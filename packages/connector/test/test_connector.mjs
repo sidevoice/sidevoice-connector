@@ -118,6 +118,26 @@ test('connector: speech while offline is queued durably and replayed on reconnec
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
 });
 
+test('connector: keeps retrying while the room is down and connects once it appears', async () => {
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  // Reserve a port, then free it so the connector's first attempts are refused.
+  const probe = http.createServer(); await new Promise(r => probe.listen(0, '127.0.0.1', r)); const port = probe.address().port; await new Promise(r => probe.close(r));
+  const frames = []; let conn = null;
+  const server = createWsServer(c => { conn = c; c.onMessage = text => { const f = JSON.parse(text); frames.push(f); if (f.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1 })); }; });
+  const socketPath = path.join(dataDir, 'connector.sock');
+  writeFileSync(path.join(dataDir, 'credentials.json'), JSON.stringify({ url: `ws://127.0.0.1:${port}/api/connectors/ws`, connector_id: 'c-1', token: 't-1' }));
+  const child = spawn(process.execPath, [connectorPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CONNECTOR_IDLE_MS: '20000' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    await until(() => existsSync(socketPath));
+    await wait(1500); // several refused attempts happen in here
+    await new Promise(r => server.listen(port, '127.0.0.1', r));
+    await until(() => frames.some(f => f.type === 'connector.hello'), 12000);
+    const facade = ipcClient(socketPath); await facade.ready;
+    await until(async () => (await facade.call('status', {})).connected, 5000);
+    facade.end();
+  } finally { child.kill(); await new Promise(r => server.close(r)); }
+});
+
 test('connector: a second instance defers to the live one', async () => {
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));

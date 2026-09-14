@@ -69,7 +69,8 @@ function open() {
   });
   ws.addEventListener('message', event => { receive(JSON.parse(String(event.data))).catch(error => send({ type: 'connector.error', error: error.message })); });
   ws.addEventListener('close', () => { connected = false; reconnect(); });
-  ws.addEventListener('error', () => {});
+  // A refused connection surfaces as 'error'; do not rely on a 'close' following it.
+  ws.addEventListener('error', () => { connected = false; reconnect(); });
 }
 function reconnect() {
   if (closed || reconnectTimer) return;
