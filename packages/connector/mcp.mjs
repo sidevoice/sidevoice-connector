@@ -101,10 +101,16 @@ async function invoke(name, args, meta) {
   if (name === 'voice_connect') {
     const who = identity(meta);
     const title = (args.title || process.env.SIDEVOICE_TITLE || path.basename(process.cwd())).slice(0, 200);
-    const result = await rpc('register', { client_ref: who.thread, harness: who.harness, thread: who.thread, title, delivery: who.delivery });
-    binding = { ...result, harness: who.harness, client_ref: who.thread };
-    // Whether the harness will actually deliver what the room posts, decided before the first message.
+    // Refuse rather than join a room we cannot hear from: a conversation whose harness holds
+    // what the room posts would sit in the list looking present while the user talks to nobody.
     const inbound = who.harness === 'claude' ? inspectInbound(who.thread) : { ok: true };
+    if (inbound.ok === false) {
+      const error = new Error(`No se conecta esta conversación: ${inbound.reason} ${inbound.remedy}`);
+      error.data = { inbound };
+      throw error;
+    }
+    const result = await rpc('register', { client_ref: who.thread, harness: who.harness, thread: who.thread, title, delivery: who.delivery, inbound });
+    binding = { ...result, harness: who.harness, client_ref: who.thread };
     return { status: result.pending ? 'joining' : 'joined', harness: who.harness, conversation: who.thread,
              binding_id: result.binding_id, delivery: 'push', room_reachable: result.connected, inbound };
   }
