@@ -1,100 +1,204 @@
 #!/usr/bin/env node
-/** One ephemeral, multiplexed outbound connector per host. Node 22+, no deps. */
+/** One connector per host: an outbound WebSocket to the room, every binding multiplexed over it,
+ *  and the last mile chosen per binding. Node 22+, no dependencies. Façades talk to it over a
+ *  local socket; a binding lives exactly as long as the façade connection that registered it. */
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdir, rm } from 'node:fs/promises';
-import { createHash, randomUUID } from 'node:crypto';
+import { mkdirSync, openSync, closeSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { deliver } from './adapters.mjs';
 
+export const PROTOCOL = 1;
 const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
 const socketPath = process.env.SIDEVOICE_CONNECTOR_SOCKET || path.join(dataDir, 'connector.sock');
-const controlUrl = process.env.SIDEVOICE_CONTROL_URL;
-const token = process.env.SIDEVOICE_CONNECTOR_TOKEN;
-const hostId = process.env.SIDEVOICE_HOST_ID || createHash('sha256').update(os.hostname()).digest('hex').slice(0, 24);
+const lockPath = socketPath + '.lock';
+const outboxPath = path.join(dataDir, 'outbox.json');
+const credentialsPath = process.env.SIDEVOICE_CREDENTIALS || path.join(dataDir, 'credentials.json');
 const idleMs = Number(process.env.SIDEVOICE_CONNECTOR_IDLE_MS || 15_000);
-if (!controlUrl || !token) throw new Error('SIDEVOICE_CONTROL_URL and SIDEVOICE_CONNECTOR_TOKEN are required');
+const hostId = process.env.SIDEVOICE_HOST_ID || os.hostname();
 
-const bindings = new Map();
-let ws, reconnectTimer, idleTimer, closed = false;
-let reconnectAttempt = 0;
+function credentials() {
+  let saved = {};
+  try { saved = JSON.parse(readFileSync(credentialsPath, 'utf8')); } catch {}
+  const url = process.env.SIDEVOICE_URL || saved.url;
+  const connector_id = process.env.SIDEVOICE_CONNECTOR_ID || saved.connector_id;
+  const token = process.env.SIDEVOICE_CONNECTOR_TOKEN || saved.token;
+  if (!url || !connector_id || !token) throw new Error(`Not paired: run pair.mjs first (looked in ${credentialsPath})`);
+  const parsed = new URL(url);
+  const loopback = ['127.0.0.1', 'localhost', '::1'].includes(parsed.hostname);
+  if (parsed.protocol !== 'wss:' && !loopback) throw new Error('The room URL must be wss:// unless it is loopback');
+  return { url, connector_id, token };
+}
 
-function send(message) {
-  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
+function alive(pid) { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } }
+function acquireLock() {
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { const fd = openSync(lockPath, 'wx', 0o600); writeFileSync(fd, String(process.pid)); closeSync(fd); return true; }
+    catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      let pid = 0; try { pid = Number(readFileSync(lockPath, 'utf8')); } catch {}
+      if (pid && alive(pid)) return false;          // A live connector holds it: we are redundant.
+      try { unlinkSync(lockPath); } catch {}         // Stale lock from a dead process.
+    }
+  }
+  return false;
 }
-function announceBindings() {
-  send({ type: 'connector.hello', host_id: hostId, token, connector_id: connectorId });
-  for (const binding of bindings.values()) send({ type: 'binding.register', ...binding });
+
+const bindings = new Map();        // binding_id -> { binding_id, client_ref, harness, thread, title, delivery, owner, chain }
+const registering = new Map();     // client_ref -> { resolve, reject, timer }
+const publishing = new Map();      // event_id -> { resolve, timer }
+const clients = new Set();         // façade IPC connections
+let outbox = [];                   // speech frames not yet confirmed by the room
+let ws = null, connected = false, closed = false, reconnectTimer = null, idleTimer = null, reconnectAttempt = 0, lastError = null;
+let creds;
+
+function loadOutbox() { try { outbox = JSON.parse(readFileSync(outboxPath, 'utf8')); if (!Array.isArray(outbox)) outbox = []; } catch { outbox = []; } }
+function saveOutbox() {
+  const temporary = outboxPath + '.' + process.pid + '.tmp';
+  writeFileSync(temporary, JSON.stringify(outbox), { mode: 0o600 }); renameSync(temporary, outboxPath);
 }
-const connectorId = randomUUID();
+function send(frame) { if (ws?.readyState === WebSocket.OPEN) { ws.send(JSON.stringify(frame)); return true; } return false; }
+
+function open() {
+  if (closed || ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return;
+  ws = new WebSocket(creds.url);
+  ws.addEventListener('open', () => {
+    send({ type: 'connector.hello', protocol: PROTOCOL, connector_id: creds.connector_id, token: creds.token, host: hostId });
+  });
+  ws.addEventListener('message', event => { receive(JSON.parse(String(event.data))).catch(error => send({ type: 'connector.error', error: error.message })); });
+  ws.addEventListener('close', () => { connected = false; reconnect(); });
+  ws.addEventListener('error', () => {});
+}
 function reconnect() {
   if (closed || reconnectTimer) return;
   const delay = Math.min(10_000, 250 * 2 ** Math.min(reconnectAttempt++, 6));
   reconnectTimer = setTimeout(() => { reconnectTimer = null; open(); }, delay);
 }
-function open() {
-  if (closed || ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return;
-  ws = new WebSocket(controlUrl);
-  ws.addEventListener('open', () => { reconnectAttempt = 0; announceBindings(); });
-  ws.addEventListener('message', event => receive(JSON.parse(String(event.data))).catch(error => {
-    send({ type: 'connector.error', error: error.message });
-  }));
-  ws.addEventListener('close', reconnect);
-  ws.addEventListener('error', () => {});
+
+async function receive(frame) {
+  switch (frame.type) {
+    case 'connector.welcome':
+      connected = true; reconnectAttempt = 0; lastError = null;
+      for (const binding of bindings.values()) send({ type: 'binding.register', client_ref: binding.client_ref, binding_id: binding.binding_id, harness: binding.harness, thread: binding.thread, title: binding.title, focus: false });
+      for (const speech of outbox) send(speech);
+      return;
+    case 'heartbeat': send({ type: 'heartbeat.ack', nonce: frame.nonce }); return;
+    case 'binding.registered': {
+      const binding = [...bindings.values()].find(b => b.client_ref === frame.client_ref);
+      if (binding && binding.binding_id !== frame.binding_id) { bindings.delete(binding.binding_id); binding.binding_id = frame.binding_id; bindings.set(frame.binding_id, binding); }
+      registering.get(frame.client_ref)?.resolve(frame); return;
+    }
+    case 'binding.rejected': registering.get(frame.client_ref)?.reject(new Error(frame.error || 'Binding rejected')); return;
+    case 'speech.published': {
+      outbox = outbox.filter(speech => speech.event_id !== frame.event_id); saveOutbox();
+      publishing.get(frame.event_id)?.resolve(frame); return;
+    }
+    case 'input.deliver': {
+      const binding = bindings.get(frame.binding_id);
+      if (!binding) { send({ type: 'input.ack', event_id: frame.event_id, status: 'unknown_binding' }); return; }
+      // One delivery at a time per binding keeps the user's turns in order.
+      binding.chain = (binding.chain || Promise.resolve()).then(async () => {
+        try { await deliver(binding.delivery, frame); send({ type: 'input.ack', event_id: frame.event_id, status: 'accepted' }); }
+        catch (error) { send({ type: 'input.ack', event_id: frame.event_id, status: 'failed', error: String(error.message || error).slice(0, 400) }); }
+      });
+      return;
+    }
+    case 'connector.error': lastError = frame.error; console.error('[sidevoice] room: ' + frame.error); return;
+  }
 }
-async function receive(message) {
-  if (message.type === 'heartbeat') { send({ type: 'heartbeat.ack', nonce: message.nonce }); return; }
-  if (message.type !== 'input.deliver') return;
-  const binding = bindings.get(message.binding_id);
-  if (!binding) { send({ type: 'input.ack', event_id: message.event_id, status: 'unknown_binding' }); return; }
-  const response = await fetch(binding.delivery_url, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ thread_id: binding.conversation_id, text: message.text,
-      message_id: message.event_id, session_id: message.session_id, revision: message.revision,
-      channel: 'voice' }), signal: AbortSignal.timeout(30_000),
-  });
-  if (!response.ok) throw new Error(`Harness delivery failed (${response.status})`);
-  send({ type: 'input.ack', event_id: message.event_id, status: 'accepted' });
+
+function snapshot() {
+  return { host: hostId, connected, protocol: PROTOCOL, outbox: outbox.length, room_error: lastError,
+    bindings: [...bindings.values()].map(({ binding_id, client_ref, harness, thread, title, delivery }) => ({ binding_id, client_ref, harness, thread, title, delivery: delivery.kind })) };
 }
 function scheduleExit() {
-  if (bindings.size || idleTimer) return;
-  idleTimer = setTimeout(() => shutdown(), idleMs);
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => { if (clients.size === 0 && bindings.size === 0) shutdown(); }, idleMs);
 }
-function snapshot() { return { host_id: hostId, connected: ws?.readyState === WebSocket.OPEN, bindings: [...bindings.values()] }; }
 function shutdown() {
-  closed = true; clearTimeout(reconnectTimer); clearTimeout(idleTimer); ws?.close(); server.close();
+  closed = true; clearTimeout(reconnectTimer); clearTimeout(idleTimer);
+  try { ws?.close(); } catch {}
+  server.close();
+  try { if (Number(readFileSync(lockPath, 'utf8')) === process.pid) { unlinkSync(socketPath); unlinkSync(lockPath); } } catch {}
+  process.exit(0);
 }
-async function command(input) {
+
+async function command(client, input) {
+  const params = input.params || {};
   switch (input.method) {
     case 'register': {
-      const binding = input.binding;
-      if (!binding?.binding_id || !binding.room_id || !binding.conversation_id || !binding.delivery_url) throw new Error('Invalid binding');
-      clearTimeout(idleTimer); idleTimer = null; bindings.set(binding.binding_id, binding); open(); send({ type: 'binding.register', ...binding }); return snapshot();
+      const { client_ref, harness, thread, title, delivery } = params;
+      if (!client_ref || !thread || !delivery?.kind) throw new Error('client_ref, thread and delivery are required');
+      const existing = [...bindings.values()].find(b => b.client_ref === client_ref);
+      if (existing) { existing.owner = client; existing.delivery = delivery; client.bindings.add(existing); return { binding_id: existing.binding_id, thread, connected }; }
+      const local_id = 'local-' + randomUUID();
+      const binding = { binding_id: local_id, client_ref, harness, thread, title, delivery, owner: client };
+      bindings.set(local_id, binding); client.bindings.add(binding); clearTimeout(idleTimer); open();
+      const frame = await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { registering.delete(client_ref); reject(new Error(connected ? 'The room did not confirm the binding' : 'The room is unreachable; retrying in the background')); }, 10_000);
+        registering.set(client_ref, { resolve: f => { clearTimeout(timer); registering.delete(client_ref); resolve(f); }, reject: e => { clearTimeout(timer); registering.delete(client_ref); reject(e); } });
+        if (!send({ type: 'binding.register', client_ref, harness, thread, title })) { /* sent on welcome */ }
+      }).catch(error => { if (!connected) return null; bindings.delete(binding.binding_id); client.bindings.delete(binding); throw error; });
+      return { binding_id: frame?.binding_id || binding.binding_id, thread, connected, pending: !frame };
     }
-    case 'unregister': bindings.delete(input.binding_id); send({ type: 'binding.unregister', binding_id: input.binding_id }); scheduleExit(); return snapshot();
     case 'publish': {
-      const binding = bindings.get(input.binding_id);
+      const binding = bindings.get(params.binding_id) || [...bindings.values()].find(b => b.client_ref === params.client_ref);
       if (!binding) throw new Error('Unknown binding');
-      send({ type: 'speech.publish', binding_id: input.binding_id, event_id: input.event_id || randomUUID(), text: input.text, language: input.language });
-      return { status: ws?.readyState === WebSocket.OPEN ? 'sent' : 'queued_for_reconnect' };
+      const speech = { type: 'speech.publish', event_id: params.event_id || randomUUID(), binding_id: binding.binding_id,
+        session_id: params.session_id, revision: params.revision, utterance_id: params.utterance_id || randomUUID(), text: params.text, language: params.language };
+      outbox.push(speech); saveOutbox();
+      if (!send(speech)) return { status: 'queued', utterance_id: speech.utterance_id };
+      const reply = await new Promise(resolve => {
+        const timer = setTimeout(() => { publishing.delete(speech.event_id); resolve(null); }, 15_000);
+        publishing.set(speech.event_id, { resolve: f => { clearTimeout(timer); publishing.delete(speech.event_id); resolve(f); } });
+      });
+      if (!reply) return { status: 'queued', utterance_id: speech.utterance_id };
+      const { type, event_id, ...result } = reply;
+      return result;
+    }
+    case 'unregister': {
+      const binding = bindings.get(params.binding_id);
+      if (binding) { bindings.delete(binding.binding_id); binding.owner?.bindings.delete(binding); if (!binding.binding_id.startsWith('local-')) send({ type: 'binding.unregister', binding_id: binding.binding_id }); }
+      scheduleExit(); return snapshot();
     }
     case 'status': return snapshot();
     default: throw new Error('Unknown connector command');
   }
 }
+
 function serve(socket) {
+  const client = { socket, bindings: new Set() };
+  clients.add(client); clearTimeout(idleTimer);
   let buffer = '';
   socket.on('data', chunk => {
     buffer += chunk;
-    for (;;) {
-      const index = buffer.indexOf('\n'); if (index < 0) break;
+    if (buffer.length > 1 << 20) { socket.destroy(); return; }
+    let index;
+    while ((index = buffer.indexOf('\n')) >= 0) {
       const line = buffer.slice(0, index); buffer = buffer.slice(index + 1);
-      Promise.resolve().then(() => command(JSON.parse(line))).then(result => socket.write(JSON.stringify({ ok: true, result }) + '\n'))
-        .catch(error => socket.write(JSON.stringify({ ok: false, error: error.message }) + '\n'));
+      if (!line.trim()) continue;
+      let input; try { input = JSON.parse(line); } catch { socket.write(JSON.stringify({ ok: false, error: 'Invalid JSON' }) + '\n'); continue; }
+      command(client, input).then(result => socket.write(JSON.stringify({ id: input.id, ok: true, result }) + '\n'))
+        .catch(error => socket.write(JSON.stringify({ id: input.id, ok: false, error: error.message }) + '\n'));
     }
   });
+  socket.on('error', () => {});
+  socket.on('close', () => {
+    clients.delete(client);
+    // The façade is gone: so is every conversation it spoke for.
+    for (const binding of client.bindings) { bindings.delete(binding.binding_id); if (!binding.binding_id.startsWith('local-')) send({ type: 'binding.unregister', binding_id: binding.binding_id }); }
+    scheduleExit();
+  });
 }
-await mkdir(dataDir, { recursive: true, mode: 0o700 });
-if (process.platform !== 'win32') await rm(socketPath, { force: true });
+
+creds = credentials();
+if (!acquireLock()) process.exit(0);
+loadOutbox();
+try { unlinkSync(socketPath); } catch {}
 const server = net.createServer(serve);
 await new Promise((resolve, reject) => server.once('error', reject).listen(socketPath, resolve));
-process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown); open();
+process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown);
+scheduleExit();
+open();

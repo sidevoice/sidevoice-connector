@@ -1,0 +1,33 @@
+name: Publish client to npm
+
+# Tag a release as v<version> (matching connector/package.json) and this publishes
+# the client package with provenance. One-time setup: an npm automation token in the
+# repository secret NPM_TOKEN (Settings → Secrets → Actions), or configure npm
+# trusted publishing for the package and drop the token.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: node --test connector/test/test_connector.mjs
+      - name: Check the tag matches the package version
+        run: |
+          pkg=$(node -p "require('./connector/package.json').version")
+          tag="${GITHUB_REF_NAME#v}"
+          [ "$pkg" = "$tag" ] || { echo "package.json is $pkg but tag is $tag"; exit 1; }
+      - run: npm publish --access public --provenance
+        working-directory: connector
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

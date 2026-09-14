@@ -1,61 +1,134 @@
 #!/usr/bin/env node
-/** Stdio MCP façade. It never owns a WebSocket; connector.mjs does. */
+/** Stdio MCP façade for one conversation. It holds no connection to the room: it starts or reuses
+ *  the host's connector and keeps one local connection to it for as long as this session lives. */
 import net from 'node:net';
-import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
 const socketPath = process.env.SIDEVOICE_CONNECTOR_SOCKET || path.join(dataDir, 'connector.sock');
 const connectorPath = fileURLToPath(new URL('./connector.mjs', import.meta.url));
-const defaultConversation = process.env.CODEX_THREAD_ID;
-function rpc(command) {
+
+const INSTRUCTIONS = `Sidevoice connects this conversation to the user's voice room.
+- Call voice_connect only when the user asks to join the voice room or enable voice for this conversation; never as a side effect.
+- Voice input arrives as a user message that starts with a JSON header ({"channel":"voice","session_id":...,"revision":...,"message_id":...}) followed by the user's literal words. Treat the header as opaque reply metadata; if the same message_id arrives twice, it is a redelivery: do not act on it again.
+- For every reply to a voice message, call voice_say with a concise spoken version and the header's session_id and revision, before long work and alongside the normal written answer. A "published" result means the room stored it, not that the user heard it. If it fails, continue in writing.
+- A message with "channel":"room-control" is an instruction from the room (for example: continue in writing); it is not a voice turn to answer aloud.
+- voice_status reports whether the room can currently reach this conversation.`;
+
+/** Who this façade speaks for, decided by what spawned it — never by the model. */
+function identity(meta) {
+  if (process.env.CLAUDE_CODE_SESSION_ID && process.env.CLAUDE_CODE_MESSAGING_SOCKET) {
+    return { harness: 'claude', thread: process.env.CLAUDE_CODE_SESSION_ID,
+      delivery: { kind: 'claude-uds', socket: process.env.CLAUDE_CODE_MESSAGING_SOCKET, token: process.env.CLAUDE_CODE_MESSAGING_TOKEN || '' } };
+  }
+  let turn = meta?.['x-codex-turn-metadata'] || {};
+  if (typeof turn === 'string') { try { turn = JSON.parse(turn); } catch { turn = {}; } }
+  const codexThread = meta?.['openai/threadId'] || meta?.['openai/thread_id'] || meta?.codexThreadId || meta?.codex_thread_id || turn.thread_id || process.env.CODEX_THREAD_ID;
+  if (codexThread) {
+    const delivery = process.env.SIDEVOICE_DELIVERY_URL ? { kind: 'http', url: process.env.SIDEVOICE_DELIVERY_URL, thread: codexThread } : { kind: 'codex-queue', thread: codexThread };
+    return { harness: 'codex', thread: codexThread, delivery };
+  }
+  if (process.env.SIDEVOICE_THREAD && process.env.SIDEVOICE_DELIVERY_URL) {
+    return { harness: process.env.SIDEVOICE_HARNESS || 'http', thread: process.env.SIDEVOICE_THREAD, delivery: { kind: 'http', url: process.env.SIDEVOICE_DELIVERY_URL, thread: process.env.SIDEVOICE_THREAD } };
+  }
+  throw new Error('Cannot tell which conversation this is: not launched by Claude Code or Codex, and no SIDEVOICE_THREAD/SIDEVOICE_DELIVERY_URL set');
+}
+
+// ----- one persistent connection to the connector -----
+let ipc = null, ipcBuffer = '', ipcSerial = 0;
+const ipcWaiting = new Map();
+function connectIpc() {
   return new Promise((resolve, reject) => {
-    const socket = net.createConnection(socketPath); let text = '';
-    socket.once('error', reject); socket.on('connect', () => socket.write(JSON.stringify(command) + '\n'));
-    socket.on('data', chunk => { text += chunk; const line = text.indexOf('\n'); if (line < 0) return; const reply = JSON.parse(text.slice(0, line)); socket.end(); reply.ok ? resolve(reply.result) : reject(new Error(reply.error)); });
+    const socket = net.createConnection(socketPath);
+    socket.once('error', reject);
+    socket.on('connect', () => {
+      socket.removeListener('error', reject);
+      socket.on('error', () => {});
+      socket.on('close', () => { if (ipc === socket) ipc = null; for (const w of ipcWaiting.values()) w.reject(new Error('Connector went away')); ipcWaiting.clear(); });
+      socket.on('data', chunk => {
+        ipcBuffer += chunk; let index;
+        while ((index = ipcBuffer.indexOf('\n')) >= 0) {
+          const line = ipcBuffer.slice(0, index); ipcBuffer = ipcBuffer.slice(index + 1);
+          let reply; try { reply = JSON.parse(line); } catch { continue; }
+          const waiting = ipcWaiting.get(reply.id); if (!waiting) continue; ipcWaiting.delete(reply.id);
+          reply.ok ? waiting.resolve(reply.result) : waiting.reject(new Error(reply.error));
+        }
+      });
+      ipc = socket; resolve(socket);
+    });
   });
 }
-async function ensure() {
-  try { await rpc({ method: 'status' }); return; } catch {}
-  const child = spawn(process.execPath, [connectorPath], { detached: true, stdio: 'ignore', env: process.env }); child.unref();
-  for (let i = 0; i < 30; i++) { await new Promise(r => setTimeout(r, 100)); try { await rpc({ method: 'status' }); return; } catch {} }
-  throw new Error('Sidevoice connector did not start');
-}
-const tools = [
-  { name: 'voice_connect', description: 'Connect this existing conversation to a Sidevoice room.', inputSchema: { type: 'object', properties: { room_id: { type: 'string' }, conversation_id: { type: 'string' }, delivery_url: { type: 'string' } }, required: ['room_id', 'delivery_url'] } },
-  { name: 'voice_say', description: 'Publish a concise spoken presentation through the active Sidevoice binding.', inputSchema: { type: 'object', properties: { binding_id: { type: 'string' }, text: { type: 'string' }, language: { type: 'string' } }, required: ['binding_id', 'text'] } },
-  { name: 'voice_disconnect', description: 'Disconnect a Sidevoice binding without stopping the task.', inputSchema: { type: 'object', properties: { binding_id: { type: 'string' } }, required: ['binding_id'] } },
-  { name: 'voice_status', description: 'Read Sidevoice connector and binding status.', inputSchema: { type: 'object', properties: {} } },
-];
-async function invoke(name, args) {
-  if (name === 'voice_status') return rpc({ method: 'status' });
-  await ensure();
-  if (name === 'voice_connect') {
-    const conversation_id = args.conversation_id || defaultConversation;
-    if (!conversation_id) throw new Error('conversation_id is required outside a Codex task');
-    const binding_id = randomUUID();
-    return rpc({ method: 'register', binding: { binding_id, room_id: args.room_id, conversation_id, delivery_url: args.delivery_url } });
+async function ensureConnector() {
+  if (ipc) return ipc;
+  try { return await connectIpc(); } catch {}
+  const child = spawn(process.execPath, [connectorPath], { detached: true, stdio: 'ignore', env: process.env });
+  child.unref();
+  for (let attempt = 0; attempt < 40; attempt++) {
+    await new Promise(r => setTimeout(r, 100));
+    try { return await connectIpc(); } catch {}
   }
-  if (name === 'voice_say') return rpc({ method: 'publish', binding_id: args.binding_id, text: args.text, language: args.language });
-  if (name === 'voice_disconnect') return rpc({ method: 'unregister', binding_id: args.binding_id });
+  throw new Error('The Sidevoice connector did not start (is this host paired? see docs/INSTALL.md)');
+}
+async function rpc(method, params) {
+  await ensureConnector();
+  const id = ++ipcSerial;
+  return new Promise((resolve, reject) => { ipcWaiting.set(id, { resolve, reject }); ipc.write(JSON.stringify({ id, method, params }) + '\n'); });
+}
+
+// ----- tools -----
+const tools = [
+  { name: 'voice_connect', description: 'Connect this conversation to the voice room. Only on an explicit request to join or enable voice.',
+    inputSchema: { type: 'object', properties: { title: { type: 'string', description: 'Short label for this conversation in the room' } }, additionalProperties: false } },
+  { name: 'voice_say', description: 'Publish a concise spoken version of your reply to the room, with the session_id and revision from the voice message header.',
+    inputSchema: { type: 'object', properties: { text: { type: 'string' }, session_id: { type: 'string' }, revision: { type: 'integer', minimum: 0 }, utterance_id: { type: 'string' }, language: { type: 'string', enum: ['es', 'en', 'fr', 'it', 'pt', 'hi'] } }, required: ['text', 'session_id', 'revision'], additionalProperties: false } },
+  { name: 'voice_disconnect', description: 'Leave the voice room. The conversation and its work continue in writing.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+  { name: 'voice_status', description: 'Whether the room can currently reach this conversation.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+];
+let binding = null;
+async function invoke(name, args, meta) {
+  if (name === 'voice_status') {
+    const status = ipc ? await rpc('status', {}) : { connected: false, bindings: [] };
+    return { joined: !!binding, room_reachable: status.connected, room_error: status.room_error || null, binding_id: binding?.binding_id || null, harness: binding?.harness || null };
+  }
+  if (name === 'voice_connect') {
+    const who = identity(meta);
+    const title = (args.title || process.env.SIDEVOICE_TITLE || path.basename(process.cwd())).slice(0, 200);
+    const result = await rpc('register', { client_ref: who.thread, harness: who.harness, thread: who.thread, title, delivery: who.delivery });
+    binding = { ...result, harness: who.harness, client_ref: who.thread };
+    return { status: result.pending ? 'joining' : 'joined', harness: who.harness, conversation: who.thread, binding_id: result.binding_id, delivery: 'push', room_reachable: result.connected };
+  }
+  if (!binding) throw new Error('Not connected to the voice room: call voice_connect first (only if the user asked).');
+  if (name === 'voice_say') {
+    const result = await rpc('publish', { binding_id: binding.binding_id, client_ref: binding.client_ref, text: args.text, session_id: args.session_id, revision: args.revision, utterance_id: args.utterance_id, language: args.language });
+    return result.text_saved ? { status: 'published', text_saved: true, audio: result.status, reason: result.reason } : result;
+  }
+  if (name === 'voice_disconnect') { const result = await rpc('unregister', { binding_id: binding.binding_id }); binding = null; return { status: 'left', room_reachable: result.connected }; }
   throw new Error('Unknown tool');
 }
+
+// ----- JSON-RPC over stdio -----
 let input = '';
-process.stdin.setEncoding('utf8'); process.stdin.on('data', async chunk => {
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', async chunk => {
   input += chunk;
   while (input.includes('\n')) {
-    const index = input.indexOf('\n'); const line = input.slice(0, index); input = input.slice(index + 1); if (!line) continue;
-    const request = JSON.parse(line); let result, error;
+    const index = input.indexOf('\n'); const line = input.slice(0, index); input = input.slice(index + 1);
+    if (!line.trim()) continue;
+    let request; try { request = JSON.parse(line); } catch { continue; }
+    if (request.id === undefined) continue; // notifications need no answer
+    let result, error;
     try {
-      if (request.method === 'initialize') result = { protocolVersion: request.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'sidevoice', version: '0.1.0' } };
+      if (request.method === 'initialize') result = { protocolVersion: request.params?.protocolVersion || '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'sidevoice', version: '0.2.0' }, instructions: INSTRUCTIONS };
       else if (request.method === 'tools/list') result = { tools };
-      else if (request.method === 'tools/call') result = { content: [{ type: 'text', text: JSON.stringify(await invoke(request.params.name, request.params.arguments || {})) }] };
+      else if (request.method === 'tools/call') { const value = await invoke(request.params.name, request.params.arguments || {}, request.params._meta); result = { content: [{ type: 'text', text: JSON.stringify(value) }] }; }
       else if (request.method === 'ping') result = {};
-      else throw new Error('Unsupported MCP method');
-    } catch (e) { error = { code: -32603, message: e.message }; }
-    if (request.id !== undefined) process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, ...(error ? { error } : { result }) }) + '\n');
+      else throw Object.assign(new Error('Method not found'), { code: -32601 });
+    } catch (e) { error = { code: e.code || -32603, message: e.message }; }
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, ...(error ? { error } : { result }) }) + '\n');
   }
 });
+process.stdin.on('end', () => { ipc?.end(); process.exit(0); });

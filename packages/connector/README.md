@@ -1,36 +1,29 @@
-# Sidevoice connector
+# Sidevoice uplink — the client side (`@sidevoice/uplink`)
 
-This is the local half of the production-oriented transport. It deliberately
-does not expose an inbound port to the internet.
+The client side. Three entry points behind one bin (`sidevoice`):
 
-`connector.mjs` owns one outbound WebSocket per host and multiplexes the active
-room bindings over it. `mcp.mjs` is a short-lived stdio MCP façade: it starts or
-reuses the connector and sends it local IPC commands. The connector exits after
-the last binding is removed (with a short grace period).
+- `mcp` — the stdio MCP server a harness starts. One per conversation. Exposes
+  `voice_connect`, `voice_say`, `voice_disconnect`, `voice_status`; carries the
+  operational instructions in its `initialize` result. It never talks to the
+  room: it keeps one local connection to the connector for as long as the
+  session lives, and the binding it registered dies with that connection.
+- `connector` — one per machine, started by the first façade that needs it and
+  gone fifteen seconds after the last binding leaves. Holds the outbound
+  WebSocket to the room, re-announces its bindings after a reconnect, keeps a
+  durable outbox for speech published while offline, answers the room's
+  heartbeat, and delivers one input event at a time per binding through the
+  adapter that binding was registered with. A file lock makes it a singleton.
+- `pair` — redeems a pairing code from the room UI for this machine's
+  credential (`~/.sidevoice/credentials.json`, mode 0600).
 
-The control-plane WebSocket contract is newline-free JSON messages:
+Adapters (`adapters.mjs`): `claude-uds` writes the voice envelope as a user
+message to the Claude Code session's inbox socket; `codex-queue` runs
+`codex queue --thread <id>`; `http` posts to any local receiver that accepts the
+room's message shape (for harnesses that have neither).
 
-- client -> server: `connector.hello`, `binding.register`, `binding.unregister`,
-  `speech.publish`, `input.ack`, and `heartbeat`;
-- server -> client: `input.deliver` and `heartbeat.ack`.
+Protocol (newline-free JSON over the WebSocket): `connector.hello` ->
+`connector.welcome`; `binding.register` -> `binding.registered|rejected`;
+`binding.unregister`; `input.deliver` -> `input.ack`; `speech.publish` ->
+`speech.published`; `heartbeat` <-> `heartbeat.ack`. Protocol version 1.
 
-Every delivery has an `event_id`. The connector preserves it when posting to the
-harness adapter and returns an acknowledgement only after that adapter confirms
-acceptance. On reconnect it re-sends `connector.hello` and every active binding.
-The remote control plane is responsible for durable events and replay after the
-last acknowledged event.
-
-## Local development
-
-The code uses Node 22's built-in `WebSocket`, `fetch`, stdio and Unix-domain
-sockets; there are no npm dependencies.
-
-```sh
-export SIDEVOICE_CONTROL_URL=wss://sidevoice.example/connectors
-export SIDEVOICE_CONNECTOR_TOKEN=development-token
-node connector/mcp.mjs
-```
-
-The checked-in voice-room prototype is still local-only and does not implement
-this control-plane endpoint. The connector is therefore a new integration layer,
-not a claim that the current `127.0.0.1:8767` server is remotely deployable.
+Node 22+, no dependencies. Tests: `node --test test/test_connector.mjs`.

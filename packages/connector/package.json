@@ -1,0 +1,29 @@
+{
+  "name": "@sidevoice/uplink",
+  "version": "0.2.0",
+  "description": "Sidevoice client side: the stdio MCP server your agent uses, one outbound uplink per machine to the room, one-time pairing.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "sidevoice": "./cli.mjs"
+  },
+  "files": [
+    "cli.mjs",
+    "mcp.mjs",
+    "connector.mjs",
+    "adapters.mjs",
+    "pair.mjs",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/test_connector.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rubasace/sidevoice.git",
+    "directory": "connector"
+  }
+}
