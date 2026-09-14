@@ -63,14 +63,16 @@ function send(frame) { if (ws?.readyState === WebSocket.OPEN) { ws.send(JSON.str
 
 function open() {
   if (closed || ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return;
-  ws = new WebSocket(creds.url);
-  ws.addEventListener('open', () => {
+  const socket = ws = new WebSocket(creds.url);
+  socket.addEventListener('open', () => {
     send({ type: 'connector.hello', protocol: PROTOCOL, connector_id: creds.connector_id, token: creds.token, host: hostId });
   });
-  ws.addEventListener('message', event => { receive(JSON.parse(String(event.data))).catch(error => send({ type: 'connector.error', error: error.message })); });
-  ws.addEventListener('close', () => { connected = false; reconnect(); });
-  // A refused connection surfaces as 'error'; do not rely on a 'close' following it.
-  ws.addEventListener('error', () => { connected = false; reconnect(); });
+  socket.addEventListener('message', event => { receive(JSON.parse(String(event.data))).catch(error => send({ type: 'connector.error', error: error.message })); });
+  const lost = () => { if (ws === socket) { ws = null; connected = false; } reconnect(); };
+  // A refused connection surfaces as 'error' with no 'close', and the dead socket stays
+  // CONNECTING forever: forget it, or open() would never make another one.
+  socket.addEventListener('close', lost);
+  socket.addEventListener('error', lost);
 }
 function reconnect() {
   if (closed || reconnectTimer) return;
