@@ -103,8 +103,14 @@ async function receive(frame) {
       if (!binding) { send({ type: 'input.ack', event_id: frame.event_id, status: 'unknown_binding' }); return; }
       // One delivery at a time per binding keeps the user's turns in order.
       binding.chain = (binding.chain || Promise.resolve()).then(async () => {
-        try { await deliver(binding.delivery, frame); send({ type: 'input.ack', event_id: frame.event_id, status: 'accepted' }); }
-        catch (error) { send({ type: 'input.ack', event_id: frame.event_id, status: 'failed', error: String(error.message || error).slice(0, 400) }); }
+        try {
+          const outcome = await deliver(binding.delivery, frame);
+          console.error(`[sidevoice] delivered ${frame.event_id} to ${binding.thread} via ${binding.delivery.kind}: ${outcome.status} (${outcome.detail})`);
+          send({ type: 'input.ack', event_id: frame.event_id, status: outcome.status, detail: outcome.detail });
+        } catch (error) {
+          console.error(`[sidevoice] delivery of ${frame.event_id} failed: ${error.message}`);
+          send({ type: 'input.ack', event_id: frame.event_id, status: 'failed', error: String(error.message || error).slice(0, 400) });
+        }
       });
       return;
     }
