@@ -7,6 +7,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { inspectInbound } from './harness-claude.mjs';
 
 const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
 const socketPath = process.env.SIDEVOICE_CONNECTOR_SOCKET || path.join(dataDir, 'connector.sock');
@@ -17,7 +18,8 @@ const INSTRUCTIONS = `Sidevoice connects this conversation to the user's voice r
 - Voice input arrives as a user message that starts with a JSON header ({"channel":"voice","session_id":...,"revision":...,"message_id":...}) followed by the user's literal words. Treat the header as opaque reply metadata; if the same message_id arrives twice, it is a redelivery: do not act on it again.
 - For every reply to a voice message, call voice_say with a concise spoken version and the header's session_id and revision, before long work and alongside the normal written answer. A "published" result means the room stored it, not that the user heard it. If it fails, continue in writing.
 - A message with "channel":"room-control" is an instruction from the room (for example: continue in writing); it is not a voice turn to answer aloud.
-- voice_status reports whether the room can currently reach this conversation.`;
+- voice_status reports whether the room can currently reach this conversation.
+- If voice_connect returns inbound.ok false, voice will look sent and never arrive: this harness holds or refuses messages posted by other local processes. Tell the user what inbound.reason says, offer inbound.remedy in your own words including what safeguard the machine-wide option removes, and let them choose. Do not change their settings without being asked to.`;
 
 /** Who this façade speaks for, decided by what spawned it — never by the model. */
 function identity(meta) {
@@ -92,14 +94,19 @@ let binding = null;
 async function invoke(name, args, meta) {
   if (name === 'voice_status') {
     const status = ipc ? await rpc('status', {}) : { connected: false, bindings: [] };
-    return { joined: !!binding, room_reachable: status.connected, room_error: status.room_error || null, binding_id: binding?.binding_id || null, harness: binding?.harness || null };
+    const inbound = binding?.harness === 'claude' ? inspectInbound(binding.client_ref) : { ok: true };
+    return { joined: !!binding, room_reachable: status.connected, room_error: status.room_error || null,
+             binding_id: binding?.binding_id || null, harness: binding?.harness || null, inbound };
   }
   if (name === 'voice_connect') {
     const who = identity(meta);
     const title = (args.title || process.env.SIDEVOICE_TITLE || path.basename(process.cwd())).slice(0, 200);
     const result = await rpc('register', { client_ref: who.thread, harness: who.harness, thread: who.thread, title, delivery: who.delivery });
     binding = { ...result, harness: who.harness, client_ref: who.thread };
-    return { status: result.pending ? 'joining' : 'joined', harness: who.harness, conversation: who.thread, binding_id: result.binding_id, delivery: 'push', room_reachable: result.connected };
+    // Whether the harness will actually deliver what the room posts, decided before the first message.
+    const inbound = who.harness === 'claude' ? inspectInbound(who.thread) : { ok: true };
+    return { status: result.pending ? 'joining' : 'joined', harness: who.harness, conversation: who.thread,
+             binding_id: result.binding_id, delivery: 'push', room_reachable: result.connected, inbound };
   }
   if (!binding) throw new Error('Not connected to the voice room: call voice_connect first (only if the user asked).');
   if (name === 'voice_say') {

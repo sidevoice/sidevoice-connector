@@ -15,6 +15,7 @@
     "mcp.mjs",
     "connector.mjs",
     "adapters.mjs",
+    "harness-claude.mjs",
     "pair.mjs",
     "README.md"
   ],
