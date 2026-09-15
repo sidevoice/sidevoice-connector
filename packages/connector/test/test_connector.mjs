@@ -55,7 +55,11 @@ test('connector: hello, register, ordered delivery with acks, speech round trip,
   const deliveryUrl = `http://127.0.0.1:${harness.address().port}/presentation/message`;
   room.handle = (frame, c) => {
     if (frame.type === 'connector.hello') { assert.equal(frame.connector_id, 'c-1'); assert.equal(frame.token, 't-1'); c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1, heartbeat_seconds: 15 })); }
-    if (frame.type === 'binding.register') c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-' + frame.client_ref, thread: frame.thread }));
+    if (frame.type === 'binding.register') {
+      // First registration carries no server binding id; reconnects do.
+      assert.ok(frame.binding_id === undefined || frame.binding_id === 'b-' + frame.client_ref);
+      c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-' + frame.client_ref, thread: frame.thread }));
+    }
     if (frame.type === 'heartbeat') c.send(JSON.stringify({ type: 'heartbeat.ack', nonce: frame.nonce }));
     if (frame.type === 'speech.publish') c.send(JSON.stringify({ type: 'speech.published', event_id: frame.event_id, status: 'queued', text_saved: true, utterance_id: frame.utterance_id }));
   };
@@ -96,9 +100,12 @@ test('connector: hello, register, ordered delivery with acks, speech round trip,
 test('connector: speech while offline is queued durably and replayed on reconnect', async () => {
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
-  let allowHello = false;
+  const port = room.server.address().port;
+  // Make the first connector attempts genuinely refused. Leaving a WebSocket
+  // peer open without a welcome races the client's connection-error handling.
+  await room.close();
   room.handle = (frame, c) => {
-    if (frame.type === 'connector.hello' && allowHello) c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1, heartbeat_seconds: 15 }));
+    if (frame.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1, heartbeat_seconds: 15 }));
     if (frame.type === 'binding.register') c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-1', thread: frame.thread }));
     if (frame.type === 'speech.publish') c.send(JSON.stringify({ type: 'speech.published', event_id: frame.event_id, status: 'queued', text_saved: true }));
   };
@@ -110,8 +117,8 @@ test('connector: speech while offline is queued durably and replayed on reconnec
     const said = await facade.call('publish', { client_ref: 'r', session_id: 's', revision: 0, text: 'sin sala' });
     assert.equal(said.status, 'queued');
     assert.equal(JSON.parse(readFileSync(path.join(dataDir, 'outbox.json'), 'utf8')).length, 1);
-    allowHello = true; room.conn.close(); // force a reconnect, this time welcomed
-    await until(() => room.frames.some(f => f.type === 'speech.publish' && f.text === 'sin sala') && room.frames.filter(f => f.type === 'connector.welcome').length === 0);
+    await new Promise(r => room.server.listen(port, '127.0.0.1', r));
+    await until(() => room.frames.some(f => f.type === 'speech.publish' && f.text === 'sin sala'));
     await until(() => JSON.parse(readFileSync(path.join(dataDir, 'outbox.json'), 'utf8')).length === 0);
     const result = await registration; assert.equal(result.binding_id, 'b-1');
     facade.end();

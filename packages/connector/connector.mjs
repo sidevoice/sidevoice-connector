@@ -84,7 +84,16 @@ async function receive(frame) {
   switch (frame.type) {
     case 'connector.welcome':
       connected = true; reconnectAttempt = 0; lastError = null;
-      for (const binding of bindings.values()) send({ type: 'binding.register', client_ref: binding.client_ref, binding_id: binding.binding_id, harness: binding.harness, thread: binding.thread, title: binding.title, inbound: binding.inbound, focus: false });
+      for (const binding of bindings.values()) {
+        // `local-*` is only a connector-side placeholder while the first
+        // registration waits for the room to mint its durable binding id.
+        // Sending it back makes the room correctly reject it as foreign.
+        const frame = { type: 'binding.register', client_ref: binding.client_ref,
+          harness: binding.harness, thread: binding.thread, title: binding.title,
+          inbound: binding.inbound, focus: false };
+        if (!binding.binding_id.startsWith('local-')) frame.binding_id = binding.binding_id;
+        send(frame);
+      }
       for (const speech of outbox) send(speech);
       return;
     case 'heartbeat': send({ type: 'heartbeat.ack', nonce: frame.nonce }); return;
