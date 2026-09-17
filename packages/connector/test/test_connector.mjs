@@ -175,6 +175,7 @@ test('mcp façade: identity comes from the harness, tools are exposed, instructi
     assert.match(replies[0].result.instructions, /voice_say/);
     assert.match(replies[0].result.instructions, /immediate acknowledgement/);
     assert.match(replies[0].result.instructions, /meaningful progress checkpoints/);
+    assert.match(replies[0].result.instructions, /process newly arrived user input before starting the next step/);
     assert.match(replies[0].result.instructions, /same original session_id and revision/);
     assert.deepEqual(replies[1].result.tools.map(t => t.name), ['voice_connect', 'voice_say', 'voice_disconnect', 'voice_status']);
     const joined = JSON.parse(replies[2].result.content[0].text);
