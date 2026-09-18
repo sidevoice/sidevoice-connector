@@ -44,9 +44,12 @@ jobs:
       # Node 22 still bundles npm 10, and publishing over OIDC needs 11.5.1 or
       # later: without this the release authenticates with nothing and fails.
       - run: npm install -g npm@latest
-      # Published over OIDC: the trusted publisher on npmjs.com names this
-      # repository and this workflow, so there is no token to hold. A release
-      # that cannot publish fails here, where it can be seen.
+      # Staged, not live. The version waits in npm's queue until a maintainer
+      # approves it from a trusted device, because this is the one step here
+      # that cannot be taken back: an npm version is spent for ever, even if it
+      # is unpublished. The registry enforces it too — the trusted publisher is
+      # configured stage-only, so a direct publish from this workflow is
+      # refused. Authentication is OIDC; there is no token to hold.
       #
       # A pre-release must not become what `npm install` picks: it goes out
       # under the `next` tag, and only a final release moves `latest`.
@@ -55,8 +58,23 @@ jobs:
             *-*) tag=next ;;
             *) tag=latest ;;
           esac
-          npm publish --access public --provenance --tag "$tag"
+          npm stage publish --access public --provenance --tag "$tag"
         working-directory: packages/connector
+      - name: Say how to land it
+        run: |
+          {
+            echo "### The client is staged, not live"
+            echo
+            echo "It becomes installable when you approve it:"
+            echo
+            echo '```sh'
+            echo "npm stage list @sidevoice/uplink"
+            echo "npm stage approve <stage-id>"
+            echo '```'
+            echo
+            echo "Or on npmjs.com: the package → Staged Packages. Approving asks"
+            echo "for your second factor, which is the point of staging."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   release:
     name: GitHub release
@@ -98,7 +116,10 @@ jobs:
           npx -y @sidevoice/uplink@$version pair
           \`\`\`
 
-          See \`docs/INSTALL.md\`. The client is attached below as a tarball too.
+          The client is **staged** on npm and becomes installable once a
+          maintainer approves it — npmjs.com → the package → Staged Packages.
+          Until then, install it from the tarball attached below, or run it from
+          a checkout. See \`docs/INSTALL.md\`.
           NOTES
           prerelease=""
           case "$version" in *-*) prerelease="--prerelease" ;; esac
