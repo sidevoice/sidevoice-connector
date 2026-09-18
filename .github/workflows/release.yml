@@ -1,0 +1,70 @@
+name: Release
+
+# main → the server image at ghcr.io/<repo>:latest and :sha-<commit>.
+# v<version> tag → the image at :<version> and :<major>.<minor>, plus a GitHub release with
+# generated notes. The client package goes to npm from publish.yml on the same tag.
+# Pull requests only build the image, to prove the Dockerfile still works.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  image:
+    name: Server image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to the GitHub container registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag matches the versions in the repository
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          client=$(node -p "require('./packages/connector/package.json').version")
+          server=$(sed -n 's/^version = "\(.*\)"/\1/p' apps/server/pyproject.toml)
+          [ "$client" = "$tag" ] || { echo "packages/connector/package.json is $client but the tag is $tag"; exit 1; }
+          [ "$server" = "$tag" ] || { echo "apps/server/pyproject.toml is $server but the tag is $tag"; exit 1; }
+      - name: Create the release with generated notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          image="ghcr.io/${{ github.repository }}:${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes \
+            --notes "Server image: \`$image\` (also \`ghcr.io/${{ github.repository }}:latest\` from main). Client package: \`@sidevoice/uplink@${GITHUB_REF_NAME#v}\` on npm."
