@@ -41,6 +41,9 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      # Node 22 still bundles npm 10, and publishing over OIDC needs 11.5.1 or
+      # later: without this the release authenticates with nothing and fails.
+      - run: npm install -g npm@latest
       # Published over OIDC: the trusted publisher on npmjs.com names this
       # repository and this workflow, so there is no token to hold. A release
       # that cannot publish fails here, where it can be seen.
