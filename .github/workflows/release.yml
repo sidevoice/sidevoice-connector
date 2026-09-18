@@ -34,37 +34,26 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write  # Provenance, and trusted publishing once it is configured.
+      id-token: write  # Trusted publishing, and the provenance it attaches.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
-      # npm needs a one-time setup that only the account owner can do
-      # (docs/RELEASING.md). Until the repository variable PUBLISH_NPM is true a
-      # release still happens; it just does not reach npm, and says so.
-      - id: gate
-        run: |
-          if [ "${{ vars.PUBLISH_NPM }}" = "true" ]; then
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::npm publish skipped: set the repository variable PUBLISH_NPM to true once the npm account is set up (docs/RELEASING.md)."
-          fi
+      # Published over OIDC: the trusted publisher on npmjs.com names this
+      # repository and this workflow, so there is no token to hold. A release
+      # that cannot publish fails here, where it can be seen.
+      #
       # A pre-release must not become what `npm install` picks: it goes out
       # under the `next` tag, and only a final release moves `latest`.
-      - if: steps.gate.outputs.publish == 'true'
-        run: |
+      - run: |
           case "${GITHUB_REF_NAME#v}" in
             *-*) tag=next ;;
             *) tag=latest ;;
           esac
           npm publish --access public --provenance --tag "$tag"
         working-directory: packages/connector
-        env:
-          # Drop this env block along with the NPM_TOKEN secret once the package
-          # has a trusted publisher configured on npmjs.com.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   release:
     name: GitHub release
