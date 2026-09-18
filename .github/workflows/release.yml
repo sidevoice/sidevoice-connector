@@ -1,70 +1,114 @@
 name: Release
 
-# main → the server image at ghcr.io/<repo>:latest and :sha-<commit>.
-# v<version> tag → the image at :<version> and :<major>.<minor>, plus a GitHub release with
-# generated notes. The client package goes to npm from publish.yml on the same tag.
-# Pull requests only build the image, to prove the Dockerfile still works.
+# A release is a tag v<version>: the whole CI runs on that tag, the server image
+# is published under the version, the client goes to npm, and the GitHub release
+# is opened last, so it only ever describes things that were actually published.
+# Cutting one: scripts/version.sh set <version>, merge, then tag.
+# See docs/RELEASING.md. Pushes to main publish :latest from ci.yml.
 on:
   push:
-    branches: [main]
     tags: ["v*"]
-  pull_request:
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
-  image:
-    name: Server image
+  version:
+    name: The tag and the manifests agree
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - name: Log in to the GitHub container registry
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+      - run: ./scripts/version.sh check "${GITHUB_REF_NAME#v}"
+
+  verify:
+    name: Verified build
+    needs: version
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      packages: write
+
+  npm:
+    name: Client to npm
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # Provenance, and trusted publishing once it is configured.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=sha-,enable={{is_default_branch}}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      # npm needs a one-time setup that only the account owner can do
+      # (docs/RELEASING.md). Until the repository variable PUBLISH_NPM is true a
+      # release still happens; it just does not reach npm, and says so.
+      - id: gate
+        run: |
+          if [ "${{ vars.PUBLISH_NPM }}" = "true" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::npm publish skipped: set the repository variable PUBLISH_NPM to true once the npm account is set up (docs/RELEASING.md)."
+          fi
+      # A pre-release must not become what `npm install` picks: it goes out
+      # under the `next` tag, and only a final release moves `latest`.
+      - if: steps.gate.outputs.publish == 'true'
+        run: |
+          case "${GITHUB_REF_NAME#v}" in
+            *-*) tag=next ;;
+            *) tag=latest ;;
+          esac
+          npm publish --access public --provenance --tag "$tag"
+        working-directory: packages/connector
+        env:
+          # Drop this env block along with the NPM_TOKEN secret once the package
+          # has a trusted publisher configured on npmjs.com.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   release:
     name: GitHub release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: image
+    needs: [verify, npm]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Check the tag matches the versions in the repository
-        run: |
-          tag="${GITHUB_REF_NAME#v}"
-          client=$(node -p "require('./packages/connector/package.json').version")
-          server=$(sed -n 's/^version = "\(.*\)"/\1/p' apps/server/pyproject.toml)
-          [ "$client" = "$tag" ] || { echo "packages/connector/package.json is $client but the tag is $tag"; exit 1; }
-          [ "$server" = "$tag" ] || { echo "apps/server/pyproject.toml is $server but the tag is $tag"; exit 1; }
-      - name: Create the release with generated notes
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Pack the client
+        run: npm pack --pack-destination "$RUNNER_TEMP"
+        working-directory: packages/connector
+      - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
+          IMAGE: ghcr.io/${{ github.repository }}
+          IMAGE_DIGEST: ${{ needs.verify.outputs.image-digest }}
         run: |
-          image="ghcr.io/${{ github.repository }}:${GITHUB_REF_NAME#v}"
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes \
-            --notes "Server image: \`$image\` (also \`ghcr.io/${{ github.repository }}:latest\` from main). Client package: \`@sidevoice/uplink@${GITHUB_REF_NAME#v}\` on npm."
+          version="${GITHUB_REF_NAME#v}"
+          notes=$(mktemp)
+          cat > "$notes" <<NOTES
+          ## Run the room
+
+          \`\`\`sh
+          docker run -d --name sidevoice -p 127.0.0.1:8767:8767 -v sidevoice-data:/data \\
+            $IMAGE:$version
+          \`\`\`
+
+          Pinned by digest: \`$IMAGE@$IMAGE_DIGEST\` (linux/amd64 and linux/arm64).
+          Room data lives in \`/data\`. The room has no access control: put it
+          behind a proxy that adds TLS and authentication before exposing it.
+
+          ## Connect a conversation
+
+          \`\`\`sh
+          npx -y @sidevoice/uplink@$version pair
+          \`\`\`
+
+          See \`docs/INSTALL.md\`. The client is attached below as a tarball too.
+          NOTES
+          prerelease=""
+          case "$version" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP"/*.tgz \
+            --title "$GITHUB_REF_NAME" --verify-tag --generate-notes --notes-file "$notes" $prerelease
