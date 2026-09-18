@@ -187,3 +187,30 @@ test('mcp façade: identity comes from the harness, tools are exposed, instructi
     assert.equal(commands[1].params.binding_id, 'b-9');
   } finally { child.kill(); fake.close(); }
 });
+
+test('connector: the room closing a conversation\'s voice removes the binding and the façade is told on its next call', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  room.handle = (frame, c) => {
+    if (frame.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1, heartbeat_seconds: 15 }));
+    if (frame.type === 'binding.register') c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-' + frame.client_ref, thread: frame.thread }));
+    if (frame.type === 'speech.publish') c.send(JSON.stringify({ type: 'speech.published', event_id: frame.event_id, status: 'queued', text_saved: true, utterance_id: frame.utterance_id }));
+  };
+  const { child, socketPath } = startConnector(room, dataDir);
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    await facade.call('register', { client_ref: 'thread-1', harness: 'test', thread: 'thread-1', title: 'T', delivery: { kind: 'http', url: 'http://127.0.0.1:1/never', thread: 'thread-1' } });
+    room.conn.send(JSON.stringify({ type: 'binding.close', binding_id: 'b-thread-1', thread: 'thread-1', reason: 'closed_from_room' }));
+    await until(async () => (await facade.call('status', {})).closed_by_room.includes('thread-1'));
+    await assert.rejects(facade.call('publish', { binding_id: 'b-thread-1', client_ref: 'thread-1', session_id: 's', revision: 1, text: 'tarde' }), /CLOSED_BY_ROOM/);
+    assert.equal((await facade.call('status', {})).bindings.length, 0);
+    // The room never hears an unregister for a binding it closed itself.
+    assert.equal(room.frames.filter(f => f.type === 'binding.unregister').length, 0);
+    // Joining again is the user's explicit request and clears the closure.
+    const again = await facade.call('register', { client_ref: 'thread-1', harness: 'test', thread: 'thread-1', title: 'T', delivery: { kind: 'http', url: 'http://127.0.0.1:1/never', thread: 'thread-1' } });
+    assert.equal(again.binding_id, 'b-thread-1');
+    assert.deepEqual((await facade.call('status', {})).closed_by_room, []);
+    facade.end();
+  } finally { if (child.exitCode === null) child.kill(); await room.close(); }
+});

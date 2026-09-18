@@ -50,6 +50,7 @@ const bindings = new Map();        // binding_id -> { binding_id, client_ref, ha
 const registering = new Map();     // client_ref -> { resolve, reject, timer }
 const publishing = new Map();      // event_id -> { resolve, timer }
 const clients = new Set();         // façade IPC connections
+const closedByRoom = new Map();    // client_ref -> reason: the user closed that conversation's voice from the room
 let outbox = [];                   // speech frames not yet confirmed by the room
 let ws = null, connected = false, closed = false, reconnectTimer = null, idleTimer = null, reconnectAttempt = 0, lastError = null;
 let creds;
@@ -123,12 +124,21 @@ async function receive(frame) {
       });
       return;
     }
+    case 'binding.close': {
+      // The user closed this conversation's voice in the room. Forget the binding; the façade learns it on its next call.
+      const binding = bindings.get(frame.binding_id);
+      if (!binding) return;
+      bindings.delete(binding.binding_id); binding.owner?.bindings.delete(binding);
+      closedByRoom.set(binding.client_ref, frame.reason || 'closed_from_room');
+      console.error(`[sidevoice] room closed voice for ${binding.thread}`);
+      scheduleExit(); return;
+    }
     case 'connector.error': lastError = frame.error; console.error('[sidevoice] room: ' + frame.error); return;
   }
 }
 
 function snapshot() {
-  return { host: hostId, connected, protocol: PROTOCOL, outbox: outbox.length, room_error: lastError,
+  return { host: hostId, connected, protocol: PROTOCOL, outbox: outbox.length, room_error: lastError, closed_by_room: [...closedByRoom.keys()],
     bindings: [...bindings.values()].map(({ binding_id, client_ref, harness, thread, title, delivery }) => ({ binding_id, client_ref, harness, thread, title, delivery: delivery.kind })) };
 }
 function scheduleExit() {
@@ -149,6 +159,7 @@ async function command(client, input) {
     case 'register': {
       const { client_ref, harness, thread, title, delivery, inbound } = params;
       if (!client_ref || !thread || !delivery?.kind) throw new Error('client_ref, thread and delivery are required');
+      closedByRoom.delete(client_ref);   // joining again is the user's explicit request
       const existing = [...bindings.values()].find(b => b.client_ref === client_ref);
       if (existing) { existing.owner = client; existing.delivery = delivery; client.bindings.add(existing); return { binding_id: existing.binding_id, thread, connected }; }
       const local_id = 'local-' + randomUUID();
@@ -163,7 +174,7 @@ async function command(client, input) {
     }
     case 'publish': {
       const binding = bindings.get(params.binding_id) || [...bindings.values()].find(b => b.client_ref === params.client_ref);
-      if (!binding) throw new Error('Unknown binding');
+      if (!binding) throw new Error(closedByRoom.has(params.client_ref) ? 'CLOSED_BY_ROOM' : 'Unknown binding');
       const speech = { type: 'speech.publish', event_id: params.event_id || randomUUID(), binding_id: binding.binding_id,
         session_id: params.session_id, revision: params.revision, utterance_id: params.utterance_id || randomUUID(), text: params.text, language: params.language };
       outbox.push(speech); saveOutbox();

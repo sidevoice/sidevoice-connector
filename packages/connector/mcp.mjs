@@ -20,7 +20,7 @@ const INSTRUCTIONS = `Sidevoice connects this conversation to the user's voice r
 - A progress publication is not itself a listening point. Divide substantive execution into bounded steps and, after each tool result or operational boundary, process newly arrived user input before starting the next step. Do not add artificial sleeps or fixed pauses.
 - If a new user message arrives during active work, treat it as an addition, refinement, or replacement according to its meaning. Stop not-yet-started obsolete work, preserve completed work that remains useful, acknowledge the new interpretation before continuing, and do not later answer a stale request. A tool already running may finish before the correction takes effect; delegation is not a substitute for listening.
 - A "published" voice_say result means the room stored it, not that the user heard it. If publication fails, continue in writing.
-- A message with "channel":"room-control" is an instruction from the room (for example: continue in writing); it is not a voice turn to answer aloud.
+- If the user closes this conversation's voice channel from the room, the connection is removed: voice_say then fails saying so. Continue in writing and do not try to speak again; call voice_connect only when the user asks for voice again.
 - voice_status reports whether the room can currently reach this conversation.
 - If voice_connect returns inbound.ok false, voice will look sent and never arrive: this harness holds or refuses messages posted by other local processes. Tell the user what inbound.reason says, offer inbound.remedy in your own words including what safeguard the machine-wide option removes, and let them choose. Do not change their settings without being asked to.`;
 
@@ -96,10 +96,14 @@ const tools = [
 let binding = null;
 async function invoke(name, args, meta) {
   if (name === 'voice_status') {
-    const status = ipc ? await rpc('status', {}) : { connected: false, bindings: [] };
+    const status = ipc ? await rpc('status', {}) : { connected: false, bindings: [], closed_by_room: [] };
+    // The room may have closed this conversation's voice since we joined: the connector is the truth.
+    const closed = !!binding && (status.closed_by_room || []).includes(binding.client_ref);
+    if (closed) binding = null;
     const inbound = binding?.harness === 'claude' ? inspectInbound(binding.client_ref) : { ok: true };
     return { joined: !!binding, room_reachable: status.connected, room_error: status.room_error || null,
-             binding_id: binding?.binding_id || null, harness: binding?.harness || null, inbound };
+             binding_id: binding?.binding_id || null, harness: binding?.harness || null, inbound,
+             ...(closed ? { closed_by_room: true, note: 'The user closed this conversation\'s voice channel from the room. Continue in writing; call voice_connect again only if they ask for voice.' } : {}) };
   }
   if (name === 'voice_connect') {
     const who = identity(meta);
@@ -119,7 +123,16 @@ async function invoke(name, args, meta) {
   }
   if (!binding) throw new Error('Not connected to the voice room: call voice_connect first (only if the user asked).');
   if (name === 'voice_say') {
-    const result = await rpc('publish', { binding_id: binding.binding_id, client_ref: binding.client_ref, text: args.text, session_id: args.session_id, revision: args.revision, utterance_id: args.utterance_id, language: args.language });
+    let result;
+    try {
+      result = await rpc('publish', { binding_id: binding.binding_id, client_ref: binding.client_ref, text: args.text, session_id: args.session_id, revision: args.revision, utterance_id: args.utterance_id, language: args.language });
+    } catch (error) {
+      if (error.message === 'CLOSED_BY_ROOM') {
+        binding = null;
+        throw new Error('The user closed this conversation\'s voice channel from the room. Continue in writing and do not publish speech; call voice_connect again only if the user asks for voice.');
+      }
+      throw error;
+    }
     return result.text_saved ? { status: 'published', text_saved: true, audio: result.status, reason: result.reason } : result;
   }
   if (name === 'voice_disconnect') { const result = await rpc('unregister', { binding_id: binding.binding_id }); binding = null; return { status: 'left', room_reachable: result.connected }; }
