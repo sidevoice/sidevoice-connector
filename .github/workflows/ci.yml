@@ -16,7 +16,7 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -r requirements.txt
-      - run: python -m unittest discover -s voice_poc -p 'test_*.py'
+      - run: PYTHONPATH=apps/server python -m unittest discover -s apps/server/tests -p 'test_*.py'
 
   client:
     name: Client (Node)
@@ -26,8 +26,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: node --check connector/cli.mjs connector/mcp.mjs connector/connector.mjs connector/adapters.mjs connector/pair.mjs
-      - run: node --test connector/test/test_connector.mjs voice_poc/test_*.cjs
+      - run: npm ci
+      - run: npm run build
+      - run: node --check packages/connector/cli.mjs packages/connector/mcp.mjs packages/connector/connector.mjs packages/connector/adapters.mjs packages/connector/pair.mjs
+      - run: npm test
       - name: Package contents (dry run)
         run: npm pack --dry-run
-        working-directory: connector
+        working-directory: packages/connector

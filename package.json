@@ -1,0 +1,15 @@
+{
+  "name": "sidevoice",
+  "private": true,
+  "workspaces": [
+    "apps/web",
+    "packages/browser-audio",
+    "packages/connector",
+    "packages/protocol"
+  ],
+  "scripts": {
+    "build": "npm run build -w @sidevoice/protocol && npm run build -w @sidevoice/browser-audio && npm run build -w @sidevoice/web",
+    "test": "npm run test -w @sidevoice/protocol && npm run test -w @sidevoice/browser-audio && npm run test -w @sidevoice/web && npm run test -w @sidevoice/uplink",
+    "dev:web": "npm run dev -w @sidevoice/web"
+  }
+}

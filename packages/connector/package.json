@@ -25,6 +25,6 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/rubasace/sidevoice.git",
-    "directory": "connector"
+    "directory": "packages/connector"
   }
 }
