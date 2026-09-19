@@ -6,7 +6,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { capabilityState, SUPPORTED, WORKING_EVENT } from './harness-contract.mjs';
-import { identifyHookHarness } from './harnesses.mjs';
+import { harnesses, identifyHookHarness } from './harnesses.mjs';
 
 const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
 const socketPath = process.env.SIDEVOICE_CONNECTOR_SOCKET || path.join(dataDir, 'connector.sock');
@@ -54,6 +54,14 @@ export function interpretWorking(payload, env = process.env) {
     : transition;
 }
 
+/** The harness this hook was installed for, as the hook command itself names it. Nothing is inferred
+ *  from the environment: one harness's variables survive into another harness launched from its terminal. */
+export function declaredHarness(argv = process.argv, env = process.env) {
+  const flag = argv.indexOf('--harness');
+  const named = flag >= 0 ? argv[flag + 1] : argv.find(arg => arg.startsWith('--harness='))?.slice('--harness='.length);
+  return named || env.SIDEVOICE_HOOK_HARNESS || null;
+}
+
 /** The context handed back to the harness: the acknowledgement is asked for at the moment the message is read. */
 export function nudge(reading) {
   return `A voice message just arrived from the room (session ${reading.session_id}, revision ${reading.revision}). `
@@ -82,19 +90,22 @@ async function main() {
   for await (const chunk of process.stdin) raw += chunk;
   let payload = null;
   try { payload = JSON.parse(raw); } catch {}
-  const transition = interpretWorking(payload);
+  const named = declaredHarness();
+  if (named && !harnesses[named]) return console.error('[sidevoice hook] unknown harness: ' + named);
+  const env = named ? { ...process.env, SIDEVOICE_HOOK_HARNESS: named } : process.env;
+  const transition = interpretWorking(payload, env);
   if (transition) {
     const outcome = await report('working', transition);
     if (!outcome.ok) console.error('[sidevoice hook] working report not sent: ' + (outcome.error || 'unknown'));
     if (!transition.working) return;
   }
-  const ended = interpretTurnEnd(payload);
+  const ended = interpretTurnEnd(payload, env);
   if (ended) {
     const outcome = await report('turn_end', ended);
     if (!outcome.ok) console.error('[sidevoice hook] end-of-turn report not sent: ' + (outcome.error || 'unknown'));
     return;
   }
-  const reading = interpret(payload);
+  const reading = interpret(payload, env);
   if (!reading) return;
   const outcome = await report('read', reading);
   if (!outcome.ok) console.error('[sidevoice hook] read receipt not sent: ' + (outcome.error || 'unknown'));

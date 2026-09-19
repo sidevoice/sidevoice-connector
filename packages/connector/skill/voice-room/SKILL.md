@@ -3,18 +3,20 @@ name: voice-room
 description: Join the user's Sidevoice voice room with this conversation. Use when the user asks to enable voice, join the room or talk by voice; never as a side effect of other work.
 argument-hint: "[title for this conversation in the room]"
 # Same shape as settings.json hooks (a list of groups): Claude Code 2.1.x registers nothing for a map here.
+# The command names its harness: a Codex session started from this terminal inherits CLAUDE_CODE_SESSION_ID,
+# so the hook cannot tell the two apart from the environment alone.
 # The installer replaces __SIDEVOICE_SKILL_DIR__ with the directory it copies this file into: the hook must
 # resolve without any variable, since ${CLAUDE_SKILL_DIR} is not expanded in a user skill's hook command.
 hooks:
   UserPromptSubmit:
     - hooks:
         - type: command
-          command: node "__SIDEVOICE_SKILL_DIR__/hook.mjs"
+          command: node "__SIDEVOICE_SKILL_DIR__/hook.mjs" --harness claude
           timeout: 5
   Stop:
     - hooks:
         - type: command
-          command: node "__SIDEVOICE_SKILL_DIR__/hook.mjs"
+          command: node "__SIDEVOICE_SKILL_DIR__/hook.mjs" --harness claude
           timeout: 5
 metadata:
   sidevoice: installed copy; the source is skill/voice-room in @sidevoice/uplink, reinstall with `sidevoice skill install`

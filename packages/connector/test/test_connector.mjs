@@ -9,7 +9,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createWsServer } from './ws-server.mjs';
 import { envelope } from '../harness-contract.mjs';
-import { interpret, interpretTurnEnd, interpretWorking, nudge, voiceEnvelope } from '../hook.mjs';
+import { declaredHarness, interpret, interpretTurnEnd, interpretWorking, nudge, voiceEnvelope } from '../hook.mjs';
 import { sessionWorking } from '../harness-claude.mjs';
 import { install as installSkill, remove as removeSkill, status as skillStatus } from '../skill.mjs';
 import './test_harness_contract.mjs';
@@ -244,6 +244,22 @@ test('hook: only a Sidevoice voice message being admitted counts, and it names t
   assert.equal(interpretTurnEnd({ hook_event_name: 'Stop', session_id: 'codex-thread' }, {}), null);
   assert.equal(interpret({ hook_event_name: 'PreToolUse', prompt }, { CLAUDE_CODE_SESSION_ID: 'x' }), null);
   assert.equal(interpret({ hook_event_name: 'UserPromptSubmit', prompt: 'typed by the user' }, { CLAUDE_CODE_SESSION_ID: 'x' }), null);
+  // The hook command names its harness. A Codex session launched from a Claude Code terminal inherits
+  // CLAUDE_CODE_SESSION_ID, and both payloads carry a session_id, so only the declaration settles it.
+  const leaked = { CLAUDE_CODE_SESSION_ID: 'a-claude-session-on-this-machine' };
+  assert.equal(interpretWorking({ hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', turn_id: 't-1', prompt }, leaked), null,
+    'without a declaration the inherited Claude environment claims the event');
+  assert.deepEqual(interpretWorking({ hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', turn_id: 't-1', prompt },
+    { ...leaked, SIDEVOICE_HOOK_HARNESS: 'codex' }),
+    { thread: 'codex-thread', turn_id: 't-1', working: true, session_id: 's-9', revision: 4, message_id: 'm-9' });
+  assert.equal(interpret({ hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', prompt },
+    { ...leaked, SIDEVOICE_HOOK_HARNESS: 'claude' }).thread, 'a-claude-session-on-this-machine');
+  assert.equal(interpret({ hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', prompt },
+    { ...leaked, SIDEVOICE_HOOK_HARNESS: 'nosuchharness' }), null);
+  assert.equal(declaredHarness(['node', 'hook.mjs', '--harness', 'codex'], {}), 'codex');
+  assert.equal(declaredHarness(['node', 'hook.mjs', '--harness=codex'], {}), 'codex');
+  assert.equal(declaredHarness(['node', 'hook.mjs'], { SIDEVOICE_HOOK_HARNESS: 'claude' }), 'claude');
+  assert.equal(declaredHarness(['node', 'hook.mjs'], {}), null);
   assert.match(nudge(claude), /voice_say/); assert.match(nudge(claude), /s-9/); assert.match(nudge(claude), /revision 4/);
 });
 
@@ -263,7 +279,9 @@ test('connector: Codex lifecycle reports are correlated, idempotent, and a stale
       { hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', turn_id: 'hook-turn', prompt: 'typed directly' },
       { hook_event_name: 'Stop', session_id: 'codex-thread', turn_id: 'hook-turn' },
     ]) {
-      const hook = spawn(process.execPath, [hookPath, 'hook'], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CODEX_THREAD_ID: '' }, stdio: ['pipe', 'pipe', 'pipe'] });
+      const hook = spawn(process.execPath, [hookPath, 'hook', '--harness', 'codex'],
+        { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CODEX_THREAD_ID: '', CLAUDE_CODE_SESSION_ID: 'a-claude-session-on-this-machine' },
+          stdio: ['pipe', 'pipe', 'pipe'] });
       hook.stdin.end(JSON.stringify(payload));
       assert.equal(await new Promise(r => hook.on('exit', r)), 0);
     }
