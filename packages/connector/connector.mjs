@@ -51,6 +51,7 @@ const registering = new Map();     // client_ref -> { resolve, reject, timer }
 const publishing = new Map();      // event_id -> { resolve, timer }
 const clients = new Set();         // façade IPC connections
 const closedByRoom = new Map();    // client_ref -> reason: the user closed that conversation's voice from the room
+const readReported = new Set();    // message ids already reported as read, so a hook that fires twice is harmless
 let outbox = [];                   // speech frames not yet confirmed by the room
 let ws = null, connected = false, closed = false, reconnectTimer = null, idleTimer = null, reconnectAttempt = 0, lastError = null;
 let creds;
@@ -186,6 +187,17 @@ async function command(client, input) {
       if (!reply) return { status: 'queued', utterance_id: speech.utterance_id };
       const { type, event_id, ...result } = reply;
       return result;
+    }
+    case 'read': {
+      // A harness hook says the conversation admitted this voice message: the room learns it was read.
+      const { thread, message_id, session_id, revision, turn_id } = params;
+      if (!thread || !message_id) throw new Error('thread and message_id are required');
+      const binding = [...bindings.values()].find(b => b.thread === thread || b.client_ref === thread);
+      if (!binding) return { status: 'no_binding' };
+      if (readReported.has(message_id)) return { status: 'already_reported' };
+      readReported.add(message_id); if (readReported.size > 512) readReported.delete(readReported.values().next().value);
+      const sent = send({ type: 'input.read', binding_id: binding.binding_id, message_id, session_id, revision, turn_id: turn_id || null });
+      return { status: sent ? 'sent' : 'offline' };
     }
     case 'unregister': {
       const binding = bindings.get(params.binding_id);

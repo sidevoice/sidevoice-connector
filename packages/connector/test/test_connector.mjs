@@ -9,8 +9,10 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createWsServer } from './ws-server.mjs';
 import { envelope } from '../adapters.mjs';
+import { interpret, nudge, voiceEnvelope } from '../hook.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const hookPath = path.join(here, '..', 'cli.mjs');
 const connectorPath = path.join(here, '..', 'connector.mjs');
 const mcpPath = path.join(here, '..', 'mcp.mjs');
 const wait = ms => new Promise(r => setTimeout(r, ms));
@@ -211,6 +213,56 @@ test('connector: the room closing a conversation\'s voice removes the binding an
     const again = await facade.call('register', { client_ref: 'thread-1', harness: 'test', thread: 'thread-1', title: 'T', delivery: { kind: 'http', url: 'http://127.0.0.1:1/never', thread: 'thread-1' } });
     assert.equal(again.binding_id, 'b-thread-1');
     assert.deepEqual((await facade.call('status', {})).closed_by_room, []);
+    facade.end();
+  } finally { if (child.exitCode === null) child.kill(); await room.close(); }
+});
+
+test('hook: only a Sidevoice voice message being admitted counts, and it names the conversation the harness names', () => {
+  const prompt = envelope({ channel: 'voice', session_id: 's-9', revision: 4, message_id: 'm-9', text: 'hola desde la sala' });
+  assert.deepEqual(voiceEnvelope(prompt), { message_id: 'm-9', session_id: 's-9', revision: 4, text: 'hola desde la sala' });
+  assert.equal(voiceEnvelope('just a prompt'), null);
+  assert.equal(voiceEnvelope('{"channel":"room-control","message_id":"x","session_id":"s","revision":1}\n\nhi'), null);
+  const claude = interpret({ hook_event_name: 'UserPromptSubmit', prompt }, { CLAUDE_CODE_SESSION_ID: 'claude-session' });
+  assert.equal(claude.thread, 'claude-session'); assert.equal(claude.message_id, 'm-9');
+  const codex = interpret({ hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', turn_id: 't-1', prompt }, {});
+  assert.equal(codex.thread, 'codex-thread'); assert.equal(codex.turn_id, 't-1');
+  assert.equal(interpret({ hook_event_name: 'PreToolUse', prompt }, { CLAUDE_CODE_SESSION_ID: 'x' }), null);
+  assert.equal(interpret({ hook_event_name: 'UserPromptSubmit', prompt: 'typed by the user' }, { CLAUDE_CODE_SESSION_ID: 'x' }), null);
+  assert.match(nudge(claude), /voice_say/); assert.match(nudge(claude), /s-9/); assert.match(nudge(claude), /revision 4/);
+});
+
+test('connector: a read receipt from the hook reaches the room once per message, and the hook command hands context back', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  room.handle = (frame, c) => {
+    if (frame.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1, heartbeat_seconds: 15 }));
+    if (frame.type === 'binding.register') c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-' + frame.client_ref, thread: frame.thread }));
+  };
+  const { child, socketPath } = startConnector(room, dataDir);
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    await facade.call('register', { client_ref: 'thread-1', harness: 'claude', thread: 'thread-1', title: 'T', delivery: { kind: 'http', url: 'http://127.0.0.1:1/never', thread: 'thread-1' } });
+    assert.deepEqual(await facade.call('read', { thread: 'thread-1', message_id: 'm-1', session_id: 's', revision: 2 }), { status: 'sent' });
+    await until(() => room.frames.some(f => f.type === 'input.read' && f.message_id === 'm-1' && f.binding_id === 'b-thread-1' && f.revision === 2));
+    assert.deepEqual(await facade.call('read', { thread: 'thread-1', message_id: 'm-1', session_id: 's', revision: 2 }), { status: 'already_reported' });
+    assert.deepEqual(await facade.call('read', { thread: 'nobody', message_id: 'm-2', session_id: 's', revision: 2 }), { status: 'no_binding' });
+    // The hook command itself: harness payload on stdin, read receipt to the connector, context on stdout, exit 0.
+    const prompt = envelope({ channel: 'voice', session_id: 's', revision: 3, message_id: 'm-3', text: 'hola' });
+    const hook = spawn(process.execPath, [hookPath, 'hook'], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'thread-1' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    let out = '', err = ''; hook.stdout.on('data', d => { out += d; }); hook.stderr.on('data', d => { err += d; });
+    hook.stdin.end(JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 'x', prompt }));
+    const code = await new Promise(r => hook.on('exit', r));
+    assert.equal(code, 0, err);
+    const output = JSON.parse(out.trim());
+    assert.equal(output.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
+    assert.match(output.hookSpecificOutput.additionalContext, /revision 3/);
+    await until(() => room.frames.some(f => f.type === 'input.read' && f.message_id === 'm-3'));
+    // A prompt that is not ours produces nothing and touches nothing.
+    const quiet = spawn(process.execPath, [hookPath, 'hook'], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'thread-1' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    let quietOut = ''; quiet.stdout.on('data', d => { quietOut += d; });
+    quiet.stdin.end(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt: 'escrito a mano' }));
+    assert.equal(await new Promise(r => quiet.on('exit', r)), 0); assert.equal(quietOut, '');
     facade.end();
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
 });
