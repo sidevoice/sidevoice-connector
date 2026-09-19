@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdirSync, openSync, closeSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { capabilityState, SUPPORTED } from './harness-contract.mjs';
+import { capabilityState, SUPPORTED, WORKING_POLL } from './harness-contract.mjs';
 import { harnessFor } from './harnesses.mjs';
 
 export const PROTOCOL = 1;
@@ -74,7 +74,7 @@ function watchWork() {
     if (!bindings.size) { clearInterval(workTimer); workTimer = null; return; }
     for (const binding of bindings.values()) {
       const harness = harnessFor(binding.harness);
-      if (capabilityState(harness, 'working') !== SUPPORTED) continue;
+      if (capabilityState(harness, 'working') !== SUPPORTED || harness.workingSource !== WORKING_POLL) continue;
       const working = harness.working(binding.client_ref);
       if (working === null || working === binding.working) continue;
       binding.working = working;
@@ -123,6 +123,9 @@ async function receive(frame) {
     case 'binding.registered': {
       const binding = [...bindings.values()].find(b => b.client_ref === frame.client_ref);
       if (binding && binding.binding_id !== frame.binding_id) { bindings.delete(binding.binding_id); binding.binding_id = frame.binding_id; bindings.set(frame.binding_id, binding); }
+      if (binding && typeof binding.working === 'boolean') {
+        send({ type: 'input.working', binding_id: binding.binding_id, working: binding.working });
+      }
       registering.get(frame.client_ref)?.resolve(frame); return;
     }
     case 'binding.rejected': registering.get(frame.client_ref)?.reject(new Error(frame.error || 'Binding rejected')); return;
@@ -204,8 +207,7 @@ async function command(client, input) {
       const binding = bindings.get(params.binding_id) || [...bindings.values()].find(b => b.client_ref === params.client_ref);
       if (!binding) throw new Error(closedByRoom.has(params.client_ref) ? 'CLOSED_BY_ROOM' : 'Unknown binding');
       const speech = { type: 'speech.publish', event_id: params.event_id || randomUUID(), binding_id: binding.binding_id,
-        session_id: params.session_id, revision: params.revision, utterance_id: params.utterance_id || randomUUID(), text: params.text, language: params.language,
-        final: params.final !== false };
+        session_id: params.session_id, revision: params.revision, utterance_id: params.utterance_id || randomUUID(), text: params.text, language: params.language };
       outbox.push(speech); saveOutbox();
       if (!send(speech)) return { status: 'queued', utterance_id: speech.utterance_id };
       const reply = await new Promise(resolve => {
@@ -232,6 +234,35 @@ async function command(client, input) {
       if (!binding) return { status: 'no_binding' };
       const sent = send({ type: 'input.working', binding_id: binding.binding_id, working: false,
         turn_id: params.turn_id || null });
+      return { status: sent ? 'sent' : 'offline' };
+    }
+    case 'working': {
+      const { thread, turn_id, working } = params;
+      if (!thread || typeof working !== 'boolean' || !turn_id) throw new Error('thread, turn_id and working are required');
+      const binding = [...bindings.values()].find(b => b.thread === thread || b.client_ref === thread);
+      if (!binding) return { status: 'no_binding' };
+      binding.activeTurns ||= new Map();
+      binding.completedTurns ||= new Set();
+      if (working) {
+        if (binding.completedTurns.has(turn_id)) return { status: 'stale' };
+        if (binding.activeTurns.has(turn_id)) return { status: 'already_reported' };
+        const correlation = { turn_id,
+          ...(typeof params.session_id === 'string' ? { session_id: params.session_id } : {}),
+          ...(Number.isInteger(params.revision) ? { revision: params.revision } : {}) };
+        binding.activeTurns.set(turn_id, correlation);
+        binding.working = true;
+        const sent = send({ type: 'input.working', binding_id: binding.binding_id, working: true,
+          turn_phase: 'start', ...correlation });
+        return { status: sent ? 'sent' : 'offline' };
+      }
+      if (binding.completedTurns.has(turn_id)) return { status: 'already_reported' };
+      const correlation = binding.activeTurns.get(turn_id);
+      binding.completedTurns.add(turn_id);
+      if (!correlation) return { status: 'stale' };
+      binding.activeTurns.delete(turn_id);
+      binding.working = binding.activeTurns.size > 0;
+      const sent = send({ type: 'input.working', binding_id: binding.binding_id, working: binding.working,
+        turn_phase: 'end', ...correlation });
       return { status: sent ? 'sent' : 'offline' };
     }
     case 'unregister': {

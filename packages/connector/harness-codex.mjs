@@ -1,10 +1,9 @@
 /** Codex harness implementation.
  *
- * Delivery and identity are available to the stdio MCP façade. Codex also invokes a configured
- * Stop hook at the end of an interactive turn. It does not publish queryable per-thread busy/idle
- * state outside the app-server connection that owns the thread, so `working` stays unsupported. */
+ * Delivery and identity are available to the stdio MCP façade. Configured UserPromptSubmit and
+ * Stop hooks report the mechanical start and end of every interactive turn. */
 import { execFile } from 'node:child_process';
-import { defineHarness, envelope, SUPPORTED, UNSUPPORTED } from './harness-contract.mjs';
+import { defineHarness, envelope, SUPPORTED, UNSUPPORTED, WORKING_EVENT } from './harness-contract.mjs';
 
 function turnMetadata(meta) {
   let turn = meta?.['x-codex-turn-metadata'] || {};
@@ -17,8 +16,8 @@ function turnMetadata(meta) {
 function sessionIdentity({ meta, env = process.env, payload } = {}) {
   const turn = turnMetadata(meta);
   const thread = meta?.['openai/threadId'] || meta?.['openai/thread_id'] || meta?.codexThreadId
-    || meta?.codex_thread_id || turn.thread_id || env.CODEX_THREAD_ID
-    || payload?.session_id || payload?.thread_id;
+    || meta?.codex_thread_id || turn.thread_id || payload?.session_id || payload?.thread_id
+    || env.CODEX_THREAD_ID;
   if (!thread) return null;
   const delivery = env.SIDEVOICE_DELIVERY_URL
     ? { kind: 'http', url: env.SIDEVOICE_DELIVERY_URL, thread }
@@ -56,16 +55,32 @@ function endOfTurn(payload, env = process.env) {
   return identity ? { thread: identity.thread, turn_id: payload.turn_id || null } : null;
 }
 
+/** A Codex lifecycle hook, normalized as a per-thread working transition. */
+function working(payload, env = process.env) {
+  const event = String(payload?.hook_event_name || payload?.hookEventName || '');
+  if (!/^(userpromptsubmit|stop)$/i.test(event)) return null;
+  const identity = sessionIdentity({ payload, env });
+  if (!identity || typeof identity.thread !== 'string' || !identity.thread
+      || typeof payload.turn_id !== 'string' || !payload.turn_id) return null;
+  return {
+    thread: identity.thread,
+    turn_id: payload.turn_id || null,
+    working: /^userpromptsubmit$/i.test(event),
+  };
+}
+
 export const codexHarness = defineHarness({
   name: 'codex',
+  workingSource: WORKING_EVENT,
   capabilities: {
     deliver: SUPPORTED,
     inspectInbound: UNSUPPORTED,
-    working: UNSUPPORTED,
+    working: SUPPORTED,
     endOfTurn: SUPPORTED,
     sessionIdentity: SUPPORTED,
   },
   deliver,
+  working,
   endOfTurn,
   sessionIdentity,
 });

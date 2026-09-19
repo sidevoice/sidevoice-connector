@@ -12,7 +12,10 @@ export const CAPABILITIES = Object.freeze([
 export const SUPPORTED = 'supported';
 export const UNSUPPORTED = 'unsupported';
 export const UNKNOWN = 'unknown';
+export const WORKING_POLL = 'poll';
+export const WORKING_EVENT = 'event';
 const DECLARED_STATES = new Set([SUPPORTED, UNSUPPORTED]);
+const WORKING_SOURCES = new Set([WORKING_POLL, WORKING_EVENT]);
 
 export function capabilityState(harness, capability) {
   const state = harness?.capabilities?.[capability];
@@ -31,6 +34,9 @@ export function defineHarness(definition) {
     if (state === SUPPORTED && typeof definition[capability] !== 'function') {
       throw new Error(`${definition.name} declares ${capability} supported but does not implement it`);
     }
+  }
+  if (definition.capabilities.working === SUPPORTED && !WORKING_SOURCES.has(definition.workingSource)) {
+    throw new Error(`${definition.name} declares working supported but does not declare a working source`);
   }
   return Object.freeze({ ...definition, capabilities: Object.freeze({ ...definition.capabilities }) });
 }

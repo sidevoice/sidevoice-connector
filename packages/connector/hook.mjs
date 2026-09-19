@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-/** Harness hook: `sidevoice hook` on stdin gets the harness's hook payload and, when the prompt being admitted is a
- *  Sidevoice voice message, tells the connector the conversation has read it (the room shows the second tick) and
- *  hands the harness a line of context so the model speaks first. It never blocks the harness: any failure exits 0. */
+/** Harness hook: `sidevoice hook` on stdin reports lifecycle events for event-backed harnesses. When an admitted
+ *  prompt is a Sidevoice voice message it also reports the read receipt and hands the harness context so the model
+ *  speaks first. It never blocks the harness: any failure exits 0. */
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { capabilityState, SUPPORTED } from './harness-contract.mjs';
+import { capabilityState, SUPPORTED, WORKING_EVENT } from './harness-contract.mjs';
 import { identifyHookHarness } from './harnesses.mjs';
 
 const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
@@ -36,8 +36,22 @@ export function interpret(payload, env = process.env) {
 /** A harness-native end-of-turn signal, normalized by that harness's module. */
 export function interpretTurnEnd(payload, env = process.env) {
   const identity = identifyHookHarness(payload, env);
-  if (!identity || capabilityState(identity.module, 'endOfTurn') !== SUPPORTED) return null;
+  if (!identity || identity.module.workingSource === WORKING_EVENT
+      || capabilityState(identity.module, 'endOfTurn') !== SUPPORTED) return null;
   return identity.module.endOfTurn(payload, env);
+}
+
+/** A lifecycle-backed harness working transition, plus Sidevoice correlation when this is our prompt. */
+export function interpretWorking(payload, env = process.env) {
+  const identity = identifyHookHarness(payload, env);
+  if (!identity || capabilityState(identity.module, 'working') !== SUPPORTED
+      || identity.module.workingSource !== WORKING_EVENT) return null;
+  const transition = identity.module.working(payload, env);
+  if (!transition) return null;
+  const reading = transition.working ? voiceEnvelope(payload.prompt) : null;
+  return reading
+    ? { ...transition, session_id: reading.session_id, revision: reading.revision, message_id: reading.message_id }
+    : transition;
 }
 
 /** The context handed back to the harness: the acknowledgement is asked for at the moment the message is read. */
@@ -68,6 +82,12 @@ async function main() {
   for await (const chunk of process.stdin) raw += chunk;
   let payload = null;
   try { payload = JSON.parse(raw); } catch {}
+  const transition = interpretWorking(payload);
+  if (transition) {
+    const outcome = await report('working', transition);
+    if (!outcome.ok) console.error('[sidevoice hook] working report not sent: ' + (outcome.error || 'unknown'));
+    if (!transition.working) return;
+  }
   const ended = interpretTurnEnd(payload);
   if (ended) {
     const outcome = await report('turn_end', ended);

@@ -9,7 +9,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createWsServer } from './ws-server.mjs';
 import { envelope } from '../harness-contract.mjs';
-import { interpret, interpretTurnEnd, nudge, voiceEnvelope } from '../hook.mjs';
+import { interpret, interpretTurnEnd, interpretWorking, nudge, voiceEnvelope } from '../hook.mjs';
 import { sessionWorking } from '../harness-claude.mjs';
 import { install as installSkill, remove as removeSkill, status as skillStatus } from '../skill.mjs';
 import './test_harness_contract.mjs';
@@ -92,6 +92,7 @@ test('connector: hello, register, ordered delivery with acks, speech round trip,
     const said = await facade.call('publish', { binding_id: 'b-thread-1', session_id: 's', revision: 1, text: 'hola', language: 'es' });
     assert.equal(said.status, 'queued'); assert.equal(said.text_saved, true);
     assert.deepEqual(JSON.parse(readFileSync(path.join(dataDir, 'outbox.json'), 'utf8')), []);
+    assert.equal(room.frames.find(f => f.type === 'speech.publish').final, undefined);
     // Heartbeat from the room is answered.
     room.conn.send(JSON.stringify({ type: 'heartbeat', nonce: 'n1' }));
     await until(() => room.frames.some(f => f.type === 'heartbeat.ack' && f.nonce === 'n1'));
@@ -233,11 +234,64 @@ test('hook: only a Sidevoice voice message being admitted counts, and it names t
   assert.equal(claude.thread, 'claude-session'); assert.equal(claude.message_id, 'm-9');
   const codex = interpret({ hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', turn_id: 't-1', prompt }, {});
   assert.equal(codex.thread, 'codex-thread'); assert.equal(codex.turn_id, 't-1');
-  assert.deepEqual(interpretTurnEnd({ hook_event_name: 'Stop', session_id: 'codex-thread', turn_id: 't-1' }, {}),
-    { thread: 'codex-thread', turn_id: 't-1' });
+  assert.equal(interpretTurnEnd({ hook_event_name: 'Stop', session_id: 'codex-thread', turn_id: 't-1' }, {}), null,
+    'event-backed Codex stops use the correlated working path, not the legacy uncorrelated end path');
+  assert.deepEqual(interpretWorking({ hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', turn_id: 't-1', prompt }, {}),
+    { thread: 'codex-thread', turn_id: 't-1', working: true, session_id: 's-9', revision: 4, message_id: 'm-9' });
+  assert.deepEqual(interpretWorking({ hook_event_name: 'Stop', session_id: 'codex-thread', turn_id: 't-1' }, {}),
+    { thread: 'codex-thread', turn_id: 't-1', working: false });
+  assert.equal(interpretWorking({ hook_event_name: 'Stop', session_id: 'codex-thread' }, {}), null);
+  assert.equal(interpretTurnEnd({ hook_event_name: 'Stop', session_id: 'codex-thread' }, {}), null);
   assert.equal(interpret({ hook_event_name: 'PreToolUse', prompt }, { CLAUDE_CODE_SESSION_ID: 'x' }), null);
   assert.equal(interpret({ hook_event_name: 'UserPromptSubmit', prompt: 'typed by the user' }, { CLAUDE_CODE_SESSION_ID: 'x' }), null);
   assert.match(nudge(claude), /voice_say/); assert.match(nudge(claude), /s-9/); assert.match(nudge(claude), /revision 4/);
+});
+
+test('connector: Codex lifecycle reports are correlated, idempotent, and a stale stop cannot clear newer work', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  room.handle = (frame, c) => {
+    if (frame.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1 }));
+    if (frame.type === 'binding.register') c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-' + frame.client_ref, thread: frame.thread }));
+  };
+  const { child, socketPath } = startConnector(room, dataDir);
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    await facade.call('register', { client_ref: 'codex-thread', harness: 'codex', thread: 'codex-thread', delivery: { kind: 'codex-queue', thread: 'codex-thread' } });
+    for (const payload of [
+      { hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', turn_id: 'hook-turn', prompt: 'typed directly' },
+      { hook_event_name: 'Stop', session_id: 'codex-thread', turn_id: 'hook-turn' },
+    ]) {
+      const hook = spawn(process.execPath, [hookPath, 'hook'], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CODEX_THREAD_ID: '' }, stdio: ['pipe', 'pipe', 'pipe'] });
+      hook.stdin.end(JSON.stringify(payload));
+      assert.equal(await new Promise(r => hook.on('exit', r)), 0);
+    }
+    await until(() => room.frames.some(f => f.type === 'input.working' && f.turn_id === 'hook-turn' && f.working === false));
+    assert.deepEqual(await facade.call('working', { thread: 'codex-thread', turn_id: 'old', working: true, session_id: 's', revision: 3 }), { status: 'sent' });
+    assert.deepEqual(await facade.call('working', { thread: 'codex-thread', turn_id: 'old', working: true, session_id: 's', revision: 3 }), { status: 'already_reported' });
+    assert.deepEqual(await facade.call('working', { thread: 'codex-thread', turn_id: 'new', working: true, session_id: 's', revision: 4 }), { status: 'sent' });
+    const workingFrames = room.frames.filter(f => f.type === 'input.working').length;
+    room.conn.send(JSON.stringify({ type: 'binding.registered', client_ref: 'codex-thread', binding_id: 'b-codex-thread', thread: 'codex-thread' }));
+    await until(() => room.frames.filter(f => f.type === 'input.working').length > workingFrames);
+    const resync = room.frames.filter(f => f.type === 'input.working').at(-1);
+    assert.deepEqual({ working: resync.working, turn_id: resync.turn_id, turn_phase: resync.turn_phase },
+      { working: true, turn_id: undefined, turn_phase: undefined });
+    const falseBeforeStaleStop = room.frames.filter(f => f.type === 'input.working' && f.working === false).length;
+    assert.deepEqual(await facade.call('working', { thread: 'codex-thread', turn_id: 'old', working: false }), { status: 'sent' });
+    assert.equal(room.frames.filter(f => f.type === 'input.working' && f.working === false).length, falseBeforeStaleStop);
+    assert.ok(room.frames.some(f => f.type === 'input.working' && f.turn_id === 'old'
+      && f.turn_phase === 'end' && f.working === true));
+    assert.deepEqual(await facade.call('working', { thread: 'codex-thread', turn_id: 'new', working: false }), { status: 'sent' });
+    await until(() => room.frames.some(f => f.type === 'input.working' && f.working === false && f.turn_id === 'new'));
+    const ended = room.frames.find(f => f.type === 'input.working' && f.working === false && f.turn_id === 'new');
+    assert.equal(ended.turn_phase, 'end');
+    assert.deepEqual({ session_id: ended.session_id, revision: ended.revision }, { session_id: 's', revision: 4 });
+    assert.deepEqual(await facade.call('working', { thread: 'codex-thread', turn_id: 'new', working: false }), { status: 'already_reported' });
+    assert.deepEqual(await facade.call('working', { thread: 'codex-thread', turn_id: 'finished-first', working: false }), { status: 'stale' });
+    assert.deepEqual(await facade.call('working', { thread: 'codex-thread', turn_id: 'finished-first', working: true }), { status: 'stale' });
+    facade.end();
+  } finally { if (child.exitCode === null) child.kill(); await room.close(); }
 });
 
 test('connector: a read receipt from the hook reaches the room once per message, and the hook command hands context back', async () => {

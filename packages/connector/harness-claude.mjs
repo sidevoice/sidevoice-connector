@@ -11,7 +11,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { defineHarness, envelope, SUPPORTED } from './harness-contract.mjs';
+import { defineHarness, envelope, SUPPORTED, WORKING_POLL } from './harness-contract.mjs';
 
 const configDir = () => process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
 
@@ -160,6 +160,7 @@ export function endOfTurn(payload, env = process.env) {
 
 export const claudeHarness = defineHarness({
   name: 'claude',
+  workingSource: WORKING_POLL,
   capabilities: {
     deliver: SUPPORTED,
     inspectInbound: SUPPORTED,

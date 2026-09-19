@@ -40,7 +40,7 @@ test('a supported declaration without an implementation is rejected', () => {
   }), /declares deliver supported but does not implement it/);
 });
 
-test('Codex identity comes from tool metadata and its Stop hook reports the turn end', () => {
+test('Codex identity comes from tool metadata and its hooks report working transitions', () => {
   const meta = { 'x-codex-turn-metadata': { thread_id: 'codex-thread', turn_id: 'turn-1' } };
   const identity = identifyHarness(meta, {});
   assert.equal(identity.module, codexHarness);
@@ -49,7 +49,11 @@ test('Codex identity comes from tool metadata and its Stop hook reports the turn
   });
   assert.deepEqual(codexHarness.endOfTurn({ hook_event_name: 'Stop', session_id: 'codex-thread', turn_id: 'turn-1' }, {}),
     { thread: 'codex-thread', turn_id: 'turn-1' });
-  assert.equal(capabilityState(codexHarness, 'working'), 'unsupported');
+  assert.deepEqual(codexHarness.working({ hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', turn_id: 'turn-1' }, {}),
+    { thread: 'codex-thread', turn_id: 'turn-1', working: true });
+  assert.deepEqual(codexHarness.working({ hook_event_name: 'Stop', session_id: 'codex-thread', turn_id: 'turn-1' }, {}),
+    { thread: 'codex-thread', turn_id: 'turn-1', working: false });
+  assert.equal(capabilityState(codexHarness, 'working'), 'supported');
   assert.equal(capabilityState(codexHarness, 'inspectInbound'), 'unsupported');
 });
 

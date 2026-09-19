@@ -17,7 +17,7 @@ The client side. Three entry points behind one bin (`sidevoice`):
   credential (`~/.sidevoice/credentials.json`, mode 0600).
 
 Harness modules implement one contract (`harness-contract.mjs`): delivery,
-inbound inspection, current working state, end-of-turn reporting and session
+inbound inspection, mechanical working state (polled or lifecycle-backed), end-of-turn reporting and session
 identity. Every capability is explicitly `supported` or `unsupported`; an old
 or malformed declaration becomes `unknown`, never false. Claude Code, Codex and
 generic HTTP each have one module. See the repository's
@@ -26,7 +26,8 @@ generic HTTP each have one module. See the repository's
 Protocol (newline-free JSON over the WebSocket): `connector.hello` ->
 `connector.welcome`; `binding.register` (including declared harness capabilities)
 -> `binding.registered|rejected`;
-`binding.unregister`; `input.deliver` -> `input.ack`; `speech.publish` ->
+`binding.unregister`; `input.deliver` -> `input.ack`; `input.working`;
+`speech.publish` ->
 `speech.published`; `heartbeat` <-> `heartbeat.ack`. Protocol version 1.
 
 Node 22+, no dependencies. Tests: `node --test test/test_connector.mjs`.

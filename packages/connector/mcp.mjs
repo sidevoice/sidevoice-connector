@@ -115,7 +115,7 @@ async function invoke(name, args, meta) {
   if (name === 'voice_say') {
     let result;
     try {
-      result = await rpc('publish', { binding_id: binding.binding_id, client_ref: binding.client_ref, text: args.text, session_id: args.session_id, revision: args.revision, utterance_id: args.utterance_id, language: args.language, final: args.final !== false });
+      result = await rpc('publish', { binding_id: binding.binding_id, client_ref: binding.client_ref, text: args.text, session_id: args.session_id, revision: args.revision, utterance_id: args.utterance_id, language: args.language });
     } catch (error) {
       if (error.message === 'CLOSED_BY_ROOM') {
         binding = null;
