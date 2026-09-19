@@ -1,5 +1,5 @@
 /** `sidevoice skill install|remove|status [--dir <skills dir>]`: the Claude Code skill that joins the room and,
- *  for that session only, registers the read-receipt hook. It is an installed copy of skill/voice plus hook.mjs;
+ *  for that session only, registers the lifecycle hook. It installs the skill plus the hook's harness runtime;
  *  running install again repairs it. A directory of the same name that is not ours is never touched. */
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const SKILL_NAME = 'voice-room';
 const MARKER = 'sidevoice: installed copy';
+const HOOK_FILES = ['hook.mjs', 'harness-contract.mjs', 'harnesses.mjs', 'harness-claude.mjs', 'harness-codex.mjs', 'harness-http.mjs'];
 
 export function skillsDir(argv = process.argv.slice(2), env = process.env) {
   const index = argv.indexOf('--dir');
@@ -31,7 +32,7 @@ export function install(dir) {
   mkdirSync(current.target, { recursive: true });
   const manifest = readFileSync(path.join(here, 'skill', SKILL_NAME, 'SKILL.md'), 'utf8').replaceAll('__SIDEVOICE_SKILL_DIR__', current.target);
   writeFileSync(path.join(current.target, 'SKILL.md'), manifest);
-  cpSync(path.join(here, 'hook.mjs'), path.join(current.target, 'hook.mjs'));
+  for (const file of HOOK_FILES) cpSync(path.join(here, file), path.join(current.target, file));
   return { ...status(dir), action: current.state === 'installed' ? 'updated' : 'installed' };
 }
 

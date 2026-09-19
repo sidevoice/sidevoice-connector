@@ -7,8 +7,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdirSync, openSync, closeSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { deliver } from './adapters.mjs';
-import { sessionWorking } from './harness-claude.mjs';
+import { capabilityState, SUPPORTED } from './harness-contract.mjs';
+import { harnessFor } from './harnesses.mjs';
 
 export const PROTOCOL = 1;
 const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
@@ -47,7 +47,7 @@ function acquireLock() {
   return false;
 }
 
-const bindings = new Map();        // binding_id -> { binding_id, client_ref, harness, thread, title, delivery, owner, chain }
+const bindings = new Map();        // binding_id -> { binding_id, client_ref, harness, thread, title, delivery, capabilities, owner, chain }
 const registering = new Map();     // client_ref -> { resolve, reject, timer }
 const publishing = new Map();      // event_id -> { resolve, timer }
 const clients = new Set();         // façade IPC connections
@@ -64,10 +64,8 @@ function saveOutbox() {
 }
 function send(frame) { if (ws?.readyState === WebSocket.OPEN) { ws.send(JSON.stringify(frame)); return true; } return false; }
 
-/* Whether a conversation is working on what it was given is the harness's own state, not something the
- * model has to remember to say. Claude Code publishes it per session and keeps it current; the connector
- * watches it for its own bindings and tells the room when it changes. A harness that publishes nothing
- * answers null here, and the room keeps using what the conversation says about its own replies. */
+/* Whether a conversation is working is the harness's own state. Each module declares whether it can
+ * answer; unknown and unsupported are skipped rather than being rendered as false. */
 const WORK_POLL_MS = Number(process.env.SIDEVOICE_WORK_POLL_MS || 400);
 let workTimer = null;
 function watchWork() {
@@ -75,8 +73,9 @@ function watchWork() {
   workTimer = setInterval(() => {
     if (!bindings.size) { clearInterval(workTimer); workTimer = null; return; }
     for (const binding of bindings.values()) {
-      if (binding.harness !== 'claude') continue;
-      const working = sessionWorking(binding.client_ref);
+      const harness = harnessFor(binding.harness);
+      if (capabilityState(harness, 'working') !== SUPPORTED) continue;
+      const working = harness.working(binding.client_ref);
       if (working === null || working === binding.working) continue;
       binding.working = working;
       send({ type: 'input.working', binding_id: binding.binding_id, working });
@@ -114,7 +113,7 @@ async function receive(frame) {
         // Sending it back makes the room correctly reject it as foreign.
         const frame = { type: 'binding.register', client_ref: binding.client_ref,
           harness: binding.harness, thread: binding.thread, title: binding.title,
-          inbound: binding.inbound, focus: false };
+          inbound: binding.inbound, capabilities: binding.capabilities, focus: false };
         if (!binding.binding_id.startsWith('local-')) frame.binding_id = binding.binding_id;
         send(frame);
       }
@@ -137,7 +136,8 @@ async function receive(frame) {
       // One delivery at a time per binding keeps the user's turns in order.
       binding.chain = (binding.chain || Promise.resolve()).then(async () => {
         try {
-          const outcome = await deliver(binding.delivery, frame);
+          const harness = harnessFor(binding.harness);
+          const outcome = await harness.deliver(binding.delivery, frame);
           console.error(`[sidevoice] delivered ${frame.event_id} to ${binding.thread} via ${binding.delivery.kind}: ${outcome.status} (${outcome.detail})`);
           send({ type: 'input.ack', event_id: frame.event_id, status: outcome.status, detail: outcome.detail });
         } catch (error) {
@@ -162,7 +162,8 @@ async function receive(frame) {
 
 function snapshot() {
   return { host: hostId, connected, protocol: PROTOCOL, outbox: outbox.length, room_error: lastError, closed_by_room: [...closedByRoom.keys()],
-    bindings: [...bindings.values()].map(({ binding_id, client_ref, harness, thread, title, delivery }) => ({ binding_id, client_ref, harness, thread, title, delivery: delivery.kind })) };
+    bindings: [...bindings.values()].map(({ binding_id, client_ref, harness, thread, title, delivery, capabilities }) =>
+      ({ binding_id, client_ref, harness, thread, title, delivery: delivery.kind, capabilities })) };
 }
 function scheduleExit() {
   if (idleTimer) clearTimeout(idleTimer);
@@ -180,18 +181,22 @@ async function command(client, input) {
   const params = input.params || {};
   switch (input.method) {
     case 'register': {
-      const { client_ref, harness, thread, title, delivery, inbound } = params;
+      const { client_ref, harness, thread, title, delivery, inbound, capabilities } = params;
       if (!client_ref || !thread || !delivery?.kind) throw new Error('client_ref, thread and delivery are required');
       closedByRoom.delete(client_ref);   // joining again is the user's explicit request
       const existing = [...bindings.values()].find(b => b.client_ref === client_ref);
-      if (existing) { existing.owner = client; existing.delivery = delivery; client.bindings.add(existing); return { binding_id: existing.binding_id, thread, connected }; }
+      if (existing) {
+        Object.assign(existing, { owner: client, delivery, inbound, capabilities });
+        client.bindings.add(existing);
+        return { binding_id: existing.binding_id, thread, connected };
+      }
       const local_id = 'local-' + randomUUID();
-      const binding = { binding_id: local_id, client_ref, harness, thread, title, delivery, inbound, owner: client };
+      const binding = { binding_id: local_id, client_ref, harness, thread, title, delivery, inbound, capabilities, owner: client };
       bindings.set(local_id, binding); client.bindings.add(binding); clearTimeout(idleTimer); open(); watchWork();
       const frame = await new Promise((resolve, reject) => {
         const timer = setTimeout(() => { registering.delete(client_ref); reject(new Error(connected ? 'The room did not confirm the binding' : 'The room is unreachable; retrying in the background')); }, 10_000);
         registering.set(client_ref, { resolve: f => { clearTimeout(timer); registering.delete(client_ref); resolve(f); }, reject: e => { clearTimeout(timer); registering.delete(client_ref); reject(e); } });
-        if (!send({ type: 'binding.register', client_ref, harness, thread, title, inbound })) { /* sent on welcome */ }
+        if (!send({ type: 'binding.register', client_ref, harness, thread, title, inbound, capabilities })) { /* sent on welcome */ }
       }).catch(error => { if (!connected) return null; bindings.delete(binding.binding_id); client.bindings.delete(binding); throw error; });
       return { binding_id: frame?.binding_id || binding.binding_id, thread, connected, pending: !frame };
     }
@@ -220,6 +225,13 @@ async function command(client, input) {
       if (readReported.has(message_id)) return { status: 'already_reported' };
       readReported.add(message_id); if (readReported.size > 512) readReported.delete(readReported.values().next().value);
       const sent = send({ type: 'input.read', binding_id: binding.binding_id, message_id, session_id, revision, turn_id: turn_id || null });
+      return { status: sent ? 'sent' : 'offline' };
+    }
+    case 'turn_end': {
+      const binding = [...bindings.values()].find(b => b.thread === params.thread || b.client_ref === params.thread);
+      if (!binding) return { status: 'no_binding' };
+      const sent = send({ type: 'input.working', binding_id: binding.binding_id, working: false,
+        turn_id: params.turn_id || null });
       return { status: sent ? 'sent' : 'offline' };
     }
     case 'unregister': {

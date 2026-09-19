@@ -8,8 +8,10 @@
  *  Documented at https://code.claude.com/docs/en/cross-session-messaging */
 import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync } from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { defineHarness, envelope, SUPPORTED } from './harness-contract.mjs';
 
 const configDir = () => process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
 
@@ -108,3 +110,68 @@ export function inspectInbound(sessionId) {
     confidence: pid ? 'read from the session launch flags and settings' : 'settings only; the session process was not found',
   };
 }
+
+/** Identity and private inbox inherited by the MCP façade Claude Code spawned. */
+export function sessionIdentity({ env = process.env } = {}) {
+  if (!env.CLAUDE_CODE_SESSION_ID) return null;
+  return {
+    harness: 'claude',
+    thread: env.CLAUDE_CODE_SESSION_ID,
+    ...(env.CLAUDE_CODE_MESSAGING_SOCKET ? { delivery: {
+      kind: 'claude-uds',
+      socket: env.CLAUDE_CODE_MESSAGING_SOCKET,
+      token: env.CLAUDE_CODE_MESSAGING_TOKEN || '',
+    } } : {}),
+  };
+}
+
+/** Claude Code's session inbox sends no acknowledgement. A prompt-admitted hook supplies the
+ *  separate read receipt; this method reports only what the socket itself proves. */
+export function deliver(delivery, event) {
+  if (delivery?.kind !== 'claude-uds') throw new Error(`Unsupported Claude delivery kind: ${delivery?.kind}`);
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const socket = net.createConnection(delivery.socket);
+    let settled = false, wrote = 0, replied = '';
+    const finish = (error, status, detail) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer); socket.destroy();
+      if (error) return reject(error);
+      resolve({ status, detail: `${detail} after ${Date.now() - started}ms${replied ? ', peer said ' + replied.slice(0, 120) : ''}` });
+    };
+    const timer = setTimeout(() => finish(null, 'unknown', 'connection still open, no acknowledgement'), 1500);
+    socket.on('error', error => finish(error));
+    socket.on('data', chunk => { replied += chunk; });
+    socket.on('connect', () => {
+      socket.write(JSON.stringify({ type: 'auth', token: delivery.token }) + '\n');
+      socket.write(JSON.stringify({ type: 'user', message: { role: 'user', content: envelope(event) } }) + '\n');
+      wrote = Date.now();
+    });
+    socket.on('close', () => finish(null, 'rejected', wrote ? 'peer closed the connection' : 'peer closed before the frames were written'));
+  });
+}
+
+/** A configured Stop hook is a direct end-of-turn signal, independent of session polling. */
+export function endOfTurn(payload, env = process.env) {
+  if (!payload || !/^stop$/i.test(String(payload.hook_event_name || payload.hookEventName || ''))) return null;
+  const identity = sessionIdentity({ env });
+  return identity ? { thread: identity.thread, turn_id: payload.turn_id || null } : null;
+}
+
+export const claudeHarness = defineHarness({
+  name: 'claude',
+  capabilities: {
+    deliver: SUPPORTED,
+    inspectInbound: SUPPORTED,
+    working: SUPPORTED,
+    endOfTurn: SUPPORTED,
+    sessionIdentity: SUPPORTED,
+  },
+  deliver,
+  inspectInbound,
+  working: sessionWorking,
+  endOfTurn,
+  sessionIdentity,
+});
+
+export default claudeHarness;

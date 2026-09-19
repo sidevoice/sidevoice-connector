@@ -8,10 +8,12 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createWsServer } from './ws-server.mjs';
-import { envelope } from '../adapters.mjs';
-import { interpret, nudge, voiceEnvelope } from '../hook.mjs';
+import { envelope } from '../harness-contract.mjs';
+import { interpret, interpretTurnEnd, nudge, voiceEnvelope } from '../hook.mjs';
 import { sessionWorking } from '../harness-claude.mjs';
 import { install as installSkill, remove as removeSkill, status as skillStatus } from '../skill.mjs';
+import './test_harness_contract.mjs';
+import './test_harness_claude.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const hookPath = path.join(here, '..', 'cli.mjs');
@@ -185,6 +187,9 @@ test('mcp façade: identity comes from the harness, tools are exposed, instructi
     const joined = JSON.parse(replies[2].result.content[0].text);
     assert.equal(joined.status, 'joined'); assert.equal(joined.harness, 'claude'); assert.equal(joined.conversation, 'sess-abc');
     assert.deepEqual(commands[0].params.delivery, { kind: 'claude-uds', socket: '/tmp/x.sock', token: 'tok' });
+    assert.deepEqual(commands[0].params.capabilities, {
+      deliver: 'supported', inspectInbound: 'supported', working: 'supported', endOfTurn: 'supported', sessionIdentity: 'supported',
+    });
     ask(4, 'tools/call', { name: 'voice_say', arguments: { text: 'hola', session_id: 's', revision: 1 } });
     await until(() => replies.length === 4);
     assert.equal(JSON.parse(replies[3].result.content[0].text).status, 'published');
@@ -228,6 +233,8 @@ test('hook: only a Sidevoice voice message being admitted counts, and it names t
   assert.equal(claude.thread, 'claude-session'); assert.equal(claude.message_id, 'm-9');
   const codex = interpret({ hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', turn_id: 't-1', prompt }, {});
   assert.equal(codex.thread, 'codex-thread'); assert.equal(codex.turn_id, 't-1');
+  assert.deepEqual(interpretTurnEnd({ hook_event_name: 'Stop', session_id: 'codex-thread', turn_id: 't-1' }, {}),
+    { thread: 'codex-thread', turn_id: 't-1' });
   assert.equal(interpret({ hook_event_name: 'PreToolUse', prompt }, { CLAUDE_CODE_SESSION_ID: 'x' }), null);
   assert.equal(interpret({ hook_event_name: 'UserPromptSubmit', prompt: 'typed by the user' }, { CLAUDE_CODE_SESSION_ID: 'x' }), null);
   assert.match(nudge(claude), /voice_say/); assert.match(nudge(claude), /s-9/); assert.match(nudge(claude), /revision 4/);
@@ -260,6 +267,12 @@ test('connector: a read receipt from the hook reaches the room once per message,
     assert.equal(output.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
     assert.match(output.hookSpecificOutput.additionalContext, /revision 3/);
     await until(() => room.frames.some(f => f.type === 'input.read' && f.message_id === 'm-3'));
+    // The same hook executable normalizes the harness's Stop event into an end-of-turn report.
+    const stopped = spawn(process.execPath, [hookPath, 'hook'], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'thread-1' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    let stopOut = ''; stopped.stdout.on('data', d => { stopOut += d; });
+    stopped.stdin.end(JSON.stringify({ hook_event_name: 'Stop', session_id: 'thread-1', turn_id: 'turn-3' }));
+    assert.equal(await new Promise(r => stopped.on('exit', r)), 0); assert.equal(stopOut, '');
+    await until(() => room.frames.some(f => f.type === 'input.working' && f.binding_id === 'b-thread-1' && f.working === false));
     // A prompt that is not ours produces nothing and touches nothing.
     const quiet = spawn(process.execPath, [hookPath, 'hook'], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'thread-1' }, stdio: ['pipe', 'pipe', 'pipe'] });
     let quietOut = ''; quiet.stdout.on('data', d => { quietOut += d; });
@@ -276,9 +289,11 @@ test('skill: install copies the voice skill and a standalone hook, repairs itsel
   assert.equal(first.action, 'installed'); assert.equal(first.hook, true);
   const manifest = readFileSync(path.join(dir, 'voice-room', 'SKILL.md'), 'utf8');
   assert.match(manifest, /^name: voice-room$/m); assert.match(manifest, /UserPromptSubmit:\n    - hooks:/, 'settings.json shape: a list of hook groups'); assert.ok(manifest.includes(`node "${path.join(dir, 'voice-room')}/hook.mjs"`), 'the hook command names the installed copy by absolute path'); assert.ok(!manifest.includes('__SIDEVOICE_SKILL_DIR__'));
+  assert.match(manifest, /Stop:\n    - hooks:/, 'the harness reports the end of a turn through the same hook');
   writeFileSync(path.join(dir, 'voice-room', 'hook.mjs'), 'broken');
   assert.equal(installSkill(dir).action, 'updated');
   assert.equal(readFileSync(path.join(dir, 'voice-room', 'hook.mjs'), 'utf8'), readFileSync(path.join(here, '..', 'hook.mjs'), 'utf8'));
+  assert.equal(existsSync(path.join(dir, 'voice-room', 'harness-contract.mjs')), true);
   // The installed hook runs on its own, from the skill directory, with no connector around: silent, exit 0.
   const child = spawn(process.execPath, [path.join(dir, 'voice-room', 'hook.mjs')], { env: { ...process.env, SIDEVOICE_DATA_DIR: path.join(dir, 'nowhere'), CLAUDE_CODE_SESSION_ID: 's' }, stdio: ['pipe', 'pipe', 'pipe'] });
   let out = ''; child.stdout.on('data', d => { out += d; });

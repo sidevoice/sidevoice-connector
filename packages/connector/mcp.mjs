@@ -7,7 +7,8 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { inspectInbound } from './harness-claude.mjs';
+import { advertisedCapabilities, capabilityState, SUPPORTED } from './harness-contract.mjs';
+import { harnessFor, identifyHarness } from './harnesses.mjs';
 
 const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
 const socketPath = process.env.SIDEVOICE_CONNECTOR_SOCKET || path.join(dataDir, 'connector.sock');
@@ -25,25 +26,6 @@ const INSTRUCTIONS = `Sidevoice connects this conversation to the user's voice r
 - voice_status reports whether the room can currently reach this conversation.
 - On Claude Code, if a skill named voice-room is available, joining through it (/voice-room) is preferred: it registers, for this session only, the hook that gives the room read receipts and asks you to speak first.
 - If voice_connect returns inbound.ok false, voice will look sent and never arrive: this harness holds or refuses messages posted by other local processes. Tell the user what inbound.reason says, offer inbound.remedy in your own words including what safeguard the machine-wide option removes, and let them choose. Do not change their settings without being asked to.`;
-
-/** Who this façade speaks for, decided by what spawned it — never by the model. */
-function identity(meta) {
-  if (process.env.CLAUDE_CODE_SESSION_ID && process.env.CLAUDE_CODE_MESSAGING_SOCKET) {
-    return { harness: 'claude', thread: process.env.CLAUDE_CODE_SESSION_ID,
-      delivery: { kind: 'claude-uds', socket: process.env.CLAUDE_CODE_MESSAGING_SOCKET, token: process.env.CLAUDE_CODE_MESSAGING_TOKEN || '' } };
-  }
-  let turn = meta?.['x-codex-turn-metadata'] || {};
-  if (typeof turn === 'string') { try { turn = JSON.parse(turn); } catch { turn = {}; } }
-  const codexThread = meta?.['openai/threadId'] || meta?.['openai/thread_id'] || meta?.codexThreadId || meta?.codex_thread_id || turn.thread_id || process.env.CODEX_THREAD_ID;
-  if (codexThread) {
-    const delivery = process.env.SIDEVOICE_DELIVERY_URL ? { kind: 'http', url: process.env.SIDEVOICE_DELIVERY_URL, thread: codexThread } : { kind: 'codex-queue', thread: codexThread };
-    return { harness: 'codex', thread: codexThread, delivery };
-  }
-  if (process.env.SIDEVOICE_THREAD && process.env.SIDEVOICE_DELIVERY_URL) {
-    return { harness: process.env.SIDEVOICE_HARNESS || 'http', thread: process.env.SIDEVOICE_THREAD, delivery: { kind: 'http', url: process.env.SIDEVOICE_DELIVERY_URL, thread: process.env.SIDEVOICE_THREAD } };
-  }
-  throw new Error('Cannot tell which conversation this is: not launched by Claude Code or Codex, and no SIDEVOICE_THREAD/SIDEVOICE_DELIVERY_URL set');
-}
 
 // ----- one persistent connection to the connector -----
 let ipc = null, ipcBuffer = '', ipcSerial = 0;
@@ -96,32 +78,39 @@ const tools = [
   { name: 'voice_status', description: 'Whether the room can currently reach this conversation.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
 ];
 let binding = null;
+function inboundFor(harness, thread) {
+  return capabilityState(harness, 'inspectInbound') === SUPPORTED ? harness.inspectInbound(thread) : null;
+}
 async function invoke(name, args, meta) {
   if (name === 'voice_status') {
     const status = ipc ? await rpc('status', {}) : { connected: false, bindings: [], closed_by_room: [] };
     // The room may have closed this conversation's voice since we joined: the connector is the truth.
     const closed = !!binding && (status.closed_by_room || []).includes(binding.client_ref);
     if (closed) binding = null;
-    const inbound = binding?.harness === 'claude' ? inspectInbound(binding.client_ref) : { ok: true };
+    const module = binding ? harnessFor(binding.harness) : null;
+    const inbound = binding ? inboundFor(module, binding.client_ref) : null;
     return { joined: !!binding, room_reachable: status.connected, room_error: status.room_error || null,
-             binding_id: binding?.binding_id || null, harness: binding?.harness || null, inbound,
+             binding_id: binding?.binding_id || null, harness: binding?.harness || null,
+             capabilities: binding?.capabilities || null, inbound,
              ...(closed ? { closed_by_room: true, note: 'The user closed this conversation\'s voice channel from the room. Continue in writing; call voice_connect again only if they ask for voice.' } : {}) };
   }
   if (name === 'voice_connect') {
-    const who = identity(meta);
+    const who = identifyHarness(meta);
     const title = (args.title || process.env.SIDEVOICE_TITLE || path.basename(process.cwd())).slice(0, 200);
     // Refuse rather than join a room we cannot hear from: a conversation whose harness holds
     // what the room posts would sit in the list looking present while the user talks to nobody.
-    const inbound = who.harness === 'claude' ? inspectInbound(who.thread) : { ok: true };
-    if (inbound.ok === false) {
+    const inbound = inboundFor(who.module, who.thread);
+    if (inbound?.ok === false) {
       const error = new Error(`No se conecta esta conversación: ${inbound.reason} ${inbound.remedy}`);
       error.data = { inbound };
       throw error;
     }
-    const result = await rpc('register', { client_ref: who.thread, harness: who.harness, thread: who.thread, title, delivery: who.delivery, inbound });
-    binding = { ...result, harness: who.harness, client_ref: who.thread };
+    const capabilities = advertisedCapabilities(who.module);
+    const result = await rpc('register', { client_ref: who.thread, harness: who.harness, thread: who.thread,
+      title, delivery: who.delivery, inbound, capabilities });
+    binding = { ...result, harness: who.harness, client_ref: who.thread, capabilities };
     return { status: result.pending ? 'joining' : 'joined', harness: who.harness, conversation: who.thread,
-             binding_id: result.binding_id, delivery: 'push', room_reachable: result.connected, inbound };
+             binding_id: result.binding_id, delivery: 'push', room_reachable: result.connected, capabilities, inbound };
   }
   if (!binding) throw new Error('Not connected to the voice room: call voice_connect first (only if the user asked).');
   if (name === 'voice_say') {

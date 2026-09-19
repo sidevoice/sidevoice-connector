@@ -16,13 +16,16 @@ The client side. Three entry points behind one bin (`sidevoice`):
 - `pair` — redeems a pairing code from the room UI for this machine's
   credential (`~/.sidevoice/credentials.json`, mode 0600).
 
-Adapters (`adapters.mjs`): `claude-uds` writes the voice envelope as a user
-message to the Claude Code session's inbox socket; `codex-queue` runs
-`codex queue --thread <id>`; `http` posts to any local receiver that accepts the
-room's message shape (for harnesses that have neither).
+Harness modules implement one contract (`harness-contract.mjs`): delivery,
+inbound inspection, current working state, end-of-turn reporting and session
+identity. Every capability is explicitly `supported` or `unsupported`; an old
+or malformed declaration becomes `unknown`, never false. Claude Code, Codex and
+generic HTTP each have one module. See the repository's
+[`docs/HARNESS_CONTRACT.md`](../../docs/HARNESS_CONTRACT.md).
 
 Protocol (newline-free JSON over the WebSocket): `connector.hello` ->
-`connector.welcome`; `binding.register` -> `binding.registered|rejected`;
+`connector.welcome`; `binding.register` (including declared harness capabilities)
+-> `binding.registered|rejected`;
 `binding.unregister`; `input.deliver` -> `input.ack`; `speech.publish` ->
 `speech.published`; `heartbeat` <-> `heartbeat.ack`. Protocol version 1.
 
