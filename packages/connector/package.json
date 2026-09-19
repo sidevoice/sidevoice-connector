@@ -17,6 +17,9 @@
     "adapters.mjs",
     "harness-claude.mjs",
     "pair.mjs",
+    "hook.mjs",
+    "skill.mjs",
+    "skill/",
     "README.md"
   ],
   "scripts": {

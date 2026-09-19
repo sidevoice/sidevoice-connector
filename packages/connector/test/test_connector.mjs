@@ -4,12 +4,13 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createWsServer } from './ws-server.mjs';
 import { envelope } from '../adapters.mjs';
 import { interpret, nudge, voiceEnvelope } from '../hook.mjs';
+import { install as installSkill, remove as removeSkill, status as skillStatus } from '../skill.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const hookPath = path.join(here, '..', 'cli.mjs');
@@ -265,4 +266,27 @@ test('connector: a read receipt from the hook reaches the room once per message,
     assert.equal(await new Promise(r => quiet.on('exit', r)), 0); assert.equal(quietOut, '');
     facade.end();
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
+});
+
+test('skill: install copies the voice skill and a standalone hook, repairs itself, and never touches a foreign skill', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'sv-skills-'));
+  assert.equal(skillStatus(dir).state, 'absent');
+  const first = installSkill(dir);
+  assert.equal(first.action, 'installed'); assert.equal(first.hook, true);
+  const manifest = readFileSync(path.join(dir, 'voice-room', 'SKILL.md'), 'utf8');
+  assert.match(manifest, /^name: voice-room$/m); assert.match(manifest, /UserPromptSubmit:\n    - hooks:/, 'settings.json shape: a list of hook groups'); assert.ok(manifest.includes(`node "${path.join(dir, 'voice-room')}/hook.mjs"`), 'the hook command names the installed copy by absolute path'); assert.ok(!manifest.includes('__SIDEVOICE_SKILL_DIR__'));
+  writeFileSync(path.join(dir, 'voice-room', 'hook.mjs'), 'broken');
+  assert.equal(installSkill(dir).action, 'updated');
+  assert.equal(readFileSync(path.join(dir, 'voice-room', 'hook.mjs'), 'utf8'), readFileSync(path.join(here, '..', 'hook.mjs'), 'utf8'));
+  // The installed hook runs on its own, from the skill directory, with no connector around: silent, exit 0.
+  const child = spawn(process.execPath, [path.join(dir, 'voice-room', 'hook.mjs')], { env: { ...process.env, SIDEVOICE_DATA_DIR: path.join(dir, 'nowhere'), CLAUDE_CODE_SESSION_ID: 's' }, stdio: ['pipe', 'pipe', 'pipe'] });
+  let out = ''; child.stdout.on('data', d => { out += d; });
+  child.stdin.end(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt: envelope({ channel: 'voice', session_id: 's', revision: 1, message_id: 'm', text: 'hola' }) }));
+  assert.equal(await new Promise(r => child.on('exit', r)), 0);
+  assert.match(out, /additionalContext/);
+  assert.equal(removeSkill(dir).action, 'removed'); assert.equal(skillStatus(dir).state, 'absent');
+  mkdirSync(path.join(dir, 'voice-room')); writeFileSync(path.join(dir, 'voice-room', 'SKILL.md'), '---\nname: voice-room\n---\nsomeone else\'s');
+  assert.equal(skillStatus(dir).state, 'foreign');
+  assert.throws(() => installSkill(dir), /not Sidevoice/); assert.throws(() => removeSkill(dir), /not Sidevoice/);
+  assert.equal(readFileSync(path.join(dir, 'voice-room', 'SKILL.md'), 'utf8').includes('someone else'), true);
 });

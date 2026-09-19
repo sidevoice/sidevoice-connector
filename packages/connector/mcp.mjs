@@ -22,6 +22,7 @@ const INSTRUCTIONS = `Sidevoice connects this conversation to the user's voice r
 - A "published" voice_say result means the room stored it, not that the user heard it. If publication fails, continue in writing.
 - If the user closes this conversation's voice channel from the room, the connection is removed: voice_say then fails saying so. Continue in writing and do not try to speak again; call voice_connect only when the user asks for voice again.
 - voice_status reports whether the room can currently reach this conversation.
+- On Claude Code, if a skill named voice-room is available, joining through it (/voice-room) is preferred: it registers, for this session only, the hook that gives the room read receipts and asks you to speak first.
 - If voice_connect returns inbound.ok false, voice will look sent and never arrive: this harness holds or refuses messages posted by other local processes. Tell the user what inbound.reason says, offer inbound.remedy in your own words including what safeguard the machine-wide option removes, and let them choose. Do not change their settings without being asked to.`;
 
 /** Who this façade speaks for, decided by what spawned it — never by the model. */
