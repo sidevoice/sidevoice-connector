@@ -17,6 +17,28 @@ function readJson(file) {
   try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return null; }
 }
 
+/** The record Claude Code keeps for a session, or null. It publishes `status` there and keeps it current. */
+export function sessionRecord(sessionId) {
+  const registry = path.join(configDir(), 'sessions');
+  let entries = [];
+  try { entries = readdirSync(registry).filter(name => name.endsWith('.json')); } catch { return null; }
+  for (const name of entries) {
+    const record = readJson(path.join(registry, name));
+    if (record?.sessionId === sessionId) return record;
+  }
+  return null;
+}
+
+/** Whether that session is working on something right now: true, false, or null when it cannot be told.
+ *  This is Claude Code's own bookkeeping, not a published interface: an unknown value answers null rather
+ *  than guessing, and the room falls back to what the conversation says about its own replies. */
+export function sessionWorking(sessionId) {
+  const status = sessionRecord(sessionId)?.status;
+  if (status === 'busy') return true;
+  if (status === 'idle' || status === 'ready' || status === 'waiting') return false;
+  return null;
+}
+
 /** The pid of the session with this id, from Claude Code's own session registry. */
 function sessionPid(sessionId) {
   const registry = path.join(configDir(), 'sessions');

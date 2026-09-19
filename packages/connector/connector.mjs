@@ -8,6 +8,7 @@ import path from 'node:path';
 import { mkdirSync, openSync, closeSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { deliver } from './adapters.mjs';
+import { sessionWorking } from './harness-claude.mjs';
 
 export const PROTOCOL = 1;
 const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
@@ -62,6 +63,27 @@ function saveOutbox() {
   writeFileSync(temporary, JSON.stringify(outbox), { mode: 0o600 }); renameSync(temporary, outboxPath);
 }
 function send(frame) { if (ws?.readyState === WebSocket.OPEN) { ws.send(JSON.stringify(frame)); return true; } return false; }
+
+/* Whether a conversation is working on what it was given is the harness's own state, not something the
+ * model has to remember to say. Claude Code publishes it per session and keeps it current; the connector
+ * watches it for its own bindings and tells the room when it changes. A harness that publishes nothing
+ * answers null here, and the room keeps using what the conversation says about its own replies. */
+const WORK_POLL_MS = Number(process.env.SIDEVOICE_WORK_POLL_MS || 400);
+let workTimer = null;
+function watchWork() {
+  if (workTimer) return;
+  workTimer = setInterval(() => {
+    if (!bindings.size) { clearInterval(workTimer); workTimer = null; return; }
+    for (const binding of bindings.values()) {
+      if (binding.harness !== 'claude') continue;
+      const working = sessionWorking(binding.client_ref);
+      if (working === null || working === binding.working) continue;
+      binding.working = working;
+      send({ type: 'input.working', binding_id: binding.binding_id, working });
+    }
+  }, WORK_POLL_MS);
+  workTimer.unref?.();
+}
 
 function open() {
   if (closed || ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return;
@@ -165,7 +187,7 @@ async function command(client, input) {
       if (existing) { existing.owner = client; existing.delivery = delivery; client.bindings.add(existing); return { binding_id: existing.binding_id, thread, connected }; }
       const local_id = 'local-' + randomUUID();
       const binding = { binding_id: local_id, client_ref, harness, thread, title, delivery, inbound, owner: client };
-      bindings.set(local_id, binding); client.bindings.add(binding); clearTimeout(idleTimer); open();
+      bindings.set(local_id, binding); client.bindings.add(binding); clearTimeout(idleTimer); open(); watchWork();
       const frame = await new Promise((resolve, reject) => {
         const timer = setTimeout(() => { registering.delete(client_ref); reject(new Error(connected ? 'The room did not confirm the binding' : 'The room is unreachable; retrying in the background')); }, 10_000);
         registering.set(client_ref, { resolve: f => { clearTimeout(timer); registering.delete(client_ref); resolve(f); }, reject: e => { clearTimeout(timer); registering.delete(client_ref); reject(e); } });

@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { createWsServer } from './ws-server.mjs';
 import { envelope } from '../adapters.mjs';
 import { interpret, nudge, voiceEnvelope } from '../hook.mjs';
+import { sessionWorking } from '../harness-claude.mjs';
 import { install as installSkill, remove as removeSkill, status as skillStatus } from '../skill.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -289,4 +290,26 @@ test('skill: install copies the voice skill and a standalone hook, repairs itsel
   assert.equal(skillStatus(dir).state, 'foreign');
   assert.throws(() => installSkill(dir), /not Sidevoice/); assert.throws(() => removeSkill(dir), /not Sidevoice/);
   assert.equal(readFileSync(path.join(dir, 'voice-room', 'SKILL.md'), 'utf8').includes('someone else'), true);
+});
+
+test('The harness says whether it is working: Claude Code publishes it per session, and an unknown state is not a guess', () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-claude-'));
+  const registry = path.join(home, 'sessions');
+  mkdirSync(registry);
+  const write = (name, record) => writeFileSync(path.join(registry, name + '.json'), JSON.stringify(record));
+  const previous = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = home;
+  try {
+    write('1', { sessionId: 'busy-one', status: 'busy', pid: 1 });
+    write('2', { sessionId: 'idle-one', status: 'idle', pid: 2 });
+    write('3', { sessionId: 'odd-one', status: 'something-new', pid: 3 });
+    write('4', { sessionId: 'quiet-one', pid: 4 });
+    assert.equal(sessionWorking('busy-one'), true);
+    assert.equal(sessionWorking('idle-one'), false);
+    // A status this code does not know, and a session that publishes none, are not evidence either way:
+    // the room falls back to what the conversation says about its own replies.
+    assert.equal(sessionWorking('odd-one'), null);
+    assert.equal(sessionWorking('quiet-one'), null);
+    assert.equal(sessionWorking('nobody'), null);
+  } finally { if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = previous; }
 });
