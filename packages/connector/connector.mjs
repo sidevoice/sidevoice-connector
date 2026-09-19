@@ -177,7 +177,8 @@ async function command(client, input) {
       const binding = bindings.get(params.binding_id) || [...bindings.values()].find(b => b.client_ref === params.client_ref);
       if (!binding) throw new Error(closedByRoom.has(params.client_ref) ? 'CLOSED_BY_ROOM' : 'Unknown binding');
       const speech = { type: 'speech.publish', event_id: params.event_id || randomUUID(), binding_id: binding.binding_id,
-        session_id: params.session_id, revision: params.revision, utterance_id: params.utterance_id || randomUUID(), text: params.text, language: params.language };
+        session_id: params.session_id, revision: params.revision, utterance_id: params.utterance_id || randomUUID(), text: params.text, language: params.language,
+        final: params.final !== false };
       outbox.push(speech); saveOutbox();
       if (!send(speech)) return { status: 'queued', utterance_id: speech.utterance_id };
       const reply = await new Promise(resolve => {

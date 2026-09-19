@@ -17,6 +17,7 @@ const INSTRUCTIONS = `Sidevoice connects this conversation to the user's voice r
 - Call voice_connect only when the user asks to join the voice room or enable voice for this conversation; never as a side effect.
 - Voice input arrives as a user message that starts with a JSON header ({"channel":"voice","session_id":...,"revision":...,"message_id":...}) followed by the user's literal words. Treat the header as opaque reply metadata; if the same message_id arrives twice, it is a redelivery: do not act on it again.
 - For substantive work, one incoming voice message may receive multiple voice_say publications: an immediate acknowledgement that states what was understood and the next action, meaningful progress checkpoints while work continues, and a final result. Use the same original session_id and revision for every publication, with distinct utterances; do not manufacture filler or narrate every tool call.
+- Mark every publication that is not your last word on the turn with final: false. The room shows the user that this conversation is still working until a publication arrives without it, so an acknowledgement or a progress note left unmarked makes the room look idle while you work.
 - A progress publication is not itself a listening point. Divide substantive execution into bounded steps and, after each tool result or operational boundary, process newly arrived user input before starting the next step. Do not add artificial sleeps or fixed pauses.
 - If a new user message arrives during active work, treat it as an addition, refinement, or replacement according to its meaning. Stop not-yet-started obsolete work, preserve completed work that remains useful, acknowledge the new interpretation before continuing, and do not later answer a stale request. A tool already running may finish before the correction takes effect; delegation is not a substitute for listening.
 - A "published" voice_say result means the room stored it, not that the user heard it. If publication fails, continue in writing.
@@ -90,7 +91,7 @@ const tools = [
   { name: 'voice_connect', description: 'Connect this conversation to the voice room. Only on an explicit request to join or enable voice.',
     inputSchema: { type: 'object', properties: { title: { type: 'string', description: 'Short label for this conversation in the room' } }, additionalProperties: false } },
   { name: 'voice_say', description: 'Publish a concise spoken version of your reply to the room, with the session_id and revision from the voice message header.',
-    inputSchema: { type: 'object', properties: { text: { type: 'string' }, session_id: { type: 'string' }, revision: { type: 'integer', minimum: 0 }, utterance_id: { type: 'string' }, language: { type: 'string', enum: ['es', 'en', 'fr', 'it', 'pt', 'hi'] } }, required: ['text', 'session_id', 'revision'], additionalProperties: false } },
+    inputSchema: { type: 'object', properties: { text: { type: 'string' }, session_id: { type: 'string' }, revision: { type: 'integer', minimum: 0 }, utterance_id: { type: 'string' }, language: { type: 'string', enum: ['es', 'en', 'fr', 'it', 'pt', 'hi'] }, final: { type: 'boolean', description: 'false while you keep working on this turn (an acknowledgement, a progress note): the room keeps showing that the conversation is busy. true, the default, when this is your last word on it.' } }, required: ['text', 'session_id', 'revision'], additionalProperties: false } },
   { name: 'voice_disconnect', description: 'Leave the voice room. The conversation and its work continue in writing.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'voice_status', description: 'Whether the room can currently reach this conversation.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
 ];
@@ -126,7 +127,7 @@ async function invoke(name, args, meta) {
   if (name === 'voice_say') {
     let result;
     try {
-      result = await rpc('publish', { binding_id: binding.binding_id, client_ref: binding.client_ref, text: args.text, session_id: args.session_id, revision: args.revision, utterance_id: args.utterance_id, language: args.language });
+      result = await rpc('publish', { binding_id: binding.binding_id, client_ref: binding.client_ref, text: args.text, session_id: args.session_id, revision: args.revision, utterance_id: args.utterance_id, language: args.language, final: args.final !== false });
     } catch (error) {
       if (error.message === 'CLOSED_BY_ROOM') {
         binding = null;
