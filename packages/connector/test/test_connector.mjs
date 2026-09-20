@@ -263,6 +263,31 @@ test('hook: only a Sidevoice voice message being admitted counts, and it names t
   assert.match(nudge(claude), /voice_say/); assert.match(nudge(claude), /s-9/); assert.match(nudge(claude), /revision 4/);
 });
 
+test('connector: the conversation\'s state is said again on a clock, not only when it changes', async () => {
+  // A room that restarts has forgotten what it was told. Waiting for the next change means a conversation
+  // that was already working shows nothing at all until it stops (2026-09-20).
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'sv-claude-'));
+  mkdirSync(path.join(claudeHome, 'sessions'));
+  writeFileSync(path.join(claudeHome, 'sessions', '4242.json'), JSON.stringify({ sessionId: 'busy-session', pid: 4242, status: 'busy' }));
+  room.handle = (frame, c) => {
+    if (frame.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1 }));
+    if (frame.type === 'binding.register') c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-1', thread: frame.thread }));
+  };
+  const { child, socketPath } = startConnector(room, dataDir,
+    { CLAUDE_CONFIG_DIR: claudeHome, SIDEVOICE_WORK_POLL_MS: '30', SIDEVOICE_WORK_ANNOUNCE_MS: '120' });
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    await facade.call('register', { client_ref: 'busy-session', harness: 'claude', thread: 'busy-session',
+      delivery: { kind: 'http', url: 'http://127.0.0.1:1/never', thread: 'busy-session' } });
+    await until(() => room.frames.filter(f => f.type === 'input.working' && f.working === true).length >= 3,
+      4000);
+    facade.end();
+  } finally { if (child.exitCode === null) child.kill(); await room.close(); }
+});
+
 test('connector: Codex lifecycle reports are correlated, idempotent, and a stale stop cannot clear newer work', async () => {
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));

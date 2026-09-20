@@ -64,21 +64,39 @@ function saveOutbox() {
 }
 function send(frame) { if (ws?.readyState === WebSocket.OPEN) { ws.send(JSON.stringify(frame)); return true; } return false; }
 
-/* Whether a conversation is working is the harness's own state. Each module declares whether it can
- * answer; unknown and unsupported are skipped rather than being rendered as false. */
+/* Whether a conversation is working is the harness's own state: each module answers in the way it can
+ * (a polled registry, a stream of lifecycle events), and unknown or unsupported is skipped rather than
+ * rendered as false.
+ *
+ * The connector does not assume the room still knows what it was told. A transition is sent the moment it
+ * happens, and the same state is said again every few seconds regardless: a room that restarted, or a
+ * socket that dropped, learns what is true within one interval instead of waiting for the next change that
+ * may never come (a conversation that was already working when the room came back showed nothing at all,
+ * 2026-09-20). Saying it again is one small frame; not saying it is a light that never comes on. */
 const WORK_POLL_MS = Number(process.env.SIDEVOICE_WORK_POLL_MS || 400);
+const WORK_ANNOUNCE_MS = Number(process.env.SIDEVOICE_WORK_ANNOUNCE_MS || 2000);
 let workTimer = null;
+function announceWork(binding, working, extra = {}) {
+  binding.working = working;
+  binding.workingSentAt = Date.now();
+  return send({ type: 'input.working', binding_id: binding.binding_id, working, ...extra });
+}
 function watchWork() {
   if (workTimer) return;
   workTimer = setInterval(() => {
     if (!bindings.size) { clearInterval(workTimer); workTimer = null; return; }
     for (const binding of bindings.values()) {
       const harness = harnessFor(binding.harness);
-      if (capabilityState(harness, 'working') !== SUPPORTED || harness.workingSource !== WORKING_POLL) continue;
-      const working = harness.working(binding.client_ref);
-      if (working === null || working === binding.working) continue;
-      binding.working = working;
-      send({ type: 'input.working', binding_id: binding.binding_id, working });
+      if (capabilityState(harness, 'working') !== SUPPORTED) continue;
+      let working = binding.working;
+      if (harness.workingSource === WORKING_POLL) {
+        const polled = harness.working(binding.client_ref);
+        if (polled === null) continue;
+        working = polled;
+      } else if (typeof working !== 'boolean') continue;
+      const due = !binding.workingSentAt || Date.now() - binding.workingSentAt >= WORK_ANNOUNCE_MS;
+      if (working === binding.working && !due) continue;
+      announceWork(binding, working);
     }
   }, WORK_POLL_MS);
   workTimer.unref?.();
@@ -123,9 +141,7 @@ async function receive(frame) {
     case 'binding.registered': {
       const binding = [...bindings.values()].find(b => b.client_ref === frame.client_ref);
       if (binding && binding.binding_id !== frame.binding_id) { bindings.delete(binding.binding_id); binding.binding_id = frame.binding_id; bindings.set(frame.binding_id, binding); }
-      if (binding && typeof binding.working === 'boolean') {
-        send({ type: 'input.working', binding_id: binding.binding_id, working: binding.working });
-      }
+      if (binding && typeof binding.working === 'boolean') announceWork(binding, binding.working);
       registering.get(frame.client_ref)?.resolve(frame); return;
     }
     case 'binding.rejected': registering.get(frame.client_ref)?.reject(new Error(frame.error || 'Binding rejected')); return;
@@ -232,8 +248,7 @@ async function command(client, input) {
     case 'turn_end': {
       const binding = [...bindings.values()].find(b => b.thread === params.thread || b.client_ref === params.thread);
       if (!binding) return { status: 'no_binding' };
-      const sent = send({ type: 'input.working', binding_id: binding.binding_id, working: false,
-        turn_id: params.turn_id || null });
+      const sent = announceWork(binding, false, { turn_id: params.turn_id || null });
       return { status: sent ? 'sent' : 'offline' };
     }
     case 'working': {
@@ -250,9 +265,7 @@ async function command(client, input) {
           ...(typeof params.session_id === 'string' ? { session_id: params.session_id } : {}),
           ...(Number.isInteger(params.revision) ? { revision: params.revision } : {}) };
         binding.activeTurns.set(turn_id, correlation);
-        binding.working = true;
-        const sent = send({ type: 'input.working', binding_id: binding.binding_id, working: true,
-          turn_phase: 'start', ...correlation });
+        const sent = announceWork(binding, true, { turn_phase: 'start', ...correlation });
         return { status: sent ? 'sent' : 'offline' };
       }
       if (binding.completedTurns.has(turn_id)) return { status: 'already_reported' };
@@ -260,9 +273,7 @@ async function command(client, input) {
       binding.completedTurns.add(turn_id);
       if (!correlation) return { status: 'stale' };
       binding.activeTurns.delete(turn_id);
-      binding.working = binding.activeTurns.size > 0;
-      const sent = send({ type: 'input.working', binding_id: binding.binding_id, working: binding.working,
-        turn_phase: 'end', ...correlation });
+      const sent = announceWork(binding, binding.activeTurns.size > 0, { turn_phase: 'end', ...correlation });
       return { status: sent ? 'sent' : 'offline' };
     }
     case 'unregister': {
