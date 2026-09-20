@@ -105,8 +105,11 @@ async function invoke(name, args, meta) {
       throw error;
     }
     const capabilities = advertisedCapabilities(who.module);
+    // Which model is answering, read from the session's own launch line rather than asked of the model.
+    let engine = null;
+    try { engine = who.module.engine?.(who.thread) || null; } catch { engine = null; }
     const result = await rpc('register', { client_ref: who.thread, harness: who.harness, thread: who.thread,
-      title, delivery: who.delivery, inbound, capabilities });
+      title, delivery: who.delivery, inbound, capabilities, engine });
     binding = { ...result, harness: who.harness, client_ref: who.thread, capabilities };
     return { status: result.pending ? 'joining' : 'joined', harness: who.harness, conversation: who.thread,
              binding_id: result.binding_id, delivery: 'push', room_reachable: result.connected, capabilities, inbound };

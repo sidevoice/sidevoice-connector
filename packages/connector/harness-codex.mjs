@@ -49,6 +49,12 @@ function deliver(delivery, event) {
   });
 }
 
+/** Which model this thread runs, from the launch line of the process that owns it, when it says. */
+function engine(thread, env = process.env) {
+  const named = env.CODEX_MODEL || null;
+  return named ? { model: named, effort: env.CODEX_REASONING_EFFORT || null, thinking: null } : null;
+}
+
 function endOfTurn(payload, env = process.env) {
   if (!payload || !/^stop$/i.test(String(payload.hook_event_name || payload.hookEventName || ''))) return null;
   const identity = sessionIdentity({ payload, env });
@@ -80,6 +86,7 @@ export const codexHarness = defineHarness({
     sessionIdentity: SUPPORTED,
   },
   deliver,
+  engine,
   working,
   endOfTurn,
   sessionIdentity,

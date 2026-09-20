@@ -200,7 +200,7 @@ async function command(client, input) {
   const params = input.params || {};
   switch (input.method) {
     case 'register': {
-      const { client_ref, harness, thread, title, delivery, inbound, capabilities } = params;
+      const { client_ref, harness, thread, title, delivery, inbound, capabilities, engine } = params;
       if (!client_ref || !thread || !delivery?.kind) throw new Error('client_ref, thread and delivery are required');
       closedByRoom.delete(client_ref);   // joining again is the user's explicit request
       const existing = [...bindings.values()].find(b => b.client_ref === client_ref);
@@ -215,7 +215,7 @@ async function command(client, input) {
       const frame = await new Promise((resolve, reject) => {
         const timer = setTimeout(() => { registering.delete(client_ref); reject(new Error(connected ? 'The room did not confirm the binding' : 'The room is unreachable; retrying in the background')); }, 10_000);
         registering.set(client_ref, { resolve: f => { clearTimeout(timer); registering.delete(client_ref); resolve(f); }, reject: e => { clearTimeout(timer); registering.delete(client_ref); reject(e); } });
-        if (!send({ type: 'binding.register', client_ref, harness, thread, title, inbound, capabilities })) { /* sent on welcome */ }
+        if (!send({ type: 'binding.register', client_ref, harness, thread, title, inbound, capabilities, engine })) { /* sent on welcome */ }
       }).catch(error => { if (!connected) return null; bindings.delete(binding.binding_id); client.bindings.delete(binding); throw error; });
       return { binding_id: frame?.binding_id || binding.binding_id, thread, connected, pending: !frame };
     }

@@ -76,6 +76,16 @@ function settingsFromFlag(args) {
 
 const BYPASS_MODES = new Set(['bypassPermissions']);
 
+/** Which model this conversation runs, read from the session's own launch line — no model is asked to
+ *  say what it is. Absent rather than guessed when the launcher did not name one (the CLI's default). */
+export function sessionEngine(sessionId) {
+  const args = launchArgs(sessionPid(sessionId));
+  if (!args) return null;
+  const model = flag(args, '--model'), effort = flag(args, '--effort'), thinking = flag(args, '--thinking');
+  if (!model && !effort) return null;
+  return { model: model || null, effort: effort || null, thinking: thinking || null };
+}
+
 /** Will an injected message be delivered to this Claude session, or held for its user? */
 export function inspectInbound(sessionId) {
   const pid = sessionPid(sessionId);
@@ -170,6 +180,7 @@ export const claudeHarness = defineHarness({
   },
   deliver,
   inspectInbound,
+  engine: sessionEngine,
   working: sessionWorking,
   endOfTurn,
   sessionIdentity,
