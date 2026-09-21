@@ -510,6 +510,18 @@ test('install: puts this version in front of the harness, re-pins an older regis
   assert.match(paired.done.join('\n'), /paired with https:\/\/room\.example \(connector c-1\)/);
   assert.ok(!paired.next.join('\n').includes('Emparejar conector'));
 
+  // Uninstall is the reverse, for this machine: unregister, remove the copies and the credential, and say
+  // what the room still remembers. The claude stand-in keeps answering "registered" so the removal is asked for.
+  writeFileSync(registered, `sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: ${command}\n  Args: ${args.join(' ')}\n`);
+  writeFileSync(log, '');
+  const { uninstall } = await import('../install.mjs');
+  const gone = await uninstall(['--harness', 'claude'], env);
+  assert.deepEqual(calls(), ['mcp get sidevoice', 'mcp remove --scope user sidevoice']);
+  assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice')), 'installed copies are gone');
+  assert.ok(!existsSync(env.SIDEVOICE_DATA_DIR), 'credential, socket and log are gone');
+  assert.match(gone.next.join('\n'), /still lists this machine as paired .* revoke it from the room/);
+  assert.match(gone.done.join('\n'), /Unregistered the MCP server/);
+
   // Codex is instructions, not edits: its configuration is machine-wide and not ours to rewrite.
   const codex = codexInstructions(env);
   assert.match(codex, /\[mcp_servers\.sidevoice\]/);

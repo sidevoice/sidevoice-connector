@@ -200,6 +200,50 @@ export async function install(argv = process.argv.slice(2), env = process.env) {
   return { done, next };
 }
 
+/** `sidevoice uninstall`: the reverse of install, for this machine. Unregisters the MCP server from Claude
+ *  Code, stops the connector, removes the installed copies, the skill copy an older version left, and the
+ *  pairing credential. The room keeps this machine's pairing until it is revoked from the room's page —
+ *  say so. Codex's machine-wide file is, as always, printed and not touched. */
+export async function uninstall(argv = process.argv.slice(2), env = process.env) {
+  const wanted = flag(argv, '--harness');
+  const harnesses = wanted ? [wanted] : harnessesPresent(env);
+  const done = [], next = [];
+  if (harnesses.includes('claude')) {
+    const current = claudeRegistration(env);
+    if (current?.scope === 'user') {
+      try { claude(['mcp', 'remove', '--scope', 'user', 'sidevoice'], env); done.push('Unregistered the MCP server from Claude Code.'); }
+      catch (error) { done.push(`Could not unregister from Claude Code (${(error.message || '').split('\n')[0]}). Run:\n    claude mcp remove --scope user sidevoice`); }
+    } else if (current) {
+      next.push(`Claude Code has a sidevoice MCP server registered outside user scope (${current.line}); remove it where it was added.`);
+    } else done.push('Claude Code had no sidevoice MCP server registered.');
+    if (skillStatus(skillsDir([], env)).state === 'installed') done.push(`Removed the voice-room skill copy at ${removeSkill(skillsDir([], env)).target}.`);
+  }
+  const running = await runningConnector(env);
+  if (running?.pid) {
+    try { process.kill(running.pid, 'SIGTERM'); done.push(`Stopped the connector (pid ${running.pid}${running.version ? ', version ' + running.version : ''}).`); }
+    catch (error) { next.push(`A connector is running (pid ${running.pid}) and could not be stopped (${error.code || error.message}); stop it yourself.`); }
+  }
+  if (!fromSource(env) && existsSync(copiesDir(env))) { rmSync(copiesDir(env), { recursive: true, force: true }); done.push(`Removed the installed copies under ${copiesDir(env)}.`); }
+  const dataDir = env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
+  const paired = pairedRoom(env);
+  if (existsSync(dataDir)) {
+    rmSync(dataDir, { recursive: true, force: true });
+    done.push(`Removed ${dataDir} (credential, socket, outbox, log).`);
+    if (paired) next.push(`The room at ${paired.origin} still lists this machine as paired (connector ${paired.connector_id}) until you revoke it from the room's page.`);
+  }
+  if (harnesses.includes('codex')) next.push(`Remove the [mcp_servers.sidevoice] table from ${env.CODEX_HOME || path.join(os.homedir(), '.codex')}/config.toml — it is machine-wide and this package does not rewrite it.`);
+  next.push('Sessions already open keep their MCP server until they end.');
+  return { done, next };
+}
+
+if (process.env.SIDEVOICE_UNINSTALL_MAIN === '1') {
+  try {
+    const { done, next } = await uninstall();
+    for (const line of done) console.log('· ' + line);
+    if (next.length) { console.log('\nLeft for you:'); for (const line of next) console.log('\n' + line); }
+  } catch (error) { console.error(error.message); process.exit(1); }
+}
+
 if (process.env.SIDEVOICE_INSTALL_MAIN === '1') {
   try {
     const { done, next } = await install();
