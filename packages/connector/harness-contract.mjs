@@ -55,11 +55,11 @@ export function envelope(event) {
   return JSON.stringify(header) + '\n\n' + event.text + note;
 }
 
-/** What the conversation is asked at the moment it reads a voice message. */
+/** What the conversation is asked at the moment it reads a voice message: one line that points at the
+ *  server's instructions, which are already in context — not a copy of them. The harness adds its own
+ *  wrapper around a cross-session message; ours stays small. */
 export function nudge(header) {
-  return `[Sidevoice] A voice message from the room (session_id "${header.session_id}", revision ${header.revision}). `
-    + 'Before any other tool, publish a short spoken acknowledgement with voice_say that says what you understood and what you will do next, '
-    + 'using that session_id and revision; then continue the work and publish the result by voice as well.';
+  return `[Sidevoice] Voice from the room: acknowledge with voice_say (session_id "${header.session_id}", revision ${header.revision}) before any other tool, then work and reply by voice, as the sidevoice server's instructions say.`;
 }
 
 /** The header at the front of a delivered message, or null when the text is not one of ours. Works on
