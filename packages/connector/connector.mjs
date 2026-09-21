@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdirSync, openSync, closeSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { capabilityState, SUPPORTED, voiceEnvelope } from './harness-contract.mjs';
 import { harnessFor } from './harnesses.mjs';
 import { privateNetwork } from './pair.mjs';
@@ -36,7 +37,16 @@ function credentials() {
   return { url, connector_id, token, room: room.origin };
 }
 
-function alive(pid) { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } }
+/** Whether the pid in the lock is a live Sidevoice connector — not merely a live pid. Pids are reused,
+ *  and on macOS a pid that now belongs to another user answers EPERM, which used to count as alive: a
+ *  stale lock then made every new connector exit at once, silently (a laptop, 2026-09-21). */
+function connectorAlive(pid) {
+  try { process.kill(pid, 0); } catch (error) { if (error.code !== 'EPERM') return false; }
+  try {
+    const args = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', timeout: 3000 }).trim();
+    return /connector(\.mjs)?(\s|$)/.test(args);   // `… connector.mjs` from a checkout, `sidevoice connector` from a package
+  } catch { return true; }                          // No ps to ask: a live pid is taken at its word.
+}
 function acquireLock() {
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -44,8 +54,12 @@ function acquireLock() {
     catch (error) {
       if (error.code !== 'EEXIST') throw error;
       let pid = 0; try { pid = Number(readFileSync(lockPath, 'utf8')); } catch {}
-      if (pid && alive(pid)) return false;          // A live connector holds it: we are redundant.
-      try { unlinkSync(lockPath); } catch {}         // Stale lock from a dead process.
+      if (pid && connectorAlive(pid)) {              // A live connector holds it: we are redundant, and we say so.
+        console.error(`[sidevoice] a connector is already running (pid ${pid}, lock ${lockPath}); this one exits`);
+        return false;
+      }
+      console.error(`[sidevoice] stale lock ${lockPath} (pid ${pid || '?'} is not a connector); taking over`);
+      try { unlinkSync(lockPath); } catch {}
     }
   }
   return false;

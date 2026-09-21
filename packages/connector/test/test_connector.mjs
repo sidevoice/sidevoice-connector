@@ -175,9 +175,25 @@ test('connector: a second instance defers to the live one', async () => {
     const second = startConnector(room, dataDir);
     const code = await until(() => second.child.exitCode !== null ? second.child.exitCode + 1 : null);
     assert.equal(code - 1, 0);
+    assert.match(second.stderr(), /a connector is already running \(pid \d+/, 'it says whom it defers to, never silently');
     assert.equal(readFileSync(path.join(dataDir, 'connector.sock.lock'), 'utf8'), String(first.child.pid));
     const facade = ipcClient(first.socketPath); await facade.ready; assert.equal((await facade.call('status', {})).host.length > 0, true); facade.end();
   } finally { if (first.child.exitCode === null) first.child.kill(); await room.close(); }
+});
+
+test('connector: a lock left by a pid that is now something else is stale, not a live connector', async () => {
+  // Pids are reused; on macOS a reused pid of another user even answers EPERM. The lock names this test's own
+  // node process — alive, but not a connector — so a connector must take over instead of exiting.
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  room.handle = (frame, c) => { if (frame.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1 })); };
+  writeFileSync(path.join(dataDir, 'connector.sock.lock'), String(process.pid));
+  const only = startConnector(room, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '5000' });
+  try {
+    await until(() => existsSync(only.socketPath));
+    assert.match(only.stderr(), /stale lock .* taking over/);
+    assert.equal(readFileSync(path.join(dataDir, 'connector.sock.lock'), 'utf8'), String(only.child.pid));
+  } finally { if (only.child.exitCode === null) only.child.kill(); await room.close(); }
 });
 
 test('mcp façade: identity comes from the harness, tools are exposed, instructions travel in initialize', async () => {
