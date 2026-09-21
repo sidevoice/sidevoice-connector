@@ -1,6 +1,6 @@
 {
   "name": "@sidevoice/uplink",
-  "version": "0.3.0-rc.1",
+  "version": "0.3.0",
   "description": "Sidevoice client side: the stdio MCP server your agent uses, one outbound uplink per machine to the room, one-time pairing.",
   "type": "module",
   "license": "MIT",
