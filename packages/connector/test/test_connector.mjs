@@ -173,6 +173,7 @@ test('mcp façade: identity comes from the harness, tools are exposed, instructi
   const commands = [];
   const fake = net.createServer(socket => { let buffer = ''; socket.on('data', chunk => { buffer += chunk; let i; while ((i = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, i); buffer = buffer.slice(i + 1); if (!line) continue; const input = JSON.parse(line); commands.push(input); const result = input.method === 'register' ? { binding_id: 'b-9', thread: input.params.thread, connected: true } : input.method === 'publish' ? { status: 'queued', text_saved: true } : { connected: true, bindings: [] }; socket.write(JSON.stringify({ id: input.id, ok: true, result }) + '\n'); } }); });
   await new Promise(r => fake.listen(socketPath, r));
+  writeFileSync(path.join(dataDir, 'credentials.json'), JSON.stringify({ url: 'wss://room.example/api/connectors/ws', connector_id: 'c-1', token: 't-1' }));
   const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'sess-abc', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/x.sock', CLAUDE_CODE_MESSAGING_TOKEN: 'tok' }, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
   const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
@@ -184,7 +185,8 @@ test('mcp façade: identity comes from the harness, tools are exposed, instructi
     assert.match(replies[0].result.instructions, /meaningful progress checkpoints/);
     assert.match(replies[0].result.instructions, /process newly arrived user input before starting the next step/);
     assert.match(replies[0].result.instructions, /same original session_id and revision/);
-    assert.deepEqual(replies[1].result.tools.map(t => t.name), ['voice_connect', 'voice_say', 'voice_disconnect', 'voice_status']);
+    assert.deepEqual(replies[1].result.tools.map(t => t.name), ['voice_connect', 'voice_pair', 'voice_say', 'voice_disconnect', 'voice_status']);
+    assert.match(replies[0].result.instructions, /Never try to obtain a code from the room yourself/);
     const joined = JSON.parse(replies[2].result.content[0].text);
     assert.equal(joined.status, 'joined'); assert.equal(joined.harness, 'claude'); assert.equal(joined.conversation, 'sess-abc');
     assert.deepEqual(commands[0].params.delivery, { kind: 'claude-uds', socket: '/tmp/x.sock', token: 'tok' });
@@ -379,49 +381,111 @@ test('connector: a read receipt from the hook reaches the room once per message,
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
 });
 
-test('install: one command pairs this machine and leaves the harness ready, twice over', async () => {
-  // The whole onboarding is mechanical except what belongs to a person: a machine-wide Codex file and
-  // Claude Code's inbound safeguard are printed, never written.
-  const { install, codexInstructions } = await import('../install.mjs');
-  const asked = [];
+test('mcp façade: an unpaired machine is told what to ask the user, and pairing is done with the code the user gave', async () => {
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const redeemed = [];
   const room = http.createServer((request, response) => {
-    asked.push(request.url);
-    let body = '';
-    request.on('data', chunk => { body += chunk; });
+    let body = ''; request.on('data', chunk => { body += chunk; });
     request.on('end', () => {
+      redeemed.push({ url: request.url, body: JSON.parse(body || '{}') });
       response.setHeader('content-type', 'application/json');
-      if (request.url === '/api/connectors/pairing-code') return response.end(JSON.stringify({ code: 'ABC123', expires_in: 600 }));
-      if (request.url === '/api/connectors/pair') {
-        assert.equal(JSON.parse(body).code, 'ABC123', 'it redeems the code it was just given');
-        return response.end(JSON.stringify({ connector_id: 'c-9', token: 't-9', protocol: 1 }));
-      }
-      response.statusCode = 404; response.end('{}');
+      if (request.url === '/api/connectors/pair' && JSON.parse(body).code === 'ABCD1234') return response.end(JSON.stringify({ connector_id: 'c-9', token: 't-9', protocol: 1 }));
+      response.statusCode = 403; response.end(JSON.stringify({ detail: 'Código de emparejamiento inválido o caducado.' }));
     });
   });
   await new Promise(resolve => room.listen(0, '127.0.0.1', resolve));
-  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-home-'));
-  const env = { ...process.env, SIDEVOICE_DATA_DIR: path.join(home, '.sidevoice'), CLAUDE_CONFIG_DIR: path.join(home, '.claude') };
-  mkdirSync(env.CLAUDE_CONFIG_DIR);
+  const roomUrl = `http://127.0.0.1:${room.address().port}`;
+  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'sess-abc', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/x.sock', CLAUDE_CODE_MESSAGING_TOKEN: 'tok' }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
+  const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   try {
-    const url = `http://127.0.0.1:${room.address().port}`;
-    const first = await install([url, '--harness', 'claude'], env);
-    assert.equal(JSON.stringify(asked), JSON.stringify(['/api/connectors/pairing-code', '/api/connectors/pair']),
-      'it asks the room for a code rather than making the person read one');
-    const credential = JSON.parse(readFileSync(path.join(env.SIDEVOICE_DATA_DIR, 'credentials.json'), 'utf8'));
-    assert.equal(credential.token, 't-9');
-    assert.match(credential.url, /^ws:\/\/127\.0\.0\.1:\d+\/api\/connectors\/ws$/);
-    assert.ok(existsSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room', 'hook.mjs')), 'the skill and its hook runtime are in place');
-    assert.match(first.next.join('\n'), /\/voice-room/, 'and it says what the person does next');
-    // Running it again changes nothing and says so, rather than pairing a second time.
-    const again = await install([url, '--harness', 'claude'], env);
-    assert.equal(asked.length, 2, 'a machine already paired is not paired again');
-    assert.match(again.done.join('\n'), /Already paired/);
-    // Codex is instructions, not edits: its configuration is machine-wide and not ours to rewrite.
-    const codex = codexInstructions();
-    assert.match(codex, /\[mcp_servers\.sidevoice\]/);
-    assert.match(codex, /--harness codex/);
-    assert.match(codex, /does not rewrite it/);
-  } finally { await new Promise(resolve => room.close(resolve)); }
+    // Not paired: no connector is started, no code is fetched; the model is told to ask the person.
+    ask(1, 'tools/call', { name: 'voice_connect', arguments: { title: 'Prueba' } });
+    await until(() => replies.length === 1);
+    assert.match(replies[0].error.message, /not paired with any room/);
+    assert.match(replies[0].error.message, /Emparejar conector/);
+    assert.match(replies[0].error.message, /voice_pair/);
+    assert.equal(redeemed.length, 0, 'nothing was asked of any room');
+    // A wrong code is the room's refusal, verbatim.
+    ask(2, 'tools/call', { name: 'voice_pair', arguments: { room: roomUrl, code: 'NOPE0000' } });
+    await until(() => replies.length === 2);
+    assert.match(replies[1].error.message, /inválido o caducado/);
+    assert.ok(!existsSync(path.join(dataDir, 'credentials.json')));
+    // The code the user read from the room, redeemed once; the credential lands on this machine only.
+    ask(3, 'tools/call', { name: 'voice_pair', arguments: { room: roomUrl + '/voice/', code: ' abcd1234 ' } });
+    await until(() => replies.length === 3);
+    const paired = JSON.parse(replies[2].result.content[0].text);
+    assert.equal(paired.status, 'paired'); assert.equal(paired.room, roomUrl);
+    assert.deepEqual(redeemed.map(r => r.url), ['/api/connectors/pair', '/api/connectors/pair']);
+    assert.equal(redeemed[1].body.code, 'ABCD1234', 'trimmed and upper-cased, as the room shows it');
+    const credential = JSON.parse(readFileSync(path.join(dataDir, 'credentials.json'), 'utf8'));
+    assert.equal(credential.token, 't-9'); assert.match(credential.url, /^ws:\/\/127\.0\.0\.1:\d+\/api\/connectors\/ws$/);
+    // Naming a different room does not silently re-pair: one room per machine, the switch is the user's.
+    ask(4, 'tools/call', { name: 'voice_connect', arguments: { room: 'https://other.example' } });
+    await until(() => replies.length === 4);
+    assert.match(replies[3].error.message, new RegExp(`paired with ${roomUrl}, not https://other.example`));
+    assert.equal(redeemed.length, 2);
+  } finally { child.kill(); await new Promise(resolve => room.close(resolve)); }
+});
+
+test('install: puts this version in front of the harness, re-pins an older registration, and pairs with nothing', async () => {
+  // Installing is mechanical and repeatable; pairing is a person's act and is not part of it. A machine-wide
+  // Codex file and Claude Code's inbound safeguard are printed, never written.
+  const { install, codexInstructions } = await import('../install.mjs');
+  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-home-'));
+  // A stand-in for `claude`: records every call, answers `mcp get` with whatever the test says is registered.
+  const log = path.join(home, 'claude.log'), registered = path.join(home, 'registered.txt'), bin = path.join(home, 'claude');
+  writeFileSync(bin, `#!/bin/sh\necho "$@" >> "${log}"\nif [ "$2" = get ]; then [ -s "${registered}" ] && cat "${registered}" || exit 1; fi\n`, { mode: 0o755 });
+  const calls = () => existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : [];
+  const env = { ...process.env, SIDEVOICE_DATA_DIR: path.join(home, '.sidevoice'), CLAUDE_CONFIG_DIR: path.join(home, '.claude'), SIDEVOICE_CLAUDE_BIN: bin };
+  mkdirSync(env.CLAUDE_CONFIG_DIR);
+  const { command, args } = (await import('../install.mjs')).serverCommand(env);
+  const wanted = [command, ...args].join(' ');
+
+  assert.rejects(install(['https://room.example', '--harness', 'claude'], env), /Pairing is not part of installing/, 'a room address is refused, with where pairing lives');
+
+  const first = await install(['--harness', 'claude'], env);
+  assert.deepEqual(calls(), ['mcp get sidevoice', `mcp add --scope user sidevoice -- ${wanted}`], 'nothing registered: it registers this version');
+  assert.match(first.done.join('\n'), /Registered the MCP server/);
+  assert.match(first.done.join('\n'), /not paired with any room yet/);
+  assert.match(first.next.join('\n'), /Emparejar conector/, 'and it says the conversation will ask for the code');
+  assert.ok(existsSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room', 'hook.mjs')), 'the skill and its hook runtime are in place');
+  assert.ok(!existsSync(path.join(env.SIDEVOICE_DATA_DIR, 'credentials.json')), 'no pairing happened');
+
+  // Registered at this version already: nothing to change, and it says so.
+  writeFileSync(registered, `sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: ${command}\n  Args: ${args.join(' ')}\n`);
+  writeFileSync(log, '');
+  const again = await install(['--harness', 'claude'], env);
+  assert.deepEqual(calls(), ['mcp get sidevoice']);
+  assert.match(again.done.join('\n'), /already runs this version/);
+  assert.match(again.done.join('\n'), /Skill updated/);
+
+  // An older pin: after an upgrade, running install again moves the harness to the new version.
+  writeFileSync(registered, `sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: npx\n  Args: -y @sidevoice/uplink@0.1.0 mcp\n`);
+  writeFileSync(log, '');
+  const upgraded = await install(['--harness', 'claude'], env);
+  assert.deepEqual(calls(), ['mcp get sidevoice', 'mcp remove --scope user sidevoice', `mcp add --scope user sidevoice -- ${wanted}`]);
+  assert.match(upgraded.done.join('\n'), /Re-pointed .* \(was: npx -y @sidevoice\/uplink@0\.1\.0 mcp\)/);
+
+  // Registered somewhere that is not ours to move: left alone, with the command to move it.
+  writeFileSync(registered, `sidevoice:\n  Scope: Project config (shared via .mcp.json)\n  Type: stdio\n  Command: npx\n  Args: -y @sidevoice/uplink@0.1.0 mcp\n`);
+  writeFileSync(log, '');
+  const elsewhere = await install(['--harness', 'claude'], env);
+  assert.deepEqual(calls(), ['mcp get sidevoice']);
+  assert.match(elsewhere.done.join('\n'), /outside user scope .* not touched/);
+
+  // A paired machine is reported as such, never re-paired.
+  mkdirSync(env.SIDEVOICE_DATA_DIR, { recursive: true });
+  writeFileSync(path.join(env.SIDEVOICE_DATA_DIR, 'credentials.json'), JSON.stringify({ url: 'wss://room.example/api/connectors/ws', connector_id: 'c-1', token: 't-1' }));
+  const paired = await install(['--harness', 'claude'], env);
+  assert.match(paired.done.join('\n'), /paired with https:\/\/room\.example \(connector c-1\)/);
+  assert.ok(!paired.next.join('\n').includes('Emparejar conector'));
+
+  // Codex is instructions, not edits: its configuration is machine-wide and not ours to rewrite.
+  const codex = codexInstructions(env);
+  assert.match(codex, /\[mcp_servers\.sidevoice\]/);
+  assert.match(codex, /--harness codex/);
+  assert.match(codex, /does not rewrite it/);
 });
 
 test('skill: install copies the voice skill and a standalone hook, repairs itself, and never touches a foreign skill', async () => {

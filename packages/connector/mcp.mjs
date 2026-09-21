@@ -9,6 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { advertisedCapabilities, capabilityState, SUPPORTED } from './harness-contract.mjs';
 import { harnessFor, identifyHarness } from './harnesses.mjs';
+import { pair, pairedRoom } from './pair.mjs';
 
 const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
 const socketPath = process.env.SIDEVOICE_CONNECTOR_SOCKET || path.join(dataDir, 'connector.sock');
@@ -22,7 +23,8 @@ const INSTRUCTIONS = `Sidevoice connects this conversation to the user's voice r
 - If a new user message arrives during active work, treat it as an addition, refinement, or replacement according to its meaning. Stop not-yet-started obsolete work, preserve completed work that remains useful, acknowledge the new interpretation before continuing, and do not later answer a stale request. A tool already running may finish before the correction takes effect; delegation is not a substitute for listening.
 - A "published" voice_say result means the room stored it, not that the user heard it. If publication fails, continue in writing.
 - If the user closes this conversation's voice channel from the room, the connection is removed: voice_say then fails saying so. Continue in writing and do not try to speak again; call voice_connect only when the user asks for voice again.
-- voice_status reports whether the room can currently reach this conversation.
+- voice_status reports whether the room can currently reach this conversation, and which room this machine is paired with.
+- Pairing is the user's act, never yours. If voice_connect answers that this machine is not paired with the room (or is paired with a different one), ask the user for the room's address and the one-time pairing code the room shows them under "Emparejar conector" (it expires in ten minutes), then call voice_pair with both and voice_connect again. Never try to obtain a code from the room yourself, and do not offer to: the room only shows it to the person in it.
 - On Claude Code, if a skill named voice-room is available, joining through it (/voice-room) is preferred: it registers, for this session only, the hook that gives the room read receipts and asks you to speak first.
 - If voice_connect returns inbound.ok false, voice will look sent and never arrive: this harness holds or refuses messages posted by other local processes. Tell the user what inbound.reason says, offer inbound.remedy in your own words including what safeguard the machine-wide option removes, and let them choose. Do not change their settings without being asked to.`;
 
@@ -69,14 +71,26 @@ async function rpc(method, params) {
 
 // ----- tools -----
 const tools = [
-  { name: 'voice_connect', description: 'Connect this conversation to the voice room. Only on an explicit request to join or enable voice.',
-    inputSchema: { type: 'object', properties: { title: { type: 'string', description: 'Short label for this conversation in the room' } }, additionalProperties: false } },
+  { name: 'voice_connect', description: 'Connect this conversation to the voice room. Only on an explicit request to join or enable voice. Fails, saying what to ask the user, when this machine is not paired with the room.',
+    inputSchema: { type: 'object', properties: { title: { type: 'string', description: 'Short label for this conversation in the room' }, room: { type: 'string', description: 'The room\'s address (https://…) when the user names one; omitted, the room this machine is paired with' } }, additionalProperties: false } },
+  { name: 'voice_pair', description: 'Pair this machine with a room using the one-time code the user read from the room\'s interface ("Emparejar conector"). Only with a code the user gave you; one room per machine, a new pairing replaces the previous one.',
+    inputSchema: { type: 'object', properties: { room: { type: 'string', description: 'The room\'s address (https://…)' }, code: { type: 'string', description: 'The one-time pairing code shown by the room' } }, required: ['room', 'code'], additionalProperties: false } },
   { name: 'voice_say', description: 'Publish a concise spoken version of your reply to the room, with the session_id and revision from the voice message header.',
     inputSchema: { type: 'object', properties: { text: { type: 'string' }, session_id: { type: 'string' }, revision: { type: 'integer', minimum: 0 }, utterance_id: { type: 'string' }, language: { type: 'string', enum: ['es', 'en', 'fr', 'it', 'pt', 'hi'] } }, required: ['text', 'session_id', 'revision'], additionalProperties: false } },
   { name: 'voice_disconnect', description: 'Leave the voice room. The conversation and its work continue in writing.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'voice_status', description: 'Whether the room can currently reach this conversation.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
 ];
 let binding = null;
+function originOf(room) {
+  try { return new URL(room).origin; } catch { throw new Error(`"${room}" is not a room address; expected something like https://voice.example`); }
+}
+/** Ask the user, do not guess: the code exists only on the room's screen. */
+function pairingNeeded(room, paired) {
+  const target = room ? originOf(room) : null;
+  if (!paired) return `This machine is not paired with ${target ? 'the room at ' + target : 'any room'}. Ask the user for the room's address${target ? ' (confirm ' + target + ')' : ''} and the one-time pairing code the room shows under "Emparejar conector", then call voice_pair with both. Do not fetch a code yourself.`;
+  if (target && target !== paired.origin) return `This machine is paired with ${paired.origin}, not ${target}. One room per machine: to switch, ask the user for the pairing code that ${target} shows under "Emparejar conector" and call voice_pair (it replaces the current pairing); to stay, call voice_connect without a room.`;
+  return null;
+}
 function inboundFor(harness, thread) {
   return capabilityState(harness, 'inspectInbound') === SUPPORTED ? harness.inspectInbound(thread) : null;
 }
@@ -88,12 +102,28 @@ async function invoke(name, args, meta) {
     if (closed) binding = null;
     const module = binding ? harnessFor(binding.harness) : null;
     const inbound = binding ? inboundFor(module, binding.client_ref) : null;
-    return { joined: !!binding, room_reachable: status.connected, room_error: status.room_error || null,
+    return { joined: !!binding, room: status.room || pairedRoom()?.origin || null, room_reachable: status.connected, room_error: status.room_error || null,
              binding_id: binding?.binding_id || null, harness: binding?.harness || null,
              capabilities: binding?.capabilities || null, inbound,
              ...(closed ? { closed_by_room: true, note: 'The user closed this conversation\'s voice channel from the room. Continue in writing; call voice_connect again only if they ask for voice.' } : {}) };
   }
+  if (name === 'voice_pair') {
+    if (!args.room || !args.code) throw new Error('voice_pair needs the room\'s address and the code the user read from it.');
+    const previous = pairedRoom();
+    // The room shows the code in upper case and compares it that way; a dictated one arrives however it was heard.
+    const result = await pair(originOf(args.room), String(args.code).trim().toUpperCase());
+    // The connector that is up, if any, was started for the previous credential: let go of it so it can
+    // exit, and the next voice_connect starts one for this room. Other conversations still bound to the
+    // previous room keep that connector alive until they leave; they are not moved.
+    if (binding) { try { await rpc('unregister', { binding_id: binding.binding_id }); } catch {} binding = null; }
+    if (ipc) { ipc.end(); ipc = null; }
+    return { status: 'paired', room: result.origin, connector_id: result.connector_id,
+             ...(previous && previous.origin !== result.origin ? { replaced: previous.origin, note: 'Conversations on this machine still joined to the previous room keep it until they leave.' } : {}),
+             next: 'Call voice_connect to join.' };
+  }
   if (name === 'voice_connect') {
+    const needed = pairingNeeded(args.room, pairedRoom());
+    if (needed) { const error = new Error(needed); error.data = { pairing_needed: true, room: args.room ? originOf(args.room) : null }; throw error; }
     const who = identifyHarness(meta);
     const title = (args.title || process.env.SIDEVOICE_TITLE || path.basename(process.cwd())).slice(0, 200);
     // Refuse rather than join a room we cannot hear from: a conversation whose harness holds
@@ -115,6 +145,7 @@ async function invoke(name, args, meta) {
              binding_id: result.binding_id, delivery: 'push', room_reachable: result.connected, capabilities, inbound };
   }
   if (!binding) throw new Error('Not connected to the voice room: call voice_connect first (only if the user asked).');
+
   if (name === 'voice_say') {
     let result;
     try {

@@ -25,11 +25,12 @@ function credentials() {
   const url = process.env.SIDEVOICE_URL || saved.url;
   const connector_id = process.env.SIDEVOICE_CONNECTOR_ID || saved.connector_id;
   const token = process.env.SIDEVOICE_CONNECTOR_TOKEN || saved.token;
-  if (!url || !connector_id || !token) throw new Error(`Not paired: run pair.mjs first (looked in ${credentialsPath})`);
+  if (!url || !connector_id || !token) throw new Error(`Not paired with any room (looked in ${credentialsPath}): the conversation's voice_pair, or sidevoice pair <room-url> <code>, with the code the room shows`);
   const parsed = new URL(url);
   const loopback = ['127.0.0.1', 'localhost', '::1'].includes(parsed.hostname);
   if (parsed.protocol !== 'wss:' && !loopback) throw new Error('The room URL must be wss:// unless it is loopback');
-  return { url, connector_id, token };
+  const room = new URL(url); room.protocol = room.protocol === 'wss:' ? 'https:' : 'http:';
+  return { url, connector_id, token, room: room.origin };
 }
 
 function alive(pid) { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } }
@@ -180,7 +181,7 @@ async function receive(frame) {
 }
 
 function snapshot() {
-  return { host: hostId, connected, protocol: PROTOCOL, outbox: outbox.length, room_error: lastError, closed_by_room: [...closedByRoom.keys()],
+  return { host: hostId, room: creds.room, connected, protocol: PROTOCOL, outbox: outbox.length, room_error: lastError, closed_by_room: [...closedByRoom.keys()],
     bindings: [...bindings.values()].map(({ binding_id, client_ref, harness, thread, title, delivery, capabilities }) =>
       ({ binding_id, client_ref, harness, thread, title, delivery: delivery.kind, capabilities })) };
 }

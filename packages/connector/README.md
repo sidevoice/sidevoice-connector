@@ -1,9 +1,12 @@
 # Sidevoice uplink — the client side (`@sidevoice/uplink`)
 
-The client side. Three entry points behind one bin (`sidevoice`):
+The client side. One bin (`sidevoice`), these entry points:
 
+- `install` — registers the MCP server with the harness (re-pinned to this
+  version when an older one was registered) and installs the skill. Pairs with
+  nothing; reports whether the machine is paired and with which room.
 - `mcp` — the stdio MCP server a harness starts. One per conversation. Exposes
-  `voice_connect`, `voice_say`, `voice_disconnect`, `voice_status`; carries the
+  `voice_connect`, `voice_pair`, `voice_say`, `voice_disconnect`, `voice_status`; carries the
   operational instructions in its `initialize` result. It never talks to the
   room: it keeps one local connection to the connector for as long as the
   session lives, and the binding it registered dies with that connection.
@@ -13,8 +16,10 @@ The client side. Three entry points behind one bin (`sidevoice`):
   durable outbox for speech published while offline, answers the room's
   heartbeat, and delivers one input event at a time per binding through the
   adapter that binding was registered with. A file lock makes it a singleton.
-- `pair` — redeems a pairing code from the room UI for this machine's
-  credential (`~/.sidevoice/credentials.json`, mode 0600).
+- `pair` — redeems, by hand, a pairing code from the room UI for this machine's
+  credential (`~/.sidevoice/credentials.json`, mode 0600). The usual path is the
+  conversation's `voice_pair`, with the code the user read from the room; nothing
+  on the client side ever asks the room for a code.
 
 Harness modules implement one contract (`harness-contract.mjs`): delivery,
 inbound inspection, mechanical working state (polled or lifecycle-backed), end-of-turn reporting and session

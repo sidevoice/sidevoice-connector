@@ -1,19 +1,21 @@
 #!/usr/bin/env node
-/** `sidevoice install <room-url>` — the whole onboarding, in one command.
+/** `sidevoice install` — put this version of Sidevoice in front of the harnesses on this machine.
  *
- *  Everything a machine needs to talk to a room is mechanical: pair with the room, register the MCP
- *  server with the harness, install the skill. This does all three, says what it changed, and is safe
- *  to run twice. What it does not do is decide for the person: it never edits a machine-wide Codex
- *  configuration it does not own, and it never relaxes Claude Code's inbound safeguard — those it
- *  prints, with the reason, for a human to apply.
- */
+ *  It registers the MCP server (re-pinned to this version when an older one was registered), installs
+ *  the skill, says what it changed, and is safe to run twice: run it again after an upgrade and the
+ *  harness points at the new version. It pairs with nothing. Pairing is a person's act — the room shows
+ *  a one-time code to whoever is in it, and a conversation asks for it the first time it joins — so
+ *  the installer only reports whether this machine is paired, and with which room.
+ *
+ *  What it does not do is decide for the person: it never edits a machine-wide Codex configuration it
+ *  does not own, and it never relaxes Claude Code's inbound safeguard — those it prints, with the reason. */
 import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { dataDir, pair, requestCode } from './pair.mjs';
-import { install as installSkill, skillsDir, status as skillStatus } from './skill.mjs';
+import { pairedRoom } from './pair.mjs';
+import { install as installSkill, skillsDir } from './skill.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const VERSION = JSON.parse(readFileSync(path.join(here, 'package.json'), 'utf8')).version;
@@ -39,35 +41,47 @@ export function harnessesPresent(env = process.env) {
   return found;
 }
 
-function alreadyPaired(env = process.env) {
-  try { return !!JSON.parse(readFileSync(path.join(dataDir(env), 'credentials.json'), 'utf8')).token; }
-  catch { return false; }
+function claude(args, env) {
+  return execFileSync(env.SIDEVOICE_CLAUDE_BIN || 'claude', args, { encoding: 'utf8', timeout: 30_000, env, stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
-function claudeRegistered() {
-  try { return execFileSync('claude', ['mcp', 'list'], { encoding: 'utf8', timeout: 15_000 }).includes('sidevoice'); }
-  catch { return null; }   // no claude on PATH: not an error, just unknown
+/** What Claude Code currently runs for `sidevoice`, read from its own `mcp get`: null when nothing is
+ *  registered or there is no `claude` to ask. The scope matters — only a user-scope entry is ours to move. */
+export function claudeRegistration(env = process.env) {
+  let output;
+  try { output = claude(['mcp', 'get', 'sidevoice'], env); } catch { return null; }
+  const field = name => (output.match(new RegExp(`^\\s*${name}:\\s*(.*)$`, 'm')) || [])[1]?.trim() ?? '';
+  const command = field('Command'), args = field('Args');
+  if (!command) return null;
+  return { scope: /user/i.test(field('Scope')) ? 'user' : 'other', line: [command, args].filter(Boolean).join(' ') };
 }
 
-function registerWithClaude(done) {
-  const { command, args } = serverCommand();
-  if (claudeRegistered()) { done.push('Claude Code already had the MCP server registered.'); return; }
+function registerWithClaude(done, env) {
+  const { command, args } = serverCommand(env);
+  const wanted = [command, ...args].join(' ');
+  const manual = `claude mcp add --scope user sidevoice -- ${wanted}`;
+  const current = claudeRegistration(env);
+  if (current?.line === wanted) { done.push('Claude Code already runs this version of the MCP server.'); return; }
+  if (current && current.scope !== 'user') {
+    done.push(`Claude Code has a sidevoice MCP server registered outside user scope (${current.line}); not touched. To move it:\n    ${manual}`);
+    return;
+  }
   try {
-    execFileSync('claude', ['mcp', 'add', '--scope', 'user', 'sidevoice', '--', command, ...args],
-                 { encoding: 'utf8', timeout: 30_000 });
-    done.push('Registered the MCP server with Claude Code (user scope).');
+    if (current) claude(['mcp', 'remove', '--scope', 'user', 'sidevoice'], env);
+    claude(['mcp', 'add', '--scope', 'user', 'sidevoice', '--', command, ...args], env);
+    done.push(current ? `Re-pointed Claude Code's MCP server to this version (was: ${current.line}).`
+                      : 'Registered the MCP server with Claude Code (user scope).');
   } catch (error) {
-    done.push(`Could not register with Claude Code automatically (${(error.message || '').split('\n')[0]}). Run:\n` +
-              `    claude mcp add --scope user sidevoice -- ${command} ${args.join(' ')}`);
+    done.push(`Could not register with Claude Code automatically (${(error.message || '').split('\n')[0]}). Run:\n    ${manual}`);
   }
 }
 
 /** Codex keeps one machine-wide file that may hold anything its user put there: we never rewrite it. */
-export function codexInstructions() {
-  const { command, args } = serverCommand();
+export function codexInstructions(env = process.env) {
+  const { command, args } = serverCommand(env);
   const hook = [command, ...args.slice(0, -1), 'hook', '--harness', 'codex'].join(' ');
   return [
-    `Add to ${process.env.CODEX_HOME || path.join(os.homedir(), '.codex')}/config.toml — it is machine-wide and`,
+    `Add to ${env.CODEX_HOME || path.join(os.homedir(), '.codex')}/config.toml — it is machine-wide and`,
     'this package does not rewrite it:',
     '',
     '  [mcp_servers.sidevoice]',
@@ -101,31 +115,33 @@ export function inboundWarning(env = process.env) {
 }
 
 export async function install(argv = process.argv.slice(2), env = process.env) {
-  const room = argv.find(item => !item.startsWith('-')) || null;
+  const stray = argv.find(item => !item.startsWith('-') && argv[argv.indexOf(item) - 1] !== '--harness');
+  if (stray) throw new Error(`usage: sidevoice install [--harness claude|codex]\n` +
+    `Pairing is not part of installing: a conversation asks for the room's code the first time it joins, ` +
+    `or run  sidevoice pair <room-url> <code>  with the code the room shows under "Emparejar conector".`);
   const wanted = flag(argv, '--harness');
   const harnesses = wanted ? [wanted] : harnessesPresent(env);
   const done = [], next = [];
 
-  if (alreadyPaired(env) && !argv.includes('--repair')) {
-    done.push(`Already paired; credential in ${dataDir(env)}. Use --repair to pair again.`);
-  } else if (!room) {
-    throw new Error('usage: sidevoice install <room-url> [--code <pairing-code>] [--harness claude|codex] [--repair]');
-  } else {
-    const code = flag(argv, '--code') || await requestCode(room);
-    const result = await pair(room, code, env);
-    done.push(`Paired with ${result.origin} as connector ${result.connector_id}.`);
-  }
-
+  done.push(`Sidevoice ${VERSION}.`);
   if (harnesses.includes('claude')) {
-    registerWithClaude(done);
+    registerWithClaude(done, env);
     const outcome = installSkill(skillsDir([], env));
     done.push(`Skill ${outcome.action} at ${outcome.target}.`);
-    next.push('In a conversation, run /voice-room to join the room and register this session\'s hooks.');
+  }
+
+  const paired = pairedRoom(env);
+  done.push(paired ? `This machine is paired with ${paired.origin} (connector ${paired.connector_id}).`
+                   : 'This machine is not paired with any room yet.');
+
+  if (harnesses.includes('claude')) {
+    next.push('In a conversation, run /voice-room to join the room and register this session\'s hooks.' +
+              (paired ? '' : ' The first time, the conversation asks you for the room\'s address and the one-time code the room shows under "Emparejar conector".'));
     next.push('Sessions already open need a restart before they can see the skill.');
     const warning = inboundWarning(env);
     if (warning) next.push(warning);
   }
-  if (harnesses.includes('codex')) next.push(codexInstructions());
+  if (harnesses.includes('codex')) next.push(codexInstructions(env));
   if (!harnesses.length) next.push('No harness found on this machine. Pass --harness claude or --harness codex.');
   return { done, next };
 }
