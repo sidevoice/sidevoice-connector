@@ -44,7 +44,7 @@ function connectorAlive(pid) {
   try { process.kill(pid, 0); } catch (error) { if (error.code !== 'EPERM') return false; }
   try {
     const args = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', timeout: 3000 }).trim();
-    return /connector(\.mjs)?(\s|$)/.test(args);   // `… connector.mjs` from a checkout, `sidevoice connector` from a package
+    return /(^|[\s/])connector(\.mjs)?(\s|$)/.test(args);   // `…/connector.mjs` from a checkout, `sidevoice connector` from a package; not test_connector.mjs
   } catch { return true; }                          // No ps to ask: a live pid is taken at its word.
 }
 function acquireLock() {
