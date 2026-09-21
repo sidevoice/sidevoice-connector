@@ -12,6 +12,7 @@
   },
   "files": [
     "cli.mjs",
+    "install.mjs",
     "mcp.mjs",
     "connector.mjs",
     "harness-contract.mjs",
