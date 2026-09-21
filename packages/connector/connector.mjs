@@ -314,9 +314,13 @@ async function command(client, input) {
       return result;
     }
     case 'unregister': {
-      const binding = bindings.get(params.binding_id);
+      // By the id the façade remembers, or by the conversation it speaks for: the room may have minted a
+      // new id since (a reconnect re-registers), and a façade that only knew the old one "left" nothing —
+      // the room kept listening to a conversation that believed it was gone (2026-09-21).
+      const binding = bindings.get(params.binding_id) || [...bindings.values()].find(b => b.client_ref === params.client_ref);
       if (binding) { log(`${binding.thread} leaves`); bindings.delete(binding.binding_id); binding.owner?.bindings.delete(binding); unwatch(binding); if (!binding.binding_id.startsWith('local-')) send({ type: 'binding.unregister', binding_id: binding.binding_id }); }
-      scheduleExit(); return snapshot();
+      else log(`unregister for ${params.client_ref || params.binding_id || '?'} matched no binding`);
+      scheduleExit(); return { ...snapshot(), left: !!binding };
     }
     case 'status': return snapshot();
     default: throw new Error('Unknown connector command');

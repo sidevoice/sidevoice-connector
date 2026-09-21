@@ -189,7 +189,13 @@ async function invoke(name, args, meta) {
     }
     return result.text_saved ? { status: 'published', text_saved: true, audio: result.status, reason: result.reason } : result;
   }
-  if (name === 'voice_disconnect') { const result = await rpc('unregister', { binding_id: binding.binding_id }); binding = null; return { status: 'left', room_reachable: result.connected }; }
+  if (name === 'voice_disconnect') {
+    const result = await rpc('unregister', { binding_id: binding.binding_id, client_ref: binding.client_ref });
+    binding = null;
+    return result.left === false
+      ? { status: 'not_joined', room_reachable: result.connected, note: 'The connector held no binding for this conversation, so there was nothing in the room to leave.' }
+      : { status: 'left', room_reachable: result.connected };
+  }
   throw new Error('Unknown tool');
 }
 

@@ -111,6 +111,33 @@ test('connector: hello, register, ordered delivery with acks, speech round trip,
   } finally { if (child.exitCode === null) child.kill(); await room.close(); harness.close(); }
 });
 
+test('connector: leaving works by conversation even after the room re-minted the binding id', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  room.handle = (frame, c) => {
+    if (frame.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1 }));
+    if (frame.type === 'binding.register') c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-first', thread: frame.thread }));
+  };
+  const { child, socketPath } = startConnector(room, dataDir);
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    const joined = await facade.call('register', { client_ref: 'thread-z', harness: 'claude', thread: 'thread-z', title: 'Z', delivery: { kind: 'http', url: 'http://127.0.0.1:1/never', thread: 'thread-z' } });
+    assert.equal(joined.binding_id, 'b-first');
+    // The room re-registers the conversation under a new id (as after a reconnect); the façade never hears.
+    room.conn.send(JSON.stringify({ type: 'binding.registered', client_ref: 'thread-z', binding_id: 'b-second', thread: 'thread-z' }));
+    await until(async () => (await facade.call('status', {})).bindings[0]?.binding_id === 'b-second');
+    // Leaving with the id the façade remembers still leaves, because it names the conversation too.
+    const left = await facade.call('unregister', { binding_id: 'b-first', client_ref: 'thread-z' });
+    assert.equal(left.left, true);
+    await until(() => room.frames.some(f => f.type === 'binding.unregister' && f.binding_id === 'b-second'));
+    assert.equal((await facade.call('status', {})).bindings.length, 0);
+    // And leaving what was never joined says so instead of pretending.
+    assert.equal((await facade.call('unregister', { binding_id: 'nope', client_ref: 'nobody' })).left, false);
+    facade.end();
+  } finally { if (child.exitCode === null) child.kill(); await room.close(); }
+});
+
 test('connector: speech while offline is queued durably and replayed on reconnect', async () => {
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
