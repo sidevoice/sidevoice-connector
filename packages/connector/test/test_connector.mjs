@@ -369,6 +369,14 @@ test('connector: Codex — the thread\'s rollout says when it took the message a
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
 });
 
+test('pairing: plaintext only where the token cannot leave the machine or the cluster', async () => {
+  const { privateNetwork, pair } = await import('../pair.mjs');
+  for (const ok of ['127.0.0.1', 'localhost', 'room.voice.svc', 'room.voice.svc.cluster.local', 'room.voice.svc.k8s.example']) assert.equal(privateNetwork(ok), true, ok);
+  for (const no of ['sidevoice.dev.example.invalid', '10.0.0.5', 'sidevoice', 'svc.cluster.local', 'evil.svc.example.com.attacker.net']) assert.equal(privateNetwork(no), false, no);
+  // Refused at pairing, before any code is spent: a plain http room on a name we cannot place.
+  await assert.rejects(pair('http://sidevoice.example', 'ABCD1234', { SIDEVOICE_DATA_DIR: mkdtempSync(path.join(os.tmpdir(), 'sv-')) }), /must be https/);
+});
+
 test('harness modules: the files each harness writes are found by name, and a rollout line reads as the contract', () => {
   const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'sv-claude-'));
   mkdirSync(path.join(claudeHome, 'projects', 'a'), { recursive: true }); mkdirSync(path.join(claudeHome, 'projects', 'b'));

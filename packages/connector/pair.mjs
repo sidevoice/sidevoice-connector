@@ -12,6 +12,15 @@ export function dataDir(env = process.env) {
   return env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
 }
 
+/** Where a plaintext connection is acceptable: the token must never cross a network we do not own. Loopback,
+ *  and a Kubernetes service name (`<svc>.<ns>.svc`, `<svc>.<ns>.svc.<cluster domain>`), which by construction
+ *  resolves only inside the cluster and is routed there. Anything else — a private IP included — needs TLS: a
+ *  host we cannot classify is not a reason to send a credential in clear. */
+export function privateNetwork(hostname) {
+  if (['127.0.0.1', 'localhost', '::1', '[::1]'].includes(hostname)) return true;
+  return /^[a-z0-9-]+\.[a-z0-9-]+\.svc(\.[a-z0-9.-]+)?$/i.test(hostname);
+}
+
 /** The room's http(s) origin from the socket address the credential stores. */
 export function roomOrigin(wsUrl) {
   const url = new URL(wsUrl); url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:'; return url.origin;
@@ -29,6 +38,9 @@ export function pairedRoom(env = process.env) {
 /** Redeem a code for this host's credential. Returns where it was written. */
 export async function pair(room, code, env = process.env) {
   const base = new URL(room);
+  if (base.protocol !== 'https:' && !privateNetwork(base.hostname)) {
+    throw new Error(`${base.origin} is reached in clear over a network this machine does not own; the room must be https:// there (loopback and Kubernetes service names are the exceptions).`);
+  }
   const response = await fetch(new URL('/api/connectors/pair', base), {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ code, host: os.hostname() }), signal: AbortSignal.timeout(15_000),

@@ -9,6 +9,7 @@ import { mkdirSync, openSync, closeSync, writeFileSync, readFileSync, unlinkSync
 import { randomUUID } from 'node:crypto';
 import { capabilityState, SUPPORTED, voiceEnvelope } from './harness-contract.mjs';
 import { harnessFor } from './harnesses.mjs';
+import { privateNetwork } from './pair.mjs';
 
 export const PROTOCOL = 1;
 const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
@@ -27,8 +28,7 @@ function credentials() {
   const token = process.env.SIDEVOICE_CONNECTOR_TOKEN || saved.token;
   if (!url || !connector_id || !token) throw new Error(`Not paired with any room (looked in ${credentialsPath}): the conversation's voice_pair, or sidevoice pair <room-url> <code>, with the code the room shows`);
   const parsed = new URL(url);
-  const loopback = ['127.0.0.1', 'localhost', '::1'].includes(parsed.hostname);
-  if (parsed.protocol !== 'wss:' && !loopback) throw new Error('The room URL must be wss:// unless it is loopback');
+  if (parsed.protocol !== 'wss:' && !privateNetwork(parsed.hostname)) throw new Error('The room URL must be wss:// unless it stays on this machine or inside its cluster');
   const room = new URL(url); room.protocol = room.protocol === 'wss:' ? 'https:' : 'http:';
   return { url, connector_id, token, room: room.origin };
 }
