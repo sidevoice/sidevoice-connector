@@ -1,7 +1,7 @@
-/** `sidevoice skill install|remove|status [--dir <skills dir>]`: the Claude Code skill that joins the room and,
- *  for that session only, registers the lifecycle hook. It installs the skill plus the hook's harness runtime;
- *  running install again repairs it. A directory of the same name that is not ours is never touched. */
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+/** `sidevoice skill install|remove|status [--dir <skills dir>]`: the Claude Code skill that joins the room
+ *  (`/voice-room`). One file; running install again repairs it. A directory of the same name that is not
+ *  ours is never touched. */
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,7 +9,6 @@ import { fileURLToPath } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const SKILL_NAME = 'voice-room';
 const MARKER = 'sidevoice: installed copy';
-const HOOK_FILES = ['hook.mjs', 'harness-contract.mjs', 'harnesses.mjs', 'harness-claude.mjs', 'harness-codex.mjs', 'harness-http.mjs'];
 
 export function skillsDir(argv = process.argv.slice(2), env = process.env) {
   const index = argv.indexOf('--dir');
@@ -23,16 +22,17 @@ export function status(dir) {
   if (!existsSync(target)) return { state: 'absent', target };
   let ours = false;
   try { ours = readFileSync(manifest, 'utf8').includes(MARKER); } catch {}
-  return { state: ours ? 'installed' : 'foreign', target, hook: existsSync(path.join(target, 'hook.mjs')) };
+  return { state: ours ? 'installed' : 'foreign', target };
 }
 
 export function install(dir) {
   const current = status(dir);
   if (current.state === 'foreign') throw new Error(`${current.target} already holds a skill that is not Sidevoice's; remove or rename it first.`);
   mkdirSync(current.target, { recursive: true });
-  const manifest = readFileSync(path.join(here, 'skill', SKILL_NAME, 'SKILL.md'), 'utf8').replaceAll('__SIDEVOICE_SKILL_DIR__', current.target);
-  writeFileSync(path.join(current.target, 'SKILL.md'), manifest);
-  for (const file of HOOK_FILES) cpSync(path.join(here, file), path.join(current.target, file));
+  writeFileSync(path.join(current.target, 'SKILL.md'), readFileSync(path.join(here, 'skill', SKILL_NAME, 'SKILL.md'), 'utf8'));
+  for (const stale of ['hook.mjs', 'harness-contract.mjs', 'harnesses.mjs', 'harness-claude.mjs', 'harness-codex.mjs', 'harness-http.mjs']) {
+    rmSync(path.join(current.target, stale), { force: true });   // an older copy carried a hook runtime; it is gone
+  }
   return { ...status(dir), action: current.state === 'installed' ? 'updated' : 'installed' };
 }
 
@@ -51,7 +51,7 @@ if (process.env.SIDEVOICE_SKILL_MAIN === '1') {
     if (!result) { console.error('usage: sidevoice skill <install|remove|status> [--dir <skills dir>]'); process.exit(2); }
     console.log(`${result.action || result.state}: ${result.target}`);
     if (result.action === 'installed' || result.action === 'updated') {
-      console.log('In Claude Code, /voice-room joins the room for that conversation and gives it read receipts. New sessions see the skill; a session already open needs a restart.');
+      console.log('In Claude Code, /voice-room joins the room for that conversation. New sessions see the skill; a session already open needs a restart.');
     }
   } catch (error) { console.error(error.message); process.exit(1); }
 }

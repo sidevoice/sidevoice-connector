@@ -4,19 +4,18 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createWsServer } from './ws-server.mjs';
-import { envelope } from '../harness-contract.mjs';
-import { declaredHarness, interpret, interpretTurnEnd, interpretWorking, nudge, voiceEnvelope } from '../hook.mjs';
-import { sessionWorking } from '../harness-claude.mjs';
+import { envelope, nudge, voiceEnvelope } from '../harness-contract.mjs';
+import { sessionWorking, transcriptPath, userMessageText } from '../harness-claude.mjs';
+import { interpretRollout, rolloutPath } from '../harness-codex.mjs';
 import { install as installSkill, remove as removeSkill, status as skillStatus } from '../skill.mjs';
 import './test_harness_contract.mjs';
 import './test_harness_claude.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const hookPath = path.join(here, '..', 'cli.mjs');
 const connectorPath = path.join(here, '..', 'connector.mjs');
 const mcpPath = path.join(here, '..', 'mcp.mjs');
 const wait = ms => new Promise(r => setTimeout(r, ms));
@@ -44,11 +43,19 @@ function startConnector(room, dataDir, extraEnv = {}) {
   return { child, socketPath, stderr: () => stderr };
 }
 
-test('envelope carries the header the skill expects', () => {
+test('envelope: the header first, the user\'s words, then the speak-first note — and the header is found wherever a harness puts it', () => {
   const text = envelope({ channel: 'voice', session_id: 's', revision: 2, message_id: 'm', text: 'hola' });
-  const [header, body] = text.split('\n\n');
+  const [header, body, note] = text.split('\n\n');
   assert.deepEqual(JSON.parse(header), { channel: 'voice', session_id: 's', revision: 2, message_id: 'm' });
   assert.equal(body, 'hola');
+  assert.equal(note, nudge({ session_id: 's', revision: 2 }));
+  assert.match(note, /^\[Sidevoice\] /); assert.match(note, /voice_say/); assert.match(note, /"s"/); assert.match(note, /revision 2/);
+  // Room control carries no note: nothing is asked of the conversation.
+  assert.ok(!envelope({ channel: 'room-control', session_id: 's', revision: 2, message_id: 'm', text: 'x' }).includes('[Sidevoice]'));
+  assert.deepEqual(voiceEnvelope(text), { channel: 'voice', message_id: 'm', session_id: 's', revision: 2 });
+  assert.deepEqual(voiceEnvelope('Another Claude session sent a message:\n' + text), { channel: 'voice', message_id: 'm', session_id: 's', revision: 2 });
+  assert.equal(voiceEnvelope('just a prompt'), null);
+  assert.equal(voiceEnvelope('{"channel":"other","message_id":"x","session_id":"s","revision":1}'), null);
 });
 
 test('connector: hello, register, ordered delivery with acks, speech round trip, façade death unregisters', async () => {
@@ -227,44 +234,6 @@ test('connector: the room closing a conversation\'s voice removes the binding an
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
 });
 
-test('hook: only a Sidevoice voice message being admitted counts, and it names the conversation the harness names', () => {
-  const prompt = envelope({ channel: 'voice', session_id: 's-9', revision: 4, message_id: 'm-9', text: 'hola desde la sala' });
-  assert.deepEqual(voiceEnvelope(prompt), { message_id: 'm-9', session_id: 's-9', revision: 4, text: 'hola desde la sala' });
-  assert.equal(voiceEnvelope('just a prompt'), null);
-  assert.equal(voiceEnvelope('{"channel":"room-control","message_id":"x","session_id":"s","revision":1}\n\nhi'), null);
-  const claude = interpret({ hook_event_name: 'UserPromptSubmit', prompt }, { CLAUDE_CODE_SESSION_ID: 'claude-session' });
-  assert.equal(claude.thread, 'claude-session'); assert.equal(claude.message_id, 'm-9');
-  const codex = interpret({ hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', turn_id: 't-1', prompt }, {});
-  assert.equal(codex.thread, 'codex-thread'); assert.equal(codex.turn_id, 't-1');
-  assert.equal(interpretTurnEnd({ hook_event_name: 'Stop', session_id: 'codex-thread', turn_id: 't-1' }, {}), null,
-    'event-backed Codex stops use the correlated working path, not the legacy uncorrelated end path');
-  assert.deepEqual(interpretWorking({ hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', turn_id: 't-1', prompt }, {}),
-    { thread: 'codex-thread', turn_id: 't-1', working: true, session_id: 's-9', revision: 4, message_id: 'm-9' });
-  assert.deepEqual(interpretWorking({ hook_event_name: 'Stop', session_id: 'codex-thread', turn_id: 't-1' }, {}),
-    { thread: 'codex-thread', turn_id: 't-1', working: false });
-  assert.equal(interpretWorking({ hook_event_name: 'Stop', session_id: 'codex-thread' }, {}), null);
-  assert.equal(interpretTurnEnd({ hook_event_name: 'Stop', session_id: 'codex-thread' }, {}), null);
-  assert.equal(interpret({ hook_event_name: 'PreToolUse', prompt }, { CLAUDE_CODE_SESSION_ID: 'x' }), null);
-  assert.equal(interpret({ hook_event_name: 'UserPromptSubmit', prompt: 'typed by the user' }, { CLAUDE_CODE_SESSION_ID: 'x' }), null);
-  // The hook command names its harness. A Codex session launched from a Claude Code terminal inherits
-  // CLAUDE_CODE_SESSION_ID, and both payloads carry a session_id, so only the declaration settles it.
-  const leaked = { CLAUDE_CODE_SESSION_ID: 'a-claude-session-on-this-machine' };
-  assert.equal(interpretWorking({ hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', turn_id: 't-1', prompt }, leaked), null,
-    'without a declaration the inherited Claude environment claims the event');
-  assert.deepEqual(interpretWorking({ hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', turn_id: 't-1', prompt },
-    { ...leaked, SIDEVOICE_HOOK_HARNESS: 'codex' }),
-    { thread: 'codex-thread', turn_id: 't-1', working: true, session_id: 's-9', revision: 4, message_id: 'm-9' });
-  assert.equal(interpret({ hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', prompt },
-    { ...leaked, SIDEVOICE_HOOK_HARNESS: 'claude' }).thread, 'a-claude-session-on-this-machine');
-  assert.equal(interpret({ hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', prompt },
-    { ...leaked, SIDEVOICE_HOOK_HARNESS: 'nosuchharness' }), null);
-  assert.equal(declaredHarness(['node', 'hook.mjs', '--harness', 'codex'], {}), 'codex');
-  assert.equal(declaredHarness(['node', 'hook.mjs', '--harness=codex'], {}), 'codex');
-  assert.equal(declaredHarness(['node', 'hook.mjs'], { SIDEVOICE_HOOK_HARNESS: 'claude' }), 'claude');
-  assert.equal(declaredHarness(['node', 'hook.mjs'], {}), null);
-  assert.match(nudge(claude), /voice_say/); assert.match(nudge(claude), /s-9/); assert.match(nudge(claude), /revision 4/);
-});
-
 test('connector: the conversation\'s state is said again on a clock, not only when it changes', async () => {
   // A room that restarts has forgotten what it was told. Waiting for the next change means a conversation
   // that was already working shows nothing at all until it stops (2026-09-20).
@@ -290,142 +259,147 @@ test('connector: the conversation\'s state is said again on a clock, not only wh
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
 });
 
-test('connector: Codex lifecycle reports are correlated, idempotent, and a stale stop cannot clear newer work', async () => {
+/** A fake Claude Code inbox: accepts the auth and user frames and keeps the connection open, as the real one does. */
+function fakeInbox(dir) {
+  const socketPath = path.join(dir, 'inbox.sock'); const received = [];
+  const server = net.createServer(socket => { let buffer = ''; socket.on('data', chunk => { buffer += chunk; let i; while ((i = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, i); buffer = buffer.slice(i + 1); if (line) received.push(JSON.parse(line)); } }); socket.on('error', () => {}); });
+  return { socketPath, received, ready: new Promise(r => server.listen(socketPath, r)), close: () => server.close() };
+}
+
+test('connector: Claude Code — the message is read when the session\'s transcript takes it, and the turn is correlated, with nothing installed in the session', async () => {
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'sv-claude-'));
+  mkdirSync(path.join(claudeHome, 'sessions')); mkdirSync(path.join(claudeHome, 'projects', '-home-someone-project'), { recursive: true });
+  const registry = path.join(claudeHome, 'sessions', '4242.json');
+  const transcript = path.join(claudeHome, 'projects', '-home-someone-project', 'sess-1.jsonl');
+  const status = state => writeFileSync(registry, JSON.stringify({ sessionId: 'sess-1', pid: 4242, status: state }));
+  const line = entry => appendFileSync(transcript, JSON.stringify(entry) + '\n');
+  status('idle'); line({ type: 'user', message: { role: 'user', content: 'an older prompt, before we started watching' } });
+  const inbox = fakeInbox(dataDir); await inbox.ready;
   room.handle = (frame, c) => {
     if (frame.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1 }));
-    if (frame.type === 'binding.register') c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-' + frame.client_ref, thread: frame.thread }));
+    if (frame.type === 'binding.register') c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-1', thread: frame.thread }));
   };
-  const { child, socketPath } = startConnector(room, dataDir);
+  const { child, socketPath, stderr } = startConnector(room, dataDir, { CLAUDE_CONFIG_DIR: claudeHome, SIDEVOICE_WORK_POLL_MS: '30', SIDEVOICE_WORK_ANNOUNCE_MS: '5000' });
   try {
     await until(() => existsSync(socketPath));
     const facade = ipcClient(socketPath); await facade.ready;
-    await facade.call('register', { client_ref: 'codex-thread', harness: 'codex', thread: 'codex-thread', delivery: { kind: 'codex-queue', thread: 'codex-thread' } });
-    for (const payload of [
-      { hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', turn_id: 'hook-turn', prompt: 'typed directly' },
-      { hook_event_name: 'Stop', session_id: 'codex-thread', turn_id: 'hook-turn' },
-    ]) {
-      const hook = spawn(process.execPath, [hookPath, 'hook', '--harness', 'codex'],
-        { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CODEX_THREAD_ID: '', CLAUDE_CODE_SESSION_ID: 'a-claude-session-on-this-machine' },
-          stdio: ['pipe', 'pipe', 'pipe'] });
-      hook.stdin.end(JSON.stringify(payload));
-      assert.equal(await new Promise(r => hook.on('exit', r)), 0);
-    }
-    await until(() => room.frames.some(f => f.type === 'input.working' && f.turn_id === 'hook-turn' && f.working === false));
-    assert.deepEqual(await facade.call('working', { thread: 'codex-thread', turn_id: 'old', working: true, session_id: 's', revision: 3 }), { status: 'sent' });
-    assert.deepEqual(await facade.call('working', { thread: 'codex-thread', turn_id: 'old', working: true, session_id: 's', revision: 3 }), { status: 'already_reported' });
-    assert.deepEqual(await facade.call('working', { thread: 'codex-thread', turn_id: 'new', working: true, session_id: 's', revision: 4 }), { status: 'sent' });
-    const workingFrames = room.frames.filter(f => f.type === 'input.working').length;
-    room.conn.send(JSON.stringify({ type: 'binding.registered', client_ref: 'codex-thread', binding_id: 'b-codex-thread', thread: 'codex-thread' }));
-    await until(() => room.frames.filter(f => f.type === 'input.working').length > workingFrames);
-    const resync = room.frames.filter(f => f.type === 'input.working').at(-1);
-    assert.deepEqual({ working: resync.working, turn_id: resync.turn_id, turn_phase: resync.turn_phase },
-      { working: true, turn_id: undefined, turn_phase: undefined });
-    const falseBeforeStaleStop = room.frames.filter(f => f.type === 'input.working' && f.working === false).length;
-    assert.deepEqual(await facade.call('working', { thread: 'codex-thread', turn_id: 'old', working: false }), { status: 'sent' });
-    assert.equal(room.frames.filter(f => f.type === 'input.working' && f.working === false).length, falseBeforeStaleStop);
-    assert.ok(room.frames.some(f => f.type === 'input.working' && f.turn_id === 'old'
-      && f.turn_phase === 'end' && f.working === true));
-    assert.deepEqual(await facade.call('working', { thread: 'codex-thread', turn_id: 'new', working: false }), { status: 'sent' });
-    await until(() => room.frames.some(f => f.type === 'input.working' && f.working === false && f.turn_id === 'new'));
-    const ended = room.frames.find(f => f.type === 'input.working' && f.working === false && f.turn_id === 'new');
-    assert.equal(ended.turn_phase, 'end');
-    assert.deepEqual({ session_id: ended.session_id, revision: ended.revision }, { session_id: 's', revision: 4 });
-    assert.deepEqual(await facade.call('working', { thread: 'codex-thread', turn_id: 'new', working: false }), { status: 'already_reported' });
-    assert.deepEqual(await facade.call('working', { thread: 'codex-thread', turn_id: 'finished-first', working: false }), { status: 'stale' });
-    assert.deepEqual(await facade.call('working', { thread: 'codex-thread', turn_id: 'finished-first', working: true }), { status: 'stale' });
+    await facade.call('register', { client_ref: 'sess-1', harness: 'claude', thread: 'sess-1', title: 'T', delivery: { kind: 'claude-uds', socket: inbox.socketPath, token: 'tok' } });
+    await until(() => room.conn);
+    room.conn.send(JSON.stringify({ type: 'input.deliver', event_id: 'e-1', binding_id: 'b-1', channel: 'voice', session_id: 's', revision: 3, message_id: 'm-1', text: 'hola desde la sala' }));
+    await until(() => inbox.received.some(f => f.type === 'user'));
+    const posted = inbox.received.find(f => f.type === 'user').message.content;
+    assert.match(posted, /^\{"channel":"voice"/); assert.match(posted, /hola desde la sala/); assert.match(posted, /\[Sidevoice\] .*voice_say/, 'the speak-first note travels inside the message');
+    // Nothing is claimed until the transcript shows the message — and the inbox has not even answered yet
+    // (Claude Code keeps the socket open; the message is taken long before that call settles).
+    await wait(150);
+    assert.ok(!room.frames.some(f => f.type === 'input.read'), 'no receipt before the session takes the message');
+    assert.ok(!room.frames.some(f => f.type === 'input.ack' && f.event_id === 'e-1'), 'the delivery call is still open');
+    // A prompt typed by hand is not ours.
+    line({ type: 'user', promptId: 'p-0', message: { role: 'user', content: [{ type: 'text', text: 'escrito a mano' }] } });
+    await wait(120);
+    assert.ok(!room.frames.some(f => f.type === 'input.read'));
+    // The session takes the message: it lands in the transcript as Claude Code writes it, and goes busy.
+    line({ type: 'user', promptId: 'p-1', message: { role: 'user', content: 'Another Claude session sent a message:\n' + posted } });
+    status('busy');
+    await until(() => room.frames.some(f => f.type === 'input.read' && f.message_id === 'm-1'));
+    const read = room.frames.find(f => f.type === 'input.read');
+    assert.deepEqual({ binding_id: read.binding_id, session_id: read.session_id, revision: read.revision, turn_id: read.turn_id }, { binding_id: 'b-1', session_id: 's', revision: 3, turn_id: 'p-1' });
+    await until(() => room.frames.some(f => f.type === 'input.working' && f.working === true && f.turn_phase === 'start'));
+    const started = room.frames.find(f => f.type === 'input.working' && f.turn_phase === 'start');
+    assert.deepEqual({ turn_id: started.turn_id, session_id: started.session_id, revision: started.revision }, { turn_id: 'p-1', session_id: 's', revision: 3 });
+    // The turn ends: the registry goes idle, and the end carries the same correlation.
+    status('idle');
+    await until(() => room.frames.some(f => f.type === 'input.working' && f.working === false && f.turn_phase === 'end'));
+    const ended = room.frames.find(f => f.type === 'input.working' && f.working === false && f.turn_phase === 'end');
+    assert.deepEqual({ turn_phase: ended.turn_phase, turn_id: ended.turn_id, session_id: ended.session_id, revision: ended.revision }, { turn_phase: 'end', turn_id: 'p-1', session_id: 's', revision: 3 });
+    // The same transcript line read again (a rewrite, a restart) is not a second receipt.
+    assert.equal(room.frames.filter(f => f.type === 'input.read').length, 1);
+    assert.match(stderr(), /sess-1 read m-1/);
     facade.end();
-  } finally { if (child.exitCode === null) child.kill(); await room.close(); }
+  } finally { if (child.exitCode === null) child.kill(); inbox.close(); await room.close(); }
 });
 
-test('connector: a read receipt from the hook reaches the room once per message, and the hook command hands context back', async () => {
+test('connector: Codex — the thread\'s rollout says when it took the message and when the turn ended; nothing is configured in Codex', async () => {
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'sv-codex-'));
+  const day = path.join(codexHome, 'sessions', '2026', '09', '21'); mkdirSync(day, { recursive: true });
+  const rollout = path.join(day, 'rollout-2026-09-21T10-00-00-thread-7.jsonl');
+  const line = (type, payload) => appendFileSync(rollout, JSON.stringify({ timestamp: new Date().toISOString(), type, payload }) + '\n');
+  line('session_meta', { id: 'thread-7' });
+  // A stand-in for `codex queue`: records the message it was given and confirms.
+  const queued = path.join(codexHome, 'queued.txt');
+  const bin = path.join(codexHome, 'codex'); writeFileSync(bin, `#!/bin/sh\nprintf '%s' "$5" > "${queued}"\n`, { mode: 0o755 });
   room.handle = (frame, c) => {
-    if (frame.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1, heartbeat_seconds: 15 }));
-    if (frame.type === 'binding.register') c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-' + frame.client_ref, thread: frame.thread }));
+    if (frame.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1 }));
+    if (frame.type === 'binding.register') c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-7', thread: frame.thread }));
   };
-  const { child, socketPath } = startConnector(room, dataDir);
+  const { child, socketPath } = startConnector(room, dataDir, { CODEX_HOME: codexHome, SIDEVOICE_CODEX_BIN: bin, SIDEVOICE_WORK_POLL_MS: '30', SIDEVOICE_WORK_ANNOUNCE_MS: '5000' });
   try {
     await until(() => existsSync(socketPath));
     const facade = ipcClient(socketPath); await facade.ready;
-    await facade.call('register', { client_ref: 'thread-1', harness: 'claude', thread: 'thread-1', title: 'T', delivery: { kind: 'http', url: 'http://127.0.0.1:1/never', thread: 'thread-1' } });
-    assert.deepEqual(await facade.call('read', { thread: 'thread-1', message_id: 'm-1', session_id: 's', revision: 2 }), { status: 'sent' });
-    await until(() => room.frames.some(f => f.type === 'input.read' && f.message_id === 'm-1' && f.binding_id === 'b-thread-1' && f.revision === 2));
-    assert.deepEqual(await facade.call('read', { thread: 'thread-1', message_id: 'm-1', session_id: 's', revision: 2 }), { status: 'already_reported' });
-    assert.deepEqual(await facade.call('read', { thread: 'nobody', message_id: 'm-2', session_id: 's', revision: 2 }), { status: 'no_binding' });
-    // The hook command itself: harness payload on stdin, read receipt to the connector, context on stdout, exit 0.
-    const prompt = envelope({ channel: 'voice', session_id: 's', revision: 3, message_id: 'm-3', text: 'hola' });
-    const hook = spawn(process.execPath, [hookPath, 'hook'], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'thread-1' }, stdio: ['pipe', 'pipe', 'pipe'] });
-    let out = '', err = ''; hook.stdout.on('data', d => { out += d; }); hook.stderr.on('data', d => { err += d; });
-    hook.stdin.end(JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 'x', prompt }));
-    const code = await new Promise(r => hook.on('exit', r));
-    assert.equal(code, 0, err);
-    const output = JSON.parse(out.trim());
-    assert.equal(output.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
-    assert.match(output.hookSpecificOutput.additionalContext, /revision 3/);
-    await until(() => room.frames.some(f => f.type === 'input.read' && f.message_id === 'm-3'));
-    // The same hook executable normalizes the harness's Stop event into an end-of-turn report.
-    const stopped = spawn(process.execPath, [hookPath, 'hook'], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'thread-1' }, stdio: ['pipe', 'pipe', 'pipe'] });
-    let stopOut = ''; stopped.stdout.on('data', d => { stopOut += d; });
-    stopped.stdin.end(JSON.stringify({ hook_event_name: 'Stop', session_id: 'thread-1', turn_id: 'turn-3' }));
-    assert.equal(await new Promise(r => stopped.on('exit', r)), 0); assert.equal(stopOut, '');
-    await until(() => room.frames.some(f => f.type === 'input.working' && f.binding_id === 'b-thread-1' && f.working === false));
-    // A prompt that is not ours produces nothing and touches nothing.
-    const quiet = spawn(process.execPath, [hookPath, 'hook'], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'thread-1' }, stdio: ['pipe', 'pipe', 'pipe'] });
-    let quietOut = ''; quiet.stdout.on('data', d => { quietOut += d; });
-    quiet.stdin.end(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt: 'escrito a mano' }));
-    assert.equal(await new Promise(r => quiet.on('exit', r)), 0); assert.equal(quietOut, '');
+    await facade.call('register', { client_ref: 'thread-7', harness: 'codex', thread: 'thread-7', title: 'T', delivery: { kind: 'codex-queue', thread: 'thread-7' } });
+    await until(() => room.conn);
+    room.conn.send(JSON.stringify({ type: 'input.deliver', event_id: 'e-7', binding_id: 'b-7', channel: 'voice', session_id: 's', revision: 5, message_id: 'm-7', text: 'hola codex' }));
+    await until(() => room.frames.some(f => f.type === 'input.ack' && f.event_id === 'e-7' && f.status === 'accepted'));
+    const message = readFileSync(queued, 'utf8');
+    assert.match(message, /hola codex/); assert.match(message, /\[Sidevoice\]/);
+    // Codex takes it on the next turn: task_started, then the user message, later task_complete.
+    line('event_msg', { type: 'task_started', turn_id: 'turn-a' });
+    await until(() => room.frames.some(f => f.type === 'input.working' && f.working === true));
+    assert.ok(!room.frames.some(f => f.type === 'input.read'));
+    line('response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text: message }] });
+    await until(() => room.frames.some(f => f.type === 'input.read' && f.message_id === 'm-7'));
+    const read = room.frames.find(f => f.type === 'input.read');
+    assert.deepEqual({ turn_id: read.turn_id, session_id: read.session_id, revision: read.revision }, { turn_id: 'turn-a', session_id: 's', revision: 5 });
+    await until(() => room.frames.some(f => f.type === 'input.working' && f.turn_phase === 'start' && f.turn_id === 'turn-a'));
+    line('event_msg', { type: 'task_complete', turn_id: 'turn-a' });
+    await until(() => room.frames.some(f => f.type === 'input.working' && f.working === false));
+    const ended = room.frames.find(f => f.type === 'input.working' && f.working === false);
+    assert.deepEqual({ turn_phase: ended.turn_phase, turn_id: ended.turn_id, session_id: ended.session_id, revision: ended.revision }, { turn_phase: 'end', turn_id: 'turn-a', session_id: 's', revision: 5 });
+    // A later turn of its own: working, uncorrelated, and its end clears nothing of ours.
+    line('event_msg', { type: 'task_started', turn_id: 'turn-b' });
+    line('response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'typed in codex' }] });
+    line('event_msg', { type: 'task_complete', turn_id: 'turn-b' });
+    await until(() => room.frames.filter(f => f.type === 'input.working' && f.working === false).length >= 2);
+    assert.equal(room.frames.filter(f => f.type === 'input.read').length, 1);
     facade.end();
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
 });
 
-test('mcp façade: an unpaired machine is told what to ask the user, and pairing is done with the code the user gave', async () => {
-  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
-  const redeemed = [];
-  const room = http.createServer((request, response) => {
-    let body = ''; request.on('data', chunk => { body += chunk; });
-    request.on('end', () => {
-      redeemed.push({ url: request.url, body: JSON.parse(body || '{}') });
-      response.setHeader('content-type', 'application/json');
-      if (request.url === '/api/connectors/pair' && JSON.parse(body).code === 'ABCD1234') return response.end(JSON.stringify({ connector_id: 'c-9', token: 't-9', protocol: 1 }));
-      response.statusCode = 403; response.end(JSON.stringify({ detail: 'Código de emparejamiento inválido o caducado.' }));
-    });
-  });
-  await new Promise(resolve => room.listen(0, '127.0.0.1', resolve));
-  const roomUrl = `http://127.0.0.1:${room.address().port}`;
-  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'sess-abc', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/x.sock', CLAUDE_CODE_MESSAGING_TOKEN: 'tok' }, stdio: ['pipe', 'pipe', 'pipe'] });
-  const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
-  const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+test('harness modules: the files each harness writes are found by name, and a rollout line reads as the contract', () => {
+  const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'sv-claude-'));
+  mkdirSync(path.join(claudeHome, 'projects', 'a'), { recursive: true }); mkdirSync(path.join(claudeHome, 'projects', 'b'));
+  writeFileSync(path.join(claudeHome, 'projects', 'b', 'sess-9.jsonl'), '');
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), 'sv-codex-'));
+  mkdirSync(path.join(codexHome, 'sessions', '2026', '08', '30'), { recursive: true }); mkdirSync(path.join(codexHome, 'sessions', '2026', '09', '02'), { recursive: true });
+  writeFileSync(path.join(codexHome, 'sessions', '2026', '08', '30', 'rollout-2026-08-30T01-02-03-thread-9.jsonl'), '');
+  const previous = { claude: process.env.CLAUDE_CONFIG_DIR, codex: process.env.CODEX_HOME };
+  process.env.CLAUDE_CONFIG_DIR = claudeHome; process.env.CODEX_HOME = codexHome;
   try {
-    // Not paired: no connector is started, no code is fetched; the model is told to ask the person.
-    ask(1, 'tools/call', { name: 'voice_connect', arguments: { title: 'Prueba' } });
-    await until(() => replies.length === 1);
-    assert.match(replies[0].error.message, /not paired with any room/);
-    assert.match(replies[0].error.message, /Emparejar conector/);
-    assert.match(replies[0].error.message, /voice_pair/);
-    assert.equal(redeemed.length, 0, 'nothing was asked of any room');
-    // A wrong code is the room's refusal, verbatim.
-    ask(2, 'tools/call', { name: 'voice_pair', arguments: { room: roomUrl, code: 'NOPE0000' } });
-    await until(() => replies.length === 2);
-    assert.match(replies[1].error.message, /inválido o caducado/);
-    assert.ok(!existsSync(path.join(dataDir, 'credentials.json')));
-    // The code the user read from the room, redeemed once; the credential lands on this machine only.
-    ask(3, 'tools/call', { name: 'voice_pair', arguments: { room: roomUrl + '/voice/', code: ' abcd1234 ' } });
-    await until(() => replies.length === 3);
-    const paired = JSON.parse(replies[2].result.content[0].text);
-    assert.equal(paired.status, 'paired'); assert.equal(paired.room, roomUrl);
-    assert.deepEqual(redeemed.map(r => r.url), ['/api/connectors/pair', '/api/connectors/pair']);
-    assert.equal(redeemed[1].body.code, 'ABCD1234', 'trimmed and upper-cased, as the room shows it');
-    const credential = JSON.parse(readFileSync(path.join(dataDir, 'credentials.json'), 'utf8'));
-    assert.equal(credential.token, 't-9'); assert.match(credential.url, /^ws:\/\/127\.0\.0\.1:\d+\/api\/connectors\/ws$/);
-    // Naming a different room does not silently re-pair: one room per machine, the switch is the user's.
-    ask(4, 'tools/call', { name: 'voice_connect', arguments: { room: 'https://other.example' } });
-    await until(() => replies.length === 4);
-    assert.match(replies[3].error.message, new RegExp(`paired with ${roomUrl}, not https://other.example`));
-    assert.equal(redeemed.length, 2);
-  } finally { child.kill(); await new Promise(resolve => room.close(resolve)); }
+    assert.equal(transcriptPath('sess-9'), path.join(claudeHome, 'projects', 'b', 'sess-9.jsonl'));
+    assert.equal(transcriptPath('nobody'), null);
+    assert.equal(rolloutPath('thread-9'), path.join(codexHome, 'sessions', '2026', '08', '30', 'rollout-2026-08-30T01-02-03-thread-9.jsonl'));
+    assert.equal(rolloutPath('nobody'), null);
+  } finally {
+    if (previous.claude === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = previous.claude;
+    if (previous.codex === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = previous.codex;
+  }
+  assert.equal(userMessageText({ type: 'user', message: { role: 'user', content: 'plain' } }), 'plain');
+  assert.equal(userMessageText({ type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }] } }), 'a\nb');
+  assert.equal(userMessageText({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'x' }] } }), null, 'a tool result is not the user');
+  assert.equal(userMessageText({ type: 'assistant', message: { role: 'assistant', content: 'x' } }), null);
+  assert.equal(userMessageText({ type: 'queue-operation', operation: 'enqueue', content: '{"channel":"voice"}' }), null, 'queued is not admitted');
+  const state = {};
+  assert.deepEqual(interpretRollout({ type: 'event_msg', payload: { type: 'task_started', turn_id: 't1' } }, state), { working: true, turn_id: 't1' });
+  assert.deepEqual(interpretRollout({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] } }, state), { text: 'hi', turn_id: 't1' });
+  assert.equal(interpretRollout({ type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'yo' }] } }, state), null);
+  assert.equal(interpretRollout({ type: 'event_msg', payload: { type: 'token_count' } }, state), null);
+  assert.deepEqual(interpretRollout({ type: 'event_msg', payload: { type: 'task_complete', turn_id: 't1' } }, state), { working: false, turn_id: 't1' });
+  assert.equal(state.turn_id, null);
+  assert.deepEqual(interpretRollout({ type: 'event_msg', payload: { type: 'turn_aborted', turn_id: 't2' } }, state), { working: false, turn_id: 't2' });
 });
 
 test('install: puts this version in front of the harness, re-pins an older registration, and pairs with nothing', async () => {
@@ -449,7 +423,7 @@ test('install: puts this version in front of the harness, re-pins an older regis
   assert.match(first.done.join('\n'), /Registered the MCP server/);
   assert.match(first.done.join('\n'), /not paired with any room yet/);
   assert.match(first.next.join('\n'), /Emparejar conector/, 'and it says the conversation will ask for the code');
-  assert.ok(existsSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room', 'hook.mjs')), 'the skill and its hook runtime are in place');
+  assert.ok(existsSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room', 'SKILL.md')), 'the skill is in place');
   assert.ok(!existsSync(path.join(env.SIDEVOICE_DATA_DIR, 'credentials.json')), 'no pairing happened');
 
   // Registered at this version already: nothing to change, and it says so.
@@ -484,28 +458,22 @@ test('install: puts this version in front of the harness, re-pins an older regis
   // Codex is instructions, not edits: its configuration is machine-wide and not ours to rewrite.
   const codex = codexInstructions(env);
   assert.match(codex, /\[mcp_servers\.sidevoice\]/);
-  assert.match(codex, /--harness codex/);
+  assert.ok(!codex.includes('hooks'), 'nothing but the MCP server is asked of Codex');
   assert.match(codex, /does not rewrite it/);
 });
 
-test('skill: install copies the voice skill and a standalone hook, repairs itself, and never touches a foreign skill', async () => {
+test('skill: install copies the voice skill, repairs itself, clears an older hook runtime, and never touches a foreign skill', () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'sv-skills-'));
   assert.equal(skillStatus(dir).state, 'absent');
   const first = installSkill(dir);
-  assert.equal(first.action, 'installed'); assert.equal(first.hook, true);
+  assert.equal(first.action, 'installed');
   const manifest = readFileSync(path.join(dir, 'voice-room', 'SKILL.md'), 'utf8');
-  assert.match(manifest, /^name: voice-room$/m); assert.match(manifest, /UserPromptSubmit:\n    - hooks:/, 'settings.json shape: a list of hook groups'); assert.ok(manifest.includes(`node "${path.join(dir, 'voice-room')}/hook.mjs"`), 'the hook command names the installed copy by absolute path'); assert.ok(!manifest.includes('__SIDEVOICE_SKILL_DIR__'));
-  assert.match(manifest, /Stop:\n    - hooks:/, 'the harness reports the end of a turn through the same hook');
-  writeFileSync(path.join(dir, 'voice-room', 'hook.mjs'), 'broken');
+  assert.match(manifest, /^name: voice-room$/m); assert.ok(!manifest.includes('hooks:'), 'nothing is registered in the session');
+  assert.match(manifest, /voice_pair/);
+  // A copy from a version that shipped a hook runtime: reinstalling leaves only the skill.
+  writeFileSync(path.join(dir, 'voice-room', 'hook.mjs'), 'old'); writeFileSync(path.join(dir, 'voice-room', 'harness-claude.mjs'), 'old');
   assert.equal(installSkill(dir).action, 'updated');
-  assert.equal(readFileSync(path.join(dir, 'voice-room', 'hook.mjs'), 'utf8'), readFileSync(path.join(here, '..', 'hook.mjs'), 'utf8'));
-  assert.equal(existsSync(path.join(dir, 'voice-room', 'harness-contract.mjs')), true);
-  // The installed hook runs on its own, from the skill directory, with no connector around: silent, exit 0.
-  const child = spawn(process.execPath, [path.join(dir, 'voice-room', 'hook.mjs')], { env: { ...process.env, SIDEVOICE_DATA_DIR: path.join(dir, 'nowhere'), CLAUDE_CODE_SESSION_ID: 's' }, stdio: ['pipe', 'pipe', 'pipe'] });
-  let out = ''; child.stdout.on('data', d => { out += d; });
-  child.stdin.end(JSON.stringify({ hook_event_name: 'UserPromptSubmit', prompt: envelope({ channel: 'voice', session_id: 's', revision: 1, message_id: 'm', text: 'hola' }) }));
-  assert.equal(await new Promise(r => child.on('exit', r)), 0);
-  assert.match(out, /additionalContext/);
+  assert.equal(existsSync(path.join(dir, 'voice-room', 'hook.mjs')), false); assert.equal(existsSync(path.join(dir, 'voice-room', 'harness-claude.mjs')), false);
   assert.equal(removeSkill(dir).action, 'removed'); assert.equal(skillStatus(dir).state, 'absent');
   mkdirSync(path.join(dir, 'voice-room')); writeFileSync(path.join(dir, 'voice-room', 'SKILL.md'), '---\nname: voice-room\n---\nsomeone else\'s');
   assert.equal(skillStatus(dir).state, 'foreign');

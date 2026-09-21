@@ -7,11 +7,11 @@
  *  cannot read could tighten this further, and the result says so rather than pretending.
  *  Documented at https://code.claude.com/docs/en/cross-session-messaging */
 import { execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { defineHarness, envelope, SUPPORTED, WORKING_POLL } from './harness-contract.mjs';
+import { defineHarness, envelope, SUPPORTED, tailJsonl } from './harness-contract.mjs';
 
 const configDir = () => process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
 
@@ -135,8 +135,8 @@ export function sessionIdentity({ env = process.env } = {}) {
   };
 }
 
-/** Claude Code's session inbox sends no acknowledgement. A prompt-admitted hook supplies the
- *  separate read receipt; this method reports only what the socket itself proves. */
+/** Claude Code's session inbox sends no acknowledgement. The read receipt comes from watching the
+ *  session's own transcript (see observe); this method reports only what the socket itself proves. */
 export function deliver(delivery, event) {
   if (delivery?.kind !== 'claude-uds') throw new Error(`Unsupported Claude delivery kind: ${delivery?.kind}`);
   return new Promise((resolve, reject) => {
@@ -161,16 +161,55 @@ export function deliver(delivery, event) {
   });
 }
 
-/** A configured Stop hook is a direct end-of-turn signal, independent of session polling. */
-export function endOfTurn(payload, env = process.env) {
-  if (!payload || !/^stop$/i.test(String(payload.hook_event_name || payload.hookEventName || ''))) return null;
-  const identity = sessionIdentity({ env });
-  return identity ? { thread: identity.thread, turn_id: payload.turn_id || null } : null;
+/** The transcript Claude Code writes for a session: one JSON-lines file named after the session id, under
+ *  the project directory it derives from the launch cwd. Found by name rather than derived, so a renamed
+ *  or moved cwd changes nothing. */
+export function transcriptPath(sessionId) {
+  const projects = path.join(configDir(), 'projects');
+  let dirs = [];
+  try { dirs = readdirSync(projects); } catch { return null; }
+  for (const dir of dirs) {
+    const candidate = path.join(projects, dir, sessionId + '.jsonl');
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/** The text of a transcript entry that is a user message, or null for anything else (tool results,
+ *  attachments, the session's own bookkeeping). */
+export function userMessageText(entry) {
+  if (entry?.type !== 'user' || entry.message?.role !== 'user') return null;
+  const content = entry.message.content;
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return null;
+  const parts = content.filter(part => part?.type === 'text').map(part => part.text);
+  return parts.length ? parts.join('\n') : null;
+}
+
+const POLL_MS = Number(process.env.SIDEVOICE_WORK_POLL_MS || 400);
+
+/** Watch one session through what Claude Code itself writes about it, and nothing installed in it:
+ *  its registry record says whether it is busy, and its transcript records every user message the
+ *  moment the session admits it (a message from the inbox is appended as the turn takes it, not when
+ *  the socket accepted it — the difference is what the second tick shows). */
+export function observe(sessionId, handlers) {
+  let lastStatus = null;
+  const stopTranscript = tailJsonl(() => transcriptPath(sessionId), entry => {
+    const text = userMessageText(entry);
+    if (text !== null) handlers.userMessage({ text, turn_id: entry.promptId || null });
+  }, { intervalMs: POLL_MS });
+  const timer = setInterval(() => {
+    const working = sessionWorking(sessionId);
+    if (working === null || working === lastStatus) return;
+    lastStatus = working;
+    handlers.working(working, {});
+  }, POLL_MS);
+  timer.unref?.();
+  return () => { clearInterval(timer); stopTranscript(); };
 }
 
 export const claudeHarness = defineHarness({
   name: 'claude',
-  workingSource: WORKING_POLL,
   capabilities: {
     deliver: SUPPORTED,
     inspectInbound: SUPPORTED,
@@ -181,8 +220,7 @@ export const claudeHarness = defineHarness({
   deliver,
   inspectInbound,
   engine: sessionEngine,
-  working: sessionWorking,
-  endOfTurn,
+  observe,
   sessionIdentity,
 });
 

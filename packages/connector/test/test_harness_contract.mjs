@@ -19,7 +19,9 @@ for (const harness of [claudeHarness, codexHarness, httpHarness]) {
     for (const capability of CAPABILITIES) {
       assert.notEqual(capabilityState(harness, capability), UNKNOWN, `${capability} must be declared`);
       if (capabilityState(harness, capability) === SUPPORTED) {
-        assert.equal(typeof harness[capability], 'function', `${capability} must be implemented`);
+        // Working state and the end of a turn are both observed: one watcher answers for both.
+        const method = capability === 'working' || capability === 'endOfTurn' ? 'observe' : capability;
+        assert.equal(typeof harness[method], 'function', `${capability} must be implemented`);
       }
     }
   });
@@ -40,20 +42,16 @@ test('a supported declaration without an implementation is rejected', () => {
   }), /declares deliver supported but does not implement it/);
 });
 
-test('Codex identity comes from tool metadata and its hooks report working transitions', () => {
+test('Codex identity comes from tool metadata, and its working state is observed rather than reported', () => {
   const meta = { 'x-codex-turn-metadata': { thread_id: 'codex-thread', turn_id: 'turn-1' } };
   const identity = identifyHarness(meta, {});
   assert.equal(identity.module, codexHarness);
   assert.deepEqual({ harness: identity.harness, thread: identity.thread, delivery: identity.delivery }, {
     harness: 'codex', thread: 'codex-thread', delivery: { kind: 'codex-queue', thread: 'codex-thread' },
   });
-  assert.deepEqual(codexHarness.endOfTurn({ hook_event_name: 'Stop', session_id: 'codex-thread', turn_id: 'turn-1' }, {}),
-    { thread: 'codex-thread', turn_id: 'turn-1' });
-  assert.deepEqual(codexHarness.working({ hook_event_name: 'UserPromptSubmit', session_id: 'codex-thread', turn_id: 'turn-1' }, {}),
-    { thread: 'codex-thread', turn_id: 'turn-1', working: true });
-  assert.deepEqual(codexHarness.working({ hook_event_name: 'Stop', session_id: 'codex-thread', turn_id: 'turn-1' }, {}),
-    { thread: 'codex-thread', turn_id: 'turn-1', working: false });
+  assert.equal(typeof codexHarness.observe, 'function');
   assert.equal(capabilityState(codexHarness, 'working'), 'supported');
+  assert.equal(capabilityState(codexHarness, 'endOfTurn'), 'supported');
   assert.equal(capabilityState(codexHarness, 'inspectInbound'), 'unsupported');
 });
 

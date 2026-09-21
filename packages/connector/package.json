@@ -21,7 +21,6 @@
     "harness-codex.mjs",
     "harness-http.mjs",
     "pair.mjs",
-    "hook.mjs",
     "skill.mjs",
     "skill/",
     "README.md"

@@ -79,7 +79,6 @@ function registerWithClaude(done, env) {
 /** Codex keeps one machine-wide file that may hold anything its user put there: we never rewrite it. */
 export function codexInstructions(env = process.env) {
   const { command, args } = serverCommand(env);
-  const hook = [command, ...args.slice(0, -1), 'hook', '--harness', 'codex'].join(' ');
   return [
     `Add to ${env.CODEX_HOME || path.join(os.homedir(), '.codex')}/config.toml — it is machine-wide and`,
     'this package does not rewrite it:',
@@ -88,13 +87,7 @@ export function codexInstructions(env = process.env) {
     `  command = "${command}"`,
     `  args = [${args.map(a => `"${a}"`).join(', ')}]`,
     '',
-    '  [[hooks.UserPromptSubmit]]',
-    `  hooks = [ { type = "command", command = "${hook}" } ]`,
-    '',
-    '  [[hooks.Stop]]',
-    `  hooks = [ { type = "command", command = "${hook}" } ]`,
-    '',
-    'Then restart Codex. Without the hooks it works, but the room shows no read receipt and no working state.',
+    'Then restart Codex. That is all: read receipts and working state come from what Codex records about the thread.',
   ].join('\n');
 }
 
@@ -135,7 +128,7 @@ export async function install(argv = process.argv.slice(2), env = process.env) {
                    : 'This machine is not paired with any room yet.');
 
   if (harnesses.includes('claude')) {
-    next.push('In a conversation, run /voice-room to join the room and register this session\'s hooks.' +
+    next.push('In a conversation, run /voice-room to join the room.' +
               (paired ? '' : ' The first time, the conversation asks you for the room\'s address and the one-time code the room shows under "Emparejar conector".'));
     next.push('Sessions already open need a restart before they can see the skill.');
     const warning = inboundWarning(env);

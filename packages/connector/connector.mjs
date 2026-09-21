@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdirSync, openSync, closeSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { capabilityState, SUPPORTED, WORKING_POLL } from './harness-contract.mjs';
+import { capabilityState, SUPPORTED, voiceEnvelope } from './harness-contract.mjs';
 import { harnessFor } from './harnesses.mjs';
 
 export const PROTOCOL = 1;
@@ -53,7 +53,7 @@ const registering = new Map();     // client_ref -> { resolve, reject, timer }
 const publishing = new Map();      // event_id -> { resolve, timer }
 const clients = new Set();         // façade IPC connections
 const closedByRoom = new Map();    // client_ref -> reason: the user closed that conversation's voice from the room
-const readReported = new Set();    // message ids already reported as read, so a hook that fires twice is harmless
+const readReported = new Set();    // message ids already reported as read, so a transcript read twice is harmless
 let outbox = [];                   // speech frames not yet confirmed by the room
 let ws = null, connected = false, closed = false, reconnectTimer = null, idleTimer = null, reconnectAttempt = 0, lastError = null;
 let creds;
@@ -65,43 +65,73 @@ function saveOutbox() {
 }
 function send(frame) { if (ws?.readyState === WebSocket.OPEN) { ws.send(JSON.stringify(frame)); return true; } return false; }
 
-/* Whether a conversation is working is the harness's own state: each module answers in the way it can
- * (a polled registry, a stream of lifecycle events), and unknown or unsupported is skipped rather than
- * rendered as false.
+/* Whether a conversation is working, and whether it has read what the room sent, are the harness's own
+ * state — and every harness writes that state down somewhere of its own: Claude Code in a session registry
+ * and a transcript, Codex in the thread's rollout. Each module watches what its harness writes (`observe`)
+ * and calls back; nothing is installed in the harness for it. Unknown or unsupported is skipped rather
+ * than rendered as false.
  *
  * The connector does not assume the room still knows what it was told. A transition is sent the moment it
- * happens, and the same state is said again every few seconds regardless: a room that restarted, or a
+ * is seen, and the same state is said again every few seconds regardless: a room that restarted, or a
  * socket that dropped, learns what is true within one interval instead of waiting for the next change that
  * may never come (a conversation that was already working when the room came back showed nothing at all,
  * 2026-09-20). Saying it again is one small frame; not saying it is a light that never comes on. */
-const WORK_POLL_MS = Number(process.env.SIDEVOICE_WORK_POLL_MS || 400);
 const WORK_ANNOUNCE_MS = Number(process.env.SIDEVOICE_WORK_ANNOUNCE_MS || 2000);
-let workTimer = null;
+const PENDING_MAX = 64;
+let announceTimer = null;
 function announceWork(binding, working, extra = {}) {
   binding.working = working;
   binding.workingSentAt = Date.now();
   return send({ type: 'input.working', binding_id: binding.binding_id, working, ...extra });
 }
-function watchWork() {
-  if (workTimer) return;
-  workTimer = setInterval(() => {
-    if (!bindings.size) { clearInterval(workTimer); workTimer = null; return; }
+function keepAnnouncing() {
+  if (announceTimer) return;
+  announceTimer = setInterval(() => {
+    if (!bindings.size) { clearInterval(announceTimer); announceTimer = null; return; }
     for (const binding of bindings.values()) {
-      const harness = harnessFor(binding.harness);
-      if (capabilityState(harness, 'working') !== SUPPORTED) continue;
-      let working = binding.working;
-      if (harness.workingSource === WORKING_POLL) {
-        const polled = harness.working(binding.client_ref);
-        if (polled === null) continue;
-        working = polled;
-      } else if (typeof working !== 'boolean') continue;
-      const due = !binding.workingSentAt || Date.now() - binding.workingSentAt >= WORK_ANNOUNCE_MS;
-      if (working === binding.working && !due) continue;
-      announceWork(binding, working);
+      if (typeof binding.working !== 'boolean') continue;
+      if (Date.now() - (binding.workingSentAt || 0) >= WORK_ANNOUNCE_MS) announceWork(binding, binding.working);
     }
-  }, WORK_POLL_MS);
-  workTimer.unref?.();
+  }, Math.max(50, WORK_ANNOUNCE_MS / 4));
+  announceTimer.unref?.();
 }
+/** Start watching a binding's conversation through its harness. What we delivered and it has not yet taken
+ *  waits in `pending`; the moment its transcript shows the message, the room gets the second tick and a
+ *  correlated start of turn; the end of that turn carries the same correlation. */
+function watch(binding) {
+  const harness = harnessFor(binding.harness);
+  if (binding.stop || capabilityState(harness, 'working') !== SUPPORTED || typeof harness.observe !== 'function') return;
+  binding.pending ||= new Map();
+  const correlation = () => binding.turn ? { turn_id: binding.turn.turn_id, session_id: binding.turn.session_id, revision: binding.turn.revision } : {};
+  binding.stop = harness.observe(binding.thread, {
+    userMessage({ text, turn_id }) {
+      const header = voiceEnvelope(text);
+      if (!header || !binding.pending.has(header.message_id)) return;
+      binding.pending.delete(header.message_id);
+      if (!readReported.has(header.message_id)) {
+        readReported.add(header.message_id); if (readReported.size > 512) readReported.delete(readReported.values().next().value);
+        send({ type: 'input.read', binding_id: binding.binding_id, message_id: header.message_id, session_id: header.session_id, revision: header.revision, turn_id: turn_id || null });
+        console.error(`[sidevoice] ${binding.thread} read ${header.message_id}`);
+      }
+      if (header.channel !== 'voice') return;
+      binding.turn = { turn_id: turn_id || null, session_id: header.session_id, revision: header.revision };
+      announceWork(binding, true, turn_id ? { turn_phase: 'start', ...correlation() } : {});
+    },
+    working(working, { turn_id } = {}) {
+      if (working) {
+        // A start we can name is said with its name; the correlated start, if any, comes with the message itself.
+        if (binding.turn && turn_id && binding.turn.turn_id === turn_id) return announceWork(binding, true, { turn_phase: 'start', ...correlation() });
+        return announceWork(binding, true, {});
+      }
+      const ours = binding.turn && (!turn_id || !binding.turn.turn_id || binding.turn.turn_id === turn_id);
+      if (ours) { const extra = binding.turn.turn_id ? { turn_phase: 'end', ...correlation() } : {}; binding.turn = null; return announceWork(binding, false, extra); }
+      if (turn_id && binding.turn) return;     // some other turn ended: ours is still running
+      return announceWork(binding, false, {});
+    },
+  });
+  keepAnnouncing();
+}
+function unwatch(binding) { try { binding.stop?.(); } catch {} binding.stop = null; }
 
 function open() {
   if (closed || ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return;
@@ -155,12 +185,20 @@ async function receive(frame) {
       if (!binding) { send({ type: 'input.ack', event_id: frame.event_id, status: 'unknown_binding' }); return; }
       // One delivery at a time per binding keeps the user's turns in order.
       binding.chain = (binding.chain || Promise.resolve()).then(async () => {
+        // Expected before it is sent: the harness can take the message, and its transcript show it, before the
+        // delivery call has even settled (Claude Code admitted one 9 ms after the write; the socket answered
+        // 1.5 s later, 2026-09-21). A message expected and never taken costs a map entry.
+        if (binding.pending && frame.message_id) {
+          binding.pending.set(frame.message_id, { session_id: frame.session_id, revision: frame.revision, at: Date.now() });
+          while (binding.pending.size > PENDING_MAX) binding.pending.delete(binding.pending.keys().next().value);
+        }
         try {
           const harness = harnessFor(binding.harness);
           const outcome = await harness.deliver(binding.delivery, frame);
           console.error(`[sidevoice] delivered ${frame.event_id} to ${binding.thread} via ${binding.delivery.kind}: ${outcome.status} (${outcome.detail})`);
           send({ type: 'input.ack', event_id: frame.event_id, status: outcome.status, detail: outcome.detail });
         } catch (error) {
+          binding.pending?.delete(frame.message_id);
           console.error(`[sidevoice] delivery of ${frame.event_id} failed: ${error.message}`);
           send({ type: 'input.ack', event_id: frame.event_id, status: 'failed', error: String(error.message || error).slice(0, 400) });
         }
@@ -171,7 +209,7 @@ async function receive(frame) {
       // The user closed this conversation's voice in the room. Forget the binding; the façade learns it on its next call.
       const binding = bindings.get(frame.binding_id);
       if (!binding) return;
-      bindings.delete(binding.binding_id); binding.owner?.bindings.delete(binding);
+      bindings.delete(binding.binding_id); binding.owner?.bindings.delete(binding); unwatch(binding);
       closedByRoom.set(binding.client_ref, frame.reason || 'closed_from_room');
       console.error(`[sidevoice] room closed voice for ${binding.thread}`);
       scheduleExit(); return;
@@ -212,12 +250,12 @@ async function command(client, input) {
       }
       const local_id = 'local-' + randomUUID();
       const binding = { binding_id: local_id, client_ref, harness, thread, title, delivery, inbound, capabilities, owner: client };
-      bindings.set(local_id, binding); client.bindings.add(binding); clearTimeout(idleTimer); open(); watchWork();
+      bindings.set(local_id, binding); client.bindings.add(binding); clearTimeout(idleTimer); open(); watch(binding);
       const frame = await new Promise((resolve, reject) => {
         const timer = setTimeout(() => { registering.delete(client_ref); reject(new Error(connected ? 'The room did not confirm the binding' : 'The room is unreachable; retrying in the background')); }, 10_000);
         registering.set(client_ref, { resolve: f => { clearTimeout(timer); registering.delete(client_ref); resolve(f); }, reject: e => { clearTimeout(timer); registering.delete(client_ref); reject(e); } });
         if (!send({ type: 'binding.register', client_ref, harness, thread, title, inbound, capabilities, engine })) { /* sent on welcome */ }
-      }).catch(error => { if (!connected) return null; bindings.delete(binding.binding_id); client.bindings.delete(binding); throw error; });
+      }).catch(error => { if (!connected) return null; bindings.delete(binding.binding_id); client.bindings.delete(binding); unwatch(binding); throw error; });
       return { binding_id: frame?.binding_id || binding.binding_id, thread, connected, pending: !frame };
     }
     case 'publish': {
@@ -235,51 +273,9 @@ async function command(client, input) {
       const { type, event_id, ...result } = reply;
       return result;
     }
-    case 'read': {
-      // A harness hook says the conversation admitted this voice message: the room learns it was read.
-      const { thread, message_id, session_id, revision, turn_id } = params;
-      if (!thread || !message_id) throw new Error('thread and message_id are required');
-      const binding = [...bindings.values()].find(b => b.thread === thread || b.client_ref === thread);
-      if (!binding) return { status: 'no_binding' };
-      if (readReported.has(message_id)) return { status: 'already_reported' };
-      readReported.add(message_id); if (readReported.size > 512) readReported.delete(readReported.values().next().value);
-      const sent = send({ type: 'input.read', binding_id: binding.binding_id, message_id, session_id, revision, turn_id: turn_id || null });
-      return { status: sent ? 'sent' : 'offline' };
-    }
-    case 'turn_end': {
-      const binding = [...bindings.values()].find(b => b.thread === params.thread || b.client_ref === params.thread);
-      if (!binding) return { status: 'no_binding' };
-      const sent = announceWork(binding, false, { turn_id: params.turn_id || null });
-      return { status: sent ? 'sent' : 'offline' };
-    }
-    case 'working': {
-      const { thread, turn_id, working } = params;
-      if (!thread || typeof working !== 'boolean' || !turn_id) throw new Error('thread, turn_id and working are required');
-      const binding = [...bindings.values()].find(b => b.thread === thread || b.client_ref === thread);
-      if (!binding) return { status: 'no_binding' };
-      binding.activeTurns ||= new Map();
-      binding.completedTurns ||= new Set();
-      if (working) {
-        if (binding.completedTurns.has(turn_id)) return { status: 'stale' };
-        if (binding.activeTurns.has(turn_id)) return { status: 'already_reported' };
-        const correlation = { turn_id,
-          ...(typeof params.session_id === 'string' ? { session_id: params.session_id } : {}),
-          ...(Number.isInteger(params.revision) ? { revision: params.revision } : {}) };
-        binding.activeTurns.set(turn_id, correlation);
-        const sent = announceWork(binding, true, { turn_phase: 'start', ...correlation });
-        return { status: sent ? 'sent' : 'offline' };
-      }
-      if (binding.completedTurns.has(turn_id)) return { status: 'already_reported' };
-      const correlation = binding.activeTurns.get(turn_id);
-      binding.completedTurns.add(turn_id);
-      if (!correlation) return { status: 'stale' };
-      binding.activeTurns.delete(turn_id);
-      const sent = announceWork(binding, binding.activeTurns.size > 0, { turn_phase: 'end', ...correlation });
-      return { status: sent ? 'sent' : 'offline' };
-    }
     case 'unregister': {
       const binding = bindings.get(params.binding_id);
-      if (binding) { bindings.delete(binding.binding_id); binding.owner?.bindings.delete(binding); if (!binding.binding_id.startsWith('local-')) send({ type: 'binding.unregister', binding_id: binding.binding_id }); }
+      if (binding) { bindings.delete(binding.binding_id); binding.owner?.bindings.delete(binding); unwatch(binding); if (!binding.binding_id.startsWith('local-')) send({ type: 'binding.unregister', binding_id: binding.binding_id }); }
       scheduleExit(); return snapshot();
     }
     case 'status': return snapshot();
@@ -307,7 +303,7 @@ function serve(socket) {
   socket.on('close', () => {
     clients.delete(client);
     // The façade is gone: so is every conversation it spoke for.
-    for (const binding of client.bindings) { bindings.delete(binding.binding_id); if (!binding.binding_id.startsWith('local-')) send({ type: 'binding.unregister', binding_id: binding.binding_id }); }
+    for (const binding of client.bindings) { bindings.delete(binding.binding_id); unwatch(binding); if (!binding.binding_id.startsWith('local-')) send({ type: 'binding.unregister', binding_id: binding.binding_id }); }
     scheduleExit();
   });
 }
