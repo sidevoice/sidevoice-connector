@@ -151,10 +151,16 @@ test('connector: keeps retrying while the room is down and connects once it appe
   try {
     await until(() => existsSync(socketPath));
     await wait(1500); // several refused attempts happen in here
+    // While the room is down, status says why — not just "not connected".
+    const facade = ipcClient(socketPath); await facade.ready;
+    const down = await facade.call('status', {});
+    assert.equal(down.connected, false);
+    assert.ok(down.socket_error && (down.socket_error.error || down.socket_error.close_code), JSON.stringify(down.socket_error));
+    assert.ok(down.socket_error.at);
     await new Promise(r => server.listen(port, '127.0.0.1', r));
     await until(() => frames.some(f => f.type === 'connector.hello'), 12000);
-    const facade = ipcClient(socketPath); await facade.ready;
     await until(async () => (await facade.call('status', {})).connected, 5000);
+    assert.equal((await facade.call('status', {})).socket_error, null, 'cleared once the room answers');
     facade.end();
   } finally { child.kill(); await new Promise(r => server.close(r)); }
 });

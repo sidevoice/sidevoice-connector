@@ -129,7 +129,7 @@ async function invoke(name, args, meta) {
     if (closed) binding = null;
     const module = binding ? harnessFor(binding.harness) : null;
     const inbound = binding ? inboundFor(module, binding.client_ref) : null;
-    return { joined: !!binding, room: status.room || pairedRoom()?.origin || null, room_reachable: status.connected, room_error: status.room_error || null,
+    return { joined: !!binding, room: status.room || pairedRoom()?.origin || null, room_reachable: status.connected, room_error: status.room_error || null, socket_error: status.socket_error || null,
              version: VERSION, connector_version: status.version || null, ...versionNote(status.version),
              binding_id: binding?.binding_id || null, harness: binding?.harness || null,
              capabilities: binding?.capabilities || null, inbound,

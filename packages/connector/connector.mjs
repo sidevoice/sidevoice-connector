@@ -59,6 +59,7 @@ const closedByRoom = new Map();    // client_ref -> reason: the user closed that
 const readReported = new Set();    // message ids already reported as read, so a transcript read twice is harmless
 let outbox = [];                   // speech frames not yet confirmed by the room
 let ws = null, connected = false, closed = false, reconnectTimer = null, idleTimer = null, reconnectAttempt = 0, lastError = null;
+let socketError = null;            // why the last attempt to reach the room failed, for whoever asks status
 let creds;
 
 function loadOutbox() { try { outbox = JSON.parse(readFileSync(outboxPath, 'utf8')); if (!Array.isArray(outbox)) outbox = []; } catch { outbox = []; } }
@@ -143,11 +144,12 @@ function open() {
     send({ type: 'connector.hello', protocol: PROTOCOL, connector_id: creds.connector_id, token: creds.token, host: hostId });
   });
   socket.addEventListener('message', event => { receive(JSON.parse(String(event.data))).catch(error => send({ type: 'connector.error', error: error.message })); });
-  const lost = () => { if (ws === socket) { ws = null; connected = false; } reconnect(); };
+  const lost = why => { if (ws === socket) { ws = null; connected = false; } if (why) { socketError = { ...why, at: new Date().toISOString(), attempt: reconnectAttempt }; console.error('[sidevoice] room unreachable: ' + JSON.stringify(why)); } reconnect(); };
   // A refused connection surfaces as 'error' with no 'close', and the dead socket stays
-  // CONNECTING forever: forget it, or open() would never make another one.
-  socket.addEventListener('close', lost);
-  socket.addEventListener('error', lost);
+  // CONNECTING forever: forget it, or open() would never make another one. Whatever the runtime
+  // says about it is kept: "not reachable" alone told a person nothing (2026-09-21).
+  socket.addEventListener('close', event => lost(connected ? null : { close_code: event.code, reason: event.reason || null }));
+  socket.addEventListener('error', event => lost({ error: event.error?.message || event.message || 'connection failed' }));
 }
 function reconnect() {
   if (closed || reconnectTimer) return;
@@ -158,7 +160,7 @@ function reconnect() {
 async function receive(frame) {
   switch (frame.type) {
     case 'connector.welcome':
-      connected = true; reconnectAttempt = 0; lastError = null;
+      connected = true; reconnectAttempt = 0; lastError = null; socketError = null;
       for (const binding of bindings.values()) {
         // `local-*` is only a connector-side placeholder while the first
         // registration waits for the room to mint its durable binding id.
@@ -222,7 +224,7 @@ async function receive(frame) {
 }
 
 function snapshot() {
-  return { host: hostId, version: VERSION, room: creds.room, connected, protocol: PROTOCOL, outbox: outbox.length, room_error: lastError, closed_by_room: [...closedByRoom.keys()],
+  return { host: hostId, version: VERSION, room: creds.room, connected, protocol: PROTOCOL, outbox: outbox.length, room_error: lastError, socket_error: socketError, closed_by_room: [...closedByRoom.keys()],
     bindings: [...bindings.values()].map(({ binding_id, client_ref, harness, thread, title, delivery, capabilities }) =>
       ({ binding_id, client_ref, harness, thread, title, delivery: delivery.kind, capabilities })) };
 }
