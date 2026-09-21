@@ -10,6 +10,9 @@ import { randomUUID } from 'node:crypto';
 import { capabilityState, SUPPORTED, voiceEnvelope } from './harness-contract.mjs';
 import { harnessFor } from './harnesses.mjs';
 import { privateNetwork } from './pair.mjs';
+import { fileURLToPath } from 'node:url';
+
+const VERSION = JSON.parse(readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf8')).version;
 
 export const PROTOCOL = 1;
 const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
@@ -219,7 +222,7 @@ async function receive(frame) {
 }
 
 function snapshot() {
-  return { host: hostId, room: creds.room, connected, protocol: PROTOCOL, outbox: outbox.length, room_error: lastError, closed_by_room: [...closedByRoom.keys()],
+  return { host: hostId, version: VERSION, room: creds.room, connected, protocol: PROTOCOL, outbox: outbox.length, room_error: lastError, closed_by_room: [...closedByRoom.keys()],
     bindings: [...bindings.values()].map(({ binding_id, client_ref, harness, thread, title, delivery, capabilities }) =>
       ({ binding_id, client_ref, harness, thread, title, delivery: delivery.kind, capabilities })) };
 }

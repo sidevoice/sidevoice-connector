@@ -194,6 +194,7 @@ test('mcp façade: identity comes from the harness, tools are exposed, instructi
     assert.match(replies[0].result.instructions, /same original session_id and revision/);
     assert.deepEqual(replies[1].result.tools.map(t => t.name), ['voice_connect', 'voice_pair', 'voice_say', 'voice_disconnect', 'voice_status']);
     assert.match(replies[0].result.instructions, /Never try to obtain a code from the room yourself/);
+    assert.equal(replies[0].result.serverInfo.version, JSON.parse(readFileSync(path.join(here, '..', 'package.json'), 'utf8')).version, 'the façade says which version it is');
     const joined = JSON.parse(replies[2].result.content[0].text);
     assert.equal(joined.status, 'joined'); assert.equal(joined.harness, 'claude'); assert.equal(joined.conversation, 'sess-abc');
     assert.deepEqual(commands[0].params.delivery, { kind: 'claude-uds', socket: '/tmp/x.sock', token: 'tok' });
@@ -203,7 +204,7 @@ test('mcp façade: identity comes from the harness, tools are exposed, instructi
     ask(4, 'tools/call', { name: 'voice_say', arguments: { text: 'hola', session_id: 's', revision: 1 } });
     await until(() => replies.length === 4);
     assert.equal(JSON.parse(replies[3].result.content[0].text).status, 'published');
-    assert.equal(commands[1].params.binding_id, 'b-9');
+    assert.equal(commands.find(c => c.method === 'publish').params.binding_id, 'b-9');
   } finally { child.kill(); fake.close(); }
 });
 
@@ -419,16 +420,26 @@ test('install: puts this version in front of the harness, re-pins an older regis
   const log = path.join(home, 'claude.log'), registered = path.join(home, 'registered.txt'), bin = path.join(home, 'claude');
   writeFileSync(bin, `#!/bin/sh\necho "$@" >> "${log}"\nif [ "$2" = get ]; then [ -s "${registered}" ] && cat "${registered}" || exit 1; fi\n`, { mode: 0o755 });
   const calls = () => existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : [];
-  const env = { ...process.env, SIDEVOICE_DATA_DIR: path.join(home, '.sidevoice'), CLAUDE_CONFIG_DIR: path.join(home, '.claude'), SIDEVOICE_CLAUDE_BIN: bin };
+  // Not from a checkout: the package is copied under the XDG data home and the harness runs that copy with node.
+  const env = { ...process.env, SIDEVOICE_DATA_DIR: path.join(home, '.sidevoice'), CLAUDE_CONFIG_DIR: path.join(home, '.claude'), SIDEVOICE_CLAUDE_BIN: bin,
+                SIDEVOICE_INSTALL_FROM_SOURCE: '0', XDG_DATA_HOME: path.join(home, 'xdg') };
   mkdirSync(env.CLAUDE_CONFIG_DIR);
+  mkdirSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1'), { recursive: true });   // a copy an older install left
   const { command, args } = (await import('../install.mjs')).serverCommand(env);
   const wanted = [command, ...args].join(' ');
+  const version = JSON.parse(readFileSync(path.join(here, '..', 'package.json'), 'utf8')).version;
+  assert.equal(wanted, `node ${path.join(env.XDG_DATA_HOME, 'sidevoice', version, 'cli.mjs')} mcp`, 'never npx at session start');
 
   assert.rejects(install(['https://room.example', '--harness', 'claude'], env), /Pairing is not part of installing/, 'a room address is refused, with where pairing lives');
 
   const first = await install(['--harness', 'claude'], env);
   assert.deepEqual(calls(), ['mcp get sidevoice', `mcp add --scope user sidevoice -- ${wanted}`], 'nothing registered: it registers this version');
   assert.match(first.done.join('\n'), /Registered the MCP server/);
+  assert.match(first.done.join('\n'), /Copied this version to .*\(removed: 0\.0\.1\)/);
+  for (const file of ['cli.mjs', 'mcp.mjs', 'connector.mjs', 'pair.mjs', 'package.json', path.join('skill', 'voice-room', 'SKILL.md')]) {
+    assert.ok(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', version, file)), file + ' is in the copy');
+  }
+  assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1')), 'the older copy is gone');
   assert.match(first.done.join('\n'), /not paired with any room yet/);
   assert.match(first.next.join('\n'), /Emparejar conector/, 'and it says the conversation will ask for the code');
   assert.ok(existsSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room', 'SKILL.md')), 'the skill is in place');
@@ -466,6 +477,7 @@ test('install: puts this version in front of the harness, re-pins an older regis
   // Codex is instructions, not edits: its configuration is machine-wide and not ours to rewrite.
   const codex = codexInstructions(env);
   assert.match(codex, /\[mcp_servers\.sidevoice\]/);
+  assert.match(codex, /command = "node"/);
   assert.ok(!codex.includes('hooks'), 'nothing but the MCP server is asked of Codex');
   assert.match(codex, /does not rewrite it/);
 });

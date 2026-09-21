@@ -10,6 +10,9 @@ import { fileURLToPath } from 'node:url';
 import { advertisedCapabilities, capabilityState, SUPPORTED } from './harness-contract.mjs';
 import { harnessFor, identifyHarness } from './harnesses.mjs';
 import { pair, pairedRoom } from './pair.mjs';
+import { readFileSync } from 'node:fs';
+
+const VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
 
 const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
 const socketPath = process.env.SIDEVOICE_CONNECTOR_SOCKET || path.join(dataDir, 'connector.sock');
@@ -91,6 +94,11 @@ function pairingNeeded(room, paired) {
   if (target && target !== paired.origin) return `This machine is paired with ${paired.origin}, not ${target}. One room per machine: to switch, ask the user for the pairing code that ${target} shows under "Emparejar conector" and call voice_pair (it replaces the current pairing); to stay, call voice_connect without a room.`;
   return null;
 }
+/** A connector from another version serves this conversation with that version's behaviour. */
+function versionNote(connectorVersion) {
+  if (!ipc || connectorVersion === VERSION) return {};
+  return { note: `The connector running on this machine is ${connectorVersion ? 'version ' + connectorVersion : 'older than this server'}; this conversation runs ${VERSION}. It exits 15 s after the last conversation leaves it; until then behaviour is that version's.` };
+}
 function inboundFor(harness, thread) {
   return capabilityState(harness, 'inspectInbound') === SUPPORTED ? harness.inspectInbound(thread) : null;
 }
@@ -103,6 +111,7 @@ async function invoke(name, args, meta) {
     const module = binding ? harnessFor(binding.harness) : null;
     const inbound = binding ? inboundFor(module, binding.client_ref) : null;
     return { joined: !!binding, room: status.room || pairedRoom()?.origin || null, room_reachable: status.connected, room_error: status.room_error || null,
+             version: VERSION, connector_version: status.version || null, ...versionNote(status.version),
              binding_id: binding?.binding_id || null, harness: binding?.harness || null,
              capabilities: binding?.capabilities || null, inbound,
              ...(closed ? { closed_by_room: true, note: 'The user closed this conversation\'s voice channel from the room. Continue in writing; call voice_connect again only if they ask for voice.' } : {}) };
@@ -141,8 +150,10 @@ async function invoke(name, args, meta) {
     const result = await rpc('register', { client_ref: who.thread, harness: who.harness, thread: who.thread,
       title, delivery: who.delivery, inbound, capabilities, engine });
     binding = { ...result, harness: who.harness, client_ref: who.thread, capabilities };
+    let connectorVersion = null; try { connectorVersion = (await rpc('status', {})).version || null; } catch {}
     return { status: result.pending ? 'joining' : 'joined', harness: who.harness, conversation: who.thread,
-             binding_id: result.binding_id, delivery: 'push', room_reachable: result.connected, capabilities, inbound };
+             binding_id: result.binding_id, delivery: 'push', room_reachable: result.connected, capabilities, inbound,
+             version: VERSION, connector_version: connectorVersion, ...versionNote(connectorVersion) };
   }
   if (!binding) throw new Error('Not connected to the voice room: call voice_connect first (only if the user asked).');
 
@@ -175,7 +186,7 @@ process.stdin.on('data', async chunk => {
     if (request.id === undefined) continue; // notifications need no answer
     let result, error;
     try {
-      if (request.method === 'initialize') result = { protocolVersion: request.params?.protocolVersion || '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'sidevoice', version: '0.2.0' }, instructions: INSTRUCTIONS };
+      if (request.method === 'initialize') result = { protocolVersion: request.params?.protocolVersion || '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'sidevoice', version: VERSION }, instructions: INSTRUCTIONS };
       else if (request.method === 'tools/list') result = { tools };
       else if (request.method === 'tools/call') { const value = await invoke(request.params.name, request.params.arguments || {}, request.params._meta); result = { content: [{ type: 'text', text: JSON.stringify(value) }] }; }
       else if (request.method === 'ping') result = {};

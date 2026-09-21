@@ -10,7 +10,8 @@
  *  What it does not do is decide for the person: it never edits a machine-wide Codex configuration it
  *  does not own, and it never relaxes Claude Code's inbound safeguard — those it prints, with the reason. */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,13 +20,66 @@ import { install as installSkill, skillsDir } from './skill.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const VERSION = JSON.parse(readFileSync(path.join(here, 'package.json'), 'utf8')).version;
-/** What a harness should run to start the server. From a checkout it names this copy, so a machine that
- *  installed from source keeps working when the published version moves; otherwise the pinned package. */
+/** The files that make up this package, copied as they are. */
+const PACKAGE_FILES = JSON.parse(readFileSync(path.join(here, 'package.json'), 'utf8')).files.concat('package.json');
+
+function fromSource(env) {
+  if (env.SIDEVOICE_INSTALL_FROM_SOURCE === '0') return false;
+  return env.SIDEVOICE_INSTALL_FROM_SOURCE === '1' || existsSync(path.join(here, '..', '..', '.git'));
+}
+
+/** Where installed copies live: one directory per version, under the XDG data home. */
+export function copiesDir(env = process.env) {
+  return path.join(env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share'), 'sidevoice');
+}
+
+/** What a harness should run to start the server. From a checkout it names that checkout, so a machine that
+ *  installed from source keeps working when the published version moves. Otherwise it names a copy of this
+ *  package that install placed on disk — never `npx`: a session start is not the moment to resolve a package
+ *  (a cold cache, a bin whose name differs from the package's, a 30 s startup budget; one session found no
+ *  `sidevoice` binary at all, 2026-09-21). */
 export function serverCommand(env = process.env) {
-  const fromSource = env.SIDEVOICE_INSTALL_FROM_SOURCE === '1' || existsSync(path.join(here, '..', '..', '.git'));
-  return fromSource
-    ? { command: 'node', args: [path.join(here, 'cli.mjs'), 'mcp'] }
-    : { command: 'npx', args: ['-y', `@sidevoice/uplink@${VERSION}`, 'mcp'] };
+  const cli = fromSource(env) ? path.join(here, 'cli.mjs') : path.join(copiesDir(env), VERSION, 'cli.mjs');
+  return { command: 'node', args: [cli, 'mcp'] };
+}
+
+/** Put this version's files where serverCommand points, and drop the other versions: an installed copy is
+ *  disposable and there is one current one. From a checkout nothing is copied. */
+export function materialize(env = process.env) {
+  if (fromSource(env)) return { action: 'checkout', target: here };
+  const root = copiesDir(env), target = path.join(root, VERSION);
+  mkdirSync(target, { recursive: true });
+  for (const file of PACKAGE_FILES) {
+    const source = path.join(here, file);
+    if (existsSync(source)) cpSync(source, path.join(target, file), { recursive: true });
+  }
+  const removed = [];
+  for (const name of readdirSync(root)) {
+    if (name !== VERSION) { rmSync(path.join(root, name), { recursive: true, force: true }); removed.push(name); }
+  }
+  return { action: 'copied', target, removed };
+}
+
+/** The connector that holds this machine's socket, if any, and which version it is: a façade uses whatever
+ *  connector is running, so one left over from before an upgrade serves every new session with old code. */
+export function runningConnector(env = process.env) {
+  const dataDir = env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
+  const socketPath = env.SIDEVOICE_CONNECTOR_SOCKET || path.join(dataDir, 'connector.sock');
+  let pid = null;
+  try { pid = Number(readFileSync(socketPath + '.lock', 'utf8')) || null; } catch { return null; }
+  return new Promise(resolve => {
+    const socket = net.createConnection(socketPath);
+    const done = value => { clearTimeout(timer); socket.destroy(); resolve(value); };
+    const timer = setTimeout(() => done(null), 1500);
+    let buffer = '';
+    socket.on('error', () => done(null));
+    socket.on('connect', () => socket.write(JSON.stringify({ id: 1, method: 'status', params: {} }) + '\n'));
+    socket.on('data', chunk => {
+      buffer += chunk; const index = buffer.indexOf('\n'); if (index < 0) return;
+      try { const reply = JSON.parse(buffer.slice(0, index)); done({ pid, version: reply.result?.version || null, bindings: reply.result?.bindings?.length ?? null }); }
+      catch { done({ pid, version: null, bindings: null }); }
+    });
+  });
 }
 
 export function flag(argv, name) {
@@ -117,6 +171,8 @@ export async function install(argv = process.argv.slice(2), env = process.env) {
   const done = [], next = [];
 
   done.push(`Sidevoice ${VERSION}.`);
+  const copy = materialize(env);
+  if (copy.action === 'copied') done.push(`Copied this version to ${copy.target}${copy.removed.length ? ` (removed: ${copy.removed.join(', ')})` : ''}.`);
   if (harnesses.includes('claude')) {
     registerWithClaude(done, env);
     const outcome = installSkill(skillsDir([], env));
@@ -126,6 +182,11 @@ export async function install(argv = process.argv.slice(2), env = process.env) {
   const paired = pairedRoom(env);
   done.push(paired ? `This machine is paired with ${paired.origin} (connector ${paired.connector_id}).`
                    : 'This machine is not paired with any room yet.');
+  const running = await runningConnector(env);
+  if (running && running.version !== VERSION) {
+    next.push(`A connector from ${running.version ? 'version ' + running.version : 'an older version'} is still running (pid ${running.pid}) and every conversation on this machine uses it. ` +
+              `It exits by itself 15 s after the last conversation leaves it; to switch now: kill ${running.pid}, then join again from each conversation.`);
+  }
 
   if (harnesses.includes('claude')) {
     next.push('In a conversation, run /voice-room to join the room.' +
