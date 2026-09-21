@@ -18,18 +18,17 @@ const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.side
 const socketPath = process.env.SIDEVOICE_CONNECTOR_SOCKET || path.join(dataDir, 'connector.sock');
 const connectorPath = fileURLToPath(new URL('./connector.mjs', import.meta.url));
 
+// Claude Code keeps at most 2048 characters of these; the rest is cut (measured 2026-09-21).
 const INSTRUCTIONS = `Sidevoice connects this conversation to the user's voice room.
-- Call voice_connect only when the user asks to join the voice room or enable voice for this conversation; never as a side effect.
-- Voice input arrives as a user message that starts with a JSON header ({"channel":"voice","session_id":...,"revision":...,"message_id":...}) followed by the user's literal words, and ends with a line marked [Sidevoice] that is not the user's words: it asks you to acknowledge by voice first. Treat the header as opaque reply metadata; if the same message_id arrives twice, it is a redelivery: do not act on it again.
-- For substantive work, one incoming voice message may receive multiple voice_say publications: an immediate acknowledgement that states what was understood and the next action, meaningful progress checkpoints while work continues, and a final result. Use the same original session_id and revision for every publication, with distinct utterances; do not manufacture filler or narrate every tool call.
-- A progress publication is not itself a listening point. Divide substantive execution into bounded steps and, after each tool result or operational boundary, process newly arrived user input before starting the next step. Do not add artificial sleeps or fixed pauses.
-- If a new user message arrives during active work, treat it as an addition, refinement, or replacement according to its meaning. Stop not-yet-started obsolete work, preserve completed work that remains useful, acknowledge the new interpretation before continuing, and do not later answer a stale request. A tool already running may finish before the correction takes effect; delegation is not a substitute for listening.
-- A "published" voice_say result means the room stored it, not that the user heard it. If publication fails, continue in writing.
-- If the user closes this conversation's voice channel from the room, the connection is removed: voice_say then fails saying so. Continue in writing and do not try to speak again; call voice_connect only when the user asks for voice again.
-- voice_status reports whether the room can currently reach this conversation, and which room this machine is paired with.
-- Pairing is the user's act, never yours. If voice_connect answers that this machine is not paired with the room (or is paired with a different one), ask the user for the room's address and the one-time pairing code the room shows them under "Emparejar conector" (it expires in ten minutes), then call voice_pair with both and voice_connect again. Never try to obtain a code from the room yourself, and do not offer to: the room only shows it to the person in it.
-- The server also offers a prompt named voice-room: the same joining steps as a command, for harnesses that expose MCP prompts (Claude Code shows it as /mcp__sidevoice__voice-room). Read receipts and working state need nothing from you: the room learns them from what the harness records about this conversation.
-- If voice_connect returns inbound.ok false, voice will look sent and never arrive: this harness holds or refuses messages posted by other local processes. Tell the user what inbound.reason says, offer inbound.remedy in your own words including what safeguard the machine-wide option removes, and let them choose. Do not change their settings without being asked to.`;
+- Call voice_connect only when the user asks to join the room or enable voice; never as a side effect.
+- Voice input is a user message: a JSON header ({"channel":"voice","session_id","revision","message_id"}), the user's literal words, then a [Sidevoice] line that is not the user's. The header is opaque reply metadata. A repeated message_id is a redelivery: do not act on it again.
+- Reply by voice with voice_say, using that message's session_id and revision for every publication. For substantive work: first a short acknowledgement (what you understood, what you will do next), then meaningful checkpoints, then the result. No filler, no narrating tool calls. Publish questions too, and wait.
+- Between steps, at each tool result, take in newly arrived user input before starting the next step: an addition, a refinement or a replacement, by its meaning. Drop obsolete work not yet started; keep what remains useful; say what you now understand. No artificial pauses.
+- "published" means the room stored it, not that the user heard it. If publishing fails, continue in writing.
+- If the user closes this conversation's voice from the room, voice_say fails saying so: continue in writing, do not retry, and call voice_connect again only if asked.
+- Pairing is the user's act. If voice_connect says this machine is not paired with the room, ask the user for the room's address and the one-time code the room shows under "Emparejar conector", then call voice_pair and voice_connect again. Never try to obtain a code from the room yourself.
+- If voice_connect returns inbound.ok false, voice will look sent and never arrive: tell the user inbound.reason, offer inbound.remedy in your own words including the safeguard the machine-wide option removes, and change no settings unasked.
+- Read receipts and working state need nothing from you: the room observes what the harness records.`;
 
 // ----- one persistent connection to the connector -----
 let ipc = null, ipcBuffer = '', ipcSerial = 0;
