@@ -22,7 +22,6 @@
     "harness-http.mjs",
     "pair.mjs",
     "skill.mjs",
-    "skill/",
     "README.md"
   ],
   "scripts": {

@@ -28,7 +28,7 @@ const INSTRUCTIONS = `Sidevoice connects this conversation to the user's voice r
 - If the user closes this conversation's voice channel from the room, the connection is removed: voice_say then fails saying so. Continue in writing and do not try to speak again; call voice_connect only when the user asks for voice again.
 - voice_status reports whether the room can currently reach this conversation, and which room this machine is paired with.
 - Pairing is the user's act, never yours. If voice_connect answers that this machine is not paired with the room (or is paired with a different one), ask the user for the room's address and the one-time pairing code the room shows them under "Emparejar conector" (it expires in ten minutes), then call voice_pair with both and voice_connect again. Never try to obtain a code from the room yourself, and do not offer to: the room only shows it to the person in it.
-- On Claude Code, /voice-room is a shortcut for the same joining steps. Read receipts and working state need nothing from you: the room learns them from what the harness records about this conversation.
+- The server also offers a prompt named voice-room: the same joining steps as a command, for harnesses that expose MCP prompts (Claude Code shows it as /mcp__sidevoice__voice-room). Read receipts and working state need nothing from you: the room learns them from what the harness records about this conversation.
 - If voice_connect returns inbound.ok false, voice will look sent and never arrive: this harness holds or refuses messages posted by other local processes. Tell the user what inbound.reason says, offer inbound.remedy in your own words including what safeguard the machine-wide option removes, and let them choose. Do not change their settings without being asked to.`;
 
 // ----- one persistent connection to the connector -----
@@ -83,6 +83,26 @@ const tools = [
   { name: 'voice_disconnect', description: 'Leave the voice room. The conversation and its work continue in writing.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'voice_status', description: 'Whether the room can currently reach this conversation.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
 ];
+/** The joining steps as a prompt: what the voice-room skill used to be, now carried by the server itself so
+ *  nothing is copied into any harness and the steps move with the version. */
+const PROMPTS = [{
+  name: 'voice-room',
+  description: 'Join the user\'s Sidevoice voice room with this conversation.',
+  arguments: [{ name: 'title', description: 'Title for this conversation in the room', required: false }],
+}];
+function promptText(args = {}) {
+  const title = (args.title || '').trim();
+  return [
+    'Join the voice room for this conversation and keep it reachable.',
+    '',
+    '1. Call voice_status. If it reports joined and room_reachable, say so in one line and stop.',
+    `2. Call voice_connect with the title ${title ? JSON.stringify(title) : 'a short label of what this conversation is about'}. If the user named a room, pass its address as room.`,
+    '   If it fails saying this machine is not paired with the room (or is paired with a different one), ask the user for the room\'s address and the one-time code the room shows them under "Emparejar conector"; call voice_pair with both, then voice_connect again. Never try to get a code from the room yourself.',
+    '3. Tell the user in one line whether the room can reach this conversation. If inbound.ok is false, relay inbound.reason and offer inbound.remedy in your own words, including what safeguard it removes; change nothing yourself.',
+    '',
+    'Nothing else is registered: the room learns that a message was read and whether this conversation is working from what the harness itself records about it. How to behave once joined is in this server\'s instructions.',
+  ].join('\n');
+}
 let binding = null;
 function originOf(room) {
   try { return new URL(room).origin; } catch { throw new Error(`"${room}" is not a room address; expected something like https://voice.example`); }
@@ -186,7 +206,12 @@ process.stdin.on('data', async chunk => {
     if (request.id === undefined) continue; // notifications need no answer
     let result, error;
     try {
-      if (request.method === 'initialize') result = { protocolVersion: request.params?.protocolVersion || '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'sidevoice', version: VERSION }, instructions: INSTRUCTIONS };
+      if (request.method === 'initialize') result = { protocolVersion: request.params?.protocolVersion || '2025-06-18', capabilities: { tools: {}, prompts: {} }, serverInfo: { name: 'sidevoice', version: VERSION }, instructions: INSTRUCTIONS };
+      else if (request.method === 'prompts/list') result = { prompts: PROMPTS };
+      else if (request.method === 'prompts/get') {
+        if (request.params?.name !== 'voice-room') throw Object.assign(new Error('Unknown prompt'), { code: -32602 });
+        result = { description: PROMPTS[0].description, messages: [{ role: 'user', content: { type: 'text', text: promptText(request.params?.arguments) } }] };
+      }
       else if (request.method === 'tools/list') result = { tools };
       else if (request.method === 'tools/call') { const value = await invoke(request.params.name, request.params.arguments || {}, request.params._meta); result = { content: [{ type: 'text', text: JSON.stringify(value) }] }; }
       else if (request.method === 'ping') result = {};

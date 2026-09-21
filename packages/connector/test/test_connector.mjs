@@ -11,7 +11,7 @@ import { createWsServer } from './ws-server.mjs';
 import { envelope, nudge, voiceEnvelope } from '../harness-contract.mjs';
 import { sessionWorking, transcriptPath, userMessageText } from '../harness-claude.mjs';
 import { interpretRollout, rolloutPath } from '../harness-codex.mjs';
-import { install as installSkill, remove as removeSkill, status as skillStatus } from '../skill.mjs';
+import { remove as removeSkill, status as skillStatus } from '../skill.mjs';
 import './test_harness_contract.mjs';
 import './test_harness_claude.mjs';
 
@@ -186,7 +186,13 @@ test('mcp façade: identity comes from the harness, tools are exposed, instructi
   const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   try {
     ask(1, 'initialize', { protocolVersion: '2025-06-18' }); ask(2, 'tools/list', {}); ask(3, 'tools/call', { name: 'voice_connect', arguments: { title: 'Prueba' } });
-    await until(() => replies.length === 3);
+    ask(5, 'prompts/list', {}); ask(6, 'prompts/get', { name: 'voice-room', arguments: { title: 'Mi sesión' } });
+    await until(() => replies.length === 5);
+    // The join shortcut is the server's own prompt: nothing is copied into a harness for it.
+    assert.equal(replies[0].result.capabilities.prompts !== undefined, true);
+    const listed = replies.find(x => x.id === 5).result.prompts; assert.deepEqual(listed.map(p => p.name), ['voice-room']);
+    const prompt = replies.find(x => x.id === 6).result.messages[0].content.text;
+    assert.match(prompt, /voice_status/); assert.match(prompt, /voice_connect with the title "Mi sesión"/); assert.match(prompt, /voice_pair/); assert.match(prompt, /Emparejar conector/);
     assert.match(replies[0].result.instructions, /voice_say/);
     assert.match(replies[0].result.instructions, /immediate acknowledgement/);
     assert.match(replies[0].result.instructions, /meaningful progress checkpoints/);
@@ -202,8 +208,8 @@ test('mcp façade: identity comes from the harness, tools are exposed, instructi
       deliver: 'supported', inspectInbound: 'supported', working: 'supported', endOfTurn: 'supported', sessionIdentity: 'supported',
     });
     ask(4, 'tools/call', { name: 'voice_say', arguments: { text: 'hola', session_id: 's', revision: 1 } });
-    await until(() => replies.length === 4);
-    assert.equal(JSON.parse(replies[3].result.content[0].text).status, 'published');
+    await until(() => replies.length === 6);
+    assert.equal(JSON.parse(replies.find(x => x.id === 4).result.content[0].text).status, 'published');
     assert.equal(commands.find(c => c.method === 'publish').params.binding_id, 'b-9');
   } finally { child.kill(); fake.close(); }
 });
@@ -436,13 +442,13 @@ test('install: puts this version in front of the harness, re-pins an older regis
   assert.deepEqual(calls(), ['mcp get sidevoice', `mcp add --scope user sidevoice -- ${wanted}`], 'nothing registered: it registers this version');
   assert.match(first.done.join('\n'), /Registered the MCP server/);
   assert.match(first.done.join('\n'), /Copied this version to .*\(removed: 0\.0\.1\)/);
-  for (const file of ['cli.mjs', 'mcp.mjs', 'connector.mjs', 'pair.mjs', 'package.json', path.join('skill', 'voice-room', 'SKILL.md')]) {
+  for (const file of ['cli.mjs', 'mcp.mjs', 'connector.mjs', 'pair.mjs', 'package.json']) {
     assert.ok(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', version, file)), file + ' is in the copy');
   }
   assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1')), 'the older copy is gone');
   assert.match(first.done.join('\n'), /not paired with any room yet/);
   assert.match(first.next.join('\n'), /Emparejar conector/, 'and it says the conversation will ask for the code');
-  assert.ok(existsSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room', 'SKILL.md')), 'the skill is in place');
+  assert.ok(!existsSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room')), 'no skill is installed: the server carries the prompt');
   assert.ok(!existsSync(path.join(env.SIDEVOICE_DATA_DIR, 'credentials.json')), 'no pairing happened');
 
   // Registered at this version already: nothing to change, and it says so.
@@ -451,7 +457,12 @@ test('install: puts this version in front of the harness, re-pins an older regis
   const again = await install(['--harness', 'claude'], env);
   assert.deepEqual(calls(), ['mcp get sidevoice']);
   assert.match(again.done.join('\n'), /already runs this version/);
-  assert.match(again.done.join('\n'), /Skill updated/);
+  // A skill copy left by an earlier version is taken away; someone else's voice-room is not.
+  mkdirSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room'), { recursive: true });
+  writeFileSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room', 'SKILL.md'), '---\nname: voice-room\nmetadata:\n  sidevoice: installed copy\n---\nold');
+  const cleaned = await install(['--harness', 'claude'], env);
+  assert.match(cleaned.done.join('\n'), /Removed the voice-room skill copy/);
+  assert.ok(!existsSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room')));
 
   // An older pin: after an upgrade, running install again moves the harness to the new version.
   writeFileSync(registered, `sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: npx\n  Args: -y @sidevoice/uplink@0.1.0 mcp\n`);
@@ -482,22 +493,16 @@ test('install: puts this version in front of the harness, re-pins an older regis
   assert.match(codex, /does not rewrite it/);
 });
 
-test('skill: install copies the voice skill, repairs itself, clears an older hook runtime, and never touches a foreign skill', () => {
+test('skill: nothing is installed any more; a copy of ours is removed and a foreign one is never touched', () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'sv-skills-'));
   assert.equal(skillStatus(dir).state, 'absent');
-  const first = installSkill(dir);
-  assert.equal(first.action, 'installed');
-  const manifest = readFileSync(path.join(dir, 'voice-room', 'SKILL.md'), 'utf8');
-  assert.match(manifest, /^name: voice-room$/m); assert.ok(!manifest.includes('hooks:'), 'nothing is registered in the session');
-  assert.match(manifest, /voice_pair/);
-  // A copy from a version that shipped a hook runtime: reinstalling leaves only the skill.
-  writeFileSync(path.join(dir, 'voice-room', 'hook.mjs'), 'old'); writeFileSync(path.join(dir, 'voice-room', 'harness-claude.mjs'), 'old');
-  assert.equal(installSkill(dir).action, 'updated');
-  assert.equal(existsSync(path.join(dir, 'voice-room', 'hook.mjs')), false); assert.equal(existsSync(path.join(dir, 'voice-room', 'harness-claude.mjs')), false);
+  assert.equal(removeSkill(dir).action, 'nothing to remove');
+  mkdirSync(path.join(dir, 'voice-room')); writeFileSync(path.join(dir, 'voice-room', 'SKILL.md'), '---\nname: voice-room\nmetadata:\n  sidevoice: installed copy\n---\nold');
+  assert.equal(skillStatus(dir).state, 'installed');
   assert.equal(removeSkill(dir).action, 'removed'); assert.equal(skillStatus(dir).state, 'absent');
   mkdirSync(path.join(dir, 'voice-room')); writeFileSync(path.join(dir, 'voice-room', 'SKILL.md'), '---\nname: voice-room\n---\nsomeone else\'s');
   assert.equal(skillStatus(dir).state, 'foreign');
-  assert.throws(() => installSkill(dir), /not Sidevoice/); assert.throws(() => removeSkill(dir), /not Sidevoice/);
+  assert.throws(() => removeSkill(dir), /not Sidevoice/);
   assert.equal(readFileSync(path.join(dir, 'voice-room', 'SKILL.md'), 'utf8').includes('someone else'), true);
 });
 

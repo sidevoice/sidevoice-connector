@@ -16,7 +16,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pairedRoom } from './pair.mjs';
-import { install as installSkill, skillsDir } from './skill.mjs';
+import { remove as removeSkill, skillsDir, status as skillStatus } from './skill.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const VERSION = JSON.parse(readFileSync(path.join(here, 'package.json'), 'utf8')).version;
@@ -175,8 +175,8 @@ export async function install(argv = process.argv.slice(2), env = process.env) {
   if (copy.action === 'copied') done.push(`Copied this version to ${copy.target}${copy.removed.length ? ` (removed: ${copy.removed.join(', ')})` : ''}.`);
   if (harnesses.includes('claude')) {
     registerWithClaude(done, env);
-    const outcome = installSkill(skillsDir([], env));
-    done.push(`Skill ${outcome.action} at ${outcome.target}.`);
+    // The join shortcut is a prompt the server offers; a skill copy from an earlier version is taken away.
+    if (skillStatus(skillsDir([], env)).state === 'installed') done.push(`Removed the voice-room skill copy at ${removeSkill(skillsDir([], env)).target}: the server offers it as the prompt /mcp__sidevoice__voice-room.`);
   }
 
   const paired = pairedRoom(env);
@@ -189,9 +189,9 @@ export async function install(argv = process.argv.slice(2), env = process.env) {
   }
 
   if (harnesses.includes('claude')) {
-    next.push('In a conversation, run /voice-room to join the room.' +
+    next.push('In a conversation, ask to join the voice room (or run /mcp__sidevoice__voice-room).' +
               (paired ? '' : ' The first time, the conversation asks you for the room\'s address and the one-time code the room shows under "Emparejar conector".'));
-    next.push('Sessions already open need a restart before they can see the skill.');
+    next.push('Sessions already open need a restart before they see the server.');
     const warning = inboundWarning(env);
     if (warning) next.push(warning);
   }
