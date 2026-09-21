@@ -5,7 +5,7 @@
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdirSync, openSync, closeSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
+import { appendFileSync, mkdirSync, openSync, closeSync, statSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { capabilityState, SUPPORTED, voiceEnvelope } from './harness-contract.mjs';
@@ -23,6 +23,21 @@ const outboxPath = path.join(dataDir, 'outbox.json');
 const credentialsPath = process.env.SIDEVOICE_CREDENTIALS || path.join(dataDir, 'credentials.json');
 const idleMs = Number(process.env.SIDEVOICE_CONNECTOR_IDLE_MS || 15_000);
 const hostId = process.env.SIDEVOICE_HOST_ID || os.hostname();
+const logPath = process.env.SIDEVOICE_CONNECTOR_LOG || path.join(dataDir, 'connector.log');
+const LOG_MAX = 1 << 20;
+
+/** One line per event, to stderr and to `connector.log` in the data dir: the façade starts this process
+ *  with its output discarded, so the file is the only record of a connector nobody ran by hand. Rolls
+ *  over once, at 1 MB. */
+function log(line) {
+  const stamped = `${new Date().toISOString()} [sidevoice] ${line}`;
+  console.error(stamped);
+  try {
+    let size = 0; try { size = statSync(logPath).size; } catch {}
+    if (size > LOG_MAX) renameSync(logPath, logPath + '.1');
+    appendFileSync(logPath, stamped + '\n', { mode: 0o600 });
+  } catch {}
+}
 
 function credentials() {
   let saved = {};
@@ -55,10 +70,10 @@ function acquireLock() {
       if (error.code !== 'EEXIST') throw error;
       let pid = 0; try { pid = Number(readFileSync(lockPath, 'utf8')); } catch {}
       if (pid && connectorAlive(pid)) {              // A live connector holds it: we are redundant, and we say so.
-        console.error(`[sidevoice] a connector is already running (pid ${pid}, lock ${lockPath}); this one exits`);
+        log(`a connector is already running (pid ${pid}, lock ${lockPath}); this one exits`);
         return false;
       }
-      console.error(`[sidevoice] stale lock ${lockPath} (pid ${pid || '?'} is not a connector); taking over`);
+      log(`stale lock ${lockPath} (pid ${pid || '?'} is not a connector); taking over`);
       try { unlinkSync(lockPath); } catch {}
     }
   }
@@ -129,7 +144,7 @@ function watch(binding) {
       if (!readReported.has(header.message_id)) {
         readReported.add(header.message_id); if (readReported.size > 512) readReported.delete(readReported.values().next().value);
         send({ type: 'input.read', binding_id: binding.binding_id, message_id: header.message_id, session_id: header.session_id, revision: header.revision, turn_id: turn_id || null });
-        console.error(`[sidevoice] ${binding.thread} read ${header.message_id}`);
+        log(`${binding.thread} read ${header.message_id} (session ${header.session_id} rev ${header.revision}, turn ${turn_id || '?'})`);
       }
       if (header.channel !== 'voice') return;
       binding.turn = { turn_id: turn_id || null, session_id: header.session_id, revision: header.revision };
@@ -158,7 +173,7 @@ function open() {
     send({ type: 'connector.hello', protocol: PROTOCOL, connector_id: creds.connector_id, token: creds.token, host: hostId });
   });
   socket.addEventListener('message', event => { receive(JSON.parse(String(event.data))).catch(error => send({ type: 'connector.error', error: error.message })); });
-  const lost = why => { if (ws === socket) { ws = null; connected = false; } if (why) { socketError = { ...why, at: new Date().toISOString(), attempt: reconnectAttempt }; console.error('[sidevoice] room unreachable: ' + JSON.stringify(why)); } reconnect(); };
+  const lost = why => { if (ws === socket) { ws = null; connected = false; } if (why) { socketError = { ...why, at: new Date().toISOString(), attempt: reconnectAttempt }; log('room unreachable: ' + JSON.stringify(why)); } reconnect(); };
   // A refused connection surfaces as 'error' with no 'close', and the dead socket stays
   // CONNECTING forever: forget it, or open() would never make another one. Whatever the runtime
   // says about it is kept: "not reachable" alone told a person nothing (2026-09-21).
@@ -168,6 +183,7 @@ function open() {
 function reconnect() {
   if (closed || reconnectTimer) return;
   const delay = Math.min(10_000, 250 * 2 ** Math.min(reconnectAttempt++, 6));
+  if (reconnectAttempt <= 3 || reconnectAttempt % 10 === 0) log(`room not connected; retrying in ${delay} ms (attempt ${reconnectAttempt})`);
   reconnectTimer = setTimeout(() => { reconnectTimer = null; open(); }, delay);
 }
 
@@ -175,6 +191,7 @@ async function receive(frame) {
   switch (frame.type) {
     case 'connector.welcome':
       connected = true; reconnectAttempt = 0; lastError = null; socketError = null;
+      log(`connected to ${creds.room} as ${creds.connector_id} (protocol ${frame.protocol ?? PROTOCOL}); ${bindings.size} binding(s) to re-register, ${outbox.length} queued speech`);
       for (const binding of bindings.values()) {
         // `local-*` is only a connector-side placeholder while the first
         // registration waits for the room to mint its durable binding id.
@@ -192,10 +209,12 @@ async function receive(frame) {
       const binding = [...bindings.values()].find(b => b.client_ref === frame.client_ref);
       if (binding && binding.binding_id !== frame.binding_id) { bindings.delete(binding.binding_id); binding.binding_id = frame.binding_id; bindings.set(frame.binding_id, binding); }
       if (binding && typeof binding.working === 'boolean') announceWork(binding, binding.working);
+      if (binding) log(`room registered ${binding.thread} as ${frame.binding_id} ("${binding.title || ''}")`);
       registering.get(frame.client_ref)?.resolve(frame); return;
     }
-    case 'binding.rejected': registering.get(frame.client_ref)?.reject(new Error(frame.error || 'Binding rejected')); return;
+    case 'binding.rejected': log(`room rejected ${frame.client_ref}: ${frame.error || 'no reason'}`); registering.get(frame.client_ref)?.reject(new Error(frame.error || 'Binding rejected')); return;
     case 'speech.published': {
+      log(`speech ${frame.utterance_id || frame.event_id} ${frame.status || 'published'}${frame.reason ? ' (' + frame.reason + ')' : ''}`);
       outbox = outbox.filter(speech => speech.event_id !== frame.event_id); saveOutbox();
       publishing.get(frame.event_id)?.resolve(frame); return;
     }
@@ -214,11 +233,11 @@ async function receive(frame) {
         try {
           const harness = harnessFor(binding.harness);
           const outcome = await harness.deliver(binding.delivery, frame);
-          console.error(`[sidevoice] delivered ${frame.event_id} to ${binding.thread} via ${binding.delivery.kind}: ${outcome.status} (${outcome.detail})`);
+          log(`delivered ${frame.event_id} (${frame.message_id}) to ${binding.thread} via ${binding.delivery.kind}: ${outcome.status} (${outcome.detail})`);
           send({ type: 'input.ack', event_id: frame.event_id, status: outcome.status, detail: outcome.detail });
         } catch (error) {
           binding.pending?.delete(frame.message_id);
-          console.error(`[sidevoice] delivery of ${frame.event_id} failed: ${error.message}`);
+          log(`delivery of ${frame.event_id} to ${binding.thread} failed: ${error.message}`);
           send({ type: 'input.ack', event_id: frame.event_id, status: 'failed', error: String(error.message || error).slice(0, 400) });
         }
       });
@@ -230,10 +249,10 @@ async function receive(frame) {
       if (!binding) return;
       bindings.delete(binding.binding_id); binding.owner?.bindings.delete(binding); unwatch(binding);
       closedByRoom.set(binding.client_ref, frame.reason || 'closed_from_room');
-      console.error(`[sidevoice] room closed voice for ${binding.thread}`);
+      log(`room closed voice for ${binding.thread} (${frame.reason || 'closed_from_room'})`);
       scheduleExit(); return;
     }
-    case 'connector.error': lastError = frame.error; console.error('[sidevoice] room: ' + frame.error); return;
+    case 'connector.error': lastError = frame.error; log('room says: ' + frame.error); return;
   }
 }
 
@@ -244,9 +263,10 @@ function snapshot() {
 }
 function scheduleExit() {
   if (idleTimer) clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => { if (clients.size === 0 && bindings.size === 0) shutdown(); }, idleMs);
+  idleTimer = setTimeout(() => { if (clients.size === 0 && bindings.size === 0) { log(`idle for ${idleMs} ms with no conversation; exiting`); shutdown(); } }, idleMs);
 }
 function shutdown() {
+  if (!closed) log(`shutting down (${bindings.size} binding(s), ${clients.size} façade(s))`);
   closed = true; clearTimeout(reconnectTimer); clearTimeout(idleTimer);
   try { ws?.close(); } catch {}
   server.close();
@@ -268,6 +288,7 @@ async function command(client, input) {
         return { binding_id: existing.binding_id, thread, connected };
       }
       const local_id = 'local-' + randomUUID();
+      log(`${harness} ${thread} joins ("${title || ''}", delivery ${delivery.kind}, inbound ${inbound ? (inbound.ok ? 'ok' : 'held') : 'n/a'})`);
       const binding = { binding_id: local_id, client_ref, harness, thread, title, delivery, inbound, capabilities, owner: client };
       bindings.set(local_id, binding); client.bindings.add(binding); clearTimeout(idleTimer); open(); watch(binding);
       const frame = await new Promise((resolve, reject) => {
@@ -294,7 +315,7 @@ async function command(client, input) {
     }
     case 'unregister': {
       const binding = bindings.get(params.binding_id);
-      if (binding) { bindings.delete(binding.binding_id); binding.owner?.bindings.delete(binding); unwatch(binding); if (!binding.binding_id.startsWith('local-')) send({ type: 'binding.unregister', binding_id: binding.binding_id }); }
+      if (binding) { log(`${binding.thread} leaves`); bindings.delete(binding.binding_id); binding.owner?.bindings.delete(binding); unwatch(binding); if (!binding.binding_id.startsWith('local-')) send({ type: 'binding.unregister', binding_id: binding.binding_id }); }
       scheduleExit(); return snapshot();
     }
     case 'status': return snapshot();
@@ -305,6 +326,7 @@ async function command(client, input) {
 function serve(socket) {
   const client = { socket, bindings: new Set() };
   clients.add(client); clearTimeout(idleTimer);
+  log(`façade attached (${clients.size} now)`);
   let buffer = '';
   socket.on('data', chunk => {
     buffer += chunk;
@@ -321,6 +343,7 @@ function serve(socket) {
   socket.on('error', () => {});
   socket.on('close', () => {
     clients.delete(client);
+    log(`façade detached (${clients.size} left); dropping ${client.bindings.size} binding(s)`);
     // The façade is gone: so is every conversation it spoke for.
     for (const binding of client.bindings) { bindings.delete(binding.binding_id); unwatch(binding); if (!binding.binding_id.startsWith('local-')) send({ type: 'binding.unregister', binding_id: binding.binding_id }); }
     scheduleExit();
@@ -329,7 +352,9 @@ function serve(socket) {
 
 creds = credentials();
 if (!acquireLock()) process.exit(0);
+log(`connector ${VERSION} starting: pid ${process.pid}, host ${hostId}, room ${creds.room}, socket ${socketPath}, log ${logPath}`);
 loadOutbox();
+if (outbox.length) log(`${outbox.length} speech frame(s) waiting in the outbox`);
 try { unlinkSync(socketPath); } catch {}
 const server = net.createServer(serve);
 await new Promise((resolve, reject) => server.once('error', reject).listen(socketPath, resolve));
