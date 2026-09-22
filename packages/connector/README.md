@@ -12,11 +12,11 @@ The client side. One bin (`sidevoice`), these entry points:
   room: it keeps one local connection to the connector for as long as the
   session lives, and the binding it registered dies with that connection.
 - `connector` — one per machine, started by the first façade that needs it and
-  gone fifteen seconds after the last binding leaves. Holds the outbound
-  WebSocket to the room, re-announces its bindings after a reconnect, keeps a
-  durable outbox for speech published while offline, answers the room's
-  heartbeat, and delivers one input event at a time per binding through the
-  adapter that binding was registered with. A file lock makes it a singleton.
+  gone fifteen seconds after the last binding leaves. Holds the outbound link to
+  the room, re-announces its bindings on every reconnect, keeps a durable outbox
+  for speech published while offline, and delivers one input event at a time per
+  binding through the adapter that binding was registered with. A file lock
+  makes it a singleton.
 - `pair` — redeems, by hand, a pairing code from the room UI for this machine's
   credential (`~/.sidevoice/credentials.json`, mode 0600). The usual path is the
   conversation's `voice_pair`, with the code the user read from the room; nothing
@@ -29,11 +29,23 @@ or malformed declaration becomes `unknown`, never false. Claude Code, Codex and
 generic HTTP each have one module. See the repository's
 [`docs/HARNESS_CONTRACT.md`](../../docs/HARNESS_CONTRACT.md).
 
-Protocol (newline-free JSON over the WebSocket): `connector.hello` ->
-`connector.welcome`; `binding.register` (including declared harness capabilities)
--> `binding.registered|rejected`;
-`binding.unregister`; `input.deliver` -> `input.ack`; `input.working`;
-`speech.publish` ->
-`speech.published`; `heartbeat` <-> `heartbeat.ack`. Protocol version 1.
+The link is Socket.IO (`link.mjs`), to `/api/connectors/socket.io` in the
+namespace `/connectors`, WebSocket transport only. Who this connector is travels
+in the connect handshake — `connector_id`, `token`, `protocol`, host and version
+— so a credential the room does not know never reaches an event; the room
+refuses it with a message that says to pair again, and a refused credential is
+not retried. Acknowledgements, keepalive and reconnection with backoff are the
+library's. The durable outbox is not: a buffer dies with the process, and speech
+a conversation was told was queued must not.
 
-Node 22+, no dependencies. Tests: `node --test test/test_connector.mjs`.
+Events: `connector.welcome` after connecting; `binding.register` (carrying the
+declared harness capabilities), answered with the binding or `{ error }`;
+`binding.unregister`; `input.deliver`, answered with the acknowledgement;
+`input.working`; `input.read`; `speech.publish`, answered with what the room did
+with it; `binding.close`. Protocol version 2.
+
+Node 22+. The published package has **no runtime dependencies**: `npm run build`
+bundles `socket.io-client` and everything else into `dist/cli.mjs` with esbuild,
+so installing it copies files and fetches nothing. Tests run on the source:
+`node --test test/test_connector.mjs`; the room's `test_connector_interop.py`
+runs this connector for real, from the checkout and from the bundle.
