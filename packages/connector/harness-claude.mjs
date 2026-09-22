@@ -178,6 +178,10 @@ export function transcriptPath(sessionId) {
 /** The text of a transcript entry that is a user message, or null for anything else (tool results,
  *  attachments, the session's own bookkeeping). */
 export function userMessageText(entry) {
+  // A message that arrives while the session is busy is not a `user` entry yet: Claude Code records it as a
+  // queued command attachment and feeds it to the running turn. Its prompt is the message, whole.
+  if (entry?.type === 'attachment' && entry.attachment?.type === 'queued_command')
+    return typeof entry.attachment.prompt === 'string' ? entry.attachment.prompt : null;
   if (entry?.type !== 'user' || entry.message?.role !== 'user') return null;
   const content = entry.message.content;
   if (typeof content === 'string') return content;

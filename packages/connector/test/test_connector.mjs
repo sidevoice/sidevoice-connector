@@ -542,6 +542,9 @@ test('harness modules: the files each harness writes are found by name, and a ro
   assert.equal(userMessageText({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'x' }] } }), null, 'a tool result is not the user');
   assert.equal(userMessageText({ type: 'assistant', message: { role: 'assistant', content: 'x' } }), null);
   assert.equal(userMessageText({ type: 'queue-operation', operation: 'enqueue', content: '{"channel":"voice"}' }), null, 'queued is not admitted');
+  assert.equal(userMessageText({ type: 'attachment', attachment: { type: 'queued_command', prompt: '{"channel":"voice"}\n\nmid-turn', commandMode: 'prompt' } }), '{"channel":"voice"}\n\nmid-turn',
+    'a message fed to a running turn is recorded as a queued-command attachment, and it is the user');
+  assert.equal(userMessageText({ type: 'attachment', attachment: { type: 'file', content: 'x' } }), null, 'other attachments are not the user');
   const state = {};
   assert.deepEqual(interpretRollout({ type: 'event_msg', payload: { type: 'task_started', turn_id: 't1' } }, state), { working: true, turn_id: 't1' });
   assert.deepEqual(interpretRollout({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] } }, state), { text: 'hi', turn_id: 't1' });
