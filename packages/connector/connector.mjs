@@ -302,7 +302,7 @@ async function asked(route, frame) {
     case 'connector.revoked':
       // The person took this machine's pairing away from the room's page. The socket is about to
       // go and will not be welcomed back; the conversations learn it from their next call.
-      refuse(frame.reason || 'La sala revocó el emparejamiento de esta máquina.');
+      refuse(frame.reason || 'The room revoked this machine\'s pairing.');
       return;
     case 'connector.error': lastError = frame.error; log('room says: ' + frame.error); return;
   }
