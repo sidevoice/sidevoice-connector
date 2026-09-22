@@ -161,7 +161,7 @@ async function invoke(name, args, meta) {
     // what the room posts would sit in the list looking present while the user talks to nobody.
     const inbound = inboundFor(who.module, who.thread);
     if (inbound?.ok === false) {
-      const error = new Error(`No se conecta esta conversación: ${inbound.reason} ${inbound.remedy}`);
+      const error = new Error(`This conversation cannot connect: ${inbound.reason} ${inbound.remedy}`);
       error.data = { inbound };
       throw error;
     }
