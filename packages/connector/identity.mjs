@@ -20,11 +20,16 @@ export function harnessesPresent(env = process.env) {
   return found;
 }
 
+/** What Node calls this platform, said the way the person reading the room's list calls it. Anything
+ *  not named here travels as Node names it: a machine we cannot put a word to is not a machine to
+ *  invent one for. */
+const PLATFORMS = { darwin: 'macOS', win32: 'Windows', linux: 'Linux' };
+
 /** This machine, as the room will list it. */
 export function machineIdentity(env = process.env) {
   return {
     host: env.SIDEVOICE_HOST_ID || os.hostname(),
-    platform: `${os.platform()} ${os.arch()}`,
+    platform: `${PLATFORMS[os.platform()] || os.platform()} ${os.arch()}`,
     version: VERSION,
     harnesses: harnessesPresent(env),
   };

@@ -203,8 +203,9 @@ export async function install(argv = process.argv.slice(2), env = process.env) {
 
 /** `sidevoice uninstall`: the reverse of install, for this machine. Unregisters the MCP server from Claude
  *  Code, stops the connector, removes the installed copies, the skill copy an older version left, and the
- *  pairing credential. The room keeps this machine's pairing until it is revoked from the room's page —
- *  say so. Codex's machine-wide file is, as always, printed and not touched. */
+ *  pairing credential. The room keeps this machine's pairing until it is revoked under "Máquinas" on
+ *  the room's page — say so, and say where. Codex's machine-wide file is, as always, printed and not
+ *  touched. */
 export async function uninstall(argv = process.argv.slice(2), env = process.env) {
   const wanted = flag(argv, '--harness');
   const harnesses = wanted ? [wanted] : harnessesPresent(env);
@@ -230,7 +231,7 @@ export async function uninstall(argv = process.argv.slice(2), env = process.env)
   if (existsSync(dataDir)) {
     rmSync(dataDir, { recursive: true, force: true });
     done.push(`Removed ${dataDir} (credential, socket, outbox, log).`);
-    if (paired) next.push(`The room at ${paired.origin} still lists this machine as paired (connector ${paired.connector_id}) until you revoke it from the room's page.`);
+    if (paired) next.push(`The room at ${paired.origin} still lists this machine as paired (connector ${paired.connector_id}) until you revoke it under "Máquinas" on the room's page.`);
   }
   if (harnesses.includes('codex')) next.push(`Remove the [mcp_servers.sidevoice] table from ${env.CODEX_HOME || path.join(os.homedir(), '.codex')}/config.toml — it is machine-wide and this package does not rewrite it.`);
   next.push('Sessions already open keep their MCP server until they end.');

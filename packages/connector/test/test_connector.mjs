@@ -81,7 +81,7 @@ test('connector: the handshake authenticates, registrations and speech are answe
     assert.equal(room.auth.protocol, PROTOCOL);
     // And so does what this machine is, so the room's list reads as a machine and not as a UUID.
     assert.equal(room.auth.host, os.hostname());
-    assert.equal(room.auth.platform, `${os.platform()} ${os.arch()}`);
+    assert.match(room.auth.platform, new RegExp(`^(macOS|Windows|Linux|${os.platform()}) ${os.arch()}$`), room.auth.platform);
     assert.equal(room.auth.version, JSON.parse(readFileSync(path.join(here, '..', 'package.json'), 'utf8')).version);
     assert.ok(Array.isArray(room.auth.harnesses), JSON.stringify(room.auth.harnesses));
     // Two deliveries: the second must wait for the first to be acknowledged by the harness.
@@ -513,7 +513,7 @@ test('pairing: plaintext only where the token cannot leave the machine or the cl
     assert.equal(asked[0].url, '/api/connectors/pair');
     assert.equal(asked[0].body.code, 'ABCD1234');
     assert.equal(asked[0].body.host, os.hostname());
-    assert.equal(asked[0].body.platform, `${os.platform()} ${os.arch()}`);
+    assert.match(asked[0].body.platform, new RegExp(`^(macOS|Windows|Linux|${os.platform()}) ${os.arch()}$`));
     assert.equal(asked[0].body.version, JSON.parse(readFileSync(path.join(here, '..', 'package.json'), 'utf8')).version);
     assert.ok(Array.isArray(asked[0].body.harnesses));
   } finally { rooms.close(); }
@@ -636,7 +636,7 @@ test('install: puts this version in front of the harness, re-pins an older regis
   assert.deepEqual(calls(), ['mcp get sidevoice', 'mcp remove --scope user sidevoice']);
   assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice')), 'installed copies are gone');
   assert.ok(!existsSync(env.SIDEVOICE_DATA_DIR), 'credential, socket and log are gone');
-  assert.match(gone.next.join('\n'), /still lists this machine as paired .* revoke it from the room/);
+  assert.match(gone.next.join('\n'), /still lists this machine as paired .* revoke it under "Máquinas" on the room/);
   assert.match(gone.done.join('\n'), /Unregistered the MCP server/);
 
   // Codex is instructions, not edits: its configuration is machine-wide and not ours to rewrite.
