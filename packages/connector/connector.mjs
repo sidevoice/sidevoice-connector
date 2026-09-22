@@ -14,11 +14,9 @@ import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { capabilityState, SUPPORTED, voiceEnvelope } from './harness-contract.mjs';
 import { harnessFor } from './harnesses.mjs';
+import { machineIdentity, VERSION } from './identity.mjs';
 import { privateNetwork, roomOrigin } from './pair.mjs';
 import { roomLink, UNREACHABLE } from './link.mjs';
-import { fileURLToPath } from 'node:url';
-
-const VERSION = JSON.parse(readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf8')).version;
 
 export const PROTOCOL = 2;
 const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
@@ -27,7 +25,9 @@ const lockPath = socketPath + '.lock';
 const outboxPath = path.join(dataDir, 'outbox.json');
 const credentialsPath = process.env.SIDEVOICE_CREDENTIALS || path.join(dataDir, 'credentials.json');
 const idleMs = Number(process.env.SIDEVOICE_CONNECTOR_IDLE_MS || 15_000);
-const hostId = process.env.SIDEVOICE_HOST_ID || os.hostname();
+// Who this machine is, said at every connection: the room keeps the latest and lists it.
+const identity = machineIdentity();
+const hostId = identity.host;
 const logPath = process.env.SIDEVOICE_CONNECTOR_LOG || path.join(dataDir, 'connector.log');
 const LOG_MAX = 1 << 20;
 
@@ -94,6 +94,7 @@ let outbox = [];                   // speech not yet confirmed by the room
 let link = null;                   // the one link to the room; it comes back on its own when it drops
 let connected = false, closed = false, idleTimer = null, lastError = null;
 let socketError = null;            // why the last attempt to reach the room failed, for whoever asks status
+let refusal = null;                // the room will not have this connector, and no retry will change that
 let waking = [];                   // whoever is waiting for the room to welcome this connector again
 let creds;
 
@@ -179,13 +180,29 @@ function watch(binding) {
 }
 function unwatch(binding) { try { binding.stop?.(); } catch {} binding.stop = null; }
 
+/** The room will not have this connector, in its own words, and nothing this process does will
+ *  change that: the pairing was taken away from the room's page. Every conversation it served is
+ *  let go the way the room closing a channel lets one go — the next `voice_say` fails saying so —
+ *  and the reason waits where status is read, instead of being a silence and a retry for ever. */
+function refuse(reason) {
+  if (refusal === reason) return;
+  refusal = lastError = reason;
+  log(`the room refused this connector and will not be asked again: ${reason} Pair this machine again with the code the room shows under "Emparejar conector".`);
+  for (const binding of [...bindings.values()]) {
+    bindings.delete(binding.binding_id); binding.owner?.bindings.delete(binding); unwatch(binding);
+    closedByRoom.set(binding.client_ref, 'connector_revoked');
+  }
+  for (const wake of waking.splice(0)) wake();   // nobody waits for a welcome that will not come
+  scheduleExit();
+}
+
 /** Open the one link to this machine's room. Idempotent: it is called whenever a conversation
  *  joins, and a link that exists already — connected, or on its way back — is the answer. */
 function open() {
   if (closed || link) return;
   link = roomLink({
     origin: creds.room, connector_id: creds.connector_id, token: creds.token,
-    host: hostId, version: VERSION, protocol: PROTOCOL,
+    protocol: PROTOCOL, identity,
     onConnected: welcome => {
       connected = true; lastError = null; socketError = null;
       log(`connected to ${creds.room} as ${creds.connector_id} (protocol ${welcome.protocol ?? PROTOCOL}); ${bindings.size} binding(s) to re-register, ${outbox.length} queued speech`);
@@ -199,9 +216,12 @@ function open() {
     onLost: reason => {
       connected = false;
       socketError = { ...reason, at: new Date().toISOString() };
-      // A credential the room will not have is not a connection that will come back, and the
-      // library stops trying: say it once, plainly, where whoever asks for status will find it.
-      if (reason.retrying === false && !closed) log(`the room refused this connector and will not be asked again: ${reason.error || reason.close_reason}. Pair this machine again with the code the room shows under "Emparejar conector".`);
+      // A refusal carries the room's own words; a socket the room merely closed does not. Only the
+      // first is this credential's problem — the second is what a connector that lost its place to a
+      // newer one of its own sees, and dropping that one's conversations would take a voice nobody
+      // took away.
+      if (reason.retrying === false && !closed && reason.error) refuse(reason.error);
+      else if (reason.retrying === false && !closed) log(`the room closed this connection and will not be asked again: ${reason.close_reason}`);
       else if (reason.attempt <= 3 || reason.attempt % 10 === 0) log('room unreachable: ' + JSON.stringify(reason));
     },
   });
@@ -220,12 +240,15 @@ function enrol(binding) {
 /** The room's answer for one binding, however long it takes to be able to ask: a conversation that
  *  joins while the room is down is registered by the next welcome, and that is this call's answer too. */
 async function joinRoom(binding, timeout = 10_000) {
+  if (refusal) throw new Error(refusal);
   if (connected) return enrol(binding);
   const welcomed = await new Promise(resolve => {
     const timer = setTimeout(() => { waking = waking.filter(wake => wake !== wakeup); resolve(false); }, timeout);
     const wakeup = () => { clearTimeout(timer); resolve(true); };
     waking.push(wakeup);
   });
+  // A room that is not there yet is worth waiting for; one that will not have this machine is not.
+  if (refusal) throw new Error(refusal);
   if (!welcomed) throw new Error(UNREACHABLE);
   return binding.registration ?? enrol(binding);
 }
@@ -276,6 +299,11 @@ async function asked(route, frame) {
       log(`room closed voice for ${binding.thread} (${frame.reason || 'closed_from_room'})`);
       scheduleExit(); return;
     }
+    case 'connector.revoked':
+      // The person took this machine's pairing away from the room's page. The socket is about to
+      // go and will not be welcomed back; the conversations learn it from their next call.
+      refuse(frame.reason || 'The room revoked this machine\'s pairing.');
+      return;
     case 'connector.error': lastError = frame.error; log('room says: ' + frame.error); return;
   }
 }
@@ -303,7 +331,10 @@ async function handOver(binding, frame) {
 
 function snapshot() {
   return { host: hostId, version: VERSION, room: creds.room, connected, protocol: PROTOCOL,
-    outbox: outbox.length, room_error: lastError, socket_error: socketError, closed_by_room: [...closedByRoom.keys()],
+    outbox: outbox.length, room_error: lastError, socket_error: socketError, refused: refusal,
+    // Which conversations lost their voice from the room, and why each one did: the same map read
+    // twice, because "it is gone" and "this is what happened" are two different questions.
+    closed_by_room: [...closedByRoom.keys()], closed_reasons: Object.fromEntries(closedByRoom),
     bindings: [...bindings.values()].map(({ binding_id, client_ref, harness, thread, title, delivery, capabilities }) =>
       ({ binding_id, client_ref, harness, thread, title, delivery: delivery.kind, capabilities })) };
 }
@@ -338,12 +369,14 @@ async function command(client, input) {
       const binding = { binding_id: local_id, client_ref, harness, thread, title, delivery, inbound, capabilities, engine, owner: client };
       bindings.set(local_id, binding); client.bindings.add(binding); clearTimeout(idleTimer); open(); watch(binding);
       // A room that is not there yet is not a failure: the binding is registered on the next welcome.
-      const reply = await joinRoom(binding).catch(error => { if (!connected) return null; bindings.delete(binding.binding_id); client.bindings.delete(binding); unwatch(binding); throw error; });
+      const reply = await joinRoom(binding).catch(error => { if (!connected && !refusal) return null; bindings.delete(binding.binding_id); client.bindings.delete(binding); unwatch(binding); throw error; });
       return { binding_id: reply?.binding_id || binding.binding_id, thread, connected, pending: !reply };
     }
     case 'publish': {
       const binding = bindings.get(params.binding_id) || [...bindings.values()].find(b => b.client_ref === params.client_ref);
-      if (!binding) throw new Error(closedByRoom.has(params.client_ref) ? 'CLOSED_BY_ROOM' : 'Unknown binding');
+      // Why it is gone travels with the refusal: a pairing revoked and a channel closed are not the
+      // same news for the conversation, and only it can say the right one to the person.
+      if (!binding) throw new Error(closedByRoom.has(params.client_ref) ? 'CLOSED_BY_ROOM:' + closedByRoom.get(params.client_ref) : 'Unknown binding');
       const speech = { event_id: params.event_id || randomUUID(), binding_id: binding.binding_id,
         session_id: params.session_id, revision: params.revision, utterance_id: params.utterance_id || randomUUID(), text: params.text, language: params.language };
       outbox.push(speech); saveOutbox();

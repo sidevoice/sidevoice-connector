@@ -37,11 +37,13 @@ class RoomLink {
   }
 
   open() {
-    const { origin, connector_id, token, protocol, host, version } = this.options;
+    const { origin, connector_id, token, protocol, identity } = this.options;
     const socket = this.socket = io(linkUrl(origin), {
       path: PATH,
       transports: ['websocket'],   // no long-polling through a proxy, and no sticky-session question
-      auth: { connector_id, token, protocol, host, version },
+      // The credential, the protocol, and whatever this machine says it is: the room keeps the
+      // latest of that description, so it travels on every connection and not only at pairing.
+      auth: { connector_id, token, protocol, ...identity },
       // The backoff this connector has always used, said in the library's words rather than
       // written again: a room that restarts is back in about a second, and a room that is away
       // is not hammered. The library's default first delay is 1 s, which measured four times
