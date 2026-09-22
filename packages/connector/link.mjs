@@ -18,7 +18,7 @@ import { io } from 'socket.io-client';
 /** The room's address for this link. Not the default `/socket.io`: this path is what a proxy in
  *  front of the room exempts from its login, by name, and the namespace leaves the browser's own
  *  link room on the same server later. The credential stores the room's origin; the rest is ours. */
-export const PATH = '/api/connectors/socket.io';
+export const PATH = '/api/connectors/link';   // the capability, not the transport behind it
 export const NAMESPACE = '/connectors';
 export const UNREACHABLE = 'The room is unreachable; retrying in the background';
 

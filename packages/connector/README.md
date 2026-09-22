@@ -29,7 +29,7 @@ or malformed declaration becomes `unknown`, never false. Claude Code, Codex and
 generic HTTP each have one module. See the repository's
 [`docs/HARNESS_CONTRACT.md`](../../docs/HARNESS_CONTRACT.md).
 
-The link is Socket.IO (`link.mjs`), to `/api/connectors/socket.io` in the
+The link is Socket.IO (`link.mjs`), to `/api/connectors/link` in the
 namespace `/connectors`, WebSocket transport only. Who this connector is travels
 in the connect handshake — `connector_id`, `token`, `protocol`, host and version
 — so a credential the room does not know never reaches an event; the room
