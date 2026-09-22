@@ -16,7 +16,9 @@ const VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.ur
 
 const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
 const socketPath = process.env.SIDEVOICE_CONNECTOR_SOCKET || path.join(dataDir, 'connector.sock');
-const connectorPath = fileURLToPath(new URL('./connector.mjs', import.meta.url));
+// The connector is started through the same entry this façade came in by — `cli.mjs connector` —
+// because published there is one bundled file and no `connector.mjs` beside it to point at.
+const cliPath = fileURLToPath(new URL('./cli.mjs', import.meta.url));
 
 // Claude Code keeps at most 2048 characters of these; the rest is cut (measured 2026-09-21).
 const INSTRUCTIONS = `Sidevoice connects this conversation to the user's voice room.
@@ -57,7 +59,7 @@ function connectIpc() {
 async function ensureConnector() {
   if (ipc) return ipc;
   try { return await connectIpc(); } catch {}
-  const child = spawn(process.execPath, [connectorPath], { detached: true, stdio: 'ignore', env: process.env });
+  const child = spawn(process.execPath, [cliPath, 'connector'], { detached: true, stdio: 'ignore', env: process.env });
   child.unref();
   for (let attempt = 0; attempt < 40; attempt++) {
     await new Promise(r => setTimeout(r, 100));
@@ -130,6 +132,7 @@ async function invoke(name, args, meta) {
     const module = binding ? harnessFor(binding.harness) : null;
     const inbound = binding ? inboundFor(module, binding.client_ref) : null;
     return { joined: !!binding, room: status.room || pairedRoom()?.origin || null, room_reachable: status.connected, room_error: status.room_error || null, socket_error: status.socket_error || null,
+             protocol: status.protocol ?? null,
              version: VERSION, connector_version: status.version || null, ...versionNote(status.version),
              binding_id: binding?.binding_id || null, harness: binding?.harness || null,
              capabilities: binding?.capabilities || null, inbound,

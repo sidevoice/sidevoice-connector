@@ -54,8 +54,11 @@ jobs:
         with:
           node-version: 22
       - run: npm ci
+      # The published client is one bundled file, so it is built before anything checks or packs
+      # it: `npm pack` would build it again through `prepack`, and a suite that ran first would be
+      # testing a `dist/` from whenever somebody last built by hand.
       - run: npm run build
-      - run: node --check packages/connector/cli.mjs packages/connector/mcp.mjs packages/connector/connector.mjs packages/connector/adapters.mjs packages/connector/pair.mjs
+      - run: node --check packages/connector/cli.mjs packages/connector/mcp.mjs packages/connector/connector.mjs packages/connector/link.mjs packages/connector/harnesses.mjs packages/connector/pair.mjs packages/connector/install.mjs packages/connector/dist/cli.mjs
       - run: npm test
       - name: Package contents (dry run)
         run: npm pack --dry-run

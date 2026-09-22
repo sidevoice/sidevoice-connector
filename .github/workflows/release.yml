@@ -44,6 +44,8 @@ jobs:
       # Node 22 still bundles npm 10, and publishing over OIDC needs 11.5.1 or
       # later: without this the release authenticates with nothing and fails.
       - run: npm install -g npm@latest
+      # `prepack` builds the bundle that is published; esbuild has to be here for it to run.
+      - run: npm ci
       # Staged, not live. The version waits in npm's queue until a maintainer
       # approves it from a trusted device, because this is the one step here
       # that cannot be taken back: an npm version is spent for ever, even if it
@@ -87,6 +89,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - run: npm ci
       - name: Pack the client
         run: npm pack --pack-destination "$RUNNER_TEMP"
         working-directory: packages/connector

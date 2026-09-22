@@ -8,28 +8,25 @@
     "node": ">=22"
   },
   "bin": {
-    "sidevoice": "./cli.mjs"
+    "sidevoice": "./dist/cli.mjs"
   },
   "files": [
-    "cli.mjs",
-    "install.mjs",
-    "mcp.mjs",
-    "connector.mjs",
-    "harness-contract.mjs",
-    "harnesses.mjs",
-    "harness-claude.mjs",
-    "harness-codex.mjs",
-    "harness-http.mjs",
-    "pair.mjs",
-    "skill.mjs",
+    "dist",
     "README.md"
   ],
   "scripts": {
+    "build": "node build.mjs",
+    "prepack": "npm run build",
     "test": "node --test test/test_connector.mjs"
   },
   "repository": {
     "type": "git",
     "url": "https://github.com/rubasace/sidevoice.git",
     "directory": "packages/connector"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3"
   }
 }
