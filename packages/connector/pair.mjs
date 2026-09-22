@@ -2,7 +2,7 @@
 /** One-time pairing: redeem the code shown by the room for this host's connector credential.
  *
  *  The code is the room's to give and the person's to carry: the room shows it to whoever is in it
- *  ("Emparejar conector"), and only that person can hand it to this machine. Nothing here asks the
+ *  ("Emparejar máquina"), and only that person can hand it to this machine. Nothing here asks the
  *  room for one — a caller that could would turn "you can reach the address" into "you are in the room". */
 import os from 'node:os';
 import path from 'node:path';
@@ -65,7 +65,7 @@ export async function pair(room, code, env = process.env) {
 
 if (process.env.SIDEVOICE_PAIR_MAIN === '1') {
   const [room, code] = process.argv.slice(2);
-  if (!room || !code) { console.error('usage: sidevoice pair <room-url> <pairing-code>   (the code is shown in the room under "Emparejar conector")'); process.exit(2); }
+  if (!room || !code) { console.error('usage: sidevoice pair <room-url> <pairing-code>   (the code is shown in the room under "Emparejar máquina")'); process.exit(2); }
   try {
     const result = await pair(room, code);
     console.log(`Paired with ${result.origin} as connector ${result.connector_id}; credential saved to ${result.file}`);

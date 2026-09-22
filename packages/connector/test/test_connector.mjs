@@ -195,7 +195,7 @@ test('connector: a credential the room refuses is said out loud and is not asked
   // fix it nor tell anyone: the library stops, and what a person has to do is in the log.
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
   const room = await startRoom();
-  room.admit = () => 'Esta máquina no está emparejada con la sala: vuelve a emparejarla con el código que la sala muestra en "Emparejar conector".';
+  room.admit = () => 'Esta máquina no está emparejada con la sala: vuelve a emparejarla con el código que la sala muestra en "Emparejar máquina".';
   const { child, socketPath, stderr } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
   try {
     await until(() => existsSync(socketPath));
@@ -205,7 +205,7 @@ test('connector: a credential the room refuses is said out loud and is not asked
       return status.socket_error?.retrying === false ? status : null;
     }, 10000);
     assert.equal(refused.connected, false);
-    assert.match(refused.socket_error.error, /Emparejar conector/);
+    assert.match(refused.socket_error.error, /Emparejar máquina/);
     assert.match(stderr(), /will not be asked again/);
     assert.match(stderr(), /Pair this machine again/);
     const attempts = refused.socket_error.attempt;
@@ -262,7 +262,7 @@ test('mcp façade: identity comes from the harness, tools are exposed, instructi
     assert.equal(replies[0].result.capabilities.prompts !== undefined, true);
     const listed = replies.find(x => x.id === 5).result.prompts; assert.deepEqual(listed.map(p => p.name), ['voice-room']);
     const prompt = replies.find(x => x.id === 6).result.messages[0].content.text;
-    assert.match(prompt, /voice_status/); assert.match(prompt, /voice_connect with the title "Mi sesión"/); assert.match(prompt, /voice_pair/); assert.match(prompt, /Emparejar conector/);
+    assert.match(prompt, /voice_status/); assert.match(prompt, /voice_connect with the title "Mi sesión"/); assert.match(prompt, /voice_pair/); assert.match(prompt, /Emparejar máquina/);
     const instructions = replies[0].result.instructions;
     assert.ok(instructions.length <= 2048, `Claude Code keeps 2048 characters of instructions; these are ${instructions.length}`);
     assert.match(instructions, /voice_say/);
@@ -317,7 +317,7 @@ test('connector: a pairing revoked from the room takes the voice now, says why, 
   // The room does this while the machine is connected: it says why, drops the bindings and closes the
   // socket, and refuses the next handshake with the same words. Neither the conversations nor whoever
   // reads status should be left with "the room disconnected me".
-  const revoked = 'La sala revocó el emparejamiento de esta máquina: vuelve a emparejarla con el código que la sala muestra en "Emparejar conector".';
+  const revoked = 'La sala revocó el emparejamiento de esta máquina: vuelve a emparejarla con el código que la sala muestra en "Emparejar máquina".';
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
   room.handle = (event, data) => {
@@ -589,7 +589,7 @@ test('install: puts this version in front of the harness, re-pins an older regis
   assert.equal(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', version, 'node_modules')), false);
   assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1')), 'the older copy is gone');
   assert.match(first.done.join('\n'), /not paired with any room yet/);
-  assert.match(first.next.join('\n'), /Emparejar conector/, 'and it says the conversation will ask for the code');
+  assert.match(first.next.join('\n'), /Emparejar máquina/, 'and it says the conversation will ask for the code');
   assert.ok(!existsSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room')), 'no skill is installed: the server carries the prompt');
   assert.ok(!existsSync(path.join(env.SIDEVOICE_DATA_DIR, 'credentials.json')), 'no pairing happened');
 
@@ -625,7 +625,7 @@ test('install: puts this version in front of the harness, re-pins an older regis
   writeFileSync(path.join(env.SIDEVOICE_DATA_DIR, 'credentials.json'), JSON.stringify({ url: 'wss://room.example/api/connectors/ws', connector_id: 'c-1', token: 't-1' }));
   const paired = await install(['--harness', 'claude'], env);
   assert.match(paired.done.join('\n'), /paired with https:\/\/room\.example \(connector c-1\)/);
-  assert.ok(!paired.next.join('\n').includes('Emparejar conector'));
+  assert.ok(!paired.next.join('\n').includes('Emparejar máquina'));
 
   // Uninstall is the reverse, for this machine: unregister, remove the copies and the credential, and say
   // what the room still remembers. The claude stand-in keeps answering "registered" so the removal is asked for.

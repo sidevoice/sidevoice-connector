@@ -166,7 +166,7 @@ export async function install(argv = process.argv.slice(2), env = process.env) {
   const stray = argv.find(item => !item.startsWith('-') && argv[argv.indexOf(item) - 1] !== '--harness');
   if (stray) throw new Error(`usage: sidevoice install [--harness claude|codex]\n` +
     `Pairing is not part of installing: a conversation asks for the room's code the first time it joins, ` +
-    `or run  sidevoice pair <room-url> <code>  with the code the room shows under "Emparejar conector".`);
+    `or run  sidevoice pair <room-url> <code>  with the code the room shows under "Emparejar máquina".`);
   const wanted = flag(argv, '--harness');
   const harnesses = wanted ? [wanted] : harnessesPresent(env);
   const done = [], next = [];
@@ -191,7 +191,7 @@ export async function install(argv = process.argv.slice(2), env = process.env) {
 
   if (harnesses.includes('claude')) {
     next.push('In a conversation, ask to join the voice room (or run /mcp__sidevoice__voice-room).' +
-              (paired ? '' : ' The first time, the conversation asks you for the room\'s address and the one-time code the room shows under "Emparejar conector".'));
+              (paired ? '' : ' The first time, the conversation asks you for the room\'s address and the one-time code the room shows under "Emparejar máquina".'));
     next.push('Sessions already open need a restart before they see the server.');
     const warning = inboundWarning(env);
     if (warning) next.push(warning);

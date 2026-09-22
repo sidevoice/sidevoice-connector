@@ -187,7 +187,7 @@ function unwatch(binding) { try { binding.stop?.(); } catch {} binding.stop = nu
 function refuse(reason) {
   if (refusal === reason) return;
   refusal = lastError = reason;
-  log(`the room refused this connector and will not be asked again: ${reason} Pair this machine again with the code the room shows under "Emparejar conector".`);
+  log(`the room refused this connector and will not be asked again: ${reason} Pair this machine again with the code the room shows under "Emparejar máquina".`);
   for (const binding of [...bindings.values()]) {
     bindings.delete(binding.binding_id); binding.owner?.bindings.delete(binding); unwatch(binding);
     closedByRoom.set(binding.client_ref, 'connector_revoked');

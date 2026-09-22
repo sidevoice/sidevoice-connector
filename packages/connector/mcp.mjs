@@ -28,7 +28,7 @@ const INSTRUCTIONS = `Sidevoice connects this conversation to the user's voice r
 - Between steps, at each tool result, take in newly arrived user input before starting the next step: an addition, a refinement or a replacement, by its meaning. Drop obsolete work not yet started; keep what remains useful; say what you now understand. No artificial pauses.
 - "published" means the room stored it, not that the user heard it. If publishing fails, continue in writing.
 - If the user closes this conversation's voice from the room, voice_say fails saying so: continue in writing, do not retry, and call voice_connect again only if asked.
-- Pairing is the user's act. If voice_connect says this machine is not paired with the room, ask the user for the room's address and the one-time code the room shows under "Emparejar conector", then call voice_pair and voice_connect again. Never try to obtain a code from the room yourself.
+- Pairing is the user's act. If voice_connect says this machine is not paired with the room, ask the user for the room's address and the one-time code the room shows under "Emparejar máquina", then call voice_pair and voice_connect again. Never try to obtain a code from the room yourself.
 - If voice_connect returns inbound.ok false, voice will look sent and never arrive: tell the user inbound.reason, offer inbound.remedy in your own words including the safeguard the machine-wide option removes, and change no settings unasked.
 - Read receipts and working state need nothing from you: the room observes what the harness records.`;
 
@@ -77,7 +77,7 @@ async function rpc(method, params) {
 const tools = [
   { name: 'voice_connect', description: 'Connect this conversation to the voice room. Only on an explicit request to join or enable voice. Fails, saying what to ask the user, when this machine is not paired with the room.',
     inputSchema: { type: 'object', properties: { title: { type: 'string', description: 'Short label for this conversation in the room' }, room: { type: 'string', description: 'The room\'s address (https://…) when the user names one; omitted, the room this machine is paired with' } }, additionalProperties: false } },
-  { name: 'voice_pair', description: 'Pair this machine with a room using the one-time code the user read from the room\'s interface ("Emparejar conector"). Only with a code the user gave you; one room per machine, a new pairing replaces the previous one.',
+  { name: 'voice_pair', description: 'Pair this machine with a room using the one-time code the user read from the room\'s interface ("Emparejar máquina"). Only with a code the user gave you; one room per machine, a new pairing replaces the previous one.',
     inputSchema: { type: 'object', properties: { room: { type: 'string', description: 'The room\'s address (https://…)' }, code: { type: 'string', description: 'The one-time pairing code shown by the room' } }, required: ['room', 'code'], additionalProperties: false } },
   { name: 'voice_say', description: 'Publish a concise spoken version of your reply to the room, with the session_id and revision from the voice message header.',
     inputSchema: { type: 'object', properties: { text: { type: 'string' }, session_id: { type: 'string' }, revision: { type: 'integer', minimum: 0 }, utterance_id: { type: 'string' }, language: { type: 'string', enum: ['es', 'en', 'fr', 'it', 'pt', 'hi'] } }, required: ['text', 'session_id', 'revision'], additionalProperties: false } },
@@ -98,7 +98,7 @@ function promptText(args = {}) {
     '',
     '1. Call voice_status. If it reports joined and room_reachable, say so in one line and stop.',
     `2. Call voice_connect with the title ${title ? JSON.stringify(title) : 'a short label of what this conversation is about'}. If the user named a room, pass its address as room.`,
-    '   If it fails saying this machine is not paired with the room (or is paired with a different one), ask the user for the room\'s address and the one-time code the room shows them under "Emparejar conector"; call voice_pair with both, then voice_connect again. Never try to get a code from the room yourself.',
+    '   If it fails saying this machine is not paired with the room (or is paired with a different one), ask the user for the room\'s address and the one-time code the room shows them under "Emparejar máquina"; call voice_pair with both, then voice_connect again. Never try to get a code from the room yourself.',
     '3. Tell the user in one line whether the room can reach this conversation. If inbound.ok is false, relay inbound.reason and offer inbound.remedy in your own words, including what safeguard it removes; change nothing yourself.',
     '',
     'Nothing else is registered: the room learns that a message was read and whether this conversation is working from what the harness itself records about it. How to behave once joined is in this server\'s instructions.',
@@ -110,7 +110,7 @@ let binding = null;
  *  from the same page, the other is this machine's pairing taken away, which only a new code undoes. */
 function closedNote(reason) {
   return reason === 'connector_revoked'
-    ? 'This machine\'s pairing was revoked from the room, so this conversation has no voice. Tell the user; to have voice again they must pair this machine with the one-time code the room shows under "Emparejar conector" (voice_pair), and then you can call voice_connect. Continue in writing meanwhile.'
+    ? 'This machine\'s pairing was revoked from the room, so this conversation has no voice. Tell the user; to have voice again they must pair this machine with the one-time code the room shows under "Emparejar máquina" (voice_pair), and then you can call voice_connect. Continue in writing meanwhile.'
     : 'The user closed this conversation\'s voice channel from the room. Continue in writing and do not publish speech; call voice_connect again only if the user asks for voice.';
 }
 function originOf(room) {
@@ -119,8 +119,8 @@ function originOf(room) {
 /** Ask the user, do not guess: the code exists only on the room's screen. */
 function pairingNeeded(room, paired) {
   const target = room ? originOf(room) : null;
-  if (!paired) return `This machine is not paired with ${target ? 'the room at ' + target : 'any room'}. Ask the user for the room's address${target ? ' (confirm ' + target + ')' : ''} and the one-time pairing code the room shows under "Emparejar conector", then call voice_pair with both. Do not fetch a code yourself.`;
-  if (target && target !== paired.origin) return `This machine is paired with ${paired.origin}, not ${target}. One room per machine: to switch, ask the user for the pairing code that ${target} shows under "Emparejar conector" and call voice_pair (it replaces the current pairing); to stay, call voice_connect without a room.`;
+  if (!paired) return `This machine is not paired with ${target ? 'the room at ' + target : 'any room'}. Ask the user for the room's address${target ? ' (confirm ' + target + ')' : ''} and the one-time pairing code the room shows under "Emparejar máquina", then call voice_pair with both. Do not fetch a code yourself.`;
+  if (target && target !== paired.origin) return `This machine is paired with ${paired.origin}, not ${target}. One room per machine: to switch, ask the user for the pairing code that ${target} shows under "Emparejar máquina" and call voice_pair (it replaces the current pairing); to stay, call voice_connect without a room.`;
   return null;
 }
 /** A connector from another version serves this conversation with that version's behaviour. */
