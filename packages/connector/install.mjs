@@ -15,6 +15,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { harnessesPresent } from './identity.mjs';
 import { pairedRoom } from './pair.mjs';
 import { remove as removeSkill, skillsDir, status as skillStatus } from './skill.mjs';
 
@@ -93,14 +94,6 @@ export function runningConnector(env = process.env) {
 export function flag(argv, name) {
   const index = argv.indexOf(name);
   return index >= 0 ? argv[index + 1] : undefined;
-}
-
-/** Which harnesses this machine has, by what they leave behind. */
-export function harnessesPresent(env = process.env) {
-  const found = [];
-  if (existsSync(env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'))) found.push('claude');
-  if (existsSync(env.CODEX_HOME || path.join(os.homedir(), '.codex'))) found.push('codex');
-  return found;
 }
 
 function claude(args, env) {

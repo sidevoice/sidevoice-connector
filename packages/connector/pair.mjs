@@ -7,6 +7,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { machineIdentity } from './identity.mjs';
 
 export function dataDir(env = process.env) {
   return env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
@@ -45,9 +46,11 @@ export async function pair(room, code, env = process.env) {
   if (base.protocol !== 'https:' && !privateNetwork(base.hostname)) {
     throw new Error(`${base.origin} is reached in clear over a network this machine does not own; the room must be https:// there (loopback and Kubernetes service names are the exceptions).`);
   }
+  // The code, and who this machine is: the room lists what it is told, so it is told here too and
+  // not only on every connection — a machine paired and never yet connected still reads as a machine.
   const response = await fetch(new URL('/api/connectors/pair', base), {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ code, host: os.hostname() }), signal: AbortSignal.timeout(15_000),
+    body: JSON.stringify({ code, ...machineIdentity(env) }), signal: AbortSignal.timeout(15_000),
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error('Pairing failed: ' + (body.detail || response.status));

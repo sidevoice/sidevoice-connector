@@ -79,6 +79,11 @@ test('connector: the handshake authenticates, registrations and speech are answe
     // Who this connector is travels in the handshake, before any event could.
     assert.equal(room.auth.connector_id, 'c-1'); assert.equal(room.auth.token, 't-1');
     assert.equal(room.auth.protocol, PROTOCOL);
+    // And so does what this machine is, so the room's list reads as a machine and not as a UUID.
+    assert.equal(room.auth.host, os.hostname());
+    assert.equal(room.auth.platform, `${os.platform()} ${os.arch()}`);
+    assert.equal(room.auth.version, JSON.parse(readFileSync(path.join(here, '..', 'package.json'), 'utf8')).version);
+    assert.ok(Array.isArray(room.auth.harnesses), JSON.stringify(room.auth.harnesses));
     // Two deliveries: the second must wait for the first to be acknowledged by the harness.
     const first = room.ask('input.deliver', { event_id: 'e1', binding_id: 'b-thread-1', thread: 'thread-1', text: 'uno', channel: 'voice', session_id: 's', revision: 1, message_id: 'm1' });
     const second = room.ask('input.deliver', { event_id: 'e2', binding_id: 'b-thread-1', thread: 'thread-1', text: 'dos', channel: 'voice', session_id: 's', revision: 1, message_id: 'm2' });
@@ -308,6 +313,50 @@ test('connector: the room closing a conversation\'s voice removes the binding an
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
 });
 
+test('connector: a pairing revoked from the room takes the voice now, says why, and is not asked again', async () => {
+  // The room does this while the machine is connected: it says why, drops the bindings and closes the
+  // socket, and refuses the next handshake with the same words. Neither the conversations nor whoever
+  // reads status should be left with "the room disconnected me".
+  const revoked = 'La sala revocó el emparejamiento de esta máquina: vuelve a emparejarla con el código que la sala muestra en "Emparejar conector".';
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  room.handle = (event, data) => {
+    if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-' + data.client_ref, thread: data.thread };
+  };
+  const { child, socketPath, stderr } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    await facade.call('register', { client_ref: 'thread-1', harness: 'test', thread: 'thread-1', title: 'T', delivery: { kind: 'http', url: 'http://127.0.0.1:1/never', thread: 'thread-1' } });
+
+    // What the room does on a revocation, in the order it does it.
+    room.admit = () => revoked;
+    room.tell('binding.close', { binding_id: 'b-thread-1', thread: 'thread-1', reason: 'connector_revoked' });
+    room.tell('connector.revoked', { reason: revoked });
+    room.socket.disconnect(true);
+
+    const status = await until(async () => {
+      const seen = await facade.call('status', {});
+      return seen.refused ? seen : null;
+    });
+    assert.equal(status.refused, revoked);
+    assert.equal(status.room_error, revoked, 'voice_status reads why without having to parse a socket');
+    assert.deepEqual(status.bindings, [], 'the conversation lost its voice at once');
+    assert.equal(status.closed_reasons['thread-1'], 'connector_revoked', 'and can say which of the two happened');
+    await assert.rejects(facade.call('publish', { binding_id: 'b-thread-1', client_ref: 'thread-1', session_id: 's', revision: 1, text: 'tarde' }),
+      /CLOSED_BY_ROOM:connector_revoked/);
+
+    // Joining again does not quietly wait for a room that will not have this machine: it says so.
+    await assert.rejects(facade.call('register', { client_ref: 'thread-1', harness: 'test', thread: 'thread-1', title: 'T', delivery: { kind: 'http', url: 'http://127.0.0.1:1/never', thread: 'thread-1' } }),
+      /revoc/);
+    assert.match(stderr(), /will not be asked again/);
+    const attempts = (await facade.call('status', {})).socket_error?.attempt ?? 0;
+    await wait(1200);
+    assert.equal((await facade.call('status', {})).socket_error?.attempt ?? 0, attempts, 'it stopped, rather than retrying for ever');
+    facade.end();
+  } finally { if (child.exitCode === null) child.kill(); await room.close(); }
+});
+
 test('connector: the conversation\'s state is said again on a clock, not only when it changes', async () => {
   // A room that restarts has forgotten what it was told. Waiting for the next change means a conversation
   // that was already working shows nothing at all until it stops (2026-09-20).
@@ -448,6 +497,26 @@ test('pairing: plaintext only where the token cannot leave the machine or the cl
   for (const no of ['sidevoice.dev.example.invalid', '10.0.0.5', 'sidevoice', 'svc.cluster.local', 'evil.svc.example.com.attacker.net']) assert.equal(privateNetwork(no), false, no);
   // Refused at pairing, before any code is spent: a plain http room on a name we cannot place.
   await assert.rejects(pair('http://sidevoice.example', 'ABCD1234', { SIDEVOICE_DATA_DIR: mkdtempSync(path.join(os.tmpdir(), 'sv-')) }), /must be https/);
+
+  // A machine paired and never yet connected still reads as a machine: it says what it is here too.
+  const asked = [];
+  const rooms = http.createServer(async (req, res) => {
+    let body = ''; for await (const chunk of req) body += chunk;
+    asked.push({ url: req.url, body: JSON.parse(body) });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ connector_id: 'c-9', token: 't-9', protocol: PROTOCOL }));
+  });
+  await new Promise(resolve => rooms.listen(0, '127.0.0.1', resolve));
+  try {
+    const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+    await pair(`http://127.0.0.1:${rooms.address().port}`, 'ABCD1234', { SIDEVOICE_DATA_DIR: dataDir });
+    assert.equal(asked[0].url, '/api/connectors/pair');
+    assert.equal(asked[0].body.code, 'ABCD1234');
+    assert.equal(asked[0].body.host, os.hostname());
+    assert.equal(asked[0].body.platform, `${os.platform()} ${os.arch()}`);
+    assert.equal(asked[0].body.version, JSON.parse(readFileSync(path.join(here, '..', 'package.json'), 'utf8')).version);
+    assert.ok(Array.isArray(asked[0].body.harnesses));
+  } finally { rooms.close(); }
 });
 
 test('harness modules: the files each harness writes are found by name, and a rollout line reads as the contract', () => {

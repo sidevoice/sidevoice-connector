@@ -105,6 +105,14 @@ function promptText(args = {}) {
   ].join('\n');
 }
 let binding = null;
+/** Why this conversation no longer has a voice, in words for the person. The room says which of the
+ *  two it is, and they are not the same news: one is a channel the user closed and can open again
+ *  from the same page, the other is this machine's pairing taken away, which only a new code undoes. */
+function closedNote(reason) {
+  return reason === 'connector_revoked'
+    ? 'This machine\'s pairing was revoked from the room, so this conversation has no voice. Tell the user; to have voice again they must pair this machine with the one-time code the room shows under "Emparejar conector" (voice_pair), and then you can call voice_connect. Continue in writing meanwhile.'
+    : 'The user closed this conversation\'s voice channel from the room. Continue in writing and do not publish speech; call voice_connect again only if the user asks for voice.';
+}
 function originOf(room) {
   try { return new URL(room).origin; } catch { throw new Error(`"${room}" is not a room address; expected something like https://voice.example`); }
 }
@@ -128,6 +136,7 @@ async function invoke(name, args, meta) {
     const status = ipc ? await rpc('status', {}) : { connected: false, bindings: [], closed_by_room: [] };
     // The room may have closed this conversation's voice since we joined: the connector is the truth.
     const closed = !!binding && (status.closed_by_room || []).includes(binding.client_ref);
+    const closedFor = closed ? status.closed_reasons?.[binding.client_ref] : null;
     if (closed) binding = null;
     const module = binding ? harnessFor(binding.harness) : null;
     const inbound = binding ? inboundFor(module, binding.client_ref) : null;
@@ -136,7 +145,7 @@ async function invoke(name, args, meta) {
              version: VERSION, connector_version: status.version || null, ...versionNote(status.version),
              binding_id: binding?.binding_id || null, harness: binding?.harness || null,
              capabilities: binding?.capabilities || null, inbound,
-             ...(closed ? { closed_by_room: true, note: 'The user closed this conversation\'s voice channel from the room. Continue in writing; call voice_connect again only if they ask for voice.' } : {}) };
+             ...(closed ? { closed_by_room: true, note: closedNote(closedFor) } : {}) };
   }
   if (name === 'voice_pair') {
     if (!args.room || !args.code) throw new Error('voice_pair needs the room\'s address and the code the user read from it.');
@@ -184,9 +193,9 @@ async function invoke(name, args, meta) {
     try {
       result = await rpc('publish', { binding_id: binding.binding_id, client_ref: binding.client_ref, text: args.text, session_id: args.session_id, revision: args.revision, utterance_id: args.utterance_id, language: args.language });
     } catch (error) {
-      if (error.message === 'CLOSED_BY_ROOM') {
+      if (error.message.startsWith('CLOSED_BY_ROOM')) {
         binding = null;
-        throw new Error('The user closed this conversation\'s voice channel from the room. Continue in writing and do not publish speech; call voice_connect again only if the user asks for voice.');
+        throw new Error(closedNote(error.message.split(':')[1]));
       }
       throw error;
     }
