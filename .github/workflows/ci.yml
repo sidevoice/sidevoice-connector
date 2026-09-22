@@ -43,6 +43,14 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -r requirements.txt
+      # The interop test spawns the real connector against the real room, from the checkout and from
+      # the bundle: the checkout imports socket.io-client and the bundle is built with esbuild, so the
+      # room's suite needs the client's modules on this runner too.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
       - run: PYTHONPATH=apps/server python -m unittest discover -s apps/server/tests -p 'test_*.py'
 
   client:
@@ -54,8 +62,13 @@ jobs:
         with:
           node-version: 22
       - run: npm ci
+      # The published client is one bundled file, so it is built before anything checks or packs
+      # it: `npm pack` would build it again through `prepack`, and a suite that ran first would be
+      # testing a `dist/` from whenever somebody last built by hand.
       - run: npm run build
-      - run: node --check packages/connector/cli.mjs packages/connector/mcp.mjs packages/connector/connector.mjs packages/connector/adapters.mjs packages/connector/pair.mjs
+      # One file per invocation: `node --check` takes a single script and treats the rest as its arguments,
+      # so a list only ever checked the first name (and a deleted file went unnoticed for two releases).
+      - run: for f in packages/connector/*.mjs packages/connector/dist/*.mjs; do node --check "$f"; done
       - run: npm test
       - name: Package contents (dry run)
         run: npm pack --dry-run

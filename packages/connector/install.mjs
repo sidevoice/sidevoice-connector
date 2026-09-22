@@ -19,13 +19,21 @@ import { pairedRoom } from './pair.mjs';
 import { remove as removeSkill, skillsDir, status as skillStatus } from './skill.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const VERSION = JSON.parse(readFileSync(path.join(here, 'package.json'), 'utf8')).version;
-/** The files that make up this package, copied as they are. */
-const PACKAGE_FILES = JSON.parse(readFileSync(path.join(here, 'package.json'), 'utf8')).files.concat('package.json');
+/** Where the package's own root is: next to these modules in the checkout, and one level up once
+ *  they have been bundled into `dist/`. Only copying needs to know — everything else reads the
+ *  `package.json` beside it, which the build puts there precisely so that this stays the one
+ *  place that has to tell the two apart. */
+const packageRoot = existsSync(path.join(here, '..', 'package.json')) ? path.dirname(here) : here;
+const manifest = JSON.parse(readFileSync(path.join(here, 'package.json'), 'utf8'));
+const VERSION = manifest.version;
+/** The files that make up this package, copied as they are — no install step, nothing fetched. */
+const PACKAGE_FILES = manifest.files.concat('package.json');
+/** What `node` is given to run this package, relative to a copy of it. */
+const ENTRY = manifest.bin.sidevoice.replace(/^\.\//, '');
 
 function fromSource(env) {
   if (env.SIDEVOICE_INSTALL_FROM_SOURCE === '0') return false;
-  return env.SIDEVOICE_INSTALL_FROM_SOURCE === '1' || existsSync(path.join(here, '..', '..', '.git'));
+  return env.SIDEVOICE_INSTALL_FROM_SOURCE === '1' || existsSync(path.join(packageRoot, '..', '..', '.git'));
 }
 
 /** Where installed copies live: one directory per version, under the XDG data home. */
@@ -39,7 +47,7 @@ export function copiesDir(env = process.env) {
  *  (a cold cache, a bin whose name differs from the package's, a 30 s startup budget; one session found no
  *  `sidevoice` binary at all, 2026-09-21). */
 export function serverCommand(env = process.env) {
-  const cli = fromSource(env) ? path.join(here, 'cli.mjs') : path.join(copiesDir(env), VERSION, 'cli.mjs');
+  const cli = fromSource(env) ? path.join(here, 'cli.mjs') : path.join(copiesDir(env), VERSION, ENTRY);
   return { command: 'node', args: [cli, 'mcp'] };
 }
 
@@ -50,7 +58,7 @@ export function materialize(env = process.env) {
   const root = copiesDir(env), target = path.join(root, VERSION);
   mkdirSync(target, { recursive: true });
   for (const file of PACKAGE_FILES) {
-    const source = path.join(here, file);
+    const source = path.join(packageRoot, file);
     if (existsSync(source)) cpSync(source, path.join(target, file), { recursive: true });
   }
   const removed = [];

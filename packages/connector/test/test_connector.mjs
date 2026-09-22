@@ -7,7 +7,7 @@ import path from 'node:path';
 import { appendFileSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { createWsServer } from './ws-server.mjs';
+import { startRoom, PROTOCOL } from './room.mjs';
 import { envelope, nudge, voiceEnvelope } from '../harness-contract.mjs';
 import { sessionWorking, transcriptPath, userMessageText } from '../harness-claude.mjs';
 import { interpretRollout, rolloutPath } from '../harness-codex.mjs';
@@ -28,16 +28,11 @@ function ipcClient(socketPath) {
     call: (method, params) => new Promise((resolve, reject) => { const id = ++serial; waiting.set(id, { resolve, reject }); socket.write(JSON.stringify({ id, method, params }) + '\n'); }), end: () => socket.end() };
 }
 
-async function startRoom() {
-  const frames = []; let conn = null; const server = createWsServer(c => { conn = c; c.onMessage = text => { const frame = JSON.parse(text); frames.push(frame); room.handle?.(frame, c); }; });
-  await new Promise(r => server.listen(0, '127.0.0.1', r));
-  const room = { server, frames, get conn() { return conn; }, url: `ws://127.0.0.1:${server.address().port}/api/connectors/ws`, handle: null, close: () => new Promise(r => server.close(r)) };
-  return room;
-}
-
-function startConnector(room, dataDir, extraEnv = {}) {
+/** The credential names the room, and nothing about how to reach it: the path and the namespace
+ *  are the connector's own knowledge, and a test that wrote them would be asserting its own copy. */
+function startConnector(origin, dataDir, extraEnv = {}) {
   const socketPath = path.join(dataDir, 'connector.sock');
-  writeFileSync(path.join(dataDir, 'credentials.json'), JSON.stringify({ url: room.url, connector_id: 'c-1', token: 't-1' }));
+  writeFileSync(path.join(dataDir, 'credentials.json'), JSON.stringify({ url: origin, connector_id: 'c-1', token: 't-1' }));
   const child = spawn(process.execPath, [connectorPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CONNECTOR_IDLE_MS: '400', ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'] });
   let stderr = ''; child.stderr.on('data', d => { stderr += d; });
   return { child, socketPath, stderr: () => stderr };
@@ -58,7 +53,7 @@ test('envelope: the header first, the user\'s words, then the speak-first note �
   assert.equal(voiceEnvelope('{"channel":"other","message_id":"x","session_id":"s","revision":1}'), null);
 });
 
-test('connector: hello, register, ordered delivery with acks, speech round trip, façade death unregisters', async () => {
+test('connector: the handshake authenticates, registrations and speech are answered on the event that asked, deliveries stay in order, and a dead façade unregisters', async () => {
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
   // A local http receiver stands in for the harness.
@@ -66,71 +61,73 @@ test('connector: hello, register, ordered delivery with acks, speech round trip,
   const harness = http.createServer(async (req, res) => { let body = ''; for await (const c of req) body += c; received.push(JSON.parse(body)); await new Promise(r => { release = r; }); res.writeHead(200); res.end('{}'); });
   await new Promise(r => harness.listen(0, '127.0.0.1', r));
   const deliveryUrl = `http://127.0.0.1:${harness.address().port}/presentation/message`;
-  room.handle = (frame, c) => {
-    if (frame.type === 'connector.hello') { assert.equal(frame.connector_id, 'c-1'); assert.equal(frame.token, 't-1'); c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1, heartbeat_seconds: 15 })); }
-    if (frame.type === 'binding.register') {
-      // First registration carries no server binding id; reconnects do.
-      assert.ok(frame.binding_id === undefined || frame.binding_id === 'b-' + frame.client_ref);
-      c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-' + frame.client_ref, thread: frame.thread }));
+  room.handle = (event, data) => {
+    if (event === 'binding.register') {
+      // First registration carries no server binding id; a re-registration does.
+      assert.ok(data.binding_id === undefined || data.binding_id === 'b-' + data.client_ref);
+      return { client_ref: data.client_ref, binding_id: 'b-' + data.client_ref, thread: data.thread };
     }
-    if (frame.type === 'heartbeat') c.send(JSON.stringify({ type: 'heartbeat.ack', nonce: frame.nonce }));
-    if (frame.type === 'speech.publish') c.send(JSON.stringify({ type: 'speech.published', event_id: frame.event_id, status: 'queued', text_saved: true, utterance_id: frame.utterance_id }));
+    if (event === 'speech.publish') return { status: 'queued', text_saved: true, utterance_id: data.utterance_id };
   };
-  const { child, socketPath, stderr } = startConnector(room, dataDir);
+  const { child, socketPath, stderr } = startConnector(room.origin, dataDir);
   try {
     await until(() => existsSync(socketPath));
     const facade = ipcClient(socketPath); await facade.ready;
     const registered = await facade.call('register', { client_ref: 'thread-1', harness: 'test', thread: 'thread-1', title: 'T', delivery: { kind: 'http', url: deliveryUrl, thread: 'thread-1' } });
     assert.equal(registered.binding_id, 'b-thread-1');
-    assert.equal(room.frames.filter(f => f.type === 'binding.register').length, 1);
+    assert.equal(room.sent('binding.register').length, 1);
+    // Who this connector is travels in the handshake, before any event could.
+    assert.equal(room.auth.connector_id, 'c-1'); assert.equal(room.auth.token, 't-1');
+    assert.equal(room.auth.protocol, PROTOCOL);
     // Two deliveries: the second must wait for the first to be acknowledged by the harness.
-    room.conn.send(JSON.stringify({ type: 'input.deliver', event_id: 'e1', binding_id: 'b-thread-1', thread: 'thread-1', text: 'uno', channel: 'voice', session_id: 's', revision: 1, message_id: 'm1' }));
-    room.conn.send(JSON.stringify({ type: 'input.deliver', event_id: 'e2', binding_id: 'b-thread-1', thread: 'thread-1', text: 'dos', channel: 'voice', session_id: 's', revision: 1, message_id: 'm2' }));
+    const first = room.ask('input.deliver', { event_id: 'e1', binding_id: 'b-thread-1', thread: 'thread-1', text: 'uno', channel: 'voice', session_id: 's', revision: 1, message_id: 'm1' });
+    const second = room.ask('input.deliver', { event_id: 'e2', binding_id: 'b-thread-1', thread: 'thread-1', text: 'dos', channel: 'voice', session_id: 's', revision: 1, message_id: 'm2' });
     await until(() => received.length === 1); await wait(100);
     assert.equal(received.length, 1); assert.equal(received[0].text, 'uno');
     release();
-    await until(() => room.frames.some(f => f.type === 'input.ack' && f.event_id === 'e1' && f.status === 'accepted'));
+    assert.equal((await first).status, 'accepted', 'the answer comes back on the event that asked');
     await until(() => received.length === 2); assert.equal(received[1].text, 'dos'); release();
-    await until(() => room.frames.some(f => f.type === 'input.ack' && f.event_id === 'e2'));
+    await second;
     // Unknown binding is acknowledged as such, never silently dropped.
-    room.conn.send(JSON.stringify({ type: 'input.deliver', event_id: 'e3', binding_id: 'nope', text: 'x' }));
-    await until(() => room.frames.some(f => f.type === 'input.ack' && f.event_id === 'e3' && f.status === 'unknown_binding'));
+    assert.equal((await room.ask('input.deliver', { event_id: 'e3', binding_id: 'nope', text: 'x' })).status, 'unknown_binding');
     // Speech goes out and comes back confirmed; the durable outbox is empty afterwards.
     const said = await facade.call('publish', { binding_id: 'b-thread-1', session_id: 's', revision: 1, text: 'hola', language: 'es' });
     assert.equal(said.status, 'queued'); assert.equal(said.text_saved, true);
     assert.deepEqual(JSON.parse(readFileSync(path.join(dataDir, 'outbox.json'), 'utf8')), []);
-    assert.equal(room.frames.find(f => f.type === 'speech.publish').final, undefined);
-    // Heartbeat from the room is answered.
-    room.conn.send(JSON.stringify({ type: 'heartbeat', nonce: 'n1' }));
-    await until(() => room.frames.some(f => f.type === 'heartbeat.ack' && f.nonce === 'n1'));
     // The façade dies: its binding is unregistered and the connector exits once idle.
     facade.end();
-    await until(() => room.frames.some(f => f.type === 'binding.unregister' && f.binding_id === 'b-thread-1'));
+    await until(() => room.sent('binding.unregister').some(d => d.binding_id === 'b-thread-1'));
     const code = await until(() => child.exitCode !== null ? child.exitCode + 1 : null, 5000);
     assert.equal(code - 1, 0, stderr());
   } finally { if (child.exitCode === null) child.kill(); await room.close(); harness.close(); }
 });
 
-test('connector: leaving works by conversation even after the room re-minted the binding id', async () => {
+test('connector: a room that comes back re-registers everything, and leaving works by conversation even after the id was re-minted', async () => {
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
-  room.handle = (frame, c) => {
-    if (frame.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1 }));
-    if (frame.type === 'binding.register') c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-first', thread: frame.thread }));
+  let mint = 'b-first';
+  room.handle = (event, data) => {
+    if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: mint, thread: data.thread };
   };
-  const { child, socketPath } = startConnector(room, dataDir);
+  const { child, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
   try {
     await until(() => existsSync(socketPath));
     const facade = ipcClient(socketPath); await facade.ready;
     const joined = await facade.call('register', { client_ref: 'thread-z', harness: 'claude', thread: 'thread-z', title: 'Z', delivery: { kind: 'http', url: 'http://127.0.0.1:1/never', thread: 'thread-z' } });
     assert.equal(joined.binding_id, 'b-first');
-    // The room re-registers the conversation under a new id (as after a reconnect); the façade never hears.
-    room.conn.send(JSON.stringify({ type: 'binding.registered', client_ref: 'thread-z', binding_id: 'b-second', thread: 'thread-z' }));
-    await until(async () => (await facade.call('status', {})).bindings[0]?.binding_id === 'b-second');
+    // The room restarts, forgets its bindings and mints a new id. Nobody tells the connector to
+    // come back: that is the library's, and re-registering what it holds is this connector's.
+    const port = room.port;
+    mint = 'b-second';
+    await room.stop();
+    await until(async () => (await facade.call('status', {})).connected === false, 10000);
+    await room.start(port);
+    await until(async () => (await facade.call('status', {})).bindings[0]?.binding_id === 'b-second', 20000);
+    assert.ok(room.connections >= 2, 'it came back by itself');
     // Leaving with the id the façade remembers still leaves, because it names the conversation too.
     const left = await facade.call('unregister', { binding_id: 'b-first', client_ref: 'thread-z' });
     assert.equal(left.left, true);
-    await until(() => room.frames.some(f => f.type === 'binding.unregister' && f.binding_id === 'b-second'));
+    await until(() => room.sent('binding.unregister').some(d => d.binding_id === 'b-second'));
     assert.equal((await facade.call('status', {})).bindings.length, 0);
     // And leaving what was never joined says so instead of pretending.
     assert.equal((await facade.call('unregister', { binding_id: 'nope', client_ref: 'nobody' })).left, false);
@@ -141,25 +138,24 @@ test('connector: leaving works by conversation even after the room re-minted the
 test('connector: speech while offline is queued durably and replayed on reconnect', async () => {
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
-  const port = room.server.address().port;
-  // Make the first connector attempts genuinely refused. Leaving a WebSocket
-  // peer open without a welcome races the client's connection-error handling.
-  await room.close();
-  room.handle = (frame, c) => {
-    if (frame.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1, heartbeat_seconds: 15 }));
-    if (frame.type === 'binding.register') c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-1', thread: frame.thread }));
-    if (frame.type === 'speech.publish') c.send(JSON.stringify({ type: 'speech.published', event_id: frame.event_id, status: 'queued', text_saved: true }));
+  const port = room.port;
+  // The room is not there when the connector starts, so the first attempts are genuinely refused.
+  await room.stop();
+  room.handle = (event, data) => {
+    if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-1', thread: data.thread };
+    if (event === 'speech.publish') return { status: 'queued', text_saved: true };
   };
-  const { child, socketPath } = startConnector(room, dataDir);
+  const { child, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
   try {
     await until(() => existsSync(socketPath));
     const facade = ipcClient(socketPath); await facade.ready;
     const registration = facade.call('register', { client_ref: 'r', harness: 'test', thread: 'thread-1', delivery: { kind: 'http', url: 'http://127.0.0.1:1/', thread: 'thread-1' } });
     const said = await facade.call('publish', { client_ref: 'r', session_id: 's', revision: 0, text: 'sin sala' });
     assert.equal(said.status, 'queued');
-    assert.equal(JSON.parse(readFileSync(path.join(dataDir, 'outbox.json'), 'utf8')).length, 1);
-    await new Promise(r => room.server.listen(port, '127.0.0.1', r));
-    await until(() => room.frames.some(f => f.type === 'speech.publish' && f.text === 'sin sala'));
+    assert.equal(JSON.parse(readFileSync(path.join(dataDir, 'outbox.json'), 'utf8')).length, 1,
+      'it waits on disk, not in the library');
+    await room.start(port);
+    await until(() => room.sent('speech.publish').some(d => d.text === 'sin sala'), 20000);
     await until(() => JSON.parse(readFileSync(path.join(dataDir, 'outbox.json'), 'utf8')).length === 0);
     const result = await registration; assert.equal(result.binding_id, 'b-1');
     facade.end();
@@ -168,13 +164,10 @@ test('connector: speech while offline is queued durably and replayed on reconnec
 
 test('connector: keeps retrying while the room is down and connects once it appears', async () => {
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
-  // Reserve a port, then free it so the connector's first attempts are refused.
-  const probe = http.createServer(); await new Promise(r => probe.listen(0, '127.0.0.1', r)); const port = probe.address().port; await new Promise(r => probe.close(r));
-  const frames = []; let conn = null;
-  const server = createWsServer(c => { conn = c; c.onMessage = text => { const f = JSON.parse(text); frames.push(f); if (f.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1 })); }; });
-  const socketPath = path.join(dataDir, 'connector.sock');
-  writeFileSync(path.join(dataDir, 'credentials.json'), JSON.stringify({ url: `ws://127.0.0.1:${port}/api/connectors/ws`, connector_id: 'c-1', token: 't-1' }));
-  const child = spawn(process.execPath, [connectorPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CONNECTOR_IDLE_MS: '20000' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const room = await startRoom();
+  const port = room.port;
+  await room.stop();
+  const { child, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
   try {
     await until(() => existsSync(socketPath));
     await wait(1500); // several refused attempts happen in here
@@ -182,24 +175,48 @@ test('connector: keeps retrying while the room is down and connects once it appe
     const facade = ipcClient(socketPath); await facade.ready;
     const down = await facade.call('status', {});
     assert.equal(down.connected, false);
-    assert.ok(down.socket_error && (down.socket_error.error || down.socket_error.close_code), JSON.stringify(down.socket_error));
+    assert.ok(down.socket_error && (down.socket_error.error || down.socket_error.close_reason), JSON.stringify(down.socket_error));
     assert.ok(down.socket_error.at);
-    await new Promise(r => server.listen(port, '127.0.0.1', r));
-    await until(() => frames.some(f => f.type === 'connector.hello'), 12000);
-    await until(async () => (await facade.call('status', {})).connected, 5000);
+    assert.equal(down.socket_error.retrying, true, 'a room that is not there yet is still worth asking');
+    await room.start(port);
+    await until(async () => (await facade.call('status', {})).connected, 20000);
     assert.equal((await facade.call('status', {})).socket_error, null, 'cleared once the room answers');
     facade.end();
-  } finally { child.kill(); await new Promise(r => server.close(r)); }
+  } finally { child.kill(); await room.close(); }
+});
+
+test('connector: a credential the room refuses is said out loud and is not asked again', async () => {
+  // The room is up and says no. That is not a connection problem, and hammering it would neither
+  // fix it nor tell anyone: the library stops, and what a person has to do is in the log.
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const room = await startRoom();
+  room.admit = () => 'Esta máquina no está emparejada con la sala: vuelve a emparejarla con el código que la sala muestra en "Emparejar conector".';
+  const { child, socketPath, stderr } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    const refused = await until(async () => {
+      const status = await facade.call('status', {});
+      return status.socket_error?.retrying === false ? status : null;
+    }, 10000);
+    assert.equal(refused.connected, false);
+    assert.match(refused.socket_error.error, /Emparejar conector/);
+    assert.match(stderr(), /will not be asked again/);
+    assert.match(stderr(), /Pair this machine again/);
+    const attempts = refused.socket_error.attempt;
+    await wait(1500);
+    assert.equal((await facade.call('status', {})).socket_error.attempt, attempts, 'it stopped, rather than retrying for ever');
+    facade.end();
+  } finally { child.kill(); await room.close(); }
 });
 
 test('connector: a second instance defers to the live one', async () => {
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
-  room.handle = (frame, c) => { if (frame.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1 })); };
-  const first = startConnector(room, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '5000' });
+  const first = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '5000' });
   try {
     await until(() => existsSync(first.socketPath));
-    const second = startConnector(room, dataDir);
+    const second = startConnector(room.origin, dataDir);
     const code = await until(() => second.child.exitCode !== null ? second.child.exitCode + 1 : null);
     assert.equal(code - 1, 0);
     assert.match(second.stderr(), /a connector is already running \(pid \d+/, 'it says whom it defers to, never silently');
@@ -213,9 +230,8 @@ test('connector: a lock left by a pid that is now something else is stale, not a
   // node process — alive, but not a connector — so a connector must take over instead of exiting.
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
-  room.handle = (frame, c) => { if (frame.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1 })); };
   writeFileSync(path.join(dataDir, 'connector.sock.lock'), String(process.pid));
-  const only = startConnector(room, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '5000' });
+  const only = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '5000' });
   try {
     await until(() => existsSync(only.socketPath));
     assert.match(only.stderr(), /stale lock .* taking over/);
@@ -269,22 +285,21 @@ test('mcp façade: identity comes from the harness, tools are exposed, instructi
 test('connector: the room closing a conversation\'s voice removes the binding and the façade is told on its next call', async () => {
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
-  room.handle = (frame, c) => {
-    if (frame.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1, heartbeat_seconds: 15 }));
-    if (frame.type === 'binding.register') c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-' + frame.client_ref, thread: frame.thread }));
-    if (frame.type === 'speech.publish') c.send(JSON.stringify({ type: 'speech.published', event_id: frame.event_id, status: 'queued', text_saved: true, utterance_id: frame.utterance_id }));
+  room.handle = (event, data) => {
+    if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-' + data.client_ref, thread: data.thread };
+    if (event === 'speech.publish') return { status: 'queued', text_saved: true, utterance_id: data.utterance_id };
   };
-  const { child, socketPath } = startConnector(room, dataDir);
+  const { child, socketPath } = startConnector(room.origin, dataDir);
   try {
     await until(() => existsSync(socketPath));
     const facade = ipcClient(socketPath); await facade.ready;
     await facade.call('register', { client_ref: 'thread-1', harness: 'test', thread: 'thread-1', title: 'T', delivery: { kind: 'http', url: 'http://127.0.0.1:1/never', thread: 'thread-1' } });
-    room.conn.send(JSON.stringify({ type: 'binding.close', binding_id: 'b-thread-1', thread: 'thread-1', reason: 'closed_from_room' }));
+    room.tell('binding.close', { binding_id: 'b-thread-1', thread: 'thread-1', reason: 'closed_from_room' });
     await until(async () => (await facade.call('status', {})).closed_by_room.includes('thread-1'));
     await assert.rejects(facade.call('publish', { binding_id: 'b-thread-1', client_ref: 'thread-1', session_id: 's', revision: 1, text: 'tarde' }), /CLOSED_BY_ROOM/);
     assert.equal((await facade.call('status', {})).bindings.length, 0);
     // The room never hears an unregister for a binding it closed itself.
-    assert.equal(room.frames.filter(f => f.type === 'binding.unregister').length, 0);
+    assert.equal(room.sent('binding.unregister').length, 0);
     // Joining again is the user's explicit request and clears the closure.
     const again = await facade.call('register', { client_ref: 'thread-1', harness: 'test', thread: 'thread-1', title: 'T', delivery: { kind: 'http', url: 'http://127.0.0.1:1/never', thread: 'thread-1' } });
     assert.equal(again.binding_id, 'b-thread-1');
@@ -301,19 +316,17 @@ test('connector: the conversation\'s state is said again on a clock, not only wh
   const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'sv-claude-'));
   mkdirSync(path.join(claudeHome, 'sessions'));
   writeFileSync(path.join(claudeHome, 'sessions', '4242.json'), JSON.stringify({ sessionId: 'busy-session', pid: 4242, status: 'busy' }));
-  room.handle = (frame, c) => {
-    if (frame.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1 }));
-    if (frame.type === 'binding.register') c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-1', thread: frame.thread }));
+  room.handle = (event, data) => {
+    if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-1', thread: data.thread };
   };
-  const { child, socketPath } = startConnector(room, dataDir,
+  const { child, socketPath } = startConnector(room.origin, dataDir,
     { CLAUDE_CONFIG_DIR: claudeHome, SIDEVOICE_WORK_POLL_MS: '30', SIDEVOICE_WORK_ANNOUNCE_MS: '120' });
   try {
     await until(() => existsSync(socketPath));
     const facade = ipcClient(socketPath); await facade.ready;
     await facade.call('register', { client_ref: 'busy-session', harness: 'claude', thread: 'busy-session',
       delivery: { kind: 'http', url: 'http://127.0.0.1:1/never', thread: 'busy-session' } });
-    await until(() => room.frames.filter(f => f.type === 'input.working' && f.working === true).length >= 3,
-      4000);
+    await until(() => room.sent('input.working').filter(d => d.working === true).length >= 3, 4000);
     facade.end();
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
 });
@@ -336,45 +349,47 @@ test('connector: Claude Code — the message is read when the session\'s transcr
   const line = entry => appendFileSync(transcript, JSON.stringify(entry) + '\n');
   status('idle'); line({ type: 'user', message: { role: 'user', content: 'an older prompt, before we started watching' } });
   const inbox = fakeInbox(dataDir); await inbox.ready;
-  room.handle = (frame, c) => {
-    if (frame.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1 }));
-    if (frame.type === 'binding.register') c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-1', thread: frame.thread }));
+  room.handle = (event, data) => {
+    if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-1', thread: data.thread };
   };
-  const { child, socketPath, stderr } = startConnector(room, dataDir, { CLAUDE_CONFIG_DIR: claudeHome, SIDEVOICE_WORK_POLL_MS: '30', SIDEVOICE_WORK_ANNOUNCE_MS: '5000' });
+  const { child, socketPath, stderr } = startConnector(room.origin, dataDir, { CLAUDE_CONFIG_DIR: claudeHome, SIDEVOICE_WORK_POLL_MS: '30', SIDEVOICE_WORK_ANNOUNCE_MS: '5000' });
   try {
     await until(() => existsSync(socketPath));
     const facade = ipcClient(socketPath); await facade.ready;
     await facade.call('register', { client_ref: 'sess-1', harness: 'claude', thread: 'sess-1', title: 'T', delivery: { kind: 'claude-uds', socket: inbox.socketPath, token: 'tok' } });
-    await until(() => room.conn);
-    room.conn.send(JSON.stringify({ type: 'input.deliver', event_id: 'e-1', binding_id: 'b-1', channel: 'voice', session_id: 's', revision: 3, message_id: 'm-1', text: 'hola desde la sala' }));
+    await until(() => room.socket);
+    let acknowledged = null;
+    const delivery = room.ask('input.deliver', { event_id: 'e-1', binding_id: 'b-1', channel: 'voice', session_id: 's', revision: 3, message_id: 'm-1', text: 'hola desde la sala' })
+      .then(answer => { acknowledged = answer; });
     await until(() => inbox.received.some(f => f.type === 'user'));
     const posted = inbox.received.find(f => f.type === 'user').message.content;
     assert.match(posted, /^\{"channel":"voice"/); assert.match(posted, /hola desde la sala/); assert.match(posted, /\[Sidevoice\] .*voice_say/, 'the speak-first note travels inside the message');
     // Nothing is claimed until the transcript shows the message — and the inbox has not even answered yet
     // (Claude Code keeps the socket open; the message is taken long before that call settles).
     await wait(150);
-    assert.ok(!room.frames.some(f => f.type === 'input.read'), 'no receipt before the session takes the message');
-    assert.ok(!room.frames.some(f => f.type === 'input.ack' && f.event_id === 'e-1'), 'the delivery call is still open');
+    assert.equal(room.sent('input.read').length, 0, 'no receipt before the session takes the message');
+    assert.equal(acknowledged, null, 'the delivery call is still open');
     // A prompt typed by hand is not ours.
     line({ type: 'user', promptId: 'p-0', message: { role: 'user', content: [{ type: 'text', text: 'escrito a mano' }] } });
     await wait(120);
-    assert.ok(!room.frames.some(f => f.type === 'input.read'));
+    assert.equal(room.sent('input.read').length, 0);
     // The session takes the message: it lands in the transcript as Claude Code writes it, and goes busy.
     line({ type: 'user', promptId: 'p-1', message: { role: 'user', content: 'Another Claude session sent a message:\n' + posted } });
     status('busy');
-    await until(() => room.frames.some(f => f.type === 'input.read' && f.message_id === 'm-1'));
-    const read = room.frames.find(f => f.type === 'input.read');
+    await until(() => room.sent('input.read').some(d => d.message_id === 'm-1'));
+    const read = room.sent('input.read')[0];
     assert.deepEqual({ binding_id: read.binding_id, session_id: read.session_id, revision: read.revision, turn_id: read.turn_id }, { binding_id: 'b-1', session_id: 's', revision: 3, turn_id: 'p-1' });
-    await until(() => room.frames.some(f => f.type === 'input.working' && f.working === true && f.turn_phase === 'start'));
-    const started = room.frames.find(f => f.type === 'input.working' && f.turn_phase === 'start');
+    await until(() => room.sent('input.working').some(d => d.working === true && d.turn_phase === 'start'));
+    const started = room.sent('input.working').find(d => d.turn_phase === 'start');
     assert.deepEqual({ turn_id: started.turn_id, session_id: started.session_id, revision: started.revision }, { turn_id: 'p-1', session_id: 's', revision: 3 });
     // The turn ends: the registry goes idle, and the end carries the same correlation.
     status('idle');
-    await until(() => room.frames.some(f => f.type === 'input.working' && f.working === false && f.turn_phase === 'end'));
-    const ended = room.frames.find(f => f.type === 'input.working' && f.working === false && f.turn_phase === 'end');
+    await until(() => room.sent('input.working').some(d => d.working === false && d.turn_phase === 'end'));
+    const ended = room.sent('input.working').find(d => d.working === false && d.turn_phase === 'end');
     assert.deepEqual({ turn_phase: ended.turn_phase, turn_id: ended.turn_id, session_id: ended.session_id, revision: ended.revision }, { turn_phase: 'end', turn_id: 'p-1', session_id: 's', revision: 3 });
     // The same transcript line read again (a rewrite, a restart) is not a second receipt.
-    assert.equal(room.frames.filter(f => f.type === 'input.read').length, 1);
+    assert.equal(room.sent('input.read').length, 1);
+    await delivery;
     assert.match(stderr(), /sess-1 read m-1/);
     facade.end();
   } finally { if (child.exitCode === null) child.kill(); inbox.close(); await room.close(); }
@@ -391,39 +406,38 @@ test('connector: Codex — the thread\'s rollout says when it took the message a
   // A stand-in for `codex queue`: records the message it was given and confirms.
   const queued = path.join(codexHome, 'queued.txt');
   const bin = path.join(codexHome, 'codex'); writeFileSync(bin, `#!/bin/sh\nprintf '%s' "$5" > "${queued}"\n`, { mode: 0o755 });
-  room.handle = (frame, c) => {
-    if (frame.type === 'connector.hello') c.send(JSON.stringify({ type: 'connector.welcome', protocol: 1 }));
-    if (frame.type === 'binding.register') c.send(JSON.stringify({ type: 'binding.registered', client_ref: frame.client_ref, binding_id: 'b-7', thread: frame.thread }));
+  room.handle = (event, data) => {
+    if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-7', thread: data.thread };
   };
-  const { child, socketPath } = startConnector(room, dataDir, { CODEX_HOME: codexHome, SIDEVOICE_CODEX_BIN: bin, SIDEVOICE_WORK_POLL_MS: '30', SIDEVOICE_WORK_ANNOUNCE_MS: '5000' });
+  const { child, socketPath } = startConnector(room.origin, dataDir, { CODEX_HOME: codexHome, SIDEVOICE_CODEX_BIN: bin, SIDEVOICE_WORK_POLL_MS: '30', SIDEVOICE_WORK_ANNOUNCE_MS: '5000' });
   try {
     await until(() => existsSync(socketPath));
     const facade = ipcClient(socketPath); await facade.ready;
     await facade.call('register', { client_ref: 'thread-7', harness: 'codex', thread: 'thread-7', title: 'T', delivery: { kind: 'codex-queue', thread: 'thread-7' } });
-    await until(() => room.conn);
-    room.conn.send(JSON.stringify({ type: 'input.deliver', event_id: 'e-7', binding_id: 'b-7', channel: 'voice', session_id: 's', revision: 5, message_id: 'm-7', text: 'hola codex' }));
-    await until(() => room.frames.some(f => f.type === 'input.ack' && f.event_id === 'e-7' && f.status === 'accepted'));
+    await until(() => room.socket);
+    const delivered = await room.ask('input.deliver', { event_id: 'e-7', binding_id: 'b-7', channel: 'voice', session_id: 's', revision: 5, message_id: 'm-7', text: 'hola codex' });
+    assert.equal(delivered.status, 'accepted');
     const message = readFileSync(queued, 'utf8');
     assert.match(message, /hola codex/); assert.match(message, /\[Sidevoice\]/);
     // Codex takes it on the next turn: task_started, then the user message, later task_complete.
     line('event_msg', { type: 'task_started', turn_id: 'turn-a' });
-    await until(() => room.frames.some(f => f.type === 'input.working' && f.working === true));
-    assert.ok(!room.frames.some(f => f.type === 'input.read'));
+    await until(() => room.sent('input.working').some(d => d.working === true));
+    assert.equal(room.sent('input.read').length, 0);
     line('response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text: message }] });
-    await until(() => room.frames.some(f => f.type === 'input.read' && f.message_id === 'm-7'));
-    const read = room.frames.find(f => f.type === 'input.read');
+    await until(() => room.sent('input.read').some(d => d.message_id === 'm-7'));
+    const read = room.sent('input.read')[0];
     assert.deepEqual({ turn_id: read.turn_id, session_id: read.session_id, revision: read.revision }, { turn_id: 'turn-a', session_id: 's', revision: 5 });
-    await until(() => room.frames.some(f => f.type === 'input.working' && f.turn_phase === 'start' && f.turn_id === 'turn-a'));
+    await until(() => room.sent('input.working').some(d => d.turn_phase === 'start' && d.turn_id === 'turn-a'));
     line('event_msg', { type: 'task_complete', turn_id: 'turn-a' });
-    await until(() => room.frames.some(f => f.type === 'input.working' && f.working === false));
-    const ended = room.frames.find(f => f.type === 'input.working' && f.working === false);
+    await until(() => room.sent('input.working').some(d => d.working === false));
+    const ended = room.sent('input.working').find(d => d.working === false);
     assert.deepEqual({ turn_phase: ended.turn_phase, turn_id: ended.turn_id, session_id: ended.session_id, revision: ended.revision }, { turn_phase: 'end', turn_id: 'turn-a', session_id: 's', revision: 5 });
     // A later turn of its own: working, uncorrelated, and its end clears nothing of ours.
     line('event_msg', { type: 'task_started', turn_id: 'turn-b' });
     line('response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'typed in codex' }] });
     line('event_msg', { type: 'task_complete', turn_id: 'turn-b' });
-    await until(() => room.frames.filter(f => f.type === 'input.working' && f.working === false).length >= 2);
-    assert.equal(room.frames.filter(f => f.type === 'input.read').length, 1);
+    await until(() => room.sent('input.working').filter(d => d.working === false).length >= 2);
+    assert.equal(room.sent('input.read').length, 1);
     facade.end();
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
 });
@@ -486,7 +500,9 @@ test('install: puts this version in front of the harness, re-pins an older regis
   const { command, args } = (await import('../install.mjs')).serverCommand(env);
   const wanted = [command, ...args].join(' ');
   const version = JSON.parse(readFileSync(path.join(here, '..', 'package.json'), 'utf8')).version;
-  assert.equal(wanted, `node ${path.join(env.XDG_DATA_HOME, 'sidevoice', version, 'cli.mjs')} mcp`, 'never npx at session start');
+  const manifest = JSON.parse(readFileSync(path.join(here, '..', 'package.json'), 'utf8'));
+  assert.equal(wanted, `node ${path.join(env.XDG_DATA_HOME, 'sidevoice', version, 'dist', 'cli.mjs')} mcp`, 'never npx at session start');
+  assert.deepEqual(manifest.dependencies, undefined, 'the published package resolves nothing at install time');
 
   assert.rejects(install(['https://room.example', '--harness', 'claude'], env), /Pairing is not part of installing/, 'a room address is refused, with where pairing lives');
 
@@ -494,9 +510,14 @@ test('install: puts this version in front of the harness, re-pins an older regis
   assert.deepEqual(calls(), ['mcp get sidevoice', `mcp add --scope user sidevoice -- ${wanted}`], 'nothing registered: it registers this version');
   assert.match(first.done.join('\n'), /Registered the MCP server/);
   assert.match(first.done.join('\n'), /Copied this version to .*\(removed: 0\.0\.1\)/);
-  for (const file of ['cli.mjs', 'mcp.mjs', 'connector.mjs', 'pair.mjs', 'package.json']) {
-    assert.ok(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', version, file)), file + ' is in the copy');
+  // The copy is what the package ships and nothing more: the bundle, the manifest beside it, and
+  // no step of its own — nothing is fetched, built or resolved on the machine being installed on.
+  // That the bundle then runs is proved where it is run for real, in the room's interop test.
+  for (const file of manifest.files.concat('package.json')) {
+    assert.ok(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', version, file)),
+      `${file} is in the copy (the bundle is built: npm run build -w @sidevoice/uplink)`);
   }
+  assert.equal(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', version, 'node_modules')), false);
   assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1')), 'the older copy is gone');
   assert.match(first.done.join('\n'), /not paired with any room yet/);
   assert.match(first.next.join('\n'), /Emparejar conector/, 'and it says the conversation will ask for the code');

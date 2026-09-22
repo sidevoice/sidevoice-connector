@@ -21,9 +21,13 @@ export function privateNetwork(hostname) {
   return /^[a-z0-9-]+\.[a-z0-9-]+\.svc(\.[a-z0-9.-]+)?$/i.test(hostname);
 }
 
-/** The room's http(s) origin from the socket address the credential stores. */
-export function roomOrigin(wsUrl) {
-  const url = new URL(wsUrl); url.protocol = url.protocol === 'wss:' ? 'https:' : 'http:'; return url.origin;
+/** The room's http(s) origin, from whatever address is to hand. A credential written by an older
+ *  version names a socket and a path; the room is the same room, and the path is no longer the
+ *  credential's to remember — the room will refuse that credential's protocol and say to pair again. */
+export function roomOrigin(address) {
+  const url = new URL(address);
+  url.protocol = url.protocol === 'wss:' ? 'https:' : url.protocol === 'ws:' ? 'http:' : url.protocol;
+  return url.origin;
 }
 
 /** Which room this machine is paired with, or null. */
@@ -47,11 +51,12 @@ export async function pair(room, code, env = process.env) {
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error('Pairing failed: ' + (body.detail || response.status));
-  const ws = new URL('/api/connectors/ws', base); ws.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:';
   const directory = dataDir(env);
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const file = path.join(directory, 'credentials.json');
-  writeFileSync(file, JSON.stringify({ url: ws.toString(), connector_id: body.connector_id, token: body.token, protocol: body.protocol }, null, 2), { mode: 0o600 });
+  // Where the room is, not how to reach it: the path and namespace that carry the link belong to
+  // the client and move with its version, so an upgrade never has to rewrite what pairing wrote.
+  writeFileSync(file, JSON.stringify({ url: base.origin, connector_id: body.connector_id, token: body.token, protocol: body.protocol }, null, 2), { mode: 0o600 });
   return { file, connector_id: body.connector_id, origin: base.origin };
 }
 
