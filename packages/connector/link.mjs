@@ -42,6 +42,12 @@ class RoomLink {
       path: PATH,
       transports: ['websocket'],   // no long-polling through a proxy, and no sticky-session question
       auth: { connector_id, token, protocol, host, version },
+      // The backoff this connector has always used, said in the library's words rather than
+      // written again: a room that restarts is back in about a second, and a room that is away
+      // is not hammered. The library's default first delay is 1 s, which measured four times
+      // longer to come back than the loop this replaces (2026-09-22).
+      reconnectionDelay: 250,
+      reconnectionDelayMax: 10_000,
     });
 
     // The room welcomes a connector in its own connect handler, so the welcome and this client's
