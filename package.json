@@ -10,6 +10,6 @@
   "scripts": {
     "build": "npm run build -w @sidevoice/protocol && npm run build -w @sidevoice/browser-audio && npm run build -w @sidevoice/web && npm run build -w @sidevoice/uplink",
     "test": "npm run test -w @sidevoice/protocol && npm run test -w @sidevoice/browser-audio && npm run test -w @sidevoice/web && npm run test -w @sidevoice/uplink",
-    "dev:web": "npm run dev -w @sidevoice/web"
+    "dev:web": "npm run build -w @sidevoice/browser-audio && npm run dev -w @sidevoice/web"
   }
 }
