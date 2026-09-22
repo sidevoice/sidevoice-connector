@@ -112,9 +112,14 @@ jobs:
 
           ## Connect a conversation
 
+          On the machine where your agent runs:
+
           \`\`\`sh
-          npx -y @sidevoice/uplink@$version pair
+          npx -y @sidevoice/uplink@$version install
           \`\`\`
+
+          Then, in a new conversation, ask the agent to join the room; the first
+          time it asks you for the code the room shows under "Emparejar conector".
 
           The client is **staged** on npm and becomes installable once a
           maintainer approves it — npmjs.com → the package → Staged Packages.
