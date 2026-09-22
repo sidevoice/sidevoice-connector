@@ -84,6 +84,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # the notes are the commits since the previous tag
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -97,8 +99,10 @@ jobs:
           IMAGE_DIGEST: ${{ needs.verify.outputs.image-digest }}
         run: |
           version="${GITHUB_REF_NAME#v}"
+          previous=$(git describe --tags --abbrev=0 "$GITHUB_REF_NAME^" 2>/dev/null || git rev-list --max-parents=0 HEAD)
           notes=$(mktemp)
-          cat > "$notes" <<NOTES
+          scripts/release-notes.sh "$previous" "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" > "$notes"
+          cat >> "$notes" <<NOTES
           ## Run the room
 
           \`\`\`sh
