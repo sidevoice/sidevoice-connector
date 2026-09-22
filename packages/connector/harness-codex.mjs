@@ -91,21 +91,44 @@ export function interpretRollout(entry, state = {}) {
   return null;
 }
 
+/** The model a rollout line says the thread thinks with. Codex writes it on the `turn_context` of every
+ *  turn — `{"type":"turn_context","payload":{"model":"gpt-5.6-terra", ...}}` — and on the `session_meta`
+ *  that opens the file when that one says it, so a thread nobody launched with `CODEX_MODEL` still says
+ *  what it thinks with. */
+export function rolloutModel(entry) {
+  if (entry?.type !== 'turn_context' && entry?.type !== 'session_meta') return null;
+  const model = entry.payload?.model;
+  return typeof model === 'string' && model ? model : null;
+}
+
 const POLL_MS = Number(process.env.SIDEVOICE_WORK_POLL_MS || 400);
 
 /** Watch one thread through its rollout: task_started/task_complete are the turn, a user message is the
- *  moment the thread took it (a queued message is written when the turn starts on it). What the rollout
- *  already holds is read first, silently, so a turn that was running before we looked is reported as
- *  running — old messages are not re-read. */
-export function observe(threadId, handlers) {
+ *  moment the thread took it (a queued message is written when the turn starts on it), and turn_context
+ *  names the model. What the rollout already holds is read first, silently, so a turn that was running
+ *  before we looked — and the model it was already thinking with — is reported once the replay is over;
+ *  old messages are not re-read. */
+export function observe(threadId, handlers, env = process.env) {
   const state = {};
-  let working = null;
+  let working = null, model = null, reported = null;
+  const sayModel = () => {
+    if (!model || model === reported) return;
+    reported = model;
+    // Effort and thinking are still only said by the environment the thread was launched in.
+    const launched = engine(threadId, env) || {};
+    handlers.engine?.({ model, effort: launched.effort || null, thinking: launched.thinking || null });
+  };
   return tailJsonl(() => rolloutPath(threadId), (entry, replayed) => {
+    const named = rolloutModel(entry);
+    if (named) { model = named; if (!replayed) sayModel(); }
     const seen = interpretRollout(entry, state);
     if (!seen) return;
     if (typeof seen.working === 'boolean') { working = seen.working; if (!replayed) handlers.working(seen.working, { turn_id: seen.turn_id }); }
     else if (!replayed) handlers.userMessage({ text: seen.text, turn_id: seen.turn_id });
-  }, { intervalMs: POLL_MS, catchUp: true, caughtUp: () => { if (working !== null) handlers.working(working, { turn_id: working ? state.turn_id : null }); } });
+  }, { intervalMs: POLL_MS, catchUp: true, caughtUp: () => {
+    if (working !== null) handlers.working(working, { turn_id: working ? state.turn_id : null });
+    sayModel();
+  } });
 }
 
 export const codexHarness = defineHarness({

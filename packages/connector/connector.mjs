@@ -175,6 +175,19 @@ function watch(binding) {
       if (turn_id && binding.turn) return;     // some other turn ended: ours is still running
       return announceWork(binding, false, {});
     },
+    /** Which model the conversation thinks with, as its harness records it. It replaces whatever the
+     *  launch line said, and stays on the binding: a room that restarts learns it from the next
+     *  registration, and one that is not there yet from the first. */
+    engine(observed) {
+      if (!observed?.model) return;
+      const engine = { model: observed.model, effort: observed.effort ?? null, thinking: observed.thinking ?? null };
+      const previous = binding.engine || {};
+      if (previous.model === engine.model && previous.effort === engine.effort && previous.thinking === engine.thinking) return;
+      binding.engine = engine;
+      log(`${binding.thread} thinks with ${engine.model}${engine.effort ? ' (effort ' + engine.effort + ')' : ''}`);
+      // Until the room has minted the durable id there is nothing to name: the registration carries it.
+      if (!binding.binding_id.startsWith('local-')) send('input.engine', { binding_id: binding.binding_id, engine });
+    },
   });
   keepAnnouncing();
 }
@@ -265,6 +278,8 @@ async function announce(binding) {
     throw error;
   });
   if (binding.binding_id !== reply.binding_id) { bindings.delete(binding.binding_id); binding.binding_id = reply.binding_id; bindings.set(reply.binding_id, binding); }
+  // An engine observed while the room was answering is not lost: the frame was built before it arrived.
+  if (binding.engine !== frame.engine) send('input.engine', { binding_id: binding.binding_id, engine: binding.engine });
   if (typeof binding.working === 'boolean') announceWork(binding, binding.working);
   log(`room registered ${binding.thread} as ${reply.binding_id} ("${binding.title || ''}")`);
   return reply;

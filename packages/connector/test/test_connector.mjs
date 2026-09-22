@@ -438,6 +438,15 @@ test('connector: Claude Code — the message is read when the session\'s transcr
     assert.deepEqual({ turn_phase: ended.turn_phase, turn_id: ended.turn_id, session_id: ended.session_id, revision: ended.revision }, { turn_phase: 'end', turn_id: 'p-1', session_id: 's', revision: 3 });
     // The same transcript line read again (a rewrite, a restart) is not a second receipt.
     assert.equal(room.sent('input.read').length, 1);
+    // Nobody launched this session with --model, and the room still learns what it thinks with: the
+    // transcript says it on every answer, and only a change is worth a frame.
+    assert.equal(room.sent('input.engine').length, 0, 'nothing is said before the session has answered once');
+    line({ type: 'assistant', message: { model: 'claude-fable-5-1', role: 'assistant', content: [{ type: 'text', text: 'ya voy' }] }, uuid: 'a-1' });
+    await until(() => room.sent('input.engine').length === 1);
+    assert.deepEqual(room.sent('input.engine')[0], { binding_id: 'b-1', engine: { model: 'claude-fable-5-1', effort: null, thinking: null } });
+    line({ type: 'assistant', message: { model: 'claude-fable-5-1', role: 'assistant', content: [{ type: 'text', text: 'sigo' }] }, uuid: 'a-2' });
+    await wait(120);
+    assert.equal(room.sent('input.engine').length, 1, 'the same model again is not news');
     await delivery;
     assert.match(stderr(), /sess-1 read m-1/);
     facade.end();
@@ -683,4 +692,76 @@ test('The harness says whether it is working: Claude Code publishes it per sessi
     assert.equal(sessionWorking('quiet-one'), null);
     assert.equal(sessionWorking('nobody'), null);
   } finally { if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = previous; }
+});
+
+test('harness modules: the model a conversation thinks with is observed where its harness records it — first seen, a change, and nothing on a repeat', async () => {
+  const previous = { claude: process.env.CLAUDE_CONFIG_DIR, codex: process.env.CODEX_HOME, poll: process.env.SIDEVOICE_WORK_POLL_MS };
+  process.env.SIDEVOICE_WORK_POLL_MS = '20';
+  try {
+    // Claude Code: every assistant entry of the transcript names the model that wrote it. The shape is
+    // the real one, from `~/.claude/projects/<slug>/<session id>.jsonl` on Claude Code 2.1.278.
+    const claudeHome = mkdtempSync(path.join(os.tmpdir(), 'sv-claude-'));
+    mkdirSync(path.join(claudeHome, 'projects', '-home-someone-project'), { recursive: true });
+    const transcript = path.join(claudeHome, 'projects', '-home-someone-project', 'sess-e.jsonl');
+    writeFileSync(transcript, '');
+    const assistant = model => appendFileSync(transcript, JSON.stringify({ parentUuid: 'u-0', isSidechain: false,
+      message: { model, id: 'msg_1', type: 'message', role: 'assistant', content: [{ type: 'text', text: 'hola' }],
+                 stop_reason: 'end_turn', usage: { input_tokens: 2, output_tokens: 9 } },
+      requestId: 'req_1', type: 'assistant', uuid: 'u-1', timestamp: new Date().toISOString() }) + '\n');
+    process.env.CLAUDE_CONFIG_DIR = claudeHome;
+    const claude = await import('../harness-claude.mjs?' + Math.random());
+    assert.equal(claude.assistantModel({ type: 'assistant', message: { model: 'claude-fable-5-1' } }), 'claude-fable-5-1');
+    assert.equal(claude.assistantModel({ type: 'user', message: { model: 'claude-fable-5-1' } }), null, 'only an assistant entry says what answered');
+    assert.equal(claude.assistantModel({ type: 'assistant', message: { role: 'assistant' } }), null);
+    const said = [];
+    const stop = claude.observe('sess-e', { userMessage() {}, working() {}, engine: seen => said.push(seen) });
+    try {
+      await wait(80);                                         // the watcher is in place before the session answers
+      assistant('claude-fable-5-1');
+      await until(() => said.length === 1);
+      assert.deepEqual(said[0], { model: 'claude-fable-5-1', effort: null, thinking: null },
+        'no launch flag to read, so effort and thinking are absent rather than guessed');
+      assistant('claude-fable-5-1');
+      assistant('claude-fable-5-1');
+      await wait(120);
+      assert.equal(said.length, 1, 'the same model, said again by the harness, is not news');
+      assistant('claude-opus-5');
+      await until(() => said.length === 2);
+      assert.equal(said[1].model, 'claude-opus-5');
+    } finally { stop(); }
+
+    // Codex: the turn_context that opens every turn names the model. Shape from a real rollout on
+    // Codex CLI 0.153.2 — its session_meta does not carry one, so the first turn is where it is seen.
+    const codexHome = mkdtempSync(path.join(os.tmpdir(), 'sv-codex-'));
+    const day = path.join(codexHome, 'sessions', '2026', '09', '22'); mkdirSync(day, { recursive: true });
+    const rollout = path.join(day, 'rollout-2026-09-22T10-00-00-thread-e.jsonl');
+    const line = (type, payload) => appendFileSync(rollout, JSON.stringify({ timestamp: new Date().toISOString(), ordinal: 0, type, payload }) + '\n');
+    const context = (model, turn_id) => line('turn_context', { cwd: '/tmp/work', model, effort: 'medium', summary: 'auto',
+      approval_policy: 'never', sandbox_policy: {}, turn_id });
+    line('session_meta', { session_id: 'thread-e', id: 'thread-e', cwd: '/tmp/work', originator: 'test',
+      cli_version: '0.153.2', source: 'vscode', model_provider: 'openai' });
+    context('gpt-5.6-terra', 'turn-a');                       // already in the file when we start watching
+    process.env.CODEX_HOME = codexHome;
+    const codex = await import('../harness-codex.mjs?' + Math.random());
+    assert.equal(codex.rolloutModel({ type: 'turn_context', payload: { model: 'gpt-5.6-terra' } }), 'gpt-5.6-terra');
+    assert.equal(codex.rolloutModel({ type: 'session_meta', payload: { model: 'gpt-5.6-terra' } }), 'gpt-5.6-terra', 'session_meta says it when that build writes it');
+    assert.equal(codex.rolloutModel({ type: 'session_meta', payload: { model_provider: 'openai' } }), null, 'a provider is not a model');
+    assert.equal(codex.rolloutModel({ type: 'event_msg', payload: { type: 'task_started' } }), null);
+    const heard = [];
+    const stopCodex = codex.observe('thread-e', { userMessage() {}, working() {}, engine: seen => heard.push(seen) }, {});
+    try {
+      // What the rollout already held is read silently; the model it named is reported once the replay is over.
+      await until(() => heard.length === 1);
+      assert.deepEqual(heard[0], { model: 'gpt-5.6-terra', effort: null, thinking: null });
+      context('gpt-5.6-terra', 'turn-b');
+      await wait(120);
+      assert.equal(heard.length, 1, 'every turn names the model; only a change is news');
+      context('gpt-5.6-mini', 'turn-c');
+      await until(() => heard.length === 2);
+      assert.equal(heard[1].model, 'gpt-5.6-mini');
+    } finally { stopCodex(); }
+  } finally {
+    for (const [name, value] of [['CLAUDE_CONFIG_DIR', previous.claude], ['CODEX_HOME', previous.codex], ['SIDEVOICE_WORK_POLL_MS', previous.poll]])
+      if (value === undefined) delete process.env[name]; else process.env[name] = value;
+  }
 });

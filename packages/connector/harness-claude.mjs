@@ -190,15 +190,32 @@ export function userMessageText(entry) {
   return parts.length ? parts.join('\n') : null;
 }
 
+/** The model a transcript entry says answered with it. Claude Code writes it on every assistant entry —
+ *  `{"type":"assistant","message":{"model":"claude-fable-5-1", ...}}` — which is why a session launched
+ *  with no `--model` still says what it thinks with, the moment it answers once. */
+export function assistantModel(entry) {
+  if (entry?.type !== 'assistant') return null;
+  const model = entry.message?.model;
+  return typeof model === 'string' && model ? model : null;
+}
+
 const POLL_MS = Number(process.env.SIDEVOICE_WORK_POLL_MS || 400);
 
 /** Watch one session through what Claude Code itself writes about it, and nothing installed in it:
- *  its registry record says whether it is busy, and its transcript records every user message the
+ *  its registry record says whether it is busy, its transcript records every user message the
  *  moment the session admits it (a message from the inbox is appended as the turn takes it, not when
- *  the socket accepted it — the difference is what the second tick shows). */
+ *  the socket accepted it — the difference is what the second tick shows), and every assistant entry
+ *  names the model that wrote it. */
 export function observe(sessionId, handlers) {
-  let lastStatus = null;
+  let lastStatus = null, lastModel = null;
   const stopTranscript = tailJsonl(() => transcriptPath(sessionId), entry => {
+    const model = assistantModel(entry);
+    if (model && model !== lastModel) {
+      lastModel = model;
+      // Effort and thinking are still only said on the launch line; absent rather than guessed.
+      const launched = sessionEngine(sessionId);
+      handlers.engine?.({ model, effort: launched?.effort || null, thinking: launched?.thinking || null });
+    }
     const text = userMessageText(entry);
     if (text !== null) handlers.userMessage({ text, turn_id: entry.promptId || null });
   }, { intervalMs: POLL_MS });
