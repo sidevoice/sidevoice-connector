@@ -281,7 +281,7 @@ export async function install(argv = process.argv.slice(2), env = process.env) {
 
   if (harnesses.includes('claude')) {
     next.push('In a conversation, ask to join the voice room (or run /mcp__sidevoice__voice-room).' +
-              (paired ? '' : ' The first time, the conversation asks you for the room\'s address and the one-time code the room shows under "Emparejar máquina".'));
+              (paired ? '' : ' With no room paired it joins this machine only: the Sidevoice app on this computer reaches it once you ask the conversation to pair a device. For a room, give the conversation its address and the code it shows under "Emparejar máquina".'));
     next.push('Sessions already open need a restart before they see the server.');
     const warning = inboundWarning(env);
     if (warning) next.push(warning);
