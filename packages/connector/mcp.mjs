@@ -96,8 +96,8 @@ const tools = [
     inputSchema: { type: 'object', properties: { title: { type: 'string', description: 'Short label for this conversation in the room' }, room: { type: 'string', description: 'The room\'s address (https://…) when the user names one; omitted, the room this machine is paired with' } }, additionalProperties: false } },
   { name: 'voice_pair', description: 'Pair this machine with a room using the one-time code the user read from the room\'s interface ("Emparejar máquina"). Only with a code the user gave you; one room per machine, a new pairing replaces the previous one.',
     inputSchema: { type: 'object', properties: { room: { type: 'string', description: 'The room\'s address (https://…)' }, code: { type: 'string', description: 'The one-time pairing code shown by the room' } }, required: ['room', 'code'], additionalProperties: false } },
-  { name: 'voice_say', description: 'Publish a concise spoken version of your reply to the room, with the session_id and revision from the voice message header.',
-    inputSchema: { type: 'object', properties: { text: { type: 'string' }, session_id: { type: 'string' }, revision: { type: 'integer', minimum: 0 }, utterance_id: { type: 'string' }, language: { type: 'string', enum: ['es', 'en', 'fr', 'it', 'pt', 'hi'] } }, required: ['text', 'session_id', 'revision'], additionalProperties: false } },
+  { name: 'voice_say', description: 'Publish a concise spoken version of your reply to the room, with the session_id and revision from the voice message header. To speak before any voice message arrived, pass instead the conversation id voice_connect returned in this chat.',
+    inputSchema: { type: 'object', properties: { text: { type: 'string' }, session_id: { type: 'string' }, revision: { type: 'integer', minimum: 0 }, conversation: { type: 'string', description: 'The conversation id voice_connect returned in this chat: to speak with no voice message to answer' }, utterance_id: { type: 'string' }, language: { type: 'string', enum: ['es', 'en', 'fr', 'it', 'pt', 'hi'] } }, required: ['text'], additionalProperties: false } },
   { name: 'voice_disconnect', description: 'Leave the voice room. The conversation and its work continue in writing.', inputSchema: { type: 'object', properties: { conversation: { type: 'string', description: 'Only when several chats of this window are joined: the conversation id voice_connect returned in this chat' } }, additionalProperties: false } },
   { name: 'voice_status', description: 'Whether the room can currently reach this conversation.', inputSchema: { type: 'object', properties: { conversation: { type: 'string', description: 'Only when several chats of this window are joined: the conversation id voice_connect returned in this chat' } }, additionalProperties: false } },
 ];
@@ -132,12 +132,12 @@ const single = () => (!cursorViews() && joined.size === 1 ? joined.values().next
 function pick(conversation) {
   if (conversation) {
     const named = joined.get(conversation);
-    if (!named) throw new Error(`"${conversation}" is not a conversation this server joined. Joined: ${[...joined.keys()].join(', ') || 'none'}.`);
+    if (!named) throw new Error(`"${conversation}" is not a conversation this server joined: pass the id voice_connect returned in this chat.`);
     return named;
   }
   if (!joined.size) return null;
   if (single()) return single();
-  throw new Error(`Several chats of this window are joined (${[...joined.values()].map(b => `${b.client_ref} "${b.title}"`).join(', ')}); pass conversation: the id voice_connect returned in this chat.`);
+  throw new Error(`Several chats of this window are joined (${[...joined.values()].map(b => `"${b.title}"`).join(', ')}); pass conversation: the id voice_connect returned in this chat.`);
 }
 async function leave(b) {
   joined.delete(b.client_ref);
@@ -211,7 +211,8 @@ async function invoke(name, args, meta) {
     const common = { room: status.room || pairedRoom()?.origin || null, room_reachable: status.connected, room_error: status.room_error || null, socket_error: status.socket_error || null,
              protocol: status.protocol ?? null,
              version: VERSION, connector_version: status.version || null, ...versionNote(status.version) };
-    const list = cursorViews() || joined.size > 1 ? { conversations: [...joined.values()].map(b => ({ conversation: b.client_ref, title: b.title, harness: b.harness })) } : {};
+    // Titles only: an id is the chat's own, handed to it by voice_connect, and must not reach another chat.
+    const list = cursorViews() || joined.size > 1 ? { conversations: [...joined.values()].map(b => ({ title: b.title, harness: b.harness })) } : {};
     if (!asked && joined.size) return { joined: null, ...common, ...list, ...closedList,
       note: 'Chats of this Cursor window are joined, and this call does not say which chat is asking. If voice_connect returned a conversation id in this chat, pass it as conversation to ask about this one; if it never did, this chat is not joined.' };
     const binding = asked ? joined.get(asked) || null : null;
@@ -282,6 +283,7 @@ async function invoke(name, args, meta) {
              ...(who.editor ? { view: `Voice reaches this chat through the small Sidevoice card drawn under this call: it must stay open in this chat. Other chats of this window can join too, each with its own card. Remember this chat's conversation id (${who.thread}): voice_status and voice_disconnect need it when several chats are joined.` } : {}),
              ...(who.watchNote ? { watch_note: who.watchNote } : {}),
              ...(isCursorClient(client) ? { card: cardReport(who, result) } : {}),
+             ...(who.editor ? { speak_first: `To speak before the user has said anything by voice, call voice_say with conversation "${who.thread}" and no session_id. To answer a voice message, use its session_id and revision as usual.` } : {}),
              ...(experimental.length ? { experimental, experimental_notes: experimental.map(name => EXPERIMENTAL_NOTES[name === 'deliver' ? who.delivery.kind : name]).filter(Boolean) } : {}),
              ...(who.delivery.kind === 'cursor-app' && result.prepared?.port ? { view_link: { conversation: who.thread, port: result.prepared.port, key: who.delivery.key } } : {}),
              version: VERSION, connector_version: connectorVersion, ...versionNote(connectorVersion) };
@@ -289,8 +291,18 @@ async function invoke(name, args, meta) {
   if (!joined.size) throw new Error('Not connected to the voice room: call voice_connect first (only if the user asked).');
 
   if (name === 'voice_say') {
-    // One conversation: it. Several: the connector finds the one this turn was delivered to.
-    const only = single();
+    // Named: the conversation voice_connect handed this chat, speaking with no turn to answer (the room plays
+    // speech of a session it does not know to whoever listens to that conversation). Otherwise one
+    // conversation: it; several: the connector finds the one the answered turn was delivered to.
+    let named = null;
+    if (args.conversation) {
+      named = joined.get(args.conversation);
+      if (!named) throw new Error(`"${args.conversation}" is not a conversation this server joined: pass the id voice_connect returned in this chat.`);
+      if (args.session_id && !String(args.session_id).startsWith('typed:')) named = null;   // a turn named too: route by the turn
+      else args = { ...args, session_id: 'typed:' + named.client_ref, revision: 0 };
+    }
+    if (!args.session_id || !Number.isInteger(args.revision)) throw new Error('voice_say needs the session_id and revision of the voice message you answer, or — to speak first — the conversation id voice_connect returned in this chat.');
+    const only = named || single();
     const route = only ? { binding_id: only.binding_id, client_ref: only.client_ref } : { client_refs: [...joined.keys()] };
     let result;
     try {
@@ -325,6 +337,9 @@ process.stdin.on('data', async chunk => {
     const index = input.indexOf('\n'); const line = input.slice(0, index); input = input.slice(index + 1);
     if (!line.trim()) continue;
     let request; try { request = JSON.parse(line); } catch { continue; }
+    // Every method the client calls, by name, so what Cursor asks — and does not ask — shows in mcp.log.
+    if (request.method && !['initialize', 'tools/list', 'resources/read', 'ping'].includes(request.method))
+      mcpLog({ event: 'request', method: request.method, ...(request.method === 'tools/call' ? { tool: request.params?.name ?? null, meta_keys: Object.keys(request.params?._meta || {}) } : {}) });
     if (request.id === undefined) continue; // notifications need no answer
     let result, error;
     try {
@@ -338,7 +353,7 @@ process.stdin.on('data', async chunk => {
         if (request.params?.name !== 'voice-room') throw Object.assign(new Error('Unknown prompt'), { code: -32602 });
         result = { description: PROMPTS[0].description, messages: [{ role: 'user', content: { type: 'text', text: promptText(request.params?.arguments) } }] };
       }
-      else if (request.method === 'tools/list') { mcpLog({ event: 'tools/list', voice_connect_carries_card: cursorViews() }); result = { tools: cursorViews() ? tools.map(tool => tool.name === 'voice_connect' ? { ...tool, _meta: { ui: { resourceUri: RESOURCE_URI } } } : tool) : tools }; }
+      else if (request.method === 'tools/list') { mcpLog({ event: 'tools/list', voice_connect_carries_card: cursorViews() }); result = { tools: cursorViews() ? tools.map(tool => tool.name === 'voice_connect' ? { ...tool, _meta: { ui: { resourceUri: RESOURCE_URI }, 'ui/resourceUri': RESOURCE_URI } } : tool) : tools }; }
       else if (request.method === 'resources/list') result = { resources: cursorViews() ? [{ uri: RESOURCE_URI, name: 'Sidevoice voice link', mimeType: resource().mimeType }] : [] };
       else if (request.method === 'resources/read') {
         mcpLog({ event: 'resources/read', uri: request.params?.uri ?? null, served: cursorViews() && request.params?.uri === RESOURCE_URI });

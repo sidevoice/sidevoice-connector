@@ -625,7 +625,7 @@ test('façade + connector: a chat of the Cursor editor joins through the view vo
     await until(() => replies.length === 4, 8000);
     const byId = id => replies.find(r => r.id === id);
     assert.ok(byId(1).result.capabilities.resources, 'resources offered to a client that draws views');
-    assert.deepEqual(byId(2).result.tools.find(t => t.name === 'voice_connect')._meta, { ui: { resourceUri: 'ui://sidevoice/voice-link' } });
+    assert.deepEqual(byId(2).result.tools.find(t => t.name === 'voice_connect')._meta, { ui: { resourceUri: 'ui://sidevoice/voice-link' }, 'ui/resourceUri': 'ui://sidevoice/voice-link' }, 'both keys Cursor reads (b1b)');
     assert.equal(byId(2).result.tools.find(t => t.name === 'voice_say')._meta, undefined);
     const html = byId(3).result.contents[0];
     assert.equal(html.mimeType, 'text/html;profile=mcp-app');
@@ -643,6 +643,9 @@ test('façade + connector: a chat of the Cursor editor joins through the view vo
     const connectLine = logged.find(line => line.event === 'voice_connect');
     assert.equal(connectLine.route, 'cursor-editor-view'); assert.ok(connectLine.card_port > 0);
     assert.ok(!JSON.stringify(logged).includes(joined.view_link.key), 'the key is never logged');
+    assert.ok(logged.some(line => line.event === 'tools/list' && line.voice_connect_carries_card));
+    assert.ok(logged.some(line => line.event === 'request' && line.method === 'tools/call' && line.tool === 'voice_connect' && line.meta_keys.includes('progressToken')), 'every method is logged by name');
+    assert.match(joined.speak_first, new RegExp(joined.conversation));
     assert.equal(joined.view_link.conversation, joined.conversation); assert.ok(joined.view_link.port > 0); assert.match(joined.view_link.key, /^[0-9a-f]{64}$/);
     assert.ok(joined.experimental_notes.some(note => /Sidevoice card/.test(note)) && !joined.experimental_notes.some(note => /tmux/.test(note)), 'the editor is told about its own route');
     assert.ok(!JSON.stringify(room.sent('binding.register')).includes(joined.view_link.key), 'the key never leaves the machine');
@@ -696,6 +699,12 @@ test('façade + connector: four chats of one Cursor editor window join at once, 
     assert.equal(other.joined, null, 'with one chat joined, a call from any chat of the window does not say which it is');
     assert.equal(other.conversations.length, 1);
     await assert.rejects(call('voice_say', { text: 'x', session_id: 'browser-1', revision: 1 }), /has received none to answer by voice/);
+    // It can speak first, with the id voice_connect gave it: published as that chat, with no turn to answer.
+    await call('voice_say', { text: 'hola, estoy aquí', conversation: chats[0] });
+    assert.deepEqual([room.sent('speech.publish').at(-1).binding_id, room.sent('speech.publish').at(-1).session_id], ['b-1', 'typed:' + chats[0]]);
+    await assert.rejects(call('voice_say', { text: 'x', conversation: 'cursor-editor-00000000-0000-0000-0000-000000000000' }), /not a conversation this server joined/);
+    await assert.rejects(call('voice_say', { text: 'x' }), /or — to speak first — the conversation id/);
+    assert.ok(!JSON.stringify(other).includes(chats[0]), 'voice_status never hands a chat another chat\'s id');
     await assert.rejects(call('voice_disconnect'), /pass conversation/);
     for (const title of ['Dos', 'Tres', 'Cuatro']) {
       const joinedChat = await call('voice_connect', { title });
@@ -715,7 +724,7 @@ test('façade + connector: four chats of one Cursor editor window join at once, 
     // Each chat answers its own turn: the reply is published as that chat, not as whichever joined last.
     await call('voice_say', { text: 'respuesta tres', session_id: 'browser-1', revision: 12 });
     await call('voice_say', { text: 'respuesta uno', session_id: 'browser-1', revision: 10 });
-    assert.deepEqual(room.sent('speech.publish').map(p => [p.binding_id, p.text]), [['b-3', 'respuesta tres'], ['b-1', 'respuesta uno']]);
+    assert.deepEqual(room.sent('speech.publish').map(p => [p.binding_id, p.text]), [['b-1', 'hola, estoy aquí'], ['b-3', 'respuesta tres'], ['b-1', 'respuesta uno']]);
     // `typed:` is only for a conversation that cannot take input: it names no chat of this window.
     await assert.rejects(call('voice_say', { text: 'x', session_id: 'typed:' + chats[3], revision: 0 }), /no conversation of yours that cannot take input/);
     // The same pair sent to two chats (the room reuses revision 0 for catch-up input) names neither.
