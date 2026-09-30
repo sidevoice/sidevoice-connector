@@ -261,8 +261,8 @@ async function invoke(name, args, meta) {
     try { who = identifyHarness(meta, process.env, client); }
     catch (error) { mcpLog({ event: 'voice_connect_refused', client: client?.name ?? null, views: cursorViews(), reason: error.message }); throw error; }
     // What only an asynchronous look adds (Cursor's editor: which chat is calling, through its Desktop Bridge).
-    try { who = (await who.module.refineIdentity?.(who)) || who; } catch {}
     const title = (args.title || process.env.SIDEVOICE_TITLE || path.basename(process.cwd())).slice(0, 200);
+    try { who = (await who.module.refineIdentity?.(who, process.env, { title: (args.title || '').trim().slice(0, 200) || null })) || who; } catch {}
     // Refuse rather than join a room we cannot hear from: a conversation whose harness holds
     // what the room posts would sit in the list looking present while the user talks to nobody.
     const inbound = inboundFor(who.module, who.thread);

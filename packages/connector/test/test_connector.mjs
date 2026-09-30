@@ -926,6 +926,40 @@ test('façade + connector: with Cursor\'s Desktop Bridge on, an editor chat gets
   } finally { view?.stop(); child.kill(); if (connector.exitCode === null) connector.kill(); await fake.close(); await room.close(); }
 });
 
+test('connector: with the Desktop Bridge on, an editor chat is identified by its transcript recording the voice_connect call, and every step is in connector.log', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const cursorHome = mkdtempSync(path.join(os.tmpdir(), 'sv-cursor-'));
+  // Cursor 3.22.12's main process answers an unknown thread with status "unknown-thread".
+  const fake = await fakeDesktopBridge({ answer: request => request.threadId === 'comp-A' ? { status: 'submitted', threadId: 'comp-A', windowId: 1, threadTitle: 'A' } : { status: 'unknown-thread' } });
+  room.handle = (event, data) => { if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-t', thread: data.thread }; };
+  const { child, socketPath } = startConnector(room.origin, dataDir, { ...fake.env, CURSOR_DATA_DIR: cursorHome, SIDEVOICE_CURSOR_SCAN_MS: '50', SIDEVOICE_CURSOR_LOOKUP_AT: '100', SIDEVOICE_CURSOR_APP_TIMEOUT_MS: '300', SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    const thread = 'cursor-editor-6b2c3d4e-5f60-4a1b-8c2d-3e4f5a6b7c8d';
+    await facade.call('register', { client_ref: thread, harness: 'cursor', thread, title: 'Mi chat', route: 'cursor-editor-bridge',
+      delivery: { kind: 'cursor-app', thread, key: 'f'.repeat(64), candidate: 'comp-A', title: 'Mi chat' },
+      capabilities: { deliver: 'supported', inspectInbound: 'unsupported', working: 'supported', endOfTurn: 'supported', sessionIdentity: 'supported' } });
+    const logText = () => readFileSync(path.join(dataDir, 'connector.log'), 'utf8');
+    await until(() => /Cursor Desktop Bridge found .*candidate chat comp-A/.test(logText()));
+    // Not identified yet: the card is tried, and the log says why.
+    const early = await room.ask('input.deliver', { event_id: 'e-0', binding_id: 'b-t', channel: 'voice', session_id: 's', revision: 1, message_id: 'm-0', text: 'pronto' });
+    assert.equal(fake.sent.length, 0); assert.equal(early.status, 'failed');
+    assert.match(logText(), /chat not identified yet — m-0 goes to the card/);
+    // Cursor writes the chat's transcript: the call, with its title.
+    const dir = path.join(cursorHome, 'projects', 'work-app', 'agent-transcripts', 'comp-A'); mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, 'comp-A.jsonl'), JSON.stringify({ role: 'user', message: { content: [{ type: 'text', text: 'únete a la sala' }] } }) + '\n'
+      + JSON.stringify({ role: 'assistant', message: { content: [{ type: 'tool_use', name: 'mcp_sidevoice_voice_connect', input: { title: 'Mi chat' } }] } }) + '\n');
+    await until(() => /identified as Cursor chat comp-A — its transcript records this voice_connect/.test(logText()));
+    const sent = await room.ask('input.deliver', { event_id: 'e-1', binding_id: 'b-t', channel: 'voice', session_id: 's', revision: 2, message_id: 'm-1', text: 'hola' });
+    assert.equal(sent.status, 'accepted'); assert.equal(fake.sent.at(-1).threadId, 'comp-A');
+    assert.match(logText(), /Desktop Bridge sent m-1 to chat comp-A: submitted/);
+    assert.ok(!logText().includes(thread), 'ids hashed in the log');
+    facade.end();
+  } finally { if (child.exitCode === null) child.kill(); await fake.close(); await room.close(); }
+});
+
 test('pairing: plaintext only where the token cannot leave the machine or the cluster', async () => {
   const { privateNetwork, pair } = await import('../pair.mjs');
   for (const ok of ['127.0.0.1', 'localhost', 'room.voice.svc', 'room.voice.svc.cluster.local', 'room.voice.svc.k8s.example']) assert.equal(privateNetwork(ok), true, ok);

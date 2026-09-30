@@ -97,7 +97,8 @@ export async function sendToThread(threadId, text, env = process.env, { force = 
     }
     const outcome = answer.body?.outcome ?? answer.body?.status;
     if (answer.statusCode === 200 && (outcome === 'submitted' || outcome === 'queued')) return { outcome, title: answer.body.threadTitle ?? null };
-    if (outcome === 'not-found') { last = Object.assign(new Error(`Cursor does not know chat ${threadId}`), { code: 'NOT_FOUND' }); continue; }
+    // 3.22.12's main process says `unknown-thread` (the renderer, `not-found`): this app does not have that chat.
+    if (outcome === 'not-found' || outcome === 'unknown-thread') { last = Object.assign(new Error(`Cursor does not know chat ${threadId}`), { code: 'NOT_FOUND' }); continue; }
     last = Object.assign(new Error(`Cursor did not take it: ${answer.body?.reason || answer.body?.message || answer.body?.error || outcome || answer.statusCode}`), { code: 'REFUSED' });
     break;
   }
@@ -108,7 +109,7 @@ export async function sendToThread(threadId, text, env = process.env, { force = 
  *  other, stored by Cursor with the chat's bubbles in its state database (written up to ~30 s late). Given a
  *  candidate, only that chat's rows are read (an index range); otherwise every bubble, in a separate process so
  *  the connector never waits on it. Exactly one chat must hold it, or none is named. */
-export async function composerHolding(marker, env = process.env, { candidate = null } = {}) {
+export async function composerHolding(marker, env = process.env, { candidate = null, onError = null } = {}) {
   if (!/^[0-9a-f]{64}$/.test(marker || '')) return null;
   for (const instance of bridgeInstances(env)) {
     const file = path.join(instance.userDataDir || '', 'User', 'globalStorage', 'state.vscdb');
@@ -120,7 +121,9 @@ const db = new DatabaseSync(file, { readOnly: true });
 const rows = db.prepare("SELECT DISTINCT substr(key, 10, instr(substr(key, 10), ':') - 1) AS chat FROM cursorDiskKV WHERE key >= ? AND key < ? AND instr(CAST(value AS TEXT), ?) > 0 LIMIT 2").all(from, to, marker);
 db.close(); process.stdout.write(JSON.stringify(rows.map(r => r.chat)));`;
     const chats = await new Promise(resolve => execFile(process.execPath, ['--no-warnings', '-e', script, file, marker, from, to], { timeout: 60_000, maxBuffer: 1 << 16 },
-      (error, stdout) => { if (error) return resolve(null); try { resolve(JSON.parse(stdout)); } catch { resolve(null); } }));
+      (error, stdout, stderr) => {
+        if (error) { onError?.(String(stderr || error.message).trim().split('\n').pop().slice(0, 200)); return resolve(null); }
+        try { resolve(JSON.parse(stdout)); } catch { resolve(null); } }));
     if (Array.isArray(chats) && chats.length === 1 && chats[0]) return chats[0];
   }
   return null;

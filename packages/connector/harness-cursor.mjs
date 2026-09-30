@@ -27,11 +27,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { defineHarness, envelope, SUPPORTED, UNSUPPORTED, tailJsonl, voiceEnvelope } from './harness-contract.mjs';
 import { deliverToView, drawsViews, openView, THREAD_PREFIX, viewKey, viewState } from './harness-cursor-app.mjs';
-import { bridgeInstances, callingThread, composerHolding, sendToThread } from './harness-cursor-desktop.mjs';
+import { bridgeDir, bridgeInstances, callingThread, composerHolding, sendToThread } from './harness-cursor-desktop.mjs';
 
 /** Which Cursor chat each editor conversation is, once known (connector process): from the Desktop Bridge at
  *  join, from Cursor's state database, or from the transcript that holds a message delivered to it. */
 const composers = new Map();
+/** The connector's log, handed over by prepare: every step of the bridge route says what it found. */
+let bridgeLog = () => {};
 
 /** Where the CLI may keep chats (`chats/`): `CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`, else
  *  `~/.cursor`. Cursor scrubs the environment of its MCP servers, so the variables the CLI saw may not be
@@ -188,8 +190,11 @@ async function persistPane(chat, env) {
  *  Cursor took them: the answer is `unknown`, and the transcript gives the read receipt. */
 /** What only an asynchronous look can add to an editor identity: which Cursor chat is calling, when the Desktop
  *  Bridge can tell (the only local chat working right now). */
-export async function refineIdentity(who, env = process.env) {
-  if (who?.delivery?.kind !== 'cursor-app' || who.route !== 'cursor-editor-bridge') return who;
+export async function refineIdentity(who, env = process.env, { title = null } = {}) {
+  if (who?.delivery?.kind !== 'cursor-app') return who;
+  // The title this call carries: the chat's transcript records it with the call, which is how the chat is found.
+  if (title) who = { ...who, delivery: { ...who.delivery, title } };
+  if (who.route !== 'cursor-editor-bridge') return who;
   // A candidate, confirmed against Cursor's own record of this chat before anything is sent to it.
   let candidate = null; try { candidate = await callingThread(env); } catch {}
   return candidate ? { ...who, delivery: { ...who.delivery, candidate } } : who;
@@ -199,15 +204,18 @@ export async function deliver(delivery, event, env = process.env) {
   if (delivery?.kind === 'cursor-app') {
     // The chat by its own id through Cursor's Desktop Bridge, when both are there; else its card.
     const composer = composers.get(delivery.thread) || null;
-    if (composer && bridgeInstances(env).length) {
+    const bridge = bridgeInstances(env).length > 0;
+    if (composer && bridge) {
       try {
         const sent = await sendToThread(composer, envelope(event), env);
+        bridgeLog(`${delivery.thread}: Desktop Bridge sent ${event.message_id} to chat ${composer}: ${sent.outcome}`);
         return { status: 'accepted', detail: `Cursor Desktop Bridge: ${sent.outcome}` };
       } catch (error) {
+        bridgeLog(`${delivery.thread}: Desktop Bridge send of ${event.message_id} to chat ${composer} failed (${error.code || 'error'}): ${error.message}`);
         // Cursor may already have it: said so, never sent again through the card.
         if (error.code === 'UNKNOWN' || error.code === 'REFUSED') return { status: 'unknown', detail: `Cursor Desktop Bridge: ${error.message}` };
       }
-    }
+    } else if (bridge) bridgeLog(`${delivery.thread}: Desktop Bridge on, chat not identified yet — ${event.message_id} goes to the card`);
     // The editor: the view drawn in that chat dispatches it. Cursor answers only when the turn it starts is
     // over, so what is known now is what a keystroke proves.
     await deliverToView(delivery.thread, { message_id: event.message_id, text: envelope(event) });
@@ -241,7 +249,10 @@ export function deliveryState(delivery) {
  *  connector's loopback bridge open for it, and learns the port from what `voice_connect` returns. */
 export async function prepare(delivery, { log, admitted } = {}) {
   if (delivery?.kind !== 'cursor-app') return null;
-  keys.set(delivery.thread, { key: delivery.key, candidate: delivery.candidate || null });
+  if (log) bridgeLog = log;
+  keys.set(delivery.thread, { key: delivery.key, candidate: delivery.candidate || null, title: delivery.title || null, joinedAt: Date.now() });
+  const instances = bridgeInstances();
+  bridgeLog(`${delivery.thread}: Cursor Desktop Bridge ${instances.length ? `found (${instances.map(i => `${i.appName || 'Cursor'} ${i.appVersion || ''} pid ${i.pid}`.trim()).join(', ')})` : `not found in ${bridgeDir()}`}; candidate chat ${delivery.candidate || 'none'}; title "${delivery.title || ''}"`);
   // Cursor answers the card's ui/message once the turn it started has run: the chat took that message.
   const { port, close } = await openView(delivery.thread, delivery.key, { log, answered: (message_id, ok) => { if (ok) admitted?.(message_id); } });
   // The card delivers, not the façade: the conversation can outlive the MCP process that created it.
@@ -363,18 +374,28 @@ function observeEditorChat(thread, handlers, env) {
     // Known already (the bridge said which chat joined), or findable in Cursor's state database: watch it now.
     const known = composers.get(thread);
     if (known) { inner = observe(known, handlers, env); return; }
-    // Cursor writes a chat's bubbles up to ~30 s late: a few looks, spread out, then the transcript alone.
-    if (!looking && tries < LOOKUP_AT.length && Date.now() - startedAt >= LOOKUP_AT[tries] && bridgeInstances(env).length && keys.get(thread)) {
-      looking = true; tries++;
-      const { key, candidate } = keys.get(thread);
-      composerHolding(key, env, { candidate }).then(found => found || (candidate ? composerHolding(key, env) : null))
-        .then(composer => { if (composer && !composers.has(thread)) composers.set(thread, composer); }).catch(() => {}).finally(() => { looking = false; });
+    const joined = keys.get(thread);
+    if (joined && bridgeInstances(env).length) {
+      // The chat's own transcript records this voice_connect call, with its title, once Cursor writes it
+      // (~1 s after the turn's first checkpoint, and at its end): cheap, so looked at on every tick.
+      const byTranscript = joinTranscript(joined, env);
+      if (byTranscript) { identify(thread, byTranscript.chat, `its transcript records this voice_connect (${byTranscript.why})`); return; }
+      // Cursor's state database holds the card key in the call's result — where this Cursor keeps it there.
+      if (!looking && tries < LOOKUP_AT.length && Date.now() - startedAt >= LOOKUP_AT[tries]) {
+        looking = true; tries++;
+        const attempt = tries, onError = reason => bridgeLog(`${thread}: state database lookup failed: ${reason}`);
+        composerHolding(joined.key, env, { candidate: joined.candidate, onError }).then(found => found || (joined.candidate ? composerHolding(joined.key, env, { onError }) : null))
+          .then(composer => {
+            if (composer) identify(thread, composer, 'its record in Cursor\'s state database holds the card key');
+            else bridgeLog(`${thread}: not identified yet (attempt ${attempt}/${LOOKUP_AT.length}: no transcript with this call, card key not in the state database)`);
+          }).catch(() => {}).finally(() => { looking = false; });
+      }
     }
     const wanted = handlers.expecting?.() || [];
     if (!wanted.length) return;
     const found = transcriptHolding(wanted, env);
     if (!found) return;
-    composers.set(thread, found.chat);
+    identify(thread, found.chat, 'its transcript holds a message delivered to it');
     inner = observe(found.chat, handlers, env);
     handlers.userMessage({ text: found.text, turn_id: null });
   }, EDITOR_SCAN_MS);
@@ -382,6 +403,46 @@ function observeEditorChat(thread, handlers, env) {
   return () => { clearInterval(timer); inner?.(); };
 }
 const EDITOR_SCAN_MS = Number(process.env.SIDEVOICE_CURSOR_SCAN_MS || 2000);
+
+function identify(thread, chat, why) {
+  if (composers.get(thread) === chat) return;
+  composers.set(thread, chat);
+  bridgeLog(`${thread}: identified as Cursor chat ${chat} — ${why}`);
+}
+
+/** The chat whose transcript records this conversation's voice_connect call: an assistant `tool_use` of a
+ *  voice_connect tool with this title, in a transcript written since the join. The candidate (the only chat
+ *  working at the join) is read first; otherwise every transcript written since, and exactly one must hold it. */
+export function joinTranscript({ title, candidate, joinedAt }, env = process.env) {
+  if (!title && !candidate) return null;
+  const since = (joinedAt || 0) - 5000;
+  // Without a title only the candidate is checked, for any voice_connect call written since the join.
+  const holds = (file, needTitle = true) => {
+    let stat; try { stat = statSync(file); } catch { return false; }
+    if (stat.mtimeMs < since) return false;
+    let text = ''; try { text = readTail(file, stat.size); } catch { return false; }
+    return text.split('\n').some(line => {
+      if (!line.includes('voice_connect')) return false;
+      let entry; try { entry = JSON.parse(line); } catch { return false; }
+      const parts = Array.isArray(entry?.message?.content) ? entry.message.content : [];
+      return entry?.role === 'assistant' && parts.some(part => part?.type === 'tool_use' && /voice_connect$/.test(String(part.name || '')) && (!needTitle && !title ? true : String(part.input?.title ?? '').trim() === title));
+    });
+  };
+  if (candidate) { const file = transcriptPath(candidate, env); if (file && holds(file, false)) return { chat: candidate, why: 'the chat that was working at the join' }; }
+  if (!title) return null;
+  const found = [];
+  for (const root of dataDirs(env)) {
+    let projects = []; try { projects = readdirSync(path.join(root, 'projects')); } catch { continue; }
+    for (const project of projects) {
+      const dir = path.join(root, 'projects', project, 'agent-transcripts');
+      let chats = []; try { chats = readdirSync(dir); } catch { continue; }
+      // A chat already known as another conversation's (it joined before, with the same title) is not this one.
+      const taken = new Set(composers.values());
+      for (const chat of chats) if (!taken.has(chat) && holds(path.join(dir, chat, chat + '.jsonl'))) found.push(chat);
+    }
+  }
+  return found.length === 1 ? { chat: found[0], why: 'the only chat whose transcript has it' } : null;
+}
 /** When, after joining, Cursor's state database is asked which chat holds the view key. */
 const LOOKUP_AT = (process.env.SIDEVOICE_CURSOR_LOOKUP_AT || '3000,15000,35000,70000').split(',').map(Number);
 /** Each editor conversation's view key and bridge candidate (connector process), to find its chat by. */

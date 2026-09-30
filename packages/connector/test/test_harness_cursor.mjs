@@ -516,3 +516,9 @@ test('cursor desktop bridge: a request Cursor took and never answered is not sen
     await assert.rejects(bridge.sendToThread('comp-A', 'hola', { CURSOR_DESKTOP_BRIDGE_DIR: dir }), error => error.code === 'UNREACHABLE');
   } finally { server.close(); }
 });
+
+test('cursor desktop bridge: Cursor\'s "unknown-thread" is a chat it does not know, not a refusal', async () => {
+  const bridge = await import('../harness-cursor-desktop.mjs');
+  const fake = await fakeDesktopBridge({ answer: () => ({ status: 'unknown-thread' }) });
+  try { await assert.rejects(bridge.sendToThread('comp-X', 'x', fake.env), error => error.code === 'NOT_FOUND'); } finally { await fake.close(); }
+});
