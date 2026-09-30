@@ -460,7 +460,7 @@ test('cursor desktop bridge: the calling chat is the only one working, and a mes
     assert.equal(bridge.bridgeInstances(fake.env).length, 1);
     assert.equal(bridge.bridgeInstances({ CURSOR_DESKTOP_BRIDGE_DIR: '/nonexistent' }).length, 0);
     assert.deepEqual((await bridge.listThreads(fake.env)).map(t => t.id), ['comp-A', 'comp-B', 'cloud-1']);
-    assert.equal(await bridge.callingThread(fake.env), 'comp-A', 'the only local chat working is the one calling');
+    assert.equal(await bridge.callingThread(fake.env), 'comp-A', 'the only local chat working is the candidate');
     fake.threads.push(thread('comp-C', 'running'));
     assert.equal(await bridge.callingThread(fake.env), null, 'two working: not told');
     assert.deepEqual(await bridge.sendToThread('comp-B', 'hola\nqué tal', fake.env), { outcome: 'queued', title: 'comp-B' });
@@ -472,19 +472,47 @@ test('cursor desktop bridge: the calling chat is the only one working, and a mes
   } finally { await fake.close(); }
 });
 
-test('cursor desktop bridge: the chat that joined is found in Cursor\'s state database by the id its voice_connect returned', async () => {
-  const bridge = await import('../harness-cursor-desktop.mjs');
-  const userDataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-cursor-user-'));
+/** A Cursor state database with a chat whose bubble holds this marker (its voice_connect result), and another. */
+export function fakeStateDb(userDataDir, { chat = 'comp-joined', marker, other = 'comp-other' } = {}) {
   mkdirSync(path.join(userDataDir, 'User', 'globalStorage'), { recursive: true });
   const db = new DatabaseSync(path.join(userDataDir, 'User', 'globalStorage', 'state.vscdb'));
-  db.exec('CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)');
-  const conversation = 'cursor-editor-5b2c3d4e-5f60-4a1b-8c2d-3e4f5a6b7c8d';
-  db.prepare('INSERT INTO cursorDiskKV VALUES (?, ?)').run('bubbleId:comp-other:b1', JSON.stringify({ type: 2, text: 'nada' }));
-  db.prepare('INSERT INTO cursorDiskKV VALUES (?, ?)').run('bubbleId:comp-joined:b7', Buffer.from(JSON.stringify({ type: 2, toolFormerData: { result: JSON.stringify({ status: 'joined', conversation }) } })));
+  db.exec('CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)');
+  db.prepare('INSERT INTO cursorDiskKV VALUES (?, ?)').run(`bubbleId:${other}:b1`, JSON.stringify({ type: 2, text: 'nada' }));
+  if (marker) db.prepare('INSERT INTO cursorDiskKV VALUES (?, ?)').run(`bubbleId:${chat}:b7`, Buffer.from(JSON.stringify({ type: 2, toolFormerData: { result: JSON.stringify({ status: 'joined', view_link: { key: marker } }) } })));
   db.close();
+}
+
+test('cursor desktop bridge: the chat that joined is found in Cursor\'s state database by the key its voice_connect returned — one chat, or none', async () => {
+  const bridge = await import('../harness-cursor-desktop.mjs');
+  const userDataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-cursor-user-'));
+  const key = 'd'.repeat(64);
+  fakeStateDb(userDataDir, { marker: key });
   const fake = await fakeDesktopBridge({ userDataDir });
   try {
-    assert.equal(await bridge.composerHolding(conversation, fake.env), 'comp-joined');
-    assert.equal(await bridge.composerHolding('cursor-editor-00000000-0000-0000-0000-000000000000', fake.env), null);
+    assert.equal(await bridge.composerHolding(key, fake.env), 'comp-joined');
+    assert.equal(await bridge.composerHolding(key, fake.env, { candidate: 'comp-joined' }), 'comp-joined', 'a candidate is confirmed by its own rows');
+    assert.equal(await bridge.composerHolding(key, fake.env, { candidate: 'comp-other' }), null, 'a wrong candidate is not');
+    assert.equal(await bridge.composerHolding('e'.repeat(64), fake.env), null);
+    assert.equal(await bridge.composerHolding('not-a-key', fake.env), null);
+    // Another chat that came to hold the same key (it read it somewhere): two chats, so none is named.
+    fakeStateDb(userDataDir, { chat: 'comp-reader', marker: key });
+    assert.equal(await bridge.composerHolding(key, fake.env), null);
   } finally { await fake.close(); }
+});
+
+test('cursor desktop bridge: a request Cursor took and never answered is not sent again; one that never reached it is', async () => {
+  const bridge = await import('../harness-cursor-desktop.mjs');
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'sv-bridge-'));
+  const socketPath = path.join(dir, 'b.sock');
+  const server = http.createServer(req => { req.on('data', () => {}); req.on('end', () => req.socket.destroy()); });
+  await new Promise(resolve => server.listen(socketPath, resolve));
+  const announce = socket => writeFileSync(path.join(dir, 'x.json'), JSON.stringify({ protocolVersion: 1, pid: process.pid, socketPath: socket, token: 't', createdAt: Date.now() }));
+  try {
+    announce(socketPath);
+    await assert.rejects(bridge.sendToThread('comp-A', 'hola', { CURSOR_DESKTOP_BRIDGE_DIR: dir }), error => error.code === 'UNKNOWN');
+    // A socket that is announced but gone: never reached Cursor, safe to try elsewhere.
+    const gone = path.join(dir, 'gone.sock'); writeFileSync(gone, '');
+    announce(gone);
+    await assert.rejects(bridge.sendToThread('comp-A', 'hola', { CURSOR_DESKTOP_BRIDGE_DIR: dir }), error => error.code === 'UNREACHABLE');
+  } finally { server.close(); }
 });

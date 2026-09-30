@@ -14,7 +14,7 @@ import { interpretRollout, rolloutPath } from '../harness-codex.mjs';
 import { remove as removeSkill, status as skillStatus } from '../skill.mjs';
 import './test_harness_contract.mjs';
 import './test_harness_claude.mjs';
-import { chatStore, fakeDesktopBridge, fakePersist, runView, TMUX } from './test_harness_cursor.mjs';
+import { chatStore, fakeDesktopBridge, fakePersist, fakeStateDb, runView, TMUX } from './test_harness_cursor.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const connectorPath = path.join(here, '..', 'connector.mjs');
@@ -820,6 +820,8 @@ test('façade + connector: Cursor replaces a window\'s MCP process — the first
     await room.ask('input.deliver', { event_id: 'e-a2', binding_id: 'b-1', channel: 'voice', session_id: 'br', revision: 3, message_id: 'm-a2', text: 'otra para A' });
     await until(() => views[0].dispatched.length === 1);
     assert.match(views[0].dispatched[0].content[0].text, /otra para A/);
+    const connectorLog = readFileSync(path.join(dataDir, 'connector.log'), 'utf8');
+    assert.ok(!connectorLog.includes(a.value.conversation) && connectorLog.includes('cursor-editor-h:'), 'the connector log names editor conversations by hash');
   } finally { views.forEach(view => view.stop()); first.child.kill(); second?.child.kill(); if (connector.exitCode === null) connector.kill(); await room.close(); }
 });
 
@@ -888,10 +890,11 @@ test('façade + connector: with Cursor\'s Desktop Bridge on, an editor chat gets
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
   let refuse = false;
-  const fake = await fakeDesktopBridge({ threads: [{ id: 'comp-A', title: 'A', source: 'local', status: 'running', lastUpdatedAt: Date.now(), windowId: 1 }],
+  const userDataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-cursor-user-'));
+  const fake = await fakeDesktopBridge({ userDataDir, threads: [{ id: 'comp-A', title: 'A', source: 'local', status: 'running', lastUpdatedAt: Date.now(), windowId: 1 }],
     answer: () => (refuse ? { outcome: 'not-found' } : { outcome: 'submitted', threadTitle: 'A' }) });
   room.handle = (event, data) => { if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-d', thread: data.thread }; };
-  const { child: connector, socketPath } = startConnector(room.origin, dataDir, { ...fake.env, SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  const { child: connector, socketPath } = startConnector(room.origin, dataDir, { ...fake.env, SIDEVOICE_CURSOR_LOOKUP_AT: '800,2000,3500', SIDEVOICE_CURSOR_SCAN_MS: '50', SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
   await until(() => existsSync(socketPath));
   const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, ...fake.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
@@ -902,9 +905,13 @@ test('façade + connector: with Cursor\'s Desktop Bridge on, an editor chat gets
     const html = (await ask(2, 'resources/read', { uri: 'ui://sidevoice/voice-link' })).result.contents[0].text;
     const joinedReply = await ask(3, 'tools/call', { name: 'voice_connect', arguments: { title: 'A' } });
     const joined = JSON.parse(joinedReply.result.content[0].text);
-    assert.equal(joined.card.bridge, true); assert.equal(joined.card.chat_known, true);
+    assert.equal(joined.card.bridge, true);
     await until(() => room.sent('binding.register').length);
     assert.equal(room.sent('binding.register')[0].route, 'cursor-editor-bridge');
+    // Cursor records the call in its state database; the candidate (the only chat working) is confirmed there.
+    fakeStateDb(userDataDir, { chat: 'comp-A', marker: joined.view_link.key });
+    const known = async () => JSON.parse((await ask(Math.floor(Math.random() * 1e9), 'tools/call', { name: 'voice_status', arguments: { conversation: joined.conversation } })).result.content[0].text).card.bridge_chat_known;
+    await until(known, 8000);
     // No card on screen: the bridge takes it, to the chat by its id.
     const sent = await room.ask('input.deliver', { event_id: 'e-1', binding_id: 'b-d', channel: 'voice', session_id: 's', revision: 1, message_id: 'm-1', text: 'hola A' });
     assert.equal(sent.status, 'accepted'); assert.match(sent.detail, /Desktop Bridge: submitted/);

@@ -190,19 +190,23 @@ async function persistPane(chat, env) {
  *  Bridge can tell (the only local chat working right now). */
 export async function refineIdentity(who, env = process.env) {
   if (who?.delivery?.kind !== 'cursor-app' || who.route !== 'cursor-editor-bridge') return who;
-  let composer = null; try { composer = await callingThread(env); } catch {}
-  return composer ? { ...who, delivery: { ...who.delivery, composer } } : who;
+  // A candidate, confirmed against Cursor's own record of this chat before anything is sent to it.
+  let candidate = null; try { candidate = await callingThread(env); } catch {}
+  return candidate ? { ...who, delivery: { ...who.delivery, candidate } } : who;
 }
 
 export async function deliver(delivery, event, env = process.env) {
   if (delivery?.kind === 'cursor-app') {
     // The chat by its own id through Cursor's Desktop Bridge, when both are there; else its card.
-    const composer = composers.get(delivery.thread) || delivery.composer || null;
+    const composer = composers.get(delivery.thread) || null;
     if (composer && bridgeInstances(env).length) {
       try {
         const sent = await sendToThread(composer, envelope(event), env);
         return { status: 'accepted', detail: `Cursor Desktop Bridge: ${sent.outcome}` };
-      } catch (error) { /* the card is still there to try */ }
+      } catch (error) {
+        // Cursor may already have it: said so, never sent again through the card.
+        if (error.code === 'UNKNOWN' || error.code === 'REFUSED') return { status: 'unknown', detail: `Cursor Desktop Bridge: ${error.message}` };
+      }
     }
     // The editor: the view drawn in that chat dispatches it. Cursor answers only when the turn it starts is
     // over, so what is known now is what a keystroke proves.
@@ -230,14 +234,14 @@ const PASTE_SETTLE_MS = Number(process.env.SIDEVOICE_CURSOR_PASTE_SETTLE_MS || 1
 export function deliveryState(delivery) {
   if (delivery?.kind !== 'cursor-app') return null;
   const view = viewState(delivery.thread);
-  return { card_connected: !!view?.seen, card_last_seen_ms_ago: view?.seen ? Date.now() - view.seen : null, bridge_chat_known: composers.has(delivery.thread) || !!delivery.composer };
+  return { card_connected: !!view?.seen, card_last_seen_ms_ago: view?.seen ? Date.now() - view.seen : null, bridge_chat_known: composers.has(delivery.thread) };
 }
 
 /** Before any delivery, when the connector registers a conversation: an editor chat's view needs the
  *  connector's loopback bridge open for it, and learns the port from what `voice_connect` returns. */
 export async function prepare(delivery, { log, admitted } = {}) {
   if (delivery?.kind !== 'cursor-app') return null;
-  if (delivery.composer) composers.set(delivery.thread, delivery.composer);
+  keys.set(delivery.thread, { key: delivery.key, candidate: delivery.candidate || null });
   // Cursor answers the card's ui/message once the turn it started has run: the chat took that message.
   const { port, close } = await openView(delivery.thread, delivery.key, { log, answered: (message_id, ok) => { if (ok) admitted?.(message_id); } });
   // The card delivers, not the façade: the conversation can outlive the MCP process that created it.
@@ -352,15 +356,19 @@ export function observe(chatId, handlers, env = process.env) {
  *  never says. The first voice message it takes says it: the transcript that holds that message's header is
  *  this chat's. From then on it is watched like a CLI chat — early read receipt, working, end of turn. */
 function observeEditorChat(thread, handlers, env) {
-  let inner = null, lookedUp = 0, looking = false;
+  let inner = null, tries = 0, looking = false;
+  const startedAt = Date.now();
   const timer = setInterval(() => {
     if (inner) return;
     // Known already (the bridge said which chat joined), or findable in Cursor's state database: watch it now.
     const known = composers.get(thread);
     if (known) { inner = observe(known, handlers, env); return; }
-    if (!looking && bridgeInstances(env).length && Date.now() - lookedUp > 5000) {
-      looking = true; lookedUp = Date.now();
-      composerHolding(thread, env).then(composer => { if (composer && !composers.has(thread)) composers.set(thread, composer); }).catch(() => {}).finally(() => { looking = false; });
+    // Cursor writes a chat's bubbles up to ~30 s late: a few looks, spread out, then the transcript alone.
+    if (!looking && tries < LOOKUP_AT.length && Date.now() - startedAt >= LOOKUP_AT[tries] && bridgeInstances(env).length && keys.get(thread)) {
+      looking = true; tries++;
+      const { key, candidate } = keys.get(thread);
+      composerHolding(key, env, { candidate }).then(found => found || (candidate ? composerHolding(key, env) : null))
+        .then(composer => { if (composer && !composers.has(thread)) composers.set(thread, composer); }).catch(() => {}).finally(() => { looking = false; });
     }
     const wanted = handlers.expecting?.() || [];
     if (!wanted.length) return;
@@ -373,7 +381,11 @@ function observeEditorChat(thread, handlers, env) {
   timer.unref?.();
   return () => { clearInterval(timer); inner?.(); };
 }
-const EDITOR_SCAN_MS = Number(process.env.SIDEVOICE_CURSOR_SCAN_MS || 1000);
+const EDITOR_SCAN_MS = Number(process.env.SIDEVOICE_CURSOR_SCAN_MS || 2000);
+/** When, after joining, Cursor's state database is asked which chat holds the view key. */
+const LOOKUP_AT = (process.env.SIDEVOICE_CURSOR_LOOKUP_AT || '3000,15000,35000,70000').split(',').map(Number);
+/** Each editor conversation's view key and bridge candidate (connector process), to find its chat by. */
+const keys = new Map();
 
 /** The chat transcript, written in the last ten minutes, whose user lines hold one of these messages. */
 export function transcriptHolding(messageIds, env = process.env) {
@@ -401,7 +413,7 @@ export function transcriptHolding(messageIds, env = process.env) {
   }
   return null;
 }
-function readTail(file, size, bytes = 256 * 1024) {
+function readTail(file, size, bytes = 1024 * 1024) {
   const start = Math.max(0, size - bytes), buffer = Buffer.alloc(size - start);
   const fd = openSync(file, 'r'); try { readSync(fd, buffer, 0, buffer.length, start); } finally { closeSync(fd); }
   return buffer.toString('utf8');

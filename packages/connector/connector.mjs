@@ -10,7 +10,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { appendFileSync, mkdirSync, openSync, closeSync, statSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { capabilityState, SUPPORTED, voiceEnvelope } from './harness-contract.mjs';
 import { harnessFor } from './harnesses.mjs';
@@ -34,7 +34,10 @@ const LOG_MAX = 1 << 20;
 /** One line per event, to stderr and to `connector.log` in the data dir: the façade starts this process
  *  with its output discarded, so the file is the only record of a connector nobody ran by hand. Rolls
  *  over once, at 1 MB. */
+/** An editor conversation's id is what lets a chat speak as it: the log names it by a hash. */
+const redact = line => String(line).replace(/cursor-editor-[0-9a-f-]{36}/g, id => 'cursor-editor-h:' + createHash('sha256').update(id).digest('hex').slice(0, 10));
 function log(line) {
+  line = redact(line);
   const stamped = `${new Date().toISOString()} [sidevoice] ${line}`;
   console.error(stamped);
   try {
