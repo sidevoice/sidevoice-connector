@@ -192,7 +192,7 @@ function watch(binding) {
   });
   keepAnnouncing();
 }
-function unwatch(binding) { try { binding.stop?.(); } catch {} binding.stop = null; }
+function unwatch(binding) { try { binding.stop?.(); } catch {} binding.stop = null; try { binding.release?.(); } catch {} binding.release = null; }
 
 /** The room will not have this connector, in its own words, and nothing this process does will
  *  change that: the pairing was taken away from the room's page. Every conversation it served is
@@ -390,9 +390,17 @@ async function command(client, input) {
       log(`${harness} ${thread} joins ("${title || ''}", delivery ${delivery.kind}, inbound ${inbound ? (inbound.ok ? 'ok' : 'held') : 'n/a'})`);
       const binding = { binding_id: local_id, client_ref, harness, thread, title, delivery, inbound, capabilities, experimental, engine, owner: client };
       bindings.set(local_id, binding); client.bindings.add(binding); clearTimeout(idleTimer); open(); watch(binding);
+      // What the harness must have open before anything is delivered (Cursor's editor: the view's bridge).
+      // Asked after the binding exists, so a command right behind this one finds it.
+      let prepared = null;
+      const module = harnessFor(harness);
+      if (typeof module.prepare === 'function') {
+        try { prepared = await module.prepare(delivery, { log }) || null; } catch (error) { log(`${thread} could not be prepared for delivery: ${error.message}`); }
+        if (prepared && bindings.get(binding.binding_id) === binding) binding.release = prepared.release; else prepared?.release?.();
+      }
       // A room that is not there yet is not a failure: the binding is registered on the next welcome.
       const reply = await joinRoom(binding).catch(error => { if (!connected && !refusal) return null; bindings.delete(binding.binding_id); client.bindings.delete(binding); unwatch(binding); throw error; });
-      return { binding_id: reply?.binding_id || binding.binding_id, thread, connected, pending: !reply };
+      return { binding_id: reply?.binding_id || binding.binding_id, thread, connected, pending: !reply, ...(prepared?.info ? { prepared: prepared.info } : {}) };
     }
     case 'publish': {
       const binding = bindings.get(params.binding_id) || [...bindings.values()].find(b => b.client_ref === params.client_ref);

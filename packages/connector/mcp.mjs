@@ -139,7 +139,9 @@ function versionNote(connectorVersion) {
  *  session it does not know to whoever is listening to this conversation. */
 /** What an experimental capability means for this conversation, said to it so it can say it to the person. */
 const EXPERIMENTAL_NOTES = {
-  deliver: 'Voice from the room reaches this conversation by an experimental route: it is typed into the harness where the user types (Cursor: pasted into the chat\'s terminal through tmux). If the user is typing at the same moment, the two texts mix. Tell the user once.',
+  'cursor-tmux': 'Voice from the room reaches this conversation by an experimental route: it is pasted into this chat\'s terminal through tmux and sent with Enter. If the user is typing at the same moment, the two texts mix. Tell the user once.',
+  'cursor-app': 'Voice from the room reaches this chat by an experimental route: the small Sidevoice card under this call submits it as if the user had typed it; it must stay open in this chat. If the user is typing at the same moment, the two may mix. Tell the user once.',
+  sessionIdentity: 'This conversation is identified by the Sidevoice card drawn in it, not by an id Cursor gives: joining from another chat of this window moves the voice there.',
 };
 
 function voiceInUnsupported(who) {
@@ -215,7 +217,8 @@ async function invoke(name, args, meta) {
              ...(pushed ? {} : { voice_in: voiceInUnsupported(who) }),
              ...(who.editor ? { view: 'Voice reaches this chat through the small Sidevoice card drawn under this call: it must stay open in this chat. One chat per Cursor window has voice at a time; joining from another moves it.' } : {}),
              ...(who.watchNote ? { watch_note: who.watchNote } : {}),
-             ...(experimental.length ? { experimental, experimental_notes: experimental.map(name => EXPERIMENTAL_NOTES[name]).filter(Boolean) } : {}),
+             ...(experimental.length ? { experimental, experimental_notes: experimental.map(name => EXPERIMENTAL_NOTES[name === 'deliver' ? who.delivery.kind : name]).filter(Boolean) } : {}),
+             ...(who.delivery.kind === 'cursor-app' && result.prepared?.port ? { view_link: { conversation: who.thread, port: result.prepared.port, key: who.delivery.key } } : {}),
              version: VERSION, connector_version: connectorVersion, ...versionNote(connectorVersion) };
   }
   if (!binding) throw new Error('Not connected to the voice room: call voice_connect first (only if the user asked).');

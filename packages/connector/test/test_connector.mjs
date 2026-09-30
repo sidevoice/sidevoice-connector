@@ -608,12 +608,11 @@ test('façade: in the Cursor CLI the chat is the store its parent holds open, an
 test('façade + connector: a chat of the Cursor editor joins through the view voice_connect carries, and the room\'s voice reaches it', async () => {
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
-  const port = String(40000 + Math.floor(Math.random() * 20000));
   room.handle = (event, data) => { if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-ed', thread: data.thread }; };
   // A real connector, started as a façade would start it; then the façade, spawned as the editor spawns it.
-  const { child: connector, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_CURSOR_APP_PORT: port, SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  const { child: connector, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
   await until(() => existsSync(socketPath));
-  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CURSOR_APP_PORT: port }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
   const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   let view = null;
@@ -635,6 +634,9 @@ test('façade + connector: a chat of the Cursor editor joins through the view vo
     assert.deepEqual(joined.experimental, ['deliver', 'sessionIdentity']);
     assert.equal(joined.delivery, 'push');
     assert.match(joined.view, /card/); assert.match(joined.watch_note, /not observed/);
+    assert.equal(joined.view_link.conversation, joined.conversation); assert.ok(joined.view_link.port > 0); assert.match(joined.view_link.key, /^[0-9a-f]{64}$/);
+    assert.ok(joined.experimental_notes.some(note => /Sidevoice card/.test(note)) && !joined.experimental_notes.some(note => /tmux/.test(note)), 'the editor is told about its own route');
+    assert.ok(!JSON.stringify(room.sent('binding.register')).includes(joined.view_link.key), 'the key never leaves the machine');
     await until(() => room.sent('binding.register').length);
     assert.deepEqual(room.sent('binding.register')[0].experimental, ['deliver', 'sessionIdentity']);
 
@@ -642,9 +644,10 @@ test('façade + connector: a chat of the Cursor editor joins through the view vo
     view = runView({ html: html.text, toolResult: byId(4).result });
     await wait(300);
     const delivered = await room.ask('input.deliver', { event_id: 'e-ed', binding_id: 'b-ed', channel: 'voice', session_id: 's', revision: 4, message_id: 'm-ed', text: 'hola editor' });
-    assert.equal(delivered.status, 'accepted', JSON.stringify(delivered));
-    assert.match(view.submitted[0].content[0].text, /hola editor/);
-    assert.match(view.submitted[0].content[0].text, /"message_id":"m-ed"/);
+    assert.equal(delivered.status, 'unknown', JSON.stringify(delivered));
+    await until(() => view.dispatched.length === 1);
+    assert.match(view.dispatched[0].content[0].text, /hola editor/);
+    assert.match(view.dispatched[0].content[0].text, /"message_id":"m-ed"/);
   } finally { view?.stop(); child.kill(); if (connector.exitCode === null) connector.kill(); await room.close(); }
 });
 

@@ -26,7 +26,7 @@ import { existsSync, readdirSync, readFileSync, readlinkSync, statSync } from 'n
 import os from 'node:os';
 import path from 'node:path';
 import { defineHarness, envelope, SUPPORTED, UNSUPPORTED, tailJsonl } from './harness-contract.mjs';
-import { deliverToView, drawsViews, THREAD_PREFIX } from './harness-cursor-app.mjs';
+import { deliverToView, drawsViews, openView, THREAD_PREFIX, viewKey } from './harness-cursor-app.mjs';
 
 /** Where the CLI may keep chats (`chats/`): `CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`, else
  *  `~/.cursor`. Cursor scrubs the environment of its MCP servers, so the variables the CLI saw may not be
@@ -112,7 +112,7 @@ export function sessionIdentity({ client, env = process.env, locate = findChat, 
   const found = locate();
   // The editor: the chat is the one the view `voice_connect` returns is drawn in, and the id is ours.
   if (!found && drawsViews(client)) { const thread = THREAD_PREFIX + randomUUID(); return { harness: 'cursor', thread,
-    delivery: { kind: 'cursor-app', thread }, capabilities: { working: UNSUPPORTED, endOfTurn: UNSUPPORTED },
+    delivery: { kind: 'cursor-app', thread, key: viewKey() }, capabilities: { working: UNSUPPORTED, endOfTurn: UNSUPPORTED },
     experimental: ['sessionIdentity'], editor: true, watchNote: EDITOR_WATCH }; }
   if (!found) throw new Error(EDITOR_NOTE);
   const persisted = session(found.chat, env);
@@ -161,7 +161,17 @@ export function persistSession(chat, env = process.env) {
 
 export function parseSessions(out) {
   return String(out).split('\n').map(line => line.split('\t')).filter(([name, managed, chat]) => name && managed === '1' && chat)
-    .map(([name, , chat, attached]) => ({ name, chat, attached: Number(attached) || 0 }));
+    .map(([name, , chat, attached, pane, inMode]) => ({ name, chat, attached: Number(attached) || 0,
+      ...(pane ? { pane } : {}), ...(inMode !== undefined ? { inMode: inMode === '1' } : {}) }));
+}
+
+/** The same lookup, without blocking the connector, and with the pane the session shows and whether that
+ *  pane is in a tmux mode (copy mode takes keys for itself). */
+async function persistPane(chat, env) {
+  let out;
+  try { out = await tmux(['list-sessions', '-F', '#{session_name}\t#{@cursor_managed}\t#{@cursor_chat_id}\t#{session_attached}\t#{pane_id}\t#{pane_in_mode}'], { env }); }
+  catch { return null; }
+  return parseSessions(out).find(session => session.chat.toLowerCase() === String(chat).toLowerCase() && /^%\d+$/.test(session.pane || '')) || null;
 }
 
 /** Type the voice message into the chat's pane: the session is looked up again now, because the chat a
@@ -171,14 +181,18 @@ export function parseSessions(out) {
  *  Cursor took them: the answer is `unknown`, and the transcript gives the read receipt. */
 export async function deliver(delivery, event, env = process.env) {
   if (delivery?.kind === 'cursor-app') {
-    // The editor: the view drawn in that chat submits it, and says whether Cursor took it.
-    await deliverToView(delivery.thread, { message_id: event.message_id, text: envelope(event) }, { env });
-    return { status: 'accepted', detail: 'the chat\'s Sidevoice view submitted it (MCP App ui/message)' };
+    // The editor: the view drawn in that chat dispatches it. Cursor answers only when the turn it starts is
+    // over, so what is known now is what a keystroke proves.
+    await deliverToView(delivery.thread, { message_id: event.message_id, text: envelope(event) });
+    return { status: 'unknown', detail: 'dispatched by the chat\'s Sidevoice view (MCP App ui/message); Cursor answers when the turn ends' };
   }
   if (delivery?.kind !== 'cursor-tmux') throw new Error(`Cursor cannot take input here (delivery ${delivery?.kind || 'none'})`);
-  const session = persistSession(delivery.chat, env);
-  if (!session) throw new Error(`Chat ${delivery.chat} is no longer running in a cursor-agent persist session`);
-  const target = session.name + ':';
+  const session = await persistPane(delivery.chat, env);
+  // Gone from persist (stopped, or /new moved the pane to another chat): nothing will take it, now or later.
+  if (!session) return { status: 'unsupported', error: `Chat ${delivery.chat} is no longer running in a cursor-agent persist session` };
+  // The exact pane, not a session name tmux would also match by prefix; out of copy mode, or Enter is its.
+  const target = session.pane;
+  if (session.inMode) await tmux(['send-keys', '-t', target, '-X', 'cancel'], { env }).catch(() => {});
   const buffer = 'sidevoice-' + randomUUID();
   await tmux(['load-buffer', '-b', buffer, '-'], { env, input: envelope(event) });
   await tmux(['paste-buffer', '-p', '-r', '-d', '-b', buffer, '-t', target], { env });
@@ -188,6 +202,14 @@ export async function deliver(delivery, event, env = process.env) {
 }
 
 const PASTE_SETTLE_MS = Number(process.env.SIDEVOICE_CURSOR_PASTE_SETTLE_MS || 150);
+
+/** Before any delivery, when the connector registers a conversation: an editor chat's view needs the
+ *  connector's loopback bridge open for it, and learns the port from what `voice_connect` returns. */
+export async function prepare(delivery, { log } = {}) {
+  if (delivery?.kind !== 'cursor-app') return null;
+  const { port, close } = await openView(delivery.thread, delivery.key, { log });
+  return { info: { port }, release: close };
+}
 
 /** The store of a chat, found by its id under every workspace's directory. */
 export function storePath(chatId, env = process.env) {
@@ -305,6 +327,7 @@ export const cursorHarness = defineHarness({
   observe,
   sessionIdentity,
   deliver,
+  prepare,
   // Delivery types into the chat's terminal through tmux (CLI) or submits through an MCP App view (editor):
   // it works, by routes Cursor does not offer as an interface.
   experimental: ['deliver'],

@@ -13,6 +13,7 @@ import { httpHarness } from '../harness-http.mjs';
 import { identifyHarness } from '../harnesses.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import { execFileSync } from 'node:child_process';
+import http from 'node:http';
 import {
   chatOfProcess, chatOfStore, cursorHarness, deliver, engine, findChat, interpretTranscript, observe, openFiles,
   parseSessions, persistSession, sessionIdentity, storeModel, transcriptPath,
@@ -326,7 +327,9 @@ test('cursor persist: a voice message is pasted whole into the chat\'s pane and 
 
     // /new in the chat's session: the pane now runs another chat, and nothing is typed into it for this one.
     tmux('set-option', '-t', 'cursor-test', '@cursor_chat_id', '99999999-9999-9999-9999-999999999999');
-    await assert.rejects(deliver({ kind: 'cursor-tmux', chat }, event, env), /no longer running in a cursor-agent persist session/);
+    const gone = await deliver({ kind: 'cursor-tmux', chat }, event, env);
+    assert.equal(gone.status, 'unsupported', 'nothing will take it, now or later: not retried');
+    assert.match(gone.error, /no longer running in a cursor-agent persist session/);
     assert.equal(readFileSync(received, 'utf8'), bytes, 'nothing more was typed');
   } finally { fake.stop(); }
 });
@@ -337,7 +340,7 @@ test('cursor persist: a voice message is pasted whole into the chat\'s pane and 
  *  script runs unchanged; the webview's Origin is added to its requests, as the browser engine would. */
 export function runView({ html, toolResult, toolCallId = 'toolu_1', submit = async () => {}, origin = 'vscode-webview://sv-test' }) {
   const script = html.slice(html.indexOf('<script>') + 8, html.lastIndexOf('</script>'));
-  const listeners = [], submitted = [], statuses = [];
+  const listeners = [], submitted = [], dispatched = [], statuses = [];
   const toView = data => { for (const listener of listeners) listener({ data }); };
   const window = {
     addEventListener: (type, listener) => { if (type === 'message') listeners.push(listener); },
@@ -345,6 +348,7 @@ export function runView({ html, toolResult, toolCallId = 'toolu_1', submit = asy
       if (message.method === 'ui/initialize') return toView({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: '2026-01-26', hostContext: { toolInfo: { id: toolCallId } } } });
       if (message.method === 'ui/notifications/initialized') return toView({ jsonrpc: '2.0', method: 'ui/notifications/tool-result', params: toolResult });
       if (message.method === 'ui/message') {
+        dispatched.push(message.params);
         try { await submit(message.params); submitted.push(message.params); toView({ jsonrpc: '2.0', id: message.id, result: {} }); }
         catch (error) { toView({ jsonrpc: '2.0', id: message.id, error: { code: -32000, message: error.message } }); }
       }
@@ -357,14 +361,15 @@ export function runView({ html, toolResult, toolCallId = 'toolu_1', submit = asy
   const pause = (fn, ms) => (controller.signal.aborted ? undefined : setTimeout(fn, ms));
   const fetchAsView = (url, options = {}) => fetch(url, { ...options, signal: controller.signal, headers: { ...(options.headers || {}), origin } });
   new Function('window', 'document', 'fetch', 'setTimeout', script)(window, document, fetchAsView, pause);
-  return { submitted, statuses, stop: () => controller.abort() };
+  return { submitted, dispatched, statuses, stop: () => controller.abort() };
 }
 
 test('cursor editor: a client that draws MCP Apps views gets a conversation of its own, marked experimental', () => {
   const editor = { name: 'cursor-vscode', version: '1.0.0', capabilities: { extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] } } } };
   const identity = sessionIdentity({ client: editor, locate: () => null });
   assert.match(identity.thread, /^cursor-editor-[0-9a-f-]{36}$/);
-  assert.deepEqual(identity.delivery, { kind: 'cursor-app', thread: identity.thread });
+  assert.deepEqual({ ...identity.delivery, key: undefined }, { kind: 'cursor-app', thread: identity.thread, key: undefined });
+  assert.match(identity.delivery.key, /^[0-9a-f]{64}$/, 'a key of its own for the view');
   const capabilities = conversationCapabilities(cursorHarness, identity);
   assert.deepEqual([capabilities.deliver, capabilities.working, capabilities.endOfTurn, capabilities.sessionIdentity], ['supported', 'unsupported', 'unsupported', 'supported']);
   assert.deepEqual(experimentalCapabilities(cursorHarness, capabilities, identity), ['deliver', 'sessionIdentity']);
@@ -373,34 +378,51 @@ test('cursor editor: a client that draws MCP Apps views gets a conversation of i
   assert.throws(() => sessionIdentity({ client: { name: 'cursor-vscode', capabilities: {} }, locate: () => null }), /draws no MCP Apps views/);
 });
 
-test('cursor editor: the view submits a voice message to its chat through ui/message, over a loopback bridge only a Cursor webview may use', async () => {
-  const { deliverToView, ensureBridge, resource, stopBridge, viewState } = await import('../harness-cursor-app.mjs?' + Math.random());
-  const port = 40000 + Math.floor(Math.random() * 20000);
-  const env = { SIDEVOICE_CURSOR_APP_PORT: String(port) };
-  await ensureBridge(env);
-  const thread = 'cursor-editor-' + '1b2c3d4e-5f60-4a1b-8c2d-3e4f5a6b7c8d';
-  const read = resource(env);
+test('cursor editor: the view dispatches a voice message to its chat through ui/message, over a bridge only its own view can use', async () => {
+  const app = await import('../harness-cursor-app.mjs?' + Math.random());
+  const thread = 'cursor-editor-1b2c3d4e-5f60-4a1b-8c2d-3e4f5a6b7c8d', key = app.viewKey();
+  const logged = [];
+  const { port, close } = await app.openView(thread, key, { log: line => logged.push(line) });
+  const read = app.resource();
   assert.equal(read.mimeType, 'text/html;profile=mcp-app');
-  assert.deepEqual(read._meta.ui.csp.connectDomains, [`http://127.0.0.1:${port}`], 'the only origin the view may reach');
-  // The tool result as Cursor hands it to the view: our voice_connect answer.
-  const toolResult = { content: [{ type: 'text', text: JSON.stringify({ status: 'joined', harness: 'cursor', conversation: thread }) }] };
-  const view = runView({ html: read.text, toolResult, toolCallId: 'toolu_42' });
+  assert.deepEqual(read._meta.ui.csp.connectDomains, ['http://127.0.0.1:*'], 'loopback only; the port comes with the call');
+  // The tool result as Cursor hands it to the view: our voice_connect answer, with the link.
+  const toolResult = { content: [{ type: 'text', text: JSON.stringify({ status: 'joined', conversation: thread, view_link: { conversation: thread, port, key } }) }] };
+  // Cursor answers ui/message when the turn it starts ends: here, long after.
+  let finishTurn; const turn = new Promise(resolve => { finishTurn = resolve; });
+  const view = runView({ html: read.text, toolResult, toolCallId: 'toolu_42', submit: () => turn });
   try {
-    await until(() => viewState(thread)?.toolCall === 'toolu_42');
+    await until(() => app.viewState(thread)?.toolCall === 'toolu_42');
     const event = { channel: 'voice', session_id: 's', revision: 1, message_id: 'm-1', text: 'hola\neditor' };
-    await deliverToView(thread, { message_id: 'm-1', text: envelope(event) }, { env });
-    assert.deepEqual(view.submitted, [{ role: 'user', content: [{ type: 'text', text: envelope(event) }] }]);
+    await app.deliverToView(thread, { message_id: 'm-1', text: envelope(event) });   // resolves on dispatch, not on the turn
+    await until(() => view.dispatched.length === 1);
+    assert.deepEqual(view.dispatched[0], { role: 'user', content: [{ type: 'text', text: envelope(event) }] });
+    // A second one while the first turn runs is dispatched too: the view does not wait on Cursor's answer.
+    await app.deliverToView(thread, { message_id: 'm-2', text: 'otra' });
+    finishTurn();
+    await until(() => logged.some(line => line.includes('took m-1')));
 
-    // Cursor refusing the submit is a failed delivery, with its reason.
-    const refusing = runView({ html: read.text, toolResult, submit: async () => { throw new Error('Composer not loaded'); } });
+    // Nobody without the key: not a web page, not a local process claiming a webview Origin.
+    const base = `http://127.0.0.1:${port}/cursor-app/next?thread=${thread}`;
+    assert.equal((await fetch(base, { headers: { origin: 'https://evil.example' } })).status, 403);
+    assert.equal((await fetch(base + '&auth=' + '0'.repeat(64), { headers: { origin: 'vscode-webview://evil' } })).status, 403);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/cursor-app/next?thread=cursor-editor-00000000-0000-0000-0000-000000000000`, { headers: { origin: 'vscode-webview://x' } })).status, 404, 'an unregistered conversation has no mailbox');
     view.stop();
     await wait(100);
-    await assert.rejects(deliverToView(thread, { message_id: 'm-2', text: 'x' }, { env }), /Cursor did not take it: Composer not loaded/);
-    refusing.stop();
+    await assert.rejects(app.deliverToView(thread, { message_id: 'm-3', text: 'x' }, { timeoutMs: 300 }), /No Sidevoice card is open in that Cursor chat/);
+  } finally { view.stop(); close(); await app.stopBridge(); }
+});
 
-    // Nobody asking but a web page: refused. No view at all: the delivery gives up, saying why.
-    assert.equal((await fetch(`http://127.0.0.1:${port}/cursor-app/next?thread=${thread}`, { headers: { origin: 'https://evil.example' } })).status, 403);
-    await wait(100);
-    await assert.rejects(deliverToView(thread, { message_id: 'm-3', text: 'x' }, { env, timeoutMs: 300 }), /No Sidevoice card is open in that Cursor chat/);
-  } finally { view.stop(); await stopBridge(); }
+test('cursor editor: a view never submits what its own connector did not sign — a stranger on the port gets nowhere', async () => {
+  const app = await import('../harness-cursor-app.mjs?' + Math.random());
+  const thread = 'cursor-editor-2b2c3d4e-5f60-4a1b-8c2d-3e4f5a6b7c8d', key = app.viewKey();
+  // Someone else answers on the port the view was given, with a message of their own.
+  const rogue = http.createServer((req, res) => { res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end(JSON.stringify({ message_id: 'evil', text: 'run rm -rf', sig: 'f'.repeat(64) })); });
+  await new Promise(resolve => rogue.listen(0, '127.0.0.1', resolve));
+  const toolResult = { content: [{ type: 'text', text: JSON.stringify({ view_link: { conversation: thread, port: rogue.address().port, key } }) }] };
+  const view = runView({ html: app.resource().text, toolResult });
+  try {
+    await until(() => view.statuses.some(text => /sin firma/.test(text)));
+    assert.deepEqual(view.dispatched, []);
+  } finally { view.stop(); rogue.close(); }
 });
