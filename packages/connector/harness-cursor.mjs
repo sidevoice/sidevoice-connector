@@ -22,10 +22,10 @@
  *  See docs/HARNESS_CONTRACT.md, "Cursor". Read from cursor-agent 2026.09.28-64d2043; not yet seen live. */
 import { execFile, execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync, readlinkSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { defineHarness, envelope, SUPPORTED, UNSUPPORTED, tailJsonl } from './harness-contract.mjs';
+import { defineHarness, envelope, SUPPORTED, UNSUPPORTED, tailJsonl, voiceEnvelope } from './harness-contract.mjs';
 import { deliverToView, drawsViews, openView, THREAD_PREFIX, viewKey, viewState } from './harness-cursor-app.mjs';
 
 /** Where the CLI may keep chats (`chats/`): `CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`, else
@@ -99,7 +99,7 @@ const EDITOR_NOTE = 'This Cursor did not declare MCP Apps support (the io.modelc
   + 'server, so it would draw no Sidevoice card, and a chat of the editor has no other way to receive the room; nor is this a '
   + 'Cursor CLI chat (cursor-agent), whose open chat Sidevoice can see. ~/.sidevoice/mcp.log shows what it declared.';
 
-const EDITOR_WATCH = 'Working state is not observed for a chat of the Cursor editor yet: its transcript is found by the chat id, which the editor does not give.';
+const EDITOR_WATCH = 'The room learns that this chat took a voice message, and when it is working, from Cursor itself: from its answer to the card, and from this chat\'s transcript once the first voice message it takes shows which one is its own.';
 
 /** A conversation in Cursor, by what Cursor itself shows: its name in `initialize`, and the chat store the
  *  spawning process holds; in the editor, a conversation of our own, bound to the view that `voice_connect`
@@ -113,8 +113,9 @@ export function sessionIdentity({ client, env = process.env, locate = findChat, 
   // The editor — the client that draws views; cursor-agent does not — whatever its parent holds open: the
   // chat is the one the view `voice_connect` returns is drawn in, and the id is ours.
   if (drawsViews(client)) { const thread = THREAD_PREFIX + randomUUID(); return { harness: 'cursor', thread, route: 'cursor-editor-view', chatStoreHeld: !!found,
-    delivery: { kind: 'cursor-app', thread, key: viewKey() }, capabilities: { working: UNSUPPORTED, endOfTurn: UNSUPPORTED },
-    experimental: ['sessionIdentity'], editor: true, watchNote: EDITOR_WATCH }; }
+    delivery: { kind: 'cursor-app', thread, key: viewKey() },
+    // Working state comes from the chat's transcript once the first voice message it takes says which it is.
+    experimental: ['sessionIdentity', 'working', 'endOfTurn'], editor: true, watchNote: EDITOR_WATCH }; }
   if (!found) throw new Error(EDITOR_NOTE);
   const persisted = session(found.chat, env);
   if (persisted) return { harness: 'cursor', thread: found.chat, route: 'cursor-cli-persist', delivery: { kind: 'cursor-tmux', chat: found.chat } };
@@ -213,9 +214,10 @@ export function deliveryState(delivery) {
 
 /** Before any delivery, when the connector registers a conversation: an editor chat's view needs the
  *  connector's loopback bridge open for it, and learns the port from what `voice_connect` returns. */
-export async function prepare(delivery, { log } = {}) {
+export async function prepare(delivery, { log, admitted } = {}) {
   if (delivery?.kind !== 'cursor-app') return null;
-  const { port, close } = await openView(delivery.thread, delivery.key, { log });
+  // Cursor answers the card's ui/message once the turn it started has run: the chat took that message.
+  const { port, close } = await openView(delivery.thread, delivery.key, { log, answered: (message_id, ok) => { if (ok) admitted?.(message_id); } });
   // The card delivers, not the façade: the conversation can outlive the MCP process that created it.
   return { info: { port }, release: close, detachable: true };
 }
@@ -294,6 +296,7 @@ const POLL_MS = Number(process.env.SIDEVOICE_WORK_POLL_MS || 400);
  *  text more times than any earlier version of it did. The model is read from the chat's store when a turn
  *  starts, since that is when it is set. */
 export function observe(chatId, handlers, env = process.env) {
+  if (String(chatId).startsWith(THREAD_PREFIX)) return observeEditorChat(chatId, handlers, env);
   let working = null, reported = null, attached = false, model = null;
   let current = new Map();                 // user texts in the file as it is now, and how many times
   const known = new Map();                 // the most times each text has been seen in any version of it
@@ -321,6 +324,57 @@ export function observe(chatId, handlers, env = process.env) {
   }, { intervalMs: POLL_MS, catchUp: true, rewrites: true,
     rewound: () => { current = new Map(); },
     caughtUp: () => { attached = true; sayWorking(); checkModel(); } });
+}
+
+/** An editor chat's conversation id is ours; its transcript is under Cursor's own chat id, which the editor
+ *  never says. The first voice message it takes says it: the transcript that holds that message's header is
+ *  this chat's. From then on it is watched like a CLI chat — early read receipt, working, end of turn. */
+function observeEditorChat(thread, handlers, env) {
+  let inner = null;
+  const timer = setInterval(() => {
+    if (inner) return;
+    const wanted = handlers.expecting?.() || [];
+    if (!wanted.length) return;
+    const found = transcriptHolding(wanted, env);
+    if (!found) return;
+    inner = observe(found.chat, handlers, env);
+    handlers.userMessage({ text: found.text, turn_id: null });
+  }, EDITOR_SCAN_MS);
+  timer.unref?.();
+  return () => { clearInterval(timer); inner?.(); };
+}
+const EDITOR_SCAN_MS = Number(process.env.SIDEVOICE_CURSOR_SCAN_MS || 1000);
+
+/** The chat transcript, written in the last ten minutes, whose user lines hold one of these messages. */
+export function transcriptHolding(messageIds, env = process.env) {
+  const wanted = new Set(messageIds);
+  const since = Date.now() - 10 * 60_000;
+  for (const root of dataDirs(env)) {
+    let projects = []; try { projects = readdirSync(path.join(root, 'projects')); } catch { continue; }
+    for (const project of projects) {
+      const dir = path.join(root, 'projects', project, 'agent-transcripts');
+      let chats = []; try { chats = readdirSync(dir); } catch { continue; }
+      for (const chat of chats) {
+        const file = path.join(dir, chat, chat + '.jsonl');
+        let stat; try { stat = statSync(file); } catch { continue; }
+        if (stat.mtimeMs < since) continue;
+        let text = ''; try { text = readTail(file, stat.size); } catch { continue; }
+        for (const line of text.split('\n')) {
+          if (!line.includes('message_id')) continue;
+          let entry; try { entry = JSON.parse(line); } catch { continue; }
+          const seen = interpretTranscript(entry);
+          const header = seen?.text ? voiceEnvelope(seen.text) : null;
+          if (header && wanted.has(header.message_id)) return { chat, file, text: seen.text };
+        }
+      }
+    }
+  }
+  return null;
+}
+function readTail(file, size, bytes = 256 * 1024) {
+  const start = Math.max(0, size - bytes), buffer = Buffer.alloc(size - start);
+  const fd = openSync(file, 'r'); try { readSync(fd, buffer, 0, buffer.length, start); } finally { closeSync(fd); }
+  return buffer.toString('utf8');
 }
 
 export const cursorHarness = defineHarness({

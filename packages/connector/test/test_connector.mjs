@@ -636,9 +636,9 @@ test('façade + connector: a chat of the Cursor editor joins through the view vo
     assert.equal(html.mimeType, 'text/html;profile=mcp-app');
     const joined = JSON.parse(byId(4).result.content[0].text);
     assert.match(joined.conversation, /^cursor-editor-/);
-    assert.deepEqual(joined.experimental, ['deliver', 'sessionIdentity']);
+    assert.deepEqual(joined.experimental, ['deliver', 'working', 'endOfTurn', 'sessionIdentity']);
     assert.equal(joined.delivery, 'push');
-    assert.match(joined.view, /card/); assert.match(joined.watch_note, /not observed/);
+    assert.match(joined.view, /card/); assert.match(joined.watch_note, /transcript/);
     assert.equal(joined.card.requested, true); assert.match(joined.card.note, /mcp\.log/);
     // What the client declared, and what happened, is in mcp.log — no key in it.
     const logged = readFileSync(path.join(dataDir, 'mcp.log'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
@@ -656,7 +656,8 @@ test('façade + connector: a chat of the Cursor editor joins through the view vo
     assert.ok(joined.experimental_notes.some(note => /Sidevoice card/.test(note)) && !joined.experimental_notes.some(note => /tmux/.test(note)), 'the editor is told about its own route');
     assert.ok(!JSON.stringify(room.sent('binding.register')).includes(joined.view_link.key), 'the key never leaves the machine');
     await until(() => room.sent('binding.register').length);
-    assert.deepEqual(room.sent('binding.register')[0].experimental, ['deliver', 'sessionIdentity']);
+    assert.deepEqual(room.sent('binding.register')[0].experimental, ['deliver', 'working', 'endOfTurn', 'sessionIdentity']);
+    assert.equal(room.sent('binding.register')[0].route, 'cursor-editor-view', 'the room is told how the chat is reached');
 
     // Cursor draws the view in that chat and hands it the call's result.
     view = runView({ html: html.text, toolResult: byId(4).result });
@@ -839,6 +840,48 @@ test('connector: an editor chat kept without a façade leaves once its card has 
     assert.equal(room.sent('binding.unregister').length, 0, 'kept while it may still be heard from');
     await until(() => room.sent('binding.unregister').length === 1, 5000);
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
+});
+
+test('connector: an editor chat\'s second tick — early from its transcript once found, or from Cursor\'s answer to the card', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const cursorHome = mkdtempSync(path.join(os.tmpdir(), 'sv-cursor-'));
+  room.handle = (event, data) => { if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-r', thread: data.thread }; };
+  const { child, socketPath } = startConnector(room.origin, dataDir, { CURSOR_DATA_DIR: cursorHome, SIDEVOICE_WORK_POLL_MS: '30', SIDEVOICE_CURSOR_SCAN_MS: '50', SIDEVOICE_WORK_ANNOUNCE_MS: '5000', SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  let view = null;
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    const thread = 'cursor-editor-4b2c3d4e-5f60-4a1b-8c2d-3e4f5a6b7c8d', key = 'b'.repeat(64);
+    const registered = await facade.call('register', { client_ref: thread, harness: 'cursor', thread, title: 'R', delivery: { kind: 'cursor-app', thread, key },
+      capabilities: { deliver: 'supported', inspectInbound: 'unsupported', working: 'supported', endOfTurn: 'supported', sessionIdentity: 'supported' } });
+    const { resource } = await import('../harness-cursor-app.mjs');
+    // The first turn runs long: Cursor has not answered the card yet.
+    const answers = [];
+    view = runView({ html: resource().text, toolResult: { content: [{ type: 'text', text: JSON.stringify({ view_link: { conversation: thread, port: registered.prepared.port, key } }) }] },
+      submit: () => new Promise(resolve => answers.push(resolve)) });
+    await wait(300);
+    assert.equal((await room.ask('input.deliver', { event_id: 'e-1', binding_id: 'b-r', channel: 'voice', session_id: 's', revision: 1, message_id: 'm-1', text: 'uno' })).status, 'unknown');
+    await until(() => view.dispatched.length === 1);
+    assert.equal(room.sent('input.read').length, 0, 'dispatched is not read');
+    // Cursor writes the chat's transcript (its own chat id) as the turn starts: that says which chat this is.
+    const dir = path.join(cursorHome, 'projects', 'work-app', 'agent-transcripts', 'composer-9'); mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'composer-9.jsonl');
+    writeFileSync(file, JSON.stringify({ role: 'user', message: { content: [{ type: 'text', text: '<user_query>\n' + view.dispatched[0].content[0].text + '\n</user_query>' }] } }) + '\n');
+    await until(() => room.sent('input.read').some(d => d.message_id === 'm-1'));
+    await until(() => room.sent('input.working').some(d => d.working === true));
+    appendFileSync(file, JSON.stringify({ role: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] } }) + '\n' + JSON.stringify({ type: 'turn_ended', status: 'success' }) + '\n');
+    await until(() => room.sent('input.working').some(d => d.working === false));
+    answers.shift()();
+    // A second message whose only signal is Cursor answering the card when its turn has run.
+    await room.ask('input.deliver', { event_id: 'e-2', binding_id: 'b-r', channel: 'voice', session_id: 's', revision: 2, message_id: 'm-2', text: 'dos' });
+    await until(() => view.dispatched.length === 2);
+    assert.ok(!room.sent('input.read').some(d => d.message_id === 'm-2'));
+    answers.shift()();
+    await until(() => room.sent('input.read').some(d => d.message_id === 'm-2'));
+    assert.equal(room.sent('input.read').filter(d => d.message_id === 'm-1').length, 1, 'one tick per message, whatever says it');
+    facade.end();
+  } finally { view?.stop(); if (child.exitCode === null) child.kill(); await room.close(); }
 });
 
 test('pairing: plaintext only where the token cannot leave the machine or the cluster', async () => {

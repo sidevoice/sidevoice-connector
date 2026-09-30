@@ -283,7 +283,7 @@ async function invoke(name, args, meta) {
     let engine = null;
     try { engine = (await who.module.engine?.(who.thread)) || null; } catch { engine = null; }
     const result = await rpc('register', { client_ref: who.thread, harness: who.harness, thread: who.thread,
-      title, delivery: who.delivery, inbound, capabilities, experimental, engine });
+      title, delivery: who.delivery, inbound, capabilities, experimental, engine, ...(who.route ? { route: who.route } : {}) });
     joined.set(who.thread, { ...result, harness: who.harness, client_ref: who.thread, title, capabilities, experimental });
     let connectorVersion = null; try { connectorVersion = (await rpc('status', {})).version || null; } catch {}
     const pushed = capabilities.deliver === SUPPORTED;

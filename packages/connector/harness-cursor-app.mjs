@@ -129,10 +129,10 @@ export function ensureBridge() {
 
 /** Make a conversation reachable by its view: called when the connector registers it. Returns the port the
  *  view must use, and a function that forgets the conversation. */
-export async function openView(thread, key, { log = () => {} } = {}) {
+export async function openView(thread, key, { log = () => {}, answered = () => {} } = {}) {
   if (!thread?.startsWith(THREAD_PREFIX) || !/^[0-9a-f]{64}$/.test(key || '')) throw new Error('An editor conversation needs its id and its view key');
   const port = await ensureBridge();
-  boxes.set(thread, { key, queue: [], polls: [], seen: 0, toolCall: null, waiting: new Map(), log });
+  boxes.set(thread, { key, queue: [], polls: [], seen: 0, toolCall: null, waiting: new Map(), log, answered });
   return { port, close: () => { const mailbox = boxes.get(thread); if (!mailbox) return; boxes.delete(thread);
     for (const poll of mailbox.polls.splice(0)) poll(null);
     for (const pending of mailbox.waiting.values()) { clearTimeout(pending.timer); pending.reject(new Error('The conversation left the room')); } } };
@@ -170,6 +170,7 @@ function handle(req, res) {
       const pending = mailbox.waiting.get(outcome.message_id);
       if (outcome.stage === 'dispatched' && pending) { mailbox.waiting.delete(outcome.message_id); clearTimeout(pending.timer); pending.resolve(); }
       // Cursor's own answer arrives when the turn it started ends; it is only news for the log.
+      if (outcome.stage === 'answered') { try { mailbox.answered(outcome.message_id, !!outcome.ok); } catch {} }
       if (outcome.stage === 'answered') mailbox.log(`${thread}: Cursor ${outcome.ok ? 'took' : 'refused'} ${outcome.message_id}${outcome.ok ? '' : ': ' + String(outcome.error || '').slice(0, 200)}`);
       res.writeHead(204, cors); res.end();
     });

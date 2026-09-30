@@ -151,6 +151,14 @@ function keepAnnouncing() {
 /** Start watching a binding's conversation through its harness. What we delivered and it has not yet taken
  *  waits in `pending`; the moment its transcript shows the message, the room gets the second tick and a
  *  correlated start of turn; the end of that turn carries the same correlation. */
+/** The second tick: the conversation took this message. Said once per message, however many signals say it. */
+function reportRead(binding, header, turn_id = null) {
+  binding.pending?.delete(header.message_id);
+  if (readReported.has(header.message_id)) return;
+  readReported.add(header.message_id); if (readReported.size > 512) readReported.delete(readReported.values().next().value);
+  send('input.read', { binding_id: binding.binding_id, message_id: header.message_id, session_id: header.session_id, revision: header.revision, turn_id: turn_id || null });
+  log(`${binding.thread} read ${header.message_id} (session ${header.session_id} rev ${header.revision}, turn ${turn_id || '?'})`);
+}
 function watch(binding) {
   const harness = harnessFor(binding.harness);
   // A conversation that declared it cannot be watched is not, though its harness can watch others.
@@ -161,16 +169,14 @@ function watch(binding) {
     userMessage({ text, turn_id }) {
       const header = voiceEnvelope(text);
       if (!header || !binding.pending.has(header.message_id)) return;
-      binding.pending.delete(header.message_id);
-      if (!readReported.has(header.message_id)) {
-        readReported.add(header.message_id); if (readReported.size > 512) readReported.delete(readReported.values().next().value);
-        send('input.read', { binding_id: binding.binding_id, message_id: header.message_id, session_id: header.session_id, revision: header.revision, turn_id: turn_id || null });
-        log(`${binding.thread} read ${header.message_id} (session ${header.session_id} rev ${header.revision}, turn ${turn_id || '?'})`);
-      }
+      reportRead(binding, header, turn_id);
       if (header.channel !== 'voice') return;
       binding.turn = { turn_id: turn_id || null, session_id: header.session_id, revision: header.revision };
       announceWork(binding, true, turn_id ? { turn_phase: 'start', ...correlation() } : {});
     },
+    /** What was delivered and not yet seen taken: a harness that must first find where its conversation is
+     *  recorded (Cursor's editor chats) looks for these. */
+    expecting() { return [...binding.pending.keys()]; },
     working(working, { turn_id } = {}) {
       if (working) {
         // A start we can name is said with its name; the correlated start, if any, comes with the message itself.
@@ -278,6 +284,7 @@ async function announce(binding) {
   // room to mint its durable binding id. Sending it back makes the room correctly reject it as foreign.
   const frame = { client_ref: binding.client_ref, harness: binding.harness, thread: binding.thread,
     title: binding.title, inbound: binding.inbound, capabilities: binding.capabilities, experimental: binding.experimental || [],
+    ...(binding.route ? { route: binding.route } : {}),
     engine: binding.engine, focus: false };
   if (!binding.binding_id.startsWith('local-')) frame.binding_id = binding.binding_id;
   const reply = await request('binding.register', frame).catch(error => {
@@ -444,25 +451,28 @@ async function command(client, input) {
   let params = input.params || {};
   switch (input.method) {
     case 'register': {
-      const { client_ref, harness, thread, title, delivery, inbound, capabilities, experimental, engine } = params;
+      const { client_ref, harness, thread, title, delivery, inbound, capabilities, experimental, engine, route } = params;
       if (!client_ref || !thread || !delivery?.kind) throw new Error('client_ref, thread and delivery are required');
       closedByRoom.delete(client_ref);   // joining again is the user's explicit request
       const existing = [...bindings.values()].find(b => b.client_ref === client_ref);
       if (existing) {
-        Object.assign(existing, { owner: client, delivery, inbound, capabilities, experimental });
+        Object.assign(existing, { owner: client, delivery, inbound, capabilities, experimental, route });
         client.bindings.add(existing);
         return { binding_id: existing.binding_id, thread, connected };
       }
       const local_id = 'local-' + randomUUID();
       log(`${harness} ${thread} joins ("${title || ''}", delivery ${delivery.kind}, inbound ${inbound ? (inbound.ok ? 'ok' : 'held') : 'n/a'})`);
-      const binding = { binding_id: local_id, client_ref, harness, thread, title, delivery, inbound, capabilities, experimental, engine, owner: client };
+      const binding = { binding_id: local_id, client_ref, harness, thread, title, delivery, inbound, capabilities, experimental, engine, route, owner: client };
       bindings.set(local_id, binding); client.bindings.add(binding); clearTimeout(idleTimer); open(); watch(binding);
       // What the harness must have open before anything is delivered (Cursor's editor: the view's bridge).
       // Asked after the binding exists, so a command right behind this one finds it.
       let prepared = null;
       const module = harnessFor(harness);
       if (typeof module.prepare === 'function') {
-        try { prepared = await module.prepare(delivery, { log }) || null; } catch (error) { log(`${thread} could not be prepared for delivery: ${error.message}`); }
+        // `admitted`: the harness itself answered that the conversation took a message (Cursor's editor answers a
+        // card's ui/message when the turn it started has run) — as good a second tick as seeing it recorded.
+        const admitted = message_id => { const sent = binding.pending?.get(message_id); if (sent) reportRead(binding, { message_id, session_id: sent.session_id, revision: sent.revision }); };
+        try { prepared = await module.prepare(delivery, { log, admitted }) || null; } catch (error) { log(`${thread} could not be prepared for delivery: ${error.message}`); }
         if (prepared && bindings.get(binding.binding_id) === binding) { binding.release = prepared.release; binding.detachable = !!prepared.detachable; } else prepared?.release?.();
       }
       // A room that is not there yet is not a failure: the binding is registered on the next welcome.

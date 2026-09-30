@@ -371,8 +371,8 @@ test('cursor editor: a client that draws MCP Apps views gets a conversation of i
   assert.deepEqual({ ...identity.delivery, key: undefined }, { kind: 'cursor-app', thread: identity.thread, key: undefined });
   assert.match(identity.delivery.key, /^[0-9a-f]{64}$/, 'a key of its own for the view');
   const capabilities = conversationCapabilities(cursorHarness, identity);
-  assert.deepEqual([capabilities.deliver, capabilities.working, capabilities.endOfTurn, capabilities.sessionIdentity], ['supported', 'unsupported', 'unsupported', 'supported']);
-  assert.deepEqual(experimentalCapabilities(cursorHarness, capabilities, identity), ['deliver', 'sessionIdentity']);
+  assert.deepEqual([capabilities.deliver, capabilities.working, capabilities.endOfTurn, capabilities.sessionIdentity], ['supported', 'supported', 'supported', 'supported']);
+  assert.deepEqual(experimentalCapabilities(cursorHarness, capabilities, identity), ['deliver', 'working', 'endOfTurn', 'sessionIdentity']);
   assert.notEqual(sessionIdentity({ client: editor, locate: () => null }).thread, identity.thread, 'each join is its own conversation');
   // The editor takes the card route even if its process holds a chat store open: only the CLI is found by one.
   const heldToo = sessionIdentity({ client: editor, locate: () => ({ chat: 'chat-x', store: '/x/store.db' }) });
