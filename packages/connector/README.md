@@ -36,8 +36,8 @@ The client side. One bin (`sidevoice`), these entry points:
 Harness modules implement one contract (`harness-contract.mjs`): delivery,
 inbound inspection, mechanical working state (polled or lifecycle-backed), end-of-turn reporting and session
 identity. Every capability is explicitly `supported` or `unsupported`; an old
-or malformed declaration becomes `unknown`, never false. Claude Code, Codex and
-generic HTTP each have one module. See the repository's
+or malformed declaration becomes `unknown`, never false. Claude Code, Codex, the
+Cursor CLI and generic HTTP each have one module. See the repository's
 [`docs/HARNESS_CONTRACT.md`](../../docs/HARNESS_CONTRACT.md).
 
 The conversations live in the core, not in the hosted room (since 2026-09-30,

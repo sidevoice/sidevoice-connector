@@ -10,10 +10,11 @@ import {
 } from '../harness-contract.mjs';
 import { claudeHarness } from '../harness-claude.mjs';
 import { codexHarness } from '../harness-codex.mjs';
+import { cursorHarness } from '../harness-cursor.mjs';
 import { httpHarness } from '../harness-http.mjs';
 import { harnessFor, identifyHarness } from '../harnesses.mjs';
 
-for (const harness of [claudeHarness, codexHarness, httpHarness]) {
+for (const harness of [claudeHarness, codexHarness, cursorHarness, httpHarness]) {
   test(`${harness.name} satisfies the harness contract`, () => {
     assert.deepEqual(Object.keys(advertisedCapabilities(harness)), [...CAPABILITIES]);
     for (const capability of CAPABILITIES) {

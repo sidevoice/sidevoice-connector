@@ -15,6 +15,7 @@ import { remove as removeSkill, status as skillStatus } from '../skill.mjs';
 import './test_harness_contract.mjs';
 import './test_harness_claude.mjs';
 import './test_core.mjs';
+import { chatStore, fakeDesktopBridge, fakePersist, fakeStateDb, runView, TMUX } from './test_harness_cursor.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const connectorPath = path.join(here, '..', 'connector.mjs');
@@ -288,6 +289,11 @@ test('mcp façade: identity comes from the harness, tools are exposed, instructi
     await until(() => replies.length === 6);
     assert.equal(JSON.parse(replies.find(x => x.id === 4).result.content[0].text).status, 'published');
     assert.equal(commands.find(c => c.method === 'publish').params.binding_id, 'b-9');
+    // Outside Cursor's editor a reply names the turn it answers: speaking by conversation id is refused.
+    ask(7, 'tools/call', { name: 'voice_say', arguments: { text: 'hola', conversation: 'sess-abc' } });
+    await until(() => replies.some(x => x.id === 7));
+    assert.match(replies.find(x => x.id === 7).error.message, /only for a chat of the Cursor editor/);
+    assert.equal(commands.filter(c => c.method === 'publish').length, 1);
   } finally { child.kill(); fake.close(); }
 });
 
@@ -673,6 +679,460 @@ test('connector: Codex — the thread\'s rollout says when it took the message a
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
 });
 
+test('connector: Cursor — the room hears the chat work, and a voice message is refused as undeliverable rather than tried', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const cursorHome = mkdtempSync(path.join(os.tmpdir(), 'sv-cursor-'));
+  const dir = path.join(cursorHome, 'projects', 'work-app', 'agent-transcripts', 'chat-7'); mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'chat-7.jsonl');
+  const turn = text => JSON.stringify({ role: 'user', message: { content: [{ type: 'text', text }] } }) + '\n';
+  writeFileSync(file, '');
+  room.handle = (event, data) => {
+    if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-c7', thread: data.thread };
+  };
+  const { child, socketPath } = startConnector(room.origin, dataDir, { CURSOR_DATA_DIR: cursorHome, CURSOR_CONFIG_DIR: cursorHome, SIDEVOICE_WORK_POLL_MS: '30', SIDEVOICE_WORK_ANNOUNCE_MS: '5000' });
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    await facade.call('register', { client_ref: 'chat-7', harness: 'cursor', thread: 'chat-7', title: 'C', delivery: { kind: 'none', chat: 'chat-7' }, capabilities: { deliver: 'unsupported' } });
+    await until(() => room.socket);
+    const refused = await room.ask('input.deliver', { event_id: 'e-c7', binding_id: 'b-c7', channel: 'voice', session_id: 's', revision: 1, message_id: 'm-c7', text: 'hola cursor' });
+    assert.equal(refused.status, 'unsupported');
+    assert.match(refused.error, /cursor offers no way to put a message into this conversation/);
+    // The person types in Cursor: the turn is seen starting and ending.
+    appendFileSync(file, turn('typed in cursor'));
+    await until(() => room.sent('input.working').some(d => d.working === true));
+    appendFileSync(file, JSON.stringify({ role: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] } }) + '\n' + JSON.stringify({ type: 'turn_ended', status: 'success' }) + '\n');
+    await until(() => room.sent('input.working').some(d => d.working === false));
+    assert.equal(room.sent('input.read').length, 0, 'nothing was delivered, so nothing is read');
+    facade.end();
+  } finally { if (child.exitCode === null) child.kill(); await room.close(); }
+});
+
+test('connector: Cursor under persist — a voice message is typed into the chat\'s pane, and its transcript gives the second tick', { skip: !TMUX && 'no tmux on this machine' }, async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const cursorHome = mkdtempSync(path.join(os.tmpdir(), 'sv-cursor-'));
+  const chat = '0d3f6c1e-2b4a-4c5d-8e9f-a1b2c3d4e5f6';
+  const dir = path.join(cursorHome, 'projects', 'work-app', 'agent-transcripts', chat); mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, chat + '.jsonl'); writeFileSync(file, '');
+  const fake = await fakePersist(chat);
+  room.handle = (event, data) => { if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-p', thread: data.thread }; };
+  const { child, socketPath } = startConnector(room.origin, dataDir, { ...fake.env, CURSOR_DATA_DIR: cursorHome, CURSOR_CONFIG_DIR: cursorHome, SIDEVOICE_WORK_POLL_MS: '30', SIDEVOICE_WORK_ANNOUNCE_MS: '5000' });
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    await facade.call('register', { client_ref: chat, harness: 'cursor', thread: chat, title: 'P', delivery: { kind: 'cursor-tmux', chat },
+      capabilities: { deliver: 'supported', inspectInbound: 'unsupported', working: 'supported', endOfTurn: 'supported', sessionIdentity: 'supported' }, experimental: ['deliver'] });
+    await until(() => room.socket);
+    assert.deepEqual(room.sent('binding.register')[0].experimental, ['deliver'], 'the room is told delivery is experimental');
+    const typed = await room.ask('input.deliver', { event_id: 'e-p', binding_id: 'b-p', channel: 'voice', session_id: 's', revision: 2, message_id: 'm-p', text: 'hola\ncursor' });
+    assert.equal(typed.status, 'unknown'); assert.match(typed.detail, /typed into persistent session cursor-test/);
+    await until(() => existsSync(fake.received) && readFileSync(fake.received, 'utf8').endsWith('\r'));
+    const pasted = readFileSync(fake.received, 'utf8').slice('\x1b[200~'.length, -('\x1b[201~\r'.length));
+    assert.match(pasted, /hola\ncursor/);
+    // Cursor takes it: the transcript's user line holds it (inside its own <user_query> wrapper).
+    appendFileSync(file, JSON.stringify({ role: 'user', message: { content: [{ type: 'text', text: '<user_query>\n' + pasted + '\n</user_query>' }] } }) + '\n');
+    await until(() => room.sent('input.read').some(d => d.message_id === 'm-p'));
+    await until(() => room.sent('input.working').some(d => d.working === true));
+    facade.end();
+  } finally { fake.stop(); if (child.exitCode === null) child.kill(); await room.close(); }
+});
+
+test('façade: in the Cursor CLI the chat is the store its parent holds open, and voice_connect says the room cannot talk to it', async () => {
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const socketPath = path.join(dataDir, 'connector.sock');
+  const cursorHome = mkdtempSync(path.join(os.tmpdir(), 'sv-cursor-'));
+  // This test process plays cursor-agent: it spawns the server and holds the chat's store open.
+  const chat = chatStore(cursorHome, 'chat-e2e', { model: 'composer-2' });
+  const commands = [];
+  const fake = net.createServer(socket => { let buffer = ''; socket.on('data', chunk => { buffer += chunk; let i; while ((i = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, i); buffer = buffer.slice(i + 1); if (!line) continue; const input = JSON.parse(line); commands.push(input); const result = input.method === 'register' ? { binding_id: 'b-e2e', thread: input.params.thread, connected: true } : { connected: true, bindings: [], version: null }; socket.write(JSON.stringify({ id: input.id, ok: true, result }) + '\n'); } }); });
+  await new Promise(r => fake.listen(socketPath, r));
+  writeFileSync(path.join(dataDir, 'credentials.json'), JSON.stringify({ url: 'wss://room.example/api/connectors/ws', connector_id: 'c-1', token: 't-1' }));
+  // What Cursor gives an MCP server: a scrubbed environment, and nothing about the chat.
+  const env = { HOME: process.env.HOME, PATH: process.env.PATH, SHELL: process.env.SHELL || '/bin/sh', SIDEVOICE_DATA_DIR: dataDir, CURSOR_CONFIG_DIR: cursorHome };
+  const child = spawn(process.execPath, [mcpPath], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
+  const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+  try {
+    ask(1, 'initialize', { protocolVersion: '2025-11-25', capabilities: { elicitation: { form: {} } }, clientInfo: { name: 'Cursor', version: '1.0.0' } });
+    ask(2, 'tools/call', { name: 'voice_connect', arguments: { title: 'Cursor' } });
+    await until(() => replies.length === 2);
+    const reply = replies.find(r => r.id === 2);
+    assert.ok(reply.result, JSON.stringify(reply.error));
+    const joined = JSON.parse(reply.result.content[0].text);
+    assert.equal(joined.harness, 'cursor');
+    assert.equal(joined.conversation, 'chat-e2e');
+    assert.equal(joined.delivery, 'none');
+    assert.equal(joined.capabilities.deliver, 'unsupported');
+    assert.deepEqual(joined.voice_in.speak_with, { session_id: 'typed:chat-e2e', revision: 0 });
+    assert.match(joined.voice_in.reason, /cannot reach this conversation/);
+    const register = commands.find(c => c.method === 'register').params;
+    assert.deepEqual({ harness: register.harness, thread: register.thread, delivery: register.delivery, engine: register.engine },
+      { harness: 'cursor', thread: 'chat-e2e', delivery: { kind: 'none', chat: 'chat-e2e' }, engine: { model: 'composer-2', effort: null, thinking: null } });
+    // /new in cursor-agent: the same server, another chat. Joining from it leaves the first.
+    chat.db.close();
+    const next = chatStore(cursorHome, 'chat-next');
+    try {
+      ask(3, 'tools/call', { name: 'voice_connect', arguments: { title: 'Otra' } });
+      await until(() => replies.some(r => r.id === 3));
+      assert.equal(JSON.parse(replies.find(r => r.id === 3).result.content[0].text).conversation, 'chat-next');
+      const after = commands.slice(commands.indexOf(commands.find(c => c.method === 'register')) + 1).filter(c => c.method !== 'status');
+      assert.deepEqual(after.map(c => [c.method, c.params.client_ref || c.params.thread]), [['unregister', 'chat-e2e'], ['register', 'chat-next']]);
+    } finally { next.db.close(); }
+  } finally { child.kill(); fake.close(); try { chat.db.close(); } catch {} }
+});
+
+test('façade + connector: a chat of the Cursor editor joins through the view voice_connect carries, and the room\'s voice reaches it', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  room.handle = (event, data) => { if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-ed', thread: data.thread }; };
+  // A real connector, started as a façade would start it; then the façade, spawned as the editor spawns it.
+  const { child: connector, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  await until(() => existsSync(socketPath));
+  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
+  const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+  let view = null;
+  try {
+    // What Cursor 3.22.12 declares: its name, and the MCP Apps extension.
+    ask(1, 'initialize', { protocolVersion: '2025-11-25', clientInfo: { name: 'cursor-vscode', version: '1.0.0' },
+      capabilities: { elicitation: { form: {} }, roots: { listChanged: false }, extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] } } } });
+    ask(2, 'tools/list', {}); ask(3, 'resources/read', { uri: 'ui://sidevoice/voice-link' });
+    ask(4, 'tools/call', { name: 'voice_connect', arguments: { title: 'Editor' }, _meta: { progressToken: 'toolu_ed' } });
+    await until(() => replies.length === 4, 8000);
+    const byId = id => replies.find(r => r.id === id);
+    assert.ok(byId(1).result.capabilities.resources, 'resources offered to a client that draws views');
+    assert.deepEqual(byId(2).result.tools.find(t => t.name === 'voice_connect')._meta, { ui: { resourceUri: 'ui://sidevoice/voice-link' }, 'ui/resourceUri': 'ui://sidevoice/voice-link' }, 'both keys Cursor reads (b1b)');
+    assert.equal(byId(2).result.tools.find(t => t.name === 'voice_say')._meta, undefined);
+    const html = byId(3).result.contents[0];
+    assert.equal(html.mimeType, 'text/html;profile=mcp-app');
+    const joined = JSON.parse(byId(4).result.content[0].text);
+    assert.match(joined.conversation, /^cursor-editor-/);
+    assert.deepEqual(joined.experimental, ['deliver', 'working', 'endOfTurn', 'sessionIdentity']);
+    assert.equal(joined.delivery, 'push');
+    assert.match(joined.view, /card/); assert.match(joined.watch_note, /transcript/);
+    assert.equal(joined.card.requested, true); assert.match(joined.card.note, /mcp\.log/);
+    // What the client declared, and what happened, is in mcp.log — no key in it.
+    const logged = readFileSync(path.join(dataDir, 'mcp.log'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    const init = logged.find(line => line.event === 'initialize');
+    assert.deepEqual({ name: init.client.name, views: init.views, extensions: init.extensions }, { name: 'cursor-vscode', views: true, extensions: ['io.modelcontextprotocol/ui'] });
+    assert.ok(logged.some(line => line.event === 'resources/read' && line.served));
+    const connectLine = logged.find(line => line.event === 'voice_connect');
+    assert.equal(connectLine.route, 'cursor-editor-view'); assert.ok(connectLine.card_port > 0);
+    assert.match(connectLine.conversation, /^h:[0-9a-f]{10}$/); assert.ok(!JSON.stringify(logged).includes(joined.conversation), 'the log names a conversation by hash only');
+    assert.ok(!JSON.stringify(logged).includes(joined.view_link.key), 'the key is never logged');
+    assert.ok(logged.some(line => line.event === 'tools/list' && line.voice_connect_carries_card));
+    assert.ok(logged.some(line => line.event === 'request' && line.method === 'tools/call' && line.tool === 'voice_connect' && line.meta_keys.includes('progressToken')), 'every method is logged by name');
+    assert.match(joined.speak_first, new RegExp(joined.conversation));
+    assert.equal(joined.view_link.conversation, joined.conversation); assert.ok(joined.view_link.port > 0); assert.match(joined.view_link.key, /^[0-9a-f]{64}$/);
+    assert.ok(joined.experimental_notes.some(note => /Sidevoice card/.test(note)) && !joined.experimental_notes.some(note => /tmux/.test(note)), 'the editor is told about its own route');
+    assert.ok(!JSON.stringify(room.sent('binding.register')).includes(joined.view_link.key), 'the key never leaves the machine');
+    await until(() => room.sent('binding.register').length);
+    assert.deepEqual(room.sent('binding.register')[0].experimental, ['deliver', 'working', 'endOfTurn', 'sessionIdentity']);
+    assert.equal(room.sent('binding.register')[0].route, 'cursor-editor-view', 'the room is told how the chat is reached');
+
+    // Cursor draws the view in that chat and hands it the call's result.
+    view = runView({ html: html.text, toolResult: byId(4).result });
+    await wait(300);
+    const delivered = await room.ask('input.deliver', { event_id: 'e-ed', binding_id: 'b-ed', channel: 'voice', session_id: 's', revision: 4, message_id: 'm-ed', text: 'hola editor' });
+    assert.equal(delivered.status, 'unknown', JSON.stringify(delivered));
+    await until(() => view.dispatched.length === 1);
+    assert.match(view.dispatched[0].content[0].text, /hola editor/);
+    assert.match(view.dispatched[0].content[0].text, /"message_id":"m-ed"/);
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'voice_status', arguments: { conversation: joined.conversation } } }) + '\n');
+    const statusReply = JSON.parse((await until(() => replies.find(r => r.id === 9), 8000)).result.content[0].text);
+    assert.equal(statusReply.card.card_connected, true); assert.equal(statusReply.card.html_read_by_cursor, 1);
+  } finally { view?.stop(); child.kill(); if (connector.exitCode === null) connector.kill(); await room.close(); }
+});
+
+test('façade + connector: four chats of one Cursor editor window join at once, each voice turn reaches its own card, and each reply is published as its own conversation', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const minted = [];
+  room.handle = (event, data) => {
+    if (event === 'binding.register') { minted.push(data.thread); return { client_ref: data.client_ref, binding_id: 'b-' + minted.length, thread: data.thread }; }
+    if (event === 'speech.publish') return { status: 'queued', text_saved: true, utterance_id: data.utterance_id };
+  };
+  const { child: connector, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  await until(() => existsSync(socketPath));
+  // One MCP process, as the editor runs one per window.
+  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
+  let serial = 0;
+  const call = async (name, args = {}) => { const id = ++serial; child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }) + '\n');
+    const reply = await until(() => replies.find(r => r.id === id), 8000);
+    if (reply.error) throw new Error(reply.error.message);
+    return { raw: reply.result, value: JSON.parse(reply.result.content[0].text) }; };
+  const views = [];
+  try {
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'initialize', params: { protocolVersion: '2025-11-25', clientInfo: { name: 'cursor-vscode', version: '1.0.0' },
+      capabilities: { extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] } } } } }) + '\n');
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: -1, method: 'resources/read', params: { uri: 'ui://sidevoice/voice-link' } }) + '\n');
+    const html = (await until(() => replies.find(r => r.id === -1), 8000)).result.contents[0].text;
+    // Four chats ask to join; Cursor draws each one's card in its chat.
+    const chats = [];
+    // One chat joined: another chat of the window asking is not told it is that one.
+    const first = await call('voice_connect', { title: 'Uno' });
+    chats.push(first.value.conversation); views.push(runView({ html, toolResult: first.raw }));
+    const other = (await call('voice_status')).value;
+    assert.equal(other.joined, null, 'with one chat joined, a call from any chat of the window does not say which it is');
+    assert.equal(other.conversations.length, 1);
+    await assert.rejects(call('voice_say', { text: 'x', session_id: 'browser-1', revision: 1 }), /has received none to answer by voice/);
+    // It can speak first, with the id voice_connect gave it: published as that chat, with no turn to answer.
+    await call('voice_say', { text: 'hola, estoy aquí', conversation: chats[0] });
+    assert.deepEqual([room.sent('speech.publish').at(-1).binding_id, room.sent('speech.publish').at(-1).session_id], ['b-1', 'typed:' + chats[0]]);
+    await assert.rejects(call('voice_say', { text: 'x', conversation: 'cursor-editor-00000000-0000-0000-0000-000000000000' }), /not a conversation this server joined/);
+    await assert.rejects(call('voice_say', { text: 'x' }), /or — to speak first — the conversation id/);
+    assert.ok(!JSON.stringify(other).includes(chats[0]), 'voice_status never hands a chat another chat\'s id');
+    await assert.rejects(call('voice_disconnect'), /pass conversation/);
+    for (const title of ['Dos', 'Tres', 'Cuatro']) {
+      const joinedChat = await call('voice_connect', { title });
+      chats.push(joinedChat.value.conversation);
+      views.push(runView({ html, toolResult: joinedChat.raw }));
+    }
+    assert.equal(new Set(chats).size, 4);
+    assert.equal(room.sent('binding.unregister').length, 0, 'joining one chat leaves no other');
+    await wait(400);
+    // A voice turn for each chat, from one browser, turn after turn: each lands in its own card only.
+    for (let i = 0; i < 4; i++) {
+      const outcome = await room.ask('input.deliver', { event_id: 'e-' + i, binding_id: 'b-' + (i + 1), channel: 'voice', session_id: 'browser-1', revision: 10 + i, message_id: 'm-' + i, text: 'para ' + i });
+      assert.equal(outcome.status, 'unknown', JSON.stringify(outcome));
+    }
+    await until(() => views.every(view => view.dispatched.length === 1));
+    views.forEach((view, i) => assert.match(view.dispatched[0].content[0].text, new RegExp('"message_id":"m-' + i + '"')));
+    // Each chat answers its own turn: the reply is published as that chat, not as whichever joined last.
+    await call('voice_say', { text: 'respuesta tres', session_id: 'browser-1', revision: 12 });
+    await call('voice_say', { text: 'respuesta uno', session_id: 'browser-1', revision: 10 });
+    assert.deepEqual(room.sent('speech.publish').map(p => [p.binding_id, p.text]), [['b-1', 'hola, estoy aquí'], ['b-3', 'respuesta tres'], ['b-1', 'respuesta uno']]);
+    // `typed:` is only for a conversation that cannot take input: it names no chat of this window.
+    await assert.rejects(call('voice_say', { text: 'x', session_id: 'typed:' + chats[3], revision: 0 }), /no conversation of yours that cannot take input/);
+    // The same pair sent to two chats (the room reuses revision 0 for catch-up input) names neither.
+    await room.ask('input.deliver', { event_id: 'e-z1', binding_id: 'b-1', channel: 'voice', session_id: 'browser-1', revision: 0, message_id: 'm-z1', text: 'a' });
+    await room.ask('input.deliver', { event_id: 'e-z2', binding_id: 'b-2', channel: 'voice', session_id: 'browser-1', revision: 0, message_id: 'm-z2', text: 'b' });
+    await assert.rejects(call('voice_say', { text: 'x', session_id: 'browser-1', revision: 0 }), /went to more than one conversation/);
+    await assert.rejects(call('voice_say', { text: '¿de quién?', session_id: 'browser-1', revision: 99 }), /name no voice turn delivered/);
+
+    // Status and leaving need the chat's own id once several are joined.
+    const all = (await call('voice_status')).value;
+    assert.equal(all.joined, null); assert.equal(all.conversations.length, 4);
+    assert.equal((await call('voice_status', { conversation: chats[1] })).value.joined, true);
+    await assert.rejects(call('voice_disconnect'), /pass conversation/);
+    assert.equal((await call('voice_disconnect', { conversation: chats[1] })).value.status, 'left');
+    await until(() => room.sent('binding.unregister').length === 1);
+    assert.deepEqual(room.sent('binding.unregister').map(d => d.binding_id), ['b-2']);
+    // A late reply from the chat that left is not published as another chat.
+    await assert.rejects(call('voice_say', { text: 'tarde', session_id: 'browser-1', revision: 11 }), /no voice turn delivered to this chat/);
+    // The room closes one chat's voice: that chat is told, the others keep theirs.
+    room.tell('binding.close', { binding_id: 'b-3', thread: chats[2], reason: 'closed_from_room' });
+    await wait(300);
+    const closedStatus = (await call('voice_status')).value;
+    assert.deepEqual(closedStatus.closed_by_room.map(entry => entry.title), ['Tres'], 'the closed chat is named by title, the others stay');
+    assert.ok(!JSON.stringify(closedStatus).includes(chats[2]), 'and no id reaches another chat');
+    assert.equal(closedStatus.conversations.length, 2);
+    assert.match(closedStatus.closed_by_room[0].note, /closed this conversation's voice/);
+    await assert.rejects(call('voice_say', { text: 'x', session_id: 'browser-1', revision: 12 }), /no voice turn delivered to this chat/, 'once told, the closed chat is no longer one of this window\'s');
+    await call('voice_say', { text: 'sigue', session_id: 'browser-1', revision: 13 });
+    assert.equal(room.sent('speech.publish').at(-1).binding_id, 'b-4');
+    const after = (await call('voice_status', { conversation: chats[3] })).value;
+    assert.equal(after.joined, true); assert.equal(after.conversations.length, 2);
+  } finally { views.forEach(view => view.stop()); child.kill(); if (connector.exitCode === null) connector.kill(); await room.close(); }
+});
+
+test('façade + connector: Cursor replaces a window\'s MCP process — the first chat keeps its card, its link and its voice, and the new process speaks for it', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const minted = [];
+  room.handle = (event, data) => {
+    if (event === 'binding.register') { minted.push(data.thread); return { client_ref: data.client_ref, binding_id: 'b-' + minted.length, thread: data.thread }; }
+    if (event === 'speech.publish') return { status: 'queued', text_saved: true, utterance_id: data.utterance_id };
+  };
+  const { child: connector, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  await until(() => existsSync(socketPath));
+  const editor = { name: 'cursor-vscode', version: '1.0.0' }, caps = { extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] } } };
+  const facade = () => {
+    const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+    const replies = []; let out = '', serial = 0;
+    child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
+    const send = (method, params) => { const id = ++serial; child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); return until(() => replies.find(r => r.id === id), 8000); };
+    const call = async (name, args = {}) => { const reply = await send('tools/call', { name, arguments: args }); if (reply.error) throw new Error(reply.error.message); return { raw: reply.result, value: JSON.parse(reply.result.content[0].text) }; };
+    return { child, send, call, ready: send('initialize', { protocolVersion: '2025-11-25', clientInfo: editor, capabilities: caps }) };
+  };
+  const views = [];
+  let second = null;
+  const first = facade();
+  try {
+    await first.ready;
+    const html = (await first.send('resources/read', { uri: 'ui://sidevoice/voice-link' })).result.contents[0].text;
+    const a = await first.call('voice_connect', { title: 'A' });
+    views.push(runView({ html, toolResult: a.raw }));
+    await wait(300);
+    // Cursor replaces the window's MCP process: the first one goes away, a new one serves the next chat.
+    first.child.stdin.end(); first.child.kill();
+    await wait(400);
+    assert.equal(room.sent('binding.unregister').length, 0, 'the first chat is not taken out of the room');
+    second = facade(); await second.ready;
+    const b = await second.call('voice_connect', { title: 'B' });
+    views.push(runView({ html, toolResult: b.raw }));
+    await wait(400);
+    // Both cards receive their own turns.
+    assert.equal((await room.ask('input.deliver', { event_id: 'e-a', binding_id: 'b-1', channel: 'voice', session_id: 'br', revision: 1, message_id: 'm-a', text: 'para A' })).status, 'unknown');
+    assert.equal((await room.ask('input.deliver', { event_id: 'e-b', binding_id: 'b-2', channel: 'voice', session_id: 'br', revision: 2, message_id: 'm-b', text: 'para B' })).status, 'unknown');
+    await until(() => views[0].dispatched.length === 1 && views[1].dispatched.length === 1);
+    assert.match(views[0].dispatched[0].content[0].text, /para A/); assert.match(views[1].dispatched[0].content[0].text, /para B/);
+    // Chat A answers through the new process: published as A, by its turn — or by its own id.
+    await second.call('voice_say', { text: 'soy A', session_id: 'br', revision: 1 });
+    assert.equal(room.sent('speech.publish').at(-1).binding_id, 'b-1');
+    await second.call('voice_say', { text: 'A otra vez', conversation: a.value.conversation });
+    assert.equal(room.sent('speech.publish').at(-1).binding_id, 'b-1');
+    assert.equal((await second.call('voice_status', { conversation: a.value.conversation })).value.joined, true);
+    // Cursor remounts A's card (the chat came back on screen): the new view re-attaches with the same link.
+    views[0].stop(); await wait(100);
+    views[0] = runView({ html, toolResult: a.raw });
+    await wait(300);
+    await room.ask('input.deliver', { event_id: 'e-a2', binding_id: 'b-1', channel: 'voice', session_id: 'br', revision: 3, message_id: 'm-a2', text: 'otra para A' });
+    await until(() => views[0].dispatched.length === 1);
+    assert.match(views[0].dispatched[0].content[0].text, /otra para A/);
+    const connectorLog = readFileSync(path.join(dataDir, 'connector.log'), 'utf8');
+    assert.ok(!connectorLog.includes(a.value.conversation) && connectorLog.includes('cursor-editor-h:'), 'the connector log names editor conversations by hash');
+  } finally { views.forEach(view => view.stop()); first.child.kill(); second?.child.kill(); if (connector.exitCode === null) connector.kill(); await room.close(); }
+});
+
+test('connector: an editor chat kept without a façade leaves once its card has been silent too long', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  room.handle = (event, data) => { if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-o', thread: data.thread }; };
+  const { child, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_ORPHAN_TTL_MS: '400', SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    const thread = 'cursor-editor-3b2c3d4e-5f60-4a1b-8c2d-3e4f5a6b7c8d';
+    await facade.call('register', { client_ref: thread, harness: 'cursor', thread, title: 'O', delivery: { kind: 'cursor-app', thread, key: 'a'.repeat(64) },
+      capabilities: { deliver: 'supported', inspectInbound: 'unsupported', working: 'unsupported', endOfTurn: 'unsupported', sessionIdentity: 'supported' } });
+    await until(() => room.sent('binding.register').length);
+    facade.end();
+    await wait(200);
+    assert.equal(room.sent('binding.unregister').length, 0, 'kept while it may still be heard from');
+    await until(() => room.sent('binding.unregister').length === 1, 5000);
+  } finally { if (child.exitCode === null) child.kill(); await room.close(); }
+});
+
+test('connector: an editor chat\'s second tick — early from its transcript once found, or from Cursor\'s answer to the card', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const cursorHome = mkdtempSync(path.join(os.tmpdir(), 'sv-cursor-'));
+  room.handle = (event, data) => { if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-r', thread: data.thread }; };
+  const { child, socketPath } = startConnector(room.origin, dataDir, { CURSOR_DATA_DIR: cursorHome, SIDEVOICE_WORK_POLL_MS: '30', SIDEVOICE_CURSOR_SCAN_MS: '50', SIDEVOICE_WORK_ANNOUNCE_MS: '5000', SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  let view = null;
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    const thread = 'cursor-editor-4b2c3d4e-5f60-4a1b-8c2d-3e4f5a6b7c8d', key = 'b'.repeat(64);
+    const registered = await facade.call('register', { client_ref: thread, harness: 'cursor', thread, title: 'R', delivery: { kind: 'cursor-app', thread, key },
+      capabilities: { deliver: 'supported', inspectInbound: 'unsupported', working: 'supported', endOfTurn: 'supported', sessionIdentity: 'supported' } });
+    const { resource } = await import('../harness-cursor-app.mjs');
+    // The first turn runs long: Cursor has not answered the card yet.
+    const answers = [];
+    view = runView({ html: resource().text, toolResult: { content: [{ type: 'text', text: JSON.stringify({ view_link: { conversation: thread, port: registered.prepared.port, key } }) }] },
+      submit: () => new Promise(resolve => answers.push(resolve)) });
+    await wait(300);
+    assert.equal((await room.ask('input.deliver', { event_id: 'e-1', binding_id: 'b-r', channel: 'voice', session_id: 's', revision: 1, message_id: 'm-1', text: 'uno' })).status, 'unknown');
+    await until(() => view.dispatched.length === 1);
+    assert.equal(room.sent('input.read').length, 0, 'dispatched is not read');
+    // Cursor writes the chat's transcript (its own chat id) as the turn starts: that says which chat this is.
+    const dir = path.join(cursorHome, 'projects', 'work-app', 'agent-transcripts', 'composer-9'); mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'composer-9.jsonl');
+    writeFileSync(file, JSON.stringify({ role: 'user', message: { content: [{ type: 'text', text: '<user_query>\n' + view.dispatched[0].content[0].text + '\n</user_query>' }] } }) + '\n');
+    await until(() => room.sent('input.read').some(d => d.message_id === 'm-1'));
+    await until(() => room.sent('input.working').some(d => d.working === true));
+    appendFileSync(file, JSON.stringify({ role: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] } }) + '\n' + JSON.stringify({ type: 'turn_ended', status: 'success' }) + '\n');
+    await until(() => room.sent('input.working').some(d => d.working === false));
+    answers.shift()();
+    // A second message whose only signal is Cursor answering the card when its turn has run.
+    await room.ask('input.deliver', { event_id: 'e-2', binding_id: 'b-r', channel: 'voice', session_id: 's', revision: 2, message_id: 'm-2', text: 'dos' });
+    await until(() => view.dispatched.length === 2);
+    assert.ok(!room.sent('input.read').some(d => d.message_id === 'm-2'));
+    answers.shift()();
+    await until(() => room.sent('input.read').some(d => d.message_id === 'm-2'));
+    assert.equal(room.sent('input.read').filter(d => d.message_id === 'm-1').length, 1, 'one tick per message, whatever says it');
+    facade.end();
+  } finally { view?.stop(); if (child.exitCode === null) child.kill(); await room.close(); }
+});
+
+test('façade + connector: with Cursor\'s Desktop Bridge on, an editor chat gets its voice by its own id, off screen too, and the card is only the fallback', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  let refuse = false;
+  const userDataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-cursor-user-'));
+  const fake = await fakeDesktopBridge({ userDataDir, threads: [{ id: 'comp-A', title: 'A', source: 'local', status: 'running', lastUpdatedAt: Date.now(), windowId: 1 }],
+    answer: () => (refuse ? { outcome: 'not-found' } : { outcome: 'submitted', threadTitle: 'A' }) });
+  room.handle = (event, data) => { if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-d', thread: data.thread }; };
+  const { child: connector, socketPath } = startConnector(room.origin, dataDir, { ...fake.env, SIDEVOICE_CURSOR_LOOKUP_AT: '800,2000,3500', SIDEVOICE_CURSOR_SCAN_MS: '50', SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  await until(() => existsSync(socketPath));
+  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, ...fake.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
+  const ask = (id, method, params) => { child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); return until(() => replies.find(r => r.id === id), 8000); };
+  let view = null;
+  try {
+    await ask(1, 'initialize', { protocolVersion: '2025-11-25', clientInfo: { name: 'cursor-vscode', version: '1.0.0' }, capabilities: { extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] } } } });
+    const html = (await ask(2, 'resources/read', { uri: 'ui://sidevoice/voice-link' })).result.contents[0].text;
+    const joinedReply = await ask(3, 'tools/call', { name: 'voice_connect', arguments: { title: 'A' } });
+    const joined = JSON.parse(joinedReply.result.content[0].text);
+    assert.equal(joined.card.bridge, true);
+    await until(() => room.sent('binding.register').length);
+    assert.equal(room.sent('binding.register')[0].route, 'cursor-editor-bridge');
+    // Cursor records the call in its state database; the candidate (the only chat working) is confirmed there.
+    fakeStateDb(userDataDir, { chat: 'comp-A', marker: joined.view_link.key });
+    const known = async () => JSON.parse((await ask(Math.floor(Math.random() * 1e9), 'tools/call', { name: 'voice_status', arguments: { conversation: joined.conversation } })).result.content[0].text).card.bridge_chat_known;
+    await until(known, 8000);
+    // No card on screen: the bridge takes it, to the chat by its id.
+    const sent = await room.ask('input.deliver', { event_id: 'e-1', binding_id: 'b-d', channel: 'voice', session_id: 's', revision: 1, message_id: 'm-1', text: 'hola A' });
+    assert.equal(sent.status, 'accepted'); assert.match(sent.detail, /Desktop Bridge: submitted/);
+    assert.equal(fake.sent[0].threadId, 'comp-A'); assert.match(fake.sent[0].text, /"message_id":"m-1"/); assert.match(fake.sent[0].text, /hola A/);
+    // The bridge no longer knows the chat: the card, when it is there, takes it.
+    refuse = true;
+    view = runView({ html, toolResult: joinedReply.result });
+    await wait(300);
+    const viaCard = await room.ask('input.deliver', { event_id: 'e-2', binding_id: 'b-d', channel: 'voice', session_id: 's', revision: 2, message_id: 'm-2', text: 'por la tarjeta' });
+    assert.equal(viaCard.status, 'unknown');
+    await until(() => view.dispatched.length === 1);
+  } finally { view?.stop(); child.kill(); if (connector.exitCode === null) connector.kill(); await fake.close(); await room.close(); }
+});
+
+test('connector: with the Desktop Bridge on, an editor chat is identified by its transcript recording the voice_connect call, and every step is in connector.log', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const cursorHome = mkdtempSync(path.join(os.tmpdir(), 'sv-cursor-'));
+  // Cursor 3.22.12's main process answers an unknown thread with status "unknown-thread".
+  const fake = await fakeDesktopBridge({ answer: request => request.threadId === 'comp-A' ? { status: 'submitted', threadId: 'comp-A', windowId: 1, threadTitle: 'A' } : { status: 'unknown-thread' } });
+  room.handle = (event, data) => { if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-t', thread: data.thread }; };
+  const { child, socketPath } = startConnector(room.origin, dataDir, { ...fake.env, CURSOR_DATA_DIR: cursorHome, SIDEVOICE_CURSOR_SCAN_MS: '50', SIDEVOICE_CURSOR_LOOKUP_AT: '100', SIDEVOICE_CURSOR_APP_TIMEOUT_MS: '300', SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    const thread = 'cursor-editor-6b2c3d4e-5f60-4a1b-8c2d-3e4f5a6b7c8d';
+    await facade.call('register', { client_ref: thread, harness: 'cursor', thread, title: 'Mi chat', route: 'cursor-editor-bridge',
+      delivery: { kind: 'cursor-app', thread, key: 'f'.repeat(64), candidate: 'comp-A', title: 'Mi chat' },
+      capabilities: { deliver: 'supported', inspectInbound: 'unsupported', working: 'supported', endOfTurn: 'supported', sessionIdentity: 'supported' } });
+    const logText = () => readFileSync(path.join(dataDir, 'connector.log'), 'utf8');
+    await until(() => /Cursor Desktop Bridge found .*candidate chat comp-A/.test(logText()));
+    // Not identified yet: the card is tried, and the log says why.
+    const early = await room.ask('input.deliver', { event_id: 'e-0', binding_id: 'b-t', channel: 'voice', session_id: 's', revision: 1, message_id: 'm-0', text: 'pronto' });
+    assert.equal(fake.sent.length, 0); assert.equal(early.status, 'failed');
+    assert.match(logText(), /chat not identified yet — m-0 goes to the card/);
+    // Cursor writes the chat's transcript: the call, with its title.
+    const dir = path.join(cursorHome, 'projects', 'work-app', 'agent-transcripts', 'comp-A'); mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, 'comp-A.jsonl'), JSON.stringify({ role: 'user', message: { content: [{ type: 'text', text: 'únete a la sala' }] } }) + '\n'
+      + JSON.stringify({ role: 'assistant', message: { content: [{ type: 'tool_use', name: 'mcp_sidevoice_voice_connect', input: { title: 'Mi chat' } }] } }) + '\n');
+    await until(() => /identified as Cursor chat comp-A — its transcript records this voice_connect/.test(logText()));
+    const sent = await room.ask('input.deliver', { event_id: 'e-1', binding_id: 'b-t', channel: 'voice', session_id: 's', revision: 2, message_id: 'm-1', text: 'hola' });
+    assert.equal(sent.status, 'accepted'); assert.equal(fake.sent.at(-1).threadId, 'comp-A');
+    assert.match(logText(), /Desktop Bridge sent m-1 to chat comp-A: submitted/);
+    assert.ok(!logText().includes(thread), 'ids hashed in the log');
+    facade.end();
+  } finally { if (child.exitCode === null) child.kill(); await fake.close(); await room.close(); }
+});
+
 test('pairing: plaintext only where the token cannot leave the machine or the cluster', async () => {
   const { privateNetwork, pair } = await import('../pair.mjs');
   for (const ok of ['127.0.0.1', 'localhost', 'room.voice.svc', 'room.voice.svc.cluster.local', 'room.voice.svc.k8s.example']) assert.equal(privateNetwork(ok), true, ok);
@@ -747,7 +1207,8 @@ test('install: puts this version in front of the harness, re-pins an older regis
   writeFileSync(bin, `#!/bin/sh\necho "$@" >> "${log}"\nif [ "$2" = get ]; then [ -s "${registered}" ] && cat "${registered}" || exit 1; fi\n`, { mode: 0o755 });
   const calls = () => existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : [];
   // Not from a checkout: the package is copied under the XDG data home and the harness runs that copy with node.
-  const env = { ...process.env, SIDEVOICE_DATA_DIR: path.join(home, '.sidevoice'), CLAUDE_CONFIG_DIR: path.join(home, '.claude'), SIDEVOICE_CLAUDE_BIN: bin,
+  // HOME too: Cursor's mcp.json lives under it, and a test must never touch the real one.
+  const env = { ...process.env, HOME: home, SIDEVOICE_DATA_DIR: path.join(home, '.sidevoice'), CLAUDE_CONFIG_DIR: path.join(home, '.claude'), SIDEVOICE_CLAUDE_BIN: bin,
                 SIDEVOICE_INSTALL_FROM_SOURCE: '0', XDG_DATA_HOME: path.join(home, 'xdg') };
   mkdirSync(env.CLAUDE_CONFIG_DIR);
   mkdirSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1'), { recursive: true });   // a copy an older install left

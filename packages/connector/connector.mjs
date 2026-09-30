@@ -14,7 +14,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { appendFileSync, mkdirSync, openSync, closeSync, statSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { capabilityState, SUPPORTED, voiceEnvelope } from './harness-contract.mjs';
 import { harnessFor } from './harnesses.mjs';
@@ -39,7 +39,10 @@ const LOG_MAX = 1 << 20;
 /** One line per event, to stderr and to `connector.log` in the data dir: the façade starts this process
  *  with its output discarded, so the file is the only record of a connector nobody ran by hand. Rolls
  *  over once, at 1 MB. */
+/** An editor conversation's id is what lets a chat speak as it: the log names it by a hash. */
+const redact = line => String(line).replace(/cursor-editor-[0-9a-f-]{36}/g, id => 'cursor-editor-h:' + createHash('sha256').update(id).digest('hex').slice(0, 10));
 function log(line) {
+  line = redact(line);
   const stamped = `${new Date().toISOString()} [sidevoice] ${line}`;
   console.error(stamped);
   try {
@@ -128,6 +131,12 @@ function request(event, data, options) {
  * 2026-09-20). Saying it again is one small frame; not saying it is a light that never comes on. */
 const WORK_ANNOUNCE_MS = Number(process.env.SIDEVOICE_WORK_ANNOUNCE_MS || 2000);
 const PENDING_MAX = 64;
+/** Which conversation each delivered voice turn went to, by the (session_id, revision) it carried: one
+ *  façade can speak for several conversations (Cursor's editor, one MCP process per window), and a
+ *  voice_say names the turn it answers, never the conversation. */
+const turnsDelivered = new Map();
+const TURNS_MAX = 512;
+const turnKey = (session_id, revision) => `${session_id}\n${revision}`;
 let announceTimer = null;
 function announceWork(binding, working, extra = {}) {
   binding.working = working;
@@ -148,25 +157,32 @@ function keepAnnouncing() {
 /** Start watching a binding's conversation through its harness. What we delivered and it has not yet taken
  *  waits in `pending`; the moment its transcript shows the message, the room gets the second tick and a
  *  correlated start of turn; the end of that turn carries the same correlation. */
+/** The second tick: the conversation took this message. Said once per message, however many signals say it. */
+function reportRead(binding, header, turn_id = null) {
+  binding.pending?.delete(header.message_id);
+  if (readReported.has(header.message_id)) return;
+  readReported.add(header.message_id); if (readReported.size > 512) readReported.delete(readReported.values().next().value);
+  send('input.read', { binding_id: binding.binding_id, message_id: header.message_id, session_id: header.session_id, revision: header.revision, turn_id: turn_id || null });
+  log(`${binding.thread} read ${header.message_id} (session ${header.session_id} rev ${header.revision}, turn ${turn_id || '?'})`);
+}
 function watch(binding) {
   const harness = harnessFor(binding.harness);
-  if (binding.stop || capabilityState(harness, 'working') !== SUPPORTED || typeof harness.observe !== 'function') return;
+  // A conversation that declared it cannot be watched is not, though its harness can watch others.
+  if (binding.stop || capabilityState(harness, 'working') !== SUPPORTED || capabilityState(binding, 'working') === 'unsupported' || typeof harness.observe !== 'function') return;
   binding.pending ||= new Map();
   const correlation = () => binding.turn ? { turn_id: binding.turn.turn_id, session_id: binding.turn.session_id, revision: binding.turn.revision } : {};
   binding.stop = harness.observe(binding.thread, {
     userMessage({ text, turn_id }) {
       const header = voiceEnvelope(text);
       if (!header || !binding.pending.has(header.message_id)) return;
-      binding.pending.delete(header.message_id);
-      if (!readReported.has(header.message_id)) {
-        readReported.add(header.message_id); if (readReported.size > 512) readReported.delete(readReported.values().next().value);
-        send('input.read', { binding_id: binding.binding_id, message_id: header.message_id, session_id: header.session_id, revision: header.revision, turn_id: turn_id || null });
-        log(`${binding.thread} read ${header.message_id} (session ${header.session_id} rev ${header.revision}, turn ${turn_id || '?'})`);
-      }
+      reportRead(binding, header, turn_id);
       if (header.channel !== 'voice') return;
       binding.turn = { turn_id: turn_id || null, session_id: header.session_id, revision: header.revision };
       announceWork(binding, true, turn_id ? { turn_phase: 'start', ...correlation() } : {});
     },
+    /** What was delivered and not yet seen taken: a harness that must first find where its conversation is
+     *  recorded (Cursor's editor chats) looks for these. */
+    expecting() { return [...binding.pending.keys()]; },
     working(working, { turn_id } = {}) {
       if (working) {
         // A start we can name is said with its name; the correlated start, if any, comes with the message itself.
@@ -194,7 +210,7 @@ function watch(binding) {
   });
   keepAnnouncing();
 }
-function unwatch(binding) { try { binding.stop?.(); } catch {} binding.stop = null; }
+function unwatch(binding) { try { binding.stop?.(); } catch {} binding.stop = null; try { binding.release?.(); } catch {} binding.release = null; }
 
 /** The room will not have this connector, in its own words, and nothing this process does will
  *  change that: the pairing was taken away from the room's page. Every conversation it served is
@@ -339,7 +355,8 @@ async function announce(binding) {
   // `local-*` is only a connector-side placeholder while the first registration waits for the
   // room to mint its durable binding id. Sending it back makes the room correctly reject it as foreign.
   const frame = { client_ref: binding.client_ref, harness: binding.harness, thread: binding.thread,
-    title: binding.title, inbound: binding.inbound, capabilities: binding.capabilities,
+    title: binding.title, inbound: binding.inbound, capabilities: binding.capabilities, experimental: binding.experimental || [],
+    ...(binding.route ? { route: binding.route } : {}),
     engine: binding.engine, focus: false };
   if (!binding.binding_id.startsWith('local-')) frame.binding_id = binding.binding_id;
   const reply = await request('binding.register', frame).catch(error => {
@@ -411,6 +428,21 @@ async function asked(route, frame) {
 
 /** One message into the conversation, through the adapter its binding was registered with. */
 async function handOver(binding, frame) {
+  // A harness that declares it cannot take input is said so, not tried: nothing reaches the conversation.
+  const harness = harnessFor(binding.harness);
+  // The conversation's own declaration counts: a harness can deliver and still not into this conversation.
+  if (capabilityState(harness, 'deliver') !== SUPPORTED || capabilityState(binding, 'deliver') === 'unsupported') {
+    log(`not delivering ${frame.event_id} (${frame.message_id}) to ${binding.thread}: ${binding.harness} cannot take input from the room`);
+    return { status: 'unsupported', error: `${binding.harness} offers no way to put a message into this conversation` };
+  }
+  if (frame.session_id !== undefined && frame.revision !== undefined) {
+    // Every conversation a turn went to: the room can send the same pair to two (revision 0 is reused for
+    // catch-up input), and then a reply naming it names neither.
+    const key = turnKey(frame.session_id, frame.revision);
+    const went = turnsDelivered.get(key) || new Set();
+    turnsDelivered.delete(key); went.add(binding.client_ref); turnsDelivered.set(key, went);
+    while (turnsDelivered.size > TURNS_MAX) turnsDelivered.delete(turnsDelivered.keys().next().value);
+  }
   // Expected before it is sent: the harness can take the message, and its transcript show it, before the
   // delivery call has even settled (Claude Code admitted one 9 ms after the write; the socket answered
   // 1.5 s later, 2026-09-21). A message expected and never taken costs a map entry.
@@ -419,7 +451,6 @@ async function handOver(binding, frame) {
     while (binding.pending.size > PENDING_MAX) binding.pending.delete(binding.pending.keys().next().value);
   }
   try {
-    const harness = harnessFor(binding.harness);
     const outcome = await harness.deliver(binding.delivery, frame);
     log(`delivered ${frame.event_id} (${frame.message_id}) to ${binding.thread} via ${binding.delivery.kind}: ${outcome.status} (${outcome.detail})`);
     return { status: outcome.status, detail: outcome.detail };
@@ -443,8 +474,10 @@ function snapshot() {
     // Which conversations lost their voice from the room, and why each one did: the same map read
     // twice, because "it is gone" and "this is what happened" are two different questions.
     closed_by_room: [...closedByRoom.keys()], closed_reasons: Object.fromEntries(closedByRoom),
-    bindings: [...bindings.values()].map(({ binding_id, client_ref, harness, thread, title, delivery, capabilities }) =>
-      ({ binding_id, client_ref, harness, thread, title, delivery: delivery.kind, capabilities })) };
+    bindings: [...bindings.values()].map(({ binding_id, client_ref, harness, thread, title, delivery, capabilities }) => {
+      let state = null; try { state = harnessFor(harness).deliveryState?.(delivery) || null; } catch {}
+      return { binding_id, client_ref, harness, thread, title, delivery: delivery.kind, capabilities, ...(state ? { delivery_state: state } : {}) };
+    }) };
 }
 function scheduleExit() {
   if (idleTimer) clearTimeout(idleTimer);
@@ -459,32 +492,100 @@ function shutdown() {
   process.exit(0);
 }
 
+/** Conversations kept without a façade leave once their card has not been heard from for this long (or, never
+ *  heard from, this long after their façade went): a chat whose window closed does not stay listed for ever. */
+const ORPHAN_TTL_MS = Number(process.env.SIDEVOICE_ORPHAN_TTL_MS || 30 * 60_000);
+let orphanTimer = null;
+function keepOrphans() {
+  if (orphanTimer) return;
+  orphanTimer = setInterval(() => {
+    let left = 0;
+    for (const binding of [...bindings.values()]) {
+      if (binding.owner || !binding.detachable) continue;
+      let state = null; try { state = harnessFor(binding.harness).deliveryState?.(binding.delivery) || null; } catch {}
+      const quiet = state?.card_connected ? state.card_last_seen_ms_ago : Date.now() - binding.orphanedAt;
+      if (quiet <= ORPHAN_TTL_MS || Date.now() - binding.orphanedAt <= ORPHAN_TTL_MS) { left++; continue; }
+      log(`${binding.thread} leaves: no façade, and its card silent for ${Math.round(quiet / 1000)} s`);
+      bindings.delete(binding.binding_id); unwatch(binding); if (!binding.binding_id.startsWith('local-')) send('binding.unregister', { binding_id: binding.binding_id });
+    }
+    if (!left) { clearInterval(orphanTimer); orphanTimer = null; scheduleExit(); }
+  }, Math.min(60_000, Math.max(50, ORPHAN_TTL_MS / 4)));
+  orphanTimer.unref?.();
+}
+/** A façade taking over a conversation kept without one. Only one that says it speaks for editor chats, and
+ *  only a conversation of that kind: the id is what the chat was handed by its own voice_connect. */
+function adopt(client, client_ref) {
+  const binding = [...bindings.values()].find(b => b.client_ref === client_ref && !b.owner && b.detachable);
+  if (!binding) return null;
+  binding.owner = client; binding.orphanedAt = null; client.bindings.add(binding);
+  log(`${binding.thread} taken over by a new façade`);
+  return { binding_id: binding.binding_id, client_ref: binding.client_ref, harness: binding.harness, title: binding.title, capabilities: binding.capabilities, experimental: binding.experimental || [] };
+}
+
+/** The conversation a voice_say belongs to, among those its façade speaks for: the one its session names
+ *  (`typed:<conversation>`, handed only to that conversation), or the one that turn was delivered to. */
+function routeSpeech({ client_refs, session_id, revision, adopt_orphans }) {
+  // An editor façade also speaks for the editor chats kept without one: the turn names which.
+  const own = new Set([...client_refs, ...(adopt_orphans ? [...bindings.values()].filter(b => !b.owner && b.detachable).map(b => b.client_ref) : [])]);
+  // Routed (several conversations, no one named): `typed:<conversation>` names one only for a conversation that
+  // cannot take input. An editor chat speaking first names itself to its façade, which sends it here by name.
+  if (typeof session_id === 'string' && session_id.startsWith('typed:')) {
+    const named = session_id.slice(6);
+    const binding = [...bindings.values()].find(b => b.client_ref === named);
+    if (own.has(named) && binding && capabilityState(binding, 'deliver') === 'unsupported') return named;
+    throw new Error('AMBIGUOUS: that typed session belongs to no conversation of yours that cannot take input; reply in writing');
+  }
+  const delivered = [...(turnsDelivered.get(turnKey(session_id, revision)) || [])];
+  const mine = delivered.filter(ref => own.has(ref));
+  if (mine.length === 1 && delivered.length === 1) return mine[0];
+  throw new Error(delivered.length > 1
+    ? 'AMBIGUOUS: that voice turn went to more than one conversation, so it cannot say which one is answering; reply in writing'
+    : 'AMBIGUOUS: this session_id and revision name no voice turn delivered to this chat — it has received none to answer by voice (reply in writing), or use the ones from the voice message you are answering');
+}
+
 async function command(client, input) {
-  const params = input.params || {};
+  let params = input.params || {};
   switch (input.method) {
     case 'register': {
-      const { client_ref, harness, thread, title, delivery, inbound, capabilities, engine } = params;
+      const { client_ref, harness, thread, title, delivery, inbound, capabilities, experimental, engine, route } = params;
       if (!client_ref || !thread || !delivery?.kind) throw new Error('client_ref, thread and delivery are required');
       closedByRoom.delete(client_ref);   // joining again is the user's explicit request
       const existing = [...bindings.values()].find(b => b.client_ref === client_ref);
       if (existing) {
-        Object.assign(existing, { owner: client, delivery, inbound, capabilities });
+        Object.assign(existing, { owner: client, delivery, inbound, capabilities, experimental, route });
         client.bindings.add(existing);
         return { binding_id: existing.binding_id, thread, connected: reachable() };
       }
       const local_id = 'local-' + randomUUID();
       log(`${harness} ${thread} joins ("${title || ''}", delivery ${delivery.kind}, inbound ${inbound ? (inbound.ok ? 'ok' : 'held') : 'n/a'})`);
-      const binding = { binding_id: local_id, client_ref, harness, thread, title, delivery, inbound, capabilities, engine, owner: client };
+      const binding = { binding_id: local_id, client_ref, harness, thread, title, delivery, inbound, capabilities, experimental, engine, route, owner: client };
       bindings.set(local_id, binding); client.bindings.add(binding); clearTimeout(idleTimer); open(); watch(binding);
+      // What the harness must have open before anything is delivered (Cursor's editor: the view's bridge).
+      // Asked after the binding exists, so a command right behind this one finds it.
+      let prepared = null;
+      const module = harnessFor(harness);
+      if (typeof module.prepare === 'function') {
+        // `admitted`: the harness itself answered that the conversation took a message (Cursor's editor answers a
+        // card's ui/message when the turn it started has run) — as good a second tick as seeing it recorded.
+        const admitted = message_id => { const sent = binding.pending?.get(message_id); if (sent) reportRead(binding, { message_id, session_id: sent.session_id, revision: sent.revision }); };
+        try { prepared = await module.prepare(delivery, { log, admitted }) || null; } catch (error) { log(`${thread} could not be prepared for delivery: ${error.message}`); }
+        if (prepared && bindings.get(binding.binding_id) === binding) { binding.release = prepared.release; binding.detachable = !!prepared.detachable; } else prepared?.release?.();
+      }
       // A room that is not there yet is not a failure: the binding is registered on the next welcome.
       const reply = await joinRoom(binding).catch(error => { if (!connected && !refusal && !coreError) return null; bindings.delete(binding.binding_id); client.bindings.delete(binding); unwatch(binding); throw error; });
-      return { binding_id: reply?.binding_id || binding.binding_id, thread, connected: reachable(), pending: !reply };
+      return { binding_id: reply?.binding_id || binding.binding_id, thread, connected: reachable(), pending: !reply, ...(prepared?.info ? { prepared: prepared.info } : {}) };
     }
     case 'publish': {
+      // A façade speaking for several conversations names them all, and the turn names which one.
+      let adopted = null;
+      if (Array.isArray(params.client_refs) && !params.client_ref) {
+        params = { ...params, client_ref: routeSpeech(params) };
+        if (params.adopt_orphans && !params.client_refs.includes(params.client_ref)) adopted = adopt(client, params.client_ref);
+      }
       const binding = bindings.get(params.binding_id) || [...bindings.values()].find(b => b.client_ref === params.client_ref);
       // Why it is gone travels with the refusal: a pairing revoked and a channel closed are not the
       // same news for the conversation, and only it can say the right one to the person.
-      if (!binding) throw new Error(closedByRoom.has(params.client_ref) ? 'CLOSED_BY_ROOM:' + closedByRoom.get(params.client_ref) : 'Unknown binding');
+      if (!binding) throw new Error(closedByRoom.has(params.client_ref) ? 'CLOSED_BY_ROOM:' + closedByRoom.get(params.client_ref) + ':' + params.client_ref : 'Unknown binding');
       const speech = { event_id: params.event_id || randomUUID(), binding_id: binding.binding_id,
         session_id: params.session_id, revision: params.revision, utterance_id: params.utterance_id || randomUUID(), text: params.text, language: params.language };
       outbox.push(speech); saveOutbox();
@@ -493,7 +594,7 @@ async function command(client, input) {
       const reply = await publish(speech).catch(() => null);
       if (!reply) return { status: 'queued', utterance_id: speech.utterance_id };
       const { type, event_id, ...result } = reply;
-      return result;
+      return adopted ? { ...result, adopted } : result;
     }
     case 'unregister': {
       // By the id the façade remembers, or by the conversation it speaks for: the room may have minted a
@@ -504,6 +605,7 @@ async function command(client, input) {
       else log(`unregister for ${params.client_ref || params.binding_id || '?'} matched no binding`);
       scheduleExit(); return { ...snapshot(), left: !!binding };
     }
+    case 'adopt': return adopt(client, params.client_ref) || { adopted: false };
     case 'status': return snapshot();
     case 'pair_device': return devicePairingCode();
     default: throw new Error('Unknown connector command');
@@ -532,7 +634,12 @@ function serve(socket) {
     clients.delete(client);
     log(`façade detached (${clients.size} left); dropping ${client.bindings.size} binding(s)`);
     // The façade is gone: so is every conversation it spoke for.
-    for (const binding of client.bindings) { bindings.delete(binding.binding_id); unwatch(binding); if (!binding.binding_id.startsWith('local-')) send('binding.unregister', { binding_id: binding.binding_id }); }
+    for (const binding of client.bindings) {
+      // A conversation whose delivery does not go through its façade (an editor chat's card) outlives it:
+      // Cursor replaces a window's MCP process at will, and the chat, its card and its voice are still there.
+      if (binding.detachable) { binding.owner = null; binding.orphanedAt = Date.now(); keepOrphans(); log(`${binding.thread} kept without a façade (its card delivers)`); continue; }
+      bindings.delete(binding.binding_id); unwatch(binding); if (!binding.binding_id.startsWith('local-')) send('binding.unregister', { binding_id: binding.binding_id });
+    }
     scheduleExit();
   });
 }
