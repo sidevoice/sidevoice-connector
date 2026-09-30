@@ -393,7 +393,8 @@ function shutdown() {
  *  (`typed:<conversation>`, handed only to that conversation), or the one that turn was delivered to. */
 function routeSpeech({ client_refs, session_id, revision }) {
   const own = new Set(client_refs);
-  // `typed:<conversation>` is handed only to a conversation that cannot take input: only there does it name one.
+  // Routed (several conversations, no one named): `typed:<conversation>` names one only for a conversation that
+  // cannot take input. An editor chat speaking first names itself to its façade, which sends it here by name.
   if (typeof session_id === 'string' && session_id.startsWith('typed:')) {
     const named = session_id.slice(6);
     const binding = [...bindings.values()].find(b => b.client_ref === named);

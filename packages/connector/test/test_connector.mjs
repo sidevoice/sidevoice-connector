@@ -285,6 +285,11 @@ test('mcp façade: identity comes from the harness, tools are exposed, instructi
     await until(() => replies.length === 6);
     assert.equal(JSON.parse(replies.find(x => x.id === 4).result.content[0].text).status, 'published');
     assert.equal(commands.find(c => c.method === 'publish').params.binding_id, 'b-9');
+    // Outside Cursor's editor a reply names the turn it answers: speaking by conversation id is refused.
+    ask(7, 'tools/call', { name: 'voice_say', arguments: { text: 'hola', conversation: 'sess-abc' } });
+    await until(() => replies.some(x => x.id === 7));
+    assert.match(replies.find(x => x.id === 7).error.message, /only for a chat of the Cursor editor/);
+    assert.equal(commands.filter(c => c.method === 'publish').length, 1);
   } finally { child.kill(); fake.close(); }
 });
 
@@ -642,6 +647,7 @@ test('façade + connector: a chat of the Cursor editor joins through the view vo
     assert.ok(logged.some(line => line.event === 'resources/read' && line.served));
     const connectLine = logged.find(line => line.event === 'voice_connect');
     assert.equal(connectLine.route, 'cursor-editor-view'); assert.ok(connectLine.card_port > 0);
+    assert.match(connectLine.conversation, /^h:[0-9a-f]{10}$/); assert.ok(!JSON.stringify(logged).includes(joined.conversation), 'the log names a conversation by hash only');
     assert.ok(!JSON.stringify(logged).includes(joined.view_link.key), 'the key is never logged');
     assert.ok(logged.some(line => line.event === 'tools/list' && line.voice_connect_carries_card));
     assert.ok(logged.some(line => line.event === 'request' && line.method === 'tools/call' && line.tool === 'voice_connect' && line.meta_keys.includes('progressToken')), 'every method is logged by name');
@@ -747,7 +753,8 @@ test('façade + connector: four chats of one Cursor editor window join at once, 
     room.tell('binding.close', { binding_id: 'b-3', thread: chats[2], reason: 'closed_from_room' });
     await wait(300);
     const closedStatus = (await call('voice_status')).value;
-    assert.deepEqual(closedStatus.closed_by_room.map(entry => entry.conversation), [chats[2]], 'the closed chat is named, the others stay');
+    assert.deepEqual(closedStatus.closed_by_room.map(entry => entry.title), ['Tres'], 'the closed chat is named by title, the others stay');
+    assert.ok(!JSON.stringify(closedStatus).includes(chats[2]), 'and no id reaches another chat');
     assert.equal(closedStatus.conversations.length, 2);
     assert.match(closedStatus.closed_by_room[0].note, /closed this conversation's voice/);
     await assert.rejects(call('voice_say', { text: 'x', session_id: 'browser-1', revision: 12 }), /no voice turn delivered to this chat/, 'once told, the closed chat is no longer one of this window\'s');

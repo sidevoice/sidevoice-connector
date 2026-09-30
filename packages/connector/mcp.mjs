@@ -5,7 +5,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { capabilityState, conversationCapabilities, experimentalCapabilities, SUPPORTED } from './harness-contract.mjs';
 import { harnessFor, identifyHarness } from './harnesses.mjs';
@@ -46,6 +46,9 @@ function mcpLog(event) {
     appendFileSync(mcpLogPath, JSON.stringify({ at: new Date().toISOString(), pid: process.pid, version: VERSION, ...event }) + '\n', { mode: 0o600 });
   } catch {}
 }
+/** A conversation id as the log writes it: a short hash, since a chat may read the log and an id is what lets
+ *  a chat speak as a conversation. */
+const logId = id => (id ? 'h:' + createHash('sha256').update(String(id)).digest('hex').slice(0, 10) : null);
 /** How many times the client read the card's HTML: the editor reads it when it is about to draw a card. */
 let cardReads = 0;
 
@@ -206,8 +209,9 @@ async function invoke(name, args, meta) {
     const asked = args.conversation || single()?.client_ref || null;
     const closed = !!asked && closedNow.includes(asked);
     const closedFor = closed ? status.closed_reasons?.[asked] : null;
+    const closedTitles = Object.fromEntries(closedNow.map(ref => [ref, joined.get(ref)?.title ?? null]));
+    const closedList = closedNow.length && !single() ? { closed_by_room: closedNow.map(ref => ({ title: closedTitles[ref], note: closedNote(status.closed_reasons?.[ref]) })) } : {};
     for (const ref of closedNow) joined.delete(ref);
-    const closedList = closedNow.length && !single() ? { closed_by_room: closedNow.map(ref => ({ conversation: ref, note: closedNote(status.closed_reasons?.[ref]) })) } : {};
     const common = { room: status.room || pairedRoom()?.origin || null, room_reachable: status.connected, room_error: status.room_error || null, socket_error: status.socket_error || null,
              protocol: status.protocol ?? null,
              version: VERSION, connector_version: status.version || null, ...versionNote(status.version) };
@@ -275,7 +279,7 @@ async function invoke(name, args, meta) {
     joined.set(who.thread, { ...result, harness: who.harness, client_ref: who.thread, title, capabilities, experimental });
     let connectorVersion = null; try { connectorVersion = (await rpc('status', {})).version || null; } catch {}
     const pushed = capabilities.deliver === SUPPORTED;
-    mcpLog({ event: 'voice_connect', route: who.route || who.harness, harness: who.harness, conversation: who.thread, delivery: who.delivery.kind,
+    mcpLog({ event: 'voice_connect', route: who.route || who.harness, harness: who.harness, conversation: logId(who.thread), delivery: who.delivery.kind,
       deliver: capabilities.deliver, experimental, views: cursorViews(), chat_store_held: who.chatStoreHeld ?? null, card_port: result.prepared?.port ?? null });
     return { status: result.pending ? 'joining' : 'joined', harness: who.harness, conversation: who.thread,
              binding_id: result.binding_id, delivery: pushed ? 'push' : 'none', room_reachable: result.connected, capabilities, inbound,
@@ -297,6 +301,9 @@ async function invoke(name, args, meta) {
     let named = null;
     if (args.conversation) {
       named = joined.get(args.conversation);
+      // Only a chat of Cursor's editor speaks by its id: everywhere else a reply names the turn it answers,
+      // which is what lets the room drop a reply the user has already moved past.
+      if (named && !(named.harness === 'cursor' && cursorViews())) throw new Error('conversation is only for a chat of the Cursor editor: answer with the session_id and revision of the voice message.');
       if (!named) throw new Error(`"${args.conversation}" is not a conversation this server joined: pass the id voice_connect returned in this chat.`);
       if (args.session_id && !String(args.session_id).startsWith('typed:')) named = null;   // a turn named too: route by the turn
       else args = { ...args, session_id: 'typed:' + named.client_ref, revision: 0 };
