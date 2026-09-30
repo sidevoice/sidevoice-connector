@@ -93,11 +93,11 @@ test('cursor: identity is claimed only for a client that says it is Cursor, and 
   assert.equal(sessionIdentity({ client: { name: 'claude-code' }, locate }), null);
   assert.equal(sessionIdentity({ client: null, locate }), null);
   const plain = sessionIdentity({ client: { name: 'Cursor', version: '1.0.0' }, locate, session: () => null });
-  assert.deepEqual({ ...plain, deliverNote: undefined }, { harness: 'cursor', thread: 'chat-9', delivery: { kind: 'none', chat: 'chat-9' }, capabilities: { deliver: 'unsupported' }, deliverNote: undefined });
+  assert.deepEqual({ ...plain, deliverNote: undefined }, { harness: 'cursor', thread: 'chat-9', route: 'cursor-cli', delivery: { kind: 'none', chat: 'chat-9' }, capabilities: { deliver: 'unsupported' }, deliverNote: undefined });
   assert.match(plain.deliverNote, /cursor-agent persist/);
   assert.deepEqual(sessionIdentity({ client: { name: 'Cursor' }, locate, session: () => ({ name: 'cursor-1', chat: 'chat-9' }) }),
-    { harness: 'cursor', thread: 'chat-9', delivery: { kind: 'cursor-tmux', chat: 'chat-9' } });
-  assert.throws(() => sessionIdentity({ client: { name: 'Cursor' }, locate: () => null }), /draws no MCP Apps views.*cursor-agent/s);
+    { harness: 'cursor', thread: 'chat-9', route: 'cursor-cli-persist', delivery: { kind: 'cursor-tmux', chat: 'chat-9' } });
+  assert.throws(() => sessionIdentity({ client: { name: 'Cursor' }, locate: () => null }), /did not declare MCP Apps support.*cursor-agent/s);
 });
 
 test('cursor: transcript lines read as the contract — a user message, the end of a turn, or nothing', () => {
@@ -374,8 +374,11 @@ test('cursor editor: a client that draws MCP Apps views gets a conversation of i
   assert.deepEqual([capabilities.deliver, capabilities.working, capabilities.endOfTurn, capabilities.sessionIdentity], ['supported', 'unsupported', 'unsupported', 'supported']);
   assert.deepEqual(experimentalCapabilities(cursorHarness, capabilities, identity), ['deliver', 'sessionIdentity']);
   assert.notEqual(sessionIdentity({ client: editor, locate: () => null }).thread, identity.thread, 'each join is its own conversation');
+  // The editor takes the card route even if its process holds a chat store open: only the CLI is found by one.
+  const heldToo = sessionIdentity({ client: editor, locate: () => ({ chat: 'chat-x', store: '/x/store.db' }) });
+  assert.equal(heldToo.route, 'cursor-editor-view'); assert.equal(heldToo.chatStoreHeld, true); assert.match(heldToo.thread, /^cursor-editor-/);
   // Without views there is no way in, and it says so.
-  assert.throws(() => sessionIdentity({ client: { name: 'cursor-vscode', capabilities: {} }, locate: () => null }), /draws no MCP Apps views/);
+  assert.throws(() => sessionIdentity({ client: { name: 'cursor-vscode', capabilities: {} }, locate: () => null }), /did not declare MCP Apps support/);
 });
 
 test('cursor editor: the view dispatches a voice message to its chat through ui/message, over a bridge only its own view can use', async () => {

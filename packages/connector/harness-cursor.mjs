@@ -26,7 +26,7 @@ import { existsSync, readdirSync, readFileSync, readlinkSync, statSync } from 'n
 import os from 'node:os';
 import path from 'node:path';
 import { defineHarness, envelope, SUPPORTED, UNSUPPORTED, tailJsonl } from './harness-contract.mjs';
-import { deliverToView, drawsViews, openView, THREAD_PREFIX, viewKey } from './harness-cursor-app.mjs';
+import { deliverToView, drawsViews, openView, THREAD_PREFIX, viewKey, viewState } from './harness-cursor-app.mjs';
 
 /** Where the CLI may keep chats (`chats/`): `CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`, else
  *  `~/.cursor`. Cursor scrubs the environment of its MCP servers, so the variables the CLI saw may not be
@@ -95,9 +95,9 @@ export function findChat(start = process.ppid, { depth = 4, filesOf = openFiles,
   return null;
 }
 
-const EDITOR_NOTE = 'Cursor did not say which chat this is: only the Cursor CLI (cursor-agent) keeps the chat it runs open where '
-  + 'Sidevoice can see it, and this Cursor draws no MCP Apps views, which is how a chat of the editor joins. Update Cursor, '
-  + 'or run the conversation in cursor-agent.';
+const EDITOR_NOTE = 'This Cursor did not declare MCP Apps support (the io.modelcontextprotocol/ui extension) when it started this '
+  + 'server, so it would draw no Sidevoice card, and a chat of the editor has no other way to receive the room; nor is this a '
+  + 'Cursor CLI chat (cursor-agent), whose open chat Sidevoice can see. ~/.sidevoice/mcp.log shows what it declared.';
 
 const EDITOR_WATCH = 'Working state is not observed for a chat of the Cursor editor yet: its transcript is found by the chat id, which the editor does not give.';
 
@@ -110,14 +110,15 @@ export const isCursorClient = client => /^cursor\b/i.test(client?.name || '');
 export function sessionIdentity({ client, env = process.env, locate = findChat, session = persistSession } = {}) {
   if (!isCursorClient(client)) return null;
   const found = locate();
-  // The editor: the chat is the one the view `voice_connect` returns is drawn in, and the id is ours.
-  if (!found && drawsViews(client)) { const thread = THREAD_PREFIX + randomUUID(); return { harness: 'cursor', thread,
+  // The editor — the client that draws views; cursor-agent does not — whatever its parent holds open: the
+  // chat is the one the view `voice_connect` returns is drawn in, and the id is ours.
+  if (drawsViews(client)) { const thread = THREAD_PREFIX + randomUUID(); return { harness: 'cursor', thread, route: 'cursor-editor-view', chatStoreHeld: !!found,
     delivery: { kind: 'cursor-app', thread, key: viewKey() }, capabilities: { working: UNSUPPORTED, endOfTurn: UNSUPPORTED },
     experimental: ['sessionIdentity'], editor: true, watchNote: EDITOR_WATCH }; }
   if (!found) throw new Error(EDITOR_NOTE);
   const persisted = session(found.chat, env);
-  if (persisted) return { harness: 'cursor', thread: found.chat, delivery: { kind: 'cursor-tmux', chat: found.chat } };
-  return { harness: 'cursor', thread: found.chat, delivery: { kind: 'none', chat: found.chat },
+  if (persisted) return { harness: 'cursor', thread: found.chat, route: 'cursor-cli-persist', delivery: { kind: 'cursor-tmux', chat: found.chat } };
+  return { harness: 'cursor', thread: found.chat, route: 'cursor-cli', delivery: { kind: 'none', chat: found.chat },
     capabilities: { deliver: UNSUPPORTED }, deliverNote: NOT_PERSISTED };
 }
 
@@ -202,6 +203,13 @@ export async function deliver(delivery, event, env = process.env) {
 }
 
 const PASTE_SETTLE_MS = Number(process.env.SIDEVOICE_CURSOR_PASTE_SETTLE_MS || 150);
+
+/** What the connector can say about a conversation's route, for voice_status: an editor chat's card. */
+export function deliveryState(delivery) {
+  if (delivery?.kind !== 'cursor-app') return null;
+  const view = viewState(delivery.thread);
+  return { card_connected: !!view?.seen, card_last_seen_ms_ago: view?.seen ? Date.now() - view.seen : null };
+}
 
 /** Before any delivery, when the connector registers a conversation: an editor chat's view needs the
  *  connector's loopback bridge open for it, and learns the port from what `voice_connect` returns. */
@@ -328,6 +336,7 @@ export const cursorHarness = defineHarness({
   sessionIdentity,
   deliver,
   prepare,
+  deliveryState,
   // Delivery types into the chat's terminal through tmux (CLI) or submits through an MCP App view (editor):
   // it works, by routes Cursor does not offer as an interface.
   experimental: ['deliver'],

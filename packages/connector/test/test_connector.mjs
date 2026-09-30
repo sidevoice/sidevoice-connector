@@ -634,6 +634,15 @@ test('façade + connector: a chat of the Cursor editor joins through the view vo
     assert.deepEqual(joined.experimental, ['deliver', 'sessionIdentity']);
     assert.equal(joined.delivery, 'push');
     assert.match(joined.view, /card/); assert.match(joined.watch_note, /not observed/);
+    assert.equal(joined.card.requested, true); assert.match(joined.card.note, /mcp\.log/);
+    // What the client declared, and what happened, is in mcp.log — no key in it.
+    const logged = readFileSync(path.join(dataDir, 'mcp.log'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    const init = logged.find(line => line.event === 'initialize');
+    assert.deepEqual({ name: init.client.name, views: init.views, extensions: init.extensions }, { name: 'cursor-vscode', views: true, extensions: ['io.modelcontextprotocol/ui'] });
+    assert.ok(logged.some(line => line.event === 'resources/read' && line.served));
+    const connectLine = logged.find(line => line.event === 'voice_connect');
+    assert.equal(connectLine.route, 'cursor-editor-view'); assert.ok(connectLine.card_port > 0);
+    assert.ok(!JSON.stringify(logged).includes(joined.view_link.key), 'the key is never logged');
     assert.equal(joined.view_link.conversation, joined.conversation); assert.ok(joined.view_link.port > 0); assert.match(joined.view_link.key, /^[0-9a-f]{64}$/);
     assert.ok(joined.experimental_notes.some(note => /Sidevoice card/.test(note)) && !joined.experimental_notes.some(note => /tmux/.test(note)), 'the editor is told about its own route');
     assert.ok(!JSON.stringify(room.sent('binding.register')).includes(joined.view_link.key), 'the key never leaves the machine');
@@ -648,6 +657,9 @@ test('façade + connector: a chat of the Cursor editor joins through the view vo
     await until(() => view.dispatched.length === 1);
     assert.match(view.dispatched[0].content[0].text, /hola editor/);
     assert.match(view.dispatched[0].content[0].text, /"message_id":"m-ed"/);
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'voice_status', arguments: { conversation: joined.conversation } } }) + '\n');
+    const statusReply = JSON.parse((await until(() => replies.find(r => r.id === 9), 8000)).result.content[0].text);
+    assert.equal(statusReply.card.card_connected, true); assert.equal(statusReply.card.html_read_by_cursor, 1);
   } finally { view?.stop(); child.kill(); if (connector.exitCode === null) connector.kill(); await room.close(); }
 });
 

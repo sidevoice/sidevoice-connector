@@ -12,7 +12,7 @@ import { harnessFor, identifyHarness } from './harnesses.mjs';
 import { drawsViews, resource, RESOURCE_URI } from './harness-cursor-app.mjs';
 import { isCursorClient } from './harness-cursor.mjs';
 import { pair, pairedRoom } from './pair.mjs';
-import { readFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync } from 'node:fs';
 
 const VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
 
@@ -33,6 +33,21 @@ const INSTRUCTIONS = `Sidevoice connects this conversation to the user's voice r
 - Pairing is the user's act. If voice_connect says this machine is not paired with the room, ask the user for the room's address and the one-time code the room shows under "Emparejar máquina", then call voice_pair and voice_connect again. Never try to obtain a code from the room yourself.
 - If voice_connect returns inbound.ok false, voice will look sent and never arrive: tell the user inbound.reason, offer inbound.remedy in your own words including the safeguard the machine-wide option removes, and change no settings unasked.
 - Read receipts and working state need nothing from you: the room observes what the harness records.`;
+
+/** What this server saw, one JSON line per event, in `mcp.log` in the data dir — above all what the client
+ *  said about itself in `initialize`, since that decides whether Cursor's editor draws the card. No secret
+ *  is written: no key, no token, no message text. */
+const mcpLogPath = path.join(dataDir, 'mcp.log');
+function mcpLog(event) {
+  try {
+    mkdirSync(dataDir, { recursive: true });
+    let size = 0; try { size = statSync(mcpLogPath).size; } catch {}
+    if (size > 1 << 20) renameSync(mcpLogPath, mcpLogPath + '.1');
+    appendFileSync(mcpLogPath, JSON.stringify({ at: new Date().toISOString(), pid: process.pid, version: VERSION, ...event }) + '\n', { mode: 0o600 });
+  } catch {}
+}
+/** How many times the client read the card's HTML: the editor reads it when it is about to draw a card. */
+let cardReads = 0;
 
 // ----- one persistent connection to the connector -----
 let ipc = null, ipcBuffer = '', ipcSerial = 0;
@@ -171,6 +186,15 @@ function voiceInUnsupported(who) {
     reason: `What the user says in the room cannot reach this conversation: ${who.deliverNote || `${who.harness} offers no way to put a message into it.`} The user types here as usual.`,
     how: `Reply by voice to what the user types, as the server's instructions say for voice messages, calling voice_say with session_id "${speakWith.session_id}" and revision 0. Tell the user once that the room hears this conversation but cannot talk to it.` };
 }
+/** Said plainly to a Cursor conversation: whether it gets a card, and if not, why — so the person is not left
+ *  wondering where it is. */
+function cardReport(who, result) {
+  if (who.route === 'cursor-editor-view') return result.prepared?.port
+    ? { requested: true, note: 'A Sidevoice card should appear under this call within seconds. If none does, Cursor did not draw it: tell the user, and that ~/.sidevoice/mcp.log says whether Cursor read the card (a "resources/read" line) — without the card, what they say in the room does not reach this chat.' }
+    : { requested: false, note: 'The connector could not open the card\'s loopback bridge, so no card will work: tell the user to look at ~/.sidevoice/connector.log.' };
+  if (!cursorViews() && !String(who.route || '').startsWith('cursor-cli')) return { requested: false, note: 'This Cursor did not declare MCP Apps support in initialize, so it draws no card: what the user says in the room cannot reach this chat. ~/.sidevoice/mcp.log shows what it declared.' };
+  return { requested: false, note: 'Cursor CLI: no card; voice reaches the chat only under cursor-agent persist.' };
+}
 function inboundFor(harness, thread) {
   return capabilityState(harness, 'inspectInbound') === SUPPORTED ? harness.inspectInbound(thread) : null;
 }
@@ -191,10 +215,13 @@ async function invoke(name, args, meta) {
     if (!asked && joined.size) return { joined: null, ...common, ...list, ...closedList,
       note: 'Chats of this Cursor window are joined, and this call does not say which chat is asking. If voice_connect returned a conversation id in this chat, pass it as conversation to ask about this one; if it never did, this chat is not joined.' };
     const binding = asked ? joined.get(asked) || null : null;
+    const route = binding ? (status.bindings || []).find(b => b.client_ref === binding.client_ref)?.delivery_state || null : null;
+    const card = binding?.harness === 'cursor' && cursorViews() ? { html_read_by_cursor: cardReads, ...(route || {}),
+      note: route?.card_connected ? 'The card in this chat is connected.' : cardReads ? 'Cursor read the card but it has not connected to this machine\'s connector: it may not be on screen, or it failed to load.' : 'Cursor never read the card, so it drew none: tell the user; ~/.sidevoice/mcp.log has what Cursor declared.' } : null;
     const module = binding ? harnessFor(binding.harness) : null;
     const inbound = binding ? inboundFor(module, binding.client_ref) : null;
     return { joined: !!binding, ...common, ...list,
-             binding_id: binding?.binding_id || null, harness: binding?.harness || null, conversation: binding?.client_ref || null,
+             binding_id: binding?.binding_id || null, harness: binding?.harness || null, conversation: binding?.client_ref || null, ...(card ? { card } : {}),
              capabilities: binding?.capabilities || null, experimental: binding?.experimental || [], inbound,
              ...closedList, ...(closed ? { closed_by_room: true, note: closedNote(closedFor) } : {}) };
   }
@@ -215,7 +242,9 @@ async function invoke(name, args, meta) {
   if (name === 'voice_connect') {
     const needed = pairingNeeded(args.room, pairedRoom());
     if (needed) { const error = new Error(needed); error.data = { pairing_needed: true, room: args.room ? originOf(args.room) : null }; throw error; }
-    const who = identifyHarness(meta, process.env, client);
+    let who;
+    try { who = identifyHarness(meta, process.env, client); }
+    catch (error) { mcpLog({ event: 'voice_connect_refused', client: client?.name ?? null, views: cursorViews(), reason: error.message }); throw error; }
     const title = (args.title || process.env.SIDEVOICE_TITLE || path.basename(process.cwd())).slice(0, 200);
     // Refuse rather than join a room we cannot hear from: a conversation whose harness holds
     // what the room posts would sit in the list looking present while the user talks to nobody.
@@ -245,11 +274,14 @@ async function invoke(name, args, meta) {
     joined.set(who.thread, { ...result, harness: who.harness, client_ref: who.thread, title, capabilities, experimental });
     let connectorVersion = null; try { connectorVersion = (await rpc('status', {})).version || null; } catch {}
     const pushed = capabilities.deliver === SUPPORTED;
+    mcpLog({ event: 'voice_connect', route: who.route || who.harness, harness: who.harness, conversation: who.thread, delivery: who.delivery.kind,
+      deliver: capabilities.deliver, experimental, views: cursorViews(), chat_store_held: who.chatStoreHeld ?? null, card_port: result.prepared?.port ?? null });
     return { status: result.pending ? 'joining' : 'joined', harness: who.harness, conversation: who.thread,
              binding_id: result.binding_id, delivery: pushed ? 'push' : 'none', room_reachable: result.connected, capabilities, inbound,
              ...(pushed ? {} : { voice_in: voiceInUnsupported(who) }),
              ...(who.editor ? { view: `Voice reaches this chat through the small Sidevoice card drawn under this call: it must stay open in this chat. Other chats of this window can join too, each with its own card. Remember this chat's conversation id (${who.thread}): voice_status and voice_disconnect need it when several chats are joined.` } : {}),
              ...(who.watchNote ? { watch_note: who.watchNote } : {}),
+             ...(isCursorClient(client) ? { card: cardReport(who, result) } : {}),
              ...(experimental.length ? { experimental, experimental_notes: experimental.map(name => EXPERIMENTAL_NOTES[name === 'deliver' ? who.delivery.kind : name]).filter(Boolean) } : {}),
              ...(who.delivery.kind === 'cursor-app' && result.prepared?.port ? { view_link: { conversation: who.thread, port: result.prepared.port, key: who.delivery.key } } : {}),
              version: VERSION, connector_version: connectorVersion, ...versionNote(connectorVersion) };
@@ -296,16 +328,22 @@ process.stdin.on('data', async chunk => {
     if (request.id === undefined) continue; // notifications need no answer
     let result, error;
     try {
-      if (request.method === 'initialize') { client = { ...(request.params?.clientInfo || {}), capabilities: request.params?.capabilities || {} }; result = { protocolVersion: request.params?.protocolVersion || '2025-06-18', capabilities: { tools: {}, prompts: {}, ...(cursorViews() ? { resources: {} } : {}) }, serverInfo: { name: 'sidevoice', version: VERSION }, instructions: INSTRUCTIONS }; }
+      if (request.method === 'initialize') { client = { ...(request.params?.clientInfo || {}), capabilities: request.params?.capabilities || {} };
+        mcpLog({ event: 'initialize', ppid: process.ppid, client: { name: client.name ?? null, version: client.version ?? null }, protocol: request.params?.protocolVersion ?? null,
+          capabilities: Object.keys(client.capabilities), extensions: Object.keys(client.capabilities.extensions || {}), ui_extension: client.capabilities.extensions?.['io.modelcontextprotocol/ui'] ?? null,
+          cursor: isCursorClient(client), views: cursorViews() });
+        result = { protocolVersion: request.params?.protocolVersion || '2025-06-18', capabilities: { tools: {}, prompts: {}, ...(cursorViews() ? { resources: {} } : {}) }, serverInfo: { name: 'sidevoice', version: VERSION }, instructions: INSTRUCTIONS }; }
       else if (request.method === 'prompts/list') result = { prompts: PROMPTS };
       else if (request.method === 'prompts/get') {
         if (request.params?.name !== 'voice-room') throw Object.assign(new Error('Unknown prompt'), { code: -32602 });
         result = { description: PROMPTS[0].description, messages: [{ role: 'user', content: { type: 'text', text: promptText(request.params?.arguments) } }] };
       }
-      else if (request.method === 'tools/list') result = { tools: cursorViews() ? tools.map(tool => tool.name === 'voice_connect' ? { ...tool, _meta: { ui: { resourceUri: RESOURCE_URI } } } : tool) : tools };
+      else if (request.method === 'tools/list') { mcpLog({ event: 'tools/list', voice_connect_carries_card: cursorViews() }); result = { tools: cursorViews() ? tools.map(tool => tool.name === 'voice_connect' ? { ...tool, _meta: { ui: { resourceUri: RESOURCE_URI } } } : tool) : tools }; }
       else if (request.method === 'resources/list') result = { resources: cursorViews() ? [{ uri: RESOURCE_URI, name: 'Sidevoice voice link', mimeType: resource().mimeType }] : [] };
       else if (request.method === 'resources/read') {
+        mcpLog({ event: 'resources/read', uri: request.params?.uri ?? null, served: cursorViews() && request.params?.uri === RESOURCE_URI });
         if (!cursorViews() || request.params?.uri !== RESOURCE_URI) throw Object.assign(new Error('Unknown resource'), { code: -32602 });
+        cardReads++;
         result = { contents: [resource()] };
       }
       else if (request.method === 'tools/call') { const value = await invoke(request.params.name, request.params.arguments || {}, request.params._meta); result = { content: [{ type: 'text', text: JSON.stringify(value) }] }; }

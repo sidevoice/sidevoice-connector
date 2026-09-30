@@ -371,8 +371,10 @@ function snapshot() {
     // Which conversations lost their voice from the room, and why each one did: the same map read
     // twice, because "it is gone" and "this is what happened" are two different questions.
     closed_by_room: [...closedByRoom.keys()], closed_reasons: Object.fromEntries(closedByRoom),
-    bindings: [...bindings.values()].map(({ binding_id, client_ref, harness, thread, title, delivery, capabilities }) =>
-      ({ binding_id, client_ref, harness, thread, title, delivery: delivery.kind, capabilities })) };
+    bindings: [...bindings.values()].map(({ binding_id, client_ref, harness, thread, title, delivery, capabilities }) => {
+      let state = null; try { state = harnessFor(harness).deliveryState?.(delivery) || null; } catch {}
+      return { binding_id, client_ref, harness, thread, title, delivery: delivery.kind, capabilities, ...(state ? { delivery_state: state } : {}) };
+    }) };
 }
 function scheduleExit() {
   if (idleTimer) clearTimeout(idleTimer);
