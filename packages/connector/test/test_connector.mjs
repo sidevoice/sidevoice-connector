@@ -29,12 +29,14 @@ function ipcClient(socketPath) {
     call: (method, params) => new Promise((resolve, reject) => { const id = ++serial; waiting.set(id, { resolve, reject }); socket.write(JSON.stringify({ id, method, params }) + '\n'); }), end: () => socket.end() };
 }
 
-/** The credential names the room, and nothing about how to reach it: the path and the namespace
- *  are the connector's own knowledge, and a test that wrote them would be asserting its own copy. */
+/** The connector links to its machine's core; here the stand-in (`room.mjs`, the same link on the same
+ *  path) is a core somebody else runs, named whole in the environment, so nothing is installed or
+ *  supervised. The address names only the origin: the path and the namespace are the connector's own
+ *  knowledge, and a test that wrote them would be asserting its own copy. */
 function startConnector(origin, dataDir, extraEnv = {}) {
   const socketPath = path.join(dataDir, 'connector.sock');
-  writeFileSync(path.join(dataDir, 'credentials.json'), JSON.stringify({ url: origin, connector_id: 'c-1', token: 't-1' }));
-  const child = spawn(process.execPath, [connectorPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CONNECTOR_IDLE_MS: '400', ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, [connectorPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CONNECTOR_IDLE_MS: '400',
+    SIDEVOICE_URL: origin, SIDEVOICE_CONNECTOR_ID: 'c-1', SIDEVOICE_CONNECTOR_TOKEN: 't-1', ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'] });
   let stderr = ''; child.stderr.on('data', d => { stderr += d; });
   return { child, socketPath, stderr: () => stderr };
 }
@@ -314,10 +316,9 @@ test('connector: the room closing a conversation\'s voice removes the binding an
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
 });
 
-test('connector: a pairing revoked from the room takes the voice now, says why, and is not asked again', async () => {
-  // The room does this while the machine is connected: it says why, drops the bindings and closes the
-  // socket, and refuses the next handshake with the same words. Neither the conversations nor whoever
-  // reads status should be left with "the room disconnected me".
+test('connector: a pairing revoked from the room takes the voice now, says why, and comes back with a new pairing', async () => {
+  // The room tells the machine's core, and the core tells its connector: every conversation lets go at
+  // once, and neither they nor whoever reads status is left with "the room disconnected me".
   const revoked = 'La sala revocó el emparejamiento de esta máquina: vuelve a emparejarla con el código que la sala muestra en "Emparejar máquina".';
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
@@ -330,11 +331,10 @@ test('connector: a pairing revoked from the room takes the voice now, says why, 
     const facade = ipcClient(socketPath); await facade.ready;
     await facade.call('register', { client_ref: 'thread-1', harness: 'test', thread: 'thread-1', title: 'T', delivery: { kind: 'http', url: 'http://127.0.0.1:1/never', thread: 'thread-1' } });
 
-    // What the room does on a revocation, in the order it does it.
-    room.admit = () => revoked;
-    room.tell('binding.close', { binding_id: 'b-thread-1', thread: 'thread-1', reason: 'connector_revoked' });
-    room.tell('connector.revoked', { reason: revoked });
-    room.socket.disconnect(true);
+    room.tell('node.rendezvous', { room: 'https://room.example', connected: true, via: 'outbound', error: null, refused: null });
+    await until(async () => (await facade.call('status', {})).room === 'https://room.example');
+    // What the core says when the room revoked this machine.
+    room.tell('node.rendezvous', { room: 'https://room.example', connected: false, via: null, error: null, refused: revoked });
 
     const status = await until(async () => {
       const seen = await facade.call('status', {});
@@ -351,9 +351,12 @@ test('connector: a pairing revoked from the room takes the voice now, says why, 
     await assert.rejects(facade.call('register', { client_ref: 'thread-1', harness: 'test', thread: 'thread-1', title: 'T', delivery: { kind: 'http', url: 'http://127.0.0.1:1/never', thread: 'thread-1' } }),
       /revoc/);
     assert.match(stderr(), /will not be asked again/);
-    const attempts = (await facade.call('status', {})).socket_error?.attempt ?? 0;
-    await wait(1200);
-    assert.equal((await facade.call('status', {})).socket_error?.attempt ?? 0, attempts, 'it stopped, rather than retrying for ever');
+    // Paired again, the core's link comes back without the refusal, and a conversation joins as before.
+    room.tell('node.rendezvous', { room: 'https://room.example', connected: true, via: 'outbound', error: null, refused: null });
+    await until(async () => !(await facade.call('status', {})).refused);
+    const again = await facade.call('register', { client_ref: 'thread-1', harness: 'test', thread: 'thread-1', title: 'T', delivery: { kind: 'http', url: 'http://127.0.0.1:1/never', thread: 'thread-1' } });
+    assert.equal(again.binding_id, 'b-thread-1');
+    assert.equal(again.connected, true, 'reachable again');
     facade.end();
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
 });

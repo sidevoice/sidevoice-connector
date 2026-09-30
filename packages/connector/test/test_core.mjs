@@ -30,7 +30,7 @@ function ipc(socketPath) {
 function machine(extraEnv = {}, entry = [path.join(packageDir, 'connector.mjs')]) {
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-core-'));
   const uvLog = path.join(dataDir, 'uv.jsonl');
-  const env = { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CORE: 'local', SIDEVOICE_CONNECTOR_IDLE_MS: '20000',
+  const env = { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CONNECTOR_IDLE_MS: '20000', SIDEVOICE_URL: undefined,
     SIDEVOICE_UV: fakeUv, SIDEVOICE_CORE_PORT: '0', FAKE_UV_LOG: uvLog, SIDEVOICE_CORE_SPEC: '', ...extraEnv };
   for (const [key, value] of Object.entries(env)) if (value === undefined) delete env[key];
   const child = spawn(process.execPath, entry, { env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -62,6 +62,9 @@ test('core: the connector installs the pinned core with uv, once, starts it and 
       ['pip', 'install', '--python', path.join(venv, 'bin', 'python'), '/wheels/sidevoice_core-' + CORE_VERSION + '-py3-none-any.whl'],
     ]);
     const core = node.ready();
+    const started = node.said().find(line => line.event === 'started').data.argv;
+    assert.equal(started[started.indexOf('--room-credential') + 1], path.join(node.dataDir, 'credentials.json'),
+      'the core is told where the machine\'s pairing is, to dial the room with it');
     const handshake = node.said().find(line => line.event === 'handshake');
     assert.equal(handshake.data.connector_id, core.connector_id, 'it links with the credential the core wrote for it');
     assert.ok(node.said().some(line => line.event === 'binding.register' && line.data.thread === 'thread-1'));
@@ -104,7 +107,7 @@ test('core: a running core is found, not started twice, and a connector that lea
     await until(() => node.child.exitCode !== null, 5000);
     assert.doesNotThrow(() => process.kill(core.pid, 0), 'the core outlives its connector: a call may be going on');
     // A new connector, as the next conversation starts one.
-    const again = spawn(process.execPath, [path.join(packageDir, 'connector.mjs')], { env: { ...process.env, SIDEVOICE_DATA_DIR: node.dataDir, SIDEVOICE_CORE: 'local', SIDEVOICE_UV: fakeUv, SIDEVOICE_CORE_PORT: '0', FAKE_UV_LOG: path.join(node.dataDir, 'uv.jsonl'), SIDEVOICE_CORE_SPEC: '/wheels/x.whl', SIDEVOICE_CONNECTOR_IDLE_MS: '20000' }, stdio: 'ignore' });
+    const again = spawn(process.execPath, [path.join(packageDir, 'connector.mjs')], { env: { ...process.env, SIDEVOICE_DATA_DIR: node.dataDir, SIDEVOICE_UV: fakeUv, SIDEVOICE_CORE_PORT: '0', FAKE_UV_LOG: path.join(node.dataDir, 'uv.jsonl'), SIDEVOICE_CORE_SPEC: '/wheels/x.whl', SIDEVOICE_CONNECTOR_IDLE_MS: '20000' }, stdio: 'ignore' });
     try {
       await until(() => existsSync(node.socketPath));
       facade = ipc(node.socketPath); await facade.ready;

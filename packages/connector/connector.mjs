@@ -1,7 +1,11 @@
 #!/usr/bin/env node
-/** One connector per host: an outbound link to the room, every binding multiplexed over it, and
+/** One connector per host: a link to this machine's core, every binding multiplexed over it, and
  *  the last mile chosen per binding. Node 22+. Façades talk to it over a local socket; a binding
  *  lives exactly as long as the façade connection that registered it.
+ *
+ *  The core (`sidevoice-core`, Python) holds the conversations and runs voice; this connector installs
+ *  it, starts it and links to it over loopback (`core.mjs`). The hosted room is the core's business:
+ *  the core dials it with this machine's pairing and tells this connector how that link is doing.
  *
  *  What carries the link, and how it comes back when it drops, is `link.mjs`'s business; nothing
  *  below this line knows what is underneath. What does not live there is the outbox: a library's
@@ -15,7 +19,7 @@ import { execFileSync } from 'node:child_process';
 import { capabilityState, SUPPORTED, voiceEnvelope } from './harness-contract.mjs';
 import { harnessFor } from './harnesses.mjs';
 import { machineIdentity, VERSION } from './identity.mjs';
-import { privateNetwork, roomOrigin } from './pair.mjs';
+import { roomOrigin } from './pair.mjs';
 import { roomLink, UNREACHABLE } from './link.mjs';
 import { coreAlive, ensureRunning, readReady } from './core.mjs';
 
@@ -31,9 +35,6 @@ const identity = machineIdentity();
 const hostId = identity.host;
 const logPath = process.env.SIDEVOICE_CONNECTOR_LOG || path.join(dataDir, 'connector.log');
 const LOG_MAX = 1 << 20;
-/** Where this connector's conversations live. `local`: in this machine's own core, which the connector
- *  installs, starts and links to over loopback (see `core.mjs`). Otherwise in the paired room, as before. */
-const nodeMode = process.env.SIDEVOICE_CORE === 'local';
 
 /** One line per event, to stderr and to `connector.log` in the data dir: the façade starts this process
  *  with its output discarded, so the file is the only record of a connector nobody ran by hand. Rolls
@@ -48,18 +49,11 @@ function log(line) {
   } catch {}
 }
 
-function credentials() {
-  let saved = {};
-  try { saved = JSON.parse(readFileSync(credentialsPath, 'utf8')); } catch {}
-  const url = process.env.SIDEVOICE_URL || saved.url;
-  const connector_id = process.env.SIDEVOICE_CONNECTOR_ID || saved.connector_id;
-  const token = process.env.SIDEVOICE_CONNECTOR_TOKEN || saved.token;
-  if (!url || !connector_id || !token) throw new Error(`Not paired with any room (looked in ${credentialsPath}): the conversation's voice_pair, or sidevoice pair <room-url> <code>, with the code the room shows`);
-  // The credential stores where the room is, not how to reach it: which path and namespace carry
-  // the link is this package's knowledge and moves with its version.
-  const room = roomOrigin(url);
-  if (new URL(room).protocol !== 'https:' && !privateNetwork(new URL(room).hostname)) throw new Error('The room URL must be https:// unless it stays on this machine or inside its cluster');
-  return { connector_id, token, room };
+/** A core somebody else runs — a checkout's, a test's — named whole in the environment: this connector
+ *  then links to it and supervises nothing. Otherwise null, and the connector runs its own. */
+function externalCore() {
+  const { SIDEVOICE_URL: url, SIDEVOICE_CONNECTOR_ID: connector_id, SIDEVOICE_CONNECTOR_TOKEN: token } = process.env;
+  return url && connector_id && token ? { room: roomOrigin(url), connector_id, token } : null;
 }
 
 /** Whether the pid in the lock is a live Sidevoice connector — not merely a live pid. Pids are reused,
@@ -100,7 +94,9 @@ let connected = false, closed = false, idleTimer = null, lastError = null;
 let socketError = null;            // why the last attempt to reach the room failed, for whoever asks status
 let refusal = null;                // the room will not have this connector, and no retry will change that
 let waking = [];                   // whoever is waiting for the room to welcome this connector again
-let creds = null;                  // where the link goes and with which credential: the room's, or the local core's
+let creds = null;                  // where the link to the core goes, and with which credential
+let rendezvous = null;             // the core's link with the hosted room, as the core last reported it
+const external = externalCore();
 let coreStarting = null;           // the core being installed or started, while it is
 let coreError = null;              // why the local core could not be had, for whoever asks
 let coreCheckedAt = 0;
@@ -221,7 +217,7 @@ function refuse(reason) {
 function startCore() {
   if (coreStarting) return coreStarting;
   coreError = null;
-  coreStarting = ensureRunning({ dataDir, log })
+  coreStarting = ensureRunning({ dataDir, log, roomCredential: credentialsPath })
     .then(ready => {
       coreError = null;
       creds = { room: ready.url, connector_id: ready.connector_id, token: ready.token, core: ready };
@@ -242,7 +238,7 @@ function startCore() {
  *  credential and, on the fixed port, the same address come back with it; if the address moved, the
  *  link moves with it, and the welcome re-registers every binding as after any reconnect. */
 async function superviseCore() {
-  if (!nodeMode || closed || coreStarting || Date.now() - coreCheckedAt < 2000) return;
+  if (external || closed || coreStarting || Date.now() - coreCheckedAt < 2000) return;
   coreCheckedAt = Date.now();
   if (creds?.core && coreAlive(creds.core.pid)) return;
   log('the local core is gone; starting it again');
@@ -255,8 +251,8 @@ async function superviseCore() {
  *  joins, and a link that exists already — connected, or on its way back — is the answer. */
 function open() {
   if (closed || link) return;
-  if (nodeMode && !creds) { startCore().then(ready => { if (ready) open(); }); return; }
-  if (!creds) creds = credentials();
+  if (!creds && external) creds = external;
+  if (!creds) { startCore().then(ready => { if (ready) open(); }); return; }
   link = roomLink({
     origin: creds.room, connector_id: creds.connector_id, token: creds.token,
     protocol: PROTOCOL, identity,
@@ -280,7 +276,7 @@ function open() {
       if (reason.retrying === false && !closed && reason.error) refuse(reason.error);
       else if (reason.retrying === false && !closed) log(`the room closed this connection and will not be asked again: ${reason.close_reason}`);
       else if (reason.attempt <= 3 || reason.attempt % 10 === 0) log('room unreachable: ' + JSON.stringify(reason));
-      if (nodeMode && reason.retrying !== false) superviseCore().catch(error => log('supervising the core failed: ' + error.message));
+      if (reason.retrying !== false) superviseCore().catch(error => log('supervising the core failed: ' + error.message));
     },
   });
   link.open();
@@ -360,11 +356,16 @@ async function asked(route, frame) {
       log(`room closed voice for ${binding.thread} (${frame.reason || 'closed_from_room'})`);
       scheduleExit(); return;
     }
-    case 'connector.revoked':
-      // The person took this machine's pairing away from the room's page. The socket is about to
-      // go and will not be welcomed back; the conversations learn it from their next call.
-      refuse(frame.reason || 'The room revoked this machine\'s pairing.');
+    case 'node.rendezvous': {
+      // How the core's link with the room is doing. A refusal — the person took this machine's pairing
+      // away from the room's page — lets every conversation go, as the room closing their voice would;
+      // a pairing made again clears it, and conversations can join again.
+      const previous = rendezvous; rendezvous = frame;
+      if (frame.refused) refuse(frame.refused);
+      else if (refusal && previous?.refused === refusal) { refusal = lastError = null; log('the room accepts this machine again'); }
+      if (!previous || previous.connected !== frame.connected) log(`the room at ${frame.room || '(not paired)'} is ${frame.connected ? 'reachable' : 'not reachable'}${frame.via ? ' (' + frame.via + ')' : ''}${frame.error ? ': ' + frame.error : ''}`);
       return;
+    }
     case 'connector.error': lastError = frame.error; log('room says: ' + frame.error); return;
   }
 }
@@ -390,10 +391,15 @@ async function handOver(binding, frame) {
   }
 }
 
+/** Whether what is said here reaches a room a person can be in: the core is linked and, when the core has
+ *  said, its link with the room is up. A core somebody else runs may never say; then its link is the answer. */
+function reachable() { return connected && (rendezvous ? rendezvous.connected === true : true); }
+
 function snapshot() {
-  return { host: hostId, version: VERSION, room: creds?.room || null, connected, protocol: PROTOCOL,
-    ...(nodeMode ? { core: creds?.core ? { url: creds.core.url, pid: creds.core.pid, version: creds.core.version } : null, core_error: coreError } : {}),
-    outbox: outbox.length, room_error: lastError, socket_error: socketError, refused: refusal,
+  return { host: hostId, version: VERSION, room: rendezvous?.room || (external ? creds?.room : null) || null, connected: reachable(), protocol: PROTOCOL,
+    core: creds?.core ? { url: creds.core.url, pid: creds.core.pid, version: creds.core.version, linked: connected } : (external ? { url: external.room, linked: connected } : null),
+    core_error: coreError, rendezvous,
+    outbox: outbox.length, room_error: lastError || rendezvous?.error || null, socket_error: socketError, refused: refusal,
     // Which conversations lost their voice from the room, and why each one did: the same map read
     // twice, because "it is gone" and "this is what happened" are two different questions.
     closed_by_room: [...closedByRoom.keys()], closed_reasons: Object.fromEntries(closedByRoom),
@@ -424,7 +430,7 @@ async function command(client, input) {
       if (existing) {
         Object.assign(existing, { owner: client, delivery, inbound, capabilities });
         client.bindings.add(existing);
-        return { binding_id: existing.binding_id, thread, connected };
+        return { binding_id: existing.binding_id, thread, connected: reachable() };
       }
       const local_id = 'local-' + randomUUID();
       log(`${harness} ${thread} joins ("${title || ''}", delivery ${delivery.kind}, inbound ${inbound ? (inbound.ok ? 'ok' : 'held') : 'n/a'})`);
@@ -432,7 +438,7 @@ async function command(client, input) {
       bindings.set(local_id, binding); client.bindings.add(binding); clearTimeout(idleTimer); open(); watch(binding);
       // A room that is not there yet is not a failure: the binding is registered on the next welcome.
       const reply = await joinRoom(binding).catch(error => { if (!connected && !refusal && !coreError) return null; bindings.delete(binding.binding_id); client.bindings.delete(binding); unwatch(binding); throw error; });
-      return { binding_id: reply?.binding_id || binding.binding_id, thread, connected, pending: !reply };
+      return { binding_id: reply?.binding_id || binding.binding_id, thread, connected: reachable(), pending: !reply };
     }
     case 'publish': {
       const binding = bindings.get(params.binding_id) || [...bindings.values()].find(b => b.client_ref === params.client_ref);
@@ -490,9 +496,8 @@ function serve(socket) {
   });
 }
 
-if (!nodeMode) creds = credentials();
 if (!acquireLock()) process.exit(0);
-log(`connector ${VERSION} starting: pid ${process.pid}, host ${hostId}, ${nodeMode ? 'conversations in this machine\'s core' : 'room ' + creds.room}, socket ${socketPath}, log ${logPath}`);
+log(`connector ${VERSION} starting: pid ${process.pid}, host ${hostId}, ${external ? 'core at ' + external.room : 'this machine\'s own core'}, socket ${socketPath}, log ${logPath}`);
 loadOutbox();
 if (outbox.length) log(`${outbox.length} speech frame(s) waiting in the outbox`);
 try { unlinkSync(socketPath); } catch {}

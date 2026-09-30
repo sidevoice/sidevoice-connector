@@ -15,6 +15,7 @@ const credentialFile = path.join(data, 'connector-credential.json');
 let credential; try { credential = JSON.parse(readFileSync(credentialFile, 'utf8')); } catch {}
 if (!credential) { credential = { connector_id: 'local-' + randomUUID(), token: randomUUID() }; writeFileSync(credentialFile, JSON.stringify(credential)); }
 const said = event => appendFileSync(path.join(data, 'said.jsonl'), JSON.stringify({ pid: process.pid, ...event }) + '\n');
+said({ event: 'started', data: { argv: process.argv.slice(2) } });
 
 const http = createServer((_, res) => { res.writeHead(404); res.end(); });
 const io = new Server(http, { path: '/api/connectors/link', transports: ['websocket'] });

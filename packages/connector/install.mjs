@@ -17,6 +17,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { harnessesPresent } from './identity.mjs';
 import { pairedRoom } from './pair.mjs';
+import { CORE_VERSION, NO_UV, coreAlive, findUv, readReady } from './core.mjs';
 import { remove as removeSkill, skillsDir, status as skillStatus } from './skill.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -183,6 +184,11 @@ export async function install(argv = process.argv.slice(2), env = process.env) {
   const paired = pairedRoom(env);
   done.push(paired ? `This machine is paired with ${paired.origin} (connector ${paired.connector_id}).`
                    : 'This machine is not paired with any room yet.');
+  // Voice runs in this machine's own core, which the connector installs with uv the first time a
+  // conversation joins: nothing is installed now, but a machine without uv is told before it matters.
+  const uv = findUv(env);
+  if (uv) done.push(`Voice runs in this machine's own Sidevoice core ${CORE_VERSION}; the connector installs it with ${uv} the first time a conversation joins (no Docker).`);
+  else next.push(NO_UV);
   const running = await runningConnector(env);
   if (running && running.version !== VERSION) {
     next.push(`A connector from ${running.version ? 'version ' + running.version : 'an older version'} is still running (pid ${running.pid}) and every conversation on this machine uses it. ` +
@@ -228,9 +234,12 @@ export async function uninstall(argv = process.argv.slice(2), env = process.env)
   if (!fromSource(env) && existsSync(copiesDir(env))) { rmSync(copiesDir(env), { recursive: true, force: true }); done.push(`Removed the installed copies under ${copiesDir(env)}.`); }
   const dataDir = env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
   const paired = pairedRoom(env);
+  // A core still running holds files under the data dir, and would dial the room again: it is asked to leave.
+  const core = readReady(dataDir);
+  if (core && coreAlive(core.pid)) { try { process.kill(core.pid, 'SIGTERM'); done.push(`Stopped the Sidevoice core (pid ${core.pid}).`); } catch {} }
   if (existsSync(dataDir)) {
     rmSync(dataDir, { recursive: true, force: true });
-    done.push(`Removed ${dataDir} (credential, socket, outbox, log).`);
+    done.push(`Removed ${dataDir} (credential, socket, outbox, log, the core and its environment).`);
     if (paired) next.push(`The room at ${paired.origin} still lists this machine as paired (connector ${paired.connector_id}) until you revoke it under "Máquinas" on the room's page.`);
   }
   if (harnesses.includes('codex')) next.push(`Remove the [mcp_servers.sidevoice] table from ${env.CODEX_HOME || path.join(os.homedir(), '.codex')}/config.toml — it is machine-wide and this package does not rewrite it.`);

@@ -120,7 +120,7 @@ const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 /** The running core's ready file: the one already running, or one this call starts. A core of another
  *  version is asked to leave first — this connector links with the version it pins. */
-export async function ensureRunning({ dataDir, env = process.env, log = () => {}, timeout = 120_000 }) {
+export async function ensureRunning({ dataDir, env = process.env, log = () => {}, timeout = 120_000, roomCredential = null }) {
   const running = readReady(dataDir);
   if (running && coreAlive(running.pid)) {
     if (!running.version || running.version === CORE_VERSION || env.SIDEVOICE_CORE_BIN) return running;
@@ -133,7 +133,10 @@ export async function ensureRunning({ dataDir, env = process.env, log = () => {}
   const data = coreData(dataDir);
   mkdirSync(data, { recursive: true, mode: 0o700 });
   const out = openSync(logPath(dataDir), 'a', 0o600);
-  const child = spawn(bin, ['--data-dir', data, '--port', String(env.SIDEVOICE_CORE_PORT ?? DEFAULT_PORT)],
+  // The machine's pairing is this connector's file (`pair.mjs` writes it); the core reads it to dial the room.
+  const args = ['--data-dir', data, '--port', String(env.SIDEVOICE_CORE_PORT ?? DEFAULT_PORT)];
+  if (roomCredential) args.push('--room-credential', roomCredential);
+  const child = spawn(bin, args,
     { detached: true, stdio: ['ignore', out, out], env: { ...env, SIDEVOICE_CORE_DATA_DIR: data } });
   closeSync(out);
   let exited = null;

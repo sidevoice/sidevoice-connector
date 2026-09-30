@@ -59,7 +59,9 @@ export async function pair(room, code, env = process.env) {
   const file = path.join(directory, 'credentials.json');
   // Where the room is, not how to reach it: the path and namespace that carry the link belong to
   // the client and move with its version, so an upgrade never has to rewrite what pairing wrote.
-  writeFileSync(file, JSON.stringify({ url: base.origin, connector_id: body.connector_id, token: body.token, protocol: body.protocol }, null, 2), { mode: 0o600 });
+  // The dial key is what the room shows this machine's core if the room is ever the one to open the link.
+  writeFileSync(file, JSON.stringify({ url: base.origin, connector_id: body.connector_id, token: body.token, protocol: body.protocol,
+    ...(body.dial_key ? { dial_key: body.dial_key } : {}) }, null, 2), { mode: 0o600 });
   return { file, connector_id: body.connector_id, origin: base.origin };
 }
 
