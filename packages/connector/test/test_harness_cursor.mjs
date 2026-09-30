@@ -257,10 +257,10 @@ test('cursor install: the person\'s mcp.json keeps its permissions and its symli
   // An older copy of ours is registered in Cursor; installing for Claude Code removes that copy, so Cursor follows.
   writeFileSync(real, JSON.stringify({ mcpServers: { sidevoice: { command: 'node', args: [path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1', 'dist', 'cli.mjs'), 'mcp'] } } }));
   mkdirSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1'), { recursive: true });
-  const installed = await install(['--harness', 'claude'], env);
+  const installed = await install(['--harness', 'claude', '--no-core'], env);
   assert.deepEqual(JSON.parse(readFileSync(real, 'utf8')).mcpServers.sidevoice.args, serverCommand(env).args);
   assert.match(installed.done.join('\n'), /Re-pointed Cursor/);
-  const gone = await uninstall(['--harness', 'claude'], env);
+  const gone = await uninstall(['--harness', 'claude', '--no-core'], env);
   assert.match(gone.next.join('\n'), /Cursor still lists the sidevoice MCP server .* points at nothing/);
 });
 

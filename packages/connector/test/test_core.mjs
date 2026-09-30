@@ -201,3 +201,93 @@ test('core: the wheel put beside the sources is installed, and once rebuilt it i
     facade.end();
   } finally { first?.stop(); second?.stop(); rmSync(beside, { recursive: true, force: true }); }
 });
+
+/** A machine for `sidevoice install`: its own HOME with Cursor in it, fake uv, the fake core on a free port. */
+function installMachine(extraEnv = {}) {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-install-'));
+  mkdirSync(path.join(home, '.cursor'));
+  const dataDir = path.join(home, '.sidevoice');
+  const env = { ...process.env, HOME: home, XDG_DATA_HOME: path.join(home, 'xdg'), SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_UV: fakeUv,
+    SIDEVOICE_CORE_PORT: '0', FAKE_UV_LOG: path.join(home, 'uv.jsonl'), SIDEVOICE_CORE_SPEC: '/wheels/x.whl', ...extraEnv };
+  for (const key of ['SIDEVOICE_URL', 'SIDEVOICE_CONNECTOR_ID', 'SIDEVOICE_CONNECTOR_TOKEN', 'SIDEVOICE_CORE_BIN']) delete env[key];
+  const uvCalls = () => { try { return readFileSync(env.FAKE_UV_LOG, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse); } catch { return []; } };
+  const ready = () => { try { return JSON.parse(readFileSync(path.join(dataDir, 'core', 'core.json'), 'utf8')); } catch { return null; } };
+  const stop = () => { const core = ready(); if (core?.pid) { try { process.kill(core.pid, 'SIGKILL'); } catch {} } };
+  return { home, dataDir, env, uvCalls, ready, stop, mcpJson: path.join(home, '.cursor', 'mcp.json') };
+}
+
+test('install: the core is installed, started and asked whether it answers before anything is registered, and a code comes at once afterwards', async () => {
+  const { install } = await import('../install.mjs');
+  const { installInProgress } = await import('../core.mjs');
+  const node = installMachine({ FAKE_UV_DELAY_MS: '600' });
+  const shown = [];
+  let connector = null;
+  try {
+    const running = install(['--harness', 'cursor'], node.env, { progress: line => shown.push(line) });
+    // While it runs, anyone asking sees who is installing: a connector waits for it instead of starting a second uv.
+    await until(() => installInProgress(node.dataDir));
+    assert.equal(installInProgress(node.dataDir).pid, process.pid);
+    const result = await running;
+    assert.equal(installInProgress(node.dataDir), null, 'the lock is let go');
+    assert.match(shown[0], /Installing this machine's Sidevoice core/);
+    assert.ok(shown.some(line => /uv: Resolved 93 packages/.test(line)), 'uv\'s progress is shown as it comes');
+    assert.ok(!shown.some(line => /\+ aiortc/.test(line)), 'not every package listed');
+    assert.match(result.done.join('\n'), /core 0\.1\.0 is installed and answering at http:\/\/127\.0\.0\.1:\d+/);
+    assert.ok(existsSync(node.mcpJson), 'registered once the core answered');
+    assert.equal(node.uvCalls().length, 2);
+    const core = node.ready();
+    // The first voice_pair_device after installing: no install, no start, the code at once.
+    connector = spawn(process.execPath, [path.join(packageDir, 'connector.mjs')], { env: { ...node.env, SIDEVOICE_CONNECTOR_IDLE_MS: '20000' }, stdio: 'ignore' });
+    const socketPath = path.join(node.dataDir, 'connector.sock');
+    await until(() => existsSync(socketPath));
+    const facade = ipc(socketPath); await facade.ready;
+    const started = Date.now();
+    const code = await facade.call('pair_device', {});
+    assert.equal(code.code, 'SV1.fake-' + core.pid, 'the core install started is the one that answered');
+    assert.ok(Date.now() - started < 5000);
+    assert.equal(node.uvCalls().length, 2, 'nothing installed again');
+    facade.end();
+  } finally { if (connector?.exitCode === null) connector.kill(); node.stop(); }
+});
+
+test('install: a uv failure says what uv said and what usually fixes it — system certificates behind a re-signing proxy — and registers nothing', async () => {
+  const { install } = await import('../install.mjs');
+  const node = installMachine({ FAKE_UV_FAIL: '1', FAKE_UV_FAIL_OUTPUT: 'error: Request failed after 3 retries\n  Caused by: error sending request for url (https://pypi.org/simple/aiortc/)\n  Caused by: invalid peer certificate: UnknownIssuer' });
+  try {
+    await assert.rejects(install(['--harness', 'cursor'], node.env), error => {
+      assert.match(error.message, /failed at "uv venv" \(exit 2\): .*UnknownIssuer/);
+      assert.match(error.message, /UV_SYSTEM_CERTS=1/); assert.match(error.message, /SSL_CERT_FILE/);
+      assert.match(error.message, /core\.log/);
+      return true;
+    });
+    assert.ok(!existsSync(node.mcpJson), 'no harness points at a voice that is not there');
+  } finally { node.stop(); }
+  const offline = installMachine({ FAKE_UV_FAIL: '1', FAKE_UV_FAIL_OUTPUT: 'error: Failed to fetch: dns error: failed to lookup address information' });
+  await assert.rejects(install(['--harness', 'cursor'], offline.env), /could not reach the network.*HTTPS_PROXY/);
+  const noUv = installMachine({ SIDEVOICE_UV: '/nonexistent/uv', PATH: '/nonexistent' });
+  const { findUv } = await import('../core.mjs');
+  if (!findUv(noUv.env)) await assert.rejects(install(['--harness', 'cursor'], noUv.env), error => error.message === NO_UV);   // a uv where installers put it is still found
+  // Asked to leave the core for later, it registers and says so.
+  const later = installMachine();
+  const skipped = await install(['--harness', 'cursor', '--no-core'], later.env);
+  assert.match(skipped.done.join('\n'), /not installed now \(--no-core\)/);
+  assert.equal(later.uvCalls().length, 0); assert.ok(existsSync(later.mcpJson));
+});
+
+test('core: a device code asked during a first install waits for it, within a bound, and past it says the install is still going', async () => {
+  const slow = machine({ SIDEVOICE_CORE_SPEC: '/wheels/x.whl', FAKE_UV_DELAY_MS: '2500', SIDEVOICE_CORE_WAIT_MS: '300' });
+  try {
+    await until(() => existsSync(slow.socketPath));
+    const facade = ipc(slow.socketPath); await facade.ready;
+    const code = await facade.call('pair_device', {});
+    assert.match(code.code, /^SV1\.fake-/, 'waited through the install rather than refusing');
+    facade.end();
+  } finally { slow.stop(); }
+  const slower = machine({ SIDEVOICE_CORE_SPEC: '/wheels/x.whl', FAKE_UV_DELAY_MS: '8000', SIDEVOICE_CORE_WAIT_MS: '300', SIDEVOICE_CORE_INSTALL_WAIT_MS: '1000' });
+  try {
+    await until(() => existsSync(slower.socketPath));
+    const facade = ipc(slower.socketPath); await facade.ready;
+    await assert.rejects(facade.call('pair_device', {}), /still being installed \(\d+ s so far; last step: .*\)\. Ask again in a minute; progress is in .*core\.log/);
+    facade.end();
+  } finally { slower.stop(); }
+});

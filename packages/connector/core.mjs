@@ -18,7 +18,7 @@
  *  going on) and exits on its own when nothing has used it for a while. The handshake is its ready
  *  file, `core/core.json`: where it listens and the credential this connector links with. */
 import { spawn, execFileSync } from 'node:child_process';
-import { accessSync, constants, existsSync, mkdirSync, openSync, closeSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdirSync, openSync, closeSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -65,21 +65,76 @@ export function findUv(env = process.env) {
   return candidates.find(candidate => candidate && executable(candidate)) || null;
 }
 
-function run(command, args, { log, env }) {
+/** Why uv failed, in words a person can act on: what it printed last, and what usually fixes it. A corporate
+ *  proxy that re-signs HTTPS (UnknownIssuer) was the first real one, 2026-09-30. */
+export function explainUvFailure(step, code, lines, log) {
+  const text = lines.join('\n');
+  const last = lines.filter(line => line.trim()).slice(-3).map(line => line.trim()).join(' | ');
+  let hint = '';
+  if (/UnknownIssuer|invalid peer certificate|certificate verify|CERTIFICATE_VERIFY_FAILED|self[- ]signed certificate|unable to get local issuer/i.test(text)) {
+    hint = ' uv could not verify a TLS certificate — usually a corporate proxy that re-signs HTTPS. Use the system\'s certificate store: run it again with UV_SYSTEM_CERTS=1 (uv 0.12 or later; older uv: UV_NATIVE_TLS=1), or point SSL_CERT_FILE at your organisation\'s CA bundle.';
+  } else if (/dns error|failed to lookup address|could not connect|connection refused|connection reset|timed out|error sending request|network is unreachable|tcp connect error/i.test(text)) {
+    hint = ' uv could not reach the network (PyPI, and GitHub for its Python): check the connection, and set HTTPS_PROXY if this machine goes through a proxy.';
+  }
+  return new Error(`Installing this machine's Sidevoice core failed at "uv ${step}" (exit ${code})${last ? ': ' + last : ''}.${hint} Full output: ${log}`);
+}
+
+/** Run uv, its output appended to the log and handed line by line to `progress`. */
+function run(command, args, { log, env, progress = () => {} }) {
   return new Promise((resolve, reject) => {
     const out = openSync(log, 'a', 0o600);
-    const child = spawn(command, args, { stdio: ['ignore', out, out], env });
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], env });
+    const tail = []; let partial = '';
+    const take = chunk => {
+      try { writeSync(out, chunk); } catch {}
+      partial += chunk;
+      let index;
+      while ((index = partial.indexOf('\n')) >= 0) {
+        const line = partial.slice(0, index); partial = partial.slice(index + 1);
+        tail.push(line); if (tail.length > 60) tail.shift();
+        try { progress(line); } catch {}
+      }
+    };
+    child.stdout.on('data', take); child.stderr.on('data', take);
     const timer = setTimeout(() => child.kill('SIGTERM'), INSTALL_TIMEOUT_MS);
     child.on('error', error => { clearTimeout(timer); closeSync(out); reject(error); });
-    child.on('exit', code => {
+    child.on('close', code => {
       clearTimeout(timer); closeSync(out);
-      code === 0 ? resolve() : reject(new Error(`${path.basename(command)} ${args.slice(0, 2).join(' ')} failed (exit ${code}); see ${log}`));
+      if (partial) tail.push(partial);
+      code === 0 ? resolve() : reject(explainUvFailure(args[0], code, tail, log));
     });
   });
 }
 
-/** The `sidevoice-core` to start, installing the pinned version first if it is not there. */
-export async function ensureInstalled({ dataDir, env = process.env, log = () => {} }) {
+/** Who is installing the core right now, if anyone: `sidevoice install` and a connector share one data dir,
+ *  and two uv runs into one environment break it. The lock is a file with the installer's pid. */
+function lockPath(dataDir) { return path.join(dataDir, 'core-install.lock'); }
+function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } }
+export function installInProgress(dataDir) {
+  let lock; try { lock = JSON.parse(readFileSync(lockPath(dataDir), 'utf8')); } catch { return null; }
+  if (!lock?.pid || !pidAlive(lock.pid)) return null;
+  let last = null;
+  try { last = readFileSync(logPath(dataDir), 'utf8').trim().split('\n').filter(line => line.trim()).at(-1)?.trim() || null; } catch {}
+  return { pid: lock.pid, since: lock.since, seconds: Math.round((Date.now() - lock.since) / 1000), last, log: logPath(dataDir) };
+}
+async function takeInstallLock(dataDir, log) {
+  const file = lockPath(dataDir);
+  const deadline = Date.now() + INSTALL_TIMEOUT_MS;
+  let said = false;
+  for (;;) {
+    try { writeFileSync(file, JSON.stringify({ pid: process.pid, since: Date.now() }), { flag: 'wx', mode: 0o600 }); return () => { try { rmSync(file, { force: true }); } catch {} }; }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    const held = installInProgress(dataDir);
+    if (!held) { try { rmSync(file, { force: true }); } catch {} continue; }   // left by an installer that is gone
+    if (!said) { log(`another process (pid ${held.pid}) is installing the core; waiting for it`); said = true; }
+    if (Date.now() > deadline) throw new Error(`Another process (pid ${held.pid}) has been installing the core for ${held.seconds} s; see ${held.log}`);
+    await wait(500);
+  }
+}
+
+/** The `sidevoice-core` to start, installing the pinned version first if it is not there. `progress` gets uv's
+ *  output line by line (`sidevoice install` shows it). */
+export async function ensureInstalled({ dataDir, env = process.env, log = () => {}, progress = () => {} }) {
   if (env.SIDEVOICE_CORE_BIN) return env.SIDEVOICE_CORE_BIN;
   const spec = coreSpec(env), identity = specIdentity(spec);
   const home = path.join(runtimeRoot(dataDir), CORE_VERSION);
@@ -88,23 +143,42 @@ export async function ensureInstalled({ dataDir, env = process.env, log = () => 
   const bin = path.join(venv, windows ? 'Scripts' : 'bin', windows ? 'sidevoice-core.exe' : 'sidevoice-core');
   const python = path.join(venv, windows ? 'Scripts' : 'bin', windows ? 'python.exe' : 'python');
   const marker = path.join(home, 'installed.json');
-  try { if (executable(bin) && JSON.parse(readFileSync(marker, 'utf8')).spec === identity) return bin; } catch {}
+  const installed = () => { try { return executable(bin) && JSON.parse(readFileSync(marker, 'utf8')).spec === identity; } catch { return false; } };
+  if (installed()) return bin;
   const uv = findUv(env);
   if (!uv) throw new Error(NO_UV);
-  mkdirSync(home, { recursive: true, mode: 0o700 });
-  log(`installing sidevoice-core ${CORE_VERSION} with ${uv} from ${spec} (first time only; output in ${logPath(dataDir)})`);
-  const started = Date.now();
-  const options = { log: logPath(dataDir), env: { ...env, UV_NO_PROGRESS: '1' } };
-  await run(uv, ['venv', '--clear', '--python', '3.12', venv], options);
-  await run(uv, ['pip', 'install', '--python', python, spec], options);
-  if (!executable(bin)) throw new Error(`uv installed ${spec} but there is no ${bin}; see ${logPath(dataDir)}`);
-  writeFileSync(marker, JSON.stringify({ version: CORE_VERSION, spec: identity, at: new Date().toISOString() }), { mode: 0o600 });
-  // One current copy: the versions this connector no longer pins are disposable.
-  for (const name of readdirSync(runtimeRoot(dataDir))) {
-    if (name !== CORE_VERSION) rmSync(path.join(runtimeRoot(dataDir), name), { recursive: true, force: true });
-  }
-  log(`sidevoice-core ${CORE_VERSION} installed in ${Math.round((Date.now() - started) / 1000)} s`);
-  return bin;
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  const release = await takeInstallLock(dataDir, log);
+  try {
+    if (installed()) return bin;   // whoever held the lock installed this very spec
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    log(`installing sidevoice-core ${CORE_VERSION} with ${uv} from ${spec} (first time only; output in ${logPath(dataDir)})`);
+    const started = Date.now();
+    const options = { log: logPath(dataDir), env: { ...env, UV_NO_PROGRESS: '1' }, progress };
+    await run(uv, ['venv', '--clear', '--python', '3.12', venv], options);
+    await run(uv, ['pip', 'install', '--python', python, spec], options);
+    if (!executable(bin)) throw new Error(`uv installed ${spec} but there is no ${bin}; see ${logPath(dataDir)}`);
+    writeFileSync(marker, JSON.stringify({ version: CORE_VERSION, spec: identity, at: new Date().toISOString() }), { mode: 0o600 });
+    // One current copy: the versions this connector no longer pins are disposable.
+    for (const name of readdirSync(runtimeRoot(dataDir))) {
+      if (name !== CORE_VERSION) rmSync(path.join(runtimeRoot(dataDir), name), { recursive: true, force: true });
+    }
+    log(`sidevoice-core ${CORE_VERSION} installed in ${Math.round((Date.now() - started) / 1000)} s`);
+    return bin;
+  } finally { release(); }
+}
+
+/** The file the core dials the room with: this machine's pairing, followed by the core (it may not exist yet). */
+export function roomCredentialPath(dataDir, env = process.env) {
+  return env.SIDEVOICE_CREDENTIALS || path.join(dataDir, 'credentials.json');
+}
+
+/** Whether a started core answers: its discovery route, the one that needs no token. */
+export async function coreAnswers(ready, timeout = 10_000) {
+  try {
+    const response = await fetch(new URL('/api/rendezvous', ready.url), { signal: AbortSignal.timeout(timeout) });
+    return response.ok && (await response.json())?.kind === 'node';
+  } catch { return false; }
 }
 
 /** Whether the pinned version's install is the one the spec names now: false after a wheel was rebuilt in place. */
@@ -135,7 +209,7 @@ const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 /** The running core's ready file: the one already running, or one this call starts. A core of another
  *  version is asked to leave first — this connector links with the version it pins. */
-export async function ensureRunning({ dataDir, env = process.env, log = () => {}, timeout = 120_000, roomCredential = null }) {
+export async function ensureRunning({ dataDir, env = process.env, log = () => {}, progress = () => {}, timeout = 120_000, roomCredential = roomCredentialPath(dataDir, env) }) {
   const running = readReady(dataDir);
   if (running && coreAlive(running.pid)) {
     if (env.SIDEVOICE_CORE_BIN) return running;
@@ -147,7 +221,7 @@ export async function ensureRunning({ dataDir, env = process.env, log = () => {}
     const deadline = Date.now() + 15_000;
     while (coreAlive(running.pid) && Date.now() < deadline) await wait(100);
   }
-  const bin = await ensureInstalled({ dataDir, env, log });
+  const bin = await ensureInstalled({ dataDir, env, log, progress });
   const data = coreData(dataDir);
   mkdirSync(data, { recursive: true, mode: 0o700 });
   const out = openSync(logPath(dataDir), 'a', 0o600);

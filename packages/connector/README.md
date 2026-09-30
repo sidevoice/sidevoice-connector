@@ -4,8 +4,9 @@ The client side. One bin (`sidevoice`), these entry points:
 
 - `install` — registers the MCP server with the harness (re-pinned to this
   version when an older one was registered) and removes a skill copy an earlier
-  version left. Pairs with nothing and installs no Python; reports whether the
-  machine is paired, with which room, and whether `uv` is there for the core.
+  version left. Installs this machine's core first (uv: Python and the pinned wheel,
+  progress shown), starts it and checks that it answers, and only then registers;
+  `--no-core` skips that. Pairs with nothing; reports whether the machine is paired.
 - `mcp` — the stdio MCP server a harness starts. One per conversation. Exposes
   `voice_connect`, `voice_pair`, `voice_say`, `voice_disconnect`, `voice_pair_device`,
   `voice_status`; carries the

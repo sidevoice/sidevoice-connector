@@ -21,7 +21,7 @@ import { harnessFor } from './harnesses.mjs';
 import { machineIdentity, VERSION } from './identity.mjs';
 import { pair, roomOrigin } from './pair.mjs';
 import { roomLink, UNREACHABLE } from './link.mjs';
-import { coreAlive, ensureRunning, readReady } from './core.mjs';
+import { coreAlive, ensureRunning, installInProgress, readReady } from './core.mjs';
 
 export const PROTOCOL = 2;
 const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
@@ -335,13 +335,21 @@ async function joinRoom(binding, timeout = 10_000) {
  *  and keeps the devices; this only asks, starting the core first as a join would. Whether the room will
  *  have this machine does not matter here: a device pairs with the machine, not with the room. */
 const CORE_WAIT_MS = Number(process.env.SIDEVOICE_CORE_WAIT_MS || 30_000);
+/** How long a code waits for a core that is being installed (the first time: Python and a few hundred MB). */
+const CORE_INSTALL_WAIT_MS = Number(process.env.SIDEVOICE_CORE_INSTALL_WAIT_MS || 120_000);
 const PAIRING_CODE_TIMEOUT_MS = 10_000;
 async function devicePairingCode() {
   open();
   if (!connected) await welcomed(CORE_WAIT_MS);
+  // A first install still running is waited for, up to a bound: the code comes as soon as the core does.
+  const waitedSince = Date.now();
+  while (!connected && !coreError && (coreStarting || installInProgress(dataDir)) && Date.now() - waitedSince < CORE_INSTALL_WAIT_MS) await welcomed(2000);
+  if (!connected && !coreError) await welcomed(5000);   // started a moment ago: the link is on its way
   if (!connected) {
     if (coreError) throw new Error(coreError);
-    throw new Error('This machine\'s core is not up yet (the first start installs it and can take a few minutes); ask again in a moment.');
+    const installing = installInProgress(dataDir);
+    if (installing) throw new Error(`This machine's Sidevoice core is still being installed (${installing.seconds} s so far${installing.last ? '; last step: ' + installing.last : ''}). Ask again in a minute; progress is in ${installing.log}.`);
+    throw new Error('This machine\'s core did not come up in time; ask again in a moment. Why is in ' + path.join(dataDir, 'core.log') + '.');
   }
   let answer;
   try { answer = await request('device.pairing_code', {}, { timeout: PAIRING_CODE_TIMEOUT_MS }); }

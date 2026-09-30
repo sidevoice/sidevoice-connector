@@ -19,7 +19,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { harnessesPresent } from './identity.mjs';
 import { pairedRoom } from './pair.mjs';
-import { CORE_VERSION, NO_UV, coreAlive, findUv, readReady } from './core.mjs';
+import { CORE_VERSION, NO_UV, coreAlive, coreAnswers, ensureRunning, findUv, readReady } from './core.mjs';
 import { remove as removeSkill, skillsDir, status as skillStatus } from './skill.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -243,9 +243,26 @@ export function inboundWarning(env = process.env) {
   ].join('\n');
 }
 
-export async function install(argv = process.argv.slice(2), env = process.env) {
+/** This machine's core, installed now rather than when a conversation first needs it: Python and the pinned
+ *  core with uv, started once and asked whether it answers. A voice_pair_device or voice_connect right after
+ *  installing then finds a core ready. It stays up and leaves by itself when nothing uses it; the connector
+ *  starts it again in seconds, and still installs it lazily if it goes missing or is rebuilt later. */
+export async function prepareCore(env = process.env, progress = () => {}) {
+  const dataDir = env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
+  if (!env.SIDEVOICE_CORE_BIN && !findUv(env)) throw new Error(NO_UV);
+  const started = Date.now();
+  const ready = await ensureRunning({ dataDir, env, log: line => progress('  ' + line),
+    // uv lists every package it adds, then says how many: the list is left out, the rest (Python, downloads) shown.
+    progress: line => { if (line.trim() && !/^\s*[+-] /.test(line)) progress('    uv: ' + line.trim()); } });
+  if (!await coreAnswers(ready)) {
+    throw new Error(`This machine's Sidevoice core started (pid ${ready.pid}) but does not answer at ${ready.url}; see ${path.join(dataDir, 'core.log')}.`);
+  }
+  return { url: ready.url, pid: ready.pid, seconds: Math.round((Date.now() - started) / 1000) };
+}
+
+export async function install(argv = process.argv.slice(2), env = process.env, { progress = () => {} } = {}) {
   const stray = argv.find(item => !item.startsWith('-') && argv[argv.indexOf(item) - 1] !== '--harness');
-  if (stray) throw new Error(`usage: sidevoice install [--harness claude|codex|cursor]\n` +
+  if (stray) throw new Error(`usage: sidevoice install [--harness claude|codex|cursor] [--no-core]\n` +
     `Pairing is not part of installing: a conversation asks for the room's code the first time it joins, ` +
     `or run  sidevoice pair <room-url> <code>  with the code the room shows under "Emparejar máquina".`);
   const wanted = flag(argv, '--harness');
@@ -253,6 +270,16 @@ export async function install(argv = process.argv.slice(2), env = process.env) {
   const done = [], next = [];
 
   done.push(`Sidevoice ${VERSION}.`);
+  // The core first: nothing is registered with a harness until the voice it would reach is really there.
+  // A core somebody else runs (`SIDEVOICE_URL`…) is not this installer's; `--no-core` leaves it for later.
+  const externalCore = env.SIDEVOICE_URL && env.SIDEVOICE_CONNECTOR_ID && env.SIDEVOICE_CONNECTOR_TOKEN;
+  if (argv.includes('--no-core')) done.push(`This machine's Sidevoice core was not installed now (--no-core): the connector installs it the first time a conversation needs it.`);
+  else if (externalCore) done.push(`Voice runs in the core at ${env.SIDEVOICE_URL} (SIDEVOICE_URL): nothing to install here.`);
+  else {
+    progress(`Installing this machine's Sidevoice core ${CORE_VERSION} (the first time: Python and a few hundred MB, some minutes)…`);
+    const core = await prepareCore(env, progress);
+    done.push(`This machine's Sidevoice core ${CORE_VERSION} is installed and answering at ${core.url} (${core.seconds} s).`);
+  }
   const copy = materialize(env);
   if (copy.action === 'copied') done.push(`Copied this version to ${copy.target}${copy.removed.length ? ` (removed: ${copy.removed.join(', ')})` : ''}.`);
   if (harnesses.includes('claude')) {
@@ -268,11 +295,6 @@ export async function install(argv = process.argv.slice(2), env = process.env) {
   const paired = pairedRoom(env);
   done.push(paired ? `This machine is paired with ${paired.origin} (connector ${paired.connector_id}).`
                    : 'This machine is not paired with any room yet.');
-  // Voice runs in this machine's own core, which the connector installs with uv the first time a
-  // conversation joins: nothing is installed now, but a machine without uv is told before it matters.
-  const uv = findUv(env);
-  if (uv) done.push(`Voice runs in this machine's own Sidevoice core ${CORE_VERSION}; the connector installs it with ${uv} the first time a conversation joins (no Docker).`);
-  else next.push(NO_UV);
   const running = await runningConnector(env);
   if (running && running.version !== VERSION) {
     next.push(`A connector from ${running.version ? 'version ' + running.version : 'an older version'} is still running (pid ${running.pid}) and every conversation on this machine uses it. ` +
@@ -346,7 +368,7 @@ if (process.env.SIDEVOICE_UNINSTALL_MAIN === '1') {
 
 if (process.env.SIDEVOICE_INSTALL_MAIN === '1') {
   try {
-    const { done, next } = await install();
+    const { done, next } = await install(process.argv.slice(2), process.env, { progress: line => console.log(line) });
     for (const line of done) console.log('· ' + line);
     if (next.length) {
       console.log('\nLeft for you:');

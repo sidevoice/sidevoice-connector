@@ -1291,7 +1291,7 @@ test('install: puts this version in front of the harness, re-pins an older regis
 
   assert.rejects(install(['https://room.example', '--harness', 'claude'], env), /Pairing is not part of installing/, 'a room address is refused, with where pairing lives');
 
-  const first = await install(['--harness', 'claude'], env);
+  const first = await install(['--harness', 'claude', '--no-core'], env);
   assert.deepEqual(calls(), ['mcp get sidevoice', `mcp add --scope user sidevoice -- ${wanted}`], 'nothing registered: it registers this version');
   assert.match(first.done.join('\n'), /Registered the MCP server/);
   assert.match(first.done.join('\n'), /Copied this version to .*\(removed: 0\.0\.1\)/);
@@ -1312,34 +1312,34 @@ test('install: puts this version in front of the harness, re-pins an older regis
   // Registered at this version already: nothing to change, and it says so.
   writeFileSync(registered, `sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: ${command}\n  Args: ${args.join(' ')}\n`);
   writeFileSync(log, '');
-  const again = await install(['--harness', 'claude'], env);
+  const again = await install(['--harness', 'claude', '--no-core'], env);
   assert.deepEqual(calls(), ['mcp get sidevoice']);
   assert.match(again.done.join('\n'), /already runs this version/);
   // A skill copy left by an earlier version is taken away; someone else's voice-room is not.
   mkdirSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room'), { recursive: true });
   writeFileSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room', 'SKILL.md'), '---\nname: voice-room\nmetadata:\n  sidevoice: installed copy\n---\nold');
-  const cleaned = await install(['--harness', 'claude'], env);
+  const cleaned = await install(['--harness', 'claude', '--no-core'], env);
   assert.match(cleaned.done.join('\n'), /Removed the voice-room skill copy/);
   assert.ok(!existsSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room')));
 
   // An older pin: after an upgrade, running install again moves the harness to the new version.
   writeFileSync(registered, `sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: npx\n  Args: -y @sidevoice/uplink@0.1.0 mcp\n`);
   writeFileSync(log, '');
-  const upgraded = await install(['--harness', 'claude'], env);
+  const upgraded = await install(['--harness', 'claude', '--no-core'], env);
   assert.deepEqual(calls(), ['mcp get sidevoice', 'mcp remove --scope user sidevoice', `mcp add --scope user sidevoice -- ${wanted}`]);
   assert.match(upgraded.done.join('\n'), /Re-pointed .* \(was: npx -y @sidevoice\/uplink@0\.1\.0 mcp\)/);
 
   // Registered somewhere that is not ours to move: left alone, with the command to move it.
   writeFileSync(registered, `sidevoice:\n  Scope: Project config (shared via .mcp.json)\n  Type: stdio\n  Command: npx\n  Args: -y @sidevoice/uplink@0.1.0 mcp\n`);
   writeFileSync(log, '');
-  const elsewhere = await install(['--harness', 'claude'], env);
+  const elsewhere = await install(['--harness', 'claude', '--no-core'], env);
   assert.deepEqual(calls(), ['mcp get sidevoice']);
   assert.match(elsewhere.done.join('\n'), /outside user scope .* not touched/);
 
   // A paired machine is reported as such, never re-paired.
   mkdirSync(env.SIDEVOICE_DATA_DIR, { recursive: true });
   writeFileSync(path.join(env.SIDEVOICE_DATA_DIR, 'credentials.json'), JSON.stringify({ url: 'wss://room.example/api/connectors/ws', connector_id: 'c-1', token: 't-1' }));
-  const paired = await install(['--harness', 'claude'], env);
+  const paired = await install(['--harness', 'claude', '--no-core'], env);
   assert.match(paired.done.join('\n'), /paired with https:\/\/room\.example \(connector c-1\)/);
   assert.ok(!paired.next.join('\n').includes('Emparejar máquina'));
 
@@ -1348,7 +1348,7 @@ test('install: puts this version in front of the harness, re-pins an older regis
   writeFileSync(registered, `sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: ${command}\n  Args: ${args.join(' ')}\n`);
   writeFileSync(log, '');
   const { uninstall } = await import('../install.mjs');
-  const gone = await uninstall(['--harness', 'claude'], env);
+  const gone = await uninstall(['--harness', 'claude', '--no-core'], env);
   assert.deepEqual(calls(), ['mcp get sidevoice', 'mcp remove --scope user sidevoice']);
   assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice')), 'installed copies are gone');
   assert.ok(!existsSync(env.SIDEVOICE_DATA_DIR), 'credential, socket and log are gone');
