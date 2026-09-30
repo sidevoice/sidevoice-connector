@@ -321,6 +321,52 @@ test('mcp façade: with no room paired a conversation joins this machine\'s core
   } finally { child.kill(); fake.close(); }
 });
 
+test('mcp façade: pairing a room keeps the conversations already joined — they live in the core, which follows the pairing', async () => {
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const socketPath = path.join(dataDir, 'connector.sock');
+  const commands = [];
+  const fake = net.createServer(socket => { let buffer = ''; socket.on('data', chunk => { buffer += chunk; let i; while ((i = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, i); buffer = buffer.slice(i + 1); if (!line) continue; const input = JSON.parse(line); commands.push(input); const result = input.method === 'register' ? { binding_id: 'b-1', thread: input.params.thread, connected: false } : input.method === 'publish' ? { status: 'queued', text_saved: true } : { connected: false, bindings: [] }; socket.write(JSON.stringify({ id: input.id, ok: true, result }) + '\n'); } }); });
+  await new Promise(r => fake.listen(socketPath, r));
+  const roomHttp = http.createServer((req, res) => { req.resume(); req.on('end', () => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ connector_id: 'c-new', token: 't-new', protocol: 3 })); }); });
+  await new Promise(r => roomHttp.listen(0, '127.0.0.1', r));
+  const room = `http://127.0.0.1:${roomHttp.address().port}`;
+  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'sess-keep', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/x.sock', CLAUDE_CODE_MESSAGING_TOKEN: 'tok' }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
+  const call = async (id, name, args) => { child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }) + '\n'); const reply = await until(() => replies.find(x => x.id === id)); if (reply.error) throw new Error(reply.error.message); return JSON.parse(reply.result.content[0].text); };
+  try {
+    assert.ok((await call(1, 'voice_connect', { title: 'Local' })).local_only);
+    assert.ok((await call(2, 'voice_status', {})).local_only, 'voice_status says it too');
+    const paired = await call(3, 'voice_pair', { room, code: 'abc123' });
+    assert.equal(paired.status, 'paired'); assert.match(paired.next, /stay joined/);
+    assert.equal(commands.filter(c => c.method === 'unregister').length, 0, 'nothing left the core');
+    const status = await call(4, 'voice_status', {});
+    assert.equal(status.joined, true); assert.equal(status.local_only, undefined); assert.equal(status.room, room);
+    assert.equal((await call(5, 'voice_say', { text: 'sigo aquí', session_id: 's', revision: 1 })).status, 'published');
+  } finally { child.kill(); fake.close(); roomHttp.close(); }
+});
+
+test('connector: a conversation refused while its registration was in flight is not put back, and the core is told to let it go', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const revoked = 'La sala revocó el emparejamiento de esta máquina.';
+  room.handle = async (event, data) => {
+    if (event !== 'binding.register') return;
+    // The core says the room refused this machine before it answers the registration.
+    room.tell('node.rendezvous', { room: 'https://room.example', connected: false, via: null, error: null, refused: revoked });
+    await wait(300);
+    return { client_ref: data.client_ref, binding_id: 'b-' + data.client_ref, thread: data.thread };
+  };
+  const { child, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    await assert.rejects(facade.call('register', { client_ref: 'thread-1', harness: 'test', thread: 'thread-1', title: 'T', delivery: { kind: 'http', url: 'http://127.0.0.1:1/never', thread: 'thread-1' } }), /revoc/);
+    await until(() => room.sent('binding.unregister').some(d => d.binding_id === 'b-thread-1'));
+    assert.deepEqual((await facade.call('status', {})).bindings, [], 'no conversation left behind with nobody in it');
+    facade.end();
+  } finally { if (child.exitCode === null) child.kill(); await room.close(); }
+});
+
 test('connector: the room closing a conversation\'s voice removes the binding and the façade is told on its next call', async () => {
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));

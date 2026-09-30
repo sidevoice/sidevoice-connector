@@ -5,7 +5,8 @@
  *  hand like every other pin here. Where it is installed from, in order: `SIDEVOICE_CORE_SPEC` (a wheel,
  *  a directory, a git URL, a requirement — anything `uv pip install` takes); the wheel the published
  *  package carries beside its bundle (`dist/core/`) — or, run from a checkout, the wheel put beside these
- *  sources (`packages/connector/core/`, ignored by git); `sidevoice-core==CORE_VERSION` from the index.
+ *  sources (`packages/connector/core/`, ignored by git; `SIDEVOICE_CORE_WHEEL_DIR` names another folder);
+ *  `sidevoice-core==CORE_VERSION` from the index.
  *  `SIDEVOICE_CORE_BIN` skips installing altogether and names a `sidevoice-core` someone installed.
  *
  *  Installing a Python program is heavy the first time (a few hundred megabytes of wheels) and nothing
@@ -37,7 +38,7 @@ function logPath(dataDir) { return path.join(dataDir, 'core.log'); }
 /** What `uv pip install` is given for the pinned version. */
 export function coreSpec(env = process.env) {
   if (env.SIDEVOICE_CORE_SPEC) return env.SIDEVOICE_CORE_SPEC;
-  const wheel = path.join(here, 'core', `sidevoice_core-${CORE_VERSION}-py3-none-any.whl`);
+  const wheel = path.join(env.SIDEVOICE_CORE_WHEEL_DIR || path.join(here, 'core'), `sidevoice_core-${CORE_VERSION}-py3-none-any.whl`);
   return existsSync(wheel) ? wheel : `sidevoice-core==${CORE_VERSION}`;
 }
 
@@ -106,6 +107,12 @@ export async function ensureInstalled({ dataDir, env = process.env, log = () => 
   return bin;
 }
 
+/** Whether the pinned version's install is the one the spec names now: false after a wheel was rebuilt in place. */
+function installCurrent(dataDir, env) {
+  try { return JSON.parse(readFileSync(path.join(runtimeRoot(dataDir), CORE_VERSION, 'installed.json'), 'utf8')).spec === specIdentity(coreSpec(env)); }
+  catch { return false; }
+}
+
 /** What the running core wrote about itself, or null. */
 export function readReady(dataDir) {
   try {
@@ -131,8 +138,11 @@ const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 export async function ensureRunning({ dataDir, env = process.env, log = () => {}, timeout = 120_000, roomCredential = null }) {
   const running = readReady(dataDir);
   if (running && coreAlive(running.pid)) {
-    if (!running.version || running.version === CORE_VERSION || env.SIDEVOICE_CORE_BIN) return running;
-    log(`the running core is ${running.version}, this connector pins ${CORE_VERSION}: asking it to leave`);
+    if (env.SIDEVOICE_CORE_BIN) return running;
+    const pinned = !running.version || running.version === CORE_VERSION;
+    if (pinned && installCurrent(dataDir, env)) return running;
+    log(pinned ? `the running core was installed from an earlier build of ${coreSpec(env)}: asking it to leave`
+      : `the running core is ${running.version}, this connector pins ${CORE_VERSION}: asking it to leave`);
     try { process.kill(running.pid, 'SIGTERM'); } catch {}
     const deadline = Date.now() + 15_000;
     while (coreAlive(running.pid) && Date.now() < deadline) await wait(100);

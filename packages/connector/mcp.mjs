@@ -54,7 +54,7 @@ const { rpc } = connector;
 
 // ----- tools -----
 const tools = [
-  { name: 'voice_connect', description: 'Connect this conversation to the voice room. Only on an explicit request to join or enable voice. Fails, saying what to ask the user, when this machine is not paired with the room.',
+  { name: 'voice_connect', description: 'Connect this conversation to the voice room. Only on an explicit request to join or enable voice. Fails, saying what to ask the user, when a room is named that this machine is not paired with; with no room paired it joins this machine only (local_only).',
     inputSchema: { type: 'object', properties: { title: { type: 'string', description: 'Short label for this conversation in the room' }, room: { type: 'string', description: 'The room\'s address (https://…) when the user names one; omitted, the room this machine is paired with' } }, additionalProperties: false } },
   { name: 'voice_pair', description: 'Pair this machine with a room using the one-time code the user read from the room\'s interface ("Emparejar máquina"). Only with a code the user gave you; one room per machine, a new pairing replaces the previous one.',
     inputSchema: { type: 'object', properties: { room: { type: 'string', description: 'The room\'s address (https://…)' }, code: { type: 'string', description: 'The one-time pairing code shown by the room' } }, required: ['room', 'code'], additionalProperties: false } },
@@ -77,7 +77,7 @@ function promptText(args = {}) {
   return [
     'Join the voice room for this conversation and keep it reachable.',
     '',
-    '1. Call voice_status. If it reports joined and room_reachable, say so in one line and stop.',
+    '1. Call voice_status. If it reports joined and room_reachable (or local_only), say so in one line and stop.',
     `2. Call voice_connect with the title ${title ? JSON.stringify(title) : 'a short label of what this conversation is about'}. If the user named a room, pass its address as room.`,
     '   If it returns local_only, the machine has no room: relay that note in one line and continue.',
     '   If it fails saying this machine is not paired with the room (or is paired with a different one), ask the user for the room\'s address and the one-time code the room shows them under "Emparejar máquina"; call voice_pair with both, then voice_connect again. Never try to get a code from the room yourself.',
@@ -186,7 +186,7 @@ async function invoke(name, args, meta) {
     const closedTitles = Object.fromEntries(closedNow.map(ref => [ref, joined.get(ref)?.title ?? null]));
     const closedList = closedNow.length && !single() ? { closed_by_room: closedNow.map(ref => ({ title: closedTitles[ref], note: closedNote(status.closed_reasons?.[ref]) })) } : {};
     for (const ref of closedNow) joined.delete(ref);
-    const common = { room: status.room || pairedRoom()?.origin || null, room_reachable: status.connected, room_error: status.room_error || null, socket_error: status.socket_error || null,
+    const common = { room: status.room || pairedRoom()?.origin || null, room_reachable: status.connected, ...(pairedRoom() ? {} : { local_only: LOCAL_ONLY }), room_error: status.room_error || null, socket_error: status.socket_error || null,
              protocol: status.protocol ?? null,
              version: VERSION, connector_version: status.version || null, ...versionNote(status.version) };
     // Titles only: an id is the chat's own, handed to it by voice_connect, and must not reach another chat.
@@ -209,14 +209,11 @@ async function invoke(name, args, meta) {
     const previous = pairedRoom();
     // The room shows the code in upper case and compares it that way; a dictated one arrives however it was heard.
     const result = await pair(originOf(args.room), String(args.code).trim().toUpperCase());
-    // The connector that is up, if any, was started for the previous credential: let go of it so it can
-    // exit, and the next voice_connect starts one for this room. Other conversations still bound to the
-    // previous room keep that connector alive until they leave; they are not moved.
-    for (const b of [...joined.values()]) { try { await leave(b); } catch {} }
-    connector.end();
+    // The core follows the pairing file and links with the new room by itself: conversations already
+    // joined stay joined — they live in this machine's core, not in the room — and move with it.
     return { status: 'paired', room: result.origin, connector_id: result.connector_id,
-             ...(previous && previous.origin !== result.origin ? { replaced: previous.origin, note: 'Conversations on this machine still joined to the previous room keep it until they leave.' } : {}),
-             next: 'Call voice_connect to join.' };
+             ...(previous && previous.origin !== result.origin ? { replaced: previous.origin, note: `Every conversation on this machine is reached through ${result.origin} now, not ${previous.origin}.` } : {}),
+             next: joined.size ? 'Conversations already joined stay joined; the room reaches them within seconds.' : 'Call voice_connect to join.' };
   }
   // The node issues the code and keeps the devices; the connector asks its core for one. Nothing here
   // needs this conversation joined: pairing a device is not voice.

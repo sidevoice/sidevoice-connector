@@ -363,6 +363,12 @@ async function announce(binding) {
     log(`room rejected ${binding.client_ref}: ${error.message}`);
     throw error;
   });
+  // Gone while the core was answering — the pairing was refused, or its façade left: not put back, and the
+  // core is told to let it go, or it would stay live there with nobody behind it.
+  if (bindings.get(binding.binding_id) !== binding) {
+    if (reply.binding_id) send('binding.unregister', { binding_id: reply.binding_id });
+    throw new Error(refusal || 'This conversation left while it was being registered.');
+  }
   if (binding.binding_id !== reply.binding_id) { bindings.delete(binding.binding_id); binding.binding_id = reply.binding_id; bindings.set(reply.binding_id, binding); }
   // An engine observed while the room was answering is not lost: the frame was built before it arrived.
   if (binding.engine !== frame.engine) send('input.engine', { binding_id: binding.binding_id, engine: binding.engine });
