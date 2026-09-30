@@ -34,6 +34,7 @@ namespace.on('connection', socket => {
     const data = args[0] || {};
     said({ event, data });
     if (event === 'binding.register') acknowledge?.({ client_ref: data.client_ref, binding_id: 'core-' + data.client_ref, thread: data.thread });
+    else if (event === 'device.pairing_code') acknowledge?.({ code: 'SV1.fake-' + process.pid, payload: { v: 1, host: 'fake' }, expires_in: 600 });
     else acknowledge?.({ status: 'queued', text_saved: true, utterance_id: data.utterance_id });
   });
 });

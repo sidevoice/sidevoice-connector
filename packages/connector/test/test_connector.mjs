@@ -274,8 +274,9 @@ test('mcp façade: identity comes from the harness, tools are exposed, instructi
     assert.match(instructions, /take in newly arrived user input before starting the next step/);
     assert.match(instructions, /session_id and revision for every publication/);
     assert.match(instructions, /\[Sidevoice\] line that is not the user's/);
-    assert.deepEqual(replies[1].result.tools.map(t => t.name), ['voice_connect', 'voice_pair', 'voice_say', 'voice_disconnect', 'voice_status']);
+    assert.deepEqual(replies[1].result.tools.map(t => t.name), ['voice_connect', 'voice_pair', 'voice_say', 'voice_disconnect', 'voice_pair_device', 'voice_status']);
     assert.match(replies[0].result.instructions, /Never try to obtain a code from the room yourself/);
+    assert.match(instructions, /Pairing a device is the user's act: voice_pair_device only when asked/);
     assert.equal(replies[0].result.serverInfo.version, JSON.parse(readFileSync(path.join(here, '..', 'package.json'), 'utf8')).version, 'the façade says which version it is');
     const joined = JSON.parse(replies[2].result.content[0].text);
     assert.equal(joined.status, 'joined'); assert.equal(joined.harness, 'claude'); assert.equal(joined.conversation, 'sess-abc');
@@ -398,6 +399,135 @@ test('connector: the core asks it to pair this machine with a room (a page talki
     const clear = await core.ask('pair.request', { room: 'http://room.example.com', code: 'GOOD-CODE' });
     assert.equal(clear.ok, false, 'never a credential in clear over a network this machine does not own');
   } finally { if (child.exitCode === null) child.kill(); await core.close(); pairing.close(); }
+});
+
+/** What a node answers when its connector asks for a device pairing code (docs/DEVICE_PAIRING.md). */
+function issuedCode(host = 'macbook-pro') {
+  const payload = { v: 1, fp: 'f'.repeat(43), host, urls: ['http://127.0.0.1:8768'], rv: null, secret: 's'.repeat(22), exp: 1790000000 };
+  return { code: 'SV1.' + Buffer.from(JSON.stringify(payload)).toString('base64url'), payload, expires_in: 600 };
+}
+
+test('connector: pair_device asks the core for a code on its link and hands the façade exactly that', async () => {
+  const core = await startRoom();   // the stand-in plays this machine's core on the link
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const issued = issuedCode();
+  let answer = issued;
+  core.handle = event => event === 'device.pairing_code' ? answer : undefined;
+  const { child, socketPath } = startConnector(core.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    // Nothing joined: pairing a device is not voice, and needs no conversation.
+    assert.deepEqual(await facade.call('pair_device', {}), issued);
+    assert.deepEqual(core.sent('device.pairing_code'), [{}], 'asked once, with nothing to say');
+    // A room that will not have this machine does not stop a device pairing with the machine.
+    core.tell('node.rendezvous', { room: 'https://room.example', connected: false, via: null, error: null, refused: 'revoked' });
+    await until(async () => (await facade.call('status', {})).refused);
+    assert.equal((await facade.call('pair_device', {})).code, issued.code);
+    // A core that answers without a code (one older than device pairing) is said as such.
+    answer = {};
+    await assert.rejects(facade.call('pair_device', {}), /without a pairing code/);
+    facade.end();
+  } finally { if (child.exitCode === null) child.kill(); await core.close(); }
+});
+
+/** A connector socket that answers `pair_device` the way the real one does, and records what it was asked. */
+async function fakeConnector(dataDir, answer) {
+  const asked = [];
+  const server = net.createServer(socket => {
+    let buffer = '';
+    socket.on('data', chunk => {
+      buffer += chunk; let i;
+      while ((i = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, i); buffer = buffer.slice(i + 1); if (!line) continue;
+        const input = JSON.parse(line); asked.push(input);
+        const reply = input.method === 'pair_device' ? { id: input.id, ok: true, result: answer } : { id: input.id, ok: true, result: { connected: false, bindings: [] } };
+        socket.write(JSON.stringify(reply) + '\n');
+      }
+    });
+  });
+  await new Promise(r => server.listen(path.join(dataDir, 'connector.sock'), r));
+  return { asked, close: () => server.close() };
+}
+
+test('mcp façade and CLI: voice_pair_device and `sidevoice pair-device` show the code, its QR, how long it lasts and where it goes', async () => {
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const issued = issuedCode('estudio');
+  const connector = await fakeConnector(dataDir, issued);
+  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
+  const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+  try {
+    ask(1, 'tools/list', {}); ask(2, 'tools/call', { name: 'voice_pair_device', arguments: {} });
+    await until(() => replies.length === 2);
+    const tool = replies.find(r => r.id === 1).result.tools.find(t => t.name === 'voice_pair_device');
+    assert.deepEqual(tool.inputSchema, { type: 'object', properties: {}, additionalProperties: false }, 'no arguments');
+    assert.match(tool.description, /Only when the user asks to pair a device/);
+    const text = replies.find(r => r.id === 2).result.content[0].text;
+    const lines = text.split('\n');
+    assert.ok(lines.includes(issued.code), 'the code, on a line of its own, to be copied whole');
+    assert.match(text, /this machine \(estudio\), valid for 10 minutes/);
+    const qr = lines.filter(line => /[▀▄█]/.test(line));
+    assert.ok(qr.length >= 20, `a QR in half blocks (${qr.length} lines)`);
+    assert.ok(new Set(qr.map(line => line.length)).size === 1, 'a square of even lines');
+    assert.equal(lines.at(-1), 'Paste it in the Sidevoice app under Máquinas → Emparejar.');
+    assert.deepEqual(connector.asked.map(c => c.method), ['pair_device']);
+
+    // The command says the same, on stdout.
+    const cli = spawn(process.execPath, [path.join(here, '..', 'cli.mjs'), 'pair-device'], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let printed = ''; cli.stdout.on('data', d => { printed += d; });
+    const code = await new Promise(resolve => cli.on('exit', resolve));
+    assert.equal(code, 0);
+    assert.equal(printed, text + '\n');
+  } finally { child.kill(); connector.close(); }
+});
+
+test('link-room: this machine asks the room for a code as its page does, naming the room as the origin, and redeems it', async () => {
+  const seen = [];
+  let codes = true;
+  const room = http.createServer(async (req, res) => {
+    let body = ''; for await (const chunk of req) body += chunk;
+    seen.push({ url: req.url, origin: req.headers.origin, body: body ? JSON.parse(body) : null });
+    const origin = `http://127.0.0.1:${room.address().port}`;
+    const reply = (status, value) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)); };
+    if (req.url === '/api/connectors/pairing-code')
+      return codes && req.headers.origin === origin ? reply(200, { code: 'ABCD-EFGH-JKMN', expires_in: 180 }) : reply(403, { detail: 'Use the room from its own address.' });
+    if (req.url === '/api/connectors/pair')
+      return reply(200, { connector_id: 'node-3', token: 'tok-3', protocol: 3, dial_key: 'dk-3' });
+    reply(404, {});
+  });
+  await new Promise(resolve => room.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${room.address().port}`;
+  const run = (dataDir, ...args) => new Promise(resolve => {
+    const child = spawn(process.execPath, [path.join(here, '..', 'cli.mjs'), 'link-room', ...args], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = ''; child.stdout.on('data', d => { stdout += d; }); child.stderr.on('data', d => { stderr += d; });
+    child.on('exit', code => resolve({ code, stdout, stderr }));
+  });
+  try {
+    const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+    const linked = await run(dataDir, origin + '/voice/');
+    assert.equal(linked.code, 0, linked.stderr);
+    assert.match(linked.stdout, new RegExp(`Linked with ${origin} as connector node-3`));
+    assert.deepEqual(seen.map(s => [s.url, s.origin]), [['/api/connectors/pairing-code', origin], ['/api/connectors/pair', undefined]]);
+    assert.equal(seen[1].body.code, 'ABCD-EFGH-JKMN');
+    assert.equal(seen[1].body.host, os.hostname(), 'the machine says what it is, as when paired by hand');
+    assert.deepEqual(JSON.parse(readFileSync(path.join(dataDir, 'credentials.json'), 'utf8')),
+      { url: origin, connector_id: 'node-3', token: 'tok-3', protocol: 3, dial_key: 'dk-3' });
+
+    // A room that gives no code says why, and nothing is written.
+    codes = false;
+    const other = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+    const refused = await run(other, origin);
+    assert.equal(refused.code, 1);
+    assert.match(refused.stderr, /gave no pairing code: Use the room from its own address/);
+    assert.equal(existsSync(path.join(other, 'credentials.json')), false);
+    // Never asked in clear over a network this machine does not own.
+    seen.length = 0;
+    const clear = await run(other, 'http://room.example.com');
+    assert.equal(clear.code, 1); assert.match(clear.stderr, /must be https/);
+    assert.equal(seen.length, 0);
+    assert.equal((await run(other)).code, 2, 'usage');
+  } finally { room.close(); }
 });
 
 test('connector: the conversation\'s state is said again on a clock, not only when it changes', async () => {

@@ -119,6 +119,19 @@ test('core: a running core is found, not started twice, and a connector that lea
   } finally { node.stop(); }
 });
 
+test('core: a device pairing code is the core\'s to issue: asked with nothing running, the connector starts the core and asks it', async () => {
+  const node = machine({ SIDEVOICE_CORE_SPEC: '/wheels/x.whl' });
+  try {
+    await until(() => existsSync(node.socketPath));
+    const facade = ipc(node.socketPath); await facade.ready;
+    const issued = await facade.call('pair_device', {});
+    const core = node.ready();
+    assert.deepEqual(issued, { code: 'SV1.fake-' + core.pid, payload: { v: 1, host: 'fake' }, expires_in: 600 });
+    assert.ok(node.said().some(line => line.pid === core.pid && line.event === 'device.pairing_code'), 'asked of the core over its link');
+    facade.end();
+  } finally { node.stop(); }
+});
+
 test('core: with no uv on the machine, joining says how to install it, and nothing else breaks', async () => {
   const empty = mkdtempSync(path.join(os.tmpdir(), 'sv-home-'));
   const node = machine({ SIDEVOICE_UV: undefined, PATH: path.dirname(process.execPath), HOME: empty });
@@ -126,6 +139,7 @@ test('core: with no uv on the machine, joining says how to install it, and nothi
     await until(() => existsSync(node.socketPath));
     const facade = ipc(node.socketPath); await facade.ready;
     await assert.rejects(register(facade), error => error.message === NO_UV);
+    await assert.rejects(facade.call('pair_device', {}), error => error.message === NO_UV, 'a device pairing code needs the core too, and says why');
     const status = await facade.call('status', {});
     assert.equal(status.core_error, NO_UV);
     assert.equal(node.child.exitCode, null, 'the connector is still there for the next attempt');

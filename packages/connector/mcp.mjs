@@ -1,24 +1,16 @@
 #!/usr/bin/env node
 /** Stdio MCP façade for one conversation. It holds no connection to the room: it starts or reuses
  *  the host's connector and keeps one local connection to it for as long as this session lives. */
-import net from 'node:net';
-import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
 import { advertisedCapabilities, capabilityState, SUPPORTED } from './harness-contract.mjs';
 import { harnessFor, identifyHarness } from './harnesses.mjs';
 import { pair, pairedRoom } from './pair.mjs';
+import { connectorClient } from './ipc.mjs';
+import { pairDevice } from './pair-device.mjs';
 import { readFileSync } from 'node:fs';
 
 const VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
-
-const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
-const socketPath = process.env.SIDEVOICE_CONNECTOR_SOCKET || path.join(dataDir, 'connector.sock');
-// The connector is started through the same entry this façade came in by — `cli.mjs connector` —
-// because published there is one bundled file and no `connector.mjs` beside it to point at.
-const cliPath = fileURLToPath(new URL('./cli.mjs', import.meta.url));
 
 // Claude Code keeps at most 2048 characters of these; the rest is cut (measured 2026-09-21).
 const INSTRUCTIONS = `Sidevoice connects this conversation to the user's voice room.
@@ -30,48 +22,12 @@ const INSTRUCTIONS = `Sidevoice connects this conversation to the user's voice r
 - If the user closes this conversation's voice from the room, voice_say fails saying so: continue in writing, do not retry, and call voice_connect again only if asked.
 - Pairing is the user's act. If voice_connect says this machine is not paired with the room, ask the user for the room's address and the one-time code the room shows under "Emparejar máquina", then call voice_pair and voice_connect again. Never try to obtain a code from the room yourself.
 - If voice_connect returns inbound.ok false, voice will look sent and never arrive: tell the user inbound.reason, offer inbound.remedy in your own words including the safeguard the machine-wide option removes, and change no settings unasked.
-- Read receipts and working state need nothing from you: the room observes what the harness records.`;
+- Read receipts and working state need nothing from you: the room observes what the harness records.
+- Pairing a device is the user's act: voice_pair_device only when asked; show just its result.`;
 
 // ----- one persistent connection to the connector -----
-let ipc = null, ipcBuffer = '', ipcSerial = 0;
-const ipcWaiting = new Map();
-function connectIpc() {
-  return new Promise((resolve, reject) => {
-    const socket = net.createConnection(socketPath);
-    socket.once('error', reject);
-    socket.on('connect', () => {
-      socket.removeListener('error', reject);
-      socket.on('error', () => {});
-      socket.on('close', () => { if (ipc === socket) ipc = null; for (const w of ipcWaiting.values()) w.reject(new Error('Connector went away')); ipcWaiting.clear(); });
-      socket.on('data', chunk => {
-        ipcBuffer += chunk; let index;
-        while ((index = ipcBuffer.indexOf('\n')) >= 0) {
-          const line = ipcBuffer.slice(0, index); ipcBuffer = ipcBuffer.slice(index + 1);
-          let reply; try { reply = JSON.parse(line); } catch { continue; }
-          const waiting = ipcWaiting.get(reply.id); if (!waiting) continue; ipcWaiting.delete(reply.id);
-          reply.ok ? waiting.resolve(reply.result) : waiting.reject(new Error(reply.error));
-        }
-      });
-      ipc = socket; resolve(socket);
-    });
-  });
-}
-async function ensureConnector() {
-  if (ipc) return ipc;
-  try { return await connectIpc(); } catch {}
-  const child = spawn(process.execPath, [cliPath, 'connector'], { detached: true, stdio: 'ignore', env: process.env });
-  child.unref();
-  for (let attempt = 0; attempt < 40; attempt++) {
-    await new Promise(r => setTimeout(r, 100));
-    try { return await connectIpc(); } catch {}
-  }
-  throw new Error('The Sidevoice connector did not start (is this host paired? see docs/INSTALL.md)');
-}
-async function rpc(method, params) {
-  await ensureConnector();
-  const id = ++ipcSerial;
-  return new Promise((resolve, reject) => { ipcWaiting.set(id, { resolve, reject }); ipc.write(JSON.stringify({ id, method, params }) + '\n'); });
-}
+const connector = connectorClient();
+const { rpc } = connector;
 
 // ----- tools -----
 const tools = [
@@ -82,6 +38,8 @@ const tools = [
   { name: 'voice_say', description: 'Publish a concise spoken version of your reply to the room, with the session_id and revision from the voice message header.',
     inputSchema: { type: 'object', properties: { text: { type: 'string' }, session_id: { type: 'string' }, revision: { type: 'integer', minimum: 0 }, utterance_id: { type: 'string' }, language: { type: 'string', enum: ['es', 'en', 'fr', 'it', 'pt', 'hi'] } }, required: ['text', 'session_id', 'revision'], additionalProperties: false } },
   { name: 'voice_disconnect', description: 'Leave the voice room. The conversation and its work continue in writing.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+  { name: 'voice_pair_device', description: 'Show a one-time code to pair a device (the desktop app or a browser) with this machine: the code, a QR of it and how long it is valid. Only when the user asks to pair a device, never on your own initiative; show the user the result as it is.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
   { name: 'voice_status', description: 'Whether the room can currently reach this conversation.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
 ];
 /** The joining steps as a prompt: what the voice-room skill used to be, now carried by the server itself so
@@ -125,7 +83,7 @@ function pairingNeeded(room, paired) {
 }
 /** A connector from another version serves this conversation with that version's behaviour. */
 function versionNote(connectorVersion) {
-  if (!ipc || connectorVersion === VERSION) return {};
+  if (!connector.connected || connectorVersion === VERSION) return {};
   return { note: `The connector running on this machine is ${connectorVersion ? 'version ' + connectorVersion : 'older than this server'}; this conversation runs ${VERSION}. It exits 15 s after the last conversation leaves it; until then behaviour is that version's.` };
 }
 function inboundFor(harness, thread) {
@@ -133,7 +91,7 @@ function inboundFor(harness, thread) {
 }
 async function invoke(name, args, meta) {
   if (name === 'voice_status') {
-    const status = ipc ? await rpc('status', {}) : { connected: false, bindings: [], closed_by_room: [] };
+    const status = connector.connected ? await rpc('status', {}) : { connected: false, bindings: [], closed_by_room: [] };
     // The room may have closed this conversation's voice since we joined: the connector is the truth.
     const closed = !!binding && (status.closed_by_room || []).includes(binding.client_ref);
     const closedFor = closed ? status.closed_reasons?.[binding.client_ref] : null;
@@ -156,11 +114,14 @@ async function invoke(name, args, meta) {
     // exit, and the next voice_connect starts one for this room. Other conversations still bound to the
     // previous room keep that connector alive until they leave; they are not moved.
     if (binding) { try { await rpc('unregister', { binding_id: binding.binding_id }); } catch {} binding = null; }
-    if (ipc) { ipc.end(); ipc = null; }
+    connector.end();
     return { status: 'paired', room: result.origin, connector_id: result.connector_id,
              ...(previous && previous.origin !== result.origin ? { replaced: previous.origin, note: 'Conversations on this machine still joined to the previous room keep it until they leave.' } : {}),
              next: 'Call voice_connect to join.' };
   }
+  // The node issues the code and keeps the devices; the connector asks its core for one. Nothing here
+  // needs this conversation joined: pairing a device is not voice.
+  if (name === 'voice_pair_device') return (await pairDevice(rpc)).text;
   if (name === 'voice_connect') {
     const needed = pairingNeeded(args.room, pairedRoom());
     if (needed) { const error = new Error(needed); error.data = { pairing_needed: true, room: args.room ? originOf(args.room) : null }; throw error; }
@@ -230,11 +191,11 @@ process.stdin.on('data', async chunk => {
         result = { description: PROMPTS[0].description, messages: [{ role: 'user', content: { type: 'text', text: promptText(request.params?.arguments) } }] };
       }
       else if (request.method === 'tools/list') result = { tools };
-      else if (request.method === 'tools/call') { const value = await invoke(request.params.name, request.params.arguments || {}, request.params._meta); result = { content: [{ type: 'text', text: JSON.stringify(value) }] }; }
+      else if (request.method === 'tools/call') { const value = await invoke(request.params.name, request.params.arguments || {}, request.params._meta); result = { content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }] }; }
       else if (request.method === 'ping') result = {};
       else throw Object.assign(new Error('Method not found'), { code: -32601 });
     } catch (e) { error = { code: e.code || -32603, message: e.message }; }
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, ...(error ? { error } : { result }) }) + '\n');
   }
 });
-process.stdin.on('end', () => { ipc?.end(); process.exit(0); });
+process.stdin.on('end', () => { connector.end(); process.exit(0); });

@@ -7,7 +7,8 @@ The client side. One bin (`sidevoice`), these entry points:
   version left. Pairs with nothing and installs no Python; reports whether the
   machine is paired, with which room, and whether `uv` is there for the core.
 - `mcp` — the stdio MCP server a harness starts. One per conversation. Exposes
-  `voice_connect`, `voice_pair`, `voice_say`, `voice_disconnect`, `voice_status`; carries the
+  `voice_connect`, `voice_pair`, `voice_say`, `voice_disconnect`, `voice_pair_device`,
+  `voice_status`; carries the
   operational instructions in its `initialize` result. It never talks to the
   room: it keeps one local connection to the connector for as long as the
   session lives, and the binding it registered dies with that connection.
@@ -19,10 +20,18 @@ The client side. One bin (`sidevoice`), these entry points:
   for speech published while offline, and delivers one input event at a time per
   binding through the adapter that binding was registered with. A file lock
   makes it a singleton.
-- `pair` — redeems, by hand, a pairing code from the room UI for this machine's
-  credential (`~/.sidevoice/credentials.json`, mode 0600). The usual path is the
-  conversation's `voice_pair`, with the code the user read from the room; nothing
-  on the client side ever asks the room for a code.
+- `pair <room-url> <code>` — redeems, by hand, a pairing code from the room UI for
+  this machine's credential (`~/.sidevoice/credentials.json`, mode 0600), the one its
+  core links with the room by. The conversation's path is `voice_pair`, with the code
+  the user read from the room; the conversation never asks the room for a code.
+- `link-room <room-url>` — the same without a page: asks the room for a code
+  (`POST /api/connectors/pairing-code`, naming the room as the origin) and redeems it.
+  Registering with a room is open: a room is a relay and grants nothing by itself.
+- `pair-device` — prints a one-time code (and a QR of it) that pairs a device — the
+  desktop app, a browser — with this machine, starting the core if needed; the same
+  as the conversation's `voice_pair_device`. The core issues it and keeps the devices
+  ([`docs/DEVICE_PAIRING.md`](../../docs/DEVICE_PAIRING.md)); the person pastes it in
+  the app under Máquinas → Emparejar.
 
 Harness modules implement one contract (`harness-contract.mjs`): delivery,
 inbound inspection, mechanical working state (polled or lifecycle-backed), end-of-turn reporting and session
@@ -51,10 +60,12 @@ Events: `connector.welcome` after connecting; `binding.register` (carrying the
 declared harness capabilities), answered with the binding or `{ error }`;
 `binding.unregister`; `input.deliver`, answered with the acknowledgement;
 `input.working`; `input.read`; `speech.publish`, answered with what the core did
-with it; `binding.close`; `node.rendezvous`. Protocol version 2 on this link.
+with it; `binding.close`; `node.rendezvous`; `pair.request`, answered with the
+pairing's outcome; `device.pairing_code`, answered with `{code, payload, expires_in}`.
+Protocol version 2 on this link.
 
 Node 22+. The published package has **no runtime dependencies**: `npm run build`
-bundles `socket.io-client` and everything else into `dist/cli.mjs` with esbuild,
+bundles `socket.io-client`, `qrcode` and everything else into `dist/cli.mjs` with esbuild,
 so installing it copies files and fetches nothing. Tests run on the source:
 `node --test test/test_connector.mjs` (`test_core.mjs` covers the install and
 supervision against a fake `uv` and a fake core); sidevoice-core's

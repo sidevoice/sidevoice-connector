@@ -291,21 +291,48 @@ function enrol(binding) {
   return binding.registration;
 }
 
+/** Until the link is up, or the timeout. True when something woke the wait — a welcome, or a failure
+ *  whose reason the caller then reads — false when the time ran out. */
+function welcomed(timeout) {
+  if (connected) return Promise.resolve(true);
+  return new Promise(resolve => {
+    const timer = setTimeout(() => { waking = waking.filter(wake => wake !== wakeup); resolve(false); }, timeout);
+    const wakeup = () => { clearTimeout(timer); resolve(true); };
+    waking.push(wakeup);
+  });
+}
+
 /** The room's answer for one binding, however long it takes to be able to ask: a conversation that
  *  joins while the room is down is registered by the next welcome, and that is this call's answer too. */
 async function joinRoom(binding, timeout = 10_000) {
   if (refusal) throw new Error(refusal);
   if (connected) return enrol(binding);
-  const welcomed = await new Promise(resolve => {
-    const timer = setTimeout(() => { waking = waking.filter(wake => wake !== wakeup); resolve(false); }, timeout);
-    const wakeup = () => { clearTimeout(timer); resolve(true); };
-    waking.push(wakeup);
-  });
+  const woken = await welcomed(timeout);
   // A room that is not there yet is worth waiting for; one that will not have this machine is not.
   if (refusal) throw new Error(refusal);
   if (coreError) throw new Error(coreError);   // the local core could not be had, and says why
-  if (!welcomed) throw new Error(UNREACHABLE);
+  if (!woken) throw new Error(UNREACHABLE);
   return binding.registration ?? enrol(binding);
+}
+
+/** A one-time code for pairing a device with this machine (`docs/DEVICE_PAIRING.md`). The core issues it
+ *  and keeps the devices; this only asks, starting the core first as a join would. Whether the room will
+ *  have this machine does not matter here: a device pairs with the machine, not with the room. */
+const CORE_WAIT_MS = Number(process.env.SIDEVOICE_CORE_WAIT_MS || 30_000);
+const PAIRING_CODE_TIMEOUT_MS = 10_000;
+async function devicePairingCode() {
+  open();
+  if (!connected) await welcomed(CORE_WAIT_MS);
+  if (!connected) {
+    if (coreError) throw new Error(coreError);
+    throw new Error('This machine\'s core is not up yet (the first start installs it and can take a few minutes); ask again in a moment.');
+  }
+  let answer;
+  try { answer = await request('device.pairing_code', {}, { timeout: PAIRING_CODE_TIMEOUT_MS }); }
+  catch (error) { throw new Error(`This machine's core did not issue a pairing code (${error.message}); it may be older than device pairing.`); }
+  if (typeof answer?.code !== 'string' || !answer.code) throw new Error(answer?.error || answer?.detail || 'This machine\'s core answered without a pairing code.');
+  log(`the core issued a device pairing code (valid ${answer.expires_in ?? '?'} s)`);
+  return { code: answer.code, payload: answer.payload ?? null, expires_in: answer.expires_in ?? null };
 }
 
 async function announce(binding) {
@@ -478,6 +505,7 @@ async function command(client, input) {
       scheduleExit(); return { ...snapshot(), left: !!binding };
     }
     case 'status': return snapshot();
+    case 'pair_device': return devicePairingCode();
     default: throw new Error('Unknown connector command');
   }
 }
