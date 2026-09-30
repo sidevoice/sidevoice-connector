@@ -361,6 +361,45 @@ test('connector: a pairing revoked from the room takes the voice now, says why, 
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
 });
 
+test('connector: the core asks it to pair this machine with a room (a page talking to the core directly), and the pairing is written as voice_pair writes it', async () => {
+  const core = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  // The room being paired with: it redeems the code for this machine's credential.
+  const redeemed = [];
+  const pairing = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      const asked = JSON.parse(body || '{}');
+      redeemed.push({ path: req.url, ...asked });
+      const good = asked.code === 'GOOD-CODE';
+      res.writeHead(good ? 200 : 400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(good ? { connector_id: 'machine-7', token: 'tok', protocol: 3, dial_key: 'dk' } : { detail: 'Código caducado' }));
+    });
+  });
+  await new Promise(resolve => pairing.listen(0, '127.0.0.1', resolve));
+  const roomUrl = `http://127.0.0.1:${pairing.address().port}`;
+  const { child } = startConnector(core.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  try {
+    await until(() => core.socket);
+    const refused = await core.ask('pair.request', { room: roomUrl, code: 'OLD-CODE' });
+    assert.equal(refused.ok, false);
+    assert.match(refused.detail, /Código caducado/);
+    assert.equal(existsSync(path.join(dataDir, 'credentials.json')), false, 'a refused code writes nothing');
+
+    const answer = await core.ask('pair.request', { room: roomUrl, code: 'GOOD-CODE' });
+    assert.deepEqual(answer, { ok: true, origin: roomUrl, connector_id: 'machine-7' });
+    assert.equal(redeemed.at(-1).path, '/api/connectors/pair');
+    assert.equal(redeemed.at(-1).code, 'GOOD-CODE');
+    const saved = JSON.parse(readFileSync(path.join(dataDir, 'credentials.json'), 'utf8'));
+    assert.deepEqual(saved, { url: roomUrl, connector_id: 'machine-7', token: 'tok', protocol: 3, dial_key: 'dk' });
+
+    assert.equal((await core.ask('pair.request', { room: '', code: 'x' })).ok, false);
+    const clear = await core.ask('pair.request', { room: 'http://room.example.com', code: 'GOOD-CODE' });
+    assert.equal(clear.ok, false, 'never a credential in clear over a network this machine does not own');
+  } finally { if (child.exitCode === null) child.kill(); await core.close(); pairing.close(); }
+});
+
 test('connector: the conversation\'s state is said again on a clock, not only when it changes', async () => {
   // A room that restarts has forgotten what it was told. Waiting for the next change means a conversation
   // that was already working shows nothing at all until it stops (2026-09-20).

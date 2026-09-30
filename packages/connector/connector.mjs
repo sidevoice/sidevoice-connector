@@ -19,7 +19,7 @@ import { execFileSync } from 'node:child_process';
 import { capabilityState, SUPPORTED, voiceEnvelope } from './harness-contract.mjs';
 import { harnessFor } from './harnesses.mjs';
 import { machineIdentity, VERSION } from './identity.mjs';
-import { roomOrigin } from './pair.mjs';
+import { pair, roomOrigin } from './pair.mjs';
 import { roomLink, UNREACHABLE } from './link.mjs';
 import { coreAlive, ensureRunning, readReady } from './core.mjs';
 
@@ -365,6 +365,18 @@ async function asked(route, frame) {
       else if (refusal && previous?.refused === refusal) { refusal = lastError = null; log('the room accepts this machine again'); }
       if (!previous || previous.connected !== frame.connected) log(`the room at ${frame.room || '(not paired)'} is ${frame.connected ? 'reachable' : 'not reachable'}${frame.via ? ' (' + frame.via + ')' : ''}${frame.error ? ': ' + frame.error : ''}`);
       return;
+    }
+    case 'pair.request': {
+      // A page talking to this machine's core directly (a desktop shell) pairs it with a room: the same
+      // act as voice_pair, with the code the person read from that room. The core asks; pairing — and the
+      // credentials file it writes, which the core then follows — stays this connector's.
+      if (typeof frame.room !== 'string' || typeof frame.code !== 'string' || !frame.room || !frame.code)
+        return { ok: false, detail: 'Hacen falta la dirección de la sala y el código.' };
+      try {
+        const paired = await pair(frame.room, frame.code);
+        log(`paired with ${paired.origin} as ${paired.connector_id}, asked from a page through the core`);
+        return { ok: true, origin: paired.origin, connector_id: paired.connector_id };
+      } catch (error) { return { ok: false, detail: error.message }; }
     }
     case 'connector.error': lastError = frame.error; log('room says: ' + frame.error); return;
   }
