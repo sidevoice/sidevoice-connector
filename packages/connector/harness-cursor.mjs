@@ -27,6 +27,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { defineHarness, envelope, SUPPORTED, UNSUPPORTED, tailJsonl, voiceEnvelope } from './harness-contract.mjs';
 import { deliverToView, drawsViews, openView, THREAD_PREFIX, viewKey, viewState } from './harness-cursor-app.mjs';
+import { bridgeInstances, callingThread, composerHolding, sendToThread } from './harness-cursor-desktop.mjs';
+
+/** Which Cursor chat each editor conversation is, once known (connector process): from the Desktop Bridge at
+ *  join, from Cursor's state database, or from the transcript that holds a message delivered to it. */
+const composers = new Map();
 
 /** Where the CLI may keep chats (`chats/`): `CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`, else
  *  `~/.cursor`. Cursor scrubs the environment of its MCP servers, so the variables the CLI saw may not be
@@ -112,7 +117,7 @@ export function sessionIdentity({ client, env = process.env, locate = findChat, 
   const found = locate();
   // The editor — the client that draws views; cursor-agent does not — whatever its parent holds open: the
   // chat is the one the view `voice_connect` returns is drawn in, and the id is ours.
-  if (drawsViews(client)) { const thread = THREAD_PREFIX + randomUUID(); return { harness: 'cursor', thread, route: 'cursor-editor-view', chatStoreHeld: !!found,
+  if (drawsViews(client)) { const thread = THREAD_PREFIX + randomUUID(); return { harness: 'cursor', thread, route: bridgeInstances(env).length ? 'cursor-editor-bridge' : 'cursor-editor-view', chatStoreHeld: !!found,
     delivery: { kind: 'cursor-app', thread, key: viewKey() },
     // Working state comes from the chat's transcript once the first voice message it takes says which it is.
     experimental: ['sessionIdentity', 'working', 'endOfTurn'], editor: true, watchNote: EDITOR_WATCH }; }
@@ -181,8 +186,24 @@ async function persistPane(chat, env) {
  *  for it, as the CLI's input does) so the newlines stay inside the message, then Enter on its own after a
  *  pause, so it is a key and not the end of the paste. tmux proves the keys reached the pane, not that
  *  Cursor took them: the answer is `unknown`, and the transcript gives the read receipt. */
+/** What only an asynchronous look can add to an editor identity: which Cursor chat is calling, when the Desktop
+ *  Bridge can tell (the only local chat working right now). */
+export async function refineIdentity(who, env = process.env) {
+  if (who?.delivery?.kind !== 'cursor-app' || who.route !== 'cursor-editor-bridge') return who;
+  let composer = null; try { composer = await callingThread(env); } catch {}
+  return composer ? { ...who, delivery: { ...who.delivery, composer } } : who;
+}
+
 export async function deliver(delivery, event, env = process.env) {
   if (delivery?.kind === 'cursor-app') {
+    // The chat by its own id through Cursor's Desktop Bridge, when both are there; else its card.
+    const composer = composers.get(delivery.thread) || delivery.composer || null;
+    if (composer && bridgeInstances(env).length) {
+      try {
+        const sent = await sendToThread(composer, envelope(event), env);
+        return { status: 'accepted', detail: `Cursor Desktop Bridge: ${sent.outcome}` };
+      } catch (error) { /* the card is still there to try */ }
+    }
     // The editor: the view drawn in that chat dispatches it. Cursor answers only when the turn it starts is
     // over, so what is known now is what a keystroke proves.
     await deliverToView(delivery.thread, { message_id: event.message_id, text: envelope(event) });
@@ -209,13 +230,14 @@ const PASTE_SETTLE_MS = Number(process.env.SIDEVOICE_CURSOR_PASTE_SETTLE_MS || 1
 export function deliveryState(delivery) {
   if (delivery?.kind !== 'cursor-app') return null;
   const view = viewState(delivery.thread);
-  return { card_connected: !!view?.seen, card_last_seen_ms_ago: view?.seen ? Date.now() - view.seen : null };
+  return { card_connected: !!view?.seen, card_last_seen_ms_ago: view?.seen ? Date.now() - view.seen : null, bridge_chat_known: composers.has(delivery.thread) || !!delivery.composer };
 }
 
 /** Before any delivery, when the connector registers a conversation: an editor chat's view needs the
  *  connector's loopback bridge open for it, and learns the port from what `voice_connect` returns. */
 export async function prepare(delivery, { log, admitted } = {}) {
   if (delivery?.kind !== 'cursor-app') return null;
+  if (delivery.composer) composers.set(delivery.thread, delivery.composer);
   // Cursor answers the card's ui/message once the turn it started has run: the chat took that message.
   const { port, close } = await openView(delivery.thread, delivery.key, { log, answered: (message_id, ok) => { if (ok) admitted?.(message_id); } });
   // The card delivers, not the façade: the conversation can outlive the MCP process that created it.
@@ -330,13 +352,21 @@ export function observe(chatId, handlers, env = process.env) {
  *  never says. The first voice message it takes says it: the transcript that holds that message's header is
  *  this chat's. From then on it is watched like a CLI chat — early read receipt, working, end of turn. */
 function observeEditorChat(thread, handlers, env) {
-  let inner = null;
+  let inner = null, lookedUp = 0, looking = false;
   const timer = setInterval(() => {
     if (inner) return;
+    // Known already (the bridge said which chat joined), or findable in Cursor's state database: watch it now.
+    const known = composers.get(thread);
+    if (known) { inner = observe(known, handlers, env); return; }
+    if (!looking && bridgeInstances(env).length && Date.now() - lookedUp > 5000) {
+      looking = true; lookedUp = Date.now();
+      composerHolding(thread, env).then(composer => { if (composer && !composers.has(thread)) composers.set(thread, composer); }).catch(() => {}).finally(() => { looking = false; });
+    }
     const wanted = handlers.expecting?.() || [];
     if (!wanted.length) return;
     const found = transcriptHolding(wanted, env);
     if (!found) return;
+    composers.set(thread, found.chat);
     inner = observe(found.chat, handlers, env);
     handlers.userMessage({ text: found.text, turn_id: null });
   }, EDITOR_SCAN_MS);
@@ -392,6 +422,7 @@ export const cursorHarness = defineHarness({
   deliver,
   prepare,
   deliveryState,
+  refineIdentity,
   // Delivery types into the chat's terminal through tmux (CLI) or submits through an MCP App view (editor):
   // it works, by routes Cursor does not offer as an interface.
   experimental: ['deliver'],

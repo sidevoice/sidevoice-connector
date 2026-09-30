@@ -429,3 +429,62 @@ test('cursor editor: a view never submits what its own connector did not sign �
     assert.deepEqual(view.dispatched, []);
   } finally { view.stop(); rogue.close(); }
 });
+
+/** A stand-in for Cursor 3.22.12's Desktop Bridge (desktopBridgeMainService): HTTP on a unix socket, POST /,
+ *  Bearer token, `listThreads` and `sendMessage`, announced by a discovery file. */
+export async function fakeDesktopBridge({ threads = [], answer = () => ({ outcome: 'submitted', threadTitle: 'T' }), userDataDir } = {}) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'sv-bridge-'));
+  const socketPath = path.join(dir, 'b.sock'), token = 'c'.repeat(64), sent = [];
+  const server = http.createServer((req, res) => {
+    const reply = (code, body) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.url !== '/' || req.method !== 'POST') return reply(404, { error: 'not_found' });
+    if (req.headers.authorization !== `Bearer ${token}`) return reply(401, { error: 'unauthorized' });
+    let body = ''; req.on('data', c => { body += c; }); req.on('end', () => {
+      const request = JSON.parse(body);
+      if (request.type === 'listThreads') return reply(200, { threads });
+      if (request.type === 'sendMessage') { sent.push(request); return reply(200, answer(request)); }
+      reply(400, { error: 'invalid_request' });
+    });
+  });
+  await new Promise(resolve => server.listen(socketPath, resolve));
+  writeFileSync(path.join(dir, 'abcdef0123456789.json'), JSON.stringify({ protocolVersion: 1, pid: process.pid, socketPath, token, appName: 'Cursor', appVersion: '3.22.12', userDataDir: userDataDir || dir, createdAt: Date.now() }), { mode: 0o600 });
+  return { dir, sent, threads, env: { CURSOR_DESKTOP_BRIDGE_DIR: dir }, close: () => new Promise(resolve => server.close(resolve)) };
+}
+
+test('cursor desktop bridge: the calling chat is the only one working, and a message goes to a chat by its id', async () => {
+  const bridge = await import('../harness-cursor-desktop.mjs');
+  const thread = (id, status, source = 'local') => ({ id, title: id, source, status, lastUpdatedAt: Date.now(), windowId: 1 });
+  const fake = await fakeDesktopBridge({ threads: [thread('comp-A', 'running'), thread('comp-B', 'idle'), thread('cloud-1', 'running', 'cloud')],
+    answer: request => request.threadId === 'ghost' ? { outcome: 'not-found' } : { outcome: request.threadId === 'comp-B' ? 'queued' : 'submitted', threadTitle: request.threadId } });
+  try {
+    assert.equal(bridge.bridgeInstances(fake.env).length, 1);
+    assert.equal(bridge.bridgeInstances({ CURSOR_DESKTOP_BRIDGE_DIR: '/nonexistent' }).length, 0);
+    assert.deepEqual((await bridge.listThreads(fake.env)).map(t => t.id), ['comp-A', 'comp-B', 'cloud-1']);
+    assert.equal(await bridge.callingThread(fake.env), 'comp-A', 'the only local chat working is the one calling');
+    fake.threads.push(thread('comp-C', 'running'));
+    assert.equal(await bridge.callingThread(fake.env), null, 'two working: not told');
+    assert.deepEqual(await bridge.sendToThread('comp-B', 'hola\nqué tal', fake.env), { outcome: 'queued', title: 'comp-B' });
+    assert.deepEqual(fake.sent.at(-1), { type: 'sendMessage', threadId: 'comp-B', text: 'hola\nqué tal', force: false });
+    await assert.rejects(bridge.sendToThread('ghost', 'x', fake.env), error => error.code === 'NOT_FOUND');
+    // An announcement from a Cursor that is gone is not a bridge.
+    writeFileSync(path.join(fake.dir, 'dead.json'), JSON.stringify({ protocolVersion: 1, pid: 2 ** 22 + 7, socketPath: '/nonexistent.sock', token: 'x', createdAt: Date.now() + 1 }));
+    assert.equal(bridge.bridgeInstances(fake.env).length, 1);
+  } finally { await fake.close(); }
+});
+
+test('cursor desktop bridge: the chat that joined is found in Cursor\'s state database by the id its voice_connect returned', async () => {
+  const bridge = await import('../harness-cursor-desktop.mjs');
+  const userDataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-cursor-user-'));
+  mkdirSync(path.join(userDataDir, 'User', 'globalStorage'), { recursive: true });
+  const db = new DatabaseSync(path.join(userDataDir, 'User', 'globalStorage', 'state.vscdb'));
+  db.exec('CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)');
+  const conversation = 'cursor-editor-5b2c3d4e-5f60-4a1b-8c2d-3e4f5a6b7c8d';
+  db.prepare('INSERT INTO cursorDiskKV VALUES (?, ?)').run('bubbleId:comp-other:b1', JSON.stringify({ type: 2, text: 'nada' }));
+  db.prepare('INSERT INTO cursorDiskKV VALUES (?, ?)').run('bubbleId:comp-joined:b7', Buffer.from(JSON.stringify({ type: 2, toolFormerData: { result: JSON.stringify({ status: 'joined', conversation }) } })));
+  db.close();
+  const fake = await fakeDesktopBridge({ userDataDir });
+  try {
+    assert.equal(await bridge.composerHolding(conversation, fake.env), 'comp-joined');
+    assert.equal(await bridge.composerHolding('cursor-editor-00000000-0000-0000-0000-000000000000', fake.env), null);
+  } finally { await fake.close(); }
+});

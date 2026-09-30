@@ -14,7 +14,7 @@ import { interpretRollout, rolloutPath } from '../harness-codex.mjs';
 import { remove as removeSkill, status as skillStatus } from '../skill.mjs';
 import './test_harness_contract.mjs';
 import './test_harness_claude.mjs';
-import { chatStore, fakePersist, runView, TMUX } from './test_harness_cursor.mjs';
+import { chatStore, fakeDesktopBridge, fakePersist, runView, TMUX } from './test_harness_cursor.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const connectorPath = path.join(here, '..', 'connector.mjs');
@@ -882,6 +882,41 @@ test('connector: an editor chat\'s second tick — early from its transcript onc
     assert.equal(room.sent('input.read').filter(d => d.message_id === 'm-1').length, 1, 'one tick per message, whatever says it');
     facade.end();
   } finally { view?.stop(); if (child.exitCode === null) child.kill(); await room.close(); }
+});
+
+test('façade + connector: with Cursor\'s Desktop Bridge on, an editor chat gets its voice by its own id, off screen too, and the card is only the fallback', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  let refuse = false;
+  const fake = await fakeDesktopBridge({ threads: [{ id: 'comp-A', title: 'A', source: 'local', status: 'running', lastUpdatedAt: Date.now(), windowId: 1 }],
+    answer: () => (refuse ? { outcome: 'not-found' } : { outcome: 'submitted', threadTitle: 'A' }) });
+  room.handle = (event, data) => { if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-d', thread: data.thread }; };
+  const { child: connector, socketPath } = startConnector(room.origin, dataDir, { ...fake.env, SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  await until(() => existsSync(socketPath));
+  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, ...fake.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
+  const ask = (id, method, params) => { child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); return until(() => replies.find(r => r.id === id), 8000); };
+  let view = null;
+  try {
+    await ask(1, 'initialize', { protocolVersion: '2025-11-25', clientInfo: { name: 'cursor-vscode', version: '1.0.0' }, capabilities: { extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] } } } });
+    const html = (await ask(2, 'resources/read', { uri: 'ui://sidevoice/voice-link' })).result.contents[0].text;
+    const joinedReply = await ask(3, 'tools/call', { name: 'voice_connect', arguments: { title: 'A' } });
+    const joined = JSON.parse(joinedReply.result.content[0].text);
+    assert.equal(joined.card.bridge, true); assert.equal(joined.card.chat_known, true);
+    await until(() => room.sent('binding.register').length);
+    assert.equal(room.sent('binding.register')[0].route, 'cursor-editor-bridge');
+    // No card on screen: the bridge takes it, to the chat by its id.
+    const sent = await room.ask('input.deliver', { event_id: 'e-1', binding_id: 'b-d', channel: 'voice', session_id: 's', revision: 1, message_id: 'm-1', text: 'hola A' });
+    assert.equal(sent.status, 'accepted'); assert.match(sent.detail, /Desktop Bridge: submitted/);
+    assert.equal(fake.sent[0].threadId, 'comp-A'); assert.match(fake.sent[0].text, /"message_id":"m-1"/); assert.match(fake.sent[0].text, /hola A/);
+    // The bridge no longer knows the chat: the card, when it is there, takes it.
+    refuse = true;
+    view = runView({ html, toolResult: joinedReply.result });
+    await wait(300);
+    const viaCard = await room.ask('input.deliver', { event_id: 'e-2', binding_id: 'b-d', channel: 'voice', session_id: 's', revision: 2, message_id: 'm-2', text: 'por la tarjeta' });
+    assert.equal(viaCard.status, 'unknown');
+    await until(() => view.dispatched.length === 1);
+  } finally { view?.stop(); child.kill(); if (connector.exitCode === null) connector.kill(); await fake.close(); await room.close(); }
 });
 
 test('pairing: plaintext only where the token cannot leave the machine or the cluster', async () => {

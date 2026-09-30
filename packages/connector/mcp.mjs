@@ -199,6 +199,8 @@ function voiceInUnsupported(who) {
 /** Said plainly to a Cursor conversation: whether it gets a card, and if not, why — so the person is not left
  *  wondering where it is. */
 function cardReport(who, result) {
+  if (who.route === 'cursor-editor-bridge') return { requested: !!result.prepared?.port, bridge: true, chat_known: !!who.delivery.composer,
+    note: who.delivery.composer ? 'Voice reaches this chat through Cursor\'s Desktop Bridge, by the chat\'s own id, whether or not it is on screen; the card under this call is only a fallback.' : 'Cursor\'s Desktop Bridge is on, but several chats were working when this one joined, so which one it is will be known within about 30 s; until then voice reaches it through the card under this call.' };
   if (who.route === 'cursor-editor-view') return result.prepared?.port
     ? { requested: true, note: 'A Sidevoice card should appear under this call within seconds. If none does, Cursor did not draw it: tell the user, and that ~/.sidevoice/mcp.log says whether Cursor read the card (a "resources/read" line) — without the card, what they say in the room does not reach this chat.' }
     : { requested: false, note: 'The connector could not open the card\'s loopback bridge, so no card will work: tell the user to look at ~/.sidevoice/connector.log.' };
@@ -258,6 +260,8 @@ async function invoke(name, args, meta) {
     let who;
     try { who = identifyHarness(meta, process.env, client); }
     catch (error) { mcpLog({ event: 'voice_connect_refused', client: client?.name ?? null, views: cursorViews(), reason: error.message }); throw error; }
+    // What only an asynchronous look adds (Cursor's editor: which chat is calling, through its Desktop Bridge).
+    try { who = (await who.module.refineIdentity?.(who)) || who; } catch {}
     const title = (args.title || process.env.SIDEVOICE_TITLE || path.basename(process.cwd())).slice(0, 200);
     // Refuse rather than join a room we cannot hear from: a conversation whose harness holds
     // what the room posts would sit in the list looking present while the user talks to nobody.
@@ -288,7 +292,7 @@ async function invoke(name, args, meta) {
     let connectorVersion = null; try { connectorVersion = (await rpc('status', {})).version || null; } catch {}
     const pushed = capabilities.deliver === SUPPORTED;
     mcpLog({ event: 'voice_connect', route: who.route || who.harness, harness: who.harness, conversation: logId(who.thread), delivery: who.delivery.kind,
-      deliver: capabilities.deliver, experimental, views: cursorViews(), chat_store_held: who.chatStoreHeld ?? null, card_port: result.prepared?.port ?? null });
+      deliver: capabilities.deliver, experimental, views: cursorViews(), chat_store_held: who.chatStoreHeld ?? null, card_port: result.prepared?.port ?? null, bridge_chat_known: !!who.delivery.composer });
     return { status: result.pending ? 'joining' : 'joined', harness: who.harness, conversation: who.thread,
              binding_id: result.binding_id, delivery: pushed ? 'push' : 'none', room_reachable: result.connected, capabilities, inbound,
              ...(pushed ? {} : { voice_in: voiceInUnsupported(who) }),
