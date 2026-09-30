@@ -142,6 +142,13 @@ function pick(conversation) {
   if (single()) return single();
   throw new Error(`Several chats of this window are joined (${[...joined.values()].map(b => `"${b.title}"`).join(', ')}); pass conversation: the id voice_connect returned in this chat.`);
 }
+/** An editor chat's conversation kept by the connector after Cursor replaced the process that joined it: taken
+ *  over by id, the id that chat was handed by its own voice_connect. */
+async function adoptById(conversation) {
+  if (!conversation || joined.has(conversation) || !cursorViews() || !String(conversation).startsWith('cursor-editor-')) return;
+  let taken = null; try { taken = await rpc('adopt', { client_ref: conversation }); } catch {}
+  if (taken?.client_ref) joined.set(taken.client_ref, taken);
+}
 async function leave(b) {
   joined.delete(b.client_ref);
   return rpc('unregister', { binding_id: b.binding_id, client_ref: b.client_ref });
@@ -203,6 +210,7 @@ function inboundFor(harness, thread) {
 }
 async function invoke(name, args, meta) {
   if (name === 'voice_status') {
+    await adoptById(args.conversation);
     const status = ipc ? await rpc('status', {}) : { connected: false, bindings: [], closed_by_room: [] };
     // The room may have closed a conversation's voice since it joined: the connector is the truth.
     const closedNow = [...joined.keys()].filter(ref => (status.closed_by_room || []).includes(ref));
@@ -292,7 +300,9 @@ async function invoke(name, args, meta) {
              ...(who.delivery.kind === 'cursor-app' && result.prepared?.port ? { view_link: { conversation: who.thread, port: result.prepared.port, key: who.delivery.key } } : {}),
              version: VERSION, connector_version: connectorVersion, ...versionNote(connectorVersion) };
   }
-  if (!joined.size) throw new Error('Not connected to the voice room: call voice_connect first (only if the user asked).');
+  await adoptById(args.conversation);
+  // An editor façade may speak for chats joined through a process Cursor has since replaced: the turn says which.
+  if (!joined.size && !(name === 'voice_say' && cursorViews())) throw new Error('Not connected to the voice room: call voice_connect first (only if the user asked).');
 
   if (name === 'voice_say') {
     // Named: the conversation voice_connect handed this chat, speaking with no turn to answer (the room plays
@@ -300,6 +310,7 @@ async function invoke(name, args, meta) {
     // conversation: it; several: the connector finds the one the answered turn was delivered to.
     let named = null;
     if (args.conversation) {
+      await adoptById(args.conversation);
       named = joined.get(args.conversation);
       // Only a chat of Cursor's editor speaks by its id: everywhere else a reply names the turn it answers,
       // which is what lets the room drop a reply the user has already moved past.
@@ -310,7 +321,7 @@ async function invoke(name, args, meta) {
     }
     if (!args.session_id || !Number.isInteger(args.revision)) throw new Error('voice_say needs the session_id and revision of the voice message you answer, or — to speak first — the conversation id voice_connect returned in this chat.');
     const only = named || single();
-    const route = only ? { binding_id: only.binding_id, client_ref: only.client_ref } : { client_refs: [...joined.keys()] };
+    const route = only ? { binding_id: only.binding_id, client_ref: only.client_ref } : { client_refs: [...joined.keys()], ...(cursorViews() ? { adopt_orphans: true } : {}) };
     let result;
     try {
       result = await rpc('publish', { ...route, text: args.text, session_id: args.session_id, revision: args.revision, utterance_id: args.utterance_id, language: args.language });
@@ -323,7 +334,9 @@ async function invoke(name, args, meta) {
       if (error.message.startsWith('AMBIGUOUS:')) throw new Error(error.message.slice(10).trim());
       throw error;
     }
-    return result.text_saved ? { status: 'published', text_saved: true, audio: result.status, reason: result.reason } : result;
+    if (result.adopted?.client_ref) joined.set(result.adopted.client_ref, result.adopted);
+    const { adopted, ...said } = result;
+    return said.text_saved ? { status: 'published', text_saved: true, audio: said.status, reason: said.reason } : said;
   }
   if (name === 'voice_disconnect') {
     const binding = pick(args.conversation);

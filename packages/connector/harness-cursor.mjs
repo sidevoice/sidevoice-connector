@@ -216,7 +216,8 @@ export function deliveryState(delivery) {
 export async function prepare(delivery, { log } = {}) {
   if (delivery?.kind !== 'cursor-app') return null;
   const { port, close } = await openView(delivery.thread, delivery.key, { log });
-  return { info: { port }, release: close };
+  // The card delivers, not the façade: the conversation can outlive the MCP process that created it.
+  return { info: { port }, release: close, detachable: true };
 }
 
 /** The store of a chat, found by its id under every workspace's directory. */

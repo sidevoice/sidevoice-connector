@@ -389,10 +389,41 @@ function shutdown() {
   process.exit(0);
 }
 
+/** Conversations kept without a façade leave once their card has not been heard from for this long (or, never
+ *  heard from, this long after their façade went): a chat whose window closed does not stay listed for ever. */
+const ORPHAN_TTL_MS = Number(process.env.SIDEVOICE_ORPHAN_TTL_MS || 30 * 60_000);
+let orphanTimer = null;
+function keepOrphans() {
+  if (orphanTimer) return;
+  orphanTimer = setInterval(() => {
+    let left = 0;
+    for (const binding of [...bindings.values()]) {
+      if (binding.owner || !binding.detachable) continue;
+      let state = null; try { state = harnessFor(binding.harness).deliveryState?.(binding.delivery) || null; } catch {}
+      const quiet = state?.card_connected ? state.card_last_seen_ms_ago : Date.now() - binding.orphanedAt;
+      if (quiet <= ORPHAN_TTL_MS || Date.now() - binding.orphanedAt <= ORPHAN_TTL_MS) { left++; continue; }
+      log(`${binding.thread} leaves: no façade, and its card silent for ${Math.round(quiet / 1000)} s`);
+      bindings.delete(binding.binding_id); unwatch(binding); if (!binding.binding_id.startsWith('local-')) send('binding.unregister', { binding_id: binding.binding_id });
+    }
+    if (!left) { clearInterval(orphanTimer); orphanTimer = null; scheduleExit(); }
+  }, Math.min(60_000, Math.max(50, ORPHAN_TTL_MS / 4)));
+  orphanTimer.unref?.();
+}
+/** A façade taking over a conversation kept without one. Only one that says it speaks for editor chats, and
+ *  only a conversation of that kind: the id is what the chat was handed by its own voice_connect. */
+function adopt(client, client_ref) {
+  const binding = [...bindings.values()].find(b => b.client_ref === client_ref && !b.owner && b.detachable);
+  if (!binding) return null;
+  binding.owner = client; binding.orphanedAt = null; client.bindings.add(binding);
+  log(`${binding.thread} taken over by a new façade`);
+  return { binding_id: binding.binding_id, client_ref: binding.client_ref, harness: binding.harness, title: binding.title, capabilities: binding.capabilities, experimental: binding.experimental || [] };
+}
+
 /** The conversation a voice_say belongs to, among those its façade speaks for: the one its session names
  *  (`typed:<conversation>`, handed only to that conversation), or the one that turn was delivered to. */
-function routeSpeech({ client_refs, session_id, revision }) {
-  const own = new Set(client_refs);
+function routeSpeech({ client_refs, session_id, revision, adopt_orphans }) {
+  // An editor façade also speaks for the editor chats kept without one: the turn names which.
+  const own = new Set([...client_refs, ...(adopt_orphans ? [...bindings.values()].filter(b => !b.owner && b.detachable).map(b => b.client_ref) : [])]);
   // Routed (several conversations, no one named): `typed:<conversation>` names one only for a conversation that
   // cannot take input. An editor chat speaking first names itself to its façade, which sends it here by name.
   if (typeof session_id === 'string' && session_id.startsWith('typed:')) {
@@ -432,7 +463,7 @@ async function command(client, input) {
       const module = harnessFor(harness);
       if (typeof module.prepare === 'function') {
         try { prepared = await module.prepare(delivery, { log }) || null; } catch (error) { log(`${thread} could not be prepared for delivery: ${error.message}`); }
-        if (prepared && bindings.get(binding.binding_id) === binding) binding.release = prepared.release; else prepared?.release?.();
+        if (prepared && bindings.get(binding.binding_id) === binding) { binding.release = prepared.release; binding.detachable = !!prepared.detachable; } else prepared?.release?.();
       }
       // A room that is not there yet is not a failure: the binding is registered on the next welcome.
       const reply = await joinRoom(binding).catch(error => { if (!connected && !refusal) return null; bindings.delete(binding.binding_id); client.bindings.delete(binding); unwatch(binding); throw error; });
@@ -440,7 +471,11 @@ async function command(client, input) {
     }
     case 'publish': {
       // A façade speaking for several conversations names them all, and the turn names which one.
-      if (Array.isArray(params.client_refs) && !params.client_ref) params = { ...params, client_ref: routeSpeech(params) };
+      let adopted = null;
+      if (Array.isArray(params.client_refs) && !params.client_ref) {
+        params = { ...params, client_ref: routeSpeech(params) };
+        if (params.adopt_orphans && !params.client_refs.includes(params.client_ref)) adopted = adopt(client, params.client_ref);
+      }
       const binding = bindings.get(params.binding_id) || [...bindings.values()].find(b => b.client_ref === params.client_ref);
       // Why it is gone travels with the refusal: a pairing revoked and a channel closed are not the
       // same news for the conversation, and only it can say the right one to the person.
@@ -453,7 +488,7 @@ async function command(client, input) {
       const reply = await publish(speech).catch(() => null);
       if (!reply) return { status: 'queued', utterance_id: speech.utterance_id };
       const { type, event_id, ...result } = reply;
-      return result;
+      return adopted ? { ...result, adopted } : result;
     }
     case 'unregister': {
       // By the id the façade remembers, or by the conversation it speaks for: the room may have minted a
@@ -464,6 +499,7 @@ async function command(client, input) {
       else log(`unregister for ${params.client_ref || params.binding_id || '?'} matched no binding`);
       scheduleExit(); return { ...snapshot(), left: !!binding };
     }
+    case 'adopt': return adopt(client, params.client_ref) || { adopted: false };
     case 'status': return snapshot();
     default: throw new Error('Unknown connector command');
   }
@@ -491,7 +527,12 @@ function serve(socket) {
     clients.delete(client);
     log(`façade detached (${clients.size} left); dropping ${client.bindings.size} binding(s)`);
     // The façade is gone: so is every conversation it spoke for.
-    for (const binding of client.bindings) { bindings.delete(binding.binding_id); unwatch(binding); if (!binding.binding_id.startsWith('local-')) send('binding.unregister', { binding_id: binding.binding_id }); }
+    for (const binding of client.bindings) {
+      // A conversation whose delivery does not go through its façade (an editor chat's card) outlives it:
+      // Cursor replaces a window's MCP process at will, and the chat, its card and its voice are still there.
+      if (binding.detachable) { binding.owner = null; binding.orphanedAt = Date.now(); keepOrphans(); log(`${binding.thread} kept without a façade (its card delivers)`); continue; }
+      bindings.delete(binding.binding_id); unwatch(binding); if (!binding.binding_id.startsWith('local-')) send('binding.unregister', { binding_id: binding.binding_id });
+    }
     scheduleExit();
   });
 }
