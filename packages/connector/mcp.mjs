@@ -185,6 +185,12 @@ async function invoke(name, args, meta) {
       error.data = { inbound };
       throw error;
     }
+    // One server can outlive its conversation — cursor-agent keeps it across /new and /resume — so joining
+    // from another one leaves the first: this façade speaks for one conversation at a time.
+    if (binding && binding.client_ref !== who.thread) {
+      try { await rpc('unregister', { binding_id: binding.binding_id, client_ref: binding.client_ref }); } catch {}
+      binding = null;
+    }
     const capabilities = advertisedCapabilities(who.module);
     // Which model is answering, read from the session's own launch line rather than asked of the model.
     let engine = null;

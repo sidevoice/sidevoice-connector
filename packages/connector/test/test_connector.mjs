@@ -562,7 +562,17 @@ test('façade: in the Cursor CLI the chat is the store its parent holds open, an
     const register = commands.find(c => c.method === 'register').params;
     assert.deepEqual({ harness: register.harness, thread: register.thread, delivery: register.delivery, engine: register.engine },
       { harness: 'cursor', thread: 'chat-e2e', delivery: { kind: 'none', chat: 'chat-e2e' }, engine: { model: 'composer-2', effort: null, thinking: null } });
-  } finally { child.kill(); fake.close(); chat.db.close(); }
+    // /new in cursor-agent: the same server, another chat. Joining from it leaves the first.
+    chat.db.close();
+    const next = chatStore(cursorHome, 'chat-next');
+    try {
+      ask(3, 'tools/call', { name: 'voice_connect', arguments: { title: 'Otra' } });
+      await until(() => replies.some(r => r.id === 3));
+      assert.equal(JSON.parse(replies.find(r => r.id === 3).result.content[0].text).conversation, 'chat-next');
+      const after = commands.slice(commands.indexOf(commands.find(c => c.method === 'register')) + 1).filter(c => c.method !== 'status');
+      assert.deepEqual(after.map(c => [c.method, c.params.client_ref || c.params.thread]), [['unregister', 'chat-e2e'], ['register', 'chat-next']]);
+    } finally { next.db.close(); }
+  } finally { child.kill(); fake.close(); try { chat.db.close(); } catch {} }
 });
 
 test('pairing: plaintext only where the token cannot leave the machine or the cluster', async () => {
@@ -639,7 +649,8 @@ test('install: puts this version in front of the harness, re-pins an older regis
   writeFileSync(bin, `#!/bin/sh\necho "$@" >> "${log}"\nif [ "$2" = get ]; then [ -s "${registered}" ] && cat "${registered}" || exit 1; fi\n`, { mode: 0o755 });
   const calls = () => existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : [];
   // Not from a checkout: the package is copied under the XDG data home and the harness runs that copy with node.
-  const env = { ...process.env, SIDEVOICE_DATA_DIR: path.join(home, '.sidevoice'), CLAUDE_CONFIG_DIR: path.join(home, '.claude'), SIDEVOICE_CLAUDE_BIN: bin,
+  // HOME too: Cursor's mcp.json lives under it, and a test must never touch the real one.
+  const env = { ...process.env, HOME: home, SIDEVOICE_DATA_DIR: path.join(home, '.sidevoice'), CLAUDE_CONFIG_DIR: path.join(home, '.claude'), SIDEVOICE_CLAUDE_BIN: bin,
                 SIDEVOICE_INSTALL_FROM_SOURCE: '0', XDG_DATA_HOME: path.join(home, 'xdg') };
   mkdirSync(env.CLAUDE_CONFIG_DIR);
   mkdirSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1'), { recursive: true });   // a copy an older install left

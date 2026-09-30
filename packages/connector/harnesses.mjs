@@ -14,7 +14,8 @@ export function harnessFor(name) {
 /** `client` is what the harness said about itself in `initialize` (`clientInfo`): the only thing Cursor
  *  says, since it passes its MCP servers neither environment nor metadata about the conversation. */
 export function identifyHarness(meta, env = process.env, client = null) {
-  for (const harness of [claudeHarness, codexHarness, cursorHarness, httpHarness]) {
+  // An explicitly configured receiver is asked before Cursor, which refuses a conversation it cannot place.
+  for (const harness of [claudeHarness, codexHarness, httpHarness, cursorHarness]) {
     const identity = harness.sessionIdentity({ meta, env, client });
     if (identity?.delivery) return { ...identity, module: harness };
   }

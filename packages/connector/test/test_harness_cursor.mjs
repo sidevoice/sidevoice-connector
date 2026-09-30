@@ -6,7 +6,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tailJsonl } from '../harness-contract.mjs';
+import { harnessesPresent } from '../identity.mjs';
+import { httpHarness } from '../harness-http.mjs';
+import { identifyHarness } from '../harnesses.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import {
   chatOfProcess, chatOfStore, cursorHarness, engine, findChat, interpretTranscript, observe, openFiles,
@@ -186,4 +190,76 @@ test('cursor install: our one key in ~/.cursor/mcp.json, everything else kept, a
   writeFileSync(file, foreign); unregisterFromCursor(done, next, env);
   assert.equal(readFileSync(file, 'utf8'), foreign); assert.match(next.at(-1), /did not write/);
   assert.ok(!existsSync(path.join(home, '.cursor', 'hooks.json')), 'nothing but the MCP server is asked of Cursor');
+});
+
+test('cursor: a rewrite seen half done, a summary and a dropped duplicate still report each new message once', async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'sv-cursor-'));
+  const env = { HOME: '/nonexistent', CURSOR_DATA_DIR: root, CURSOR_CONFIG_DIR: root };
+  const file = transcript(root, 'chat-r');
+  writeFileSync(file, user('uno') + user('uno') + assistant('a') + ended());
+  const said = [];
+  const stop = observe('chat-r', { working() {}, userMessage: m => said.push(m.text.replace(/<\/?user_query>|\n/g, '')) }, env);
+  try {
+    await wait(500);
+    // Truncated, then written in two goes: the first half ends mid-line.
+    const whole = user('uno') + assistant('a') + user('dos');
+    truncateSync(file, 0); await wait(450);
+    writeFileSync(file, whole.slice(0, whole.length - 20)); await wait(450);
+    writeFileSync(file, whole);
+    await until(() => said.includes('dos'));
+    // A summary: most of the history gone, then a new message.
+    writeFileSync(file, user('resumen') + user('tres'));
+    await until(() => said.includes('tres'));
+    await wait(450);
+    assert.deepEqual(said, ['dos', 'resumen', 'tres'], 'nothing old re-reported, nothing new missed');
+  } finally { stop(); }
+});
+
+test('tail: a transcript that disappears and comes back short is read again, not given up on', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'sv-tail-'));
+  const file = path.join(dir, 't.jsonl');
+  writeFileSync(file, JSON.stringify({ n: 'a'.repeat(100) }) + '\n');
+  const lines = [];
+  const stop = tailJsonl(() => (existsSync(file) ? file : null), (entry, replayed) => lines.push({ ...entry, replayed }), { intervalMs: 20, catchUp: true, rewrites: true });
+  try {
+    await until(() => lines.length === 1);
+    unlinkSync(file); await wait(80);
+    writeFileSync(file, '{"n":1}\n');
+    await until(() => lines.some(l => l.n === 1));
+  } finally { stop(); }
+});
+
+test('cursor install: the person\'s mcp.json keeps its permissions and its symlink, and an install for another harness keeps Cursor pointing at a copy that exists', async () => {
+  const { install, uninstall, registerWithCursor, cursorMcpFile, serverCommand } = await import('../install.mjs');
+  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-home-'));
+  const env = { ...process.env, HOME: home, SIDEVOICE_DATA_DIR: path.join(home, '.sidevoice'), CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+    SIDEVOICE_CLAUDE_BIN: '/nonexistent/claude', SIDEVOICE_INSTALL_FROM_SOURCE: '0', XDG_DATA_HOME: path.join(home, 'xdg') };
+  const dotfiles = path.join(home, 'dotfiles'); mkdirSync(dotfiles); mkdirSync(path.join(home, '.cursor'));
+  const real = path.join(dotfiles, 'mcp.json');
+  writeFileSync(real, JSON.stringify({ mcpServers: { gh: { command: 'gh-mcp', env: { GITHUB_TOKEN: 'secret' } } } }));
+  chmodSync(real, 0o600);
+  symlinkSync(real, cursorMcpFile(env));
+  registerWithCursor([], env);
+  assert.ok(lstatSync(cursorMcpFile(env)).isSymbolicLink(), 'still a symlink');
+  assert.equal(statSync(real).mode & 0o777, 0o600, 'still private');
+  assert.equal(JSON.parse(readFileSync(real, 'utf8')).mcpServers.sidevoice.command, 'node');
+
+  // An older copy of ours is registered in Cursor; installing for Claude Code removes that copy, so Cursor follows.
+  writeFileSync(real, JSON.stringify({ mcpServers: { sidevoice: { command: 'node', args: [path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1', 'dist', 'cli.mjs'), 'mcp'] } } }));
+  mkdirSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1'), { recursive: true });
+  const installed = await install(['--harness', 'claude'], env);
+  assert.deepEqual(JSON.parse(readFileSync(real, 'utf8')).mcpServers.sidevoice.args, serverCommand(env).args);
+  assert.match(installed.done.join('\n'), /Re-pointed Cursor/);
+  const gone = await uninstall(['--harness', 'claude'], env);
+  assert.match(gone.next.join('\n'), /Cursor still lists the sidevoice MCP server .* points at nothing/);
+});
+
+test('cursor: an explicitly configured receiver wins over Cursor, and the CLI — not the editor — makes Cursor present', () => {
+  const identity = identifyHarness({}, { SIDEVOICE_THREAD: 'ext-1', SIDEVOICE_DELIVERY_URL: 'http://127.0.0.1:9/inbox' }, { name: 'Cursor' });
+  assert.equal(identity.module, httpHarness);
+  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-home-'));
+  mkdirSync(path.join(home, '.cursor'));
+  assert.ok(!harnessesPresent({ HOME: home, PATH: '' }).includes('cursor'), 'the editor alone makes ~/.cursor');
+  mkdirSync(path.join(home, '.local', 'bin'), { recursive: true }); writeFileSync(path.join(home, '.local', 'bin', 'cursor-agent'), '');
+  assert.ok(harnessesPresent({ HOME: home, PATH: '' }).includes('cursor'));
 });

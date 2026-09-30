@@ -17,7 +17,12 @@ export function harnessesPresent(env = process.env) {
   const found = [];
   if (existsSync(env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'))) found.push('claude');
   if (existsSync(env.CODEX_HOME || path.join(os.homedir(), '.codex'))) found.push('codex');
-  if (existsSync(path.join(env.HOME || os.homedir(), '.cursor'))) found.push('cursor');
+  // The Cursor CLI, not the editor (which makes ~/.cursor too, and whose chats cannot join): its binary where
+  // its installer puts it or on PATH, or the configuration only the CLI writes.
+  const home = env.HOME || os.homedir();
+  const cli = [path.join(home, '.local', 'bin', 'cursor-agent'), ...String(env.PATH || '').split(path.delimiter).filter(Boolean).map(dir => path.join(dir, 'cursor-agent')),
+    path.join(env.CURSOR_CONFIG_DIR || path.join(home, '.cursor'), 'cli-config.json')];
+  if (cli.some(file => existsSync(file))) found.push('cursor');
   return found;
 }
 

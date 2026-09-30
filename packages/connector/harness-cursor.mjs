@@ -169,11 +169,14 @@ export function interpretTranscript(entry) {
 const POLL_MS = Number(process.env.SIDEVOICE_WORK_POLL_MS || 400);
 
 /** Watch one chat through its transcript. A user line opens a turn, `turn_ended` closes it. The CLI
- *  rewrites the whole file on the first write after a turn ends (dropping the earlier `turn_ended`
- *  lines), so a rewrite is read again silently and only the user messages beyond those already seen are
- *  news. The model is read from the chat's store when a turn starts, since that is when it is set. */
+ *  rewrites the whole file on the first write after a turn ends — dropping the earlier `turn_ended` lines,
+ *  and after a summary most of the history — so a user message is news only when the file now holds that
+ *  text more times than any earlier version of it did. The model is read from the chat's store when a turn
+ *  starts, since that is when it is set. */
 export function observe(chatId, handlers, env = process.env) {
-  let working = null, reported = null, attached = false, users = 0, seenUsers = 0, model = null;
+  let working = null, reported = null, attached = false, model = null;
+  let current = new Map();                 // user texts in the file as it is now, and how many times
+  const known = new Map();                 // the most times each text has been seen in any version of it
   const sayWorking = () => { if (working !== null && working !== reported) { reported = working; handlers.working(working, {}); } };
   const checkModel = () => {
     storeModel(storePath(chatId, env)).then(found => {
@@ -186,15 +189,17 @@ export function observe(chatId, handlers, env = process.env) {
     const seen = interpretTranscript(entry);
     if (!seen) return;
     if (seen.ended) { working = false; if (!replayed) sayWorking(); return; }
-    working = true; users++;
-    const news = users > seenUsers;
-    if (news) seenUsers = users;
-    if (replayed && !(attached && news)) return;
+    working = true;
+    const count = (current.get(seen.text) || 0) + 1;
+    current.set(seen.text, count);
+    if (count <= (known.get(seen.text) || 0)) return;          // this version of the file already had it
+    known.set(seen.text, count);
+    if (!attached) return;                                     // there before we looked: not news
     sayWorking();
     handlers.userMessage({ text: seen.text, turn_id: null });
     checkModel();
   }, { intervalMs: POLL_MS, catchUp: true, rewrites: true,
-    rewound: () => { users = 0; },
+    rewound: () => { current = new Map(); },
     caughtUp: () => { attached = true; sayWorking(); checkModel(); } });
 }
 

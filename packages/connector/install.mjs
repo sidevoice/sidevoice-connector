@@ -12,7 +12,7 @@
  *  Cursor's `mcp.json` is a map keyed by server name: only the `sidevoice` key is written, and only when it
  *  is absent or is one this package wrote. */
 import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -159,6 +159,17 @@ function oursInCursor(entry) {
     && entry.args[1] === 'mcp' && /cli\.mjs$/.test(entry.args[0] || '');
 }
 
+/** Replace a file the person owns without changing what it is: through a symlink to where it really lives,
+ *  and with the permissions it had — an mcp.json often holds tokens. */
+function rewriteKept(file, text) {
+  let target = file, mode = 0o600;
+  try { target = realpathSync(file); mode = statSync(target).mode & 0o777; } catch {}
+  mkdirSync(path.dirname(target), { recursive: true });
+  const temporary = target + '.' + process.pid + '.tmp';
+  writeFileSync(temporary, text, { mode });
+  renameSync(temporary, target);
+}
+
 function cursorManual(env) {
   const { command, args } = serverCommand(env);
   return `Add to ${cursorMcpFile(env)}:\n\n  { "mcpServers": { "sidevoice": { "command": "${command}", "args": [${args.map(a => `"${a}"`).join(', ')}] } } }`;
@@ -180,12 +191,13 @@ export function registerWithCursor(done, env = process.env) {
   if (current && !oursInCursor(current)) { done.push(`Cursor has a sidevoice MCP server of its own in ${file} (${current.command || current.url || '?'}); not touched. ${cursorManual(env)}`); return; }
   if (current && current.args[0] === args[0]) { done.push('Cursor already runs this version of the MCP server.'); return; }
   config.mcpServers = { ...servers, sidevoice: { ...(current || {}), command, args } };
-  mkdirSync(path.dirname(file), { recursive: true });
-  const temporary = file + '.' + process.pid + '.tmp';
-  writeFileSync(temporary, JSON.stringify(config, null, 2) + '\n');
-  renameSync(temporary, file);
+  rewriteKept(file, JSON.stringify(config, null, 2) + '\n');
   done.push(current ? `Re-pointed Cursor's MCP server to this version in ${file} (was: ${current.args.join(' ')}).`
                     : `Registered the MCP server with Cursor in ${file}.`);
+}
+
+export function cursorHasOurs(env = process.env) {
+  try { return oursInCursor(JSON.parse(readFileSync(cursorMcpFile(env), 'utf8'))?.mcpServers?.sidevoice); } catch { return false; }
 }
 
 /** Take our key out of Cursor's `mcp.json`, leaving everything else as it was. */
@@ -197,9 +209,7 @@ export function unregisterFromCursor(done, next, env = process.env) {
   if (!current) { done.push('Cursor had no sidevoice MCP server registered.'); return; }
   if (!oursInCursor(current)) { next.push(`Cursor has a sidevoice MCP server this package did not write in ${file}; remove it there if you want it gone.`); return; }
   delete config.mcpServers.sidevoice;
-  const temporary = file + '.' + process.pid + '.tmp';
-  writeFileSync(temporary, JSON.stringify(config, null, 2) + '\n');
-  renameSync(temporary, file);
+  rewriteKept(file, JSON.stringify(config, null, 2) + '\n');
   done.push(`Unregistered the MCP server from Cursor (${file}).`);
 }
 
@@ -248,7 +258,9 @@ export async function install(argv = process.argv.slice(2), env = process.env) {
     if (skillStatus(skillsDir([], env)).state === 'installed') done.push(`Removed the voice-room skill copy at ${removeSkill(skillsDir([], env)).target}: the server offers it as the prompt /mcp__sidevoice__voice-room.`);
   }
 
-  if (harnesses.includes('cursor')) registerWithCursor(done, env);
+  // The copy an older registration runs was just removed: an entry of ours in Cursor follows this version
+  // even when Cursor was not asked for, or it would point at nothing.
+  if (harnesses.includes('cursor') || cursorHasOurs(env)) registerWithCursor(done, env);
 
   const paired = pairedRoom(env);
   done.push(paired ? `This machine is paired with ${paired.origin} (connector ${paired.connector_id}).`
@@ -297,7 +309,10 @@ export async function uninstall(argv = process.argv.slice(2), env = process.env)
     try { process.kill(running.pid, 'SIGTERM'); done.push(`Stopped the connector (pid ${running.pid}${running.version ? ', version ' + running.version : ''}).`); }
     catch (error) { next.push(`A connector is running (pid ${running.pid}) and could not be stopped (${error.code || error.message}); stop it yourself.`); }
   }
-  if (!fromSource(env) && existsSync(copiesDir(env))) { rmSync(copiesDir(env), { recursive: true, force: true }); done.push(`Removed the installed copies under ${copiesDir(env)}.`); }
+  if (!fromSource(env) && existsSync(copiesDir(env))) {
+    rmSync(copiesDir(env), { recursive: true, force: true }); done.push(`Removed the installed copies under ${copiesDir(env)}.`);
+    if (!harnesses.includes('cursor') && cursorHasOurs(env)) next.push(`Cursor still lists the sidevoice MCP server in ${cursorMcpFile(env)}, and it now points at nothing: run  sidevoice uninstall --harness cursor , or install again.`);
+  }
   const dataDir = env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
   const paired = pairedRoom(env);
   if (existsSync(dataDir)) {
