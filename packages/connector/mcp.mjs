@@ -105,6 +105,8 @@ function promptText(args = {}) {
   ].join('\n');
 }
 let binding = null;
+/** Who spawned this server, as it said in `initialize`. Cursor says nothing else about itself. */
+let client = null;
 /** Why this conversation no longer has a voice, in words for the person. The room says which of the
  *  two it is, and they are not the same news: one is a channel the user closed and can open again
  *  from the same page, the other is this machine's pairing taken away, which only a new code undoes. */
@@ -127,6 +129,15 @@ function pairingNeeded(room, paired) {
 function versionNote(connectorVersion) {
   if (!ipc || connectorVersion === VERSION) return {};
   return { note: `The connector running on this machine is ${connectorVersion ? 'version ' + connectorVersion : 'older than this server'}; this conversation runs ${VERSION}. It exits 15 s after the last conversation leaves it; until then behaviour is that version's.` };
+}
+/** A harness that cannot take input still speaks: no voice message will ever carry a session_id and
+ *  revision to reply with, so the conversation is given a pair of its own. The room plays speech whose
+ *  session it does not know to whoever is listening to this conversation. */
+function voiceInUnsupported(who) {
+  const speakWith = { session_id: 'typed:' + who.thread, revision: 0 };
+  return { supported: false, speak_with: speakWith,
+    reason: `What the user says in the room cannot reach this conversation: ${who.harness} offers no way to put a message into it. The user types here as usual.`,
+    how: `Reply by voice to what the user types, as the server's instructions say for voice messages, calling voice_say with session_id "${speakWith.session_id}" and revision 0. Tell the user once that the room hears this conversation but cannot talk to it.` };
 }
 function inboundFor(harness, thread) {
   return capabilityState(harness, 'inspectInbound') === SUPPORTED ? harness.inspectInbound(thread) : null;
@@ -164,7 +175,7 @@ async function invoke(name, args, meta) {
   if (name === 'voice_connect') {
     const needed = pairingNeeded(args.room, pairedRoom());
     if (needed) { const error = new Error(needed); error.data = { pairing_needed: true, room: args.room ? originOf(args.room) : null }; throw error; }
-    const who = identifyHarness(meta);
+    const who = identifyHarness(meta, process.env, client);
     const title = (args.title || process.env.SIDEVOICE_TITLE || path.basename(process.cwd())).slice(0, 200);
     // Refuse rather than join a room we cannot hear from: a conversation whose harness holds
     // what the room posts would sit in the list looking present while the user talks to nobody.
@@ -177,13 +188,15 @@ async function invoke(name, args, meta) {
     const capabilities = advertisedCapabilities(who.module);
     // Which model is answering, read from the session's own launch line rather than asked of the model.
     let engine = null;
-    try { engine = who.module.engine?.(who.thread) || null; } catch { engine = null; }
+    try { engine = (await who.module.engine?.(who.thread)) || null; } catch { engine = null; }
     const result = await rpc('register', { client_ref: who.thread, harness: who.harness, thread: who.thread,
       title, delivery: who.delivery, inbound, capabilities, engine });
     binding = { ...result, harness: who.harness, client_ref: who.thread, capabilities };
     let connectorVersion = null; try { connectorVersion = (await rpc('status', {})).version || null; } catch {}
+    const pushed = capabilityState(who.module, 'deliver') === SUPPORTED;
     return { status: result.pending ? 'joining' : 'joined', harness: who.harness, conversation: who.thread,
-             binding_id: result.binding_id, delivery: 'push', room_reachable: result.connected, capabilities, inbound,
+             binding_id: result.binding_id, delivery: pushed ? 'push' : 'none', room_reachable: result.connected, capabilities, inbound,
+             ...(pushed ? {} : { voice_in: voiceInUnsupported(who) }),
              version: VERSION, connector_version: connectorVersion, ...versionNote(connectorVersion) };
   }
   if (!binding) throw new Error('Not connected to the voice room: call voice_connect first (only if the user asked).');
@@ -223,7 +236,7 @@ process.stdin.on('data', async chunk => {
     if (request.id === undefined) continue; // notifications need no answer
     let result, error;
     try {
-      if (request.method === 'initialize') result = { protocolVersion: request.params?.protocolVersion || '2025-06-18', capabilities: { tools: {}, prompts: {} }, serverInfo: { name: 'sidevoice', version: VERSION }, instructions: INSTRUCTIONS };
+      if (request.method === 'initialize') { client = request.params?.clientInfo || null; result = { protocolVersion: request.params?.protocolVersion || '2025-06-18', capabilities: { tools: {}, prompts: {} }, serverInfo: { name: 'sidevoice', version: VERSION }, instructions: INSTRUCTIONS }; }
       else if (request.method === 'prompts/list') result = { prompts: PROMPTS };
       else if (request.method === 'prompts/get') {
         if (request.params?.name !== 'voice-room') throw Object.assign(new Error('Unknown prompt'), { code: -32602 });

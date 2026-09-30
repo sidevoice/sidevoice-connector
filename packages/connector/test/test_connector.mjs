@@ -14,6 +14,7 @@ import { interpretRollout, rolloutPath } from '../harness-codex.mjs';
 import { remove as removeSkill, status as skillStatus } from '../skill.mjs';
 import './test_harness_contract.mjs';
 import './test_harness_claude.mjs';
+import { chatStore } from './test_harness_cursor.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const connectorPath = path.join(here, '..', 'connector.mjs');
@@ -498,6 +499,70 @@ test('connector: Codex — the thread\'s rollout says when it took the message a
     assert.equal(room.sent('input.read').length, 1);
     facade.end();
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
+});
+
+test('connector: Cursor — the room hears the chat work, and a voice message is refused as undeliverable rather than tried', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const cursorHome = mkdtempSync(path.join(os.tmpdir(), 'sv-cursor-'));
+  const dir = path.join(cursorHome, 'projects', 'work-app', 'agent-transcripts', 'chat-7'); mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'chat-7.jsonl');
+  const turn = text => JSON.stringify({ role: 'user', message: { content: [{ type: 'text', text }] } }) + '\n';
+  writeFileSync(file, '');
+  room.handle = (event, data) => {
+    if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-c7', thread: data.thread };
+  };
+  const { child, socketPath } = startConnector(room.origin, dataDir, { CURSOR_DATA_DIR: cursorHome, CURSOR_CONFIG_DIR: cursorHome, SIDEVOICE_WORK_POLL_MS: '30', SIDEVOICE_WORK_ANNOUNCE_MS: '5000' });
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    await facade.call('register', { client_ref: 'chat-7', harness: 'cursor', thread: 'chat-7', title: 'C', delivery: { kind: 'none', chat: 'chat-7' } });
+    await until(() => room.socket);
+    const refused = await room.ask('input.deliver', { event_id: 'e-c7', binding_id: 'b-c7', channel: 'voice', session_id: 's', revision: 1, message_id: 'm-c7', text: 'hola cursor' });
+    assert.equal(refused.status, 'unsupported');
+    assert.match(refused.error, /cursor offers no way to put a message into this conversation/);
+    // The person types in Cursor: the turn is seen starting and ending.
+    appendFileSync(file, turn('typed in cursor'));
+    await until(() => room.sent('input.working').some(d => d.working === true));
+    appendFileSync(file, JSON.stringify({ role: 'assistant', message: { content: [{ type: 'text', text: 'ok' }] } }) + '\n' + JSON.stringify({ type: 'turn_ended', status: 'success' }) + '\n');
+    await until(() => room.sent('input.working').some(d => d.working === false));
+    assert.equal(room.sent('input.read').length, 0, 'nothing was delivered, so nothing is read');
+    facade.end();
+  } finally { if (child.exitCode === null) child.kill(); await room.close(); }
+});
+
+test('façade: in the Cursor CLI the chat is the store its parent holds open, and voice_connect says the room cannot talk to it', async () => {
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const socketPath = path.join(dataDir, 'connector.sock');
+  const cursorHome = mkdtempSync(path.join(os.tmpdir(), 'sv-cursor-'));
+  // This test process plays cursor-agent: it spawns the server and holds the chat's store open.
+  const chat = chatStore(cursorHome, 'chat-e2e', { model: 'composer-2' });
+  const commands = [];
+  const fake = net.createServer(socket => { let buffer = ''; socket.on('data', chunk => { buffer += chunk; let i; while ((i = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, i); buffer = buffer.slice(i + 1); if (!line) continue; const input = JSON.parse(line); commands.push(input); const result = input.method === 'register' ? { binding_id: 'b-e2e', thread: input.params.thread, connected: true } : { connected: true, bindings: [], version: null }; socket.write(JSON.stringify({ id: input.id, ok: true, result }) + '\n'); } }); });
+  await new Promise(r => fake.listen(socketPath, r));
+  writeFileSync(path.join(dataDir, 'credentials.json'), JSON.stringify({ url: 'wss://room.example/api/connectors/ws', connector_id: 'c-1', token: 't-1' }));
+  // What Cursor gives an MCP server: a scrubbed environment, and nothing about the chat.
+  const env = { HOME: process.env.HOME, PATH: process.env.PATH, SHELL: process.env.SHELL || '/bin/sh', SIDEVOICE_DATA_DIR: dataDir, CURSOR_CONFIG_DIR: cursorHome };
+  const child = spawn(process.execPath, [mcpPath], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
+  const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+  try {
+    ask(1, 'initialize', { protocolVersion: '2025-11-25', capabilities: { elicitation: { form: {} } }, clientInfo: { name: 'Cursor', version: '1.0.0' } });
+    ask(2, 'tools/call', { name: 'voice_connect', arguments: { title: 'Cursor' } });
+    await until(() => replies.length === 2);
+    const reply = replies.find(r => r.id === 2);
+    assert.ok(reply.result, JSON.stringify(reply.error));
+    const joined = JSON.parse(reply.result.content[0].text);
+    assert.equal(joined.harness, 'cursor');
+    assert.equal(joined.conversation, 'chat-e2e');
+    assert.equal(joined.delivery, 'none');
+    assert.equal(joined.capabilities.deliver, 'unsupported');
+    assert.deepEqual(joined.voice_in.speak_with, { session_id: 'typed:chat-e2e', revision: 0 });
+    assert.match(joined.voice_in.reason, /cannot reach this conversation/);
+    const register = commands.find(c => c.method === 'register').params;
+    assert.deepEqual({ harness: register.harness, thread: register.thread, delivery: register.delivery, engine: register.engine },
+      { harness: 'cursor', thread: 'chat-e2e', delivery: { kind: 'none', chat: 'chat-e2e' }, engine: { model: 'composer-2', effort: null, thinking: null } });
+  } finally { child.kill(); fake.close(); chat.db.close(); }
 });
 
 test('pairing: plaintext only where the token cannot leave the machine or the cluster', async () => {

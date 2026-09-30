@@ -79,9 +79,13 @@ export function voiceEnvelope(text) {
 /** Follows a JSON-lines file the harness appends to: each complete new line is handed to `onLine` as
  *  parsed JSON. From where the file is now, unless `catchUp` is set — then what is already there is
  *  read first, with `replayed = true`, so a watcher can learn the current state without mistaking old
- *  lines for news. The file may not exist yet — `locate` is asked again until it does. */
-export function tailJsonl(locate, onLine, { intervalMs = 400, catchUp = false, caughtUp = () => {} } = {}) {
-  let file = null, offset = null, remainder = '', replaying = false;
+ *  lines for news. The file may not exist yet — `locate` is asked again until it does.
+ *
+ *  A harness that rewrites the file in place instead of only appending sets `rewrites`: the last bytes
+ *  read are checked before reading on, and a file that no longer ends where it did is read again from the
+ *  top as a replay — `rewound()` first, `caughtUp()` after — rather than from the middle of new text. */
+export function tailJsonl(locate, onLine, { intervalMs = 400, catchUp = false, caughtUp = () => {}, rewrites = false, rewound = () => {} } = {}) {
+  let file = null, offset = null, remainder = '', replaying = false, tail = Buffer.alloc(0);
   const poll = async () => {
     const { statSync, openSync, readSync, closeSync } = await import('node:fs');
     if (!file) { file = locate(); if (!file) return; }
@@ -91,13 +95,17 @@ export function tailJsonl(locate, onLine, { intervalMs = 400, catchUp = false, c
       if (!catchUp) { offset = size; return; }                // start at the end: only what happens from now on
       offset = 0; replaying = true;
     }
-    if (size < offset) { offset = 0; remainder = ''; }        // rewritten: read it again from the top
     if (size === offset) return;
     const fd = openSync(file, 'r');
     try {
+      if (rewrites && offset > 0 && (size < offset || !sameTail(fd, offset, tail, readSync))) {
+        offset = 0; remainder = ''; tail = Buffer.alloc(0); replaying = true;
+        try { rewound(); } catch {}
+      } else if (size < offset) { offset = 0; remainder = ''; }   // rewritten: read it again from the top
       const buffer = Buffer.alloc(size - offset);
       readSync(fd, buffer, 0, buffer.length, offset);
       offset = size;
+      if (rewrites) tail = Buffer.concat([tail, buffer]).subarray(-64);
       remainder += buffer.toString('utf8');
     } finally { closeSync(fd); }
     let index;
@@ -113,4 +121,12 @@ export function tailJsonl(locate, onLine, { intervalMs = 400, catchUp = false, c
   timer.unref?.();
   poll().catch(() => {});
   return () => clearInterval(timer);
+}
+
+/** Whether the bytes that ended the file when it was last read are still there. */
+function sameTail(fd, offset, tail, readSync) {
+  if (!tail.length) return true;
+  const now = Buffer.alloc(tail.length);
+  readSync(fd, now, 0, now.length, offset - tail.length);
+  return now.equals(tail);
 }

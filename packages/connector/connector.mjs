@@ -325,6 +325,12 @@ async function asked(route, frame) {
 
 /** One message into the conversation, through the adapter its binding was registered with. */
 async function handOver(binding, frame) {
+  // A harness that declares it cannot take input is said so, not tried: nothing reaches the conversation.
+  const harness = harnessFor(binding.harness);
+  if (capabilityState(harness, 'deliver') !== SUPPORTED) {
+    log(`not delivering ${frame.event_id} (${frame.message_id}) to ${binding.thread}: ${binding.harness} cannot take input from the room`);
+    return { status: 'unsupported', error: `${binding.harness} offers no way to put a message into this conversation` };
+  }
   // Expected before it is sent: the harness can take the message, and its transcript show it, before the
   // delivery call has even settled (Claude Code admitted one 9 ms after the write; the socket answered
   // 1.5 s later, 2026-09-21). A message expected and never taken costs a map entry.
@@ -333,7 +339,6 @@ async function handOver(binding, frame) {
     while (binding.pending.size > PENDING_MAX) binding.pending.delete(binding.pending.keys().next().value);
   }
   try {
-    const harness = harnessFor(binding.harness);
     const outcome = await harness.deliver(binding.delivery, frame);
     log(`delivered ${frame.event_id} (${frame.message_id}) to ${binding.thread} via ${binding.delivery.kind}: ${outcome.status} (${outcome.detail})`);
     return { status: outcome.status, detail: outcome.detail };

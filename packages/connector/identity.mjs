@@ -17,6 +17,7 @@ export function harnessesPresent(env = process.env) {
   const found = [];
   if (existsSync(env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'))) found.push('claude');
   if (existsSync(env.CODEX_HOME || path.join(os.homedir(), '.codex'))) found.push('codex');
+  if (existsSync(path.join(env.HOME || os.homedir(), '.cursor'))) found.push('cursor');
   return found;
 }
 
