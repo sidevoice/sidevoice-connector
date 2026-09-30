@@ -7,8 +7,10 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { advertisedCapabilities, capabilityState, SUPPORTED } from './harness-contract.mjs';
+import { capabilityState, conversationCapabilities, experimentalCapabilities, SUPPORTED } from './harness-contract.mjs';
 import { harnessFor, identifyHarness } from './harnesses.mjs';
+import { drawsViews, resource, RESOURCE_URI } from './harness-cursor-app.mjs';
+import { isCursorClient } from './harness-cursor.mjs';
 import { pair, pairedRoom } from './pair.mjs';
 import { readFileSync } from 'node:fs';
 
@@ -105,8 +107,10 @@ function promptText(args = {}) {
   ].join('\n');
 }
 let binding = null;
-/** Who spawned this server, as it said in `initialize`. Cursor says nothing else about itself. */
+/** Who spawned this server, as it said in `initialize`, and what it said it can do. Cursor says nothing else about itself. */
 let client = null;
+/** The Cursor editor draws MCP Apps views: `voice_connect` carries one, which is how voice reaches its chats. */
+const cursorViews = () => isCursorClient(client) && drawsViews(client);
 /** Why this conversation no longer has a voice, in words for the person. The room says which of the
  *  two it is, and they are not the same news: one is a channel the user closed and can open again
  *  from the same page, the other is this machine's pairing taken away, which only a new code undoes. */
@@ -133,10 +137,15 @@ function versionNote(connectorVersion) {
 /** A harness that cannot take input still speaks: no voice message will ever carry a session_id and
  *  revision to reply with, so the conversation is given a pair of its own. The room plays speech whose
  *  session it does not know to whoever is listening to this conversation. */
+/** What an experimental capability means for this conversation, said to it so it can say it to the person. */
+const EXPERIMENTAL_NOTES = {
+  deliver: 'Voice from the room reaches this conversation by an experimental route: it is typed into the harness where the user types (Cursor: pasted into the chat\'s terminal through tmux). If the user is typing at the same moment, the two texts mix. Tell the user once.',
+};
+
 function voiceInUnsupported(who) {
   const speakWith = { session_id: 'typed:' + who.thread, revision: 0 };
   return { supported: false, speak_with: speakWith,
-    reason: `What the user says in the room cannot reach this conversation: ${who.harness} offers no way to put a message into it. The user types here as usual.`,
+    reason: `What the user says in the room cannot reach this conversation: ${who.deliverNote || `${who.harness} offers no way to put a message into it.`} The user types here as usual.`,
     how: `Reply by voice to what the user types, as the server's instructions say for voice messages, calling voice_say with session_id "${speakWith.session_id}" and revision 0. Tell the user once that the room hears this conversation but cannot talk to it.` };
 }
 function inboundFor(harness, thread) {
@@ -155,7 +164,7 @@ async function invoke(name, args, meta) {
              protocol: status.protocol ?? null,
              version: VERSION, connector_version: status.version || null, ...versionNote(status.version),
              binding_id: binding?.binding_id || null, harness: binding?.harness || null,
-             capabilities: binding?.capabilities || null, inbound,
+             capabilities: binding?.capabilities || null, experimental: binding?.experimental || [], inbound,
              ...(closed ? { closed_by_room: true, note: closedNote(closedFor) } : {}) };
   }
   if (name === 'voice_pair') {
@@ -191,18 +200,22 @@ async function invoke(name, args, meta) {
       try { await rpc('unregister', { binding_id: binding.binding_id, client_ref: binding.client_ref }); } catch {}
       binding = null;
     }
-    const capabilities = advertisedCapabilities(who.module);
+    const capabilities = conversationCapabilities(who.module, who);
+    const experimental = experimentalCapabilities(who.module, capabilities, who);
     // Which model is answering, read from the session's own launch line rather than asked of the model.
     let engine = null;
     try { engine = (await who.module.engine?.(who.thread)) || null; } catch { engine = null; }
     const result = await rpc('register', { client_ref: who.thread, harness: who.harness, thread: who.thread,
-      title, delivery: who.delivery, inbound, capabilities, engine });
-    binding = { ...result, harness: who.harness, client_ref: who.thread, capabilities };
+      title, delivery: who.delivery, inbound, capabilities, experimental, engine });
+    binding = { ...result, harness: who.harness, client_ref: who.thread, capabilities, experimental };
     let connectorVersion = null; try { connectorVersion = (await rpc('status', {})).version || null; } catch {}
-    const pushed = capabilityState(who.module, 'deliver') === SUPPORTED;
+    const pushed = capabilities.deliver === SUPPORTED;
     return { status: result.pending ? 'joining' : 'joined', harness: who.harness, conversation: who.thread,
              binding_id: result.binding_id, delivery: pushed ? 'push' : 'none', room_reachable: result.connected, capabilities, inbound,
              ...(pushed ? {} : { voice_in: voiceInUnsupported(who) }),
+             ...(who.editor ? { view: 'Voice reaches this chat through the small Sidevoice card drawn under this call: it must stay open in this chat. One chat per Cursor window has voice at a time; joining from another moves it.' } : {}),
+             ...(who.watchNote ? { watch_note: who.watchNote } : {}),
+             ...(experimental.length ? { experimental, experimental_notes: experimental.map(name => EXPERIMENTAL_NOTES[name]).filter(Boolean) } : {}),
              version: VERSION, connector_version: connectorVersion, ...versionNote(connectorVersion) };
   }
   if (!binding) throw new Error('Not connected to the voice room: call voice_connect first (only if the user asked).');
@@ -242,13 +255,18 @@ process.stdin.on('data', async chunk => {
     if (request.id === undefined) continue; // notifications need no answer
     let result, error;
     try {
-      if (request.method === 'initialize') { client = request.params?.clientInfo || null; result = { protocolVersion: request.params?.protocolVersion || '2025-06-18', capabilities: { tools: {}, prompts: {} }, serverInfo: { name: 'sidevoice', version: VERSION }, instructions: INSTRUCTIONS }; }
+      if (request.method === 'initialize') { client = { ...(request.params?.clientInfo || {}), capabilities: request.params?.capabilities || {} }; result = { protocolVersion: request.params?.protocolVersion || '2025-06-18', capabilities: { tools: {}, prompts: {}, ...(cursorViews() ? { resources: {} } : {}) }, serverInfo: { name: 'sidevoice', version: VERSION }, instructions: INSTRUCTIONS }; }
       else if (request.method === 'prompts/list') result = { prompts: PROMPTS };
       else if (request.method === 'prompts/get') {
         if (request.params?.name !== 'voice-room') throw Object.assign(new Error('Unknown prompt'), { code: -32602 });
         result = { description: PROMPTS[0].description, messages: [{ role: 'user', content: { type: 'text', text: promptText(request.params?.arguments) } }] };
       }
-      else if (request.method === 'tools/list') result = { tools };
+      else if (request.method === 'tools/list') result = { tools: cursorViews() ? tools.map(tool => tool.name === 'voice_connect' ? { ...tool, _meta: { ui: { resourceUri: RESOURCE_URI } } } : tool) : tools };
+      else if (request.method === 'resources/list') result = { resources: cursorViews() ? [{ uri: RESOURCE_URI, name: 'Sidevoice voice link', mimeType: resource().mimeType }] : [] };
+      else if (request.method === 'resources/read') {
+        if (!cursorViews() || request.params?.uri !== RESOURCE_URI) throw Object.assign(new Error('Unknown resource'), { code: -32602 });
+        result = { contents: [resource()] };
+      }
       else if (request.method === 'tools/call') { const value = await invoke(request.params.name, request.params.arguments || {}, request.params._meta); result = { content: [{ type: 'text', text: JSON.stringify(value) }] }; }
       else if (request.method === 'ping') result = {};
       else throw Object.assign(new Error('Method not found'), { code: -32601 });

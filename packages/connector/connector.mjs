@@ -147,7 +147,8 @@ function keepAnnouncing() {
  *  correlated start of turn; the end of that turn carries the same correlation. */
 function watch(binding) {
   const harness = harnessFor(binding.harness);
-  if (binding.stop || capabilityState(harness, 'working') !== SUPPORTED || typeof harness.observe !== 'function') return;
+  // A conversation that declared it cannot be watched is not, though its harness can watch others.
+  if (binding.stop || capabilityState(harness, 'working') !== SUPPORTED || capabilityState(binding, 'working') === 'unsupported' || typeof harness.observe !== 'function') return;
   binding.pending ||= new Map();
   const correlation = () => binding.turn ? { turn_id: binding.turn.turn_id, session_id: binding.turn.session_id, revision: binding.turn.revision } : {};
   binding.stop = harness.observe(binding.thread, {
@@ -270,7 +271,7 @@ async function announce(binding) {
   // `local-*` is only a connector-side placeholder while the first registration waits for the
   // room to mint its durable binding id. Sending it back makes the room correctly reject it as foreign.
   const frame = { client_ref: binding.client_ref, harness: binding.harness, thread: binding.thread,
-    title: binding.title, inbound: binding.inbound, capabilities: binding.capabilities,
+    title: binding.title, inbound: binding.inbound, capabilities: binding.capabilities, experimental: binding.experimental || [],
     engine: binding.engine, focus: false };
   if (!binding.binding_id.startsWith('local-')) frame.binding_id = binding.binding_id;
   const reply = await request('binding.register', frame).catch(error => {
@@ -327,7 +328,8 @@ async function asked(route, frame) {
 async function handOver(binding, frame) {
   // A harness that declares it cannot take input is said so, not tried: nothing reaches the conversation.
   const harness = harnessFor(binding.harness);
-  if (capabilityState(harness, 'deliver') !== SUPPORTED) {
+  // The conversation's own declaration counts: a harness can deliver and still not into this conversation.
+  if (capabilityState(harness, 'deliver') !== SUPPORTED || capabilityState(binding, 'deliver') === 'unsupported') {
     log(`not delivering ${frame.event_id} (${frame.message_id}) to ${binding.thread}: ${binding.harness} cannot take input from the room`);
     return { status: 'unsupported', error: `${binding.harness} offers no way to put a message into this conversation` };
   }
@@ -375,18 +377,18 @@ async function command(client, input) {
   const params = input.params || {};
   switch (input.method) {
     case 'register': {
-      const { client_ref, harness, thread, title, delivery, inbound, capabilities, engine } = params;
+      const { client_ref, harness, thread, title, delivery, inbound, capabilities, experimental, engine } = params;
       if (!client_ref || !thread || !delivery?.kind) throw new Error('client_ref, thread and delivery are required');
       closedByRoom.delete(client_ref);   // joining again is the user's explicit request
       const existing = [...bindings.values()].find(b => b.client_ref === client_ref);
       if (existing) {
-        Object.assign(existing, { owner: client, delivery, inbound, capabilities });
+        Object.assign(existing, { owner: client, delivery, inbound, capabilities, experimental });
         client.bindings.add(existing);
         return { binding_id: existing.binding_id, thread, connected };
       }
       const local_id = 'local-' + randomUUID();
       log(`${harness} ${thread} joins ("${title || ''}", delivery ${delivery.kind}, inbound ${inbound ? (inbound.ok ? 'ok' : 'held') : 'n/a'})`);
-      const binding = { binding_id: local_id, client_ref, harness, thread, title, delivery, inbound, capabilities, engine, owner: client };
+      const binding = { binding_id: local_id, client_ref, harness, thread, title, delivery, inbound, capabilities, experimental, engine, owner: client };
       bindings.set(local_id, binding); client.bindings.add(binding); clearTimeout(idleTimer); open(); watch(binding);
       // A room that is not there yet is not a failure: the binding is registered on the next welcome.
       const reply = await joinRoom(binding).catch(error => { if (!connected && !refusal) return null; bindings.delete(binding.binding_id); client.bindings.delete(binding); unwatch(binding); throw error; });

@@ -14,7 +14,7 @@ import { interpretRollout, rolloutPath } from '../harness-codex.mjs';
 import { remove as removeSkill, status as skillStatus } from '../skill.mjs';
 import './test_harness_contract.mjs';
 import './test_harness_claude.mjs';
-import { chatStore } from './test_harness_cursor.mjs';
+import { chatStore, fakePersist, runView, TMUX } from './test_harness_cursor.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const connectorPath = path.join(here, '..', 'connector.mjs');
@@ -516,7 +516,7 @@ test('connector: Cursor — the room hears the chat work, and a voice message is
   try {
     await until(() => existsSync(socketPath));
     const facade = ipcClient(socketPath); await facade.ready;
-    await facade.call('register', { client_ref: 'chat-7', harness: 'cursor', thread: 'chat-7', title: 'C', delivery: { kind: 'none', chat: 'chat-7' } });
+    await facade.call('register', { client_ref: 'chat-7', harness: 'cursor', thread: 'chat-7', title: 'C', delivery: { kind: 'none', chat: 'chat-7' }, capabilities: { deliver: 'unsupported' } });
     await until(() => room.socket);
     const refused = await room.ask('input.deliver', { event_id: 'e-c7', binding_id: 'b-c7', channel: 'voice', session_id: 's', revision: 1, message_id: 'm-c7', text: 'hola cursor' });
     assert.equal(refused.status, 'unsupported');
@@ -529,6 +529,36 @@ test('connector: Cursor — the room hears the chat work, and a voice message is
     assert.equal(room.sent('input.read').length, 0, 'nothing was delivered, so nothing is read');
     facade.end();
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
+});
+
+test('connector: Cursor under persist — a voice message is typed into the chat\'s pane, and its transcript gives the second tick', { skip: !TMUX && 'no tmux on this machine' }, async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const cursorHome = mkdtempSync(path.join(os.tmpdir(), 'sv-cursor-'));
+  const chat = '0d3f6c1e-2b4a-4c5d-8e9f-a1b2c3d4e5f6';
+  const dir = path.join(cursorHome, 'projects', 'work-app', 'agent-transcripts', chat); mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, chat + '.jsonl'); writeFileSync(file, '');
+  const fake = await fakePersist(chat);
+  room.handle = (event, data) => { if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-p', thread: data.thread }; };
+  const { child, socketPath } = startConnector(room.origin, dataDir, { ...fake.env, CURSOR_DATA_DIR: cursorHome, CURSOR_CONFIG_DIR: cursorHome, SIDEVOICE_WORK_POLL_MS: '30', SIDEVOICE_WORK_ANNOUNCE_MS: '5000' });
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    await facade.call('register', { client_ref: chat, harness: 'cursor', thread: chat, title: 'P', delivery: { kind: 'cursor-tmux', chat },
+      capabilities: { deliver: 'supported', inspectInbound: 'unsupported', working: 'supported', endOfTurn: 'supported', sessionIdentity: 'supported' }, experimental: ['deliver'] });
+    await until(() => room.socket);
+    assert.deepEqual(room.sent('binding.register')[0].experimental, ['deliver'], 'the room is told delivery is experimental');
+    const typed = await room.ask('input.deliver', { event_id: 'e-p', binding_id: 'b-p', channel: 'voice', session_id: 's', revision: 2, message_id: 'm-p', text: 'hola\ncursor' });
+    assert.equal(typed.status, 'unknown'); assert.match(typed.detail, /typed into persistent session cursor-test/);
+    await until(() => existsSync(fake.received) && readFileSync(fake.received, 'utf8').endsWith('\r'));
+    const pasted = readFileSync(fake.received, 'utf8').slice('\x1b[200~'.length, -('\x1b[201~\r'.length));
+    assert.match(pasted, /hola\ncursor/);
+    // Cursor takes it: the transcript's user line holds it (inside its own <user_query> wrapper).
+    appendFileSync(file, JSON.stringify({ role: 'user', message: { content: [{ type: 'text', text: '<user_query>\n' + pasted + '\n</user_query>' }] } }) + '\n');
+    await until(() => room.sent('input.read').some(d => d.message_id === 'm-p'));
+    await until(() => room.sent('input.working').some(d => d.working === true));
+    facade.end();
+  } finally { fake.stop(); if (child.exitCode === null) child.kill(); await room.close(); }
 });
 
 test('façade: in the Cursor CLI the chat is the store its parent holds open, and voice_connect says the room cannot talk to it', async () => {
@@ -573,6 +603,49 @@ test('façade: in the Cursor CLI the chat is the store its parent holds open, an
       assert.deepEqual(after.map(c => [c.method, c.params.client_ref || c.params.thread]), [['unregister', 'chat-e2e'], ['register', 'chat-next']]);
     } finally { next.db.close(); }
   } finally { child.kill(); fake.close(); try { chat.db.close(); } catch {} }
+});
+
+test('façade + connector: a chat of the Cursor editor joins through the view voice_connect carries, and the room\'s voice reaches it', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const port = String(40000 + Math.floor(Math.random() * 20000));
+  room.handle = (event, data) => { if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-ed', thread: data.thread }; };
+  // A real connector, started as a façade would start it; then the façade, spawned as the editor spawns it.
+  const { child: connector, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_CURSOR_APP_PORT: port, SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  await until(() => existsSync(socketPath));
+  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CURSOR_APP_PORT: port }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
+  const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+  let view = null;
+  try {
+    // What Cursor 3.22.12 declares: its name, and the MCP Apps extension.
+    ask(1, 'initialize', { protocolVersion: '2025-11-25', clientInfo: { name: 'cursor-vscode', version: '1.0.0' },
+      capabilities: { elicitation: { form: {} }, roots: { listChanged: false }, extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] } } } });
+    ask(2, 'tools/list', {}); ask(3, 'resources/read', { uri: 'ui://sidevoice/voice-link' });
+    ask(4, 'tools/call', { name: 'voice_connect', arguments: { title: 'Editor' }, _meta: { progressToken: 'toolu_ed' } });
+    await until(() => replies.length === 4, 8000);
+    const byId = id => replies.find(r => r.id === id);
+    assert.ok(byId(1).result.capabilities.resources, 'resources offered to a client that draws views');
+    assert.deepEqual(byId(2).result.tools.find(t => t.name === 'voice_connect')._meta, { ui: { resourceUri: 'ui://sidevoice/voice-link' } });
+    assert.equal(byId(2).result.tools.find(t => t.name === 'voice_say')._meta, undefined);
+    const html = byId(3).result.contents[0];
+    assert.equal(html.mimeType, 'text/html;profile=mcp-app');
+    const joined = JSON.parse(byId(4).result.content[0].text);
+    assert.match(joined.conversation, /^cursor-editor-/);
+    assert.deepEqual(joined.experimental, ['deliver', 'sessionIdentity']);
+    assert.equal(joined.delivery, 'push');
+    assert.match(joined.view, /card/); assert.match(joined.watch_note, /not observed/);
+    await until(() => room.sent('binding.register').length);
+    assert.deepEqual(room.sent('binding.register')[0].experimental, ['deliver', 'sessionIdentity']);
+
+    // Cursor draws the view in that chat and hands it the call's result.
+    view = runView({ html: html.text, toolResult: byId(4).result });
+    await wait(300);
+    const delivered = await room.ask('input.deliver', { event_id: 'e-ed', binding_id: 'b-ed', channel: 'voice', session_id: 's', revision: 4, message_id: 'm-ed', text: 'hola editor' });
+    assert.equal(delivered.status, 'accepted', JSON.stringify(delivered));
+    assert.match(view.submitted[0].content[0].text, /hola editor/);
+    assert.match(view.submitted[0].content[0].text, /"message_id":"m-ed"/);
+  } finally { view?.stop(); child.kill(); if (connector.exitCode === null) connector.kill(); await room.close(); }
 });
 
 test('pairing: plaintext only where the token cannot leave the machine or the cluster', async () => {

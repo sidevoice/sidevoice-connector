@@ -216,11 +216,13 @@ export function unregisterFromCursor(done, next, env = process.env) {
 /** What Cursor can and cannot do with a room, said once at install so nobody expects more. */
 export function cursorNotes() {
   return [
-    'Cursor: voice works from a conversation in the Cursor CLI (cursor-agent). The first time, cursor-agent asks to',
-    'approve the new MCP server (or run  cursor-agent mcp enable sidevoice ). Ask the chat to join the voice room: it',
-    'speaks its replies to the room and the room sees when it is working. What you say in the room does not reach',
-    'Cursor — Cursor offers no way to put a message into a running chat — so you talk to it by typing. A chat in the',
-    'Cursor editor cannot join: the editor does not tell an MCP server which chat is calling.',
+    'Cursor: ask a chat to join the voice room; it speaks its replies there. The first time, Cursor asks to approve the',
+    'new MCP server (cursor-agent: or run  cursor-agent mcp enable sidevoice ). What you say in the room reaches Cursor',
+    'only by experimental routes, because Cursor offers none of its own:',
+    '  - Cursor CLI: only a chat started with  cursor-agent persist  (needs tmux); the room types into its terminal.',
+    '  - Cursor editor: a small Sidevoice card appears under the join call; while it stays open in that chat, the room',
+    '    sends to it. One chat per window at a time.',
+    'If you type while the room sends, the two mix.',
   ].join('\n');
 }
 

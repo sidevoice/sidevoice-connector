@@ -23,6 +23,27 @@ export function advertisedCapabilities(harness) {
   return Object.fromEntries(CAPABILITIES.map(capability => [capability, capabilityState(harness, capability)]));
 }
 
+/** A module may mark supported capabilities `experimental`: they work, by a route the harness does not offer
+ *  as an interface (typing into its terminal, driving its UI), and the person is told so wherever the
+ *  capability is shown. Anything not declared supported is never experimental. */
+export function experimentalCapabilities(harness, capabilities = advertisedCapabilities(harness), identity = null) {
+  // The module's own marks, and those its identity adds for one conversation (an editor chat of Cursor is
+  // identified by a route the module does not use for the CLI).
+  const declared = [...(Array.isArray(harness?.experimental) ? harness.experimental : []), ...(Array.isArray(identity?.experimental) ? identity.experimental : [])];
+  return CAPABILITIES.filter(capability => declared.includes(capability) && capabilities[capability] === SUPPORTED);
+}
+
+/** What one conversation can do: the module's declaration, narrowed by what its identity found out about
+ *  that conversation (a Cursor chat not running under `persist` cannot take input though the module can).
+ *  A conversation can only lose a capability here, never gain one. */
+export function conversationCapabilities(harness, identity) {
+  const declared = advertisedCapabilities(harness);
+  for (const [capability, state] of Object.entries(identity?.capabilities || {})) {
+    if (declared[capability] === SUPPORTED && state === UNSUPPORTED) declared[capability] = UNSUPPORTED;
+  }
+  return declared;
+}
+
 /** `working` and `endOfTurn` are both answered by observation: a harness that supports either
  *  implements `observe(thread, handlers)`, which watches what the harness itself writes about that
  *  conversation and calls back — `working(bool, { turn_id })` on every transition it can see, and
@@ -38,7 +59,11 @@ export function defineHarness(definition) {
       throw new Error(`${definition.name} declares ${capability} supported but does not implement it`);
     }
   }
-  return Object.freeze({ ...definition, capabilities: Object.freeze({ ...definition.capabilities }) });
+  for (const capability of definition.experimental || []) {
+    if (definition.capabilities[capability] !== SUPPORTED) throw new Error(`${definition.name} marks ${capability} experimental but does not support it`);
+  }
+  return Object.freeze({ ...definition, capabilities: Object.freeze({ ...definition.capabilities }),
+    ...(definition.experimental ? { experimental: Object.freeze([...definition.experimental]) } : {}) });
 }
 
 /** The header before the user's literal words, and — for a voice message — the note after them that
@@ -95,7 +120,10 @@ export function tailJsonl(locate, onLine, { intervalMs = 400, catchUp = false, c
     try { size = statSync(file).size; } catch { file = null; offset = null; tail = Buffer.alloc(0); return; }
     if (offset === null) {
       if (!catchUp) { offset = size; return; }                // start at the end: only what happens from now on
-      offset = 0; replaying = true;
+      offset = 0;
+      // An empty file has no past to replay: what arrives next is news.
+      if (size === 0) { try { caughtUp(); } catch {} return; }
+      replaying = true;
     }
     if (size === offset) return;
     const fd = openSync(file, 'r');

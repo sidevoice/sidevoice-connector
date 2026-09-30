@@ -6,19 +6,27 @@
  *  the chat it is running open: `chats/<md5 of cwd>/<chat id>/store.db`, a SQLite store the CLI keeps
  *  open for as long as the chat is its current one. That open file is the identity — nothing is asked
  *  of the model. The Cursor editor keeps its chats elsewhere and serves every chat of a window from one
- *  MCP process, so it has no such file to point at: a conversation there is refused, saying why.
+ *  MCP process, so it has no such file to point at: its chats join through an MCP App view instead
+ *  (harness-cursor-app.mjs).
  *
  *  Working state and the messages a chat admits come from the transcript Cursor itself writes for the
  *  chat, `projects/<workspace slug>/agent-transcripts/<chat id>/<chat id>.jsonl`, and the model from the
  *  chat's own store. Nothing is installed in Cursor.
  *
- *  Delivery is unsupported: Cursor offers no way to put a message into a chat someone is using (see
- *  docs/HARNESS_CONTRACT.md, "Cursor"). Read from cursor-agent 2026.09.28-64d2043; not yet seen live. */
-import { execFileSync } from 'node:child_process';
+ *  Delivery is experimental, and only for a chat started with `cursor-agent persist`: Cursor offers no way
+ *  to put a message into a chat, but `persist` runs the CLI inside tmux (`tmux -L cursor-agent`, socket
+ *  under `TMUX_TMPDIR=/tmp`) and tags the session with the chat it runs (`@cursor_chat_id`). The voice
+ *  message is pasted into that pane as a bracketed paste — the CLI's input turns bracketed paste on and
+ *  keeps a pasted text whole, newlines included — and Enter sends it. It types where the person types:
+ *  both at once would mix, which the operator accepted. Any other chat declares delivery unsupported.
+ *  See docs/HARNESS_CONTRACT.md, "Cursor". Read from cursor-agent 2026.09.28-64d2043; not yet seen live. */
+import { execFile, execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, readlinkSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { defineHarness, SUPPORTED, UNSUPPORTED, tailJsonl } from './harness-contract.mjs';
+import { defineHarness, envelope, SUPPORTED, UNSUPPORTED, tailJsonl } from './harness-contract.mjs';
+import { deliverToView, drawsViews, THREAD_PREFIX } from './harness-cursor-app.mjs';
 
 /** Where the CLI may keep chats (`chats/`): `CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`, else
  *  `~/.cursor`. Cursor scrubs the environment of its MCP servers, so the variables the CLI saw may not be
@@ -88,17 +96,98 @@ export function findChat(start = process.ppid, { depth = 4, filesOf = openFiles,
 }
 
 const EDITOR_NOTE = 'Cursor did not say which chat this is: only the Cursor CLI (cursor-agent) keeps the chat it runs open where '
-  + 'Sidevoice can see it. The Cursor editor serves every chat of a window from one MCP server and tells it nothing about '
-  + 'which one is calling, so a chat in the editor cannot join the voice room. Run the conversation in cursor-agent to use voice.';
+  + 'Sidevoice can see it, and this Cursor draws no MCP Apps views, which is how a chat of the editor joins. Update Cursor, '
+  + 'or run the conversation in cursor-agent.';
+
+const EDITOR_WATCH = 'Working state is not observed for a chat of the Cursor editor yet: its transcript is found by the chat id, which the editor does not give.';
 
 /** A conversation in Cursor, by what Cursor itself shows: its name in `initialize`, and the chat store the
- *  spawning process holds. Not Cursor: null. Cursor, but no chat to point at: refused with the reason. */
-export function sessionIdentity({ client, locate = findChat } = {}) {
-  if (!/^cursor\b/i.test(client?.name || '')) return null;
+ *  spawning process holds; in the editor, a conversation of our own, bound to the view that `voice_connect`
+ *  draws in the chat. Not Cursor: null. Cursor with neither: refused with the reason. */
+/** Whether the MCP client says it is Cursor: "Cursor" (CLI) or "cursor-vscode" (editor), in `initialize`. */
+export const isCursorClient = client => /^cursor\b/i.test(client?.name || '');
+
+export function sessionIdentity({ client, env = process.env, locate = findChat, session = persistSession } = {}) {
+  if (!isCursorClient(client)) return null;
   const found = locate();
+  // The editor: the chat is the one the view `voice_connect` returns is drawn in, and the id is ours.
+  if (!found && drawsViews(client)) { const thread = THREAD_PREFIX + randomUUID(); return { harness: 'cursor', thread,
+    delivery: { kind: 'cursor-app', thread }, capabilities: { working: UNSUPPORTED, endOfTurn: UNSUPPORTED },
+    experimental: ['sessionIdentity'], editor: true, watchNote: EDITOR_WATCH }; }
   if (!found) throw new Error(EDITOR_NOTE);
-  return { harness: 'cursor', thread: found.chat, delivery: { kind: 'none', chat: found.chat } };
+  const persisted = session(found.chat, env);
+  if (persisted) return { harness: 'cursor', thread: found.chat, delivery: { kind: 'cursor-tmux', chat: found.chat } };
+  return { harness: 'cursor', thread: found.chat, delivery: { kind: 'none', chat: found.chat },
+    capabilities: { deliver: UNSUPPORTED }, deliverNote: NOT_PERSISTED };
 }
+
+const NOT_PERSISTED = 'This chat is not running under cursor-agent persist, so nothing can put a message into it. To let the '
+  + 'room talk to a Cursor CLI chat (experimental), start it with  cursor-agent persist  (it needs tmux).';
+
+/** The tmux that `persist` uses, the way the CLI picks it, and the server it runs its sessions on. */
+function tmuxCommand(env = process.env) {
+  const binary = env.SIDEVOICE_TMUX_BIN?.trim() || env.CURSOR_AGENT_TMUX_PATH?.trim()
+    || (env.AGENT_TMUX_ROOT_PATH?.trim() ? path.join(env.AGENT_TMUX_ROOT_PATH.trim(), 'bin', 'tmux') : 'tmux');
+  const named = env.CURSOR_AGENT_TMUX_SERVER_NAME?.trim();
+  const server = named && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(named) ? named : 'cursor-agent';
+  // The environment persist gives tmux: its socket lives under TMUX_TMPDIR=/tmp, and a TMUX of ours must
+  // not make it think it is nested.
+  const childEnv = { PATH: env.PATH || '/usr/bin:/bin', HOME: env.HOME || os.homedir(), TMUX_TMPDIR: '/tmp' };
+  return { binary, prefix: ['-u', '-L', server, '-f', '/dev/null'], env: childEnv };
+}
+
+function tmux(args, { env = process.env, input } = {}) {
+  const { binary, prefix, env: childEnv } = tmuxCommand(env);
+  return new Promise((resolve, reject) => {
+    const child = execFile(binary, [...prefix, ...args], { env: childEnv, timeout: 5000, maxBuffer: 1 << 20 }, (error, stdout, stderr) => {
+      if (error) return reject(new Error((String(stderr || '').trim() || error.message).slice(0, 300)));
+      resolve(String(stdout));
+    });
+    if (input !== undefined) child.stdin.end(input); else child.stdin.end();
+  });
+}
+
+/** The persistent session running this chat, as `cursor-agent persist` lists its own: sessions it manages
+ *  (`@cursor_managed` 1) carry the chat they run in `@cursor_chat_id`, which follows /new and /resume. */
+export function persistSession(chat, env = process.env) {
+  const { binary, prefix, env: childEnv } = tmuxCommand(env);
+  let out;
+  try {
+    out = execFileSync(binary, [...prefix, 'list-sessions', '-F', '#{session_name}\t#{@cursor_managed}\t#{@cursor_chat_id}\t#{session_attached}'],
+      { env: childEnv, encoding: 'utf8', timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'] });
+  } catch { return null; }
+  return parseSessions(out).find(session => session.chat.toLowerCase() === String(chat).toLowerCase()) || null;
+}
+
+export function parseSessions(out) {
+  return String(out).split('\n').map(line => line.split('\t')).filter(([name, managed, chat]) => name && managed === '1' && chat)
+    .map(([name, , chat, attached]) => ({ name, chat, attached: Number(attached) || 0 }));
+}
+
+/** Type the voice message into the chat's pane: the session is looked up again now, because the chat a
+ *  pane runs changes with /new. Pasted with bracketed paste (tmux wraps it only for a pane that asked
+ *  for it, as the CLI's input does) so the newlines stay inside the message, then Enter on its own after a
+ *  pause, so it is a key and not the end of the paste. tmux proves the keys reached the pane, not that
+ *  Cursor took them: the answer is `unknown`, and the transcript gives the read receipt. */
+export async function deliver(delivery, event, env = process.env) {
+  if (delivery?.kind === 'cursor-app') {
+    // The editor: the view drawn in that chat submits it, and says whether Cursor took it.
+    await deliverToView(delivery.thread, { message_id: event.message_id, text: envelope(event) }, { env });
+    return { status: 'accepted', detail: 'the chat\'s Sidevoice view submitted it (MCP App ui/message)' };
+  }
+  if (delivery?.kind !== 'cursor-tmux') throw new Error(`Cursor cannot take input here (delivery ${delivery?.kind || 'none'})`);
+  const session = persistSession(delivery.chat, env);
+  if (!session) throw new Error(`Chat ${delivery.chat} is no longer running in a cursor-agent persist session`);
+  const target = session.name + ':';
+  const buffer = 'sidevoice-' + randomUUID();
+  await tmux(['load-buffer', '-b', buffer, '-'], { env, input: envelope(event) });
+  await tmux(['paste-buffer', '-p', '-r', '-d', '-b', buffer, '-t', target], { env });
+  await new Promise(resolve => setTimeout(resolve, PASTE_SETTLE_MS));
+  await tmux(['send-keys', '-t', target, 'Enter'], { env });
+  return { status: 'unknown', detail: `typed into persistent session ${session.name}${session.attached ? ' (someone is attached)' : ''}` };
+}
+
+const PASTE_SETTLE_MS = Number(process.env.SIDEVOICE_CURSOR_PASTE_SETTLE_MS || 150);
 
 /** The store of a chat, found by its id under every workspace's directory. */
 export function storePath(chatId, env = process.env) {
@@ -206,7 +295,7 @@ export function observe(chatId, handlers, env = process.env) {
 export const cursorHarness = defineHarness({
   name: 'cursor',
   capabilities: {
-    deliver: UNSUPPORTED,
+    deliver: SUPPORTED,
     inspectInbound: UNSUPPORTED,
     working: SUPPORTED,
     endOfTurn: SUPPORTED,
@@ -215,6 +304,10 @@ export const cursorHarness = defineHarness({
   engine,
   observe,
   sessionIdentity,
+  deliver,
+  // Delivery types into the chat's terminal through tmux (CLI) or submits through an MCP App view (editor):
+  // it works, by routes Cursor does not offer as an interface.
+  experimental: ['deliver'],
 });
 
 export default cursorHarness;

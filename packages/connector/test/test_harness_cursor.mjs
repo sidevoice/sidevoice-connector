@@ -7,14 +7,15 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
-import { tailJsonl } from '../harness-contract.mjs';
+import { conversationCapabilities, envelope, experimentalCapabilities, tailJsonl } from '../harness-contract.mjs';
 import { harnessesPresent } from '../identity.mjs';
 import { httpHarness } from '../harness-http.mjs';
 import { identifyHarness } from '../harnesses.mjs';
 import { DatabaseSync } from 'node:sqlite';
+import { execFileSync } from 'node:child_process';
 import {
-  chatOfProcess, chatOfStore, cursorHarness, engine, findChat, interpretTranscript, observe, openFiles,
-  sessionIdentity, storeModel, transcriptPath,
+  chatOfProcess, chatOfStore, cursorHarness, deliver, engine, findChat, interpretTranscript, observe, openFiles,
+  parseSessions, persistSession, sessionIdentity, storeModel, transcriptPath,
 } from '../harness-cursor.mjs';
 
 const wait = ms => new Promise(r => setTimeout(r, ms));
@@ -43,11 +44,16 @@ const user = text => JSON.stringify({ role: 'user', message: { content: [{ type:
 const assistant = text => JSON.stringify({ role: 'assistant', message: { content: [{ type: 'text', text }, { type: 'tool_use', name: 'Shell', input: { command: 'ls' } }] } }) + '\n';
 const ended = (status = 'success') => JSON.stringify({ type: 'turn_ended', status }) + '\n';
 
-test('cursor: declares what Cursor offers — observed working and end of turn, identity, and no delivery', () => {
+test('cursor: declares what Cursor offers — observed working and end of turn, identity, and delivery marked experimental', () => {
   assert.deepEqual({ ...cursorHarness.capabilities }, {
-    deliver: 'unsupported', inspectInbound: 'unsupported', working: 'supported', endOfTurn: 'supported', sessionIdentity: 'supported',
+    deliver: 'supported', inspectInbound: 'unsupported', working: 'supported', endOfTurn: 'supported', sessionIdentity: 'supported',
   });
-  assert.equal(cursorHarness.deliver, undefined, 'nothing pretends to deliver');
+  assert.deepEqual(experimentalCapabilities(cursorHarness), ['deliver']);
+  // A chat not under persist loses delivery, and with it the experimental mark.
+  const narrowed = conversationCapabilities(cursorHarness, { capabilities: { deliver: 'unsupported' } });
+  assert.equal(narrowed.deliver, 'unsupported');
+  assert.deepEqual(experimentalCapabilities(cursorHarness, narrowed), []);
+  assert.equal(conversationCapabilities(cursorHarness, { capabilities: { inspectInbound: 'supported' } }).inspectInbound, 'unsupported', 'a conversation never gains one');
 });
 
 test('cursor: the conversation is the chat store the spawning process holds open, never a model\'s word', () => {
@@ -85,9 +91,12 @@ test('cursor: identity is claimed only for a client that says it is Cursor, and 
   const locate = () => ({ chat: 'chat-9', store: '/x/store.db' });
   assert.equal(sessionIdentity({ client: { name: 'claude-code' }, locate }), null);
   assert.equal(sessionIdentity({ client: null, locate }), null);
-  assert.deepEqual(sessionIdentity({ client: { name: 'Cursor', version: '1.0.0' }, locate }),
-    { harness: 'cursor', thread: 'chat-9', delivery: { kind: 'none', chat: 'chat-9' } });
-  assert.throws(() => sessionIdentity({ client: { name: 'Cursor' }, locate: () => null }), /Cursor editor .*cursor-agent/s);
+  const plain = sessionIdentity({ client: { name: 'Cursor', version: '1.0.0' }, locate, session: () => null });
+  assert.deepEqual({ ...plain, deliverNote: undefined }, { harness: 'cursor', thread: 'chat-9', delivery: { kind: 'none', chat: 'chat-9' }, capabilities: { deliver: 'unsupported' }, deliverNote: undefined });
+  assert.match(plain.deliverNote, /cursor-agent persist/);
+  assert.deepEqual(sessionIdentity({ client: { name: 'Cursor' }, locate, session: () => ({ name: 'cursor-1', chat: 'chat-9' }) }),
+    { harness: 'cursor', thread: 'chat-9', delivery: { kind: 'cursor-tmux', chat: 'chat-9' } });
+  assert.throws(() => sessionIdentity({ client: { name: 'Cursor' }, locate: () => null }), /draws no MCP Apps views.*cursor-agent/s);
 });
 
 test('cursor: transcript lines read as the contract — a user message, the end of a turn, or nothing', () => {
@@ -254,12 +263,144 @@ test('cursor install: the person\'s mcp.json keeps its permissions and its symli
   assert.match(gone.next.join('\n'), /Cursor still lists the sidevoice MCP server .* points at nothing/);
 });
 
-test('cursor: an explicitly configured receiver wins over Cursor, and the CLI — not the editor — makes Cursor present', () => {
+test('cursor: an explicitly configured receiver wins over Cursor, and ~/.cursor makes Cursor present', () => {
   const identity = identifyHarness({}, { SIDEVOICE_THREAD: 'ext-1', SIDEVOICE_DELIVERY_URL: 'http://127.0.0.1:9/inbox' }, { name: 'Cursor' });
   assert.equal(identity.module, httpHarness);
+  // The editor hands its MCP servers its whole environment: a Claude Code session that opened it leaves its id there.
+  const editor = { name: 'cursor-vscode', capabilities: { extensions: { 'io.modelcontextprotocol/ui': {} } } };
+  assert.equal(identifyHarness({}, { CLAUDE_CODE_SESSION_ID: 'claude-1', CODEX_THREAD_ID: 'codex-1' }, editor).harness, 'cursor');
   const home = mkdtempSync(path.join(os.tmpdir(), 'sv-home-'));
+  assert.ok(!harnessesPresent({ HOME: home, PATH: '' }).includes('cursor'));
   mkdirSync(path.join(home, '.cursor'));
-  assert.ok(!harnessesPresent({ HOME: home, PATH: '' }).includes('cursor'), 'the editor alone makes ~/.cursor');
-  mkdirSync(path.join(home, '.local', 'bin'), { recursive: true }); writeFileSync(path.join(home, '.local', 'bin', 'cursor-agent'), '');
-  assert.ok(harnessesPresent({ HOME: home, PATH: '' }).includes('cursor'));
+  assert.ok(harnessesPresent({ HOME: home, PATH: '' }).includes('cursor'), 'the editor alone is Cursor too: its chats can join');
+});
+
+/** A real tmux, when this machine has one: `SIDEVOICE_TMUX_BIN`, else `tmux` on PATH, else ~/tools/bin/tmux. */
+function findTmux() {
+  for (const candidate of [process.env.SIDEVOICE_TMUX_BIN, 'tmux', path.join(os.homedir(), 'tools', 'bin', 'tmux')].filter(Boolean)) {
+    try { execFileSync(candidate, ['-V'], { stdio: 'ignore' }); return candidate; } catch {}
+  }
+  return null;
+}
+export const TMUX = findTmux();
+
+/** A tmux server laid out as `cursor-agent persist` lays it out: its own -L server under TMUX_TMPDIR=/tmp, a
+ *  managed session tagged with its chat. In the pane, a stand-in for the CLI's input: raw mode, bracketed
+ *  paste turned on (\e[?2004h, as cursor-agent's input does), every byte it receives recorded. */
+export async function fakePersist(chat) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'sv-tmux-'));
+  const received = path.join(dir, 'received.bin');
+  const input = path.join(dir, 'input.mjs');
+  writeFileSync(input, `import { appendFileSync } from 'node:fs';
+process.stdin.setRawMode(true); process.stdout.write('\\x1b[?2004h> ');
+process.stdin.on('data', chunk => appendFileSync(${JSON.stringify(received)}, chunk));`);
+  const env = { SIDEVOICE_TMUX_BIN: TMUX, CURSOR_AGENT_TMUX_SERVER_NAME: 'sv-test-' + process.pid + '-' + Math.random().toString(36).slice(2, 8) };
+  const tmux = (...args) => execFileSync(TMUX, ['-u', '-L', env.CURSOR_AGENT_TMUX_SERVER_NAME, '-f', '/dev/null', ...args], { env: { ...process.env, TMUX_TMPDIR: '/tmp', TMUX: '' }, encoding: 'utf8' });
+  tmux('new-session', '-d', '-s', 'cursor-test', '-x', '120', '-y', '30', `${process.execPath} ${input}`, ';',
+    'set-option', '-t', 'cursor-test', '@cursor_managed', '1', ';', 'set-option', '-t', 'cursor-test', '@cursor_chat_id', chat);
+  await until(() => tmux('capture-pane', '-p', '-t', 'cursor-test:').includes('>'));
+  return { env, received, tmux, stop: () => { try { tmux('kill-server'); } catch {} } };
+}
+
+test('cursor persist: sessions are read as cursor-agent lists its own — managed ones, by the chat they run', () => {
+  const out = 'cursor-a\t1\t11111111-1111-1111-1111-111111111111\t1\nplain\t\t\t0\ncursor-b\t1\t\t0\n';
+  assert.deepEqual(parseSessions(out), [{ name: 'cursor-a', chat: '11111111-1111-1111-1111-111111111111', attached: 1 }]);
+});
+
+test('cursor persist: a voice message is pasted whole into the chat\'s pane and sent with Enter, through a real tmux', { skip: !TMUX && 'no tmux on this machine' }, async () => {
+  const chat = '5f0c9a8e-1d2b-4c3a-9e8f-7a6b5c4d3e2f';
+  const fake = await fakePersist(chat);
+  const env = { ...process.env, ...fake.env }, { received, tmux } = fake;
+  tmux('new-session', '-d', '-s', 'someone-else', 'sleep 60');
+  try {
+    assert.deepEqual(persistSession(chat.toUpperCase(), env), { name: 'cursor-test', chat, attached: 0 });
+    assert.equal(persistSession('00000000-0000-0000-0000-000000000000', env), null);
+
+    const event = { channel: 'voice', session_id: 's-1', revision: 3, message_id: 'm-1', text: 'primera línea\nsegunda "con comillas" y $HOME; \'x\'' };
+    const outcome = await deliver({ kind: 'cursor-tmux', chat }, event, env);
+    assert.equal(outcome.status, 'unknown', 'tmux proves the keys reached the pane, not that Cursor took them');
+    await until(() => existsSync(received) && readFileSync(received, 'latin1').endsWith('\r'));
+    const bytes = readFileSync(received, 'utf8');
+    // One bracketed paste holding the whole message, newlines as newlines, nothing expanded; then Enter alone.
+    assert.equal(bytes, '\x1b[200~' + envelope(event) + '\x1b[201~' + '\r');
+
+    // /new in the chat's session: the pane now runs another chat, and nothing is typed into it for this one.
+    tmux('set-option', '-t', 'cursor-test', '@cursor_chat_id', '99999999-9999-9999-9999-999999999999');
+    await assert.rejects(deliver({ kind: 'cursor-tmux', chat }, event, env), /no longer running in a cursor-agent persist session/);
+    assert.equal(readFileSync(received, 'utf8'), bytes, 'nothing more was typed');
+  } finally { fake.stop(); }
+});
+
+/** A stand-in for Cursor's MCP Apps host (3.22.12's McpAppView): it answers `ui/initialize` with the tool
+ *  call in `hostContext.toolInfo`, sends the tool result once the view says it is initialized, and answers
+ *  `ui/message` the way `handleUiMessage` does — `{}` once submitted, an error otherwise. The view's own
+ *  script runs unchanged; the webview's Origin is added to its requests, as the browser engine would. */
+export function runView({ html, toolResult, toolCallId = 'toolu_1', submit = async () => {}, origin = 'vscode-webview://sv-test' }) {
+  const script = html.slice(html.indexOf('<script>') + 8, html.lastIndexOf('</script>'));
+  const listeners = [], submitted = [], statuses = [];
+  const toView = data => { for (const listener of listeners) listener({ data }); };
+  const window = {
+    addEventListener: (type, listener) => { if (type === 'message') listeners.push(listener); },
+    parent: { postMessage: async message => {
+      if (message.method === 'ui/initialize') return toView({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: '2026-01-26', hostContext: { toolInfo: { id: toolCallId } } } });
+      if (message.method === 'ui/notifications/initialized') return toView({ jsonrpc: '2.0', method: 'ui/notifications/tool-result', params: toolResult });
+      if (message.method === 'ui/message') {
+        try { await submit(message.params); submitted.push(message.params); toView({ jsonrpc: '2.0', id: message.id, result: {} }); }
+        catch (error) { toView({ jsonrpc: '2.0', id: message.id, error: { code: -32000, message: error.message } }); }
+      }
+    } },
+  };
+  const element = { set textContent(text) { statuses.push(text); }, set className(_) {} };
+  const document = { getElementById: () => element };
+  const controller = new AbortController();
+  // Once stopped, the view's retry pause never ends: its loop is left waiting, holding no timer.
+  const pause = (fn, ms) => (controller.signal.aborted ? undefined : setTimeout(fn, ms));
+  const fetchAsView = (url, options = {}) => fetch(url, { ...options, signal: controller.signal, headers: { ...(options.headers || {}), origin } });
+  new Function('window', 'document', 'fetch', 'setTimeout', script)(window, document, fetchAsView, pause);
+  return { submitted, statuses, stop: () => controller.abort() };
+}
+
+test('cursor editor: a client that draws MCP Apps views gets a conversation of its own, marked experimental', () => {
+  const editor = { name: 'cursor-vscode', version: '1.0.0', capabilities: { extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] } } } };
+  const identity = sessionIdentity({ client: editor, locate: () => null });
+  assert.match(identity.thread, /^cursor-editor-[0-9a-f-]{36}$/);
+  assert.deepEqual(identity.delivery, { kind: 'cursor-app', thread: identity.thread });
+  const capabilities = conversationCapabilities(cursorHarness, identity);
+  assert.deepEqual([capabilities.deliver, capabilities.working, capabilities.endOfTurn, capabilities.sessionIdentity], ['supported', 'unsupported', 'unsupported', 'supported']);
+  assert.deepEqual(experimentalCapabilities(cursorHarness, capabilities, identity), ['deliver', 'sessionIdentity']);
+  assert.notEqual(sessionIdentity({ client: editor, locate: () => null }).thread, identity.thread, 'each join is its own conversation');
+  // Without views there is no way in, and it says so.
+  assert.throws(() => sessionIdentity({ client: { name: 'cursor-vscode', capabilities: {} }, locate: () => null }), /draws no MCP Apps views/);
+});
+
+test('cursor editor: the view submits a voice message to its chat through ui/message, over a loopback bridge only a Cursor webview may use', async () => {
+  const { deliverToView, ensureBridge, resource, stopBridge, viewState } = await import('../harness-cursor-app.mjs?' + Math.random());
+  const port = 40000 + Math.floor(Math.random() * 20000);
+  const env = { SIDEVOICE_CURSOR_APP_PORT: String(port) };
+  await ensureBridge(env);
+  const thread = 'cursor-editor-' + '1b2c3d4e-5f60-4a1b-8c2d-3e4f5a6b7c8d';
+  const read = resource(env);
+  assert.equal(read.mimeType, 'text/html;profile=mcp-app');
+  assert.deepEqual(read._meta.ui.csp.connectDomains, [`http://127.0.0.1:${port}`], 'the only origin the view may reach');
+  // The tool result as Cursor hands it to the view: our voice_connect answer.
+  const toolResult = { content: [{ type: 'text', text: JSON.stringify({ status: 'joined', harness: 'cursor', conversation: thread }) }] };
+  const view = runView({ html: read.text, toolResult, toolCallId: 'toolu_42' });
+  try {
+    await until(() => viewState(thread)?.toolCall === 'toolu_42');
+    const event = { channel: 'voice', session_id: 's', revision: 1, message_id: 'm-1', text: 'hola\neditor' };
+    await deliverToView(thread, { message_id: 'm-1', text: envelope(event) }, { env });
+    assert.deepEqual(view.submitted, [{ role: 'user', content: [{ type: 'text', text: envelope(event) }] }]);
+
+    // Cursor refusing the submit is a failed delivery, with its reason.
+    const refusing = runView({ html: read.text, toolResult, submit: async () => { throw new Error('Composer not loaded'); } });
+    view.stop();
+    await wait(100);
+    await assert.rejects(deliverToView(thread, { message_id: 'm-2', text: 'x' }, { env }), /Cursor did not take it: Composer not loaded/);
+    refusing.stop();
+
+    // Nobody asking but a web page: refused. No view at all: the delivery gives up, saying why.
+    assert.equal((await fetch(`http://127.0.0.1:${port}/cursor-app/next?thread=${thread}`, { headers: { origin: 'https://evil.example' } })).status, 403);
+    await wait(100);
+    await assert.rejects(deliverToView(thread, { message_id: 'm-3', text: 'x' }, { env, timeoutMs: 300 }), /No Sidevoice card is open in that Cursor chat/);
+  } finally { view.stop(); await stopBridge(); }
 });
