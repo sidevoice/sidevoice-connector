@@ -8,8 +8,10 @@
  *  `package.json` is copied next to the bundle because the modules inside it read their own
  *  version from the file beside them, and that is true of the source and of the bundle alike. */
 import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { build } from 'esbuild';
+import { CORE_VERSION } from './core.mjs';
 
 /** Some of what travels inside the bundle is CommonJS and calls `require` — for `fs`, for the
  *  optional native speed-ups `ws` asks for and does without. An ES module has no `require`, and
@@ -42,3 +44,15 @@ await writeFile(bundle, code.replace(/^#!.*\n/, line => line + REQUIRE), { mode:
 // The modules inside read their own version from the `package.json` beside them, and that is as
 // true of the bundle as of the source it was built from.
 await copyFile(fileURLToPath(new URL('./package.json', here)), fileURLToPath(new URL('./package.json', out)));
+
+// The core this version pins, as a wheel inside the package, when the build is handed one
+// (`SIDEVOICE_CORE_WHEEL`, built from sidevoice/sidevoice-core with `uv build`): the connector then
+// installs it with uv from beside the bundle, and nothing has to be fetched from a private index.
+// Without one, the connector asks the index for `sidevoice-core==CORE_VERSION`.
+const wheel = process.env.SIDEVOICE_CORE_WHEEL;
+if (wheel) {
+  const expected = `sidevoice_core-${CORE_VERSION}-py3-none-any.whl`;
+  if (path.basename(wheel) !== expected) throw new Error(`SIDEVOICE_CORE_WHEEL is ${path.basename(wheel)}, but this package pins ${expected}`);
+  await mkdir(fileURLToPath(new URL('./core/', out)), { recursive: true });
+  await copyFile(wheel, fileURLToPath(new URL('./core/' + expected, out)));
+}

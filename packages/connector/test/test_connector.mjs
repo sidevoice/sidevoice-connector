@@ -14,6 +14,7 @@ import { interpretRollout, rolloutPath } from '../harness-codex.mjs';
 import { remove as removeSkill, status as skillStatus } from '../skill.mjs';
 import './test_harness_contract.mjs';
 import './test_harness_claude.mjs';
+import './test_core.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const connectorPath = path.join(here, '..', 'connector.mjs');
