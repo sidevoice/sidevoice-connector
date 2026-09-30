@@ -391,9 +391,10 @@ async function handOver(binding, frame) {
   }
 }
 
-/** Whether what is said here reaches a room a person can be in: the core is linked and, when the core has
- *  said, its link with the room is up. A core somebody else runs may never say; then its link is the answer. */
-function reachable() { return connected && (rendezvous ? rendezvous.connected === true : true); }
+/** Whether what is said here reaches a room a person can be in: the core is linked and its link with the
+ *  room is up. Until this machine's own core has said, the answer is no; a core somebody else runs may
+ *  never say, and then its link is the answer. */
+function reachable() { return connected && (rendezvous ? rendezvous.connected === true : !!external); }
 
 function snapshot() {
   return { host: hostId, version: VERSION, room: rendezvous?.room || (external ? creds?.room : null) || null, connected: reachable(), protocol: PROTOCOL,

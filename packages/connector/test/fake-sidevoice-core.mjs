@@ -27,6 +27,8 @@ namespace.use((socket, next) => {
 });
 namespace.on('connection', socket => {
   socket.emit('connector.welcome', { protocol: 2 });
+  // A core whose link with the room is up, as the real one reports it to its connector.
+  socket.emit('node.rendezvous', { room: 'http://room.test', connected: true, via: 'outbound', error: null, refused: null });
   socket.onAny((event, ...args) => {
     const acknowledge = typeof args[args.length - 1] === 'function' ? args.pop() : null;
     const data = args[0] || {};
