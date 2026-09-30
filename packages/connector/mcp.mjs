@@ -109,7 +109,9 @@ function promptText(args = {}) {
 /** The conversations this server speaks for, by id. One, except in Cursor's editor, whose one MCP process
  *  serves every chat of a window: each chat that joins is a conversation of its own, with its own card. */
 const joined = new Map();
-const single = () => (joined.size === 1 ? joined.values().next().value : null);
+/** The only conversation, where "only" means something: in Cursor's editor any chat of the window may be the
+ *  one calling, joined or not, so there the conversation is always named or routed, never inferred. */
+const single = () => (!cursorViews() && joined.size === 1 ? joined.values().next().value : null);
 /** The conversation a call is about: the one named, the only one, or — several joined and none named — a
  *  question back, since tools/call does not say which chat is calling. */
 function pick(conversation) {
@@ -118,7 +120,8 @@ function pick(conversation) {
     if (!named) throw new Error(`"${conversation}" is not a conversation this server joined. Joined: ${[...joined.keys()].join(', ') || 'none'}.`);
     return named;
   }
-  if (joined.size <= 1) return single();
+  if (!joined.size) return null;
+  if (single()) return single();
   throw new Error(`Several chats of this window are joined (${[...joined.values()].map(b => `${b.client_ref} "${b.title}"`).join(', ')}); pass conversation: the id voice_connect returned in this chat.`);
 }
 async function leave(b) {
@@ -176,23 +179,24 @@ async function invoke(name, args, meta) {
     const status = ipc ? await rpc('status', {}) : { connected: false, bindings: [], closed_by_room: [] };
     // The room may have closed a conversation's voice since it joined: the connector is the truth.
     const closedNow = [...joined.keys()].filter(ref => (status.closed_by_room || []).includes(ref));
-    const asked = args.conversation || (joined.size === 1 ? single().client_ref : null);
+    const asked = args.conversation || single()?.client_ref || null;
     const closed = !!asked && closedNow.includes(asked);
     const closedFor = closed ? status.closed_reasons?.[asked] : null;
     for (const ref of closedNow) joined.delete(ref);
+    const closedList = closedNow.length && !single() ? { closed_by_room: closedNow.map(ref => ({ conversation: ref, note: closedNote(status.closed_reasons?.[ref]) })) } : {};
     const common = { room: status.room || pairedRoom()?.origin || null, room_reachable: status.connected, room_error: status.room_error || null, socket_error: status.socket_error || null,
              protocol: status.protocol ?? null,
              version: VERSION, connector_version: status.version || null, ...versionNote(status.version) };
-    const list = joined.size > 1 ? { conversations: [...joined.values()].map(b => ({ conversation: b.client_ref, title: b.title, harness: b.harness })) } : {};
-    if (!asked && joined.size > 1) return { joined: null, ...common, ...list,
-      note: 'Several chats of this window are joined. If voice_connect returned a conversation id in this chat, pass it as conversation to ask about this one; if it never did, this chat is not joined.' };
+    const list = cursorViews() || joined.size > 1 ? { conversations: [...joined.values()].map(b => ({ conversation: b.client_ref, title: b.title, harness: b.harness })) } : {};
+    if (!asked && joined.size) return { joined: null, ...common, ...list, ...closedList,
+      note: 'Chats of this Cursor window are joined, and this call does not say which chat is asking. If voice_connect returned a conversation id in this chat, pass it as conversation to ask about this one; if it never did, this chat is not joined.' };
     const binding = asked ? joined.get(asked) || null : null;
     const module = binding ? harnessFor(binding.harness) : null;
     const inbound = binding ? inboundFor(module, binding.client_ref) : null;
     return { joined: !!binding, ...common, ...list,
              binding_id: binding?.binding_id || null, harness: binding?.harness || null, conversation: binding?.client_ref || null,
              capabilities: binding?.capabilities || null, experimental: binding?.experimental || [], inbound,
-             ...(closed ? { closed_by_room: true, note: closedNote(closedFor) } : {}) };
+             ...closedList, ...(closed ? { closed_by_room: true, note: closedNote(closedFor) } : {}) };
   }
   if (name === 'voice_pair') {
     if (!args.room || !args.code) throw new Error('voice_pair needs the room\'s address and the code the user read from it.');
@@ -225,6 +229,12 @@ async function invoke(name, args, meta) {
     // from another one leaves the first. Cursor's editor is the exception: one server for every chat of a
     // window, each chat that joins its own conversation with its own card, all of them kept.
     if (!who.editor) for (const b of [...joined.values()]) if (b.client_ref !== who.thread) { try { await leave(b); } catch {} }
+    // A connector from before several chats could share one server cannot route their replies: say so
+    // rather than join a second chat whose voice_say would fail.
+    if (who.editor && joined.size) {
+      let running = null; try { running = (await rpc('status', {})).version || null; } catch {}
+      if (running !== VERSION) throw new Error(`Another chat of this window is already joined, and the connector running on this machine (${running ? 'version ' + running : 'an older version'}) cannot tell several chats' replies apart. It exits 15 s after the last conversation leaves it; then join again.`);
+    }
     const capabilities = conversationCapabilities(who.module, who);
     const experimental = experimentalCapabilities(who.module, capabilities, who);
     // Which model is answering, read from the session's own launch line rather than asked of the model.

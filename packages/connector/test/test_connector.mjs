@@ -677,7 +677,15 @@ test('façade + connector: four chats of one Cursor editor window join at once, 
     const html = (await until(() => replies.find(r => r.id === -1), 8000)).result.contents[0].text;
     // Four chats ask to join; Cursor draws each one's card in its chat.
     const chats = [];
-    for (const title of ['Uno', 'Dos', 'Tres', 'Cuatro']) {
+    // One chat joined: another chat of the window asking is not told it is that one.
+    const first = await call('voice_connect', { title: 'Uno' });
+    chats.push(first.value.conversation); views.push(runView({ html, toolResult: first.raw }));
+    const other = (await call('voice_status')).value;
+    assert.equal(other.joined, null, 'with one chat joined, a call from any chat of the window does not say which it is');
+    assert.equal(other.conversations.length, 1);
+    await assert.rejects(call('voice_say', { text: 'x', session_id: 'browser-1', revision: 1 }), /has received none to answer by voice/);
+    await assert.rejects(call('voice_disconnect'), /pass conversation/);
+    for (const title of ['Dos', 'Tres', 'Cuatro']) {
       const joinedChat = await call('voice_connect', { title });
       chats.push(joinedChat.value.conversation);
       views.push(runView({ html, toolResult: joinedChat.raw }));
@@ -695,8 +703,13 @@ test('façade + connector: four chats of one Cursor editor window join at once, 
     // Each chat answers its own turn: the reply is published as that chat, not as whichever joined last.
     await call('voice_say', { text: 'respuesta tres', session_id: 'browser-1', revision: 12 });
     await call('voice_say', { text: 'respuesta uno', session_id: 'browser-1', revision: 10 });
-    await call('voice_say', { text: 'escrito en cuatro', session_id: 'typed:' + chats[3], revision: 0 });
-    assert.deepEqual(room.sent('speech.publish').map(p => [p.binding_id, p.text]), [['b-3', 'respuesta tres'], ['b-1', 'respuesta uno'], ['b-4', 'escrito en cuatro']]);
+    assert.deepEqual(room.sent('speech.publish').map(p => [p.binding_id, p.text]), [['b-3', 'respuesta tres'], ['b-1', 'respuesta uno']]);
+    // `typed:` is only for a conversation that cannot take input: it names no chat of this window.
+    await assert.rejects(call('voice_say', { text: 'x', session_id: 'typed:' + chats[3], revision: 0 }), /no conversation of yours that cannot take input/);
+    // The same pair sent to two chats (the room reuses revision 0 for catch-up input) names neither.
+    await room.ask('input.deliver', { event_id: 'e-z1', binding_id: 'b-1', channel: 'voice', session_id: 'browser-1', revision: 0, message_id: 'm-z1', text: 'a' });
+    await room.ask('input.deliver', { event_id: 'e-z2', binding_id: 'b-2', channel: 'voice', session_id: 'browser-1', revision: 0, message_id: 'm-z2', text: 'b' });
+    await assert.rejects(call('voice_say', { text: 'x', session_id: 'browser-1', revision: 0 }), /went to more than one conversation/);
     await assert.rejects(call('voice_say', { text: '¿de quién?', session_id: 'browser-1', revision: 99 }), /name no voice turn delivered/);
 
     // Status and leaving need the chat's own id once several are joined.
@@ -707,13 +720,20 @@ test('façade + connector: four chats of one Cursor editor window join at once, 
     assert.equal((await call('voice_disconnect', { conversation: chats[1] })).value.status, 'left');
     await until(() => room.sent('binding.unregister').length === 1);
     assert.deepEqual(room.sent('binding.unregister').map(d => d.binding_id), ['b-2']);
+    // A late reply from the chat that left is not published as another chat.
+    await assert.rejects(call('voice_say', { text: 'tarde', session_id: 'browser-1', revision: 11 }), /no voice turn delivered to this chat/);
     // The room closes one chat's voice: that chat is told, the others keep theirs.
     room.tell('binding.close', { binding_id: 'b-3', thread: chats[2], reason: 'closed_from_room' });
     await wait(300);
-    await assert.rejects(call('voice_say', { text: 'x', session_id: 'browser-1', revision: 12 }), /closed this conversation's voice/);
+    const closedStatus = (await call('voice_status')).value;
+    assert.deepEqual(closedStatus.closed_by_room.map(entry => entry.conversation), [chats[2]], 'the closed chat is named, the others stay');
+    assert.equal(closedStatus.conversations.length, 2);
+    assert.match(closedStatus.closed_by_room[0].note, /closed this conversation's voice/);
+    await assert.rejects(call('voice_say', { text: 'x', session_id: 'browser-1', revision: 12 }), /no voice turn delivered to this chat/, 'once told, the closed chat is no longer one of this window\'s');
     await call('voice_say', { text: 'sigue', session_id: 'browser-1', revision: 13 });
     assert.equal(room.sent('speech.publish').at(-1).binding_id, 'b-4');
-    assert.equal((await call('voice_status')).value.conversations.length, 2);
+    const after = (await call('voice_status', { conversation: chats[3] })).value;
+    assert.equal(after.joined, true); assert.equal(after.conversations.length, 2);
   } finally { views.forEach(view => view.stop()); child.kill(); if (connector.exitCode === null) connector.kill(); await room.close(); }
 });
 

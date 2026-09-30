@@ -340,8 +340,11 @@ async function handOver(binding, frame) {
     return { status: 'unsupported', error: `${binding.harness} offers no way to put a message into this conversation` };
   }
   if (frame.session_id !== undefined && frame.revision !== undefined) {
-    turnsDelivered.delete(turnKey(frame.session_id, frame.revision));
-    turnsDelivered.set(turnKey(frame.session_id, frame.revision), binding.client_ref);
+    // Every conversation a turn went to: the room can send the same pair to two (revision 0 is reused for
+    // catch-up input), and then a reply naming it names neither.
+    const key = turnKey(frame.session_id, frame.revision);
+    const went = turnsDelivered.get(key) || new Set();
+    turnsDelivered.delete(key); went.add(binding.client_ref); turnsDelivered.set(key, went);
     while (turnsDelivered.size > TURNS_MAX) turnsDelivered.delete(turnsDelivered.keys().next().value);
   }
   // Expected before it is sent: the harness can take the message, and its transcript show it, before the
@@ -388,11 +391,19 @@ function shutdown() {
  *  (`typed:<conversation>`, handed only to that conversation), or the one that turn was delivered to. */
 function routeSpeech({ client_refs, session_id, revision }) {
   const own = new Set(client_refs);
-  if (typeof session_id === 'string' && session_id.startsWith('typed:') && own.has(session_id.slice(6))) return session_id.slice(6);
-  const delivered = turnsDelivered.get(turnKey(session_id, revision));
-  if (delivered && own.has(delivered)) return delivered;
-  if (own.size === 1) return client_refs[0];
-  throw new Error('AMBIGUOUS: this session_id and revision name no voice turn delivered to one of these conversations; use the ones from the voice message you are answering');
+  // `typed:<conversation>` is handed only to a conversation that cannot take input: only there does it name one.
+  if (typeof session_id === 'string' && session_id.startsWith('typed:')) {
+    const named = session_id.slice(6);
+    const binding = [...bindings.values()].find(b => b.client_ref === named);
+    if (own.has(named) && binding && capabilityState(binding, 'deliver') === 'unsupported') return named;
+    throw new Error('AMBIGUOUS: that typed session belongs to no conversation of yours that cannot take input; reply in writing');
+  }
+  const delivered = [...(turnsDelivered.get(turnKey(session_id, revision)) || [])];
+  const mine = delivered.filter(ref => own.has(ref));
+  if (mine.length === 1 && delivered.length === 1) return mine[0];
+  throw new Error(delivered.length > 1
+    ? 'AMBIGUOUS: that voice turn went to more than one conversation, so it cannot say which one is answering; reply in writing'
+    : 'AMBIGUOUS: this session_id and revision name no voice turn delivered to this chat — it has received none to answer by voice (reply in writing), or use the ones from the voice message you are answering');
 }
 
 async function command(client, input) {
