@@ -4,7 +4,8 @@
  *  Installed with `uv`, never Docker, at the one version this package pins: `CORE_VERSION`, bumped by
  *  hand like every other pin here. Where it is installed from, in order: `SIDEVOICE_CORE_SPEC` (a wheel,
  *  a directory, a git URL, a requirement — anything `uv pip install` takes); the wheel the published
- *  package carries beside its bundle (`dist/core/`); `sidevoice-core==CORE_VERSION` from the index.
+ *  package carries beside its bundle (`dist/core/`) — or, run from a checkout, the wheel put beside these
+ *  sources (`packages/connector/core/`, ignored by git); `sidevoice-core==CORE_VERSION` from the index.
  *  `SIDEVOICE_CORE_BIN` skips installing altogether and names a `sidevoice-core` someone installed.
  *
  *  Installing a Python program is heavy the first time (a few hundred megabytes of wheels) and nothing
@@ -40,6 +41,13 @@ export function coreSpec(env = process.env) {
   return existsSync(wheel) ? wheel : `sidevoice-core==${CORE_VERSION}`;
 }
 
+/** What names an installed copy: the spec, and for a wheel file its size and time too, so a wheel rebuilt in
+ *  the same place (a checkout's) is installed again instead of taken for the one already there. */
+function specIdentity(spec) {
+  try { const stat = statSync(spec); if (stat.isFile()) return `${spec}@${stat.size}-${Math.round(stat.mtimeMs)}`; } catch {}
+  return spec;
+}
+
 function executable(file) {
   try { accessSync(file, constants.X_OK); return statSync(file).isFile(); } catch { return false; }
 }
@@ -72,14 +80,14 @@ function run(command, args, { log, env }) {
 /** The `sidevoice-core` to start, installing the pinned version first if it is not there. */
 export async function ensureInstalled({ dataDir, env = process.env, log = () => {} }) {
   if (env.SIDEVOICE_CORE_BIN) return env.SIDEVOICE_CORE_BIN;
-  const spec = coreSpec(env);
+  const spec = coreSpec(env), identity = specIdentity(spec);
   const home = path.join(runtimeRoot(dataDir), CORE_VERSION);
   const venv = path.join(home, 'venv');
   const windows = process.platform === 'win32';
   const bin = path.join(venv, windows ? 'Scripts' : 'bin', windows ? 'sidevoice-core.exe' : 'sidevoice-core');
   const python = path.join(venv, windows ? 'Scripts' : 'bin', windows ? 'python.exe' : 'python');
   const marker = path.join(home, 'installed.json');
-  try { if (executable(bin) && JSON.parse(readFileSync(marker, 'utf8')).spec === spec) return bin; } catch {}
+  try { if (executable(bin) && JSON.parse(readFileSync(marker, 'utf8')).spec === identity) return bin; } catch {}
   const uv = findUv(env);
   if (!uv) throw new Error(NO_UV);
   mkdirSync(home, { recursive: true, mode: 0o700 });
@@ -89,7 +97,7 @@ export async function ensureInstalled({ dataDir, env = process.env, log = () => 
   await run(uv, ['venv', '--clear', '--python', '3.12', venv], options);
   await run(uv, ['pip', 'install', '--python', python, spec], options);
   if (!executable(bin)) throw new Error(`uv installed ${spec} but there is no ${bin}; see ${logPath(dataDir)}`);
-  writeFileSync(marker, JSON.stringify({ version: CORE_VERSION, spec, at: new Date().toISOString() }), { mode: 0o600 });
+  writeFileSync(marker, JSON.stringify({ version: CORE_VERSION, spec: identity, at: new Date().toISOString() }), { mode: 0o600 });
   // One current copy: the versions this connector no longer pins are disposable.
   for (const name of readdirSync(runtimeRoot(dataDir))) {
     if (name !== CORE_VERSION) rmSync(path.join(runtimeRoot(dataDir), name), { recursive: true, force: true });

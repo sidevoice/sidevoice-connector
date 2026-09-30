@@ -18,3 +18,5 @@ __pycache__/
 *.key
 coverage/
 .pytest_cache/
+# A checkout's copy of the pinned core wheel (packages/connector/core.mjs)
+packages/connector/core/

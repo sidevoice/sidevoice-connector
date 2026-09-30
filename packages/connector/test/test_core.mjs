@@ -171,3 +171,30 @@ test('core: the published bundle installs the wheel it carries, and the pin is t
   execFileSync(process.execPath, [path.join(packageDir, 'build.mjs')], { stdio: 'ignore' });
   assert.equal(coreSpec({}), `sidevoice-core==${CORE_VERSION}`);
 });
+
+test('core: run from a checkout, the connector installs the wheel put beside its sources, and again once that wheel is rebuilt', async () => {
+  const beside = path.join(packageDir, 'core');
+  const wheel = path.join(beside, `sidevoice_core-${CORE_VERSION}-py3-none-any.whl`);
+  mkdirSync(beside, { recursive: true });
+  writeFileSync(wheel, 'first build');
+  let first = null, second = null;
+  try {
+    assert.equal(coreSpec({}), wheel, 'a checkout\'s wheel comes before the index');
+    first = machine();
+    await until(() => existsSync(first.socketPath));
+    let facade = ipc(first.socketPath); await facade.ready;
+    await register(facade);
+    assert.equal(first.uvCalls()[1].at(-1), wheel);
+    facade.end(); first.stop();
+    await until(() => first.child.exitCode !== null || first.child.signalCode !== null);
+    // Rebuilt in place (`uv build` after a pull): same path, other contents — installed again, not reused.
+    writeFileSync(wheel, 'second build, longer');
+    // The same machine again: its data dir, where the first install left its marker.
+    second = machine({ SIDEVOICE_DATA_DIR: first.dataDir, FAKE_UV_LOG: path.join(first.dataDir, 'uv.jsonl') });
+    await until(() => existsSync(first.socketPath));
+    facade = ipc(first.socketPath); await facade.ready;
+    await register(facade);
+    assert.equal(first.uvCalls().length, 4, 'the rebuilt wheel was installed');
+    facade.end();
+  } finally { first?.stop(); second?.stop(); rmSync(beside, { recursive: true, force: true }); }
+});
