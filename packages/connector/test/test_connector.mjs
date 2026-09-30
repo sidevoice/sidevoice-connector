@@ -297,6 +297,30 @@ test('mcp façade: identity comes from the harness, tools are exposed, instructi
   } finally { child.kill(); fake.close(); }
 });
 
+test('mcp façade: with no room paired a conversation joins this machine\'s core and says so; a room named still asks for its code', async () => {
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const socketPath = path.join(dataDir, 'connector.sock');
+  const commands = [];
+  const fake = net.createServer(socket => { let buffer = ''; socket.on('data', chunk => { buffer += chunk; let i; while ((i = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, i); buffer = buffer.slice(i + 1); if (!line) continue; const input = JSON.parse(line); commands.push(input); const result = input.method === 'register' ? { binding_id: 'b-1', thread: input.params.thread, connected: false } : { connected: false, bindings: [] }; socket.write(JSON.stringify({ id: input.id, ok: true, result }) + '\n'); } }); });
+  await new Promise(r => fake.listen(socketPath, r));
+  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'sess-local', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/x.sock', CLAUDE_CODE_MESSAGING_TOKEN: 'tok' }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
+  const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+  try {
+    ask(1, 'tools/call', { name: 'voice_connect', arguments: { title: 'Local', room: 'https://room.example' } });
+    await until(() => replies.some(x => x.id === 1));
+    assert.match(replies.find(x => x.id === 1).error.message, /not paired with the room at https:\/\/room\.example/, 'a room named is a room to pair with');
+    assert.equal(commands.filter(c => c.method === 'register').length, 0);
+    ask(2, 'tools/call', { name: 'voice_connect', arguments: { title: 'Local' } });
+    await until(() => replies.some(x => x.id === 2));
+    const joined = JSON.parse(replies.find(x => x.id === 2).result.content[0].text);
+    assert.equal(joined.status, 'joined'); assert.equal(joined.room_reachable, false);
+    assert.match(joined.local_only, /only from devices paired with this machine/);
+    assert.match(joined.local_only, /voice_pair_device/);
+    assert.equal(commands.filter(c => c.method === 'register').length, 1);
+  } finally { child.kill(); fake.close(); }
+});
+
 test('connector: the room closing a conversation\'s voice removes the binding and the façade is told on its next call', async () => {
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));

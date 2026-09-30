@@ -79,6 +79,7 @@ function promptText(args = {}) {
     '',
     '1. Call voice_status. If it reports joined and room_reachable, say so in one line and stop.',
     `2. Call voice_connect with the title ${title ? JSON.stringify(title) : 'a short label of what this conversation is about'}. If the user named a room, pass its address as room.`,
+    '   If it returns local_only, the machine has no room: relay that note in one line and continue.',
     '   If it fails saying this machine is not paired with the room (or is paired with a different one), ask the user for the room\'s address and the one-time code the room shows them under "Emparejar máquina"; call voice_pair with both, then voice_connect again. Never try to get a code from the room yourself.',
     '3. Tell the user in one line whether the room can reach this conversation. If inbound.ok is false, relay inbound.reason and offer inbound.remedy in your own words, including what safeguard it removes; change nothing yourself.',
     '',
@@ -168,6 +169,8 @@ function cardReport(who, result) {
   if (!cursorViews() && !String(who.route || '').startsWith('cursor-cli')) return { requested: false, note: 'This Cursor did not declare MCP Apps support in initialize, so it draws no card: what the user says in the room cannot reach this chat. ~/.sidevoice/mcp.log shows what it declared.' };
   return { requested: false, note: 'Cursor CLI: no card; voice reaches the chat only under cursor-agent persist.' };
 }
+/** Joined with no room paired: said, so the conversation can tell the person where it can be heard from. */
+const LOCAL_ONLY = 'This machine is not paired with any room, so this conversation is reachable only from devices paired with this machine itself (the Sidevoice app on this computer, at this machine\'s own address). Tell the user in one line. Pairing the app is voice_pair_device, only if they ask; reaching it from elsewhere needs a room\'s address and code (voice_pair).';
 function inboundFor(harness, thread) {
   return capabilityState(harness, 'inspectInbound') === SUPPORTED ? harness.inspectInbound(thread) : null;
 }
@@ -219,7 +222,10 @@ async function invoke(name, args, meta) {
   // needs this conversation joined: pairing a device is not voice.
   if (name === 'voice_pair_device') return (await pairDevice(rpc)).text;
   if (name === 'voice_connect') {
-    const needed = pairingNeeded(args.room, pairedRoom());
+    // No room at all is not a refusal: the conversation joins this machine's core, which devices paired with
+    // the machine itself reach directly (the desktop app on this computer). A room named is still checked.
+    const paired = pairedRoom();
+    const needed = args.room || paired ? pairingNeeded(args.room, paired) : null;
     if (needed) { const error = new Error(needed); error.data = { pairing_needed: true, room: args.room ? originOf(args.room) : null }; throw error; }
     let who;
     try { who = identifyHarness(meta, process.env, client); }
@@ -259,6 +265,7 @@ async function invoke(name, args, meta) {
       deliver: capabilities.deliver, experimental, views: cursorViews(), chat_store_held: who.chatStoreHeld ?? null, card_port: result.prepared?.port ?? null, bridge_candidate: !!who.delivery.candidate });
     return { status: result.pending ? 'joining' : 'joined', harness: who.harness, conversation: who.thread,
              binding_id: result.binding_id, delivery: pushed ? 'push' : 'none', room_reachable: result.connected, capabilities, inbound,
+             ...(paired ? {} : { local_only: LOCAL_ONLY }),
              ...(pushed ? {} : { voice_in: voiceInUnsupported(who) }),
              ...(who.editor ? { view: `Voice reaches this chat through the small Sidevoice card drawn under this call: it must stay open in this chat. Other chats of this window can join too, each with its own card. Remember this chat's conversation id (${who.thread}): voice_status and voice_disconnect need it when several chats are joined.` } : {}),
              ...(who.watchNote ? { watch_note: who.watchNote } : {}),
