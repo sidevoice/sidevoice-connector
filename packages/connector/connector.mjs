@@ -125,6 +125,12 @@ function request(event, data, options) {
  * 2026-09-20). Saying it again is one small frame; not saying it is a light that never comes on. */
 const WORK_ANNOUNCE_MS = Number(process.env.SIDEVOICE_WORK_ANNOUNCE_MS || 2000);
 const PENDING_MAX = 64;
+/** Which conversation each delivered voice turn went to, by the (session_id, revision) it carried: one
+ *  façade can speak for several conversations (Cursor's editor, one MCP process per window), and a
+ *  voice_say names the turn it answers, never the conversation. */
+const turnsDelivered = new Map();
+const TURNS_MAX = 512;
+const turnKey = (session_id, revision) => `${session_id}\n${revision}`;
 let announceTimer = null;
 function announceWork(binding, working, extra = {}) {
   binding.working = working;
@@ -333,6 +339,11 @@ async function handOver(binding, frame) {
     log(`not delivering ${frame.event_id} (${frame.message_id}) to ${binding.thread}: ${binding.harness} cannot take input from the room`);
     return { status: 'unsupported', error: `${binding.harness} offers no way to put a message into this conversation` };
   }
+  if (frame.session_id !== undefined && frame.revision !== undefined) {
+    turnsDelivered.delete(turnKey(frame.session_id, frame.revision));
+    turnsDelivered.set(turnKey(frame.session_id, frame.revision), binding.client_ref);
+    while (turnsDelivered.size > TURNS_MAX) turnsDelivered.delete(turnsDelivered.keys().next().value);
+  }
   // Expected before it is sent: the harness can take the message, and its transcript show it, before the
   // delivery call has even settled (Claude Code admitted one 9 ms after the write; the socket answered
   // 1.5 s later, 2026-09-21). A message expected and never taken costs a map entry.
@@ -373,8 +384,19 @@ function shutdown() {
   process.exit(0);
 }
 
+/** The conversation a voice_say belongs to, among those its façade speaks for: the one its session names
+ *  (`typed:<conversation>`, handed only to that conversation), or the one that turn was delivered to. */
+function routeSpeech({ client_refs, session_id, revision }) {
+  const own = new Set(client_refs);
+  if (typeof session_id === 'string' && session_id.startsWith('typed:') && own.has(session_id.slice(6))) return session_id.slice(6);
+  const delivered = turnsDelivered.get(turnKey(session_id, revision));
+  if (delivered && own.has(delivered)) return delivered;
+  if (own.size === 1) return client_refs[0];
+  throw new Error('AMBIGUOUS: this session_id and revision name no voice turn delivered to one of these conversations; use the ones from the voice message you are answering');
+}
+
 async function command(client, input) {
-  const params = input.params || {};
+  let params = input.params || {};
   switch (input.method) {
     case 'register': {
       const { client_ref, harness, thread, title, delivery, inbound, capabilities, experimental, engine } = params;
@@ -403,10 +425,12 @@ async function command(client, input) {
       return { binding_id: reply?.binding_id || binding.binding_id, thread, connected, pending: !reply, ...(prepared?.info ? { prepared: prepared.info } : {}) };
     }
     case 'publish': {
+      // A façade speaking for several conversations names them all, and the turn names which one.
+      if (Array.isArray(params.client_refs) && !params.client_ref) params = { ...params, client_ref: routeSpeech(params) };
       const binding = bindings.get(params.binding_id) || [...bindings.values()].find(b => b.client_ref === params.client_ref);
       // Why it is gone travels with the refusal: a pairing revoked and a channel closed are not the
       // same news for the conversation, and only it can say the right one to the person.
-      if (!binding) throw new Error(closedByRoom.has(params.client_ref) ? 'CLOSED_BY_ROOM:' + closedByRoom.get(params.client_ref) : 'Unknown binding');
+      if (!binding) throw new Error(closedByRoom.has(params.client_ref) ? 'CLOSED_BY_ROOM:' + closedByRoom.get(params.client_ref) + ':' + params.client_ref : 'Unknown binding');
       const speech = { event_id: params.event_id || randomUUID(), binding_id: binding.binding_id,
         session_id: params.session_id, revision: params.revision, utterance_id: params.utterance_id || randomUUID(), text: params.text, language: params.language };
       outbox.push(speech); saveOutbox();

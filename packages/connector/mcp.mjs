@@ -83,8 +83,8 @@ const tools = [
     inputSchema: { type: 'object', properties: { room: { type: 'string', description: 'The room\'s address (https://…)' }, code: { type: 'string', description: 'The one-time pairing code shown by the room' } }, required: ['room', 'code'], additionalProperties: false } },
   { name: 'voice_say', description: 'Publish a concise spoken version of your reply to the room, with the session_id and revision from the voice message header.',
     inputSchema: { type: 'object', properties: { text: { type: 'string' }, session_id: { type: 'string' }, revision: { type: 'integer', minimum: 0 }, utterance_id: { type: 'string' }, language: { type: 'string', enum: ['es', 'en', 'fr', 'it', 'pt', 'hi'] } }, required: ['text', 'session_id', 'revision'], additionalProperties: false } },
-  { name: 'voice_disconnect', description: 'Leave the voice room. The conversation and its work continue in writing.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
-  { name: 'voice_status', description: 'Whether the room can currently reach this conversation.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+  { name: 'voice_disconnect', description: 'Leave the voice room. The conversation and its work continue in writing.', inputSchema: { type: 'object', properties: { conversation: { type: 'string', description: 'Only when several chats of this window are joined: the conversation id voice_connect returned in this chat' } }, additionalProperties: false } },
+  { name: 'voice_status', description: 'Whether the room can currently reach this conversation.', inputSchema: { type: 'object', properties: { conversation: { type: 'string', description: 'Only when several chats of this window are joined: the conversation id voice_connect returned in this chat' } }, additionalProperties: false } },
 ];
 /** The joining steps as a prompt: what the voice-room skill used to be, now carried by the server itself so
  *  nothing is copied into any harness and the steps move with the version. */
@@ -106,7 +106,25 @@ function promptText(args = {}) {
     'Nothing else is registered: the room learns that a message was read and whether this conversation is working from what the harness itself records about it. How to behave once joined is in this server\'s instructions.',
   ].join('\n');
 }
-let binding = null;
+/** The conversations this server speaks for, by id. One, except in Cursor's editor, whose one MCP process
+ *  serves every chat of a window: each chat that joins is a conversation of its own, with its own card. */
+const joined = new Map();
+const single = () => (joined.size === 1 ? joined.values().next().value : null);
+/** The conversation a call is about: the one named, the only one, or — several joined and none named — a
+ *  question back, since tools/call does not say which chat is calling. */
+function pick(conversation) {
+  if (conversation) {
+    const named = joined.get(conversation);
+    if (!named) throw new Error(`"${conversation}" is not a conversation this server joined. Joined: ${[...joined.keys()].join(', ') || 'none'}.`);
+    return named;
+  }
+  if (joined.size <= 1) return single();
+  throw new Error(`Several chats of this window are joined (${[...joined.values()].map(b => `${b.client_ref} "${b.title}"`).join(', ')}); pass conversation: the id voice_connect returned in this chat.`);
+}
+async function leave(b) {
+  joined.delete(b.client_ref);
+  return rpc('unregister', { binding_id: b.binding_id, client_ref: b.client_ref });
+}
 /** Who spawned this server, as it said in `initialize`, and what it said it can do. Cursor says nothing else about itself. */
 let client = null;
 /** The Cursor editor draws MCP Apps views: `voice_connect` carries one, which is how voice reaches its chats. */
@@ -141,7 +159,7 @@ function versionNote(connectorVersion) {
 const EXPERIMENTAL_NOTES = {
   'cursor-tmux': 'Voice from the room reaches this conversation by an experimental route: it is pasted into this chat\'s terminal through tmux and sent with Enter. If the user is typing at the same moment, the two texts mix. Tell the user once.',
   'cursor-app': 'Voice from the room reaches this chat by an experimental route: the small Sidevoice card under this call submits it as if the user had typed it; it must stay open in this chat. If the user is typing at the same moment, the two may mix. Tell the user once.',
-  sessionIdentity: 'This conversation is identified by the Sidevoice card drawn in it, not by an id Cursor gives: joining from another chat of this window moves the voice there.',
+  sessionIdentity: 'This conversation is identified by the Sidevoice card drawn in it, not by an id Cursor gives: each chat of this window that joins gets a card and a conversation of its own. Asking this same chat to join again gives it a second one; leave the old one with voice_disconnect and its conversation id.',
 };
 
 function voiceInUnsupported(who) {
@@ -156,16 +174,23 @@ function inboundFor(harness, thread) {
 async function invoke(name, args, meta) {
   if (name === 'voice_status') {
     const status = ipc ? await rpc('status', {}) : { connected: false, bindings: [], closed_by_room: [] };
-    // The room may have closed this conversation's voice since we joined: the connector is the truth.
-    const closed = !!binding && (status.closed_by_room || []).includes(binding.client_ref);
-    const closedFor = closed ? status.closed_reasons?.[binding.client_ref] : null;
-    if (closed) binding = null;
+    // The room may have closed a conversation's voice since it joined: the connector is the truth.
+    const closedNow = [...joined.keys()].filter(ref => (status.closed_by_room || []).includes(ref));
+    const asked = args.conversation || (joined.size === 1 ? single().client_ref : null);
+    const closed = !!asked && closedNow.includes(asked);
+    const closedFor = closed ? status.closed_reasons?.[asked] : null;
+    for (const ref of closedNow) joined.delete(ref);
+    const common = { room: status.room || pairedRoom()?.origin || null, room_reachable: status.connected, room_error: status.room_error || null, socket_error: status.socket_error || null,
+             protocol: status.protocol ?? null,
+             version: VERSION, connector_version: status.version || null, ...versionNote(status.version) };
+    const list = joined.size > 1 ? { conversations: [...joined.values()].map(b => ({ conversation: b.client_ref, title: b.title, harness: b.harness })) } : {};
+    if (!asked && joined.size > 1) return { joined: null, ...common, ...list,
+      note: 'Several chats of this window are joined. If voice_connect returned a conversation id in this chat, pass it as conversation to ask about this one; if it never did, this chat is not joined.' };
+    const binding = asked ? joined.get(asked) || null : null;
     const module = binding ? harnessFor(binding.harness) : null;
     const inbound = binding ? inboundFor(module, binding.client_ref) : null;
-    return { joined: !!binding, room: status.room || pairedRoom()?.origin || null, room_reachable: status.connected, room_error: status.room_error || null, socket_error: status.socket_error || null,
-             protocol: status.protocol ?? null,
-             version: VERSION, connector_version: status.version || null, ...versionNote(status.version),
-             binding_id: binding?.binding_id || null, harness: binding?.harness || null,
+    return { joined: !!binding, ...common, ...list,
+             binding_id: binding?.binding_id || null, harness: binding?.harness || null, conversation: binding?.client_ref || null,
              capabilities: binding?.capabilities || null, experimental: binding?.experimental || [], inbound,
              ...(closed ? { closed_by_room: true, note: closedNote(closedFor) } : {}) };
   }
@@ -177,7 +202,7 @@ async function invoke(name, args, meta) {
     // The connector that is up, if any, was started for the previous credential: let go of it so it can
     // exit, and the next voice_connect starts one for this room. Other conversations still bound to the
     // previous room keep that connector alive until they leave; they are not moved.
-    if (binding) { try { await rpc('unregister', { binding_id: binding.binding_id }); } catch {} binding = null; }
+    for (const b of [...joined.values()]) { try { await leave(b); } catch {} }
     if (ipc) { ipc.end(); ipc = null; }
     return { status: 'paired', room: result.origin, connector_id: result.connector_id,
              ...(previous && previous.origin !== result.origin ? { replaced: previous.origin, note: 'Conversations on this machine still joined to the previous room keep it until they leave.' } : {}),
@@ -197,11 +222,9 @@ async function invoke(name, args, meta) {
       throw error;
     }
     // One server can outlive its conversation — cursor-agent keeps it across /new and /resume — so joining
-    // from another one leaves the first: this façade speaks for one conversation at a time.
-    if (binding && binding.client_ref !== who.thread) {
-      try { await rpc('unregister', { binding_id: binding.binding_id, client_ref: binding.client_ref }); } catch {}
-      binding = null;
-    }
+    // from another one leaves the first. Cursor's editor is the exception: one server for every chat of a
+    // window, each chat that joins its own conversation with its own card, all of them kept.
+    if (!who.editor) for (const b of [...joined.values()]) if (b.client_ref !== who.thread) { try { await leave(b); } catch {} }
     const capabilities = conversationCapabilities(who.module, who);
     const experimental = experimentalCapabilities(who.module, capabilities, who);
     // Which model is answering, read from the session's own launch line rather than asked of the model.
@@ -209,39 +232,44 @@ async function invoke(name, args, meta) {
     try { engine = (await who.module.engine?.(who.thread)) || null; } catch { engine = null; }
     const result = await rpc('register', { client_ref: who.thread, harness: who.harness, thread: who.thread,
       title, delivery: who.delivery, inbound, capabilities, experimental, engine });
-    binding = { ...result, harness: who.harness, client_ref: who.thread, capabilities, experimental };
+    joined.set(who.thread, { ...result, harness: who.harness, client_ref: who.thread, title, capabilities, experimental });
     let connectorVersion = null; try { connectorVersion = (await rpc('status', {})).version || null; } catch {}
     const pushed = capabilities.deliver === SUPPORTED;
     return { status: result.pending ? 'joining' : 'joined', harness: who.harness, conversation: who.thread,
              binding_id: result.binding_id, delivery: pushed ? 'push' : 'none', room_reachable: result.connected, capabilities, inbound,
              ...(pushed ? {} : { voice_in: voiceInUnsupported(who) }),
-             ...(who.editor ? { view: 'Voice reaches this chat through the small Sidevoice card drawn under this call: it must stay open in this chat. One chat per Cursor window has voice at a time; joining from another moves it.' } : {}),
+             ...(who.editor ? { view: `Voice reaches this chat through the small Sidevoice card drawn under this call: it must stay open in this chat. Other chats of this window can join too, each with its own card. Remember this chat's conversation id (${who.thread}): voice_status and voice_disconnect need it when several chats are joined.` } : {}),
              ...(who.watchNote ? { watch_note: who.watchNote } : {}),
              ...(experimental.length ? { experimental, experimental_notes: experimental.map(name => EXPERIMENTAL_NOTES[name === 'deliver' ? who.delivery.kind : name]).filter(Boolean) } : {}),
              ...(who.delivery.kind === 'cursor-app' && result.prepared?.port ? { view_link: { conversation: who.thread, port: result.prepared.port, key: who.delivery.key } } : {}),
              version: VERSION, connector_version: connectorVersion, ...versionNote(connectorVersion) };
   }
-  if (!binding) throw new Error('Not connected to the voice room: call voice_connect first (only if the user asked).');
+  if (!joined.size) throw new Error('Not connected to the voice room: call voice_connect first (only if the user asked).');
 
   if (name === 'voice_say') {
+    // One conversation: it. Several: the connector finds the one this turn was delivered to.
+    const only = single();
+    const route = only ? { binding_id: only.binding_id, client_ref: only.client_ref } : { client_refs: [...joined.keys()] };
     let result;
     try {
-      result = await rpc('publish', { binding_id: binding.binding_id, client_ref: binding.client_ref, text: args.text, session_id: args.session_id, revision: args.revision, utterance_id: args.utterance_id, language: args.language });
+      result = await rpc('publish', { ...route, text: args.text, session_id: args.session_id, revision: args.revision, utterance_id: args.utterance_id, language: args.language });
     } catch (error) {
       if (error.message.startsWith('CLOSED_BY_ROOM')) {
-        binding = null;
-        throw new Error(closedNote(error.message.split(':')[1]));
+        const [, reason, ...ref] = error.message.split(':');
+        joined.delete(ref.join(':') || only?.client_ref);
+        throw new Error(closedNote(reason));
       }
+      if (error.message.startsWith('AMBIGUOUS:')) throw new Error(error.message.slice(10).trim());
       throw error;
     }
     return result.text_saved ? { status: 'published', text_saved: true, audio: result.status, reason: result.reason } : result;
   }
   if (name === 'voice_disconnect') {
-    const result = await rpc('unregister', { binding_id: binding.binding_id, client_ref: binding.client_ref });
-    binding = null;
+    const binding = pick(args.conversation);
+    const result = await leave(binding);
     return result.left === false
       ? { status: 'not_joined', room_reachable: result.connected, note: 'The connector held no binding for this conversation, so there was nothing in the room to leave.' }
-      : { status: 'left', room_reachable: result.connected };
+      : { status: 'left', conversation: binding.client_ref, room_reachable: result.connected };
   }
   throw new Error('Unknown tool');
 }

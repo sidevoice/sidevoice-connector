@@ -651,6 +651,72 @@ test('façade + connector: a chat of the Cursor editor joins through the view vo
   } finally { view?.stop(); child.kill(); if (connector.exitCode === null) connector.kill(); await room.close(); }
 });
 
+test('façade + connector: four chats of one Cursor editor window join at once, each voice turn reaches its own card, and each reply is published as its own conversation', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const minted = [];
+  room.handle = (event, data) => {
+    if (event === 'binding.register') { minted.push(data.thread); return { client_ref: data.client_ref, binding_id: 'b-' + minted.length, thread: data.thread }; }
+    if (event === 'speech.publish') return { status: 'queued', text_saved: true, utterance_id: data.utterance_id };
+  };
+  const { child: connector, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  await until(() => existsSync(socketPath));
+  // One MCP process, as the editor runs one per window.
+  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
+  let serial = 0;
+  const call = async (name, args = {}) => { const id = ++serial; child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }) + '\n');
+    const reply = await until(() => replies.find(r => r.id === id), 8000);
+    if (reply.error) throw new Error(reply.error.message);
+    return { raw: reply.result, value: JSON.parse(reply.result.content[0].text) }; };
+  const views = [];
+  try {
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'initialize', params: { protocolVersion: '2025-11-25', clientInfo: { name: 'cursor-vscode', version: '1.0.0' },
+      capabilities: { extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] } } } } }) + '\n');
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: -1, method: 'resources/read', params: { uri: 'ui://sidevoice/voice-link' } }) + '\n');
+    const html = (await until(() => replies.find(r => r.id === -1), 8000)).result.contents[0].text;
+    // Four chats ask to join; Cursor draws each one's card in its chat.
+    const chats = [];
+    for (const title of ['Uno', 'Dos', 'Tres', 'Cuatro']) {
+      const joinedChat = await call('voice_connect', { title });
+      chats.push(joinedChat.value.conversation);
+      views.push(runView({ html, toolResult: joinedChat.raw }));
+    }
+    assert.equal(new Set(chats).size, 4);
+    assert.equal(room.sent('binding.unregister').length, 0, 'joining one chat leaves no other');
+    await wait(400);
+    // A voice turn for each chat, from one browser, turn after turn: each lands in its own card only.
+    for (let i = 0; i < 4; i++) {
+      const outcome = await room.ask('input.deliver', { event_id: 'e-' + i, binding_id: 'b-' + (i + 1), channel: 'voice', session_id: 'browser-1', revision: 10 + i, message_id: 'm-' + i, text: 'para ' + i });
+      assert.equal(outcome.status, 'unknown', JSON.stringify(outcome));
+    }
+    await until(() => views.every(view => view.dispatched.length === 1));
+    views.forEach((view, i) => assert.match(view.dispatched[0].content[0].text, new RegExp('"message_id":"m-' + i + '"')));
+    // Each chat answers its own turn: the reply is published as that chat, not as whichever joined last.
+    await call('voice_say', { text: 'respuesta tres', session_id: 'browser-1', revision: 12 });
+    await call('voice_say', { text: 'respuesta uno', session_id: 'browser-1', revision: 10 });
+    await call('voice_say', { text: 'escrito en cuatro', session_id: 'typed:' + chats[3], revision: 0 });
+    assert.deepEqual(room.sent('speech.publish').map(p => [p.binding_id, p.text]), [['b-3', 'respuesta tres'], ['b-1', 'respuesta uno'], ['b-4', 'escrito en cuatro']]);
+    await assert.rejects(call('voice_say', { text: '¿de quién?', session_id: 'browser-1', revision: 99 }), /name no voice turn delivered/);
+
+    // Status and leaving need the chat's own id once several are joined.
+    const all = (await call('voice_status')).value;
+    assert.equal(all.joined, null); assert.equal(all.conversations.length, 4);
+    assert.equal((await call('voice_status', { conversation: chats[1] })).value.joined, true);
+    await assert.rejects(call('voice_disconnect'), /pass conversation/);
+    assert.equal((await call('voice_disconnect', { conversation: chats[1] })).value.status, 'left');
+    await until(() => room.sent('binding.unregister').length === 1);
+    assert.deepEqual(room.sent('binding.unregister').map(d => d.binding_id), ['b-2']);
+    // The room closes one chat's voice: that chat is told, the others keep theirs.
+    room.tell('binding.close', { binding_id: 'b-3', thread: chats[2], reason: 'closed_from_room' });
+    await wait(300);
+    await assert.rejects(call('voice_say', { text: 'x', session_id: 'browser-1', revision: 12 }), /closed this conversation's voice/);
+    await call('voice_say', { text: 'sigue', session_id: 'browser-1', revision: 13 });
+    assert.equal(room.sent('speech.publish').at(-1).binding_id, 'b-4');
+    assert.equal((await call('voice_status')).value.conversations.length, 2);
+  } finally { views.forEach(view => view.stop()); child.kill(); if (connector.exitCode === null) connector.kill(); await room.close(); }
+});
+
 test('pairing: plaintext only where the token cannot leave the machine or the cluster', async () => {
   const { privateNetwork, pair } = await import('../pair.mjs');
   for (const ok of ['127.0.0.1', 'localhost', 'room.voice.svc', 'room.voice.svc.cluster.local', 'room.voice.svc.k8s.example']) assert.equal(privateNetwork(ok), true, ok);

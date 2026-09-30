@@ -221,7 +221,7 @@ export function cursorNotes() {
     'only by experimental routes, because Cursor offers none of its own:',
     '  - Cursor CLI: only a chat started with  cursor-agent persist  (needs tmux); the room types into its terminal.',
     '  - Cursor editor: a small Sidevoice card appears under the join call; while it stays open in that chat, the room',
-    '    sends to it. One chat per window at a time.',
+    '    sends to it. Several chats of a window can join, each with its own card.',
     'If you type while the room sends, the two mix.',
   ].join('\n');
 }
