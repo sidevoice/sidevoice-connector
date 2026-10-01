@@ -26,10 +26,12 @@
  *  Errors propagate and keep the journal. The supervisor recovers at its start (and while a journal waits): if the
  *  selection is not the program it is, it hands over to that program (`connector.mjs`). */
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync, readdirSync, renameSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { API_RANGE, CORE_VERSION, LINK_RANGE, installRuntime, launchedFrom, readReady, runtimePaths, runtimeRoot, takeInstallLock } from './core.mjs';
+import { selfIdentity } from './proc.mjs';
 import { keyed, t } from './i18n.mjs';
 import { connectorClient } from './ipc.mjs';
 import { dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
@@ -184,9 +186,13 @@ export const VERIFY_DEADLINE_MS = VERIFY_MS;
  *  detached supervisor) the service is reloaded from its definition — the supervisor is replaced. With none, the
  *  connector answering is replaced by this installation's (`connector --replace` takes it over by handover), or one is
  *  started through the launcher with this installation's command; then the core is ensured. */
-export async function runsCompatibly(env, record, { service, log = () => {} }) {
+export async function runsCompatibly(env, record, { service, log = () => {}, permit = null }) {
   const dataDir = dataDirOf(env);
   let last = null;
+  // The node this transaction starts to verify is the only one that may serve while it holds the install lock: a
+  // supervisor booting meanwhile without this permit waits for the transaction (`connector.mjs`). A file, not the
+  // environment: a service manager starts the node with its definition's.
+  if (permit) writePrivate(nodeFiles(dataDir).permit, { journal: permit, pid: process.pid, start: selfIdentity().start ?? null });
   try {
     if (service) {
       // Another installation is starting: what the one before spent of the budget is not this one's.
@@ -213,6 +219,7 @@ export async function runsCompatibly(env, record, { service, log = () => {} }) {
       await wait(250);
     }
   } catch (error) { return { ok: false, failure: { key: error.key || 'install.verify', message: error.message } }; }
+  finally { if (permit) rmSync(nodeFiles(dataDir).permit, { force: true }); }
   const why = selectionRuns(last, record, dataDir).why;
   log(`the installation ${record.id} did not run (${why})`);
   return { ok: false, failure: last?.state === 'failed' && last.failure ? last.failure : { key: why } };
@@ -242,16 +249,27 @@ export async function recover(env, { mode = 'installer', log = () => {} } = {}) 
   await reconcile(env, journal, side);
   const record = side === 'to' ? journal.to : journal.from;
   if (mode === 'supervisor') return { journal, side, record };
+  if (!record) await nothingRuns(env);
   if (mode === 'artifacts' || !record) { rmSync(files.journal, { force: true }); return { side, record }; }
-  let ran = await runsCompatibly(env, record, { service: desired(journal, side).service, log });
+  const permit = journal.id ?? journal.at;
+  let ran = await runsCompatibly(env, record, { service: desired(journal, side).service, log, permit });
   if (!ran.ok && side === 'to') {
     side = 'from';
     writePrivate(files.journal, { ...journal, selection: 'from', failure: ran.failure });
     await reconcile(env, journal, 'from');
-    ran = journal.from ? await runsCompatibly(env, journal.from, { service: desired(journal, 'from').service, log }) : { ok: true };
+    ran = journal.from ? await runsCompatibly(env, journal.from, { service: desired(journal, 'from').service, log, permit }) : (await nothingRuns(env), { ok: true });
   }
   if (ran.ok) rmSync(files.journal, { force: true });
   return { side, record: side === 'to' ? journal.to : journal.from, ran };
+}
+
+/** Nothing of this node runs — no connector answering, no connector or core alive by its records — seen under the
+ *  install lock, after a reconcile to nothing and before the journal goes: what started meanwhile is stopped now, and
+ *  what cannot be stopped keeps the journal. */
+async function nothingRuns(env) {
+  const down = await stopNode(env);
+  const answering = await askConnector('node.status', {}, { env, timeout: 1500 });
+  if (down.left.length || answering?.state) throw keyed('service.unload-failed', { detail: down.left.length ? `pid ${down.left.join(', ')} still running` : 'a connector still answers' });
 }
 
 /** The supervisor's side of a recovered journal: the selection runs — the journal goes; it cannot — roll back to
@@ -326,17 +344,18 @@ export async function transact(env, { core = true, applyNow = false, by = env.SI
         await wait(CALLS_POLL_MS);
       }
     }
-    const journal = { ...plan, at: new Date().toISOString() };
+    const journal = { ...plan, id: randomUUID(), at: new Date().toISOString() };
     writePrivate(files.journal, journal);
     crash('txn-journal');
     const notes = await reconcile(env, journal, 'to', { crashing: true, notes: planNotes });
     const needsRun = core && (action !== 'noop' || newService);
-    const ran = needsRun ? await runsCompatibly(env, next, { service: plan.service.want, log }) : { ok: true };
+    const ran = needsRun ? await runsCompatibly(env, next, { service: plan.service.want, log, permit: journal.id }) : { ok: true };
     if (ran.ok) { rmSync(files.journal, { force: true }); return { action, record: next, from: current, notes }; }
     // Back to what was there — nothing at all after a first install — and that must run in turn.
     writePrivate(files.journal, { ...journal, selection: 'from', failure: ran.failure });
     await reconcile(env, journal, 'from');
-    const back = current && core ? await runsCompatibly(env, current, { service: plan.service.before, log }) : { ok: true };
+    const back = current && core ? await runsCompatibly(env, current, { service: plan.service.before, log, permit: journal.id }) : { ok: true };
+    if (!current) await nothingRuns(env);
     if (back.ok) rmSync(files.journal, { force: true });
     if (!current && next.copy) rmSync(next.copy, { recursive: true, force: true });
     return { action: 'rollback', record: current, from: current, failure: ran.failure, back: back.ok, backFailure: back.failure ?? null, notes };

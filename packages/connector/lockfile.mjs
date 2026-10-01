@@ -9,7 +9,9 @@
  *    process holds it open, and is close-on-exec too. Abstract names have no permissions, so they must not be
  *    guessable by another user, who could otherwise take the name first and keep this one from starting: each is
  *    derived from a 128-bit random salt kept in the lock's directory (`lock-salt`, 0600, made once and atomically —
- *    every process of this user reads the same one; the directory is private, so no other user can).
+ *    every process of this user reads the same one; the directory is private, so no other user can). The salt is the
+ *    directory's lock identity: it is made only in a directory nothing has used yet, never again in one that has
+ *    been (`lockSalt`), and a holder that finds it changed or gone once it is bound lets go and fails.
  *
  *  The lock file itself (`<lock>`) also carries who holds it — pid, process start time, kind — for people and for
  *  the takeover's handover request. That record is information only, never the lock: a record without a holder,
@@ -18,7 +20,7 @@ import net from 'node:net';
 import path from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { closeSync, constants, ftruncateSync, linkSync, mkdirSync, openSync, readdirSync, realpathSync, unlinkSync, writeSync } from 'node:fs';
-import { isProcess, selfIdentity } from './proc.mjs';
+import { selfIdentity } from './proc.mjs';
 import { keyed } from './i18n.mjs';
 import { readTrusted, writePrivateFile } from './secure-fs.mjs';
 import { pause } from './testpoint.mjs';
@@ -39,35 +41,43 @@ export function readLock(file) {
   } catch { return { unreadable: true }; }
 }
 
-/** The salt of a lock directory: read, or made — written whole to a private temporary file and linked into place,
- *  so two processes making it at once end up reading the same one. */
+/** Whether a directory has been used — anything a lock, a connector or an installation leaves in it: then its lock
+ *  identity exists already, and a missing salt is a lost one. */
+const USED = name => name === 'install.json' || name === 'core' || name === 'connector.sock' || name.endsWith('.lock') || /^node-.*\.json$/.test(name);
+const readSalt = file => { const text = readTrusted(file, { checkDir: false }); return text && /^[0-9a-f]{32}$/.test(text.trim()) ? text.trim() : null; };
+
+/** The salt of a lock directory: read, or — in a directory nothing has used yet — made, written whole to a private
+ *  temporary file and linked into place, so two processes making it at once end up reading the same one. Made again
+ *  in a used directory, it would give a second name beside one a holder may have bound — whether or not that holder
+ *  has written its record yet — so its loss there is an error, never repaired here. */
 export function lockSalt(directory) {
   const file = path.join(directory, 'lock-salt');
-  const read = () => { const text = readTrusted(file, { checkDir: false }); return text && /^[0-9a-f]{32}$/.test(text.trim()) ? text.trim() : null; };
-  const existing = read();
+  const existing = readSalt(file);
   if (existing) return existing;
-  // The salt is this directory's lock identity. Made again while a holder lives, it would give a second name — a
-  // second lock beside the one held. Lost while held, it is an error until those holders are gone.
-  for (const name of safeList(directory).filter(entry => entry.endsWith('.lock'))) {
-    const owner = readLock(path.join(directory, name));
-    if (owner && !owner.unreadable && isProcess(owner.pid, { start: owner.start ?? null })) {
-      throw keyed('identity.lock-salt-missing', { path: file, pid: owner.pid, lock: name });
-    }
-  }
+  const used = safeList(directory).filter(USED);
+  if (used.length) throw keyed('identity.lock-salt-missing', { path: file, what: used.slice(0, 3).join(', ') });
   const temporary = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
   writePrivateFile(temporary, randomBytes(16).toString('hex'));
   try { linkSync(temporary, file); } catch (error) { if (error.code !== 'EEXIST') throw error; }
   finally { try { unlinkSync(temporary); } catch {} }
-  const salt = read();
+  const salt = readSalt(file);
   if (!salt) throw new Error(`${file} is not a lock salt`);
   return salt;
 }
 
+/** The directory's lock identity, made now if it is to be made at all: what is about to use a directory nothing has
+ *  used yet (a supervisor writing its takeover intent before it takes its lock) settles it first. Linux only. */
+export function ensureLockIdentity(directory) {
+  if (process.platform !== 'linux') return;
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  lockSalt(realpathSync(directory));
+}
+
 /** The abstract socket name of a lock on Linux: this user, the directory's salt, this lock file's real directory and
  *  name, this kind — nothing another user can work out. */
-export function abstractName(file, kind) {
+export function abstractName(file, kind, salt = lockSalt(realpathSync(path.dirname(file)))) {
   const directory = realpathSync(path.dirname(file));
-  const digest = createHash('sha256').update(lockSalt(directory) + '\0' + directory + '\0' + path.basename(file)).digest('hex').slice(0, 32);
+  const digest = createHash('sha256').update(salt + '\0' + directory + '\0' + path.basename(file)).digest('hex').slice(0, 32);
   return `\0sidevoice-${uid()}-${digest}-${kind}`;
 }
 
@@ -87,15 +97,29 @@ export async function tryLock(file, { kind = 'lock' } = {}) {
     return { held: true, record, release: () => { if (released) return; released = true; try { ftruncateSync(fd, 0); } catch {} try { closeSync(fd); } catch {} } };
   }
   if (process.platform === 'linux') {
+    const directory = realpathSync(path.dirname(file));
+    const salt = lockSalt(directory);
     const server = net.createServer(socket => socket.destroy());
     const outcome = await new Promise(resolve => {
       server.once('error', error => resolve(error.code === 'EADDRINUSE' ? 'held' : error));
-      server.listen(abstractName(file, kind), () => resolve('ours'));
+      server.listen(abstractName(file, kind, salt), () => resolve('ours'));
     });
     if (outcome === 'held') return { held: false, owner: readLock(file) };
     if (outcome !== 'ours') throw outcome;
     server.unref();   // the lock lives as long as the process holds it; it does not keep the process alive
+    // Bound under the identity read before binding. Changed or gone since — deleted, and made again by a process
+    // that found the directory unused — another name may be held beside this one: let go, and fail. Looked at
+    // before and after the record is written: once it is, the directory is used, and nobody makes a salt again.
+    const intact = () => readSalt(path.join(directory, 'lock-salt')) === salt;
+    const giveUp = () => {
+      try { if (readLock(file)?.pid === process.pid) writePrivateFile(file, ''); } catch {}
+      try { server.close(); } catch {}
+      return keyed('identity.lock-salt-missing', { path: path.join(directory, 'lock-salt'), what: path.basename(file) });
+    };
+    await pause(`lock-bound-${kind}`);
+    if (!intact()) throw giveUp();
     try { writePrivateFile(file, JSON.stringify(record)); } catch {}
+    if (!intact()) throw giveUp();
     await pause(`lock-held-${kind}`);
     let released = false;
     // Let go: the record says nobody holds it (one a killed holder leaves names a dead process, and says so too).

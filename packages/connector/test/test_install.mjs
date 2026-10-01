@@ -11,6 +11,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, 
 import { fileURLToPath } from 'node:url';
 import { decide, recover } from '../install-txn.mjs';
 import { unitText } from '../service.mjs';
+import { ensureLockIdentity } from '../lockfile.mjs';
 import { supervisedNode } from './test_core.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -65,6 +66,7 @@ function upgradeMachine() {
   const home = mkdtempSync(path.join(os.tmpdir(), 'sv-txn-'));
   const dataDir = path.join(home, '.sidevoice'), copies = path.join(home, 'xdg', 'sidevoice');
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  ensureLockIdentity(dataDir);   // as the first lock taken in it left it
   const claude = fakeClaude(home);
   const oldCli = path.join(copies, '0.5.0', 'dist', 'cli.mjs');
   mkdirSync(path.dirname(oldCli), { recursive: true });

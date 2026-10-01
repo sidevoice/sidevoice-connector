@@ -27,6 +27,8 @@ export function nodeFiles(dataDir) {
     restart: at('node-restart.json'),      // a person asked for a restart the service manager carries out: {at}
     handover: at('handover.json'),         // bindings moving from a plain connector to the supervisor
     takeover: at('node-takeover.json'),    // a supervisor is taking the socket over: {pid, start}
+    permit: at('install-permit.json'),     // the install lock's holder starts the node to verify it: {journal, pid, start}
+    recovery: at('node-recovery.json'),    // how the last `service recover` ended: {at, ok, error?}
     serviceLog: at('node-service.log'),
     connectorLog: at('connector.log'),
   };

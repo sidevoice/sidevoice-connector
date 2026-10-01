@@ -11,6 +11,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { CORE_VERSION, NO_UV, coreSpec, runtimeIdentity } from '../core.mjs';
+import { ensureLockIdentity } from '../lockfile.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const packageDir = path.join(here, '..');
@@ -306,6 +307,9 @@ const fakeCore = path.join(here, 'fake-sidevoice-core.mjs');
  *  launch of the core does, in order (the last repeats). Timings shortened: probes 300 ms apart, 150 ms of
  *  backoff, 1 s for a core to leave before it is killed. */
 export function supervisedNode({ modes = ['ok'], env: extra = {}, dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-node-')) } = {}) {
+  // A data directory as a first lock leaves it, whatever a test then writes into it before anything runs: its lock
+  // identity made (`lockfile.mjs` refuses to make one in a directory already used).
+  if (existsSync(dataDir)) ensureLockIdentity(dataDir);
   const tools = mkdtempSync(path.join(os.tmpdir(), 'sv-bin-'));
   const bin = path.join(tools, 'sidevoice-core');
   writeFileSync(bin, `#!/bin/sh\nexec "${process.execPath}" "${fakeCore}" "$@"\n`, { mode: 0o755 });

@@ -22,7 +22,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { accessSync, constants, existsSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
 import { coreRunning, launchProcess, readReady, socketPathOf, takeInstallLock } from './core.mjs';
-import { readLock } from './lockfile.mjs';
+import { ensureLockIdentity, readLock } from './lockfile.mjs';
 import { isProcess, signalVerified, validPid } from './proc.mjs';
 import { localHealth } from './core-socket.mjs';
 import { keyed, t } from './i18n.mjs';
@@ -34,6 +34,7 @@ export const UNIT = 'sidevoice-node.service';
 export const RUN_LINGER = false;
 const TEARDOWN_MS = Number(process.env.SIDEVOICE_TEARDOWN_MS || 15_000);
 const START_WAIT_MS = Number(process.env.SIDEVOICE_SERVICE_START_WAIT_MS || 10_000);
+const START_LOCK_MS = Number(process.env.SIDEVOICE_START_LOCK_MS || 120_000);
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const uid = () => process.getuid?.() ?? 0;
@@ -137,10 +138,37 @@ export function spawnOutsideJob(kind, argv, env) {
  *  own removal (`connector.mjs`): under the lock, the installer's recovery — reconcile, run, verify, journal gone. */
 export async function recoverInstallation(env = process.env) {
   const { recover } = await import('./install-txn.mjs');
-  const release = await takeInstallLock(dataDirOf(env));
+  const files = nodeFiles(dataDirOf(env));
+  // How it ended, for the supervisor that started it (`connector.mjs`): under systemd it is a unit of its own, whose
+  // exit that supervisor never sees.
+  const at = new Date().toISOString();
+  const said = outcome => { try { writePrivate(files.recovery, { at, ...outcome }); } catch {} };
   let outcome;
-  try { outcome = await recover(env, { mode: 'installer' }); } finally { release(); }
-  return { ok: !outcome || outcome.ran?.ok !== false, state: outcome?.record ? 'recovered' : 'absent', service: installedService(env)?.kind ?? 'none', selected: outcome?.record?.id ?? null };
+  try {
+    const release = await takeInstallLock(dataDirOf(env));
+    try { outcome = await recover(env, { mode: 'installer' }); } finally { release(); }
+  } catch (error) { said({ ok: false, error: { key: error.key || 'service.failed', message: error.message } }); throw error; }
+  const result = { ok: !outcome || outcome.ran?.ok !== false, state: outcome?.record ? 'recovered' : 'absent', service: installedService(env)?.kind ?? 'none', selected: outcome?.record?.id ?? null };
+  said(result.ok ? { ok: true } : { ok: false, error: outcome.ran.failure ?? { key: 'install.verify', message: 'the selected installation does not run' } });
+  return result;
+}
+
+/** `operation` holding the install lock, waited for up to `START_LOCK_MS`: a person's start or restart never runs
+ *  beside an installer or a recovery — one reconciling to nothing would otherwise report nothing running while the
+ *  node just started runs on. */
+async function underInstallLock(env, operation) {
+  let release;
+  try { release = await takeInstallLock(dataDirOf(env), () => {}, { timeout: START_LOCK_MS }); }
+  catch (error) { if (error.key) throw error; throw keyed('service.busy', { detail: error.message }); }
+  try { return await operation(); } finally { release(); }
+}
+
+/** A transaction left behind is finished before anything starts from it, as an installer would (`install-txn.mjs`).
+ *  Called holding the install lock. */
+async function finishTransaction(env) {
+  if (!existsSync(nodeFiles(dataDirOf(env)).journal)) return;
+  const { recover } = await import('./install-txn.mjs');
+  await recover(env, { mode: 'installer' });
 }
 
 /** The `SIDEVOICE_*` settings an installation is made with — recorded in it (`install.json`), so its service runs
@@ -484,18 +512,24 @@ export function linger(env = process.env) {
 /** `service start`: a stop no longer holds; the manager starts the service, or a detached supervisor starts. */
 export async function start(env = process.env, { clear = true } = {}) {
   const files = nodeFiles(dataDirOf(env));
-  if (clear) { try { rmSync(files.stopped, { force: true }); } catch {} }
-  const kind = installedService(env)?.kind ?? 'none';
-  const running = await askConnector('node.status', {}, { env });
-  if (running?.state && running.supervisor && running.service === kind) return { ok: true, state: running.state, service: kind };
-  if (kind === 'none') {
-    if (!existsSync(files.install)) throw keyed('service.no-installation');
-    // A plain connector already serving is taken over by the supervisor (handover); none is started twice.
-    startDetached(env);
-  } else {
-    const started = await managerStart(env);
-    if (!started.ok) throw keyed(started.key, { detail: started.detail || '' });
-  }
+  const begun = await underInstallLock(env, async () => {
+    await finishTransaction(env);
+    if (clear) { try { rmSync(files.stopped, { force: true }); } catch {} }
+    const kind = installedService(env)?.kind ?? 'none';
+    const running = await askConnector('node.status', {}, { env });
+    if (running?.state && running.supervisor && running.service === kind) return { done: { ok: true, state: running.state, service: kind } };
+    if (kind === 'none') {
+      if (!existsSync(files.install)) throw keyed('service.no-installation');
+      // A plain connector already serving is taken over by the supervisor (handover); none is started twice.
+      startDetached(env);
+    } else {
+      const started = await managerStart(env);
+      if (!started.ok) throw keyed(started.key, { detail: started.detail || '' });
+    }
+    return { kind };
+  });
+  if (begun.done) return begun.done;
+  const kind = begun.kind;
   const up = await awaitUp(env);
   if (!up) throw keyed('service.not-loaded', { detail: '' });
   return { ok: true, state: up.state, service: kind };
@@ -505,6 +539,7 @@ export async function start(env = process.env, { clear = true } = {}) {
  *  manager stops it (launchd: bootout, so KeepAlive does not bring it back), and both processes are awaited. */
 export async function stop(env = process.env) {
   const files = nodeFiles(dataDirOf(env));
+  try { ensureLockIdentity(dataDirOf(env)); } catch {}   // made now if this is the directory's first use; a stop needs no lock
   writePrivate(files.stopped, { at: new Date().toISOString() });
   const kind = installedService(env)?.kind ?? 'none';
   const processes = nodeProcesses(env);
@@ -525,17 +560,21 @@ export async function restart(env = process.env) {
   // Stopped: restarting is starting — and still a person's restart, so the supervisor that starts closes the budget
   // window as `node.restart` would (the marker is read at its start).
   if (existsSync(files.stopped)) { writePrivate(files.restart, { at: new Date().toISOString(), why: 'restart while stopped' }); return start(env); }
+  // A supervisor answering restarts its own core: nothing of this process's starts.
   const answered = await askConnector('node.restart', {}, { env, timeout: 90_000 });
   if (answered?.state && answered.supervisor && answered.service === kind) return { ok: true, state: answered.state, service: kind };
-  writePrivate(files.restart, { at: new Date().toISOString() });
-  if (kind === 'launchd') {
-    const kicked = manage(env, kind, ['kickstart', '-k', target()]);
-    if (!kicked.ok) return start(env);
-  } else if (kind === 'systemd') {
+  if (kind === 'none') return start(env);
+  const kicked = await underInstallLock(env, async () => {
+    await finishTransaction(env);
+    if (!installedService(env)) return false;
+    writePrivate(files.restart, { at: new Date().toISOString() });
+    if (kind === 'launchd') return manage(env, kind, ['kickstart', '-k', target()]).ok;
     if (managerState(kind, env).reason === 'start-limit') manage(env, kind, ['--user', 'reset-failed', UNIT]);
     const restarted = manage(env, kind, ['--user', 'restart', UNIT]);
     if (!restarted.ok) throw keyed(`service.${serviceFailure(kind, env)}`, { detail: restarted.output.trim() });
-  } else return start(env);
+    return true;
+  });
+  if (!kicked) return start(env);
   const up = await awaitUp(env);
   if (!up) throw keyed('service.not-loaded', { detail: '' });
   return { ok: true, state: up.state, service: kind };

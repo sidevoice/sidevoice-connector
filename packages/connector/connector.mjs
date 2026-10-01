@@ -29,14 +29,15 @@ import { machineIdentity, VERSION } from './identity.mjs';
 import { pair, roomOrigin } from './pair.mjs';
 import { roomLink, UNREACHABLE } from './link.mjs';
 import { API_RANGE, CORE_VERSION, NO_UV, awaitReady, coreArgs, coreRunning, runsSelected, coreData, ensureInstalled, ensureRunning, examineRunning, failureCause,
-  failurePath, installInProgress, roomCredentialPath, spawnCore, takeInstallLock, terminateCore, unlinkSocket } from './core.mjs';
+  failurePath, installInProgress, lockPath as installLockPath, roomCredentialPath, spawnCore, takeInstallLock, terminateCore, unlinkSocket } from './core.mjs';
 import { ensureCoreDirectory, localHealth, socketAgent } from './core-socket.mjs';
 import { appendLine, rotate } from './logfile.mjs';
 import { pause } from './testpoint.mjs';
 import { Supervisor } from './supervisor.mjs';
 import { VERIFY_DEADLINE_MS, pruneInstallations, recover, sameCommand, selectionRuns, settle } from './install-txn.mjs';
 import { connectorSocketOf, dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
-import { readLock, tryLock } from './lockfile.mjs';
+import { ensureLockIdentity, readLock, tryLock } from './lockfile.mjs';
+import { t } from './i18n.mjs';
 import { launchEnvironment, spawnOutsideJob } from './service.mjs';
 import { isProcess, selfIdentity, signalVerified } from './proc.mjs';
 import { verifyPrivateDir } from './secure-fs.mjs';
@@ -268,7 +269,7 @@ function refuse(reason) {
 /** The local core, installed and started if need be, and the credential its ready file names. Waiters
  *  are woken on failure too, so a conversation asking to join hears why rather than timing out. */
 function startCore() {
-  if (supervised) return supervisor.ensure().then(status => (status.state === 'running' ? creds?.core : null));
+  if (supervised) return withheld ? Promise.resolve(null) : supervisor.ensure().then(status => (status.state === 'running' ? creds?.core : null));
   if (coreStarting) return coreStarting;
   coreError = null; coreFailure = null;
   coreStarting = ensureRunning({ dataDir, env, log, roomCredential: credentialsPath })
@@ -694,16 +695,101 @@ async function settleJournal(snapshot, { expired = false } = {}) {
   if (settled.outcome === 'outside') { pendingJournal = null; recoverOutside(); }
 }
 
+/** While a journal selects nothing, or another installation, this supervisor serves nothing: its core is stopped
+ *  and not started again — not by a façade's `node.ensure`, not by a restart. */
+let withheld = false;
+function withhold(why) {
+  if (withheld) return;
+  withheld = true;
+  log(`not serving: ${why}`);
+  supervisor?.stop();
+}
+
 /** The installation to recover to has no supervisor — nothing at all, or one with no service: this supervisor cannot
  *  reconcile that without stopping itself halfway. A helper outside its job (`service recover`) does it — stops this
  *  supervisor and its core by their verified identities (or the manager, if a definition goes), reconciles every
- *  artifact, starts and verifies a plain installation, and deletes the journal only then. Started once. */
-let recovering = false;
+ *  artifact, starts and verifies a plain installation, and deletes the journal only then. Under systemd the helper
+ *  is a transient unit, and nothing else: a child in this unit's cgroup would be killed by the very stop it does.
+ *  One at a time; a helper that cannot be started, exits non-zero, says it failed or says nothing in time is a
+ *  failure (`recover.helper-failed`, in `node.status`), tried again with backoff up to `RECOVER_ATTEMPTS` times —
+ *  the journal kept meanwhile, and nothing served. */
+const RECOVER_ATTEMPTS = 5;
+let recovery = null, recoveryTimer = null;
 function recoverOutside() {
-  if (recovering) return;
-  recovering = true;
-  log('the installation to recover to runs without this supervisor: finishing the recovery outside it');
-  spawnOutsideJob(serviceKind, [...ownCommand(), 'service', 'recover', '--json'], env);
+  withhold('an install transaction selects an installation without this supervisor; it is finished outside it');
+  if (recovery?.state === 'recovering' || recoveryTimer) return;
+  if (recovery?.state === 'failed' && recovery.attempts >= RECOVER_ATTEMPTS) return;
+  const attempts = (recovery?.attempts ?? 0) + 1, launchedAt = Date.now();
+  recovery = { state: 'recovering', attempts, failure: recovery?.failure ?? null, next_retry_at: null, launchedAt };
+  log(`finishing the install recovery outside this supervisor (attempt ${attempts} of ${RECOVER_ATTEMPTS})`);
+  const failed = detail => { if (recovery?.launchedAt === launchedAt && recovery.state === 'recovering') helperFailed(detail); };
+  let job;
+  try { job = spawnOutsideJob(serviceKind, [...ownCommand(), 'service', 'recover', '--json'], env); }
+  catch (error) { return failed(error.message); }
+  job.once('error', error => failed(error.message));
+  job.once('exit', (code, signal) => { if (code !== 0) failed(`${serviceKind === 'systemd' ? 'systemd-run' : 'the helper'} exited with ${code ?? signal}`); });
+  // Its own outcome: the helper says how it ended (`service.mjs`), and must within a while.
+  const deadline = launchedAt + 2 * VERIFY_DEADLINE_MS + 30_000;
+  const watch = setInterval(() => {
+    if (recovery?.launchedAt !== launchedAt || recovery.state !== 'recovering') return clearInterval(watch);
+    let said = null; try { said = readJson(files.recovery); } catch {}
+    if (said && Date.parse(said.at) >= launchedAt - 1000) {
+      clearInterval(watch);
+      if (said.ok) { recovery = null; return resumeIfResolved(); }
+      return failed(said.error?.message ?? said.error?.key ?? '?');
+    }
+    if (Date.now() > deadline) { clearInterval(watch); failed('it said nothing of how it ended'); }
+  }, 250);
+  watch.unref();
+}
+function helperFailed(detail) {
+  const attempts = recovery?.attempts ?? 1;
+  const more = attempts < RECOVER_ATTEMPTS;
+  const delay = Number(env.SIDEVOICE_RECOVER_BACKOFF_MS || 2000) * 2 ** (attempts - 1);
+  const failure = { key: 'recover.helper-failed', message: t('recover.helper-failed', { detail }) };
+  recovery = { state: 'failed', attempts, failure, next_retry_at: more ? new Date(Date.now() + delay).toISOString() : null };
+  log(`${failure.message} ${more ? `Trying again in ${delay} ms.` : 'Not trying again.'}`);
+  if (more) {
+    recoveryTimer = setTimeout(() => {
+      recoveryTimer = null;
+      if (!existsSync(files.journal)) return resumeIfResolved();
+      checkInstallJournal().catch(error => log('recovering the install transaction failed (it is kept): ' + error.message));
+    }, delay);
+  }
+}
+/** The transaction resolved by someone else while this supervisor held back: it serves again if it is still the
+ *  selected program, and leaves if not. */
+function resumeIfResolved() {
+  if (!withheld || existsSync(files.journal)) return;
+  let selected = null; try { selected = readJson(files.install); } catch {}
+  if (selected && sameCommand(selected.command, ownCommand())) { withheld = false; recovery = null; log('the install transaction is resolved: serving again'); supervisor.boot(); }
+  else { log('the install transaction is resolved, and this program is not selected: stopping'); shutdown(0); }
+}
+
+/** A supervisor starting while an install transaction is under way that is not its own to recover: one is, when a
+ *  journal exists and another process holds the install lock — an installer, or a helper reconciling to nothing.
+ *  It serves only with that holder's permit (the node it starts to verify, `install-txn.mjs`); otherwise it waits,
+ *  bounded, for the transaction to end. Returns `{release, waited}` — `release` the install lock this supervisor
+ *  then holds through its own boot, so no transaction starts beside it before it can be seen — or null. */
+const TXN_WAIT_MS = () => Number(env.SIDEVOICE_TXN_WAIT_MS || 2 * VERIFY_DEADLINE_MS + 30_000);
+function permitted() {
+  try {
+    const permit = readJson(files.permit), journal = readJson(files.journal), holder = readLock(installLockPath(dataDir));
+    return !!(permit && journal && permit.journal === (journal.id ?? journal.at) && holder?.pid === permit.pid && isProcess(permit.pid, { start: permit.start ?? null }));
+  } catch { return false; }
+}
+async function enterTransactionGate() {
+  const deadline = Date.now() + TXN_WAIT_MS();
+  let waited = false;
+  for (;;) {
+    const release = await takeInstallLock(dataDir, log, { wait: false });
+    if (release) return { release, waited };
+    if (!existsSync(files.journal) || permitted()) return { release: () => {}, waited };
+    if (!waited) log(`an install transaction is under way, held by another process (pid ${readLock(installLockPath(dataDir))?.pid ?? '?'}): waiting for it before serving`);
+    waited = true;
+    if (Date.now() > deadline) return null;
+    await wait(200);
+  }
 }
 
 /** The selected installation is another program: it takes over. Under a service manager, the definition (already
@@ -713,6 +799,7 @@ function recoverOutside() {
 async function handOff(record) {
   if (!record) { log('no installation is selected any more: stopping'); return shutdown(0); }
   log(`the selected installation is ${record.id} (${record.command.join(' ')}), not this program: handing over to it`);
+  withhold(`the selected installation is ${record.id}`);
   // Another program's start: what this one spent of the budget is not that one's (as after a person's restart).
   try { writePrivate(files.restart, { at: new Date().toISOString(), why: 'handover' }); } catch {}
   const args = serviceKind === 'none' ? ['connector', '--supervise', '--after', String(process.pid)] : ['service', 'reload', '--json'];
@@ -737,7 +824,9 @@ async function nodeStatus() {
       const health = await localHealth(supervisor.core.socket, 1000);
       if (typeof health?.body?.calls === 'number') supervisor.calls = health.body.calls;
     }
-    return { ...supervisor.status(), installed, supervisor: true, command: ownCommand() };
+    const status = supervisor.status();
+    const held = recovery ? { state: recovery.state, attempts: recovery.attempts, failure: recovery.failure, next_retry_at: recovery.next_retry_at } : null;
+    return { ...status, failure: status.failure ?? held?.failure ?? null, recovery: held, installed, supervisor: true, command: ownCommand() };
   }
   const core = creds?.core && !external && coreRunning(creds.core) ? creds.core : null;
   const health = core ? await localHealth(core.socket, 1000) : null;
@@ -754,7 +843,7 @@ const ownCommand = () => [process.execPath, process.argv[1]];
  *  or a pairing written (`sidevoice pair`) that the core must start with. */
 async function nodeRestart() {
   // Answered once the restart has begun (`starting`): the launch takes up to a minute, and `node.status` follows it.
-  if (supervisor) { supervisor.restart(); return nodeStatus(); }
+  if (supervisor) { if (!withheld) supervisor.restart(); return nodeStatus(); }
   if (external) return nodeStatus();
   // A plain connector's restarts, one at a time: a second never terminates what the first just started.
   const run = plainRestarts.then(restartPlainCore, restartPlainCore);
@@ -1086,6 +1175,10 @@ export async function run(argv = [], environment = process.env) {
   // Refused, not repaired: a data directory others can write into is not one to serve from (`secure-fs.mjs`).
   try { verifyPrivateDir(dataDir, { create: true }); }
   catch (error) { log(`not starting: ${error.message}`); process.exitCode = 78; return; }
+  // The lock identities, settled before anything written here is a directory's first use (`lockfile.mjs`): made in
+  // one nothing has used yet, and refused — never made again — in one that lost it.
+  try { for (const directory of new Set([dataDir, path.dirname(lockPath)])) ensureLockIdentity(directory); }
+  catch (error) { log(`not starting: ${error.message}`); process.exit(1); }
   // What the lock file said before this process took the lock: a bare pid is an older connector's.
   const before = readLock(lockPath);
   // A supervisor taking over says so first. Between the plain connector letting go and this process taking the lock
@@ -1094,6 +1187,16 @@ export async function run(argv = [], environment = process.env) {
   // `--replace`: a plain connector of the installation just selected, taking over the one running (an upgrade with
   // no service), the same way.
   const taking = supervised || argv.includes('--replace');
+  // A transaction under way that is not this supervisor's: waited for before anything (`enterTransactionGate`).
+  let gate = null;
+  if (supervised) {
+    gate = await enterTransactionGate();
+    if (!gate) { log('the install transaction under way did not end in time: not serving'); process.exit(1); }
+    if (gate.waited) {
+      let selected = null; try { selected = readJson(files.install); } catch {}
+      if (!selected || !sameCommand(selected.command, ownCommand())) { log(`the install transaction ended, and ${selected ? 'another installation' : 'nothing'} is selected: not serving`); gate.release(); process.exit(0); }
+    }
+  }
   if (taking) { writePrivate(files.takeover, { pid: process.pid, start: selfIdentity().start ?? null, at: new Date().toISOString() }); await pause('takeover-intent'); }
   for (let attempt = 0; !(await acquireLock()); attempt++) {
     if (!taking || attempt >= 50) process.exit(0);
@@ -1125,6 +1228,7 @@ export async function run(argv = [], environment = process.env) {
     // An install transaction that died is reconciled before anything runs from it — unless an installer holds
     // the lock now, which then does it. Looked at again while a journal waits.
     await checkInstallJournal();
+    gate.release();
     if (closed) return;
     setInterval(() => { if (!pendingJournal) checkInstallJournal().catch(() => {}); }, 5000).unref();
   }
@@ -1148,6 +1252,6 @@ export async function run(argv = [], environment = process.env) {
   // A core this process does not own the output of (a plain connector's detached core, an adopted one) writes
   // straight into core.log: rotated in place on a clock while this process runs.
   setInterval(() => rotate(path.join(dataDir, 'core.log')), Number(env.SIDEVOICE_LOG_ROTATE_MS || 10_000)).unref();
-  if (supervisor && !external) supervisor.boot();
+  if (supervisor && !external && !withheld) supervisor.boot();
   else open();
 }

@@ -291,21 +291,28 @@ test('takeover intent: a writer killed before taking over — reaped or left a z
   }
 });
 
-test('lock salt: removed while its lock is held, it is not made again beside the holder — install and connector refuse with identity.lock-salt-missing until the holder is gone', { skip: process.platform !== 'linux' && 'the salt names Linux abstract sockets' }, async () => {
+test('lock salt: removed from a directory already used, it is never made again — with a holder or without one, install and connector refuse with identity.lock-salt-missing', { skip: process.platform !== 'linux' && 'the salt names Linux abstract sockets' }, async () => {
+  const { tryLock } = await import('../lockfile.mjs');
   // The install lock, held by another process.
   const dir = mkdtempSync(path.join(os.tmpdir(), 'sv-salt-'));
   const file = path.join(dir, 'install.lock'), log = path.join(dir, 'order.log');
   const holder = contender(file, 'install', log, 'A', { forever: true });
   await until(() => existsSync(log));
   rmSync(path.join(dir, 'lock-salt'));
-  const { tryLock } = await import('../lockfile.mjs');
   await assert.rejects(tryLock(file, { kind: 'install' }), error => error.key === 'identity.lock-salt-missing');
   assert.equal(existsSync(path.join(dir, 'lock-salt')), false, 'not made again');
+  // Its holder gone, the directory is still a used one: still refused, still not made.
   holder.kill('SIGKILL'); await exited(holder);
-  const taken = await tryLock(file, { kind: 'install' });
-  assert.equal(taken.held, true, 'with no holder left, a new identity is made');
-  taken.release();
-  // The connector lock, held by a running supervisor.
+  await assert.rejects(tryLock(file, { kind: 'install' }), error => error.key === 'identity.lock-salt-missing');
+  assert.equal(existsSync(path.join(dir, 'lock-salt')), false);
+  // A data directory used without any lock record at all — a selection, a core directory — is used too.
+  for (const used of ['install.json', 'core', 'node-status.json', 'connector.sock']) {
+    const other = mkdtempSync(path.join(os.tmpdir(), 'sv-salt-'));
+    if (used === 'core') mkdirSync(path.join(other, used)); else writeFileSync(path.join(other, used), '');
+    await assert.rejects(tryLock(path.join(other, 'install.lock'), { kind: 'install' }), error => error.key === 'identity.lock-salt-missing', used);
+    assert.equal(existsSync(path.join(other, 'lock-salt')), false, used);
+  }
+  // The connector lock, held by a running supervisor; and after it.
   const node = supervisedNode();
   try {
     const supervisor = node.start();
@@ -313,8 +320,30 @@ test('lock salt: removed while its lock is held, it is not made again beside the
     rmSync(path.join(node.dataDir, 'lock-salt'));
     const second = node.start([]);
     assert.equal(await exited(second), 1, 'refused, not a second lock');
-    assert.match(second.stderrText, /lock identity .* is gone while connector\.sock\.lock is held/);
+    assert.match(second.stderrText, /lock identity .* is missing or was replaced/);
     assert.equal(lockOf(node).pid, supervisor.pid);
+    supervisor.kill('SIGKILL'); await exited(supervisor);
+    assert.equal(await exited(node.start()), 1, 'a supervisor after it is refused too');
     assert.equal(existsSync(path.join(node.dataDir, 'lock-salt')), false);
   } finally { node.stop(); }
+});
+
+test('lock salt: removed between a holder binding its lock and writing its record — the other process takes a new identity, and the first finds its own gone, lets go and fails: never two holders (install and connector)', { skip: process.platform !== 'linux' && 'the salt names Linux abstract sockets' }, async () => {
+  for (const kind of ['install', 'connector']) {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'sv-salt-'));
+    const file = path.join(dir, `${kind}.lock`), log = path.join(dir, 'order.log');
+    const held = hooks(`lock-bound-${kind}`);
+    const first = contender(file, kind, log, 'A', { forever: true, hooksDir: held.dir });
+    await held.paused(`lock-bound-${kind}`);
+    assert.equal(existsSync(file), false, 'bound, its record not written yet');
+    rmSync(path.join(dir, 'lock-salt'));
+    const second = contender(file, kind, log, 'B', { forever: true });
+    await until(() => existsSync(log) && readFileSync(log, 'utf8').includes('B in'));
+    held.resume(`lock-bound-${kind}`);
+    assert.notEqual(await exited(first), 0, `${kind}: the first holder fails`);
+    assert.ok(!readFileSync(log, 'utf8').includes('A in'), `${kind}: and never held it`);
+    assert.equal(second.exitCode, null, `${kind}: the second holds it, alone`);
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).pid, second.pid, `${kind}: its record stands`);
+    second.kill('SIGKILL'); await exited(second);
+  }
 });
