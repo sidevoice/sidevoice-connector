@@ -57,31 +57,49 @@ let cardReads = 0;
 let connector = null;
 /** Asked again once, after a handover cut it off, only when asking twice is harmless. */
 const RETRIED = new Set(['status', 'register']);
-/** The connection went away other than by a handover (the node service restarted, an upgrade, a stop and a
- *  start): the conversations are registered again before anything else is asked of the connector that answers next. */
-let lost = false;
 async function rpc(method, params) {
-  if (lost && method !== 'register') { lost = false; await reattach().catch(() => {}); }
+  // A reconnection under way is waited for (briefly): a reply must not reach a connector that does not yet know
+  // the conversation it answers for.
+  if (reconnecting && method !== 'register') await Promise.race([reconnecting, new Promise(resolve => setTimeout(resolve, 10_000))]);
   try { return await connector.rpc(method, params); }
   catch (error) { if (!error.gone || !RETRIED.has(method)) throw error; return connector.rpc(method, params); }
 }
-/** After a handover: every conversation this server joined is registered again with the supervisor. Retried
- *  for a while — the supervisor is taking the socket over as this runs. */
-async function reattach() {
-  const pending = [...joined.values()].filter(b => b.params);
-  const deadline = Date.now() + 20_000;
-  while (pending.length && Date.now() < deadline) {
-    const b = pending[0];
-    try {
-      const result = await rpc('register', b.params);
-      if (joined.get(b.client_ref) === b) b.binding_id = result.binding_id;
-      pending.shift();
-      mcpLog({ event: 'reattached', conversation: logId(b.client_ref) });
-    } catch (error) {
-      mcpLog({ event: 'reattach_failed', conversation: logId(b.client_ref), reason: error.message });
-      await new Promise(resolve => setTimeout(resolve, 250));
+
+/** The connection to the connector is gone — a handover, the node service restarted or upgraded, a stop and a
+ *  start: one loop, never two, connects again through the launcher and registers every conversation this server
+ *  joined, without waiting for a tool call — a voice turn may arrive before the agent calls anything. It backs off
+ *  while there is no connector to reach, and a person's stop is waited out, never overridden (the launcher refuses
+ *  to start anything then). It ends when every conversation is registered, or none is left. */
+let reconnecting = null, closing = false;
+const RECONNECT_MAX_MS = Number(process.env.SIDEVOICE_RECONNECT_MAX_MS || 5000);
+function reconnect() {
+  if (reconnecting || !joined.size) return reconnecting;
+  reconnecting = (async () => {
+    let delay = 100;
+    for (;;) {
+      const pending = [...joined.values()].filter(b => b.params && !b.registered);
+      if (!pending.length) return;
+      for (const b of pending) {
+        try {
+          const result = await connector.rpc('register', b.params);
+          if (joined.get(b.client_ref) === b) { b.binding_id = result.binding_id; b.registered = true; }
+          mcpLog({ event: 'reattached', conversation: logId(b.client_ref) });
+        } catch (error) {
+          mcpLog({ event: 'reattach_failed', conversation: logId(b.client_ref), reason: error.message, key: error.key ?? null });
+          break;
+        }
+      }
+      if (![...joined.values()].some(b => b.params && !b.registered)) return;
+      await new Promise(resolve => setTimeout(resolve, delay));
+      delay = Math.min(delay * 2, RECONNECT_MAX_MS);
     }
-  }
+  })().finally(() => { reconnecting = null; if ([...joined.values()].some(b => b.params && !b.registered)) reconnect(); });
+  return reconnecting;
+}
+/** Every conversation is to be registered again with whichever connector answers next. */
+function connectionLost() {
+  for (const b of joined.values()) b.registered = false;
+  reconnect();
 }
 
 // ----- tools -----
@@ -288,7 +306,7 @@ async function invoke(name, args, meta) {
     const params = { client_ref: who.thread, harness: who.harness, thread: who.thread,
       title, delivery: who.delivery, inbound, capabilities, experimental, engine, ...(who.route ? { route: who.route } : {}) };
     const result = await rpc('register', params);
-    joined.set(who.thread, { ...result, harness: who.harness, client_ref: who.thread, title, capabilities, experimental, params });
+    joined.set(who.thread, { ...result, harness: who.harness, client_ref: who.thread, title, capabilities, experimental, params, registered: true });
     let connectorVersion = null; try { connectorVersion = (await rpc('status', {})).version || null; } catch {}
     const pushed = capabilities.deliver === SUPPORTED;
     mcpLog({ event: 'voice_connect', route: who.route || who.harness, harness: who.harness, conversation: logId(who.thread), delivery: who.delivery.kind,
@@ -356,7 +374,7 @@ async function invoke(name, args, meta) {
 // ----- JSON-RPC over stdio -----
 /** `sidevoice mcp`. */
 export function run(argv = [], env = process.env) {
-  connector = connectorClient(env, { onHandover: () => { reattach().catch(() => {}); }, onLost: () => { lost = joined.size > 0; } });
+  connector = connectorClient(env, { onHandover: connectionLost, onLost: () => { if (!closing) connectionLost(); } });
   let input = '';
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', async chunk => {
@@ -396,5 +414,5 @@ export function run(argv = [], env = process.env) {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, ...(error ? { error } : { result }) }) + '\n');
   }
 });
-  process.stdin.on('end', () => { connector.end(); process.exit(0); });
+  process.stdin.on('end', () => { closing = true; connector.end(); process.exit(0); });
 }

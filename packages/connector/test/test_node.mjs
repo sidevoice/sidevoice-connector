@@ -45,7 +45,8 @@ test('handover: a supervisor takes over a plain connector — a new voice turn r
   const node = supervisedNode();
   // The harness behind the façade-owned conversation: a receiver the http harness delivers to.
   const received = [];
-  const receiver = http.createServer(async (req, res) => { let body = ''; for await (const chunk of req) body += chunk; received.push(JSON.parse(body)); res.writeHead(200); res.end('{}'); });
+  // A turn whose text says "slow" takes 1.5 s to be taken: it is still being delivered when the takeover starts.
+  const receiver = http.createServer(async (req, res) => { let body = ''; for await (const chunk of req) body += chunk; const turn = JSON.parse(body); if (/slow/.test(turn.text)) await wait(1500); received.push(turn); res.writeHead(200); res.end('{}'); });
   await new Promise(resolve => receiver.listen(0, '127.0.0.1', resolve));
   const env = { ...node.env, SIDEVOICE_THREAD: 'thread-http', SIDEVOICE_DELIVERY_URL: `http://127.0.0.1:${receiver.address().port}/deliver` };
   const editorCaps = { extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] } } };
@@ -72,6 +73,12 @@ test('handover: a supervisor takes over a plain connector — a new voice turn r
     deliver(node, { event_id: 'before-card', binding_id: cardBinding, channel: 'voice', session_id: 's', revision: 2, message_id: 'm-2', text: 'antes card' });
     await until(() => received.length === 1 && view.dispatched.length === 1);
 
+    // A turn to the card that its chat will answer only after the takeover, and a slow turn still being taken
+    // when the takeover begins.
+    deliver(node, { event_id: 'crossing', binding_id: cardBinding, channel: 'voice', session_id: 'x', revision: 9, message_id: 'm-x', text: 'contesta luego' });
+    await until(() => view.dispatched.length === 2);
+    deliver(node, { event_id: 'slow-one', binding_id: 'core-thread-http', channel: 'voice', session_id: 's', revision: 2, message_id: 'm-slow', text: 'slow turn' });
+    await until(() => readFileSync(path.join(node.dataDir, 'connector.log'), 'utf8').includes('m-slow') || received.length >= 2, 5000).catch(() => {});
     // The node service starts: its supervisor finds the plain connector, which hands over and leaves.
     const supervisor = node.start(['--supervise']);
     await until(() => !alive(plain), 20_000);
@@ -85,10 +92,10 @@ test('handover: a supervisor takes over a plain connector — a new voice turn r
     // A new voice turn, in each conversation, after the takeover.
     deliver(node, { event_id: 'after-http', binding_id: 'core-thread-http', channel: 'voice', session_id: 's', revision: 3, message_id: 'm-3', text: 'después' });
     deliver(node, { event_id: 'after-card', binding_id: cardBinding, channel: 'voice', session_id: 's', revision: 4, message_id: 'm-4', text: 'después card' });
-    await until(() => received.length === 2 && view.dispatched.length === 2, 20_000);
-    assert.match(received[1].text, /después/);
-    assert.match(view.dispatched[1].content[0].text, /después card/);
-    assert.equal(delivered(node, 'after-http').answer.status, 'accepted');
+    await until(() => received.some(turn => /después/.test(turn.text)) && view.dispatched.length === 3, 20_000);
+    assert.ok(received.some(turn => turn.text === 'slow turn'), 'the slow turn was taken');
+    assert.match(view.dispatched[2].content[0].text, /después card/);
+    assert.equal((await until(() => delivered(node, 'after-http'))).answer.status, 'accepted');
     // The façade still speaks for its conversation through the supervisor.
     const said = await owner.call('voice_say', { text: 'hola', session_id: 's', revision: 3 });
     assert.ok(['queued', 'published'].includes(said.value.status), said.value.status);
@@ -98,6 +105,16 @@ test('handover: a supervisor takes over a plain connector — a new voice turn r
     assert.ok(registered.filter(id => id === 'core-thread-http').length >= 1);
     assert.ok(registered.includes(cardBinding), 'the orphaned card\'s binding rejoined under its id');
     assert.match(node.log(), /restored from the handover/);
+    // The slow turn finished being delivered before the old connector let its bindings go: its answer reached the core.
+    assert.equal((await until(() => delivered(node, 'slow-one'))).answer.status, 'accepted');
+    // The crossing turn: delivered before the takeover, answered after it from a new editor process — routed by the
+    // turn to the card's conversation, which the supervisor learned from the handover.
+    const later = facade(editorEnv, { name: 'cursor-vscode', version: '1.0.0' }, editorCaps); await later.ready;
+    try {
+      const answer = await later.call('voice_say', { text: 'ya está', session_id: 'x', revision: 9 });
+      assert.ok(['queued', 'published'].includes(answer.value.status), JSON.stringify(answer.value));
+      await until(() => node.said().some(line => line.event === 'speech.publish' && line.data.binding_id === cardBinding && line.data.text === 'ya está'));
+    } finally { later.child.kill(); }
     void supervisor;
   } finally { view?.stop(); owner?.child.kill(); editor?.child.kill(); node.stop(); receiver.close(); }
 });
@@ -340,4 +357,42 @@ test('teardown: a unit whose manager cannot be reached is still what is installe
   assert.equal(full.status, 1);
   assert.match(full.stderr, /nothing was deleted|untouched/);
   assert.ok(existsSync(unit) && existsSync(path.join(dataDir, 'install.json')), 'uninstall stopped before deleting anything the unit points at');
+});
+
+test('façade: the supervisor replaced under it — a new voice turn reaches its conversation with no tool call in between; after a person\'s stop it starts nothing and comes back with the service', async () => {
+  const node = supervisedNode();
+  const received = [];
+  const receiver = http.createServer(async (req, res) => { let body = ''; for await (const chunk of req) body += chunk; received.push(JSON.parse(body)); res.writeHead(200); res.end('{}'); });
+  await new Promise(resolve => receiver.listen(0, '127.0.0.1', resolve));
+  let owner = null;
+  try {
+    const first = node.start();
+    await node.status(s => s.state === 'running');
+    owner = facade({ ...node.env, SIDEVOICE_THREAD: 'thread-r', SIDEVOICE_DELIVERY_URL: `http://127.0.0.1:${receiver.address().port}/deliver` });
+    await owner.ready;
+    assert.equal((await owner.call('voice_connect', {})).value.binding_id, 'core-thread-r');
+    const registrations = () => node.said().filter(line => line.event === 'binding.register' && line.data.client_ref === 'thread-r').length;
+    // The service manager replaces the supervisor (an upgrade, a crash): the old one is gone at once.
+    first.kill('SIGKILL');
+    await until(() => first.signalCode !== null);
+    node.start();
+    await until(() => registrations() >= 2, 20_000);
+    deliver(node, { event_id: 'after-restart', binding_id: 'core-thread-r', channel: 'voice', session_id: 's', revision: 1, message_id: 'm-r', text: 'otra vez' });
+    await until(() => received.length === 1, 20_000);
+    assert.match(received[0].text, /otra vez/);
+    assert.equal((await until(() => delivered(node, 'after-restart'))).answer.status, 'accepted');
+    // A person's stop: the supervisor goes, and the façade's loop starts nothing in its place.
+    writeFileSync(path.join(node.dataDir, 'node-stopped.json'), JSON.stringify({ at: new Date().toISOString() }), { mode: 0o600 });
+    const second = node.children.at(-1);
+    second.kill('SIGTERM');
+    await until(() => second.exitCode !== null);
+    await wait(1500);
+    assert.equal(existsSync(node.socketPath), false, 'nothing started while stopped');
+    // The person starts it again: the conversation is registered again by itself.
+    const before = registrations();
+    node.start();
+    await until(() => registrations() > before, 20_000);
+    deliver(node, { event_id: 'after-stop', binding_id: 'core-thread-r', channel: 'voice', session_id: 's', revision: 2, message_id: 'm-s', text: 'de vuelta' });
+    await until(() => received.length === 2, 20_000);
+  } finally { owner?.child.kill(); node.stop(); receiver.close(); }
 });

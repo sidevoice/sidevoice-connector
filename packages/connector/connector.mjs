@@ -113,6 +113,7 @@ let coreFailure = null;            // the same, as the keyed failure `node.statu
 let coreCheckedAt = 0;
 let handingOver = false;           // a supervisor is taking over: no new command is accepted
 const inFlight = new Set();        // commands being answered, which a handover lets settle
+const deliveries = new Set();      // voice turns being delivered to a harness, which a handover lets settle too
 
 function loadOutbox() { try { outbox = JSON.parse(readFileSync(outboxPath, 'utf8')); if (!Array.isArray(outbox)) outbox = []; } catch { outbox = []; } }
 function saveOutbox() {
@@ -501,6 +502,8 @@ async function asked(route, frame) {
       // One delivery at a time per binding keeps the user's turns in order.
       const answer = (binding.chain || Promise.resolve()).then(() => handOver(binding, frame));
       binding.chain = answer.catch(() => {});
+      // Counted: a handover waits for every delivery under way to settle before it lets the bindings go.
+      deliveries.add(answer); answer.catch(() => {}).finally(() => deliveries.delete(answer));
       return answer;
     }
     case 'binding.close': {
@@ -732,11 +735,24 @@ async function yieldToSupervisor(requester) {
   const settle = Promise.allSettled([...inFlight]);
   await Promise.race([settle, wait(HANDOVER_SETTLE_MS)]);
   if (connected && outbox.length) await Promise.race([Promise.allSettled([...outbox].map(speech => publish(speech))), wait(HANDOVER_SETTLE_MS)]);
+  // No new turn from the core: the link is closed, and the turns it already sent are delivered (or have failed)
+  // before anything is written — what a delivery records (the turn it carried, the message the harness is to
+  // take) is then complete.
+  closed = true;
+  try { link?.close(); } catch {}
+  await Promise.race([Promise.allSettled([...deliveries]), wait(HANDOVER_SETTLE_MS)]);
+  if (deliveries.size) log(`${deliveries.size} delivery(ies) still under way after ${HANDOVER_SETTLE_MS} ms: the core delivers them again`);
   const record = { at: new Date().toISOString(), from_pid: process.pid,
+    // Which conversation each turn went to (a reply names the turn, not the conversation), and which messages
+    // were already reported read: the supervisor routes a reply to a turn delivered here, and reports nothing twice.
+    turns: [...turnsDelivered].map(([key, refs]) => [key, [...refs]]),
+    read: [...readReported],
     bindings: [...bindings.values()].map(binding => ({
       binding_id: binding.binding_id, client_ref: binding.client_ref, harness: binding.harness, thread: binding.thread, title: binding.title,
       delivery: binding.delivery, inbound: binding.inbound, capabilities: binding.capabilities, experimental: binding.experimental,
-      engine: binding.engine, route: binding.route, owned: !!binding.owner, prepared: binding.prepared || null })) };
+      engine: binding.engine, route: binding.route, owned: !!binding.owner, prepared: binding.prepared || null,
+      // What the conversation was doing: messages delivered and not yet seen taken, the turn under way, working or not.
+      pending: binding.pending ? [...binding.pending] : [], turn: binding.turn ?? null, working: binding.working ?? null })) };
   writePrivate(files.handover, record);
   log(`handover.json written: ${record.bindings.length} binding(s), ${outbox.length} speech frame(s) left in the outbox`);
   // After the answer has gone: façades told and closed (their bindings are the supervisor's now), the
@@ -748,8 +764,6 @@ async function yieldToSupervisor(requester) {
       client.socket.end(JSON.stringify({ type: 'handover' }) + '\n');
     }
     for (const binding of bindings.values()) unwatch(binding);
-    closed = true;
-    try { link?.close(); } catch {}
     releaseLock({ socket: false });
     setTimeout(() => process.exit(0), 100);
   });
@@ -793,10 +807,13 @@ async function takeOver(owner) {
 async function restoreHandover() {
   const record = readJson(files.handover);
   if (!record) return;
+  for (const [key, refs] of record.turns || []) if (Array.isArray(refs)) turnsDelivered.set(key, new Set(refs));
+  for (const id of record.read || []) readReported.add(id);
   for (const saved of record.bindings || []) {
     if (!saved?.binding_id || !saved.client_ref || !saved.delivery?.kind) continue;
-    const { prepared, owned, ...fields } = saved;
-    const binding = { ...fields, owner: null };
+    const { prepared, owned, pending, turn, working, ...fields } = saved;
+    const binding = { ...fields, owner: null, pending: new Map(Array.isArray(pending) ? pending : []), turn: turn ?? null };
+    if (typeof working === 'boolean') binding.working = working;
     bindings.set(binding.binding_id, binding);
     watch(binding);
     await prepareBinding(binding, { port: prepared?.port ?? null });
