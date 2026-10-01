@@ -39,7 +39,7 @@ function facade(env, clientInfo = { name: 'test', version: '1' }, capabilities =
 function delivered(node, eventId) {
   try { return readFileSync(path.join(node.dataDir, 'core', 'delivered.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse).find(line => line.frame.event_id === eventId) || null; } catch { return null; }
 }
-const attempts = (node, eventId) => { try { return readFileSync(path.join(node.dataDir, 'core', 'delivery-attempts.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse).filter(line => line.event_id === eventId).length; } catch { return 0; } };
+const attempts = (node, eventId) => { try { return readFileSync(path.join(node.dataDir, 'core', 'delivery-attempts.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse).filter(line => line.event_id === eventId && !('ack' in line) && !('requeued' in line)).length; } catch { return 0; } };
 const deliver = (node, frame) => appendFileSync(path.join(node.dataDir, 'core', 'deliver.jsonl'), JSON.stringify(frame) + '\n');
 
 test('handover: a supervisor takes over a plain connector — a new voice turn reaches a façade\'s conversation and an orphaned editor card, and the core never sees one leave', async () => {
