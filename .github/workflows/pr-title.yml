@@ -1,0 +1,38 @@
+name: pr-title
+
+# Squash merge makes the PR title the commit on main, and release-please reads versions and the changelog from it.
+# The job name is the required status check: keep it exactly as it is.
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+  # release-please opens and updates its release PR with GITHUB_TOKEN, which starts no pull_request run, so
+  # release-please.yml dispatches this on the release branch: the check lands on that PR's head commit.
+  workflow_dispatch:
+
+permissions:
+  pull-requests: read
+
+concurrency:
+  group: pr-title-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  title:
+    name: PR title is a conventional commit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: The release PR's title (release-please's branch only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF_NAME" in release-please--*) ;; *) echo "dispatch is for release-please's branch only"; exit 1;; esac
+          TITLE=$(gh pr view "$GITHUB_REF_NAME" --json title -q .title)
+          echo "$TITLE"
+          echo "$TITLE" | grep -Eq '^chore(\([^)]+\))?: release '
