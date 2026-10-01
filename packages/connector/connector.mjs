@@ -92,7 +92,7 @@ function acquireLock() {
       if (error.code !== 'EEXIST') throw error;
       let pid = 0; try { pid = Number(readFileSync(lockPath, 'utf8')); } catch {}
       if (pid && connectorAlive(pid)) {              // A live connector holds it: we are redundant, and we say so.
-        log(`a connector is already running (pid ${pid}, lock ${lockPath}); this one exits`);
+        if (!supervised) log(`a connector is already running (pid ${pid}, lock ${lockPath}); this one exits`);
         return false;
       }
       log(`stale lock ${lockPath} (pid ${pid || '?'} is not a connector); taking over`);
@@ -696,7 +696,8 @@ async function takeOver(pid) {
     });
   });
   if (!answer.ok && /node service/.test(answer.error || '')) return false;
-  if (!answer.ok) {
+  // Already handing over (to another supervisor that asked first): it leaves by itself.
+  if (!answer.ok && !String(answer.error).startsWith('HANDOVER:')) {
     // It cannot hand over (it answers nothing, or does not know how): asked to leave like any stop.
     log(`the connector (pid ${pid}) did not hand over (${answer.error}); asking it to stop`);
     try { process.kill(pid, 'SIGTERM'); } catch {}
@@ -924,9 +925,11 @@ export async function run(argv = [], environment = process.env) {
   serviceKind = supervised ? (env.SIDEVOICE_SERVICE || 'none') : 'none';
   external = externalCore();
 
-  if (!acquireLock()) {
+  // A plain connector gives way to the supervisor; one started in the gap of a takeover (a façade's launcher
+  // finding no socket for a moment) is taken over in turn.
+  for (let attempt = 0; !acquireLock(); attempt++) {
     let pid = 0; try { pid = Number(readFileSync(lockPath, 'utf8')); } catch {}
-    if (!supervised || !(await takeOver(pid)) || !acquireLock()) process.exit(0);
+    if (!supervised || attempt >= 5 || !(await takeOver(pid))) process.exit(0);
   }
   if (supervised) {
     // A supervisor starting is the next login, or a person's start: a stop no longer holds.
