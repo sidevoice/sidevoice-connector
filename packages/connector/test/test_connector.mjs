@@ -15,6 +15,7 @@ import { remove as removeSkill, status as skillStatus } from '../skill.mjs';
 import './test_harness_contract.mjs';
 import './test_harness_claude.mjs';
 import './test_core.mjs';
+import './test_supervisor.mjs';
 import { chatStore, fakeDesktopBridge, fakePersist, fakeStateDb, runView, TMUX } from './test_harness_cursor.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));

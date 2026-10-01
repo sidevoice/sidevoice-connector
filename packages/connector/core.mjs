@@ -10,30 +10,47 @@
  *  `SIDEVOICE_CORE_BIN` skips installing altogether and names a `sidevoice-core` someone installed.
  *
  *  Installing a Python program is heavy the first time (a few hundred megabytes of wheels) and nothing
- *  afterwards: one virtual environment per version under the data directory, and the other versions'
- *  are removed once this one is in place. Models are not part of it; the core loads Silero and
- *  smart-turn from its wheels, and nothing else unless a person picks a local engine.
+ *  afterwards: one virtual environment per version under the data directory; the previous version's stays
+ *  until an upgrade has run for five minutes, so a failed one can go back to it. Models are not part of it;
+ *  the core loads Silero and smart-turn from its wheels, and nothing else unless a person picks a local engine.
  *
- *  Started detached and left running: the core outlives this connector on purpose (a call may be
- *  going on) and exits on its own when nothing has used it for a while. The handshake is its ready
- *  file, `core/core.json`: where it listens and the credential this connector links with. */
+ *  Who starts it (§4.2): the node service's supervisor, as its child (`supervisor.mjs`); without a service, a
+ *  connector, detached and left running — that core outlives its connector on purpose (a call may be going on)
+ *  and exits on its own when nothing has used it for a while. Every start carries a launch id. The handshake is
+ *  the ready file, `core/core.json`: where it listens (its socket, `core-socket.mjs`), the launch it belongs
+ *  to, and the credential the connector links with. A core that died before serving says why in
+ *  `core/core-failure.json`, under the same launch id. */
 import { spawn, execFileSync } from 'node:child_process';
-import { accessSync, constants, existsSync, mkdirSync, openSync, closeSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { accessSync, constants, existsSync, mkdirSync, openSync, closeSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ensureCoreDirectory, localHealth } from './core-socket.mjs';
+import { keyed } from './i18n.mjs';
+import { rotate } from './logfile.mjs';
 
 export const CORE_VERSION = '0.1.0';
 export const DEFAULT_PORT = 8768;
+/** The client surface (`api`) and the connector link (`link`, the `protocol` in `core.json`) this connector
+ *  speaks (§4.3): a core outside either range is not one it can use. */
+export const API_RANGE = [1, 1];
+export const LINK_RANGE = [2, 2];
 const here = path.dirname(fileURLToPath(import.meta.url));
 const INSTALL_TIMEOUT_MS = 20 * 60_000;
+/** How long a started core has to be ready: its ready file with this launch id, and its health answering. */
+export const READY_TIMEOUT_MS = Number(process.env.SIDEVOICE_CORE_READY_MS || 60_000);
+/** How long a core asked to leave (SIGTERM) has before it is killed. */
+export const STOP_GRACE_MS = Number(process.env.SIDEVOICE_CORE_STOP_GRACE_MS || 15_000);
 
 export const NO_UV = 'Sidevoice installs its core with uv, and uv is not on this machine. Install it '
   + '(macOS/Linux: curl -LsSf https://astral.sh/uv/install.sh | sh — or brew install uv) and ask for voice again.';
 
 export function coreData(dataDir) { return path.join(dataDir, 'core'); }
-function runtimeRoot(dataDir) { return path.join(dataDir, 'core-runtime'); }
-function logPath(dataDir) { return path.join(dataDir, 'core.log'); }
+export function runtimeRoot(dataDir) { return path.join(dataDir, 'core-runtime'); }
+export function logPath(dataDir) { return path.join(dataDir, 'core.log'); }
+export function socketPathOf(dataDir) { return path.join(coreData(dataDir), 'local.sock'); }
+export function failurePath(dataDir) { return path.join(coreData(dataDir), 'core-failure.json'); }
 
 /** What `uv pip install` is given for the pinned version. */
 export function coreSpec(env = process.env) {
@@ -106,10 +123,11 @@ function run(command, args, { log, env, progress = () => {} }) {
   });
 }
 
-/** Who is installing the core right now, if anyone: `sidevoice install` and a connector share one data dir,
- *  and two uv runs into one environment break it. The lock is a file with the installer's pid. */
-function lockPath(dataDir) { return path.join(dataDir, 'core-install.lock'); }
-function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } }
+/** Who is installing right now, if anyone: `sidevoice install` (its whole transaction, `install.mjs`) and a
+ *  connector installing its core share one data dir, and two uv runs into one environment break it. One lock,
+ *  `install.lock`, a file with the holder's pid; asked for again by the process that holds it, it is the same hold. */
+export function lockPath(dataDir) { return path.join(dataDir, 'install.lock'); }
+export function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } }
 export function installInProgress(dataDir) {
   let lock; try { lock = JSON.parse(readFileSync(lockPath(dataDir), 'utf8')); } catch { return null; }
   if (!lock?.pid || !pidAlive(lock.pid)) return null;
@@ -117,17 +135,21 @@ export function installInProgress(dataDir) {
   try { last = readFileSync(logPath(dataDir), 'utf8').trim().split('\n').filter(line => line.trim()).at(-1)?.trim() || null; } catch {}
   return { pid: lock.pid, since: lock.since, seconds: Math.round((Date.now() - lock.since) / 1000), last, log: logPath(dataDir) };
 }
-async function takeInstallLock(dataDir, log) {
+/** The lock, waited for; `{wait: false}` answers null at once when another process holds it. */
+export async function takeInstallLock(dataDir, log = () => {}, { timeout = INSTALL_TIMEOUT_MS, wait: waiting = true } = {}) {
   const file = lockPath(dataDir);
-  const deadline = Date.now() + INSTALL_TIMEOUT_MS;
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  const deadline = Date.now() + timeout;
   let said = false;
   for (;;) {
     try { writeFileSync(file, JSON.stringify({ pid: process.pid, since: Date.now() }), { flag: 'wx', mode: 0o600 }); return () => { try { rmSync(file, { force: true }); } catch {} }; }
     catch (error) { if (error.code !== 'EEXIST') throw error; }
     const held = installInProgress(dataDir);
     if (!held) { try { rmSync(file, { force: true }); } catch {} continue; }   // left by an installer that is gone
-    if (!said) { log(`another process (pid ${held.pid}) is installing the core; waiting for it`); said = true; }
-    if (Date.now() > deadline) throw new Error(`Another process (pid ${held.pid}) has been installing the core for ${held.seconds} s; see ${held.log}`);
+    if (held.pid === process.pid) return () => {};                         // this process holds it: the outer hold lets go
+    if (!waiting) return null;
+    if (!said) { log(`another process (pid ${held.pid}) is installing; waiting for it`); said = true; }
+    if (Date.now() > deadline) throw new Error(`Another process (pid ${held.pid}) has been installing for ${held.seconds} s; see ${held.log}`);
     await wait(500);
   }
 }
@@ -161,10 +183,8 @@ export async function ensureInstalled({ dataDir, env = process.env, log = () => 
     await run(uv, ['pip', 'install', '--python', python, spec], options);
     if (!executable(bin)) throw new Error(`uv installed ${spec} but there is no ${bin}; see ${logPath(dataDir)}`);
     writeFileSync(marker, JSON.stringify({ version: CORE_VERSION, spec: identity, at: new Date().toISOString() }), { mode: 0o600 });
-    // One current copy: the versions this connector no longer pins are disposable.
-    for (const name of readdirSync(runtimeRoot(dataDir))) {
-      if (name !== CORE_VERSION) rmSync(path.join(runtimeRoot(dataDir), name), { recursive: true, force: true });
-    }
+    // Other versions stay: the previous one is what a failed upgrade rolls back to, and it goes only once
+    // this one has been running for five minutes (`pruneInstallations`, `install.mjs`).
     log(`sidevoice-core ${CORE_VERSION} installed in ${Math.round((Date.now() - started) / 1000)} s`);
     return bin;
   } finally { release(); }
@@ -193,7 +213,7 @@ function installCurrent(dataDir, env) {
 export function readReady(dataDir) {
   try {
     const ready = JSON.parse(readFileSync(path.join(coreData(dataDir), 'core.json'), 'utf8'));
-    return ready && ready.pid && ready.url && ready.connector_id && ready.token ? ready : null;
+    return ready && ready.pid && ready.socket && ready.connector_id && ready.token ? ready : null;
   } catch { return null; }
 }
 
@@ -209,43 +229,157 @@ export function coreAlive(pid) {
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-/** The running core's ready file: the one already running, or one this call starts. A core of another
- *  version is asked to leave first — this connector links with the version it pins. */
-export async function ensureRunning({ dataDir, env = process.env, log = () => {}, progress = () => {}, timeout = 120_000, roomCredential = roomCredentialPath(dataDir, env) }) {
-  const running = readReady(dataDir);
-  if (running && coreAlive(running.pid)) {
+/** Whether a core speaks what this connector speaks: `api` from its health, `link` from its ready file. */
+export function compatible(core) {
+  const within = (value, [low, high]) => Number.isInteger(value) && value >= low && value <= high;
+  return within(core?.api, API_RANGE) && within(core?.protocol, LINK_RANGE);
+}
+
+/** The launch that is ready: `core.json` names this launch id and `GET /api/local/health` answers 200 with
+ *  it within 2 s. Then the ready file and the health together, else null. Alive is not ready: a stale ready
+ *  file outlives a SIGKILLed core, and a wedged core is alive. */
+export async function launchReady(dataDir, launchId, timeout = 2000) {
+  const ready = readReady(dataDir);
+  if (!ready || !launchId || ready.launch_id !== launchId) return null;
+  const health = await localHealth(ready.socket, timeout);
+  if (health?.status !== 200 || health.body?.launch_id !== launchId) return null;
+  return { ...ready, ...health.body };
+}
+
+/** A core found running: adopted when its health answers with the launch id its ready file names, else a
+ *  core to terminate (wedged, or a leftover whose file is someone else's). `{adopt}`, `{terminate: pid}` or
+ *  `{}` when no core is running. */
+export async function examineRunning(dataDir) {
+  const ready = readReady(dataDir);
+  if (!ready || !coreAlive(ready.pid)) return {};
+  const live = await launchReady(dataDir, ready.launch_id);
+  return live ? { adopt: live } : { terminate: ready.pid };
+}
+
+/** The arguments of one launch. `idleExit` 0 for the supervisor's child (it never leaves on its own); a
+ *  detached core keeps its default and leaves when unused. */
+export function coreArgs({ dataDir, env = process.env, launchId, idleExit = null, roomCredential = null }) {
+  const args = ['--data-dir', coreData(dataDir), '--port', String(env.SIDEVOICE_CORE_PORT ?? DEFAULT_PORT),
+    '--socket', socketPathOf(dataDir), '--launch-id', launchId];
+  if (idleExit !== null) args.push('--idle-exit', String(idleExit));
+  if (roomCredential) args.push('--room-credential', roomCredential);
+  return args;
+}
+
+/** Start one launch: its output appended to `core.log` (rotated first), what it said about a previous
+ *  failure removed, and a handle whose `exit` settles when it is gone — a spawn error (no such program, no
+ *  permission) included. */
+export function spawnCore(bin, args, { dataDir, env = process.env, detached = false }) {
+  const log = logPath(dataDir);
+  rotate(log);
+  const out = openSync(log, 'a', 0o600);
+  let child;
+  try { child = spawn(bin, args, { detached, stdio: ['ignore', out, out], env: { ...env, SIDEVOICE_CORE_DATA_DIR: coreData(dataDir) } }); }
+  finally { closeSync(out); }
+  const handle = { pid: child.pid ?? null, child, done: null };
+  handle.exit = new Promise(resolve => {
+    child.once('exit', (code, signal) => resolve(handle.done = { code, signal }));
+    child.once('error', error => resolve(handle.done = { error: { code: error.code, message: error.message, path: bin } }));
+  });
+  if (detached) child.unref();
+  return handle;
+}
+
+/** The last lines of `core.log`, for a failure a person reads. */
+export function logTail(dataDir, lines = 10) {
+  try { return readFileSync(logPath(dataDir), 'utf8').trimEnd().split('\n').slice(-lines); } catch { return []; }
+}
+
+/** What the core reported about this launch, if it reported anything: a report of another launch is
+ *  somebody else's news and is ignored. */
+export function readFailure(dataDir, launchId) {
+  try {
+    const report = JSON.parse(readFileSync(failurePath(dataDir), 'utf8'));
+    return report && report.launch_id === launchId && report.key ? report : null;
+  } catch { return null; }
+}
+
+/** Why a launch did not come up or went away (§4.2): the core's own report for this launch; else the spawn
+ *  error (`launch.missing-executable`, `launch.permission`); else `launch.exited` with its exit code. Every
+ *  cause carries the log tail. `hang` and `ready.timeout` are the supervisor's own findings. */
+export function failureCause({ dataDir, launchId, exit, key = null }) {
+  const at = new Date().toISOString(), log_tail = logTail(dataDir);
+  const report = key ? null : readFailure(dataDir, launchId);
+  if (report) {
+    const detail = report.key === 'import.missing-module' ? (String(report.message).match(/module named '?([\w.]+)/)?.[1] ?? report.message) : report.message;
+    return { key: report.key, step: report.step || null, message: report.message, detail, at, log_tail };
+  }
+  const describe = (cause, step, detail) => ({ key: cause, step, message: keyed(cause, { detail }).message, detail, at, log_tail });
+  if (key) return describe(key, key === 'hang' ? 'health' : 'ready', null);
+  if (exit?.error) {
+    if (exit.error.code === 'ENOENT') return describe('launch.missing-executable', 'spawn', exit.error.path);
+    if (exit.error.code === 'EACCES' || exit.error.code === 'EPERM') return describe('launch.permission', 'spawn', exit.error.path);
+    return describe('launch.exited', 'spawn', exit.error.message);
+  }
+  return describe('launch.exited', 'run', exit?.code ?? exit?.signal ?? null);
+}
+
+/** Ask a core to leave and wait until it has: SIGTERM, `STOP_GRACE_MS`, SIGKILL, and its exit awaited. A
+ *  handle of ours settles on its exit; an adopted pid is watched until it is gone. */
+export async function terminateCore(target, { grace = STOP_GRACE_MS, log = () => {} } = {}) {
+  const pid = typeof target === 'number' ? target : target?.pid;
+  const gone = typeof target === 'object' && target?.exit
+    ? () => target.done !== null
+    : () => !coreAlive(pid);
+  if (!pid || gone()) return;
+  try { process.kill(pid, 'SIGTERM'); } catch {}
+  const deadline = Date.now() + grace;
+  while (!gone() && Date.now() < deadline) await wait(50);
+  if (!gone()) {
+    log(`the core (pid ${pid}) did not leave within ${Math.round(grace / 1000)} s; killing it`);
+    try { process.kill(pid, 'SIGKILL'); } catch {}
+    const after = Date.now() + 5000;
+    while (!gone() && Date.now() < after) await wait(50);
+  }
+  if (typeof target === 'object' && target?.exit) await target.exit;
+}
+
+/** The socket of a core that has exited, removed only now: never while a core may still serve on it. */
+export function unlinkSocket(dataDir) { try { unlinkSync(socketPathOf(dataDir)); } catch {} }
+
+/** Wait for one launch to be ready, within `READY_TIMEOUT_MS`: its ready file and health, or why not. */
+export async function awaitReady(handle, { dataDir, launchId, timeout = READY_TIMEOUT_MS }) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (handle.done) return { failure: failureCause({ dataDir, launchId, exit: handle.done }) };
+    const ready = await launchReady(dataDir, launchId);
+    if (ready) return { ready };
+    await wait(100);
+  }
+  return { failure: failureCause({ dataDir, launchId, key: 'ready.timeout' }) };
+}
+
+/** The running core's ready file, without a service: the one already running when its health answers for
+ *  its own launch, or one this call starts, detached. A core of another version is asked to leave first —
+ *  this connector links with the version it pins — and so is one that does not answer for its launch. */
+export async function ensureRunning({ dataDir, env = process.env, log = () => {}, progress = () => {}, roomCredential = roomCredentialPath(dataDir, env) }) {
+  ensureCoreDirectory(coreData(dataDir));
+  const found = await examineRunning(dataDir);
+  if (found.adopt) {
+    const running = found.adopt;
     if (env.SIDEVOICE_CORE_BIN) return running;
     const pinned = !running.version || running.version === CORE_VERSION;
     if (pinned && installCurrent(dataDir, env)) return running;
     log(pinned ? `the running core was installed from an earlier build of ${coreSpec(env)}: asking it to leave`
       : `the running core is ${running.version}, this connector pins ${CORE_VERSION}: asking it to leave`);
-    try { process.kill(running.pid, 'SIGTERM'); } catch {}
-    const deadline = Date.now() + 15_000;
-    while (coreAlive(running.pid) && Date.now() < deadline) await wait(100);
+    await terminateCore(running.pid, { log });
+  } else if (found.terminate) {
+    log(`a core is running (pid ${found.terminate}) but does not answer for its own launch: terminating it`);
+    await terminateCore(found.terminate, { log });
   }
   const bin = await ensureInstalled({ dataDir, env, log, progress });
-  const data = coreData(dataDir);
-  mkdirSync(data, { recursive: true, mode: 0o700 });
-  const out = openSync(logPath(dataDir), 'a', 0o600);
-  // The machine's pairing is this connector's file (`pair.mjs` writes it); the core reads it to dial the room.
-  const args = ['--data-dir', data, '--port', String(env.SIDEVOICE_CORE_PORT ?? DEFAULT_PORT)];
-  if (roomCredential) args.push('--room-credential', roomCredential);
-  const child = spawn(bin, args,
-    { detached: true, stdio: ['ignore', out, out], env: { ...env, SIDEVOICE_CORE_DATA_DIR: data } });
-  closeSync(out);
-  let exited = null;
-  child.on('exit', code => { exited = code ?? 'signal'; });
-  child.on('error', error => { exited = error.message; });
-  child.unref();
-  log(`started sidevoice-core (pid ${child.pid}); waiting for ${path.join(data, 'core.json')}`);
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    const ready = readReady(dataDir);
-    if (ready && ready.pid === child.pid) return ready;
-    if (exited !== null) break;
-    await wait(100);
-  }
-  let tail = '';
-  try { tail = readFileSync(logPath(dataDir), 'utf8').trim().split('\n').slice(-3).join(' | '); } catch {}
-  throw new Error(`sidevoice-core did not start (${exited !== null ? 'it exited: ' + exited : 'no ready file in time'})${tail ? ': ' + tail : ''}`);
+  unlinkSocket(dataDir);
+  try { rmSync(failurePath(dataDir), { force: true }); } catch {}
+  const launchId = randomUUID();
+  const handle = spawnCore(bin, coreArgs({ dataDir, env, launchId, roomCredential }), { dataDir, env, detached: true });
+  log(`started sidevoice-core (pid ${handle.pid ?? '?'}, launch ${launchId}); waiting for it to be ready`);
+  const { ready, failure } = await awaitReady(handle, { dataDir, launchId });
+  if (ready) return ready;
+  if (failure.key === 'ready.timeout') await terminateCore(handle, { log });
+  throw Object.assign(keyed(failure.key, { detail: failure.detail ?? '' }), { failure });
 }

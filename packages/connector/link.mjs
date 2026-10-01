@@ -11,6 +11,9 @@
  *  a lost connection comes back on its own with backoff. What the library does not do is survive
  *  this process — the outbox does that, and nothing here relies on the library holding anything.
  *
+ *  What it dials is an origin, or — for this machine's own core — that core's Unix socket, through the
+ *  `agent` the caller hands over.
+ *
  *  A credential the room refuses is not a connection problem and is not retried: the library stops
  *  by itself, `onLost` says so with `retrying: false`, and the person is told to pair again. */
 import { io } from 'socket.io-client';
@@ -37,10 +40,13 @@ class RoomLink {
   }
 
   open() {
-    const { origin, connector_id, token, protocol, identity } = this.options;
+    const { origin, connector_id, token, protocol, identity, agent } = this.options;
     const socket = this.socket = io(linkUrl(origin), {
       path: PATH,
       transports: ['websocket'],   // no long-polling through a proxy, and no sticky-session question
+      // This machine's own core is dialled on its Unix socket (`core-socket.mjs`): the agent opens the socket
+      // whatever host the URL names, so the link and its credential never cross TCP.
+      ...(agent ? { agent } : {}),
       // The credential, the protocol, and whatever this machine says it is: the room keeps the
       // latest of that description, so it travels on every connection and not only at pairing.
       auth: { connector_id, token, protocol, ...identity },
