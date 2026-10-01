@@ -152,6 +152,10 @@ jobs:
           cache: npm
       - run: npm ci
       - run: launchctl print "gui/$(id -u)" >/dev/null && echo "gui domain present"
+      # The locks are the kernel's: on macOS the lock file opened O_EXLOCK|O_NONBLOCK through libuv. Proved here, on the
+      # platform: three contenders never hold it at once, a SIGKILLed holder frees it at once, a held lock is refused.
+      - name: Kernel-held locks on macOS
+        run: node --test --test-name-pattern="^lock|install lock" packages/connector/test/test_security.mjs
       - run: node packages/connector/test/service-integration.mjs
 
   package:
