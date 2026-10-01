@@ -402,6 +402,32 @@ export async function restart(env = process.env) {
   return { ok: true, state: up.state, service: kind };
 }
 
+/** The service started again from its definition as it is now — what an install transaction does once it has
+ *  rewritten it: launchd reads a plist only when it is bootstrapped, so the job is booted out and in again;
+ *  systemd reloads and restarts; a detached supervisor is replaced. The supervisor and its core are new. */
+export async function reload(env = process.env) {
+  const kind = installedService(env)?.kind ?? 'none';
+  const pids = nodePids(env);
+  if (kind === 'launchd') {
+    if (loaded(kind, env)) manage(env, kind, ['bootout', target()]);
+    await awaitDown(env, pids);
+    const booted = manage(env, kind, ['bootstrap', domain(), definitionPath(kind, env)]);
+    if (!booted.ok) throw keyed('service.not-loaded', { detail: booted.output.trim() });
+  } else if (kind === 'systemd') {
+    manage(env, kind, ['--user', 'daemon-reload']);
+    if (managerState(kind, env).reason === 'start-limit') manage(env, kind, ['--user', 'reset-failed', UNIT]);
+    const restarted = manage(env, kind, ['--user', 'restart', UNIT]);
+    if (!restarted.ok) throw keyed(`service.${serviceFailure(kind, env)}`, { detail: restarted.output.trim() });
+  } else {
+    if (pids.connector) { try { process.kill(pids.connector, 'SIGTERM'); } catch {} }
+    await awaitDown(env, { connector: pids.connector, core: null });
+    startDetached(env);
+  }
+  const up = await awaitUp(env);
+  if (!up) throw keyed('service.not-loaded', { detail: '' });
+  return { ok: true, state: up.state, service: kind };
+}
+
 /** `service uninstall`: stopped, both processes gone (killed after 15 s), the definition deleted, the manager
  *  reloaded. Idempotent. An unload the manager refuses stops here, with nothing deleted. */
 export async function uninstall(env = process.env, { keepStopped = false } = {}) {

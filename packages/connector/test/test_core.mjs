@@ -223,7 +223,7 @@ test('install: the core is installed, started and asked whether it answers befor
   const shown = [];
   let connector = null;
   try {
-    const running = install(['--harness', 'cursor'], node.env, { progress: line => shown.push(line) });
+    const running = install(['--harness', 'cursor', '--no-service'], node.env, { progress: line => shown.push(line) });
     // While it runs, anyone asking sees who is installing: a connector waits for it instead of starting a second uv.
     await until(() => installInProgress(node.dataDir));
     assert.equal(installInProgress(node.dataDir).pid, process.pid);
@@ -328,6 +328,8 @@ export function supervisedNode({ modes = ['ok'], env: extra = {}, dataDir = mkdt
     log() { try { return readFileSync(path.join(dataDir, 'node-service.log'), 'utf8'); } catch { return ''; } },
     stop() {
       for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      // Whatever else runs here: a connector a launcher or a service start spawned, and every core.
+      try { process.kill(Number(readFileSync(node.socketPath + '.lock', 'utf8')), 'SIGKILL'); } catch {}
       for (const line of node.said()) { try { process.kill(line.pid, 'SIGKILL'); } catch {} }
     },
   };

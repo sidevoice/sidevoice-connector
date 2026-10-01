@@ -244,7 +244,10 @@ test('concurrent starts — three façades, the app\'s service start and npx\'s,
     assert.deepEqual(bindings, ['thread-1', 'thread-2', 'thread-3']);
     assert.ok(!node.said().some(line => line.event === 'binding.unregister'), 'none of them left on the way');
     for (const owner of owners) owner.child.kill();
-  } finally { node.stop(); }
+  } finally {
+    // A supervisor still waiting to take over takes the lock once the first is killed: cleaned up across that window.
+    node.stop(); await wait(2500); node.stop();
+  }
 });
 
 test('service definitions: the LaunchAgent and the user unit, exactly', () => {

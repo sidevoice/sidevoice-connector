@@ -21,7 +21,7 @@ export function connectorSocket(env = process.env) {
 
 const gone = message => Object.assign(new Error(message), { gone: true });
 
-export function connectorClient(env = process.env, { onHandover = () => {} } = {}) {
+export function connectorClient(env = process.env, { onHandover = () => {}, onLost = () => {} } = {}) {
   const socketPath = connectorSocket(env);
   let socket = null, buffer = '', serial = 0;
   const waiting = new Map();
@@ -38,7 +38,7 @@ export function connectorClient(env = process.env, { onHandover = () => {} } = {
           if (socket === attempt) socket = null;
           for (const w of waiting.values()) w.reject(gone(handedOver ? 'HANDOVER: the connector handed over to the node service' : 'Connector went away'));
           waiting.clear();
-          if (handedOver) onHandover();
+          if (handedOver) onHandover(); else onLost();
         });
         attempt.on('data', chunk => {
           buffer += chunk; let index;

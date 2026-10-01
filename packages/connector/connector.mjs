@@ -29,10 +29,11 @@ import { machineIdentity, VERSION } from './identity.mjs';
 import { pair, roomOrigin } from './pair.mjs';
 import { roomLink, UNREACHABLE } from './link.mjs';
 import { CORE_VERSION, NO_UV, awaitReady, coreAlive, coreArgs, coreData, ensureInstalled, ensureRunning, examineRunning, failureCause,
-  failurePath, installInProgress, roomCredentialPath, spawnCore, terminateCore, unlinkSocket } from './core.mjs';
+  failurePath, installInProgress, roomCredentialPath, spawnCore, takeInstallLock, terminateCore, unlinkSocket } from './core.mjs';
 import { ensureCoreDirectory, localHealth, socketAgent } from './core-socket.mjs';
 import { appendLine } from './logfile.mjs';
 import { Supervisor } from './supervisor.mjs';
+import { pruneInstallations, recover } from './install-txn.mjs';
 import { connectorSocketOf, dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -325,12 +326,23 @@ function superviseWith(restored) {
 
 /** What the link does when the supervisor's core changes: a new launch is linked to (the welcome then
  *  re-registers every binding); a failure is what a conversation asking to join is told. */
+/** Five minutes running: the installation before this one is no longer what a rollback would need (§4.3 step 6). */
+let pruneTimer = null;
+function schedulePrune() {
+  clearTimeout(pruneTimer);
+  pruneTimer = setTimeout(() => { pruneInstallations(env, { log }).catch(error => log('removing previous installations failed: ' + error.message)); }, PRUNE_AFTER_MS);
+  pruneTimer.unref?.();
+}
+const PRUNE_AFTER_MS = 5 * 60_000;
+
 function coreChanged(snapshot) {
   coreFailure = snapshot.state === 'failed' || snapshot.state === 'backoff' ? snapshot.failure : null;
   coreError = snapshot.state === 'failed' ? (snapshot.failure?.message || snapshot.failure?.key || 'the core failed') : null;
   if (snapshot.state === 'failed') { lastError = coreError; for (const wake of waking.splice(0)) wake(); }
+  if (snapshot.state !== 'running') clearTimeout(pruneTimer);
   if (snapshot.state !== 'running' || !supervisor?.core) return;
   if (creds?.core?.launch_id === supervisor.core.launch_id) return;
+  schedulePrune();
   creds = coreLink(supervisor.core);
   log(`linking to this machine's core ${creds.core.version || '?'} on ${creds.core.socket} (pid ${creds.core.pid}, launch ${creds.core.launch_id})`);
   if (link) { const old = link; link = null; old.close(); }
@@ -938,6 +950,10 @@ export async function run(argv = [], environment = process.env) {
     supervisor = superviseWith(restored);
     // A restart a person asked the service manager for closes the window, as one asked of this process would.
     if (existsSync(files.restart)) { supervisor.closeWindow(); try { rmSync(files.restart, { force: true }); } catch {} }
+    // An install transaction that died is reconciled before anything runs from it — unless an installer holds
+    // the lock now, which then does it.
+    const release = await takeInstallLock(dataDir, log, { wait: false });
+    if (release) { try { await recover(env, { log }); } catch (error) { log('recovering the install transaction failed: ' + error.message); } finally { release(); } }
   }
   log(`connector ${VERSION} starting${supervised ? ' as the node service (' + serviceKind + ')' : ''}: pid ${process.pid}, host ${hostId}, ${external ? 'core at ' + external.room : 'this machine\'s own core'}, socket ${socketPath}, log ${logPath}`);
   loadOutbox();

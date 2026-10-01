@@ -17,6 +17,7 @@ import './test_harness_claude.mjs';
 import './test_core.mjs';
 import './test_supervisor.mjs';
 import './test_node.mjs';
+import './test_install.mjs';
 import { chatStore, fakeDesktopBridge, fakePersist, fakeStateDb, runView, TMUX } from './test_harness_cursor.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -1321,9 +1322,10 @@ test('install: puts this version in front of the harness, re-pins an older regis
   assert.rejects(install(['https://room.example', '--harness', 'claude'], env), /Pairing is not part of installing/, 'a room address is refused, with where pairing lives');
 
   const first = await install(['--harness', 'claude', '--no-core'], env);
-  assert.deepEqual(calls(), ['mcp get sidevoice', `mcp add --scope user sidevoice -- ${wanted}`], 'nothing registered: it registers this version');
+  // Asked twice: by the transaction, which only ever re-points an entry of ours, and by the registration.
+  assert.deepEqual(calls(), ['mcp get sidevoice', 'mcp get sidevoice', `mcp add --scope user sidevoice -- ${wanted}`], 'nothing registered: it registers this version');
   assert.match(first.done.join('\n'), /Registered the MCP server/);
-  assert.match(first.done.join('\n'), /Copied this version to .*\(removed: 0\.0\.1\)/);
+  assert.match(first.done.join('\n'), /Copied this version to /);
   // The copy is what the package ships and nothing more: the bundle, the manifest beside it, and
   // no step of its own — nothing is fetched, built or resolved on the machine being installed on.
   // That the bundle then runs is proved where it is run for real, in the room's interop test.
@@ -1332,7 +1334,12 @@ test('install: puts this version in front of the harness, re-pins an older regis
       `${file} is in the copy (the bundle is built: npm run build -w @sidevoice/uplink)`);
   }
   assert.equal(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', version, 'node_modules')), false);
-  assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1')), 'the older copy is gone');
+  // The older copy stays until the new one has run five minutes — then the supervisor prunes it (§4.3 step 6).
+  assert.ok(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1')), 'the older copy stays for a rollback');
+  const { pruneInstallations } = await import('../install.mjs');
+  assert.deepEqual(await pruneInstallations(env), [path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1')]);
+  assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1')), 'then it is gone');
+  assert.ok(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', version)), 'and the selected one is not');
   assert.match(first.done.join('\n'), /not paired with any room yet/);
   assert.match(first.next.join('\n'), /Emparejar máquina/, 'and it says the conversation will ask for the code');
   assert.ok(!existsSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room')), 'no skill is installed: the server carries the prompt');

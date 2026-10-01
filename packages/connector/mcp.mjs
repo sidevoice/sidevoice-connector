@@ -57,7 +57,11 @@ let cardReads = 0;
 let connector = null;
 /** Asked again once, after a handover cut it off, only when asking twice is harmless. */
 const RETRIED = new Set(['status', 'register']);
+/** The connection went away other than by a handover (the node service restarted, an upgrade, a stop and a
+ *  start): the conversations are registered again before anything else is asked of the connector that answers next. */
+let lost = false;
 async function rpc(method, params) {
+  if (lost && method !== 'register') { lost = false; await reattach().catch(() => {}); }
   try { return await connector.rpc(method, params); }
   catch (error) { if (!error.gone || !RETRIED.has(method)) throw error; return connector.rpc(method, params); }
 }
@@ -352,7 +356,7 @@ async function invoke(name, args, meta) {
 // ----- JSON-RPC over stdio -----
 /** `sidevoice mcp`. */
 export function run(argv = [], env = process.env) {
-  connector = connectorClient(env, { onHandover: () => { reattach().catch(() => {}); } });
+  connector = connectorClient(env, { onHandover: () => { reattach().catch(() => {}); }, onLost: () => { lost = joined.size > 0; } });
   let input = '';
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', async chunk => {

@@ -47,6 +47,14 @@ export const en = {
   'service.reason.start-limit': 'too many failed starts',
   'service.reason.not-loaded': 'not loaded by the service manager',
 
+  // The install transaction (§4.3).
+  'install.copy-missing': 'The installed copy {path} is missing and there is nothing staged to restore it from: install again.',
+  'install.self-test': 'The core that was just installed does not start ({detail}).',
+  'install.incompatible': 'The core that was just installed does not speak this connector\'s protocol.',
+  'install.verify': 'The new installation could not be started.',
+  'install.rollback': 'The update failed and this machine is back on the previous installation.',
+  'install.failed': 'Installing Sidevoice failed.',
+
   // Pairing.
   'pair.core-restarted': 'This machine\'s core was restarted with the new pairing.',
   'pair.failed': 'Pairing with the room failed.',
