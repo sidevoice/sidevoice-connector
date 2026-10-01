@@ -91,3 +91,15 @@ export function signalVerified(pid, signal, expected) {
   if (!isProcess(pid, expected)) return false;
   try { process.kill(pid, signal); return true; } catch { return false; }
 }
+
+/** How long `pid` has run, in seconds (`ps -o etime=`: `[[dd-]hh:]mm:ss`), or null when it cannot be told. */
+export function processAge(pid) {
+  if (!validPid(pid)) return null;
+  try {
+    const text = execFileSync('ps', ['-o', 'etime=', '-p', String(pid)], { encoding: 'utf8', timeout: 3000 }).trim();
+    const match = text.match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
+    if (!match) return null;
+    const [, days = 0, hours = 0, minutes, seconds] = match;
+    return ((Number(days) * 24 + Number(hours)) * 60 + Number(minutes)) * 60 + Number(seconds);
+  } catch { return null; }
+}

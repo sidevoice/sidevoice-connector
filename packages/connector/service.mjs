@@ -1,66 +1,81 @@
-/** `sidevoice service install | uninstall | start | stop | restart | status [--json]` — the node service (§4.2):
- *  the login service that runs `connector --supervise`, which runs this machine's core. One owner for the app
- *  and for `npx` alike.
+/** `sidevoice service install | uninstall | start | stop | restart | status [--json]` — Sidevoice at login (§2.1–§2.3,
+ *  §2.8–§2.9): two jobs of this user's service manager, and nothing of ours supervising either.
  *
- *  | manager | definition | start / stop / restart / uninstall |
+ *  | job | launchd (`~/Library/LaunchAgents/<label>.plist`) | systemd (`~/.config/systemd/user/<unit>`) |
  *  |---|---|---|
- *  | launchd (macOS) | `~/Library/LaunchAgents/dev.sidevoice.node.plist`: RunAtLoad, KeepAlive, ThrottleInterval 10, output → `node-service.log` | bootstrap + kickstart / bootout / kickstart -k / bootout + delete |
- *  | systemd (Linux, a user manager) | `~/.config/systemd/user/sidevoice-node.service`: Restart=on-failure, RestartSec=2, StartLimitIntervalSec=600, StartLimitBurst=5 | start / stop / restart (reset-failed first after a start limit) / disable --now, delete, daemon-reload |
- *  | none (containers, pods: no user manager) | — | a detached supervisor; nothing brings it back after a reboot |
+ *  | core `dev.sidevoice.core` / `sidevoice-core.service` | RunAtLoad; KeepAlive {SuccessfulExit false, Crashed true}; ThrottleInterval 10; output → `core.stderr.log` | Restart=on-failure, RestartSec=10, at most 5 starts in 10 min |
+ *  | connector `dev.sidevoice.connector` / `sidevoice-connector.service` | RunAtLoad; KeepAlive; ThrottleInterval 10; output → `connector.log` | Restart=always, RestartSec=2, the same start limit |
  *
- *  The program is the selected installation's `command` from `install.json` (absolute paths) followed by
- *  `connector --supervise`: R1 `node …/cli.mjs`, R4 the single executable — only `command` changes.
+ *  The core runs `R/current/core/bin/sidevoice-core --data-dir C … --idle-exit 0`; the connector runs `install.json`'s
+ *  `command` + `connector --service` (R1 `node R/current/dist/cli.mjs`; R4 only `command` changes). Both name paths
+ *  through `R/current` (`release.mjs`), so a definition is rewritten only when its text would change. Neither job
+ *  starts, signals or adopts the other: the connector links to the core when it answers, and the core's exit status
+ *  tells the manager whether to restart it (SEAMS §2: 0 after a failed start — not again; 75 while another core holds
+ *  its directory — later; a crash after ready — again). One instance of each: the manager's, plus the core's `flock`
+ *  and the connector's lock (`lockfile.mjs`).
  *
  *  A stop is a person's: `node-stopped.json` is written before the manager is asked, and while it is there the
- *  launcher starts nothing (`launcher.mjs`); only `service start` — or the supervisor starting at the next
- *  login — clears it. Linux keeps a user's services only while that user has a session; running them without
- *  one is `loginctl enable-linger`, a system setting the machine's owner enables (O4): it is printed, with the
- *  reason, and never run (`RUN_LINGER`). */
-import { execFileSync, spawn } from 'node:child_process';
+ *  launcher starts nothing (`launcher.mjs`); `service start` clears it, and so does the connector job starting at the
+ *  next login. Every command that changes something holds the install lock. Linux keeps a user's services only while
+ *  that user has a session; running them without one is `loginctl enable-linger`, a system setting the machine's
+ *  owner enables (O4): printed, with the reason, and never run (`RUN_LINGER`).
+ *
+ *  What the node is doing is never stored: `deriveStatus()` reads it fresh from the manager, the core's failure
+ *  report and the core's health — the same answer for `service status --json` and for any connector's `node.status`. */
+import { execFileSync } from 'node:child_process';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { accessSync, constants, existsSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
-import { coreRunning, launchProcess, readReady, socketPathOf, takeInstallLock } from './core.mjs';
-import { ensureLockIdentity, readLock } from './lockfile.mjs';
-import { isProcess, signalVerified, validPid } from './proc.mjs';
+import { accessSync, constants, existsSync, readFileSync, rmSync } from 'node:fs';
+import { API_RANGE, LINK_RANGE, coreArgs, coreProcesses, coreRunning, describeFailure, failurePath, logTail, readFailure, readReady,
+  roomCredentialPath, socketPathOf, takeInstallLock, terminateCore } from './core.mjs';
 import { localHealth } from './core-socket.mjs';
+import { readLock, tryLock } from './lockfile.mjs';
+import { isProcess, processAge, signalVerified } from './proc.mjs';
+import { coreProgram, selection } from './release.mjs';
 import { keyed, t } from './i18n.mjs';
-import { connectorSocketOf, dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
+import { connectorLockOf, connectorSocketOf, dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
 
-export const LABEL = 'dev.sidevoice.node';
-export const UNIT = 'sidevoice-node.service';
+export const JOBS = {
+  core: { label: 'dev.sidevoice.core', unit: 'sidevoice-core.service' },
+  connector: { label: 'dev.sidevoice.connector', unit: 'sidevoice-connector.service' },
+};
+/** systemd's start limit, the same for both jobs; launchd has none. */
+export const START_LIMIT = 5;
 /** O4: Sidevoice prints the linger command and never runs it. The one place to change that decision. */
 export const RUN_LINGER = false;
-const TEARDOWN_MS = Number(process.env.SIDEVOICE_TEARDOWN_MS || 15_000);
-const START_WAIT_MS = Number(process.env.SIDEVOICE_SERVICE_START_WAIT_MS || 10_000);
-const START_LOCK_MS = Number(process.env.SIDEVOICE_START_LOCK_MS || 120_000);
+/** A core job running this long without being ready is not starting any more (§2.8 row 6). */
+const STARTING_S = 60;
+const TEARDOWN_MS = () => Number(process.env.SIDEVOICE_TEARDOWN_MS || 15_000);
+const SETTLE_MS = () => Number(process.env.SIDEVOICE_SERVICE_START_WAIT_MS || 10_000);
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const uid = () => process.getuid?.() ?? 0;
+const ORDER = ['core', 'connector'];
 
-/** Which manager this machine offers this user. `SIDEVOICE_SERVICE_MANAGER` names one (a test's stand-in; or
- *  `none` to keep the detached supervisor). Linux has one only when a user manager answers. */
+/** Which manager this machine offers this user. `SIDEVOICE_SERVICE_MANAGER` names one (a test's stand-in, or `none`).
+ *  Linux has one only when a user manager answers. */
 export function managerKind(env = process.env) {
   if (env.SIDEVOICE_SERVICE_MANAGER) return env.SIDEVOICE_SERVICE_MANAGER;
   if (process.platform === 'darwin') return 'launchd';
   if (process.platform === 'linux') return manage(env, 'systemd', ['--user', 'show-environment']).ok ? 'systemd' : 'none';
   return 'none';
 }
+const platformKind = env => env.SIDEVOICE_SERVICE_MANAGER || (process.platform === 'darwin' ? 'launchd' : process.platform === 'linux' ? 'systemd' : 'none');
 
-export function definitionPath(kind, env = process.env) {
+export function definitionPath(kind, job, env = process.env) {
   const home = env.HOME || os.homedir();
-  if (kind === 'launchd') return path.join(home, 'Library', 'LaunchAgents', `${LABEL}.plist`);
-  if (kind === 'systemd') return path.join(env.XDG_CONFIG_HOME || path.join(home, '.config'), 'systemd', 'user', UNIT);
+  if (kind === 'launchd') return path.join(home, 'Library', 'LaunchAgents', `${JOBS[job].label}.plist`);
+  if (kind === 'systemd') return path.join(env.XDG_CONFIG_HOME || path.join(home, '.config'), 'systemd', 'user', JOBS[job].unit);
   return null;
 }
 
-/** The service registered with this machine's manager, if one is: `{kind, file}` or null. Found by its
- *  definition alone — asking a manager is slow, and this is asked at every launch. */
+/** The jobs defined on this machine, found by their definitions alone — asking a manager is slow, and this is asked at
+ *  every launch: `{kind, core, connector}` (each a file or null), or null when neither is. */
 export function installedService(env = process.env) {
-  const kind = env.SIDEVOICE_SERVICE_MANAGER || (process.platform === 'darwin' ? 'launchd' : process.platform === 'linux' ? 'systemd' : 'none');
-  const file = definitionPath(kind, env);
-  return file && existsSync(file) ? { kind, file } : null;
+  const kind = platformKind(env);
+  const files = Object.fromEntries(ORDER.map(job => { const file = definitionPath(kind, job, env); return [job, file && existsSync(file) ? file : null]; }));
+  return files.core || files.connector ? { kind, ...files } : null;
 }
 
 /** Run the manager's own command; never throws. Every call has an absolute deadline. */
@@ -75,29 +90,18 @@ function manage(env, kind, args) {
   }
 }
 
-/** What the supervisor is started with besides its arguments: the `SIDEVOICE_*` settings the installation was made
- *  with (a data dir, a core named by hand…) — never a credential of a core somebody else runs — the paths it lives
- *  at, and which manager runs it, which `node.status` reports. The installation's recorded ones; else this
- *  process's. */
-export function serviceEnvironment(kind, env = process.env, record = null) {
-  return { ...(record?.settings ?? installationSettings(env)), ...(record?.paths ?? installationPaths(env)), SIDEVOICE_SERVICE: kind };
-}
+/* ----- the definitions ----- */
 
-/** The one environment every launch of an installation runs with — a detached supervisor, a hand-off, a
- *  replacement connector, a recovery helper: this process's environment with none of its own `SIDEVOICE_*`, then the
- *  installation's recorded settings (`settings`, from `install.json`), then `extra`. The settings replace this
- *  process's set rather than overlay it: a setting the installation does not have is not lent to it (a rollback is
- *  launched by the installation rolled back from). Carried through as process controls, not settings: test hooks. */
-const CARRIED = new Set(['SIDEVOICE_TEST_HOOKS']);
-export function launchEnvironment(record, env = process.env, extra = {}) {
-  const base = Object.fromEntries(Object.entries(env).filter(([name]) => !name.startsWith('SIDEVOICE_') || CARRIED.has(name)));
-  return { ...base, ...(record?.settings ?? installationSettings(env)), ...(record?.paths ?? installationPaths(env)), ...extra };
+/** The `SIDEVOICE_*` settings an installation is made with — never a credential of a core somebody else runs, nor a
+ *  test's hooks, nor what only says where to install from. */
+const NOT_SETTINGS = ['SIDEVOICE_URL', 'SIDEVOICE_CONNECTOR_ID', 'SIDEVOICE_CONNECTOR_TOKEN', 'SIDEVOICE_SERVICE', 'SIDEVOICE_TEST_HOOKS',
+  'SIDEVOICE_CORE_BIN', 'SIDEVOICE_CORE_SPEC', 'SIDEVOICE_CORE_WHEEL_DIR', 'SIDEVOICE_UV', 'SIDEVOICE_INSTALL_FROM_SOURCE', 'SIDEVOICE_INSTALLED_BY'];
+export function installationSettings(env = process.env) {
+  const kept = Object.entries(env).filter(([name]) => name.startsWith('SIDEVOICE_') && !NOT_SETTINGS.includes(name));
+  return Object.fromEntries(kept.sort(([a], [b]) => a.localeCompare(b)));
 }
-
-/** Where an installation lives, resolved and absolute as its installer saw them: its data directory, the directory
- *  its copies go under (`XDG_DATA_HOME`), the one its service definition goes under (`XDG_CONFIG_HOME`). Recorded in
- *  it and in its journal, and given to everything that runs it or takes it apart: a unit's process, a helper, a
- *  person's shell need not have the installer's environment to find what it made. */
+/** Where the installation lives, resolved and absolute: what a job's process is started with, whatever the manager's
+ *  environment says. */
 export function installationPaths(env = process.env) {
   const home = env.HOME || os.homedir();
   return {
@@ -106,78 +110,8 @@ export function installationPaths(env = process.env) {
     XDG_CONFIG_HOME: path.resolve(env.XDG_CONFIG_HOME || path.join(home, '.config')),
   };
 }
-
-/** `env` with the paths recorded for this data directory — an install transaction's under way, else the selected
- *  installation's — in place of its own: what acts on an installation acts where that installation is. */
-export function withRecordedPaths(env = process.env) {
-  const files = nodeFiles(dataDirOf(env));
-  let recorded = null;
-  try { recorded = readJson(files.journal)?.paths ?? readJson(files.install)?.paths ?? null; } catch {}
-  return recorded ? { ...env, ...recorded } : env;
-}
-
-/** Start `argv` where stopping this node's service cannot take it along. Under systemd a unit's processes all go
- *  when it stops (its cgroup), detached or not: there the helper is a transient unit of its own (`systemd-run --user`,
- *  which exists wherever the user manager does). launchd ends only the job's process group, which a detached
- *  process leaves; with no manager, detached is enough. */
-export function spawnOutsideJob(kind, argv, env) {
-  if (kind === 'systemd') {
-    const settings = Object.entries(env).filter(([name]) => name.startsWith('SIDEVOICE_') || ['HOME', 'PATH', 'USER', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS'].includes(name));
-    const child = spawn(env.SIDEVOICE_SYSTEMD_RUN || 'systemd-run', ['--user', '--collect', '--quiet', ...settings.map(([name, value]) => `--setenv=${name}=${value}`), '--', ...argv], { detached: true, stdio: 'ignore', env });
-    child.on('error', () => {});
-    child.unref();
-    return child;
-  }
-  const child = spawn(argv[0], argv.slice(1), { detached: true, stdio: 'ignore', env });
-  child.on('error', () => {});
-  child.unref();
-  return child;
-}
-
-/** `service recover` (internal): an install transaction finished outside the supervisor, which cannot reconcile its
- *  own removal (`connector.mjs`): under the lock, the installer's recovery — reconcile, run, verify, journal gone. */
-export async function recoverInstallation(env = process.env) {
-  const { recover } = await import('./install-txn.mjs');
-  const files = nodeFiles(dataDirOf(env));
-  // How it ended, for the supervisor that started it (`connector.mjs`): under systemd it is a unit of its own, whose
-  // exit that supervisor never sees.
-  const at = new Date().toISOString();
-  const said = outcome => { try { writePrivate(files.recovery, { at, ...outcome }); } catch {} };
-  let outcome;
-  try {
-    const release = await takeInstallLock(dataDirOf(env));
-    try { outcome = await recover(env, { mode: 'installer' }); } finally { release(); }
-  } catch (error) { said({ ok: false, error: { key: error.key || 'service.failed', message: error.message } }); throw error; }
-  const result = { ok: !outcome || outcome.ran?.ok !== false, state: outcome?.record ? 'recovered' : 'absent', service: installedService(env)?.kind ?? 'none', selected: outcome?.record?.id ?? null };
-  said(result.ok ? { ok: true } : { ok: false, error: outcome.ran.failure ?? { key: 'install.verify', message: 'the selected installation does not run' } });
-  return result;
-}
-
-/** `operation` holding the install lock, waited for up to `START_LOCK_MS`: a person's start or restart never runs
- *  beside an installer or a recovery — one reconciling to nothing would otherwise report nothing running while the
- *  node just started runs on. */
-async function underInstallLock(env, operation) {
-  let release;
-  try { release = await takeInstallLock(dataDirOf(env), () => {}, { timeout: START_LOCK_MS }); }
-  catch (error) { if (error.key) throw error; throw keyed('service.busy', { detail: error.message }); }
-  try { return await operation(); } finally { release(); }
-}
-
-/** A transaction left behind is finished before anything starts from it, as an installer would (`install-txn.mjs`).
- *  Called holding the install lock. */
-async function finishTransaction(env) {
-  if (!existsSync(nodeFiles(dataDirOf(env)).journal)) return;
-  const { recover } = await import('./install-txn.mjs');
-  await recover(env, { mode: 'installer' });
-}
-
-/** The `SIDEVOICE_*` settings an installation is made with — recorded in it (`install.json`), so its service runs
- *  with them whoever writes its definition later (a rollback is written by the other installation's process) — never
- *  a credential of a core somebody else runs, nor a test's hooks. */
-export function installationSettings(env = process.env) {
-  const kept = Object.entries(env).filter(([name]) => name.startsWith('SIDEVOICE_')
-    && !['SIDEVOICE_URL', 'SIDEVOICE_CONNECTOR_ID', 'SIDEVOICE_CONNECTOR_TOKEN', 'SIDEVOICE_SERVICE', 'SIDEVOICE_TEST_HOOKS'].includes(name));
-  return Object.fromEntries(kept.sort(([a], [b]) => a.localeCompare(b)));
+export function serviceEnvironment(kind, env = process.env) {
+  return { ...installationSettings(env), ...installationPaths(env), SIDEVOICE_SERVICE: kind };
 }
 
 /** A value that goes into a definition: text with no control character. A newline in a path or a setting would
@@ -190,17 +124,20 @@ function safeValue(text, what) {
 const xml = (text, what) => safeValue(text, what).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const unxml = text => text.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
 
-/** The LaunchAgent. KeepAlive brings the supervisor back whenever it exits (only `bootout` stops it), at most
- *  every 10 s; its output goes to the log it also writes itself. */
-export function plistText({ program, log, environment = {} }) {
+/** A LaunchAgent. `keepAlive`: `true` (the connector: back whenever it exits) or `crashed` (the core: back after a
+ *  crash or a non-zero exit, never after exit 0). At most one start every 10 s. */
+export function plistText({ label, program, log, environment = {}, keepAlive = true }) {
   const strings = items => items.map(item => `    <string>${xml(item, 'ProgramArguments')}</string>`).join('\n');
   const variables = Object.entries(environment).map(([name, value]) => `    <key>${xml(name, name)}</key>\n    <string>${xml(value, name)}</string>`).join('\n');
+  const alive = keepAlive === 'crashed'
+    ? '<dict>\n    <key>SuccessfulExit</key>\n    <false/>\n    <key>Crashed</key>\n    <true/>\n  </dict>'
+    : '<true/>';
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${LABEL}</string>
+  <string>${xml(label, 'Label')}</string>
   <key>ProgramArguments</key>
   <array>
 ${strings(program)}
@@ -212,7 +149,7 @@ ${variables}
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  ${alive}
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
@@ -228,45 +165,40 @@ ${variables}
  * - ExecStart= words are quoted; inside, `\\` and `"` are escaped, `%` is a specifier (`%%`) and `$` is variable
  *   expansion (`$$`);
  * - Environment= is one quoted `NAME=value`: `\\` and `"` escaped, `%` a specifier — and `$` nothing special, so it
- *   is written as it is (doubling it there would change the value);
- * - append: takes a path, where `%` is a specifier.
- * No value may hold a control character. */
+ *   is written as it is (doubling it there would change the value).
+ * No value may hold a control character. Output goes to the journal. */
 const execWord = (text, what) => `"${safeValue(text, what).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%').replace(/\$/g, '$$$$')}"`;
 const environmentAssignment = (name, value) => {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw keyed('service.unsafe-value', { what: name });
   return `"${name}=${safeValue(value, name).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%')}"`;
 };
-const appendPath = text => safeValue(text, 'StandardOutput').replace(/%/g, '%%');
 const unexecWord = word => word.replace(/\\(.)/g, '$1').replace(/%%/g, '%').replace(/\$\$/g, '$');
 
-/** The user unit. Restarted on failure 2 s later, at most 5 starts in 10 minutes (then `start-limit`, which
- *  `service restart` clears); started with the user's manager (`default.target`). */
-export function unitText({ program, log, environment = {} }) {
+/** A user unit: restarted `restart` (`on-failure`: the core; `always`: the connector) `restartSec` later, at most 5
+ *  starts in 10 minutes (then `start-limit-hit`, which `service restart` clears); started with the user's manager. */
+export function unitText({ description, program, environment = {}, restart = 'on-failure', restartSec = 10 }) {
   const variables = Object.entries(environment).map(([name, value]) => `Environment=${environmentAssignment(name, value)}`).join('\n');
-  const file = appendPath(log);
   return `[Unit]
-Description=Sidevoice node service (the connector supervising this machine's core)
+Description=${safeValue(description, 'Description')}
 StartLimitIntervalSec=600
-StartLimitBurst=5
+StartLimitBurst=${START_LIMIT}
 
 [Service]
 Type=simple
 ExecStart=${program.map(word => execWord(word, 'ExecStart')).join(' ')}
 ${variables}
-Restart=on-failure
-RestartSec=2
+Restart=${restart}
+RestartSec=${restartSec}
 KillMode=control-group
-TimeoutStopSec=25
-StandardOutput=append:${file}
-StandardError=append:${file}
+TimeoutStopSec=20
 
 [Install]
 WantedBy=default.target
 `;
 }
 
-/** The program a definition on disk runs, read back as its serializer wrote it (the install transaction checks it). */
-export function definitionProgram({ kind, file }) {
+/** The program a definition on disk runs, read back as its serializer wrote it. */
+export function definitionProgram(kind, file) {
   let text; try { text = readFileSync(file, 'utf8'); } catch { return null; }
   if (kind === 'launchd') {
     const block = text.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)?.[1];
@@ -276,76 +208,109 @@ export function definitionProgram({ kind, file }) {
   return line ? [...line.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map(match => unexecWord(match[1])) : null;
 }
 
-/** The program the service runs: the selected installation's command, then `connector --supervise`. */
-export function serviceProgram(record) {
+/** What each job runs: the core through `R/current`, the connector as `install.json`'s `command` says. */
+export function jobPrograms(env = process.env) {
+  const dataDir = dataDirOf(env);
+  const record = readJson(nodeFiles(dataDir).install);
   if (!Array.isArray(record?.command) || !record.command.length) throw keyed('service.no-installation');
-  return [...record.command, 'connector', '--supervise'];
+  return {
+    core: [coreProgram(env), ...coreArgs({ dataDir, env, idleExit: 0, roomCredential: roomCredentialPath(dataDir, env) })],
+    connector: [...record.command, 'connector', '--service'],
+  };
 }
 
-/** Write the definition for this installation (also what an install transaction does to re-point it). */
-export function writeDefinition(kind, record, env = process.env) {
-  const file = definitionPath(kind, env);
-  if (!file) return null;
-  const dataDir = dataDirOf(env);
-  // The installation's own settings when it recorded them; else this process's.
-  const environment = serviceEnvironment(kind, env, record);
-  const spec = { program: serviceProgram(record), log: nodeFiles(dataDir).serviceLog, environment };
-  writePrivate(file, kind === 'launchd' ? plistText(spec) : unitText(spec));
-  return file;
+/** The text of both definitions for this manager. */
+export function definitionTexts(kind, env = process.env) {
+  const programs = jobPrograms(env), environment = serviceEnvironment(kind, env), files = nodeFiles(dataDirOf(env));
+  if (kind === 'launchd') return {
+    core: plistText({ label: JOBS.core.label, program: programs.core, log: files.coreStderr, environment, keepAlive: 'crashed' }),
+    connector: plistText({ label: JOBS.connector.label, program: programs.connector, log: files.connectorLog, environment, keepAlive: true }),
+  };
+  return {
+    core: unitText({ description: 'Sidevoice core (this machine\'s conversations and voice)', program: programs.core, environment, restart: 'on-failure', restartSec: 10 }),
+    connector: unitText({ description: 'Sidevoice connector (the harnesses\' link to the core)', program: programs.connector, environment, restart: 'always', restartSec: 2 }),
+  };
 }
+
+/** Write each definition whose text would change; returns the jobs whose definition changed. */
+export function writeDefinitions(kind, env = process.env) {
+  const texts = definitionTexts(kind, env), changed = [];
+  for (const job of ORDER) {
+    const file = definitionPath(kind, job, env);
+    let now = null; try { now = readFileSync(file, 'utf8'); } catch {}
+    if (now === texts[job]) continue;
+    writePrivate(file, texts[job]);
+    changed.push(job);
+  }
+  return changed;
+}
+
+/* ----- the manager ----- */
 
 const domain = () => `gui/${uid()}`;
-const target = () => `${domain()}/${LABEL}`;
-
-/** `launchctl bootout` returns before launchd has let the job go, and a `bootstrap` in that interval fails
- *  ("5: Input/output error", measured on macos-14): the job is waited out, and the bootstrap tried again. */
-async function bootOut(env) {
-  manage(env, 'launchd', ['bootout', target()]);
-  for (let i = 0; i < 100 && loaded('launchd', env); i++) await wait(100);
-}
-async function bootIn(env, file) {
-  let booted = manage(env, 'launchd', ['bootstrap', domain(), file]);
-  for (let i = 0; i < 10 && !booted.ok && !loaded('launchd', env); i++) { await wait(500); booted = manage(env, 'launchd', ['bootstrap', domain(), file]); }
-  return booted.ok || loaded('launchd', env) ? { ok: true } : booted;
-}
-
-function loaded(kind, env) {
-  if (kind === 'launchd') return manage(env, kind, ['print', target()]).ok;
-  if (kind === 'systemd') return !/LoadState=not-found/.test(manage(env, kind, ['--user', 'show', '-p', 'LoadState', UNIT]).output);
+const target = job => `${domain()}/${JOBS[job].label}`;
+function loaded(kind, job, env) {
+  if (kind === 'launchd') return manage(env, kind, ['print', target(job)]).ok;
+  if (kind === 'systemd') return !/LoadState=not-found/.test(manage(env, kind, ['--user', 'show', '-p', 'LoadState', JOBS[job].unit]).output);
   return false;
 }
+/** `launchctl bootout` returns before launchd has let the job go, and a `bootstrap` in that interval fails
+ *  ("5: Input/output error", measured on macos-14): the job is waited out, and the bootstrap tried again. */
+async function bootOut(env, job) {
+  const out = manage(env, 'launchd', ['bootout', target(job)]);
+  for (let i = 0; i < 100 && loaded('launchd', job, env); i++) await wait(100);
+  return loaded('launchd', job, env) ? { ok: false, output: out.output.trim() || 'still loaded' } : { ok: true };
+}
+async function bootIn(env, job) {
+  const file = definitionPath('launchd', job, env);
+  let booted = manage(env, 'launchd', ['bootstrap', domain(), file]);
+  for (let i = 0; i < 10 && !booted.ok && !loaded('launchd', job, env); i++) { await wait(500); booted = manage(env, 'launchd', ['bootstrap', domain(), file]); }
+  return booted.ok || loaded('launchd', job, env) ? { ok: true } : booted;
+}
 
-/** What the manager says about the service: `{loaded, active, result, exit, reason}`. */
-export function managerState(kind, env = process.env) {
-  if (kind === 'launchd') {
-    const printed = manage(env, kind, ['print', target()]);
-    if (!printed.ok) return { loaded: false, active: false, reason: 'not-loaded' };
-    const field = name => (printed.output.match(new RegExp(`^\\s*${name} = (.*)$`, 'm')) || [])[1]?.trim() ?? null;
-    const exit = field('last exit code');
-    return { loaded: true, active: field('state') === 'running', exit, pid: Number(field('pid')) || null, reason: null };
-  }
+/** `launchctl print` read: `{loaded, running, pid, exit, signal, runs, restarting, reason}`. A job that is loaded,
+ *  not running, and last ended badly is one launchd starts again (its `KeepAlive`), throttled. */
+export function parseLaunchd(printed) {
+  if (!printed.ok) return { loaded: false, running: false, pid: null, exit: null, runs: null, restarting: false, reason: 'not-loaded' };
+  const field = name => (printed.output.match(new RegExp(`^\\s*${name} = (.*)$`, 'm')) || [])[1]?.trim() ?? null;
+  const pid = Number(field('pid')) || null;
+  const running = field('state') === 'running' && !!pid;
+  const exit = /^-?\d+$/.test(field('last exit code') ?? '') ? Number(field('last exit code')) : null;
+  const signal = field('last terminating signal');
+  return { loaded: true, running, pid: running ? pid : null, exit, signal, runs: Number(field('runs')) || null,
+    restarting: !running && ((exit !== null && exit !== 0) || !!signal), reason: null };
+}
+/** `systemctl --user show` read, the same shape. */
+export function parseSystemd(shown) {
+  const field = name => (shown.match(new RegExp(`^${name}=(.*)$`, 'm')) || [])[1]?.trim() ?? null;
+  const load = field('LoadState');
+  const pid = Number(field('ExecMainPID')) || null;
+  const running = ['active', 'activating', 'reloading'].includes(field('ActiveState')) && field('SubState') !== 'auto-restart' && !!pid;
+  return { loaded: !!load && load !== 'not-found', running, pid: running ? pid : null,
+    exit: field('ExecMainStatus') === null ? null : Number(field('ExecMainStatus')), signal: null,
+    runs: field('NRestarts') === null ? null : Number(field('NRestarts')), restarting: field('SubState') === 'auto-restart',
+    reason: !load || load === 'not-found' ? 'not-loaded' : field('Result') === 'start-limit-hit' ? 'start-limit' : null };
+}
+export function managerState(kind, job, env = process.env) {
+  if (kind === 'launchd') return parseLaunchd(manage(env, kind, ['print', target(job)]));
   if (kind === 'systemd') {
-    const shown = manage(env, kind, ['--user', 'show', '-p', 'ActiveState,Result,ExecMainStatus,LoadState', UNIT]).output;
-    const field = name => (shown.match(new RegExp(`^${name}=(.*)$`, 'm')) || [])[1]?.trim() ?? null;
-    const load = field('LoadState');
-    return { loaded: !!load && load !== 'not-found', active: ['active', 'activating', 'reloading'].includes(field('ActiveState')),
-      result: field('Result'), exit: field('ExecMainStatus'), reason: load === 'not-found' ? 'not-loaded' : field('Result') === 'start-limit-hit' ? 'start-limit' : null };
+    const shown = manage(env, kind, ['--user', 'show', '-p', 'LoadState,ActiveState,SubState,Result,ExecMainStatus,ExecMainPID,NRestarts', JOBS[job].unit]);
+    return parseSystemd(shown.ok ? shown.output : '');
   }
-  return { loaded: false, active: false, reason: null };
+  return { loaded: false, running: false, pid: null, exit: null, runs: null, restarting: false, reason: null };
 }
 
-/** Why a registered service has no supervisor answering, as one of `executable-missing | permission-denied |
- *  start-limit | not-loaded`: the manager's word where it has one, else the program itself examined. */
-export function serviceFailure(kind, env = process.env) {
-  const state = managerState(kind, env);
-  if (state.reason) return state.reason;
-  const record = readJson(nodeFiles(dataDirOf(env)).install);
-  for (const file of (record?.command || []).filter(item => path.isAbsolute(item))) {
-    if (!existsSync(file)) return 'executable-missing';
-    try { accessSync(file, file === record.command[0] ? constants.X_OK : constants.R_OK); } catch { return 'permission-denied'; }
-  }
-  return 'not-loaded';
+/** Why a defined job's program cannot run, if it cannot: `executable-missing` or `permission-denied`. */
+function programProblem(program) {
+  const file = program?.[0];
+  if (!file) return 'executable-missing';
+  if (!existsSync(file)) return 'executable-missing';
+  try { accessSync(file, constants.X_OK); } catch { return 'permission-denied'; }
+  for (const item of program.slice(1, 2)) if (path.isAbsolute(item) && /\.m?js$/.test(item) && !existsSync(item)) return 'executable-missing';
+  return null;
 }
+
+/* ----- what the node is doing (§2.8) ----- */
 
 /** One request to the connector on its socket, or null when none answers within `timeout`. */
 export function askConnector(method, params = {}, { env = process.env, timeout = 1500 } = {}) {
@@ -363,141 +328,190 @@ export function askConnector(method, params = {}, { env = process.env, timeout =
   });
 }
 
-/** `service status --json` (SEAMS §3): the supervisor's own `node.status` when one answers, else derived from
- *  the files and the manager without starting anything.
- *
- *  A plain connector answering (`supervisor: false`) speaks only for the core it started on demand: what the
- *  node service is — `not-installed`, `stopped-by-person`… — comes from the files and the manager as when
- *  nothing answers, with that core's `core` and `calls`. A supervisor's `stopped` is only ever transient (before
- *  its first start, and while it shuts down — its socket stops taking connections first). */
-export async function status(env = process.env) {
-  const answered = await askConnector('node.status', {}, { env });
-  if (answered && !answered.error && answered.state && answered.supervisor) return { ...answered, ok: true };
+/** Everything `deriveStatus` needs, read fresh: the definitions on disk, the manager's view of each job, the stop
+ *  marker, the core's health on its socket, its ready file and its failure report. `connectorRunning`: the connector
+ *  answering this (itself), else asked. */
+export async function observe(env = process.env, { connectorRunning = null } = {}) {
   const dataDir = dataDirOf(env), files = nodeFiles(dataDir);
-  const kind = managerKind(env);
   const service = installedService(env);
-  const installed = existsSync(files.install);
+  const kind = service?.kind ?? managerKind(env);
+  const defined = { core: !!service?.core, connector: !!service?.connector };
+  const jobs = Object.fromEntries(ORDER.map(job => [job, defined[job] ? managerState(kind, job, env) : null]));
   const ready = readReady(dataDir);
-  const health = ready && !answered?.core ? await localHealth(ready.socket, 1500) : null;
-  const core = answered?.core ?? (health?.status === 200 ? { pid: health.body.pid, version: health.body.version, api: health.body.api, launch_id: health.body.launch_id } : null);
-  const calls = answered?.core ? answered.calls ?? 0 : health?.status === 200 ? health.body.calls ?? 0 : 0;
-  const base = { ok: true, service: kind, installed, failure: null, calls, core };
-  if (!installed && !service) return { ...base, state: 'absent' };
-  if (existsSync(files.stopped)) return { ...base, state: 'stopped-by-person' };
-  if (!service) return { ...base, state: 'not-installed' };
-  return { ...base, state: 'service-failed', failure: { key: serviceFailure(kind, env) } };
+  const health = await localHealth(ready?.socket || socketPathOf(dataDir), 1500);
+  const report = readFailure(dataDir);
+  return {
+    service: kind, installed: !!selection(env, 'current'), defined, jobs,
+    stopped: existsSync(files.stopped), health, ready,
+    failure: report ? describeFailure(dataDir, report) : null,
+    coreAge: jobs.core?.running ? processAge(jobs.core.pid) : null,
+    program: defined.core ? programProblem(definitionProgram(kind, service.core)) : null,
+    logTail: logTail(dataDir),
+    connectorRunning: connectorRunning ?? !!(await askConnector('status', {}, { env, timeout: 1000 })),
+  };
 }
 
-/** What must be gone for the node to be down: the connector holding the socket, as its lock records it (pid and
- *  start time), and the core, as its ready file records it (pid and launch id). Each is signalled only while it
- *  is provably that process (`proc.mjs`): a stale file naming a reused pid names somebody else's work. */
-function nodeProcesses(env) {
-  const lock = readLock(connectorSocketOf(env) + '.lock');
-  const connector = lock && !lock.unreadable && validPid(lock.pid) ? { pid: lock.pid, start: lock.start ?? null } : null;
-  // The core: by its ready file, or — not ready yet, its starter perhaps dead — by its launch record and launch id,
-  // as startup finds it (`core.mjs`). Both, when they name different launches.
-  const ready = readReady(dataDirOf(env));
-  const cores = [];
-  if (ready && validPid(ready.pid) && ready.launch_id) cores.push(ready);
-  const launching = launchProcess(dataDirOf(env));
-  if (launching && !cores.some(core => core.pid === launching.pid)) cores.push(launching);
-  return { connector, cores };
-}
-const connectorUp = owner => !!owner && isProcess(owner.pid, { start: owner.start });
-function signalNode(processes, signal) {
-  const sent = [];
-  if (connectorUp(processes.connector) && signalVerified(processes.connector.pid, signal, { start: processes.connector.start })) sent.push(processes.connector.pid);
-  for (const core of processes.cores || []) {
-    if (coreRunning(core) && signalVerified(core.pid, signal, { command: new RegExp(`--launch-id[= ]${core.launch_id.replace(/[^\w-]/g, '')}(\\s|$)`) })) sent.push(core.pid);
+/** The node's state from what was observed (§2.8; SEAMS §4), in this order:
+ *  1. the core answers its health → `running` — unless the service condition says otherwise (no job, a person's stop,
+ *     a manager that does not run the job), which wins, with `reachable: true`;
+ *  2. nothing installed, nothing defined → `absent`;  3. no core job → `not-installed`;  4. stopped → `stopped-by-person`;
+ *  5. the manager does not have the job loaded, hit its start limit, or its program is missing → `service-failed`;
+ *  6. job running, not ready yet, for less than 60 s → `starting` (longer: `failed`, `ready.timeout`);
+ *  7. job running and ready, health silent → `failed`, `hang`;
+ *  8. job not running, the core's failure report there → `failed` with it;
+ *  9. job not running, the manager will start it again → `backoff`, with the manager's count;
+ *  10. otherwise → `failed`, `launch.exited`. */
+export function deriveStatus(o) {
+  const body = o.health?.status === 200 ? o.health.body : null;
+  const base = { ok: true, service: o.service, installed: !!o.installed,
+    core: body ? { pid: body.pid ?? null, version: body.version ?? null, api: body.api ?? null, launch_id: body.launch_id ?? null } : null,
+    calls: body ? (typeof body.calls === 'number' ? body.calls : null) : null,
+    failure: null, attempts: null, limit: null, since: null, window_started: null, next_retry_at: null,
+    reachable: !!body, connector: { running: !!o.connectorRunning } };
+  const job = o.jobs?.core;
+  const serviceFailure = o.defined?.core ? (job?.reason || o.program || null) : null;
+  const condition = () => {
+    if (!o.installed && !o.defined?.core && !o.defined?.connector) return { ...base, state: 'absent' };
+    if (!o.defined?.core) return { ...base, state: 'not-installed' };
+    if (o.stopped) return { ...base, state: 'stopped-by-person' };
+    if (serviceFailure) return { ...base, state: 'service-failed', failure: { key: serviceFailure } };
+    return null;
+  };
+  const held = condition();
+  if (body) return held ?? { ...base, state: 'running' };
+  if (held) return held;
+  const tail = o.logTail ?? [];
+  const exited = detail => ({ key: 'launch.exited', step: 'run', message: t('launch.exited', { detail: detail ?? '?' }), detail, at: new Date().toISOString(), log_tail: tail });
+  if (job?.running) {
+    if (!o.ready || o.ready.pid !== job.pid) {
+      return o.coreAge !== null && o.coreAge !== undefined && o.coreAge > STARTING_S
+        ? { ...base, state: 'failed', failure: { key: 'ready.timeout', step: 'ready', message: t('ready.timeout'), at: new Date().toISOString(), log_tail: tail } }
+        : { ...base, state: 'starting' };
+    }
+    return { ...base, state: 'failed', failure: { key: 'hang', step: 'health', message: t('hang'), at: new Date().toISOString(), log_tail: tail } };
   }
-  return sent;
+  if (o.failure) return { ...base, state: 'failed', failure: o.failure };
+  const lastExit = job?.signal ?? job?.exit ?? null;
+  if (job?.restarting) return { ...base, state: 'backoff', failure: exited(lastExit), attempts: job.runs ?? null, limit: o.service === 'systemd' ? START_LIMIT : null };
+  return { ...base, state: 'failed', failure: exited(lastExit) };
 }
 
-/** Wait for the supervisor and its core to be gone, up to `TEARDOWN_MS`; then kill what is provably still them.
- *  Their sockets go with them. */
-async function awaitDown(env, processes = nodeProcesses(env)) {
-  const deadline = Date.now() + TEARDOWN_MS;
-  const left = () => [connectorUp(processes.connector) && processes.connector.pid, ...(processes.cores || []).map(core => coreRunning(core) && core.pid)].filter(Boolean);
-  while (left().length && Date.now() < deadline) await wait(100);
-  const killed = left().length ? signalNode(processes, 'SIGKILL') : [];
-  const after = Date.now() + 5000;
-  while (left().length && Date.now() < after) await wait(50);
-  if (!left().length) {
-    for (const file of [connectorSocketOf(env), socketPathOf(dataDirOf(env))]) { try { unlinkSync(file); } catch {} }
-    const lock = readLock(connectorSocketOf(env) + '.lock');
-    if (lock && !lock.unreadable && !connectorUp({ pid: lock.pid, start: lock.start ?? null })) { try { unlinkSync(connectorSocketOf(env) + '.lock'); } catch {} }
-  }
-  return { killed, left: left() };
+/** `service status --json` (SEAMS §3–§4): derived, read-only, never starts anything. */
+export async function status(env = process.env, options = {}) {
+  return deriveStatus(await observe(env, options));
 }
 
-/** Stop whatever node runs without a service manager — the connector holding the socket (a detached supervisor or
- *  a plain connector) and the core — each signalled only as its verified self, and wait until both are gone. */
-export async function stopNode(env = process.env) {
-  const processes = nodeProcesses(env);
-  signalNode(processes, 'SIGTERM');
-  return awaitDown(env, processes);
-}
-
-/** Wait for a connector to answer on the socket, up to `START_WAIT_MS`. */
-async function awaitUp(env, timeout = START_WAIT_MS) {
+/** Wait, up to `timeout`, for the core to be past `starting`: what start and restart answer with. */
+async function settled(env, timeout = SETTLE_MS()) {
   const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    const answered = await askConnector('node.status', {}, { env, timeout: 1000 });
-    if (answered?.state) return answered;
-    await wait(200);
+  let now = await status(env);
+  while (['starting', 'backoff'].includes(now.state) && Date.now() < deadline) { await wait(200); now = await status(env); }
+  return now;
+}
+
+/* ----- what runs without a manager (§2.5 step 3) ----- */
+
+/** The connector holding its lock, by the lock's record — and only while the lock is held: a lock this process can take
+ *  has no holder, whatever its file says. */
+async function lockHolder(env) {
+  const file = connectorLockOf(env);
+  if (!existsSync(file)) return null;
+  const probe = await tryLock(file, { kind: 'probe', env });
+  if (probe.held) { probe.release(); return null; }
+  const record = probe.owner ?? readLock(file);
+  return record && isProcess(record.pid, { start: record.start ?? null }) ? { pid: record.pid, start: record.start ?? null } : null;
+}
+
+/** Stop what runs outside a manager — an on-demand connector, and every core of this data directory (ready, or still
+ *  starting) — each signalled only as its verified self, and wait until both are gone and their sockets silent. Returns
+ *  `{killed, left}`. */
+export async function stopOnDemand(env = process.env) {
+  const dataDir = dataDirOf(env);
+  const connector = await lockHolder(env);
+  if (connector) signalVerified(connector.pid, 'SIGTERM', { start: connector.start });
+  const connectorUp = () => !!connector && isProcess(connector.pid, { start: connector.start });
+  const deadline = Date.now() + TEARDOWN_MS();
+  while (connectorUp() && Date.now() < deadline) await wait(100);
+  const killed = [];
+  if (connectorUp() && signalVerified(connector.pid, 'SIGKILL', { start: connector.start })) killed.push(connector.pid);
+  for (const pid of coreProcesses(dataDir)) {
+    await terminateCore(dataDir, pid, { grace: TEARDOWN_MS() });
+    if (coreRunning(dataDir, pid)) killed.push(pid);
+  }
+  for (let i = 0; i < 50 && (connectorUp() || (await askConnector('status', {}, { env, timeout: 300 }))); i++) await wait(100);
+  const left = [connectorUp() && connector.pid, ...coreProcesses(dataDir)].filter(Boolean);
+  return { killed, left };
+}
+
+/* ----- starting and stopping the jobs ----- */
+
+/** Each job started from its definition as it is now: a changed definition is loaded again (launchd reads a plist only
+ *  when it is bootstrapped; systemd reloads), and with `restart` a running job is restarted (launchd `kickstart -k`;
+ *  systemd `reset-failed` + `restart`, which clears a start limit — an explicit retry, or a new release). */
+export async function startJobs(env, { changed = [], restart = false, jobs = ORDER } = {}) {
+  const kind = installedService(env)?.kind;
+  // A core about to be started again: its last failure report is about a start that is over (the core deletes it
+  // too, once it holds its lock), and must not be read as this start's while it begins.
+  if (jobs.includes('core') && (restart || changed.includes('core'))) rmSync(failurePath(dataDirOf(env)), { force: true });
+  const fail = (job, out) => { throw keyed('service.not-loaded', { detail: `${JOBS[job].label}: ${String(out.output || '').trim()}` }); };
+  if (kind === 'launchd') {
+    for (const job of jobs) {
+      if (changed.includes(job) && loaded(kind, job, env)) { const out = await bootOut(env, job); if (!out.ok) fail(job, out); }
+      if (!loaded(kind, job, env)) { const booted = await bootIn(env, job); if (!booted.ok) fail(job, booted); continue; }
+      const kicked = manage(env, kind, ['kickstart', ...(restart ? ['-k'] : []), target(job)]);
+      if (!kicked.ok) fail(job, kicked);
+    }
+  } else if (kind === 'systemd') {
+    if (changed.length) manage(env, kind, ['--user', 'daemon-reload']);
+    for (const job of jobs) {
+      manage(env, kind, ['--user', 'enable', JOBS[job].unit]);
+      manage(env, kind, ['--user', 'reset-failed', JOBS[job].unit]);
+      const out = manage(env, kind, ['--user', restart || changed.includes(job) ? 'restart' : 'start', JOBS[job].unit]);
+      if (!out.ok) throw keyed(`service.${managerState(kind, job, env).reason || programProblem(definitionProgram(kind, definitionPath(kind, job, env))) || 'not-loaded'}`, { detail: out.output.trim() });
+    }
+  } else throw keyed('service.no-manager');
+}
+
+/** Both jobs unloaded (the connector first): launchd `bootout`, waited out; systemd `stop` (or `disable --now`).
+ *  Returns the first refusal, or null. */
+async function unloadJobs(env, { disable = false } = {}) {
+  const service = installedService(env);
+  if (!service) return null;
+  for (const job of [...ORDER].reverse()) {
+    if (!service[job]) continue;
+    if (service.kind === 'launchd') {
+      if (!loaded('launchd', job, env)) continue;
+      const out = await bootOut(env, job);
+      if (!out.ok) return `${JOBS[job].label}: ${out.output}`;
+    } else if (service.kind === 'systemd') {
+      const out = manage(env, 'systemd', ['--user', ...(disable ? ['disable', '--now'] : ['stop']), JOBS[job].unit]);
+      if (!out.ok && loaded('systemd', job, env)) return `${JOBS[job].unit}: ${out.output.trim()}`;
+    }
   }
   return null;
 }
 
-/** Ask the manager to start the registered service (or, with none, a detached supervisor). Starts nothing
- *  already running. Used by `service start` and by the launcher, which never spawns where a service exists. */
-export async function managerStart(env = process.env, { load = true } = {}) {
-  const service = installedService(env);
-  const kind = service?.kind ?? managerKind(env);
-  if (kind === 'launchd' && service) {
-    if (!loaded(kind, env)) {
-      if (!load) return { ok: false, key: 'service.not-loaded' };
-      const booted = await bootIn(env, service.file);
-      if (!booted.ok) return { ok: false, key: 'service.not-loaded', detail: booted.output.trim() };
-    }
-    const kicked = manage(env, kind, ['kickstart', target()]);
-    return kicked.ok ? { ok: true } : { ok: false, key: 'service.not-loaded', detail: kicked.output.trim() };
-  }
-  if (kind === 'systemd' && service) {
-    let started = manage(env, kind, ['--user', 'start', UNIT]);
-    if (!started.ok && managerState(kind, env).reason === 'start-limit') {
-      manage(env, kind, ['--user', 'reset-failed', UNIT]);
-      started = manage(env, kind, ['--user', 'start', UNIT]);
-    }
-    if (started.ok) return { ok: true };
-    const reason = serviceFailure(kind, env);
-    return { ok: false, key: reason === 'not-loaded' ? 'service.not-loaded' : `service.${reason}`, detail: started.output.trim() };
-  }
-  return { ok: false, key: 'service.not-loaded' };
+/** The commands, each under the install lock (`underLock`). */
+async function underLock(env, operation) {
+  const release = await takeInstallLock(dataDirOf(env));
+  try { return await operation(); } finally { release(); }
 }
 
-/** Start a detached supervisor: the node service where there is no manager to run it. */
-function startDetached(env) {
-  const record = readJson(nodeFiles(dataDirOf(env)).install);
-  const program = serviceProgram(record);
-  const child = spawn(program[0], program.slice(1), { detached: true, stdio: 'ignore', env: launchEnvironment(record, env, { SIDEVOICE_SERVICE: 'none' }) });
-  child.on('error', () => {});
-  child.unref();
-}
-
-/** `service install`: the definition written from the selected installation, the manager told, the service
- *  started; with no manager, a detached supervisor. Linux says what linger would add. */
+/** `service install`: both definitions written for the selected installation, anything running on demand stopped,
+ *  both jobs started; answered with the core's state once it settles. Linux says what linger would add. */
 export async function install(env = process.env) {
-  const files = nodeFiles(dataDirOf(env));
-  const kind = managerKind(env);
-  try { rmSync(files.stopped, { force: true }); } catch {}
-  // The definition is part of the installation: written, verified running, or undone, in its transaction.
-  const { transact } = await import('./install-txn.mjs');
-  const result = await transact(env, { keep: true, service: true });
-  if (result.action === 'rollback') throw keyed('install.rollback', {}, { failure: result.failure });
-  const running = await askConnector('node.status', {}, { env });
-  const started = running?.state && running.supervisor ? { ok: true, state: running.state, service: kind } : await start(env, { clear: false });
-  return { ...started, ...(kind === 'systemd' ? { linger: linger(env) } : {}) };
+  return underLock(env, async () => {
+    if (!selection(env, 'current')) throw keyed('service.no-installation');
+    const kind = managerKind(env);
+    if (kind === 'none') throw keyed('service.no-manager');
+    rmSync(nodeFiles(dataDirOf(env)).stopped, { force: true });
+    const had = installedService(env);
+    const changed = writeDefinitions(kind, env);
+    if (!had) await stopOnDemand(env);
+    await startJobs(env, { changed });
+    const now = await settled(env, Number(env.SIDEVOICE_INSTALL_VERIFY_MS || 60_000));
+    return { ok: true, state: now.state, service: kind, ...(now.failure ? { failure: now.failure } : {}), ...(kind === 'systemd' ? { linger: linger(env) } : {}) };
+  });
 }
 
 /** Linux: whether this user's services run without a session, and how to make them (O4). */
@@ -509,160 +523,94 @@ export function linger(env = process.env) {
   return { enabled, command, reason: t('service.linger-reason') };
 }
 
-/** `service start`: a stop no longer holds; the manager starts the service, or a detached supervisor starts. */
-export async function start(env = process.env, { clear = true } = {}) {
-  const files = nodeFiles(dataDirOf(env));
-  const begun = await underInstallLock(env, async () => {
-    await finishTransaction(env);
-    if (clear) { try { rmSync(files.stopped, { force: true }); } catch {} }
-    const kind = installedService(env)?.kind ?? 'none';
-    const running = await askConnector('node.status', {}, { env });
-    if (running?.state && running.supervisor && running.service === kind) return { done: { ok: true, state: running.state, service: kind } };
-    if (kind === 'none') {
-      if (!existsSync(files.install)) throw keyed('service.no-installation');
-      // A plain connector already serving is taken over by the supervisor (handover); none is started twice.
-      startDetached(env);
-    } else {
-      const started = await managerStart(env);
-      if (!started.ok) throw keyed(started.key, { detail: started.detail || '' });
-    }
-    return { kind };
-  });
-  if (begun.done) return begun.done;
-  const kind = begun.kind;
-  const up = await awaitUp(env);
-  if (!up) throw keyed('service.not-loaded', { detail: '' });
-  return { ok: true, state: up.state, service: kind };
-}
-
-/** `service stop`: the person's stop — written first, so nothing starts the node again meanwhile — then the
- *  manager stops it (launchd: bootout, so KeepAlive does not bring it back), and both processes are awaited. */
-export async function stop(env = process.env) {
-  const files = nodeFiles(dataDirOf(env));
-  try { ensureLockIdentity(dataDirOf(env)); } catch {}   // made now if this is the directory's first use; a stop needs no lock
-  writePrivate(files.stopped, { at: new Date().toISOString() });
-  const kind = installedService(env)?.kind ?? 'none';
-  const processes = nodeProcesses(env);
-  if (kind === 'launchd') manage(env, kind, ['bootout', target()]);
-  else if (kind === 'systemd') manage(env, kind, ['--user', 'stop', UNIT]);
-  // No manager: the detached supervisor, or a plain connector and its detached core, each asked to leave.
-  else signalNode(processes, 'SIGTERM');
-  const down = await awaitDown(env, processes);
-  return { ok: !down.left.length, state: 'stopped-by-person', service: kind, ...(down.killed.length ? { note: t('service.killed', { pids: down.killed.join(', ') }) } : {}) };
-}
-
-/** `service restart` — the person's «Reintentar». A supervisor that answers restarts the core itself
- *  (`node.restart`, which closes the budget window); one that does not is restarted by its manager, with a
- *  note that this restart is the person's, so the new supervisor closes the window too. */
-export async function restart(env = process.env) {
-  const files = nodeFiles(dataDirOf(env));
-  const kind = installedService(env)?.kind ?? 'none';
-  // Stopped: restarting is starting — and still a person's restart, so the supervisor that starts closes the budget
-  // window as `node.restart` would (the marker is read at its start).
-  if (existsSync(files.stopped)) { writePrivate(files.restart, { at: new Date().toISOString(), why: 'restart while stopped' }); return start(env); }
-  // A supervisor answering restarts its own core: nothing of this process's starts.
-  const answered = await askConnector('node.restart', {}, { env, timeout: 90_000 });
-  if (answered?.state && answered.supervisor && answered.service === kind) return { ok: true, state: answered.state, service: kind };
-  if (kind === 'none') return start(env);
-  const kicked = await underInstallLock(env, async () => {
-    await finishTransaction(env);
-    if (!installedService(env)) return false;
-    writePrivate(files.restart, { at: new Date().toISOString() });
-    if (kind === 'launchd') return manage(env, kind, ['kickstart', '-k', target()]).ok;
-    if (managerState(kind, env).reason === 'start-limit') manage(env, kind, ['--user', 'reset-failed', UNIT]);
-    const restarted = manage(env, kind, ['--user', 'restart', UNIT]);
-    if (!restarted.ok) throw keyed(`service.${serviceFailure(kind, env)}`, { detail: restarted.output.trim() });
-    return true;
-  });
-  if (!kicked) return start(env);
-  const up = await awaitUp(env);
-  if (!up) throw keyed('service.not-loaded', { detail: '' });
-  return { ok: true, state: up.state, service: kind };
-}
-
-/** The service started again from its definition as it is now — what an install transaction does once it has
- *  rewritten it: launchd reads a plist only when it is bootstrapped, so the job is booted out and in again;
- *  systemd reloads and restarts; a detached supervisor is replaced. The supervisor and its core are new. */
-export async function reload(env = process.env) {
-  const kind = installedService(env)?.kind ?? 'none';
-  const processes = nodeProcesses(env);
-  if (kind === 'launchd') {
-    if (loaded(kind, env)) await bootOut(env);
-    await awaitDown(env, processes);
-    const booted = await bootIn(env, definitionPath(kind, env));
-    if (!booted.ok) throw keyed('service.not-loaded', { detail: booted.output.trim() });
-  } else if (kind === 'systemd') {
-    manage(env, kind, ['--user', 'daemon-reload']);
-    if (managerState(kind, env).reason === 'start-limit') manage(env, kind, ['--user', 'reset-failed', UNIT]);
-    const restarted = manage(env, kind, ['--user', 'restart', UNIT]);
-    if (!restarted.ok) throw keyed(`service.${serviceFailure(kind, env)}`, { detail: restarted.output.trim() });
-  } else {
-    signalNode({ connector: processes.connector, cores: [] }, 'SIGTERM');
-    await awaitDown(env, { connector: processes.connector, cores: [] });
-    startDetached(env);
-  }
-  const up = await awaitUp(env);
-  if (!up) throw keyed('service.not-loaded', { detail: '' });
-  return { ok: true, state: up.state, service: kind };
-}
-
-/** `service uninstall`: stopped, both processes gone (killed after 15 s), the definition deleted, the manager
- *  reloaded. Idempotent. An unload the manager refuses stops here, with nothing deleted. */
-export async function uninstall(env = process.env, { keepStopped = false } = {}) {
-  const files = nodeFiles(dataDirOf(env));
-  // What is installed is what is on disk — a definition is there whether or not its manager answers now. A
-  // manager that cannot be asked to let it go stops everything here: nothing it still points at is deleted.
+/** `service start`: a stop no longer holds; the manager starts both jobs. With no jobs, nothing is started here — the
+ *  next conversation starts Sidevoice on demand. */
+export async function start(env = process.env) {
   const service = installedService(env);
-  const kind = service?.kind ?? 'none';
-  const processes = nodeProcesses(env);
-  const release = await takeInstallLock(dataDirOf(env));
-  try {
-    writePrivate(files.stopped, { at: new Date().toISOString() });   // nothing may start the node while it is taken apart
-    if (kind === 'launchd') {
-      if (loaded(kind, env)) {
-        const out = manage(env, kind, ['bootout', target()]);
-        for (let i = 0; i < 100 && loaded(kind, env); i++) await wait(100);
-        if (loaded(kind, env)) throw keyed('service.unload-failed', { detail: out.output.trim() || 'still loaded' });
-      }
-    } else if (kind === 'systemd') {
-      const out = manage(env, kind, ['--user', 'disable', '--now', UNIT]);
-      if (!out.ok) throw keyed('service.unload-failed', { detail: out.output.trim() });
-    } else signalNode(processes, 'SIGTERM');
-    const down = await awaitDown(env, processes);
+  await underLock(env, async () => {
+    rmSync(nodeFiles(dataDirOf(env)).stopped, { force: true });
+    if (service) await startJobs(env);
+  });
+  const now = await settled(env);
+  return { ok: true, state: now.state, service: service?.kind ?? 'none' };
+}
+
+/** `service stop`: the person's stop — written first, so nothing starts Sidevoice again meanwhile — then the manager
+ *  stops both jobs (launchd: bootout, so KeepAlive does not bring them back until the next login). With no jobs, what
+ *  runs on demand is stopped. */
+export async function stop(env = process.env) {
+  return underLock(env, async () => {
+    writePrivate(nodeFiles(dataDirOf(env)).stopped, { at: new Date().toISOString() });
+    const service = installedService(env);
+    const refused = await unloadJobs(env);
+    if (refused) throw keyed('service.unload-failed', { detail: refused });
+    const down = await stopOnDemand(env);
+    return { ok: !down.left.length, state: 'stopped-by-person', service: service?.kind ?? 'none', ...(down.killed.length ? { note: t('service.killed', { pids: down.killed.join(', ') }) } : {}) };
+  });
+}
+
+/** `service restart` — the person's «Reintentar»: the core job restarted (its start limit cleared first); stopped, it is
+ *  a start. With no jobs, the core running on demand is ended, and the next conversation starts it again. */
+export async function restart(env = process.env) {
+  if (existsSync(nodeFiles(dataDirOf(env)).stopped)) return start(env);
+  const service = installedService(env);
+  await underLock(env, async () => {
+    if (service?.core) await startJobs(env, { restart: true, jobs: ['core'] });
+    else for (const pid of coreProcesses(dataDirOf(env))) await terminateCore(dataDirOf(env), pid);
+  });
+  const now = await settled(env);
+  return { ok: true, state: now.state, service: service?.kind ?? 'none' };
+}
+
+/** `service uninstall` (§2.5 steps 1–4): the stop written, both jobs unloaded — any refusal stops here, with nothing
+ *  deleted — what runs on demand stopped, both definitions deleted and the manager told. `keepStopped`: the caller goes
+ *  on taking the installation apart and clears the marker itself. Idempotent. */
+export async function uninstall(env = process.env, { keepStopped = false } = {}) {
+  return underLock(env, async () => {
+    const files = nodeFiles(dataDirOf(env));
+    const service = installedService(env);
+    const kind = service?.kind ?? 'none';
+    writePrivate(files.stopped, { at: new Date().toISOString() });
+    const refused = await unloadJobs(env, { disable: true });
+    if (refused) throw keyed('service.unload-failed', { detail: refused });
+    const down = await stopOnDemand(env);
     if (down.left.length) throw keyed('service.unload-failed', { detail: `pid ${down.left.join(', ')} still running` });
     if (service) {
-      rmSync(service.file, { force: true });
+      for (const job of ORDER) if (service[job]) rmSync(service[job], { force: true });
       if (kind === 'systemd') {
         const reloaded = manage(env, kind, ['--user', 'daemon-reload']);
         if (!reloaded.ok) throw keyed('service.unload-failed', { detail: reloaded.output.trim() });
-        manage(env, kind, ['--user', 'reset-failed', UNIT]);
+        for (const job of ORDER) manage(env, kind, ['--user', 'reset-failed', JOBS[job].unit]);
       }
     }
-    if (!keepStopped) { try { rmSync(files.stopped, { force: true }); } catch {} }
-    return { ok: true, state: existsSync(files.install) ? 'not-installed' : 'absent', service: kind,
+    if (!keepStopped) rmSync(files.stopped, { force: true });
+    return { ok: true, state: selection(env, 'current') ? 'not-installed' : 'absent', service: kind,
       ...(down.killed.length ? { note: t('service.killed', { pids: down.killed.join(', ') }) } : {}) };
-  } finally { release(); }
+  });
+}
+
+/** Whether a core speaks what this connector speaks: `api` from its health, `link` from its ready file. */
+export function compatibleCore(core, ready) {
+  const within = (value, [low, high]) => Number.isInteger(value) && value >= low && value <= high;
+  return within(core?.api, API_RANGE) && within(ready?.protocol, LINK_RANGE);
 }
 
 /** `sidevoice service <install|uninstall|start|stop|restart|status> [--json]`. */
 export async function run(argv = [], env = process.env) {
   const [action] = argv.filter(item => !item.startsWith('-'));
   const json = argv.includes('--json');
-  // `reload` and `recover` are the node's own: a supervisor handing over to the installation now selected, or
-  // having its own removal finished outside it (`connector.mjs`).
-  const actions = { install, uninstall, start, stop, restart, status, reload, recover: recoverInstallation };
+  const actions = { install, uninstall, start, stop, restart, status };
   if (!actions[action]) {
     if (json) { console.log(JSON.stringify({ ok: false, error: { key: 'service.usage', message: t('service.usage') } })); return 1; }
     console.error(t('service.usage')); return 2;
   }
   let result;
-  // Every action is on the installation there is: where it recorded it lives, whatever this shell says.
-  try { result = await actions[action](withRecordedPaths(env)); }
+  try { result = await actions[action](env); }
   catch (error) { result = { ok: false, error: { key: error.key || 'service.failed', message: error.message } }; }
   if (json) console.log(JSON.stringify(result));
   else if (!result.ok) console.error(result.error?.message || t('service.failed'));
   else {
-    console.log(t(`service.state.${result.state}`, { service: result.service }) + (result.failure?.key ? ` (${t('service.reason.' + result.failure.key)})` : ''));
+    console.log(t(`service.state.${result.state}`, { service: result.service }) + (result.failure?.key ? ` (${result.failure.message || t('service.reason.' + result.failure.key)})` : ''));
     if (result.note) console.log(result.note);
     if (result.linger && !result.linger.enabled) console.log(`\n${result.linger.reason}\n    ${result.linger.command}`);
   }

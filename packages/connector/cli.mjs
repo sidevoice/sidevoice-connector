@@ -7,21 +7,24 @@
  *  resolve at build time would be a path that does not exist at run time. No top-level await — the single
  *  executable (R4) is a CommonJS build, where there is none. */
 import { run as connector } from './connector.mjs';
-import { runInstall, runUninstall } from './install.mjs';
+import { runInstall, runRollback, runUninstall } from './install.mjs';
 import { run as mcp } from './mcp.mjs';
 import { runLinkRoom, runPair } from './pair.mjs';
 import { run as pairDevice } from './pair-device.mjs';
 import { run as service } from './service.mjs';
 import { run as skill } from './skill.mjs';
 import { t } from './i18n.mjs';
+import { VERSION } from './identity.mjs';
 
-const COMMANDS = { install: runInstall, uninstall: runUninstall, mcp, pair: runPair, 'link-room': runLinkRoom,
+const COMMANDS = { install: runInstall, uninstall: runUninstall, rollback: runRollback, mcp, pair: runPair, 'link-room': runLinkRoom,
   'pair-device': pairDevice, connector, service, skill };
 
 /** With `--json`, every failure is one object on stdout — `{ok: false, error: {key, message}}` — and exit 1. */
 const failJson = (key, message) => { console.log(JSON.stringify({ ok: false, error: { key, message } })); return 1; };
 
 async function main([command, ...argv]) {
+  // What an installer asks a staged release (`release.mjs`): this package's version, and nothing else.
+  if (command === '--version') { console.log(VERSION); return 0; }
   const json = argv.includes('--json');
   const entry = COMMANDS[command];
   if (!entry) {

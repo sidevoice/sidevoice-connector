@@ -2,44 +2,37 @@
  *  the last mile chosen per binding. Node 22+. Façades talk to it over a local socket; a binding
  *  lives exactly as long as the façade connection that registered it.
  *
- *  The core (`sidevoice-core`, Python) holds the conversations and runs voice; this connector installs
- *  it, starts it and links to it over the core's own Unix socket (`core.mjs`, `core-socket.mjs`). The
- *  hosted room is the core's business: the core dials it with this machine's pairing and tells this
- *  connector how that link is doing.
+ *  The core (`sidevoice-core`, Python) holds the conversations and runs voice; this connector links to it
+ *  over the core's own Unix socket (`core.mjs`, `core-socket.mjs`). The hosted room is the core's business:
+ *  the core dials it with this machine's pairing and tells this connector how that link is doing.
  *
- *  Two ways to run (§4.2). `connector --supervise` is the node service: started by launchd or systemd at
- *  login (or detached where there is no user service manager), it runs the core as its child, never leaves
- *  on its own, and answers `node.status`/`node.ensure`/`node.restart`. Plain `connector` is what the
- *  launcher starts where no service is installed: the core detached, and gone itself 15 s after its last
- *  conversation. A supervisor that finds a plain connector holding the socket takes over from it
- *  (`handover`): every binding moves, with everything `register` was told, and the room never sees one leave.
+ *  Two ways to run (§2.6), and nothing else. `connector --service` is the connector job (`service.mjs`): started
+ *  by launchd or systemd at login, it never leaves on its own and **never starts a core** — the core job does; it
+ *  links when the core answers and again whenever another launch of it answers, with a bounded backoff while none
+ *  does. Plain `connector` is what the launcher starts where there is no job: it starts a core, detached, if none
+ *  answers (one with a core job defined is only waited for), and leaves 15 s after its last conversation. Neither is
+ *  anyone's supervisor: restarts are the service manager's.
  *
  *  What carries the link, and how it comes back when it drops, is `link.mjs`'s business; nothing
  *  below this line knows what is underneath. What does not live there is the outbox: a library's
  *  buffer dies with this process, and speech the user was promised must not. */
 import net from 'node:net';
-import os from 'node:os';
 import path from 'node:path';
-import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, rmSync, statSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, lstatSync, rmSync, statSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
 import { capabilityState, SUPPORTED, voiceEnvelope } from './harness-contract.mjs';
 import { harnessFor } from './harnesses.mjs';
 import { machineIdentity, VERSION } from './identity.mjs';
 import { pair, roomOrigin } from './pair.mjs';
 import { roomLink, UNREACHABLE } from './link.mjs';
-import { API_RANGE, CORE_VERSION, NO_UV, awaitReady, coreArgs, coreRunning, runsSelected, coreData, ensureInstalled, ensureRunning, examineRunning, failureCause,
-  failurePath, installInProgress, lockPath as installLockPath, roomCredentialPath, spawnCore, takeInstallLock, terminateCore, unlinkSocket } from './core.mjs';
-import { ensureCoreDirectory, localHealth, socketAgent } from './core-socket.mjs';
-import { appendLine, rotate } from './logfile.mjs';
-import { pause } from './testpoint.mjs';
-import { Supervisor } from './supervisor.mjs';
-import { VERIFY_DEADLINE_MS, pruneInstallations, recover, sameCommand, selectionRuns, settle } from './install-txn.mjs';
-import { connectorSocketOf, dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
-import { ensureLockIdentity, readLock, tryLock } from './lockfile.mjs';
+import { compatible, coreRunning, ensureRunning, installInProgress, roomCredentialPath, serving } from './core.mjs';
+import { socketAgent } from './core-socket.mjs';
+import { appendLine } from './logfile.mjs';
+import { coreProgram } from './release.mjs';
+import { installedService, status as nodeStatusOf } from './service.mjs';
+import { connectorLockOf, connectorSocketOf, dataDirOf, nodeFiles } from './node-files.mjs';
+import { tryLock } from './lockfile.mjs';
 import { t } from './i18n.mjs';
-import { launchEnvironment, spawnOutsideJob } from './service.mjs';
-import { isProcess, selfIdentity, signalVerified } from './proc.mjs';
 import { verifyPrivateDir } from './secure-fs.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -47,20 +40,20 @@ const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 export const PROTOCOL = 2;
 // Set by `run`: nothing here reads the environment, or does anything, on import.
 let env = process.env, dataDir, socketPath, lockPath, outboxPath, credentialsPath, idleMs, identity, hostId, logPath, files;
-/** `--supervise`: this process is the node service, and the core is its child. */
-let supervised = false, supervisor = null, serviceKind = 'none';
+/** `--service`: this process is the connector job. `ownsCore`: no core job is defined, so this connector starts one. */
+let serviceMode = false, ownsCore = true;
 const LOG_MAX = 1 << 20;
 
 /** One line per event. A plain connector writes to stderr and to `connector.log` in the data dir: the façade
  *  starts it with its output discarded, so the file is the only record of a connector nobody ran by hand
- *  (rolls over once, at 1 MB). The supervisor writes `node-service.log` only — the service manager already
- *  puts its stderr in that same file, so writing both would say everything twice. */
+ *  (rolls over once, at 1 MB). The connector job writes `connector.log` only (rotated, `logfile.mjs`): launchd
+ *  already puts its stderr in that same file, so writing both would say everything twice. */
 /** An editor conversation's id is what lets a chat speak as it: the log names it by a hash. */
 const redact = line => String(line).replace(/cursor-editor-[0-9a-f-]{36}/g, id => 'cursor-editor-h:' + createHash('sha256').update(id).digest('hex').slice(0, 10));
 function log(line) {
   line = redact(line);
   const stamped = `${new Date().toISOString()} [sidevoice] ${line}`;
-  if (supervised) return appendLine(logPath, stamped);
+  if (serviceMode) return appendLine(logPath, stamped);
   console.error(stamped);
   try {
     let size = 0; try { size = statSync(logPath).size; } catch {}
@@ -70,7 +63,7 @@ function log(line) {
 }
 
 /** A core somebody else runs — a checkout's, a test's — named whole in the environment: this connector
- *  then links to it over TCP and supervises nothing. Otherwise null, and the connector runs its own. */
+ *  then links to it over TCP and starts nothing. Otherwise null, and the connector links to this machine's own. */
 function externalCore() {
   const { SIDEVOICE_URL: url, SIDEVOICE_CONNECTOR_ID: connector_id, SIDEVOICE_CONNECTOR_TOKEN: token } = env;
   return url && connector_id && token ? { room: roomOrigin(url), connector_id, token } : null;
@@ -81,45 +74,8 @@ function coreLink(ready) {
   return { room: 'http://localhost', connector_id: ready.connector_id, token: ready.token, core: ready, agent: socketAgent(ready.socket) };
 }
 
-/** The singleton lock (`lockfile.mjs`): held by the kernel for as long as this process lives. Its record — pid and
- *  start time — says which connector holds the socket; a pid alone never does. */
+/** The connector's lock (`lockfile.mjs`, `D/connector.lock`): held by the kernel for as long as this process lives. */
 let lockHold = null;
-const TAKEOVER_EXPIRY_MS = 60_000;
-async function acquireLock() {
-  let taken;
-  try { taken = await tryLock(lockPath, { kind: 'connector' }); }
-  catch (error) { log(`not starting: ${error.message}`); process.exit(1); }
-  if (taken.held) { lockHold = taken; return true; }
-  if (!supervised) log(`a connector is already running (pid ${taken.owner?.pid ?? '?'}, lock ${lockPath}); this one exits`);
-  return false;
-}
-/** Whether the connector a lock record names is still that process. */
-const connectorAlive = owner => !!owner && !owner.unreadable && isProcess(owner.pid, { start: owner.start ?? null });
-
-/** A connector from before the kernel-held lock (today's main writes its bare pid into the lock file) can still be
- *  serving the socket while this process holds the lock. It cannot hand over (it has no `handover`): verified to be
- *  that connector — this user's process, a Sidevoice connector by its command line, answering on our socket — it is
- *  asked to stop (then killed), and this one serves. Its façades lose their connector; theirs have no reconnect
- *  loop, so those sessions need restarting. A dead pid in such a file is only information, and is ignored. */
-async function stopLegacyConnector() {
-  const answer = await new Promise(resolve => {
-    const socket = net.createConnection(socketPath);
-    let buffer = '';
-    const timer = setTimeout(() => { socket.destroy(); resolve(null); }, 1500);
-    socket.on('error', () => { clearTimeout(timer); resolve(null); });
-    socket.on('connect', () => socket.write(JSON.stringify({ id: 1, method: 'status', params: {} }) + '\n'));
-    socket.on('data', chunk => { buffer += chunk; const index = buffer.indexOf('\n'); if (index < 0) return; clearTimeout(timer); socket.destroy(); try { resolve(JSON.parse(buffer.slice(0, index))); } catch { resolve(null); } });
-  });
-  if (!answer) return;
-  const legacy = lockHold?.legacyPid ?? null;
-  const command = /(^|[\s/])connector(\.mjs)?(\s|$)/;
-  if (!legacy || !isProcess(legacy, { command })) { log(`a connector answers on ${socketPath} but cannot be identified; not serving beside it`); process.exit(0); }
-  log(`an older connector (pid ${legacy}, version ${answer.result?.version ?? '?'}) serves ${socketPath} without the lock: stopping it`);
-  signalVerified(legacy, 'SIGTERM', { command });
-  const deadline = Date.now() + 10_000;
-  while (isProcess(legacy, { command }) && Date.now() < deadline) await wait(50);
-  if (isProcess(legacy, { command })) { signalVerified(legacy, 'SIGKILL', { command }); await wait(200); }
-}
 
 const bindings = new Map();        // binding_id -> { binding_id, client_ref, harness, thread, title, delivery, capabilities, owner, chain }
 const clients = new Set();         // façade IPC connections
@@ -138,9 +94,6 @@ let coreStarting = null;           // the core being installed or started, while
 let coreError = null;              // why the local core could not be had, for whoever asks
 let coreFailure = null;            // the same, as the keyed failure `node.status` carries
 let coreCheckedAt = 0;
-let handingOver = false;           // a supervisor is taking over: no new command is accepted
-const inFlight = new Set();        // commands being answered, which a handover lets settle
-const deliveries = new Set();      // voice turns being delivered to a harness, which a handover lets settle too
 
 function loadOutbox() { try { outbox = JSON.parse(readFileSync(outboxPath, 'utf8')); if (!Array.isArray(outbox)) outbox = []; } catch { outbox = []; } }
 function saveOutbox() {
@@ -266,13 +219,14 @@ function refuse(reason) {
   scheduleExit();
 }
 
-/** The local core, installed and started if need be, and the credential its ready file names. Waiters
- *  are woken on failure too, so a conversation asking to join hears why rather than timing out. */
+/** The core this connector starts (no core job): the selected release's program when there is one, else this
+ *  package's own build, installed if need be — started detached, and the credential its ready file names. Waiters are
+ *  woken on failure too, so a conversation asking to join hears why rather than timing out. */
 function startCore() {
-  if (supervised) return withheld ? Promise.resolve(null) : supervisor.ensure().then(status => (status.state === 'running' ? creds?.core : null));
   if (coreStarting) return coreStarting;
   coreError = null; coreFailure = null;
-  coreStarting = ensureRunning({ dataDir, env, log, roomCredential: credentialsPath })
+  const selected = coreProgram(env);
+  coreStarting = ensureRunning({ dataDir, env, log, roomCredential: credentialsPath, bin: existsSync(selected) ? selected : null })
     .then(ready => {
       coreError = null;
       creds = coreLink(ready);
@@ -290,97 +244,48 @@ function startCore() {
   return coreStarting;
 }
 
-/** Whether a core is on its way: a plain connector starting one, or the supervisor starting or retrying. */
-function coreComing() {
-  return supervised ? ['starting', 'backoff'].includes(supervisor.state) : !!coreStarting;
+/** Whether a core is on its way: one this connector is starting, or — the core job's — one its manager is starting or
+ *  about to start again (`service.mjs`). A job that failed says why, for whoever is waiting. */
+async function coreComing() {
+  if (ownsCore) return !!coreStarting;
+  const now = await nodeStatusOf(env, { connectorRunning: true });
+  if (['failed', 'service-failed', 'stopped-by-person'].includes(now.state)) {
+    coreFailure = now.failure; coreError = now.failure ? (now.failure.message || now.failure.key) : t(`service.state.${now.state}`);
+  }
+  return ['starting', 'backoff'].includes(now.state);
 }
 
-/** The supervisor's core, as the state machine needs it: real processes, real files (`core.mjs`). */
-function superviseWith(restored) {
-  const install = message => /certificate|UnknownIssuer|proxy/i.test(message) ? 'install.proxy'
-    : /network|reach|dns|connect/i.test(message) ? 'install.network' : null;
-  const number = name => (env[name] ? Number(env[name]) : undefined);
-  const timing = Object.fromEntries(Object.entries({ probe: number('SIDEVOICE_PROBE_MS'), healthy: number('SIDEVOICE_HEALTHY_MS'),
-    backoff: env.SIDEVOICE_BACKOFF_MS ? env.SIDEVOICE_BACKOFF_MS.split(',').map(Number) : undefined }).filter(([, value]) => value !== undefined));
-  return new Supervisor({
-    service: serviceKind, restored, log, timing,
-    async launch(launchId) {
-      ensureCoreDirectory(coreData(dataDir));
-      const bin = await ensureInstalled({ dataDir, env, log });
-      unlinkSocket(dataDir);
-      try { rmSync(failurePath(dataDir), { force: true }); } catch {}
-      return spawnCore(bin, coreArgs({ dataDir, env, launchId, idleExit: 0, roomCredential: credentialsPath }), { dataDir, env });
-    },
-    awaitReady: (handle, launchId, signal) => awaitReady(handle, { dataDir, launchId, signal }),
-    probe: async core => { const health = await localHealth(core.socket, 2000); return health?.status === 200 && health.body?.launch_id === core.launch_id ? health.body : null; },
-    async terminate(handle) { await (handle.terminate ? handle.terminate() : terminateCore(handle, { log })); unlinkSocket(dataDir); },
-    cause({ launchId, exit, key }) {
-      // Installing the core is part of starting it: a uv that is missing or cannot reach its index says so.
-      // A refusal made before spawning keeps its own key (`identity.unsafe-directory`…): it is the cause.
-      if (exit?.error?.key) return { key: exit.error.key, step: exit.error.key.split('.')[0], message: exit.error.message, detail: null, at: new Date().toISOString(), log_tail: [] };
-      const message = exit?.error?.message || '';
-      if (message === NO_UV) return { key: 'install.no-bundle', step: 'install', message, detail: null, at: new Date().toISOString(), log_tail: [] };
-      if (exit?.error && !exit.error.path && install(message)) return { key: install(message), step: 'install', message, detail: null, at: new Date().toISOString(), log_tail: [] };
-      return failureCause({ dataDir, launchId, exit, key });
-    },
-    /** A core left running — by a SIGKILLed supervisor, by a plain connector — is kept when it answers for its
-     *  own launch and is the version pinned; anything else running is ended before this one starts its own. */
-    async adopt() {
-      const found = await examineRunning(dataDir);
-      const fits = found.adopt && runsSelected(dataDir, env, found.adopt);
-      const leftover = found.terminate || (found.adopt && !fits ? found.adopt : null);
-      if (leftover) { log(`a core is running (pid ${leftover.pid}) that this supervisor does not keep: terminating it`); await terminateCore(leftover, { log }); unlinkSocket(dataDir); }
-      if (!fits) return null;
-      const adopted = found.adopt;
-      // Not a child: watched by its identity, and signalled only while it is still that launch.
-      const handle = { pid: adopted.pid, launch_id: adopted.launch_id, done: null };
-      handle.terminate = () => terminateCore({ pid: adopted.pid, launch_id: adopted.launch_id }, { log });
-      handle.exit = new Promise(resolve => {
-        const timer = setInterval(() => { if (!coreRunning(adopted)) { clearInterval(timer); resolve(handle.done = { code: null, signal: null, gone: true }); } }, 200);
-        timer.unref?.();
-      });
-      return { handle, core: found.adopt };
-    },
-    persist(snapshot) {
-      try { writePrivate(files.status, { ...snapshot, installed: existsSync(files.install), at: new Date().toISOString() }); } catch {}
-      coreChanged(snapshot);
-    },
-  });
+/** A core this connector does not start (the core job's): linked when it answers, and linked again when another launch
+ *  of it answers — a restart, an upgrade. Never started, signalled or adopted here. While none answers it is looked for
+ *  again with a bounded backoff (0.5 s, doubling, at most 5 s); while one does, every 2 s. */
+let followTimer = null, followDelay = 500;
+async function followCore() {
+  clearTimeout(followTimer); followTimer = null;
+  if (closed || external) return;
+  const ready = await serving(dataDir, 1500).catch(() => null);
+  if (ready && !compatible(ready)) {
+    coreError = lastError = t('install.incompatible');
+    coreFailure = { key: 'install.incompatible', message: coreError, at: new Date().toISOString() };
+  } else if (ready && ready.launch_id !== creds?.core?.launch_id) {
+    coreError = null; coreFailure = null;
+    creds = coreLink(ready);
+    log(`linking to this machine's core ${ready.version || '?'} on ${ready.socket} (pid ${ready.pid}, launch ${ready.launch_id})`);
+    if (link) { const old = link; link = null; old.close(); }
+    open();
+  }
+  followDelay = ready ? 2000 : Math.min(followDelay * 2, 5000);
+  if (closed) return;
+  followTimer = setTimeout(() => followCore().catch(error => log('looking for the core failed: ' + error.message)), followDelay);
+  followTimer.unref?.();
 }
 
-/** What the link does when the supervisor's core changes: a new launch is linked to (the welcome then
- *  re-registers every binding); a failure is what a conversation asking to join is told. */
-/** Five minutes running: the installation before this one is no longer what a rollback would need (§4.3 step 6). */
-let pruneTimer = null;
-function schedulePrune() {
-  clearTimeout(pruneTimer);
-  pruneTimer = setTimeout(() => { pruneInstallations(env, { log }).catch(error => log('removing previous installations failed: ' + error.message)); }, PRUNE_AFTER_MS);
-  pruneTimer.unref?.();
-}
-const PRUNE_AFTER_MS = 5 * 60_000;
-
-function coreChanged(snapshot) {
-  coreFailure = snapshot.state === 'failed' || snapshot.state === 'backoff' ? snapshot.failure : null;
-  coreError = snapshot.state === 'failed' ? (snapshot.failure?.message || snapshot.failure?.key || 'the core failed') : null;
-  if (snapshot.state === 'failed') { lastError = coreError; for (const wake of waking.splice(0)) wake(); }
-  if (snapshot.state !== 'running') clearTimeout(pruneTimer);
-  if (pendingJournal && (snapshot.state === 'running' || snapshot.state === 'failed')) settleJournal(snapshot).catch(error => log('settling the install transaction failed: ' + error.message));
-  if (snapshot.state !== 'running' || !supervisor?.core) return;
-  if (creds?.core?.launch_id === supervisor.core.launch_id) return;
-  schedulePrune();
-  creds = coreLink(supervisor.core);
-  log(`linking to this machine's core ${creds.core.version || '?'} on ${creds.core.socket} (pid ${creds.core.pid}, launch ${creds.core.launch_id})`);
-  if (link) { const old = link; link = null; old.close(); }
-  open();
-}
-
-/** A plain connector's core: a link that keeps failing to a core whose process is gone is a core to start
- *  again, and the link goes to that launch; the welcome re-registers every binding as after any reconnect.
- *  The supervisor's core is the state machine's business. */
+/** The link keeps failing: a core this connector started whose process is gone is started again, and the link goes to
+ *  that launch (the welcome re-registers every binding as after any reconnect); the core job's is looked for again now. */
 async function superviseCore() {
-  if (supervised || external || closed || coreStarting || Date.now() - coreCheckedAt < 2000) return;
+  if (external || closed || coreStarting || Date.now() - coreCheckedAt < 2000) return;
   coreCheckedAt = Date.now();
-  if (creds?.core && coreRunning(creds.core)) return;
+  if (!ownsCore) { followDelay = 500; return followCore(); }
+  if (creds?.core && coreRunning(dataDir, creds.core.pid)) return;
   log('the local core is gone; starting it again');
   const previous = creds?.core?.launch_id;
   const ready = await startCore();
@@ -393,8 +298,8 @@ async function superviseCore() {
 function open() {
   if (closed || link) return;
   if (!creds && external) creds = external;
-  // The supervisor's core links when it is running (`coreChanged`); a plain connector starts its own.
-  if (!creds) { if (!supervised) startCore().then(ready => { if (ready) open(); }); return; }
+  // A core this connector starts is started now; the core job's is linked when it answers (`followCore`).
+  if (!creds) { if (ownsCore) startCore().then(ready => { if (ready) open(); }); else if (!followTimer) followCore().catch(() => {}); return; }
   link = roomLink({
     origin: creds.room, connector_id: creds.connector_id, token: creds.token, agent: creds.agent,
     protocol: PROTOCOL, identity,
@@ -469,7 +374,7 @@ async function devicePairingCode() {
   if (!connected) await welcomed(CORE_WAIT_MS);
   // A first install still running is waited for, up to a bound: the code comes as soon as the core does.
   const waitedSince = Date.now();
-  while (!connected && !coreError && (coreComing() || installInProgress(dataDir)) && Date.now() - waitedSince < CORE_INSTALL_WAIT_MS) await welcomed(2000);
+  while (!connected && !coreError && ((await coreComing()) || installInProgress(dataDir)) && Date.now() - waitedSince < CORE_INSTALL_WAIT_MS) await welcomed(2000);
   if (!connected && !coreError) await welcomed(5000);   // started a moment ago: the link is on its way
   if (!connected) {
     if (coreError) throw new Error(coreError);
@@ -524,15 +429,11 @@ async function publish(speech) {
 async function asked(route, frame) {
   switch (route) {
     case 'input.deliver': {
-      // Handing over: not taken here. The core keeps it and delivers it to the supervisor.
-      if (handingOver) return { status: 'retry', detail: 'this connector is handing over to the node service' };
       const binding = bindings.get(frame.binding_id);
       if (!binding) return { status: 'unknown_binding' };
       // One delivery at a time per binding keeps the user's turns in order.
       const answer = (binding.chain || Promise.resolve()).then(() => handOver(binding, frame));
       binding.chain = answer.catch(() => {});
-      // Counted: a handover waits for every delivery under way to settle before it lets the bindings go.
-      deliveries.add(answer); answer.catch(() => {}).finally(() => deliveries.delete(answer));
       return answer;
     }
     case 'binding.close': {
@@ -629,9 +530,9 @@ function snapshot() {
 const PROBES = new Set(['status', 'node.status']);
 const engaged = () => [...clients].filter(client => client.engaged).length;
 
-/** A plain connector leaves once nothing has used it for a while; the supervisor never does. */
+/** A plain connector leaves once nothing has used it for a while; the connector job never does. */
 function scheduleExit() {
-  if (supervised || handingOver) return;
+  if (serviceMode) return;
   if (idleTimer) clearTimeout(idleTimer);
   idleTimer = setTimeout(() => { if (engaged() === 0 && bindings.size === 0) { log(`idle for ${idleMs} ms with no conversation; exiting`); shutdown(); } }, idleMs);
 }
@@ -642,172 +543,10 @@ async function shutdown(code = 0) {
   closed = true; clearTimeout(idleTimer);
   try { link?.close(); } catch {}
   server?.close();
-  // The supervisor's core is its child: it leaves with it (SIGTERM, 15 s, SIGKILL), and its socket after it.
-  if (supervisor) await supervisor.stop().catch(error => log('stopping the core failed: ' + error.message));
   releaseLock({ socket: true });
   process.exit(code);
 }
 
-/* ----- an install transaction under way, seen from the supervisor (§4.3, `install-txn.mjs`) ----- */
-
-/** The recovered transaction this supervisor runs, while it waits to be seen running: `{side, record}`. */
-let pendingJournal = null, journalDeadline = null;
-/** Recover a journal an installer left (unless an installer holds the lock: then it is the installer's). The
- *  artifacts are made so for the selected installation; if that is not this program, this supervisor hands over
- *  to it; if it is, the journal stays until this supervisor's core runs compatibly (`settleJournal`). */
-async function checkInstallJournal() {
-  if (!supervisor || !existsSync(files.journal)) return;
-  const release = await takeInstallLock(dataDir, log, { wait: false });
-  if (!release) return;
-  let outcome = null;
-  try { outcome = await recover(env, { mode: 'supervisor', log }); }
-  catch (error) { log('recovering the install transaction failed (it is kept): ' + error.message); }
-  finally { release(); }
-  if (!outcome) return;
-  if (outcome.outside) return recoverOutside();
-  if (!outcome.record || !sameCommand(outcome.record.command, ownCommand())) return handOff(outcome.record);
-  pendingJournal = outcome;
-  // Bounded like the installer's verification: not compatible and running by then, it is a failure.
-  clearTimeout(journalDeadline);
-  journalDeadline = setTimeout(() => settleJournal(supervisor.status(), { expired: true }).catch(error => log('settling the install transaction failed: ' + error.message)), VERIFY_DEADLINE_MS);
-  journalDeadline.unref?.();
-  if (supervisor.state === 'running' || supervisor.state === 'failed') await settleJournal(supervisor.status());
-}
-
-/** This supervisor's core ran (the journal goes) or cannot (back to the previous installation, handed over to). */
-async function settleJournal(snapshot, { expired = false } = {}) {
-  if (!pendingJournal) return;
-  // The installer's own gate (`selectionRuns`): this program, this runtime, a compatible api and link. Running but
-  // incompatible is a failure, as is not running compatibly by the deadline.
-  const verdict = selectionRuns({ ...snapshot, command: ownCommand() }, pendingJournal.record, dataDir);
-  const running = verdict.ok;
-  const failed = !running && (expired || snapshot.state === 'failed' || snapshot.state === 'running');
-  if (!running && !failed) return;
-  if (failed) log(`the selected installation does not run compatibly (${verdict.why}): rolling back`);
-  const release = await takeInstallLock(dataDir, log, { wait: false });
-  if (!release) return;
-  let settled;
-  try { settled = await settle(env, { running, failed }); }
-  finally { release(); }
-  clearTimeout(journalDeadline);
-  if (settled.outcome === 'done') { pendingJournal = null; log('the installation this supervisor runs is running: the install transaction is complete'); }
-  if (settled.outcome === 'rollback') { pendingJournal = null; await handOff(settled.record); }
-  if (settled.outcome === 'outside') { pendingJournal = null; recoverOutside(); }
-}
-
-/** While a journal selects nothing, or another installation, this supervisor serves nothing: its core is stopped
- *  and not started again — not by a façade's `node.ensure`, not by a restart. */
-let withheld = false;
-function withhold(why) {
-  if (withheld) return;
-  withheld = true;
-  log(`not serving: ${why}`);
-  supervisor?.stop();
-}
-
-/** The installation to recover to has no supervisor — nothing at all, or one with no service: this supervisor cannot
- *  reconcile that without stopping itself halfway. A helper outside its job (`service recover`) does it — stops this
- *  supervisor and its core by their verified identities (or the manager, if a definition goes), reconciles every
- *  artifact, starts and verifies a plain installation, and deletes the journal only then. Under systemd the helper
- *  is a transient unit, and nothing else: a child in this unit's cgroup would be killed by the very stop it does.
- *  One at a time; a helper that cannot be started, exits non-zero, says it failed or says nothing in time is a
- *  failure (`recover.helper-failed`, in `node.status`), tried again with backoff up to `RECOVER_ATTEMPTS` times —
- *  the journal kept meanwhile, and nothing served. */
-const RECOVER_ATTEMPTS = 5;
-let recovery = null, recoveryTimer = null;
-function recoverOutside() {
-  withhold('an install transaction selects an installation without this supervisor; it is finished outside it');
-  if (recovery?.state === 'recovering' || recoveryTimer) return;
-  if (recovery?.state === 'failed' && recovery.attempts >= RECOVER_ATTEMPTS) return;
-  const attempts = (recovery?.attempts ?? 0) + 1, launchedAt = Date.now();
-  recovery = { state: 'recovering', attempts, failure: recovery?.failure ?? null, next_retry_at: null, launchedAt };
-  log(`finishing the install recovery outside this supervisor (attempt ${attempts} of ${RECOVER_ATTEMPTS})`);
-  const failed = detail => { if (recovery?.launchedAt === launchedAt && recovery.state === 'recovering') helperFailed(detail); };
-  let job;
-  try { job = spawnOutsideJob(serviceKind, [...ownCommand(), 'service', 'recover', '--json'], env); }
-  catch (error) { return failed(error.message); }
-  job.once('error', error => failed(error.message));
-  job.once('exit', (code, signal) => { if (code !== 0) failed(`${serviceKind === 'systemd' ? 'systemd-run' : 'the helper'} exited with ${code ?? signal}`); });
-  // Its own outcome: the helper says how it ended (`service.mjs`), and must within a while.
-  const deadline = launchedAt + 2 * VERIFY_DEADLINE_MS + 30_000;
-  const watch = setInterval(() => {
-    if (recovery?.launchedAt !== launchedAt || recovery.state !== 'recovering') return clearInterval(watch);
-    let said = null; try { said = readJson(files.recovery); } catch {}
-    if (said && Date.parse(said.at) >= launchedAt - 1000) {
-      clearInterval(watch);
-      if (said.ok) { recovery = null; return resumeIfResolved(); }
-      return failed(said.error?.message ?? said.error?.key ?? '?');
-    }
-    if (Date.now() > deadline) { clearInterval(watch); failed('it said nothing of how it ended'); }
-  }, 250);
-  watch.unref();
-}
-function helperFailed(detail) {
-  const attempts = recovery?.attempts ?? 1;
-  const more = attempts < RECOVER_ATTEMPTS;
-  const delay = Number(env.SIDEVOICE_RECOVER_BACKOFF_MS || 2000) * 2 ** (attempts - 1);
-  const failure = { key: 'recover.helper-failed', message: t('recover.helper-failed', { detail }) };
-  recovery = { state: 'failed', attempts, failure, next_retry_at: more ? new Date(Date.now() + delay).toISOString() : null };
-  log(`${failure.message} ${more ? `Trying again in ${delay} ms.` : 'Not trying again.'}`);
-  if (more) {
-    recoveryTimer = setTimeout(() => {
-      recoveryTimer = null;
-      if (!existsSync(files.journal)) return resumeIfResolved();
-      checkInstallJournal().catch(error => log('recovering the install transaction failed (it is kept): ' + error.message));
-    }, delay);
-  }
-}
-/** The transaction resolved by someone else while this supervisor held back: it serves again if it is still the
- *  selected program, and leaves if not. */
-function resumeIfResolved() {
-  if (!withheld || existsSync(files.journal)) return;
-  let selected = null; try { selected = readJson(files.install); } catch {}
-  if (selected && sameCommand(selected.command, ownCommand())) { withheld = false; recovery = null; log('the install transaction is resolved: serving again'); supervisor.boot(); }
-  else { log('the install transaction is resolved, and this program is not selected: stopping'); shutdown(0); }
-}
-
-/** A supervisor starting while an install transaction is under way that is not its own to recover: one is, when a
- *  journal exists and another process holds the install lock — an installer, or a helper reconciling to nothing.
- *  It serves only with that holder's permit (the node it starts to verify, `install-txn.mjs`); otherwise it waits,
- *  bounded, for the transaction to end. Returns `{release, waited}` — `release` the install lock this supervisor
- *  then holds through its own boot, so no transaction starts beside it before it can be seen — or null. */
-const TXN_WAIT_MS = () => Number(env.SIDEVOICE_TXN_WAIT_MS || 2 * VERIFY_DEADLINE_MS + 30_000);
-function permitted() {
-  try {
-    const permit = readJson(files.permit), journal = readJson(files.journal), holder = readLock(installLockPath(dataDir));
-    return !!(permit && journal && permit.journal === (journal.id ?? journal.at) && holder?.pid === permit.pid && isProcess(permit.pid, { start: permit.start ?? null }));
-  } catch { return false; }
-}
-async function enterTransactionGate() {
-  const deadline = Date.now() + TXN_WAIT_MS();
-  let waited = false;
-  for (;;) {
-    const release = await takeInstallLock(dataDir, log, { wait: false });
-    if (release) return { release, waited };
-    if (!existsSync(files.journal) || permitted()) return { release: () => {}, waited };
-    if (!waited) log(`an install transaction is under way, held by another process (pid ${readLock(installLockPath(dataDir))?.pid ?? '?'}): waiting for it before serving`);
-    waited = true;
-    if (Date.now() > deadline) return null;
-    await wait(200);
-  }
-}
-
-/** The selected installation is another program: it takes over. Under a service manager, the definition (already
- *  rewritten for it) is loaded again by `service reload`, run by a helper outside this job — launchd reads a plist
- *  only when it is bootstrapped, and booting the job out ends this process. Detached, the selected program is
- *  started to wait for this one to leave (`--after`). Nothing selected: this supervisor stops. */
-async function handOff(record) {
-  if (!record) { log('no installation is selected any more: stopping'); return shutdown(0); }
-  log(`the selected installation is ${record.id} (${record.command.join(' ')}), not this program: handing over to it`);
-  withhold(`the selected installation is ${record.id}`);
-  // Another program's start: what this one spent of the budget is not that one's (as after a person's restart).
-  try { writePrivate(files.restart, { at: new Date().toISOString(), why: 'handover' }); } catch {}
-  const args = serviceKind === 'none' ? ['connector', '--supervise', '--after', String(process.pid)] : ['service', 'reload', '--json'];
-  const child = spawn(record.command[0], [...record.command.slice(1), ...args], { detached: true, stdio: 'ignore', env: launchEnvironment(record, env, { SIDEVOICE_SERVICE: serviceKind }) });
-  child.on('error', error => log('handing over failed: ' + error.message));
-  child.unref();
-  if (serviceKind === 'none') return shutdown(0);
-}
 function releaseLock({ socket }) {
   // The socket is ours to remove only while the lock is.
   if (!lockHold) return;
@@ -815,164 +554,9 @@ function releaseLock({ socket }) {
   lockHold.release(); lockHold = null;
 }
 
-/** `node.status` (SEAMS §4): the supervisor's state machine as it is, the calls fresh from the core; a plain
- *  connector says what it knows of the core it started or found. */
-async function nodeStatus() {
-  const installed = existsSync(files.install);
-  if (supervisor) {
-    if (supervisor.state === 'running' && supervisor.core) {
-      const health = await localHealth(supervisor.core.socket, 1000);
-      if (typeof health?.body?.calls === 'number') supervisor.calls = health.body.calls;
-    }
-    const status = supervisor.status();
-    const held = recovery ? { state: recovery.state, attempts: recovery.attempts, failure: recovery.failure, next_retry_at: recovery.next_retry_at } : null;
-    return { ...status, failure: status.failure ?? held?.failure ?? null, recovery: held, installed, supervisor: true, command: ownCommand() };
-  }
-  const core = creds?.core && !external && coreRunning(creds.core) ? creds.core : null;
-  const health = core ? await localHealth(core.socket, 1000) : null;
-  const state = core ? 'running' : coreStarting ? 'starting' : coreFailure ? 'failed' : 'stopped';
-  return { ok: true, state, since: null, attempts: 0, window_started: null, next_retry_at: null,
-    core: core ? { pid: core.pid, version: core.version ?? null, api: health?.body?.api ?? core.api ?? null, launch_id: core.launch_id ?? null } : null,
-    calls: health?.body?.calls ?? 0, failure: core ? null : coreFailure, service: 'none', installed, supervisor: false, command: ownCommand() };
-}
-
-/** The program this connector is — what an installation's `command` names when it is this one. */
-const ownCommand = () => [process.execPath, process.argv[1]];
-
-/** `node.restart`: the core stopped and started again — a person's restart, which closes the budget window,
- *  or a pairing written (`sidevoice pair`) that the core must start with. */
-async function nodeRestart() {
-  // Answered once the restart has begun (`starting`): the launch takes up to a minute, and `node.status` follows it.
-  if (supervisor) { if (!withheld) supervisor.restart(); return nodeStatus(); }
-  if (external) return nodeStatus();
-  // A plain connector's restarts, one at a time: a second never terminates what the first just started.
-  const run = plainRestarts.then(restartPlainCore, restartPlainCore);
-  plainRestarts = run.catch(() => {});
-  return run;
-}
-let plainRestarts = Promise.resolve();
-async function restartPlainCore() {
-  const running = creds?.core;
-  if (running && coreRunning(running)) await terminateCore(running, { log });
-  creds = null;
-  const ready = await startCore();
-  if (ready && link) { const old = link; link = null; old.close(); }
-  open();
-  return nodeStatus();
-}
-
-/* ----- handover (§4.2): a plain connector gives every binding, whole, to the supervisor ----- */
-
-const HANDOVER_SETTLE_MS = 5000;
-/** A restored binding whose façade does not come back for it within this long is let go — unless its
- *  delivery does not need a façade (an editor chat's card), which stays as any kept conversation does. */
-const REATTACH_MS = Number(process.env.SIDEVOICE_HANDOVER_REATTACH_MS || 60_000);
-
-/** The old connector's side: stop taking commands, let those in flight settle, flush the outbox, write every
- *  binding as `register` built it, tell each façade, close it without letting its bindings go, and leave. */
-async function yieldToSupervisor(requester) {
-  if (supervised) throw new Error('This connector is the node service; it does not hand over.');
-  handingOver = true; clearTimeout(idleTimer);
-  log(`a supervisor is taking over: settling ${inFlight.size} command(s), flushing ${outbox.length} queued speech`);
-  server.close();   // no new façade; the connected ones are told below
-  const settle = Promise.allSettled([...inFlight]);
-  await Promise.race([settle, wait(HANDOVER_SETTLE_MS)]);
-  // New turns are refused from now on (`retry`: the core keeps them and delivers them to the supervisor). Turns
-  // already accepted are let finish with the link still open, so each one's acknowledgement reaches the core —
-  // closing first would make the core take them back and deliver them a second time. What a delivery records (the
-  // turn it carried, the message the harness is to take) is then complete before anything is written.
-  await Promise.race([Promise.allSettled([...deliveries]), wait(HANDOVER_SETTLE_MS)]);
-  if (deliveries.size) log(`${deliveries.size} delivery(ies) still under way after ${HANDOVER_SETTLE_MS} ms: the core takes them back and delivers them again (at least once)`);
-  if (connected && outbox.length) await Promise.race([Promise.allSettled([...outbox].map(speech => publish(speech))), wait(HANDOVER_SETTLE_MS)]);
-  closed = true;
-  try { link?.close(); } catch {}
-  const record = { at: new Date().toISOString(), from_pid: process.pid,
-    // Which conversation each turn went to (a reply names the turn, not the conversation), and which messages
-    // were already reported read: the supervisor routes a reply to a turn delivered here, and reports nothing twice.
-    turns: [...turnsDelivered].map(([key, refs]) => [key, [...refs]]),
-    read: [...readReported],
-    bindings: [...bindings.values()].map(binding => ({
-      binding_id: binding.binding_id, client_ref: binding.client_ref, harness: binding.harness, thread: binding.thread, title: binding.title,
-      delivery: binding.delivery, inbound: binding.inbound, capabilities: binding.capabilities, experimental: binding.experimental,
-      engine: binding.engine, route: binding.route, owned: !!binding.owner, prepared: binding.prepared || null,
-      // What the conversation was doing: messages delivered and not yet seen taken, the turn under way, working or not.
-      pending: binding.pending ? [...binding.pending] : [], turn: binding.turn ?? null, working: binding.working ?? null })) };
-  writePrivate(files.handover, record);
-  log(`handover.json written: ${record.bindings.length} binding(s), ${outbox.length} speech frame(s) left in the outbox`);
-  // After the answer has gone: façades told and closed (their bindings are the supervisor's now), the
-  // watchers and the card bridge let go so the supervisor can take them, the lock released, gone.
-  setImmediate(() => {
-    for (const client of clients) {
-      if (client === requester) continue;
-      client.handedOver = true;
-      client.socket.end(JSON.stringify({ type: 'handover' }) + '\n');
-    }
-    for (const binding of bindings.values()) unwatch(binding);
-    releaseLock({ socket: false });
-    setTimeout(() => process.exit(0), 100);
-  });
-  return { ok: true, bindings: record.bindings.length };
-}
-
-/** The supervisor's side, finding a plain connector on the socket: ask it to hand over, wait until it is
- *  gone. False when the one holding the socket is itself a supervisor (then this one is redundant). */
-async function takeOver(owner) {
-  const pid = owner?.pid;
-  if (!connectorAlive(owner)) return true;   // gone meanwhile, or not provably anyone: the lock decides
-  log(`a connector (pid ${pid}) holds ${socketPath}: asking it to hand over`);
-  const answer = await new Promise(resolve => {
-    const socket = net.createConnection(socketPath);
-    let buffer = '';
-    const timer = setTimeout(() => { socket.destroy(); resolve({ ok: false, error: 'no answer' }); }, 15_000);
-    socket.on('error', error => { clearTimeout(timer); resolve({ ok: false, error: error.message }); });
-    socket.on('connect', () => socket.write(JSON.stringify({ id: 1, method: 'handover', params: {} }) + '\n'));
-    socket.on('data', chunk => {
-      buffer += chunk; const index = buffer.indexOf('\n'); if (index < 0) return;
-      clearTimeout(timer); socket.destroy();
-      try { resolve(JSON.parse(buffer.slice(0, index))); } catch { resolve({ ok: false, error: 'unreadable answer' }); }
-    });
-  });
-  if (!answer.ok && /node service/.test(answer.error || '')) return false;
-  // Already handing over (to another supervisor that asked first): it leaves by itself.
-  if (!answer.ok && !String(answer.error).startsWith('HANDOVER:')) {
-    // It cannot hand over (it answers nothing, or does not know how): asked to leave like any stop.
-    log(`the connector (pid ${pid}) did not hand over (${answer.error}); asking it to stop`);
-    signalVerified(pid, 'SIGTERM', { start: owner.start ?? null });
-  }
-  const deadline = Date.now() + 10_000;
-  while (connectorAlive(owner) && Date.now() < deadline) await wait(50);
-  if (connectorAlive(owner)) { signalVerified(pid, 'SIGKILL', { start: owner.start ?? null }); await wait(200); }
-  return true;
-}
-
-/** Every binding of `handover.json`, through the same code as `register`: watched, prepared (an editor chat's
- *  card bridge on the port its card knows), and — at the next welcome — joined to the core with the same
- *  `binding_id`, which the core takes as that binding coming back. Then the file goes. Before any façade. */
-async function restoreHandover() {
-  const record = readJson(files.handover);
-  if (!record) return;
-  for (const [key, refs] of record.turns || []) if (Array.isArray(refs)) turnsDelivered.set(key, new Set(refs));
-  for (const id of record.read || []) readReported.add(id);
-  for (const saved of record.bindings || []) {
-    if (!saved?.binding_id || !saved.client_ref || !saved.delivery?.kind) continue;
-    const { prepared, owned, pending, turn, working, ...fields } = saved;
-    const binding = { ...fields, owner: null, pending: new Map(Array.isArray(pending) ? pending : []), turn: turn ?? null };
-    if (typeof working === 'boolean') binding.working = working;
-    bindings.set(binding.binding_id, binding);
-    watch(binding);
-    await prepareBinding(binding, { port: prepared?.port ?? null });
-    if (binding.detachable) { binding.orphanedAt = Date.now(); keepOrphans(); }
-    else {
-      binding.ownerTimer = setTimeout(() => {
-        if (binding.owner || bindings.get(binding.binding_id) !== binding) return;
-        log(`${binding.thread} leaves: its façade did not come back after the handover`);
-        bindings.delete(binding.binding_id); unwatch(binding); send('binding.unregister', { binding_id: binding.binding_id }); scheduleExit();
-      }, REATTACH_MS);
-      binding.ownerTimer.unref?.();
-    }
-    log(`${binding.thread} restored from the handover as ${binding.binding_id}${owned ? ', waiting for its façade' : ' (kept without a façade)'}`);
-  }
-  try { unlinkSync(files.handover); } catch {}
+/** `node.status` (SEAMS §4): the node's state derived on read, as `service status --json` answers it. */
+function nodeStatus() {
+  return nodeStatusOf(env, { connectorRunning: true });
 }
 
 /** Conversations kept without a façade leave once their card has not been heard from for this long (or, never
@@ -996,8 +580,7 @@ function keepOrphans() {
   orphanTimer.unref?.();
 }
 /** What the harness must have open before anything is delivered (Cursor's editor: the view's bridge), for a
- *  binding that already exists — so a command right behind `register` finds it. The same for a new binding
- *  and for one restored after a handover, which asks for the port its card already knows. */
+ *  binding that already exists — so a command right behind `register` finds it. */
 async function prepareBinding(binding, { port = null } = {}) {
   const module = harnessFor(binding.harness);
   if (typeof module.prepare !== 'function') return null;
@@ -1051,7 +634,7 @@ async function command(client, input) {
       closedByRoom.delete(client_ref);   // joining again is the user's explicit request
       const existing = [...bindings.values()].find(b => b.client_ref === client_ref);
       if (existing) {
-        // The same conversation again — its façade after a handover, or a second voice_connect: only the owner
+        // The same conversation again — its façade after a reconnect, or a second voice_connect: only the owner
         // is attached; the binding, its watch and its preparation are the ones already there.
         Object.assign(existing, { owner: client, delivery, inbound, capabilities, experimental, route, orphanedAt: null });
         clearTimeout(existing.ownerTimer); existing.ownerTimer = null;
@@ -1099,9 +682,6 @@ async function command(client, input) {
     }
     case 'adopt': return adopt(client, params.client_ref) || { adopted: false };
     case 'node.status': return nodeStatus();
-    case 'node.ensure': await startCore(); return nodeStatus();
-    case 'node.restart': return nodeRestart();
-    case 'handover': return yieldToSupervisor(client);
     case 'status': return snapshot();
     case 'pair_device': return devicePairingCode();
     default: throw new Error('Unknown connector command');
@@ -1121,11 +701,8 @@ function serve(socket) {
       const line = buffer.slice(0, index); buffer = buffer.slice(index + 1);
       if (!line.trim()) continue;
       let input; try { input = JSON.parse(line); } catch { socket.write(JSON.stringify({ ok: false, error: 'Invalid JSON' }) + '\n'); continue; }
-      // Handing over: nothing new is started here; the façade asks the supervisor instead.
-      if (handingOver) { socket.write(JSON.stringify({ id: input.id, ok: false, error: 'HANDOVER: this connector is handing over to the node service' }) + '\n'); continue; }
       if (!PROBES.has(input.method) && !client.engaged) { client.engaged = true; clearTimeout(idleTimer); log(`façade attached (${engaged()} now)`); }
       const job = command(client, input);
-      inFlight.add(job); job.catch(() => {}).finally(() => inFlight.delete(job));
       job.then(result => { if (!socket.destroyed) socket.write(JSON.stringify({ id: input.id, ok: true, result }) + '\n'); })
         .catch(error => { if (!socket.destroyed) socket.write(JSON.stringify({ id: input.id, ok: false, error: error.message }) + '\n'); });
     }
@@ -1133,8 +710,6 @@ function serve(socket) {
   socket.on('error', () => {});
   socket.on('close', () => {
     clients.delete(client);
-    // Handed over: its conversations are the supervisor's now, not gone.
-    if (client.handedOver) return;
     if (client.engaged) log(`façade detached (${engaged()} left); dropping ${client.bindings.size} binding(s)`);
     // The façade is gone: so is every conversation it spoke for.
     for (const binding of client.bindings) {
@@ -1148,94 +723,46 @@ function serve(socket) {
   });
 }
 
-/** `sidevoice connector [--supervise]`. */
+/** `sidevoice connector [--service]`. */
 export async function run(argv = [], environment = process.env) {
   env = environment;
-  supervised = argv.includes('--supervise');
+  serviceMode = argv.includes('--service');
   dataDir = dataDirOf(env);
   files = nodeFiles(dataDir);
   socketPath = connectorSocketOf(env);
-  lockPath = socketPath + '.lock';
+  lockPath = connectorLockOf(env);
   outboxPath = path.join(dataDir, 'outbox.json');
   credentialsPath = roomCredentialPath(dataDir, env);
   idleMs = Number(env.SIDEVOICE_CONNECTOR_IDLE_MS || 15_000);
   // Who this machine is, said at every connection: the room keeps the latest and lists it.
   identity = machineIdentity(env);
   hostId = identity.host;
-  logPath = supervised ? files.serviceLog : env.SIDEVOICE_CONNECTOR_LOG || files.connectorLog;
-  // Which manager runs this supervisor: its definition says (`service.mjs`); detached, none.
-  serviceKind = supervised ? (env.SIDEVOICE_SERVICE || 'none') : 'none';
+  logPath = serviceMode ? files.connectorLog : env.SIDEVOICE_CONNECTOR_LOG || files.connectorLog;
   external = externalCore();
+  // The core is started here only where nobody else does: never by the connector job, never beside a core job.
+  ownsCore = !serviceMode && !installedService(env)?.core;
 
-  // A plain connector gives way to the supervisor; one started in the gap of a takeover (a façade's launcher
-  // finding no socket for a moment) is taken over in turn.
-  // Handed over to by another supervisor (`--after <pid>`): that one leaves first.
-  const after = Number(argv[argv.indexOf('--after') + 1]);
-  if (argv.includes('--after')) { const until = Date.now() + 30_000; while (isProcess(after) && Date.now() < until) await wait(100); }
   // Refused, not repaired: a data directory others can write into is not one to serve from (`secure-fs.mjs`).
   try { verifyPrivateDir(dataDir, { create: true }); }
   catch (error) { log(`not starting: ${error.message}`); process.exitCode = 78; return; }
-  // The lock identities, settled before anything written here is a directory's first use (`lockfile.mjs`): made in
-  // one nothing has used yet, and refused — never made again — in one that lost it.
-  try { for (const directory of new Set([dataDir, path.dirname(lockPath)])) ensureLockIdentity(directory); }
-  catch (error) { log(`not starting: ${error.message}`); process.exit(1); }
-  // What the lock file said before this process took the lock: a bare pid is an older connector's.
-  const before = readLock(lockPath);
-  // A supervisor taking over says so first. Between the plain connector letting go and this process taking the lock
-  // there is a gap, and a façade that just lost its connector gets one started through the launcher in exactly that
-  // gap: that one, seeing a live supervisor's intent, lets the lock go at once instead of serving.
-  // `--replace`: a plain connector of the installation just selected, taking over the one running (an upgrade with
-  // no service), the same way.
-  const taking = supervised || argv.includes('--replace');
-  // A transaction under way that is not this supervisor's: waited for before anything (`enterTransactionGate`).
-  let gate = null;
-  if (supervised) {
-    gate = await enterTransactionGate();
-    if (!gate) { log('the install transaction under way did not end in time: not serving'); process.exit(1); }
-    if (gate.waited) {
-      let selected = null; try { selected = readJson(files.install); } catch {}
-      if (!selected || !sameCommand(selected.command, ownCommand())) { log(`the install transaction ended, and ${selected ? 'another installation' : 'nothing'} is selected: not serving`); gate.release(); process.exit(0); }
-    }
+  // One connector serves the socket. A plain one that finds it held leaves; the job waits for the holder to go (a
+  // connector somebody started by hand), rather than exiting into its manager's restart loop.
+  for (let said = false; ;) {
+    let taken;
+    try { taken = await tryLock(lockPath, { kind: 'connector', env }); }
+    catch (error) { log(`not starting: ${error.message}`); process.exit(1); }
+    if (taken.held) { lockHold = taken; break; }
+    if (!serviceMode) { log(`a connector is already running (pid ${taken.owner?.pid ?? '?'}, lock ${lockPath}); this one exits`); process.exit(0); }
+    if (!said) { log(`another connector holds ${lockPath} (pid ${taken.owner?.pid ?? '?'}); waiting for it to leave`); said = true; }
+    await wait(1000);
   }
-  if (taking) { writePrivate(files.takeover, { pid: process.pid, start: selfIdentity().start ?? null, at: new Date().toISOString() }); await pause('takeover-intent'); }
-  for (let attempt = 0; !(await acquireLock()); attempt++) {
-    if (!taking || attempt >= 50) process.exit(0);
-    // The holder's record may not be written yet: asked again in a moment.
-    const owner = readLock(lockPath);
-    if (connectorAlive(owner) && !(await takeOver(owner))) { try { rmSync(files.takeover, { force: true }); } catch {} process.exit(0); }
-    await wait(50);
-  }
-  if (taking) { try { rmSync(files.takeover, { force: true }); } catch {} }
-  else {
-    let intent = null; try { intent = readJson(files.takeover); } catch {}
-    // Only a living writer's intent, and only for a while: a dead one (a zombie included) or one that never finished
-    // taking over does not keep connectors from serving.
-    const fresh = intent && Date.now() - (Date.parse(intent.at) || 0) < TAKEOVER_EXPIRY_MS;
-    if (fresh && isProcess(intent.pid, { start: intent.start ?? null })) { log(`a supervisor (pid ${intent.pid}) is taking over: not serving`); releaseLock({ socket: false }); process.exit(0); }
-  }
-  lockHold.legacyPid = before?.legacyPid ?? null;
-  await stopLegacyConnector();
-  // A person's stop holds for every connector, not only for the launcher that spawned it: one spawned just before
-  // the stop, and starting only now, does not serve. Only a supervisor starting (a login, `service start`) clears it.
-  if (!supervised && existsSync(files.stopped)) { log('Sidevoice is stopped on this machine: not serving'); releaseLock({ socket: false }); process.exit(0); }
-  if (supervised) {
-    // A supervisor starting is the next login, or a person's start: a stop no longer holds.
-    try { rmSync(files.stopped, { force: true }); } catch {}
-    const restored = readJson(files.status);
-    supervisor = superviseWith(restored);
-    // A restart a person asked the service manager for closes the window, as one asked of this process would.
-    if (existsSync(files.restart)) { supervisor.closeWindow(); try { rmSync(files.restart, { force: true }); } catch {} }
-    // An install transaction that died is reconciled before anything runs from it — unless an installer holds
-    // the lock now, which then does it. Looked at again while a journal waits.
-    await checkInstallJournal();
-    gate.release();
-    if (closed) return;
-    setInterval(() => { if (!pendingJournal) checkInstallJournal().catch(() => {}); }, 5000).unref();
-  }
-  log(`connector ${VERSION} starting${supervised ? ' as the node service (' + serviceKind + ')' : ''}: pid ${process.pid}, host ${hostId}, ${external ? 'core at ' + external.room : 'this machine\'s own core'}, socket ${socketPath}, log ${logPath}`);
+  // A person's stop holds for every connector the launcher started, not only for the launcher: one spawned just before
+  // the stop, and starting only now, does not serve. The job starting is a login or `service start`: it clears it.
+  if (serviceMode) rmSync(files.stopped, { force: true });
+  else if (existsSync(files.stopped)) { log('Sidevoice is stopped on this machine: not serving'); releaseLock({ socket: false }); process.exit(0); }
+  log(`connector ${VERSION} starting${serviceMode ? ' as the connector job' : ''}: pid ${process.pid}, host ${hostId}, ${external ? 'core at ' + external.room : ownsCore ? 'this machine\'s own core, started on demand' : 'this machine\'s core job'}, socket ${socketPath}, log ${logPath}`);
   loadOutbox();
   if (outbox.length) log(`${outbox.length} speech frame(s) waiting in the outbox`);
-  await restoreHandover();
   try { unlinkSync(socketPath); } catch {}
   server = net.createServer(serve);
   // Created 0600 (a umask that lets nothing through while it is bound), and checked: a socket another user could
@@ -1249,9 +776,6 @@ export async function run(argv = [], environment = process.env) {
   // Node hands a signal handler the signal's name: the handlers take nothing, and the exit is clean.
   process.on('SIGTERM', () => shutdown(0)); process.on('SIGINT', () => shutdown(0));
   scheduleExit();
-  // A core this process does not own the output of (a plain connector's detached core, an adopted one) writes
-  // straight into core.log: rotated in place on a clock while this process runs.
-  setInterval(() => rotate(path.join(dataDir, 'core.log')), Number(env.SIDEVOICE_LOG_ROTATE_MS || 10_000)).unref();
-  if (supervisor && !external && !withheld) supervisor.boot();
-  else open();
+  // The link opens now — the connector job's with no conversation needed: R2's agents reach this machine through it.
+  open();
 }

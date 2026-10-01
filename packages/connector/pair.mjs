@@ -11,7 +11,6 @@ import path from 'node:path';
 import { readTrustedJson, writePrivateFile } from './secure-fs.mjs';
 import { machineIdentity } from './identity.mjs';
 import { t } from './i18n.mjs';
-import { askConnector } from './service.mjs';
 
 export function dataDir(env = process.env) {
   return env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
@@ -98,13 +97,8 @@ export async function linkRoom(room, env = process.env) {
   return pair(base.origin, body.code, env);
 }
 
-/** The core starts with this machine's pairing (`--room-credential`): once a new one is written, the connector
- *  running now — the node service's supervisor, or a plain one — restarts it with it (`node.restart`). None
- *  running: the next core starts with it anyway. Nothing is started here. */
-async function restartCore(env) {
-  const answered = await askConnector('node.restart', {}, { env, timeout: 90_000 });
-  return answered && !answered.error ? answered.state : null;
-}
+/* The core follows this machine's pairing itself (`--room-credential`): it reads the file again when it changes, and
+ * links with a new pairing, a changed one, or none — so pairing restarts nothing (SEAMS §3). */
 
 /** `sidevoice pair <room-url> <code> [--json]`. */
 export async function runPair(argv = [], env = process.env) {
@@ -116,11 +110,9 @@ export async function runPair(argv = [], env = process.env) {
   }
   try {
     const result = await pair(room, code, env);
-    const core = await restartCore(env);
     if (json) console.log(JSON.stringify({ ok: true, room: result.origin, connector_id: result.connector_id }));
     else {
       console.log(`Paired with ${result.origin} as connector ${result.connector_id}; credential saved to ${result.file}`);
-      if (core) console.log(t('pair.core-restarted'));
     }
     return 0;
   } catch (error) {
@@ -136,7 +128,6 @@ export async function runLinkRoom(argv = [], env = process.env) {
   if (!room) { console.error('usage: sidevoice link-room <room-url>   (links this machine with that room; no code needed)'); return 2; }
   try {
     const result = await linkRoom(room, env);
-    await restartCore(env);
     console.log(`Linked with ${result.origin} as connector ${result.connector_id}; credential saved to ${result.file}`);
     return 0;
   } catch (error) { console.error(error.message); return 1; }

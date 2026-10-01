@@ -1,11 +1,10 @@
 /** Stdio MCP façade for one conversation. It holds no connection to the room: it gets the host's connector
  *  through the launcher and keeps one local connection to it for as long as this session lives.
  *
- *  It keeps, for every conversation it joined, the whole `register` it sent: when the connector hands over to
- *  the node service (§4.2), the façade connects to the supervisor and sends each one again, and the supervisor
- *  — which already restored the binding — only re-attaches it. A command the handover cut off is asked again
- *  once when asking twice changes nothing (`status`, `register`); `voice_say` is not: its speech is in the
- *  connector's outbox, which travels with the handover. */
+ *  It keeps, for every conversation it joined, the whole `register` it sent: when the connector goes — restarted by
+ *  its manager, upgraded, stopped and started — the façade connects again and sends each one again, with no tool
+ *  call needed. A command the lost connection cut off is asked again once when asking twice changes nothing
+ *  (`status`, `register`); `voice_say` is not: its speech is in the connector's durable outbox. */
 import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -55,7 +54,7 @@ let cardReads = 0;
 
 // ----- one persistent connection to the connector -----
 let connector = null;
-/** Asked again once, after a handover cut it off, only when asking twice is harmless. */
+/** Asked again once, after a lost connection cut it off, only when asking twice is harmless. */
 const RETRIED = new Set(['status', 'register']);
 async function rpc(method, params) {
   // A reconnection under way is waited for (briefly): a reply must not reach a connector that does not yet know
@@ -65,9 +64,9 @@ async function rpc(method, params) {
   catch (error) { if (!error.gone || !RETRIED.has(method)) throw error; return connector.rpc(method, params); }
 }
 
-/** The connection to the connector is gone — a handover, the node service restarted or upgraded, a stop and a
- *  start: one loop, never two, connects again through the launcher and registers every conversation this server
- *  joined, without waiting for a tool call — a voice turn may arrive before the agent calls anything. It backs off
+/** The connection to the connector is gone — the connector job restarted or upgraded, a stop and a start: one
+ *  loop, never two, connects again through the launcher and registers every conversation this server joined, without
+ *  waiting for a tool call — a voice turn may arrive before the agent calls anything. It backs off
  *  while there is no connector to reach, and a person's stop is waited out, never overridden (the launcher refuses
  *  to start anything then). It ends when every conversation is registered, or none is left. */
 let reconnecting = null, closing = false;
@@ -374,7 +373,7 @@ async function invoke(name, args, meta) {
 // ----- JSON-RPC over stdio -----
 /** `sidevoice mcp`. */
 export function run(argv = [], env = process.env) {
-  connector = connectorClient(env, { onHandover: connectionLost, onLost: () => { if (!closing) connectionLost(); } });
+  connector = connectorClient(env, { onLost: () => { if (!closing) connectionLost(); } });
   let input = '';
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', async chunk => {

@@ -43,7 +43,7 @@ await writeFile(bundle, code.replace(/^#!.*\n/, line => line + REQUIRE), { mode:
 
 // The modules inside read their own version from the `package.json` beside them, and that is as
 // true of the bundle as of the source it was built from. What kind of build it is travels there too: the
-// installer orders two builds of one version by it (`install-txn.mjs`) — `SIDEVOICE_CHANNEL` (`release` or
+// installer orders two builds of one version by it (`release.mjs`) — `SIDEVOICE_CHANNEL` (`release` or
 // `nightly`) and `SIDEVOICE_BUILD_SEQ` (CI's run number), stamped by CI; a build without them is a release, 0.
 const shipped = JSON.parse(await readFile(fileURLToPath(new URL('./package.json', here)), 'utf8'));
 if (process.env.SIDEVOICE_CHANNEL || process.env.SIDEVOICE_BUILD_SEQ) {
