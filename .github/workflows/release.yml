@@ -1,10 +1,9 @@
 name: Release
 
-# A release is a tag v<version>: the whole CI runs on that tag, the server image
-# is published under the version, the client goes to npm, and the GitHub release
-# is opened last, so it only ever describes things that were actually published.
+# A release is a tag v<version>: the whole CI runs on that tag, the client goes to
+# npm, and the GitHub release is opened last, so it only ever describes things
+# that were actually published.
 # Cutting one: scripts/version.sh set <version>, merge, then tag.
-# See docs/RELEASING.md. Pushes to main publish :latest from ci.yml.
 on:
   push:
     tags: ["v*"]
@@ -26,7 +25,6 @@ jobs:
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
-      packages: write
 
   npm:
     name: Client to npm
@@ -98,25 +96,12 @@ jobs:
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-          IMAGE: ghcr.io/${{ github.repository }}
-          IMAGE_DIGEST: ${{ needs.verify.outputs.image-digest }}
         run: |
           version="${GITHUB_REF_NAME#v}"
           previous=$(git describe --tags --abbrev=0 "$GITHUB_REF_NAME^" 2>/dev/null || git rev-list --max-parents=0 HEAD)
           notes=$(mktemp)
           scripts/release-notes.sh "$previous" "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" > "$notes"
           cat >> "$notes" <<NOTES
-          ## Run the room
-
-          \`\`\`sh
-          docker run -d --name sidevoice -p 127.0.0.1:8767:8767 -v sidevoice-data:/data \\
-            $IMAGE:$version
-          \`\`\`
-
-          Pinned by digest: \`$IMAGE@$IMAGE_DIGEST\` (linux/amd64 and linux/arm64).
-          Room data lives in \`/data\`. The room has no access control: put it
-          behind a proxy that adds TLS and authentication before exposing it.
-
           ## Connect a conversation
 
           On the machine where your agent runs:
