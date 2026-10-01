@@ -82,7 +82,9 @@ function coreLink(ready) {
  *  start time — says which connector holds the socket; a pid alone never does. */
 let lockHold = null;
 async function acquireLock() {
-  const taken = await tryLock(lockPath, { kind: 'connector' });
+  let taken;
+  try { taken = await tryLock(lockPath, { kind: 'connector' }); }
+  catch (error) { log(`not starting: ${error.message}`); process.exit(1); }
   if (taken.held) { lockHold = taken; return true; }
   if (!supervised) log(`a connector is already running (pid ${taken.owner?.pid ?? '?'}, lock ${lockPath}); this one exits`);
   return false;

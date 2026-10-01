@@ -17,13 +17,15 @@
 import net from 'node:net';
 import path from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
-import { closeSync, constants, ftruncateSync, linkSync, mkdirSync, openSync, realpathSync, unlinkSync, writeSync } from 'node:fs';
-import { selfIdentity } from './proc.mjs';
+import { closeSync, constants, ftruncateSync, linkSync, mkdirSync, openSync, readdirSync, realpathSync, unlinkSync, writeSync } from 'node:fs';
+import { isProcess, selfIdentity } from './proc.mjs';
+import { keyed } from './i18n.mjs';
 import { readTrusted, writePrivateFile } from './secure-fs.mjs';
 import { pause } from './testpoint.mjs';
 
 const DARWIN_O_EXLOCK = 0x20, DARWIN_O_NONBLOCK = 0x4;
 const uid = () => (typeof process.getuid === 'function' ? process.getuid() : 0);
+const safeList = directory => { try { return readdirSync(directory); } catch { return []; } };
 
 /** The holder's record, or `null` when there is none, or `{unreadable: true}` (another format — the bare pid an
  *  older connector wrote, kept as `legacyPid` — or a half-written one): information only. */
@@ -44,6 +46,14 @@ export function lockSalt(directory) {
   const read = () => { const text = readTrusted(file, { checkDir: false }); return text && /^[0-9a-f]{32}$/.test(text.trim()) ? text.trim() : null; };
   const existing = read();
   if (existing) return existing;
+  // The salt is this directory's lock identity. Made again while a holder lives, it would give a second name — a
+  // second lock beside the one held. Lost while held, it is an error until those holders are gone.
+  for (const name of safeList(directory).filter(entry => entry.endsWith('.lock'))) {
+    const owner = readLock(path.join(directory, name));
+    if (owner && !owner.unreadable && isProcess(owner.pid, { start: owner.start ?? null })) {
+      throw keyed('identity.lock-salt-missing', { path: file, pid: owner.pid, lock: name });
+    }
+  }
   const temporary = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
   writePrivateFile(temporary, randomBytes(16).toString('hex'));
   try { linkSync(temporary, file); } catch (error) { if (error.code !== 'EEXIST') throw error; }

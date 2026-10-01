@@ -88,6 +88,7 @@ export const en = {
   'install.reconcile-failed': 'After installing, {what} does not point at the selected installation.',
   'service.unsafe-value': 'A value for the service definition ({what}) contains a control character; nothing was written.',
   'identity.unsafe-file': 'The Sidevoice file {path} is not safe to use ({why}): it must be a regular file owned by you that nobody else can write.',
+  'identity.lock-salt-missing': 'The lock identity of this machine ({path}) is gone while {lock} is held (pid {pid}): stop Sidevoice (sidevoice service stop) and try again.',
   'command.unknown': 'Unknown command: {command}.',
   'pair.usage': 'usage: sidevoice pair <room-url> <pairing-code> [--json]   (the code is shown in the room under "Emparejar máquina")',
 

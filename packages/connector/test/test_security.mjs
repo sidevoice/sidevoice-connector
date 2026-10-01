@@ -66,7 +66,7 @@ function contender(file, kind, log, name, { hold = 300, hooksDir = null, forever
       const taken = await tryLock(${JSON.stringify(file)}, { kind: ${JSON.stringify(kind)} });
       if (taken.held) {
         appendFileSync(${JSON.stringify(log)}, '${name} in ' + Date.now() + '\\n');
-        if (${forever}) await new Promise(() => {});
+        if (${forever}) await new Promise(() => setInterval(() => {}, 60_000));   // the lock is unref'd: keep this holder alive
         await new Promise(r => setTimeout(r, ${hold}));
         appendFileSync(${JSON.stringify(log)}, '${name} out ' + Date.now() + '\\n');
         taken.release(); break;
@@ -258,4 +258,32 @@ test('lock names: another user cannot work out a lock\'s abstract name — a squ
     const second = node.start([]);
     assert.equal(await exited(second), 0);
   } finally { for (const server of squatters) server.close(); node.stop(); }
+});
+
+test('lock salt: removed while its lock is held, it is not made again beside the holder — install and connector refuse with identity.lock-salt-missing until the holder is gone', { skip: process.platform !== 'linux' && 'the salt names Linux abstract sockets' }, async () => {
+  // The install lock, held by another process.
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'sv-salt-'));
+  const file = path.join(dir, 'install.lock'), log = path.join(dir, 'order.log');
+  const holder = contender(file, 'install', log, 'A', { forever: true });
+  await until(() => existsSync(log));
+  rmSync(path.join(dir, 'lock-salt'));
+  const { tryLock } = await import('../lockfile.mjs');
+  await assert.rejects(tryLock(file, { kind: 'install' }), error => error.key === 'identity.lock-salt-missing');
+  assert.equal(existsSync(path.join(dir, 'lock-salt')), false, 'not made again');
+  holder.kill('SIGKILL'); await exited(holder);
+  const taken = await tryLock(file, { kind: 'install' });
+  assert.equal(taken.held, true, 'with no holder left, a new identity is made');
+  taken.release();
+  // The connector lock, held by a running supervisor.
+  const node = supervisedNode();
+  try {
+    const supervisor = node.start();
+    await node.status(s => s.state === 'running');
+    rmSync(path.join(node.dataDir, 'lock-salt'));
+    const second = node.start([]);
+    assert.equal(await exited(second), 1, 'refused, not a second lock');
+    assert.match(second.stderrText, /lock identity .* is gone while connector\.sock\.lock is held/);
+    assert.equal(lockOf(node).pid, supervisor.pid);
+    assert.equal(existsSync(path.join(node.dataDir, 'lock-salt')), false);
+  } finally { node.stop(); }
 });
