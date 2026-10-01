@@ -5,7 +5,7 @@
  *  The code comes from the room's page ("Emparejar máquina"), carried by the person (`sidevoice pair`,
  *  `voice_pair`), or this machine asks the room for one itself (`sidevoice link-room`). Registering with a
  *  room is open by decision: a room is a relay and grants nothing by itself — which device may use this
- *  machine is this machine's own pairing (`docs/DEVICE_PAIRING.md`). The conversation never asks the room
+ *  machine is this machine's own pairing (sidevoice-core's `server/devices.py`). The conversation never asks the room
  *  for a code: linking a room is still the person's act, by hand. */
 import os from 'node:os';
 import path from 'node:path';
@@ -16,7 +16,7 @@ export function dataDir(env = process.env) {
   return env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
 }
 
-/** The hosts the operator named as reachable in clear: `SIDEVOICE_TRUSTED_CLUSTER_HOSTS`, comma-separated. An
+/** The hosts whoever runs this machine named as reachable in clear: `SIDEVOICE_TRUSTED_CLUSTER_HOSTS`, comma-separated. An
  *  entry starting with a dot is a suffix (`.svc.cluster.local`), any other one exact host. Empty by default. */
 export function trustedClusterHosts(env = process.env) {
   return String(env.SIDEVOICE_TRUSTED_CLUSTER_HOSTS || '').split(',').map(entry => entry.trim().toLowerCase())
@@ -24,8 +24,8 @@ export function trustedClusterHosts(env = process.env) {
 }
 
 /** Where a credential may travel in clear: loopback, and the hosts in `SIDEVOICE_TRUSTED_CLUSTER_HOSTS` — the same
- *  rule sidevoice-core applies when it dials the room. Listing a host there is the operator saying the network to
- *  it is theirs (a cluster's pod network) and that whatever can read that network may read the credential: a host
+ *  rule sidevoice-core applies when it dials the room. Listing a host there is whoever runs this machine saying the
+ *  network to it is theirs (a cluster's pod network) and that whatever can read that network may read the credential: a host
  *  name proves nothing about where it resolves, so no spelling is trusted by default. Anything else — a private
  *  IP or a cluster service name included — needs TLS. */
 export function plaintextAllowed(hostname, env = process.env) {

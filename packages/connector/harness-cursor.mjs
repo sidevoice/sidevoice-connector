@@ -18,8 +18,8 @@
  *  under `TMUX_TMPDIR=/tmp`) and tags the session with the chat it runs (`@cursor_chat_id`). The voice
  *  message is pasted into that pane as a bracketed paste — the CLI's input turns bracketed paste on and
  *  keeps a pasted text whole, newlines included — and Enter sends it. It types where the person types:
- *  both at once would mix, which the operator accepted. Any other chat declares delivery unsupported.
- *  See docs/HARNESS_CONTRACT.md, "Cursor". Read from cursor-agent 2026.09.28-64d2043; not yet seen live. */
+ *  both at once would mix, an accepted trade-off. Any other chat declares delivery unsupported.
+ *  The contract is `harness-contract.mjs`. Read from cursor-agent 2026.09.28-64d2043; not yet seen live. */
 import { execFile, execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, statSync } from 'node:fs';

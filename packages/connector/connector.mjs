@@ -331,7 +331,7 @@ async function joinRoom(binding, timeout = 10_000) {
   return binding.registration ?? enrol(binding);
 }
 
-/** A one-time code for pairing a device with this machine (`docs/DEVICE_PAIRING.md`). The core issues it
+/** A one-time code for pairing a device with this machine (sidevoice-core's `server/devices.py`). The core issues it
  *  and keeps the devices; this only asks, starting the core first as a join would. Whether the room will
  *  have this machine does not matter here: a device pairs with the machine, not with the room. */
 const CORE_WAIT_MS = Number(process.env.SIDEVOICE_CORE_WAIT_MS || 30_000);

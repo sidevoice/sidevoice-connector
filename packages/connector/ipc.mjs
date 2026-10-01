@@ -54,7 +54,7 @@ export function connectorClient(env = process.env) {
       await new Promise(r => setTimeout(r, 100));
       try { return await connect(); } catch {}
     }
-    throw new Error('The Sidevoice connector did not start (is this host paired? see docs/INSTALL.md)');
+    throw new Error('The Sidevoice connector did not start (is this host paired?)');
   }
 
   async function rpc(method, params) {

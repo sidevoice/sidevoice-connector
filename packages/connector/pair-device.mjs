@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /** A one-time code for pairing a device — the desktop app, a browser — with this machine
- *  (`docs/DEVICE_PAIRING.md`). The node issues it and keeps the devices; this asks for one through the
+ *  (sidevoice-core's `server/devices.py`). The node issues it and keeps the devices; this asks for one through the
  *  connector (`pair_device`, which starts the core if it is not running) and says it the way a person
  *  can use it: the code to paste, the same code as a QR, how long it is valid, and where to paste it.
  *

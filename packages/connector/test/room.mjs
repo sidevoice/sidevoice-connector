@@ -1,6 +1,6 @@
 /** A room, for the connector's tests: the real Socket.IO server the real room runs, on the path and
  *  in the namespace this package knows. The stand-in is the room's behaviour, never its transport —
- *  a hand-written server here would be a second implementation of what #70 stopped maintaining.
+ *  a hand-written server here would be a second implementation of the transport, kept by hand.
  *
  *  It can be stopped and started again on the same port, which is how a connector's reconnection,
  *  its re-registration and its outbox are put under real conditions. */

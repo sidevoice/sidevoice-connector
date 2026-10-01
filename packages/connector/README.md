@@ -31,18 +31,17 @@ The client side. One bin (`sidevoice`), these entry points:
 - `pair-device` — prints a one-time code (and a QR of it) that pairs a device — the
   desktop app, a browser — with this machine, starting the core if needed; the same
   as the conversation's `voice_pair_device`. The core issues it and keeps the devices
-  ([`docs/DEVICE_PAIRING.md`](../../docs/DEVICE_PAIRING.md)); the person pastes it in
+  (sidevoice-core's `server/devices.py`); the person pastes it in
   the app under Máquinas → Emparejar.
 
 Harness modules implement one contract (`harness-contract.mjs`): delivery,
 inbound inspection, mechanical working state (polled or lifecycle-backed), end-of-turn reporting and session
 identity. Every capability is explicitly `supported` or `unsupported`; an old
 or malformed declaration becomes `unknown`, never false. Claude Code, Codex, the
-Cursor CLI and generic HTTP each have one module. See the repository's
-[`docs/HARNESS_CONTRACT.md`](../../docs/HARNESS_CONTRACT.md).
+Cursor CLI and generic HTTP each have one module (`harness-*.mjs`).
 
-The conversations live in the core, not in the hosted room (since 2026-09-30,
-see [`docs/RENDEZVOUS.md`](../../docs/RENDEZVOUS.md)). The connector links to the
+The conversations live in the core, not in the hosted room (the core's side of
+the room is sidevoice-core's `server/rendezvous.py`). The connector links to the
 core over loopback with the credential the core wrote in `~/.sidevoice/core/core.json`;
 the core dials the room with this machine's pairing and tells the connector how
 that goes (`node.rendezvous`: reachable, or refused because the pairing was
@@ -71,7 +70,6 @@ so installing it copies files and fetches nothing. Tests run on the source:
 `node --test test/test_connector.mjs` (`test_core.mjs` covers the install and
 supervision against a fake `uv` and a fake core); sidevoice-core's
 `test_connector_interop.py` runs this connector for real against the core, from
-the checkout and from the bundle, and `apps/server/tests/test_rendezvous_e2e.py`
-runs it end to end through the room. `SIDEVOICE_CORE_WHEEL=<wheel> npm run build`
+the checkout and from the bundle. `SIDEVOICE_CORE_WHEEL=<wheel> npm run build`
 puts the pinned core's wheel inside `dist/core/`, so the published package
 installs it without any index.
