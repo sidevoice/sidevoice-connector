@@ -1,28 +1,26 @@
-/** The install transaction (§4.3): which candidate replaces which installation; an installer killed after each of
- *  its side effects — inside a registration's own replacement too — and the machine put back together; installers
- *  that overlap; a selection that cannot run, undone (to nothing, after a first install); and a supervisor that
- *  finds a transaction under way. Interleavings are held at pause points (`testpoint.mjs`), never raced. */
+/** Installing, updating and rolling back (§2.4): which candidate replaces which release; an installer killed after each
+ *  step of a switch, and the machine whole either way; installers that overlap; a release that does not run, flipped
+ *  back to the previous one — by the installer, by the installer run again after it was killed, or by a person
+ *  (`sidevoice rollback`). Real built packages, the fake core, a stand-in systemd; points crashed at
+ *  (`testpoint.mjs`), never raced. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { decide, recover } from '../install-txn.mjs';
-import { unitText } from '../service.mjs';
-import { ensureLockIdentity } from '../lockfile.mjs';
-import { supervisedNode } from './test_core.mjs';
+import { decide } from '../release.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const packageDir = path.join(here, '..');
 const fakeCore = path.join(here, 'fake-sidevoice-core.mjs');
+const fakeManager = path.join(here, 'fake-service-manager.mjs');
 const wait = ms => new Promise(r => setTimeout(r, ms));
-async function until(check, timeout = 30_000) { const start = Date.now(); while (Date.now() - start < timeout) { const value = await check(); if (value) return value; await wait(50); } throw new Error('timed out waiting'); }
-const exited = child => new Promise(resolve => (child.exitCode !== null || child.signalCode !== null ? resolve(child.exitCode) : child.once('exit', code => resolve(code))));
+const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
 test('versions: higher replaces, lower never does, and the same version only as a later nightly build', () => {
-  const at = (connector, channel = 'release', build_seq = 0) => ({ connector, channel, build_seq, command: ['node', `/c/${connector}/${build_seq}`] });
+  const at = (connector, channel = 'release', build_seq = 0) => ({ id: connector, connector, channel, build_seq });
   assert.equal(decide(null, at('0.6.0')), 'install');
   assert.equal(decide(at('0.6.0'), at('0.7.0')), 'upgrade');
   assert.equal(decide(at('0.7.0'), at('0.6.0')), 'noop', 'never a downgrade: the app and npx converge on the higher');
@@ -32,76 +30,15 @@ test('versions: higher replaces, lower never does, and the same version only as 
   assert.equal(decide(at('0.6.0', 'nightly', 9), at('0.6.0', 'nightly', 9)), 'noop');
   assert.equal(decide(at('0.6.0', 'nightly', 9), at('0.6.0', 'nightly', 7)), 'noop', 'two builds never replace each other in a loop');
   assert.equal(decide(at('0.6.10'), at('0.6.9')), 'noop', 'numerically, not as text');
-  assert.equal(decide(at('0.6.0'), { ...at('0.6.0'), channel: 'source', command: ['node', '/checkout/cli.mjs'] }), 'upgrade', 'a checkout points everything at itself');
+  const source = { ...at('0.6.0', 'source'), id: '0.6.0-source', source: '/checkout' };
+  assert.equal(decide(at('0.6.0'), source), 'upgrade', 'a checkout selects itself');
+  assert.equal(decide(source, source), 'noop');
 });
 
-/** A stand-in for `claude` that keeps what it was told: `mcp get` answers with the entry `mcp add` wrote. */
-
-/** A stand-in for `claude` that keeps what it was told: `mcp get` answers with the entry `mcp add` wrote.
- *  `FAKE_CLAUDE_FAIL_ADD` makes `add` fail. */
-function fakeClaude(dir) {
-  const bin = path.join(dir, 'claude'), entry = path.join(dir, 'claude-entry.txt');
-  writeFileSync(bin, `#!/bin/sh
-case "$2" in
-  get) [ -s "${entry}" ] && cat "${entry}" || exit 1 ;;
-  remove) rm -f "${entry}" ;;
-  add) [ -n "$FAKE_CLAUDE_FAIL_ADD" ] && { echo "add refused" >&2; exit 1; }; shift 6; cmd="$1"; shift; printf 'sidevoice:\\n  Scope: User config\\n  Type: stdio\\n  Command: %s\\n  Args: %s\\n' "$cmd" "$*" > "${entry}" ;;
-esac
-`, { mode: 0o755 });
-  return { bin, entry, line: () => { try { const text = readFileSync(entry, 'utf8'); return `${text.match(/Command: (.*)/)[1]} ${text.match(/Args: (.*)/)[1]}`; } catch { return null; } } };
-}
-
-/** A hooks directory: crash or pause points armed. */
-function hooks({ crash = [], pause = [] } = {}) {
-  const dir = mkdtempSync(path.join(os.tmpdir(), 'sv-hooks-'));
-  for (const point of crash) writeFileSync(path.join(dir, `crash-${point}`), '');
-  for (const point of pause) writeFileSync(path.join(dir, `pause-${point}`), '');
-  return { dir, paused: point => until(() => existsSync(path.join(dir, `paused-${point}`))), resume: point => writeFileSync(path.join(dir, `resume-${point}`), '') };
-}
-
-/** A machine with an older installation (`0.5.0`): its copy under the copies directory, its unit (a systemd that
- *  answers everything), its Claude Code and Cursor entries and `install.json`, all pointing at it — and this
- *  checkout's package as the candidate. */
-function upgradeMachine() {
-  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-txn-'));
-  const dataDir = path.join(home, '.sidevoice'), copies = path.join(home, 'xdg', 'sidevoice');
-  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-  ensureLockIdentity(dataDir);   // as the first lock taken in it left it
-  const claude = fakeClaude(home);
-  const oldCli = path.join(copies, '0.5.0', 'dist', 'cli.mjs');
-  mkdirSync(path.dirname(oldCli), { recursive: true });
-  writeFileSync(oldCli, '// the previous installation\n');
-  const from = { id: '0.5.0', connector: '0.5.0', core: '0.1.0', channel: 'release', build_seq: 0, sha256: null, runtime: 'uv', service: 'systemd',
-    copy: path.join(copies, '0.5.0'), command: [process.execPath, oldCli], by: 'cli', at: '2026-09-30T10:00:00Z' };
-  writeFileSync(path.join(dataDir, 'install.json'), JSON.stringify(from), { mode: 0o600 });
-  const unit = path.join(home, '.config', 'systemd', 'user', 'sidevoice-node.service');
-  mkdirSync(path.dirname(unit), { recursive: true });
-  writeFileSync(unit, unitText({ program: [...from.command, 'connector', '--supervise'], log: path.join(dataDir, 'node-service.log'), environment: {} }));
-  mkdirSync(path.join(home, '.cursor'));
-  writeFileSync(path.join(home, '.cursor', 'mcp.json'), JSON.stringify({ mcpServers: { other: { command: 'x' }, sidevoice: { command: 'node', args: [oldCli, 'mcp'] } } }));
-  execFileSync(claude.bin, ['mcp', 'add', '--scope', 'user', 'sidevoice', '--', 'node', oldCli, 'mcp']);
-  const env = { ...process.env, HOME: home, XDG_DATA_HOME: path.join(home, 'xdg'), XDG_CONFIG_HOME: path.join(home, '.config'), SIDEVOICE_DATA_DIR: dataDir,
-    SIDEVOICE_CLAUDE_BIN: claude.bin, SIDEVOICE_INSTALL_FROM_SOURCE: '0', SIDEVOICE_SERVICE_MANAGER: 'systemd', SIDEVOICE_SYSTEMCTL: '/bin/true' };
-  for (const key of ['SIDEVOICE_URL', 'SIDEVOICE_CONNECTOR_ID', 'SIDEVOICE_CONNECTOR_TOKEN', 'SIDEVOICE_CORE_BIN', 'SIDEVOICE_TEST_HOOKS']) delete env[key];
-  const version = JSON.parse(readFileSync(path.join(packageDir, 'package.json'), 'utf8')).version;
-  const newCli = path.join(copies, version, 'dist', 'cli.mjs');
-  /** Where every artifact points: the copy each one runs. */
-  const artifacts = () => ({
-    install: existsSync(path.join(dataDir, 'install.json')) ? JSON.parse(readFileSync(path.join(dataDir, 'install.json'), 'utf8')).command[1] : null,
-    unit: existsSync(unit) ? readFileSync(unit, 'utf8').match(/^ExecStart="[^"]*" "([^"]*)"/m)[1] : null,
-    claude: claude.line()?.split(' ')[1] ?? null,
-    cursor: JSON.parse(readFileSync(path.join(home, '.cursor', 'mcp.json'), 'utf8')).mcpServers.sidevoice?.args[0] ?? null,
-  });
-  const install = (more = {}, args = ['--harness', 'claude', '--no-core']) => spawnSync(process.execPath, [path.join(packageDir, 'cli.mjs'), 'install', ...args], { env: { ...env, ...more }, encoding: 'utf8' });
-  return { home, dataDir, env, from, oldCli, newCli, copies, unit, claude, artifacts, install,
-    cursorOther: () => JSON.parse(readFileSync(path.join(home, '.cursor', 'mcp.json'), 'utf8')).mcpServers.other };
-}
-
-/** This package built for real — `build.mjs`, stamped as CI stamps it — and copied to stand as a second package,
- *  as the app's bundled connector against npx's. */
+/** This package built for real — `build.mjs`, stamped as CI stamps it — and copied to stand as another package, as
+ *  the app's bundled connector against npx's, or one version against the next. */
 function builtAs(version, stamp = {}) {
   const root = mkdtempSync(path.join(os.tmpdir(), 'sv-pkg-'));
-  // The real build, with the stamp CI gives it; only the version is changed afterwards, as a release bump would.
   execFileSync(process.execPath, [path.join(packageDir, 'build.mjs')], { env: { ...process.env, ...stamp }, stdio: 'ignore' });
   cpSync(path.join(packageDir, 'dist'), path.join(root, 'dist'), { recursive: true });
   for (const manifest of [path.join(root, 'dist', 'package.json'), path.join(root, 'package.json')]) {
@@ -111,78 +48,211 @@ function builtAs(version, stamp = {}) {
   execFileSync(process.execPath, [path.join(packageDir, 'build.mjs')], { stdio: 'ignore' });   // the checkout's dist as it was
   return path.join(root, 'dist', 'cli.mjs');
 }
-const installWith = (cli, env) => new Promise(resolve => {
-  const child = spawn(process.execPath, [cli, 'install', '--no-agents', '--no-core', '--json'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
-  let out = ''; child.stdout.on('data', d => { out += d; });
-  child.on('exit', code => resolve({ code, ...JSON.parse(out.trim().split('\n').at(-1)) }));
-});
 
-test('concurrent installers — two genuinely built packages, the app\'s and npx\'s — converge on the higher version, and same-version nightlies on the higher build', async () => {
-  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-conc-'));
-  const env = { ...process.env, HOME: home, XDG_DATA_HOME: path.join(home, 'xdg'), SIDEVOICE_DATA_DIR: path.join(home, '.sidevoice'), SIDEVOICE_INSTALL_FROM_SOURCE: '0', SIDEVOICE_SERVICE_MANAGER: 'none' };
-  const app = builtAs('0.6.0'), npx = builtAs('0.7.0');
-  const [a, b] = await Promise.all([installWith(app, env), installWith(npx, env)]);
-  assert.equal(a.ok && b.ok, true);
-  const installed = JSON.parse(readFileSync(path.join(env.SIDEVOICE_DATA_DIR, 'install.json'), 'utf8'));
-  assert.equal(installed.connector, '0.7.0');
-  assert.equal((await installWith(app, env)).action, 'noop');
-  assert.equal((await installWith(npx, env)).action, 'noop');
-  // Same version, stamped by the build as CI stamps a nightly: the higher run number wins, whichever runs last.
-  const home2 = mkdtempSync(path.join(os.tmpdir(), 'sv-conc-'));
-  const env2 = { ...env, HOME: home2, XDG_DATA_HOME: path.join(home2, 'xdg'), SIDEVOICE_DATA_DIR: path.join(home2, '.sidevoice') };
-  const older = builtAs('0.6.0', { SIDEVOICE_CHANNEL: 'nightly', SIDEVOICE_BUILD_SEQ: '10' }), newer = builtAs('0.6.0', { SIDEVOICE_CHANNEL: 'nightly', SIDEVOICE_BUILD_SEQ: '12' });
-  assert.deepEqual(JSON.parse(readFileSync(path.join(path.dirname(newer), 'package.json'), 'utf8')).sidevoice, { channel: 'nightly', build_seq: 12 }, 'stamped into the shipped manifest');
-  await Promise.all([installWith(older, env2), installWith(newer, env2)]);
-  assert.equal(JSON.parse(readFileSync(path.join(env2.SIDEVOICE_DATA_DIR, 'install.json'), 'utf8')).build_seq, 12);
-  assert.equal((await installWith(older, env2)).action, 'noop');
-  assert.equal((await installWith(newer, env2)).action, 'noop');
-  assert.ok(existsSync(path.join(env2.XDG_DATA_HOME, 'sidevoice', '0.6.0-nightly.12')), 'a nightly build is a copy of its own');
-});
-
-/** A wrapper for the fake core; `mode` is baked in, so a service started from a definition (which carries only
- *  Sidevoice's own settings) runs it too. Its self-test passes either way. */
-function coreWrapper(mode = '') {
-  const tools = mkdtempSync(path.join(os.tmpdir(), 'sv-bin-'));
-  const bin = path.join(tools, 'sidevoice-core');
-  writeFileSync(bin, `#!/bin/sh\n${mode ? `FAKE_CORE_MODE=${mode} ` : ''}exec "${process.execPath}" "${fakeCore}" "$@"\n`, { mode: 0o755 });
-  return bin;
+/** A wrapper for the fake core whose mode is read from a file beside it at each start (a job carries only Sidevoice's
+ *  own settings): `set(mode)` changes how the next start behaves. */
+function coreWrapper(mode = 'ok') {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'sv-bin-'));
+  const bin = path.join(dir, 'sidevoice-core'), file = path.join(dir, 'mode');
+  writeFileSync(file, mode);
+  writeFileSync(bin, `#!/bin/sh\nFAKE_CORE_MODE=$(cat "${file}") exec "${process.execPath}" "${fakeCore}" "$@"\n`, { mode: 0o755 });
+  return { bin, set: next => writeFileSync(file, next), toString: () => bin };
 }
 
-test('install transaction: an upgrade whose core does not come up is rolled back — install.json and every registration back on the previous one', async () => {
-  const machine = upgradeMachine();
-  rmSync(machine.unit);
-  const env = { SIDEVOICE_SERVICE_MANAGER: 'none', SIDEVOICE_CORE_BIN: coreWrapper(), FAKE_CORE_MODE: 'import', SIDEVOICE_CORE_PORT: '0', SIDEVOICE_INSTALL_VERIFY_MS: '8000' };
-  const run = machine.install(env, ['--harness', 'claude', '--no-service', '--json']);
-  const result = JSON.parse(run.stdout.trim().split('\n').at(-1));
-  assert.equal(run.status, 1);
-  assert.equal(result.ok, false);
-  // The previous installation here is a placeholder that cannot run either: said apart from a rollback that runs.
-  assert.equal(result.error.key, 'install.rollback-failed');
-  const { install, claude, cursor } = machine.artifacts();
-  assert.deepEqual({ install, claude, cursor }, { install: machine.oldCli, claude: machine.oldCli, cursor: machine.oldCli });
-  // Every artifact is back on it, and the
-  // journal stays (forced to it) until it is seen running — it is not declared done on files alone.
-  const journal = JSON.parse(readFileSync(path.join(machine.dataDir, 'install-txn.json'), 'utf8'));
-  assert.equal(journal.selection, 'from');
-  supervisedNode({ dataDir: machine.dataDir }).stop();
-  // A core self-test that fails stops before the commit: nothing changed at all.
-  const fresh = upgradeMachine();
-  rmSync(fresh.unit);
-  const tested = fresh.install({ ...env, FAKE_CORE_MODE: 'ok', FAKE_CORE_SELF_TEST_FAIL: '1' }, ['--harness', 'claude', '--no-service', '--json']);
-  assert.equal(JSON.parse(tested.stdout.trim().split('\n').at(-1)).error.key, 'import.missing-module');
-  assert.equal(existsSync(path.join(fresh.dataDir, 'install-txn.json')), false, 'no journal: nothing was committed');
-  assert.equal(JSON.parse(readFileSync(path.join(fresh.dataDir, 'install.json'), 'utf8')).id, '0.5.0');
-  assert.deepEqual(fresh.artifacts(), { install: fresh.oldCli, unit: null, claude: fresh.oldCli, cursor: fresh.oldCli });
+/** A stand-in for `claude` that keeps what it was told: `mcp get` answers with the entry `mcp add` wrote. */
+function fakeClaude(dir) {
+  const bin = path.join(dir, 'claude'), entry = path.join(dir, 'claude-entry.txt');
+  writeFileSync(bin, `#!/bin/sh
+case "$2" in
+  get) [ -s "${entry}" ] && cat "${entry}" || exit 1 ;;
+  remove) rm -f "${entry}" ;;
+  add) shift 6; cmd="$1"; shift; printf 'sidevoice:\\n  Scope: User config\\n  Type: stdio\\n  Command: %s\\n  Args: %s\\n' "$cmd" "$*" > "${entry}" ;;
+esac
+`, { mode: 0o755 });
+  return { bin, line: () => { try { const text = readFileSync(entry, 'utf8'); return `${text.match(/Command: (.*)/)[1]} ${text.match(/Args: (.*)/)[1]}`; } catch { return null; } } };
+}
+
+/** A machine for installing: its own HOME (Claude Code and Cursor in it), a stand-in systemd (or none). */
+function machine(kind = 'systemd') {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-rel-'));
+  const tools = mkdtempSync(path.join(os.tmpdir(), 'sv-mgr-'));
+  const state = path.join(tools, 'state');
+  const manager = path.join(tools, 'systemctl');
+  writeFileSync(manager, `#!/bin/sh\nFAKE_MANAGER_DIR="${state}" exec "${process.execPath}" "${fakeManager}" systemctl "$@"\n`, { mode: 0o755 });
+  mkdirSync(path.join(home, '.cursor'));
+  const claude = fakeClaude(home);
+  const dataDir = path.join(home, '.sidevoice');
+  const R = path.join(home, 'xdg', 'sidevoice');
+  const env = { ...process.env, HOME: home, XDG_DATA_HOME: path.join(home, 'xdg'), XDG_CONFIG_HOME: path.join(home, '.config'), SIDEVOICE_DATA_DIR: dataDir,
+    SIDEVOICE_CLAUDE_BIN: claude.bin, SIDEVOICE_INSTALL_FROM_SOURCE: '0', SIDEVOICE_SERVICE_MANAGER: kind, SIDEVOICE_SYSTEMCTL: manager, SIDEVOICE_LOGINCTL: '/bin/false',
+    SIDEVOICE_CORE_PORT: '0', SIDEVOICE_INSTALL_VERIFY_MS: '15000', SIDEVOICE_TEARDOWN_MS: '3000', SIDEVOICE_SERVICE_START_WAIT_MS: '3000' };
+  for (const key of ['SIDEVOICE_URL', 'SIDEVOICE_CONNECTOR_ID', 'SIDEVOICE_CONNECTOR_TOKEN', 'SIDEVOICE_CORE_BIN', 'SIDEVOICE_TEST_HOOKS', 'FAKE_CORE_MODE', 'FAKE_CORE_MODES']) delete env[key];
+  /** `<cli> <args…> --json` (a built package's, or this checkout's): its exit, its signal, and its one JSON line. */
+  const run = (cli, args, more = {}) => {
+    const ran = spawnSync(process.execPath, [cli, ...args, '--json'], { env: { ...env, ...more }, encoding: 'utf8' });
+    let answer = null; try { answer = JSON.parse(ran.stdout.trim().split('\n').at(-1)); } catch {}
+    return { status: ran.status, signal: ran.signal, answer, stderr: ran.stderr };
+  };
+  const selected = name => { try { return JSON.parse(readFileSync(path.join(R, name, 'release.json'), 'utf8')).connector; } catch { return null; } };
+  const pid = job => { try { return Number(readFileSync(path.join(state, `sidevoice-${job}.service`, 'pid'), 'utf8')); } catch { return null; } };
+  return {
+    home, dataDir, R, env, claude, run, selected, pid,
+    install: (cli, core = coreWrapper(), args = ['--harness', 'claude', '--service'], more = {}) => run(cli, ['install', ...args], { SIDEVOICE_CORE_BIN: String(core), ...more }),
+    releases: () => readdirSync(path.join(R, 'releases')).sort(),
+    status: () => run(path.join(packageDir, 'cli.mjs'), ['service', 'status']).answer,
+    cursor: () => JSON.parse(readFileSync(path.join(home, '.cursor', 'mcp.json'), 'utf8')).mcpServers?.sidevoice ?? null,
+    stop() {
+      for (const job of ['core', 'connector']) { try { process.kill(pid(job), 'SIGKILL'); } catch {} }
+      try { process.kill(JSON.parse(readFileSync(path.join(dataDir, 'connector.lock'), 'utf8')).pid, 'SIGKILL'); } catch {}
+      try { for (const line of readFileSync(path.join(dataDir, 'core', 'said.jsonl'), 'utf8').trim().split('\n')) { try { process.kill(JSON.parse(line).pid, 'SIGKILL'); } catch {} } } catch {}
+    },
+  };
+}
+/** A hooks directory with one crash point armed. */
+function crashAt(point) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'sv-hooks-'));
+  writeFileSync(path.join(dir, `crash-${point}`), '');
+  return dir;
+}
+
+test('concurrent installers — two genuinely built packages, the app\'s and npx\'s — converge on the higher version, and same-version nightlies on the higher build', async () => {
+  const one = machine('none');
+  const app = builtAs('0.6.0'), npx = builtAs('0.7.0');
+  const both = await Promise.all([app, npx].map(cli => new Promise(resolve => {
+    const child = spawn(process.execPath, [cli, 'install', '--no-agents', '--no-core', '--json'], { env: one.env, stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = ''; child.stdout.on('data', d => { out += d; });
+    child.on('exit', code => resolve({ code, ...JSON.parse(out.trim().split('\n').at(-1)) }));
+  })));
+  assert.deepEqual(both.map(result => result.ok), [true, true]);
+  assert.equal(one.selected('current'), '0.7.0');
+  assert.equal(one.run(app, ['install', '--no-agents', '--no-core']).answer.action, 'noop');
+  assert.equal(one.run(npx, ['install', '--no-agents', '--no-core']).answer.action, 'noop');
+  assert.deepEqual(JSON.parse(readFileSync(path.join(one.dataDir, 'install.json'), 'utf8')), { command: [process.execPath, path.join(one.R, 'current', 'dist', 'cli.mjs')] }, 'install.json is the stable command');
+  // Same version, stamped by the build as CI stamps a nightly: the higher run number wins, whichever runs last.
+  const two = machine('none');
+  const older = builtAs('0.6.0', { SIDEVOICE_CHANNEL: 'nightly', SIDEVOICE_BUILD_SEQ: '10' }), newer = builtAs('0.6.0', { SIDEVOICE_CHANNEL: 'nightly', SIDEVOICE_BUILD_SEQ: '12' });
+  assert.deepEqual(JSON.parse(readFileSync(path.join(path.dirname(newer), 'package.json'), 'utf8')).sidevoice, { channel: 'nightly', build_seq: 12 }, 'stamped into the shipped manifest');
+  await Promise.all([older, newer].map(cli => new Promise(resolve => spawn(process.execPath, [cli, 'install', '--no-agents', '--no-core', '--json'], { env: two.env, stdio: 'ignore' }).on('exit', resolve))));
+  assert.equal(realpathSync(path.join(two.R, 'current')), path.join(realpathSync(two.R), 'releases', '0.6.0-nightly.12'), 'a nightly build is a release of its own');
+  assert.equal(two.run(older, ['install', '--no-agents', '--no-core']).answer.action, 'noop');
+  assert.equal(two.run(newer, ['install', '--no-agents', '--no-core']).answer.action, 'noop');
 });
 
-test('install transaction: foreign entries named sidevoice — even another program called cli.mjs — are never replaced or removed', async () => {
-  const machine = upgradeMachine();
-  execFileSync(machine.claude.bin, ['mcp', 'remove', '--scope', 'user', 'sidevoice']);
-  execFileSync(machine.claude.bin, ['mcp', 'add', '--scope', 'user', 'sidevoice', '--', 'node', '/opt/unrelated/cli.mjs', 'mcp']);
-  writeFileSync(path.join(machine.home, '.cursor', 'mcp.json'), JSON.stringify({ mcpServers: { sidevoice: { command: 'node', args: ['/opt/unrelated/cli.mjs', 'mcp'] } } }));
-  assert.equal(machine.install({}, ['--harness', 'claude', '--harness', 'cursor', '--no-core']).status, 0);
-  assert.equal(machine.artifacts().claude, '/opt/unrelated/cli.mjs');
-  assert.equal(machine.artifacts().cursor, '/opt/unrelated/cli.mjs');
-  spawnSync(process.execPath, [path.join(packageDir, 'cli.mjs'), 'uninstall', '--harness', 'claude'], { env: { ...machine.env, SIDEVOICE_SYSTEMCTL: '/bin/true' }, encoding: 'utf8' });
-  assert.equal(machine.claude.line(), 'node /opt/unrelated/cli.mjs mcp', 'uninstall leaves it too');
+test('upgrade A→B runs, B→C cannot serve: back on B, restarted on it and verified; registrations through current never touched; a failed self-test changes nothing', async () => {
+  const node = machine();
+  const [a, b, c] = [builtAs('0.6.1'), builtAs('0.6.2'), builtAs('0.6.3')];
+  try {
+    const first = node.install(a);
+    assert.equal(first.status, 0, JSON.stringify(first.answer) + first.stderr);
+    assert.deepEqual([first.answer.action, first.answer.service, first.answer.state], ['install', 'systemd', 'running']);
+    const registered = node.claude.line();
+    assert.equal(registered, `node ${path.join(node.R, 'current', 'dist', 'cli.mjs')} mcp`, 'Claude Code runs whatever current selects');
+    const upgraded = node.install(b);
+    assert.equal(upgraded.answer.action, 'upgrade', JSON.stringify(upgraded.answer));
+    assert.deepEqual([node.selected('current'), node.selected('previous')], ['0.6.2', '0.6.1']);
+    // C's core fails before it is ready (an import): verified, flipped back, B restarted and verified again.
+    const broken = node.install(c, coreWrapper('import'));
+    assert.equal(broken.status, 1);
+    assert.equal(broken.answer.error.key, 'install.rollback', JSON.stringify(broken.answer));
+    assert.equal(broken.answer.failure.key, 'import.missing-module');
+    assert.match(broken.answer.error.message, /0\.6\.3 failed.*back on 0\.6\.2/);
+    assert.equal(node.selected('current'), '0.6.2');
+    const after = node.status();
+    assert.equal(after.state, 'running', JSON.stringify(after));
+    assert.deepEqual(node.releases(), ['0.6.2'], 'the failed release, and the one before the previous, pruned');
+    assert.equal(node.claude.line(), registered, 'the registration was never re-pointed');
+    // A self-test that fails stops before the switch: nothing changes.
+    const tested = node.install(c, coreWrapper('ok'), ['--harness', 'claude', '--service'], { FAKE_CORE_SELF_TEST_FAIL: '1' });
+    assert.equal(tested.answer.error.key, 'import.missing-module');
+    assert.equal(node.selected('current'), '0.6.2');
+    assert.equal(node.status().state, 'running');
+  } finally { node.stop(); }
+});
+
+test('a first install that cannot serve is left installed and failing, said with the core\'s key, and nothing spins; installing again once it can is the recovery', async () => {
+  const node = machine();
+  const cli = builtAs('0.6.1');
+  const core = coreWrapper('import');
+  try {
+    const failed = node.install(cli, core);
+    assert.equal(failed.status, 1);
+    assert.deepEqual([failed.answer.error.key, failed.answer.failure.key], ['install.verify', 'import.missing-module']);
+    assert.equal(node.selected('current'), '0.6.1', 'nothing to go back to: it stays selected');
+    const status = node.status();
+    assert.deepEqual([status.state, status.failure.key], ['failed', 'import.missing-module']);
+    await wait(1000);
+    assert.equal(alive(node.pid('core')), false, 'a failed start is not started again');
+    // What was wrong is fixed (the core it runs can now import): installing again restarts and verifies the selection.
+    core.set('ok');
+    const again = node.install(cli, core);
+    assert.deepEqual([again.status, again.answer.action, again.answer.state], [0, 'noop', 'running'], JSON.stringify(again.answer));
+  } finally { node.stop(); }
+});
+
+for (const point of ['stage-copied', 'switch-previous', 'switch-current', 'definitions-written']) {
+  test(`switch: the installer killed at "${point}" — current names a complete release, old or new, never none or half of one; the next install cleans up and finishes`, async () => {
+    const node = machine();
+    const [a, b] = [builtAs('0.6.1'), builtAs('0.6.2')];
+    try {
+      assert.equal(node.install(a).status, 0);
+      const killed = node.install(b, coreWrapper(), ['--harness', 'claude', '--service'], { SIDEVOICE_TEST_HOOKS: crashAt(point) });
+      assert.equal(killed.signal, 'SIGKILL', `killed at ${point} (${killed.stderr})`);
+      const current = path.join(node.R, 'current');
+      assert.ok(lstatSync(current).isSymbolicLink());
+      assert.equal(node.selected('current'), ['stage-copied', 'switch-previous'].includes(point) ? '0.6.1' : '0.6.2');
+      assert.ok(existsSync(path.join(current, 'dist', 'cli.mjs')) && existsSync(path.join(current, 'core', 'bin', 'sidevoice-core')), 'and that release is whole');
+      assert.match(readlinkSync(current), /^releases\/0\.6\.[12]$/);
+      // The lock went with the installer; the next one removes what it left by name, and finishes.
+      const again = node.install(b);
+      assert.equal(again.status, 0, JSON.stringify(again.answer) + again.stderr);
+      assert.equal(node.selected('current'), '0.6.2');
+      assert.equal(node.status().state, 'running');
+      assert.deepEqual(readdirSync(node.R).filter(name => name.endsWith('.tmp')), []);
+      assert.deepEqual(node.releases().filter(name => name.includes('.tmp-')), []);
+    } finally { node.stop(); }
+  });
+}
+
+test('rollback: `sidevoice rollback` goes back to previous and verifies it; an installer killed after selecting a release that cannot serve — the next install flips back', async () => {
+  const node = machine();
+  const [a, b, c] = [builtAs('0.6.1'), builtAs('0.6.2'), builtAs('0.6.3')];
+  try {
+    assert.equal(node.install(a).status, 0);
+    assert.equal(node.install(b).status, 0);
+    // A person goes back: current ← previous, the jobs restarted on it and verified.
+    const back = node.run(path.join(node.R, 'current', 'dist', 'cli.mjs'), ['rollback']);
+    assert.deepEqual([back.status, back.answer.installed, back.answer.from], [0, '0.6.1', '0.6.2'], JSON.stringify(back.answer));
+    assert.equal(node.selected('current'), '0.6.1');
+    assert.equal(node.status().state, 'running');
+    assert.equal(node.run(path.join(node.R, 'current', 'dist', 'cli.mjs'), ['rollback']).answer.error.key, 'install.no-previous');
+    // Forward again, then C selected and its installer killed before it could verify: C stays selected, and fails.
+    assert.equal(node.install(b).status, 0);
+    const killed = node.install(c, coreWrapper('import'), ['--harness', 'claude', '--service'], { SIDEVOICE_TEST_HOOKS: crashAt('definitions-written') });
+    assert.equal(killed.signal, 'SIGKILL');
+    assert.equal(node.selected('current'), '0.6.3');
+    // Installing again is the recovery: the same release is no upgrade, so the selection is verified — it does not run,
+    // and current goes back to what ran before.
+    const recovered = node.install(c, coreWrapper('import'));
+    assert.equal(recovered.answer.error.key, 'install.rollback', JSON.stringify(recovered.answer));
+    assert.equal(node.selected('current'), '0.6.2');
+    assert.equal(node.status().state, 'running');
+  } finally { node.stop(); }
+});
+
+test('foreign entries named sidevoice — even another program called cli.mjs — are never replaced or removed; ours from before are re-pointed once, through current', async () => {
+  const node = machine('none');
+  execFileSync(node.claude.bin, ['mcp', 'add', '--scope', 'user', 'sidevoice', '--', 'node', '/opt/unrelated/cli.mjs', 'mcp']);
+  writeFileSync(path.join(node.home, '.cursor', 'mcp.json'), JSON.stringify({ mcpServers: { other: { command: 'x' }, sidevoice: { command: 'node', args: ['/opt/unrelated/cli.mjs', 'mcp'] } } }));
+  const cli = path.join(packageDir, 'cli.mjs');
+  assert.equal(node.run(cli, ['install', '--harness', 'claude', '--harness', 'cursor', '--no-core'], { SIDEVOICE_INSTALL_FROM_SOURCE: '1' }).status, 0);
+  assert.equal(node.claude.line(), 'node /opt/unrelated/cli.mjs mcp');
+  assert.deepEqual(node.cursor(), { command: 'node', args: ['/opt/unrelated/cli.mjs', 'mcp'] });
+  node.run(cli, ['uninstall', '--harness', 'claude']);
+  assert.equal(node.claude.line(), 'node /opt/unrelated/cli.mjs mcp', 'uninstall leaves it too');
+  // Ours from an earlier version (a copy under R) is re-pointed once, through current; then never again.
+  const old = path.join(node.R, '0.5.0', 'dist', 'cli.mjs');
+  writeFileSync(path.join(node.home, '.cursor', 'mcp.json'), JSON.stringify({ mcpServers: { other: { command: 'x' }, sidevoice: { command: 'node', args: [old, 'mcp'] } } }));
+  assert.equal(node.run(cli, ['install', '--no-agents', '--no-core'], { SIDEVOICE_INSTALL_FROM_SOURCE: '1' }).status, 0);
+  assert.deepEqual(node.cursor(), { command: 'node', args: [path.join(node.R, 'current', 'dist', 'cli.mjs'), 'mcp'] });
+  assert.equal(JSON.parse(readFileSync(path.join(node.home, '.cursor', 'mcp.json'), 'utf8')).mcpServers.other.command, 'x');
 });
