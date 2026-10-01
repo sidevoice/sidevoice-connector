@@ -454,3 +454,21 @@ test('service restart while stopped is still a person\'s restart: the persisted 
     assert.equal(running.attempts, 1, 'a fresh window, not the five spent before the stop');
   } finally { node.stop(); }
 });
+
+test('teardown at the crash point: a core whose supervisor died before it was ready is found by its launch record — stop and uninstall end it before saying so', async () => {
+  for (const action of ['stop', 'uninstall']) {
+    const node = supervisedNode({ modes: ['slow:4000'] });
+    try {
+      const supervisor = node.start();
+      const launch = await until(() => { try { const record = JSON.parse(readFileSync(path.join(node.dataDir, 'core-launch.json'), 'utf8')); return record.pid ? record : null; } catch { return null; } });
+      supervisor.kill('SIGKILL');
+      await until(() => supervisor.signalCode !== null);
+      assert.equal(existsSync(path.join(node.dataDir, 'core', 'core.json')), false, 'not ready yet');
+      const run = spawnSync(process.execPath, [cli, 'service', action, '--json'], { env: node.env, encoding: 'utf8' });
+      assert.equal(JSON.parse(run.stdout.trim().split('\n').at(-1)).ok, true, `${action}: ${run.stdout}`);
+      assert.equal(alive(launch.pid), false, `${action}: the starting core is gone when it answers`);
+      await wait(4500);
+      assert.equal(existsSync(path.join(node.dataDir, 'core', 'core.json')), false, `${action}: and never became ready`);
+    } finally { node.stop(); }
+  }
+});

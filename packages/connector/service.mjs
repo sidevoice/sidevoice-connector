@@ -21,7 +21,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { accessSync, constants, existsSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
-import { coreRunning, readReady, socketPathOf, takeInstallLock } from './core.mjs';
+import { coreRunning, launchProcess, readReady, socketPathOf, takeInstallLock } from './core.mjs';
 import { readLock } from './lockfile.mjs';
 import { isProcess, signalVerified, validPid } from './proc.mjs';
 import { localHealth } from './core-socket.mjs';
@@ -304,15 +304,22 @@ export async function status(env = process.env) {
 function nodeProcesses(env) {
   const lock = readLock(connectorSocketOf(env) + '.lock');
   const connector = lock && !lock.unreadable && validPid(lock.pid) ? { pid: lock.pid, start: lock.start ?? null } : null;
+  // The core: by its ready file, or — not ready yet, its starter perhaps dead — by its launch record and launch id,
+  // as startup finds it (`core.mjs`). Both, when they name different launches.
   const ready = readReady(dataDirOf(env));
-  const core = ready && validPid(ready.pid) && ready.launch_id ? ready : null;
-  return { connector, core };
+  const cores = [];
+  if (ready && validPid(ready.pid) && ready.launch_id) cores.push(ready);
+  const launching = launchProcess(dataDirOf(env));
+  if (launching && !cores.some(core => core.pid === launching.pid)) cores.push(launching);
+  return { connector, cores };
 }
 const connectorUp = owner => !!owner && isProcess(owner.pid, { start: owner.start });
 function signalNode(processes, signal) {
   const sent = [];
   if (connectorUp(processes.connector) && signalVerified(processes.connector.pid, signal, { start: processes.connector.start })) sent.push(processes.connector.pid);
-  if (processes.core && coreRunning(processes.core) && signalVerified(processes.core.pid, signal, { command: new RegExp(`--launch-id[= ]${processes.core.launch_id.replace(/[^\w-]/g, '')}(\\s|$)`) })) sent.push(processes.core.pid);
+  for (const core of processes.cores || []) {
+    if (coreRunning(core) && signalVerified(core.pid, signal, { command: new RegExp(`--launch-id[= ]${core.launch_id.replace(/[^\w-]/g, '')}(\\s|$)`) })) sent.push(core.pid);
+  }
   return sent;
 }
 
@@ -320,7 +327,7 @@ function signalNode(processes, signal) {
  *  Their sockets go with them. */
 async function awaitDown(env, processes = nodeProcesses(env)) {
   const deadline = Date.now() + TEARDOWN_MS;
-  const left = () => [connectorUp(processes.connector) && processes.connector.pid, processes.core && coreRunning(processes.core) && processes.core.pid].filter(Boolean);
+  const left = () => [connectorUp(processes.connector) && processes.connector.pid, ...(processes.cores || []).map(core => coreRunning(core) && core.pid)].filter(Boolean);
   while (left().length && Date.now() < deadline) await wait(100);
   const killed = left().length ? signalNode(processes, 'SIGKILL') : [];
   const after = Date.now() + 5000;
@@ -489,8 +496,8 @@ export async function reload(env = process.env) {
     const restarted = manage(env, kind, ['--user', 'restart', UNIT]);
     if (!restarted.ok) throw keyed(`service.${serviceFailure(kind, env)}`, { detail: restarted.output.trim() });
   } else {
-    signalNode({ connector: processes.connector, core: null }, 'SIGTERM');
-    await awaitDown(env, { connector: processes.connector, core: null });
+    signalNode({ connector: processes.connector, cores: [] }, 'SIGTERM');
+    await awaitDown(env, { connector: processes.connector, cores: [] });
     startDetached(env);
   }
   const up = await awaitUp(env);

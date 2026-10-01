@@ -385,3 +385,32 @@ test('rollback to nothing: a first install whose core serves but speaks another 
     } finally { node.stop(); }
   }
 });
+
+test('rollback at the crash point: the supervisor killed between spawning its core and recording it — the installer\'s rollback finds that core by its launch id and ends it before saying nothing runs', { skip: process.platform !== 'linux' && 'reads /proc' }, async () => {
+  const node = supervisedNode({ modes: ['deaf'] });
+  const home = path.dirname(node.dataDir);
+  const armed = hooks({ pause: ['core-spawned'] });
+  const env = { ...node.env, XDG_DATA_HOME: path.join(home, path.basename(node.dataDir) + '-xdg'), SIDEVOICE_INSTALL_FROM_SOURCE: '0', SIDEVOICE_INSTALL_VERIFY_MS: '5000', SIDEVOICE_TEST_HOOKS: armed.dir };
+  const cores = () => {
+    const found = [];
+    for (const line of execFileSync('ps', ['-axo', 'pid=,stat=,command='], { encoding: 'utf8' }).split('\n')) {
+      const match = line.trim().match(/^(\d+)\s+(\S+)\s+(.*)$/);
+      if (match && !match[2].includes('Z') && match[3].includes(`--data-dir ${path.join(node.dataDir, 'core')}`)) found.push(Number(match[1]));
+    }
+    return found;
+  };
+  try {
+    const installer = spawn(process.execPath, [path.join(packageDir, 'cli.mjs'), 'install', '--no-agents', '--json'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = ''; installer.stdout.on('data', d => { out += d; });
+    await armed.paused('core-spawned');
+    const supervisor = Number(readFileSync(path.join(armed.dir, 'paused-core-spawned'), 'utf8'));
+    const [core] = await until(() => { const found = cores(); return found.length ? found : null; });
+    assert.equal(JSON.parse(readFileSync(path.join(node.dataDir, 'core-launch.json'), 'utf8')).pid, null, 'spawned, not recorded');
+    process.kill(supervisor, 'SIGKILL');
+    assert.equal(await exited(installer), 1, out);
+    assert.equal(JSON.parse(out.trim().split('\n').at(-1)).error.key, 'install.rollback');
+    assert.equal(existsSync(path.join(node.dataDir, 'install.json')), false);
+    assert.equal(existsSync(path.join(node.dataDir, 'install-txn.json')), false, 'absence reported only once nothing runs');
+    assert.deepEqual(cores(), [], `the starting core ${core} is gone`);
+  } finally { node.stop(); }
+});
