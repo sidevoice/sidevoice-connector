@@ -282,3 +282,34 @@ test('blocker 3: a full uninstall keeps the stop — a connector already on its 
     assert.equal(existsSync(path.join(node.dataDir, 'node-stopped.json')), false);
   } finally { child?.kill('SIGKILL'); node.stop(); }
 });
+
+test('blocker 4: with no manager, installing again verifies the selection — a broken one left by a dead installer goes back to the verified one', async () => {
+  const node = machine('none');
+  const [a, b] = [builtAs('0.6.81'), builtAs('0.6.82')];
+  try {
+    assert.equal(node.install(a, coreWrapper(), ['--no-agents']).status, 0);
+    assert.equal(node.install(b, coreWrapper('import'), ['--no-agents'], { SIDEVOICE_TEST_HOOKS: crashAt('switch-current') }).signal, 'SIGKILL');
+    node.stop();   // a reboot: nothing of the old release runs any more
+    await wait(250);
+    const again = node.install(b, coreWrapper('import'), ['--no-agents']);
+    assert.equal(again.answer.error?.key, 'install.rollback', JSON.stringify(again.answer));
+    assert.equal(node.selected('current'), '0.6.81');
+    assert.equal(node.status().reachable, true, 'the verified release serves again');
+  } finally { node.stop(); }
+});
+
+test('blocker 5: the rollback target is the last verified release — A runs, B is left selected unverified by a dead installer, C cannot serve: back on A', async () => {
+  const node = machine();
+  const [a, b, c] = [builtAs('0.6.81'), builtAs('0.6.82'), builtAs('0.6.83')];
+  try {
+    assert.equal(node.install(a, coreWrapper(), ['--no-agents', '--service']).status, 0);
+    assert.equal(node.selected('verified'), '0.6.81');
+    assert.equal(node.install(b, coreWrapper('import'), ['--no-agents', '--service'], { SIDEVOICE_TEST_HOOKS: crashAt('switch-current') }).signal, 'SIGKILL');
+    assert.deepEqual([node.selected('current'), node.selected('verified')], ['0.6.82', '0.6.81'], 'B selected, never verified');
+    const broken = node.install(c, coreWrapper('import'), ['--no-agents', '--service']);
+    assert.equal(broken.answer.error?.key, 'install.rollback', JSON.stringify(broken.answer));
+    assert.deepEqual([node.selected('current'), node.selected('previous'), node.selected('verified')], ['0.6.81', '0.6.81', '0.6.81']);
+    assert.equal(node.status().state, 'running');
+    assert.deepEqual(node.releases(), ['0.6.81'], 'B and C pruned; A kept');
+  } finally { node.stop(); }
+});

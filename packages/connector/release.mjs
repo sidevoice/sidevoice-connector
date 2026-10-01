@@ -3,7 +3,8 @@
  *    R/releases/<id>/   immutable once renamed into place: `dist/` (this package), `core` (→ the core runtime it was
  *                       verified with), `release.json` {id, connector, core, core_build, channel, build_seq}
  *    R/current  → releases/<id>   the selection
- *    R/previous → releases/<id>   the rollback target
+ *    R/verified → releases/<id>   the last release seen running (written only after a verification)
+ *    R/previous → releases/<id>   what was verified before the selection: the rollback target
  *
  *  `R` is `$XDG_DATA_HOME/sidevoice`. Everything that runs Sidevoice — both job definitions, every harness
  *  registration, `install.json`'s `command` — names a path through `R/current`, so it is written once and never
@@ -42,7 +43,7 @@ export function releaseRoot(env = process.env) {
 }
 export function releaseLayout(env = process.env) {
   const root = releaseRoot(env);
-  return { root, releases: path.join(root, 'releases'), current: path.join(root, 'current'), previous: path.join(root, 'previous') };
+  return { root, releases: path.join(root, 'releases'), current: path.join(root, 'current'), previous: path.join(root, 'previous'), verified: path.join(root, 'verified') };
 }
 /** The program each job and harness runs, through `current` (R1: node + `cli.mjs`; R4 swaps it for the executable). */
 export function stableCommand(env = process.env) {
@@ -163,26 +164,34 @@ export async function stage(env, next, { dataDir, core = true, log = () => {}, p
   return release;
 }
 
-/** Step 5: `previous` ← `current`, then `current` ← `releases/<id>` — the commit point. */
+/** Step 5: `previous` ← the last verified release (never a selection nobody saw run — one an installer that died left
+ *  selected), then `current` ← `releases/<id>` — the commit point. */
 export function switchTo(env, id) {
-  const now = selection(env, 'current');
-  if (now) { point(env, 'previous', now.id); crash('switch-previous'); }
+  const verified = selection(env, 'verified');
+  if (verified) { point(env, 'previous', verified.id); crash('switch-previous'); }
   point(env, 'current', id);
   crash('switch-current');
 }
 
-/** Step 8 alone: `current` back to what `previous` names. Null when there is nothing to go back to. */
-export function flipBack(env) {
-  const previous = selection(env, 'previous'), current = selection(env, 'current');
-  if (!previous || previous.id === current?.id) return null;
-  point(env, 'current', previous.id);
-  return previous.release;
+/** After a verification: `verified` ← `releases/<id>`. */
+export function markVerified(env, id) {
+  if (selection(env, 'verified')?.id !== id) point(env, 'verified', id);
 }
 
-/** Step 9: every release and core runtime neither `current` nor `previous` names, deleted. */
+/** Step 8 alone: `current` back to the last verified release — or, when that is the selection itself (a person going
+ *  back), to `previous`. Null when there is nothing to go back to. */
+export function flipBack(env) {
+  const current = selection(env, 'current');
+  const back = ['verified', 'previous'].map(name => selection(env, name)).find(selected => selected && selected.id !== current?.id);
+  if (!back) return null;
+  point(env, 'current', back.id);
+  return back.release;
+}
+
+/** Step 9: every release and core runtime none of `current`, `verified` and `previous` names, deleted. */
 export function prune(env, dataDir) {
   const { releases } = releaseLayout(env);
-  const kept = ['current', 'previous'].map(name => selection(env, name)).filter(Boolean);
+  const kept = ['current', 'verified', 'previous'].map(name => selection(env, name)).filter(Boolean);
   const keptDirs = new Set(kept.map(selected => path.basename(selected.dir)));
   const keptRuntimes = new Set(kept.map(selected => selected.release.core_build).filter(Boolean));
   const removed = [];

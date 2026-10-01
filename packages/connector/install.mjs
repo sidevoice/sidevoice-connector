@@ -29,7 +29,7 @@ import { pairedRoom } from './pair.mjs';
 import { CORE_VERSION, NO_UV, ensureRunning, findUv, readReady, takeInstallLock } from './core.mjs';
 import { keyed, t } from './i18n.mjs';
 import { remove as removeSkill, skillsDir, status as skillStatus } from './skill.mjs';
-import { candidate, coreProgram, decide, flipBack, prune, removeLeftovers, removeReleases, selection, stableCommand, stage, switchTo } from './release.mjs';
+import { candidate, coreProgram, decide, flipBack, markVerified, prune, removeLeftovers, removeReleases, selection, stableCommand, stage, switchTo } from './release.mjs';
 import { HARNESS_REGISTRATIONS, codexInstructions, cursorMcpFile, registration, unregisterFromClaude, unregisterFromCursor } from './registrations.mjs';
 import { askConnector, compatibleCore, installedService, jobDefinitions, linger, managerKind, recordInstallation, settledState, startJobs, status, stopOnDemand, uninstall as uninstallService, writeDefinitions } from './service.mjs';
 import { dataDirOf, nodeFiles } from './node-files.mjs';
@@ -120,12 +120,15 @@ async function restartOn(env, kind) {
   await startJobs(env, { restart: true });
 }
 
-/** Step 8: back to `previous`, restarted, verified again. Null when there is nothing to go back to. */
+/** Step 8: back to the last verified release (`flipBack`), restarted, verified again. Null when there is nothing to go
+ *  back to. */
 async function goBack(env, kind) {
   const back = flipBack(env);
   if (!back) return null;
   await restartOn(env, kind);
-  return { release: back, ...(await verify(env, back, kind)) };
+  const verified = await verify(env, back, kind);
+  if (verified.ok) markVerified(env, back.id);
+  return { release: back, ...verified };
 }
 
 /** Wait for every call on this machine to end (an update that changes the core would end them). */
@@ -169,8 +172,9 @@ export async function apply(env, { core = true, service = false, applyNow = fals
       const restart = action !== 'noop' || !(await runsSelection(env, chosen));
       await startJobs(env, { changed, restart });
     } else if (action !== 'noop') await stopOnDemand(env);
-    const verified = action !== 'noop' || kind !== 'none' ? await verify(env, chosen, kind) : { ok: true };
-    if (verified.ok) { prune(env, dataDir); return { action, release: chosen, from: current, kind }; }
+    // Verified on a noop too, with or without a manager: running install again is how a selection is recovered.
+    const verified = await verify(env, chosen, kind);
+    if (verified.ok) { markVerified(env, chosen.id); prune(env, dataDir); return { action, release: chosen, from: current, kind }; }
     const back = await goBack(env, kind);
     if (!back) return { action: 'failed', release: chosen, from: current, failure: verified.failure, kind };
     if (back.ok) prune(env, dataDir);
