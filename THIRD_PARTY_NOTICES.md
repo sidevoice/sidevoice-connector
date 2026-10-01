@@ -1,6 +1,6 @@
 # Third-party components
 
-Sidevoice's MIT license applies to its own code. Dependencies and models keep
+Sidevoice's Apache-2.0 license applies to its own code. Dependencies and models keep
 their original licenses. This repository does not bundle weights or generated
 browser assets.
 
@@ -17,7 +17,7 @@ their MIT licenses.
 
 In particular, eSpeak NG has GPL license obligations when redistributing its
 generated WASM/bundles. Review upstream licenses and model cards before
-redistributing compiled assets or weights; the repository's MIT license does
+redistributing compiled assets or weights; the repository's Apache-2.0 license does
 not replace those terms.
 
 - https://github.com/pipecat-ai/pipecat
