@@ -220,18 +220,23 @@ export function askConnector(method, params = {}, { env = process.env, timeout =
 }
 
 /** `service status --json` (SEAMS §3): the supervisor's own `node.status` when one answers, else derived from
- *  the files and the manager without starting anything. */
+ *  the files and the manager without starting anything.
+ *
+ *  A plain connector answering (`supervisor: false`) speaks only for the core it started on demand: what the
+ *  node service is — `not-installed`, `stopped-by-person`… — comes from the files and the manager as when
+ *  nothing answers, with that core's `core` and `calls`. A supervisor's `stopped` is only ever transient (before
+ *  its first start, and while it shuts down — its socket stops taking connections first). */
 export async function status(env = process.env) {
   const answered = await askConnector('node.status', {}, { env });
-  if (answered && !answered.error && answered.state) return { ...answered, ok: true };
+  if (answered && !answered.error && answered.state && answered.supervisor) return { ...answered, ok: true };
   const dataDir = dataDirOf(env), files = nodeFiles(dataDir);
   const kind = managerKind(env);
   const service = installedService(env);
   const installed = existsSync(files.install);
   const ready = readReady(dataDir);
-  const health = ready ? await localHealth(ready.socket, 1500) : null;
-  const core = health?.status === 200 ? { pid: health.body.pid, version: health.body.version, api: health.body.api, launch_id: health.body.launch_id } : null;
-  const calls = health?.status === 200 ? health.body.calls ?? 0 : 0;
+  const health = ready && !answered?.core ? await localHealth(ready.socket, 1500) : null;
+  const core = answered?.core ?? (health?.status === 200 ? { pid: health.body.pid, version: health.body.version, api: health.body.api, launch_id: health.body.launch_id } : null);
+  const calls = answered?.core ? answered.calls ?? 0 : health?.status === 200 ? health.body.calls ?? 0 : 0;
   const base = { ok: true, service: kind, installed, failure: null, calls, core };
   if (!installed && !service) return { ...base, state: 'absent' };
   if (existsSync(files.stopped)) return { ...base, state: 'stopped-by-person' };

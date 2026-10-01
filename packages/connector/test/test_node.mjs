@@ -275,3 +275,40 @@ test('service definitions: the LaunchAgent and the user unit, exactly', () => {
   assert.deepEqual(serviceEnvironment('systemd', { SIDEVOICE_DATA_DIR: '/d', SIDEVOICE_CONNECTOR_TOKEN: 'secret', SIDEVOICE_URL: 'http://x', PATH: '/bin', SIDEVOICE_SERVICE: 'launchd' }),
     { SIDEVOICE_DATA_DIR: '/d', SIDEVOICE_SERVICE: 'systemd' });
 });
+
+test('a plain connector: the app\'s status probes neither keep it alive nor reset its idle timer; a façade that asks for work does', async () => {
+  const node = supervisedNode({ env: { SIDEVOICE_CONNECTOR_IDLE_MS: '600' } });
+  try {
+    const plain = node.start([]);
+    await until(() => existsSync(node.socketPath));
+    // The app's poll: a fresh connection every 100 ms asking only node.status, then status.
+    let probing = true, answered = 0;
+    const probe = (async () => { while (probing) { try { await node.ask(answered % 2 ? 'status' : 'node.status'); answered++; } catch {} await wait(100); } })();
+    const started = Date.now();
+    await until(() => plain.exitCode !== null, 5000);
+    probing = false; await probe;
+    assert.ok(answered >= 3, `probed ${answered} times while it ran`);
+    assert.ok(Date.now() - started < 3000, 'it left on its own idle time, probes or not');
+    // The plain connector's status for the app: its core, and the service state from the files (here: no service).
+    const second = node.start([]);
+    await until(() => existsSync(node.socketPath));
+    // A façade that asked for real work (pair_device, here) keeps it, probes or not, for as long as it is connected.
+    const { default: net } = await import('node:net');
+    const held = net.createConnection(node.socketPath);
+    await new Promise(resolve => held.once('connect', resolve));
+    held.write(JSON.stringify({ id: 1, method: 'pair_device', params: {} }) + '\n');
+    await wait(1500);
+    assert.equal(second.exitCode, null, 'still there past its idle time');
+    held.end();
+    await until(() => second.exitCode !== null, 5000);
+    const third = node.start([]);
+    await until(() => existsSync(node.socketPath));
+    const keeper = spawn(process.execPath, [cli, 'service', 'status', '--json'], { env: node.env, stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = ''; keeper.stdout.on('data', d => { out += d; });
+    await new Promise(resolve => keeper.on('exit', resolve));
+    const status = JSON.parse(out);
+    assert.equal(status.state, 'absent', 'nothing installed: a plain connector does not make a service');
+    assert.equal(status.supervisor, undefined);
+    third.kill('SIGKILL');
+  } finally { node.stop(); }
+});

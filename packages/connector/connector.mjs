@@ -594,11 +594,17 @@ function snapshot() {
       return { binding_id, client_ref, harness, thread, title, delivery: delivery.kind, capabilities, ...(state ? { delivery_state: state } : {}) };
     }) };
 }
+/** What only asks how things are: the app polls it every 2 s on a fresh connection. A client that asks nothing
+ *  else does not keep a plain connector alive, and neither its arrival nor its leaving touches the idle timer —
+ *  only conversations and façades that asked for real work do. */
+const PROBES = new Set(['status', 'node.status']);
+const engaged = () => [...clients].filter(client => client.engaged).length;
+
 /** A plain connector leaves once nothing has used it for a while; the supervisor never does. */
 function scheduleExit() {
   if (supervised || handingOver) return;
   if (idleTimer) clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => { if (clients.size === 0 && bindings.size === 0) { log(`idle for ${idleMs} ms with no conversation; exiting`); shutdown(); } }, idleMs);
+  idleTimer = setTimeout(() => { if (engaged() === 0 && bindings.size === 0) { log(`idle for ${idleMs} ms with no conversation; exiting`); shutdown(); } }, idleMs);
 }
 let server = null;
 async function shutdown() {
@@ -882,8 +888,8 @@ async function command(client, input) {
 
 function serve(socket) {
   const client = { socket, bindings: new Set() };
-  clients.add(client); clearTimeout(idleTimer);
-  log(`façade attached (${clients.size} now)`);
+  clients.add(client);
+
   let buffer = '';
   socket.on('data', chunk => {
     buffer += chunk;
@@ -895,6 +901,7 @@ function serve(socket) {
       let input; try { input = JSON.parse(line); } catch { socket.write(JSON.stringify({ ok: false, error: 'Invalid JSON' }) + '\n'); continue; }
       // Handing over: nothing new is started here; the façade asks the supervisor instead.
       if (handingOver) { socket.write(JSON.stringify({ id: input.id, ok: false, error: 'HANDOVER: this connector is handing over to the node service' }) + '\n'); continue; }
+      if (!PROBES.has(input.method) && !client.engaged) { client.engaged = true; clearTimeout(idleTimer); log(`façade attached (${engaged()} now)`); }
       const job = command(client, input);
       inFlight.add(job); job.catch(() => {}).finally(() => inFlight.delete(job));
       job.then(result => { if (!socket.destroyed) socket.write(JSON.stringify({ id: input.id, ok: true, result }) + '\n'); })
@@ -906,7 +913,7 @@ function serve(socket) {
     clients.delete(client);
     // Handed over: its conversations are the supervisor's now, not gone.
     if (client.handedOver) return;
-    log(`façade detached (${clients.size} left); dropping ${client.bindings.size} binding(s)`);
+    if (client.engaged) log(`façade detached (${engaged()} left); dropping ${client.bindings.size} binding(s)`);
     // The façade is gone: so is every conversation it spoke for.
     for (const binding of client.bindings) {
       // A conversation whose delivery does not go through its façade (an editor chat's card) outlives it:
@@ -914,7 +921,8 @@ function serve(socket) {
       if (binding.detachable) { binding.owner = null; binding.orphanedAt = Date.now(); keepOrphans(); log(`${binding.thread} kept without a façade (its card delivers)`); continue; }
       bindings.delete(binding.binding_id); unwatch(binding); if (!binding.binding_id.startsWith('local-')) send('binding.unregister', { binding_id: binding.binding_id });
     }
-    scheduleExit();
+    // A probe leaving changes nothing: the idle timer runs on as it was.
+    if (client.engaged) scheduleExit();
   });
 }
 
