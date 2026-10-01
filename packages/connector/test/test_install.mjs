@@ -548,3 +548,49 @@ test('rollback at the crash point: the supervisor killed between spawning its co
     assert.deepEqual(cores(), [], `the starting core ${core} is gone`);
   } finally { node.stop(); }
 });
+
+test('recorded paths: installed with XDG_DATA_HOME and XDG_CONFIG_HOME of its own — recovery (helper or supervisor) and uninstall from a shell without them find the definition, the copies and the data', { skip: process.platform !== 'linux' && 'reads /proc' }, async () => {
+  for (const recovery of ['service recover', 'service start']) {
+    // The data directory is the default under HOME: the one thing a bare shell can find on its own.
+    const home = mkdtempSync(path.join(os.tmpdir(), 'sv-paths-'));
+    const node = supervisedNode({ dataDir: path.join(home, '.sidevoice') });
+    const tools = mkdtempSync(path.join(os.tmpdir(), 'sv-mgr-'));
+    writeFileSync(node.bin, `#!/bin/sh\nFAKE_CORE_MODES="${node.modesFile}" exec "${process.execPath}" "${path.join(here, 'fake-sidevoice-core.mjs')}" "$@"\n`, { mode: 0o755 });
+    const systemctl = path.join(tools, 'systemctl');
+    writeFileSync(systemctl, `#!/bin/sh\nFAKE_MANAGER_DIR="${path.join(tools, 'state')}" exec "${process.execPath}" "${path.join(here, 'fake-service-manager.mjs')}" systemctl "$@"\n`, { mode: 0o755 });
+    const custom = { XDG_DATA_HOME: path.join(home, 'elsewhere', 'data'), XDG_CONFIG_HOME: path.join(home, 'elsewhere', 'config') };
+    const bare = { ...node.env, HOME: home, SIDEVOICE_INSTALL_FROM_SOURCE: '0', SIDEVOICE_INSTALL_VERIFY_MS: '15000', SIDEVOICE_TEARDOWN_MS: '3000',
+      SIDEVOICE_SERVICE_MANAGER: 'systemd', SIDEVOICE_SYSTEMCTL: systemctl, SIDEVOICE_SYSTEMD_RUN: systemdRunShim(tools) };
+    for (const name of ['SIDEVOICE_DATA_DIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'FAKE_MANAGER_DIR']) delete bare[name];
+    const unit = path.join(custom.XDG_CONFIG_HOME, 'systemd', 'user', 'sidevoice-node.service');
+    const defaultUnit = path.join(home, '.config', 'systemd', 'user', 'sidevoice-node.service');
+    const cli = (args, env) => spawnSync(process.execPath, [path.join(packageDir, 'cli.mjs'), ...args], { env, encoding: 'utf8' });
+    try {
+      const armed = hooks({ crash: ['txn-install.json'] });
+      assert.equal(cli(['install', '--no-agents', '--json'], { ...bare, ...custom, SIDEVOICE_TEST_HOOKS: armed.dir }).signal, 'SIGKILL');
+      const selected = JSON.parse(readFileSync(path.join(node.dataDir, 'install.json'), 'utf8'));
+      assert.deepEqual(selected.paths, { SIDEVOICE_DATA_DIR: node.dataDir, ...custom }, 'the installation records where it lives');
+      assert.ok(selected.copy.startsWith(custom.XDG_DATA_HOME + path.sep) && existsSync(unit));
+      assert.match(readFileSync(unit, 'utf8'), new RegExp(`Environment="XDG_CONFIG_HOME=${custom.XDG_CONFIG_HOME}"`), 'and its definition carries them');
+      // Recovered from the bare shell: by the helper itself, or by the supervisor that shell starts.
+      const recovered = cli(recovery.split(' ').concat('--json'), bare);
+      assert.equal(recovered.status, 0, `${recovery}: ${recovered.stdout}${recovered.stderr}`);
+      await until(() => !existsSync(path.join(node.dataDir, 'install-txn.json')), 30_000);
+      const status = await node.status(s => s.state === 'running' && s.supervisor, 30_000);
+      assert.deepEqual(status.command, selected.command, `${recovery}: the selected installation runs`);
+      assert.ok(existsSync(unit) && !existsSync(defaultUnit), `${recovery}: one definition, where it was installed`);
+      assert.equal(existsSync(path.join(home, '.local', 'share', 'sidevoice')), false, `${recovery}: no copies where it was not installed`);
+      // Uninstalled from the bare shell: everything, where it is.
+      const removed = cli(['uninstall'], bare);
+      assert.equal(removed.status, 0, removed.stdout + removed.stderr);
+      assert.equal(existsSync(unit), false, 'the definition');
+      assert.equal(existsSync(path.join(custom.XDG_DATA_HOME, 'sidevoice')), false, 'the copies');
+      assert.equal(existsSync(node.dataDir), false, 'the data');
+      assert.equal(await node.ask('node.status').then(() => true, () => false), false, 'nothing runs');
+      for (const pid of new Set(node.said().map(line => line.pid))) assert.equal(running(pid), false, `core ${pid}`);
+    } finally {
+      node.stop();
+      try { process.kill(Number(readFileSync(path.join(tools, 'state', 'pid'), 'utf8')), 'SIGKILL'); } catch {}
+    }
+  }
+});

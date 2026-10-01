@@ -27,7 +27,7 @@ import { remove as removeSkill, skillsDir, status as skillStatus } from './skill
 import { transact } from './install-txn.mjs';
 import { HARNESS_REGISTRATIONS, candidate, claudeState, codexInstructions, copiesDir, cursorHasOurs, cursorMcpFile, cursorState, fromSource,
   registerWithClaude, unregisterFromClaude, unregisterFromCursor } from './registrations.mjs';
-import { askConnector, installedService, linger, uninstall as uninstallService } from './service.mjs';
+import { askConnector, installedService, linger, uninstall as uninstallService, withRecordedPaths } from './service.mjs';
 import { dataDirOf } from './node-files.mjs';
 import { readLock } from './lockfile.mjs';
 
@@ -174,6 +174,7 @@ export async function install(argv = [], env = process.env, { progress = () => {
  *  pairing until it is revoked under "Máquinas" on the room's page — said, with where. Codex's machine-wide
  *  file is, as always, printed and not touched. */
 export async function uninstall(argv = [], env = process.env) {
+  env = withRecordedPaths(env);   // taken apart where it was put, whatever this shell's XDG_* say
   const wanted = flag(argv, '--harness');
   const harnesses = wanted ? [wanted] : harnessesPresent(env);
   const done = [], next = [];

@@ -302,9 +302,13 @@ test('service definitions: the LaunchAgent and the user unit, exactly', () => {
     'Environment="SIDEVOICE_SERVICE=systemd"', 'Environment="SIDEVOICE_X=50%%$HOME"']) assert.ok(lines.includes(line), `${line} in the unit`);
   assert.ok(lines.indexOf('StartLimitBurst=5') < lines.indexOf('[Service]'), 'the start limit is the unit\'s, in [Unit]');
 
-  // What the definition carries from this environment: Sidevoice's settings, never a credential of a core somebody else runs.
-  assert.deepEqual(serviceEnvironment('systemd', { SIDEVOICE_DATA_DIR: '/d', SIDEVOICE_CONNECTOR_TOKEN: 'secret', SIDEVOICE_URL: 'http://x', PATH: '/bin', SIDEVOICE_SERVICE: 'launchd' }),
-    { SIDEVOICE_DATA_DIR: '/d', SIDEVOICE_SERVICE: 'systemd' });
+  // What the definition carries from this environment: Sidevoice's settings, never a credential of a core somebody else
+  // runs, and the paths the installation lives at, resolved.
+  assert.deepEqual(serviceEnvironment('systemd', { HOME: '/home/ana', SIDEVOICE_DATA_DIR: '/d', SIDEVOICE_CONNECTOR_TOKEN: 'secret', SIDEVOICE_URL: 'http://x', PATH: '/bin', SIDEVOICE_SERVICE: 'launchd', XDG_CONFIG_HOME: '/cfg' }),
+    { SIDEVOICE_DATA_DIR: '/d', XDG_DATA_HOME: '/home/ana/.local/share', XDG_CONFIG_HOME: '/cfg', SIDEVOICE_SERVICE: 'systemd' });
+  // An installation's recorded ones win over this process's.
+  const recorded = { settings: { SIDEVOICE_DATA_DIR: '/e' }, paths: { SIDEVOICE_DATA_DIR: '/e', XDG_DATA_HOME: '/x/data', XDG_CONFIG_HOME: '/x/config' } };
+  assert.deepEqual(serviceEnvironment('launchd', { HOME: '/home/ana', XDG_CONFIG_HOME: '/cfg' }, recorded), { ...recorded.paths, SIDEVOICE_SERVICE: 'launchd' });
 });
 
 test('a plain connector: the app\'s status probes neither keep it alive nor reset its idle timer; a façade that asks for work does', async () => {

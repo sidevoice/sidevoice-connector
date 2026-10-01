@@ -74,11 +74,12 @@ function manage(env, kind, args) {
   }
 }
 
-/** What the supervisor is started with besides its arguments: the `SIDEVOICE_*` settings this install was made
- *  with (a data dir, a core named by hand…) — never a credential of a core somebody else runs — and which
- *  manager runs it, which `node.status` reports. */
-export function serviceEnvironment(kind, env = process.env) {
-  return { ...installationSettings(env), SIDEVOICE_SERVICE: kind };
+/** What the supervisor is started with besides its arguments: the `SIDEVOICE_*` settings the installation was made
+ *  with (a data dir, a core named by hand…) — never a credential of a core somebody else runs — the paths it lives
+ *  at, and which manager runs it, which `node.status` reports. The installation's recorded ones; else this
+ *  process's. */
+export function serviceEnvironment(kind, env = process.env, record = null) {
+  return { ...(record?.settings ?? installationSettings(env)), ...(record?.paths ?? installationPaths(env)), SIDEVOICE_SERVICE: kind };
 }
 
 /** The one environment every launch of an installation runs with — a detached supervisor, a hand-off, a
@@ -89,7 +90,29 @@ export function serviceEnvironment(kind, env = process.env) {
 const CARRIED = new Set(['SIDEVOICE_TEST_HOOKS']);
 export function launchEnvironment(record, env = process.env, extra = {}) {
   const base = Object.fromEntries(Object.entries(env).filter(([name]) => !name.startsWith('SIDEVOICE_') || CARRIED.has(name)));
-  return { ...base, ...(record?.settings ?? installationSettings(env)), ...extra };
+  return { ...base, ...(record?.settings ?? installationSettings(env)), ...(record?.paths ?? installationPaths(env)), ...extra };
+}
+
+/** Where an installation lives, resolved and absolute as its installer saw them: its data directory, the directory
+ *  its copies go under (`XDG_DATA_HOME`), the one its service definition goes under (`XDG_CONFIG_HOME`). Recorded in
+ *  it and in its journal, and given to everything that runs it or takes it apart: a unit's process, a helper, a
+ *  person's shell need not have the installer's environment to find what it made. */
+export function installationPaths(env = process.env) {
+  const home = env.HOME || os.homedir();
+  return {
+    SIDEVOICE_DATA_DIR: path.resolve(dataDirOf(env)),
+    XDG_DATA_HOME: path.resolve(env.XDG_DATA_HOME || path.join(home, '.local', 'share')),
+    XDG_CONFIG_HOME: path.resolve(env.XDG_CONFIG_HOME || path.join(home, '.config')),
+  };
+}
+
+/** `env` with the paths recorded for this data directory — an install transaction's under way, else the selected
+ *  installation's — in place of its own: what acts on an installation acts where that installation is. */
+export function withRecordedPaths(env = process.env) {
+  const files = nodeFiles(dataDirOf(env));
+  let recorded = null;
+  try { recorded = readJson(files.journal)?.paths ?? readJson(files.install)?.paths ?? null; } catch {}
+  return recorded ? { ...env, ...recorded } : env;
 }
 
 /** Start `argv` where stopping this node's service cannot take it along. Under systemd a unit's processes all go
@@ -237,7 +260,7 @@ export function writeDefinition(kind, record, env = process.env) {
   if (!file) return null;
   const dataDir = dataDirOf(env);
   // The installation's own settings when it recorded them; else this process's.
-  const environment = record.settings ? { ...record.settings, SIDEVOICE_SERVICE: kind } : serviceEnvironment(kind, env);
+  const environment = serviceEnvironment(kind, env, record);
   const spec = { program: serviceProgram(record), log: nodeFiles(dataDir).serviceLog, environment };
   writePrivate(file, kind === 'launchd' ? plistText(spec) : unitText(spec));
   return file;
@@ -586,7 +609,6 @@ export async function uninstall(env = process.env, { keepStopped = false } = {})
 export async function run(argv = [], env = process.env) {
   const [action] = argv.filter(item => !item.startsWith('-'));
   const json = argv.includes('--json');
-  // `reload` is the node's own: a supervisor handing over to the installation now selected (`connector.mjs`).
   // `reload` and `recover` are the node's own: a supervisor handing over to the installation now selected, or
   // having its own removal finished outside it (`connector.mjs`).
   const actions = { install, uninstall, start, stop, restart, status, reload, recover: recoverInstallation };
@@ -595,7 +617,8 @@ export async function run(argv = [], env = process.env) {
     console.error(t('service.usage')); return 2;
   }
   let result;
-  try { result = await actions[action](env); }
+  // Every action is on the installation there is: where it recorded it lives, whatever this shell says.
+  try { result = await actions[action](withRecordedPaths(env)); }
   catch (error) { result = { ok: false, error: { key: error.key || 'service.failed', message: error.message } }; }
   if (json) console.log(JSON.stringify(result));
   else if (!result.ok) console.error(result.error?.message || t('service.failed'));

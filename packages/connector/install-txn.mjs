@@ -34,7 +34,7 @@ import { keyed, t } from './i18n.mjs';
 import { connectorClient } from './ipc.mjs';
 import { dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
 import { HARNESS_REGISTRATIONS, candidate, copiesDir, registration, stageCopy } from './registrations.mjs';
-import { askConnector, definitionProgram, installationSettings, installedService, launchEnvironment, managerKind, reload, stopNode, uninstall as removeService, writeDefinition } from './service.mjs';
+import { askConnector, definitionProgram, installationPaths, installationSettings, installedService, launchEnvironment, managerKind, reload, stopNode, uninstall as removeService, writeDefinition } from './service.mjs';
 import { crash, pause } from './testpoint.mjs';
 
 const VERIFY_MS = Number(process.env.SIDEVOICE_INSTALL_VERIFY_MS || 60_000);
@@ -76,7 +76,7 @@ async function planFor(env, { from, to, consent = [], wantService = false, notes
   // With no manager, the node service is a detached supervisor: there is one if one answers.
   const detached = !existing && managerKind(env) === 'none' && !!(await askConnector('node.status', {}, { env, timeout: 1500 }))?.supervisor;
   const before = !!existing || detached;
-  return { from, to, harnesses, service: { kind: existing?.kind ?? managerKind(env), before, want: wantService || before } };
+  return { from, to, harnesses, service: { kind: existing?.kind ?? managerKind(env), before, want: wantService || before }, paths: installationPaths(env) };
 }
 
 /** For one side of a journal: the installation, what each registration must be, and whether a service is defined. */
@@ -94,6 +94,7 @@ function desired(journal, side) {
 /** Make every artifact so for one side, then read each back. Every step is "make it so": done again, it changes
  *  nothing. `crashing` arms the test crash points between side effects. */
 export async function reconcile(env, journal, side, { crashing = false, notes = [] } = {}) {
+  env = { ...env, ...journal.paths };   // where the transaction's installer put things, whoever reconciles
   const files = nodeFiles(dataDirOf(env));
   const point = name => { if (crashing) crash(`txn-${name}`); };
   const { record, harnesses, service } = desired(journal, side);
@@ -230,6 +231,7 @@ export async function recover(env, { mode = 'installer', log = () => {} } = {}) 
   const files = nodeFiles(dataDirOf(env));
   const journal = readJson(files.journal);
   if (!journal) return null;
+  env = { ...env, ...journal.paths };
   let side = selectedSide(env, journal);
   // A supervisor cannot reconcile toward an installation without itself — nothing at all, or one with no service:
   // stopping what runs would stop the reconciler. That recovery is finished outside it (`service recover`).
@@ -297,7 +299,7 @@ export async function transact(env, { core = true, applyNow = false, by = env.SI
     await recover(env, { mode: core ? 'installer' : 'artifacts', log });
     const current = readJson(files.install);   // the selection, read again under the lock
     if (keep && !current) throw keyed('service.no-installation');
-    const fresh = { ...candidate(env), by, at: new Date().toISOString(), settings: installationSettings(env) };
+    const fresh = { ...candidate(env), by, at: new Date().toISOString(), settings: installationSettings(env), paths: installationPaths(env) };
     const action = keep ? 'noop' : decide(current, fresh);
     let next = action === 'noop' ? current : fresh;
     if (action !== 'noop') {
