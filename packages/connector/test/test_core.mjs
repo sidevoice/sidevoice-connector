@@ -58,7 +58,7 @@ test('core: the connector installs the pinned core with uv, once, starts it and 
     assert.equal(joined.binding_id, 'core-thread-1', 'the binding is the core\'s, over the loopback link');
     const venv = path.join(node.dataDir, 'core-runtime', CORE_VERSION, 'venv');
     assert.deepEqual(node.uvCalls(), [
-      ['venv', '--clear', '--python', '3.12', venv],
+      ['venv', '--clear', '--python-preference', 'only-managed', '--python', '3.12', venv],
       ['pip', 'install', '--python', path.join(venv, 'bin', 'python'), '/wheels/sidevoice_core-' + CORE_VERSION + '-py3-none-any.whl'],
     ]);
     const core = node.ready();

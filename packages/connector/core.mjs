@@ -155,7 +155,9 @@ export async function ensureInstalled({ dataDir, env = process.env, log = () => 
     log(`installing sidevoice-core ${CORE_VERSION} with ${uv} from ${spec} (first time only; output in ${logPath(dataDir)})`);
     const started = Date.now();
     const options = { log: logPath(dataDir), env: { ...env, UV_NO_PROGRESS: '1' }, progress };
-    await run(uv, ['venv', '--clear', '--python', '3.12', venv], options);
+    // uv's own Python, never the machine's: the core then runs on one known build everywhere, whatever a
+    // system Python, Homebrew or a version manager left on the PATH.
+    await run(uv, ['venv', '--clear', '--python-preference', 'only-managed', '--python', '3.12', venv], options);
     await run(uv, ['pip', 'install', '--python', python, spec], options);
     if (!executable(bin)) throw new Error(`uv installed ${spec} but there is no ${bin}; see ${logPath(dataDir)}`);
     writeFileSync(marker, JSON.stringify({ version: CORE_VERSION, spec: identity, at: new Date().toISOString() }), { mode: 0o600 });
