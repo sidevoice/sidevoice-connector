@@ -77,10 +77,6 @@ Build artifacts on Actions runs are kept 7 days, for debugging only. Download fr
 
 ## What this needs (repository settings)
 
-- **Secret `SIDEVOICE_CORE_RELEASES_TOKEN`** (repository secret): reads sidevoice/sidevoice-core's releases. The
-  core is private, and a run's own token reaches only this repository. A fine-grained token on
-  sidevoice/sidevoice-core alone, **Contents: read**, nothing else. Without it, nightlies and releases fail at
-  the wheel; pull requests do not need it.
 - **Environment `npm`** (Settings → Environments) with **required reviewers** (the maintainers), deployment branches
   limited to `main` (release-please runs there). The workflow checks it is there and protected before anything
   reaches npm, and refuses otherwise. Note: GitHub documents required reviewers on a private repository as an

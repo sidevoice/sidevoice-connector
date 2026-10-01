@@ -17,10 +17,6 @@ on:
         description: The draft release release-please created (vX.Y.Z); its assets are built from that tag.
         type: string
         required: true
-    secrets:
-      SIDEVOICE_CORE_RELEASES_TOKEN:
-        description: Reads sidevoice/sidevoice-core's releases (a private repository, out of this run's own token's reach).
-        required: false
 
 permissions:
   contents: read
@@ -77,14 +73,10 @@ jobs:
       - name: The core's wheel this version pins (a release takes the core's vX.Y.Z, anything else its nightly)
         id: core
         env:
-          GH_TOKEN: ${{ secrets.SIDEVOICE_CORE_RELEASES_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           KIND: ${{ steps.kind.outputs.publish }}
         run: |
           set -euo pipefail
-          if [ -z "$GH_TOKEN" ]; then
-            echo "::error::The secret SIDEVOICE_CORE_RELEASES_TOKEN is not set: this run cannot read sidevoice/sidevoice-core's releases (RELEASING.md)."
-            exit 1
-          fi
           CORE_VERSION=$(node --input-type=module -e "import { CORE_VERSION } from './packages/connector/core.mjs'; console.log(CORE_VERSION)")
           CORE_TAG=$([ "$KIND" = release ] && echo "v$CORE_VERSION" || echo nightly)
           WHEEL="sidevoice_core-${CORE_VERSION}-py3-none-any.whl"
