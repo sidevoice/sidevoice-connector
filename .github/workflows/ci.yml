@@ -28,7 +28,7 @@ permissions:
 
 env:
   # The real core the interop job runs against: R1-a (sidevoice/sidevoice-core#29) until it merges, then main.
-  CORE_REF: ${{ inputs.core-ref || '64274208ccffbdbdbd3728b0a718bdd1f8141350' }}
+  CORE_REF: ${{ inputs.core-ref || '8b7d2beb8b066763b32feb54f22de954ebd36dbe' }}
 
 concurrency:
   # Per ref. A release (github.workflow is the caller's, release-please) never shares a group with a push.
@@ -66,23 +66,27 @@ jobs:
           set -euo pipefail
           printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$(command -v node)" "$PWD/test/fake-sidevoice-core.mjs" > "$RUNNER_TEMP/sidevoice-core"
           chmod 755 "$RUNNER_TEMP/sidevoice-core"
-          export SIDEVOICE_SERVICE_MANAGER=none SIDEVOICE_CORE_BIN="$RUNNER_TEMP/sidevoice-core" SIDEVOICE_CORE_PORT=0
-          node cli.mjs connector --supervise &
-          for i in $(seq 1 60); do [ -f "$HOME/.sidevoice/core/core.json" ] && break; sleep 1; done
+          export SIDEVOICE_SERVICE_MANAGER=none SIDEVOICE_CORE_PORT=0
+          # The two jobs as their manager would run them: the core, then the connector, which links to it.
+          mkdir -m 700 -p "$HOME/.sidevoice/core"
+          "$RUNNER_TEMP/sidevoice-core" --data-dir "$HOME/.sidevoice/core" --port 0 --socket "$HOME/.sidevoice/core/local.sock" --idle-exit 0 &
+          node cli.mjs connector --service &
+          for i in $(seq 1 60); do [ -f "$HOME/.sidevoice/core/core.json" ] && [ -S "$HOME/.sidevoice/connector.sock" ] && break; sleep 1; done
           url=$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.env.HOME + '/.sidevoice/core/core.json', 'utf8')).url)")
           chmod o+x "$HOME"; chmod 755 "$HOME/.sidevoice"
           ls -la "$HOME/.sidevoice" "$HOME/.sidevoice/core" || true
           sudo useradd -m sidevoice-other
           install -m 644 test/second-uid-probe.mjs /tmp/second-uid-probe.mjs
           sudo -u sidevoice-other "$(command -v node)" /tmp/second-uid-probe.mjs "$HOME/.sidevoice" "$url"
-          kill %1
+          kill %1 %2
       - name: Package contents (dry run)
         run: npm pack --dry-run
         working-directory: packages/connector
 
-  # The connector against the real core, not the fake: it supervises it, links on its socket (no Origin, a loopback
-  # Host), registers a binding and gets a device code minted there, and finds the link gone from TCP. Required here:
-  # a core that is not there fails the job instead of skipping the test.
+  # The connector against the real core, not the fake: the connector job links to a core it did not start, on its
+  # socket (no Origin, a loopback Host), registers a binding and gets a device code minted there, and finds the link
+  # gone from TCP; and the core holds its data directory (a second start exits 75) and exits 0 after a failed start.
+  # Required here: a core that is not there fails the job instead of skipping the test.
   interop-core:
     name: Interop with the real core
     if: ${{ !inputs.release-tag }}
@@ -112,10 +116,12 @@ jobs:
           SIDEVOICE_INTEROP_REQUIRED: '1'
         run: node --test --test-name-pattern=interop packages/connector/test/test_core.mjs
 
-  # The node service under the real service managers, end to end (packages/connector/test/service-integration.mjs):
-  # install with no agents → the core running with no harness → killed → backoff → running → a login, approximated
-  # → stop (the person's; the launcher refuses) → start → uninstall with a client connected → no job, no process,
-  # no socket, and nothing after the next login. The fake core plays the core.
+  # The two jobs under the real service managers, end to end (packages/connector/test/service-integration.mjs):
+  # install with no agents → both jobs up with no harness → kill -9 the core: the manager restarts it → a core that
+  # fails its import: failed, and no new process for 3× the throttle → service restart → running → a login,
+  # approximated → stop (the launcher refuses) → start → upgrade A→B → upgrade B→C (its core cannot serve): back on B
+  # → uninstall with a client connected → no job, process, socket or release, and nothing after the next login.
+  # Three real builds of the package; the fake core plays the core.
   service-linux:
     name: Node service (systemd user manager)
     needs: client
@@ -138,11 +144,6 @@ jobs:
           echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
       - run: systemctl --user show-environment >/dev/null && systemctl --user is-system-running || true
       - run: node packages/connector/test/service-integration.mjs
-      # The supervisor's hand-off under the manager: an installer killed right after committing a new selection; the
-      # supervisor running the old one hands over through 'service reload' and the manager ends up running the new one —
-      # and a selection whose core cannot serve is rolled back, under the manager, to the one before.
-      - name: Hand-off to a new selection, and its rollback, under the manager
-        run: node packages/connector/test/service-handoff.mjs
 
   service-macos:
     name: Node service (launchd)
@@ -157,16 +158,12 @@ jobs:
           cache: npm
       - run: npm ci
       - run: launchctl print "gui/$(id -u)" >/dev/null && echo "gui domain present"
-      # The locks are the kernel's: on macOS the lock file opened O_EXLOCK|O_NONBLOCK through libuv. Proved here, on the
-      # platform: three contenders never hold it at once, a SIGKILLed holder frees it at once, a held lock is refused.
+      # The locks are the kernel's: on macOS the lock file opened O_EXLOCK|O_NONBLOCK through libuv (Linux: util-linux
+      # flock on the same descriptor). Proved here, on the platform: three contenders never hold it at once, a SIGKILLed
+      # holder frees it at once, a held lock is refused, a link is never followed.
       - name: Kernel-held locks on macOS
         run: node --test --test-name-pattern="^lock|install lock" packages/connector/test/test_security.mjs
       - run: node packages/connector/test/service-integration.mjs
-      # The supervisor's hand-off under the manager: an installer killed right after committing a new selection; the
-      # supervisor running the old one hands over through 'service reload' and the manager ends up running the new one —
-      # and a selection whose core cannot serve is rolled back, under the manager, to the one before.
-      - name: Hand-off to a new selection, and its rollback, under the manager
-        run: node packages/connector/test/service-handoff.mjs
 
   package:
     name: npm tarball with the core inside
@@ -212,7 +209,7 @@ jobs:
         env:
           SIDEVOICE_CORE_WHEEL: ${{ steps.core.outputs.wheel }}
           KIND: ${{ steps.kind.outputs.publish }}
-          # Which build this is, for the installer's ordering (install-txn.mjs): a nightly carries the version of the
+          # Which build this is, for the installer's ordering (release.mjs): a nightly carries the version of the
           # last release, so two nightlies of one version are ordered by this run number. build.mjs stamps both into
           # dist/package.json; the package's own manifest is stamped here too.
           SIDEVOICE_CHANNEL: ${{ steps.kind.outputs.publish == 'nightly' && 'nightly' || 'release' }}
