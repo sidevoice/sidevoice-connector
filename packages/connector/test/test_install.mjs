@@ -316,3 +316,72 @@ test('supervisor recovery: a supervisor started from the new program while the s
     await until(() => !existsSync(path.join(node.dataDir, 'install-txn.json')), 15_000);
   } finally { node.stop(); }
 });
+
+test('supervisor recovery: a committed upgrade whose core runs but speaks another link protocol is a failure — rolled back to the previous installation, never declared done', { skip: process.platform !== 'linux' && 'reads /proc' }, async () => {
+  const { node, from, to, startAs, holder } = twoInstallations();
+  writeFileSync(path.join(node.dataDir, 'install.json'), JSON.stringify(to), { mode: 0o600 });
+  writeFileSync(node.modesFile, ['ok+link:999', 'ok'].join('\n') + '\n');
+  try {
+    startAs(to);
+    await until(() => !existsSync(path.join(node.dataDir, 'install-txn.json')) && holder().includes(from.copy), 60_000);
+    const status = await node.status(s => s.state === 'running', 30_000);
+    assert.deepEqual(status.command, from.command);
+    assert.equal(JSON.parse(readFileSync(path.join(node.dataDir, 'install.json'), 'utf8')).id, '0.5.0');
+    assert.match(node.log(), /does not run compatibly \(install\.incompatible\): rolling back/);
+  } finally { node.stop(); }
+});
+
+/** A machine where a built 0.5.0 copy is installed and its plain connector runs, and this checkout is the candidate. */
+function runningPlainMachine(modes = ['ok']) {
+  execFileSync(process.execPath, [path.join(packageDir, 'build.mjs')], { stdio: 'ignore' });
+  const node = supervisedNode({ modes });
+  const home = path.dirname(node.dataDir);
+  const xdg = path.join(home, path.basename(node.dataDir) + '-xdg');
+  const copy = path.join(xdg, 'sidevoice', '0.5.0');
+  cpSync(path.join(packageDir, 'dist'), path.join(copy, 'dist'), { recursive: true });
+  const from = { id: '0.5.0', connector: '0.5.0', core: '0.1.0', channel: 'release', build_seq: 0, runtime: 'external', runtime_id: 'external', service: 'none', copy, command: [process.execPath, path.join(copy, 'dist', 'cli.mjs')] };
+  mkdirSync(node.dataDir, { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(node.dataDir, 'install.json'), JSON.stringify(from), { mode: 0o600 });
+  const env = { ...node.env, XDG_DATA_HOME: xdg, SIDEVOICE_INSTALL_FROM_SOURCE: '0', SIDEVOICE_INSTALL_VERIFY_MS: '15000' };
+  return { node, env, from, xdg };
+}
+
+test('no-service upgrade: the running connector of the previous installation is replaced by the selected one, and that is what is verified', { skip: process.platform !== 'linux' && 'reads /proc' }, async () => {
+  const { node, env, from, xdg } = runningPlainMachine();
+  try {
+    const old = spawn(from.command[0], [from.command[1], 'connector'], { env, stdio: 'ignore' });
+    node.children.push(old);
+    await until(() => existsSync(node.socketPath));
+    await node.ask('node.ensure');
+    const run = spawnSync(process.execPath, [path.join(packageDir, 'cli.mjs'), 'install', '--no-agents', '--no-service', '--json'], { env, encoding: 'utf8' });
+    const answer = JSON.parse(run.stdout.trim().split('\n').at(-1));
+    assert.equal(run.status, 0, run.stdout + run.stderr);
+    assert.equal(answer.action, 'upgrade');
+    const selected = JSON.parse(readFileSync(path.join(node.dataDir, 'install.json'), 'utf8'));
+    const status = await node.ask('node.status');
+    assert.deepEqual(status.command, selected.command, 'the connector answering is the selected installation\'s');
+    assert.ok(status.command[1].startsWith(path.join(xdg, 'sidevoice')) && !status.command[1].includes('0.5.0'));
+    await until(() => old.exitCode !== null, 10_000);
+    assert.equal(existsSync(path.join(node.dataDir, 'install-txn.json')), false);
+  } finally { node.stop(); }
+});
+
+test('rollback to nothing: a first install whose core serves but speaks another link protocol leaves no supervisor, connector or core running — with and without a service', async () => {
+  for (const service of [true, false]) {
+    const node = supervisedNode({ modes: ['ok+link:999'] });
+    const home = path.dirname(node.dataDir);
+    const env = { ...node.env, XDG_DATA_HOME: path.join(home, path.basename(node.dataDir) + '-xdg'), SIDEVOICE_INSTALL_FROM_SOURCE: '0', SIDEVOICE_INSTALL_VERIFY_MS: '8000' };
+    try {
+      const run = spawnSync(process.execPath, [path.join(packageDir, 'cli.mjs'), 'install', '--no-agents', ...(service ? [] : ['--no-service']), '--json'], { env, encoding: 'utf8' });
+      const answer = JSON.parse(run.stdout.trim().split('\n').at(-1));
+      assert.equal(run.status, 1, `service ${service}: ${run.stdout}`);
+      assert.equal(answer.error.key, 'install.rollback');
+      assert.equal(existsSync(path.join(node.dataDir, 'install.json')), false);
+      assert.equal(existsSync(path.join(node.dataDir, 'install-txn.json')), false);
+      const cores = [...new Set(node.said().filter(line => line.event === 'started').map(line => line.pid))];
+      assert.ok(cores.length >= 1, 'a core was started and judged');
+      for (const pid of cores) assert.equal((() => { try { process.kill(pid, 0); return true; } catch { return false; } })(), false, `service ${service}: core ${pid} is gone`);
+      assert.equal(await node.ask('node.status').then(() => true, () => false), false, `service ${service}: nothing answers on the socket`);
+    } finally { node.stop(); }
+  }
+});

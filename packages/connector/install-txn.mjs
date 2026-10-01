@@ -28,12 +28,13 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, renameSync, rmSync } from 'node:fs';
 import path from 'node:path';
-import { API_RANGE, CORE_VERSION, LINK_RANGE, installRuntime, readReady, runtimePaths, runtimeRoot, takeInstallLock } from './core.mjs';
+import { spawn } from 'node:child_process';
+import { API_RANGE, CORE_VERSION, LINK_RANGE, installRuntime, launchedFrom, readReady, runtimePaths, runtimeRoot, takeInstallLock } from './core.mjs';
 import { keyed, t } from './i18n.mjs';
 import { connectorClient } from './ipc.mjs';
 import { dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
 import { HARNESS_REGISTRATIONS, candidate, copiesDir, registration, stageCopy } from './registrations.mjs';
-import { askConnector, definitionProgram, installedService, managerKind, reload, uninstall as removeService, writeDefinition } from './service.mjs';
+import { askConnector, definitionProgram, installedService, managerKind, reload, stopNode, uninstall as removeService, writeDefinition } from './service.mjs';
 import { crash, pause } from './testpoint.mjs';
 
 const VERIFY_MS = Number(process.env.SIDEVOICE_INSTALL_VERIFY_MS || 60_000);
@@ -62,7 +63,7 @@ export const sameCommand = (a, b) => Array.isArray(a) && Array.isArray(b) && a.l
 const sameRecord = (a, b) => !!a && !!b && a.id === b.id && sameCommand(a.command, b.command);
 
 /** What a transaction will make true, and what was true before it — so either side can be made true again. */
-function planFor(env, { from, to, consent = [], wantService = false, notes = [] }) {
+async function planFor(env, { from, to, consent = [], wantService = false, notes = [] }) {
   const harnesses = {};
   for (const [name, operations] of Object.entries(HARNESS_REGISTRATIONS)) {
     const before = operations.state(env).state;
@@ -72,7 +73,10 @@ function planFor(env, { from, to, consent = [], wantService = false, notes = [] 
     harnesses[name] = { before, want: before === 'ours' || (consent.includes(name) && before === 'absent' && reachable) };
   }
   const existing = installedService(env);
-  return { from, to, harnesses, service: { kind: existing?.kind ?? managerKind(env), before: !!existing, want: wantService || !!existing } };
+  // With no manager, the node service is a detached supervisor: there is one if one answers.
+  const detached = !existing && managerKind(env) === 'none' && !!(await askConnector('node.status', {}, { env, timeout: 1500 }))?.supervisor;
+  const before = !!existing || detached;
+  return { from, to, harnesses, service: { kind: existing?.kind ?? managerKind(env), before, want: wantService || before } };
 }
 
 /** For one side of a journal: the installation, what each registration must be, and whether a service is defined. */
@@ -93,6 +97,12 @@ export async function reconcile(env, journal, side, { crashing = false, notes = 
   const files = nodeFiles(dataDirOf(env));
   const point = name => { if (crashing) crash(`txn-${name}`); };
   const { record, harnesses, service } = desired(journal, side);
+  // Toward nothing, or toward an installation without a service: whatever runs now — a detached supervisor, a
+  // connector, their core — is stopped, and seen gone (each by its verified identity), before anything is cleared.
+  if (!record || (!service && journal.service.kind === 'none')) {
+    const status = await askConnector('node.status', {}, { env, timeout: 1500 });
+    if (!record || status?.supervisor) { const down = await stopNode(env); if (down.left.length) throw keyed('service.unload-failed', { detail: `pid ${down.left.join(', ')} still running` }); }
+  }
   if (record?.copy && !existsSync(record.copy)) {
     if (!existsSync(record.copy + '.staging')) throw keyed('install.copy-missing', { path: record.copy });
     renameSync(record.copy + '.staging', record.copy);
@@ -152,32 +162,53 @@ function verifyRegistrations(env, record, harnesses) {
   }
 }
 
-/** Whether the node runs this installation compatibly: restarted on it — through its service when one is defined
- *  (the supervisor is replaced, and must be this installation's program), else through the launcher, which starts
- *  this installation's connector — and answering `running` with a compatible `api` and link. */
+/** The one verification gate (installer and supervisor alike): the connector answering runs this installation's
+ *  command and is running; its core was launched from this installation's runtime; and it speaks a compatible `api`
+ *  and link. `{ok}`, or `{ok: false, why}` — `why` a cause key. */
+export function selectionRuns(status, record, dataDir) {
+  if (status?.state !== 'running') return { ok: false, why: status?.state === 'failed' ? (status.failure?.key || 'install.verify') : 'ready.timeout' };
+  if (!sameCommand(status.command, record.command)) return { ok: false, why: 'install.not-selected' };
+  if (record.core_bin && record.runtime_id !== 'external' && launchedFrom(dataDir, status.core?.launch_id) !== record.core_bin) return { ok: false, why: 'install.not-selected' };
+  const api = status.core?.api, link = readReady(dataDir)?.protocol;
+  const within = (value, [low, high]) => Number.isInteger(value) && value >= low && value <= high;
+  if (!within(api, API_RANGE) || !within(link, LINK_RANGE)) return { ok: false, why: 'install.incompatible' };
+  return { ok: true };
+}
+export const VERIFY_DEADLINE_MS = VERIFY_MS;
+
+/** Make the node run this installation and judge it with `selectionRuns`, within `VERIFY_MS`. With a service (or a
+ *  detached supervisor) the service is reloaded from its definition — the supervisor is replaced. With none, the
+ *  connector answering is replaced by this installation's (`connector --replace` takes it over by handover), or one is
+ *  started through the launcher with this installation's command; then the core is ensured. */
 export async function runsCompatibly(env, record, { service, log = () => {} }) {
   const dataDir = dataDirOf(env);
-  const fits = status => status?.state === 'running' && Number.isInteger(status.core?.api) && status.core.api >= API_RANGE[0] && status.core.api <= API_RANGE[1]
-    && (() => { const ready = readReady(dataDir); return Number.isInteger(ready?.protocol) && ready.protocol >= LINK_RANGE[0] && ready.protocol <= LINK_RANGE[1]; })()
-    && (!service || (status.supervisor && sameCommand(status.command, record.command)));
   let last = null;
   try {
     if (service) await reload(env);
     else {
+      const answering = await askConnector('node.status', {}, { env, timeout: 1500 });
+      if (answering?.state && !sameCommand(answering.command, record.command)) {
+        log(`the connector running (${answering.command?.join(' ')}) is not the selected installation's: replacing it`);
+        const child = spawn(record.command[0], [...record.command.slice(1), 'connector', '--replace'], { detached: true, stdio: 'ignore', env });
+        child.on('error', () => {}); child.unref();
+        const until = Date.now() + VERIFY_MS;
+        while (Date.now() < until && !sameCommand((await askConnector('node.status', {}, { env, timeout: 1500 }))?.command, record.command)) await wait(100);
+      }
       const client = connectorClient(env, { self: record.command });
       try { last = await client.rpc('node.ensure', {}); } finally { client.end(); }
-      if (fits(last)) return { ok: true };
+      if (selectionRuns(last, record, dataDir).ok) return { ok: true };
     }
     const deadline = Date.now() + VERIFY_MS;
     while (Date.now() < deadline) {
       last = await askConnector('node.status', {}, { env, timeout: 1500 });
-      if (fits(last)) return { ok: true };
+      if (selectionRuns(last, record, dataDir).ok) return { ok: true };
       if (last?.state === 'failed') break;
-      await wait(500);
+      await wait(250);
     }
   } catch (error) { return { ok: false, failure: { key: error.key || 'install.verify', message: error.message } }; }
-  log(`the installation ${record.id} did not run (${last?.state ?? 'no answer'})`);
-  return { ok: false, failure: last?.failure || { key: last?.state === 'running' ? 'install.incompatible' : 'ready.timeout' } };
+  const why = selectionRuns(last, record, dataDir).why;
+  log(`the installation ${record.id} did not run (${why})`);
+  return { ok: false, failure: last?.state === 'failed' && last.failure ? last.failure : { key: why } };
 }
 
 /** Which side recovery selects. */
@@ -268,7 +299,7 @@ export async function transact(env, { core = true, applyNow = false, by = env.SI
       } else if (current?.runtime_id) next = { ...next, runtime_id: current.runtime_id, core_bin: current.core_bin };
     }
     const planNotes = [];
-    const plan = planFor(env, { from: current, to: next, consent, wantService: service, notes: planNotes });
+    const plan = await planFor(env, { from: current, to: next, consent, wantService: service, notes: planNotes });
     // The record says which service it was installed with (informational: the definition on disk is the truth).
     next = plan.to = { ...next, service: plan.service.want ? plan.service.kind : 'none' };
     const newConsent = Object.values(plan.harnesses).some(harness => harness.want && harness.before === 'absent');

@@ -251,8 +251,8 @@ test('connector: a lock left by a pid that is now something else is stale, not a
   writeFileSync(path.join(dataDir, 'connector.sock.lock'), JSON.stringify({ pid: process.pid, start: 'another-process', kind: 'connector', nonce: 'stale', at: new Date().toISOString() }), { mode: 0o600 });
   const only = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '5000' });
   try {
+    // The lock is the kernel's: a record naming another process is only information, and blocks nothing.
     await until(() => existsSync(only.socketPath));
-    assert.match(only.stderr(), /stale lock .* taking over/);
     assert.equal(JSON.parse(readFileSync(path.join(dataDir, 'connector.sock.lock'), 'utf8')).pid, only.child.pid);
   } finally { if (only.child.exitCode === null) only.child.kill(); await room.close(); }
 });

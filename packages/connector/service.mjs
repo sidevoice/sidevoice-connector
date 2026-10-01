@@ -324,6 +324,14 @@ async function awaitDown(env, processes = nodeProcesses(env)) {
   return { killed, left: left() };
 }
 
+/** Stop whatever node runs without a service manager — the connector holding the socket (a detached supervisor or
+ *  a plain connector) and the core — each signalled only as its verified self, and wait until both are gone. */
+export async function stopNode(env = process.env) {
+  const processes = nodeProcesses(env);
+  signalNode(processes, 'SIGTERM');
+  return awaitDown(env, processes);
+}
+
 /** Wait for a connector to answer on the socket, up to `START_WAIT_MS`. */
 async function awaitUp(env, timeout = START_WAIT_MS) {
   const deadline = Date.now() + timeout;

@@ -48,6 +48,9 @@ const [behaviour, ...modifiers] = mode().split('+');
 const [kind, argument] = behaviour.split(':');
 const stubborn = modifiers.includes('stubborn');
 const chatty = Number(modifiers.find(item => item.startsWith('chatty:'))?.slice(7) || 0);
+// `+link:<n>` / `+api:<n>`: a core that serves, but speaks another link protocol or client api.
+const linkProtocol = Number(modifiers.find(item => item.startsWith('link:'))?.slice(5) || 2);
+const clientApi = Number(modifiers.find(item => item.startsWith('api:'))?.slice(4) || 1);
 if (chatty) setInterval(() => process.stderr.write('x'.repeat(chatty - 1) + '\n'), 20);
 if (modifiers.includes('vanish') && process.env.FAKE_CORE_WRAPPER) rmSync(process.env.FAKE_CORE_WRAPPER, { force: true });
 
@@ -97,7 +100,7 @@ const local = createServer((req, res) => {
   if (Date.now() >= hangAt) return;                           // wedged: never answers
   if (req.method === 'GET' && req.url === '/api/local/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ launch_id: launchId, pid: process.pid, version, api: 1, ...identity, calls: calls() }));
+    res.end(JSON.stringify({ launch_id: launchId, pid: process.pid, version, api: clientApi, ...identity, calls: calls() }));
     return;
   }
   res.writeHead(404); res.end();
@@ -141,7 +144,7 @@ async function serve() {
   const bound = tcp.address().port;
   const ready = path.join(data, 'core.json');
   writeFileSync(ready + '.tmp', JSON.stringify({ pid: process.pid, port: bound, url: `http://127.0.0.1:${bound}`,
-    version, protocol: 2, api: 1, socket: socketPath, launch_id: launchId, ...credential }), { mode: 0o600 });
+    version, protocol: linkProtocol, api: clientApi, socket: socketPath, launch_id: launchId, ...credential }), { mode: 0o600 });
   renameSync(ready + '.tmp', ready);
   said({ event: 'ready', data: { socket: socketPath, port: bound } });
 }

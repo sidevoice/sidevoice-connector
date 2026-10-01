@@ -33,7 +33,7 @@ import { API_RANGE, CORE_VERSION, NO_UV, awaitReady, coreArgs, coreRunning, runs
 import { ensureCoreDirectory, localHealth, socketAgent } from './core-socket.mjs';
 import { appendLine, rotate } from './logfile.mjs';
 import { Supervisor } from './supervisor.mjs';
-import { pruneInstallations, recover, sameCommand, settle } from './install-txn.mjs';
+import { VERIFY_DEADLINE_MS, pruneInstallations, recover, sameCommand, selectionRuns, settle } from './install-txn.mjs';
 import { connectorSocketOf, dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
 import { readLock, tryLock } from './lockfile.mjs';
 import { isProcess, selfIdentity, signalVerified } from './proc.mjs';
@@ -645,7 +645,7 @@ async function shutdown(code = 0) {
 /* ----- an install transaction under way, seen from the supervisor (§4.3, `install-txn.mjs`) ----- */
 
 /** The recovered transaction this supervisor runs, while it waits to be seen running: `{side, record}`. */
-let pendingJournal = null;
+let pendingJournal = null, journalDeadline = null;
 /** Recover a journal an installer left (unless an installer holds the lock: then it is the installer's). The
  *  artifacts are made so for the selected installation; if that is not this program, this supervisor hands over
  *  to it; if it is, the journal stays until this supervisor's core runs compatibly (`settleJournal`). */
@@ -660,17 +660,29 @@ async function checkInstallJournal() {
   if (!outcome) return;
   if (!outcome.record || !sameCommand(outcome.record.command, ownCommand())) return handOff(outcome.record);
   pendingJournal = outcome;
+  // Bounded like the installer's verification: not compatible and running by then, it is a failure.
+  clearTimeout(journalDeadline);
+  journalDeadline = setTimeout(() => settleJournal(supervisor.status(), { expired: true }).catch(error => log('settling the install transaction failed: ' + error.message)), VERIFY_DEADLINE_MS);
+  journalDeadline.unref?.();
   if (supervisor.state === 'running' || supervisor.state === 'failed') await settleJournal(supervisor.status());
 }
 
 /** This supervisor's core ran (the journal goes) or cannot (back to the previous installation, handed over to). */
-async function settleJournal(snapshot) {
-  const running = snapshot.state === 'running' && Number.isInteger(snapshot.core?.api) && snapshot.core.api >= API_RANGE[0] && snapshot.core.api <= API_RANGE[1];
+async function settleJournal(snapshot, { expired = false } = {}) {
+  if (!pendingJournal) return;
+  // The installer's own gate (`selectionRuns`): this program, this runtime, a compatible api and link. Running but
+  // incompatible is a failure, as is not running compatibly by the deadline.
+  const verdict = selectionRuns({ ...snapshot, command: ownCommand() }, pendingJournal.record, dataDir);
+  const running = verdict.ok;
+  const failed = !running && (expired || snapshot.state === 'failed' || snapshot.state === 'running');
+  if (!running && !failed) return;
+  if (failed) log(`the selected installation does not run compatibly (${verdict.why}): rolling back`);
   const release = await takeInstallLock(dataDir, log, { wait: false });
   if (!release) return;
   let settled;
-  try { settled = await settle(env, { running, failed: snapshot.state === 'failed' }); }
+  try { settled = await settle(env, { running, failed }); }
   finally { release(); }
+  clearTimeout(journalDeadline);
   if (settled.outcome === 'done') { pendingJournal = null; log('the installation this supervisor runs is running: the install transaction is complete'); }
   if (settled.outcome === 'rollback') { pendingJournal = null; await handOff(settled.record); }
 }
@@ -1060,15 +1072,18 @@ export async function run(argv = [], environment = process.env) {
   // A supervisor taking over says so first. Between the plain connector letting go and this process taking the lock
   // there is a gap, and a façade that just lost its connector gets one started through the launcher in exactly that
   // gap: that one, seeing a live supervisor's intent, lets the lock go at once instead of serving.
-  if (supervised) writePrivate(files.takeover, { pid: process.pid, start: selfIdentity().start ?? null, at: new Date().toISOString() });
+  // `--replace`: a plain connector of the installation just selected, taking over the one running (an upgrade with
+  // no service), the same way.
+  const taking = supervised || argv.includes('--replace');
+  if (taking) writePrivate(files.takeover, { pid: process.pid, start: selfIdentity().start ?? null, at: new Date().toISOString() });
   for (let attempt = 0; !(await acquireLock()); attempt++) {
-    if (!supervised || attempt >= 50) process.exit(0);
+    if (!taking || attempt >= 50) process.exit(0);
     // The holder's record may not be written yet: asked again in a moment.
     const owner = readLock(lockPath);
     if (connectorAlive(owner) && !(await takeOver(owner))) { try { rmSync(files.takeover, { force: true }); } catch {} process.exit(0); }
     await wait(50);
   }
-  if (supervised) { try { rmSync(files.takeover, { force: true }); } catch {} }
+  if (taking) { try { rmSync(files.takeover, { force: true }); } catch {} }
   else {
     let intent = null; try { intent = readJson(files.takeover); } catch {}
     if (intent && isProcess(intent.pid, { start: intent.start ?? null })) { log(`a supervisor (pid ${intent.pid}) is taking over: not serving`); releaseLock({ socket: false }); process.exit(0); }

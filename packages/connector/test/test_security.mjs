@@ -110,11 +110,12 @@ test('lock: a holder killed with SIGKILL frees the lock at once — nothing stal
     holder.kill('SIGKILL');
     await exited(holder);
     const killedAt = Date.now();
-    const next = contender(file, kind, log, 'B', { hold: 10 });
+    const next = contender(file, kind, log, 'B', { hold: 800 });
+    await until(() => readFileSync(log, 'utf8').includes('B in'));
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).pid, next.pid, 'the record says who holds it now');
     await exited(next);
     const took = Number(readFileSync(log, 'utf8').trim().split('\n').find(line => line.startsWith('B in')).split(' ')[2]);
     assert.ok(took - killedAt < 1000, `${kind}: taken ${took - killedAt} ms after the holder died`);
-    assert.equal(JSON.parse(readFileSync(file, 'utf8')).pid, next.pid, 'the record says who holds it now');
   }
 });
 
