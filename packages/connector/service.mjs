@@ -251,17 +251,34 @@ export function writeDefinitions(kind, env = process.env) {
 
 const domain = () => `gui/${uid()}`;
 const target = job => `${domain()}/${JOBS[job].label}`;
-function loaded(kind, job, env) {
-  if (kind === 'launchd') return manage(env, kind, ['print', target(job)]).ok;
-  if (kind === 'systemd') return !/LoadState=not-found/.test(manage(env, kind, ['--user', 'show', '-p', 'LoadState', JOBS[job].unit]).output);
-  return false;
+/** Whether the manager has a job, as it answers: `{state: 'loaded' | 'absent' | 'unknown', active, detail}`. Absent
+ *  only when the manager said so — launchd's "Could not find service" (113), systemd's `LoadState=not-found`; a
+ *  manager that cannot be asked, or answers anything else, is `unknown`, never absence. */
+export function presence(kind, job, env = process.env) {
+  if (kind === 'launchd') {
+    const printed = manage(env, kind, ['print', target(job)]);
+    if (printed.ok) return { state: 'loaded', active: /^\s*state = running$/m.test(printed.output), detail: null };
+    if (printed.code === 113 || /Could not find service/i.test(printed.output)) return { state: 'absent', active: false, detail: null };
+    return { state: 'unknown', active: null, detail: String(printed.output).trim() || `launchctl exited ${printed.code}` };
+  }
+  if (kind === 'systemd') {
+    const shown = manage(env, kind, ['--user', 'show', '-p', 'LoadState,ActiveState', JOBS[job].unit]);
+    const load = shown.output.match(/^LoadState=(.*)$/m)?.[1]?.trim(), active = shown.output.match(/^ActiveState=(.*)$/m)?.[1]?.trim();
+    if (!shown.ok || !load) return { state: 'unknown', active: null, detail: String(shown.output).trim() || `systemctl exited ${shown.code}` };
+    if (load === 'not-found') return { state: 'absent', active: false, detail: null };
+    return { state: 'loaded', active: ['active', 'activating', 'deactivating', 'reloading'].includes(active), detail: null };
+  }
+  return { state: 'absent', active: false, detail: null };
 }
+const loaded = (kind, job, env) => presence(kind, job, env).state === 'loaded';
 /** `launchctl bootout` returns before launchd has let the job go, and a `bootstrap` in that interval fails
- *  ("5: Input/output error", measured on macos-14): the job is waited out, and the bootstrap tried again. */
+ *  ("5: Input/output error", measured on macos-14): the job is waited out — until launchd says it is gone, which a
+ *  manager that cannot be asked never says — and the bootstrap tried again. */
 async function bootOut(env, job) {
   const out = manage(env, 'launchd', ['bootout', target(job)]);
-  for (let i = 0; i < 100 && loaded('launchd', job, env); i++) await wait(100);
-  return loaded('launchd', job, env) ? { ok: false, output: out.output.trim() || 'still loaded' } : { ok: true };
+  let now = presence('launchd', job, env);
+  for (let i = 0; i < 100 && now.state !== 'absent'; i++) { await wait(100); now = presence('launchd', job, env); }
+  return now.state === 'absent' ? { ok: true } : { ok: false, output: now.state === 'unknown' ? `not confirmed: ${now.detail}` : out.output.trim() || 'still loaded' };
 }
 async function bootIn(env, job) {
   const file = definitionPath('launchd', job, env);
@@ -490,12 +507,18 @@ async function unloadJobs(env, { disable = false } = {}) {
   for (const job of [...ORDER].reverse()) {
     if (!service[job]) continue;
     if (service.kind === 'launchd') {
-      if (!loaded('launchd', job, env)) continue;
+      const before = presence('launchd', job, env);
+      if (before.state === 'unknown') return `${JOBS[job].label}: the manager could not be asked (${before.detail})`;
+      if (before.state === 'absent') continue;
       const out = await bootOut(env, job);
       if (!out.ok) return `${JOBS[job].label}: ${out.output}`;
     } else if (service.kind === 'systemd') {
+      // Stopped is what the manager says afterwards, not what the command returned.
       const out = manage(env, 'systemd', ['--user', ...(disable ? ['disable', '--now'] : ['stop']), JOBS[job].unit]);
-      if (!out.ok && loaded('systemd', job, env)) return `${JOBS[job].unit}: ${out.output.trim()}`;
+      const after = presence('systemd', job, env);
+      if (after.state === 'unknown') return `${JOBS[job].unit}: not confirmed (${after.detail})`;
+      if (after.active) return `${JOBS[job].unit}: still active`;
+      if (!out.ok && after.state !== 'absent') return `${JOBS[job].unit}: ${out.output.trim()}`;
     }
   }
   return null;

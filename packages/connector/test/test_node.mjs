@@ -462,3 +462,29 @@ test('deriveStatus: rows 1–10 — health, nothing installed, no core job, a pe
     } finally { for (const item of [up, down, unloaded, restarting]) item.done(); }
   }
 });
+
+/* ----- review blockers (R1-b-rebuild-astra.md), one regression each ----- */
+
+test('blocker 1: a manager that cannot be asked, or cannot confirm a job gone after its bootout, is not absence — uninstall says service.unload-failed and deletes nothing', async () => {
+  const node = await managedNode('launchd');
+  try {
+    await node.status(s => s.state === 'running');
+    const kept = () => ['core', 'connector'].every(job => existsSync(node.definition(job))) && existsSync(path.join(node.home, 'xdg', 'sidevoice', 'current'));
+    // Unreachable throughout.
+    const unreachable = await node.run(['uninstall'], { SIDEVOICE_LAUNCHCTL: '/bin/false' });
+    assert.deepEqual([unreachable.ok, unreachable.error?.key], [false, 'service.unload-failed'], JSON.stringify(unreachable));
+    assert.ok(kept(), 'definitions and releases are all there');
+    assert.ok(alive(node.pid('core')) && alive(node.pid('connector')), 'and the jobs still run');
+    // Reachable for the bootout, not for the probe after it: unconfirmed is not gone.
+    const wrapper = path.join(node.home, 'launchctl-forgetful');
+    const real = node.env.SIDEVOICE_LAUNCHCTL;
+    writeFileSync(wrapper, `#!/bin/sh\nif [ "$1" = print ] && [ -e "${node.home}/booted" ]; then echo "launchctl: unavailable" >&2; exit 5; fi\n[ "$1" = bootout ] && touch "${node.home}/booted"\nexec "${real}" "$@"\n`, { mode: 0o755 });
+    const unconfirmed = await node.run(['uninstall'], { SIDEVOICE_LAUNCHCTL: wrapper });
+    assert.deepEqual([unconfirmed.ok, unconfirmed.error?.key], [false, 'service.unload-failed'], JSON.stringify(unconfirmed));
+    assert.match(unconfirmed.error.message, /not confirmed/);
+    assert.ok(kept(), 'still nothing deleted');
+    // A manager that answers: it goes.
+    assert.equal((await node.run(['uninstall'])).ok, true);
+    assert.ok(!existsSync(node.definition('core')) && !existsSync(path.join(node.home, 'xdg', 'sidevoice')));
+  } finally { node.stop(); }
+});
