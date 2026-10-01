@@ -4,7 +4,7 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { appendFileSync, chmodSync, rmSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { appendFileSync, chmodSync, rmSync, mkdtempSync, mkdirSync, readdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { startRoom, PROTOCOL } from './room.mjs';
@@ -15,7 +15,6 @@ import { remove as removeSkill, status as skillStatus } from '../skill.mjs';
 import './test_harness_contract.mjs';
 import './test_harness_claude.mjs';
 import './test_core.mjs';
-import './test_supervisor.mjs';
 import './test_node.mjs';
 import './test_install.mjs';
 import './test_security.mjs';
@@ -237,7 +236,7 @@ test('connector: a second instance defers to the live one', async () => {
     const code = await until(() => second.child.exitCode !== null ? second.child.exitCode + 1 : null);
     assert.equal(code - 1, 0);
     assert.match(second.stderr(), /a connector is already running \(pid \d+/, 'it says whom it defers to, never silently');
-    assert.equal(JSON.parse(readFileSync(path.join(dataDir, 'connector.sock.lock'), 'utf8')).pid, first.child.pid);
+    assert.equal(JSON.parse(readFileSync(path.join(dataDir, 'connector.lock'), 'utf8')).pid, first.child.pid);
     const facade = ipcClient(first.socketPath); await facade.ready; assert.equal((await facade.call('status', {})).host.length > 0, true); facade.end();
   } finally { if (first.child.exitCode === null) first.child.kill(); await room.close(); }
 });
@@ -248,12 +247,12 @@ test('connector: a lock left by a pid that is now something else is stale, not a
   // over instead of exiting.
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
-  writeFileSync(path.join(dataDir, 'connector.sock.lock'), JSON.stringify({ pid: process.pid, start: 'another-process', kind: 'connector', nonce: 'stale', at: new Date().toISOString() }), { mode: 0o600 });
+  writeFileSync(path.join(dataDir, 'connector.lock'), JSON.stringify({ pid: process.pid, start: 'another-process', kind: 'connector', nonce: 'stale', at: new Date().toISOString() }), { mode: 0o600 });
   const only = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '5000' });
   try {
     // The lock is the kernel's: a record naming another process is only information, and blocks nothing.
     await until(() => existsSync(only.socketPath));
-    assert.equal(JSON.parse(readFileSync(path.join(dataDir, 'connector.sock.lock'), 'utf8')).pid, only.child.pid);
+    assert.equal(JSON.parse(readFileSync(path.join(dataDir, 'connector.lock'), 'utf8')).pid, only.child.pid);
   } finally { if (only.child.exitCode === null) only.child.kill(); await room.close(); }
 });
 
@@ -1329,12 +1328,12 @@ esac
   const env = { ...process.env, HOME: home, SIDEVOICE_DATA_DIR: path.join(home, '.sidevoice'), CLAUDE_CONFIG_DIR: path.join(home, '.claude'), SIDEVOICE_CLAUDE_BIN: bin,
                 SIDEVOICE_INSTALL_FROM_SOURCE: '0', XDG_DATA_HOME: path.join(home, 'xdg') };
   mkdirSync(env.CLAUDE_CONFIG_DIR);
-  mkdirSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1'), { recursive: true });   // a copy an older install left
+  mkdirSync(path.join(env.XDG_DATA_HOME, 'sidevoice', 'releases', '0.0.1'), { recursive: true });   // a release nothing selects
   const { command, args } = (await import('../install.mjs')).serverCommand(env);
   const wanted = [command, ...args].join(' ');
   const version = JSON.parse(readFileSync(path.join(here, '..', 'package.json'), 'utf8')).version;
   const manifest = JSON.parse(readFileSync(path.join(here, '..', 'package.json'), 'utf8'));
-  assert.equal(wanted, `node ${path.join(env.XDG_DATA_HOME, 'sidevoice', version, 'dist', 'cli.mjs')} mcp`, 'never npx at session start');
+  assert.equal(wanted, `node ${path.join(env.XDG_DATA_HOME, 'sidevoice', 'current', 'dist', 'cli.mjs')} mcp`, 'never npx at session start: the release current selects');
   assert.deepEqual(manifest.dependencies, undefined, 'the published package resolves nothing at install time');
 
   assert.rejects(install(['https://room.example', '--harness', 'claude'], env), /Pairing is not part of installing/, 'a room address is refused, with where pairing lives');
@@ -1343,21 +1342,18 @@ esac
   assert.deepEqual(changes(), [`mcp add --scope user sidevoice -- ${wanted}`], 'nothing registered: it registers this version');
   assert.equal(line(), wanted);
   assert.match(first.done.join('\n'), /Registered the MCP server/);
-  assert.match(first.done.join('\n'), /Copied this version to /);
+  assert.match(first.done.join('\n'), new RegExp(`now runs ${version.replace(/\./g, '\\.')}`));
   // The copy is what the package ships and nothing more: the bundle, the manifest beside it, and
   // no step of its own — nothing is fetched, built or resolved on the machine being installed on.
   // That the bundle then runs is proved where it is run for real, in the room's interop test.
   for (const file of manifest.files.concat('package.json')) {
-    assert.ok(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', version, file)),
+    assert.ok(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', 'releases', version, file)),
       `${file} is in the copy (the bundle is built: npm run build -w @sidevoice/uplink)`);
   }
-  assert.equal(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', version, 'node_modules')), false);
-  // The older copy stays until the new one has run five minutes — then the supervisor prunes it (§4.3 step 6).
-  assert.ok(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1')), 'the older copy stays for a rollback');
-  const { pruneInstallations } = await import('../install.mjs');
-  assert.deepEqual(await pruneInstallations(env), [path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1')]);
-  assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1')), 'then it is gone');
-  assert.ok(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', version)), 'and the selected one is not');
+  assert.equal(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', 'releases', version, 'node_modules')), false);
+  // A release neither current nor previous names is pruned (§2.4 step 9); the selected one is not.
+  assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', 'releases', '0.0.1')), 'pruned');
+  assert.ok(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', 'releases', version, 'release.json')), 'the selected one stays');
   assert.match(first.done.join('\n'), /not paired with any room yet/);
   assert.match(first.next.join('\n'), /Emparejar máquina/, 'and it says the conversation will ask for the code');
   assert.ok(!existsSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room')), 'no skill is installed: the server carries the prompt');
@@ -1383,7 +1379,7 @@ esac
   const upgraded = await install(['--harness', 'claude', '--no-core'], env);
   assert.deepEqual(changes(), ['mcp remove --scope user sidevoice', `mcp add --scope user sidevoice -- ${wanted}`]);
   assert.equal(line(), wanted);
-  assert.match(upgraded.done.join('\n'), /Re-pointed Claude Code/);
+  assert.match(upgraded.done.join('\n'), /Registered the MCP server with Claude Code/);
 
   // Registered somewhere that is not ours to move: left alone, with the command to move it.
   writeFileSync(registered, `sidevoice:\n  Scope: Project config (shared via .mcp.json)\n  Type: stdio\n  Command: npx\n  Args: -y @sidevoice/uplink@0.1.0 mcp\n`);
@@ -1406,8 +1402,8 @@ esac
   const { uninstall } = await import('../install.mjs');
   const gone = await uninstall(['--harness', 'claude', '--no-core'], env);
   assert.deepEqual(changes(), ['mcp remove --scope user sidevoice']);
-  assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice')), 'installed copies are gone');
-  assert.ok(!existsSync(env.SIDEVOICE_DATA_DIR), 'credential, socket and log are gone');
+  assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice')), 'the releases are gone');
+  assert.deepEqual(readdirSync(env.SIDEVOICE_DATA_DIR), ['install.lock'], 'credential, socket and log are gone; the lock file is permanent');
   assert.match(gone.next.join('\n'), /still lists this machine as paired .* revoke it under "Máquinas" on the room/);
   assert.match(gone.done.join('\n'), /Unregistered the MCP server/);
 

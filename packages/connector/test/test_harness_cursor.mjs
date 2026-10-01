@@ -245,7 +245,7 @@ test('tail: a transcript that disappears and comes back short is read again, not
   } finally { stop(); }
 });
 
-test('cursor install: the person\'s mcp.json keeps its permissions and its symlink, and an install for another harness keeps Cursor pointing at a copy that exists', async () => {
+test('cursor install: the person\'s mcp.json keeps its permissions and its symlink; an install for another harness re-points ours from before through current, and uninstall takes it out', async () => {
   const { install, uninstall, registerWithCursor, cursorMcpFile, serverCommand } = await import('../install.mjs');
   const home = mkdtempSync(path.join(os.tmpdir(), 'sv-home-'));
   const env = { ...process.env, HOME: home, SIDEVOICE_DATA_DIR: path.join(home, '.sidevoice'), CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
@@ -265,9 +265,12 @@ test('cursor install: the person\'s mcp.json keeps its permissions and its symli
   mkdirSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1'), { recursive: true });
   const installed = await install(['--harness', 'claude', '--no-core'], env);
   assert.deepEqual(JSON.parse(readFileSync(real, 'utf8')).mcpServers.sidevoice.args, serverCommand(env).args);
-  assert.match(installed.done.join('\n'), /Re-pointed Cursor/);
-  const gone = await uninstall(['--harness', 'claude', '--no-core'], env);
-  assert.match(gone.next.join('\n'), /Cursor still lists the sidevoice MCP server .* points at nothing/);
+  assert.match(installed.done.join('\n'), /Registered the MCP server with Cursor/);
+  // Uninstalling takes our entry out of every harness that has one, not only the one named: nothing is left
+  // pointing at releases that are gone.
+  const gone = await uninstall([], env);
+  assert.match(gone.done.join('\n'), /Unregistered the MCP server from Cursor/);
+  assert.equal(JSON.parse(readFileSync(real, 'utf8')).mcpServers.sidevoice, undefined);
 });
 
 test('cursor: an explicitly configured receiver wins over Cursor, and ~/.cursor makes Cursor present', () => {
