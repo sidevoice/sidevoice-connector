@@ -184,8 +184,11 @@ export async function runsCompatibly(env, record, { service, log = () => {} }) {
   const dataDir = dataDirOf(env);
   let last = null;
   try {
-    if (service) await reload(env);
-    else {
+    if (service) {
+      // Another installation is starting: what the one before spent of the budget is not this one's.
+      writePrivate(nodeFiles(dataDir).restart, { at: new Date().toISOString(), why: `selected ${record.id}` });
+      await reload(env);
+    } else {
       const answering = await askConnector('node.status', {}, { env, timeout: 1500 });
       if (answering?.state && !sameCommand(answering.command, record.command)) {
         log(`the connector running (${answering.command?.join(' ')}) is not the selected installation's: replacing it`);
@@ -325,7 +328,7 @@ export async function transact(env, { core = true, applyNow = false, by = env.SI
     const back = current && core ? await runsCompatibly(env, current, { service: plan.service.before, log }) : { ok: true };
     if (back.ok) rmSync(files.journal, { force: true });
     if (!current && next.copy) rmSync(next.copy, { recursive: true, force: true });
-    return { action: 'rollback', record: current, from: current, failure: ran.failure, back: back.ok, notes };
+    return { action: 'rollback', record: current, from: current, failure: ran.failure, back: back.ok, backFailure: back.failure ?? null, notes };
   } finally { release(); }
 }
 

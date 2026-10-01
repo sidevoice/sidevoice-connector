@@ -211,10 +211,11 @@ test('install transaction: an upgrade whose core does not come up is rolled back
   const result = JSON.parse(run.stdout.trim().split('\n').at(-1));
   assert.equal(run.status, 1);
   assert.equal(result.ok, false);
-  assert.equal(result.error.key, 'install.rollback');
+  // The previous installation here is a placeholder that cannot run either: said apart from a rollback that runs.
+  assert.equal(result.error.key, 'install.rollback-failed');
   const { install, claude, cursor } = machine.artifacts();
   assert.deepEqual({ install, claude, cursor }, { install: machine.oldCli, claude: machine.oldCli, cursor: machine.oldCli });
-  // The previous installation here is a placeholder that cannot run either: every artifact is back on it, and the
+  // Every artifact is back on it, and the
   // journal stays (forced to it) until it is seen running — it is not declared done on files alone.
   const journal = JSON.parse(readFileSync(path.join(machine.dataDir, 'install-txn.json'), 'utf8'));
   assert.equal(journal.selection, 'from');
@@ -382,6 +383,34 @@ test('rollback to nothing: a first install whose core serves but speaks another 
       assert.ok(cores.length >= 1, 'a core was started and judged');
       for (const pid of cores) assert.equal((() => { try { process.kill(pid, 0); return true; } catch { return false; } })(), false, `service ${service}: core ${pid} is gone`);
       assert.equal(await node.ask('node.status').then(() => true, () => false), false, `service ${service}: nothing answers on the socket`);
+    } finally { node.stop(); }
+  }
+});
+
+test('installer rollback after the candidate spent its whole start budget: the previous installation starts with a budget of its own and runs; when it cannot either, that is said apart', { skip: process.platform !== 'linux' && 'reads /proc' }, async () => {
+  for (const back of ['runs', 'fails']) {
+    const tail = back === 'runs' ? ['ok'] : ['import', 'import', 'import', 'import', 'import', 'import'];
+    const { node, env, from } = runningPlainMachine(['ok', 'import', 'import', 'import', 'import', 'import', ...tail]);
+    try {
+      const started = spawnSync(process.execPath, [from.command[1], 'service', 'start', '--json'], { env, encoding: 'utf8' });
+      assert.equal(started.status, 0, started.stdout + started.stderr);
+      await node.status(s => s.state === 'running' && s.supervisor);
+      const run = spawnSync(process.execPath, [path.join(packageDir, 'cli.mjs'), 'install', '--no-agents', '--json'], { env: { ...env, SIDEVOICE_INSTALL_VERIFY_MS: '20000' }, encoding: 'utf8' });
+      const answer = JSON.parse(run.stdout.trim().split('\n').at(-1));
+      assert.equal(run.status, 1, `${back}: ${run.stdout}${run.stderr}`);
+      assert.equal(JSON.parse(readFileSync(path.join(node.dataDir, 'install.json'), 'utf8')).id, '0.5.0', `${back}: the previous installation is selected`);
+      if (back === 'runs') {
+        assert.equal(answer.error.key, 'install.rollback', run.stdout);
+        const status = await node.ask('node.status');
+        assert.deepEqual(status.command, from.command, 'the previous installation serves');
+        assert.equal(status.state, 'running');
+        assert.equal(status.attempts, 1, 'with its own budget: one start, not the candidate\'s five');
+        assert.equal(existsSync(path.join(node.dataDir, 'install-txn.json')), false);
+      } else {
+        assert.equal(answer.error.key, 'install.rollback-failed', run.stdout);
+        assert.match(answer.error.message, /0\.5\.0/);
+        assert.ok(existsSync(path.join(node.dataDir, 'install-txn.json')), 'the journal stays until the selection is seen running');
+      }
     } finally { node.stop(); }
   }
 });

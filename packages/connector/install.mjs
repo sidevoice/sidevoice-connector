@@ -115,6 +115,9 @@ export async function install(argv = [], env = process.env, { progress = () => {
   const result = await transact(env, { core, applyNow: argv.includes('--apply-now'), service, consent, progress });
   const record = result.record;
   done.push(t('install.version', { version: candidate(env).connector }));
+  if (result.action === 'rollback' && result.back === false) {
+    throw keyed('install.rollback-failed', { to: candidate(env).id, from: result.from?.id ?? t('install.nothing'), cause: result.failure?.key ?? '?', back: result.backFailure?.key ?? '?' }, { failure: result.failure, result });
+  }
   if (result.action === 'rollback') {
     throw keyed('install.rollback', { to: candidate(env).id, from: result.from?.id ?? t('install.nothing'), cause: result.failure?.key ?? '?' }, { failure: result.failure, result });
   }
