@@ -12,6 +12,7 @@ function armed(name) {
   const root = dir();
   if (!root || !existsSync(path.join(root, `pause-${name}`))) return null;
   writeFileSync(path.join(root, `paused-${name}`), String(process.pid));
+  writeFileSync(path.join(root, `paused-${name}-${process.pid}`), '');   // every process held here, one by one
   return path.join(root, `resume-${name}`);
 }
 

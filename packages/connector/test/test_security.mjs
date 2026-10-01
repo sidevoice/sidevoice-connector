@@ -5,8 +5,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { supervisedNode } from './test_core.mjs';
 
@@ -27,7 +27,7 @@ const lockOf = node => JSON.parse(readFileSync(node.socketPath + '.lock', 'utf8'
 /** A pid that certainly names no process now. */
 function deadPid() { const child = spawnSync(process.execPath, ['-e', '']); return child.pid; }
 
-test('lock: a connector held between writing its record and publishing it does not also take a lock taken meanwhile — one serves', async () => {
+test('lock: a connector held before taking the lock does not also take it once another has — one serves', async () => {
   const node = supervisedNode();
   const hold = hooks('lock-publish-connector');
   try {
@@ -37,20 +37,20 @@ test('lock: a connector held between writing its record and publishing it does n
     await until(() => existsSync(node.socketPath));
     assert.equal(lockOf(node).pid, second.pid);
     hold.resume('lock-publish-connector');
-    assert.equal(await exited(first), 0, 'the first sees the lock taken, and defers');
+    assert.equal(await exited(first), 0, 'the first finds the lock held, and defers');
     assert.equal(second.exitCode, null, 'the second serves');
     assert.equal(lockOf(node).pid, second.pid);
   } finally { node.stop(); }
 });
 
-test('lock: a lock just published is never taken for abandoned — a second starter defers to its owner', async () => {
+test('lock: a lock just taken is held — a second starter defers to its owner', async () => {
   const node = supervisedNode();
   const hold = hooks('lock-held-connector');
   try {
     const first = node.start([], { SIDEVOICE_TEST_HOOKS: hold.dir });
     await hold.paused('lock-held-connector');
     const second = node.start([]);
-    assert.equal(await exited(second), 0, 'the owner is alive: the second exits');
+    assert.equal(await exited(second), 0, 'held: the second exits');
     hold.resume('lock-held-connector');
     await until(() => existsSync(node.socketPath));
     assert.equal(lockOf(node).pid, first.pid);
@@ -58,36 +58,80 @@ test('lock: a lock just published is never taken for abandoned — a second star
   } finally { node.stop(); }
 });
 
-test('lock: a stale lock taken over by someone else between judging and reclaiming is put back — the late reclaimer does not also hold it', async () => {
-  const node = supervisedNode();
-  mkdirSync(node.dataDir, { recursive: true, mode: 0o700 });
-  writeFileSync(node.socketPath + '.lock', JSON.stringify({ pid: deadPid(), start: 'gone', kind: 'connector', nonce: 'stale-one', at: new Date().toISOString() }), { mode: 0o600 });
-  const hold = hooks('lock-reclaim-connector');
-  try {
-    const late = node.start([], { SIDEVOICE_TEST_HOOKS: hold.dir });
-    await hold.paused('lock-reclaim-connector');
-    const quick = node.start([]);
-    await until(() => existsSync(node.socketPath) && lockOf(node).pid === quick.pid);
-    hold.resume('lock-reclaim-connector');
-    assert.equal(await exited(late), 0, 'it finds the lock is not the stale one it judged, and defers');
-    assert.equal(lockOf(node).pid, quick.pid, 'the new owner\'s lock is back in place');
-    assert.equal(quick.exitCode, null);
-  } finally { node.stop(); }
+/** A process that takes the lock (\`kind\`) as soon as it can and says when it holds it and when it lets go. */
+function contender(file, kind, log, name, { hold = 300, hooksDir = null, forever = false } = {}) {
+  const script = `import { tryLock } from ${JSON.stringify(path.join(here, '..', 'lockfile.mjs'))};
+    import { appendFileSync } from 'node:fs';
+    for (;;) {
+      const taken = await tryLock(${JSON.stringify(file)}, { kind: ${JSON.stringify(kind)} });
+      if (taken.held) {
+        appendFileSync(${JSON.stringify(log)}, '${name} in ' + Date.now() + '\\n');
+        if (${forever}) await new Promise(() => {});
+        await new Promise(r => setTimeout(r, ${hold}));
+        appendFileSync(${JSON.stringify(log)}, '${name} out ' + Date.now() + '\\n');
+        taken.release(); break;
+      }
+      await new Promise(r => setTimeout(r, 5));
+    }`;
+  return spawn(process.execPath, ['--input-type=module', '-e', script], { env: { ...process.env, ...(hooksDir ? { SIDEVOICE_TEST_HOOKS: hooksDir } : {}) }, stdio: 'ignore' });
+}
+/** The holders in a contender log never overlap. */
+function oneAtATime(log) {
+  let inside = null;
+  for (const [name, what] of readFileSync(log, 'utf8').trim().split('\n').map(line => line.split(' '))) {
+    if (what === 'in') { assert.equal(inside, null, `${name} took the lock while ${inside} held it`); inside = name; }
+    else { assert.equal(inside, name); inside = null; }
+  }
+}
+
+test('lock: three contenders — one holding, two released together at the very moment — never two holders, and each gets it in turn', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'sv-three-'));
+  const file = path.join(dir, 'install.lock'), log = path.join(dir, 'order.log');
+  const held = hooks('lock-held-install');
+  const holder = contender(file, 'install', log, 'A', { hooksDir: held.dir, hold: 200 });
+  await held.paused('lock-held-install');
+  // B and C both wait at the point of taking the lock, and are let go together while A still holds it.
+  const gate = hooks('lock-publish-install');
+  const b = contender(file, 'install', log, 'B', { hooksDir: gate.dir }), c = contender(file, 'install', log, 'C', { hooksDir: gate.dir });
+  await until(() => readdirSync(gate.dir).filter(name => name.startsWith('paused-lock-publish-install-')).length === 2);
+  gate.resume('lock-publish-install');
+  held.resume('lock-held-install');
+  await Promise.all([exited(holder), exited(b), exited(c)]);
+  oneAtATime(log);
+  assert.deepEqual(readFileSync(log, 'utf8').trim().split('\n').filter(line => line.includes(' in ')).map(line => line.split(' ')[0]).sort(), ['A', 'B', 'C']);
 });
 
-test('lock: an empty or unreadable lock is never deleted as if its owner were dead', async () => {
-  const node = supervisedNode();
-  mkdirSync(node.dataDir, { recursive: true, mode: 0o700 });
-  writeFileSync(node.socketPath + '.lock', '', { mode: 0o600 });
-  try {
-    const child = node.start([]);
-    assert.equal(await exited(child), 0);
-    assert.equal(readFileSync(node.socketPath + '.lock', 'utf8'), '', 'left exactly as it was');
-    assert.equal(existsSync(node.socketPath), false);
-  } finally { node.stop(); }
+test('lock: a holder killed with SIGKILL frees the lock at once — nothing stale is left to reclaim', async () => {
+  for (const kind of ['install', 'connector']) {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'sv-kill-'));
+    const file = path.join(dir, `${kind}.lock`), log = path.join(dir, 'order.log');
+    const holder = contender(file, kind, log, 'A', { forever: true });
+    await until(() => existsSync(log));
+    holder.kill('SIGKILL');
+    await exited(holder);
+    const killedAt = Date.now();
+    const next = contender(file, kind, log, 'B', { hold: 10 });
+    await exited(next);
+    const took = Number(readFileSync(log, 'utf8').trim().split('\n').find(line => line.startsWith('B in')).split(' ')[2]);
+    assert.ok(took - killedAt < 1000, `${kind}: taken ${took - killedAt} ms after the holder died`);
+    assert.equal(JSON.parse(readFileSync(file, 'utf8')).pid, next.pid, 'the record says who holds it now');
+  }
 });
 
-test('install lock: an installer held before publishing its lock waits for the one that took it meanwhile', async () => {
+test('lock: a record that is not a holder\'s — empty, unreadable, a dead pid in the old format — blocks nothing', async () => {
+  for (const content of ['', '{garbage', String(deadPid())]) {
+    const node = supervisedNode();
+    mkdirSync(node.dataDir, { recursive: true, mode: 0o700 });
+    writeFileSync(node.socketPath + '.lock', content, { mode: 0o600 });
+    try {
+      const child = node.start(content ? ['--supervise'] : []);
+      await until(() => existsSync(node.socketPath));
+      assert.equal(lockOf(node).pid, child.pid, JSON.stringify(content));
+    } finally { node.stop(); }
+  }
+});
+
+test('install lock: an installer held before taking the lock waits for the one that took it meanwhile', async () => {
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-ilock-'));
   const log = path.join(dataDir, 'order.log');
   const hold = hooks('lock-publish-install');
@@ -164,4 +208,30 @@ test('signals: a stale lock or ready file naming a reused pid never gets somebod
     spawnSync(process.execPath, [cli, 'service', 'uninstall', '--json'], { env, encoding: 'utf8' });
     assert.ok(alive(bystander.pid), 'the bystander is still running');
   } finally { bystander.kill('SIGKILL'); }
+});
+
+test('legacy: a connector of today\'s main (bare pid in the lock, no handover) serving the socket is identified and stopped; the supervisor serves', async () => {
+  const { startRoom } = await import('./room.mjs');
+  // main's own connector, from git, beside this checkout so it resolves the same node_modules.
+  const repo = path.join(here, '..', '..', '..');
+  const legacyRoot = mkdtempSync(path.join(repo, '.legacy-'));
+  const node = supervisedNode();
+  const room = await startRoom();
+  let legacy = null;
+  try {
+    // A shallow CI checkout may not have main: fetched for this.
+    if (spawnSync('git', ['-C', repo, 'rev-parse', '--verify', '-q', 'origin/main']).status !== 0) execFileSync('git', ['-C', repo, 'fetch', '--depth=1', 'origin', 'main:refs/remotes/origin/main'], { stdio: 'ignore' });
+    execFileSync('sh', ['-c', `git -C "${repo}" archive origin/main packages/connector | tar -x -C "${legacyRoot}"`]);
+    mkdirSync(node.dataDir, { recursive: true, mode: 0o700 });
+    legacy = spawn(process.execPath, [path.join(legacyRoot, 'packages', 'connector', 'connector.mjs')], {
+      env: { ...node.env, SIDEVOICE_URL: room.origin, SIDEVOICE_CONNECTOR_ID: 'c-legacy', SIDEVOICE_CONNECTOR_TOKEN: 't', SIDEVOICE_CONNECTOR_IDLE_MS: '60000' }, stdio: 'ignore' });
+    await until(() => existsSync(node.socketPath));
+    assert.equal(readFileSync(node.socketPath + '.lock', 'utf8').trim(), String(legacy.pid), 'the old format: a bare pid');
+    const supervisor = node.start(['--supervise']);
+    assert.notEqual(await exited(legacy), null, 'the old connector was stopped');
+    const status = await node.status(s => s.supervisor && s.state === 'running', 20_000);
+    assert.equal(lockOf(node).pid, supervisor.pid);
+    assert.match(node.log(), /an older connector \(pid \d+.*\) serves .* without the lock: stopping it/);
+    void status;
+  } finally { if (legacy?.exitCode === null) legacy.kill('SIGKILL'); node.stop(); await room.close(); rmSync(legacyRoot, { recursive: true, force: true }); }
 });

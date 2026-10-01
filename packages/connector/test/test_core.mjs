@@ -21,6 +21,10 @@ async function until(check, timeout = 15_000) { const start = Date.now(); while 
 function ipc(socketPath) {
   const socket = net.createConnection(socketPath); let buffer = '', serial = 0; const waiting = new Map();
   socket.on('data', chunk => { buffer += chunk; let i; while ((i = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, i); buffer = buffer.slice(i + 1); if (!line) continue; const reply = JSON.parse(line); const w = waiting.get(reply.id); if (!w) continue; waiting.delete(reply.id); reply.ok ? w.resolve(reply.result) : w.reject(new Error(reply.error)); } });
+  // A connection closed with requests unanswered (a connector handing over closes its façades) fails them: a
+  // caller polling for a state asks again instead of waiting for ever.
+  socket.on('close', () => { for (const w of waiting.values()) w.reject(new Error('connection closed')); waiting.clear(); });
+  socket.on('error', () => {});
   return { ready: new Promise((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); }),
     call: (method, params) => new Promise((resolve, reject) => { const id = ++serial; waiting.set(id, { resolve, reject }); socket.write(JSON.stringify({ id, method, params }) + '\n'); }),
     end: () => socket.end() };
@@ -522,17 +526,26 @@ test('supervise: two node.restart at once against a core that ignores SIGTERM �
   } finally { node.stop(); }
 });
 
-test('supervise: core.log is rotated while the core runs — it never grows past the limit, and the core is never restarted for it', async () => {
-  const node = supervisedNode({ modes: ['ok+chatty:2000'], env: { SIDEVOICE_LOG_MAX_BYTES: '50000' } });
+test('supervise: core.log is rotated while the core runs — bounded, two copies kept, the core never restarted for it — and still written after its supervisor died and another adopted it', async () => {
+  const node = supervisedNode({ modes: ['ok+chatty:2000'], env: { SIDEVOICE_LOG_MAX_BYTES: '50000', SIDEVOICE_LOG_ROTATE_MS: '100' } });
   try {
-    node.start();
+    const first = node.start();
     const running = await node.status(s => s.state === 'running');
     const log = path.join(node.dataDir, 'core.log');
     await until(() => existsSync(log + '.2'), 20_000);
-    for (let i = 0; i < 20; i++) { assert.ok(statSync(log).size <= 50_000 + 4096, `core.log is ${statSync(log).size} bytes`); await wait(25); }
-    assert.ok(statSync(log + '.1').size > 40_000 && statSync(log + '.2').size > 40_000, 'two rotated copies kept');
-    assert.equal(existsSync(log + '.3'), false, 'and no more');
-    assert.equal((await node.ask('node.status')).core.pid, running.core.pid, 'the same core throughout');
+    // The clock rotates it: between two ticks the core writes 2000 bytes every 20 ms.
+    for (let i = 0; i < 20; i++) { assert.ok(statSync(log).size <= 50_000 + 2000 * 20, `core.log is ${statSync(log).size} bytes`); await wait(25); }
+    assert.equal(existsSync(log + '.3'), false, 'two rotated copies, no more');
+    // Its supervisor dies outside a service manager; the core lives on, and a new supervisor adopts it. The core's
+    // output is a file it appends to, not a pipe left with no reader: it still reaches core.log.
+    first.kill('SIGKILL');
+    await until(() => first.signalCode !== null);
+    node.start();
+    const adopted = await node.status(s => s.state === 'running');
+    assert.equal(adopted.core.pid, running.core.pid, 'the same core, adopted');
+    const marker = statSync(log).mtimeMs;
+    await until(() => statSync(log).mtimeMs > marker && statSync(log).size > 0, 5000);
+    assert.ok(readFileSync(log, 'utf8').includes('x'.repeat(100)), 'its output keeps arriving');
   } finally { node.stop(); }
 });
 
@@ -547,4 +560,19 @@ test('a plain connector\'s detached core: its core.log is rotated in place while
     await wait(500);
     assert.ok(statSync(log).size < 50_000 + 2000 * 60, `bounded by what one clock tick lets through (${statSync(log).size})`);
   } finally { node.stop(); }
+});
+
+test('supervise: an ordinary stop — SIGTERM or SIGINT — ends cleanly: exit 0, nothing on stderr, its core gone with it', async () => {
+  for (const signal of ['SIGTERM', 'SIGINT']) {
+    const node = supervisedNode();
+    try {
+      const supervisor = node.start();
+      const running = await node.status(s => s.state === 'running');
+      supervisor.kill(signal);
+      await until(() => supervisor.exitCode !== null || supervisor.signalCode !== null);
+      assert.equal(supervisor.exitCode, 0, `${signal}: exit code`);
+      assert.equal(supervisor.stderrText, '', `${signal}: stderr`);
+      assert.equal(alive(running.core.pid), false);
+    } finally { node.stop(); }
+  }
 });

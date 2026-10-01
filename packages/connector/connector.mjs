@@ -35,7 +35,7 @@ import { appendLine, rotate } from './logfile.mjs';
 import { Supervisor } from './supervisor.mjs';
 import { pruneInstallations, recover, sameCommand, settle } from './install-txn.mjs';
 import { connectorSocketOf, dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
-import { readLock, releaseLock as giveUp, stillHeld, tryLock } from './lockfile.mjs';
+import { readLock, tryLock } from './lockfile.mjs';
 import { isProcess, signalVerified } from './proc.mjs';
 import { verifyPrivateDir } from './secure-fs.mjs';
 
@@ -78,21 +78,42 @@ function coreLink(ready) {
   return { room: 'http://localhost', connector_id: ready.connector_id, token: ready.token, core: ready, agent: socketAgent(ready.socket) };
 }
 
-/** The singleton lock (`lockfile.mjs`): taken atomically, taken over only from an owner proven gone. Its record —
- *  pid and process start time — is what identifies the connector holding the socket; a pid alone never does. */
-let lockRecord = null;
-function acquireLock() {
-  const taken = tryLock(lockPath, { kind: 'connector' });
-  if (taken.held) {
-    lockRecord = taken.record;
-    if (taken.reclaimed) log(`stale lock ${lockPath} (pid ${taken.reclaimed.pid} is gone, or is another process now); taking over`);
-    return true;
-  }
+/** The singleton lock (`lockfile.mjs`): held by the kernel for as long as this process lives. Its record — pid and
+ *  start time — says which connector holds the socket; a pid alone never does. */
+let lockHold = null;
+async function acquireLock() {
+  const taken = await tryLock(lockPath, { kind: 'connector' });
+  if (taken.held) { lockHold = taken; return true; }
   if (!supervised) log(`a connector is already running (pid ${taken.owner?.pid ?? '?'}, lock ${lockPath}); this one exits`);
   return false;
 }
 /** Whether the connector a lock record names is still that process. */
 const connectorAlive = owner => !!owner && !owner.unreadable && isProcess(owner.pid, { start: owner.start ?? null });
+
+/** A connector from before the kernel-held lock (today's main writes its bare pid into the lock file) can still be
+ *  serving the socket while this process holds the lock. It cannot hand over (it has no `handover`): verified to be
+ *  that connector — this user's process, a Sidevoice connector by its command line, answering on our socket — it is
+ *  asked to stop (then killed), and this one serves. Its façades lose their connector; theirs have no reconnect
+ *  loop, so those sessions need restarting. A dead pid in such a file is only information, and is ignored. */
+async function stopLegacyConnector() {
+  const answer = await new Promise(resolve => {
+    const socket = net.createConnection(socketPath);
+    let buffer = '';
+    const timer = setTimeout(() => { socket.destroy(); resolve(null); }, 1500);
+    socket.on('error', () => { clearTimeout(timer); resolve(null); });
+    socket.on('connect', () => socket.write(JSON.stringify({ id: 1, method: 'status', params: {} }) + '\n'));
+    socket.on('data', chunk => { buffer += chunk; const index = buffer.indexOf('\n'); if (index < 0) return; clearTimeout(timer); socket.destroy(); try { resolve(JSON.parse(buffer.slice(0, index))); } catch { resolve(null); } });
+  });
+  if (!answer) return;
+  const legacy = lockHold?.legacyPid ?? null;
+  const command = /(^|[\s/])connector(\.mjs)?(\s|$)/;
+  if (!legacy || !isProcess(legacy, { command })) { log(`a connector answers on ${socketPath} but cannot be identified; not serving beside it`); process.exit(0); }
+  log(`an older connector (pid ${legacy}, version ${answer.result?.version ?? '?'}) serves ${socketPath} without the lock: stopping it`);
+  signalVerified(legacy, 'SIGTERM', { command });
+  const deadline = Date.now() + 10_000;
+  while (isProcess(legacy, { command }) && Date.now() < deadline) await wait(50);
+  if (isProcess(legacy, { command })) { signalVerified(legacy, 'SIGKILL', { command }); await wait(200); }
+}
 
 const bindings = new Map();        // binding_id -> { binding_id, client_ref, harness, thread, title, delivery, capabilities, owner, chain }
 const clients = new Set();         // façade IPC connections
@@ -668,10 +689,10 @@ async function handOff(record) {
   if (serviceKind === 'none') return shutdown(0);
 }
 function releaseLock({ socket }) {
-  // The socket is ours to remove only while the lock still is.
-  if (!lockRecord || !stillHeld(lockPath, lockRecord)) return;
+  // The socket is ours to remove only while the lock is.
+  if (!lockHold) return;
   if (socket) { try { unlinkSync(socketPath); } catch {} }
-  giveUp(lockPath, lockRecord);
+  lockHold.release(); lockHold = null;
 }
 
 /** `node.status` (SEAMS §4): the supervisor's state machine as it is, the calls fresh from the core; a plain
@@ -1031,9 +1052,20 @@ export async function run(argv = [], environment = process.env) {
   // Refused, not repaired: a data directory others can write into is not one to serve from (`secure-fs.mjs`).
   try { verifyPrivateDir(dataDir, { create: true }); }
   catch (error) { log(`not starting: ${error.message}`); process.exitCode = 78; return; }
-  for (let attempt = 0; !acquireLock(); attempt++) {
-    if (!supervised || attempt >= 5 || !(await takeOver(readLock(lockPath)))) process.exit(0);
+  // What the lock file said before this process took the lock: a bare pid is an older connector's.
+  const before = readLock(lockPath);
+  for (let attempt = 0; !(await acquireLock()); attempt++) {
+    if (!supervised || attempt >= 10) process.exit(0);
+    // The holder's record may not be written yet: asked again in a moment.
+    const owner = readLock(lockPath);
+    if (connectorAlive(owner) && !(await takeOver(owner))) process.exit(0);
+    await wait(200);
   }
+  lockHold.legacyPid = before?.legacyPid ?? null;
+  await stopLegacyConnector();
+  // A person's stop holds for every connector, not only for the launcher that spawned it: one spawned just before
+  // the stop, and starting only now, does not serve. Only a supervisor starting (a login, `service start`) clears it.
+  if (!supervised && existsSync(files.stopped)) { log('Sidevoice is stopped on this machine: not serving'); releaseLock({ socket: false }); process.exit(0); }
   if (supervised) {
     // A supervisor starting is the next login, or a person's start: a stop no longer holds.
     try { rmSync(files.stopped, { force: true }); } catch {}
@@ -1061,7 +1093,8 @@ export async function run(argv = [], environment = process.env) {
   chmodSync(socketPath, 0o600);
   const bound = lstatSync(socketPath);
   if (!bound.isSocket() || bound.uid !== process.getuid() || (bound.mode & 0o077)) { log(`not serving: ${socketPath} is not this user's alone`); server.close(); process.exitCode = 78; return; }
-  process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown);
+  // Node hands a signal handler the signal's name: the handlers take nothing, and the exit is clean.
+  process.on('SIGTERM', () => shutdown(0)); process.on('SIGINT', () => shutdown(0));
   scheduleExit();
   // A core this process does not own the output of (a plain connector's detached core, an adopted one) writes
   // straight into core.log: rotated in place on a clock while this process runs.

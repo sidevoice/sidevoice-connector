@@ -27,12 +27,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureCoreDirectory, localHealth } from './core-socket.mjs';
-import { lockStale, readLock, stillHeld, tryLock } from './lockfile.mjs';
+import { readLock, tryLock } from './lockfile.mjs';
 import { isProcess, signalVerified } from './proc.mjs';
 import { verifyPrivateDir } from './secure-fs.mjs';
 import { nodeFiles, readJson, writePrivate } from './node-files.mjs';
 import { keyed } from './i18n.mjs';
-import { appendChunk, rotate } from './logfile.mjs';
+import { rotate } from './logfile.mjs';
 
 export const CORE_VERSION = '0.1.0';
 export const DEFAULT_PORT = 8768;
@@ -129,13 +129,14 @@ function run(command, args, { log, env, progress = () => {} }) {
 
 /** Who is installing right now, if anyone: `sidevoice install` (its whole transaction, `install-txn.mjs`) and a
  *  connector installing its core share one data dir, and two uv runs into one environment break it. One lock,
- *  `install.lock` (`lockfile.mjs`: taken atomically, taken over only from an owner proven gone); asked for again by
+ *  `install.lock` (`lockfile.mjs`: held by the kernel, gone with its holder); asked for again by
  *  the process that holds it, it is the same hold. */
 export function lockPath(dataDir) { return path.join(dataDir, 'install.lock'); }
 export function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } }
 export function installInProgress(dataDir) {
+  // Who holds it, from its record (information only): enough to wait for an install and say whose it is.
   const lock = readLock(lockPath(dataDir));
-  if (!lock || lockStale(lock)) return null;
+  if (!lock || lock.unreadable || !isProcess(lock.pid, { start: lock.start ?? null })) return null;
   let last = null;
   try { last = readFileSync(logPath(dataDir), 'utf8').trim().split('\n').filter(line => line.trim()).at(-1)?.trim() || null; } catch {}
   const since = Date.parse(lock.at) || Date.now();
@@ -147,11 +148,11 @@ export async function takeInstallLock(dataDir, log = () => {}, { timeout = INSTA
   const file = lockPath(dataDir);
   verifyPrivateDir(dataDir, { create: true });
   const mine = holds.get(file);
-  if (mine && stillHeld(file, mine.record)) { mine.depth++; return () => { mine.depth--; }; }
+  if (mine) { mine.depth++; return () => { mine.depth--; }; }
   const deadline = Date.now() + timeout;
   let said = false;
   for (;;) {
-    const taken = tryLock(file, { kind: 'install' });
+    const taken = await tryLock(file, { kind: 'install' });
     if (taken.held) {
       const hold = { record: taken.record, depth: 1 };
       holds.set(file, hold);
@@ -305,25 +306,20 @@ export function coreArgs({ dataDir, env = process.env, launchId, idleExit = null
   return args;
 }
 
-/** Start one launch: its output to `core.log`, and a handle whose `exit` settles when it is gone — a spawn error
- *  (no such program, no permission) included. The supervisor's child writes into a pipe this process reads, so the
- *  log is rotated as it grows, however long the core runs (`logfile.mjs`). A detached core outlives whoever started
- *  it, so it is handed the file itself (appending); that one is rotated in place, on a clock, by its connector. */
+/** Start one launch: its output appended to `core.log`, and a handle whose `exit` settles when it is gone — a spawn
+ *  error (no such program, no permission) included. Every core is handed the file itself, opened for appending, never
+ *  a pipe: a core can outlive whoever started it (a plain connector's detached core; a supervisor's child when that
+ *  supervisor dies outside a service manager, then adopted), and a pipe with no reader left would fail its writes or
+ *  lose them. The file is rotated in place, on a clock, by whichever connector runs (`logfile.mjs`). */
 export function spawnCore(bin, args, { dataDir, env = process.env, detached = false }) {
   const log = logPath(dataDir);
   const launchId = args[args.indexOf('--launch-id') + 1];
   writePrivate(launchesPath(dataDir), { launch_id: launchId, bin, at: new Date().toISOString() });
   rotate(log);
   let child;
-  if (detached) {
-    const out = openSync(log, 'a', 0o600);
-    try { child = spawn(bin, args, { detached, stdio: ['ignore', out, out], env: { ...env, SIDEVOICE_CORE_DATA_DIR: coreData(dataDir) } }); }
-    finally { closeSync(out); }
-  } else {
-    child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], env: { ...env, SIDEVOICE_CORE_DATA_DIR: coreData(dataDir) } });
-    const write = chunk => appendChunk(log, chunk);
-    child.stdout?.on('data', write); child.stderr?.on('data', write);
-  }
+  const out = openSync(log, 'a', 0o600);
+  try { child = spawn(bin, args, { detached, stdio: ['ignore', out, out], env: { ...env, SIDEVOICE_CORE_DATA_DIR: coreData(dataDir) } }); }
+  finally { closeSync(out); }
   const handle = { pid: child.pid ?? null, child, done: null };
   handle.exit = new Promise(resolve => {
     child.once('exit', (code, signal) => resolve(handle.done = { code, signal }));

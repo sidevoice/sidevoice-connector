@@ -371,12 +371,21 @@ test('façade: the supervisor replaced under it — a new voice turn reaches its
     owner = facade({ ...node.env, SIDEVOICE_THREAD: 'thread-r', SIDEVOICE_DELIVERY_URL: `http://127.0.0.1:${receiver.address().port}/deliver` });
     await owner.ready;
     assert.equal((await owner.call('voice_connect', {})).value.binding_id, 'core-thread-r');
-    const registrations = () => node.said().filter(line => line.event === 'binding.register' && line.data.client_ref === 'thread-r').length;
+    /** Ready for a turn: the connector holding the socket is a supervisor, running and linked, and holds this
+     *  conversation under the core's id. "The core saw a registration" is not that: with no service defined, the
+     *  façade's loop gets a plain connector in the gap, which registers and then hands over to the supervisor — a
+     *  turn sent while that one is letting go and the supervisor is not yet linked reaches no connector. */
+    const servedBySupervisor = () => until(async () => {
+      try {
+        const [node_, status] = [await node.ask('node.status'), await node.ask('status')];
+        return node_.supervisor && node_.state === 'running' && status.connected && status.bindings.some(binding => binding.binding_id === 'core-thread-r');
+      } catch { return false; }
+    }, 20_000);
     // The service manager replaces the supervisor (an upgrade, a crash): the old one is gone at once.
     first.kill('SIGKILL');
     await until(() => first.signalCode !== null);
     node.start();
-    await until(() => registrations() >= 2, 20_000);
+    await servedBySupervisor();
     deliver(node, { event_id: 'after-restart', binding_id: 'core-thread-r', channel: 'voice', session_id: 's', revision: 1, message_id: 'm-r', text: 'otra vez' });
     await until(() => received.length === 1, 20_000);
     assert.match(received[0].text, /otra vez/);
@@ -387,11 +396,11 @@ test('façade: the supervisor replaced under it — a new voice turn reaches its
     second.kill('SIGTERM');
     await until(() => second.exitCode !== null);
     await wait(1500);
+    if (existsSync(node.socketPath)) { let who = ''; try { const pid = JSON.parse(readFileSync(node.socketPath + '.lock', 'utf8')).pid; who = pid + ' ' + readFileSync('/proc/' + pid + '/cmdline', 'utf8').split('\0').join(' ') + ' env:' + (readFileSync('/proc/' + pid + '/environ', 'utf8').includes('SIDEVOICE_SERVICE=') ? 'svc' : 'plain'); } catch (e) { who = String(e); } console.error('DIAG holder', who, 'stopped-marker:', existsSync(path.join(node.dataDir, 'node-stopped.json')), '\n', readFileSync(path.join(node.dataDir, 'connector.log'), 'utf8').split('\n').slice(-12).join('\n')); }
     assert.equal(existsSync(node.socketPath), false, 'nothing started while stopped');
     // The person starts it again: the conversation is registered again by itself.
-    const before = registrations();
     node.start();
-    await until(() => registrations() > before, 20_000);
+    await servedBySupervisor();
     deliver(node, { event_id: 'after-stop', binding_id: 'core-thread-r', channel: 'voice', session_id: 's', revision: 2, message_id: 'm-s', text: 'de vuelta' });
     await until(() => received.length === 2, 20_000);
   } finally { owner?.child.kill(); node.stop(); receiver.close(); }
