@@ -387,6 +387,41 @@ test('rollback to nothing: a first install whose core serves but speaks another 
   }
 });
 
+test('detached hand-off: each installation\'s supervisor runs with its own settings — the candidate\'s on upgrade, the previous one\'s (a setting the candidate deleted included) on rollback, never the caller\'s', { skip: process.platform !== 'linux' && 'reads /proc' }, async () => {
+  const { node, from, to } = twoInstallations();
+  const journalFile = path.join(node.dataDir, 'install-txn.json');
+  const journal = JSON.parse(readFileSync(journalFile, 'utf8'));
+  rmSync(journalFile);
+  const home = path.dirname(node.dataDir), xdg = path.dirname(path.dirname(from.copy));
+  const base = Object.fromEntries(Object.entries(node.env).filter(([name]) => name.startsWith('SIDEVOICE_')));
+  from.settings = { ...base, SIDEVOICE_SHARED: 'from', SIDEVOICE_ONLY_FROM: 'from' };
+  to.settings = { ...base, SIDEVOICE_SHARED: 'to' };   // the candidate deleted SIDEVOICE_ONLY_FROM
+  writeFileSync(path.join(node.dataDir, 'install.json'), JSON.stringify(from), { mode: 0o600 });
+  writeFileSync(node.modesFile, ['ok', 'slow:3000+link:999', 'ok'].join('\n') + '\n');
+  const holder = () => { try { return JSON.parse(readFileSync(node.socketPath + '.lock', 'utf8')).pid; } catch { return null; } };
+  const settingsOf = pid => {
+    const environ = Object.fromEntries(readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0').filter(Boolean).map(line => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]));
+    return { command: readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')[1], SHARED: environ.SIDEVOICE_SHARED, ONLY_FROM: environ.SIDEVOICE_ONLY_FROM, CALLER: environ.SIDEVOICE_CALLER_ONLY, SERVICE: environ.SIDEVOICE_SERVICE };
+  };
+  try {
+    // Started by a caller whose environment has settings of its own: they are not the installation's.
+    const caller = { ...node.env, HOME: home, XDG_DATA_HOME: xdg, SIDEVOICE_SHARED: 'caller', SIDEVOICE_CALLER_ONLY: 'caller' };
+    const started = spawnSync(process.execPath, [from.command[1], 'service', 'start', '--json'], { env: caller, encoding: 'utf8' });
+    assert.equal(started.status, 0, started.stdout + started.stderr);
+    const first = await until(() => { const pid = holder(); return pid && settingsOf(pid).command === from.command[1] ? pid : null; });
+    assert.deepEqual(settingsOf(first), { command: from.command[1], SHARED: 'from', ONLY_FROM: 'from', CALLER: undefined, SERVICE: 'none' }, 'started: the installation\'s settings');
+    // The candidate committed (as an installer killed after its commit point leaves it): the supervisor hands over.
+    writeFileSync(journalFile, JSON.stringify({ ...journal, from, to, service: { kind: 'none', before: true, want: true } }), { mode: 0o600 });
+    writeFileSync(path.join(node.dataDir, 'install.json'), JSON.stringify(to), { mode: 0o600 });
+    const upgraded = await until(() => { const pid = holder(); try { return pid && settingsOf(pid).command === to.command[1] ? pid : null; } catch { return null; } });
+    assert.deepEqual(settingsOf(upgraded), { command: to.command[1], SHARED: 'to', ONLY_FROM: undefined, CALLER: undefined, SERVICE: 'none' }, 'upgrade: the candidate\'s settings, the deleted one gone');
+    // Its core speaks another link protocol: rolled back, and the previous installation runs with its own again.
+    await until(() => !existsSync(journalFile) && holder() !== upgraded && (() => { try { return settingsOf(holder()).command === from.command[1]; } catch { return false; } })(), 60_000);
+    assert.deepEqual(settingsOf(holder()), { command: from.command[1], SHARED: 'from', ONLY_FROM: 'from', CALLER: undefined, SERVICE: 'none' }, 'rollback: the previous installation\'s settings, the deleted one back');
+    assert.equal(JSON.parse(readFileSync(path.join(node.dataDir, 'install.json'), 'utf8')).id, '0.5.0');
+  } finally { node.stop(); }
+});
+
 test('installer rollback after the candidate spent its whole start budget: the previous installation starts with a budget of its own and runs; when it cannot either, that is said apart', { skip: process.platform !== 'linux' && 'reads /proc' }, async () => {
   for (const back of ['runs', 'fails']) {
     const tail = back === 'runs' ? ['ok'] : ['import', 'import', 'import', 'import', 'import', 'import'];

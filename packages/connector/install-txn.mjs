@@ -34,7 +34,7 @@ import { keyed, t } from './i18n.mjs';
 import { connectorClient } from './ipc.mjs';
 import { dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
 import { HARNESS_REGISTRATIONS, candidate, copiesDir, registration, stageCopy } from './registrations.mjs';
-import { askConnector, definitionProgram, installationSettings, installedService, managerKind, reload, stopNode, uninstall as removeService, writeDefinition } from './service.mjs';
+import { askConnector, definitionProgram, installationSettings, installedService, launchEnvironment, managerKind, reload, stopNode, uninstall as removeService, writeDefinition } from './service.mjs';
 import { crash, pause } from './testpoint.mjs';
 
 const VERIFY_MS = Number(process.env.SIDEVOICE_INSTALL_VERIFY_MS || 60_000);
@@ -192,12 +192,12 @@ export async function runsCompatibly(env, record, { service, log = () => {} }) {
       const answering = await askConnector('node.status', {}, { env, timeout: 1500 });
       if (answering?.state && !sameCommand(answering.command, record.command)) {
         log(`the connector running (${answering.command?.join(' ')}) is not the selected installation's: replacing it`);
-        const child = spawn(record.command[0], [...record.command.slice(1), 'connector', '--replace'], { detached: true, stdio: 'ignore', env });
+        const child = spawn(record.command[0], [...record.command.slice(1), 'connector', '--replace'], { detached: true, stdio: 'ignore', env: launchEnvironment(record, env) });
         child.on('error', () => {}); child.unref();
         const until = Date.now() + VERIFY_MS;
         while (Date.now() < until && !sameCommand((await askConnector('node.status', {}, { env, timeout: 1500 }))?.command, record.command)) await wait(100);
       }
-      const client = connectorClient(env, { self: record.command });
+      const client = connectorClient(launchEnvironment(record, env), { self: record.command });
       try { last = await client.rpc('node.ensure', {}); } finally { client.end(); }
       if (selectionRuns(last, record, dataDir).ok) return { ok: true };
     }

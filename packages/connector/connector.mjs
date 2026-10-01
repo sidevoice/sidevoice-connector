@@ -37,6 +37,7 @@ import { Supervisor } from './supervisor.mjs';
 import { VERIFY_DEADLINE_MS, pruneInstallations, recover, sameCommand, selectionRuns, settle } from './install-txn.mjs';
 import { connectorSocketOf, dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
 import { readLock, tryLock } from './lockfile.mjs';
+import { launchEnvironment } from './service.mjs';
 import { isProcess, selfIdentity, signalVerified } from './proc.mjs';
 import { verifyPrivateDir } from './secure-fs.mjs';
 
@@ -701,7 +702,7 @@ async function handOff(record) {
   // Another program's start: what this one spent of the budget is not that one's (as after a person's restart).
   try { writePrivate(files.restart, { at: new Date().toISOString(), why: 'handover' }); } catch {}
   const args = serviceKind === 'none' ? ['connector', '--supervise', '--after', String(process.pid)] : ['service', 'reload', '--json'];
-  const child = spawn(record.command[0], [...record.command.slice(1), ...args], { detached: true, stdio: 'ignore', env: { ...env, SIDEVOICE_SERVICE: serviceKind } });
+  const child = spawn(record.command[0], [...record.command.slice(1), ...args], { detached: true, stdio: 'ignore', env: launchEnvironment(record, env, { SIDEVOICE_SERVICE: serviceKind }) });
   child.on('error', error => log('handing over failed: ' + error.message));
   child.unref();
   if (serviceKind === 'none') return shutdown(0);

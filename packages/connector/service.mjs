@@ -81,6 +81,17 @@ export function serviceEnvironment(kind, env = process.env) {
   return { ...installationSettings(env), SIDEVOICE_SERVICE: kind };
 }
 
+/** The one environment every launch of an installation runs with — a detached supervisor, a hand-off, a
+ *  replacement connector, a recovery helper: this process's environment with none of its own `SIDEVOICE_*`, then the
+ *  installation's recorded settings (`settings`, from `install.json`), then `extra`. The settings replace this
+ *  process's set rather than overlay it: a setting the installation does not have is not lent to it (a rollback is
+ *  launched by the installation rolled back from). Carried through as process controls, not settings: test hooks. */
+const CARRIED = new Set(['SIDEVOICE_TEST_HOOKS']);
+export function launchEnvironment(record, env = process.env, extra = {}) {
+  const base = Object.fromEntries(Object.entries(env).filter(([name]) => !name.startsWith('SIDEVOICE_') || CARRIED.has(name)));
+  return { ...base, ...(record?.settings ?? installationSettings(env)), ...extra };
+}
+
 /** The `SIDEVOICE_*` settings an installation is made with — recorded in it (`install.json`), so its service runs
  *  with them whoever writes its definition later (a rollback is written by the other installation's process) — never
  *  a credential of a core somebody else runs, nor a test's hooks. */
@@ -390,7 +401,7 @@ export async function managerStart(env = process.env, { load = true } = {}) {
 function startDetached(env) {
   const record = readJson(nodeFiles(dataDirOf(env)).install);
   const program = serviceProgram(record);
-  const child = spawn(program[0], program.slice(1), { detached: true, stdio: 'ignore', env: { ...env, SIDEVOICE_SERVICE: 'none' } });
+  const child = spawn(program[0], program.slice(1), { detached: true, stdio: 'ignore', env: launchEnvironment(record, env, { SIDEVOICE_SERVICE: 'none' }) });
   child.on('error', () => {});
   child.unref();
 }
