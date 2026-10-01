@@ -11,7 +11,7 @@ export const en = {
   'import.missing-module': 'The core is missing a part it needs ({detail}).',
   'launch.missing-executable': 'The core\'s program is not where it was installed ({detail}).',
   'launch.permission': 'The core\'s program cannot be run: permission denied ({detail}).',
-  'launch.exited': 'The core stopped while starting (exit {detail}).',
+  'launch.exited': 'The core exited ({detail}).',
   'hang': 'The core stopped answering.',
   'bind.core-running': 'Another Sidevoice core is already running for this data directory.',
   'start.failed': 'The core could not start ({detail}).',

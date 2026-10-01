@@ -78,12 +78,14 @@ export function installedService(env = process.env) {
   return files.core || files.connector ? { kind, ...files } : null;
 }
 
-/** Run the manager's own command; never throws. Every call has an absolute deadline. */
+/** Run the manager's own command; never throws. Every call has an absolute deadline: 30 s, because launchd holds a
+ *  `kickstart` of a job started less than its ThrottleInterval (10 s) ago until that interval has passed (measured on
+ *  macos-14, an upgrade restarting the core right after an earlier one), and systemd's `stop` waits TimeoutStopSec (20). */
 function manage(env, kind, args) {
   const bin = kind === 'launchd' ? env.SIDEVOICE_LAUNCHCTL || '/bin/launchctl'
     : kind === 'systemd' ? env.SIDEVOICE_SYSTEMCTL || 'systemctl' : env.SIDEVOICE_LOGINCTL || 'loginctl';
   try {
-    const output = execFileSync(bin, args, { encoding: 'utf8', timeout: 10_000, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const output = execFileSync(bin, args, { encoding: 'utf8', timeout: 30_000, env, stdio: ['ignore', 'pipe', 'pipe'] });
     return { ok: true, output, code: 0 };
   } catch (error) {
     return { ok: false, output: `${error.stdout || ''}${error.stderr || ''}` || error.message, code: error.status ?? error.code ?? null };

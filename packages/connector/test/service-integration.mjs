@@ -196,7 +196,7 @@ try {
   step('upgrade 0.6.2 → 0.6.3, whose core cannot serve: back on 0.6.2');
   const rolled = sidevoice(c, ['install', '--no-agents', '--json'], { SIDEVOICE_CORE_BIN: broken.bin });
   assert.equal(rolled.code, 1);
-  assert.deepEqual([rolled.json.error.key, rolled.json.failure.key, selected()], ['install.rollback', 'import.missing-module', '0.6.2']);
+  assert.deepEqual([rolled.json.error?.key, rolled.json.failure?.key, selected()], ['install.rollback', 'import.missing-module', '0.6.2'], JSON.stringify(rolled.json));
   await until('running on 0.6.2', async () => status()?.state === 'running' && (await connectorVersion()) === '0.6.2');
   assert.deepEqual(readdirSync(path.join(R, 'releases')), ['0.6.2'], 'the broken release pruned');
 
