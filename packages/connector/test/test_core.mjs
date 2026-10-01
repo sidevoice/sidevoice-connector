@@ -337,6 +337,14 @@ export function supervisedNode({ modes = ['ok'], env: extra = {}, dataDir = mkdt
       // Whatever else runs here: a connector a launcher or a service start spawned, and every core.
       try { process.kill(JSON.parse(readFileSync(node.socketPath + '.lock', 'utf8')).pid, 'SIGKILL'); } catch {}
       for (const line of node.said()) { try { process.kill(line.pid, 'SIGKILL'); } catch {} }
+      // And anything started for this node that has not said so yet — a detached core a plain connector spawned just
+      // before the test ended: found by its data directory on its command line.
+      try {
+        for (const line of execFileSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8' }).split('\n')) {
+          const match = line.trim().match(/^(\d+)\s+(.*)$/);
+          if (match && Number(match[1]) !== process.pid && match[2].includes(`--data-dir ${path.join(dataDir, 'core')}`)) { try { process.kill(Number(match[1]), 'SIGKILL'); } catch {} }
+        }
+      } catch {}
     },
   };
   return node;

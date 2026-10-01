@@ -154,7 +154,10 @@ try {
   await wait(5000);
   assert.ok(!jobLoaded(), 'still no job');
   assert.ok(!existsSync(path.join(dataDir, 'connector.sock')), 'still no socket');
-  const ps = spawnSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8' }).stdout.split('\n').filter(line => /connector --supervise|fake-sidevoice-core/.test(line));
+  // This node's processes: its supervisor or connector, and its core (by its data directory) — not anything another
+  // job step left elsewhere.
+  const ps = spawnSync('ps', ['-axo', 'pid=,command='], { encoding: 'utf8' }).stdout.split('\n')
+    .filter(line => (/connector --supervise/.test(line) && line.includes(cli)) || line.includes(`--data-dir ${path.join(dataDir, 'core')}`));
   assert.deepEqual(ps, [], 'still no process');
 
   step('sidevoice uninstall: everything else');
