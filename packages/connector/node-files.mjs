@@ -26,6 +26,7 @@ export function nodeFiles(dataDir) {
     stopped: at('node-stopped.json'),      // a person stopped the node service: {at}
     restart: at('node-restart.json'),      // a person asked for a restart the service manager carries out: {at}
     handover: at('handover.json'),         // bindings moving from a plain connector to the supervisor
+    takeover: at('node-takeover.json'),    // a supervisor is taking the socket over: {pid, start}
     serviceLog: at('node-service.log'),
     connectorLog: at('connector.log'),
   };

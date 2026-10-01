@@ -436,7 +436,9 @@ export async function stop(env = process.env) {
 export async function restart(env = process.env) {
   const files = nodeFiles(dataDirOf(env));
   const kind = installedService(env)?.kind ?? 'none';
-  if (existsSync(files.stopped)) return start(env);
+  // Stopped: restarting is starting — and still a person's restart, so the supervisor that starts closes the budget
+  // window as `node.restart` would (the marker is read at its start).
+  if (existsSync(files.stopped)) { writePrivate(files.restart, { at: new Date().toISOString(), why: 'restart while stopped' }); return start(env); }
   const answered = await askConnector('node.restart', {}, { env, timeout: 90_000 });
   if (answered?.state && answered.supervisor && answered.service === kind) return { ok: true, state: answered.state, service: kind };
   writePrivate(files.restart, { at: new Date().toISOString() });

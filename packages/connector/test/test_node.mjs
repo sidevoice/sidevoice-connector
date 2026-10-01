@@ -39,14 +39,17 @@ function facade(env, clientInfo = { name: 'test', version: '1' }, capabilities =
 function delivered(node, eventId) {
   try { return readFileSync(path.join(node.dataDir, 'core', 'delivered.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse).find(line => line.frame.event_id === eventId) || null; } catch { return null; }
 }
+const attempts = (node, eventId) => { try { return readFileSync(path.join(node.dataDir, 'core', 'delivery-attempts.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse).filter(line => line.event_id === eventId).length; } catch { return 0; } };
 const deliver = (node, frame) => appendFileSync(path.join(node.dataDir, 'core', 'deliver.jsonl'), JSON.stringify(frame) + '\n');
 
 test('handover: a supervisor takes over a plain connector — a new voice turn reaches a façade\'s conversation and an orphaned editor card, and the core never sees one leave', async () => {
   const node = supervisedNode();
   // The harness behind the façade-owned conversation: a receiver the http harness delivers to.
   const received = [];
-  // A turn whose text says "slow" takes 1.5 s to be taken: it is still being delivered when the takeover starts.
-  const receiver = http.createServer(async (req, res) => { let body = ''; for await (const chunk of req) body += chunk; const turn = JSON.parse(body); if (/slow/.test(turn.text)) await wait(1500); received.push(turn); res.writeHead(200); res.end('{}'); });
+  // A turn whose text says "slow" takes 1.5 s to be taken, and says when it arrived: the takeover starts at that very
+  // moment, so the delivery straddles it.
+  let slowArrived; const slowArrival = new Promise(resolve => { slowArrived = resolve; });
+  const receiver = http.createServer(async (req, res) => { let body = ''; for await (const chunk of req) body += chunk; const turn = JSON.parse(body); if (/slow/.test(turn.text)) { slowArrived(); await wait(1500); } received.push(turn); res.writeHead(200); res.end('{}'); });
   await new Promise(resolve => receiver.listen(0, '127.0.0.1', resolve));
   const env = { ...node.env, SIDEVOICE_THREAD: 'thread-http', SIDEVOICE_DELIVERY_URL: `http://127.0.0.1:${receiver.address().port}/deliver` };
   const editorCaps = { extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] } } };
@@ -78,7 +81,7 @@ test('handover: a supervisor takes over a plain connector — a new voice turn r
     deliver(node, { event_id: 'crossing', binding_id: cardBinding, channel: 'voice', session_id: 'x', revision: 9, message_id: 'm-x', text: 'contesta luego' });
     await until(() => view.dispatched.length === 2);
     deliver(node, { event_id: 'slow-one', binding_id: 'core-thread-http', channel: 'voice', session_id: 's', revision: 2, message_id: 'm-slow', text: 'slow turn' });
-    await until(() => readFileSync(path.join(node.dataDir, 'connector.log'), 'utf8').includes('m-slow') || received.length >= 2, 5000).catch(() => {});
+    await slowArrival;
     // The node service starts: its supervisor finds the plain connector, which hands over and leaves.
     const supervisor = node.start(['--supervise']);
     await until(() => !alive(plain), 20_000);
@@ -105,8 +108,12 @@ test('handover: a supervisor takes over a plain connector — a new voice turn r
     assert.ok(registered.filter(id => id === 'core-thread-http').length >= 1);
     assert.ok(registered.includes(cardBinding), 'the orphaned card\'s binding rejoined under its id');
     assert.match(node.log(), /restored from the handover/);
-    // The slow turn finished being delivered before the old connector let its bindings go: its answer reached the core.
+    // The slow turn finished being delivered before the old connector closed its link: its answer reached the core,
+    // which therefore never took it back to deliver it a second time.
     assert.equal((await until(() => delivered(node, 'slow-one'))).answer.status, 'accepted');
+    await wait(500);
+    assert.equal(attempts(node, 'slow-one'), 1, 'delivered once, not again by the supervisor');
+    assert.equal(received.filter(turn => turn.text === 'slow turn').length, 1);
     // The crossing turn: delivered before the takeover, answered after it from a new editor process — routed by the
     // turn to the card's conversation, which the supervisor learned from the handover.
     const later = facade(editorEnv, { name: 'cursor-vscode', version: '1.0.0' }, editorCaps); await later.ready;
@@ -425,5 +432,26 @@ test('--json: every failure is one object {ok:false, error:{key, message}} and e
     node.start();
     const status = await node.status(s => s.failure, 15_000);
     assert.equal(status.failure.key, 'identity.unsafe-directory');
+  } finally { node.stop(); }
+});
+
+test('service restart while stopped is still a person\'s restart: the persisted budget is cleared and the core starts again', async () => {
+  const node = supervisedNode({ modes: ['import'] });
+  mkdirSync(node.dataDir, { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(node.dataDir, 'install.json'), JSON.stringify({ id: 'x', connector: '0.6.0', command: [process.execPath, cli] }), { mode: 0o600 });
+  const service = async (...args) => {
+    const run = spawnSync(process.execPath, [cli, 'service', ...args, '--json'], { env: node.env, encoding: 'utf8' });
+    return JSON.parse(run.stdout.trim().split('\n').at(-1));
+  };
+  try {
+    assert.equal((await service('start')).ok, true);
+    const failed = await node.status(s => s.state === 'failed', 20_000);
+    assert.equal(failed.attempts, 5);
+    assert.equal((await service('stop')).state, 'stopped-by-person');
+    writeFileSync(node.modesFile, 'ok\n');   // the person fixed what failed
+    const restarted = await service('restart');
+    assert.equal(restarted.ok, true, JSON.stringify(restarted));
+    const running = await node.status(s => s.state === 'running', 20_000);
+    assert.equal(running.attempts, 1, 'a fresh window, not the five spent before the stop');
   } finally { node.stop(); }
 });

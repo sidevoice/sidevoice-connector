@@ -36,7 +36,7 @@ import { Supervisor } from './supervisor.mjs';
 import { pruneInstallations, recover, sameCommand, settle } from './install-txn.mjs';
 import { connectorSocketOf, dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
 import { readLock, tryLock } from './lockfile.mjs';
-import { isProcess, signalVerified } from './proc.mjs';
+import { isProcess, selfIdentity, signalVerified } from './proc.mjs';
 import { verifyPrivateDir } from './secure-fs.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -518,6 +518,8 @@ async function publish(speech) {
 async function asked(route, frame) {
   switch (route) {
     case 'input.deliver': {
+      // Handing over: not taken here. The core keeps it and delivers it to the supervisor.
+      if (handingOver) return { status: 'retry', detail: 'this connector is handing over to the node service' };
       const binding = bindings.get(frame.binding_id);
       if (!binding) return { status: 'unknown_binding' };
       // One delivery at a time per binding keeps the user's turns in order.
@@ -755,14 +757,15 @@ async function yieldToSupervisor(requester) {
   server.close();   // no new façade; the connected ones are told below
   const settle = Promise.allSettled([...inFlight]);
   await Promise.race([settle, wait(HANDOVER_SETTLE_MS)]);
+  // New turns are refused from now on (`retry`: the core keeps them and delivers them to the supervisor). Turns
+  // already accepted are let finish with the link still open, so each one's acknowledgement reaches the core —
+  // closing first would make the core take them back and deliver them a second time. What a delivery records (the
+  // turn it carried, the message the harness is to take) is then complete before anything is written.
+  await Promise.race([Promise.allSettled([...deliveries]), wait(HANDOVER_SETTLE_MS)]);
+  if (deliveries.size) log(`${deliveries.size} delivery(ies) still under way after ${HANDOVER_SETTLE_MS} ms: the core takes them back and delivers them again (at least once)`);
   if (connected && outbox.length) await Promise.race([Promise.allSettled([...outbox].map(speech => publish(speech))), wait(HANDOVER_SETTLE_MS)]);
-  // No new turn from the core: the link is closed, and the turns it already sent are delivered (or have failed)
-  // before anything is written — what a delivery records (the turn it carried, the message the harness is to
-  // take) is then complete.
   closed = true;
   try { link?.close(); } catch {}
-  await Promise.race([Promise.allSettled([...deliveries]), wait(HANDOVER_SETTLE_MS)]);
-  if (deliveries.size) log(`${deliveries.size} delivery(ies) still under way after ${HANDOVER_SETTLE_MS} ms: the core delivers them again`);
   const record = { at: new Date().toISOString(), from_pid: process.pid,
     // Which conversation each turn went to (a reply names the turn, not the conversation), and which messages
     // were already reported read: the supervisor routes a reply to a turn delivered here, and reports nothing twice.
@@ -1054,12 +1057,21 @@ export async function run(argv = [], environment = process.env) {
   catch (error) { log(`not starting: ${error.message}`); process.exitCode = 78; return; }
   // What the lock file said before this process took the lock: a bare pid is an older connector's.
   const before = readLock(lockPath);
+  // A supervisor taking over says so first. Between the plain connector letting go and this process taking the lock
+  // there is a gap, and a façade that just lost its connector gets one started through the launcher in exactly that
+  // gap: that one, seeing a live supervisor's intent, lets the lock go at once instead of serving.
+  if (supervised) writePrivate(files.takeover, { pid: process.pid, start: selfIdentity().start ?? null, at: new Date().toISOString() });
   for (let attempt = 0; !(await acquireLock()); attempt++) {
-    if (!supervised || attempt >= 10) process.exit(0);
+    if (!supervised || attempt >= 50) process.exit(0);
     // The holder's record may not be written yet: asked again in a moment.
     const owner = readLock(lockPath);
-    if (connectorAlive(owner) && !(await takeOver(owner))) process.exit(0);
-    await wait(200);
+    if (connectorAlive(owner) && !(await takeOver(owner))) { try { rmSync(files.takeover, { force: true }); } catch {} process.exit(0); }
+    await wait(50);
+  }
+  if (supervised) { try { rmSync(files.takeover, { force: true }); } catch {} }
+  else {
+    let intent = null; try { intent = readJson(files.takeover); } catch {}
+    if (intent && isProcess(intent.pid, { start: intent.start ?? null })) { log(`a supervisor (pid ${intent.pid}) is taking over: not serving`); releaseLock({ socket: false }); process.exit(0); }
   }
   lockHold.legacyPid = before?.legacyPid ?? null;
   await stopLegacyConnector();

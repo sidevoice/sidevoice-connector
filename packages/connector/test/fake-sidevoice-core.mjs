@@ -147,23 +147,36 @@ async function serve() {
 }
 serve();
 
-// Turns to deliver, dropped by a test into `deliver.jsonl`: each line goes to the connector as the room's
-// delivery would, and its answer is written back to `delivered.jsonl`.
-let delivered = 0;
+// Turns to deliver, dropped by a test into `deliver.jsonl`, delivered as the real core delivers them
+// (`control/connectors.py`): one at a time, to the connector linked now; none linked — it waits for one; the
+// connector gone while one is in flight — it goes back at once and is delivered again to the next; an answer other
+// than accepted, unknown or unsupported — tried again a little later. Every attempt goes to `delivery-attempts.jsonl`
+// and the settled answer to `delivered.jsonl`.
+const queue = [];
+let read = 0, inflight = null;
+const record = (file, entry) => appendFileSync(path.join(data, file), JSON.stringify(entry) + '\n');
+const SETTLED = new Set(['accepted', 'unknown', 'unsupported']);
 setInterval(() => {
   let lines = [];
-  try { lines = readFileSync(path.join(data, 'deliver.jsonl'), 'utf8').split('\n').filter(Boolean); } catch { return; }
-  for (const line of lines.slice(delivered)) {
-    delivered++;
-    const frame = JSON.parse(line);
-    // The connector linked most recently, as the real core delivers to the one linked now: one killed a moment ago
-    // can still be listed until its disconnect is seen.
-    const socket = [...namespace.sockets.values()].filter(item => item.connected).at(-1);
-    if (!socket) { appendFileSync(path.join(data, 'delivered.jsonl'), JSON.stringify({ frame, answer: { status: 'no_connector' } }) + '\n'); continue; }
-    socket.timeout(10_000).emit('input.deliver', frame, (error, answer) =>
-      appendFileSync(path.join(data, 'delivered.jsonl'), JSON.stringify({ frame, answer: error ? { status: 'unacknowledged' } : answer }) + '\n'));
-  }
-}, 50).unref();
+  try { lines = readFileSync(path.join(data, 'deliver.jsonl'), 'utf8').split('\n').filter(Boolean); } catch {}
+  for (const line of lines.slice(read)) { read++; queue.push(JSON.parse(line)); }
+  if (inflight || !queue.length) return;
+  const socket = [...namespace.sockets.values()].filter(item => item.connected).at(-1);
+  if (!socket) return;
+  const frame = queue.shift();
+  const attempt = inflight = { frame, socket };
+  record('delivery-attempts.jsonl', { event_id: frame.event_id, at: Date.now() });
+  socket.timeout(10_000).emit('input.deliver', frame, (error, answer) => {
+    if (inflight !== attempt) return;   // already given back when its connector went away
+    inflight = null;
+    if (!error && SETTLED.has(answer?.status)) return record('delivered.jsonl', { frame, answer });
+    setTimeout(() => queue.unshift(frame), 200);
+  });
+}, 25).unref();
+namespace.on('connection', socket => socket.on('disconnect', () => {
+  if (inflight?.socket !== socket) return;
+  queue.unshift(inflight.frame); inflight = null;
+}));
 
 // No connector and no call for `--idle-exit` seconds: leave, as the real core does (0: never).
 if (idleExit > 0) setInterval(() => { if (!linked && !calls() && Date.now() - quietSince >= idleExit * 1000) leave(); }, 200).unref();
