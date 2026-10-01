@@ -1,25 +1,47 @@
 name: CI
 
-# The client's suite. The release workflow calls this one on a tag, so nothing is
-# published under a version that was not tested.
+# What runs when (RELEASING.md):
+# - pull request: the client's suite on Linux and a dry run of the package. Nothing is packaged.
+# - push to main, manual run: the same, then the npm tarball with the core's wheel inside; a green run on main
+#   replaces the `nightly` pre-release.
+# - a release (called by release-please.yml with the tag it created): the same, attached to that draft release;
+#   release-please.yml then takes it to npm and publishes the release.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
   workflow_call:
+    inputs:
+      release-tag:
+        description: The draft release release-please created (vX.Y.Z); its assets are built from that tag.
+        type: string
+        required: true
+    secrets:
+      SIDEVOICE_CORE_RELEASES_TOKEN:
+        description: Reads sidevoice/sidevoice-core's releases (a private repository, out of this run's own token's reach).
+        required: false
 
 permissions:
   contents: read
 
+concurrency:
+  # Per ref. A release (github.workflow is the caller's, release-please) never shares a group with a push.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   client:
     name: Client (Node)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release-tag }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
       - run: npm ci
       # The published client is one bundled file, so it is built before anything checks or packs
       # it: `npm pack` would build it again through `prepack`, and a suite that ran first would be
@@ -32,3 +54,119 @@ jobs:
       - name: Package contents (dry run)
         run: npm pack --dry-run
         working-directory: packages/connector
+
+  package:
+    name: npm tarball with the core inside
+    needs: client
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    outputs:
+      # Where the assets go: the release that called this, or the rolling `nightly` pre-release on a push to main.
+      publish: ${{ steps.kind.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release-tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - id: kind
+        run: echo "publish=${{ inputs.release-tag && 'release' || (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'nightly' || '' }}" >> "$GITHUB_OUTPUT"
+      - run: npm ci
+      - name: The core's wheel this version pins (a release takes the core's vX.Y.Z, anything else its nightly)
+        id: core
+        env:
+          GH_TOKEN: ${{ secrets.SIDEVOICE_CORE_RELEASES_TOKEN }}
+          KIND: ${{ steps.kind.outputs.publish }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::The secret SIDEVOICE_CORE_RELEASES_TOKEN is not set: this run cannot read sidevoice/sidevoice-core's releases (RELEASING.md)."
+            exit 1
+          fi
+          CORE_VERSION=$(node --input-type=module -e "import { CORE_VERSION } from './packages/connector/core.mjs'; console.log(CORE_VERSION)")
+          CORE_TAG=$([ "$KIND" = release ] && echo "v$CORE_VERSION" || echo nightly)
+          WHEEL="sidevoice_core-${CORE_VERSION}-py3-none-any.whl"
+          DIR="$RUNNER_TEMP/core"
+          gh release download "$CORE_TAG" -R sidevoice/sidevoice-core -D "$DIR" -p 'sidevoice_core-*-py3-none-any.whl' -p SHA256SUMS
+          if [ ! -f "$DIR/$WHEEL" ]; then
+            echo "::error::sidevoice-core's $CORE_TAG carries $(cd "$DIR" && ls -- *.whl), but packages/connector/core.mjs pins CORE_VERSION $CORE_VERSION."
+            exit 1
+          fi
+          grep -q "  $WHEEL\$" "$DIR/SHA256SUMS"
+          (cd "$DIR" && sha256sum -c --ignore-missing SHA256SUMS)
+          echo "wheel=$DIR/$WHEEL" >> "$GITHUB_OUTPUT"
+          echo "core=$CORE_TAG" >> "$GITHUB_OUTPUT"
+      - name: Pack the client, the wheel inside (prepack runs `npm run build`, which takes SIDEVOICE_CORE_WHEEL)
+        working-directory: packages/connector
+        env:
+          SIDEVOICE_CORE_WHEEL: ${{ steps.core.outputs.wheel }}
+          KIND: ${{ steps.kind.outputs.publish }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/dist-release"
+          npm pack --pack-destination "$GITHUB_WORKSPACE/dist-release"
+          TGZ=$(ls "$GITHUB_WORKSPACE"/dist-release/sidevoice-uplink-*.tgz)
+          WHEEL=$(basename "$SIDEVOICE_CORE_WHEEL")
+          tar -tzf "$TGZ" | grep -x 'package/dist/cli.mjs' >/dev/null
+          tar -xzOf "$TGZ" "package/dist/core/$WHEEL" | cmp - "$SIDEVOICE_CORE_WHEEL"
+          if [ "$KIND" = nightly ]; then
+            # The nightly carries the version of the last release, so it says it is not that version.
+            mv "$TGZ" "${TGZ%.tgz}-nightly.tgz"
+          fi
+          cd "$GITHUB_WORKSPACE/dist-release"
+          sha256sum -- * > SHA256SUMS
+          ls -la; cat SHA256SUMS
+          echo "Core wheel: $WHEEL from sidevoice/sidevoice-core ${{ steps.core.outputs.core }}" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sidevoice-connector-dist
+          path: dist-release/
+          retention-days: 7
+          if-no-files-found: error
+
+  # Only after the suite and the package passed. Pull requests never get here. A release is only attached
+  # here, as a draft: release-please.yml publishes it after npm.
+  publish:
+    name: Attach (release) or publish (nightly)
+    needs: package
+    if: needs.package.outputs.publish != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.release-tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sidevoice-connector-dist
+          path: assets
+      - name: Attach to the draft release
+        if: needs.package.outputs.publish == 'release'
+        run: gh release upload "$TAG" assets/* --clobber
+      - name: Replace the nightly pre-release (move its tag here, replace every asset)
+        if: needs.package.outputs.publish == 'nightly'
+        env:
+          WHEN: ${{ github.event.head_commit.timestamp }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/$GH_REPO/git/ref/tags/nightly" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/nightly" -f sha="$GITHUB_SHA" -F force=true >/dev/null
+          else
+            gh api -X POST "repos/$GH_REPO/git/refs" -f ref=refs/tags/nightly -f sha="$GITHUB_SHA" >/dev/null
+          fi
+          NOTES="Snapshot of \`main\` at $GITHUB_SHA (committed $WHEN), with sidevoice-core's nightly wheel inside. Not a versioned release: the \`nightly\` tag moves to every commit on \`main\` whose CI passes, and these assets are replaced each time. It is never published to npm. Versioned releases are the \`vX.Y.Z\` ones."
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release edit nightly --title "Nightly (main)" --notes "$NOTES" --prerelease --latest=false
+            gh release upload nightly assets/* --clobber
+            # Anything left from an older snapshot that this one did not replace (the tarball is named after the version).
+            gh release view nightly --json assets -q '.assets[].name' | while read -r name; do
+              [ -e "assets/$name" ] || gh release delete-asset nightly "$name" --yes
+            done
+          else
+            gh release create nightly assets/* --verify-tag --title "Nightly (main)" --notes "$NOTES" \
+              --prerelease --latest=false
+          fi
