@@ -32,6 +32,7 @@ import { API_RANGE, CORE_VERSION, NO_UV, awaitReady, coreArgs, coreRunning, runs
   failurePath, installInProgress, roomCredentialPath, spawnCore, takeInstallLock, terminateCore, unlinkSocket } from './core.mjs';
 import { ensureCoreDirectory, localHealth, socketAgent } from './core-socket.mjs';
 import { appendLine, rotate } from './logfile.mjs';
+import { pause } from './testpoint.mjs';
 import { Supervisor } from './supervisor.mjs';
 import { VERIFY_DEADLINE_MS, pruneInstallations, recover, sameCommand, selectionRuns, settle } from './install-txn.mjs';
 import { connectorSocketOf, dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
@@ -81,6 +82,7 @@ function coreLink(ready) {
 /** The singleton lock (`lockfile.mjs`): held by the kernel for as long as this process lives. Its record — pid and
  *  start time — says which connector holds the socket; a pid alone never does. */
 let lockHold = null;
+const TAKEOVER_EXPIRY_MS = 60_000;
 async function acquireLock() {
   let taken;
   try { taken = await tryLock(lockPath, { kind: 'connector' }); }
@@ -1077,7 +1079,7 @@ export async function run(argv = [], environment = process.env) {
   // `--replace`: a plain connector of the installation just selected, taking over the one running (an upgrade with
   // no service), the same way.
   const taking = supervised || argv.includes('--replace');
-  if (taking) writePrivate(files.takeover, { pid: process.pid, start: selfIdentity().start ?? null, at: new Date().toISOString() });
+  if (taking) { writePrivate(files.takeover, { pid: process.pid, start: selfIdentity().start ?? null, at: new Date().toISOString() }); await pause('takeover-intent'); }
   for (let attempt = 0; !(await acquireLock()); attempt++) {
     if (!taking || attempt >= 50) process.exit(0);
     // The holder's record may not be written yet: asked again in a moment.
@@ -1088,7 +1090,10 @@ export async function run(argv = [], environment = process.env) {
   if (taking) { try { rmSync(files.takeover, { force: true }); } catch {} }
   else {
     let intent = null; try { intent = readJson(files.takeover); } catch {}
-    if (intent && isProcess(intent.pid, { start: intent.start ?? null })) { log(`a supervisor (pid ${intent.pid}) is taking over: not serving`); releaseLock({ socket: false }); process.exit(0); }
+    // Only a living writer's intent, and only for a while: a dead one (a zombie included) or one that never finished
+    // taking over does not keep connectors from serving.
+    const fresh = intent && Date.now() - (Date.parse(intent.at) || 0) < TAKEOVER_EXPIRY_MS;
+    if (fresh && isProcess(intent.pid, { start: intent.start ?? null })) { log(`a supervisor (pid ${intent.pid}) is taking over: not serving`); releaseLock({ socket: false }); process.exit(0); }
   }
   lockHold.legacyPid = before?.legacyPid ?? null;
   await stopLegacyConnector();

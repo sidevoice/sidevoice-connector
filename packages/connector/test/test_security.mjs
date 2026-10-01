@@ -260,6 +260,37 @@ test('lock names: another user cannot work out a lock\'s abstract name — a squ
   } finally { for (const server of squatters) server.close(); node.stop(); }
 });
 
+test('takeover intent: a writer killed before taking over — reaped or left a zombie by its parent — keeps no connector from serving; an old intent expires', async () => {
+  for (const variant of ['reaped', 'zombie', 'expired']) {
+    const node = supervisedNode();
+    const hold = hooks('takeover-intent');
+    try {
+      mkdirSync(node.dataDir, { recursive: true, mode: 0o700 });
+      if (variant === 'expired') {
+        // A live process's intent, from two minutes ago: a takeover that never finished.
+        const { selfIdentity } = await import('../proc.mjs');
+        writeFileSync(path.join(node.dataDir, 'node-takeover.json'), JSON.stringify({ pid: process.pid, start: selfIdentity().start, at: new Date(Date.now() - 120_000).toISOString() }), { mode: 0o600 });
+      } else {
+        const cliPath = path.join(here, '..', 'cli.mjs');
+        // A zombie: the writer's parent is a shell that exec'd into sleep, and never reaps it.
+        const writer = variant === 'reaped'
+          ? spawn(process.execPath, [cliPath, 'connector', '--supervise'], { env: { ...node.env, SIDEVOICE_TEST_HOOKS: hold.dir }, stdio: 'ignore' })
+          : spawn('sh', ['-c', `"${process.execPath}" "${cliPath}" connector --supervise & exec sleep 60`], { env: { ...node.env, SIDEVOICE_TEST_HOOKS: hold.dir }, stdio: 'ignore' });
+        node.children.push(writer);
+        await hold.paused('takeover-intent');
+        const pid = Number(readFileSync(path.join(hold.dir, 'paused-takeover-intent'), 'utf8'));
+        process.kill(pid, 'SIGKILL');
+        if (variant === 'zombie') {
+          await until(() => { try { return /^\S+ \(.*\) Z/.test(readFileSync(`/proc/${pid}/stat`, 'utf8')) || process.platform !== 'linux'; } catch { return false; } });
+        } else await until(() => { try { process.kill(pid, 0); return false; } catch { return true; } });
+      }
+      const plain = node.start([]);
+      await until(() => existsSync(node.socketPath), 10_000);
+      assert.equal(lockOf(node).pid, plain.pid, `${variant}: the plain connector serves`);
+    } finally { node.stop(); }
+  }
+});
+
 test('lock salt: removed while its lock is held, it is not made again beside the holder — install and connector refuse with identity.lock-salt-missing until the holder is gone', { skip: process.platform !== 'linux' && 'the salt names Linux abstract sockets' }, async () => {
   // The install lock, held by another process.
   const dir = mkdtempSync(path.join(os.tmpdir(), 'sv-salt-'));

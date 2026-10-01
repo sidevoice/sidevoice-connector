@@ -9,23 +9,29 @@ import { readdirSync, readFileSync } from 'node:fs';
 const uid = () => (typeof process.getuid === 'function' ? process.getuid() : null);
 export const validPid = pid => Number.isInteger(pid) && pid > 1;
 
-/** `{uid, start, command}` of a live pid, `null` when there is no such process, `undefined` when it cannot be told. */
+/** `{uid, start, command}` of a live pid, `null` when there is no such process, `undefined` when it cannot be told.
+ *  A zombie — dead, not yet reaped by its parent — is no process: `kill(pid, 0)` and `/proc` still answer for it, but
+ *  it will never do anything again (Linux: state `Z`/`X` in `/proc/<pid>/stat`; elsewhere: `Z` in `ps -o stat=`). */
 export function processIdentity(pid) {
   if (!validPid(pid)) return null;
   try { process.kill(pid, 0); } catch (error) { if (error.code === 'ESRCH') return null; if (error.code !== 'EPERM') return undefined; }
   if (process.platform === 'linux') {
     try {
       const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-      const start = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];   // field 22: start time, in clock ticks since boot
+      const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      if (fields[0] === 'Z' || fields[0] === 'X' || fields[0] === 'x') return null;   // field 3: state
+      const start = fields[19];   // field 22: start time, in clock ticks since boot
       const owner = Number(readFileSync(`/proc/${pid}/status`, 'utf8').match(/^Uid:\s+(\d+)/m)[1]);
       const command = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean).join(' ');
       return { uid: owner, start, command };
     } catch (error) { return error.code === 'ENOENT' ? null : undefined; }
   }
   try {
-    const line = execFileSync('ps', ['-o', 'uid=', '-o', 'lstart=', '-o', 'command=', '-p', String(pid)], { encoding: 'utf8', timeout: 3000 }).trim();
-    const match = line.match(/^(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+[\d:]+\s+\d{4})\s+(.*)$/);
-    return match ? { uid: Number(match[1]), start: match[2].replace(/\s+/g, ' '), command: match[3] } : undefined;
+    const line = execFileSync('ps', ['-o', 'stat=', '-o', 'uid=', '-o', 'lstart=', '-o', 'command=', '-p', String(pid)], { encoding: 'utf8', timeout: 3000 }).trim();
+    const match = line.match(/^(\S+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+[\d:]+\s+\d{4})\s+(.*)$/);
+    if (!match) return undefined;
+    if (match[1].includes('Z')) return null;
+    return { uid: Number(match[2]), start: match[3].replace(/\s+/g, ' '), command: match[4] };
   } catch (error) { return error.status === 1 ? null : undefined; }
 }
 
