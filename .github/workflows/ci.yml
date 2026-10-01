@@ -47,9 +47,71 @@ jobs:
       # so a list only ever checked the first name (and a deleted file went unnoticed for two releases).
       - run: for f in packages/connector/*.mjs packages/connector/dist/*.mjs; do node --check "$f"; done
       - run: npm test
+      # The trust boundary is the OS user (design §4.1): another user on this machine must reach neither the core's
+      # socket — the connector link and the local routes are only there — nor the connector's, and the core's TCP
+      # listener must not offer the link. The data dir is opened up on purpose, so the core's own 0700 directory and
+      # the sockets' own modes are what refuse, not the home directory. The fake core plays the core.
+      - name: A second OS user cannot reach this user's core or connector
+        working-directory: packages/connector
+        run: |
+          set -euo pipefail
+          printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$(command -v node)" "$PWD/test/fake-sidevoice-core.mjs" > "$RUNNER_TEMP/sidevoice-core"
+          chmod 755 "$RUNNER_TEMP/sidevoice-core"
+          export SIDEVOICE_SERVICE_MANAGER=none SIDEVOICE_CORE_BIN="$RUNNER_TEMP/sidevoice-core" SIDEVOICE_CORE_PORT=0
+          node cli.mjs connector --supervise &
+          for i in $(seq 1 60); do [ -f "$HOME/.sidevoice/core/core.json" ] && break; sleep 1; done
+          url=$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.env.HOME + '/.sidevoice/core/core.json', 'utf8')).url)")
+          chmod o+x "$HOME"; chmod 755 "$HOME/.sidevoice"
+          ls -la "$HOME/.sidevoice" "$HOME/.sidevoice/core" || true
+          sudo useradd -m sidevoice-other
+          install -m 644 test/second-uid-probe.mjs /tmp/second-uid-probe.mjs
+          sudo -u sidevoice-other "$(command -v node)" /tmp/second-uid-probe.mjs "$HOME/.sidevoice" "$url"
+          kill %1
       - name: Package contents (dry run)
         run: npm pack --dry-run
         working-directory: packages/connector
+
+  # The node service under the real service managers, end to end (packages/connector/test/service-integration.mjs):
+  # install with no agents → the core running with no harness → killed → backoff → running → a login, approximated
+  # → stop (the person's; the launcher refuses) → start → uninstall with a client connected → no job, no process,
+  # no socket, and nothing after the next login. The fake core plays the core.
+  service-linux:
+    name: Node service (systemd user manager)
+    needs: client
+    if: ${{ !inputs.release-tag }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # The runner's user has no login session, so no user manager: lingering gives it one, as on a headless machine.
+      - name: A user manager for the runner
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$USER"
+          for i in $(seq 1 30); do [ -S "/run/user/$(id -u)/bus" ] && break; sleep 1; done
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - run: systemctl --user show-environment >/dev/null && systemctl --user is-system-running || true
+      - run: node packages/connector/test/service-integration.mjs
+
+  service-macos:
+    name: Node service (launchd)
+    needs: client
+    if: ${{ !inputs.release-tag }}
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: launchctl print "gui/$(id -u)" >/dev/null && echo "gui domain present"
+      - run: node packages/connector/test/service-integration.mjs
 
   package:
     name: npm tarball with the core inside
