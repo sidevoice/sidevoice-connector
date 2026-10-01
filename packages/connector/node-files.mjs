@@ -17,20 +17,18 @@ export function connectorSocketOf(env = process.env) {
   return env.SIDEVOICE_CONNECTOR_SOCKET || path.join(dataDirOf(env), 'connector.sock');
 }
 
+/** The connector's own lock, beside the socket it protects: `D/connector.lock`. */
+export function connectorLockOf(env = process.env) {
+  return path.join(path.dirname(connectorSocketOf(env)), 'connector.lock');
+}
+
 export function nodeFiles(dataDir) {
   const at = name => path.join(dataDir, name);
   return {
-    install: at('install.json'),           // the selected installation (§4.3)
-    journal: at('install-txn.json'),       // an install transaction under way: {from, to}
-    status: at('node-status.json'),        // the supervisor's last snapshot, with its budget window
-    stopped: at('node-stopped.json'),      // a person stopped the node service: {at}
-    restart: at('node-restart.json'),      // a person asked for a restart the service manager carries out: {at}
-    handover: at('handover.json'),         // bindings moving from a plain connector to the supervisor
-    takeover: at('node-takeover.json'),    // a supervisor is taking the socket over: {pid, start}
-    permit: at('install-permit.json'),     // the install lock's holder starts the node to verify it: {journal, pid, start}
-    recovery: at('node-recovery.json'),    // how the last `service recover` ended: {at, ok, error?}
-    serviceLog: at('node-service.log'),
+    install: at('install.json'),           // {command}: what runs this installation — stable, through `R/current`
+    stopped: at('node-stopped.json'),      // a person stopped Sidevoice: {at}
     connectorLog: at('connector.log'),
+    coreStderr: at('core.stderr.log'),     // what launchd catches from the core job: a crash's output
   };
 }
 
