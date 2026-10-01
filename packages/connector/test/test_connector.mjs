@@ -477,7 +477,7 @@ test('connector: the core asks it to pair this machine with a room (a page talki
   } finally { if (child.exitCode === null) child.kill(); await core.close(); pairing.close(); }
 });
 
-/** What a node answers when its connector asks for a device pairing code (docs/DEVICE_PAIRING.md). */
+/** What a node answers when its connector asks for a device pairing code (sidevoice-core's `server/devices.py`). */
 function issuedCode(host = 'macbook-pro') {
   const payload = { v: 1, fp: 'f'.repeat(43), host, urls: ['http://127.0.0.1:8768'], rv: null, secret: 's'.repeat(22), exp: 1790000000 };
   return { code: 'SV1.' + Buffer.from(JSON.stringify(payload)).toString('base64url'), payload, expires_in: 600 };
@@ -1203,7 +1203,7 @@ test('connector: with the Desktop Bridge on, an editor chat is identified by its
   } finally { if (child.exitCode === null) child.kill(); await fake.close(); await room.close(); }
 });
 
-test('pairing: plaintext only to loopback and the cluster hosts the operator named', async () => {
+test('pairing: plaintext only to loopback and the cluster hosts named in SIDEVOICE_TRUSTED_CLUSTER_HOSTS', async () => {
   const { plaintextAllowed, trustedClusterHosts, pair } = await import('../pair.mjs');
   for (const ok of ['127.0.0.1', 'localhost', 'LOCALHOST', '::1', '[::1]']) assert.equal(plaintextAllowed(ok, {}), true, ok);
   // No spelling is trusted by default: a service name may be anyone's DNS.

@@ -3,7 +3,7 @@ name: release-please
 # On every push to main: keep the "release X.Y.Z" PR up to date (version from feat/fix, changelog from the squashed
 # PR titles). Merging that PR is the release: this run then creates the tag and a draft GitHub Release; ci.yml
 # (called below) builds the npm tarball from the tag, the core's matching wheel inside, and attaches it; the client
-# goes to npm once the operator approves the `npm` environment; the Release is published last. RELEASING.md.
+# goes to npm once a maintainer approves the `npm` environment; the Release is published last. RELEASING.md.
 on:
   push:
     branches: [main]
@@ -73,7 +73,7 @@ jobs:
           fi
 
   npm:
-    name: Client to npm (approved by the operator)
+    name: Client to npm (approved by a maintainer)
     needs: [release-please, assets, npm-gate]
     runs-on: ubuntu-24.04
     # The approval is the publication. The trusted publisher on npm names this workflow and this environment.

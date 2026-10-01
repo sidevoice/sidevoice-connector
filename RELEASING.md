@@ -13,8 +13,8 @@ a PR like any other change.
 |---|---|---|
 | Open / update a PR | anyone | `CI`: the client's suite (Linux) and a dry run of the package. **PR title is a conventional commit**. Nothing is packaged. |
 | Squash-merge into `main` | reviewer | The PR title becomes the commit. `CI` runs the suite and packs the client with sidevoice-core's `nightly` wheel inside; when it is green, the `nightly` pre-release is replaced. release-please opens or updates the **release PR** ("chore(main): release X.Y.Z"). Nothing versioned is published, nothing goes to npm. |
-| Merge the release PR | the operator | release-please tags `vX.Y.Z` and creates a draft GitHub Release whose notes are that version's changelog; `CI` runs from the tag, packs the client with the wheel of sidevoice-core's `vCORE_VERSION` release inside, and attaches it to the draft. |
-| Approve the `npm` deployment | the operator | **This is the publication.** The run waits on the `npm` environment; once approved, the attached tarball, byte for byte, goes to npm (`latest`, or `next` for a pre-release), then the GitHub Release is published. Rejecting it leaves the Release a draft and npm untouched. |
+| Merge the release PR | a maintainer | release-please tags `vX.Y.Z` and creates a draft GitHub Release whose notes are that version's changelog; `CI` runs from the tag, packs the client with the wheel of sidevoice-core's `vCORE_VERSION` release inside, and attaches it to the draft. |
+| Approve the `npm` deployment | a maintainer | **This is the publication.** The run waits on the `npm` environment; once approved, the attached tarball, byte for byte, goes to npm (`latest`, or `next` for a pre-release), then the GitHub Release is published. Rejecting it leaves the Release a draft and npm untouched. |
 
 Assets of a release:
 
@@ -33,9 +33,9 @@ Release itself.
 footer) bumps the minor, not the major. `docs:`, `chore:`, `ci:`, `test:`, `refactor:` alone make no release.
 
 The manifest starts at 0.6.0, the version the package carries. With no GitHub Release yet, release-please finds
-the tag of that version, `v0.6.0` (the monorepo's, rubasace/sidevoice, like `v0.4.3` and `v0.5.0` here), and reads
-the history from it: the first release PR proposes 0.7.0, and its changelog also lists monorepo commits after
-that tag that were about other parts (trim them in the release PR). Without that tag it would read from the
+the tag of that version, `v0.6.0` (from the history before the client had a repository of its own, like `v0.4.3`
+and `v0.5.0` here), and reads the history from it: the first release PR proposes 0.7.0, and its changelog also
+lists commits after that tag that were about other parts (trim them in the release PR). Without that tag it would read from the
 commit where this repository became the client alone (`bootstrap-sha`). npm has 0.5.0 as its latest: 0.6.0 was
 never published there. To publish 0.6.0 itself, use `Release-As: 0.6.0` (below).
 
@@ -75,13 +75,13 @@ Build artifacts on Actions runs are kept 7 days, for debugging only. Download fr
 - npm refuses the publication: the Release stays a draft with its assets. Re-run the `npm` job once fixed.
 - A `nightly` run fails: the previous snapshot stays. The next green push replaces it.
 
-## What this needs (the operator's, `GITHUB-SETUP.md`)
+## What this needs (repository settings)
 
 - **Secret `SIDEVOICE_CORE_RELEASES_TOKEN`** (repository secret): reads sidevoice/sidevoice-core's releases. The
   core is private, and a run's own token reaches only this repository. A fine-grained token on
   sidevoice/sidevoice-core alone, **Contents: read**, nothing else. Without it, nightlies and releases fail at
   the wheel; pull requests do not need it.
-- **Environment `npm`** (Settings → Environments) with **required reviewers** (the operator), deployment branches
+- **Environment `npm`** (Settings → Environments) with **required reviewers** (the maintainers), deployment branches
   limited to `main` (release-please runs there). The workflow checks it is there and protected before anything
   reaches npm, and refuses otherwise. Note: GitHub documents required reviewers on a private repository as an
   Enterprise feature; on the Free plan they exist once the repository is public. Until then no release reaches npm

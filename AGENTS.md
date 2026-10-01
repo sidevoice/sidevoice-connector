@@ -15,6 +15,5 @@ Rules for any coding agent (and person) working in this repository.
 
 ## Before changing things
 
-Read `docs/ARCHITECTURE.md`, and `docs/FRONTEND.md` for the web. Today the web's source strings are Spanish,
-translated by pairs in `packages/browser-audio/room-i18n.js`; moving to English-keyed bundles is #128 — new text
-follows the rule above, not the old pattern.
+Read `packages/connector/README.md`. New text follows the rule above; the web client's move to English-keyed
+bundles is sidevoice/sidevoice-web#17.
