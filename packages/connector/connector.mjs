@@ -225,8 +225,8 @@ function refuse(reason) {
 function startCore() {
   if (coreStarting) return coreStarting;
   coreError = null; coreFailure = null;
-  const selected = coreProgram(env);
-  coreStarting = ensureRunning({ dataDir, env, log, roomCredential: credentialsPath, bin: existsSync(selected) ? selected : null })
+  let selected = null; try { selected = coreProgram(env); } catch {}
+  coreStarting = ensureRunning({ dataDir, env, log, roomCredential: credentialsPath, bin: selected && existsSync(selected) ? selected : null })
     .then(ready => {
       coreError = null;
       creds = coreLink(ready);
@@ -739,11 +739,11 @@ export async function run(argv = [], environment = process.env) {
   hostId = identity.host;
   logPath = serviceMode ? files.connectorLog : env.SIDEVOICE_CONNECTOR_LOG || files.connectorLog;
   external = externalCore();
-  // The core is started here only where nobody else does: never by the connector job, never beside a core job.
-  ownsCore = !serviceMode && !installedService(env)?.core;
-
   // Refused, not repaired: a data directory others can write into is not one to serve from (`secure-fs.mjs`).
   try { verifyPrivateDir(dataDir, { create: true }); }
+  catch (error) { log(`not starting: ${error.message}`); process.exitCode = 78; return; }
+  // The core is started here only where nobody else does: never by the connector job, never beside a core job.
+  try { ownsCore = !serviceMode && !installedService(env)?.core; }
   catch (error) { log(`not starting: ${error.message}`); process.exitCode = 78; return; }
   // One connector serves the socket. A plain one that finds it held leaves; the job waits for the holder to go (a
   // connector somebody started by hand), rather than exiting into its manager's restart loop.

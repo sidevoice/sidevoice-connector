@@ -23,6 +23,7 @@ import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { CORE_VERSION, installRuntime, runtimeRoot, selfTest } from './core.mjs';
 import { keyed, t } from './i18n.mjs';
+import { recordedInstallation } from './node-files.mjs';
 import { readTrustedJson, verifyPrivateDir, writePrivateFile } from './secure-fs.mjs';
 import { crash } from './testpoint.mjs';
 
@@ -33,7 +34,10 @@ const packageRoot = () => (existsSync(path.join(here, '..', 'package.json')) ? p
 let manifestCache = null;
 const manifest = () => (manifestCache ??= JSON.parse(readFileSync(path.join(here, 'package.json'), 'utf8')));
 
+/** `R`: where the installation recorded it was made (`install.json`'s `releases`), else `$XDG_DATA_HOME/sidevoice`. */
 export function releaseRoot(env = process.env) {
+  const recorded = recordedInstallation(env)?.releases;
+  if (typeof recorded === 'string' && path.isAbsolute(recorded) && path.basename(recorded) === 'sidevoice') return recorded;
   return path.join(env.XDG_DATA_HOME || path.join(env.HOME || os.homedir(), '.local', 'share'), 'sidevoice');
 }
 export function releaseLayout(env = process.env) {

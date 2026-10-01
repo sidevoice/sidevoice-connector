@@ -32,9 +32,9 @@ import { API_RANGE, LINK_RANGE, coreArgs, coreProcesses, coreRunning, describeFa
 import { localHealth } from './core-socket.mjs';
 import { readLock, tryLock } from './lockfile.mjs';
 import { isProcess, processAge, signalVerified } from './proc.mjs';
-import { coreProgram, selection } from './release.mjs';
+import { coreProgram, releaseRoot, selection, stableCommand } from './release.mjs';
 import { keyed, t } from './i18n.mjs';
-import { connectorLockOf, connectorSocketOf, dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
+import { connectorLockOf, connectorSocketOf, dataDirOf, nodeFiles, readJson, recordedInstallation, writePrivate } from './node-files.mjs';
 
 export const JOBS = {
   core: { label: 'dev.sidevoice.core', unit: 'sidevoice-core.service' },
@@ -63,7 +63,18 @@ export function managerKind(env = process.env) {
 }
 const platformKind = env => env.SIDEVOICE_SERVICE_MANAGER || (process.platform === 'darwin' ? 'launchd' : process.platform === 'linux' ? 'systemd' : 'none');
 
+/** Where a job's definition is: where the installation recorded it (`install.json`'s `definitions` — only a path that
+ *  names this job's own file), else where this environment puts it. */
 export function definitionPath(kind, job, env = process.env) {
+  const recorded = recordedDefinition(kind, job, env);
+  return recorded ?? defaultDefinitionPath(kind, job, env);
+}
+function recordedDefinition(kind, job, env) {
+  const name = kind === 'launchd' ? `${JOBS[job].label}.plist` : kind === 'systemd' ? JOBS[job].unit : null;
+  const list = recordedInstallation(env)?.definitions;
+  return Array.isArray(list) ? list.find(file => typeof file === 'string' && path.isAbsolute(file) && path.basename(file) === name) ?? null : null;
+}
+function defaultDefinitionPath(kind, job, env) {
   const home = env.HOME || os.homedir();
   if (kind === 'launchd') return path.join(home, 'Library', 'LaunchAgents', `${JOBS[job].label}.plist`);
   if (kind === 'systemd') return path.join(env.XDG_CONFIG_HOME || path.join(home, '.config'), 'systemd', 'user', JOBS[job].unit);
@@ -74,7 +85,7 @@ export function definitionPath(kind, job, env = process.env) {
  *  every launch: `{kind, core, connector}` (each a file or null), or null when neither is. */
 export function installedService(env = process.env) {
   const kind = platformKind(env);
-  const files = Object.fromEntries(ORDER.map(job => { const file = definitionPath(kind, job, env); return [job, file && existsSync(file) ? file : null]; }));
+  const files = Object.fromEntries(ORDER.map(job => [job, [recordedDefinition(kind, job, env), defaultDefinitionPath(kind, job, env)].find(file => file && existsSync(file)) ?? null]));
   return files.core || files.connector ? { kind, ...files } : null;
 }
 
@@ -245,6 +256,19 @@ export function writeDefinitions(kind, env = process.env) {
     changed.push(job);
   }
   return changed;
+}
+
+/** `install.json` written as it now is: the stable command, `R`, and the definitions (`definitions`: kept as recorded
+ *  when not given) — each an absolute path, so later commands act where the installation is. */
+export function recordInstallation(env = process.env, { definitions } = {}) {
+  const file = nodeFiles(dataDirOf(env)).install;
+  let now = null; try { now = readJson(file); } catch {}
+  const next = { command: stableCommand(env), releases: releaseRoot(env), definitions: definitions ?? (Array.isArray(now?.definitions) ? now.definitions : []) };
+  if (JSON.stringify(now) !== JSON.stringify(next)) writePrivate(file, next);
+}
+/** The definitions of both jobs for this manager, as paths. */
+export function jobDefinitions(kind, env = process.env) {
+  return ORDER.map(job => definitionPath(kind, job, env));
 }
 
 /* ----- the manager ----- */
@@ -540,6 +564,7 @@ export async function install(env = process.env) {
     rmSync(nodeFiles(dataDirOf(env)).stopped, { force: true });
     const had = installedService(env);
     const changed = writeDefinitions(kind, env);
+    recordInstallation(env, { definitions: jobDefinitions(kind, env) });
     if (!had) await stopOnDemand(env);
     await startJobs(env, { changed });
     const now = await settled(env, Number(env.SIDEVOICE_INSTALL_VERIFY_MS || 60_000));
@@ -610,6 +635,7 @@ export async function uninstall(env = process.env, { keepStopped = false } = {})
     if (down.left.length) throw keyed('service.unload-failed', { detail: `pid ${down.left.join(', ')} still running` });
     if (service) {
       for (const job of ORDER) if (service[job]) rmSync(service[job], { force: true });
+      if (existsSync(files.install)) recordInstallation(env, { definitions: [] });
       if (kind === 'systemd') {
         const reloaded = manage(env, kind, ['--user', 'daemon-reload']);
         if (!reloaded.ok) throw keyed('service.unload-failed', { detail: reloaded.output.trim() });

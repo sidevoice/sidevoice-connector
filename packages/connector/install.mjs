@@ -31,8 +31,8 @@ import { keyed, t } from './i18n.mjs';
 import { remove as removeSkill, skillsDir, status as skillStatus } from './skill.mjs';
 import { candidate, coreProgram, decide, flipBack, prune, removeLeftovers, removeReleases, selection, stableCommand, stage, switchTo } from './release.mjs';
 import { HARNESS_REGISTRATIONS, codexInstructions, cursorMcpFile, registration, unregisterFromClaude, unregisterFromCursor } from './registrations.mjs';
-import { askConnector, compatibleCore, installedService, linger, managerKind, settledState, startJobs, status, stopOnDemand, uninstall as uninstallService, writeDefinitions } from './service.mjs';
-import { dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
+import { askConnector, compatibleCore, installedService, jobDefinitions, linger, managerKind, recordInstallation, settledState, startJobs, status, stopOnDemand, uninstall as uninstallService, writeDefinitions } from './service.mjs';
+import { dataDirOf, nodeFiles } from './node-files.mjs';
 import { crash } from './testpoint.mjs';
 
 export { claudeRegistration, codexInstructions, copiesDir, cursorHasOurs, cursorMcpFile, registerWithCursor, serverCommand,
@@ -155,15 +155,14 @@ export async function apply(env, { core = true, service = false, applyNow = fals
       if (current && !applyNow && current.core_build !== chosen.core_build) await callsEnd(env, progress);
       switchTo(env, chosen.id);
     }
-    const command = stableCommand(env);
-    let recorded = null; try { recorded = readJson(files.install); } catch {}
-    if (JSON.stringify(recorded?.command) !== JSON.stringify(command)) writePrivate(files.install, { command });
+    recordInstallation(env);
     const kind = core && (service || installedService(env)) ? managerKind(env) : 'none';
     if (!core || !chosen.core_build) { prune(env, dataDir); return { action, release: chosen, from: current, kind: 'none' }; }
     if (kind !== 'none') {
       rmSync(files.stopped, { force: true });
       const had = installedService(env);
       const changed = writeDefinitions(kind, env);
+      recordInstallation(env, { definitions: jobDefinitions(kind, env) });
       crash('definitions-written');
       if (!had) await stopOnDemand(env);
       const restart = action !== 'noop' || !(await runsSelection(env, chosen));

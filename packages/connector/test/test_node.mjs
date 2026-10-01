@@ -121,7 +121,8 @@ for (const kind of ['launchd', 'systemd']) {
       for (const job of ['core', 'connector']) assert.ok(existsSync(node.definition(job)), `${job}: defined`);
       assert.ok(readFileSync(node.definition('core'), 'utf8').includes(path.join(node.home, 'xdg', 'sidevoice', 'current', 'core', 'bin', 'sidevoice-core')), 'the core job runs R/current\'s core');
       assert.ok(readFileSync(node.definition('connector'), 'utf8').includes(path.join(node.home, 'xdg', 'sidevoice', 'current', 'dist', 'cli.mjs')), 'the connector job runs through R/current');
-      assert.deepEqual(JSON.parse(readFileSync(path.join(node.dataDir, 'install.json'), 'utf8')), { command: [process.execPath, path.join(node.home, 'xdg', 'sidevoice', 'current', 'dist', 'cli.mjs')] });
+      assert.deepEqual(JSON.parse(readFileSync(path.join(node.dataDir, 'install.json'), 'utf8')), { command: [process.execPath, path.join(node.home, 'xdg', 'sidevoice', 'current', 'dist', 'cli.mjs')],
+        releases: path.join(node.home, 'xdg', 'sidevoice'), definitions: [node.definition('core'), node.definition('connector')] });
       // A façade is served by the connector job: the launcher spawned nothing beside it.
       owner = facade({ ...node.env, SIDEVOICE_THREAD: 'thread-s', SIDEVOICE_DELIVERY_URL: 'http://127.0.0.1:9/none' });
       await owner.ready;
@@ -486,5 +487,30 @@ test('blocker 1: a manager that cannot be asked, or cannot confirm a job gone af
     // A manager that answers: it goes.
     assert.equal((await node.run(['uninstall'])).ok, true);
     assert.ok(!existsSync(node.definition('core')) && !existsSync(path.join(node.home, 'xdg', 'sidevoice')));
+  } finally { node.stop(); }
+});
+
+test('blocker 2: uninstall acts where the installation recorded it is — the definitions and R in install.json — whatever this shell\'s XDG paths say', async () => {
+  const node = await managedNode('systemd');
+  try {
+    await node.status(s => s.state === 'running');
+    const record = JSON.parse(readFileSync(path.join(node.dataDir, 'install.json'), 'utf8'));
+    const R = path.join(node.home, 'xdg', 'sidevoice');
+    assert.deepEqual(record, { command: [process.execPath, path.join(R, 'current', 'dist', 'cli.mjs')], releases: R,
+      definitions: [node.definition('core'), node.definition('connector')] });
+    const elsewhere = { XDG_CONFIG_HOME: path.join(node.home, 'other-config'), XDG_DATA_HOME: path.join(node.home, 'other-data') };
+    // Its status, from that shell, is still this installation's.
+    const seen = await node.run(['service', 'status'], elsewhere);
+    assert.deepEqual([seen.state, seen.installed], ['running', true]);
+    // The manager cannot confirm: refused, nothing deleted.
+    const refused = await node.run(['uninstall'], { ...elsewhere, FAKE_MANAGER_FAIL: 'show', SIDEVOICE_SYSTEMCTL: '/bin/false' });
+    assert.equal(refused.error?.key, 'service.unload-failed');
+    assert.ok(existsSync(node.definition('core')) && existsSync(R));
+    const pids = [node.pid('core'), node.pid('connector')];
+    const removed = await node.run(['uninstall'], elsewhere);
+    assert.equal(removed.ok, true, JSON.stringify(removed));
+    for (const job of ['core', 'connector']) assert.equal(existsSync(node.definition(job)), false, `${job}: the recorded definition is gone`);
+    assert.ok(pids.every(pid => !alive(pid)), 'both jobs stopped');
+    assert.equal(existsSync(R), false, 'the recorded releases are gone');
   } finally { node.stop(); }
 });

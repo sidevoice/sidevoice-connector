@@ -25,11 +25,19 @@ export function connectorLockOf(env = process.env) {
 export function nodeFiles(dataDir) {
   const at = name => path.join(dataDir, name);
   return {
-    install: at('install.json'),           // {command}: what runs this installation — stable, through `R/current`
+    install: at('install.json'),           // {command, releases, definitions}: what runs it (through `R/current`), and where it is
     stopped: at('node-stopped.json'),      // a person stopped Sidevoice: {at}
     connectorLog: at('connector.log'),
     coreStderr: at('core.stderr.log'),     // what launchd catches from the core job: a crash's output
   };
+}
+
+/** What `install.json` records (SEAMS §1): `{command, releases, definitions}` — the command everything runs, and the
+ *  absolute paths the installation was made at (`R`, each job definition), so that whatever acts on it later finds it
+ *  there whatever its own environment says. Null when nothing is installed; an untrusted record throws (keyed). */
+export function recordedInstallation(env = process.env) {
+  const record = readTrustedJson(nodeFiles(dataDirOf(env)).install);
+  return record && typeof record === 'object' ? record : null;
 }
 
 /** A trusted record, parsed; null when it is absent or does not parse. An untrusted one throws (keyed). */

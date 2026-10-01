@@ -127,7 +127,7 @@ test('concurrent installers — two genuinely built packages, the app\'s and npx
   assert.equal(one.selected('current'), '0.7.0');
   assert.equal(one.run(app, ['install', '--no-agents', '--no-core']).answer.action, 'noop');
   assert.equal(one.run(npx, ['install', '--no-agents', '--no-core']).answer.action, 'noop');
-  assert.deepEqual(JSON.parse(readFileSync(path.join(one.dataDir, 'install.json'), 'utf8')), { command: [process.execPath, path.join(one.R, 'current', 'dist', 'cli.mjs')] }, 'install.json is the stable command');
+  assert.deepEqual(JSON.parse(readFileSync(path.join(one.dataDir, 'install.json'), 'utf8')), { command: [process.execPath, path.join(one.R, 'current', 'dist', 'cli.mjs')], releases: one.R, definitions: [] }, 'install.json: the stable command, and where the installation is');
   // Same version, stamped by the build as CI stamps a nightly: the higher run number wins, whichever runs last.
   const two = machine('none');
   const older = builtAs('0.6.0', { SIDEVOICE_CHANNEL: 'nightly', SIDEVOICE_BUILD_SEQ: '10' }), newer = builtAs('0.6.0', { SIDEVOICE_CHANNEL: 'nightly', SIDEVOICE_BUILD_SEQ: '12' });
