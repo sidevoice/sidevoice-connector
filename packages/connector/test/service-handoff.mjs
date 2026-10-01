@@ -66,7 +66,8 @@ function managerRuns() {
   const shown = spawnSync('systemctl', ['--user', 'show', '-p', 'ActiveState,ExecStart', 'sidevoice-node.service'], { encoding: 'utf8' }).stdout;
   return { running: /ActiveState=active/.test(shown), program: shown.match(/^ExecStart=(.*)$/m)?.[1] ?? '' };
 }
-/** The installation the manager runs and the supervisor answering are both `cli`'s, and nothing is left to recover. */
+/** The installation the manager runs and the supervisor answering are both `cli`'s — the installed copy's CLI, as the
+ *  selection names it — and nothing is left to recover. */
 const servedBy = cli => until(`the manager running ${cli}`, () => {
   const now = status(), manager = managerRuns();
   return now?.supervisor && now.state === 'running' && now.command?.[1] === cli && manager.running && manager.program.includes(cli) && !journal() ? now : null;
@@ -83,20 +84,23 @@ function commitAndDie(cli, extra = {}) {
 try {
   step(`A installed with its service (${kind})`);
   assert.equal(run(a, ['install', '--no-agents', '--json']).status, 0);
-  await servedBy(a);
+  const installedA = selected().command[1];
+  await servedBy(installedA);
 
   step('B committed by an installer that died: the running supervisor (A) hands over through `service reload`');
   commitAndDie(b);
-  assert.equal(selected().command[1], b);
-  const handedOver = await servedBy(b);
+  const installedB = selected().command[1];
+  assert.ok(installedB !== installedA && installedB.includes(`${path.sep}9.1.0${path.sep}`), installedB);
+  const handedOver = await servedBy(installedB);
   console.log(`the manager runs B; supervisor attempts ${handedOver.attempts}`);
 
   step('C committed the same way, but its core cannot serve: C rolls back to B and hands over again');
   commitAndDie(c, { SIDEVOICE_TEST_FAIL_CORE: '1' });
-  assert.equal(selected().command[1], c);
-  await until('C\'s supervisor took over', () => status()?.command?.[1] === c || selected().command[1] === b);
-  const back = await servedBy(b);
-  assert.equal(selected().command[1], b, 'the installation is B again');
+  const installedC = selected().command[1];
+  assert.ok(installedC.includes(`${path.sep}9.2.0${path.sep}`), installedC);
+  await until('C\'s supervisor took over', () => status()?.command?.[1] === installedC || selected().command[1] === installedB);
+  const back = await servedBy(installedB);
+  assert.equal(selected().command[1], installedB, 'the installation is B again');
   console.log(`rolled back: the manager runs B; core ${back.core?.pid}`);
 
   step('uninstall');
