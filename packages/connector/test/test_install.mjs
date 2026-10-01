@@ -327,3 +327,32 @@ test('blocker 6: a release installed without its core does not satisfy an instal
     assert.equal(node.install(cli, coreWrapper(), ['--no-agents', '--no-core']).answer.action, 'noop');
   } finally { node.stop(); }
 });
+
+test('re-check: with no manager, a core still running from the verified release never verifies another — A runs, B is left selected (A\'s core alive), installing B again goes back to A; C broken: back on A, and rollback still works', async () => {
+  const node = machine('none');
+  const [a, b, c] = [builtAs('0.6.81'), builtAs('0.6.82'), builtAs('0.6.83')];
+  try {
+    assert.equal(node.install(a, coreWrapper(), ['--no-agents']).status, 0);
+    const corePid = () => { try { return JSON.parse(readFileSync(path.join(node.dataDir, 'core', 'core.json'), 'utf8')).pid; } catch { return null; } };
+    const first = corePid();
+    assert.ok(first && alive(first));
+    assert.equal(node.install(b, coreWrapper('import'), ['--no-agents'], { SIDEVOICE_TEST_HOOKS: crashAt('switch-current') }).signal, 'SIGKILL');
+    assert.ok(alive(first), 'A\'s detached core outlives the installer');
+    assert.deepEqual([node.selected('current'), node.selected('verified')], ['0.6.82', '0.6.81']);
+    // B's own core is what is verified — not A's, still answering: B cannot serve, so back on A.
+    const again = node.install(b, coreWrapper('import'), ['--no-agents']);
+    assert.equal(again.answer.error?.key, 'install.rollback', JSON.stringify(again.answer));
+    assert.deepEqual([node.selected('current'), node.selected('verified')], ['0.6.81', '0.6.81']);
+    assert.notEqual(corePid(), first, 'the core serving now is one started from A, after A\'s old one was stopped');
+    const broken = node.install(c, coreWrapper('import'), ['--no-agents']);
+    assert.equal(broken.answer.error?.key, 'install.rollback', JSON.stringify(broken.answer));
+    assert.deepEqual([node.selected('current'), node.selected('verified')], ['0.6.81', '0.6.81']);
+    assert.equal(node.status().reachable, true);
+    // A healthy update, then a person goes back: rollback still works.
+    const d = builtAs('0.6.84');
+    assert.equal(node.install(d, coreWrapper(), ['--no-agents']).status, 0);
+    assert.equal(node.selected('verified'), '0.6.84');
+    const back = node.run(path.join(node.R, 'current', 'dist', 'cli.mjs'), ['rollback']);
+    assert.deepEqual([back.status, back.answer.installed], [0, '0.6.81'], JSON.stringify(back.answer));
+  } finally { node.stop(); }
+});

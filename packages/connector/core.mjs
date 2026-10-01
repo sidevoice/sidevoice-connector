@@ -346,17 +346,20 @@ export async function awaitReady(handle, { dataDir, launchId, timeout = READY_TI
 /** The core serving this data directory, without a service manager: the one already serving, or one this call starts,
  *  detached, from `bin` (the selected release's; else this package's build, installed now if need be). Another core
  *  still starting holds the directory (its `flock`): this launch is refused with `bind.core-running`, and that one is
- *  waited for instead. Nothing here unlinks a socket: only the core holding the directory replaces its own. */
-export async function ensureRunning({ dataDir, env = process.env, log = () => {}, progress = () => {}, roomCredential = roomCredentialPath(dataDir, env), bin = null }) {
+ *  waited for instead. Nothing here unlinks a socket: only the core holding the directory replaces its own.
+ *  `fresh`: only a core this call starts will do (an installer verifying a selection): one already serving, or another
+ *  holding the directory, is `install.not-selected` — never taken for the one asked for. */
+export async function ensureRunning({ dataDir, env = process.env, log = () => {}, progress = () => {}, roomCredential = roomCredentialPath(dataDir, env), bin = null, fresh = false }) {
   ensureCoreDirectory(coreData(dataDir));
   const running = await serving(dataDir);
+  if (running && fresh) throw keyed('install.not-selected', { detail: `a core of another launch (pid ${running.pid}) still serves` });
   if (running) return running;
   const program = bin || await ensureInstalled({ dataDir, env, log, progress });
   const launchId = randomUUID();
   const handle = spawnCore(program, coreArgs({ dataDir, env, launchId, roomCredential }), { dataDir, env });
   log(`started sidevoice-core (pid ${handle.pid ?? '?'}, launch ${launchId}); waiting for it to be ready`);
   let { ready, failure } = await awaitReady(handle, { dataDir, launchId });
-  if (!ready && failure.key === 'bind.core-running') {
+  if (!ready && failure.key === 'bind.core-running' && !fresh) {
     log('another core holds this data directory: waiting for it instead');
     const deadline = Date.now() + READY_TIMEOUT_MS;
     while (!ready && Date.now() < deadline) { ready = await serving(dataDir); if (!ready) await wait(200); }

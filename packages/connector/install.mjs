@@ -82,12 +82,13 @@ export function inboundWarning(env = process.env) {
 /** Step 7: the selection runs — the core healthy at `release`'s core version, speaking a compatible `api` and link, and
  *  (with jobs) the connector answering at `release`'s version — within `VERIFY_MS`. A failure the core reported, or a
  *  job its manager will not run, ends the wait at once. With no manager, the core is started on demand from `current`
- *  (it leaves by itself when unused). `{ok}` or `{ok: false, failure}`. */
-async function verify(env, release, kind) {
+ *  (it leaves by itself when unused); `fresh`: it must be that very start — a core already serving, of whatever
+ *  release, proves nothing about this one. `{ok}` or `{ok: false, failure}`. */
+async function verify(env, release, kind, { fresh = false } = {}) {
   const dataDir = dataDirOf(env);
   if (kind === 'none') {
     try {
-      const ready = await ensureRunning({ dataDir, env, bin: coreProgram(env) });
+      const ready = await ensureRunning({ dataDir, env, bin: coreProgram(env), fresh });
       if (ready.version !== release.core) return { ok: false, failure: { key: 'install.not-selected', message: t('install.not-selected', { detail: `core ${ready.version}` }) } };
       return compatibleCore(ready, ready) ? { ok: true } : { ok: false, failure: { key: 'install.incompatible', message: t('install.incompatible') } };
     } catch (error) { return { ok: false, failure: error.failure ?? { key: error.key || 'install.verify', message: error.message } }; }
@@ -126,7 +127,7 @@ async function goBack(env, kind) {
   const back = flipBack(env);
   if (!back) return null;
   await restartOn(env, kind);
-  const verified = await verify(env, back, kind);
+  const verified = await verify(env, back, kind, { fresh: kind === 'none' });
   if (verified.ok) markVerified(env, back.id);
   return { release: back, ...verified };
 }
@@ -174,9 +175,13 @@ export async function apply(env, { core = true, service = false, applyNow = fals
       if (!had) await stopOnDemand(env);
       const restart = action !== 'noop' || !(await runsSelection(env, chosen));
       await startJobs(env, { changed, restart });
-    } else if (action !== 'noop') await stopOnDemand(env);
-    // Verified on a noop too, with or without a manager: running install again is how a selection is recovered.
-    const verified = await verify(env, chosen, kind);
+    }
+    // Verified on a noop too, with or without a manager: running install again is how a selection is recovered. With no
+    // manager, a selection not yet verified (or just switched to) is verified by a core started from it: what runs on
+    // demand is stopped first — a core of the release before would answer for it otherwise.
+    const fresh = kind === 'none' && (action !== 'noop' || selection(env, 'verified')?.id !== chosen.id);
+    if (fresh) await stopOnDemand(env);
+    const verified = await verify(env, chosen, kind, { fresh });
     if (verified.ok) { markVerified(env, chosen.id); prune(env, dataDir); return { action, release: chosen, from: current, kind }; }
     const back = await goBack(env, kind);
     if (!back) return { action: 'failed', release: chosen, from: current, failure: verified.failure, kind };
