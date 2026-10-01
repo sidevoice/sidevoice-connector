@@ -19,8 +19,12 @@ import './test_supervisor.mjs';
 import { chatStore, fakeDesktopBridge, fakePersist, fakeStateDb, runView, TMUX } from './test_harness_cursor.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const connectorPath = path.join(here, '..', 'connector.mjs');
-const mcpPath = path.join(here, '..', 'mcp.mjs');
+// No test reaches this machine's own service manager: a service installed here must not be started by a test.
+process.env.SIDEVOICE_SERVICE_MANAGER ??= 'none';
+// Modules do nothing on import: the CLI runs them, as a harness and the launcher do.
+const cliPath = path.join(here, '..', 'cli.mjs');
+const connectorPath = [cliPath, 'connector'];
+const mcpPath = [cliPath, 'mcp'];
 const wait = ms => new Promise(r => setTimeout(r, ms));
 async function until(check, timeout = 5000) { const start = Date.now(); while (Date.now() - start < timeout) { const value = await check(); if (value) return value; await wait(25); } throw new Error('timed out waiting'); }
 
@@ -37,7 +41,7 @@ function ipcClient(socketPath) {
  *  knowledge, and a test that wrote them would be asserting its own copy. */
 function startConnector(origin, dataDir, extraEnv = {}) {
   const socketPath = path.join(dataDir, 'connector.sock');
-  const child = spawn(process.execPath, [connectorPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CONNECTOR_IDLE_MS: '400',
+  const child = spawn(process.execPath, connectorPath, { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CONNECTOR_IDLE_MS: '400',
     SIDEVOICE_URL: origin, SIDEVOICE_CONNECTOR_ID: 'c-1', SIDEVOICE_CONNECTOR_TOKEN: 't-1', ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'] });
   let stderr = ''; child.stderr.on('data', d => { stderr += d; });
   return { child, socketPath, stderr: () => stderr };
@@ -256,7 +260,7 @@ test('mcp façade: identity comes from the harness, tools are exposed, instructi
   const fake = net.createServer(socket => { let buffer = ''; socket.on('data', chunk => { buffer += chunk; let i; while ((i = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, i); buffer = buffer.slice(i + 1); if (!line) continue; const input = JSON.parse(line); commands.push(input); const result = input.method === 'register' ? { binding_id: 'b-9', thread: input.params.thread, connected: true } : input.method === 'publish' ? { status: 'queued', text_saved: true } : { connected: true, bindings: [] }; socket.write(JSON.stringify({ id: input.id, ok: true, result }) + '\n'); } }); });
   await new Promise(r => fake.listen(socketPath, r));
   writeFileSync(path.join(dataDir, 'credentials.json'), JSON.stringify({ url: 'wss://room.example/api/connectors/ws', connector_id: 'c-1', token: 't-1' }));
-  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'sess-abc', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/x.sock', CLAUDE_CODE_MESSAGING_TOKEN: 'tok' }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, mcpPath, { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'sess-abc', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/x.sock', CLAUDE_CODE_MESSAGING_TOKEN: 'tok' }, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
   const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   try {
@@ -304,7 +308,7 @@ test('mcp façade: with no room paired a conversation joins this machine\'s core
   const commands = [];
   const fake = net.createServer(socket => { let buffer = ''; socket.on('data', chunk => { buffer += chunk; let i; while ((i = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, i); buffer = buffer.slice(i + 1); if (!line) continue; const input = JSON.parse(line); commands.push(input); const result = input.method === 'register' ? { binding_id: 'b-1', thread: input.params.thread, connected: false } : { connected: false, bindings: [] }; socket.write(JSON.stringify({ id: input.id, ok: true, result }) + '\n'); } }); });
   await new Promise(r => fake.listen(socketPath, r));
-  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'sess-local', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/x.sock', CLAUDE_CODE_MESSAGING_TOKEN: 'tok' }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, mcpPath, { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'sess-local', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/x.sock', CLAUDE_CODE_MESSAGING_TOKEN: 'tok' }, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
   const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   try {
@@ -331,7 +335,7 @@ test('mcp façade: pairing a room keeps the conversations already joined — the
   const roomHttp = http.createServer((req, res) => { req.resume(); req.on('end', () => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ connector_id: 'c-new', token: 't-new', protocol: 3 })); }); });
   await new Promise(r => roomHttp.listen(0, '127.0.0.1', r));
   const room = `http://127.0.0.1:${roomHttp.address().port}`;
-  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'sess-keep', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/x.sock', CLAUDE_CODE_MESSAGING_TOKEN: 'tok' }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, mcpPath, { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'sess-keep', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/x.sock', CLAUDE_CODE_MESSAGING_TOKEN: 'tok' }, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
   const call = async (id, name, args) => { child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }) + '\n'); const reply = await until(() => replies.find(x => x.id === id)); if (reply.error) throw new Error(reply.error.message); return JSON.parse(reply.result.content[0].text); };
   try {
@@ -531,7 +535,7 @@ test('mcp façade and CLI: voice_pair_device and `sidevoice pair-device` show th
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
   const issued = issuedCode('estudio');
   const connector = await fakeConnector(dataDir, issued);
-  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, mcpPath, { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
   const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   try {
@@ -550,13 +554,30 @@ test('mcp façade and CLI: voice_pair_device and `sidevoice pair-device` show th
     assert.equal(lines.at(-1), 'Paste it in the Sidevoice app under Máquinas → Emparejar.');
     assert.deepEqual(connector.asked.map(c => c.method), ['pair_device']);
 
-    // The command says the same, on stdout.
-    const cli = spawn(process.execPath, [path.join(here, '..', 'cli.mjs'), 'pair-device'], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['ignore', 'pipe', 'pipe'] });
-    let printed = ''; cli.stdout.on('data', d => { printed += d; });
-    const code = await new Promise(resolve => cli.on('exit', resolve));
-    assert.equal(code, 0);
-    assert.equal(printed, text + '\n');
+    // The command says the same, on stdout — and, the code carrying only this computer's address, that it
+    // works only here, with the way to reach it from elsewhere (F3).
+    const command = async (...args) => {
+      const cli = spawn(process.execPath, [path.join(here, '..', 'cli.mjs'), 'pair-device', ...args], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['ignore', 'pipe', 'pipe'] });
+      let printed = ''; cli.stdout.on('data', d => { printed += d; });
+      return { code: await new Promise(resolve => cli.on('exit', resolve)), printed };
+    };
+    const shown = await command();
+    assert.equal(shown.code, 0);
+    assert.ok(shown.printed.startsWith(text + '\n'));
+    assert.match(shown.printed.slice(text.length), /only works on this computer.*sidevoice pair <room-url> <code>/s);
+    // For the app: one JSON object, the reach worked out from the payload.
+    const json = await command('--json');
+    assert.equal(json.code, 0);
+    assert.deepEqual(JSON.parse(json.printed), { ok: true, code: issued.code, expires_in: 600, reach: 'local-only', payload: issued.payload });
   } finally { child.kill(); connector.close(); }
+});
+
+test('pair-device: the reach of a code — the room it carries, an address beyond this computer, or this computer only', async () => {
+  const { reach } = await import('../pair-device.mjs');
+  assert.equal(reach({ urls: ['http://127.0.0.1:8768'], rv: { room: 'https://room.example' } }), 'room');
+  assert.equal(reach({ urls: ['http://127.0.0.1:8768', 'https://nuc.example'], rv: null }), 'direct');
+  assert.equal(reach({ urls: ['http://127.0.0.1:8768', 'http://localhost:8768', 'http://[::1]:8768'], rv: null }), 'local-only');
+  assert.equal(reach(null), 'local-only');
 });
 
 test('link-room: this machine asks the room for a code as its page does, naming the room as the origin, and redeems it', async () => {
@@ -822,7 +843,7 @@ test('façade: in the Cursor CLI the chat is the store its parent holds open, an
   writeFileSync(path.join(dataDir, 'credentials.json'), JSON.stringify({ url: 'wss://room.example/api/connectors/ws', connector_id: 'c-1', token: 't-1' }));
   // What Cursor gives an MCP server: a scrubbed environment, and nothing about the chat.
   const env = { HOME: process.env.HOME, PATH: process.env.PATH, SHELL: process.env.SHELL || '/bin/sh', SIDEVOICE_DATA_DIR: dataDir, CURSOR_CONFIG_DIR: cursorHome };
-  const child = spawn(process.execPath, [mcpPath], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, mcpPath, { env, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
   const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   try {
@@ -861,7 +882,7 @@ test('façade + connector: a chat of the Cursor editor joins through the view vo
   // A real connector, started as a façade would start it; then the façade, spawned as the editor spawns it.
   const { child: connector, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
   await until(() => existsSync(socketPath));
-  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, mcpPath, { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
   const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   let view = null;
@@ -928,7 +949,7 @@ test('façade + connector: four chats of one Cursor editor window join at once, 
   const { child: connector, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
   await until(() => existsSync(socketPath));
   // One MCP process, as the editor runs one per window.
-  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, mcpPath, { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
   let serial = 0;
   const call = async (name, args = {}) => { const id = ++serial; child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }) + '\n');
@@ -1022,7 +1043,7 @@ test('façade + connector: Cursor replaces a window\'s MCP process — the first
   await until(() => existsSync(socketPath));
   const editor = { name: 'cursor-vscode', version: '1.0.0' }, caps = { extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] } } };
   const facade = () => {
-    const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, mcpPath, { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
     const replies = []; let out = '', serial = 0;
     child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
     const send = (method, params) => { const id = ++serial; child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); return until(() => replies.find(r => r.id === id), 8000); };
@@ -1140,7 +1161,7 @@ test('façade + connector: with Cursor\'s Desktop Bridge on, an editor chat gets
   room.handle = (event, data) => { if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-d', thread: data.thread }; };
   const { child: connector, socketPath } = startConnector(room.origin, dataDir, { ...fake.env, SIDEVOICE_CURSOR_LOOKUP_AT: '800,2000,3500', SIDEVOICE_CURSOR_SCAN_MS: '50', SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
   await until(() => existsSync(socketPath));
-  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, ...fake.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, mcpPath, { env: { ...process.env, ...fake.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
   const ask = (id, method, params) => { child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); return until(() => replies.find(r => r.id === id), 8000); };
   let view = null;

@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /** One-time pairing: redeem a room's code for this host's connector credential — the credential this
  *  machine's core links with the room by.
  *
@@ -11,6 +10,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { machineIdentity } from './identity.mjs';
+import { t } from './i18n.mjs';
+import { askConnector } from './service.mjs';
 
 export function dataDir(env = process.env) {
   return env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
@@ -97,20 +98,43 @@ export async function linkRoom(room, env = process.env) {
   return pair(base.origin, body.code, env);
 }
 
-if (process.env.SIDEVOICE_PAIR_MAIN === '1') {
-  const [room, code] = process.argv.slice(2);
-  if (!room || !code) { console.error('usage: sidevoice pair <room-url> <pairing-code>   (the code is shown in the room under "Emparejar máquina")'); process.exit(2); }
-  try {
-    const result = await pair(room, code);
-    console.log(`Paired with ${result.origin} as connector ${result.connector_id}; credential saved to ${result.file}`);
-  } catch (error) { console.error(error.message); process.exit(1); }
+/** The core starts with this machine's pairing (`--room-credential`): once a new one is written, the connector
+ *  running now — the node service's supervisor, or a plain one — restarts it with it (`node.restart`). None
+ *  running: the next core starts with it anyway. Nothing is started here. */
+async function restartCore(env) {
+  const answered = await askConnector('node.restart', {}, { env, timeout: 90_000 });
+  return answered && !answered.error ? answered.state : null;
 }
 
-if (process.env.SIDEVOICE_LINK_ROOM_MAIN === '1') {
-  const [room] = process.argv.slice(2);
-  if (!room) { console.error('usage: sidevoice link-room <room-url>   (links this machine with that room; no code needed)'); process.exit(2); }
+/** `sidevoice pair <room-url> <code> [--json]`. */
+export async function runPair(argv = [], env = process.env) {
+  const json = argv.includes('--json');
+  const [room, code] = argv.filter(item => !item.startsWith('--'));
+  if (!room || !code) { console.error('usage: sidevoice pair <room-url> <pairing-code> [--json]   (the code is shown in the room under "Emparejar máquina")'); return 2; }
   try {
-    const result = await linkRoom(room);
+    const result = await pair(room, code, env);
+    const core = await restartCore(env);
+    if (json) console.log(JSON.stringify({ ok: true, room: result.origin, connector_id: result.connector_id }));
+    else {
+      console.log(`Paired with ${result.origin} as connector ${result.connector_id}; credential saved to ${result.file}`);
+      if (core) console.log(t('pair.core-restarted'));
+    }
+    return 0;
+  } catch (error) {
+    if (json) console.log(JSON.stringify({ ok: false, error: { key: error.key || 'pair.failed', message: error.message } }));
+    else console.error(error.message);
+    return 1;
+  }
+}
+
+/** `sidevoice link-room <room-url>`. */
+export async function runLinkRoom(argv = [], env = process.env) {
+  const [room] = argv;
+  if (!room) { console.error('usage: sidevoice link-room <room-url>   (links this machine with that room; no code needed)'); return 2; }
+  try {
+    const result = await linkRoom(room, env);
+    await restartCore(env);
     console.log(`Linked with ${result.origin} as connector ${result.connector_id}; credential saved to ${result.file}`);
-  } catch (error) { console.error(error.message); process.exit(1); }
+    return 0;
+  } catch (error) { console.error(error.message); return 1; }
 }

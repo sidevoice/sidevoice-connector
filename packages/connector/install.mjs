@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /** `sidevoice install` — put this version of Sidevoice in front of the harnesses on this machine.
  *
  *  It registers the MCP server (re-pinned to this version when an older one was registered), installs
@@ -358,21 +357,25 @@ export async function uninstall(argv = process.argv.slice(2), env = process.env)
   return { done, next };
 }
 
-if (process.env.SIDEVOICE_UNINSTALL_MAIN === '1') {
+/** `sidevoice uninstall`. */
+export async function runUninstall(argv = [], env = process.env) {
   try {
-    const { done, next } = await uninstall();
+    const { done, next } = await uninstall(argv, env);
     for (const line of done) console.log('· ' + line);
     if (next.length) { console.log('\nLeft for you:'); for (const line of next) console.log('\n' + line); }
-  } catch (error) { console.error(error.message); process.exit(1); }
+    return 0;
+  } catch (error) { console.error(error.message); return 1; }
 }
 
-if (process.env.SIDEVOICE_INSTALL_MAIN === '1') {
+/** `sidevoice install`. */
+export async function runInstall(argv = [], env = process.env) {
   try {
-    const { done, next } = await install(process.argv.slice(2), process.env, { progress: line => console.log(line) });
+    const { done, next } = await install(argv, env, { progress: line => console.log(line) });
     for (const line of done) console.log('· ' + line);
     if (next.length) {
       console.log('\nLeft for you:');
       for (const line of next) console.log('\n' + line);
     }
-  } catch (error) { console.error(error.message); process.exit(1); }
+    return 0;
+  } catch (error) { console.error(error.message); return 1; }
 }

@@ -27,7 +27,7 @@ function ipc(socketPath) {
 }
 
 /** A machine with nothing installed: its own data dir, and uv only where the test says. */
-function machine(extraEnv = {}, entry = [path.join(packageDir, 'connector.mjs')]) {
+function machine(extraEnv = {}, entry = [path.join(packageDir, 'cli.mjs'), 'connector']) {
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-core-'));
   const uvLog = path.join(dataDir, 'uv.jsonl');
   const env = { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CONNECTOR_IDLE_MS: '20000', SIDEVOICE_URL: undefined,
@@ -107,7 +107,7 @@ test('core: a running core is found, not started twice, and a connector that lea
     await until(() => node.child.exitCode !== null, 5000);
     assert.doesNotThrow(() => process.kill(core.pid, 0), 'the core outlives its connector: a call may be going on');
     // A new connector, as the next conversation starts one.
-    const again = spawn(process.execPath, [path.join(packageDir, 'connector.mjs')], { env: { ...process.env, SIDEVOICE_DATA_DIR: node.dataDir, SIDEVOICE_UV: fakeUv, SIDEVOICE_CORE_PORT: '0', FAKE_UV_LOG: path.join(node.dataDir, 'uv.jsonl'), SIDEVOICE_CORE_SPEC: '/wheels/x.whl', SIDEVOICE_CONNECTOR_IDLE_MS: '20000' }, stdio: 'ignore' });
+    const again = spawn(process.execPath, [path.join(packageDir, 'cli.mjs'), 'connector'], { env: { ...process.env, SIDEVOICE_DATA_DIR: node.dataDir, SIDEVOICE_UV: fakeUv, SIDEVOICE_CORE_PORT: '0', FAKE_UV_LOG: path.join(node.dataDir, 'uv.jsonl'), SIDEVOICE_CORE_SPEC: '/wheels/x.whl', SIDEVOICE_CONNECTOR_IDLE_MS: '20000' }, stdio: 'ignore' });
     try {
       await until(() => existsSync(node.socketPath));
       facade = ipc(node.socketPath); await facade.ready;
@@ -126,7 +126,7 @@ test('core: a device pairing code is the core\'s to issue: asked with nothing ru
     const facade = ipc(node.socketPath); await facade.ready;
     const issued = await facade.call('pair_device', {});
     const core = node.ready();
-    assert.deepEqual(issued, { code: 'SV1.fake-' + core.pid, payload: { v: 1, host: 'fake' }, expires_in: 600 });
+    assert.deepEqual(issued, { code: 'SV1.fake-' + core.pid, payload: { v: 1, host: 'fake', urls: ['http://127.0.0.1:8768'], rv: null }, expires_in: 600 });
     assert.ok(node.said().some(line => line.pid === core.pid && line.event === 'device.pairing_code'), 'asked of the core over its link');
     facade.end();
   } finally { node.stop(); }
@@ -237,7 +237,7 @@ test('install: the core is installed, started and asked whether it answers befor
     assert.equal(node.uvCalls().length, 2);
     const core = node.ready();
     // The first voice_pair_device after installing: no install, no start, the code at once.
-    connector = spawn(process.execPath, [path.join(packageDir, 'connector.mjs')], { env: { ...node.env, SIDEVOICE_CONNECTOR_IDLE_MS: '20000' }, stdio: 'ignore' });
+    connector = spawn(process.execPath, [path.join(packageDir, 'cli.mjs'), 'connector'], { env: { ...node.env, SIDEVOICE_CONNECTOR_IDLE_MS: '20000' }, stdio: 'ignore' });
     const socketPath = path.join(node.dataDir, 'connector.sock');
     await until(() => existsSync(socketPath));
     const facade = ipc(socketPath); await facade.ready;
