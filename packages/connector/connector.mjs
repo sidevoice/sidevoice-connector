@@ -279,8 +279,11 @@ function coreComing() {
 function superviseWith(restored) {
   const install = message => /certificate|UnknownIssuer|proxy/i.test(message) ? 'install.proxy'
     : /network|reach|dns|connect/i.test(message) ? 'install.network' : null;
+  const number = name => (env[name] ? Number(env[name]) : undefined);
+  const timing = Object.fromEntries(Object.entries({ probe: number('SIDEVOICE_PROBE_MS'), healthy: number('SIDEVOICE_HEALTHY_MS'),
+    backoff: env.SIDEVOICE_BACKOFF_MS ? env.SIDEVOICE_BACKOFF_MS.split(',').map(Number) : undefined }).filter(([, value]) => value !== undefined));
   return new Supervisor({
-    service: serviceKind, restored, log,
+    service: serviceKind, restored, log, timing,
     async launch(launchId) {
       ensureCoreDirectory(coreData(dataDir));
       const bin = await ensureInstalled({ dataDir, env, log });
@@ -623,7 +626,8 @@ async function nodeStatus() {
 /** `node.restart`: the core stopped and started again — a person's restart, which closes the budget window,
  *  or a pairing written (`sidevoice pair`) that the core must start with. */
 async function nodeRestart() {
-  if (supervisor) { await supervisor.restart(); return nodeStatus(); }
+  // Answered once the restart has begun (`starting`): the launch takes up to a minute, and `node.status` follows it.
+  if (supervisor) { supervisor.restart(); return nodeStatus(); }
   if (external) return nodeStatus();
   const running = creds?.core;
   if (running && coreAlive(running.pid)) await terminateCore(running.pid, { log });

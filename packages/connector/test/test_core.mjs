@@ -8,7 +8,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
-import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { CORE_VERSION, NO_UV, coreSpec } from '../core.mjs';
 
@@ -290,4 +290,177 @@ test('core: a device code asked during a first install waits for it, within a bo
     await assert.rejects(facade.call('pair_device', {}), /still being installed \(\d+ s so far; last step: .*\)\. Ask again in a minute; progress is in .*core\.log/);
     facade.end();
   } finally { slower.stop(); }
+});
+
+/* ----- the node service's supervisor (§4.2), with the fake core's failure modes ----- */
+
+const fakeCore = path.join(here, 'fake-sidevoice-core.mjs');
+
+/** A machine whose core is the fake, run by a supervisor (`connector --supervise`): `modes` is what each
+ *  launch of the core does, in order (the last repeats). Timings shortened: probes 300 ms apart, 150 ms of
+ *  backoff, 1 s for a core to leave before it is killed. */
+export function supervisedNode({ modes = ['ok'], env: extra = {}, dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-node-')) } = {}) {
+  const tools = mkdtempSync(path.join(os.tmpdir(), 'sv-bin-'));
+  const bin = path.join(tools, 'sidevoice-core');
+  writeFileSync(bin, `#!/bin/sh\nexec "${process.execPath}" "${fakeCore}" "$@"\n`, { mode: 0o755 });
+  const modesFile = path.join(tools, 'modes');
+  writeFileSync(modesFile, modes.join('\n') + '\n');
+  const env = { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CORE_BIN: bin, FAKE_CORE_MODES: modesFile, FAKE_CORE_WRAPPER: bin,
+    SIDEVOICE_CORE_PORT: '0', SIDEVOICE_PROBE_MS: '300', SIDEVOICE_BACKOFF_MS: '150', SIDEVOICE_CORE_STOP_GRACE_MS: '1000',
+    SIDEVOICE_SERVICE_MANAGER: 'none', SIDEVOICE_CONNECTOR_IDLE_MS: '20000', ...extra };
+  for (const key of ['SIDEVOICE_URL', 'SIDEVOICE_CONNECTOR_ID', 'SIDEVOICE_CONNECTOR_TOKEN']) delete env[key];
+  const children = [];
+  const node = {
+    dataDir, bin, env, modesFile, children, socketPath: path.join(dataDir, 'connector.sock'),
+    /** One more supervisor (`--supervise`), or a plain connector (`[]`). */
+    start(args = ['--supervise'], more = {}) {
+      const child = spawn(process.execPath, [path.join(packageDir, 'cli.mjs'), 'connector', ...args], { env: { ...env, ...more }, stdio: ['ignore', 'pipe', 'pipe'] });
+      child.stderrText = ''; child.stderr.on('data', d => { child.stderrText += d; });
+      children.push(child); return child;
+    },
+    said() { try { return readFileSync(path.join(dataDir, 'core', 'said.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse); } catch { return []; } },
+    ready() { try { return JSON.parse(readFileSync(path.join(dataDir, 'core', 'core.json'), 'utf8')); } catch { return null; } },
+    async ask(method, params = {}) { const facade = ipc(node.socketPath); await facade.ready; try { return await facade.call(method, params); } finally { facade.end(); } },
+    /** The status once `check` holds for it. */
+    status(check, timeout = 15_000) {
+      return until(async () => { try { const status = await node.ask('node.status'); return check(status) ? status : null; } catch { return null; } }, timeout);
+    },
+    log() { try { return readFileSync(path.join(dataDir, 'node-service.log'), 'utf8'); } catch { return ''; } },
+    stop() {
+      for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      for (const line of node.said()) { try { process.kill(line.pid, 'SIGKILL'); } catch {} }
+    },
+  };
+  return node;
+}
+const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+test('supervise: the core is the supervisor\'s child — never idle, one launch id each start — and a core that dies is started again', async () => {
+  const node = supervisedNode();
+  try {
+    const supervisor = node.start();
+    const running = await node.status(s => s.state === 'running');
+    assert.equal(running.service, 'none'); assert.equal(running.supervisor, true); assert.equal(running.attempts, 1);
+    assert.equal(running.core.pid, node.ready().pid); assert.equal(running.core.launch_id, node.ready().launch_id); assert.equal(running.core.api, 1);
+    const argv = node.said().find(line => line.event === 'started').data.argv;
+    assert.equal(argv[argv.indexOf('--idle-exit') + 1], '0', 'the service\'s core never leaves on its own');
+    assert.equal(argv[argv.indexOf('--launch-id') + 1], running.core.launch_id);
+    assert.equal(argv[argv.indexOf('--socket') + 1], path.join(node.dataDir, 'core', 'local.sock'));
+    assert.equal(statSync(path.join(node.dataDir, 'core')).mode & 0o777, 0o700, 'the core\'s directory is this user\'s alone');
+    // Linked over the core's socket with the credential the core wrote: a binding registers there.
+    const facade = ipc(node.socketPath); await facade.ready;
+    assert.equal((await register(facade)).binding_id, 'core-thread-1');
+    assert.ok(!node.said().some(line => line.event === 'refused'), 'the link and the probes carry no Origin and a loopback Host');
+    // Calls come fresh from the core's health.
+    writeFileSync(path.join(node.dataDir, 'core', 'fake-calls'), '2');
+    assert.equal((await facade.call('node.status', {})).calls, 2);
+    writeFileSync(path.join(node.dataDir, 'core', 'fake-calls'), '0');
+    // The core dies: backoff, then a new launch, and the binding registers with it under the same id.
+    process.kill(running.core.pid, 'SIGKILL');
+    const again = await node.status(s => s.state === 'running' && s.core.pid !== running.core.pid, 20_000);
+    assert.notEqual(again.core.launch_id, running.core.launch_id);
+    assert.equal(again.attempts, 2);
+    await until(() => node.said().some(line => line.pid === again.core.pid && line.event === 'binding.register' && line.data.binding_id === 'core-thread-1'));
+    assert.match(node.log(), /went away/, 'the supervisor writes node-service.log');
+    assert.equal(supervisor.stderrText, '', 'and nothing to stderr: the service manager puts that in the same file');
+    const snapshot = JSON.parse(readFileSync(path.join(node.dataDir, 'node-status.json'), 'utf8'));
+    assert.equal(snapshot.state, 'running'); assert.equal(snapshot.attempts, 2); assert.ok(snapshot.window_started);
+    facade.end();
+    // The supervisor is stopped (as launchd or systemd stop it): its core leaves with it, the socket after it.
+    supervisor.kill('SIGTERM');
+    await until(() => supervisor.exitCode !== null);
+    assert.equal(alive(again.core.pid), false);
+    assert.equal(existsSync(path.join(node.dataDir, 'core', 'local.sock')), false);
+  } finally { node.stop(); }
+});
+
+test('supervise: an import failure every time ends in failed with its cause; node.restart is a person\'s retry and closes the window', async () => {
+  const node = supervisedNode({ modes: ['import'] });
+  try {
+    node.start();
+    const failed = await node.status(s => s.state === 'failed', 20_000);
+    assert.equal(failed.failure.key, 'import.missing-module');
+    assert.equal(failed.failure.step, 'import');
+    assert.equal(failed.failure.detail, 'soxr');
+    assert.equal(failed.failure.attempts, 5);
+    assert.equal(failed.attempts, 5);
+    assert.ok(failed.failure.log_tail.some(line => /soxr/.test(line)), 'with the log tail');
+    assert.equal(node.said().filter(line => line.event === 'started').length, 5, 'five starts');
+    await wait(800);
+    assert.equal(node.said().filter(line => line.event === 'started').length, 5, 'and then none');
+    // The person fixed it and retries.
+    writeFileSync(node.modesFile, 'ok\n');
+    await node.ask('node.restart');
+    const running = await node.status(s => s.state === 'running');
+    assert.equal(running.attempts, 1, 'a fresh window');
+    assert.equal(running.failure, null);
+  } finally { node.stop(); }
+});
+
+test('supervise: alternating causes — an exit, an import error, a missing program — each read for its own launch, never a stale one', async () => {
+  const node = supervisedNode({ modes: ['exit:3', 'import', 'exit:4', 'import+vanish'] });
+  // What a previous life left: a ready file and a failure report, both of another launch.
+  mkdirSync(path.join(node.dataDir, 'core'), { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(node.dataDir, 'core', 'core.json'), JSON.stringify({ pid: 999_999, port: 1, url: 'http://127.0.0.1:1', socket: path.join(node.dataDir, 'core', 'local.sock'), launch_id: 'stale', connector_id: 'x', token: 'y', version: '0.1.0', protocol: 2, api: 1 }));
+  writeFileSync(path.join(node.dataDir, 'core', 'core-failure.json'), JSON.stringify({ launch_id: 'stale', step: 'identity', key: 'identity.unreadable', message: 'old news', at: '2026-01-01T00:00:00Z' }));
+  try {
+    node.start();
+    const seen = [];
+    const failed = await node.status(s => {
+      const entry = s.failure ? `${s.failure.attempts}:${s.failure.key}` : null;
+      if (entry && seen.at(-1) !== entry) seen.push(entry);
+      return s.state === 'failed';
+    }, 20_000);
+    assert.equal(failed.failure.key, 'launch.missing-executable');
+    assert.equal(failed.failure.detail, node.bin);
+    assert.ok(!seen.some(entry => entry.endsWith('identity.unreadable')), 'the stale report of another launch is never a cause');
+    assert.ok(seen.includes('4:import.missing-module') && seen.includes('5:launch.missing-executable'), seen.join(' '));
+    assert.ok(seen.some(entry => entry.endsWith('launch.exited')), seen.join(' '));
+  } finally { node.stop(); }
+});
+
+test('supervise: a hang — the core alive and its health silent — is terminated, killed when it ignores SIGTERM, before the next one starts', async () => {
+  const node = supervisedNode({ modes: ['hang:300+stubborn', 'ok'] });
+  try {
+    node.start();
+    const first = await node.status(s => s.state === 'running');
+    const next = await node.status(s => s.state === 'running' && s.core.pid !== first.core.pid, 20_000);
+    assert.equal(alive(first.core.pid), false, 'the wedged core is gone');
+    const said = node.said();
+    const term = said.findIndex(line => line.pid === first.core.pid && line.event === 'sigterm');
+    const started = said.findIndex(line => line.pid === next.core.pid && line.event === 'started');
+    assert.ok(term >= 0 && term < started, 'asked to leave before the next one started');
+    assert.match(node.log(), /did not answer 3 health probes/);
+    assert.match(node.log(), /did not leave within 1 s; killing it/, 'SIGKILL after the grace period');
+    assert.equal(next.attempts, 2);
+  } finally { node.stop(); }
+});
+
+test('supervise: a SIGKILLed supervisor leaves its core running — the next one adopts it if it answers for its launch, else ends it', async () => {
+  const node = supervisedNode({ env: { SIDEVOICE_PROBE_MS: '60000' }, modes: ['ok', 'hang:1500', 'ok'] });
+  try {
+    const first = node.start();
+    const running = await node.status(s => s.state === 'running');
+    first.kill('SIGKILL');
+    await until(() => first.signalCode !== null);
+    assert.ok(alive(running.core.pid), 'nothing took the core down with it');
+    // The next supervisor (a login, the service manager): the same core, no start counted.
+    const second = node.start();
+    const adopted = await node.status(s => s.state === 'running');
+    assert.equal(adopted.core.pid, running.core.pid);
+    assert.equal(adopted.core.launch_id, running.core.launch_id);
+    assert.equal(adopted.attempts, running.attempts, 'no start counted (the window is the one persisted before)');
+    assert.equal(node.said().filter(line => line.event === 'started').length, 1);
+    // Its core replaced by one that stops answering once ready; the supervisor is SIGKILLed before it notices.
+    await node.ask('node.restart');
+    const wedged = (await node.status(s => s.state === 'running' && s.core.pid !== running.core.pid)).core;
+    second.kill('SIGKILL');
+    await wait(1600);
+    await until(() => second.signalCode !== null);
+    assert.ok(alive(wedged.pid));
+    node.start();
+    const replaced = await node.status(s => s.state === 'running' && s.core.pid !== wedged.pid, 20_000);
+    assert.equal(alive(wedged.pid), false, 'a core that does not answer for its own launch is ended, not adopted');
+    assert.ok(replaced.core.launch_id);
+  } finally { node.stop(); }
 });

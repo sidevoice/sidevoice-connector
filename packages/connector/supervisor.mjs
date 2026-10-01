@@ -40,14 +40,16 @@ export class Supervisor {
    *  `cause({launchId, exit, key})` → a failure; `adopt()` → `{handle, core}` of a live core, or null;
    *  `persist(snapshot)`; `restored` → `{window_started, attempts}` from the last snapshot. */
   constructor({ clock = systemClock, launch, awaitReady, probe, terminate, cause, adopt = async () => null,
-    persist = () => {}, restored = null, log = () => {}, newLaunchId = randomUUID, service = 'none' }) {
+    persist = () => {}, restored = null, log = () => {}, newLaunchId = randomUUID, service = 'none', timing = {} }) {
     Object.assign(this, { clock, launchCore: launch, awaitReady, probe, terminate, cause, adopt, persist, log, newLaunchId, service });
+    // The design's numbers; a test of real processes shortens them (`connector.mjs` reads SIDEVOICE_*_MS).
+    this.timing = { budget: BUDGET_STARTS, window: WINDOW_MS, healthy: HEALTHY_MS, probe: PROBE_MS, probes: PROBE_FAILURES, backoff: BACKOFF_MS, ...timing };
     this.state = 'stopped';
     this.since = clock.now();
     this.attempts = 0;
     this.windowStarted = null;
     const window = restored?.window_started ? Date.parse(restored.window_started) : null;
-    if (window !== null && Number.isFinite(window) && clock.now() - window < WINDOW_MS) {
+    if (window !== null && Number.isFinite(window) && clock.now() - window < this.timing.window) {
       this.windowStarted = window;
       this.attempts = Number(restored.attempts) || 0;
       this.failure = restored.failure ?? null;
@@ -138,9 +140,9 @@ export class Supervisor {
 
   async launch(generation) {
     const now = this.clock.now();
-    if (this.windowStarted === null || now - this.windowStarted >= WINDOW_MS) { this.windowStarted = now; this.attempts = 0; }
+    if (this.windowStarted === null || now - this.windowStarted >= this.timing.window) { this.windowStarted = now; this.attempts = 0; }
     // A window whose budget is spent — restored from before this supervisor started — starts nothing.
-    if (this.attempts >= BUDGET_STARTS) return this.set('failed', { failure: this.failure, core: null, calls: 0, nextRetryAt: null });
+    if (this.attempts >= this.timing.budget) return this.set('failed', { failure: this.failure, core: null, calls: 0, nextRetryAt: null });
     this.attempts++;
     this.set('starting', { nextRetryAt: null, core: null, calls: 0 });
     // No overlapping cores: whatever ran before is gone, and seen gone, before another starts.
@@ -176,7 +178,7 @@ export class Supervisor {
     this.timers.healthy = this.clock.setTimeout(() => {
       if (generation !== this.generation || this.state !== 'running') return;
       this.closeWindow(); this.set('running');
-    }, HEALTHY_MS);
+    }, this.timing.healthy);
     let misses = 0;
     const probe = () => {
       this.timers.probe = this.clock.setTimeout(async () => {
@@ -184,15 +186,15 @@ export class Supervisor {
         const health = await this.probe(this.core).catch(() => null);
         if (generation !== this.generation || this.state !== 'running') return;
         if (health) { misses = 0; if (typeof health.calls === 'number' && health.calls !== this.calls) this.set('running', { calls: health.calls }); return probe(); }
-        if (++misses < PROBE_FAILURES) return probe();
+        if (++misses < this.timing.probes) return probe();
         // Alive and not answering: a hang. It is ended before anything else is decided.
-        this.log(`the core did not answer ${PROBE_FAILURES} health probes ${PROBE_MS / 1000} s apart: terminating it`);
+        this.log(`the core did not answer ${this.timing.probes} health probes ${this.timing.probe / 1000} s apart: terminating it`);
         this.clear('healthy');
         const wedged = this.handle; this.handle = null;
         if (wedged) await this.terminate(wedged);
         if (generation !== this.generation) return;
         this.failed(this.cause({ launchId: this.launchId, key: 'hang' }), generation);
-      }, PROBE_MS);
+      }, this.timing.probe);
     };
     probe();
   }
@@ -201,11 +203,12 @@ export class Supervisor {
     if (generation !== this.generation) return;
     const now = this.clock.now();
     failure = { ...failure, attempts: this.attempts };
-    this.log(`the core failed: ${failure.key}${failure.detail ? ' (' + failure.detail + ')' : ''}, start ${this.attempts} of ${BUDGET_STARTS} in this window`);
-    if (this.attempts >= BUDGET_STARTS && this.windowStarted !== null && now - this.windowStarted < WINDOW_MS) {
+    this.log(`the core failed: ${failure.key}${failure.detail ? ' (' + failure.detail + ')' : ''}, start ${this.attempts} of ${this.timing.budget} in this window`);
+    if (this.attempts >= this.timing.budget && this.windowStarted !== null && now - this.windowStarted < this.timing.window) {
       return this.set('failed', { failure, core: null, calls: 0, nextRetryAt: null });
     }
-    const delay = BACKOFF_MS[Math.min(this.attempts, BACKOFF_MS.length) - 1] ?? BACKOFF_MS[0];
+    const backoff = this.timing.backoff;
+    const delay = backoff[Math.min(this.attempts, backoff.length) - 1] ?? backoff[0];
     this.set('backoff', { failure, core: null, calls: 0, nextRetryAt: now + delay });
     this.timers.retry = this.clock.setTimeout(() => { if (generation === this.generation) this.launch(generation); }, delay);
   }

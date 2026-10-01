@@ -116,22 +116,28 @@ const POLL_MS = 25_000;
 const boxes = new Map();       // thread -> { key, queue, polls, seen, toolCall, waiting: Map(message_id -> {resolve, reject, timer}), log }
 let server = null, listening = null;
 
-export function ensureBridge() {
+/** `port`: the one a card already knows — a connector that took over from another listens where that one
+ *  did, so the cards it served find this one there. Taken, any port, and those cards cannot reach it. */
+export function ensureBridge(port = 0) {
   if (listening) return listening;
   server = http.createServer(handle);
-  listening = new Promise((resolve, reject) => {
-    server.once('error', error => { listening = null; server = null; reject(new Error(`The Cursor bridge could not listen on 127.0.0.1: ${error.code || error.message}`)); });
-    server.listen(0, '127.0.0.1', () => resolve(server.address().port));
+  const listen = (on, fallback) => new Promise((resolve, reject) => {
+    server.once('error', error => {
+      if (fallback && error.code === 'EADDRINUSE') return resolve(listen(0, false));
+      listening = null; server = null; reject(new Error(`The Cursor bridge could not listen on 127.0.0.1: ${error.code || error.message}`));
+    });
+    server.listen(on, '127.0.0.1', () => resolve(server.address().port));
   });
+  listening = listen(port || 0, !!port);
   server.unref?.();
   return listening;
 }
 
 /** Make a conversation reachable by its view: called when the connector registers it. Returns the port the
  *  view must use, and a function that forgets the conversation. */
-export async function openView(thread, key, { log = () => {}, answered = () => {} } = {}) {
+export async function openView(thread, key, { log = () => {}, answered = () => {}, port: wanted = 0 } = {}) {
   if (!thread?.startsWith(THREAD_PREFIX) || !/^[0-9a-f]{64}$/.test(key || '')) throw new Error('An editor conversation needs its id and its view key');
-  const port = await ensureBridge();
+  const port = await ensureBridge(wanted);
   boxes.set(thread, { key, queue: [], polls: [], seen: 0, toolCall: null, waiting: new Map(), log, answered });
   return { port, close: () => { const mailbox = boxes.get(thread); if (!mailbox) return; boxes.delete(thread);
     for (const poll of mailbox.polls.splice(0)) poll(null);

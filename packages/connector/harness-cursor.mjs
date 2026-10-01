@@ -247,14 +247,15 @@ export function deliveryState(delivery) {
 
 /** Before any delivery, when the connector registers a conversation: an editor chat's view needs the
  *  connector's loopback bridge open for it, and learns the port from what `voice_connect` returns. */
-export async function prepare(delivery, { log, admitted } = {}) {
+export async function prepare(delivery, { log, admitted, port: wanted = null } = {}) {
   if (delivery?.kind !== 'cursor-app') return null;
   if (log) bridgeLog = log;
   keys.set(delivery.thread, { key: delivery.key, candidate: delivery.candidate || null, title: delivery.title || null, joinedAt: Date.now() });
   const instances = bridgeInstances();
   bridgeLog(`${delivery.thread}: Cursor Desktop Bridge ${instances.length ? `found (${instances.map(i => `${i.appName || 'Cursor'} ${i.appVersion || ''} pid ${i.pid}`.trim()).join(', ')})` : `not found in ${bridgeDir()}`}; candidate chat ${delivery.candidate || 'none'}; title "${delivery.title || ''}"`);
   // Cursor answers the card's ui/message once the turn it started has run: the chat took that message.
-  const { port, close } = await openView(delivery.thread, delivery.key, { log, answered: (message_id, ok) => { if (ok) admitted?.(message_id); } });
+  // `wanted`: after a handover, the port the card under the chat already polls.
+  const { port, close } = await openView(delivery.thread, delivery.key, { port: wanted || 0, log, answered: (message_id, ok) => { if (ok) admitted?.(message_id); } });
   // The card delivers, not the façade: the conversation can outlive the MCP process that created it.
   return { info: { port }, release: close, detachable: true };
 }

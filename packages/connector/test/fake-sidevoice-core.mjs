@@ -10,9 +10,10 @@
  *  otherwise `FAKE_CORE_MODE`. Modes: `ok`; `import` (an ImportError before serving: `core-failure.json`
  *  with `import.missing-module`, exit 1); `identity`; `bind`; `exit:<code>` (dies before serving, no report);
  *  `slow:<ms>` (ready that much later); `hang:<ms>` (serves, then stops answering health after that long);
- *  `deaf` (alive, never ready); add `+stubborn` to ignore SIGTERM. */
+ *  `deaf` (alive, never ready); add `+stubborn` to ignore SIGTERM, `+vanish` to delete the program that started
+ *  it (`FAKE_CORE_WRAPPER`), so the next launch finds no executable. */
 import { createServer } from 'node:http';
-import { appendFileSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { Server } from 'socket.io';
@@ -45,6 +46,7 @@ function mode() {
 const [behaviour, ...modifiers] = mode().split('+');
 const [kind, argument] = behaviour.split(':');
 const stubborn = modifiers.includes('stubborn');
+if (modifiers.includes('vanish') && process.env.FAKE_CORE_WRAPPER) rmSync(process.env.FAKE_CORE_WRAPPER, { force: true });
 
 function fail(step, key, message, code = 1) {
   const report = { launch_id: launchId, step, key, message, at: new Date().toISOString() };
@@ -78,8 +80,16 @@ const tcp = createServer((req, res) => {
   if (req.method === 'GET' && req.url.startsWith('/api/rendezvous')) { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ kind: 'node', fingerprint: identity.fingerprint, api: 1 })); return; }
   res.writeHead(404); res.end();
 });
-// The socket: the local routes, and the link.
+// The socket: the local routes, and the link — as the real core serves them (SEAMS §2): the Host must name
+// loopback, and a local-only path carrying an `Origin` is refused (404), since only a browser sends one and
+// native callers must not.
+const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
+const hostOk = req => LOOPBACK.has(String(req.headers.host || '').toLowerCase().replace(/:\d+$/, ''));
+const localOnly = url => /^\/api\/(local|device\/local|connectors\/link)/.test(url);
+const refusal = req => (!hostOk(req) ? 421 : localOnly(req.url) && req.headers.origin !== undefined ? 404 : 0);
 const local = createServer((req, res) => {
+  const refused = refusal(req);
+  if (refused) { said({ event: 'refused', data: { url: req.url, status: refused, origin: req.headers.origin ?? null, host: req.headers.host ?? null } }); res.writeHead(refused); res.end(); return; }
   if (req.url.startsWith('/api/connectors/link')) return;   // Socket.IO's
   if (Date.now() >= hangAt) return;                           // wedged: never answers
   if (req.method === 'GET' && req.url === '/api/local/health') {
@@ -89,7 +99,9 @@ const local = createServer((req, res) => {
   }
   res.writeHead(404); res.end();
 });
-const io = new Server(local, { path: '/api/connectors/link', transports: ['websocket'] });
+const io = new Server(local, { path: '/api/connectors/link', transports: ['websocket'],
+  // The link's upgrade goes through the same rule: a request carrying an Origin, or a foreign Host, is refused.
+  allowRequest: (req, callback) => { const refused = refusal(req); if (refused) said({ event: 'refused', data: { url: req.url, status: refused, origin: req.headers.origin ?? null, host: req.headers.host ?? null } }); callback(refused ? 'refused' : null, !refused); } });
 const namespace = io.of('/connectors');
 let linked = 0, quietSince = Date.now();
 namespace.use((socket, next) => {
