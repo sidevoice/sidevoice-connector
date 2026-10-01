@@ -32,10 +32,12 @@ Release itself.
 `fix:` → patch, `feat:` → minor. While the version is 0.x a breaking change (`feat!:` or a `BREAKING CHANGE:`
 footer) bumps the minor, not the major. `docs:`, `chore:`, `ci:`, `test:`, `refactor:` alone make no release.
 
-The manifest starts at 0.6.0, the version the package carries; release-please reads the history from the commit
-where this repository became the client alone (`bootstrap-sha`), so the first release PR proposes 0.7.0 if there
-is a `feat`. npm has 0.5.0 as its latest: 0.6.0 was never published there. To publish 0.6.0 itself, use
-`Release-As: 0.6.0` (below). The `v0.4.3` to `v0.6.0` tags here are the monorepo's (rubasace/sidevoice).
+The manifest starts at 0.6.0, the version the package carries. With no GitHub Release yet, release-please finds
+the tag of that version, `v0.6.0` (the monorepo's, rubasace/sidevoice, like `v0.4.3` and `v0.5.0` here), and reads
+the history from it: the first release PR proposes 0.7.0, and its changelog also lists monorepo commits after
+that tag that were about other parts (trim them in the release PR). Without that tag it would read from the
+commit where this repository became the client alone (`bootstrap-sha`). npm has 0.5.0 as its latest: 0.6.0 was
+never published there. To publish 0.6.0 itself, use `Release-As: 0.6.0` (below).
 
 ## A release candidate, or any explicit version
 
