@@ -1403,7 +1403,7 @@ esac
   const gone = await uninstall(['--harness', 'claude', '--no-core'], env);
   assert.deepEqual(changes(), ['mcp remove --scope user sidevoice']);
   assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice')), 'the releases are gone');
-  assert.deepEqual(readdirSync(env.SIDEVOICE_DATA_DIR), ['install.lock'], 'credential, socket and log are gone; the lock file is permanent');
+  assert.deepEqual(readdirSync(env.SIDEVOICE_DATA_DIR).sort(), ['install.lock', 'node-stopped.json'], 'credential, socket and log are gone; the lock file is permanent, and the stop stays');
   assert.match(gone.next.join('\n'), /still lists this machine as paired .* revoke it under "Máquinas" on the room/);
   assert.match(gone.done.join('\n'), /Unregistered the MCP server/);
 

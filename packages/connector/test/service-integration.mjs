@@ -211,7 +211,8 @@ try {
   assert.ok(last.every(pid => !alive(pid)), 'no process');
   assert.ok(!existsSync(path.join(dataDir, 'connector.sock')) && !existsSync(path.join(dataDir, 'core', 'local.sock')), 'no socket');
   assert.ok(!existsSync(R), 'no release');
-  assert.deepEqual(readdirSync(dataDir).sort(), ['connector.lock', 'install.lock'].filter(name => existsSync(path.join(dataDir, name))), 'only the permanent lock files');
+  assert.deepEqual(readdirSync(dataDir).sort(), ['connector.lock', 'install.lock', 'node-stopped.json'].filter(name => existsSync(path.join(dataDir, name))), 'only the permanent lock files, and the stop');
+  assert.ok(existsSync(path.join(dataDir, 'node-stopped.json')), 'the stop stays: nothing on its way serves');
 
   step('a login after the uninstall starts nothing');
   await relogin();

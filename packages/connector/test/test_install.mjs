@@ -256,3 +256,29 @@ test('foreign entries named sidevoice — even another program called cli.mjs �
   assert.deepEqual(node.cursor(), { command: 'node', args: [path.join(node.R, 'current', 'dist', 'cli.mjs'), 'mcp'] });
   assert.equal(JSON.parse(readFileSync(path.join(node.home, '.cursor', 'mcp.json'), 'utf8')).mcpServers.other.command, 'x');
 });
+
+/* ----- review blockers (R1-b-rebuild-astra.md), one regression each ----- */
+
+test('blocker 3: a full uninstall keeps the stop — a connector already on its way does not serve after it; an explicit install or start clears it', async () => {
+  const node = machine('none');
+  const cli = path.join(packageDir, 'cli.mjs'), core = coreWrapper();
+  const hooks = mkdtempSync(path.join(os.tmpdir(), 'sv-hooks-'));
+  writeFileSync(path.join(hooks, 'pause-lock-before-connector'), '');
+  let child = null;
+  try {
+    assert.equal(node.install(cli, core, ['--no-agents', '--no-core'], { SIDEVOICE_INSTALL_FROM_SOURCE: '1' }).status, 0);
+    child = spawn(process.execPath, [cli, 'connector'], { env: { ...node.env, SIDEVOICE_TEST_HOOKS: hooks, SIDEVOICE_CORE_BIN: core.bin, SIDEVOICE_CONNECTOR_IDLE_MS: '60000' }, stdio: 'ignore' });
+    for (let i = 0; i < 300 && !existsSync(path.join(hooks, 'paused-lock-before-connector')); i++) await wait(20);
+    const removed = node.run(cli, ['uninstall']);
+    assert.equal(removed.status, 0, JSON.stringify(removed.answer));
+    assert.deepEqual(readdirSync(node.dataDir).sort(), ['install.lock', 'node-stopped.json'], 'the stop stays, with the permanent lock');
+    writeFileSync(path.join(hooks, 'resume-lock-before-connector'), '');
+    const code = await new Promise(resolve => (child.exitCode !== null ? resolve(child.exitCode) : child.once('exit', resolve)));
+    assert.equal(code, 0, 'the connector on its way finds the stop and leaves');
+    assert.equal(existsSync(path.join(node.dataDir, 'connector.sock')), false, 'nothing serves');
+    assert.equal(existsSync(path.join(node.dataDir, 'core', 'core.json')), false, 'and no core was started');
+    // An explicit install is a person's start.
+    assert.equal(node.install(cli, core, ['--no-agents', '--no-core'], { SIDEVOICE_INSTALL_FROM_SOURCE: '1' }).status, 0);
+    assert.equal(existsSync(path.join(node.dataDir, 'node-stopped.json')), false);
+  } finally { child?.kill('SIGKILL'); node.stop(); }
+});

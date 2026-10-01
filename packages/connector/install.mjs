@@ -146,6 +146,8 @@ export async function apply(env, { core = true, service = false, applyNow = fals
   const release = await takeInstallLock(dataDir, log);
   try {
     removeLeftovers(env);
+    // An explicit install is a person's start: a stop (or the one an uninstall left) no longer holds.
+    rmSync(files.stopped, { force: true });
     const current = selection(env, 'current')?.release ?? null;
     const next = candidate(env);
     const action = decide(current, next);
@@ -159,7 +161,6 @@ export async function apply(env, { core = true, service = false, applyNow = fals
     const kind = core && (service || installedService(env)) ? managerKind(env) : 'none';
     if (!core || !chosen.core_build) { prune(env, dataDir); return { action, release: chosen, from: current, kind: 'none' }; }
     if (kind !== 'none') {
-      rmSync(files.stopped, { force: true });
       const had = installedService(env);
       const changed = writeDefinitions(kind, env);
       recordInstallation(env, { definitions: jobDefinitions(kind, env) });
@@ -305,7 +306,7 @@ export async function runRollback(argv = [], env = process.env) {
 /** `sidevoice uninstall`: the reverse of install, in the order that leaves nothing pointing at what is gone — under the
  *  install lock, the stop written, both jobs unloaded (a refusal stops everything here: nothing deleted), what runs on
  *  demand stopped, the definitions deleted (`service.mjs`); then our harness registrations; then the releases (`R`) and
- *  the data directory — all of it but the two lock files, which are permanent (SEAMS §1). The room keeps this machine's
+ *  the data directory — all of it but the two lock files, which are permanent (SEAMS §1), and the stop. The room keeps this machine's
  *  pairing until it is revoked under "Máquinas" on the room's page — said, with where. Codex's machine-wide file is, as
  *  always, printed and not touched. */
 export async function uninstall(argv = [], env = process.env) {
@@ -330,7 +331,10 @@ export async function uninstall(argv = [], env = process.env) {
     removeReleases(env);
     done.push(t('uninstall.releases-removed', { root: path.dirname(path.dirname(stableCommand(env)[1])) }));
     const paired = pairedRoom(env);
-    const kept = new Set(['install.lock', 'connector.lock']);
+    // Kept: the two lock files (permanent inodes) and the stop, so that a connector already on its way — a façade's
+    // launcher that started one just before — finds it and does not serve. Only an install, `service start` or the
+    // connector job at a login clears it.
+    const kept = new Set(['install.lock', 'connector.lock', 'node-stopped.json']);
     let entries = [];
     try { entries = readdirSync(dataDir); } catch {}
     for (const name of entries) if (!kept.has(name)) rmSync(path.join(dataDir, name), { recursive: true, force: true });
