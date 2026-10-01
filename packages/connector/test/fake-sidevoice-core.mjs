@@ -1,14 +1,16 @@
-/** A stand-in for `sidevoice-core`, as the connector starts it (SEAMS §2): flags in; a TCP listener that
- *  serves only discovery; the core's own socket (`--socket`, default `<data>/local.sock`) serving
- *  `GET /api/local/health` and the connector link on the path and namespace the real core serves; a ready
- *  file naming the socket, the launch id and `api`; `core-failure.json` when it fails before serving; and a
- *  log of what it was told. The name matters: the connector recognises a live core by `sidevoice-core` in
- *  its command line.
+/** A stand-in for `sidevoice-core`, as the core job or a connector starts it (SEAMS §2): flags in; one core per data
+ *  directory (an exclusive lock on `<data>/core.lock`, held for its life — another holder: `bind.core-running`,
+ *  exit 75); its last failure report deleted once it holds that lock; a TCP listener that serves only discovery;
+ *  the core's own socket (`--socket`, default `<data>/local.sock`) serving `GET /api/local/health` and the
+ *  connector link on the path and namespace the real core serves; a ready file naming the socket, the launch id
+ *  (given, or made up) and `api`; `core-failure.json` and exit 0 when it fails before serving; its own log
+ *  (`--log-file`, default `core.log` beside the data directory); and a record of what it was told.
  *
  *  How a launch behaves is chosen per launch, so a test can make one start fail and the next one work:
  *  `FAKE_CORE_MODES` names a file of lines, and each launch takes the first one (the last one repeats);
  *  otherwise `FAKE_CORE_MODE`. Modes: `ok`; `import` (an ImportError before serving: `core-failure.json`
- *  with `import.missing-module`, exit 1); `identity`; `bind`; `exit:<code>` (dies before serving, no report);
+ *  with `import.missing-module`, exit 0); `identity`; `bind`; `exit:<code>` (dies before serving, no report);
+ *  `crash:<ms>` (serves, then dies with exit 3 after that long: a crash after ready);
  *  `slow:<ms>` (ready that much later); `hang:<ms>` (serves, then stops answering health after that long);
  *  `deaf` (alive, never ready); add `+stubborn` to ignore SIGTERM, `+vanish` to delete the program that started
  *  it (`FAKE_CORE_WRAPPER`), so the next launch finds no executable, `+chatty:<bytes>` to write that much to stderr
@@ -18,6 +20,7 @@ import { appendFileSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync,
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { Server } from 'socket.io';
+import { tryLock } from '../lockfile.mjs';
 
 const flag = name => { const at = process.argv.indexOf(name); return at > 0 ? process.argv[at + 1] : null; };
 const version = process.env.FAKE_CORE_VERSION || '0.1.0';
@@ -31,7 +34,9 @@ if (process.argv.includes('--self-test')) {
 
 const data = flag('--data-dir');
 const port = Number(flag('--port') || 0);
-const launchId = flag('--launch-id');
+const launchId = flag('--launch-id') || randomUUID();
+const logFile = flag('--log-file') || path.join(path.dirname(data), 'core.log');
+const logLine = line => { try { appendFileSync(logFile, `${new Date().toISOString()} fake core ${process.pid}: ${line}\n`, { mode: 0o600 }); } catch {} };
 const socketPath = flag('--socket') || path.join(data, 'local.sock');
 const idleExit = Number(flag('--idle-exit') ?? 600);
 const said = event => appendFileSync(path.join(data, 'said.jsonl'), JSON.stringify({ pid: process.pid, launch_id: launchId, ...event }) + '\n');
@@ -54,10 +59,13 @@ const clientApi = Number(modifiers.find(item => item.startsWith('api:'))?.slice(
 if (chatty) setInterval(() => process.stderr.write('x'.repeat(chatty - 1) + '\n'), 20);
 if (modifiers.includes('vanish') && process.env.FAKE_CORE_WRAPPER) rmSync(process.env.FAKE_CORE_WRAPPER, { force: true });
 
-function fail(step, key, message, code = 1) {
+/** A start that failed before ready: the report, the log, and exit 0 — the manager does not start it again — except
+ *  while another core holds the directory (75: later). */
+function fail(step, key, message, code = 0) {
   const report = { launch_id: launchId, step, key, message, at: new Date().toISOString() };
   writeFileSync(path.join(data, 'core-failure.json.tmp'), JSON.stringify(report), { mode: 0o600 });
   renameSync(path.join(data, 'core-failure.json.tmp'), path.join(data, 'core-failure.json'));
+  logLine(`could not start (${key}): ${message}`);
   console.error(`fake core: ${key}: ${message}`);
   process.exit(code);
 }
@@ -67,7 +75,13 @@ try {
   const stat = lstatSync(data);
   if (!stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o077)) fail('directory', 'identity.unsafe-directory', `${data} is not this user's alone`);
 } catch (error) { if (error.code === 'ENOENT') mkdirSync(data, { recursive: true, mode: 0o700 }); else throw error; }
+// One core per data directory, before anything is touched: the lock is held for this process's life.
+const held = await tryLock(path.join(data, 'core.lock'), { kind: 'core' });
+if (!held.held) fail('bind', 'bind.core-running', `another core (pid ${held.owner?.pid ?? '?'}) holds ${data}`, 75);
+// The directory is this core's now, and so is its last failure report: it was about a start that is over.
+rmSync(path.join(data, 'core-failure.json'), { force: true });
 said({ event: 'started', data: { argv: process.argv.slice(2), mode: behaviour } });
+logLine(`started (launch ${launchId}, mode ${behaviour})`);
 
 if (kind === 'import') fail('import', 'import.missing-module', 'No module named soxr');
 if (kind === 'identity') fail('identity', 'identity.unreadable', 'identity.json is not readable');
@@ -147,6 +161,8 @@ async function serve() {
     version, protocol: linkProtocol, api: clientApi, socket: socketPath, launch_id: launchId, ...credential }), { mode: 0o600 });
   renameSync(ready + '.tmp', ready);
   said({ event: 'ready', data: { socket: socketPath, port: bound } });
+  logLine(`ready on ${socketPath} and 127.0.0.1:${bound}`);
+  if (kind === 'crash') setTimeout(() => { logLine('Traceback (most recent call last): crashing after ready'); process.exit(3); }, Number(argument || 0));
 }
 serve();
 
