@@ -7,7 +7,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { supervisedNode } from './test_core.mjs';
 import { runView } from './test_harness_cursor.mjs';
@@ -395,4 +395,26 @@ test('façade: the supervisor replaced under it — a new voice turn reaches its
     deliver(node, { event_id: 'after-stop', binding_id: 'core-thread-r', channel: 'voice', session_id: 's', revision: 2, message_id: 'm-s', text: 'de vuelta' });
     await until(() => received.length === 2, 20_000);
   } finally { owner?.child.kill(); node.stop(); receiver.close(); }
+});
+
+test('--json: every failure is one object {ok:false, error:{key, message}} and exit 1; a refusal before the core starts keeps its key in node.status', async () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-json-'));
+  const env = { ...process.env, HOME: home, SIDEVOICE_DATA_DIR: path.join(home, '.sidevoice'), SIDEVOICE_SERVICE_MANAGER: 'none' };
+  for (const [args, key] of [[['pair', '--json'], 'pair.usage'], [['pair', 'https://room.example', '--json'], 'pair.usage'], [['service', 'bogus', '--json'], 'service.usage'],
+    [['service', '--json'], 'service.usage'], [['bogus', '--json'], 'command.unknown'], [['install', 'https://room.example', '--json'], 'install.usage']]) {
+    const run = spawnSync(process.execPath, [cli, ...args], { env, encoding: 'utf8' });
+    const lines = run.stdout.trim().split('\n');
+    assert.equal(lines.length, 1, `${args.join(' ')}: exactly one line`);
+    const answer = JSON.parse(lines[0]);
+    assert.equal(run.status, 1, args.join(' '));
+    assert.deepEqual([answer.ok, answer.error.key, typeof answer.error.message], [false, key, 'string'], args.join(' '));
+  }
+  // The core's directory open to others: refused before any core starts, and said with its own key.
+  const node = supervisedNode();
+  mkdirSync(path.join(node.dataDir, 'core'), { recursive: true }); chmodSync(path.join(node.dataDir, 'core'), 0o755);
+  try {
+    node.start();
+    const status = await node.status(s => s.failure, 15_000);
+    assert.equal(status.failure.key, 'identity.unsafe-directory');
+  } finally { node.stop(); }
 });

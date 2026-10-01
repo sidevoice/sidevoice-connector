@@ -32,7 +32,7 @@ import { isProcess, signalVerified } from './proc.mjs';
 import { verifyPrivateDir } from './secure-fs.mjs';
 import { nodeFiles, readJson, writePrivate } from './node-files.mjs';
 import { keyed } from './i18n.mjs';
-import { rotate } from './logfile.mjs';
+import { appendChunk, rotate } from './logfile.mjs';
 
 export const CORE_VERSION = '0.1.0';
 export const DEFAULT_PORT = 8768;
@@ -305,18 +305,25 @@ export function coreArgs({ dataDir, env = process.env, launchId, idleExit = null
   return args;
 }
 
-/** Start one launch: its output appended to `core.log` (rotated first), what it said about a previous
- *  failure removed, and a handle whose `exit` settles when it is gone — a spawn error (no such program, no
- *  permission) included. */
+/** Start one launch: its output to `core.log`, and a handle whose `exit` settles when it is gone — a spawn error
+ *  (no such program, no permission) included. The supervisor's child writes into a pipe this process reads, so the
+ *  log is rotated as it grows, however long the core runs (`logfile.mjs`). A detached core outlives whoever started
+ *  it, so it is handed the file itself (appending); that one is rotated in place, on a clock, by its connector. */
 export function spawnCore(bin, args, { dataDir, env = process.env, detached = false }) {
   const log = logPath(dataDir);
   const launchId = args[args.indexOf('--launch-id') + 1];
   writePrivate(launchesPath(dataDir), { launch_id: launchId, bin, at: new Date().toISOString() });
   rotate(log);
-  const out = openSync(log, 'a', 0o600);
   let child;
-  try { child = spawn(bin, args, { detached, stdio: ['ignore', out, out], env: { ...env, SIDEVOICE_CORE_DATA_DIR: coreData(dataDir) } }); }
-  finally { closeSync(out); }
+  if (detached) {
+    const out = openSync(log, 'a', 0o600);
+    try { child = spawn(bin, args, { detached, stdio: ['ignore', out, out], env: { ...env, SIDEVOICE_CORE_DATA_DIR: coreData(dataDir) } }); }
+    finally { closeSync(out); }
+  } else {
+    child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], env: { ...env, SIDEVOICE_CORE_DATA_DIR: coreData(dataDir) } });
+    const write = chunk => appendChunk(log, chunk);
+    child.stdout?.on('data', write); child.stderr?.on('data', write);
+  }
   const handle = { pid: child.pid ?? null, child, done: null };
   handle.exit = new Promise(resolve => {
     child.once('exit', (code, signal) => resolve(handle.done = { code, signal }));

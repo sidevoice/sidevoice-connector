@@ -272,8 +272,8 @@ export function registerWithCursor(done, env = process.env, record = selected(en
   const file = cursorMcpFile(env);
   const { command, args } = registration(record);
   const manual = `Add to ${file}:\n\n  { "mcpServers": { "sidevoice": { "command": "${command}", "args": [${args.map(a => `"${a}"`).join(', ')}] } } }`;
-  if (outcome === 'invalid') done.push(`${file} is ${cursorState(env).why}; not touched. ${manual}`);
-  else if (outcome === 'foreign') done.push(`Cursor has a sidevoice MCP server of its own in ${file}; not touched. ${manual}`);
+  if (outcome === 'invalid') done.push(t('cursor.invalid', { file, why: cursorState(env).why, manual }));
+  else if (outcome === 'foreign') done.push(t('cursor.foreign', { file, manual }));
   else if (outcome === 'unchanged') done.push('Cursor already runs this version of the MCP server.');
   else done.push(outcome === 'repointed' ? `Re-pointed Cursor's MCP server to this version in ${file}.` : `Registered the MCP server with Cursor in ${file}.`);
   return outcome;
@@ -289,7 +289,7 @@ export function unregisterFromCursor(done, next, env = process.env) {
   const outcome = removeCursor(env);
   if (outcome === 'removed') done.push(`Unregistered the MCP server from Cursor (${file}).`);
   else if (outcome === 'foreign') next.push(`Cursor has a sidevoice MCP server this package did not write in ${file}; remove it there if you want it gone.`);
-  else if (outcome === 'invalid') next.push(`${file} could not be read; not touched.`);
+  else if (outcome === 'invalid') next.push(t('cursor.unreadable', { file }));
   else done.push('Cursor had no sidevoice MCP server registered.');
 }
 

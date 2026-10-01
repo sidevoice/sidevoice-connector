@@ -518,3 +518,30 @@ test('supervise: two node.restart at once against a core that ignores SIGTERM â€
     assert.ok(existsSync(path.join(node.dataDir, 'core', 'local.sock')), 'the running core\'s socket was not removed by the termination before it');
   } finally { node.stop(); }
 });
+
+test('supervise: core.log is rotated while the core runs â€” it never grows past the limit, and the core is never restarted for it', async () => {
+  const node = supervisedNode({ modes: ['ok+chatty:2000'], env: { SIDEVOICE_LOG_MAX_BYTES: '50000' } });
+  try {
+    node.start();
+    const running = await node.status(s => s.state === 'running');
+    const log = path.join(node.dataDir, 'core.log');
+    await until(() => existsSync(log + '.2'), 20_000);
+    for (let i = 0; i < 20; i++) { assert.ok(statSync(log).size <= 50_000 + 4096, `core.log is ${statSync(log).size} bytes`); await wait(25); }
+    assert.ok(statSync(log + '.1').size > 40_000 && statSync(log + '.2').size > 40_000, 'two rotated copies kept');
+    assert.equal(existsSync(log + '.3'), false, 'and no more');
+    assert.equal((await node.ask('node.status')).core.pid, running.core.pid, 'the same core throughout');
+  } finally { node.stop(); }
+});
+
+test('a plain connector\'s detached core: its core.log is rotated in place while it runs, by the connector', async () => {
+  const node = supervisedNode({ modes: ['ok+chatty:2000'], env: { SIDEVOICE_LOG_MAX_BYTES: '50000', SIDEVOICE_LOG_ROTATE_MS: '100' } });
+  try {
+    node.start([]);
+    await until(() => existsSync(node.socketPath));
+    await node.ask('node.ensure');
+    const log = path.join(node.dataDir, 'core.log');
+    await until(() => existsSync(log + '.1'), 20_000);
+    await wait(500);
+    assert.ok(statSync(log).size < 50_000 + 2000 * 60, `bounded by what one clock tick lets through (${statSync(log).size})`);
+  } finally { node.stop(); }
+});

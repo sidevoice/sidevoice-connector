@@ -523,7 +523,10 @@ export async function run(argv = [], env = process.env) {
   const json = argv.includes('--json');
   // `reload` is the node's own: a supervisor handing over to the installation now selected (`connector.mjs`).
   const actions = { install, uninstall, start, stop, restart, status, reload };
-  if (!actions[action]) { console.error(t('service.usage')); return 2; }
+  if (!actions[action]) {
+    if (json) { console.log(JSON.stringify({ ok: false, error: { key: 'service.usage', message: t('service.usage') } })); return 1; }
+    console.error(t('service.usage')); return 2;
+  }
   let result;
   try { result = await actions[action](env); }
   catch (error) { result = { ok: false, error: { key: error.key || 'service.failed', message: error.message } }; }

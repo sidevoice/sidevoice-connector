@@ -110,7 +110,10 @@ async function restartCore(env) {
 export async function runPair(argv = [], env = process.env) {
   const json = argv.includes('--json');
   const [room, code] = argv.filter(item => !item.startsWith('--'));
-  if (!room || !code) { console.error('usage: sidevoice pair <room-url> <pairing-code> [--json]   (the code is shown in the room under "Emparejar máquina")'); return 2; }
+  if (!room || !code) {
+    if (json) { console.log(JSON.stringify({ ok: false, error: { key: 'pair.usage', message: t('pair.usage') } })); return 1; }
+    console.error(t('pair.usage')); return 2;
+  }
   try {
     const result = await pair(room, code, env);
     const core = await restartCore(env);

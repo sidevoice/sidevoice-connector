@@ -13,14 +13,23 @@ import { runLinkRoom, runPair } from './pair.mjs';
 import { run as pairDevice } from './pair-device.mjs';
 import { run as service } from './service.mjs';
 import { run as skill } from './skill.mjs';
+import { t } from './i18n.mjs';
 
 const COMMANDS = { install: runInstall, uninstall: runUninstall, mcp, pair: runPair, 'link-room': runLinkRoom,
   'pair-device': pairDevice, connector, service, skill };
 
+/** With `--json`, every failure is one object on stdout — `{ok: false, error: {key, message}}` — and exit 1. */
+const failJson = (key, message) => { console.log(JSON.stringify({ ok: false, error: { key, message } })); return 1; };
+
 async function main([command, ...argv]) {
+  const json = argv.includes('--json');
   const entry = COMMANDS[command];
-  if (!entry) { console.error(`usage: sidevoice <${Object.keys(COMMANDS).join('|')}> [args]`); return 2; }
-  return entry(argv, process.env);
+  if (!entry) {
+    if (json) return failJson('command.unknown', t('command.unknown', { command: command ?? '' }));
+    console.error(`usage: sidevoice <${Object.keys(COMMANDS).join('|')}> [args]`); return 2;
+  }
+  try { return await entry(argv, process.env); }
+  catch (error) { if (json) return failJson(error?.key || `${command}.failed`, error?.message || String(error)); throw error; }
 }
 
 main(process.argv.slice(2)).then(

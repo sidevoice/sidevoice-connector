@@ -11,7 +11,8 @@
  *  with `import.missing-module`, exit 1); `identity`; `bind`; `exit:<code>` (dies before serving, no report);
  *  `slow:<ms>` (ready that much later); `hang:<ms>` (serves, then stops answering health after that long);
  *  `deaf` (alive, never ready); add `+stubborn` to ignore SIGTERM, `+vanish` to delete the program that started
- *  it (`FAKE_CORE_WRAPPER`), so the next launch finds no executable. */
+ *  it (`FAKE_CORE_WRAPPER`), so the next launch finds no executable, `+chatty:<bytes>` to write that much to stderr
+ *  every 20 ms for as long as it runs. */
 import { createServer } from 'node:http';
 import { appendFileSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -46,6 +47,8 @@ function mode() {
 const [behaviour, ...modifiers] = mode().split('+');
 const [kind, argument] = behaviour.split(':');
 const stubborn = modifiers.includes('stubborn');
+const chatty = Number(modifiers.find(item => item.startsWith('chatty:'))?.slice(7) || 0);
+if (chatty) setInterval(() => process.stderr.write('x'.repeat(chatty - 1) + '\n'), 20);
 if (modifiers.includes('vanish') && process.env.FAKE_CORE_WRAPPER) rmSync(process.env.FAKE_CORE_WRAPPER, { force: true });
 
 function fail(step, key, message, code = 1) {

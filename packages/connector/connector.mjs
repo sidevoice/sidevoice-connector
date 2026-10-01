@@ -31,7 +31,7 @@ import { roomLink, UNREACHABLE } from './link.mjs';
 import { API_RANGE, CORE_VERSION, NO_UV, awaitReady, coreArgs, coreRunning, runsSelected, coreData, ensureInstalled, ensureRunning, examineRunning, failureCause,
   failurePath, installInProgress, roomCredentialPath, spawnCore, takeInstallLock, terminateCore, unlinkSocket } from './core.mjs';
 import { ensureCoreDirectory, localHealth, socketAgent } from './core-socket.mjs';
-import { appendLine } from './logfile.mjs';
+import { appendLine, rotate } from './logfile.mjs';
 import { Supervisor } from './supervisor.mjs';
 import { pruneInstallations, recover, sameCommand, settle } from './install-txn.mjs';
 import { connectorSocketOf, dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
@@ -1063,6 +1063,9 @@ export async function run(argv = [], environment = process.env) {
   if (!bound.isSocket() || bound.uid !== process.getuid() || (bound.mode & 0o077)) { log(`not serving: ${socketPath} is not this user's alone`); server.close(); process.exitCode = 78; return; }
   process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown);
   scheduleExit();
+  // A core this process does not own the output of (a plain connector's detached core, an adopted one) writes
+  // straight into core.log: rotated in place on a clock while this process runs.
+  setInterval(() => rotate(path.join(dataDir, 'core.log')), Number(env.SIDEVOICE_LOG_ROTATE_MS || 10_000)).unref();
   if (supervisor && !external) supervisor.boot();
   else open();
 }

@@ -176,10 +176,10 @@ export async function uninstall(argv = [], env = process.env) {
   const done = [], next = [];
   try {
     const service = await uninstallService(env, { keepStopped: true });
-    done.push(`Removed the Sidevoice node service (${service.service}); its supervisor and core are stopped.`);
+    done.push(t('uninstall.service-removed', { service: service.service }));
     if (service.note) done.push(service.note);
   } catch (error) {
-    throw Object.assign(new Error(`${error.message} Uninstall stopped there: the copies, the registrations and ${dataDirOf(env)} are untouched.`), { key: error.key });
+    throw Object.assign(new Error(`${error.message} ${t('uninstall.stopped', { data: dataDirOf(env) })}`), { key: error.key });
   }
   if (harnesses.includes('claude')) {
     unregisterFromClaude(done, next, env);

@@ -22,6 +22,11 @@ export function rotate(file, max = LOG_MAX) {
   } catch { return false; }
 }
 
+/** Output appended as it comes (a child's stream this process owns), the log rotated first. */
+export function appendChunk(file, chunk) {
+  try { rotate(file); appendFileSync(file, chunk, { mode: 0o600 }); } catch {}
+}
+
 /** One line appended to a rotated log, 0600. */
 export function appendLine(file, line) {
   try { rotate(file); appendFileSync(file, line.endsWith('\n') ? line : line + '\n', { mode: 0o600 }); } catch {}
