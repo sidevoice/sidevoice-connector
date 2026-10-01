@@ -28,7 +28,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureCoreDirectory, localHealth } from './core-socket.mjs';
 import { readLock, tryLock } from './lockfile.mjs';
-import { isProcess, signalVerified } from './proc.mjs';
+import { findProcess, isProcess, processIdentity, signalVerified } from './proc.mjs';
+import { pauseSync } from './testpoint.mjs';
 import { verifyPrivateDir } from './secure-fs.mjs';
 import { nodeFiles, readJson, writePrivate } from './node-files.mjs';
 import { keyed } from './i18n.mjs';
@@ -230,12 +231,26 @@ export async function ensureInstalled({ dataDir, env = process.env, log = () => 
   return selectedCoreBin(dataDir, env) || (await installRuntime({ dataDir, env, log, progress })).bin;
 }
 
-/** Which program each launch was started from, written by whoever starts it (the connector) before it does: a
- *  core found running is kept only if it runs the program that would be started now. */
+/** The launch under way or running, written by whoever starts it (the connector): before it spawns — its launch id
+ *  and program — and completed right after with the child's pid and start time. It is how a launch is found again
+ *  when its starter dies before the core is ready (no ready file yet), and which program a running core came from:
+ *  a core is kept only if it runs the program that would be started now. */
 function launchesPath(dataDir) { return path.join(dataDir, 'core-launch.json'); }
+function readLaunch(dataDir) { try { return readJson(launchesPath(dataDir)); } catch { return null; } }
 export function launchedFrom(dataDir, launchId) {
-  let record = null; try { record = readJson(launchesPath(dataDir)); } catch {}
+  const record = readLaunch(dataDir);
   return record?.launch_id === launchId ? record.bin : null;
+}
+
+/** The process of the last recorded launch, if it is alive: by its recorded pid and start time, or — when its
+ *  starter died between spawning it and recording it — by the launch id on its command line. */
+export function launchProcess(dataDir) {
+  const record = readLaunch(dataDir);
+  if (!record?.launch_id) return null;
+  const command = launchPattern(record.launch_id);
+  if (record.pid && isProcess(record.pid, { start: record.start ?? null, command })) return { pid: record.pid, launch_id: record.launch_id };
+  const found = findProcess(command);
+  return found ? { pid: found, launch_id: record.launch_id } : null;
 }
 
 /** The file the core dials the room with: this machine's pairing, followed by the core (it may not exist yet). */
@@ -291,9 +306,14 @@ export async function launchReady(dataDir, launchId, timeout = 2000) {
  *  `{}` when no core is running. */
 export async function examineRunning(dataDir) {
   const ready = readReady(dataDir);
-  if (!ready || !coreRunning(ready)) return {};
-  const live = await launchReady(dataDir, ready.launch_id);
-  return live ? { adopt: live } : { terminate: ready };
+  if (ready && coreRunning(ready)) {
+    const live = await launchReady(dataDir, ready.launch_id);
+    return live ? { adopt: live } : { terminate: ready };
+  }
+  // No ready core: a launch whose starter died before it was ready is ended before anything else starts, and
+  // before its socket is touched — it may still bind it (and the real core's own lock would refuse a second).
+  const starting = launchProcess(dataDir);
+  return starting ? { terminate: starting } : {};
 }
 
 /** The arguments of one launch. `idleExit` 0 for the supervisor's child (it never leaves on its own); a
@@ -314,12 +334,14 @@ export function coreArgs({ dataDir, env = process.env, launchId, idleExit = null
 export function spawnCore(bin, args, { dataDir, env = process.env, detached = false }) {
   const log = logPath(dataDir);
   const launchId = args[args.indexOf('--launch-id') + 1];
-  writePrivate(launchesPath(dataDir), { launch_id: launchId, bin, at: new Date().toISOString() });
+  writePrivate(launchesPath(dataDir), { launch_id: launchId, bin, pid: null, start: null, at: new Date().toISOString() });
   rotate(log);
   let child;
   const out = openSync(log, 'a', 0o600);
   try { child = spawn(bin, args, { detached, stdio: ['ignore', out, out], env: { ...env, SIDEVOICE_CORE_DATA_DIR: coreData(dataDir) } }); }
   finally { closeSync(out); }
+  pauseSync('core-spawned');
+  if (child.pid) writePrivate(launchesPath(dataDir), { launch_id: launchId, bin, pid: child.pid, start: processIdentity(child.pid)?.start ?? null, at: new Date().toISOString() });
   const handle = { pid: child.pid ?? null, child, done: null };
   handle.exit = new Promise(resolve => {
     child.once('exit', (code, signal) => resolve(handle.done = { code, signal }));

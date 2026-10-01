@@ -4,7 +4,7 @@
  *  A process is identified by its owner, its start time and its command line — on Linux from `/proc`, elsewhere
  *  from `ps`. When those cannot be read, the answer is "unknown", and unknown never authorises a signal. */
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 
 const uid = () => (typeof process.getuid === 'function' ? process.getuid() : null);
 export const validPid = pid => Number.isInteger(pid) && pid > 1;
@@ -52,6 +52,32 @@ export function processState(pid, { start = null } = {}) {
   if (found === null) return 'gone';
   if (found === undefined || start === null) return 'unknown';
   return found.start === start ? 'alive' : 'gone';
+}
+
+/** This user's process whose command line matches `pattern`, if there is one (the first found): how a process is
+ *  found when only something it was started with is known. */
+export function findProcess(pattern) {
+  if (process.platform === 'linux') {
+    let entries = [];
+    try { entries = readdirSync('/proc').filter(name => /^\d+$/.test(name)); } catch { return null; }
+    for (const name of entries) {
+      const pid = Number(name);
+      if (pid === process.pid) continue;
+      try {
+        const command = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean).join(' ');
+        if (pattern.test(command) && isProcess(pid, { command: pattern })) return pid;
+      } catch {}
+    }
+    return null;
+  }
+  try {
+    const lines = execFileSync('ps', ['-axo', 'pid=', '-o', 'command='], { encoding: 'utf8', timeout: 5000 }).split('\n');
+    for (const line of lines) {
+      const match = line.trim().match(/^(\d+)\s+(.*)$/);
+      if (match && Number(match[1]) !== process.pid && pattern.test(match[2]) && isProcess(Number(match[1]), { command: pattern })) return Number(match[1]);
+    }
+  } catch {}
+  return null;
 }
 
 /** Signal a pid only if it is still the process described; returns whether it was signalled. */

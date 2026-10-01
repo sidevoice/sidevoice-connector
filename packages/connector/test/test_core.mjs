@@ -576,3 +576,82 @@ test('supervise: an ordinary stop — SIGTERM or SIGINT — ends cleanly: exit 0
     } finally { node.stop(); }
   }
 });
+
+/** Watch the fake cores of a node: the most alive at once, until stopped. */
+function coreWatch(node) {
+  let most = 0, on = true;
+  const started = () => [...new Set(node.said().filter(line => line.event === 'started').map(line => line.pid))];
+  const loop = (async () => { while (on) { most = Math.max(most, started().filter(alive).length); await wait(10); } })();
+  return { started, stop: async () => { on = false; await loop; return most; } };
+}
+
+test('supervise: a supervisor killed while its core is still starting — the next one ends that core before starting its own, and never unlinks a socket it may yet bind', async () => {
+  const node = supervisedNode({ modes: ['slow:2500', 'ok'] });
+  const watch = coreWatch(node);
+  try {
+    const first = node.start();
+    await until(() => watch.started().length === 1);
+    const orphan = watch.started()[0];
+    first.kill('SIGKILL');
+    await until(() => first.signalCode !== null);
+    node.start();
+    const running = await node.status(s => s.state === 'running', 20_000);
+    assert.notEqual(running.core.pid, orphan);
+    assert.equal(alive(orphan), false, 'the orphan was ended');
+    assert.equal(await watch.stop(), 1, 'one core at a time');
+    assert.ok(existsSync(path.join(node.dataDir, 'core', 'local.sock')), 'the serving core keeps its socket');
+  } finally { node.stop(); }
+});
+
+test('supervise: a supervisor killed between spawning its core and recording it — the next one finds that core by its launch id and ends it first', async () => {
+  const node = supervisedNode({ modes: ['deaf', 'ok'] });
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'sv-hooks-'));
+  writeFileSync(path.join(dir, 'pause-core-spawned'), '');
+  const watch = coreWatch(node);
+  try {
+    const first = node.start(['--supervise'], { SIDEVOICE_TEST_HOOKS: dir });
+    await until(() => existsSync(path.join(dir, 'paused-core-spawned')) && watch.started().length === 1);
+    const orphan = watch.started()[0];
+    assert.equal(JSON.parse(readFileSync(path.join(node.dataDir, 'core-launch.json'), 'utf8')).pid, null, 'killed before the launch was completed');
+    first.kill('SIGKILL');
+    await until(() => first.signalCode !== null);
+    node.start();
+    const running = await node.status(s => s.state === 'running', 20_000);
+    assert.notEqual(running.core.pid, orphan);
+    assert.equal(alive(orphan), false);
+    assert.equal(await watch.stop(), 1);
+  } finally { node.stop(); }
+});
+
+test('interop: the real core — its supervisor killed before it was ready — is ended by the next supervisor, which then runs its own; its socket is never unlinked under it', { skip: !interopRequired && !existsSync(interopPython) && `no core checkout with a .venv at ${interopCore}` }, async () => {
+  const tools = mkdtempSync(path.join(os.tmpdir(), 'sv-real-'));
+  const bin = path.join(tools, 'sidevoice-core');
+  // The real core, its ready file published 3 s late the first time (a scratch delay; nothing else changed).
+  const flag = path.join(tools, 'delayed');
+  writeFileSync(bin, `#!/bin/sh\nexec "${interopPython}" -c "import os, sys, time, sidevoice_core.server.__main__ as m
+first = not os.path.exists('${flag}')
+open('${flag}', 'a').close()
+original = m.write_ready
+def late(*a, **k):
+    if first: time.sleep(3)
+    return original(*a, **k)
+m.write_ready = late
+sys.exit(m.main())" "$@"\n`, { mode: 0o755 });
+  const node = supervisedNode({ env: { SIDEVOICE_CORE_BIN: bin, SIDEVOICE_PROBE_MS: '2000', SIDEVOICE_CORE_STOP_GRACE_MS: '15000' } });
+  try {
+    const first = node.start();
+    const launch = await until(() => { try { const record = JSON.parse(readFileSync(path.join(node.dataDir, 'core-launch.json'), 'utf8')); return record.pid ? record : null; } catch { return null; } }, 30_000);
+    first.kill('SIGKILL');
+    await until(() => first.signalCode !== null);
+    assert.ok(alive(launch.pid), 'the first core outlives its supervisor, still starting');
+    node.start();
+    const running = await node.status(s => s.state === 'running' || s.state === 'failed', 90_000);
+    assert.equal(running.state, 'running', JSON.stringify(running.failure));
+    assert.notEqual(running.core.pid, launch.pid);
+    assert.equal(alive(launch.pid), false, 'the first core was ended, not left beside the second');
+    // The window persisted from the first supervisor counts its start; the second's first start succeeded — none was
+    // lost to the port or the core's own lock still held by the orphan.
+    assert.equal(running.attempts, 2);
+    assert.equal(running.failure, null);
+  } finally { node.stop(); }
+});
