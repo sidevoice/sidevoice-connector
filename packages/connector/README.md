@@ -2,51 +2,54 @@
 
 The client side. One bin (`sidevoice`), these entry points:
 
-- `install` — one transaction (`install-txn.mjs`): stages this version and the
-  core (uv: Python and the pinned wheel, progress shown), runs the core's
-  `--self-test`, waits for calls to end (`--apply-now` does not), commits behind a
-  journal so a killed installer is recovered, restarts the node and rolls back if
-  it does not come up. A same or older version is a no-op. Then the node service
-  (`--no-service` opts out) and the harnesses: each one found, `--harness <id>`, or
-  none with `--no-agents`. `--no-core` leaves the core for later; `--json` prints
-  one object for the app. Pairs with nothing; reports whether the machine is paired.
-- `service install|uninstall|start|stop|restart|status [--json]` — the node
-  service: a LaunchAgent (`dev.sidevoice.node`, macOS) or a systemd user unit
-  (`sidevoice-node.service`, Linux) running `connector --supervise`; where there is
-  no user service manager (containers, pods), a detached supervisor. `stop` is a
-  person's stop: nothing starts the node again until `service start` or the next
-  login. On Linux, `install` prints the `loginctl enable-linger` command that would
-  keep it running without a session, and never runs it.
-- `uninstall` — the node service, then our harness registrations, then the
-  copies, then `~/.sidevoice`; it stops before deleting anything if the service
-  manager will not unload the service.
+- `install` — under one lock (`release.mjs`): stages this version as an immutable
+  release (`~/.local/share/sidevoice/releases/<id>`: the package, the core runtime — uv:
+  Python and the pinned wheel, progress shown — its `--self-test`), waits for calls to
+  end (`--apply-now` does not), switches `current` to it (`previous` keeps the one before;
+  each a symlink replaced by rename), restarts the jobs on it and verifies it within 60 s;
+  if it does not run, `current` goes back to `previous`. A same or older version is a
+  no-op that still verifies the selection — running it again is the recovery. `--service`
+  (or jobs already defined) installs Sidevoice as a login service; the harnesses: each one
+  found, `--harness <id>`, or none with `--no-agents`, registered once through
+  `current`. `--no-core` leaves the core for later; `--json` prints one object for the
+  app. Pairs with nothing; reports whether the machine is paired.
+- `rollback [--json]` — `current` back to `previous`, the jobs restarted on it and verified.
+- `service install|uninstall|start|stop|restart|status [--json]` — Sidevoice at login: two
+  jobs of the user's own service manager, neither supervising the other — the core
+  (`dev.sidevoice.core` / `sidevoice-core.service`) and the connector (`dev.sidevoice.connector`
+  / `sidevoice-connector.service`, running `connector --service`). The manager restarts them;
+  the core's exit status tells it whether to (0 after a failed start: not again). `status` is
+  derived on read from the manager, the core's failure report and its health (`deriveStatus`),
+  the same object a connector answers to `node.status`. `stop` is a person's stop: nothing
+  starts Sidevoice again until `service start` or the next login. `restart` restarts the core
+  job. On Linux, `service install` prints the `loginctl enable-linger` command that would keep
+  it running without a session, and never runs it.
+- `uninstall` — the jobs unloaded (it stops, deleting nothing, if the manager will not), what
+  runs on demand stopped, the definitions, then our harness registrations, then the releases
+  and `~/.sidevoice` (all but its two lock files).
 - `mcp` — the stdio MCP server a harness starts. One per conversation. Exposes
   `voice_connect`, `voice_pair`, `voice_say`, `voice_disconnect`, `voice_pair_device`,
   `voice_status`; carries the
   operational instructions in its `initialize` result. It never talks to the
   room: it keeps one local connection to the connector for as long as the
   session lives, and the binding it registered dies with that connection.
-- `connector [--supervise]` — one per machine. With `--supervise` it is the node
-  service: the core is its child (`--idle-exit 0`, a launch id per start), judged
-  ready by its health on its socket, restarted with backoff within a budget
-  (`supervisor.mjs`), and reported by `node.status`. Without, it is what the
-  launcher (`launcher.mjs`, the only way anything gets a connector) starts where
-  no service is installed: the core detached, and itself gone fifteen seconds after
-  the last binding leaves; a supervisor finding one takes its bindings over whole
-  (`handover`). There is no handover from one supervisor to another: when the node
-  service is restarted or upgraded, each façade reconnects by itself and registers its
-  conversations again, without waiting for a tool call. Either installs (with `uv`, at the pinned `CORE_VERSION`) and runs
-  this machine's **core** (`sidevoice/sidevoice-core`, `core.mjs`), holds the link to
-  it over the core's own socket (`core-socket.mjs`),
-  re-announces its bindings on every reconnect, keeps a durable outbox
-  for speech published while offline, and delivers one input event at a time per
-  binding through the adapter that binding was registered with. A file lock
-  makes it a singleton.
+- `connector [--service]` — one per machine (a kernel lock, `connector.lock`). With `--service`
+  it is the connector job: it never leaves on its own and never starts a core — it links to the
+  core job's when that answers, and again whenever it restarts. Without, it is what the launcher
+  (`launcher.mjs`, the only way anything gets a connector) starts where no connector job is
+  defined: it starts a core, detached, if none answers (with uv, at the pinned `CORE_VERSION`,
+  `core.mjs`), and leaves fifteen seconds after the last binding does. Where a connector job is
+  defined the launcher never spawns one. When the connector is restarted or upgraded, each façade
+  reconnects by itself and registers its conversations again, without waiting for a tool call.
+  Either holds the link to this machine's **core** (`sidevoice/sidevoice-core`) over the core's
+  own socket (`core-socket.mjs`), re-announces its bindings on every reconnect, keeps a durable
+  outbox for speech published while offline, and delivers one input event at a time per binding
+  through the adapter that binding was registered with.
 - `pair <room-url> <code> [--json]` — redeems, by hand, a pairing code from the room UI for
   this machine's credential (`~/.sidevoice/credentials.json`, mode 0600), the one its
   core links with the room by. The conversation's path is `voice_pair`, with the code
   the user read from the room; the conversation never asks the room for a code.
-  The running connector then restarts the core with it (`node.restart`).
+  It restarts nothing: the core follows that file, and links with a new pairing by itself.
 - `link-room <room-url>` — the same without a page: asks the room for a code
   (`POST /api/connectors/pairing-code`, naming the room as the origin) and redeems it.
   Registering with a room is open: a room is a relay and grants nothing by itself.
@@ -92,11 +95,11 @@ Protocol version 2 on this link.
 Node 22+. The published package has **no runtime dependencies**: `npm run build`
 bundles `socket.io-client`, `qrcode` and everything else into `dist/cli.mjs` with esbuild,
 so installing it copies files and fetches nothing. Tests run on the source:
-`node --test test/test_connector.mjs` (`test_core.mjs` covers the install and
-supervision against a fake `uv` and a fake core, `test_supervisor.mjs` the state
-machine on a fake clock, `test_node.mjs` the handover, the launcher and the service
-commands against stand-ins of launchd and systemd, `test_install.mjs` the install
-transaction; `test/service-integration.mjs` runs the real service managers in CI); sidevoice-core's
+`node --test test/test_connector.mjs` (`test_core.mjs` covers the core's install and start
+against a fake `uv` and a fake core, and the two jobs' contract; `test_node.mjs` the jobs,
+the launcher and `deriveStatus` against stand-ins of launchd and systemd; `test_install.mjs`
+releases, the switch and rollback; `test_security.mjs` the locks and the trust boundary;
+`test/service-integration.mjs` runs the real service managers in CI); sidevoice-core's
 `test_connector_interop.py` runs this connector for real against the core, from
 the checkout and from the bundle. `SIDEVOICE_CORE_WHEEL=<wheel> npm run build`
 puts the pinned core's wheel inside `dist/core/`, so the published package
