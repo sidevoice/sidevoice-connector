@@ -36,8 +36,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          BRANCH: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
-        run: gh workflow run pr-title.yml --ref "$BRANCH"
+        # The release PR's branch, read from the PR itself: the action's `pr` output can be empty while
+        # `prs_created` is true, and fromJSON('') then fails the whole job.
+        run: |
+          for branch in $(gh pr list --state open --label 'autorelease: pending' --json headRefName --jq '.[].headRefName'); do
+            gh workflow run pr-title.yml --ref "$branch"
+          done
 
   assets:
     name: Release assets
@@ -48,8 +52,6 @@ jobs:
     uses: ./.github/workflows/ci.yml
     with:
       release-tag: ${{ needs.release-please.outputs.tag_name }}
-    secrets:
-      SIDEVOICE_CORE_RELEASES_TOKEN: ${{ secrets.SIDEVOICE_CORE_RELEASES_TOKEN }}
 
   # A job naming an environment that does not exist creates it, unprotected: this one refuses to go on unless
   # `npm` exists and asks a person to approve, so publishing is never this workflow's own decision.
