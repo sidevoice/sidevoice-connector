@@ -156,7 +156,9 @@ setInterval(() => {
   for (const line of lines.slice(delivered)) {
     delivered++;
     const frame = JSON.parse(line);
-    const [socket] = namespace.sockets.values();
+    // The connector linked most recently, as the real core delivers to the one linked now: one killed a moment ago
+    // can still be listed until its disconnect is seen.
+    const socket = [...namespace.sockets.values()].filter(item => item.connected).at(-1);
     if (!socket) { appendFileSync(path.join(data, 'delivered.jsonl'), JSON.stringify({ frame, answer: { status: 'no_connector' } }) + '\n'); continue; }
     socket.timeout(10_000).emit('input.deliver', frame, (error, answer) =>
       appendFileSync(path.join(data, 'delivered.jsonl'), JSON.stringify({ frame, answer: error ? { status: 'unacknowledged' } : answer }) + '\n'));
