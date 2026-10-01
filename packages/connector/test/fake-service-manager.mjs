@@ -41,7 +41,7 @@ const read = (job, name) => { try { return readFileSync(path.join(jobDir(job), n
 const write = (job, name, value) => writeFileSync(path.join(jobDir(job), name), String(value));
 const pid = job => Number(read(job, 'pid')) || null;
 const running = job => !!pid(job) && alive(pid(job));
-const force = job => { try { return JSON.parse(read(job, 'force.json')); } catch { return {}; } };
+const force = job => { try { return JSON.parse(read(job, 'force.json')) ?? {}; } catch { return {}; } };
 const ended = job => { try { return JSON.parse(read(job, 'exit')); } catch { return null; } };
 
 /** The definition `service.mjs` wrote: the program, its environment and its log. */
