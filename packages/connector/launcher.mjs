@@ -30,7 +30,7 @@ export async function launch({ connect, self, env = process.env }) {
   if (stoppedByPerson(env)) throw keyed('node.stopped');
   const service = installedService(env);
   if (service) {
-    const started = managerStart(env, { load: false });
+    const started = await managerStart(env, { load: false });
     if (!started.ok) throw keyed('service.not-loaded', { detail: started.detail || started.key });
     const deadline = Date.now() + SERVICE_WAIT_MS;
     while (Date.now() < deadline) {

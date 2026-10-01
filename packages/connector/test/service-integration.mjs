@@ -55,11 +55,12 @@ const jobLoaded = () => (kind === 'launchd'
   : !/LoadState=not-found/.test(spawnSync('systemctl', ['--user', 'show', '-p', 'LoadState', 'sidevoice-node.service'], { encoding: 'utf8' }).stdout));
 const definition = kind === 'launchd' ? path.join(home, 'Library', 'LaunchAgents', 'dev.sidevoice.node.plist') : path.join(home, '.config', 'systemd', 'user', 'sidevoice-node.service');
 
-/** What a logout and a login do to the job (see the header). */
-function relogin() {
+/** What a logout and a login do to the job (see the header). `bootout` returns before launchd lets the job go. */
+async function relogin() {
   if (kind === 'launchd') {
     spawnSync('launchctl', ['bootout', `gui/${uid}/dev.sidevoice.node`]);
-    if (existsSync(definition)) execFileSync('launchctl', ['bootstrap', `gui/${uid}`, definition]);
+    await until('the job let go', () => !jobLoaded(), 15_000);
+    if (existsSync(definition)) await until('bootstrapped', () => spawnSync('launchctl', ['bootstrap', `gui/${uid}`, definition]).status === 0 || jobLoaded(), 15_000);
   } else {
     execFileSync('sudo', ['systemctl', 'restart', `user@${uid}.service`]);
   }
@@ -106,7 +107,7 @@ try {
   console.log(`back: core ${back.core.pid} (adopted: ${back.core.pid === second.core.pid})`);
 
   step('a login, approximated');
-  relogin(); await managerUp();
+  await relogin(); await managerUp();
   await until('running after the login', () => { const s = status(); return s?.state === 'running' && s.supervisor ? s : null; }, 90_000);
 
   step('stop: the person\'s — nothing runs, and the launcher refuses');
@@ -142,7 +143,7 @@ try {
   assert.ok(!existsSync(path.join(dataDir, 'connector.sock')) && !existsSync(path.join(dataDir, 'core', 'local.sock')), 'no socket');
 
   step('a login after the uninstall starts nothing');
-  relogin(); await managerUp();
+  await relogin(); await managerUp();
   await wait(5000);
   assert.ok(!jobLoaded(), 'still no job');
   assert.ok(!existsSync(path.join(dataDir, 'connector.sock')), 'still no socket');

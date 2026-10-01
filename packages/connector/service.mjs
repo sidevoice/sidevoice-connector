@@ -165,6 +165,18 @@ export function writeDefinition(kind, record, env = process.env) {
 const domain = () => `gui/${uid()}`;
 const target = () => `${domain()}/${LABEL}`;
 
+/** `launchctl bootout` returns before launchd has let the job go, and a `bootstrap` in that interval fails
+ *  ("5: Input/output error", measured on macos-14): the job is waited out, and the bootstrap tried again. */
+async function bootOut(env) {
+  manage(env, 'launchd', ['bootout', target()]);
+  for (let i = 0; i < 100 && loaded('launchd', env); i++) await wait(100);
+}
+async function bootIn(env, file) {
+  let booted = manage(env, 'launchd', ['bootstrap', domain(), file]);
+  for (let i = 0; i < 10 && !booted.ok && !loaded('launchd', env); i++) { await wait(500); booted = manage(env, 'launchd', ['bootstrap', domain(), file]); }
+  return booted.ok || loaded('launchd', env) ? { ok: true } : booted;
+}
+
 function loaded(kind, env) {
   if (kind === 'launchd') return manage(env, kind, ['print', target()]).ok;
   if (kind === 'systemd') return !/LoadState=not-found/.test(manage(env, kind, ['--user', 'show', '-p', 'LoadState', UNIT]).output);
@@ -282,14 +294,14 @@ async function awaitUp(env, timeout = START_WAIT_MS) {
 
 /** Ask the manager to start the registered service (or, with none, a detached supervisor). Starts nothing
  *  already running. Used by `service start` and by the launcher, which never spawns where a service exists. */
-export function managerStart(env = process.env, { load = true } = {}) {
+export async function managerStart(env = process.env, { load = true } = {}) {
   const service = installedService(env);
   const kind = service?.kind ?? managerKind(env);
   if (kind === 'launchd' && service) {
     if (!loaded(kind, env)) {
       if (!load) return { ok: false, key: 'service.not-loaded' };
-      const booted = manage(env, kind, ['bootstrap', domain(), service.file]);
-      if (!booted.ok && !loaded(kind, env)) return { ok: false, key: 'service.not-loaded', detail: booted.output.trim() };
+      const booted = await bootIn(env, service.file);
+      if (!booted.ok) return { ok: false, key: 'service.not-loaded', detail: booted.output.trim() };
     }
     const kicked = manage(env, kind, ['kickstart', target()]);
     return kicked.ok ? { ok: true } : { ok: false, key: 'service.not-loaded', detail: kicked.output.trim() };
@@ -329,7 +341,7 @@ export async function install(env = process.env) {
       const file = writeDefinition(kind, record, env);
       if (kind === 'systemd') { manage(env, kind, ['--user', 'daemon-reload']); manage(env, kind, ['--user', 'enable', UNIT]); }
       // A job loaded from an earlier definition is replaced by this one.
-      if (kind === 'launchd' && loaded(kind, env)) manage(env, kind, ['bootout', target()]);
+      if (kind === 'launchd' && loaded(kind, env)) await bootOut(env);
       void file;
     }
     if (record.service !== kind) writePrivate(files.install, { ...record, service: kind });
@@ -360,7 +372,7 @@ export async function start(env = process.env, { clear = true } = {}) {
     // A plain connector already serving is taken over by the supervisor (handover); none is started twice.
     startDetached(env);
   } else {
-    const started = managerStart(env);
+    const started = await managerStart(env);
     if (!started.ok) throw keyed(started.key, { detail: started.detail || '' });
   }
   const up = await awaitUp(env);
@@ -414,9 +426,9 @@ export async function reload(env = process.env) {
   const kind = installedService(env)?.kind ?? 'none';
   const pids = nodePids(env);
   if (kind === 'launchd') {
-    if (loaded(kind, env)) manage(env, kind, ['bootout', target()]);
+    if (loaded(kind, env)) await bootOut(env);
     await awaitDown(env, pids);
-    const booted = manage(env, kind, ['bootstrap', domain(), definitionPath(kind, env)]);
+    const booted = await bootIn(env, definitionPath(kind, env));
     if (!booted.ok) throw keyed('service.not-loaded', { detail: booted.output.trim() });
   } else if (kind === 'systemd') {
     manage(env, kind, ['--user', 'daemon-reload']);
