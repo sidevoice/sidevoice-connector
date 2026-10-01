@@ -9,7 +9,10 @@
  *  journal, sees it is not the selected program, and hands over through the `service reload` helper; the manager must
  *  end up running B. C is committed the same way, but C's core cannot serve: B's supervisor hands over to C, C's
  *  supervisor finds its core failing, rolls the installation back to B and hands over again; the manager must end up
- *  running B, with the journal gone. The core is the fake. */
+ *  running B, with the journal gone. Last, a first install committed the same way whose core cannot serve: there is
+ *  nothing to roll back to, so the supervisor has the recovery finished outside its own job (`service recover`, a
+ *  transient unit under systemd) — the definition, the job, the selection and the journal must all be gone, and
+ *  nothing left running. The core is the fake. */
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
@@ -57,6 +60,7 @@ function run(cli, args, env = base) {
 const status = () => { const out = run(a, ['service', 'status', '--json']).stdout.trim().split('\n').at(-1); try { return JSON.parse(out); } catch { return null; } };
 const selected = () => JSON.parse(readFileSync(path.join(dataDir, 'install.json'), 'utf8'));
 const journal = () => existsSync(path.join(dataDir, 'install-txn.json'));
+const definitionFile = kind === 'launchd' ? path.join(os.homedir(), 'Library', 'LaunchAgents', 'dev.sidevoice.node.plist') : path.join(os.homedir(), '.config', 'systemd', 'user', 'sidevoice-node.service');
 /** What the manager runs now: its job's program, from the manager itself. */
 function managerRuns() {
   if (kind === 'launchd') {
@@ -105,6 +109,15 @@ try {
 
   step('uninstall');
   assert.equal(run(b, ['uninstall']).status, 0);
+
+  step('a first install committed by an installer that died, whose core cannot serve: recovered to nothing, outside the supervisor');
+  commitAndDie(a, { SIDEVOICE_TEST_FAIL_CORE: '1' });
+  assert.equal(run(a, ['service', 'start', '--json']).status, 0);
+  await until('the recovery to nothing', () => !journal() && !existsSync(path.join(dataDir, 'install.json')));
+  await until('the manager running nothing', () => !managerRuns().running);
+  assert.equal(existsSync(definitionFile), false, 'no definition left');
+  assert.ok(!status()?.supervisor, 'no supervisor answers');
+  console.log('recovered to nothing: no definition, no job, no selection, no journal');
   console.log('\nOK');
 } catch (error) {
   console.error(`\nFAILED: ${error.stack || error.message}`);

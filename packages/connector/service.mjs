@@ -92,6 +92,34 @@ export function launchEnvironment(record, env = process.env, extra = {}) {
   return { ...base, ...(record?.settings ?? installationSettings(env)), ...extra };
 }
 
+/** Start `argv` where stopping this node's service cannot take it along. Under systemd a unit's processes all go
+ *  when it stops (its cgroup), detached or not: there the helper is a transient unit of its own (`systemd-run --user`,
+ *  which exists wherever the user manager does). launchd ends only the job's process group, which a detached
+ *  process leaves; with no manager, detached is enough. */
+export function spawnOutsideJob(kind, argv, env) {
+  if (kind === 'systemd') {
+    const settings = Object.entries(env).filter(([name]) => name.startsWith('SIDEVOICE_') || ['HOME', 'PATH', 'USER', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS'].includes(name));
+    const child = spawn(env.SIDEVOICE_SYSTEMD_RUN || 'systemd-run', ['--user', '--collect', '--quiet', ...settings.map(([name, value]) => `--setenv=${name}=${value}`), '--', ...argv], { detached: true, stdio: 'ignore', env });
+    child.on('error', () => {});
+    child.unref();
+    return child;
+  }
+  const child = spawn(argv[0], argv.slice(1), { detached: true, stdio: 'ignore', env });
+  child.on('error', () => {});
+  child.unref();
+  return child;
+}
+
+/** `service recover` (internal): an install transaction finished outside the supervisor, which cannot reconcile its
+ *  own removal (`connector.mjs`): under the lock, the installer's recovery — reconcile, run, verify, journal gone. */
+export async function recoverInstallation(env = process.env) {
+  const { recover } = await import('./install-txn.mjs');
+  const release = await takeInstallLock(dataDirOf(env));
+  let outcome;
+  try { outcome = await recover(env, { mode: 'installer' }); } finally { release(); }
+  return { ok: !outcome || outcome.ran?.ok !== false, state: outcome?.record ? 'recovered' : 'absent', service: installedService(env)?.kind ?? 'none', selected: outcome?.record?.id ?? null };
+}
+
 /** The `SIDEVOICE_*` settings an installation is made with — recorded in it (`install.json`), so its service runs
  *  with them whoever writes its definition later (a rollback is written by the other installation's process) — never
  *  a credential of a core somebody else runs, nor a test's hooks. */
@@ -559,7 +587,9 @@ export async function run(argv = [], env = process.env) {
   const [action] = argv.filter(item => !item.startsWith('-'));
   const json = argv.includes('--json');
   // `reload` is the node's own: a supervisor handing over to the installation now selected (`connector.mjs`).
-  const actions = { install, uninstall, start, stop, restart, status, reload };
+  // `reload` and `recover` are the node's own: a supervisor handing over to the installation now selected, or
+  // having its own removal finished outside it (`connector.mjs`).
+  const actions = { install, uninstall, start, stop, restart, status, reload, recover: recoverInstallation };
   if (!actions[action]) {
     if (json) { console.log(JSON.stringify({ ok: false, error: { key: 'service.usage', message: t('service.usage') } })); return 1; }
     console.error(t('service.usage')); return 2;

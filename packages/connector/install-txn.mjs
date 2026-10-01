@@ -100,6 +100,9 @@ export async function reconcile(env, journal, side, { crashing = false, notes = 
   // Toward nothing, or toward an installation without a service: whatever runs now — a detached supervisor, a
   // connector, their core — is stopped, and seen gone (each by its verified identity), before anything is cleared.
   if (!record || (!service && journal.service.kind === 'none')) {
+    // A defined service goes through its manager first (stopping it stops its supervisor and core, and nothing
+    // restarts them); what then still runs is stopped by its verified identity.
+    if (!service && installedService(env)) await removeService(env, { keepStopped: false });
     const status = await askConnector('node.status', {}, { env, timeout: 1500 });
     if (!record || status?.supervisor) { const down = await stopNode(env); if (down.left.length) throw keyed('service.unload-failed', { detail: `pid ${down.left.join(', ')} still running` }); }
   }
@@ -228,6 +231,11 @@ export async function recover(env, { mode = 'installer', log = () => {} } = {}) 
   const journal = readJson(files.journal);
   if (!journal) return null;
   let side = selectedSide(env, journal);
+  // A supervisor cannot reconcile toward an installation without itself — nothing at all, or one with no service:
+  // stopping what runs would stop the reconciler. That recovery is finished outside it (`service recover`).
+  if (mode === 'supervisor' && (!(side === 'to' ? journal.to : journal.from) || !desired(journal, side).service)) {
+    return { journal, side, record: side === 'to' ? journal.to : journal.from, outside: true };
+  }
   log(`an install transaction was interrupted (${journal.from?.id ?? 'nothing'} → ${journal.to?.id}); reconciling to ${(side === 'to' ? journal.to : journal.from)?.id ?? 'nothing'}`);
   await reconcile(env, journal, side);
   const record = side === 'to' ? journal.to : journal.from;
@@ -254,8 +262,9 @@ export async function settle(env, { running, failed }) {
   if (running) { rmSync(files.journal, { force: true }); return { outcome: 'done' }; }
   if (failed && side === 'to') {
     writePrivate(files.journal, { ...journal, selection: 'from' });
+    // Back to nothing, or to an installation with no service: not this supervisor's to reconcile (see `recover`).
+    if (!journal.from || !desired(journal, 'from').service) return { outcome: 'outside', record: journal.from };
     await reconcile(env, journal, 'from');
-    if (!journal.from) rmSync(files.journal, { force: true });
     return { outcome: 'rollback', record: journal.from };
   }
   return { outcome: 'keep' };

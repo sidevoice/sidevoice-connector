@@ -387,6 +387,76 @@ test('rollback to nothing: a first install whose core serves but speaks another 
   }
 });
 
+/** A stand-in for `systemd-run --user`: runs the command after `--`, detached, as a transient unit would. */
+function systemdRunShim(dir) {
+  const shim = path.join(dir, 'systemd-run');
+  writeFileSync(shim, `#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done; shift\nexec "$@"\n`, { mode: 0o755 });
+  return shim;
+}
+const running = pid => { try { process.kill(pid, 0); return !/^\S+ \(.*\) Z/.test(readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return false; } };
+
+test('supervisor recovery to nothing: a first install committed by an installer that died, whose core cannot serve — the supervisor never signals itself; recovery outside it stops everything, verifies, and the next start finds nothing', { skip: process.platform !== 'linux' && 'reads /proc' }, async () => {
+  for (const manager of ['none', 'systemd']) {
+    const node = supervisedNode({ modes: ['ok+link:999'] });
+    // A home of its own, its paths the defaults: a unit's process sees HOME and the settings, not this shell's XDG_*.
+    const home = mkdtempSync(path.join(os.tmpdir(), 'sv-home-'));
+    const tools = mkdtempSync(path.join(os.tmpdir(), 'sv-mgr-'));
+    // Under a manager the core sees only the installation's settings: its modes go in its wrapper.
+    writeFileSync(node.bin, `#!/bin/sh\nFAKE_CORE_MODES="${node.modesFile}" FAKE_CORE_WRAPPER="${node.bin}" exec "${process.execPath}" "${path.join(here, 'fake-sidevoice-core.mjs')}" "$@"\n`, { mode: 0o755 });
+    const systemctl = path.join(tools, 'systemctl');
+    // Its state directory written into it: a unit's own `systemctl` calls (the supervisor's) find it too.
+    writeFileSync(systemctl, `#!/bin/sh\nFAKE_MANAGER_DIR="${path.join(tools, 'state')}" exec "${process.execPath}" "${path.join(here, 'fake-service-manager.mjs')}" systemctl "$@"\n`, { mode: 0o755 });
+    const env = { ...node.env, HOME: home,
+      SIDEVOICE_INSTALL_FROM_SOURCE: '0', SIDEVOICE_INSTALL_VERIFY_MS: '8000', SIDEVOICE_TEARDOWN_MS: '3000', SIDEVOICE_SERVICE_MANAGER: manager,
+      SIDEVOICE_SYSTEMCTL: systemctl, FAKE_MANAGER_DIR: path.join(tools, 'state'), SIDEVOICE_SYSTEMD_RUN: systemdRunShim(tools) };
+    for (const name of ['XDG_DATA_HOME', 'XDG_CONFIG_HOME']) delete env[name];
+    const unit = path.join(home, '.config', 'systemd', 'user', 'sidevoice-node.service');
+    try {
+      const armed = hooks({ crash: ['txn-install.json'] });
+      const died = spawnSync(process.execPath, [path.join(packageDir, 'cli.mjs'), 'install', '--no-agents', '--json'], { env: { ...env, SIDEVOICE_TEST_HOOKS: armed.dir }, encoding: 'utf8' });
+      assert.equal(died.signal, 'SIGKILL', `${manager}: ${died.stdout}${died.stderr}`);
+      assert.ok(existsSync(path.join(node.dataDir, 'install.json')) && existsSync(path.join(node.dataDir, 'install-txn.json')), 'committed, journal left');
+      const started = spawnSync(process.execPath, [path.join(packageDir, 'cli.mjs'), 'service', 'start', '--json'], { env, encoding: 'utf8' });
+      assert.equal(started.status, 0, `${manager}: ${started.stdout}${started.stderr}`);
+      const supervisor = await until(() => { try { return JSON.parse(readFileSync(node.socketPath + '.lock', 'utf8')).pid; } catch { return null; } });
+      await until(() => !existsSync(path.join(node.dataDir, 'install-txn.json')), 60_000);
+      assert.equal(existsSync(path.join(node.dataDir, 'install.json')), false, `${manager}: nothing selected`);
+      assert.equal(existsSync(unit), false, `${manager}: no definition`);
+      assert.equal(running(supervisor), false, `${manager}: the supervisor is gone once the journal is`);
+      for (const pid of new Set(node.said().map(line => line.pid))) assert.equal(running(pid), false, `${manager}: core ${pid} is gone`);
+      assert.equal(await node.ask('node.status').then(() => true, () => false), false, `${manager}: nothing answers`);
+      assert.doesNotMatch(node.log(), /stopping \(pid \d+\).*\b${supervisor}\b|signal.*itself/i);
+      // The next start has nothing to start, and starts nothing.
+      const again = spawnSync(process.execPath, [path.join(packageDir, 'cli.mjs'), 'service', 'start', '--json'], { env, encoding: 'utf8' });
+      await wait(1500);
+      assert.equal(await node.ask('node.status').then(() => true, () => false), false, `${manager}: still nothing (${again.stdout.trim()})`);
+      assert.equal(existsSync(path.join(node.dataDir, 'install-txn.json')), false);
+    } finally {
+      node.stop();
+      try { process.kill(Number(readFileSync(path.join(tools, 'state', 'pid'), 'utf8')), 'SIGKILL'); } catch {}
+    }
+  }
+});
+
+test('supervisor recovery to a plain installation: an upgrade from a connector with no service, committed and failing — rolled back outside the supervisor; the previous plain connector serves, no supervisor left', { skip: process.platform !== 'linux' && 'reads /proc' }, async () => {
+  const { node, from, to, startAs, holder } = twoInstallations();
+  const tools = mkdtempSync(path.join(os.tmpdir(), 'sv-run-'));
+  const journalFile = path.join(node.dataDir, 'install-txn.json');
+  writeFileSync(journalFile, JSON.stringify({ ...JSON.parse(readFileSync(journalFile, 'utf8')), service: { kind: 'none', before: false, want: true } }), { mode: 0o600 });
+  writeFileSync(path.join(node.dataDir, 'install.json'), JSON.stringify(to), { mode: 0o600 });
+  writeFileSync(node.modesFile, ['ok+link:999', 'ok'].join('\n') + '\n');
+  try {
+    const supervisor = startAs(to);
+    await until(() => !existsSync(journalFile), 60_000);
+    assert.equal(JSON.parse(readFileSync(path.join(node.dataDir, 'install.json'), 'utf8')).id, '0.5.0');
+    await until(() => supervisor.exitCode !== null || supervisor.signalCode !== null, 10_000);
+    const status = await node.status(s => s.state === 'running', 30_000);
+    assert.deepEqual(status.command, from.command, 'the previous installation\'s connector serves');
+    assert.equal(status.supervisor, false, 'as it was: plain, no supervisor');
+    assert.ok(holder().includes(from.copy) && !holder().includes('--supervise'));
+  } finally { node.stop(); }
+});
+
 test('detached hand-off: each installation\'s supervisor runs with its own settings — the candidate\'s on upgrade, the previous one\'s (a setting the candidate deleted included) on rollback, never the caller\'s', { skip: process.platform !== 'linux' && 'reads /proc' }, async () => {
   const { node, from, to } = twoInstallations();
   const journalFile = path.join(node.dataDir, 'install-txn.json');

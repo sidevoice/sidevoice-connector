@@ -37,7 +37,7 @@ import { Supervisor } from './supervisor.mjs';
 import { VERIFY_DEADLINE_MS, pruneInstallations, recover, sameCommand, selectionRuns, settle } from './install-txn.mjs';
 import { connectorSocketOf, dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
 import { readLock, tryLock } from './lockfile.mjs';
-import { launchEnvironment } from './service.mjs';
+import { launchEnvironment, spawnOutsideJob } from './service.mjs';
 import { isProcess, selfIdentity, signalVerified } from './proc.mjs';
 import { verifyPrivateDir } from './secure-fs.mjs';
 
@@ -663,6 +663,7 @@ async function checkInstallJournal() {
   catch (error) { log('recovering the install transaction failed (it is kept): ' + error.message); }
   finally { release(); }
   if (!outcome) return;
+  if (outcome.outside) return recoverOutside();
   if (!outcome.record || !sameCommand(outcome.record.command, ownCommand())) return handOff(outcome.record);
   pendingJournal = outcome;
   // Bounded like the installer's verification: not compatible and running by then, it is a failure.
@@ -690,6 +691,19 @@ async function settleJournal(snapshot, { expired = false } = {}) {
   clearTimeout(journalDeadline);
   if (settled.outcome === 'done') { pendingJournal = null; log('the installation this supervisor runs is running: the install transaction is complete'); }
   if (settled.outcome === 'rollback') { pendingJournal = null; await handOff(settled.record); }
+  if (settled.outcome === 'outside') { pendingJournal = null; recoverOutside(); }
+}
+
+/** The installation to recover to has no supervisor — nothing at all, or one with no service: this supervisor cannot
+ *  reconcile that without stopping itself halfway. A helper outside its job (`service recover`) does it — stops this
+ *  supervisor and its core by their verified identities (or the manager, if a definition goes), reconciles every
+ *  artifact, starts and verifies a plain installation, and deletes the journal only then. Started once. */
+let recovering = false;
+function recoverOutside() {
+  if (recovering) return;
+  recovering = true;
+  log('the installation to recover to runs without this supervisor: finishing the recovery outside it');
+  spawnOutsideJob(serviceKind, [...ownCommand(), 'service', 'recover', '--json'], env);
 }
 
 /** The selected installation is another program: it takes over. Under a service manager, the definition (already
