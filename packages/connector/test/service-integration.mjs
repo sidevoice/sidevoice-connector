@@ -86,6 +86,13 @@ try {
   if (kind === 'systemd') console.log(`linger: ${JSON.stringify(installed.json.linger)}`);
   assert.ok(existsSync(definition), 'the definition is written');
   assert.ok(jobLoaded(), 'and the manager has the job');
+  if (kind === 'systemd') {
+    // The unit as systemd itself parses it: every directive ours wrote is one it accepts, as written.
+    const verified = spawnSync('systemd-analyze', ['--user', 'verify', definition], { encoding: 'utf8' });
+    console.log(`systemd-analyze verify → exit ${verified.status}\n${verified.stdout}${verified.stderr}`);
+    assert.equal(verified.status, 0);
+    assert.ok(!/sidevoice-node\.service:\d+:/.test(verified.stderr), 'no complaint about any line of the unit');
+  }
 
   step('the core runs with no harness');
   const first = await until('running', () => { const s = status(); return s?.state === 'running' && s.supervisor ? s : null; });

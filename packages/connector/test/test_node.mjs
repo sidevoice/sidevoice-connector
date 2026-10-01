@@ -190,7 +190,7 @@ for (const kind of ['launchd', 'systemd']) {
       assert.equal(started.ok, true, JSON.stringify(started));
       await node.status(s => s.state === 'running' && s.supervisor, 20_000);
       assert.equal(existsSync(path.join(node.dataDir, 'node-stopped.json')), false);
-      assert.equal((await owner.call('voice_connect', {})).value.binding_id, 'core-thread-s');
+      await until(async () => (await owner.call('voice_connect', {})).value.binding_id === 'core-thread-s', 20_000);
 
       // Uninstall with a façade still connected: no job, no process, no socket — and nothing restarts it.
       const pids = [node.managerPid(), (await node.ask('node.status')).core.pid];

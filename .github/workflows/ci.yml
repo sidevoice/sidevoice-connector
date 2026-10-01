@@ -11,6 +11,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      core-ref:
+        description: The sidevoice-core commit the interop job runs against (default below).
+        type: string
+        required: false
   workflow_call:
     inputs:
       release-tag:
@@ -20,6 +25,10 @@ on:
 
 permissions:
   contents: read
+
+env:
+  # The real core the interop job runs against: R1-a (sidevoice/sidevoice-core#29) until it merges, then main.
+  CORE_REF: ${{ inputs.core-ref || '64274208ccffbdbdbd3728b0a718bdd1f8141350' }}
 
 concurrency:
   # Per ref. A release (github.workflow is the caller's, release-please) never shares a group with a push.
@@ -70,6 +79,38 @@ jobs:
       - name: Package contents (dry run)
         run: npm pack --dry-run
         working-directory: packages/connector
+
+  # The connector against the real core, not the fake: it supervises it, links on its socket (no Origin, a loopback
+  # Host), registers a binding and gets a device code minted there, and finds the link gone from TCP. Required here:
+  # a core that is not there fails the job instead of skipping the test.
+  interop-core:
+    name: Interop with the real core
+    if: ${{ !inputs.release-tag }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: sidevoice/sidevoice-core
+          ref: ${{ env.CORE_REF }}
+          path: core
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci
+      - name: The core, installed as its own CI installs it
+        working-directory: core
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python -e .
+          .venv/bin/python -m sidevoice_core.server --self-test
+      - name: Interop test (required)
+        env:
+          SIDEVOICE_INTEROP_CORE_DIR: ${{ github.workspace }}/core
+          SIDEVOICE_INTEROP_REQUIRED: '1'
+        run: node --test --test-name-pattern=interop packages/connector/test/test_core.mjs
 
   # The node service under the real service managers, end to end (packages/connector/test/service-integration.mjs):
   # install with no agents → the core running with no harness → killed → backoff → running → a login, approximated
@@ -157,13 +198,21 @@ jobs:
         env:
           SIDEVOICE_CORE_WHEEL: ${{ steps.core.outputs.wheel }}
           KIND: ${{ steps.kind.outputs.publish }}
+          # Which build this is, for the installer's ordering (install-txn.mjs): a nightly carries the version of the
+          # last release, so two nightlies of one version are ordered by this run number. build.mjs stamps both into
+          # dist/package.json; the package's own manifest is stamped here too.
+          SIDEVOICE_CHANNEL: ${{ steps.kind.outputs.publish == 'nightly' && 'nightly' || 'release' }}
+          SIDEVOICE_BUILD_SEQ: ${{ github.run_number }}
         run: |
           set -euo pipefail
+          npm pkg set "sidevoice.channel=$SIDEVOICE_CHANNEL"
+          npm pkg set "sidevoice.build_seq=$SIDEVOICE_BUILD_SEQ" --json
           mkdir -p "$GITHUB_WORKSPACE/dist-release"
           npm pack --pack-destination "$GITHUB_WORKSPACE/dist-release"
           TGZ=$(ls "$GITHUB_WORKSPACE"/dist-release/sidevoice-uplink-*.tgz)
           WHEEL=$(basename "$SIDEVOICE_CORE_WHEEL")
           tar -tzf "$TGZ" | grep -x 'package/dist/cli.mjs' >/dev/null
+          tar -xzOf "$TGZ" package/dist/package.json | node -e "const m = JSON.parse(require('fs').readFileSync(0, 'utf8')); if (m.sidevoice?.channel !== process.env.SIDEVOICE_CHANNEL || m.sidevoice?.build_seq !== Number(process.env.SIDEVOICE_BUILD_SEQ)) { console.error('unstamped manifest', m.sidevoice); process.exit(1); }"
           tar -xzOf "$TGZ" "package/dist/core/$WHEEL" | cmp - "$SIDEVOICE_CORE_WHEEL"
           if [ "$KIND" = nightly ]; then
             # The nightly carries the version of the last release, so it says it is not that version.

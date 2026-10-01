@@ -470,10 +470,13 @@ test('supervise: a SIGKILLed supervisor leaves its core running — the next one
 });
 
 /** The real core (R1-a) when a checkout of it is at hand — `SIDEVOICE_INTEROP_CORE_DIR`, or a `core` checkout beside
- *  this repository — with its environment in `.venv`; skipped otherwise. */
+ *  this repository — with its environment in `.venv`; skipped otherwise, except where `SIDEVOICE_INTEROP_REQUIRED=1`
+ *  (the CI job that installs it): there a missing core is a failure, never a skip. */
 const interopCore = process.env.SIDEVOICE_INTEROP_CORE_DIR || path.join(packageDir, '..', '..', '..', 'core');
 const interopPython = path.join(interopCore, '.venv', 'bin', 'python');
-test('interop: the supervisor runs the real core — ready by launch id and health on its socket, linked there with no Origin, a binding and a device code from it', { skip: !existsSync(interopPython) && `no core checkout with a .venv at ${interopCore}` }, async () => {
+const interopRequired = process.env.SIDEVOICE_INTEROP_REQUIRED === '1';
+test('interop: the supervisor runs the real core — ready by launch id and health on its socket, linked there with no Origin, a binding and a device code from it', { skip: !interopRequired && !existsSync(interopPython) && `no core checkout with a .venv at ${interopCore}` }, async () => {
+  assert.ok(existsSync(interopPython), `the real core is required here, and there is none at ${interopCore}`);
   const tools = mkdtempSync(path.join(os.tmpdir(), 'sv-real-'));
   const bin = path.join(tools, 'sidevoice-core');
   writeFileSync(bin, `#!/bin/sh\nexec "${interopPython}" -m sidevoice_core.server "$@"\n`, { mode: 0o755 });

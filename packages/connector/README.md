@@ -33,7 +33,9 @@ The client side. One bin (`sidevoice`), these entry points:
   launcher (`launcher.mjs`, the only way anything gets a connector) starts where
   no service is installed: the core detached, and itself gone fifteen seconds after
   the last binding leaves; a supervisor finding one takes its bindings over whole
-  (`handover`). Either installs (with `uv`, at the pinned `CORE_VERSION`) and runs
+  (`handover`). There is no handover from one supervisor to another: when the node
+  service is restarted or upgraded, each façade reconnects by itself and registers its
+  conversations again, without waiting for a tool call. Either installs (with `uv`, at the pinned `CORE_VERSION`) and runs
   this machine's **core** (`sidevoice/sidevoice-core`, `core.mjs`), holds the link to
   it over the core's own socket (`core-socket.mjs`),
   re-announces its bindings on every reconnect, keeps a durable outbox
