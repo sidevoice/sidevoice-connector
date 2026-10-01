@@ -21,7 +21,7 @@
  *  to, and the credential the connector links with. A core that died before serving says why in
  *  `core/core-failure.json`, under the same launch id. */
 import { spawn, execFileSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { accessSync, constants, existsSync, mkdirSync, openSync, closeSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -30,6 +30,7 @@ import { ensureCoreDirectory, localHealth } from './core-socket.mjs';
 import { lockStale, readLock, stillHeld, tryLock } from './lockfile.mjs';
 import { isProcess, signalVerified } from './proc.mjs';
 import { verifyPrivateDir } from './secure-fs.mjs';
+import { nodeFiles, readJson, writePrivate } from './node-files.mjs';
 import { keyed } from './i18n.mjs';
 import { rotate } from './logfile.mjs';
 
@@ -166,38 +167,74 @@ export async function takeInstallLock(dataDir, log = () => {}, { timeout = INSTA
 
 /** The `sidevoice-core` to start, installing the pinned version first if it is not there. `progress` gets uv's
  *  output line by line (`sidevoice install` shows it). */
-export async function ensureInstalled({ dataDir, env = process.env, log = () => {}, progress = () => {} }) {
-  if (env.SIDEVOICE_CORE_BIN) return env.SIDEVOICE_CORE_BIN;
-  const spec = coreSpec(env), identity = specIdentity(spec);
-  const home = path.join(runtimeRoot(dataDir), CORE_VERSION);
-  const venv = path.join(home, 'venv');
+/** One runtime per build of the core, never changed once made: `core-runtime/<version>-<hash of the spec>` (a wheel's
+ *  identity includes its size and time, so a wheel rebuilt in place is another build). An install never clears a
+ *  runtime something may be running from: a new build goes to a new directory, and the one before it stays until
+ *  pruned (`install-txn.mjs`). `SIDEVOICE_CORE_BIN` names a core installed by hand: no runtime of ours. */
+export function runtimeIdentity(env = process.env) {
+  if (env.SIDEVOICE_CORE_BIN) return { id: 'external', spec: null };
+  const spec = coreSpec(env);
+  return { id: `${CORE_VERSION}-${createHash('sha256').update(specIdentity(spec)).digest('hex').slice(0, 12)}`, spec };
+}
+export function runtimePaths(dataDir, id) {
+  const home = path.join(runtimeRoot(dataDir), id), venv = path.join(home, 'venv');
   const windows = process.platform === 'win32';
-  const bin = path.join(venv, windows ? 'Scripts' : 'bin', windows ? 'sidevoice-core.exe' : 'sidevoice-core');
-  const python = path.join(venv, windows ? 'Scripts' : 'bin', windows ? 'python.exe' : 'python');
-  const marker = path.join(home, 'installed.json');
-  const installed = () => { try { return executable(bin) && JSON.parse(readFileSync(marker, 'utf8')).spec === identity; } catch { return false; } };
-  if (installed()) return bin;
+  return { home, venv, marker: path.join(home, 'installed.json'),
+    bin: path.join(venv, windows ? 'Scripts' : 'bin', windows ? 'sidevoice-core.exe' : 'sidevoice-core'),
+    python: path.join(venv, windows ? 'Scripts' : 'bin', windows ? 'python.exe' : 'python') };
+}
+const runtimeComplete = paths => { try { return executable(paths.bin) && !!JSON.parse(readFileSync(paths.marker, 'utf8')).spec; } catch { return false; } };
+
+/** This package's build of the core, installed if it is not there: `{id, bin}`. */
+export async function installRuntime({ dataDir, env = process.env, log = () => {}, progress = () => {} }) {
+  if (env.SIDEVOICE_CORE_BIN) return { id: 'external', bin: env.SIDEVOICE_CORE_BIN };
+  const { id, spec } = runtimeIdentity(env);
+  const paths = runtimePaths(dataDir, id);
+  if (runtimeComplete(paths)) return { id, bin: paths.bin };
   const uv = findUv(env);
   if (!uv) throw new Error(NO_UV);
-  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const release = await takeInstallLock(dataDir, log);
   try {
-    if (installed()) return bin;   // whoever held the lock installed this very spec
-    mkdirSync(home, { recursive: true, mode: 0o700 });
+    if (runtimeComplete(paths)) return { id, bin: paths.bin };   // whoever held the lock installed this very build
+    // A directory of this build with no marker is an install of it that did not finish: nothing selects or runs it.
+    rmSync(paths.home, { recursive: true, force: true });
+    mkdirSync(paths.home, { recursive: true, mode: 0o700 });
     log(`installing sidevoice-core ${CORE_VERSION} with ${uv} from ${spec} (first time only; output in ${logPath(dataDir)})`);
     const started = Date.now();
     const options = { log: logPath(dataDir), env: { ...env, UV_NO_PROGRESS: '1' }, progress };
     // uv's own Python, never the machine's: the core then runs on one known build everywhere, whatever a
     // system Python, Homebrew or a version manager left on the PATH.
-    await run(uv, ['venv', '--clear', '--python-preference', 'only-managed', '--python', '3.12', venv], options);
-    await run(uv, ['pip', 'install', '--python', python, spec], options);
-    if (!executable(bin)) throw new Error(`uv installed ${spec} but there is no ${bin}; see ${logPath(dataDir)}`);
-    writeFileSync(marker, JSON.stringify({ version: CORE_VERSION, spec: identity, at: new Date().toISOString() }), { mode: 0o600 });
-    // Other versions stay: the previous one is what a failed upgrade rolls back to, and it goes only once
-    // this one has been running for five minutes (`pruneInstallations`, `install.mjs`).
+    await run(uv, ['venv', '--python-preference', 'only-managed', '--python', '3.12', paths.venv], options);
+    await run(uv, ['pip', 'install', '--python', paths.python, spec], options);
+    if (!executable(paths.bin)) throw new Error(`uv installed ${spec} but there is no ${paths.bin}; see ${logPath(dataDir)}`);
+    writeFileSync(paths.marker, JSON.stringify({ version: CORE_VERSION, id, spec: specIdentity(spec), at: new Date().toISOString() }), { mode: 0o600 });
     log(`sidevoice-core ${CORE_VERSION} installed in ${Math.round((Date.now() - started) / 1000)} s`);
-    return bin;
+    return { id, bin: paths.bin };
   } finally { release(); }
+}
+
+/** The core program the selected installation runs (`install.json`'s runtime, while it is complete), else this
+ *  package's own build — installed now if need be. */
+export function selectedCoreBin(dataDir, env = process.env) {
+  if (env.SIDEVOICE_CORE_BIN) return env.SIDEVOICE_CORE_BIN;
+  let record = null; try { record = readJson(nodeFiles(dataDir).install); } catch {}
+  if (record?.runtime_id && record.runtime_id !== 'external') {
+    const paths = runtimePaths(dataDir, record.runtime_id);
+    if (record.core_bin === paths.bin && runtimeComplete(paths)) return paths.bin;
+  }
+  const own = runtimePaths(dataDir, runtimeIdentity(env).id);
+  return runtimeComplete(own) ? own.bin : null;
+}
+export async function ensureInstalled({ dataDir, env = process.env, log = () => {}, progress = () => {} }) {
+  return selectedCoreBin(dataDir, env) || (await installRuntime({ dataDir, env, log, progress })).bin;
+}
+
+/** Which program each launch was started from, written by whoever starts it (the connector) before it does: a
+ *  core found running is kept only if it runs the program that would be started now. */
+function launchesPath(dataDir) { return path.join(dataDir, 'core-launch.json'); }
+export function launchedFrom(dataDir, launchId) {
+  let record = null; try { record = readJson(launchesPath(dataDir)); } catch {}
+  return record?.launch_id === launchId ? record.bin : null;
 }
 
 /** The file the core dials the room with: this machine's pairing, followed by the core (it may not exist yet). */
@@ -211,12 +248,6 @@ export async function coreAnswers(ready, timeout = 10_000) {
     const response = await fetch(new URL('/api/rendezvous', ready.url), { signal: AbortSignal.timeout(timeout) });
     return response.ok && (await response.json())?.kind === 'node';
   } catch { return false; }
-}
-
-/** Whether the pinned version's install is the one the spec names now: false after a wheel was rebuilt in place. */
-function installCurrent(dataDir, env) {
-  try { return JSON.parse(readFileSync(path.join(runtimeRoot(dataDir), CORE_VERSION, 'installed.json'), 'utf8')).spec === specIdentity(coreSpec(env)); }
-  catch { return false; }
 }
 
 /** What the running core wrote about itself, or null. */
@@ -279,6 +310,8 @@ export function coreArgs({ dataDir, env = process.env, launchId, idleExit = null
  *  permission) included. */
 export function spawnCore(bin, args, { dataDir, env = process.env, detached = false }) {
   const log = logPath(dataDir);
+  const launchId = args[args.indexOf('--launch-id') + 1];
+  writePrivate(launchesPath(dataDir), { launch_id: launchId, bin, at: new Date().toISOString() });
   rotate(log);
   const out = openSync(log, 'a', 0o600);
   let child;
@@ -364,6 +397,13 @@ export async function awaitReady(handle, { dataDir, launchId, timeout = READY_TI
   return { failure: failureCause({ dataDir, launchId, key: 'ready.timeout' }) };
 }
 
+/** Whether a running core runs the program that would be started now. */
+export function runsSelected(dataDir, env, running) {
+  if (env.SIDEVOICE_CORE_BIN) return true;
+  const bin = selectedCoreBin(dataDir, env);
+  return !!bin && launchedFrom(dataDir, running.launch_id) === bin;
+}
+
 /** The running core's ready file, without a service: the one already running when its health answers for
  *  its own launch, or one this call starts, detached. A core of another version is asked to leave first —
  *  this connector links with the version it pins — and so is one that does not answer for its launch. */
@@ -372,11 +412,8 @@ export async function ensureRunning({ dataDir, env = process.env, log = () => {}
   const found = await examineRunning(dataDir);
   if (found.adopt) {
     const running = found.adopt;
-    if (env.SIDEVOICE_CORE_BIN) return running;
-    const pinned = !running.version || running.version === CORE_VERSION;
-    if (pinned && installCurrent(dataDir, env)) return running;
-    log(pinned ? `the running core was installed from an earlier build of ${coreSpec(env)}: asking it to leave`
-      : `the running core is ${running.version}, this connector pins ${CORE_VERSION}: asking it to leave`);
+    if (runsSelected(dataDir, env, running)) return running;
+    log(`the running core (launch ${running.launch_id}) is not the build this installation selects: asking it to leave`);
     await terminateCore(running, { log });
   } else if (found.terminate) {
     log(`a core is running (pid ${found.terminate.pid}) but does not answer for its own launch: terminating it`);

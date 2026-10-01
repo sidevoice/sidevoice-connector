@@ -179,16 +179,22 @@ test('cursor install: our one key in ~/.cursor/mcp.json, everything else kept, a
   registerWithCursor(done, env);
   assert.match(done.at(-1), /already runs this version/);
 
-  // An older version of ours is re-pointed, keeping what the person added to it; their other servers stay.
-  writeFileSync(file, JSON.stringify({ mcpServers: { other: { url: 'https://x' }, sidevoice: { command: 'node', args: ['/old/sidevoice/0.5.0/dist/cli.mjs', 'mcp'], env: { A: '1' } } }, extra: true }));
+  // An older copy of ours (under the copies directory) is re-pointed, keeping what the person added to it; their
+  // other servers stay.
+  writeFileSync(file, JSON.stringify({ mcpServers: { other: { url: 'https://x' }, sidevoice: { command: 'node', args: [path.join(env.XDG_DATA_HOME, 'sidevoice', '0.5.0', 'dist', 'cli.mjs'), 'mcp'], env: { A: '1' } } }, extra: true }));
   registerWithCursor(done, env);
   assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { mcpServers: { other: { url: 'https://x' }, sidevoice: { command, args, env: { A: '1' } } }, extra: true });
   assert.match(done.at(-1), /Re-pointed/);
 
-  // Not ours: printed, not touched. Not JSON: printed, not touched.
+  // Not ours: printed, not touched — a program merely called cli.mjs is not Sidevoice's. Not JSON: printed, not touched.
   const foreign = JSON.stringify({ mcpServers: { sidevoice: { command: 'my-wrapper', args: [] } } });
   writeFileSync(file, foreign); registerWithCursor(done, env);
   assert.equal(readFileSync(file, 'utf8'), foreign); assert.match(done.at(-1), /not touched/);
+  const lookalike = JSON.stringify({ mcpServers: { sidevoice: { command: 'node', args: ['/opt/unrelated/cli.mjs', 'mcp'] } } });
+  writeFileSync(file, lookalike); registerWithCursor(done, env);
+  assert.equal(readFileSync(file, 'utf8'), lookalike, 'an unrelated cli.mjs is not ours'); assert.match(done.at(-1), /not touched/);
+  unregisterFromCursor(done, [], env);
+  assert.equal(readFileSync(file, 'utf8'), lookalike, 'and is never removed');
   writeFileSync(file, '{ // comment'); registerWithCursor(done, env);
   assert.equal(readFileSync(file, 'utf8'), '{ // comment'); assert.match(done.at(-1), /not valid JSON/);
 

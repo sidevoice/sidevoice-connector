@@ -4,7 +4,7 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { appendFileSync, chmodSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { appendFileSync, chmodSync, rmSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { startRoom, PROTOCOL } from './room.mjs';
@@ -1309,10 +1309,21 @@ test('install: puts this version in front of the harness, re-pins an older regis
   // Codex file and Claude Code's inbound safeguard are printed, never written.
   const { install, codexInstructions } = await import('../install.mjs');
   const home = mkdtempSync(path.join(os.tmpdir(), 'sv-home-'));
-  // A stand-in for `claude`: records every call, answers `mcp get` with whatever the test says is registered.
+  // A stand-in for `claude`: records every call, answers `mcp get` with what is registered — what the test wrote,
+  // or what `mcp add` added — and forgets it on `mcp remove`.
   const log = path.join(home, 'claude.log'), registered = path.join(home, 'registered.txt'), bin = path.join(home, 'claude');
-  writeFileSync(bin, `#!/bin/sh\necho "$@" >> "${log}"\nif [ "$2" = get ]; then [ -s "${registered}" ] && cat "${registered}" || exit 1; fi\n`, { mode: 0o755 });
+  writeFileSync(bin, `#!/bin/sh
+echo "$@" >> "${log}"
+case "$2" in
+  get) [ -s "${registered}" ] && cat "${registered}" || exit 1 ;;
+  remove) rm -f "${registered}" ;;
+  add) shift 6; cmd="$1"; shift; printf 'sidevoice:\\n  Scope: User config\\n  Type: stdio\\n  Command: %s\\n  Args: %s\\n' "$cmd" "$*" > "${registered}" ;;
+esac
+`, { mode: 0o755 });
   const calls = () => existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : [];
+  /** What changed Claude Code's registration: its adds and removes, in order. */
+  const changes = () => calls().filter(call => /^mcp (add|remove)/.test(call));
+  const line = () => { try { const text = readFileSync(registered, 'utf8'); return `${text.match(/Command: (.*)/)[1]} ${text.match(/Args: (.*)/)[1]}`; } catch { return null; } };
   // Not from a checkout: the package is copied under the XDG data home and the harness runs that copy with node.
   // HOME too: Cursor's mcp.json lives under it, and a test must never touch the real one.
   const env = { ...process.env, HOME: home, SIDEVOICE_DATA_DIR: path.join(home, '.sidevoice'), CLAUDE_CONFIG_DIR: path.join(home, '.claude'), SIDEVOICE_CLAUDE_BIN: bin,
@@ -1329,8 +1340,8 @@ test('install: puts this version in front of the harness, re-pins an older regis
   assert.rejects(install(['https://room.example', '--harness', 'claude'], env), /Pairing is not part of installing/, 'a room address is refused, with where pairing lives');
 
   const first = await install(['--harness', 'claude', '--no-core'], env);
-  // Asked twice: by the transaction, which only ever re-points an entry of ours, and by the registration.
-  assert.deepEqual(calls(), ['mcp get sidevoice', 'mcp get sidevoice', `mcp add --scope user sidevoice -- ${wanted}`], 'nothing registered: it registers this version');
+  assert.deepEqual(changes(), [`mcp add --scope user sidevoice -- ${wanted}`], 'nothing registered: it registers this version');
+  assert.equal(line(), wanted);
   assert.match(first.done.join('\n'), /Registered the MCP server/);
   assert.match(first.done.join('\n'), /Copied this version to /);
   // The copy is what the package ships and nothing more: the bundle, the manifest beside it, and
@@ -1356,8 +1367,8 @@ test('install: puts this version in front of the harness, re-pins an older regis
   writeFileSync(registered, `sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: ${command}\n  Args: ${args.join(' ')}\n`);
   writeFileSync(log, '');
   const again = await install(['--harness', 'claude', '--no-core'], env);
-  assert.deepEqual(calls(), ['mcp get sidevoice']);
-  assert.match(again.done.join('\n'), /already runs this version/);
+  assert.deepEqual(changes(), [], 'already this version: nothing changed');
+  assert.match(again.done.join('\n'), /Installed already/);
   // A skill copy left by an earlier version is taken away; someone else's voice-room is not.
   mkdirSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room'), { recursive: true });
   writeFileSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room', 'SKILL.md'), '---\nname: voice-room\nmetadata:\n  sidevoice: installed copy\n---\nold');
@@ -1368,16 +1379,18 @@ test('install: puts this version in front of the harness, re-pins an older regis
   // An older pin: after an upgrade, running install again moves the harness to the new version.
   writeFileSync(registered, `sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: npx\n  Args: -y @sidevoice/uplink@0.1.0 mcp\n`);
   writeFileSync(log, '');
+  rmSync(path.join(env.SIDEVOICE_DATA_DIR, 'install.json'));   // an older installation's entry, re-pointed as the new one is installed
   const upgraded = await install(['--harness', 'claude', '--no-core'], env);
-  assert.deepEqual(calls(), ['mcp get sidevoice', 'mcp remove --scope user sidevoice', `mcp add --scope user sidevoice -- ${wanted}`]);
-  assert.match(upgraded.done.join('\n'), /Re-pointed .* \(was: npx -y @sidevoice\/uplink@0\.1\.0 mcp\)/);
+  assert.deepEqual(changes(), ['mcp remove --scope user sidevoice', `mcp add --scope user sidevoice -- ${wanted}`]);
+  assert.equal(line(), wanted);
+  assert.match(upgraded.done.join('\n'), /Re-pointed Claude Code/);
 
   // Registered somewhere that is not ours to move: left alone, with the command to move it.
   writeFileSync(registered, `sidevoice:\n  Scope: Project config (shared via .mcp.json)\n  Type: stdio\n  Command: npx\n  Args: -y @sidevoice/uplink@0.1.0 mcp\n`);
   writeFileSync(log, '');
   const elsewhere = await install(['--harness', 'claude', '--no-core'], env);
-  assert.deepEqual(calls(), ['mcp get sidevoice']);
-  assert.match(elsewhere.done.join('\n'), /outside user scope .* not touched/);
+  assert.deepEqual(changes(), [], 'not ours to move');
+  assert.match(elsewhere.done.join('\n'), /not touched/);
 
   // A paired machine is reported as such, never re-paired.
   mkdirSync(env.SIDEVOICE_DATA_DIR, { recursive: true });
@@ -1392,7 +1405,7 @@ test('install: puts this version in front of the harness, re-pins an older regis
   writeFileSync(log, '');
   const { uninstall } = await import('../install.mjs');
   const gone = await uninstall(['--harness', 'claude', '--no-core'], env);
-  assert.deepEqual(calls(), ['mcp get sidevoice', 'mcp remove --scope user sidevoice']);
+  assert.deepEqual(changes(), ['mcp remove --scope user sidevoice']);
   assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice')), 'installed copies are gone');
   assert.ok(!existsSync(env.SIDEVOICE_DATA_DIR), 'credential, socket and log are gone');
   assert.match(gone.next.join('\n'), /still lists this machine as paired .* revoke it under "Máquinas" on the room/);

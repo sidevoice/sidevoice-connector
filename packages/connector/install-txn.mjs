@@ -1,43 +1,44 @@
-/** The install transaction (§4.3): one installation selected at a time, moved to another under one lock, and
- *  put back together after a crash whatever was done before it.
+/** The install transaction (§4.3): one installation selected at a time, moved to another under one lock, and put
+ *  back together after a crash whatever was done before it.
  *
- *  Under `install.lock` (the lock the core's install already took, `core.mjs`):
- *  0. recover: a journal (`install-txn.json`) left by a transaction that died is finished or undone;
- *  1. the candidate is compared with `install.json`: only a higher version, or the same version on `nightly`
- *     with a higher `build_seq`, replaces it — a release's artifacts are immutable, so two builds of the same
- *     version never replace each other in a loop; a lower one is never installed (the app never downgrades,
- *     and neither does `npx`: concurrent installers converge on the higher one);
- *  2. the copy is staged (`<copy>.staging`) and the core installed beside the one running (`core.mjs` keeps
- *     one runtime per version), then `sidevoice-core --self-test` must pass;
+ *  Everything an installation is takes part: its copy, its core runtime, the service definition, every harness
+ *  registration of ours — those it re-points and those the person just consented to — and `install.json`. Under
+ *  `install.lock`:
+ *  0. recover: a journal left by a transaction that died is finished or undone (below);
+ *  1. the selection is read again, here, under the lock, and the candidate compared with it: only a higher
+ *     version, or the same version on `nightly` with a higher `build_seq`, replaces it — a release's artifacts are
+ *     immutable, and the app and `npx` never downgrade, so concurrent installers converge on the higher one;
+ *  2. the copy is staged (`<copy>.staging`) and the core installed into a runtime of its own (`core.mjs`: one
+ *     immutable directory per build, never one something runs from), then that runtime's `--self-test` must pass;
  *  3. a call in progress is waited for, unless the person said to apply now;
- *  4. commit: the journal `{from, to}` is written before any side effect, then every artifact is made to point
- *     at `to` (`reconcile`), `install.json` last — the commit point;
- *  5. the node is restarted; not `running` with a compatible `api` and link within 60 s → every artifact back to
- *     `from`, restarted, reported as `rollback`;
- *  6. the previous installation is deleted only after five minutes running (`pruneInstallations`, the supervisor).
+ *  4. the plan — both installations, and for each registration and the service whether it existed before and what
+ *     is wanted — is journaled (`install-txn.json`) before any side effect; then every artifact is made to point at
+ *     the new installation (`reconcile`), `install.json` last, and read back;
+ *  5. the selection must run: the node restarted on it and answering `running` with a compatible `api` and link
+ *     within 60 s — a first install too. Not running → every artifact back to the previous installation (to none
+ *     at all after a first install), which must run in turn; the journal goes only once the selection runs;
+ *  6. the previous installation is deleted after five minutes running (`pruneInstallations`, the supervisor).
  *
  *  **Recovery by reconciliation.** The journal records no steps. Recovery selects `to` if `install.json` already
- *  names it, else `from`, and makes every artifact so for the selected one: its copy present, the service
- *  definition written from its command, every registration of ours pointed at it (foreign ones untouched),
- *  `install.json` naming it, no `*.staging` left. Each of those is "make it so", so a step that half ran, or ran
- *  without being recorded, is simply done again. */
+ *  names it (or the side a rollback forced), else `from`, and makes every artifact so for it from the plan — a
+ *  registration that existed before is put back even if a crash left none, one added for `to` is removed for
+ *  `from`, a foreign one is never touched — reads them back, and then requires the selection to run, as step 5.
+ *  Errors propagate and keep the journal. The supervisor recovers at its start (and while a journal waits): if the
+ *  selection is not the program it is, it hands over to that program (`connector.mjs`). */
 import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, renameSync, rmSync } from 'node:fs';
 import path from 'node:path';
-import { API_RANGE, CORE_VERSION, LINK_RANGE, ensureInstalled, ensureRunning, examineRunning, readReady, runtimeRoot, takeInstallLock } from './core.mjs';
-import { keyed } from './i18n.mjs';
+import { API_RANGE, CORE_VERSION, LINK_RANGE, installRuntime, readReady, runtimePaths, runtimeRoot, takeInstallLock } from './core.mjs';
+import { keyed, t } from './i18n.mjs';
+import { connectorClient } from './ipc.mjs';
 import { dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
-import { candidate, copiesDir, repointClaude, repointCursor, stageCopy } from './registrations.mjs';
-import { askConnector, installedService, reload, writeDefinition } from './service.mjs';
+import { HARNESS_REGISTRATIONS, candidate, copiesDir, registration, stageCopy } from './registrations.mjs';
+import { askConnector, definitionProgram, installedService, managerKind, reload, uninstall as removeService, writeDefinition } from './service.mjs';
+import { crash, pause } from './testpoint.mjs';
 
 const VERIFY_MS = Number(process.env.SIDEVOICE_INSTALL_VERIFY_MS || 60_000);
 const CALLS_POLL_MS = 2000;
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
-
-/** A test kills the installer right after one side effect, to recover from there (`SIDEVOICE_TXN_CRASH_AFTER`). */
-function sideEffect(env, name) {
-  if (env.SIDEVOICE_TXN_CRASH_AFTER === name) process.kill(process.pid, 'SIGKILL');
-}
 
 const parts = version => String(version || '0').split(/[.+-]/).slice(0, 3).map(part => Number(part) || 0);
 export function compareVersions(a, b) {
@@ -57,107 +58,179 @@ export function decide(current, next) {
   return next.channel === 'nightly' && next.build_seq > (Number(current.build_seq) || 0) ? 'upgrade' : 'noop';
 }
 
-/** Make every artifact point at `record`; `record` null makes them point at nothing (a first install undone). */
-export function reconcile(env, record, { crash = false, done = [] } = {}) {
-  const dataDir = dataDirOf(env), files = nodeFiles(dataDir);
-  const step = name => { if (crash) sideEffect(env, name); };
+export const sameCommand = (a, b) => Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((item, index) => item === b[index]);
+const sameRecord = (a, b) => !!a && !!b && a.id === b.id && sameCommand(a.command, b.command);
+
+/** What a transaction will make true, and what was true before it — so either side can be made true again. */
+function planFor(env, { from, to, consent = [], wantService = false, notes = [] }) {
+  const harnesses = {};
+  for (const [name, operations] of Object.entries(HARNESS_REGISTRATIONS)) {
+    const before = operations.state(env).state;
+    // Asked for, but its tool is not there to add an entry with: said, with the command to run, not attempted.
+    const reachable = !consent.includes(name) || before !== 'absent' || operations.reachable(env);
+    if (!reachable) notes.push(t(`install.${name}-unreachable`, { manual: `claude mcp add --scope user sidevoice -- ${[registration(to).command, ...registration(to).args].join(' ')}` }));
+    harnesses[name] = { before, want: before === 'ours' || (consent.includes(name) && before === 'absent' && reachable) };
+  }
+  const existing = installedService(env);
+  return { from, to, harnesses, service: { kind: existing?.kind ?? managerKind(env), before: !!existing, want: wantService || !!existing } };
+}
+
+/** For one side of a journal: the installation, what each registration must be, and whether a service is defined. */
+function desired(journal, side) {
+  const record = side === 'to' ? journal.to : journal.from;
+  const harnesses = {};
+  for (const [name, plan] of Object.entries(journal.harnesses)) {
+    harnesses[name] = !record ? 'remove'
+      : side === 'to' ? (plan.want ? 'set' : 'keep')
+      : plan.before === 'ours' ? 'set' : 'remove';
+  }
+  return { record, harnesses, service: !!record && (side === 'to' ? journal.service.want : journal.service.before) };
+}
+
+/** Make every artifact so for one side, then read each back. Every step is "make it so": done again, it changes
+ *  nothing. `crashing` arms the test crash points between side effects. */
+export async function reconcile(env, journal, side, { crashing = false, notes = [] } = {}) {
+  const files = nodeFiles(dataDirOf(env));
+  const point = name => { if (crashing) crash(`txn-${name}`); };
+  const { record, harnesses, service } = desired(journal, side);
   if (record?.copy && !existsSync(record.copy)) {
     if (!existsSync(record.copy + '.staging')) throw keyed('install.copy-missing', { path: record.copy });
     renameSync(record.copy + '.staging', record.copy);
   }
-  step('copy');
-  const service = installedService(env);
-  if (service && record) {
-    writeDefinition(service.kind, record, env);
-    if (service.kind === 'systemd') { try { execFileSync(env.SIDEVOICE_SYSTEMCTL || 'systemctl', ['--user', 'daemon-reload'], { timeout: 10_000, env, stdio: 'ignore' }); } catch {} }
+  point('copy');
+  if (record?.runtime_id && record.runtime_id !== 'external' && !existsSync(runtimePaths(dataDirOf(env), record.runtime_id).marker)) throw keyed('install.copy-missing', { path: runtimePaths(dataDirOf(env), record.runtime_id).home });
+  // With no service manager the node service is a detached supervisor: nothing to define, only to run.
+  if (service && journal.service.kind !== 'none') {
+    const kind = installedService(env)?.kind ?? journal.service.kind;
+    writeDefinition(kind, record, env);
+    if (kind === 'systemd') {
+      for (const args of [['--user', 'daemon-reload'], ['--user', 'enable', 'sidevoice-node.service']]) execFileSync(env.SIDEVOICE_SYSTEMCTL || 'systemctl', args, { timeout: 10_000, env, stdio: 'ignore' });
+    }
+  } else if (!service && installedService(env)) {
+    await removeService(env, { keepStopped: false });
   }
-  step('definition');
-  if (record) {
-    try { const was = repointClaude(env, record); if (was) done.push(`Re-pointed Claude Code's MCP server to this version (was: ${was}).`); } catch {}
-    step('register:claude');
-    try { repointCursor(env, record, done); } catch {}
-    step('register:cursor');
-    writePrivate(files.install, record);
-  } else rmSync(files.install, { force: true });
-  step('install.json');
-  removeStaging(env);
+  point('definition');
+  for (const [name, action] of Object.entries(harnesses)) {
+    const operations = HARNESS_REGISTRATIONS[name];
+    await pause(`txn-register-${name}`);
+    const outcome = action === 'set' ? operations.set(env, record) : action === 'remove' ? operations.remove(env) : null;
+    if (outcome === 'repointed' && crashing) notes.push(t('install.repointed', { harness: t(`harness.${name}`) }));
+    if (outcome === 'foreign' || outcome === 'invalid') notes.push(t(`install.${name}-${outcome === 'foreign' && name === 'claude' ? 'foreign-note' : outcome}`));
+    point(`register:${name}`);
+  }
+  if (record) writePrivate(files.install, record); else rmSync(files.install, { force: true });
+  point('install.json');
+  for (const name of safeList(copiesDir(env))) if (name.endsWith('.staging')) rmSync(path.join(copiesDir(env), name), { recursive: true, force: true });
+  verifyArtifacts(env, journal, side);
+  return notes;
 }
 
-function removeStaging(env) {
-  try { for (const name of readdirSync(copiesDir(env))) if (name.endsWith('.staging')) rmSync(path.join(copiesDir(env), name), { recursive: true, force: true }); } catch {}
+/** Read every artifact back: what reconcile wrote is what is there. */
+function verifyArtifacts(env, journal, side) {
+  const { record, harnesses, service } = desired(journal, side);
+  const wrong = what => { throw keyed('install.reconcile-failed', { what }); };
+  const installed = readJson(nodeFiles(dataDirOf(env)).install);
+  if (record ? !sameRecord(installed, record) : installed) wrong('install.json');
+  if (record?.copy && !existsSync(record.copy)) wrong(record.copy);
+  const definition = installedService(env);
+  if (journal.service.kind === 'none') return verifyRegistrations(env, record, harnesses);
+  if (service && (!definition || !sameCommand(definitionProgram(definition), [...record.command, 'connector', '--supervise']))) wrong('the service definition');
+  if (!service && definition) wrong('the service definition');
+  verifyRegistrations(env, record, harnesses);
+}
+function verifyRegistrations(env, record, harnesses) {
+  const wrong = what => { throw keyed('install.reconcile-failed', { what }); };
+  for (const [name, action] of Object.entries(harnesses)) {
+    const state = HARNESS_REGISTRATIONS[name].state(env);
+    if (action === 'set' && state.state === 'ours') {
+      const { command, args } = registration(record);
+      const line = state.line ?? [state.entry.command, ...state.entry.args].join(' ');
+      if (line !== [command, ...args].join(' ')) wrong(`${name}'s registration`);
+    }
+    if (action === 'set' && state.state === 'absent') wrong(`${name}'s registration`);
+    if (action === 'remove' && state.state === 'ours') wrong(`${name}'s registration`);
+  }
 }
 
-/** Recovery: finish or undo the transaction a journal says was under way. `verify` continues a recovered `to` at
- *  step 5 (the installer's own recovery); the supervisor, which is itself what step 5 restarts, only reconciles. */
-export async function recover(env, { verify = false, log = () => {} } = {}) {
+/** Whether the node runs this installation compatibly: restarted on it — through its service when one is defined
+ *  (the supervisor is replaced, and must be this installation's program), else through the launcher, which starts
+ *  this installation's connector — and answering `running` with a compatible `api` and link. */
+export async function runsCompatibly(env, record, { service, log = () => {} }) {
+  const dataDir = dataDirOf(env);
+  const fits = status => status?.state === 'running' && Number.isInteger(status.core?.api) && status.core.api >= API_RANGE[0] && status.core.api <= API_RANGE[1]
+    && (() => { const ready = readReady(dataDir); return Number.isInteger(ready?.protocol) && ready.protocol >= LINK_RANGE[0] && ready.protocol <= LINK_RANGE[1]; })()
+    && (!service || (status.supervisor && sameCommand(status.command, record.command)));
+  let last = null;
+  try {
+    if (service) await reload(env);
+    else {
+      const client = connectorClient(env, { self: record.command });
+      try { last = await client.rpc('node.ensure', {}); } finally { client.end(); }
+      if (fits(last)) return { ok: true };
+    }
+    const deadline = Date.now() + VERIFY_MS;
+    while (Date.now() < deadline) {
+      last = await askConnector('node.status', {}, { env, timeout: 1500 });
+      if (fits(last)) return { ok: true };
+      if (last?.state === 'failed') break;
+      await wait(500);
+    }
+  } catch (error) { return { ok: false, failure: { key: error.key || 'install.verify', message: error.message } }; }
+  log(`the installation ${record.id} did not run (${last?.state ?? 'no answer'})`);
+  return { ok: false, failure: last?.failure || { key: last?.state === 'running' ? 'install.incompatible' : 'ready.timeout' } };
+}
+
+/** Which side recovery selects. */
+function selectedSide(env, journal) {
+  if (journal.selection) return journal.selection;
+  return sameRecord(readJson(nodeFiles(dataDirOf(env)).install), journal.to) ? 'to' : 'from';
+}
+
+/** Recovery (holding the lock). `mode`: `installer` — reconcile, then the selection must run (rolling back as step
+ *  5 does), then the journal goes; `supervisor` — reconcile and say which installation is selected, the journal
+ *  staying until the supervisor sees it run (`settle`); `artifacts` — no core to run (`--no-core`). */
+export async function recover(env, { mode = 'installer', log = () => {} } = {}) {
   const files = nodeFiles(dataDirOf(env));
   const journal = readJson(files.journal);
   if (!journal) return null;
-  const current = readJson(files.install);
-  const selectedTo = !!journal.to && current?.id === journal.to.id && current?.command?.join('\0') === journal.to.command.join('\0');
-  const chosen = selectedTo ? journal.to : journal.from;
-  log(`an install transaction was interrupted (${journal.from?.id ?? 'nothing'} → ${journal.to?.id}); reconciling to ${chosen?.id ?? 'nothing'}`);
-  reconcile(env, chosen);
-  let outcome = { recovered: chosen?.id ?? null };
-  if (selectedTo && verify) outcome = { ...outcome, ...(await verifyOrRollBack(env, journal.from, journal.to, { log })) };
-  rmSync(files.journal, { force: true });
-  return outcome;
+  let side = selectedSide(env, journal);
+  log(`an install transaction was interrupted (${journal.from?.id ?? 'nothing'} → ${journal.to?.id}); reconciling to ${(side === 'to' ? journal.to : journal.from)?.id ?? 'nothing'}`);
+  await reconcile(env, journal, side);
+  const record = side === 'to' ? journal.to : journal.from;
+  if (mode === 'supervisor') return { journal, side, record };
+  if (mode === 'artifacts' || !record) { rmSync(files.journal, { force: true }); return { side, record }; }
+  let ran = await runsCompatibly(env, record, { service: desired(journal, side).service, log });
+  if (!ran.ok && side === 'to') {
+    side = 'from';
+    writePrivate(files.journal, { ...journal, selection: 'from', failure: ran.failure });
+    await reconcile(env, journal, 'from');
+    ran = journal.from ? await runsCompatibly(env, journal.from, { service: desired(journal, 'from').service, log }) : { ok: true };
+  }
+  if (ran.ok) rmSync(files.journal, { force: true });
+  return { side, record: side === 'to' ? journal.to : journal.from, ran };
 }
 
-/** Whether a core is running and speaks this connector's `api` and link. */
-function compatible(status, dataDir) {
-  const ready = readReady(dataDir);
-  const api = status?.core?.api;
-  return status?.state === 'running' && Number.isInteger(api) && api >= API_RANGE[0] && api <= API_RANGE[1]
-    && Number.isInteger(ready?.protocol) && ready.protocol >= LINK_RANGE[0] && ready.protocol <= LINK_RANGE[1];
+/** The supervisor's side of a recovered journal: the selection runs — the journal goes; it cannot — roll back to
+ *  `from` (the caller then hands over to it). Called holding the lock. Returns `done`, `rollback` or `keep`. */
+export async function settle(env, { running, failed }) {
+  const files = nodeFiles(dataDirOf(env));
+  const journal = readJson(files.journal);
+  if (!journal) return { outcome: 'done' };
+  const side = selectedSide(env, journal);
+  if (running) { rmSync(files.journal, { force: true }); return { outcome: 'done' }; }
+  if (failed && side === 'to') {
+    writePrivate(files.journal, { ...journal, selection: 'from' });
+    await reconcile(env, journal, 'from');
+    if (!journal.from) rmSync(files.journal, { force: true });
+    return { outcome: 'rollback', record: journal.from };
+  }
+  return { outcome: 'keep' };
 }
 
-/** Step 5: the node restarted on the new installation and seen running compatibly within 60 s, else every
- *  artifact back to `from` and the node restarted on it. */
-async function verifyOrRollBack(env, from, to, { log = () => {}, skip = false } = {}) {
-  if (skip) return { action: 'committed' };
-  const dataDir = dataDirOf(env);
-  let failure = null;
-  try {
-    await restartNode(env);
-    const deadline = Date.now() + VERIFY_MS;
-    let status = null;
-    while (Date.now() < deadline) {
-      status = await nodeState(env);
-      if (compatible(status, dataDir)) return { action: 'committed' };
-      if (status?.state === 'failed') break;
-      await wait(500);
-    }
-    failure = status?.failure || { key: status?.state === 'running' ? 'install.incompatible' : 'ready.timeout' };
-  } catch (error) { failure = { key: error.key || 'install.verify', message: error.message }; }
-  log(`the new installation did not come up (${failure.key}); rolling back to ${from?.id ?? 'nothing'}`);
-  reconcile(env, from);
-  if (from) { try { await restartNode(env); } catch {} }
-  return { action: 'rollback', failure };
-}
-
-/** Restart the node so it runs the selected installation: through the service manager when there is a
- *  service (the supervisor itself is replaced, not only its core), else a core started without a service. */
-async function restartNode(env) {
-  const running = await askConnector('node.status', {}, { env, timeout: 1500 });
-  if (installedService(env) || running?.supervisor) return reload(env);
-  // No service: the next plain connector links with whatever core runs; this one is started now, on the new
-  // runtime (`ensureRunning` asks a core of another version to leave), and is what step 5 judges.
-  const ready = await ensureRunning({ dataDir: dataDirOf(env), env });
-  return { ok: true, state: 'running', core: ready };
-}
-
-/** The node as the connector sees it, or — no connector, no service — the core itself, by its health. */
-async function nodeState(env) {
-  const status = await askConnector('node.status', {}, { env, timeout: 1500 });
-  if (status?.state) return status;
-  const found = await examineRunning(dataDirOf(env));
-  return found.adopt ? { state: 'running', core: { pid: found.adopt.pid, api: found.adopt.api, version: found.adopt.version }, calls: found.adopt.calls ?? 0 } : null;
-}
-
-/** The number of calls open on the running core, or 0 when none answers. */
+/** The number of calls open on the running node, or 0 when none answers. */
 async function openCalls(env) {
-  return (await nodeState(env))?.calls ?? 0;
+  const status = await askConnector('node.status', {}, { env, timeout: 1500 });
+  return status?.calls ?? 0;
 }
 
 /** `sidevoice-core --self-test`: imports everything serving needs, binds nothing, writes nothing. */
@@ -170,42 +243,58 @@ export function selfTest(bin, env) {
   return report;
 }
 
-/** The whole transaction. `core: false` leaves the core for later (nothing to self-test or restart). Returns
- *  `{action: 'install'|'upgrade'|'noop'|'rollback', record, from, failure?}`. */
-export async function transact(env, { core = true, applyNow = false, by = env.SIDEVOICE_INSTALLED_BY || 'cli', service = null, progress = () => {}, log = () => {} } = {}) {
+/** The whole transaction. `consent`: harnesses the person asked to connect now. `service`: the node service wanted.
+ *  `keep`: the selected installation stays (only consent or service change — `service install`). `core: false`
+ *  leaves the core for later (`--no-core`): nothing to install or run, so artifacts are all that is checked.
+ *  Returns `{action: 'install'|'upgrade'|'noop'|'rollback', record, from, failure?, notes}`. */
+export async function transact(env, { core = true, applyNow = false, by = env.SIDEVOICE_INSTALLED_BY || 'cli', service = false, consent = [], keep = false, progress = () => {}, log = () => {} } = {}) {
   const dataDir = dataDirOf(env), files = nodeFiles(dataDir);
   const release = await takeInstallLock(dataDir, log);
   try {
-    await recover(env, { verify: core, log });
-    const current = readJson(files.install);
-    const next = { ...candidate(env), by, at: new Date().toISOString(), service: service ?? current?.service ?? 'none' };
-    const action = decide(current, next);
-    if (action === 'noop') return { action, record: current, from: current };
-    // 2. staged, and the core installed beside the one running, then asked whether it imports.
-    stageCopy(next);
-    if (core) {
-      progress(`Installing this machine's Sidevoice core ${CORE_VERSION} (the first time: Python and a few hundred MB, some minutes)…`);
-      const bin = await ensureInstalled({ dataDir, env, log: line => progress('  ' + line),
-        progress: line => { if (line.trim() && !/^\s*[+-] /.test(line)) progress('    uv: ' + line.trim()); } });
-      try { selfTest(bin, env); } catch (error) { removeStaging(env); throw error; }
+    await recover(env, { mode: core ? 'installer' : 'artifacts', log });
+    const current = readJson(files.install);   // the selection, read again under the lock
+    if (keep && !current) throw keyed('service.no-installation');
+    const fresh = { ...candidate(env), by, at: new Date().toISOString() };
+    const action = keep ? 'noop' : decide(current, fresh);
+    let next = action === 'noop' ? current : fresh;
+    if (action !== 'noop') {
+      stageCopy(next);
+      if (core) {
+        progress(t('install.progress.core', { version: CORE_VERSION }));
+        const runtime = await installRuntime({ dataDir, env, log: line => progress('  ' + line),
+          progress: line => { if (line.trim() && !/^\s*[+-] /.test(line)) progress('    uv: ' + line.trim()); } });
+        next = { ...next, runtime_id: runtime.id, core_bin: runtime.bin };
+        selfTest(runtime.bin, env);
+      } else if (current?.runtime_id) next = { ...next, runtime_id: current.runtime_id, core_bin: current.core_bin };
     }
-    // 3. not in the middle of someone's call.
-    if (current && !applyNow) {
+    const planNotes = [];
+    const plan = planFor(env, { from: current, to: next, consent, wantService: service, notes: planNotes });
+    // The record says which service it was installed with (informational: the definition on disk is the truth).
+    next = plan.to = { ...next, service: plan.service.want ? plan.service.kind : 'none' };
+    const newConsent = Object.values(plan.harnesses).some(harness => harness.want && harness.before === 'absent');
+    const newService = plan.service.want && !plan.service.before;
+    if (action === 'noop' && !newConsent && !newService) return { action, record: current, from: current, notes: planNotes };
+    if (current && !applyNow && action !== 'noop') {
       let said = false;
       for (let calls = await openCalls(env); calls > 0; calls = await openCalls(env)) {
-        if (!said) { progress(`Waiting for ${calls} call(s) on this machine to end before applying the update (--apply-now applies it at once)…`); said = true; }
+        if (!said) { progress(t('install.progress.calls', { calls })); said = true; }
         await wait(CALLS_POLL_MS);
       }
     }
-    // 4. the journal before any side effect, then every artifact, install.json last.
-    writePrivate(files.journal, { from: current, to: next, at: new Date().toISOString() });
-    sideEffect(env, 'journal');
-    const done = [];
-    reconcile(env, next, { crash: true, done });
-    // 5. running on it, or back.
-    const outcome = await verifyOrRollBack(env, current, next, { log, skip: !core || !current });
-    rmSync(files.journal, { force: true });
-    return { ...outcome, action: outcome.action === 'rollback' ? 'rollback' : action, record: outcome.action === 'rollback' ? current : next, from: current, done: outcome.action === 'rollback' ? [] : done };
+    const journal = { ...plan, at: new Date().toISOString() };
+    writePrivate(files.journal, journal);
+    crash('txn-journal');
+    const notes = await reconcile(env, journal, 'to', { crashing: true, notes: planNotes });
+    const needsRun = core && (action !== 'noop' || newService);
+    const ran = needsRun ? await runsCompatibly(env, next, { service: plan.service.want, log }) : { ok: true };
+    if (ran.ok) { rmSync(files.journal, { force: true }); return { action, record: next, from: current, notes }; }
+    // Back to what was there — nothing at all after a first install — and that must run in turn.
+    writePrivate(files.journal, { ...journal, selection: 'from', failure: ran.failure });
+    await reconcile(env, journal, 'from');
+    const back = current && core ? await runsCompatibly(env, current, { service: plan.service.before, log }) : { ok: true };
+    if (back.ok) rmSync(files.journal, { force: true });
+    if (!current && next.copy) rmSync(next.copy, { recursive: true, force: true });
+    return { action: 'rollback', record: current, from: current, failure: ran.failure, back: back.ok, notes };
   } finally { release(); }
 }
 
@@ -226,7 +315,7 @@ export async function pruneInstallations(env, { log = () => {} } = {}) {
       }
     }
     for (const name of safeList(runtimeRoot(dataDir))) {
-      if (name !== record.core) { rmSync(path.join(runtimeRoot(dataDir), name), { recursive: true, force: true }); removed.push(path.join(runtimeRoot(dataDir), name)); }
+      if (name !== record.runtime_id) { rmSync(path.join(runtimeRoot(dataDir), name), { recursive: true, force: true }); removed.push(path.join(runtimeRoot(dataDir), name)); }
     }
     if (removed.length) log(`removed the previous installation(s): ${removed.join(', ')}`);
     return removed;

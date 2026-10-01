@@ -21,13 +21,15 @@ import path from 'node:path';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { harnessesPresent } from './identity.mjs';
 import { pairedRoom } from './pair.mjs';
-import { CORE_VERSION, NO_UV, coreAnswers, ensureRunning, findUv, readReady } from './core.mjs';
+import { CORE_VERSION, NO_UV, findUv, readReady } from './core.mjs';
+import { keyed, t } from './i18n.mjs';
 import { remove as removeSkill, skillsDir, status as skillStatus } from './skill.mjs';
 import { transact } from './install-txn.mjs';
-import { candidate, codexInstructions, copiesDir, cursorHasOurs, cursorMcpFile, fromSource, registerWithClaude, registerWithCursor,
-  unregisterFromClaude, unregisterFromCursor } from './registrations.mjs';
-import { install as installService, managerKind, uninstall as uninstallService } from './service.mjs';
+import { HARNESS_REGISTRATIONS, candidate, claudeState, codexInstructions, copiesDir, cursorHasOurs, cursorMcpFile, cursorState, fromSource,
+  registerWithClaude, unregisterFromClaude, unregisterFromCursor } from './registrations.mjs';
+import { askConnector, installedService, linger, uninstall as uninstallService } from './service.mjs';
 import { dataDirOf } from './node-files.mjs';
+import { readLock } from './lockfile.mjs';
 
 export { claudeRegistration, codexInstructions, copiesDir, cursorHasOurs, cursorMcpFile, registerWithCursor, serverCommand,
   unregisterFromCursor } from './registrations.mjs';
@@ -38,8 +40,9 @@ export { compareVersions, decide, pruneInstallations, recover } from './install-
 export function runningConnector(env = process.env) {
   const dataDir = env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
   const socketPath = env.SIDEVOICE_CONNECTOR_SOCKET || path.join(dataDir, 'connector.sock');
-  let pid = null;
-  try { pid = Number(readFileSync(socketPath + '.lock', 'utf8')) || null; } catch { return null; }
+  const lock = readLock(socketPath + '.lock');
+  if (!lock || lock.unreadable) return null;
+  const pid = lock.pid;
   return new Promise(resolve => {
     const socket = net.createConnection(socketPath);
     const done = value => { clearTimeout(timer); socket.destroy(); resolve(value); };
@@ -93,9 +96,7 @@ const USAGE = 'usage: sidevoice install [--harness claude|codex|cursor] [--no-ag
 
 export async function install(argv = [], env = process.env, { progress = () => {} } = {}) {
   const stray = argv.find(item => !item.startsWith('-') && argv[argv.indexOf(item) - 1] !== '--harness');
-  if (stray) throw new Error(`${USAGE}\n` +
-    `Pairing is not part of installing: a conversation asks for the room's code the first time it joins, ` +
-    `or run  sidevoice pair <room-url> <code>  with the code the room shows under "Emparejar máquina".`);
+  if (stray) throw keyed('install.usage', { usage: USAGE });
   const wanted = flag(argv, '--harness');
   // `--no-agents`: nothing registered with any harness — the person picks agents later (W3, `sidevoice agents`).
   const harnesses = argv.includes('--no-agents') ? [] : wanted ? [wanted] : harnessesPresent(env);
@@ -107,47 +108,43 @@ export async function install(argv = [], env = process.env, { progress = () => {
   if (core && !env.SIDEVOICE_CORE_BIN && !findUv(env)) throw new Error(NO_UV);
   // The node service by default (F3): the manager's where there is one, a detached supervisor where not.
   const service = core && !argv.includes('--no-service');
-  const kind = managerKind(env);
 
-  // The core first, inside the transaction: nothing is registered with a harness until the voice it would reach is there.
-  const result = await transact(env, { core, applyNow: argv.includes('--apply-now'), service: service ? kind : null, progress });
+  // One transaction: the copy, the core, the service and every registration — the ones the person asked for now
+  // included — committed together, and the result running before anything is said to be installed.
+  const consent = harnesses.filter(name => name in HARNESS_REGISTRATIONS);
+  const result = await transact(env, { core, applyNow: argv.includes('--apply-now'), service, consent, progress });
   const record = result.record;
-  done.push(`Sidevoice ${candidate(env).connector}.`);
+  done.push(t('install.version', { version: candidate(env).connector }));
   if (result.action === 'rollback') {
-    throw Object.assign(new Error(`Updating to ${candidate(env).id} failed (${result.failure?.key}${result.failure?.message ? ': ' + result.failure.message : ''}); this machine is back on ${result.from?.id ?? 'nothing'}.`), { key: 'install.rollback', failure: result.failure, result });
+    throw keyed('install.rollback', { to: candidate(env).id, from: result.from?.id ?? t('install.nothing'), cause: result.failure?.key ?? '?' }, { failure: result.failure, result });
   }
-  done.push(...(result.done || []).filter(line => !/already runs/.test(line)));
-  if (result.action === 'noop') done.push(`Installed already: ${record.id} (${record.channel}), the same or newer than this one — nothing replaced.`);
-  else if (record.copy) done.push(`Copied this version to ${record.copy}${result.from?.copy && result.from.copy !== record.copy ? ` (the previous one, ${result.from.id}, stays for five minutes of running in case this one has to be undone)` : ''}.`);
-  if (!core) done.push(externalCore ? `Voice runs in the core at ${env.SIDEVOICE_URL} (SIDEVOICE_URL): nothing to install here.`
-    : `This machine's Sidevoice core was not installed now (--no-core): the connector installs it the first time a conversation needs it.`);
+  done.push(...result.notes);
+  if (result.action === 'noop') done.push(t('install.noop', { id: record.id, channel: record.channel }));
+  else if (record.copy) done.push(t(result.from?.copy && result.from.copy !== record.copy ? 'install.copied-keeping' : 'install.copied', { copy: record.copy, previous: result.from?.id }));
+  if (!core) done.push(externalCore ? t('install.external-core', { url: env.SIDEVOICE_URL }) : t('install.no-core'));
 
-  let serviceResult = null;
+  let serviceStatus = null;
   if (service) {
-    serviceResult = await installService(env);
-    done.push(`The Sidevoice node service is ${serviceResult.state} (${serviceResult.service === 'none' ? 'no service manager here: a detached supervisor, not started again after a reboot' : serviceResult.service}).`);
-    if (serviceResult.linger && !serviceResult.linger.enabled) next.push(`${serviceResult.linger.reason}\n    ${serviceResult.linger.command}`);
-    const ready = readReady(dataDirOf(env));
-    if (ready) done.push(`This machine's Sidevoice core ${CORE_VERSION} is installed and answering at ${ready.url}.`);
-  } else if (core) {
-    // No service: the core is started now, detached, and asked whether it answers.
-    const started = Date.now();
-    const ready = await ensureRunning({ dataDir: dataDirOf(env), env, log: line => progress('  ' + line) });
-    if (!await coreAnswers(ready)) throw new Error(`This machine's Sidevoice core started (pid ${ready.pid}) but does not answer at ${ready.url}; see ${path.join(dataDirOf(env), 'core.log')}.`);
-    done.push(`This machine's Sidevoice core ${CORE_VERSION} is installed and answering at ${ready.url} (${Math.round((Date.now() - started) / 1000)} s).`);
+    serviceStatus = await askConnector('node.status', {}, { env });
+    const kind = installedService(env)?.kind ?? 'none';
+    done.push(t(kind === 'none' ? 'install.service-detached' : 'install.service', { state: serviceStatus?.state ?? '?', service: kind }));
+    if (kind === 'systemd') { const lingering = linger(env); if (!lingering.enabled) next.push(`${lingering.reason}\n    ${lingering.command}`); serviceStatus = { ...serviceStatus, linger: lingering }; }
   }
+  const ready = core ? readReady(dataDirOf(env)) : null;
+  if (ready) done.push(t('install.core-answering', { version: CORE_VERSION, url: ready.url }));
 
   if (harnesses.includes('claude')) {
     registerWithClaude(done, env, record);
+    if (claudeState(env).state === 'ours') done.push(t('install.claude-registered'));
     // The join shortcut is a prompt the server offers; a skill copy from an earlier version is taken away.
-    if (skillStatus(skillsDir([], env)).state === 'installed') done.push(`Removed the voice-room skill copy at ${removeSkill(skillsDir([], env)).target}: the server offers it as the prompt /mcp__sidevoice__voice-room.`);
+    if (skillStatus(skillsDir([], env)).state === 'installed') done.push(t('install.skill-removed', { target: removeSkill(skillsDir([], env)).target }));
   }
-  if (harnesses.includes('cursor')) registerWithCursor(done, env, record);
+  if (harnesses.includes('cursor') && cursorState(env).state === 'ours') done.push(t('install.cursor-registered', { file: cursorMcpFile(env) }));
 
   const paired = pairedRoom(env);
   done.push(paired ? `This machine is paired with ${paired.origin} (connector ${paired.connector_id}).`
                    : 'This machine is not paired with any room yet.');
-  if (!paired && core) next.push('To use it from another device, connect it to your room: in the room, "Emparejar máquina", and here  sidevoice pair <room-url> <code>.');
+  if (!paired && core) next.push(t('install.route'));
   const running = await runningConnector(env);
   if (running && running.version !== record.connector && !service) {
     next.push(`A connector from ${running.version ? 'version ' + running.version : 'an older version'} is still running (pid ${running.pid}) and every conversation on this machine uses it. ` +
@@ -164,7 +161,7 @@ export async function install(argv = [], env = process.env, { progress = () => {
   if (harnesses.includes('codex')) next.push(codexInstructions(env, record));
   if (harnesses.includes('cursor')) next.push(cursorNotes());
   if (!harnesses.length && !argv.includes('--no-agents')) next.push('No harness found on this machine. Pass --harness claude, --harness codex or --harness cursor.');
-  return { done, next, result, service: serviceResult };
+  return { done, next, result, service: serviceStatus };
 }
 
 /** `sidevoice uninstall`: the reverse of install, for this machine, in the order that leaves nothing pointing at

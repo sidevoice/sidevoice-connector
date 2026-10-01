@@ -11,6 +11,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CORE_VERSION } from './core.mjs';
 import { dataDirOf, nodeFiles, readJson } from './node-files.mjs';
+import { t } from './i18n.mjs';
+import { crash } from './testpoint.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 /** Where the package's own root is: next to these modules in the checkout, and one level up once
@@ -81,78 +83,106 @@ export function stageCopy(record) {
   return staging;
 }
 
-/** A Claude Code entry of ours: a Sidevoice copy's or checkout's `cli.mjs`, the executable, or the package. */
-export function oursInClaude(line) {
-  return /(^|[\s/])(cli\.mjs|sidevoice) mcp$/.test(line || '') || /@sidevoice\/uplink(@\S+)? mcp$/.test(line || '');
+/* ----- what is ours ----- */
+
+/** The installation roots and recorded commands Sidevoice wrote: every copy directory under `copiesDir`, and the
+ *  CLI or executable of each installation a record names (`install.json`, and both sides of a transaction under
+ *  way — a checkout's `cli.mjs` is ours only because a record says it was installed). */
+function recordedPrograms(env) {
+  const files = nodeFiles(dataDirOf(env));
+  const records = [readJsonQuiet(files.install), ...(() => { const journal = readJsonQuiet(files.journal); return journal ? [journal.from, journal.to] : []; })()];
+  return new Set(records.filter(Boolean).map(record => record.command?.[1] || record.command?.[0]).filter(Boolean));
+}
+const readJsonQuiet = file => { try { return readJson(file); } catch { return null; } };
+
+/** Whether this program (a CLI path run by node, or an executable) is one of ours. */
+export function ourProgram(program, env = process.env) {
+  if (!program || !path.isAbsolute(program)) return false;
+  const root = copiesDir(env) + path.sep;
+  if (program.startsWith(root)) {
+    const rest = program.slice(root.length).split(path.sep);
+    // <copiesDir>/<id>/dist/cli.mjs (R1) or <copiesDir>/<id>/sidevoice (R4); an id is one path segment.
+    if ((rest.length === 3 && rest[1] === 'dist' && rest[2] === 'cli.mjs') || (rest.length === 2 && rest[1] === 'sidevoice')) return /^[\w.+-]+$/.test(rest[0]);
+  }
+  return recordedPrograms(env).has(program);
 }
 
-/** Point Claude Code's entry at this installation — only when the entry there is ours (§4.3: existing ones are
- *  re-pointed, none is added). What it pointed at before, when it changed it. */
-export function repointClaude(env, record) {
-  const current = claudeRegistration(env);
-  if (!current || current.scope !== 'user' || !oursInClaude(current.line)) return null;
-  const { command, args } = registration(record);
-  if (current.line === [command, ...args].join(' ')) return null;
-  claude(['mcp', 'remove', '--scope', 'user', 'sidevoice'], env);
-  claude(['mcp', 'add', '--scope', 'user', 'sidevoice', '--', command, ...args], env);
-  return current.line;
+/** Whether a harness entry `{command, args}` runs one of ours as `mcp` — or is the package itself through npx. */
+export function oursEntry(entry, env = process.env) {
+  const { command, args = [] } = entry || {};
+  if (!command || !Array.isArray(args) || args.at(-1) !== 'mcp') return false;
+  if (args.some(arg => /^@sidevoice\/uplink(@[\w.-]+)?$/.test(arg))) return true;
+  if (args.length === 2 && path.basename(command) === 'node') return ourProgram(args[0], env);
+  if (args.length === 1) return ourProgram(command, env);
+  return false;
 }
 
-/** The same for Cursor's `mcp.json`. */
-export function repointCursor(env, record, done = []) {
-  if (!cursorHasOurs(env)) return false;
-  registerWithCursor(done, env, record);
-  return true;
-}
-
-/** Take our entry out of Claude Code — only ours, only at user scope. */
-export function unregisterFromClaude(done, next, env = process.env) {
-  const current = claudeRegistration(env);
-  if (current?.scope === 'user' && oursInClaude(current.line)) {
-    try { claude(['mcp', 'remove', '--scope', 'user', 'sidevoice'], env); done.push('Unregistered the MCP server from Claude Code.'); }
-    catch (error) { done.push(`Could not unregister from Claude Code (${(error.message || '').split('\n')[0]}). Run:\n    claude mcp remove --scope user sidevoice`); }
-  } else if (current) {
-    next.push(`Claude Code has a sidevoice MCP server that is not this package's or is registered outside user scope (${current.line}); remove it where it was added.`);
-  } else done.push('Claude Code had no sidevoice MCP server registered.');
-}
+/* ----- Claude Code ----- */
 
 function claude(args, env) {
   return execFileSync(env.SIDEVOICE_CLAUDE_BIN || 'claude', args, { encoding: 'utf8', timeout: 30_000, env, stdio: ['ignore', 'pipe', 'pipe'] });
 }
+/** Whether there is a `claude` to ask: an entry can only be added through it. */
+export function claudeReachable(env = process.env) {
+  try { claude(['--version'], env); return true; } catch (error) { return error.code !== 'ENOENT' && error.code !== 'EACCES'; }
+}
 
-/** What Claude Code currently runs for `sidevoice`, read from its own `mcp get`: null when nothing is
- *  registered or there is no `claude` to ask. The scope matters — only a user-scope entry is ours to move. */
+/** What Claude Code currently runs for `sidevoice`, read from its own `mcp get`: null when nothing is registered
+ *  or there is no `claude` to ask. Only a user-scope entry is ours to move. */
 export function claudeRegistration(env = process.env) {
   let output;
   try { output = claude(['mcp', 'get', 'sidevoice'], env); } catch { return null; }
   const field = name => (output.match(new RegExp(`^\\s*${name}:\\s*(.*)$`, 'm')) || [])[1]?.trim() ?? '';
   const command = field('Command'), args = field('Args');
   if (!command) return null;
-  return { scope: /user/i.test(field('Scope')) ? 'user' : 'other', line: [command, args].filter(Boolean).join(' ') };
+  return { scope: /user/i.test(field('Scope')) ? 'user' : 'other', line: [command, args].filter(Boolean).join(' '), command, args: args ? args.split(/\s+/) : [] };
 }
 
+/** Claude Code's entry, judged: `absent`, `ours` (with its line) or `foreign`. */
+export function claudeState(env = process.env) {
+  const current = claudeRegistration(env);
+  if (!current) return { state: 'absent' };
+  return { state: current.scope === 'user' && oursEntry(current, env) ? 'ours' : 'foreign', line: current.line };
+}
+
+/** Make Claude Code run this installation. Replacing is two steps of Claude's own (remove, add): an installer
+ *  that dies between them leaves no entry, which recovery adds back (the journal says it was there). */
+export function setClaude(env, record) {
+  const { command, args } = registration(record);
+  const current = claudeState(env);
+  if (current.state === 'foreign') return 'foreign';
+  if (current.state === 'ours' && current.line === [command, ...args].join(' ')) return 'unchanged';
+  if (current.state === 'ours') { claude(['mcp', 'remove', '--scope', 'user', 'sidevoice'], env); crash('claude-removed'); }
+  claude(['mcp', 'add', '--scope', 'user', 'sidevoice', '--', command, ...args], env);
+  return current.state === 'ours' ? 'repointed' : 'added';
+}
+
+/** Take our entry out of Claude Code; a foreign one stays. */
+export function removeClaude(env) {
+  const current = claudeState(env);
+  if (current.state !== 'ours') return current.state;
+  claude(['mcp', 'remove', '--scope', 'user', 'sidevoice'], env);
+  return 'removed';
+}
+
+/** `install`'s words for Claude Code, after the transaction set it. */
 export function registerWithClaude(done, env = process.env, record = selected(env)) {
   const { command, args } = registration(record);
-  const wanted = [command, ...args].join(' ');
-  const manual = `claude mcp add --scope user sidevoice -- ${wanted}`;
   const current = claudeRegistration(env);
-  if (current?.line === wanted) { done.push('Claude Code already runs this version of the MCP server.'); return; }
-  if (current && current.scope !== 'user') {
-    done.push(`Claude Code has a sidevoice MCP server registered outside user scope (${current.line}); not touched. To move it:\n    ${manual}`);
-    return;
+  if (current && !(current.scope === 'user' && oursEntry(current, env))) {
+    done.push(t('install.claude-foreign', { line: current.line, manual: `claude mcp add --scope user sidevoice -- ${[command, ...args].join(' ')}` }));
   }
-  if (current && !oursInClaude(current.line)) {
-    done.push(`Claude Code has a sidevoice MCP server that is not Sidevoice's (${current.line}); not touched. To replace it:\n    claude mcp remove --scope user sidevoice && ${manual}`);
-    return;
-  }
-  try {
-    if (current) claude(['mcp', 'remove', '--scope', 'user', 'sidevoice'], env);
-    claude(['mcp', 'add', '--scope', 'user', 'sidevoice', '--', command, ...args], env);
-    done.push(current ? `Re-pointed Claude Code's MCP server to this version (was: ${current.line}).`
-                      : 'Registered the MCP server with Claude Code (user scope).');
-  } catch (error) {
-    done.push(`Could not register with Claude Code automatically (${(error.message || '').split('\n')[0]}). Run:\n    ${manual}`);
-  }
+}
+
+/** Take our entry out of Claude Code — only ours, only at user scope. */
+export function unregisterFromClaude(done, next, env = process.env) {
+  const current = claudeState(env);
+  if (current.state === 'ours') {
+    try { removeClaude(env); done.push('Unregistered the MCP server from Claude Code.'); }
+    catch (error) { done.push(`Could not unregister from Claude Code (${(error.message || '').split('\n')[0]}). Run:\n    claude mcp remove --scope user sidevoice`); }
+  } else if (current.state === 'foreign') {
+    next.push(`Claude Code has a sidevoice MCP server that is not this package's or is registered outside user scope (${current.line}); remove it where it was added.`);
+  } else done.push('Claude Code had no sidevoice MCP server registered.');
 }
 
 /** Codex keeps one machine-wide file that may hold anything its user put there: we never rewrite it. */
@@ -170,16 +200,15 @@ export function codexInstructions(env = process.env, record = selected(env)) {
   ].join('\n');
 }
 
+/* ----- Cursor ----- */
+
 /** Where Cursor reads its user-wide MCP servers — the CLI and the editor alike: `~/.cursor/mcp.json`. */
 export function cursorMcpFile(env = process.env) {
   return path.join(env.HOME || os.homedir(), '.cursor', 'mcp.json');
 }
 
-/** An entry this package wrote: node running a sidevoice `cli.mjs` as `mcp`. Anything else is the person's. */
-export function oursInCursor(entry) {
-  return entry?.command === 'node' && Array.isArray(entry.args) && entry.args.length === 2
-    && entry.args[1] === 'mcp' && /cli\.mjs$/.test(entry.args[0] || '');
-}
+/** An entry this package wrote. Anything else is the person's. */
+export function oursInCursor(entry, env = process.env) { return oursEntry(entry, env); }
 
 /** Replace a file the person owns without changing what it is: through a symlink to where it really lives,
  *  and with the permissions it had — an mcp.json often holds tokens. */
@@ -192,46 +221,80 @@ function rewriteKept(file, text) {
   renameSync(temporary, target);
 }
 
-function cursorManual(env, record) {
-  const { command, args } = registration(record);
-  return `Add to ${cursorMcpFile(env)}:\n\n  { "mcpServers": { "sidevoice": { "command": "${command}", "args": [${args.map(a => `"${a}"`).join(', ')}] } } }`;
+/** Cursor's `mcp.json`, parsed: `{config}` (empty when there is no file), or `{invalid}` when it is not a JSON object. */
+function cursorConfig(env) {
+  const file = cursorMcpFile(env);
+  if (!existsSync(file)) return { config: {} };
+  let config;
+  try { config = JSON.parse(readFileSync(file, 'utf8')); } catch { return { invalid: 'not valid JSON' }; }
+  if (!config || typeof config !== 'object' || Array.isArray(config)) return { invalid: 'not a JSON object' };
+  return { config };
 }
 
-/** Register with Cursor by writing our one key into its user-wide `mcp.json`; the rest of the file is kept. */
-export function registerWithCursor(done, env = process.env, record = selected(env)) {
-  const file = cursorMcpFile(env);
+/** Cursor's entry, judged: `absent`, `ours`, `foreign` — or `invalid` (a file we cannot read is never written). */
+export function cursorState(env = process.env) {
+  const { config, invalid } = cursorConfig(env);
+  if (invalid) return { state: 'invalid', why: invalid };
+  const current = config.mcpServers?.sidevoice;
+  if (!current) return { state: 'absent' };
+  return { state: oursEntry(current, env) ? 'ours' : 'foreign', entry: current };
+}
+
+/** Make Cursor run this installation: our one key written, the rest of the file kept. */
+export function setCursor(env, record) {
   const { command, args } = registration(record);
-  let config = {};
-  if (existsSync(file)) {
-    try { config = JSON.parse(readFileSync(file, 'utf8')); } catch {
-      done.push(`${file} is not valid JSON; not touched. ${cursorManual(env, record)}`); return;
-    }
-    if (!config || typeof config !== 'object' || Array.isArray(config)) { done.push(`${file} is not a JSON object; not touched. ${cursorManual(env, record)}`); return; }
-  }
+  const { config, invalid } = cursorConfig(env);
+  if (invalid) return 'invalid';
   const servers = config.mcpServers && typeof config.mcpServers === 'object' ? config.mcpServers : {};
   const current = servers.sidevoice;
-  if (current && !oursInCursor(current)) { done.push(`Cursor has a sidevoice MCP server of its own in ${file} (${current.command || current.url || '?'}); not touched. ${cursorManual(env, record)}`); return; }
-  if (current && current.args[0] === args[0]) { done.push('Cursor already runs this version of the MCP server.'); return; }
+  if (current && !oursEntry(current, env)) return 'foreign';
+  if (current && current.command === command && JSON.stringify(current.args) === JSON.stringify(args)) return 'unchanged';
   config.mcpServers = { ...servers, sidevoice: { ...(current || {}), command, args } };
-  rewriteKept(file, JSON.stringify(config, null, 2) + '\n');
-  done.push(current ? `Re-pointed Cursor's MCP server to this version in ${file} (was: ${current.args.join(' ')}).`
-                    : `Registered the MCP server with Cursor in ${file}.`);
-}
-
-export function cursorHasOurs(env = process.env) {
-  try { return oursInCursor(JSON.parse(readFileSync(cursorMcpFile(env), 'utf8'))?.mcpServers?.sidevoice); } catch { return false; }
+  rewriteKept(cursorMcpFile(env), JSON.stringify(config, null, 2) + '\n');
+  return current ? 'repointed' : 'added';
 }
 
 /** Take our key out of Cursor's `mcp.json`, leaving everything else as it was. */
-export function unregisterFromCursor(done, next, env = process.env) {
-  const file = cursorMcpFile(env);
-  let config;
-  try { config = JSON.parse(readFileSync(file, 'utf8')); } catch { done.push('Cursor had no sidevoice MCP server registered.'); return; }
-  const current = config?.mcpServers?.sidevoice;
-  if (!current) { done.push('Cursor had no sidevoice MCP server registered.'); return; }
-  if (!oursInCursor(current)) { next.push(`Cursor has a sidevoice MCP server this package did not write in ${file}; remove it there if you want it gone.`); return; }
+export function removeCursor(env) {
+  const { config, invalid } = cursorConfig(env);
+  if (invalid) return 'invalid';
+  const current = config.mcpServers?.sidevoice;
+  if (!current) return 'absent';
+  if (!oursEntry(current, env)) return 'foreign';
   delete config.mcpServers.sidevoice;
-  rewriteKept(file, JSON.stringify(config, null, 2) + '\n');
-  done.push(`Unregistered the MCP server from Cursor (${file}).`);
+  rewriteKept(cursorMcpFile(env), JSON.stringify(config, null, 2) + '\n');
+  return 'removed';
 }
 
+/** `install`'s words for Cursor (and what a test of the old entry point still calls): set it, and say what happened. */
+export function registerWithCursor(done, env = process.env, record = selected(env)) {
+  const outcome = setCursor(env, record);
+  const file = cursorMcpFile(env);
+  const { command, args } = registration(record);
+  const manual = `Add to ${file}:\n\n  { "mcpServers": { "sidevoice": { "command": "${command}", "args": [${args.map(a => `"${a}"`).join(', ')}] } } }`;
+  if (outcome === 'invalid') done.push(`${file} is ${cursorState(env).why}; not touched. ${manual}`);
+  else if (outcome === 'foreign') done.push(`Cursor has a sidevoice MCP server of its own in ${file}; not touched. ${manual}`);
+  else if (outcome === 'unchanged') done.push('Cursor already runs this version of the MCP server.');
+  else done.push(outcome === 'repointed' ? `Re-pointed Cursor's MCP server to this version in ${file}.` : `Registered the MCP server with Cursor in ${file}.`);
+  return outcome;
+}
+
+export function cursorHasOurs(env = process.env) {
+  return cursorState(env).state === 'ours';
+}
+
+/** `uninstall`'s words for Cursor. */
+export function unregisterFromCursor(done, next, env = process.env) {
+  const file = cursorMcpFile(env);
+  const outcome = removeCursor(env);
+  if (outcome === 'removed') done.push(`Unregistered the MCP server from Cursor (${file}).`);
+  else if (outcome === 'foreign') next.push(`Cursor has a sidevoice MCP server this package did not write in ${file}; remove it there if you want it gone.`);
+  else if (outcome === 'invalid') next.push(`${file} could not be read; not touched.`);
+  else done.push('Cursor had no sidevoice MCP server registered.');
+}
+
+/** The harnesses whose registration an installation owns, with their operations. */
+export const HARNESS_REGISTRATIONS = {
+  claude: { state: claudeState, set: setClaude, remove: removeClaude, reachable: claudeReachable },
+  cursor: { state: cursorState, set: setCursor, remove: removeCursor, reachable: () => true },
+};

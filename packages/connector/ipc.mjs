@@ -22,7 +22,9 @@ export function connectorSocket(env = process.env) {
 
 const gone = message => Object.assign(new Error(message), { gone: true });
 
-export function connectorClient(env = process.env, { onHandover = () => {}, onLost = () => {} } = {}) {
+/** `self`: the argv prefix that runs the CLI a plain connector is started from — this package's own by default,
+ *  an installation's `command` when an installer verifies that installation. */
+export function connectorClient(env = process.env, { onHandover = () => {}, onLost = () => {}, self = [process.execPath, cliPath] } = {}) {
   const socketPath = connectorSocket(env);
   let socket = null, buffer = '', serial = 0;
   const waiting = new Map();
@@ -62,7 +64,7 @@ export function connectorClient(env = process.env, { onHandover = () => {}, onLo
 
   async function ensure() {
     if (socket) return socket;
-    return launch({ connect, self: [process.execPath, cliPath], env });
+    return launch({ connect, self, env });
   }
 
   async function rpc(method, params) {

@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { supervisedNode } from './test_core.mjs';
@@ -264,11 +264,18 @@ test('service definitions: the LaunchAgent and the user unit, exactly', () => {
   assert.match(plistText({ program: ['/a & b/<x>'], log: '/l', environment: {} }), /<string>\/a &amp; b\/&lt;x&gt;<\/string>/, 'escaped as XML');
 
   const unit = unitText({ program: ['/usr/bin/node', '/home/ana/sv 1/cli.mjs', 'connector', '--supervise'], log: '/home/ana/.sidevoice/node-service.log', environment: { SIDEVOICE_SERVICE: 'systemd', SIDEVOICE_X: '50%$HOME' } });
+  // `$` is literal in Environment= and an expansion in ExecStart=: escaped only there, and read back as written.
+  assert.ok(unitText({ program: ['/a/$b'], log: '/l', environment: {} }).includes('ExecStart="/a/$$b"'));
+  // No value may start a directive of its own (a newline in a setting, a path, an argument).
+  for (const bad of [{ environment: { SIDEVOICE_PUBLIC_URLS: 'x\nExecStartPre=/bin/echo INJECTED' } }, { log: '/l\nExecStartPre=/bin/x' }, { program: ['/a\rb'] }]) {
+    assert.throws(() => unitText({ program: ['/a'], log: '/l', environment: {}, ...bad }), error => error.key === 'service.unsafe-value');
+    assert.throws(() => plistText({ program: ['/a'], log: '/l', environment: {}, ...bad }), error => error.key === 'service.unsafe-value');
+  }
   const lines = unit.split('\n');
   for (const line of ['StartLimitIntervalSec=600', 'StartLimitBurst=5', 'Restart=on-failure', 'RestartSec=2', 'WantedBy=default.target',
     'ExecStart="/usr/bin/node" "/home/ana/sv 1/cli.mjs" "connector" "--supervise"',
     'StandardOutput=append:/home/ana/.sidevoice/node-service.log', 'StandardError=append:/home/ana/.sidevoice/node-service.log',
-    'Environment="SIDEVOICE_SERVICE=systemd"', 'Environment="SIDEVOICE_X=50%%$$HOME"']) assert.ok(lines.includes(line), `${line} in the unit`);
+    'Environment="SIDEVOICE_SERVICE=systemd"', 'Environment="SIDEVOICE_X=50%%$HOME"']) assert.ok(lines.includes(line), `${line} in the unit`);
   assert.ok(lines.indexOf('StartLimitBurst=5') < lines.indexOf('[Service]'), 'the start limit is the unit\'s, in [Unit]');
 
   // What the definition carries from this environment: Sidevoice's settings, never a credential of a core somebody else runs.
@@ -311,4 +318,26 @@ test('a plain connector: the app\'s status probes neither keep it alive nor rese
     assert.equal(status.supervisor, undefined);
     third.kill('SIGKILL');
   } finally { node.stop(); }
+});
+
+test('teardown: a unit whose manager cannot be reached is still what is installed — nothing is deleted, and it says service.unload-failed', { skip: process.platform !== 'linux' && 'the systemd case' }, async () => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-nobus-'));
+  const dataDir = path.join(home, '.sidevoice');
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(dataDir, 'install.json'), JSON.stringify({ id: '0.6.0', connector: '0.6.0', command: [process.execPath, cli] }), { mode: 0o600 });
+  const unit = path.join(home, '.config', 'systemd', 'user', 'sidevoice-node.service');
+  mkdirSync(path.dirname(unit), { recursive: true });
+  writeFileSync(unit, unitText({ program: [process.execPath, cli, 'connector', '--supervise'], log: path.join(dataDir, 'node-service.log'), environment: {} }));
+  // No user bus: every systemctl --user call fails, as in a container or an SSH session without one.
+  const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), SIDEVOICE_DATA_DIR: dataDir, XDG_DATA_HOME: path.join(home, 'xdg'), SIDEVOICE_SYSTEMCTL: '/bin/false' };
+  delete env.SIDEVOICE_SERVICE_MANAGER;
+  const service = spawnSync(process.execPath, [cli, 'service', 'uninstall', '--json'], { env, encoding: 'utf8' });
+  const answer = JSON.parse(service.stdout.trim().split('\n').at(-1));
+  assert.equal(service.status, 1);
+  assert.equal(answer.error.key, 'service.unload-failed');
+  assert.ok(existsSync(unit), 'the unit is still there');
+  const full = spawnSync(process.execPath, [cli, 'uninstall'], { env, encoding: 'utf8' });
+  assert.equal(full.status, 1);
+  assert.match(full.stderr, /nothing was deleted|untouched/);
+  assert.ok(existsSync(unit) && existsSync(path.join(dataDir, 'install.json')), 'uninstall stopped before deleting anything the unit points at');
 });

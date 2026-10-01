@@ -10,7 +10,7 @@ import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { CORE_VERSION, NO_UV, coreSpec } from '../core.mjs';
+import { CORE_VERSION, NO_UV, coreSpec, runtimeIdentity } from '../core.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const packageDir = path.join(here, '..');
@@ -56,9 +56,11 @@ test('core: the connector installs the pinned core with uv, once, starts it and 
     const facade = ipc(node.socketPath); await facade.ready;
     const joined = await register(facade);
     assert.equal(joined.binding_id, 'core-thread-1', 'the binding is the core\'s, over the loopback link');
-    const venv = path.join(node.dataDir, 'core-runtime', CORE_VERSION, 'venv');
+    // A runtime of its own for this build, never one a core may be running from: nothing to clear.
+    const venv = path.join(node.dataDir, 'core-runtime', runtimeIdentity({ SIDEVOICE_CORE_SPEC: '/wheels/sidevoice_core-' + CORE_VERSION + '-py3-none-any.whl' }).id, 'venv');
+    assert.match(path.basename(path.dirname(venv)), new RegExp(`^${CORE_VERSION.replace(/\./g, '\\.')}-[0-9a-f]{12}$`));
     assert.deepEqual(node.uvCalls(), [
-      ['venv', '--clear', '--python-preference', 'only-managed', '--python', '3.12', venv],
+      ['venv', '--python-preference', 'only-managed', '--python', '3.12', venv],
       ['pip', 'install', '--python', path.join(venv, 'bin', 'python'), '/wheels/sidevoice_core-' + CORE_VERSION + '-py3-none-any.whl'],
     ]);
     const core = node.ready();

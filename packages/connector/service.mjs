@@ -83,13 +83,21 @@ export function serviceEnvironment(kind, env = process.env) {
   return Object.fromEntries([...kept.sort(([a], [b]) => a.localeCompare(b)), ['SIDEVOICE_SERVICE', kind]]);
 }
 
-const xml = text => String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+/** A value that goes into a definition: text with no control character. A newline in a path or a setting would
+ *  start a directive of its own in a unit (an injected `ExecStartPre=`), and has no place in a plist either. */
+function safeValue(text, what) {
+  const value = String(text);
+  if (/[\u0000-\u001f\u007f]/.test(value)) throw keyed('service.unsafe-value', { what });
+  return value;
+}
+const xml = (text, what) => safeValue(text, what).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+const unxml = text => text.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
 
 /** The LaunchAgent. KeepAlive brings the supervisor back whenever it exits (only `bootout` stops it), at most
  *  every 10 s; its output goes to the log it also writes itself. */
 export function plistText({ program, log, environment = {} }) {
-  const strings = items => items.map(item => `    <string>${xml(item)}</string>`).join('\n');
-  const variables = Object.entries(environment).map(([name, value]) => `    <key>${xml(name)}</key>\n    <string>${xml(value)}</string>`).join('\n');
+  const strings = items => items.map(item => `    <string>${xml(item, 'ProgramArguments')}</string>`).join('\n');
+  const variables = Object.entries(environment).map(([name, value]) => `    <key>${xml(name, name)}</key>\n    <string>${xml(value, name)}</string>`).join('\n');
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -111,22 +119,34 @@ ${variables}
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
-  <string>${xml(log)}</string>
+  <string>${xml(log, 'StandardOutPath')}</string>
   <key>StandardErrorPath</key>
-  <string>${xml(log)}</string>
+  <string>${xml(log, 'StandardErrorPath')}</string>
 </dict>
 </plist>
 `;
 }
 
-/** One systemd word: quoted, its quotes and backslashes escaped, and `%`/`$` kept from being specifiers. */
-const systemdWord = text => `"${String(text).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%').replace(/\$/g, '$$$$')}"`;
+/* systemd, one serializer per directive (systemd.service(5), systemd.exec(5), systemd.unit(5)):
+ * - ExecStart= words are quoted; inside, `\\` and `"` are escaped, `%` is a specifier (`%%`) and `$` is variable
+ *   expansion (`$$`);
+ * - Environment= is one quoted `NAME=value`: `\\` and `"` escaped, `%` a specifier — and `$` nothing special, so it
+ *   is written as it is (doubling it there would change the value);
+ * - append: takes a path, where `%` is a specifier.
+ * No value may hold a control character. */
+const execWord = (text, what) => `"${safeValue(text, what).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%').replace(/\$/g, '$$$$')}"`;
+const environmentAssignment = (name, value) => {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw keyed('service.unsafe-value', { what: name });
+  return `"${name}=${safeValue(value, name).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%')}"`;
+};
+const appendPath = text => safeValue(text, 'StandardOutput').replace(/%/g, '%%');
+const unexecWord = word => word.replace(/\\(.)/g, '$1').replace(/%%/g, '%').replace(/\$\$/g, '$');
 
 /** The user unit. Restarted on failure 2 s later, at most 5 starts in 10 minutes (then `start-limit`, which
  *  `service restart` clears); started with the user's manager (`default.target`). */
 export function unitText({ program, log, environment = {} }) {
-  const variables = Object.entries(environment).map(([name, value]) => `Environment=${systemdWord(`${name}=${value}`)}`).join('\n');
-  const file = String(log).replace(/%/g, '%%');
+  const variables = Object.entries(environment).map(([name, value]) => `Environment=${environmentAssignment(name, value)}`).join('\n');
+  const file = appendPath(log);
   return `[Unit]
 Description=Sidevoice node service (the connector supervising this machine's core)
 StartLimitIntervalSec=600
@@ -134,7 +154,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart=${program.map(systemdWord).join(' ')}
+ExecStart=${program.map(word => execWord(word, 'ExecStart')).join(' ')}
 ${variables}
 Restart=on-failure
 RestartSec=2
@@ -146,6 +166,17 @@ StandardError=append:${file}
 [Install]
 WantedBy=default.target
 `;
+}
+
+/** The program a definition on disk runs, read back as its serializer wrote it (the install transaction checks it). */
+export function definitionProgram({ kind, file }) {
+  let text; try { text = readFileSync(file, 'utf8'); } catch { return null; }
+  if (kind === 'launchd') {
+    const block = text.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)?.[1];
+    return block ? [...block.matchAll(/<string>([^<]*)<\/string>/g)].map(match => unxml(match[1])) : null;
+  }
+  const line = text.match(/^ExecStart=(.*)$/m)?.[1];
+  return line ? [...line.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map(match => unexecWord(match[1])) : null;
 }
 
 /** The program the service runs: the selected installation's command, then `connector --supervise`. */
@@ -343,23 +374,15 @@ function startDetached(env) {
 /** `service install`: the definition written from the selected installation, the manager told, the service
  *  started; with no manager, a detached supervisor. Linux says what linger would add. */
 export async function install(env = process.env) {
-  const dataDir = dataDirOf(env), files = nodeFiles(dataDir);
+  const files = nodeFiles(dataDirOf(env));
   const kind = managerKind(env);
-  const release = await takeInstallLock(dataDir);
-  try {
-    const record = readJson(files.install);
-    if (!record?.command) throw keyed('service.no-installation');
-    if (kind !== 'none') {
-      const file = writeDefinition(kind, record, env);
-      if (kind === 'systemd') { manage(env, kind, ['--user', 'daemon-reload']); manage(env, kind, ['--user', 'enable', UNIT]); }
-      // A job loaded from an earlier definition is replaced by this one.
-      if (kind === 'launchd' && loaded(kind, env)) await bootOut(env);
-      void file;
-    }
-    if (record.service !== kind) writePrivate(files.install, { ...record, service: kind });
-  } finally { release(); }
   try { rmSync(files.stopped, { force: true }); } catch {}
-  const started = await start(env, { clear: false });
+  // The definition is part of the installation: written, verified running, or undone, in its transaction.
+  const { transact } = await import('./install-txn.mjs');
+  const result = await transact(env, { keep: true, service: true });
+  if (result.action === 'rollback') throw keyed('install.rollback', {}, { failure: result.failure });
+  const running = await askConnector('node.status', {}, { env });
+  const started = running?.state && running.supervisor ? { ok: true, state: running.state, service: kind } : await start(env, { clear: false });
   return { ...started, ...(kind === 'systemd' ? { linger: linger(env) } : {}) };
 }
 
@@ -498,7 +521,8 @@ export async function uninstall(env = process.env, { keepStopped = false } = {})
 export async function run(argv = [], env = process.env) {
   const [action] = argv.filter(item => !item.startsWith('-'));
   const json = argv.includes('--json');
-  const actions = { install, uninstall, start, stop, restart, status };
+  // `reload` is the node's own: a supervisor handing over to the installation now selected (`connector.mjs`).
+  const actions = { install, uninstall, start, stop, restart, status, reload };
   if (!actions[action]) { console.error(t('service.usage')); return 2; }
   let result;
   try { result = await actions[action](env); }

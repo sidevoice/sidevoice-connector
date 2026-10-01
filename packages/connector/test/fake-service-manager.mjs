@@ -37,9 +37,10 @@ function definition() {
     const pairs = [...text.match(/<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/)[1].matchAll(/<key>([^<]*)<\/key>\s*<string>([^<]*)<\/string>/g)];
     return { program, environment: Object.fromEntries(pairs.map(([, name, value]) => [decode(name), decode(value)])), log: decode(text.match(/<key>StandardErrorPath<\/key>\s*<string>([^<]*)<\/string>/)[1]) };
   }
-  const words = line => [...line.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map(match => match[1].replace(/\\(.)/g, '$1').replace(/%%/g, '%').replace(/\$\$/g, '$'));
-  const program = words(text.match(/^ExecStart=(.*)$/m)[1]);
-  const environment = Object.fromEntries(text.split('\n').filter(line => line.startsWith('Environment=')).map(line => { const [pair] = words(line.slice(12)); const at = pair.indexOf('='); return [pair.slice(0, at), pair.slice(at + 1)]; }));
+  // As systemd reads them: `$$` is a literal `$` in ExecStart= only; Environment= takes `$` as it is.
+  const words = (line, exec) => [...line.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map(match => { const value = match[1].replace(/\\(.)/g, '$1').replace(/%%/g, '%'); return exec ? value.replace(/\$\$/g, '$') : value; });
+  const program = words(text.match(/^ExecStart=(.*)$/m)[1], true);
+  const environment = Object.fromEntries(text.split('\n').filter(line => line.startsWith('Environment=')).map(line => { const [pair] = words(line.slice(12), false); const at = pair.indexOf('='); return [pair.slice(0, at), pair.slice(at + 1)]; }));
   return { program, environment, log: text.match(/^StandardError=append:(.*)$/m)[1] };
 }
 

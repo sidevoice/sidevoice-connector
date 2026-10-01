@@ -22,18 +22,18 @@ import os from 'node:os';
 import path from 'node:path';
 import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, rmSync, statSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { capabilityState, SUPPORTED, voiceEnvelope } from './harness-contract.mjs';
 import { harnessFor } from './harnesses.mjs';
 import { machineIdentity, VERSION } from './identity.mjs';
 import { pair, roomOrigin } from './pair.mjs';
 import { roomLink, UNREACHABLE } from './link.mjs';
-import { CORE_VERSION, NO_UV, awaitReady, coreArgs, coreRunning, coreData, ensureInstalled, ensureRunning, examineRunning, failureCause,
+import { API_RANGE, CORE_VERSION, NO_UV, awaitReady, coreArgs, coreRunning, runsSelected, coreData, ensureInstalled, ensureRunning, examineRunning, failureCause,
   failurePath, installInProgress, roomCredentialPath, spawnCore, takeInstallLock, terminateCore, unlinkSocket } from './core.mjs';
 import { ensureCoreDirectory, localHealth, socketAgent } from './core-socket.mjs';
 import { appendLine } from './logfile.mjs';
 import { Supervisor } from './supervisor.mjs';
-import { pruneInstallations, recover } from './install-txn.mjs';
+import { pruneInstallations, recover, sameCommand, settle } from './install-txn.mjs';
 import { connectorSocketOf, dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
 import { readLock, releaseLock as giveUp, stillHeld, tryLock } from './lockfile.mjs';
 import { isProcess, signalVerified } from './proc.mjs';
@@ -299,7 +299,7 @@ function superviseWith(restored) {
      *  own launch and is the version pinned; anything else running is ended before this one starts its own. */
     async adopt() {
       const found = await examineRunning(dataDir);
-      const fits = found.adopt && (env.SIDEVOICE_CORE_BIN || !found.adopt.version || found.adopt.version === CORE_VERSION);
+      const fits = found.adopt && runsSelected(dataDir, env, found.adopt);
       const leftover = found.terminate || (found.adopt && !fits ? found.adopt : null);
       if (leftover) { log(`a core is running (pid ${leftover.pid}) that this supervisor does not keep: terminating it`); await terminateCore(leftover, { log }); unlinkSocket(dataDir); }
       if (!fits) return null;
@@ -336,6 +336,7 @@ function coreChanged(snapshot) {
   coreError = snapshot.state === 'failed' ? (snapshot.failure?.message || snapshot.failure?.key || 'the core failed') : null;
   if (snapshot.state === 'failed') { lastError = coreError; for (const wake of waking.splice(0)) wake(); }
   if (snapshot.state !== 'running') clearTimeout(pruneTimer);
+  if (pendingJournal && (snapshot.state === 'running' || snapshot.state === 'failed')) settleJournal(snapshot).catch(error => log('settling the install transaction failed: ' + error.message));
   if (snapshot.state !== 'running' || !supervisor?.core) return;
   if (creds?.core?.launch_id === supervisor.core.launch_id) return;
   schedulePrune();
@@ -603,7 +604,7 @@ function scheduleExit() {
   idleTimer = setTimeout(() => { if (engaged() === 0 && bindings.size === 0) { log(`idle for ${idleMs} ms with no conversation; exiting`); shutdown(); } }, idleMs);
 }
 let server = null;
-async function shutdown() {
+async function shutdown(code = 0) {
   if (closed) return;
   log(`shutting down (${bindings.size} binding(s), ${clients.size} façade(s))`);
   closed = true; clearTimeout(idleTimer);
@@ -612,7 +613,56 @@ async function shutdown() {
   // The supervisor's core is its child: it leaves with it (SIGTERM, 15 s, SIGKILL), and its socket after it.
   if (supervisor) await supervisor.stop().catch(error => log('stopping the core failed: ' + error.message));
   releaseLock({ socket: true });
-  process.exit(0);
+  process.exit(code);
+}
+
+/* ----- an install transaction under way, seen from the supervisor (§4.3, `install-txn.mjs`) ----- */
+
+/** The recovered transaction this supervisor runs, while it waits to be seen running: `{side, record}`. */
+let pendingJournal = null;
+/** Recover a journal an installer left (unless an installer holds the lock: then it is the installer's). The
+ *  artifacts are made so for the selected installation; if that is not this program, this supervisor hands over
+ *  to it; if it is, the journal stays until this supervisor's core runs compatibly (`settleJournal`). */
+async function checkInstallJournal() {
+  if (!supervisor || !existsSync(files.journal)) return;
+  const release = await takeInstallLock(dataDir, log, { wait: false });
+  if (!release) return;
+  let outcome = null;
+  try { outcome = await recover(env, { mode: 'supervisor', log }); }
+  catch (error) { log('recovering the install transaction failed (it is kept): ' + error.message); }
+  finally { release(); }
+  if (!outcome) return;
+  if (!outcome.record || !sameCommand(outcome.record.command, ownCommand())) return handOff(outcome.record);
+  pendingJournal = outcome;
+  if (supervisor.state === 'running' || supervisor.state === 'failed') await settleJournal(supervisor.status());
+}
+
+/** This supervisor's core ran (the journal goes) or cannot (back to the previous installation, handed over to). */
+async function settleJournal(snapshot) {
+  const running = snapshot.state === 'running' && Number.isInteger(snapshot.core?.api) && snapshot.core.api >= API_RANGE[0] && snapshot.core.api <= API_RANGE[1];
+  const release = await takeInstallLock(dataDir, log, { wait: false });
+  if (!release) return;
+  let settled;
+  try { settled = await settle(env, { running, failed: snapshot.state === 'failed' }); }
+  finally { release(); }
+  if (settled.outcome === 'done') { pendingJournal = null; log('the installation this supervisor runs is running: the install transaction is complete'); }
+  if (settled.outcome === 'rollback') { pendingJournal = null; await handOff(settled.record); }
+}
+
+/** The selected installation is another program: it takes over. Under a service manager, the definition (already
+ *  rewritten for it) is loaded again by `service reload`, run by a helper outside this job — launchd reads a plist
+ *  only when it is bootstrapped, and booting the job out ends this process. Detached, the selected program is
+ *  started to wait for this one to leave (`--after`). Nothing selected: this supervisor stops. */
+async function handOff(record) {
+  if (!record) { log('no installation is selected any more: stopping'); return shutdown(0); }
+  log(`the selected installation is ${record.id} (${record.command.join(' ')}), not this program: handing over to it`);
+  // Another program's start: what this one spent of the budget is not that one's (as after a person's restart).
+  try { writePrivate(files.restart, { at: new Date().toISOString(), why: 'handover' }); } catch {}
+  const args = serviceKind === 'none' ? ['connector', '--supervise', '--after', String(process.pid)] : ['service', 'reload', '--json'];
+  const child = spawn(record.command[0], [...record.command.slice(1), ...args], { detached: true, stdio: 'ignore', env: { ...env, SIDEVOICE_SERVICE: serviceKind } });
+  child.on('error', error => log('handing over failed: ' + error.message));
+  child.unref();
+  if (serviceKind === 'none') return shutdown(0);
 }
 function releaseLock({ socket }) {
   // The socket is ours to remove only while the lock still is.
@@ -630,15 +680,18 @@ async function nodeStatus() {
       const health = await localHealth(supervisor.core.socket, 1000);
       if (typeof health?.body?.calls === 'number') supervisor.calls = health.body.calls;
     }
-    return { ...supervisor.status(), installed, supervisor: true };
+    return { ...supervisor.status(), installed, supervisor: true, command: ownCommand() };
   }
   const core = creds?.core && !external && coreRunning(creds.core) ? creds.core : null;
   const health = core ? await localHealth(core.socket, 1000) : null;
   const state = core ? 'running' : coreStarting ? 'starting' : coreFailure ? 'failed' : 'stopped';
   return { ok: true, state, since: null, attempts: 0, window_started: null, next_retry_at: null,
     core: core ? { pid: core.pid, version: core.version ?? null, api: health?.body?.api ?? core.api ?? null, launch_id: core.launch_id ?? null } : null,
-    calls: health?.body?.calls ?? 0, failure: core ? null : coreFailure, service: 'none', installed, supervisor: false };
+    calls: health?.body?.calls ?? 0, failure: core ? null : coreFailure, service: 'none', installed, supervisor: false, command: ownCommand() };
 }
+
+/** The program this connector is — what an installation's `command` names when it is this one. */
+const ownCommand = () => [process.execPath, process.argv[1]];
 
 /** `node.restart`: the core stopped and started again — a person's restart, which closes the budget window,
  *  or a pairing written (`sidevoice pair`) that the core must start with. */
@@ -955,6 +1008,9 @@ export async function run(argv = [], environment = process.env) {
 
   // A plain connector gives way to the supervisor; one started in the gap of a takeover (a façade's launcher
   // finding no socket for a moment) is taken over in turn.
+  // Handed over to by another supervisor (`--after <pid>`): that one leaves first.
+  const after = Number(argv[argv.indexOf('--after') + 1]);
+  if (argv.includes('--after')) { const until = Date.now() + 30_000; while (isProcess(after) && Date.now() < until) await wait(100); }
   // Refused, not repaired: a data directory others can write into is not one to serve from (`secure-fs.mjs`).
   try { verifyPrivateDir(dataDir, { create: true }); }
   catch (error) { log(`not starting: ${error.message}`); process.exitCode = 78; return; }
@@ -969,9 +1025,10 @@ export async function run(argv = [], environment = process.env) {
     // A restart a person asked the service manager for closes the window, as one asked of this process would.
     if (existsSync(files.restart)) { supervisor.closeWindow(); try { rmSync(files.restart, { force: true }); } catch {} }
     // An install transaction that died is reconciled before anything runs from it — unless an installer holds
-    // the lock now, which then does it.
-    const release = await takeInstallLock(dataDir, log, { wait: false });
-    if (release) { try { await recover(env, { log }); } catch (error) { log('recovering the install transaction failed: ' + error.message); } finally { release(); } }
+    // the lock now, which then does it. Looked at again while a journal waits.
+    await checkInstallJournal();
+    if (closed) return;
+    setInterval(() => { if (!pendingJournal) checkInstallJournal().catch(() => {}); }, 5000).unref();
   }
   log(`connector ${VERSION} starting${supervised ? ' as the node service (' + serviceKind + ')' : ''}: pid ${process.pid}, host ${hostId}, ${external ? 'core at ' + external.room : 'this machine\'s own core'}, socket ${socketPath}, log ${logPath}`);
   loadOutbox();
