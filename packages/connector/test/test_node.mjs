@@ -403,7 +403,6 @@ test('façade: the supervisor replaced under it — a new voice turn reaches its
     second.kill('SIGTERM');
     await until(() => second.exitCode !== null);
     await wait(1500);
-    if (existsSync(node.socketPath)) { let who = ''; try { const pid = JSON.parse(readFileSync(node.socketPath + '.lock', 'utf8')).pid; who = pid + ' ' + readFileSync('/proc/' + pid + '/cmdline', 'utf8').split('\0').join(' ') + ' env:' + (readFileSync('/proc/' + pid + '/environ', 'utf8').includes('SIDEVOICE_SERVICE=') ? 'svc' : 'plain'); } catch (e) { who = String(e); } console.error('DIAG holder', who, 'stopped-marker:', existsSync(path.join(node.dataDir, 'node-stopped.json')), '\n', readFileSync(path.join(node.dataDir, 'connector.log'), 'utf8').split('\n').slice(-12).join('\n')); }
     assert.equal(existsSync(node.socketPath), false, 'nothing started while stopped');
     // The person starts it again: the conversation is registered again by itself.
     node.start();

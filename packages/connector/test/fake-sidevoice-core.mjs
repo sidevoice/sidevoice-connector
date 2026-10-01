@@ -159,10 +159,13 @@ const queue = [];
 let read = 0, inflight = null;
 const record = (file, entry) => appendFileSync(path.join(data, file), JSON.stringify(entry) + '\n');
 const SETTLED = new Set(['accepted', 'unknown', 'unsupported']);
+// What is settled is settled for good, across launches: the real core's journal is durable, and a core started again
+// never delivers a settled turn a second time.
+const settled = () => { try { return new Set(readFileSync(path.join(data, 'delivered.jsonl'), 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line).frame.event_id)); } catch { return new Set(); } };
 setInterval(() => {
   let lines = [];
   try { lines = readFileSync(path.join(data, 'deliver.jsonl'), 'utf8').split('\n').filter(Boolean); } catch {}
-  for (const line of lines.slice(read)) { read++; queue.push(JSON.parse(line)); }
+  for (const line of lines.slice(read)) { read++; const frame = JSON.parse(line); if (!settled().has(frame.event_id)) queue.push(frame); }
   if (inflight || !queue.length) return;
   const socket = [...namespace.sockets.values()].filter(item => item.connected).at(-1);
   if (!socket) return;
@@ -170,6 +173,7 @@ setInterval(() => {
   const attempt = inflight = { frame, socket };
   record('delivery-attempts.jsonl', { event_id: frame.event_id, at: Date.now() });
   socket.timeout(10_000).emit('input.deliver', frame, (error, answer) => {
+    record('delivery-attempts.jsonl', { event_id: frame.event_id, ack: answer?.status ?? null, error: error?.message ?? null, current: inflight === attempt, at: Date.now() });
     if (inflight !== attempt) return;   // already given back when its connector went away
     inflight = null;
     if (!error && SETTLED.has(answer?.status)) return record('delivered.jsonl', { frame, answer });
@@ -178,6 +182,7 @@ setInterval(() => {
 }, 25).unref();
 namespace.on('connection', socket => socket.on('disconnect', () => {
   if (inflight?.socket !== socket) return;
+  record('delivery-attempts.jsonl', { event_id: inflight.frame.event_id, requeued: 'disconnect', at: Date.now() });
   queue.unshift(inflight.frame); inflight = null;
 }));
 
