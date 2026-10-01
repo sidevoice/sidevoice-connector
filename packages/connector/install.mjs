@@ -31,8 +31,9 @@ import { keyed, t } from './i18n.mjs';
 import { remove as removeSkill, skillsDir, status as skillStatus } from './skill.mjs';
 import { candidate, coreProgram, decide, flipBack, prune, removeLeftovers, removeReleases, selection, stableCommand, stage, switchTo } from './release.mjs';
 import { HARNESS_REGISTRATIONS, codexInstructions, cursorMcpFile, registration, unregisterFromClaude, unregisterFromCursor } from './registrations.mjs';
-import { askConnector, compatibleCore, installedService, linger, managerKind, startJobs, status, stopOnDemand, uninstall as uninstallService, writeDefinitions } from './service.mjs';
+import { askConnector, compatibleCore, installedService, linger, managerKind, settledState, startJobs, status, stopOnDemand, uninstall as uninstallService, writeDefinitions } from './service.mjs';
 import { dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
+import { crash } from './testpoint.mjs';
 
 export { claudeRegistration, codexInstructions, copiesDir, cursorHasOurs, cursorMcpFile, registerWithCursor, serverCommand,
   unregisterFromCursor } from './registrations.mjs';
@@ -100,7 +101,7 @@ async function verify(env, release, kind) {
       const answered = await askConnector('status', {}, { env, timeout: 1500 });
       if (answered?.version === release.connector) return { ok: true };
     }
-    if (last.state === 'service-failed' || (last.state === 'failed' && last.failure?.step !== 'run')) return { ok: false, failure: last.failure };
+    if (settledState(last) && last.state !== 'running') return { ok: false, failure: last.failure };
     await wait(250);
   }
   return { ok: false, failure: last?.failure ?? { key: 'ready.timeout', message: t('ready.timeout') } };
@@ -163,6 +164,7 @@ export async function apply(env, { core = true, service = false, applyNow = fals
       rmSync(files.stopped, { force: true });
       const had = installedService(env);
       const changed = writeDefinitions(kind, env);
+      crash('definitions-written');
       if (!had) await stopOnDemand(env);
       const restart = action !== 'noop' || !(await runsSelection(env, chosen));
       await startJobs(env, { changed, restart });

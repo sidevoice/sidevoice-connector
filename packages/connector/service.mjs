@@ -401,11 +401,19 @@ export async function status(env = process.env, options = {}) {
   return deriveStatus(await observe(env, options));
 }
 
-/** Wait, up to `timeout`, for the core to be past `starting`: what start and restart answer with. */
+/** Whether a status is final for whoever just started the core: running, or a failure that will not change by waiting —
+ *  the manager cannot run the job, or the core reported why it did not start. An exit the manager may follow with a
+ *  start, a health probe unanswered a moment after a restart, a core still starting: not yet. */
+export function settledState(now) {
+  if (now.state === 'failed') return !['run', 'health', 'ready'].includes(now.failure?.step);
+  return !['starting', 'backoff'].includes(now.state);
+}
+
+/** Wait, up to `timeout`, for the core's state to settle: what start and restart answer with. */
 async function settled(env, timeout = SETTLE_MS()) {
   const deadline = Date.now() + timeout;
   let now = await status(env);
-  while (['starting', 'backoff'].includes(now.state) && Date.now() < deadline) { await wait(200); now = await status(env); }
+  while (!settledState(now) && Date.now() < deadline) { await wait(200); now = await status(env); }
   return now;
 }
 
