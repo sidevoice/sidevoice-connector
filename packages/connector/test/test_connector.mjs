@@ -1203,12 +1203,18 @@ test('connector: with the Desktop Bridge on, an editor chat is identified by its
   } finally { if (child.exitCode === null) child.kill(); await fake.close(); await room.close(); }
 });
 
-test('pairing: plaintext only where the token cannot leave the machine or the cluster', async () => {
-  const { privateNetwork, pair } = await import('../pair.mjs');
-  for (const ok of ['127.0.0.1', 'localhost', 'room.voice.svc', 'room.voice.svc.cluster.local', 'room.voice.svc.k8s.example']) assert.equal(privateNetwork(ok), true, ok);
-  for (const no of ['sidevoice.dev.example.invalid', '10.0.0.5', 'sidevoice', 'svc.cluster.local', 'evil.svc.example.com.attacker.net']) assert.equal(privateNetwork(no), false, no);
-  // Refused at pairing, before any code is spent: a plain http room on a name we cannot place.
-  await assert.rejects(pair('http://sidevoice.example', 'ABCD1234', { SIDEVOICE_DATA_DIR: mkdtempSync(path.join(os.tmpdir(), 'sv-')) }), /must be https/);
+test('pairing: plaintext only to loopback and the cluster hosts the operator named', async () => {
+  const { plaintextAllowed, trustedClusterHosts, pair } = await import('../pair.mjs');
+  for (const ok of ['127.0.0.1', 'localhost', 'LOCALHOST', '::1', '[::1]']) assert.equal(plaintextAllowed(ok, {}), true, ok);
+  // No spelling is trusted by default: a service name may be anyone's DNS.
+  for (const no of ['room.example', '10.0.0.5', 'sidevoice', 'room.voice.svc', 'room.voice.svc.cluster.local', 'node.team.svc.example.com', '']) assert.equal(plaintextAllowed(no, {}), false, no);
+  const cluster = { SIDEVOICE_TRUSTED_CLUSTER_HOSTS: ' .svc.cluster.local , room.internal ,, . ' };
+  assert.deepEqual(trustedClusterHosts(cluster), ['.svc.cluster.local', 'room.internal']);
+  for (const ok of ['room.voice.svc.cluster.local', 'Room.Voice.SVC.cluster.local', 'room.internal', 'room.internal.']) assert.equal(plaintextAllowed(ok, cluster), true, ok);
+  for (const no of ['svc.cluster.local', 'evilsvc.cluster.local', 'room.voice.svc.cluster.local.attacker.net', 'a.room.internal', 'node.team.svc.example.com']) assert.equal(plaintextAllowed(no, cluster), false, no);
+  // Refused at pairing, before any code is spent: a plain http room nobody vouched for, a cluster name included.
+  for (const room of ['http://room.example', 'http://room.voice.svc.cluster.local:8080', 'ws://room.example'])
+    await assert.rejects(pair(room, 'ABCD1234', { SIDEVOICE_DATA_DIR: mkdtempSync(path.join(os.tmpdir(), 'sv-')) }), /must be https/, room);
 
   // A machine paired and never yet connected still reads as a machine: it says what it is here too.
   const asked = [];
