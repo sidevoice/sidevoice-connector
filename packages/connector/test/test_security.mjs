@@ -236,3 +236,26 @@ test('legacy: a connector of today\'s main (bare pid in the lock, no handover) s
     void status;
   } finally { if (legacy?.exitCode === null) legacy.kill('SIGKILL'); node.stop(); await room.close(); rmSync(legacyRoot, { recursive: true, force: true }); }
 });
+
+test('lock names: another user cannot work out a lock\'s abstract name — a squatter on the old, guessable name does not keep the connector from starting', { skip: process.platform !== 'linux' && 'abstract sockets are Linux\'s' }, async () => {
+  const { createHash } = await import('node:crypto');
+  const net = (await import('node:net')).default;
+  const { realpathSync, statSync } = await import('node:fs');
+  const node = supervisedNode();
+  mkdirSync(node.dataDir, { recursive: true, mode: 0o700 });
+  // What anyone knowing the path could compute before: uid + the directory + the lock's name.
+  const guessable = kind => `\0sidevoice-${process.getuid()}-${createHash('sha256').update(realpathSync(node.dataDir) + '\0' + (kind === 'connector' ? 'connector.sock.lock' : 'install.lock')).digest('hex').slice(0, 16)}-${kind}`;
+  const squatters = await Promise.all(['connector', 'install'].map(kind => new Promise((resolve, reject) => { const server = net.createServer(); server.once('error', reject); server.listen(guessable(kind), () => resolve(server)); })));
+  try {
+    const child = node.start(['--supervise']);
+    await until(() => existsSync(node.socketPath));
+    assert.equal(lockOf(node).pid, child.pid, 'it starts, holding a name the squatter could not know');
+    await node.status(s => s.state === 'running');
+    const salt = path.join(node.dataDir, 'lock-salt');
+    assert.match(readFileSync(salt, 'utf8'), /^[0-9a-f]{32}$/, '128 random bits');
+    assert.equal(statSync(salt).mode & 0o777, 0o600);
+    // Every process of this user derives the same name: a second starter is still refused.
+    const second = node.start([]);
+    assert.equal(await exited(second), 0);
+  } finally { for (const server of squatters) server.close(); node.stop(); }
+});
