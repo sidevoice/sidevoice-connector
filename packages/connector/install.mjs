@@ -1,11 +1,17 @@
 /** `sidevoice install` — put this version of Sidevoice on this machine and in front of the harnesses on it.
  *
- *  It is one transaction (`install-txn.mjs`, §4.3): the copy and the core staged, checked, committed, the node
- *  restarted on them and rolled back if it does not come up — and a no-op when what is installed is the same or
- *  newer. Then the node service (`service.mjs`) — by default; `--no-service` leaves the core to start on demand —
- *  and the harnesses: each one found, or `--harness`, or none at all with `--no-agents` (the app's install: it
- *  connects agents only when the person picks them). It is safe to run twice: run it again after an upgrade and
- *  every harness of ours points at the new version.
+ *  Under the install lock (§2.4, `release.mjs`): leftovers of a dead installer deleted; this package compared with the
+ *  selection (`decide`: only a higher version, or a later nightly build, replaces it); staged as `R/releases/<id>` with
+ *  its core runtime and both self-checks; a call in progress waited for (unless `--apply-now`); `current` switched; the
+ *  job definitions written if their text changed and the jobs restarted on the new release (`--service`, or jobs
+ *  already defined; with no manager, what runs on demand is stopped); the selection verified within 60 s — the core
+ *  healthy at this release's version and speaking a compatible `api` and link, the connector answering at this
+ *  release's version; on failure `current` flipped back to `previous`, restarted and verified again. A first install
+ *  that fails is left installed and failing, said with the core's own key. Then every release and runtime neither link
+ *  names is pruned. Run again, it verifies the selection and flips back if it does not run: the recovery.
+ *
+ *  Then the harnesses — each one found, or `--harness`, or none with `--no-agents` (the app's install: it connects agents
+ *  only when the person picks them) — registered once, through `R/current`, so an update never touches them.
  *
  *  It pairs with nothing. Pairing is a person's act — the room shows a one-time code to whoever is in it, and a
  *  conversation asks for it the first time it joins — so the installer only reports whether this machine is
@@ -15,48 +21,26 @@
  *  does not own, it never relaxes Claude Code's inbound safeguard, and it never enables Linux lingering —
  *  those it prints, with the reason. Cursor's `mcp.json` is a map keyed by server name: only the `sidevoice`
  *  key is written, and only when it is absent or is one this package wrote. */
-import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { readdirSync, readFileSync, rmSync } from 'node:fs';
 import { harnessesPresent } from './identity.mjs';
 import { pairedRoom } from './pair.mjs';
-import { CORE_VERSION, NO_UV, findUv, readReady } from './core.mjs';
+import { CORE_VERSION, NO_UV, ensureRunning, findUv, readReady, takeInstallLock } from './core.mjs';
 import { keyed, t } from './i18n.mjs';
 import { remove as removeSkill, skillsDir, status as skillStatus } from './skill.mjs';
-import { transact } from './install-txn.mjs';
-import { HARNESS_REGISTRATIONS, candidate, claudeState, codexInstructions, copiesDir, cursorHasOurs, cursorMcpFile, cursorState, fromSource,
-  registerWithClaude, unregisterFromClaude, unregisterFromCursor } from './registrations.mjs';
-import { askConnector, installedService, linger, uninstall as uninstallService, withRecordedPaths } from './service.mjs';
-import { dataDirOf } from './node-files.mjs';
-import { readLock } from './lockfile.mjs';
+import { candidate, coreProgram, decide, flipBack, prune, removeLeftovers, removeReleases, selection, stableCommand, stage, switchTo } from './release.mjs';
+import { HARNESS_REGISTRATIONS, codexInstructions, cursorMcpFile, registration, unregisterFromClaude, unregisterFromCursor } from './registrations.mjs';
+import { askConnector, compatibleCore, installedService, linger, managerKind, startJobs, status, stopOnDemand, uninstall as uninstallService, writeDefinitions } from './service.mjs';
+import { dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
 
 export { claudeRegistration, codexInstructions, copiesDir, cursorHasOurs, cursorMcpFile, registerWithCursor, serverCommand,
   unregisterFromCursor } from './registrations.mjs';
-export { compareVersions, decide, pruneInstallations, recover } from './install-txn.mjs';
+export { compareVersions, decide } from './release.mjs';
 
-/** The connector that holds this machine's socket, if any, and which version it is: a façade uses whatever
- *  connector is running, so one left over from before an upgrade serves every new session with old code. */
-export function runningConnector(env = process.env) {
-  const dataDir = env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
-  const socketPath = env.SIDEVOICE_CONNECTOR_SOCKET || path.join(dataDir, 'connector.sock');
-  const lock = readLock(socketPath + '.lock');
-  if (!lock || lock.unreadable) return null;
-  const pid = lock.pid;
-  return new Promise(resolve => {
-    const socket = net.createConnection(socketPath);
-    const done = value => { clearTimeout(timer); socket.destroy(); resolve(value); };
-    const timer = setTimeout(() => done(null), 1500);
-    let buffer = '';
-    socket.on('error', () => done(null));
-    socket.on('connect', () => socket.write(JSON.stringify({ id: 1, method: 'status', params: {} }) + '\n'));
-    socket.on('data', chunk => {
-      buffer += chunk; const index = buffer.indexOf('\n'); if (index < 0) return;
-      try { const reply = JSON.parse(buffer.slice(0, index)); done({ pid, version: reply.result?.version || null, bindings: reply.result?.bindings?.length ?? null }); }
-      catch { done({ pid, version: null, bindings: null }); }
-    });
-  });
-}
+const VERIFY_MS = () => Number(process.env.SIDEVOICE_INSTALL_VERIFY_MS || 60_000);
+const CALLS_POLL_MS = 2000;
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 export function flag(argv, name) {
   const index = argv.indexOf(name);
@@ -92,7 +76,109 @@ export function inboundWarning(env = process.env) {
   ].join('\n');
 }
 
-const USAGE = 'usage: sidevoice install [--harness claude|codex|cursor] [--no-agents] [--no-service] [--no-core] [--apply-now] [--json]';
+/* ----- verify, flip back (§2.4 steps 6–8) ----- */
+
+/** Step 7: the selection runs — the core healthy at `release`'s core version, speaking a compatible `api` and link, and
+ *  (with jobs) the connector answering at `release`'s version — within `VERIFY_MS`. A failure the core reported, or a
+ *  job its manager will not run, ends the wait at once. With no manager, the core is started on demand from `current`
+ *  (it leaves by itself when unused). `{ok}` or `{ok: false, failure}`. */
+async function verify(env, release, kind) {
+  const dataDir = dataDirOf(env);
+  if (kind === 'none') {
+    try {
+      const ready = await ensureRunning({ dataDir, env, bin: coreProgram(env) });
+      if (ready.version !== release.core) return { ok: false, failure: { key: 'install.not-selected', message: t('install.not-selected', { detail: `core ${ready.version}` }) } };
+      return compatibleCore(ready, ready) ? { ok: true } : { ok: false, failure: { key: 'install.incompatible', message: t('install.incompatible') } };
+    } catch (error) { return { ok: false, failure: error.failure ?? { key: error.key || 'install.verify', message: error.message } }; }
+  }
+  const deadline = Date.now() + VERIFY_MS();
+  let last = null;
+  while (Date.now() < deadline) {
+    last = await status(env);
+    if (last.state === 'running' && last.core?.version === release.core) {
+      if (!compatibleCore(last.core, readReady(dataDir))) return { ok: false, failure: { key: 'install.incompatible', message: t('install.incompatible') } };
+      const answered = await askConnector('status', {}, { env, timeout: 1500 });
+      if (answered?.version === release.connector) return { ok: true };
+    }
+    if (last.state === 'service-failed' || (last.state === 'failed' && last.failure?.step !== 'run')) return { ok: false, failure: last.failure };
+    await wait(250);
+  }
+  return { ok: false, failure: last?.failure ?? { key: 'ready.timeout', message: t('ready.timeout') } };
+}
+
+/** Whether the jobs run the selection already (a re-run finds them on it, or on what ran before a crash). */
+async function runsSelection(env, release) {
+  const now = await status(env);
+  if (now.state !== 'running' || now.core?.version !== release.core) return false;
+  return (await askConnector('status', {}, { env, timeout: 1500 }))?.version === release.connector;
+}
+
+/** Step 6 for whatever is selected now: the jobs restarted on it (with a manager), or what runs on demand stopped. */
+async function restartOn(env, kind) {
+  if (kind === 'none') { await stopOnDemand(env); return; }
+  await startJobs(env, { restart: true });
+}
+
+/** Step 8: back to `previous`, restarted, verified again. Null when there is nothing to go back to. */
+async function goBack(env, kind) {
+  const back = flipBack(env);
+  if (!back) return null;
+  await restartOn(env, kind);
+  return { release: back, ...(await verify(env, back, kind)) };
+}
+
+/** Wait for every call on this machine to end (an update that changes the core would end them). */
+async function callsEnd(env, progress) {
+  let said = false;
+  for (;;) {
+    const now = await status(env);
+    if (!now.calls) return;
+    if (!said) { progress(t('install.progress.calls', { calls: now.calls })); said = true; }
+    await wait(CALLS_POLL_MS);
+  }
+}
+
+/** Steps 1–9 under the install lock. `core: false` (`--no-core`) stages no core: nothing to run, nothing verified.
+ *  Returns `{action: 'install'|'upgrade'|'noop'|'rollback'|'failed', release, from, failure?, back?, kind}`. */
+export async function apply(env, { core = true, service = false, applyNow = false, progress = () => {}, log = () => {} } = {}) {
+  const dataDir = dataDirOf(env), files = nodeFiles(dataDir);
+  const release = await takeInstallLock(dataDir, log);
+  try {
+    removeLeftovers(env);
+    const current = selection(env, 'current')?.release ?? null;
+    const next = candidate(env);
+    const action = decide(current, next);
+    let chosen = current;
+    if (action !== 'noop') {
+      chosen = await stage(env, next, { dataDir, core, log, progress });
+      if (current && !applyNow && current.core_build !== chosen.core_build) await callsEnd(env, progress);
+      switchTo(env, chosen.id);
+    }
+    const command = stableCommand(env);
+    let recorded = null; try { recorded = readJson(files.install); } catch {}
+    if (JSON.stringify(recorded?.command) !== JSON.stringify(command)) writePrivate(files.install, { command });
+    const kind = core && (service || installedService(env)) ? managerKind(env) : 'none';
+    if (!core || !chosen.core_build) { prune(env, dataDir); return { action, release: chosen, from: current, kind: 'none' }; }
+    if (kind !== 'none') {
+      rmSync(files.stopped, { force: true });
+      const had = installedService(env);
+      const changed = writeDefinitions(kind, env);
+      if (!had) await stopOnDemand(env);
+      const restart = action !== 'noop' || !(await runsSelection(env, chosen));
+      await startJobs(env, { changed, restart });
+    } else if (action !== 'noop') await stopOnDemand(env);
+    const verified = action !== 'noop' || kind !== 'none' ? await verify(env, chosen, kind) : { ok: true };
+    if (verified.ok) { prune(env, dataDir); return { action, release: chosen, from: current, kind }; }
+    const back = await goBack(env, kind);
+    if (!back) return { action: 'failed', release: chosen, from: current, failure: verified.failure, kind };
+    if (back.ok) prune(env, dataDir);
+    return { action: 'rollback', release: back.release, from: current, failed: chosen, failure: verified.failure, back: back.ok, backFailure: back.failure ?? null, kind };
+  } finally { release(); }
+}
+
+/* ----- install ----- */
+
+const USAGE = 'usage: sidevoice install [--harness claude|codex|cursor] [--no-agents] [--service] [--no-core] [--apply-now] [--json]';
 
 export async function install(argv = [], env = process.env, { progress = () => {} } = {}) {
   const stray = argv.find(item => !item.startsWith('-') && argv[argv.indexOf(item) - 1] !== '--harness');
@@ -106,54 +192,50 @@ export async function install(argv = [], env = process.env, { progress = () => {
   const externalCore = env.SIDEVOICE_URL && env.SIDEVOICE_CONNECTOR_ID && env.SIDEVOICE_CONNECTOR_TOKEN;
   const core = !argv.includes('--no-core') && !externalCore;
   if (core && !env.SIDEVOICE_CORE_BIN && !findUv(env)) throw new Error(NO_UV);
-  // The node service by default (F3): the manager's where there is one, a detached supervisor where not.
-  const service = core && !argv.includes('--no-service');
-
-  // One transaction: the copy, the core, the service and every registration — the ones the person asked for now
-  // included — committed together, and the result running before anything is said to be installed.
-  const consent = harnesses.filter(name => name in HARNESS_REGISTRATIONS);
-  const result = await transact(env, { core, applyNow: argv.includes('--apply-now'), service, consent, progress });
-  const record = result.record;
+  const result = await apply(env, { core, service: argv.includes('--service'), applyNow: argv.includes('--apply-now'), progress });
+  const record = result.release;
   done.push(t('install.version', { version: candidate(env).connector }));
-  if (result.action === 'rollback' && result.back === false) {
-    throw keyed('install.rollback-failed', { to: candidate(env).id, from: result.from?.id ?? t('install.nothing'), cause: result.failure?.key ?? '?', back: result.backFailure?.key ?? '?' }, { failure: result.failure, result });
-  }
   if (result.action === 'rollback') {
-    throw keyed('install.rollback', { to: candidate(env).id, from: result.from?.id ?? t('install.nothing'), cause: result.failure?.key ?? '?' }, { failure: result.failure, result });
+    const words = { to: result.failed.id, from: result.release.id, cause: result.failure?.key ?? '?', back: result.backFailure?.key ?? '?' };
+    throw keyed(result.back ? 'install.rollback' : 'install.rollback-failed', words, { failure: result.failure, result });
   }
-  done.push(...result.notes);
+  if (result.action === 'failed') throw keyed('install.verify', { cause: result.failure?.key ?? '?' }, { failure: result.failure, result });
   if (result.action === 'noop') done.push(t('install.noop', { id: record.id, channel: record.channel }));
-  else if (record.copy) done.push(t(result.from?.copy && result.from.copy !== record.copy ? 'install.copied-keeping' : 'install.copied', { copy: record.copy, previous: result.from?.id }));
+  else done.push(t('install.selected', { id: record.id, previous: result.from?.id ?? t('install.nothing') }));
   if (!core) done.push(externalCore ? t('install.external-core', { url: env.SIDEVOICE_URL }) : t('install.no-core'));
 
   let serviceStatus = null;
-  if (service) {
-    serviceStatus = await askConnector('node.status', {}, { env });
-    const kind = installedService(env)?.kind ?? 'none';
-    done.push(t(kind === 'none' ? 'install.service-detached' : 'install.service', { state: serviceStatus?.state ?? '?', service: kind }));
-    if (kind === 'systemd') { const lingering = linger(env); if (!lingering.enabled) next.push(`${lingering.reason}\n    ${lingering.command}`); serviceStatus = { ...serviceStatus, linger: lingering }; }
+  if (core) {
+    serviceStatus = await status(env);
+    done.push(t(result.kind === 'none' ? 'install.on-demand' : 'install.service', { state: serviceStatus.state, service: result.kind }));
+    if (result.kind === 'systemd') { const lingering = linger(env); if (!lingering.enabled) next.push(`${lingering.reason}\n    ${lingering.command}`); serviceStatus = { ...serviceStatus, linger: lingering }; }
+    const ready = readReady(dataDirOf(env));
+    if (serviceStatus.reachable && ready) done.push(t('install.core-answering', { version: CORE_VERSION, url: ready.url }));
   }
-  const ready = core ? readReady(dataDirOf(env)) : null;
-  if (ready) done.push(t('install.core-answering', { version: CORE_VERSION, url: ready.url }));
 
-  if (harnesses.includes('claude')) {
-    registerWithClaude(done, env, record);
-    if (claudeState(env).state === 'ours') done.push(t('install.claude-registered'));
-    // The join shortcut is a prompt the server offers; a skill copy from an earlier version is taken away.
-    if (skillStatus(skillsDir([], env)).state === 'installed') done.push(t('install.skill-removed', { target: removeSkill(skillsDir([], env)).target }));
+  // Registered once, through `R/current`: the ones the person asked for now, and ours from before re-pointed there.
+  const selectedRecord = { command: stableCommand(env) };
+  const { command: shown, args } = registration(selectedRecord);
+  for (const [name, operations] of Object.entries(HARNESS_REGISTRATIONS)) {
+    const before = operations.state(env).state;
+    if (!harnesses.includes(name) && before !== 'ours') continue;
+    if (name === 'claude' && before === 'absent' && !operations.reachable(env)) { done.push(t('install.claude-unreachable', { manual: `claude mcp add --scope user sidevoice -- ${[shown, ...args].join(' ')}` })); continue; }
+    let outcome;
+    try { outcome = operations.set(env, selectedRecord); }
+    catch (error) { done.push(t(`install.${name}-failed`, { detail: String(error.message || error).split('\n')[0] })); continue; }
+    if (outcome === 'added' || outcome === 'repointed') done.push(t(`install.${name}-registered`, { file: cursorMcpFile(env) }));
+    else if (outcome === 'foreign') done.push(name === 'claude'
+      ? t('install.claude-foreign', { line: operations.state(env).line, manual: `claude mcp add --scope user sidevoice -- ${[shown, ...args].join(' ')}` })
+      : t('cursor.foreign', { file: cursorMcpFile(env), manual: '' }));
+    else if (outcome === 'invalid') done.push(t('cursor.invalid', { file: cursorMcpFile(env), why: operations.state(env).why, manual: '' }));
   }
-  if (harnesses.includes('cursor') && cursorState(env).state === 'ours') done.push(t('install.cursor-registered', { file: cursorMcpFile(env) }));
+  // The join shortcut is a prompt the server offers; a skill copy from an earlier version is taken away.
+  if (harnesses.includes('claude') && skillStatus(skillsDir([], env)).state === 'installed') done.push(t('install.skill-removed', { target: removeSkill(skillsDir([], env)).target }));
 
   const paired = pairedRoom(env);
   done.push(paired ? `This machine is paired with ${paired.origin} (connector ${paired.connector_id}).`
                    : 'This machine is not paired with any room yet.');
   if (!paired && core) next.push(t('install.route'));
-  const running = await runningConnector(env);
-  if (running && running.version !== record.connector && !service) {
-    next.push(`A connector from ${running.version ? 'version ' + running.version : 'an older version'} is still running (pid ${running.pid}) and every conversation on this machine uses it. ` +
-              `It exits by itself 15 s after the last conversation leaves it; to switch now: kill ${running.pid}, then join again from each conversation.`);
-  }
-
   if (harnesses.includes('claude')) {
     next.push('In a conversation, ask to join the voice room (or run /mcp__sidevoice__voice-room).' +
               (paired ? '' : ' With no room paired it joins this machine only: the Sidevoice app on this computer reaches it once you ask the conversation to pair a device. For a room, give the conversation its address and the code it shows under "Emparejar máquina".'));
@@ -161,59 +243,10 @@ export async function install(argv = [], env = process.env, { progress = () => {
     const warning = inboundWarning(env);
     if (warning) next.push(warning);
   }
-  if (harnesses.includes('codex')) next.push(codexInstructions(env, record));
+  if (harnesses.includes('codex')) next.push(codexInstructions(env, selectedRecord));
   if (harnesses.includes('cursor')) next.push(cursorNotes());
   if (!harnesses.length && !argv.includes('--no-agents')) next.push('No harness found on this machine. Pass --harness claude, --harness codex or --harness cursor.');
   return { done, next, result, service: serviceStatus };
-}
-
-/** `sidevoice uninstall`: the reverse of install, for this machine, in the order that leaves nothing pointing at
- *  what is gone (§4.2 teardown): the node service first — stopped, its supervisor and core gone, its definition
- *  deleted — then our harness registrations, then the copies, then the data. If the service manager will not
- *  unload the service, nothing it still points at is deleted, and it says so. The room keeps this machine's
- *  pairing until it is revoked under "Máquinas" on the room's page — said, with where. Codex's machine-wide
- *  file is, as always, printed and not touched. */
-export async function uninstall(argv = [], env = process.env) {
-  env = withRecordedPaths(env);   // taken apart where it was put, whatever this shell's XDG_* say
-  const wanted = flag(argv, '--harness');
-  const harnesses = wanted ? [wanted] : harnessesPresent(env);
-  const done = [], next = [];
-  try {
-    const service = await uninstallService(env, { keepStopped: true });
-    done.push(t('uninstall.service-removed', { service: service.service }));
-    if (service.note) done.push(service.note);
-  } catch (error) {
-    throw Object.assign(new Error(`${error.message} ${t('uninstall.stopped', { data: dataDirOf(env) })}`), { key: error.key });
-  }
-  if (harnesses.includes('claude')) {
-    unregisterFromClaude(done, next, env);
-    if (skillStatus(skillsDir([], env)).state === 'installed') done.push(`Removed the voice-room skill copy at ${removeSkill(skillsDir([], env)).target}.`);
-  }
-  if (harnesses.includes('cursor')) unregisterFromCursor(done, next, env);
-  if (!fromSource(env) && existsSync(copiesDir(env))) {
-    rmSync(copiesDir(env), { recursive: true, force: true }); done.push(`Removed the installed copies under ${copiesDir(env)}.`);
-    if (!harnesses.includes('cursor') && cursorHasOurs(env)) next.push(`Cursor still lists the sidevoice MCP server in ${cursorMcpFile(env)}, and it now points at nothing: run  sidevoice uninstall --harness cursor , or install again.`);
-  }
-  const dataDir = dataDirOf(env);
-  const paired = pairedRoom(env);
-  if (existsSync(dataDir)) {
-    rmSync(dataDir, { recursive: true, force: true });
-    done.push(`Removed ${dataDir} (credential, socket, outbox, log, the core and its environment).`);
-    if (paired) next.push(`The room at ${paired.origin} still lists this machine as paired (connector ${paired.connector_id}) until you revoke it under "Máquinas" on the room's page.`);
-  }
-  if (harnesses.includes('codex')) next.push(`Remove the [mcp_servers.sidevoice] table from ${env.CODEX_HOME || path.join(os.homedir(), '.codex')}/config.toml — it is machine-wide and this package does not rewrite it.`);
-  next.push('Sessions already open keep their MCP server until they end.');
-  return { done, next };
-}
-
-/** `sidevoice uninstall`. */
-export async function runUninstall(argv = [], env = process.env) {
-  try {
-    const { done, next } = await uninstall(argv, env);
-    for (const line of done) console.log('· ' + line);
-    if (next.length) { console.log('\nLeft for you:'); for (const line of next) console.log('\n' + line); }
-    return 0;
-  } catch (error) { console.error(error.message); return 1; }
 }
 
 /** `sidevoice install [--json]`: with `--json`, one object for the app — progress goes to stderr then. */
@@ -222,8 +255,8 @@ export async function runInstall(argv = [], env = process.env) {
   try {
     const { done, next, result, service } = await install(argv.filter(item => item !== '--json'), env, { progress: line => (json ? console.error(line) : console.log(line)) });
     if (json) {
-      console.log(JSON.stringify({ ok: true, action: result.action, installed: result.record.id, connector: result.record.connector, core: result.record.core,
-        channel: result.record.channel, command: result.record.command, service: service?.service ?? 'none', state: service?.state ?? null,
+      console.log(JSON.stringify({ ok: true, action: result.action, installed: result.release.id, connector: result.release.connector, core: result.release.core,
+        channel: result.release.channel, command: stableCommand(env), service: result.kind, state: service?.state ?? null,
         ...(service?.linger ? { linger: service.linger } : {}) }));
       return 0;
     }
@@ -235,6 +268,92 @@ export async function runInstall(argv = [], env = process.env) {
     return 0;
   } catch (error) {
     if (json) console.log(JSON.stringify({ ok: false, error: { key: error.key || 'install.failed', message: error.message }, ...(error.failure ? { failure: error.failure } : {}) }));
+    else console.error(error.message);
+    return 1;
+  }
+}
+
+/** `sidevoice rollback [--json]`: `current` back to `previous` (§2.4 step 8 alone), the jobs restarted on it and verified. */
+export async function rollback(env = process.env) {
+  const dataDir = dataDirOf(env);
+  const release = await takeInstallLock(dataDir);
+  try {
+    const kind = installedService(env) ? managerKind(env) : 'none';
+    const from = selection(env, 'current')?.release ?? null;
+    const back = await goBack(env, kind);
+    if (!back) throw keyed('install.no-previous');
+    if (!back.ok) throw keyed('install.rollback-failed', { to: from?.id ?? '?', from: back.release.id, cause: 'rollback', back: back.failure?.key ?? '?' }, { failure: back.failure });
+    return { ok: true, action: 'rollback', installed: back.release.id, from: from?.id ?? null, service: kind };
+  } finally { release(); }
+}
+export async function runRollback(argv = [], env = process.env) {
+  const json = argv.includes('--json');
+  try {
+    const result = await rollback(env);
+    console.log(json ? JSON.stringify(result) : t('install.rolled-back', { id: result.installed, from: result.from ?? t('install.nothing') }));
+    return 0;
+  } catch (error) {
+    if (json) console.log(JSON.stringify({ ok: false, error: { key: error.key || 'install.failed', message: error.message }, ...(error.failure ? { failure: error.failure } : {}) }));
+    else console.error(error.message);
+    return 1;
+  }
+}
+
+/* ----- uninstall (§2.5) ----- */
+
+/** `sidevoice uninstall`: the reverse of install, in the order that leaves nothing pointing at what is gone — under the
+ *  install lock, the stop written, both jobs unloaded (a refusal stops everything here: nothing deleted), what runs on
+ *  demand stopped, the definitions deleted (`service.mjs`); then our harness registrations; then the releases (`R`) and
+ *  the data directory — all of it but the two lock files, which are permanent (SEAMS §1). The room keeps this machine's
+ *  pairing until it is revoked under "Máquinas" on the room's page — said, with where. Codex's machine-wide file is, as
+ *  always, printed and not touched. */
+export async function uninstall(argv = [], env = process.env) {
+  const wanted = flag(argv, '--harness');
+  const harnesses = wanted ? [wanted] : [...new Set([...Object.keys(HARNESS_REGISTRATIONS), ...harnessesPresent(env)])];
+  const done = [], next = [];
+  const dataDir = dataDirOf(env);
+  const release = await takeInstallLock(dataDir);
+  try {
+    try {
+      const service = await uninstallService(env, { keepStopped: true });
+      done.push(t('uninstall.service-removed', { service: service.service }));
+      if (service.note) done.push(service.note);
+    } catch (error) {
+      throw Object.assign(new Error(`${error.message} ${t('uninstall.stopped', { data: dataDir })}`), { key: error.key });
+    }
+    if (harnesses.includes('claude')) {
+      unregisterFromClaude(done, next, env);
+      if (skillStatus(skillsDir([], env)).state === 'installed') done.push(`Removed the voice-room skill copy at ${removeSkill(skillsDir([], env)).target}.`);
+    }
+    if (harnesses.includes('cursor')) unregisterFromCursor(done, next, env);
+    removeReleases(env);
+    done.push(t('uninstall.releases-removed', { root: path.dirname(path.dirname(stableCommand(env)[1])) }));
+    const paired = pairedRoom(env);
+    const kept = new Set(['install.lock', 'connector.lock']);
+    let entries = [];
+    try { entries = readdirSync(dataDir); } catch {}
+    for (const name of entries) if (!kept.has(name)) rmSync(path.join(dataDir, name), { recursive: true, force: true });
+    if (entries.length) {
+      done.push(`Removed what was in ${dataDir} (credential, socket, outbox, logs, the core and its environment).`);
+      if (paired) next.push(`The room at ${paired.origin} still lists this machine as paired (connector ${paired.connector_id}) until you revoke it under "Máquinas" on the room's page.`);
+    }
+  } finally { release(); }
+  if (harnesses.includes('codex')) next.push(`Remove the [mcp_servers.sidevoice] table from ${env.CODEX_HOME || path.join(os.homedir(), '.codex')}/config.toml — it is machine-wide and this package does not rewrite it.`);
+  next.push('Sessions already open keep their MCP server until they end.');
+  return { done, next };
+}
+
+/** `sidevoice uninstall [--json]`. */
+export async function runUninstall(argv = [], env = process.env) {
+  const json = argv.includes('--json');
+  try {
+    const { done, next } = await uninstall(argv.filter(item => item !== '--json'), env);
+    if (json) { console.log(JSON.stringify({ ok: true, state: 'absent' })); return 0; }
+    for (const line of done) console.log('· ' + line);
+    if (next.length) { console.log('\nLeft for you:'); for (const line of next) console.log('\n' + line); }
+    return 0;
+  } catch (error) {
+    if (json) console.log(JSON.stringify({ ok: false, error: { key: error.key || 'uninstall.failed', message: error.message } }));
     else console.error(error.message);
     return 1;
   }

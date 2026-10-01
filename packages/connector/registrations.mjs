@@ -1,56 +1,28 @@
-/** Our MCP server in each harness, and the installation it runs: what `install` registers, what an install
- *  transaction re-points (§4.3), and what `uninstall` takes out — only ever Sidevoice's own entries.
+/** Our MCP server in each harness, and the installation it runs: what `install` registers and what `uninstall` takes
+ *  out — only ever Sidevoice's own entries.
  *
- *  An installation is a record (`install.json`, SEAMS §1): its `command`, the absolute argv prefix that runs this
- *  package's CLI — R1 `node <copy>/dist/cli.mjs`, or a checkout's `cli.mjs`; R4 the single executable — and what
- *  it is (`connector`, `core`, `channel`, `build_seq`). A harness is given that command with `mcp`. */
+ *  An installation is run by one command (`install.json`, SEAMS §1): R1 `node R/current/dist/cli.mjs`, R4 the single
+ *  executable `R/current/sidevoice` — a path through `R/current` (`release.mjs`), so a registration is written once,
+ *  when the person consents, and an update never touches it. A harness is given that command with `mcp`. */
 import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { CORE_VERSION } from './core.mjs';
 import { dataDirOf, nodeFiles, readJson } from './node-files.mjs';
 import { t } from './i18n.mjs';
 import { crash } from './testpoint.mjs';
+import { releaseRoot, stableCommand } from './release.mjs';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-/** Where the package's own root is: next to these modules in the checkout, and one level up once
- *  they have been bundled into `dist/`. Only copying needs to know — everything else reads the
- *  `package.json` beside it, which the build puts there precisely so that this stays the one
- *  place that has to tell the two apart. */
-const packageRoot = () => (existsSync(path.join(here, '..', 'package.json')) ? path.dirname(here) : here);
-let manifestCache = null;
-const manifest = () => (manifestCache ??= JSON.parse(readFileSync(path.join(here, 'package.json'), 'utf8')));
-
-export function fromSource(env = process.env) {
-  if (env.SIDEVOICE_INSTALL_FROM_SOURCE === '0') return false;
-  return env.SIDEVOICE_INSTALL_FROM_SOURCE === '1' || existsSync(path.join(packageRoot(), '..', '..', '.git'));
-}
-
-/** Where installed copies live: one directory per installation, under the XDG data home. */
+/** Where installations live (`R`): `$XDG_DATA_HOME/sidevoice`. */
 export function copiesDir(env = process.env) {
-  return path.join(env.XDG_DATA_HOME || path.join(env.HOME || os.homedir(), '.local', 'share'), 'sidevoice');
+  return releaseRoot(env);
 }
 
-/** The installation this package would make: its version, its channel and build (`sidevoice` in the manifest,
- *  stamped by CI; a checkout's is `source`), the copy it would live in and the command that runs it. A nightly
- *  is its own directory (`<version>-nightly.<build_seq>`): it carries the version of the last release. */
-export function candidate(env = process.env) {
-  const { version, sidevoice = {}, bin } = manifest();
-  const source = fromSource(env);
-  const channel = source ? 'source' : sidevoice.channel || 'release';
-  const build_seq = Number(sidevoice.build_seq) || 0;
-  const id = channel === 'nightly' ? `${version}-nightly.${build_seq}` : version;
-  const copy = source ? null : path.join(copiesDir(env), id);
-  const cli = source ? path.join(here, 'cli.mjs') : path.join(copy, bin.sidevoice.replace(/^\.\//, ''));
-  return { id, connector: version, core: CORE_VERSION, channel, build_seq, sha256: null,
-    runtime: env.SIDEVOICE_CORE_BIN ? 'external' : 'uv', copy, command: [process.execPath, cli] };
-}
-
-/** The selected installation (`install.json`), or — nothing installed yet — the one this package would make. */
+/** The installation as `install.json` records it — or, nothing installed yet, the one an install would record. */
 export function selected(env = process.env) {
-  return readJson(nodeFiles(dataDirOf(env)).install) || candidate(env);
+  let record = null;
+  try { record = readJson(nodeFiles(dataDirOf(env)).install); } catch {}
+  return Array.isArray(record?.command) && record.command.length ? record : { command: stableCommand(env) };
 }
 
 /** What a harness runs for an installation: R1 `node <cli.mjs> mcp` — `node` from the harness's own PATH, as
@@ -60,51 +32,28 @@ export function registration(record) {
   return cli ? { command: 'node', args: [cli, 'mcp'] } : { command: program, args: ['mcp'] };
 }
 
-/** What a harness should run to start the server. From a checkout it names that checkout, so a machine that
- *  installed from source keeps working when the published version moves. Otherwise it names a copy of this
- *  package that install placed on disk — never `npx`: a session start is not the moment to resolve a package
- *  (a cold cache, a bin whose name differs from the package's, a 30 s startup budget; one session found no
- *  `sidevoice` binary at all, 2026-09-21). */
+/** What a harness should run to start the server: the installation's command — never `npx`: a session start is not
+ *  the moment to resolve a package (a cold cache, a bin whose name differs from the package's, a 30 s startup budget;
+ *  one session found no `sidevoice` binary at all, 2026-09-21). */
 export function serverCommand(env = process.env, record = selected(env)) {
   return registration(record);
 }
 
-/** This package's files, copied as they are — no install step, nothing fetched — to `<copy>.staging`; the
- *  commit renames it into place (`install-txn.mjs`). */
-export function stageCopy(record) {
-  if (!record.copy) return null;
-  const staging = record.copy + '.staging';
-  rmSync(staging, { recursive: true, force: true });
-  mkdirSync(staging, { recursive: true });
-  for (const file of manifest().files.concat('package.json')) {
-    const source = path.join(packageRoot(), file);
-    if (existsSync(source)) cpSync(source, path.join(staging, file), { recursive: true });
-  }
-  return staging;
-}
-
 /* ----- what is ours ----- */
 
-/** The installation roots and recorded commands Sidevoice wrote: every copy directory under `copiesDir`, and the
- *  CLI or executable of each installation a record names (`install.json`, and both sides of a transaction under
- *  way — a checkout's `cli.mjs` is ours only because a record says it was installed). */
-function recordedPrograms(env) {
-  const files = nodeFiles(dataDirOf(env));
-  const records = [readJsonQuiet(files.install), ...(() => { const journal = readJsonQuiet(files.journal); return journal ? [journal.from, journal.to] : []; })()];
-  return new Set(records.filter(Boolean).map(record => record.command?.[1] || record.command?.[0]).filter(Boolean));
-}
-const readJsonQuiet = file => { try { return readJson(file); } catch { return null; } };
-
-/** Whether this program (a CLI path run by node, or an executable) is one of ours. */
+/** Whether this program (a CLI path run by node, or an executable) is one of ours: under `R` — through `current`, in a
+ *  release, or in a copy an earlier version made (`R/<id>`) — or the program `install.json` records. */
 export function ourProgram(program, env = process.env) {
   if (!program || !path.isAbsolute(program)) return false;
   const root = copiesDir(env) + path.sep;
   if (program.startsWith(root)) {
-    const rest = program.slice(root.length).split(path.sep);
-    // <copiesDir>/<id>/dist/cli.mjs (R1) or <copiesDir>/<id>/sidevoice (R4); an id is one path segment.
+    let rest = program.slice(root.length).split(path.sep);
+    if (rest[0] === 'releases') rest = rest.slice(1);
+    // <R>/{current|releases/<id>|<id>}/dist/cli.mjs (R1) or …/sidevoice (R4); an id is one path segment.
     if ((rest.length === 3 && rest[1] === 'dist' && rest[2] === 'cli.mjs') || (rest.length === 2 && rest[1] === 'sidevoice')) return /^[\w.+-]+$/.test(rest[0]);
   }
-  return recordedPrograms(env).has(program);
+  let record = null; try { record = readJson(nodeFiles(dataDirOf(env)).install); } catch {}
+  return !!record?.command && (record.command[1] || record.command[0]) === program;
 }
 
 /** Whether a harness entry `{command, args}` runs one of ours as `mcp` — or is the package itself through npx. */
