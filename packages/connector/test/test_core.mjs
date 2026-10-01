@@ -466,3 +466,35 @@ test('supervise: a SIGKILLed supervisor leaves its core running — the next one
     assert.ok(replaced.core.launch_id);
   } finally { node.stop(); }
 });
+
+/** The real core (R1-a) when a checkout of it is at hand — `SIDEVOICE_INTEROP_CORE_DIR`, or a `core` checkout beside
+ *  this repository — with its environment in `.venv`; skipped otherwise. */
+const interopCore = process.env.SIDEVOICE_INTEROP_CORE_DIR || path.join(packageDir, '..', '..', '..', 'core');
+const interopPython = path.join(interopCore, '.venv', 'bin', 'python');
+test('interop: the supervisor runs the real core — ready by launch id and health on its socket, linked there with no Origin, a binding and a device code from it', { skip: !existsSync(interopPython) && `no core checkout with a .venv at ${interopCore}` }, async () => {
+  const tools = mkdtempSync(path.join(os.tmpdir(), 'sv-real-'));
+  const bin = path.join(tools, 'sidevoice-core');
+  writeFileSync(bin, `#!/bin/sh\nexec "${interopPython}" -m sidevoice_core.server "$@"\n`, { mode: 0o755 });
+  const node = supervisedNode({ env: { SIDEVOICE_CORE_BIN: bin, SIDEVOICE_PROBE_MS: '2000', SIDEVOICE_CORE_STOP_GRACE_MS: '15000' } });
+  try {
+    const supervisor = node.start();
+    const running = await node.status(s => s.state === 'running' || s.state === 'failed', 90_000);
+    assert.equal(running.state, 'running', JSON.stringify(running.failure));
+    assert.equal(running.core.api, 1);
+    assert.equal(running.core.launch_id, node.ready().launch_id);
+    assert.equal(node.ready().socket, path.join(node.dataDir, 'core', 'local.sock'));
+    const facade = ipc(node.socketPath); await facade.ready;
+    const joined = await register(facade, 'interop-thread');
+    assert.ok(joined.binding_id && !joined.binding_id.startsWith('local-'), `the core minted the binding (${joined.binding_id})`);
+    const code = await facade.call('pair_device', {});
+    assert.match(code.code, /^SV1\./, 'a device code, which only the link on the socket can ask for');
+    // The link is not on TCP any more: the same path there is not found.
+    const tcp = await fetch(new URL('/api/connectors/link/?EIO=4&transport=polling', node.ready().url)).then(response => response.status).catch(() => null);
+    assert.equal(tcp, 404);
+    facade.end();
+    supervisor.kill('SIGTERM');
+    await until(() => supervisor.exitCode !== null, 30_000);
+    assert.equal(coreGone(running.core.pid), true, 'the core left with its supervisor');
+  } finally { node.stop(); }
+});
+const coreGone = pid => { try { process.kill(pid, 0); return false; } catch { return true; } };
