@@ -78,9 +78,16 @@ function manage(env, kind, args) {
  *  with (a data dir, a core named by hand…) — never a credential of a core somebody else runs — and which
  *  manager runs it, which `node.status` reports. */
 export function serviceEnvironment(kind, env = process.env) {
+  return { ...installationSettings(env), SIDEVOICE_SERVICE: kind };
+}
+
+/** The `SIDEVOICE_*` settings an installation is made with — recorded in it (`install.json`), so its service runs
+ *  with them whoever writes its definition later (a rollback is written by the other installation's process) — never
+ *  a credential of a core somebody else runs, nor a test's hooks. */
+export function installationSettings(env = process.env) {
   const kept = Object.entries(env).filter(([name]) => name.startsWith('SIDEVOICE_')
-    && !['SIDEVOICE_URL', 'SIDEVOICE_CONNECTOR_ID', 'SIDEVOICE_CONNECTOR_TOKEN', 'SIDEVOICE_SERVICE'].includes(name));
-  return Object.fromEntries([...kept.sort(([a], [b]) => a.localeCompare(b)), ['SIDEVOICE_SERVICE', kind]]);
+    && !['SIDEVOICE_URL', 'SIDEVOICE_CONNECTOR_ID', 'SIDEVOICE_CONNECTOR_TOKEN', 'SIDEVOICE_SERVICE', 'SIDEVOICE_TEST_HOOKS'].includes(name));
+  return Object.fromEntries(kept.sort(([a], [b]) => a.localeCompare(b)));
 }
 
 /** A value that goes into a definition: text with no control character. A newline in a path or a setting would
@@ -190,7 +197,9 @@ export function writeDefinition(kind, record, env = process.env) {
   const file = definitionPath(kind, env);
   if (!file) return null;
   const dataDir = dataDirOf(env);
-  const spec = { program: serviceProgram(record), log: nodeFiles(dataDir).serviceLog, environment: serviceEnvironment(kind, env) };
+  // The installation's own settings when it recorded them; else this process's.
+  const environment = record.settings ? { ...record.settings, SIDEVOICE_SERVICE: kind } : serviceEnvironment(kind, env);
+  const spec = { program: serviceProgram(record), log: nodeFiles(dataDir).serviceLog, environment };
   writePrivate(file, kind === 'launchd' ? plistText(spec) : unitText(spec));
   return file;
 }

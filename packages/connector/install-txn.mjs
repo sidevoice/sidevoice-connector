@@ -34,7 +34,7 @@ import { keyed, t } from './i18n.mjs';
 import { connectorClient } from './ipc.mjs';
 import { dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
 import { HARNESS_REGISTRATIONS, candidate, copiesDir, registration, stageCopy } from './registrations.mjs';
-import { askConnector, definitionProgram, installedService, managerKind, reload, stopNode, uninstall as removeService, writeDefinition } from './service.mjs';
+import { askConnector, definitionProgram, installationSettings, installedService, managerKind, reload, stopNode, uninstall as removeService, writeDefinition } from './service.mjs';
 import { crash, pause } from './testpoint.mjs';
 
 const VERIFY_MS = Number(process.env.SIDEVOICE_INSTALL_VERIFY_MS || 60_000);
@@ -285,7 +285,7 @@ export async function transact(env, { core = true, applyNow = false, by = env.SI
     await recover(env, { mode: core ? 'installer' : 'artifacts', log });
     const current = readJson(files.install);   // the selection, read again under the lock
     if (keep && !current) throw keyed('service.no-installation');
-    const fresh = { ...candidate(env), by, at: new Date().toISOString() };
+    const fresh = { ...candidate(env), by, at: new Date().toISOString(), settings: installationSettings(env) };
     const action = keep ? 'noop' : decide(current, fresh);
     let next = action === 'noop' ? current : fresh;
     if (action !== 'noop') {

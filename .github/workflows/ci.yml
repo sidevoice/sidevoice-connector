@@ -138,6 +138,11 @@ jobs:
           echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
       - run: systemctl --user show-environment >/dev/null && systemctl --user is-system-running || true
       - run: node packages/connector/test/service-integration.mjs
+      # The supervisor's hand-off under the manager: an installer killed right after committing a new selection; the
+      # supervisor running the old one hands over through 'service reload' and the manager ends up running the new one —
+      # and a selection whose core cannot serve is rolled back, under the manager, to the one before.
+      - name: Hand-off to a new selection, and its rollback, under the manager
+        run: node packages/connector/test/service-handoff.mjs
 
   service-macos:
     name: Node service (launchd)
@@ -157,6 +162,11 @@ jobs:
       - name: Kernel-held locks on macOS
         run: node --test --test-name-pattern="^lock|install lock" packages/connector/test/test_security.mjs
       - run: node packages/connector/test/service-integration.mjs
+      # The supervisor's hand-off under the manager: an installer killed right after committing a new selection; the
+      # supervisor running the old one hands over through 'service reload' and the manager ends up running the new one —
+      # and a selection whose core cannot serve is rolled back, under the manager, to the one before.
+      - name: Hand-off to a new selection, and its rollback, under the manager
+        run: node packages/connector/test/service-handoff.mjs
 
   package:
     name: npm tarball with the core inside
