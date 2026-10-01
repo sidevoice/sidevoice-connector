@@ -133,7 +133,7 @@ test('concurrent installers — two genuinely built packages, the app\'s and npx
   const older = builtAs('0.6.0', { SIDEVOICE_CHANNEL: 'nightly', SIDEVOICE_BUILD_SEQ: '10' }), newer = builtAs('0.6.0', { SIDEVOICE_CHANNEL: 'nightly', SIDEVOICE_BUILD_SEQ: '12' });
   assert.deepEqual(JSON.parse(readFileSync(path.join(path.dirname(newer), 'package.json'), 'utf8')).sidevoice, { channel: 'nightly', build_seq: 12 }, 'stamped into the shipped manifest');
   await Promise.all([older, newer].map(cli => new Promise(resolve => spawn(process.execPath, [cli, 'install', '--no-agents', '--no-core', '--json'], { env: two.env, stdio: 'ignore' }).on('exit', resolve))));
-  assert.equal(realpathSync(path.join(two.R, 'current')), path.join(realpathSync(two.R), 'releases', '0.6.0-nightly.12'), 'a nightly build is a release of its own');
+  assert.equal(realpathSync(path.join(two.R, 'current')), path.join(realpathSync(two.R), 'releases', '0.6.0-nightly.12-nocore'), 'a nightly build is a release of its own');
   assert.equal(two.run(older, ['install', '--no-agents', '--no-core']).answer.action, 'noop');
   assert.equal(two.run(newer, ['install', '--no-agents', '--no-core']).answer.action, 'noop');
 });
@@ -311,5 +311,19 @@ test('blocker 5: the rollback target is the last verified release — A runs, B 
     assert.deepEqual([node.selected('current'), node.selected('previous'), node.selected('verified')], ['0.6.81', '0.6.81', '0.6.81']);
     assert.equal(node.status().state, 'running');
     assert.deepEqual(node.releases(), ['0.6.81'], 'B and C pruned; A kept');
+  } finally { node.stop(); }
+});
+
+test('blocker 6: a release installed without its core does not satisfy an install that needs one — a complete one is staged, and the jobs run it', async () => {
+  const node = machine();
+  const cli = builtAs('0.6.81');
+  try {
+    const coreless = node.install(cli, coreWrapper(), ['--no-agents', '--no-core']);
+    assert.deepEqual([coreless.status, coreless.answer.installed], [0, '0.6.81-nocore']);
+    const full = node.install(cli, coreWrapper(), ['--no-agents', '--service']);
+    assert.deepEqual([full.status, full.answer.action, full.answer.installed, full.answer.service, full.answer.state], [0, 'upgrade', '0.6.81', 'systemd', 'running'], JSON.stringify(full.answer));
+    assert.ok(existsSync(path.join(node.home, '.config', 'systemd', 'user', 'sidevoice-core.service')));
+    // And a coreless install afterwards changes nothing.
+    assert.equal(node.install(cli, coreWrapper(), ['--no-agents', '--no-core']).answer.action, 'noop');
   } finally { node.stop(); }
 });

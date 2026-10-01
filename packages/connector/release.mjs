@@ -81,7 +81,7 @@ export function compareVersions(a, b) {
  *  with no higher build). A checkout is its own channel: installing from one selects it. */
 export function decide(current, next) {
   if (!current) return 'install';
-  if (next.channel === 'source' || current.channel === 'source') return current.id === next.id && current.source === next.source ? 'noop' : 'upgrade';
+  if (next.channel === 'source' || current.channel === 'source') return current.source === next.source && current.connector === next.connector ? 'noop' : 'upgrade';
   const order = compareVersions(next.connector, current.connector);
   if (order > 0) return 'upgrade';
   if (order < 0) return 'noop';

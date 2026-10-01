@@ -1342,18 +1342,18 @@ esac
   assert.deepEqual(changes(), [`mcp add --scope user sidevoice -- ${wanted}`], 'nothing registered: it registers this version');
   assert.equal(line(), wanted);
   assert.match(first.done.join('\n'), /Registered the MCP server/);
-  assert.match(first.done.join('\n'), new RegExp(`now runs ${version.replace(/\./g, '\\.')}`));
+  assert.match(first.done.join('\n'), new RegExp(`now runs ${version.replace(/\./g, '\\.')}-nocore`));
   // The copy is what the package ships and nothing more: the bundle, the manifest beside it, and
   // no step of its own — nothing is fetched, built or resolved on the machine being installed on.
   // That the bundle then runs is proved where it is run for real, in the room's interop test.
   for (const file of manifest.files.concat('package.json')) {
-    assert.ok(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', 'releases', version, file)),
+    assert.ok(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', 'releases', `${version}-nocore`, file)),
       `${file} is in the copy (the bundle is built: npm run build -w @sidevoice/uplink)`);
   }
-  assert.equal(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', 'releases', version, 'node_modules')), false);
+  assert.equal(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', 'releases', `${version}-nocore`, 'node_modules')), false);
   // A release neither current nor previous names is pruned (§2.4 step 9); the selected one is not.
   assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', 'releases', '0.0.1')), 'pruned');
-  assert.ok(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', 'releases', version, 'release.json')), 'the selected one stays');
+  assert.ok(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', 'releases', `${version}-nocore`, 'release.json')), 'the selected one stays');
   assert.match(first.done.join('\n'), /not paired with any room yet/);
   assert.match(first.next.join('\n'), /Emparejar máquina/, 'and it says the conversation will ask for the code');
   assert.ok(!existsSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room')), 'no skill is installed: the server carries the prompt');

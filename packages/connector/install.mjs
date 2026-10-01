@@ -152,8 +152,11 @@ export async function apply(env, { core = true, service = false, applyNow = fals
     // An explicit install is a person's start: a stop (or the one an uninstall left) no longer holds.
     rmSync(files.stopped, { force: true });
     const current = selection(env, 'current')?.release ?? null;
-    const next = candidate(env);
-    const action = decide(current, next);
+    // A release without a core (`--no-core`) is one of its own, and does not satisfy an install that needs the core:
+    // that one stages a complete release instead.
+    const next = { ...candidate(env), ...(core ? {} : { id: `${candidate(env).id}-nocore` }) };
+    let action = decide(current, next);
+    if (action === 'noop' && core && current && !current.core_build) action = 'upgrade';
     let chosen = current;
     if (action !== 'noop') {
       chosen = await stage(env, next, { dataDir, core, log, progress });
