@@ -26,7 +26,7 @@ export function stoppedByPerson(env = process.env) {
 /** A connection to this machine's connector, getting one started the only way allowed. `connect()` tries the
  *  socket once; `self` is the argv prefix that runs this package's CLI (a plain connector is `self + connector`). */
 export async function launch({ connect, self, env = process.env }) {
-  try { return await connect(); } catch {}
+  try { return await connect(); } catch (error) { if (error.unsafe) throw error; }
   if (stoppedByPerson(env)) throw keyed('node.stopped');
   const service = installedService(env);
   if (service) {

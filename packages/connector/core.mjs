@@ -27,6 +27,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ensureCoreDirectory, localHealth } from './core-socket.mjs';
+import { lockStale, readLock, stillHeld, tryLock } from './lockfile.mjs';
+import { isProcess, signalVerified } from './proc.mjs';
+import { verifyPrivateDir } from './secure-fs.mjs';
 import { keyed } from './i18n.mjs';
 import { rotate } from './logfile.mjs';
 
@@ -123,34 +126,41 @@ function run(command, args, { log, env, progress = () => {} }) {
   });
 }
 
-/** Who is installing right now, if anyone: `sidevoice install` (its whole transaction, `install.mjs`) and a
+/** Who is installing right now, if anyone: `sidevoice install` (its whole transaction, `install-txn.mjs`) and a
  *  connector installing its core share one data dir, and two uv runs into one environment break it. One lock,
- *  `install.lock`, a file with the holder's pid; asked for again by the process that holds it, it is the same hold. */
+ *  `install.lock` (`lockfile.mjs`: taken atomically, taken over only from an owner proven gone); asked for again by
+ *  the process that holds it, it is the same hold. */
 export function lockPath(dataDir) { return path.join(dataDir, 'install.lock'); }
 export function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } }
 export function installInProgress(dataDir) {
-  let lock; try { lock = JSON.parse(readFileSync(lockPath(dataDir), 'utf8')); } catch { return null; }
-  if (!lock?.pid || !pidAlive(lock.pid)) return null;
+  const lock = readLock(lockPath(dataDir));
+  if (!lock || lockStale(lock)) return null;
   let last = null;
   try { last = readFileSync(logPath(dataDir), 'utf8').trim().split('\n').filter(line => line.trim()).at(-1)?.trim() || null; } catch {}
-  return { pid: lock.pid, since: lock.since, seconds: Math.round((Date.now() - lock.since) / 1000), last, log: logPath(dataDir) };
+  const since = Date.parse(lock.at) || Date.now();
+  return { pid: lock.pid ?? null, since, seconds: Math.round((Date.now() - since) / 1000), last, log: logPath(dataDir) };
 }
+const holds = new Map();   // lock file -> {record, depth}: this process's own hold, taken again
 /** The lock, waited for; `{wait: false}` answers null at once when another process holds it. */
 export async function takeInstallLock(dataDir, log = () => {}, { timeout = INSTALL_TIMEOUT_MS, wait: waiting = true } = {}) {
   const file = lockPath(dataDir);
-  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  verifyPrivateDir(dataDir, { create: true });
+  const mine = holds.get(file);
+  if (mine && stillHeld(file, mine.record)) { mine.depth++; return () => { mine.depth--; }; }
   const deadline = Date.now() + timeout;
   let said = false;
   for (;;) {
-    try { writeFileSync(file, JSON.stringify({ pid: process.pid, since: Date.now() }), { flag: 'wx', mode: 0o600 }); return () => { try { rmSync(file, { force: true }); } catch {} }; }
-    catch (error) { if (error.code !== 'EEXIST') throw error; }
-    const held = installInProgress(dataDir);
-    if (!held) { try { rmSync(file, { force: true }); } catch {} continue; }   // left by an installer that is gone
-    if (held.pid === process.pid) return () => {};                         // this process holds it: the outer hold lets go
+    const taken = tryLock(file, { kind: 'install' });
+    if (taken.held) {
+      const hold = { record: taken.record, depth: 1 };
+      holds.set(file, hold);
+      return () => { if (--hold.depth === 0) { holds.delete(file); taken.release(); } };
+    }
     if (!waiting) return null;
-    if (!said) { log(`another process (pid ${held.pid}) is installing; waiting for it`); said = true; }
-    if (Date.now() > deadline) throw new Error(`Another process (pid ${held.pid}) has been installing for ${held.seconds} s; see ${held.log}`);
-    await wait(500);
+    const owner = taken.owner || {};
+    if (!said) { log(`another process (pid ${owner.pid ?? '?'}) is installing; waiting for it`); said = true; }
+    if (Date.now() > deadline) throw new Error(`Another process (pid ${owner.pid ?? '?'}) has been installing for too long; see ${logPath(dataDir)}`);
+    await wait(250);
   }
 }
 
@@ -217,14 +227,12 @@ export function readReady(dataDir) {
   } catch { return null; }
 }
 
-/** Whether that pid is a live Sidevoice core — not merely a live pid: pids are reused. */
-export function coreAlive(pid) {
-  if (!pid) return false;
-  try { process.kill(pid, 0); } catch (error) { if (error.code !== 'EPERM') return false; }
-  try {
-    const args = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', timeout: 3000 }).trim();
-    return /sidevoice[-_]core/.test(args);
-  } catch { return true; }
+/** Whether a ready file's core is still that core: this user's process whose command line carries that launch's
+ *  `--launch-id`. A pid alone, or a process that cannot be examined, is not a core of ours — pids are reused, and
+ *  a stale ready file can name somebody else's work. */
+const launchPattern = launchId => new RegExp(`--launch-id[= ]${String(launchId).replace(/[^\w-]/g, '')}(\\s|$)`);
+export function coreRunning(ready) {
+  return !!ready?.launch_id && isProcess(ready.pid, { command: launchPattern(ready.launch_id) });
 }
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -251,9 +259,9 @@ export async function launchReady(dataDir, launchId, timeout = 2000) {
  *  `{}` when no core is running. */
 export async function examineRunning(dataDir) {
   const ready = readReady(dataDir);
-  if (!ready || !coreAlive(ready.pid)) return {};
+  if (!ready || !coreRunning(ready)) return {};
   const live = await launchReady(dataDir, ready.launch_id);
-  return live ? { adopt: live } : { terminate: ready.pid };
+  return live ? { adopt: live } : { terminate: ready };
 }
 
 /** The arguments of one launch. `idleExit` 0 for the supervisor's child (it never leaves on its own); a
@@ -319,20 +327,21 @@ export function failureCause({ dataDir, launchId, exit, key = null }) {
   return describe('launch.exited', 'run', exit?.code ?? exit?.signal ?? null);
 }
 
-/** Ask a core to leave and wait until it has: SIGTERM, `STOP_GRACE_MS`, SIGKILL, and its exit awaited. A
- *  handle of ours settles on its exit; an adopted pid is watched until it is gone. */
+/** Ask a core to leave and wait until it has: SIGTERM, `STOP_GRACE_MS`, SIGKILL, and its exit awaited. A child
+ *  handle of ours is signalled directly and settles on its exit; a core known only from its ready file is
+ *  signalled only while it is provably that launch (`coreRunning`), and watched until it is not. */
 export async function terminateCore(target, { grace = STOP_GRACE_MS, log = () => {} } = {}) {
-  const pid = typeof target === 'number' ? target : target?.pid;
-  const gone = typeof target === 'object' && target?.exit
-    ? () => target.done !== null
-    : () => !coreAlive(pid);
+  const child = !!target?.exit;
+  const pid = target?.pid;
+  const gone = child ? () => target.done !== null : () => !coreRunning(target);
+  const signal = name => (child ? (() => { try { process.kill(pid, name); } catch {} })() : signalVerified(pid, name, { command: launchPattern(target.launch_id) }));
   if (!pid || gone()) return;
-  try { process.kill(pid, 'SIGTERM'); } catch {}
+  signal('SIGTERM');
   const deadline = Date.now() + grace;
   while (!gone() && Date.now() < deadline) await wait(50);
   if (!gone()) {
     log(`the core (pid ${pid}) did not leave within ${Math.round(grace / 1000)} s; killing it`);
-    try { process.kill(pid, 'SIGKILL'); } catch {}
+    signal('SIGKILL');
     const after = Date.now() + 5000;
     while (!gone() && Date.now() < after) await wait(50);
   }
@@ -367,9 +376,9 @@ export async function ensureRunning({ dataDir, env = process.env, log = () => {}
     if (pinned && installCurrent(dataDir, env)) return running;
     log(pinned ? `the running core was installed from an earlier build of ${coreSpec(env)}: asking it to leave`
       : `the running core is ${running.version}, this connector pins ${CORE_VERSION}: asking it to leave`);
-    await terminateCore(running.pid, { log });
+    await terminateCore(running, { log });
   } else if (found.terminate) {
-    log(`a core is running (pid ${found.terminate}) but does not answer for its own launch: terminating it`);
+    log(`a core is running (pid ${found.terminate.pid}) but does not answer for its own launch: terminating it`);
     await terminateCore(found.terminate, { log });
   }
   const bin = await ensureInstalled({ dataDir, env, log, progress });

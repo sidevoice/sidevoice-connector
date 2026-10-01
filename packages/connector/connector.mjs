@@ -20,7 +20,7 @@
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { appendFileSync, existsSync, mkdirSync, openSync, closeSync, rmSync, statSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, rmSync, statSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { capabilityState, SUPPORTED, voiceEnvelope } from './harness-contract.mjs';
@@ -28,13 +28,16 @@ import { harnessFor } from './harnesses.mjs';
 import { machineIdentity, VERSION } from './identity.mjs';
 import { pair, roomOrigin } from './pair.mjs';
 import { roomLink, UNREACHABLE } from './link.mjs';
-import { CORE_VERSION, NO_UV, awaitReady, coreAlive, coreArgs, coreData, ensureInstalled, ensureRunning, examineRunning, failureCause,
+import { CORE_VERSION, NO_UV, awaitReady, coreArgs, coreRunning, coreData, ensureInstalled, ensureRunning, examineRunning, failureCause,
   failurePath, installInProgress, roomCredentialPath, spawnCore, takeInstallLock, terminateCore, unlinkSocket } from './core.mjs';
 import { ensureCoreDirectory, localHealth, socketAgent } from './core-socket.mjs';
 import { appendLine } from './logfile.mjs';
 import { Supervisor } from './supervisor.mjs';
 import { pruneInstallations, recover } from './install-txn.mjs';
 import { connectorSocketOf, dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
+import { readLock, releaseLock as giveUp, stillHeld, tryLock } from './lockfile.mjs';
+import { isProcess, signalVerified } from './proc.mjs';
+import { verifyPrivateDir } from './secure-fs.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -75,33 +78,21 @@ function coreLink(ready) {
   return { room: 'http://localhost', connector_id: ready.connector_id, token: ready.token, core: ready, agent: socketAgent(ready.socket) };
 }
 
-/** Whether the pid in the lock is a live Sidevoice connector — not merely a live pid. Pids are reused,
- *  and on macOS a pid that now belongs to another user answers EPERM, which used to count as alive: a
- *  stale lock then made every new connector exit at once, silently (a laptop, 2026-09-21). */
-function connectorAlive(pid) {
-  try { process.kill(pid, 0); } catch (error) { if (error.code !== 'EPERM') return false; }
-  try {
-    const args = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', timeout: 3000 }).trim();
-    return /(^|[\s/])connector(\.mjs)?(\s|$)/.test(args);   // `…/connector.mjs` from a checkout, `sidevoice connector` from a package; not test_connector.mjs
-  } catch { return true; }                          // No ps to ask: a live pid is taken at its word.
-}
+/** The singleton lock (`lockfile.mjs`): taken atomically, taken over only from an owner proven gone. Its record —
+ *  pid and process start time — is what identifies the connector holding the socket; a pid alone never does. */
+let lockRecord = null;
 function acquireLock() {
-  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try { const fd = openSync(lockPath, 'wx', 0o600); writeFileSync(fd, String(process.pid)); closeSync(fd); return true; }
-    catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-      let pid = 0; try { pid = Number(readFileSync(lockPath, 'utf8')); } catch {}
-      if (pid && connectorAlive(pid)) {              // A live connector holds it: we are redundant, and we say so.
-        if (!supervised) log(`a connector is already running (pid ${pid}, lock ${lockPath}); this one exits`);
-        return false;
-      }
-      log(`stale lock ${lockPath} (pid ${pid || '?'} is not a connector); taking over`);
-      try { unlinkSync(lockPath); } catch {}
-    }
+  const taken = tryLock(lockPath, { kind: 'connector' });
+  if (taken.held) {
+    lockRecord = taken.record;
+    if (taken.reclaimed) log(`stale lock ${lockPath} (pid ${taken.reclaimed.pid} is gone, or is another process now); taking over`);
+    return true;
   }
+  if (!supervised) log(`a connector is already running (pid ${taken.owner?.pid ?? '?'}, lock ${lockPath}); this one exits`);
   return false;
 }
+/** Whether the connector a lock record names is still that process. */
+const connectorAlive = owner => !!owner && !owner.unreadable && isProcess(owner.pid, { start: owner.start ?? null });
 
 const bindings = new Map();        // binding_id -> { binding_id, client_ref, harness, thread, title, delivery, capabilities, owner, chain }
 const clients = new Set();         // façade IPC connections
@@ -294,7 +285,7 @@ function superviseWith(restored) {
     },
     awaitReady: (handle, launchId) => awaitReady(handle, { dataDir, launchId }),
     probe: async core => { const health = await localHealth(core.socket, 2000); return health?.status === 200 && health.body?.launch_id === core.launch_id ? health.body : null; },
-    async terminate(handle) { await terminateCore(handle, { log }); unlinkSocket(dataDir); },
+    async terminate(handle) { await (handle.terminate ? handle.terminate() : terminateCore(handle, { log })); unlinkSocket(dataDir); },
     cause({ launchId, exit, key }) {
       // Installing the core is part of starting it: a uv that is missing or cannot reach its index says so.
       const message = exit?.error?.message || '';
@@ -307,12 +298,15 @@ function superviseWith(restored) {
     async adopt() {
       const found = await examineRunning(dataDir);
       const fits = found.adopt && (env.SIDEVOICE_CORE_BIN || !found.adopt.version || found.adopt.version === CORE_VERSION);
-      const leftover = found.terminate || (found.adopt && !fits ? found.adopt.pid : null);
-      if (leftover) { log(`a core is running (pid ${leftover}) that this supervisor does not keep: terminating it`); await terminateCore(leftover, { log }); unlinkSocket(dataDir); }
+      const leftover = found.terminate || (found.adopt && !fits ? found.adopt : null);
+      if (leftover) { log(`a core is running (pid ${leftover.pid}) that this supervisor does not keep: terminating it`); await terminateCore(leftover, { log }); unlinkSocket(dataDir); }
       if (!fits) return null;
-      const handle = { pid: found.adopt.pid, done: null };
+      const adopted = found.adopt;
+      // Not a child: watched by its identity, and signalled only while it is still that launch.
+      const handle = { pid: adopted.pid, launch_id: adopted.launch_id, done: null };
+      handle.terminate = () => terminateCore({ pid: adopted.pid, launch_id: adopted.launch_id }, { log });
       handle.exit = new Promise(resolve => {
-        const timer = setInterval(() => { if (!coreAlive(handle.pid)) { clearInterval(timer); resolve(handle.done = { code: null, signal: null, gone: true }); } }, 200);
+        const timer = setInterval(() => { if (!coreRunning(adopted)) { clearInterval(timer); resolve(handle.done = { code: null, signal: null, gone: true }); } }, 200);
         timer.unref?.();
       });
       return { handle, core: found.adopt };
@@ -355,7 +349,7 @@ function coreChanged(snapshot) {
 async function superviseCore() {
   if (supervised || external || closed || coreStarting || Date.now() - coreCheckedAt < 2000) return;
   coreCheckedAt = Date.now();
-  if (creds?.core && coreAlive(creds.core.pid)) return;
+  if (creds?.core && coreRunning(creds.core)) return;
   log('the local core is gone; starting it again');
   const previous = creds?.core?.launch_id;
   const ready = await startCore();
@@ -619,7 +613,10 @@ async function shutdown() {
   process.exit(0);
 }
 function releaseLock({ socket }) {
-  try { if (Number(readFileSync(lockPath, 'utf8')) === process.pid) { if (socket) unlinkSync(socketPath); unlinkSync(lockPath); } } catch {}
+  // The socket is ours to remove only while the lock still is.
+  if (!lockRecord || !stillHeld(lockPath, lockRecord)) return;
+  if (socket) { try { unlinkSync(socketPath); } catch {} }
+  giveUp(lockPath, lockRecord);
 }
 
 /** `node.status` (SEAMS §4): the supervisor's state machine as it is, the calls fresh from the core; a plain
@@ -633,7 +630,7 @@ async function nodeStatus() {
     }
     return { ...supervisor.status(), installed, supervisor: true };
   }
-  const core = creds?.core && !external && coreAlive(creds.core.pid) ? creds.core : null;
+  const core = creds?.core && !external && coreRunning(creds.core) ? creds.core : null;
   const health = core ? await localHealth(core.socket, 1000) : null;
   const state = core ? 'running' : coreStarting ? 'starting' : coreFailure ? 'failed' : 'stopped';
   return { ok: true, state, since: null, attempts: 0, window_started: null, next_retry_at: null,
@@ -648,7 +645,7 @@ async function nodeRestart() {
   if (supervisor) { supervisor.restart(); return nodeStatus(); }
   if (external) return nodeStatus();
   const running = creds?.core;
-  if (running && coreAlive(running.pid)) await terminateCore(running.pid, { log });
+  if (running && coreRunning(running)) await terminateCore(running, { log });
   creds = null;
   const ready = await startCore();
   if (ready && link) { const old = link; link = null; old.close(); }
@@ -699,7 +696,9 @@ async function yieldToSupervisor(requester) {
 
 /** The supervisor's side, finding a plain connector on the socket: ask it to hand over, wait until it is
  *  gone. False when the one holding the socket is itself a supervisor (then this one is redundant). */
-async function takeOver(pid) {
+async function takeOver(owner) {
+  const pid = owner?.pid;
+  if (!connectorAlive(owner)) return true;   // gone meanwhile, or not provably anyone: the lock decides
   log(`a connector (pid ${pid}) holds ${socketPath}: asking it to hand over`);
   const answer = await new Promise(resolve => {
     const socket = net.createConnection(socketPath);
@@ -718,11 +717,11 @@ async function takeOver(pid) {
   if (!answer.ok && !String(answer.error).startsWith('HANDOVER:')) {
     // It cannot hand over (it answers nothing, or does not know how): asked to leave like any stop.
     log(`the connector (pid ${pid}) did not hand over (${answer.error}); asking it to stop`);
-    try { process.kill(pid, 'SIGTERM'); } catch {}
+    signalVerified(pid, 'SIGTERM', { start: owner.start ?? null });
   }
   const deadline = Date.now() + 10_000;
-  while (connectorAlive(pid) && Date.now() < deadline) await wait(50);
-  if (connectorAlive(pid)) { try { process.kill(pid, 'SIGKILL'); } catch {} await wait(200); }
+  while (connectorAlive(owner) && Date.now() < deadline) await wait(50);
+  if (connectorAlive(owner)) { signalVerified(pid, 'SIGKILL', { start: owner.start ?? null }); await wait(200); }
   return true;
 }
 
@@ -947,9 +946,11 @@ export async function run(argv = [], environment = process.env) {
 
   // A plain connector gives way to the supervisor; one started in the gap of a takeover (a façade's launcher
   // finding no socket for a moment) is taken over in turn.
+  // Refused, not repaired: a data directory others can write into is not one to serve from (`secure-fs.mjs`).
+  try { verifyPrivateDir(dataDir, { create: true }); }
+  catch (error) { log(`not starting: ${error.message}`); process.exitCode = 78; return; }
   for (let attempt = 0; !acquireLock(); attempt++) {
-    let pid = 0; try { pid = Number(readFileSync(lockPath, 'utf8')); } catch {}
-    if (!supervised || attempt >= 5 || !(await takeOver(pid))) process.exit(0);
+    if (!supervised || attempt >= 5 || !(await takeOver(readLock(lockPath)))) process.exit(0);
   }
   if (supervised) {
     // A supervisor starting is the next login, or a person's start: a stop no longer holds.
@@ -969,7 +970,14 @@ export async function run(argv = [], environment = process.env) {
   await restoreHandover();
   try { unlinkSync(socketPath); } catch {}
   server = net.createServer(serve);
-  await new Promise((resolve, reject) => server.once('error', reject).listen(socketPath, resolve));
+  // Created 0600 (a umask that lets nothing through while it is bound), and checked: a socket another user could
+  // open is not served on — every command on it is this user's authority.
+  const umask = process.umask(0o077);
+  try { await new Promise((resolve, reject) => server.once('error', reject).listen(socketPath, resolve)); }
+  finally { process.umask(umask); }
+  chmodSync(socketPath, 0o600);
+  const bound = lstatSync(socketPath);
+  if (!bound.isSocket() || bound.uid !== process.getuid() || (bound.mode & 0o077)) { log(`not serving: ${socketPath} is not this user's alone`); server.close(); process.exitCode = 78; return; }
   process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown);
   scheduleExit();
   if (supervisor && !external) supervisor.boot();

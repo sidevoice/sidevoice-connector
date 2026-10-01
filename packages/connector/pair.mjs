@@ -8,7 +8,7 @@
  *  for a code: linking a room is still the person's act, by hand. */
 import os from 'node:os';
 import path from 'node:path';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { readTrustedJson, writePrivateFile } from './secure-fs.mjs';
 import { machineIdentity } from './identity.mjs';
 import { t } from './i18n.mjs';
 import { askConnector } from './service.mjs';
@@ -48,7 +48,7 @@ export function roomOrigin(address) {
 /** Which room this machine is paired with, or null. */
 export function pairedRoom(env = process.env) {
   try {
-    const saved = JSON.parse(readFileSync(path.join(dataDir(env), 'credentials.json'), 'utf8'));
+    const saved = readTrustedJson(path.join(dataDir(env), 'credentials.json'));
     if (!saved.url || !saved.connector_id || !saved.token) return null;
     return { origin: roomOrigin(saved.url), connector_id: saved.connector_id };
   } catch { return null; }
@@ -75,14 +75,14 @@ export async function pair(room, code, env = process.env) {
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error('Pairing failed: ' + (body.detail || response.status));
-  const directory = dataDir(env);
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const file = path.join(directory, 'credentials.json');
+  const file = path.join(dataDir(env), 'credentials.json');
   // Where the room is, not how to reach it: the path and namespace that carry the link belong to
   // the client and move with its version, so an upgrade never has to rewrite what pairing wrote.
   // The dial key is what the room shows this machine's core if the room is ever the one to open the link.
-  writeFileSync(file, JSON.stringify({ url: base.origin, connector_id: body.connector_id, token: body.token, protocol: body.protocol,
-    ...(body.dial_key ? { dial_key: body.dial_key } : {}) }, null, 2), { mode: 0o600 });
+  // Through a fresh private file renamed into place: an existing file's permissions or a link there never decide
+  // who can read this machine's credential (`secure-fs.mjs`).
+  writePrivateFile(file, JSON.stringify({ url: base.origin, connector_id: body.connector_id, token: body.token, protocol: body.protocol,
+    ...(body.dial_key ? { dial_key: body.dial_key } : {}) }, null, 2));
   return { file, connector_id: body.connector_id, origin: base.origin };
 }
 

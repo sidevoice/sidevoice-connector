@@ -55,7 +55,7 @@ test('handover: a supervisor takes over a plain connector — a new voice turn r
     owner = facade(env); await owner.ready;
     const joined = await owner.call('voice_connect', { title: 'HTTP' });
     assert.equal(joined.value.binding_id, 'core-thread-http');
-    const plain = Number(readFileSync(node.socketPath + '.lock', 'utf8'));
+    const plain = JSON.parse(readFileSync(node.socketPath + '.lock', 'utf8')).pid;
     // An editor chat joins, and Cursor replaces its MCP process: its card keeps the conversation without a façade.
     const editorEnv = { ...node.env }; delete editorEnv.SIDEVOICE_THREAD; delete editorEnv.SIDEVOICE_DELIVERY_URL;
     editor = facade(editorEnv, { name: 'cursor-vscode', version: '1.0.0' }, editorCaps); await editor.ready;
@@ -157,7 +157,7 @@ for (const kind of ['launchd', 'systemd']) {
       await owner.ready;
       assert.equal((await owner.call('voice_connect', {})).value.binding_id, 'core-thread-s');
       const supervisorPid = node.managerPid();
-      assert.equal(Number(readFileSync(node.socketPath + '.lock', 'utf8')), supervisorPid);
+      assert.equal(JSON.parse(readFileSync(node.socketPath + '.lock', 'utf8')).pid, supervisorPid);
 
       // Stop: the person's. Supervisor and core gone; the launcher refuses; status says so without starting anything.
       const corePid = running.core.pid;
@@ -237,7 +237,7 @@ test('concurrent starts — three façades, the app\'s service start and npx\'s,
     const logs = ['connector.log', 'node-service.log'].map(name => { try { return readFileSync(path.join(node.dataDir, name), 'utf8'); } catch { return ''; } }).join('\n');
     const started = [...logs.matchAll(/connector \S+ starting.*?: pid (\d+)/g)].map(match => Number(match[1]));
     const living = [...new Set(started)].filter(alive);
-    assert.deepEqual(living, [Number(readFileSync(node.socketPath + '.lock', 'utf8'))], `one connector alive of ${started.length} started`);
+    assert.deepEqual(living, [JSON.parse(readFileSync(node.socketPath + '.lock', 'utf8')).pid], `one connector alive of ${started.length} started`);
     assert.equal(status.supervisor, true);
     // The façades are all served by it: their three conversations are there.
     const bindings = await until(async () => { const list = (await node.ask('status')).bindings.map(binding => binding.client_ref).sort(); return list.length === 3 ? list : null; }, 20_000);

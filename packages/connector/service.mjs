@@ -21,7 +21,9 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { accessSync, constants, existsSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
-import { coreAlive, readReady, socketPathOf, takeInstallLock } from './core.mjs';
+import { coreRunning, readReady, socketPathOf, takeInstallLock } from './core.mjs';
+import { readLock } from './lockfile.mjs';
+import { isProcess, signalVerified, validPid } from './proc.mjs';
 import { localHealth } from './core-socket.mjs';
 import { keyed, t } from './i18n.mjs';
 import { connectorSocketOf, dataDirOf, nodeFiles, readJson, writePrivate } from './node-files.mjs';
@@ -256,27 +258,37 @@ export async function status(env = process.env) {
   return { ...base, state: 'service-failed', failure: { key: serviceFailure(kind, env) } };
 }
 
-/** The pids that must be gone for the node to be down: the connector holding the socket, and the core. */
-function nodePids(env) {
-  const dataDir = dataDirOf(env);
-  let connector = null; try { connector = Number(readFileSync(connectorSocketOf(env) + '.lock', 'utf8')) || null; } catch {}
-  const core = readReady(dataDir)?.pid || null;
+/** What must be gone for the node to be down: the connector holding the socket, as its lock records it (pid and
+ *  start time), and the core, as its ready file records it (pid and launch id). Each is signalled only while it
+ *  is provably that process (`proc.mjs`): a stale file naming a reused pid names somebody else's work. */
+function nodeProcesses(env) {
+  const lock = readLock(connectorSocketOf(env) + '.lock');
+  const connector = lock && !lock.unreadable && validPid(lock.pid) ? { pid: lock.pid, start: lock.start ?? null } : null;
+  const ready = readReady(dataDirOf(env));
+  const core = ready && validPid(ready.pid) && ready.launch_id ? ready : null;
   return { connector, core };
 }
-const alive = pid => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
+const connectorUp = owner => !!owner && isProcess(owner.pid, { start: owner.start });
+function signalNode(processes, signal) {
+  const sent = [];
+  if (connectorUp(processes.connector) && signalVerified(processes.connector.pid, signal, { start: processes.connector.start })) sent.push(processes.connector.pid);
+  if (processes.core && coreRunning(processes.core) && signalVerified(processes.core.pid, signal, { command: new RegExp(`--launch-id[= ]${processes.core.launch_id.replace(/[^\w-]/g, '')}(\\s|$)`) })) sent.push(processes.core.pid);
+  return sent;
+}
 
-/** Wait for the supervisor and its core to be gone, up to `TEARDOWN_MS`; then kill what is left. Their sockets
- *  go with them. */
-async function awaitDown(env, pids = nodePids(env)) {
+/** Wait for the supervisor and its core to be gone, up to `TEARDOWN_MS`; then kill what is provably still them.
+ *  Their sockets go with them. */
+async function awaitDown(env, processes = nodeProcesses(env)) {
   const deadline = Date.now() + TEARDOWN_MS;
-  const left = () => [pids.connector, pids.core].filter(pid => pid && (pid === pids.core ? coreAlive(pid) : alive(pid)));
+  const left = () => [connectorUp(processes.connector) && processes.connector.pid, processes.core && coreRunning(processes.core) && processes.core.pid].filter(Boolean);
   while (left().length && Date.now() < deadline) await wait(100);
-  const killed = left();
-  for (const pid of killed) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+  const killed = left().length ? signalNode(processes, 'SIGKILL') : [];
   const after = Date.now() + 5000;
   while (left().length && Date.now() < after) await wait(50);
-  for (const file of [connectorSocketOf(env), connectorSocketOf(env) + '.lock', socketPathOf(dataDirOf(env))]) {
-    if (!left().length) { try { unlinkSync(file); } catch {} }
+  if (!left().length) {
+    for (const file of [connectorSocketOf(env), socketPathOf(dataDirOf(env))]) { try { unlinkSync(file); } catch {} }
+    const lock = readLock(connectorSocketOf(env) + '.lock');
+    if (lock && !lock.unreadable && !connectorUp({ pid: lock.pid, start: lock.start ?? null })) { try { unlinkSync(connectorSocketOf(env) + '.lock'); } catch {} }
   }
   return { killed, left: left() };
 }
@@ -386,13 +398,12 @@ export async function stop(env = process.env) {
   const files = nodeFiles(dataDirOf(env));
   writePrivate(files.stopped, { at: new Date().toISOString() });
   const kind = installedService(env)?.kind ?? 'none';
-  const pids = nodePids(env);
+  const processes = nodeProcesses(env);
   if (kind === 'launchd') manage(env, kind, ['bootout', target()]);
   else if (kind === 'systemd') manage(env, kind, ['--user', 'stop', UNIT]);
-  else if (pids.connector) { try { process.kill(pids.connector, 'SIGTERM'); } catch {} }
-  // A plain connector's core is detached and outlives it: it is asked to leave as well.
-  if (kind === 'none' && pids.core) { try { process.kill(pids.core, 'SIGTERM'); } catch {} }
-  const down = await awaitDown(env, pids);
+  // No manager: the detached supervisor, or a plain connector and its detached core, each asked to leave.
+  else signalNode(processes, 'SIGTERM');
+  const down = await awaitDown(env, processes);
   return { ok: !down.left.length, state: 'stopped-by-person', service: kind, ...(down.killed.length ? { note: t('service.killed', { pids: down.killed.join(', ') }) } : {}) };
 }
 
@@ -424,10 +435,10 @@ export async function restart(env = process.env) {
  *  systemd reloads and restarts; a detached supervisor is replaced. The supervisor and its core are new. */
 export async function reload(env = process.env) {
   const kind = installedService(env)?.kind ?? 'none';
-  const pids = nodePids(env);
+  const processes = nodeProcesses(env);
   if (kind === 'launchd') {
     if (loaded(kind, env)) await bootOut(env);
-    await awaitDown(env, pids);
+    await awaitDown(env, processes);
     const booted = await bootIn(env, definitionPath(kind, env));
     if (!booted.ok) throw keyed('service.not-loaded', { detail: booted.output.trim() });
   } else if (kind === 'systemd') {
@@ -436,8 +447,8 @@ export async function reload(env = process.env) {
     const restarted = manage(env, kind, ['--user', 'restart', UNIT]);
     if (!restarted.ok) throw keyed(`service.${serviceFailure(kind, env)}`, { detail: restarted.output.trim() });
   } else {
-    if (pids.connector) { try { process.kill(pids.connector, 'SIGTERM'); } catch {} }
-    await awaitDown(env, { connector: pids.connector, core: null });
+    signalNode({ connector: processes.connector, core: null }, 'SIGTERM');
+    await awaitDown(env, { connector: processes.connector, core: null });
     startDetached(env);
   }
   const up = await awaitUp(env);
@@ -449,28 +460,38 @@ export async function reload(env = process.env) {
  *  reloaded. Idempotent. An unload the manager refuses stops here, with nothing deleted. */
 export async function uninstall(env = process.env, { keepStopped = false } = {}) {
   const files = nodeFiles(dataDirOf(env));
-  const kind = managerKind(env);
-  const file = definitionPath(kind, env);
-  const pids = nodePids(env);
-  // Nothing may start the node while it is being taken apart.
-  writePrivate(files.stopped, { at: new Date().toISOString() });
-  if (kind === 'launchd' && loaded(kind, env)) {
-    const out = manage(env, kind, ['bootout', target()]);
-    if (!out.ok && loaded(kind, env)) throw keyed('service.unload-failed', { detail: out.output.trim() });
-  } else if (kind === 'systemd' && file && existsSync(file)) {
-    const out = manage(env, kind, ['--user', 'disable', '--now', UNIT]);
-    if (!out.ok && managerState(kind, env).active) throw keyed('service.unload-failed', { detail: out.output.trim() });
-  } else if (pids.connector) { try { process.kill(pids.connector, 'SIGTERM'); } catch {} }
-  if (pids.core) { try { process.kill(pids.core, 'SIGTERM'); } catch {} }
-  const down = await awaitDown(env, pids);
-  if (down.left.length) throw keyed('service.unload-failed', { detail: `pid ${down.left.join(', ')} still running` });
-  if (file) { try { rmSync(file, { force: true }); } catch {} }
-  if (kind === 'systemd') { manage(env, kind, ['--user', 'daemon-reload']); manage(env, kind, ['--user', 'reset-failed', UNIT]); }
-  if (!keepStopped) { try { rmSync(files.stopped, { force: true }); } catch {} }
-  const record = readJson(files.install);
-  if (record && record.service !== 'none') { try { writePrivate(files.install, { ...record, service: 'none' }); } catch {} }
-  return { ok: true, state: existsSync(files.install) ? 'not-installed' : 'absent', service: kind,
-    ...(down.killed.length ? { note: t('service.killed', { pids: down.killed.join(', ') }) } : {}) };
+  // What is installed is what is on disk — a definition is there whether or not its manager answers now. A
+  // manager that cannot be asked to let it go stops everything here: nothing it still points at is deleted.
+  const service = installedService(env);
+  const kind = service?.kind ?? 'none';
+  const processes = nodeProcesses(env);
+  const release = await takeInstallLock(dataDirOf(env));
+  try {
+    writePrivate(files.stopped, { at: new Date().toISOString() });   // nothing may start the node while it is taken apart
+    if (kind === 'launchd') {
+      if (loaded(kind, env)) {
+        const out = manage(env, kind, ['bootout', target()]);
+        for (let i = 0; i < 100 && loaded(kind, env); i++) await wait(100);
+        if (loaded(kind, env)) throw keyed('service.unload-failed', { detail: out.output.trim() || 'still loaded' });
+      }
+    } else if (kind === 'systemd') {
+      const out = manage(env, kind, ['--user', 'disable', '--now', UNIT]);
+      if (!out.ok) throw keyed('service.unload-failed', { detail: out.output.trim() });
+    } else signalNode(processes, 'SIGTERM');
+    const down = await awaitDown(env, processes);
+    if (down.left.length) throw keyed('service.unload-failed', { detail: `pid ${down.left.join(', ')} still running` });
+    if (service) {
+      rmSync(service.file, { force: true });
+      if (kind === 'systemd') {
+        const reloaded = manage(env, kind, ['--user', 'daemon-reload']);
+        if (!reloaded.ok) throw keyed('service.unload-failed', { detail: reloaded.output.trim() });
+        manage(env, kind, ['--user', 'reset-failed', UNIT]);
+      }
+    }
+    if (!keepStopped) { try { rmSync(files.stopped, { force: true }); } catch {} }
+    return { ok: true, state: existsSync(files.install) ? 'not-installed' : 'absent', service: kind,
+      ...(down.killed.length ? { note: t('service.killed', { pids: down.killed.join(', ') }) } : {}) };
+  } finally { release(); }
 }
 
 /** `sidevoice service <install|uninstall|start|stop|restart|status> [--json]`. */

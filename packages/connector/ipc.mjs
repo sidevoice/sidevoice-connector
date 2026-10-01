@@ -10,6 +10,7 @@ import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { launch } from './launcher.mjs';
 import { connectorSocketOf } from './node-files.mjs';
+import { verifyConnectorSocket } from './secure-fs.mjs';
 
 // The connector is started through the same entry the façade came in by — `cli.mjs connector` —
 // because published there is one bundled file and no `connector.mjs` beside it to point at.
@@ -28,6 +29,8 @@ export function connectorClient(env = process.env, { onHandover = () => {}, onLo
 
   function connect() {
     return new Promise((resolve, reject) => {
+      // Only a socket this user owns, in a data directory nobody else can write into (`secure-fs.mjs`).
+      try { verifyConnectorSocket(socketPath); } catch (error) { if (error.key) { error.unsafe = true; return reject(error); } }
       const attempt = net.createConnection(socketPath);
       let handedOver = false;
       attempt.once('error', reject);

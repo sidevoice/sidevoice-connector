@@ -329,7 +329,7 @@ export function supervisedNode({ modes = ['ok'], env: extra = {}, dataDir = mkdt
     stop() {
       for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
       // Whatever else runs here: a connector a launcher or a service start spawned, and every core.
-      try { process.kill(Number(readFileSync(node.socketPath + '.lock', 'utf8')), 'SIGKILL'); } catch {}
+      try { process.kill(JSON.parse(readFileSync(node.socketPath + '.lock', 'utf8')).pid, 'SIGKILL'); } catch {}
       for (const line of node.said()) { try { process.kill(line.pid, 'SIGKILL'); } catch {} }
     },
   };

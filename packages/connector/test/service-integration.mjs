@@ -90,7 +90,7 @@ try {
   step('the core runs with no harness');
   const first = await until('running', () => { const s = status(); return s?.state === 'running' && s.supervisor ? s : null; });
   assert.equal(first.service, kind);
-  const supervisor1 = Number(readFileSync(path.join(dataDir, 'connector.sock.lock'), 'utf8'));
+  const supervisor1 = JSON.parse(readFileSync(path.join(dataDir, 'connector.sock.lock'), 'utf8')).pid;
   console.log(`supervisor pid ${supervisor1}, core pid ${first.core.pid}`);
 
   step('the core is killed: backoff, then running again');
@@ -103,7 +103,7 @@ try {
 
   step('the supervisor dies: the manager brings it back (KeepAlive / Restart=on-failure)');
   process.kill(supervisor1, 'SIGKILL');
-  const back = await until('a new supervisor', () => { const s = status(); const pid = Number(readFileSync(path.join(dataDir, 'connector.sock.lock'), 'utf8').trim() || 0); return s?.state === 'running' && s.supervisor && pid !== supervisor1 ? s : null; }, 90_000);
+  const back = await until('a new supervisor', () => { const s = status(); let pid = 0; try { pid = JSON.parse(readFileSync(path.join(dataDir, 'connector.sock.lock'), 'utf8')).pid; } catch {} return s?.state === 'running' && s.supervisor && pid !== supervisor1 ? s : null; }, 90_000);
   console.log(`back: core ${back.core.pid} (adopted: ${back.core.pid === second.core.pid})`);
 
   step('a login, approximated');
@@ -112,7 +112,7 @@ try {
 
   step('stop: the person\'s — nothing runs, and the launcher refuses');
   const runningNow = status();
-  const supervisorNow = Number(readFileSync(path.join(dataDir, 'connector.sock.lock'), 'utf8'));
+  const supervisorNow = JSON.parse(readFileSync(path.join(dataDir, 'connector.sock.lock'), 'utf8')).pid;
   const stopped = sidevoice('service', 'stop', '--json');
   assert.equal(stopped.json.state, 'stopped-by-person');
   assert.equal(status().state, 'stopped-by-person');
@@ -133,7 +133,7 @@ try {
   const client = await openClient();
   await wait(500);
   const before = status();
-  const supervisorLast = Number(readFileSync(path.join(dataDir, 'connector.sock.lock'), 'utf8'));
+  const supervisorLast = JSON.parse(readFileSync(path.join(dataDir, 'connector.sock.lock'), 'utf8')).pid;
   const removed = sidevoice('service', 'uninstall', '--json');
   assert.equal(removed.json.ok, true);
   client.destroy();
