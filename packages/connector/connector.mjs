@@ -283,11 +283,13 @@ function superviseWith(restored) {
       try { rmSync(failurePath(dataDir), { force: true }); } catch {}
       return spawnCore(bin, coreArgs({ dataDir, env, launchId, idleExit: 0, roomCredential: credentialsPath }), { dataDir, env });
     },
-    awaitReady: (handle, launchId) => awaitReady(handle, { dataDir, launchId }),
+    awaitReady: (handle, launchId, signal) => awaitReady(handle, { dataDir, launchId, signal }),
     probe: async core => { const health = await localHealth(core.socket, 2000); return health?.status === 200 && health.body?.launch_id === core.launch_id ? health.body : null; },
     async terminate(handle) { await (handle.terminate ? handle.terminate() : terminateCore(handle, { log })); unlinkSocket(dataDir); },
     cause({ launchId, exit, key }) {
       // Installing the core is part of starting it: a uv that is missing or cannot reach its index says so.
+      // A refusal made before spawning keeps its own key (`identity.unsafe-directory`…): it is the cause.
+      if (exit?.error?.key) return { key: exit.error.key, step: exit.error.key.split('.')[0], message: exit.error.message, detail: null, at: new Date().toISOString(), log_tail: [] };
       const message = exit?.error?.message || '';
       if (message === NO_UV) return { key: 'install.no-bundle', step: 'install', message, detail: null, at: new Date().toISOString(), log_tail: [] };
       if (exit?.error && !exit.error.path && install(message)) return { key: install(message), step: 'install', message, detail: null, at: new Date().toISOString(), log_tail: [] };
@@ -644,6 +646,13 @@ async function nodeRestart() {
   // Answered once the restart has begun (`starting`): the launch takes up to a minute, and `node.status` follows it.
   if (supervisor) { supervisor.restart(); return nodeStatus(); }
   if (external) return nodeStatus();
+  // A plain connector's restarts, one at a time: a second never terminates what the first just started.
+  const run = plainRestarts.then(restartPlainCore, restartPlainCore);
+  plainRestarts = run.catch(() => {});
+  return run;
+}
+let plainRestarts = Promise.resolve();
+async function restartPlainCore() {
   const running = creds?.core;
   if (running && coreRunning(running)) await terminateCore(running, { log });
   creds = null;

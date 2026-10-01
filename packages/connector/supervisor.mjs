@@ -63,6 +63,8 @@ export class Supervisor {
     this.generation = 0;   // every decision in flight belongs to one; a later one makes it moot
     this.timers = {};
     this.waiters = new Set();
+    this.chain = Promise.resolve();
+    this.controller = new AbortController();
   }
 
   status() {
@@ -83,43 +85,74 @@ export class Supervisor {
     for (const name of names.length ? names : Object.keys(this.timers)) { if (this.timers[name]) this.clock.clearTimeout(this.timers[name]); delete this.timers[name]; }
   }
 
+  /** Every effect on the core — boot, start, restart, stop, a launch after backoff, ending a hang — runs one at a
+   *  time, in order, here. A later request supersedes an earlier one (its generation), and aborts its wait for
+   *  readiness; it never runs beside it. */
+  exclusive(operation) {
+    const run = this.chain.then(operation, operation);
+    this.chain = run.then(() => {}, () => {});
+    return run;
+  }
+
+  /** A new generation: whatever was decided for the previous one is moot, and its wait is cut short. */
+  supersede() {
+    this.generation++;
+    this.clear();
+    this.controller?.abort();
+    this.controller = new AbortController();
+    return this.generation;
+  }
+
+  /** The current child gone, and seen gone, before anything else happens: the handle is kept until it has exited
+   *  (a terminate still in progress is still this core), and the socket goes with it (inside \`terminate\`). */
+  async endCurrent() {
+    const handle = this.handle;
+    if (!handle) return;
+    await this.terminate(handle);
+    if (this.handle === handle) this.handle = null;
+  }
+
   /** The supervisor's own first start: a live core of the right launch is adopted (no start counted), else
    *  one is started. */
-  async boot() {
-    const generation = ++this.generation;
-    const found = await this.adopt().catch(() => null);
-    if (generation !== this.generation) return;
-    if (found) {
-      this.handle = found.handle; this.launchId = found.core.launch_id;
-      this.log(`adopted the running core (pid ${found.core.pid}, launch ${found.core.launch_id})`);
-      return this.running(found.core, generation);
-    }
-    return this.launch(generation);
+  boot() {
+    const generation = this.supersede();
+    return this.exclusive(async () => {
+      if (generation !== this.generation) return;
+      const found = await this.adopt().catch(() => null);
+      if (generation !== this.generation) { if (found) { this.handle = found.handle; await this.endCurrent(); } return; }
+      if (found) {
+        this.handle = found.handle; this.launchId = found.core.launch_id;
+        this.log(`adopted the running core (pid ${found.core.pid}, launch ${found.core.launch_id})`);
+        return this.running(found.core, generation);
+      }
+      return this.launch(generation);
+    });
   }
 
   /** Start, unless already on its way. An explicit start (a person's) closes the window: they asked again. */
   start({ explicit = false } = {}) {
-    if (!explicit && ['starting', 'running', 'backoff'].includes(this.state)) return;
-    if (explicit && ['starting', 'running'].includes(this.state)) return;
+    if (!explicit && ['starting', 'running', 'backoff'].includes(this.state)) return this.chain;
+    if (explicit && ['starting', 'running'].includes(this.state)) return this.chain;
     if (explicit) this.closeWindow();
-    this.clear();
-    return this.launch(++this.generation);
+    const generation = this.supersede();
+    return this.exclusive(() => this.launch(generation));
   }
 
   /** A person's restart: the window closes and the core starts again, whatever state it was in. */
   restart() {
     this.closeWindow();
-    this.clear();
-    return this.launch(++this.generation);
+    const generation = this.supersede();
+    this.set('starting', { nextRetryAt: null });
+    return this.exclusive(() => this.launch(generation));
   }
 
   /** Stop the core and stay stopped. */
-  async stop() {
-    const generation = ++this.generation;
-    this.clear();
-    const handle = this.handle; this.handle = null;
-    if (handle) await this.terminate(handle);
-    if (generation === this.generation) this.set('stopped', { core: null, calls: 0, nextRetryAt: null });
+  stop() {
+    const generation = this.supersede();
+    return this.exclusive(async () => {
+      await this.endCurrent();
+      if (generation === this.generation) this.set('stopped', { core: null, calls: 0, nextRetryAt: null });
+    });
   }
 
   /** What `node.ensure` is: started if it was stopped, then the first settled state — running, failed, or
@@ -138,7 +171,9 @@ export class Supervisor {
 
   closeWindow() { this.windowStarted = null; this.attempts = 0; }
 
+  /** One launch, inside \`exclusive\`. */
   async launch(generation) {
+    if (generation !== this.generation) return;
     const now = this.clock.now();
     if (this.windowStarted === null || now - this.windowStarted >= this.timing.window) { this.windowStarted = now; this.attempts = 0; }
     // A window whose budget is spent — restored from before this supervisor started — starts nothing.
@@ -146,34 +181,33 @@ export class Supervisor {
     this.attempts++;
     this.set('starting', { nextRetryAt: null, core: null, calls: 0 });
     // No overlapping cores: whatever ran before is gone, and seen gone, before another starts.
-    const previous = this.handle; this.handle = null;
-    if (previous) await this.terminate(previous);
+    await this.endCurrent();
     if (generation !== this.generation) return;
     const launchId = this.launchId = this.newLaunchId();
     let handle;
     try { handle = await this.launchCore(launchId); }
-    catch (error) { return this.failed(this.cause({ launchId, exit: { error: { code: error.code, message: error.message, path: error.path } } }), generation); }
-    if (generation !== this.generation) { await this.terminate(handle); return; }
+    catch (error) { return this.failed(this.cause({ launchId, exit: { error: { code: error.code, key: error.key, message: error.message, path: error.path } } }), generation); }
     this.handle = handle;
+    if (generation !== this.generation) return;   // the next operation in the chain ends it
     this.log(`started the core (pid ${handle.pid ?? '?'}, launch ${launchId}, start ${this.attempts} in this window)`);
-    const outcome = await this.awaitReady(handle, launchId);
+    const outcome = await this.awaitReady(handle, launchId, this.controller.signal);
     if (generation !== this.generation) return;
     if (outcome.ready) return this.running(outcome.ready, generation);
     // Never ready in time: it is not left running beside the next one.
-    if (outcome.failure.key === 'ready.timeout' && this.handle === handle) { this.handle = null; await this.terminate(handle); }
+    if (outcome.failure.key === 'ready.timeout') await this.endCurrent();
     return this.failed(outcome.failure, generation);
   }
 
   running(core, generation) {
     this.set('running', { core, calls: core.calls ?? 0, failure: null, nextRetryAt: null });
     const handle = this.handle;
-    handle?.exit?.then(exit => {
+    handle?.exit?.then(exit => this.exclusive(() => {
       if (generation !== this.generation || this.handle !== handle) return;
       this.handle = null;
       this.clear('probe', 'healthy');
       this.log(`the core (pid ${handle.pid}) went away: ${JSON.stringify(exit)}`);
       this.failed(this.cause({ launchId: this.launchId, exit }), generation);
-    });
+    }));
     // Five continuous minutes running: the budget is whole again.
     this.timers.healthy = this.clock.setTimeout(() => {
       if (generation !== this.generation || this.state !== 'running') return;
@@ -188,12 +222,14 @@ export class Supervisor {
         if (health) { misses = 0; if (typeof health.calls === 'number' && health.calls !== this.calls) this.set('running', { calls: health.calls }); return probe(); }
         if (++misses < this.timing.probes) return probe();
         // Alive and not answering: a hang. It is ended before anything else is decided.
-        this.log(`the core did not answer ${this.timing.probes} health probes ${this.timing.probe / 1000} s apart: terminating it`);
-        this.clear('healthy');
-        const wedged = this.handle; this.handle = null;
-        if (wedged) await this.terminate(wedged);
-        if (generation !== this.generation) return;
-        this.failed(this.cause({ launchId: this.launchId, key: 'hang' }), generation);
+        this.exclusive(async () => {
+          if (generation !== this.generation) return;
+          this.log(`the core did not answer ${this.timing.probes} health probes ${this.timing.probe / 1000} s apart: terminating it`);
+          this.clear('healthy');
+          await this.endCurrent();
+          if (generation !== this.generation) return;
+          this.failed(this.cause({ launchId: this.launchId, key: 'hang' }), generation);
+        });
       }, this.timing.probe);
     };
     probe();
@@ -210,6 +246,6 @@ export class Supervisor {
     const backoff = this.timing.backoff;
     const delay = backoff[Math.min(this.attempts, backoff.length) - 1] ?? backoff[0];
     this.set('backoff', { failure, core: null, calls: 0, nextRetryAt: now + delay });
-    this.timers.retry = this.clock.setTimeout(() => { if (generation === this.generation) this.launch(generation); }, delay);
+    this.timers.retry = this.clock.setTimeout(() => { if (generation === this.generation) this.exclusive(() => this.launch(generation)); }, delay);
   }
 }

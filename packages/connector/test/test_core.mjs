@@ -498,3 +498,21 @@ test('interop: the supervisor runs the real core — ready by launch id and heal
   } finally { node.stop(); }
 });
 const coreGone = pid => { try { process.kill(pid, 0); return false; } catch { return true; } };
+
+test('supervise: two node.restart at once against a core that ignores SIGTERM — never two cores alive, one running after', async () => {
+  const node = supervisedNode({ modes: ['ok+stubborn'] });
+  try {
+    node.start();
+    await node.status(s => s.state === 'running');
+    const started = () => [...new Set(node.said().filter(line => line.event === 'started').map(line => line.pid))];
+    let most = 0, sampling = true;
+    const sampler = (async () => { while (sampling) { most = Math.max(most, started().filter(alive).length); await wait(10); } })();
+    await Promise.all([node.ask('node.restart'), node.ask('node.restart')]);
+    const running = await node.status(s => s.state === 'running' && s.core.pid !== started()[0], 20_000);
+    await wait(300);
+    sampling = false; await sampler;
+    assert.equal(most, 1, 'one core at a time');
+    assert.deepEqual(started().filter(alive), [running.core.pid]);
+    assert.ok(existsSync(path.join(node.dataDir, 'core', 'local.sock')), 'the running core\'s socket was not removed by the termination before it');
+  } finally { node.stop(); }
+});

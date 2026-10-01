@@ -245,3 +245,74 @@ test('cause keys: the core\'s report counts only for its own launch; a stale one
   assert.equal(failureCause({ dataDir, launchId: 'launch-1', key: 'hang' }).key, 'hang', 'the supervisor\'s own findings win over any report');
   assert.equal(failureCause({ dataDir, launchId: 'launch-5', key: 'ready.timeout' }).key, 'ready.timeout');
 });
+
+test('supervisor: two restarts at once, the first core slow to leave — one core at a time, its socket removed only after it exited, before the next starts', async () => {
+  const clock = fakeClock();
+  const events = [], alive = new Set();
+  let pid = 200, endings = [];
+  const supervisor = new Supervisor({
+    clock, newLaunchId: () => `launch-${pid + 1}`,
+    async launch(launchId) {
+      assert.equal(alive.size, 0, `no core starts while another is alive (${[...alive]})`);
+      const handle = { pid: ++pid, launchId, done: null }; let resolve;
+      handle.exit = new Promise(r => { resolve = r; }); handle.die = () => { handle.done = {}; alive.delete(handle.pid); events.push(`exit:${handle.pid}`); resolve({}); };
+      alive.add(handle.pid); events.push(`launch:${handle.pid}`); return handle;
+    },
+    awaitReady: async (handle, launchId) => ({ ready: { pid: handle.pid, launch_id: launchId, api: 1 } }),
+    probe: async () => ({ calls: 0 }),
+    // A core that ignores SIGTERM: its termination ends only when the test says so.
+    terminate: handle => new Promise(resolve => { events.push(`terminate:${handle.pid}`); endings.push(() => { handle.die(); events.push(`unlink-socket-after:${handle.pid}`); resolve(); }); }),
+    cause: ({ key }) => ({ key: key || 'launch.exited' }),
+  });
+  await supervisor.boot();
+  assert.equal(supervisor.state, 'running');
+  const first = supervisor.restart(), second = supervisor.restart();
+  await settle();
+  assert.deepEqual(events, ['launch:201', 'terminate:201'], 'nothing launched while the first core is still leaving');
+  assert.equal(endings.length, 1, 'and it is asked to leave once, not twice');
+  endings.shift()();
+  await first; await second; await settle();
+  assert.deepEqual(events, ['launch:201', 'terminate:201', 'exit:201', 'unlink-socket-after:201', 'launch:202']);
+  assert.equal(alive.size, 1);
+  assert.equal(supervisor.state, 'running');
+  assert.equal(supervisor.status().core.pid, 202);
+  // A stop while a restart waits behind a slow termination: the stop wins, and nothing is left running.
+  const restarting = supervisor.restart(); const stopping = supervisor.stop();
+  await settle();
+  endings.shift()();
+  await restarting; await stopping; await settle();
+  assert.equal(alive.size, 0);
+  assert.equal(supervisor.state, 'stopped');
+  assert.ok(!events.includes('launch:203'), 'the superseded restart launched nothing');
+});
+
+test('supervisor: a restart while a launch waits to be ready aborts that wait, and the waiting child is ended before the next', async () => {
+  const clock = fakeClock();
+  const alive = new Set(), events = [];
+  let pid = 300;
+  const supervisor = new Supervisor({
+    clock, newLaunchId: () => `l-${pid + 1}`,
+    async launch(launchId) { assert.equal(alive.size, 0); const handle = { pid: ++pid, done: null }; handle.exit = new Promise(() => {}); alive.add(handle.pid); events.push(`launch:${handle.pid}`); return handle; },
+    // The first launch never becomes ready: only its abort ends the wait.
+    awaitReady: (handle, launchId, signal) => handle.pid === 301
+      ? new Promise(resolve => signal.addEventListener('abort', () => resolve({ aborted: true, failure: { key: 'aborted' } })))
+      : Promise.resolve({ ready: { pid: handle.pid, launch_id: launchId } }),
+    probe: async () => ({ calls: 0 }),
+    async terminate(handle) { events.push(`terminate:${handle.pid}`); alive.delete(handle.pid); handle.done = {}; },
+    cause: () => ({ key: 'launch.exited' }),
+  });
+  supervisor.boot(); await settle();
+  assert.equal(supervisor.state, 'starting');
+  await supervisor.restart(); await settle();
+  assert.deepEqual(events, ['launch:301', 'terminate:301', 'launch:302']);
+  assert.equal(supervisor.state, 'running');
+});
+
+test('supervisor: a refusal before spawning keeps its own key', async () => {
+  const supervisor = new Supervisor({ clock: fakeClock(),
+    async launch() { throw Object.assign(new Error('unsafe'), { key: 'identity.unsafe-directory' }); },
+    awaitReady: async () => ({}), probe: async () => null, terminate: async () => {},
+    cause: ({ exit }) => (exit?.error?.key ? { key: exit.error.key } : { key: 'launch.exited' }) });
+  await supervisor.boot(); await settle();
+  assert.equal(supervisor.status().failure.key, 'identity.unsafe-directory');
+});

@@ -352,9 +352,10 @@ export async function terminateCore(target, { grace = STOP_GRACE_MS, log = () =>
 export function unlinkSocket(dataDir) { try { unlinkSync(socketPathOf(dataDir)); } catch {} }
 
 /** Wait for one launch to be ready, within `READY_TIMEOUT_MS`: its ready file and health, or why not. */
-export async function awaitReady(handle, { dataDir, launchId, timeout = READY_TIMEOUT_MS }) {
+export async function awaitReady(handle, { dataDir, launchId, timeout = READY_TIMEOUT_MS, signal = null }) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
+    if (signal?.aborted) return { aborted: true, failure: { key: 'aborted' } };
     if (handle.done) return { failure: failureCause({ dataDir, launchId, exit: handle.done }) };
     const ready = await launchReady(dataDir, launchId);
     if (ready) return { ready };
