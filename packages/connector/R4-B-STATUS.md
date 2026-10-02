@@ -10,7 +10,9 @@ Branch `feat/r4-single-executable` keeps the npm ESM client and adds a Node 22 C
 - TUF checks through the SEA: cold online and warm offline verification pass; cold, expired, and corrupt offline caches fail closed with the `sigstore` check named. Production verification does not force cache-only mode.
 - `node --test packages/connector/test/test_install.mjs`: 15 passed, 0 failed. Covers R1 install, crash recovery, rollback, concurrency, legacy Node interpreter recovery, format-aware service commands, and registration lifecycle.
 - `npm test -w @sidevoice/uplink`: 140 tests; 138 passed, 2 skipped, 0 failed. The two skips need a separate sidevoice-core checkout with its `.venv`.
-- Independent Astra review found no remaining concrete security or lifecycle blockers after the fixes. Native macOS and Linux arm64 jobs are configured in `.github/workflows/r4-sea.yml`; those hosted jobs have not run from this branch yet.
+- GitHub Actions on implementation commit `90cc15dac031ee16feb4d93748ab82bbf37ebaf4` passed the native Linux x86_64, Linux arm64, and macOS arm64 SEA jobs; Client (Node), real-core interoperability, launchd, systemd, and PR-title jobs also passed. Release attachment and npm publication jobs were skipped for the draft PR.
+- The first macOS run found a path spelling difference in the existing open-SQLite-process test (`/var/...` versus `lsof`'s `/private/var/...`). The test now resolves both the expected path and open-file paths through `realpathSync`; the macOS job passed on rerun.
+- Independent Astra review found no remaining concrete security or lifecycle blockers after the fixes. Native target CI is configured in `.github/workflows/r4-sea.yml`.
 
 ## R4-a inputs still required
 
