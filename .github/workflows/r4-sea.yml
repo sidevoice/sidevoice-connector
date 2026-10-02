@@ -175,6 +175,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: v22.23.3
+      - name: Install locked npm dependencies
+        run: npm ci
       - uses: actions/download-artifact@v4
         with:
           name: sidevoice-connector-macos-aarch64-r4b

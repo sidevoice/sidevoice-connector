@@ -613,6 +613,8 @@ test('production npm and SEA workflows require the signed core manifest; only th
   assert.match(seaWorkflow, /SIDEVOICE_CORE_MANIFEST_SIGSTORE:\s*\$\{\{\s*steps\.core\.outputs\.manifest_sigstore\s*\}\}/);
   assert.match(seaWorkflow, /SIDEVOICE_REQUIRE_CORE_MANIFEST:\s*\$\{\{\s*steps\.core\.outputs\.require_manifest\s*\}\}/);
   assert.match(seaWorkflow, /echo "require_manifest=1"/);
+  assert.match(seaWorkflow, /  desktop-pin:\n[\s\S]*?      - uses: actions\/setup-node@v4\n        with:\n          node-version: v22\.23\.3\n      - name: Install locked npm dependencies\n        run: npm ci\n      - uses: actions\/download-artifact@v4/,
+    'desktop-pin installs its locked dependencies before importing connector modules');
   assert.match(seaWorkflow, new RegExp(`name: ${SEA_ARTIFACT_NAME}`));
   assert.match(seaWorkflow, /path: packages\/connector\/dist-sea\/macos-aarch64\/sidevoice/);
   assert.match(seaWorkflow, /retention-days: 90/);
