@@ -1403,16 +1403,16 @@ esac
   const gone = await uninstall(['--harness', 'claude', '--no-core'], env);
   assert.deepEqual(changes(), ['mcp remove --scope user sidevoice']);
   assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice')), 'the releases are gone');
-  assert.deepEqual(readdirSync(env.SIDEVOICE_DATA_DIR).sort(), ['install.lock', 'node-stopped.json'], 'credential, socket and log are gone; the lock file is permanent, and the stop stays');
+  assert.deepEqual(readdirSync(env.SIDEVOICE_DATA_DIR).sort(), ['agents.lock', 'install.lock', 'node-stopped.json'], 'credential, socket, log and agent state are gone; permanent locks and the stop stay');
   assert.match(gone.next.join('\n'), /still lists this machine as paired .* revoke it under "Máquinas" on the room/);
   assert.match(gone.done.join('\n'), /Unregistered the MCP server/);
 
-  // Codex is instructions, not edits: its configuration is machine-wide and not ours to rewrite.
+  // Manual Codex setup remains available, while explicit connection delegates configuration changes to Codex itself.
   const codex = codexInstructions(env);
   assert.match(codex, /\[mcp_servers\.sidevoice\]/);
   assert.match(codex, /command = "node"/);
   assert.ok(!codex.includes('hooks'), 'nothing but the MCP server is asked of Codex');
-  assert.match(codex, /does not rewrite it/);
+  assert.match(codex, /leaves Codex configuration changes to Codex itself/);
 });
 
 test('skill: nothing is installed any more; a copy of ours is removed and a foreign one is never touched', () => {

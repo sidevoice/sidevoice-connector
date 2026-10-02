@@ -13,6 +13,7 @@ import { runLinkRoom, runPair } from './pair.mjs';
 import { run as pairDevice } from './pair-device.mjs';
 import { run as service } from './service.mjs';
 import { run as skill } from './skill.mjs';
+import { run as agents, scanInstalledAgents } from './agents.mjs';
 import { t } from './i18n.mjs';
 import { VERSION } from './identity.mjs';
 import { realpathSync } from 'node:fs';
@@ -27,9 +28,11 @@ import { readFile } from 'node:fs/promises';
 import { stableCommand } from './release.mjs';
 import { connectorMetadata, versionMetadata } from './metadata.mjs';
 import { pause } from './testpoint.mjs';
+import { appendLine } from './logfile.mjs';
+import { dataDirOf, nodeFiles } from './node-files.mjs';
 
 const COMMANDS = { install: runInstall, uninstall: runUninstall, rollback: runRollback, mcp, pair: runPair, 'link-room': runLinkRoom,
-  'pair-device': pairDevice, connector, service, skill };
+  'pair-device': pairDevice, connector, service, skill, agents };
 
 /** With `--json`, every failure is one object on stdout — `{ok: false, error: {key, message}}` — and exit 1. */
 const failJson = (key, message) => { console.log(JSON.stringify({ ok: false, error: { key, message } })); return 1; };
@@ -52,6 +55,15 @@ export async function main([command, ...argv] = process.argv.slice(2)) {
   if (command === '--sidevoice-selected-command') {
     try { console.log(JSON.stringify(stableCommand(process.env))); return 0; }
     catch (error) { console.log(JSON.stringify({ error: error.key ?? 'install.failed' })); return 1; }
+  }
+  if (command === '--sidevoice-agent-scan') {
+    try { scanInstalledAgents(process.env); return 0; }
+    catch (error) {
+      const detail = [error?.message, error?.stdout, error?.stderr].filter(Boolean).map(value => String(value).trim()).filter(Boolean).join('\n');
+      const file = process.env.SIDEVOICE_CONNECTOR_LOG || nodeFiles(dataDirOf()).connectorLog;
+      appendLine(file, `${new Date().toISOString()} [sidevoice] agent scan failed${detail ? `:\n${detail}` : ''}`);
+      return 1;
+    }
   }
   // Exercise the same bundled Sigstore path production core installation uses. This private command intentionally
   // returns only machine-readable verification outcomes; the public verification test uses a genuine unrelated bundle.

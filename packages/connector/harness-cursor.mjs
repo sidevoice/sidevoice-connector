@@ -28,6 +28,9 @@ import path from 'node:path';
 import { defineHarness, envelope, SUPPORTED, UNSUPPORTED, tailJsonl, voiceEnvelope } from './harness-contract.mjs';
 import { deliverToView, drawsViews, openView, THREAD_PREFIX, viewKey, viewState } from './harness-cursor-app.mjs';
 import { bridgeDir, bridgeInstances, callingThread, composerHolding, sendToThread } from './harness-cursor-desktop.mjs';
+import { cursorState, removeCursor, selected, setCursor } from './registrations.mjs';
+import { connectorMcpCommand, executableVersion, mcpJson, shellCommand } from './agent-support.mjs';
+import { t } from './i18n.mjs';
 
 /** Which Cursor chat each editor conversation is, once known (connector process): from the Desktop Bridge at
  *  join, from Cursor's state database, or from the transcript that holds a message delivered to it. */
@@ -237,6 +240,21 @@ export async function deliver(delivery, event, env = process.env) {
 }
 
 const PASTE_SETTLE_MS = Number(process.env.SIDEVOICE_CURSOR_PASTE_SETTLE_MS || 150);
+
+function detectAgent(env, { binary = null, includeVersion = true } = {}) {
+  const current = cursorState(env).state;
+  const launch = connectorMcpCommand(env);
+  const command = shellCommand(launch.command, launch.args);
+  const file = path.join(env.CURSOR_CONFIG_DIR || path.join(env.HOME || os.homedir(), '.cursor'), 'mcp.json');
+  return {
+    id: 'cursor', label: t('harness.cursor', {}, env), version: binary && includeVersion ? (executableVersion(binary, ['--version'], env) || null) : null,
+    registration: current === 'absent' ? 'not-connected' : current === 'ours' ? 'connected' : current,
+    connect: 'auto', instructions: { command, file, snippet: mcpJson(launch.command, launch.args) },
+  };
+}
+
+function connectAgent(env) { return setCursor(env, selected(env)); }
+function disconnectAgent(env) { return removeCursor(env); }
 
 /** What the connector can say about a conversation's route, for voice_status: an editor chat's card. */
 export function deliveryState(delivery) {
@@ -497,6 +515,7 @@ export const cursorHarness = defineHarness({
   prepare,
   deliveryState,
   refineIdentity,
+  agent: Object.freeze({ detect: detectAgent, connect: connectAgent, disconnect: disconnectAgent }),
   // Delivery types into the chat's terminal through tmux (CLI) or submits through an MCP App view (editor):
   // it works, by routes Cursor does not offer as an interface.
   experimental: ['deliver'],

@@ -17,10 +17,10 @@
  *  which signals that process only as its verified self (`proc.mjs`). That record is information, never the lock. */
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { closeSync, constants, ftruncateSync, mkdirSync, openSync, writeSync } from 'node:fs';
+import { closeSync, constants, fstatSync, ftruncateSync, mkdirSync, openSync, writeSync } from 'node:fs';
 import { selfIdentity } from './proc.mjs';
 import { keyed } from './i18n.mjs';
-import { readTrusted } from './secure-fs.mjs';
+import { readTrusted, verifyPrivateDir } from './secure-fs.mjs';
 import { pause } from './testpoint.mjs';
 
 const DARWIN_O_EXLOCK = 0x20, DARWIN_O_NONBLOCK = 0x4;
@@ -80,6 +80,28 @@ export async function tryLock(file, { kind = 'lock', env = process.env, signal }
   try { await pause(`lock-held-${kind}`, { signal }); }
   catch (error) { release(); throw error; }
   return { held: true, record, release };
+}
+
+/** Synchronous short-lived lock for small read/modify/write records used from synchronous connector routes. */
+export function tryLockSync(file, { env = process.env } = {}) {
+  verifyPrivateDir(path.dirname(file), { create: true });
+  let fd;
+  if (process.platform === 'darwin') {
+    try { fd = openSync(file, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW | DARWIN_O_EXLOCK | DARWIN_O_NONBLOCK, 0o600); }
+    catch (error) { if (error.code === 'EAGAIN' || error.code === 'EWOULDBLOCK') return { held: false }; throw error; }
+  } else if (process.platform === 'linux') {
+    fd = openSync(file, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+    let taken;
+    try { taken = flockLinux(fd, env); } catch (error) { closeSync(fd); throw error; }
+    if (!taken) { closeSync(fd); return { held: false }; }
+  } else throw keyed('lock.unavailable', { detail: process.platform });
+  const stat = fstatSync(fd);
+  if (!stat.isFile() || (typeof process.getuid === 'function' && stat.uid !== process.getuid()) || (stat.mode & 0o077)) {
+    closeSync(fd);
+    throw keyed('identity.unsafe-file', { path: file, why: 'not a private regular file owned by this user' });
+  }
+  let released = false;
+  return { held: true, release() { if (released) return; released = true; try { closeSync(fd); } catch {} } };
 }
 
 /** The install lock (`D/install.lock`): taken by every command that changes the installation and held to its end.

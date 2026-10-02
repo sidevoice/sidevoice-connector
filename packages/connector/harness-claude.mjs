@@ -12,6 +12,9 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { defineHarness, envelope, SUPPORTED, tailJsonl } from './harness-contract.mjs';
+import { claudeState, removeClaude, selected, setClaude } from './registrations.mjs';
+import { agentTimeout, connectorMcpCommand, shellCommand } from './agent-support.mjs';
+import { t } from './i18n.mjs';
 
 const configDir = () => process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
 
@@ -201,6 +204,34 @@ export function assistantModel(entry) {
 
 const POLL_MS = Number(process.env.SIDEVOICE_WORK_POLL_MS || 400);
 
+function detectAgent(env, { binary = null, includeVersion = true } = {}) {
+  const currentEnv = binary ? { ...env, SIDEVOICE_CLAUDE_BIN: binary } : env;
+  const current = binary ? claudeState(currentEnv).state : 'unknown';
+  const launch = connectorMcpCommand(env);
+  const command = shellCommand(binary || 'claude', ['mcp', 'add', '--scope', 'user', 'sidevoice', '--', launch.command, ...launch.args]);
+  return {
+    id: 'claude', label: t('harness.claude', {}, env), version: binary && includeVersion ? (version(binary, env) || null) : null,
+    registration: current === 'absent' ? 'not-connected' : current === 'ours' ? 'connected' : current,
+    connect: binary ? 'auto' : 'manual',
+    instructions: { command, file: null, snippet: command },
+  };
+}
+
+function version(binary, env) {
+  try { return execFileSync(binary, ['--version'], { encoding: 'utf8', timeout: agentTimeout(env), env, stdio: ['ignore', 'pipe', 'ignore'] }).trim().split(/\r?\n/)[0] || null; }
+  catch { return null; }
+}
+
+function connectAgent(env, _record, { binary = null } = {}) {
+  if (!binary) return 'manual';
+  return setClaude({ ...env, SIDEVOICE_CLAUDE_BIN: binary }, selected(env));
+}
+
+function disconnectAgent(env, { binary = null } = {}) {
+  if (!binary) return claudeState(env).state;
+  return removeClaude({ ...env, SIDEVOICE_CLAUDE_BIN: binary });
+}
+
 /** Watch one session through what Claude Code itself writes about it, and nothing installed in it:
  *  its registry record says whether it is busy, its transcript records every user message the
  *  moment the session admits it (a message from the inbox is appended as the turn takes it, not when
@@ -243,6 +274,7 @@ export const claudeHarness = defineHarness({
   engine: sessionEngine,
   observe,
   sessionIdentity,
+  agent: Object.freeze({ detect: detectAgent, connect: connectAgent, disconnect: disconnectAgent }),
 });
 
 export default claudeHarness;

@@ -2,11 +2,14 @@
  *
  * Delivery and identity are available to the stdio MCP façade. Working state and read receipts come
  * from the thread's own rollout file, which Codex appends as the turn runs; nothing is configured in Codex. */
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { existsSync, readdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { defineHarness, envelope, SUPPORTED, UNSUPPORTED, tailJsonl } from './harness-contract.mjs';
+import { codexState, removeCodex, selected, setCodex } from './registrations.mjs';
+import { agentTimeout, connectorMcpCommand, shellCommand } from './agent-support.mjs';
+import { t } from './i18n.mjs';
 
 function turnMetadata(meta) {
   let turn = meta?.['x-codex-turn-metadata'] || {};
@@ -26,6 +29,35 @@ function sessionIdentity({ meta, env = process.env, payload } = {}) {
     ? { kind: 'http', url: env.SIDEVOICE_DELIVERY_URL, thread }
     : { kind: 'codex-queue', thread };
   return { harness: 'codex', thread, delivery };
+}
+
+function detectAgent(env, { binary = null, includeVersion = true } = {}) {
+  const currentEnv = binary ? { ...env, SIDEVOICE_CODEX_BIN: binary } : env;
+  const current = binary ? codexState(currentEnv).state : 'unknown';
+  const launch = connectorMcpCommand(env);
+  const command = shellCommand(launch.command, launch.args);
+  const file = path.join(env.CODEX_HOME || path.join(env.HOME || os.homedir(), '.codex'), 'config.toml');
+  const snippet = `[mcp_servers.sidevoice]\ncommand = ${JSON.stringify(launch.command)}\nargs = ${JSON.stringify(launch.args)}`;
+  return {
+    id: 'codex', label: t('harness.codex', {}, env), version: binary && includeVersion ? (version(binary, env) || null) : null,
+    registration: current === 'absent' ? 'not-connected' : current === 'ours' ? 'connected' : current,
+    connect: binary ? 'auto' : 'manual', instructions: { command, file, snippet },
+  };
+}
+
+function version(binary, env) {
+  try { return execFileSync(binary, ['--version'], { encoding: 'utf8', timeout: agentTimeout(env), env, stdio: ['ignore', 'pipe', 'ignore'] }).trim().split(/\r?\n/)[0] || null; }
+  catch { return null; }
+}
+
+function connectAgent(env, _record, { binary = null } = {}) {
+  if (!binary) return 'manual';
+  return setCodex({ ...env, SIDEVOICE_CODEX_BIN: binary }, selected(env));
+}
+
+function disconnectAgent(env, { binary = null } = {}) {
+  if (!binary) return codexState(env).state;
+  return removeCodex({ ...env, SIDEVOICE_CODEX_BIN: binary });
 }
 
 function deliver(delivery, event) {
@@ -144,6 +176,7 @@ export const codexHarness = defineHarness({
   engine,
   observe,
   sessionIdentity,
+  agent: Object.freeze({ detect: detectAgent, connect: connectAgent, disconnect: disconnectAgent }),
 });
 
 export default codexHarness;

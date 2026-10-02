@@ -13,6 +13,12 @@ The client side. One bin (`sidevoice`), these entry points:
   found, `--harness <id>`, or none with `--no-agents`, registered once through
   `current`. `--no-core` leaves the core for later; `--json` prints one object for the
   app. Pairs with nothing; reports whether the machine is paired.
+- `agents [--json]` scans Claude Code, Codex and Cursor from the captured login-shell PATH
+  plus known locations, reports their versions and Sidevoice registration state, and returns
+  each agent's manual command or file snippet. `agents connect|disconnect|dismiss <id>` is
+  the explicit consent path. The private `agents.json` stores the last scan, resolved binary
+  paths and dismissal generations. Entries Sidevoice did not create are left untouched. The
+  generic MCP command and JSON come from the selected Sidevoice install path.
 - `rollback [--json]` — `current` back to `previous`, the jobs restarted on it and verified.
 - `service install|uninstall|start|stop|restart|status [--json]` — Sidevoice at login: two
   jobs of the user's own service manager, neither supervising the other — the core
@@ -26,7 +32,7 @@ The client side. One bin (`sidevoice`), these entry points:
   it running without a session, and never runs it.
 - `uninstall` — the jobs unloaded (it stops, deleting nothing, if the manager will not), what
   runs on demand stopped, the definitions, then our harness registrations, then the releases
-  and `~/.sidevoice` (all but its two lock files).
+  and `~/.sidevoice` (all but its permanent lock files).
 - `mcp` — the stdio MCP server a harness starts. One per conversation. Exposes
   `voice_connect`, `voice_pair`, `voice_say`, `voice_disconnect`, `voice_pair_device`,
   `voice_status`; carries the
