@@ -33,15 +33,22 @@ function sessionIdentity({ meta, env = process.env, payload } = {}) {
 
 function detectAgent(env, { binary = null, includeVersion = true } = {}) {
   const currentEnv = binary ? { ...env, SIDEVOICE_CODEX_BIN: binary } : env;
-  const current = binary ? codexState(currentEnv).state : 'unknown';
+  const current = codexState(currentEnv);
   const launch = connectorMcpCommand(env);
   const command = shellCommand(launch.command, launch.args);
   const file = path.join(env.CODEX_HOME || path.join(env.HOME || os.homedir(), '.codex'), 'config.toml');
   const snippet = `[mcp_servers.sidevoice]\ncommand = ${JSON.stringify(launch.command)}\nargs = ${JSON.stringify(launch.args)}`;
+  const replaceCommand = shellCommand(binary || env.SIDEVOICE_CODEX_BIN || 'codex', ['mcp', 'remove', 'sidevoice']);
+  const addCommand = shellCommand(binary || env.SIDEVOICE_CODEX_BIN || 'codex', ['mcp', 'add', 'sidevoice', '--', launch.command, ...launch.args]);
+  const replacingForeign = current.state === 'foreign';
+  const instructions = replacingForeign
+    ? { command: t('agents.manual.codex.replace-existing', { remove: replaceCommand, add: addCommand }, env), file: null, snippet: null }
+    : { command, file, snippet };
   return {
     id: 'codex', label: t('harness.codex', {}, env), version: binary && includeVersion ? (version(binary, env) || null) : null,
-    registration: current === 'absent' ? 'not-connected' : current === 'ours' ? 'connected' : current,
-    connect: binary ? 'auto' : 'manual', instructions: { command, file, snippet },
+    registration: current.state === 'absent' ? 'not-connected' : current.state === 'ours'
+      ? (current.connected ? 'connected' : 'not-connected') : current.state,
+    connect: binary ? 'auto' : 'manual', instructions,
   };
 }
 

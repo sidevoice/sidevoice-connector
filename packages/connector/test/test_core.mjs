@@ -4,6 +4,7 @@
  *  for the two programs; everything else is the real connector. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,6 +18,32 @@ const packageDir = path.join(here, '..');
 const fakeUv = path.join(here, 'fake-uv.mjs');
 const wait = ms => new Promise(r => setTimeout(r, ms));
 async function until(check, timeout = 15_000) { const start = Date.now(); while (Date.now() - start < timeout) { const value = await check(); if (value) return value; await wait(25); } throw new Error('timed out waiting'); }
+
+function localHttp(socketPath, method, route, body = null) {
+  const payload = body === null ? null : JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const request = http.request({ socketPath, path: route, method, headers: payload === null ? {} : {
+      'content-type': 'application/json', 'content-length': Buffer.byteLength(payload),
+    } }, response => {
+      let text = '';
+      response.setEncoding('utf8'); response.on('data', chunk => { text += chunk; });
+      response.on('end', () => {
+        let json = null; try { json = JSON.parse(text); } catch {}
+        resolve({ status: response.statusCode, json, text });
+      });
+    });
+    request.once('error', reject);
+    if (payload !== null) request.write(payload);
+    request.end();
+  });
+}
+
+async function coreHttp(url, method, route, token) {
+  const response = await fetch(new URL(route, url), { method, headers: token ? { authorization: `Bearer ${token}` } : {} });
+  const text = await response.text();
+  let json = null; try { json = JSON.parse(text); } catch {}
+  return { status: response.status, json, text };
+}
 
 function ipc(socketPath) {
   const socket = net.createConnection(socketPath); let buffer = '', serial = 0; const waiting = new Map();
@@ -415,9 +442,9 @@ test('core: one core per data directory — a second start exits 75 with bind.co
   } finally { node.stop(); }
 });
 
-/** The real core (R1-a) when a checkout of it is at hand — `SIDEVOICE_INTEROP_CORE_DIR`, or a `core` checkout beside
+/** The real core when a checkout of it is at hand — `SIDEVOICE_INTEROP_CORE_DIR`, or a `core` checkout beside
  *  this repository — with its environment in `.venv`; skipped otherwise, except where `SIDEVOICE_INTEROP_REQUIRED=1`
- *  (the CI job that installs it): there a missing core is a failure, never a skip. */
+ *  (the CI job that installs reviewed core #38): there a missing core is a failure, never a skip. */
 const interopCore = process.env.SIDEVOICE_INTEROP_CORE_DIR || path.join(packageDir, '..', '..', '..', 'core');
 const interopPython = path.join(interopCore, '.venv', 'bin', 'python');
 const interopRequired = process.env.SIDEVOICE_INTEROP_REQUIRED === '1';
@@ -455,6 +482,50 @@ test('interop: the connector job links to the real core it did not start — rea
     connector.kill('SIGTERM');
     await until(() => connector.exitCode !== null, 30_000);
     assert.equal(alive(running.core.pid), true, 'the core is not the connector\'s: it keeps running');
+  } finally { node.stop(); }
+});
+
+test('interop: core #38 authenticates host agent API calls and relays the connector key and no-connector failure', { skip: interopSkip }, async () => {
+  const node = realNode();
+  let connector = null;
+  try {
+    const coreCommit = execFileSync('git', ['-C', interopCore, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    assert.equal(coreCommit, '59e32df778c7ac68590f05310b2df8db91f5873f', 'this interop must exercise the reviewed core #38 head');
+    node.startCore();
+    const ready = await until(() => node.ready(), 90_000);
+    connector = node.start(['--service']);
+    await node.status(status => status.reachable, 90_000);
+    await until(() => existsSync(node.socketPath), 30_000);
+
+    const pairing = await localHttp(ready.socket, 'POST', '/api/device/local/pair', { name: 'R2 connector interop' });
+    assert.equal(pairing.status, 200, pairing.text);
+    assert.ok(pairing.json?.token, 'the core issued the device credential through its local-only socket');
+
+    const unauthenticated = await coreHttp(ready.url, 'GET', '/api/host/agents?rescan=1&watch=codex');
+    assert.equal(unauthenticated.status, 401, 'the host-agent API requires a paired device');
+
+    const listed = await until(async () => {
+      const response = await coreHttp(ready.url, 'GET', '/api/host/agents?rescan=1&watch=codex', pairing.json.token);
+      return response.status === 200 ? response : null;
+    }, 90_000);
+    assert.equal(listed.status, 200, listed.text);
+    assert.deepEqual(Object.keys(listed.json || {}).sort(), ['agents', 'custom', 'scanned_at']);
+    assert.ok(Array.isArray(listed.json?.agents));
+    assert.ok(listed.json?.custom && typeof listed.json.custom === 'object');
+
+    const keyedFailure = await coreHttp(ready.url, 'POST', '/api/host/agents/not-registered/connect', pairing.json.token);
+    assert.equal(keyedFailure.status, 409, keyedFailure.text);
+    assert.equal(keyedFailure.json?.error?.key, 'agents.unknown');
+    assert.equal(keyedFailure.json?.error?.params?.id, 'not-registered');
+    assert.doesNotMatch(keyedFailure.text, /stderr|stdout|command output/i);
+
+    connector.kill('SIGTERM');
+    await until(() => connector.exitCode !== null, 30_000);
+    const withoutConnector = await until(async () => {
+      const response = await coreHttp(ready.url, 'GET', '/api/host/agents?rescan=0', pairing.json.token);
+      return response.status === 503 ? response : null;
+    }, 10_000);
+    assert.deepEqual(withoutConnector.json, { key: 'no-connector' });
   } finally { node.stop(); }
 });
 

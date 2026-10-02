@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       core-ref:
-        description: The sidevoice-core commit the interop job runs against (default below).
+        description: The sidevoice-core commit the interop job runs against (R2 host-agent interop pins core #38 below).
         type: string
         required: false
   workflow_call:
@@ -27,8 +27,8 @@ permissions:
   contents: read
 
 env:
-  # The real core the interop job runs against: R1-a (sidevoice/sidevoice-core#29) until it merges, then main.
-  CORE_REF: ${{ inputs.core-ref || '8b7d2beb8b066763b32feb54f22de954ebd36dbe' }}
+  # R2 host-agent interop is pinned to the reviewed sidevoice-core#38 head.
+  CORE_REF: ${{ inputs.core-ref || '59e32df778c7ac68590f05310b2df8db91f5873f' }}
 
 concurrency:
   # Per ref. A release (github.workflow is the caller's, release-please) never shares a group with a push.

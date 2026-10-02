@@ -232,13 +232,18 @@ export function codexRegistration(env = process.env) {
   }
   if (file.state === 'foreign' || file.state === 'invalid') return file;
   const registration = { command: transport.command, args: transport.args };
-  return { state: oursEntry(registration, env) ? 'ours' : 'foreign', file: file.file, ...registration };
+  return { state: oursEntry(registration, env) ? 'ours' : 'foreign', enabled: entry.enabled !== false,
+    file: file.file, ...registration };
 }
 
 /** Codex CLI's identity and own configuration; the config is read only, and Codex performs every write. */
 export function codexState(env = process.env) {
   const registration = codexRegistration(env);
-  return { state: registration.state, ...(registration.file ? { file: registration.file } : {}),
+  const installed = serverCommand(env);
+  const connected = registration.state === 'ours' && registration.enabled !== false
+    && registration.command === installed.command && JSON.stringify(registration.args) === JSON.stringify(installed.args);
+  return { state: registration.state, connected, ...(registration.enabled !== undefined ? { enabled: registration.enabled } : {}),
+    ...(registration.file ? { file: registration.file } : {}),
     ...(registration.why ? { why: registration.why } : {}), ...(registration.command ? { command: registration.command, args: registration.args } : {}) };
 }
 
@@ -253,7 +258,8 @@ export function setCodex(env, record) {
   if (before.state === 'unknown') return codexReachable(env) ? 'unknown' : 'manual';
   const { command, args } = registration(record);
   const current = before;
-  if (current.state === 'ours' && current.command === command && JSON.stringify(current.args) === JSON.stringify(args)) return 'unchanged';
+  if (current.state === 'ours' && current.enabled !== false && current.command === command
+      && JSON.stringify(current.args) === JSON.stringify(args)) return 'unchanged';
   if (current.state === 'ours') codex(['mcp', 'remove', 'sidevoice'], env);
   codex(['mcp', 'add', 'sidevoice', '--', command, ...args], env);
   return current.state === 'ours' ? 'repointed' : 'added';

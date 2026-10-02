@@ -41,6 +41,7 @@ fi
 exit 2
 `);
   const codexConfig = path.join(codexDir, 'config.toml');
+  const codexEnabled = path.join(home, 'codex-enabled');
   const codexInvocations = path.join(home, 'codex-invocations.txt');
   const codex = path.join(binDir, 'codex');
   executable(codex, `#!/bin/sh
@@ -54,14 +55,16 @@ if [ "$1" = "mcp" ] && [ "$2" = "get" ] && [ "$3" = "sidevoice" ] && [ "$4" = "-
   command=$(sed -n 's/^command = "\\(.*\\)"/\\1/p' ${JSON.stringify(codexConfig)})
   args=$(sed -n 's/^args = \\["\\(.*\\)", "\\(.*\\)"\\]/\\1 \\2/p' ${JSON.stringify(codexConfig)})
   set -- $args
-  printf '{"name":"sidevoice","enabled":true,"transport":{"type":"stdio","command":"%s","args":["%s","%s"]}}\\n' "$command" "$1" "$2"
+  enabled=true; if [ "$CODEX_DISABLED" = "1" ] && [ ! -e "$CODEX_ENABLED_FILE" ]; then enabled=false; fi
+  printf '{"name":"sidevoice","enabled":%s,"transport":{"type":"stdio","command":"%s","args":["%s","%s"]}}\\n' "$enabled" "$command" "$1" "$2"
   exit 0
 fi
 if [ "$1" = "mcp" ] && [ "$2" = "add" ]; then
   printf '[mcp_servers.sidevoice]\\ncommand = "%s"\\nargs = ["%s", "%s"]\\n' "$5" "$6" "$7" > ${JSON.stringify(codexConfig)}
+  if [ -n "$CODEX_ENABLED_FILE" ]; then : > "$CODEX_ENABLED_FILE"; fi
   exit 0
 fi
-if [ "$1" = "mcp" ] && [ "$2" = "remove" ]; then rm -f ${JSON.stringify(codexConfig)}; exit 0; fi
+if [ "$1" = "mcp" ] && [ "$2" = "remove" ]; then rm -f ${JSON.stringify(codexConfig)} "$CODEX_ENABLED_FILE"; exit 0; fi
 exit 2
 `);
   const cursorVersion = path.join(home, 'cursor-version'); writeFileSync(cursorVersion, 'Cursor 2.0.0\n');
@@ -72,9 +75,14 @@ exit 2
 `);
   const env = { ...process.env, HOME: home, SHELL: shell, AGENT_TEST_LOGIN_PATH: binDir, SIDEVOICE_DATA_DIR: dataDir,
     XDG_DATA_HOME: path.join(home, 'share'), CLAUDE_CONFIG_DIR: claudeDir, CODEX_HOME: codexDir, CURSOR_CONFIG_DIR: cursorDir,
+    CODEX_ENABLED_FILE: codexEnabled,
     SIDEVOICE_AGENT_TIMEOUT_MS: '1000' };
   for (const key of ['SIDEVOICE_URL', 'SIDEVOICE_CONNECTOR_ID', 'SIDEVOICE_CONNECTOR_TOKEN']) delete env[key];
-  return { home, binDir, claudeDir, codexDir, cursorDir, dataDir, claude, codex, cursor, cursorVersion, codexConfig, codexInvocations, env };
+  return { home, binDir, claudeDir, codexDir, cursorDir, dataDir, claude, codex, cursor, cursorVersion, codexConfig, codexEnabled, codexInvocations, env };
+}
+
+function writeCodexEntry(f, command, args) {
+  writeFileSync(f.codexConfig, `[mcp_servers.sidevoice]\ncommand = ${JSON.stringify(command)}\nargs = [${args.map(JSON.stringify).join(', ')}]\n`);
 }
 
 test('host scan captures login-shell PATH and returns agent-specific manual configuration from the installed command', () => {
@@ -111,6 +119,72 @@ test('explicit connect and disconnect use each harness, and foreign entries stay
   writeFileSync(path.join(f.cursorDir, 'mcp.json'), JSON.stringify(foreign));
   assert.throws(() => agentAction('connect', 'cursor', f.env), error => error.key === 'agents.foreign');
   assert.deepEqual(JSON.parse(readFileSync(path.join(f.cursorDir, 'mcp.json'), 'utf8')), foreign);
+});
+
+test('Codex connects an old Sidevoice release to the selected install, then Connect is idempotent', () => {
+  const f = fixture();
+  const oldCli = path.join(f.home, 'share', 'sidevoice', 'releases', '0.5.9', 'dist', 'cli.mjs');
+  mkdirSync(path.dirname(oldCli), { recursive: true }); writeFileSync(oldCli, '');
+  writeCodexEntry(f, 'node', [oldCli, 'mcp']);
+  f.env.CODEX_INVOCATIONS_FILE = f.codexInvocations;
+
+  const old = listAgents(f.env, { rescan: true }).agents.find(agent => agent.id === 'codex');
+  assert.equal(old.registration, 'not-connected', 'an owned entry for a different release is not connected to this install');
+  assert.equal(old.actionable, true);
+
+  const connected = agentAction('connect', 'codex', f.env).agents.find(agent => agent.id === 'codex');
+  assert.equal(connected.registration, 'connected');
+  const current = path.join(f.home, 'share', 'sidevoice', 'current', 'dist', 'cli.mjs');
+  assert.match(readFileSync(f.codexConfig, 'utf8'), new RegExp(current.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  const afterFirstConnect = readFileSync(f.codexInvocations, 'utf8').trim().split('\n');
+  assert.ok(afterFirstConnect.some(line => line.startsWith('mcp remove sidevoice')));
+  assert.ok(afterFirstConnect.some(line => line.startsWith('mcp add sidevoice')));
+
+  const again = agentAction('connect', 'codex', f.env).agents.find(agent => agent.id === 'codex');
+  assert.equal(again.registration, 'connected');
+  const afterSecondConnect = readFileSync(f.codexInvocations, 'utf8').trim().split('\n');
+  assert.equal(afterSecondConnect.slice(afterFirstConnect.length).some(line => line.startsWith('mcp add sidevoice') || line.startsWith('mcp remove sidevoice')), false,
+    'the current enabled entry is not rewritten by a repeated Connect');
+});
+
+test('a disabled Codex entry for the selected install is not connected and explicit Connect re-enables it', () => {
+  const f = fixture();
+  const current = path.join(f.home, 'share', 'sidevoice', 'current', 'dist', 'cli.mjs');
+  writeCodexEntry(f, 'node', [current, 'mcp']);
+  f.env.CODEX_DISABLED = '1';
+  f.env.CODEX_INVOCATIONS_FILE = f.codexInvocations;
+
+  const disabled = listAgents(f.env, { rescan: true }).agents.find(agent => agent.id === 'codex');
+  assert.equal(disabled.registration, 'not-connected');
+  assert.equal(disabled.actionable, true);
+
+  const connected = agentAction('connect', 'codex', f.env).agents.find(agent => agent.id === 'codex');
+  assert.equal(connected.registration, 'connected');
+  assert.equal(existsSync(f.codexEnabled), true, 'Codex add enabled the newly written entry');
+  assert.ok(readFileSync(f.codexInvocations, 'utf8').includes('mcp remove sidevoice'));
+  assert.ok(readFileSync(f.codexInvocations, 'utf8').includes('mcp add sidevoice'));
+});
+
+test('a Codex entry from an old checkout stays untouched and manual instructions replace rather than append TOML', () => {
+  const f = fixture();
+  const oldCheckout = path.join(f.home, 'old-sidevoice-checkout', 'packages', 'connector', 'cli.mjs');
+  mkdirSync(path.dirname(oldCheckout), { recursive: true }); writeFileSync(oldCheckout, '');
+  const before = `[mcp_servers.sidevoice]\ncommand = "node"\nargs = ${JSON.stringify([oldCheckout, 'mcp'])}\n`;
+  writeFileSync(f.codexConfig, before);
+
+  const agent = listAgents(f.env, { rescan: true }).agents.find(row => row.id === 'codex');
+  assert.equal(agent.registration, 'foreign');
+  assert.equal(agent.instructions.file, null, 'do not tell a user to append a second table to the existing file');
+  assert.equal(agent.instructions.snippet, null);
+  const recovery = agent.instructions.command.split('\n');
+  assert.match(recovery[0], /Replace the existing Sidevoice entry/);
+  assert.equal(recovery.length, 3, 'recovery names only the existing Sidevoice entry, followed by remove/add commands');
+  assert.match(recovery[1], /mcp' 'remove' 'sidevoice/);
+  assert.match(recovery[2], /mcp' 'add' 'sidevoice' '--'/);
+  assert.match(recovery[2], /current.*dist.*cli\.mjs/);
+
+  assert.throws(() => agentAction('connect', 'codex', f.env), error => error.key === 'agents.foreign');
+  assert.equal(readFileSync(f.codexConfig, 'utf8'), before, 'automatic Connect does not rewrite a foreign checkout');
 });
 
 test('dismissal survives rescans and restarts, then a missing agent reappearing gets a new notice generation', () => {
