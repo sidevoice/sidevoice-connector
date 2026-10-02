@@ -23,6 +23,7 @@ import { decide, discardRuntimeIfUnselected, point, releaseLayout, stableCommand
 import { definitionTexts, recordInstallation } from '../service.mjs';
 import { oursInCursor } from '../registrations.mjs';
 import { connectorMetadata, versionMetadata } from '../metadata.mjs';
+import { createDesktopPinRecord, PIN_ARTIFACT_NAME, SEA_ARTIFACT_NAME, verifyArtifactRoundTrip } from '../sea-artifact.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixture = path.join(here, 'fixtures', 'r4', 'sigstore-5.0.0.sigstore.json');
@@ -563,7 +564,7 @@ test('release and nightly package builds refuse to omit the signed core manifest
   }
 });
 
-test('production npm and main-branch SEA workflows pass the signed core manifest and sidecar to the build', async () => {
+test('production npm and SEA workflows require the signed core manifest; only the tested production macOS SEA is uploaded', async () => {
   const repoRoot = path.resolve(connectorPackage, '..', '..');
   const ci = await readFile(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8');
   const seaWorkflow = await readFile(path.join(repoRoot, '.github', 'workflows', 'r4-sea.yml'), 'utf8');
@@ -573,11 +574,70 @@ test('production npm and main-branch SEA workflows pass the signed core manifest
   assert.match(ci, /SIDEVOICE_CORE_MANIFEST:\s*\$\{\{\s*steps\.core\.outputs\.manifest\s*\}\}/);
   assert.match(ci, /SIDEVOICE_CORE_MANIFEST_SIGSTORE:\s*\$\{\{\s*steps\.core\.outputs\.manifest_sigstore\s*\}\}/);
   assert.match(ci, /SIDEVOICE_REQUIRE_CORE_MANIFEST:\s*'1'/);
-  assert.match(seaWorkflow, /if: github\.ref == 'refs\/heads\/main'/);
+  assert.match(seaWorkflow, /^  workflow_dispatch:/m);
+  assert.match(seaWorkflow, /if: github\.event_name != 'pull_request'/);
   assert.match(seaWorkflow, /gh release download nightly[\s\S]*?-p core-manifest\.json -p core-manifest\.json\.sigstore\.json/);
   assert.match(seaWorkflow, /SIDEVOICE_CORE_MANIFEST:\s*\$\{\{\s*steps\.core\.outputs\.manifest\s*\}\}/);
   assert.match(seaWorkflow, /SIDEVOICE_CORE_MANIFEST_SIGSTORE:\s*\$\{\{\s*steps\.core\.outputs\.manifest_sigstore\s*\}\}/);
   assert.match(seaWorkflow, /SIDEVOICE_REQUIRE_CORE_MANIFEST:\s*\$\{\{\s*steps\.core\.outputs\.require_manifest\s*\}\}/);
+  assert.match(seaWorkflow, /echo "require_manifest=1"/);
+  assert.match(seaWorkflow, new RegExp(`name: ${SEA_ARTIFACT_NAME}`));
+  assert.match(seaWorkflow, /path: packages\/connector\/dist-sea\/macos-aarch64\/sidevoice/);
+  assert.match(seaWorkflow, /retention-days: 90/);
+  assert.match(seaWorkflow, /actions\/download-artifact@v4/);
+  assert.match(seaWorkflow, /sea-artifact\.mjs verify-copy/);
+  assert.match(seaWorkflow, new RegExp(`name: ${PIN_ARTIFACT_NAME}`));
+  assert.match(seaWorkflow, /actions\/upload-artifact@v4/);
+  const productionSteps = seaWorkflow.match(/if: matrix\.target == 'macos-aarch64' && github\.event_name != 'pull_request'/g) || [];
+  assert.equal(productionSteps.length, 6, 'all production artifact and pin steps exclude manifestless PR runs');
+});
+
+test('production desktop pin metadata binds the exact SEA, signed manifest bytes, and immutable run artifact', async () => {
+  const original = await readFile(coreProducerManifestFixture);
+  const coreManifestBytes = Buffer.from(original.toString('utf8').replaceAll('/v0.1.0/', '/nightly/'));
+  const manifest = JSON.parse(coreManifestBytes.toString('utf8'));
+  const buildPackage = { version: VERSION, sidevoice: { channel: 'nightly', build_seq: 29, connector_sha: 'c'.repeat(40) } };
+  const target = { os: 'macos', arch: 'aarch64' };
+  const metadata = connectorMetadata({ buildPackage, manifest, manifestSha256: sha256(coreManifestBytes), target, sea: true });
+  const version = versionMetadata({ buildPackage, target, sea: true });
+  const executableBytes = Buffer.from('test-only Mach-O bytes');
+  const coreManifestSidecarBytes = Buffer.from('{"mediaType":"application/vnd.dev.sigstore.bundle+json"}');
+  const pin = createDesktopPinRecord({ executableBytes, version, metadata, coreManifestBytes, coreManifestSidecarBytes,
+    expectedConnectorSha: buildPackage.sidevoice.connector_sha, expectedBuildSeq: buildPackage.sidevoice.build_seq,
+    repository: 'sidevoice/sidevoice-connector', repositoryId: '12345',
+    workflow: '.github/workflows/r4-sea.yml@refs/heads/feat/r4-single-executable', runId: 123, artifactId: 456 });
+
+  assert.equal(pin.status, 'ready');
+  assert.equal(pin.target, 'macos-aarch64');
+  assert.equal(pin.core_manifest_sha256, sha256(coreManifestBytes));
+  assert.equal(pin.core_manifest_size, coreManifestBytes.length);
+  assert.equal(pin.core_manifest_bytes_base64, coreManifestBytes.toString('base64'));
+  assert.equal(pin.executable_sha256, sha256(executableBytes));
+  assert.equal(pin.executable_size, executableBytes.length);
+  assert.equal(pin.asset_url, 'https://api.github.com/repos/sidevoice/sidevoice-connector/actions/runs/123/artifacts/456/zip');
+  assert.equal(pin.provenance.artifact_name, SEA_ARTIFACT_NAME);
+  assert.equal(pin.core_manifest_sidecars[0].sha256, sha256(coreManifestSidecarBytes));
+  assert.equal(pin.core_manifest_sidecars[0].url,
+    'https://github.com/sidevoice/sidevoice-core/releases/download/nightly/core-manifest.json.sigstore.json');
+  assert.deepEqual(pin.core_assets, metadata.embedded_core.assets);
+
+  const source = path.join(scratch, 'sea-roundtrip-source');
+  const downloaded = path.join(scratch, 'sea-roundtrip-artifact');
+  await mkdir(downloaded, { recursive: true });
+  await writeFile(source, executableBytes);
+  await writeFile(path.join(downloaded, 'sidevoice'), executableBytes);
+  assert.deepEqual(await verifyArtifactRoundTrip(source, downloaded), {
+    executable_size: executableBytes.length, executable_sha256: sha256(executableBytes),
+  });
+  await writeFile(path.join(downloaded, 'unexpected.txt'), 'not part of the root executable artifact');
+  await assert.rejects(() => verifyArtifactRoundTrip(source, downloaded), /only root sidevoice/);
+
+  assert.throws(() => createDesktopPinRecord({ executableBytes, version,
+    metadata: { ...metadata, embedded_core: { ...metadata.embedded_core, manifest_sha256: null, assets: [] } },
+    coreManifestBytes, coreManifestSidecarBytes, expectedConnectorSha: buildPackage.sidevoice.connector_sha,
+    expectedBuildSeq: buildPackage.sidevoice.build_seq, repository: 'sidevoice/sidevoice-connector',
+    repositoryId: '12345', workflow: '.github/workflows/r4-sea.yml@refs/heads/main', runId: 123, artifactId: 456 }),
+  /embedded manifest SHA does not match/);
 });
 
 async function makeArchive(filename, entries) {

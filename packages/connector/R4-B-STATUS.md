@@ -77,3 +77,19 @@ Genuine R4-a manifest, bundle, wheel and Sigstore sidecars remain unavailable. P
 synthetic producer manifest test cryptographic-library behavior, cache failure behavior and schema compatibility; they
 are not evidence of a genuine Sidevoice core installation. Real R4-a verification/install, no-runtime clean-account
 execution and macOS quarantine remain later integration gates. No merge or release was made.
+
+## Native CI artifact handoff for Desktop PR #21
+
+`.github/workflows/r4-sea.yml` keeps pull-request SEA builds manifestless and test-only, with no artifact upload.
+Main and manually dispatched production candidates require the genuine signed nightly core manifest before build; the
+macOS arm64 executable is uploaded only after the native SEA test suite passes. The stable executable artifact is
+`sidevoice-connector-macos-aarch64-r4b`; it contains a single root `sidevoice`. A second artifact,
+`sidevoice-connector-macos-aarch64-r4b-pin`, contains a ready-shaped Desktop `connector-pin.json` with the exact
+executable size/SHA, embedded manifest bytes/SHA, core assets, Sigstore sidecar digest, protocols and immutable Actions
+run/artifact provenance. The CI job downloads the executable artifact and checks the one-entry root layout and
+byte-for-byte identity against the tested SEA before generating the pin.
+
+Actions artifacts are temporary dogfood inputs retained for 90 days, not a durable release source. The current
+`sidevoice/sidevoice-core` nightly release listing contains no `core-manifest.json`, its `.sigstore.json` sidecar, or
+the R4-a platform bundles, so no genuine production SEA or Desktop pin can be emitted until those core assets are
+published. PR/test-only manifestless artifacts must not be used for Desktop packaging.

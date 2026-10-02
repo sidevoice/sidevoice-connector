@@ -35,10 +35,10 @@ jobs:
           cache: npm
       - run: test "$(node --version)" = v22.23.3
       - run: npm ci
-      # PR runs use the public Sigstore fixture in test_r4 and deliberately have no R4-a production manifest.
-      # A main build is a production SEA and must embed the genuine signed nightly manifest.
+      # PR runs are test-only, manifestless SEAs. Main and manually dispatched builds are production candidates and
+      # must have the genuine signed nightly core manifest before they can be built or uploaded.
       - id: core
-        if: github.ref == 'refs/heads/main'
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -49,6 +49,7 @@ jobs:
           test -s "$DIR/core-manifest.json.sigstore.json"
           echo "manifest=$DIR/core-manifest.json" >> "$GITHUB_OUTPUT"
           echo "manifest_sigstore=$DIR/core-manifest.json.sigstore.json" >> "$GITHUB_OUTPUT"
+          echo "manifest_url=https://github.com/sidevoice/sidevoice-core/releases/download/nightly/core-manifest.json" >> "$GITHUB_OUTPUT"
           echo "channel=nightly" >> "$GITHUB_OUTPUT"
           echo "build_seq=$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"
           echo "require_manifest=1" >> "$GITHUB_OUTPUT"
@@ -67,3 +68,47 @@ jobs:
           SEA_TARGET: ${{ matrix.target }}
         run: |
           node --input-type=module -e 'import { stat, appendFile } from "node:fs/promises"; import path from "node:path"; const f=path.join("packages/connector/dist-sea",process.env.SEA_TARGET,"sidevoice"); const s=await stat(f); console.log(`${f}: ${s.size} bytes`); await appendFile(process.env.GITHUB_STEP_SUMMARY,`- ${process.env.SEA_TARGET}: ${s.size} bytes\n`);'
+      - name: Verify genuine macOS SEA metadata before publishing the test-passed artifact
+        if: matrix.target == 'macos-aarch64' && github.event_name != 'pull_request'
+        env:
+          SIDEVOICE_SEA_EXECUTABLE: packages/connector/dist-sea/macos-aarch64/sidevoice
+          SIDEVOICE_CORE_MANIFEST: ${{ steps.core.outputs.manifest }}
+          SIDEVOICE_CORE_MANIFEST_SIGSTORE: ${{ steps.core.outputs.manifest_sigstore }}
+        run: node packages/connector/sea-artifact.mjs verify-build
+      - name: Upload the production macOS arm64 SEA
+        if: matrix.target == 'macos-aarch64' && github.event_name != 'pull_request'
+        id: connector-artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sidevoice-connector-macos-aarch64-r4b
+          path: packages/connector/dist-sea/macos-aarch64/sidevoice
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+      - name: Download the uploaded artifact through the Actions consumer path
+        if: matrix.target == 'macos-aarch64' && github.event_name != 'pull_request'
+        uses: actions/download-artifact@v4
+        with:
+          name: sidevoice-connector-macos-aarch64-r4b
+          path: ${{ runner.temp }}/r4-sea-artifact
+      - name: Verify the artifact has one root executable with the tested SEA bytes
+        if: matrix.target == 'macos-aarch64' && github.event_name != 'pull_request'
+        run: node packages/connector/sea-artifact.mjs verify-copy packages/connector/dist-sea/macos-aarch64/sidevoice "$RUNNER_TEMP/r4-sea-artifact"
+      - name: Generate the complete Desktop connector pin record
+        if: matrix.target == 'macos-aarch64' && github.event_name != 'pull_request'
+        env:
+          SIDEVOICE_SEA_EXECUTABLE: packages/connector/dist-sea/macos-aarch64/sidevoice
+          SIDEVOICE_CORE_MANIFEST: ${{ steps.core.outputs.manifest }}
+          SIDEVOICE_CORE_MANIFEST_SIGSTORE: ${{ steps.core.outputs.manifest_sigstore }}
+          SIDEVOICE_ARTIFACT_ID: ${{ steps.connector-artifact.outputs.artifact-id }}
+          SIDEVOICE_PIN_OUTPUT: ${{ runner.temp }}/connector-pin.json
+        run: node packages/connector/sea-artifact.mjs write-pin
+      - name: Upload the Desktop pin metadata
+        if: matrix.target == 'macos-aarch64' && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sidevoice-connector-macos-aarch64-r4b-pin
+          path: ${{ runner.temp }}/connector-pin.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90

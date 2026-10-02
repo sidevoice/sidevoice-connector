@@ -145,3 +145,26 @@ runtime tests, but refuses core installation. At runtime, a platform uses its
 signed core bundle when the embedded manifest contains one; otherwise it takes
 the verified-wheel uv path. Local developer overrides can name local files or
 directories and cannot select a network requirement.
+
+## macOS arm64 Desktop dogfood artifact
+
+`.github/workflows/r4-sea.yml` uploads `sidevoice-connector-macos-aarch64-r4b` only from a non-PR production run,
+after the native SEA test suite passes. The artifact ZIP contains exactly one root file, `sidevoice`. The run also
+uploads `sidevoice-connector-macos-aarch64-r4b-pin`, containing a ready-to-review `connector-pin.json` with the
+executable SHA-256/size, connector and embedded-core identity, exact signed manifest bytes and digest, core assets,
+core Sigstore sidecar digest, and the immutable Actions run/artifact URL and provenance fields required by Desktop.
+The CI job downloads its own executable artifact and compares the single root file byte-for-byte with the tested SEA
+before writing the pin record.
+
+Pull request builds are test-only: they have no R4-a production manifest and upload neither artifact. The artifact
+handoff runs on main or a manual `workflow_dispatch` only after the genuine signed nightly manifest and sidecar are
+available and verified at build time. A manifest-less SEA must not be pinned or shipped.
+
+For a local consumer, download the named executable artifact from its successful run with
+`gh run download <run-id> -R sidevoice/sidevoice-connector -n sidevoice-connector-macos-aarch64-r4b -D artifacts/mac`.
+Use the matching pin artifact's `executable_sha256` and `executable_size` to verify `artifacts/mac/sidevoice`; its
+`asset_url` has the form `https://api.github.com/repos/sidevoice/sidevoice-connector/actions/runs/<run-id>/artifacts/<artifact-id>/zip`.
+Desktop uses that same Actions artifact and independently verifies the executable bytes and SEA metadata.
+
+These artifacts are dogfood handoff inputs, not durable release assets. The workflow retains them for 90 days, the
+maximum available for public-repository Actions artifacts; a durable immutable source is a separate release gate.
