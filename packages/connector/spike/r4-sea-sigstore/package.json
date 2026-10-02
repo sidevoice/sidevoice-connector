@@ -1,0 +1,16 @@
+{
+  "name": "@sidevoice/r4-sea-sigstore-spike",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test.mjs"
+  },
+  "dependencies": {
+    "sigstore": "5.0.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "postject": "1.0.0-alpha.6"
+  }
+}
