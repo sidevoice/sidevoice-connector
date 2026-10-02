@@ -1,0 +1,29 @@
+{
+  "bundles": [
+    {
+      "os": "macos",
+      "arch": "aarch64",
+      "url": "https://github.com/sidevoice/sidevoice-core/releases/download/v0.1.0/sidevoice-core-0.1.0-macos-aarch64.tar.zst",
+      "sha256": "8d5aff9158d92f50952f80f8661d51c46d37b4702c3af2082c5496b41f7ebf43",
+      "size": 76
+    },
+    {
+      "os": "linux",
+      "arch": "x86_64",
+      "url": "https://github.com/sidevoice/sidevoice-core/releases/download/v0.1.0/sidevoice-core-0.1.0-linux-x86_64.tar.zst",
+      "sha256": "b2ea7f08cdb5abf9cf070e34a03159525fd67e480463cf7df3ee65ba5a36b4f5",
+      "size": 75
+    },
+    {
+      "os": "linux",
+      "arch": "aarch64",
+      "url": "https://github.com/sidevoice/sidevoice-core/releases/download/v0.1.0/sidevoice-core-0.1.0-linux-aarch64.tar.zst",
+      "sha256": "50eac3b3b1bafd0611029a3324af91bfe8fe91b7da2519532a418aa4f6ccf7bc",
+      "size": 76
+    }
+  ],
+  "wheel": {
+    "url": "https://github.com/sidevoice/sidevoice-core/releases/download/v0.1.0/sidevoice_core-0.1.0-py3-none-any.whl",
+    "sha256": "a5cf505f930ea68d6c3768c43a37b468d112345b517caac995779c392f85cd9f"
+  }
+}

@@ -189,7 +189,11 @@ test('trust boundary: a data directory others can write into is not served from;
   const umask = process.umask(0);
   try {
     node.start([]);
-    await until(() => existsSync(node.socketPath));
+    // listen() creates the socket path before its callback; the connector chmods it to 0600 before serving.
+    // Wait for that completed bind rather than observing the transient 0700 mode imposed by its umask.
+    await until(() => {
+      try { return (lstatSync(node.socketPath).mode & 0o777) === 0o600; } catch { return false; }
+    });
     assert.equal(lstatSync(node.socketPath).mode & 0o777, 0o600, 'nobody else can open it');
   } finally { process.umask(umask); node.stop(); }
 });

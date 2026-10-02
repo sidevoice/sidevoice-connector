@@ -29,6 +29,11 @@ test('versions: higher replaces, lower never does, and the same version only as 
   assert.equal(decide(at('0.6.0', 'nightly', 7), at('0.6.0', 'nightly', 9)), 'upgrade');
   assert.equal(decide(at('0.6.0', 'nightly', 9), at('0.6.0', 'nightly', 9)), 'noop');
   assert.equal(decide(at('0.6.0', 'nightly', 9), at('0.6.0', 'nightly', 7)), 'noop', 'two builds never replace each other in a loop');
+  assert.equal(decide({ ...at('0.6.0', 'nightly', 100), format: 'esm' }, { ...at('0.6.0', 'nightly', 1), format: 'sea' }), 'noop', 'format preference cannot replace a later nightly with an older build');
+  assert.equal(decide({ ...at('0.6.0', 'nightly', 1), format: 'sea' }, { ...at('0.6.0', 'nightly', 100), format: 'esm' }), 'upgrade', 'the next nightly build wins even when it uses ESM');
+  assert.equal(decide({ ...at('0.6.0', 'nightly', 100), format: 'esm' }, { ...at('0.6.0', 'nightly', 100), format: 'sea' }), 'upgrade', 'SEA is preferred only at the same nightly build');
+  assert.equal(decide({ ...at('0.6.0', 'nightly', 100), format: 'esm' }, { ...at('0.6.0', 'release', 0), format: 'sea' }), 'noop', 'a release-format preference cannot cross from a newer nightly');
+  assert.equal(decide({ ...at('0.6.0', 'release', 0), format: 'sea' }, { ...at('0.6.0', 'nightly', 100), format: 'esm' }), 'upgrade', 'a later nightly sequence wins across formats');
   assert.equal(decide(at('0.6.10'), at('0.6.9')), 'noop', 'numerically, not as text');
   const source = { ...at('0.6.0', 'source'), id: '0.6.0-source', source: '/checkout' };
   assert.equal(decide(at('0.6.0'), source), 'upgrade', 'a checkout selects itself');
@@ -127,11 +132,13 @@ test('concurrent installers — two genuinely built packages, the app\'s and npx
   assert.equal(one.selected('current'), '0.7.0');
   assert.equal(one.run(app, ['install', '--no-agents', '--no-core']).answer.action, 'noop');
   assert.equal(one.run(npx, ['install', '--no-agents', '--no-core']).answer.action, 'noop');
-  assert.deepEqual(JSON.parse(readFileSync(path.join(one.dataDir, 'install.json'), 'utf8')), { command: [process.execPath, path.join(one.R, 'current', 'dist', 'cli.mjs')], releases: one.R, definitions: [] }, 'install.json: the stable command, and where the installation is');
+  assert.deepEqual(JSON.parse(readFileSync(path.join(one.dataDir, 'install.json'), 'utf8')), { command: [process.execPath, path.join(one.R, 'current', 'dist', 'cli.mjs')], nodeExecutable: process.execPath, releases: one.R, definitions: [] }, 'install.json: the stable command, its rollback interpreter, and where the installation is');
   // Same version, stamped by the build as CI stamps a nightly: the higher run number wins, whichever runs last.
   const two = machine('none');
   const older = builtAs('0.6.0', { SIDEVOICE_CHANNEL: 'nightly', SIDEVOICE_BUILD_SEQ: '10' }), newer = builtAs('0.6.0', { SIDEVOICE_CHANNEL: 'nightly', SIDEVOICE_BUILD_SEQ: '12' });
-  assert.deepEqual(JSON.parse(readFileSync(path.join(path.dirname(newer), 'package.json'), 'utf8')).sidevoice, { channel: 'nightly', build_seq: 12 }, 'stamped into the shipped manifest');
+  const stamped = JSON.parse(readFileSync(path.join(path.dirname(newer), 'package.json'), 'utf8')).sidevoice;
+  assert.deepEqual({ channel: stamped.channel, build_seq: stamped.build_seq }, { channel: 'nightly', build_seq: 12 }, 'stamped into the shipped manifest');
+  assert.match(stamped.connector_sha, /^[0-9a-f]{40}$/, 'the shipped package carries the source commit identity');
   await Promise.all([older, newer].map(cli => new Promise(resolve => spawn(process.execPath, [cli, 'install', '--no-agents', '--no-core', '--json'], { env: two.env, stdio: 'ignore' }).on('exit', resolve))));
   assert.equal(realpathSync(path.join(two.R, 'current')), path.join(realpathSync(two.R), 'releases', '0.6.0-nightly.12-nocore'), 'a nightly build is a release of its own');
   assert.equal(two.run(older, ['install', '--no-agents', '--no-core']).answer.action, 'noop');

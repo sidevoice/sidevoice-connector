@@ -26,6 +26,16 @@ import { pause } from './testpoint.mjs';
 const DARWIN_O_EXLOCK = 0x20, DARWIN_O_NONBLOCK = 0x4;
 const FLOCK = ['flock', '/usr/bin/flock', '/bin/flock'];
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+function waitOrAbort(ms, signal) {
+  if (!signal) return wait(ms);
+  if (signal.aborted) return Promise.reject(keyed('install.cancelled'));
+  return new Promise((resolve, reject) => {
+    const finish = callback => value => { clearTimeout(timer); signal.removeEventListener('abort', aborted); callback(value); };
+    const aborted = finish(() => reject(keyed('install.cancelled')));
+    const timer = setTimeout(finish(resolve), ms);
+    signal.addEventListener('abort', aborted, { once: true });
+  });
+}
 
 /** The holder's record, or `null` (none, or not one): information only. */
 export function readLock(file) {
@@ -48,9 +58,10 @@ function flockLinux(fd, env) {
 }
 
 /** Try once: `{held: true, release, record}` or `{held: false, owner}` (the record found, information only). */
-export async function tryLock(file, { kind = 'lock', env = process.env } = {}) {
+export async function tryLock(file, { kind = 'lock', env = process.env, signal } = {}) {
+  if (signal?.aborted) throw keyed('install.cancelled');
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  await pause(`lock-before-${kind}`);
+  await pause(`lock-before-${kind}`, { signal });
   let fd;
   if (process.platform === 'darwin') {
     try { fd = openSync(file, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW | DARWIN_O_EXLOCK | DARWIN_O_NONBLOCK, 0o600); }
@@ -64,9 +75,11 @@ export async function tryLock(file, { kind = 'lock', env = process.env } = {}) {
   const record = { pid: process.pid, start: selfIdentity().start ?? null, kind, at: new Date().toISOString() };
   // Into the locked file itself: a replaced file would leave the lock on an inode nobody else opens.
   try { ftruncateSync(fd, 0); writeSync(fd, JSON.stringify(record), 0); } catch {}
-  await pause(`lock-held-${kind}`);
   let released = false;
-  return { held: true, record, release: () => { if (released) return; released = true; try { ftruncateSync(fd, 0); } catch {} try { closeSync(fd); } catch {} } };
+  const release = () => { if (released) return; released = true; try { ftruncateSync(fd, 0); } catch {} try { closeSync(fd); } catch {} };
+  try { await pause(`lock-held-${kind}`, { signal }); }
+  catch (error) { release(); throw error; }
+  return { held: true, record, release };
 }
 
 /** The install lock (`D/install.lock`): taken by every command that changes the installation and held to its end.
@@ -74,21 +87,23 @@ export async function tryLock(file, { kind = 'lock', env = process.env } = {}) {
 export function installLockPath(dataDir) { return path.join(dataDir, 'install.lock'); }
 const holds = new Map();   // lock file -> {depth}: this process's own hold, taken again
 /** The lock, waited for up to `timeout`; `{wait: false}` answers null at once when another process holds it. */
-export async function takeLock(file, { kind = 'lock', env = process.env, timeout = 20 * 60_000, wait: waiting = true, log = () => {} } = {}) {
+export async function takeLock(file, { kind = 'lock', env = process.env, timeout = 20 * 60_000, wait: waiting = true, log = () => {}, signal, onWait = () => {} } = {}) {
+  if (signal?.aborted) throw keyed('install.cancelled');
   const mine = holds.get(file);
   if (mine) { mine.depth++; return () => { if (--mine.depth === 0) { holds.delete(file); mine.release(); } }; }
   const deadline = Date.now() + timeout;
   let said = false;
   for (;;) {
-    const taken = await tryLock(file, { kind, env });
+    if (signal?.aborted) throw keyed('install.cancelled');
+    const taken = await tryLock(file, { kind, env, signal });
     if (taken.held) {
       const hold = { depth: 1, release: taken.release };
       holds.set(file, hold);
       return () => { if (--hold.depth === 0) { holds.delete(file); taken.release(); } };
     }
     if (!waiting) return null;
-    if (!said) { log(`another process (pid ${taken.owner?.pid ?? '?'}) holds ${path.basename(file)}; waiting for it`); said = true; }
+    if (!said) { log(`another process (pid ${taken.owner?.pid ?? '?'}) holds ${path.basename(file)}; waiting for it`); onWait(); said = true; }
     if (Date.now() > deadline) throw keyed('service.busy', { detail: `pid ${taken.owner?.pid ?? '?'} holds ${file}` });
-    await wait(250);
+    await waitOrAbort(250, signal);
   }
 }

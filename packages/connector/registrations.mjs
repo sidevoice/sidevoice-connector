@@ -49,8 +49,8 @@ export function ourProgram(program, env = process.env) {
   if (program.startsWith(root)) {
     let rest = program.slice(root.length).split(path.sep);
     if (rest[0] === 'releases') rest = rest.slice(1);
-    // <R>/{current|releases/<id>|<id>}/dist/cli.mjs (R1) or …/sidevoice (R4); an id is one path segment.
-    if ((rest.length === 3 && rest[1] === 'dist' && rest[2] === 'cli.mjs') || (rest.length === 2 && rest[1] === 'sidevoice')) return /^[\w.+-]+$/.test(rest[0]);
+    // <R>/{current|releases/<id>|<id>}/dist/cli.mjs (R1) or …/dist/sidevoice (R4); an id is one path segment.
+    if (rest.length === 3 && rest[1] === 'dist' && ['cli.mjs', 'sidevoice'].includes(rest[2])) return /^[\w.+-]+$/.test(rest[0]);
   }
   let record = null; try { record = readJson(nodeFiles(dataDirOf(env)).install); } catch {}
   return !!record?.command && (record.command[1] || record.command[0]) === program;

@@ -14,6 +14,7 @@
  *  Nothing is installed in Cursor, and nothing of Cursor's is changed: if the beta is off, this route is simply
  *  not there and the card is the one left. */
 import { execFile } from 'node:child_process';
+import { runningAsSea } from './sea-runtime.mjs';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -24,6 +25,7 @@ export function bridgeDir(env = process.env) {
 }
 
 const alive = pid => { try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; } };
+const CURSOR_CHAT_QUERY = "SELECT DISTINCT substr(key, 10, instr(substr(key, 10), ':') - 1) AS chat FROM cursorDiskKV WHERE key >= ? AND key < ? AND instr(CAST(value AS TEXT), ?) > 0 LIMIT 2";
 
 /** The running Cursor apps that announced a bridge, newest first. */
 export function bridgeInstances(env = process.env) {
@@ -118,13 +120,27 @@ export async function composerHolding(marker, env = process.env, { candidate = n
     const script = `const { DatabaseSync } = require('node:sqlite');
 const [file, marker, from, to] = process.argv.slice(1);
 const db = new DatabaseSync(file, { readOnly: true });
-const rows = db.prepare("SELECT DISTINCT substr(key, 10, instr(substr(key, 10), ':') - 1) AS chat FROM cursorDiskKV WHERE key >= ? AND key < ? AND instr(CAST(value AS TEXT), ?) > 0 LIMIT 2").all(from, to, marker);
+const rows = db.prepare(${JSON.stringify(CURSOR_CHAT_QUERY)}).all(from, to, marker);
 db.close(); process.stdout.write(JSON.stringify(rows.map(r => r.chat)));`;
-    const chats = await new Promise(resolve => execFile(process.execPath, ['--no-warnings', '-e', script, file, marker, from, to], { timeout: 60_000, maxBuffer: 1 << 16 },
+    const args = runningAsSea()
+      ? ['--sidevoice-cursor-db-query', file, marker, from, to]
+      : ['--no-warnings', '-e', script, file, marker, from, to];
+    const chats = await new Promise(resolve => execFile(process.execPath, args, { timeout: 60_000, maxBuffer: 1 << 16 },
       (error, stdout, stderr) => {
         if (error) { onError?.(String(stderr || error.message).trim().split('\n').pop().slice(0, 200)); return resolve(null); }
         try { resolve(JSON.parse(stdout)); } catch { resolve(null); } }));
     if (Array.isArray(chats) && chats.length === 1 && chats[0]) return chats[0];
   }
   return null;
+}
+
+/** Private child-process entry used by the SEA, which is not a Node `-e` interpreter. */
+export async function cursorDatabaseMatches(file, marker, from, to) {
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = new DatabaseSync(file, { readOnly: true });
+  try {
+    const rows = db.prepare(CURSOR_CHAT_QUERY)
+      .all(from, to, marker);
+    return rows.map(row => row.chat);
+  } finally { db.close(); }
 }

@@ -122,7 +122,7 @@ for (const kind of ['launchd', 'systemd']) {
       assert.ok(readFileSync(node.definition('core'), 'utf8').includes(path.join(node.home, 'xdg', 'sidevoice', 'current', 'core', 'bin', 'sidevoice-core')), 'the core job runs R/current\'s core');
       assert.ok(readFileSync(node.definition('connector'), 'utf8').includes(path.join(node.home, 'xdg', 'sidevoice', 'current', 'dist', 'cli.mjs')), 'the connector job runs through R/current');
       assert.deepEqual(JSON.parse(readFileSync(path.join(node.dataDir, 'install.json'), 'utf8')), { command: [process.execPath, path.join(node.home, 'xdg', 'sidevoice', 'current', 'dist', 'cli.mjs')],
-        releases: path.join(node.home, 'xdg', 'sidevoice'), definitions: [node.definition('core'), node.definition('connector')] });
+        nodeExecutable: process.execPath, releases: path.join(node.home, 'xdg', 'sidevoice'), definitions: [node.definition('core'), node.definition('connector')] });
       // A façade is served by the connector job: the launcher spawned nothing beside it.
       owner = facade({ ...node.env, SIDEVOICE_THREAD: 'thread-s', SIDEVOICE_DELIVERY_URL: 'http://127.0.0.1:9/none' });
       await owner.ready;
@@ -140,7 +140,8 @@ for (const kind of ['launchd', 'systemd']) {
       // Start: the marker goes, both jobs run again, and the façade's conversation is registered again by itself.
       const started = await node.service('start');
       assert.equal(started.ok, true, JSON.stringify(started));
-      assert.equal(started.state, 'running');
+      const startedStatus = await node.status(s => s.state === 'running', 60_000);
+      assert.equal(startedStatus.state, 'running', JSON.stringify({ started, startedStatus }));
       assert.equal(existsSync(path.join(node.dataDir, 'node-stopped.json')), false);
       await until(() => node.said().some(line => line.event === 'binding.register' && line.pid === node.pid('core') && line.data.client_ref === 'thread-s'), 20_000);
       // Restart (the person's «Reintentar»): the core job only, a new process.
@@ -496,7 +497,7 @@ test('blocker 2: uninstall acts where the installation recorded it is — the de
     await node.status(s => s.state === 'running');
     const record = JSON.parse(readFileSync(path.join(node.dataDir, 'install.json'), 'utf8'));
     const R = path.join(node.home, 'xdg', 'sidevoice');
-    assert.deepEqual(record, { command: [process.execPath, path.join(R, 'current', 'dist', 'cli.mjs')], releases: R,
+    assert.deepEqual(record, { command: [process.execPath, path.join(R, 'current', 'dist', 'cli.mjs')], nodeExecutable: process.execPath, releases: R,
       definitions: [node.definition('core'), node.definition('connector')] });
     const elsewhere = { XDG_CONFIG_HOME: path.join(node.home, 'other-config'), XDG_DATA_HOME: path.join(node.home, 'other-data') };
     // Its status, from that shell, is still this installation's.

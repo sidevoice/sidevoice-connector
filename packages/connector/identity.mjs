@@ -6,11 +6,11 @@
  *  nothing is asked of the room, and nothing is guessed. */
 import os from 'node:os';
 import path from 'node:path';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
+import { BUILD_PACKAGE } from './build-info.mjs';
 
-/** This package's version, from the `package.json` beside these modules — true of the checkout and
- *  of the bundle alike, which is why the build copies that file next to it. */
-export const VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
+/** The version is compiled into SEA builds and comes from the package in source builds. */
+export const VERSION = BUILD_PACKAGE.version;
 
 /** Which harnesses live on this machine, by the home each of them keeps. Nothing is run to find out. */
 export function harnessesPresent(env = process.env) {

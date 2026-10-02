@@ -1,68 +1,139 @@
-/** The published package, as one file with nothing to resolve at install time.
- *
- *  `socket.io-client` is a dependency of this source and of no artifact: esbuild puts it inside
- *  `dist/cli.mjs` along with everything else `cli.mjs` reaches, so what npm ships declares no
- *  runtime dependency and `sidevoice install` stays a copy of files that run with `node`. A
- *  machine gaining a voice is not the moment to discover a cold cache or a proxy.
- *
- *  `package.json` is copied next to the bundle because the modules inside it read their own
- *  version from the file beside them, and that is true of the source and of the bundle alike. */
-import { fileURLToPath } from 'node:url';
+/** Build the unchanged npm ESM client and, on request, a native Node 22 CommonJS SEA executable. */
+import { chmod, copyFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import os from 'node:os';
 import path from 'node:path';
-import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 import { CORE_VERSION } from './core.mjs';
+import { verifyCoreArtifact } from './core-attestation.mjs';
+import { validateCoreManifest } from './core-bundle.mjs';
 
-/** Some of what travels inside the bundle is CommonJS and calls `require` — for `fs`, for the
- *  optional native speed-ups `ws` asks for and does without. An ES module has no `require`, and
- *  esbuild's stand-in throws rather than guess, so one is made here from this file's own URL.
- *  Without it the bundle dies on its first import (2026-09-22), which is why the interop test
- *  runs against the built artifact and not only the source. */
-const REQUIRE = 'import { createRequire } from "node:module";\nconst require = createRequire(import.meta.url);\n';
+const root = path.dirname(fileURLToPath(import.meta.url));
+const out = path.join(root, 'dist');
+const outSea = path.join(root, 'dist-sea');
+const packagePath = path.join(root, 'package.json');
+const original = JSON.parse(await readFile(packagePath, 'utf8'));
+const shipped = { ...original };
+delete shipped.devDependencies;
 
-const here = new URL('./', import.meta.url);
-const out = new URL('./dist/', here);
-await rm(fileURLToPath(out), { recursive: true, force: true });
-await mkdir(fileURLToPath(out), { recursive: true });
+let connectorSha = process.env.SIDEVOICE_CONNECTOR_SHA || process.env.GITHUB_SHA || null;
+if (!connectorSha) {
+  try { connectorSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(); }
+  catch { connectorSha = null; }
+}
+if (connectorSha !== null && !/^[0-9a-f]{40}$/.test(connectorSha)) throw new Error('connector build SHA must be 40 lowercase hexadecimal characters');
 
+// Build channel/order metadata is copied into ESM and compiled into the SEA executable.
+const channel = process.env.SIDEVOICE_CHANNEL || 'release';
+if (!['release', 'nightly'].includes(channel)) throw new Error(`SIDEVOICE_CHANNEL is ${channel}: release or nightly`);
+const build_seq = Number(process.env.SIDEVOICE_BUILD_SEQ || 0);
+if (!Number.isSafeInteger(build_seq) || build_seq < 0) throw new Error(`SIDEVOICE_BUILD_SEQ is ${process.env.SIDEVOICE_BUILD_SEQ}: a non-negative integer`);
+shipped.sidevoice = { ...(shipped.sidevoice || {}), channel, build_seq, connector_sha: connectorSha };
+
+if (process.env.SIDEVOICE_REQUIRE_CORE_MANIFEST === '1' && !process.env.SIDEVOICE_CORE_MANIFEST) {
+  throw new Error('SIDEVOICE_CORE_MANIFEST is required for release and nightly builds');
+}
+
+let manifestText = null;
+let manifestSha256 = null;
+if (process.env.SIDEVOICE_CORE_MANIFEST) {
+  const manifestPath = path.resolve(process.env.SIDEVOICE_CORE_MANIFEST);
+  const sidecarPath = process.env.SIDEVOICE_CORE_MANIFEST_SIGSTORE
+    ? path.resolve(process.env.SIDEVOICE_CORE_MANIFEST_SIGSTORE) : `${manifestPath}.sigstore.json`;
+  const raw = await readFile(manifestPath);
+  const sidecar = await readFile(sidecarPath).catch(() => { throw new Error(`missing signed core manifest sidecar: ${sidecarPath}`); });
+  const parsed = JSON.parse(raw.toString('utf8'));
+  const channel = shipped.sidevoice?.channel || 'release';
+  validateCoreManifest(parsed, CORE_VERSION, channel);
+  await verifyCoreArtifact({ bytes: raw, bundleBytes: sidecar, channel,
+    tufCachePath: process.env.SIDEVOICE_TUF_CACHE || path.join(os.homedir(), '.sidevoice', 'sigstore-build'), label: 'core-manifest.json' });
+  // Preserve the signed manifest's exact bytes in the generated JavaScript string.
+  manifestText = raw.toString('utf8');
+  manifestSha256 = (await import('node:crypto')).createHash('sha256').update(raw).digest('hex');
+}
+
+await rm(out, { recursive: true, force: true });
+await mkdir(out, { recursive: true });
 await build({
-  entryPoints: [fileURLToPath(new URL('./cli.mjs', here))],
-  outfile: fileURLToPath(new URL('./cli.mjs', out)),
+  entryPoints: [path.join(root, 'cli.mjs')],
+  outfile: path.join(out, 'cli.mjs'),
   bundle: true,
   platform: 'node',
   format: 'esm',
   target: 'node22',
-  // Node's own modules are Node's; everything else travels.
   external: ['node:*'],
   legalComments: 'none',
+  define: {
+    __SIDEVOICE_CORE_MANIFEST_JSON__: JSON.stringify(manifestText ?? 'null'),
+    __SIDEVOICE_CORE_MANIFEST_SHA256__: JSON.stringify(manifestSha256 ?? 'null'),
+  },
 });
 
-const bundle = fileURLToPath(new URL('./cli.mjs', out));
-const code = await readFile(bundle, 'utf8');
-await writeFile(bundle, code.replace(/^#!.*\n/, line => line + REQUIRE), { mode: 0o755 });
+// The ESM build keeps createRequire for CommonJS dependencies such as ws optional speed-ups.
+const esm = path.join(out, 'cli.mjs');
+const code = await readFile(esm, 'utf8');
+const requireBanner = 'import { createRequire as __sidevoiceCreateRequire } from "node:module";\nconst require = __sidevoiceCreateRequire(import.meta.url);\n';
+await writeFile(esm, code.replace(/^#!.*\n/, line => line + requireBanner), { mode: 0o755 });
+await writeFile(path.join(out, 'package.json'), JSON.stringify(shipped, null, 2) + '\n');
 
-// The modules inside read their own version from the `package.json` beside them, and that is as
-// true of the bundle as of the source it was built from. What kind of build it is travels there too: the
-// installer orders two builds of one version by it (`release.mjs`) — `SIDEVOICE_CHANNEL` (`release` or
-// `nightly`) and `SIDEVOICE_BUILD_SEQ` (CI's run number), stamped by CI; a build without them is a release, 0.
-const shipped = JSON.parse(await readFile(fileURLToPath(new URL('./package.json', here)), 'utf8'));
-if (process.env.SIDEVOICE_CHANNEL || process.env.SIDEVOICE_BUILD_SEQ) {
-  const channel = process.env.SIDEVOICE_CHANNEL || 'release';
-  if (!['release', 'nightly'].includes(channel)) throw new Error(`SIDEVOICE_CHANNEL is ${channel}: release or nightly`);
-  const build_seq = Number(process.env.SIDEVOICE_BUILD_SEQ || 0);
-  if (!Number.isInteger(build_seq) || build_seq < 0) throw new Error(`SIDEVOICE_BUILD_SEQ is ${process.env.SIDEVOICE_BUILD_SEQ}: a non-negative integer`);
-  shipped.sidevoice = { channel, build_seq };
+// The npm artifact above remains ESM and platform independent. CI opts into a native SEA per target runner.
+if (process.env.SIDEVOICE_BUILD_SEA === '1') {
+  const pin = JSON.parse(await readFile(path.join(root, 'sea-targets.json'), 'utf8'));
+  if (process.version !== pin.nodeVersion) throw new Error(`SEA requires pinned Node ${pin.nodeVersion}; got ${process.version}`);
+  const target = pin.targets.find(item => item.platform === process.platform && item.nodeArch === process.arch);
+  if (!target) throw new Error(`SEA has no native target for ${process.platform}/${process.arch}`);
+
+  await rm(outSea, { recursive: true, force: true });
+  await mkdir(outSea, { recursive: true });
+  const cjs = path.join(outSea, 'sea.cjs');
+  const configPath = path.join(outSea, 'sea-config.json');
+  const blobPath = path.join(outSea, 'sea-prep.blob');
+  const executablePath = path.join(outSea, 'sidevoice');
+  await build({
+    entryPoints: [path.join(root, 'sea.mjs')],
+    outfile: cjs,
+    bundle: true,
+    platform: 'node',
+    format: 'cjs',
+    target: 'node22',
+    packages: 'bundle',
+    external: ['node:*'],
+    legalComments: 'none',
+    define: {
+      __SIDEVOICE_PACKAGE_JSON__: JSON.stringify(JSON.stringify(shipped)),
+      __SIDEVOICE_CORE_MANIFEST_JSON__: JSON.stringify(manifestText ?? 'null'),
+      __SIDEVOICE_CORE_MANIFEST_SHA256__: JSON.stringify(manifestSha256 ?? 'null'),
+      'import.meta.url': JSON.stringify('file:///sidevoice-runtime/sea.mjs'),
+    },
+  });
+  await writeFile(configPath, JSON.stringify({ main: cjs, output: blobPath,
+    disableExperimentalSEAWarning: true, useCodeCache: false }, null, 2) + '\n');
+  execFileSync(process.execPath, ['--experimental-sea-config', configPath], { cwd: root, stdio: 'inherit' });
+  await copyFile(process.execPath, executablePath);
+  await chmod(executablePath, 0o755);
+  if (process.platform === 'darwin') execFileSync('codesign', ['--remove-signature', executablePath], { stdio: 'inherit' });
+  const postject = path.resolve(root, '..', '..', 'node_modules', '.bin', 'postject');
+  const injectArgs = [executablePath, 'NODE_SEA_BLOB', blobPath, '--sentinel-fuse', 'NODE_SEA_FUSE_fce680ab2cc467b6e072b8b5df1996b2'];
+  if (process.platform === 'darwin') injectArgs.push('--macho-segment-name', 'NODE_SEA');
+  execFileSync(postject, injectArgs, { stdio: 'inherit' });
+  if (process.platform === 'darwin') execFileSync('codesign', ['--force', '--sign', '-', '--timestamp=none', executablePath], { stdio: 'inherit' });
+  const builtPath = path.join(outSea, target.name);
+  await mkdir(builtPath, { recursive: true });
+  const targetExecutable = path.join(builtPath, 'sidevoice');
+  await copyFile(executablePath, targetExecutable);
+  await chmod(targetExecutable, 0o755);
+  const [executable, blob] = await Promise.all([stat(targetExecutable), stat(blobPath)]);
+  process.stdout.write(JSON.stringify({ node: process.version, target: target.name, executable: targetExecutable,
+    executableBytes: executable.size, seaBlobBytes: blob.size, manifestEmbedded: !!manifestText }) + '\n');
 }
-await writeFile(fileURLToPath(new URL('./package.json', out)), JSON.stringify(shipped, null, 2) + '\n');
 
-// The core this version pins, as a wheel inside the package, when the build is handed one
-// (`SIDEVOICE_CORE_WHEEL`, built from sidevoice/sidevoice-core with `uv build`): the connector then
-// installs it with uv from beside the bundle, and nothing has to be fetched from a private index.
-// Without one, the connector asks the index for `sidevoice-core==CORE_VERSION`.
+// An explicitly named wheel is copied into the ESM artifact only for the existing developer workflow. Production
+// core installs use the signed R4-a manifest and the target bundle (or its verified wheel fallback).
 const wheel = process.env.SIDEVOICE_CORE_WHEEL;
 if (wheel) {
   const expected = `sidevoice_core-${CORE_VERSION}-py3-none-any.whl`;
   if (path.basename(wheel) !== expected) throw new Error(`SIDEVOICE_CORE_WHEEL is ${path.basename(wheel)}, but this package pins ${expected}`);
-  await mkdir(fileURLToPath(new URL('./core/', out)), { recursive: true });
-  await copyFile(wheel, fileURLToPath(new URL('./core/' + expected, out)));
+  await mkdir(path.join(out, 'core'), { recursive: true });
+  await copyFile(wheel, path.join(out, 'core', expected));
 }

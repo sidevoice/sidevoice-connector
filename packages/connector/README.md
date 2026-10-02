@@ -104,3 +104,69 @@ releases, the switch and rollback; `test_security.mjs` the locks and the trust b
 the checkout and from the bundle. `SIDEVOICE_CORE_WHEEL=<wheel> npm run build`
 puts the pinned core's wheel inside `dist/core/`, so the published package
 installs it without any index.
+
+## Machine-readable install and build identity
+
+`install --json --progress=jsonl` keeps the install result as exactly one JSON object on stdout and writes bounded JSON
+Lines progress records to stderr (`sidevoice-progress-jsonl-v1`). Every progress record is
+`{type:"progress",step,done,total}`. Stable steps are `download`, `verify`, `stage`, `service-start`, `wait-calls`,
+`wait-lock`, `commit`, `pairing`, and `rollback`. `done` and `total` are byte counts for core artifact downloads (the
+Sigstore sidecar is not counted); other steps use `null` for both, and unknown download totals use `null` for `total`.
+SIGINT before the commit point returns one final
+`install.cancelled` JSON result, removes staged releases and partial uv runtimes, preserves the previous selection and
+any existing stop intent. Once `current` is switched, SIGINT is acknowledged by completing verification or rollback
+and the final JSON reports that actual result. Download transport failures use `install.network`; an HTTP 407 or
+recognized TLS certificate interception failure uses `install.proxy`; filesystem exhaustion (`ENOSPC`/`EDQUOT`) uses
+`install.disk`. Digest, manifest, Sigstore and provenance failures retain `install.authenticity` with a named check.
+
+`--version --json` reports `version`, `target`, `channel`, `connector_sha`, `build_seq`, `format`, and `sea`, with
+`ok: true`; plain `--version` remains the package version. `metadata --json` reports the `sidevoice-metadata-v1`
+identity. `connector` includes those build fields and `link_min`/`link_max`. `embedded_core` includes the pinned core
+version, SHA-256 of the exact embedded signed manifest bytes, all signed bundle assets (`name`, `url`, `sha256`,
+`size`) in producer order, API and link ids. The asset list is independent of the executable target so Desktop can
+compare the complete manifest. `protocols` reports the metadata and progress protocol ids.
+
+The signed manifest stays byte-for-byte as produced by sidevoice-core: its `{bundles,wheel}` schema has no version
+field. Exact asset URLs and versioned filenames bind it to this connector's `CORE_VERSION`, and the manifest digest
+also binds the wheel entry. The active Desktop pin validates this exact producer schema, binds the separate pinned core
+version through versioned bundle/wheel URLs, and compares its bundle list to `metadata --json`. Its macOS arm64 pin
+requires the signed bundle entries, each of which carries a size. The current core manifest does not include wheel
+size, so a future Desktop pin targeting a platform that uses the wheel would need an explicit wheel-size contract.
+
+R4 adds a second output and leaves the npm ESM entry point in place. On a native
+runner with Node `v22.23.3`, `npm run build:sea -w @sidevoice/uplink` emits
+`dist-sea/<target>/sidevoice` for macOS arm64 and Linux x86_64/arm64. To make an
+installable production executable, set `SIDEVOICE_CORE_MANIFEST` to R4-a's
+signed `core-manifest.json` and provide its adjacent `.sigstore.json`; the build
+verifies the manifest and embeds its exact bytes. `SIDEVOICE_CHANNEL` may be
+`release` or `nightly`, and `SIDEVOICE_BUILD_SEQ` sets the build sequence recorded
+by the install transaction. A build without the manifest is useful for build and
+runtime tests, but refuses core installation. At runtime, a platform uses its
+signed core bundle when the embedded manifest contains one; otherwise it takes
+the verified-wheel uv path. Local developer overrides can name local files or
+directories and cannot select a network requirement.
+
+## macOS arm64 Desktop dogfood artifact
+
+`.github/workflows/r4-sea.yml` uploads `sidevoice-connector-macos-aarch64-r4b` only on protected `main`, after the
+native macOS SEA test suite passes. Its artifact ZIP contains exactly one root file, `sidevoice`. The later attestation
+and pin jobs wait for all three native matrix jobs, then create and verify a genuine GitHub public-good Sigstore build
+attestation for those executable bytes and upload the root bundle as
+`sidevoice-connector-macos-aarch64-r4b-provenance`. A final macOS job verifies the bundle against the same executable,
+reads the official run-artifact metadata, and writes `connector-pin.json` to
+`sidevoice-connector-macos-aarch64-r4b-pin`. The pin records the executable SHA-256/size, connector and embedded-core
+identity, exact signed manifest bytes/digest, core assets, and nonempty provenance sidecar metadata.
+
+Pull request builds and non-main manual dispatches are test-only: they have no R4-a production manifest and upload no
+production artifact or pin. Main handoff runs only after the genuine signed nightly manifest and sidecar are available
+and verified at build time. A manifest-less SEA must not be pinned or shipped.
+
+The pin `asset_url` and provenance sidecar URL use GitHub's canonical
+`https://api.github.com/repos/sidevoice/sidevoice-connector/actions/artifacts/<artifact-id>/zip` route. The executable
+digest/size describe root `sidevoice`; the provenance sidecar digest/size describe the sidecar artifact ZIP, which
+contains root `sidevoice.sigstore.json`. Desktop must verify the ZIP, extract the bundle, and cryptographically verify
+the attestation against the executable. Fetch/auth requirements and the exact verification identity are in
+[`R4-B-DESKTOP-HANDOFF-2026-10-02.md`](R4-B-DESKTOP-HANDOFF-2026-10-02.md).
+
+These artifacts are dogfood handoff inputs, not durable release assets. The workflow retains them for 90 days, the
+maximum available for public-repository Actions artifacts; a durable immutable source is a separate release gate.

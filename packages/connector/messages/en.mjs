@@ -18,9 +18,13 @@ export const en = {
   'ready.timeout': 'The core did not become ready in time.',
 
   // Install keys (the core's runtime could not be had).
-  'install.no-bundle': 'There is no core build for this platform and uv is not installed: install uv (https://docs.astral.sh/uv/) and try again.',
-  'install.network': 'The core could not be downloaded: the network is not reachable.',
-  'install.proxy': 'The core could not be downloaded: a proxy re-signs HTTPS and its certificate is not trusted.',
+  'install.no-bundle': 'There is no signed core build for this platform and uv is not installed: install uv (https://docs.astral.sh/uv/) and try again.',
+  'install.cancelled': 'Installation was cancelled before the new release was committed.',
+  'install.node-runtime-missing': 'The Node runtime needed to start this older Sidevoice release is missing from the installation record.',
+  'install.network': 'The core could not be downloaded from GitHub. Check the network connection and retry.',
+  'install.proxy': 'The core could not be downloaded through the configured proxy. Check its URL, credentials, or TLS certificate trust.',
+  'install.disk': 'There is not enough available disk space to install the Sidevoice core.',
+  'install.authenticity': 'The downloaded Sidevoice core was refused at check "{check}".',
 
   // The launcher and the node service (§4.2). `node.stopped` also reaches agents, so it stays plain English.
   'node.stopped': 'Sidevoice is stopped on this computer: start it from the app or with `sidevoice service start`.',
@@ -58,6 +62,8 @@ export const en = {
   'install.not-selected': 'The core answering is not the selected release\'s ({detail}).',
   'install.rollback': 'Installing {to} failed ({cause}); this machine is back on {from}.',
   'install.rollback-failed': 'Installing {to} failed ({cause}), and {from} does not run either ({back}); both releases are kept: install again, or `sidevoice rollback`.',
+  'install.rollback-registration': 'Installing {to} failed ({cause}); Sidevoice selected {from} again (rollback check: {back}), but could not repoint its own registrations for {harnesses}.',
+  'install.registration-reconcile': 'The selected release is running, but Sidevoice could not repoint its own registrations for {harnesses}. Run `sidevoice install` again to reconcile them.',
   'install.no-previous': 'There is no previous release to go back to.',
   'install.rolled-back': 'This machine is back on {id} (from {from}).',
   'install.selected': 'This machine now runs {id} (before: {previous}).',
@@ -92,7 +98,9 @@ export const en = {
   'harness.cursor': 'Cursor',
   'install.skill-removed': 'Removed the voice-room skill copy at {target}: the server offers it as the prompt /mcp__sidevoice__voice-room.',
   'install.route': 'To use it from another device, connect it to your room: in the room, "Emparejar máquina", and here  sidevoice pair <room-url> <code>.',
-  'install.progress.core': 'Installing this machine\'s Sidevoice core {version} (the first time: Python and a few hundred MB, some minutes)…',
+  'install.progress.core': 'Installing this machine\'s Sidevoice core {version}…',
+  'install.progress.bundle': 'Downloading and verifying the signed {platform} core bundle…',
+  'install.progress.wheel': 'Downloading and verifying the signed core wheel for this unsupported platform…',
   'install.progress.calls': 'Waiting for {calls} call(s) on this machine to end before applying the update (--apply-now applies it at once)…',
   'service.unsafe-value': 'A value for the service definition ({what}) contains a control character; nothing was written.',
   'identity.unsafe-file': 'The Sidevoice file {path} is not safe to use ({why}): it must be a regular file owned by you that nobody else can write.',

@@ -4,6 +4,7 @@
  *  `crash(name)` kills this process when `<dir>/crash-<name>` exists. Names are listed where they are used. */
 import { existsSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { keyed } from './i18n.mjs';
 
 const dir = () => process.env.SIDEVOICE_TEST_HOOKS || null;
 const sleeper = new Int32Array(new SharedArrayBuffer(4));
@@ -17,10 +18,14 @@ function armed(name) {
 }
 
 /** Wait here, without blocking the event loop, while a test holds this point. */
-export async function pause(name) {
+export async function pause(name, { signal } = {}) {
   const resume = armed(name);
   if (!resume) return;
-  while (!existsSync(resume)) await new Promise(r => setTimeout(r, 20));
+  while (!existsSync(resume)) {
+    if (signal?.aborted) throw keyed('install.cancelled');
+    await new Promise(r => setTimeout(r, 20));
+  }
+  if (signal?.aborted) throw keyed('install.cancelled');
 }
 
 /** The same for synchronous code (a lock being taken): the whole process waits. */
