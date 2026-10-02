@@ -1,6 +1,10 @@
-#!/usr/bin/env node
-/** Stdio MCP façade for one conversation. It holds no connection to the room: it starts or reuses
- *  the host's connector and keeps one local connection to it for as long as this session lives. */
+/** Stdio MCP façade for one conversation. It holds no connection to the room: it gets the host's connector
+ *  through the launcher and keeps one local connection to it for as long as this session lives.
+ *
+ *  It keeps, for every conversation it joined, the whole `register` it sent: when the connector goes — restarted by
+ *  its manager, upgraded, stopped and started — the façade connects again and sends each one again, with no tool
+ *  call needed. A command the lost connection cut off is asked again once when asking twice changes nothing
+ *  (`status`, `register`); `voice_say` is not: its speech is in the connector's durable outbox. */
 import os from 'node:os';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -49,8 +53,53 @@ const logId = id => (id ? 'h:' + createHash('sha256').update(String(id)).digest(
 let cardReads = 0;
 
 // ----- one persistent connection to the connector -----
-const connector = connectorClient();
-const { rpc } = connector;
+let connector = null;
+/** Asked again once, after a lost connection cut it off, only when asking twice is harmless. */
+const RETRIED = new Set(['status', 'register']);
+async function rpc(method, params) {
+  // A reconnection under way is waited for (briefly): a reply must not reach a connector that does not yet know
+  // the conversation it answers for.
+  if (reconnecting && method !== 'register') await Promise.race([reconnecting, new Promise(resolve => setTimeout(resolve, 10_000))]);
+  try { return await connector.rpc(method, params); }
+  catch (error) { if (!error.gone || !RETRIED.has(method)) throw error; return connector.rpc(method, params); }
+}
+
+/** The connection to the connector is gone — the connector job restarted or upgraded, a stop and a start: one
+ *  loop, never two, connects again through the launcher and registers every conversation this server joined, without
+ *  waiting for a tool call — a voice turn may arrive before the agent calls anything. It backs off
+ *  while there is no connector to reach, and a person's stop is waited out, never overridden (the launcher refuses
+ *  to start anything then). It ends when every conversation is registered, or none is left. */
+let reconnecting = null, closing = false;
+const RECONNECT_MAX_MS = Number(process.env.SIDEVOICE_RECONNECT_MAX_MS || 5000);
+function reconnect() {
+  if (reconnecting || !joined.size) return reconnecting;
+  reconnecting = (async () => {
+    let delay = 100;
+    for (;;) {
+      const pending = [...joined.values()].filter(b => b.params && !b.registered);
+      if (!pending.length) return;
+      for (const b of pending) {
+        try {
+          const result = await connector.rpc('register', b.params);
+          if (joined.get(b.client_ref) === b) { b.binding_id = result.binding_id; b.registered = true; }
+          mcpLog({ event: 'reattached', conversation: logId(b.client_ref) });
+        } catch (error) {
+          mcpLog({ event: 'reattach_failed', conversation: logId(b.client_ref), reason: error.message, key: error.key ?? null });
+          break;
+        }
+      }
+      if (![...joined.values()].some(b => b.params && !b.registered)) return;
+      await new Promise(resolve => setTimeout(resolve, delay));
+      delay = Math.min(delay * 2, RECONNECT_MAX_MS);
+    }
+  })().finally(() => { reconnecting = null; if ([...joined.values()].some(b => b.params && !b.registered)) reconnect(); });
+  return reconnecting;
+}
+/** Every conversation is to be registered again with whichever connector answers next. */
+function connectionLost() {
+  for (const b of joined.values()) b.registered = false;
+  reconnect();
+}
 
 // ----- tools -----
 const tools = [
@@ -253,9 +302,10 @@ async function invoke(name, args, meta) {
     // Which model is answering, read from the session's own launch line rather than asked of the model.
     let engine = null;
     try { engine = (await who.module.engine?.(who.thread)) || null; } catch { engine = null; }
-    const result = await rpc('register', { client_ref: who.thread, harness: who.harness, thread: who.thread,
-      title, delivery: who.delivery, inbound, capabilities, experimental, engine, ...(who.route ? { route: who.route } : {}) });
-    joined.set(who.thread, { ...result, harness: who.harness, client_ref: who.thread, title, capabilities, experimental });
+    const params = { client_ref: who.thread, harness: who.harness, thread: who.thread,
+      title, delivery: who.delivery, inbound, capabilities, experimental, engine, ...(who.route ? { route: who.route } : {}) };
+    const result = await rpc('register', params);
+    joined.set(who.thread, { ...result, harness: who.harness, client_ref: who.thread, title, capabilities, experimental, params, registered: true });
     let connectorVersion = null; try { connectorVersion = (await rpc('status', {})).version || null; } catch {}
     const pushed = capabilities.deliver === SUPPORTED;
     mcpLog({ event: 'voice_connect', route: who.route || who.harness, harness: who.harness, conversation: logId(who.thread), delivery: who.delivery.kind,
@@ -321,9 +371,12 @@ async function invoke(name, args, meta) {
 }
 
 // ----- JSON-RPC over stdio -----
-let input = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', async chunk => {
+/** `sidevoice mcp`. */
+export function run(argv = [], env = process.env) {
+  connector = connectorClient(env, { onLost: () => { if (!closing) connectionLost(); } });
+  let input = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', async chunk => {
   input += chunk;
   while (input.includes('\n')) {
     const index = input.indexOf('\n'); const line = input.slice(0, index); input = input.slice(index + 1);
@@ -360,4 +413,5 @@ process.stdin.on('data', async chunk => {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, ...(error ? { error } : { result }) }) + '\n');
   }
 });
-process.stdin.on('end', () => { connector.end(); process.exit(0); });
+  process.stdin.on('end', () => { closing = true; connector.end(); process.exit(0); });
+}

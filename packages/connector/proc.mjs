@@ -1,0 +1,105 @@
+/** Which process a pid is, before anything is done to it. A pid read from a file is only a hint: pids are reused,
+ *  and a stale lock or ready file can name somebody else's work. Nothing is signalled on a pid alone.
+ *
+ *  A process is identified by its owner, its start time and its command line — on Linux from `/proc`, elsewhere
+ *  from `ps`. When those cannot be read, the answer is "unknown", and unknown never authorises a signal. */
+import { execFileSync } from 'node:child_process';
+import { readdirSync, readFileSync } from 'node:fs';
+
+const uid = () => (typeof process.getuid === 'function' ? process.getuid() : null);
+export const validPid = pid => Number.isInteger(pid) && pid > 1;
+
+/** `{uid, start, command}` of a live pid, `null` when there is no such process, `undefined` when it cannot be told.
+ *  A zombie — dead, not yet reaped by its parent — is no process: `kill(pid, 0)` and `/proc` still answer for it, but
+ *  it will never do anything again (Linux: state `Z`/`X` in `/proc/<pid>/stat`; elsewhere: `Z` in `ps -o stat=`). */
+export function processIdentity(pid) {
+  if (!validPid(pid)) return null;
+  try { process.kill(pid, 0); } catch (error) { if (error.code === 'ESRCH') return null; if (error.code !== 'EPERM') return undefined; }
+  if (process.platform === 'linux') {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      if (fields[0] === 'Z' || fields[0] === 'X' || fields[0] === 'x') return null;   // field 3: state
+      const start = fields[19];   // field 22: start time, in clock ticks since boot
+      const owner = Number(readFileSync(`/proc/${pid}/status`, 'utf8').match(/^Uid:\s+(\d+)/m)[1]);
+      const command = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean).join(' ');
+      return { uid: owner, start, command };
+    } catch (error) { return error.code === 'ENOENT' ? null : undefined; }
+  }
+  try {
+    const line = execFileSync('ps', ['-o', 'stat=', '-o', 'uid=', '-o', 'lstart=', '-o', 'command=', '-p', String(pid)], { encoding: 'utf8', timeout: 3000 }).trim();
+    const match = line.match(/^(\S+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+[\d:]+\s+\d{4})\s+(.*)$/);
+    if (!match) return undefined;
+    if (match[1].includes('Z')) return null;
+    return { uid: Number(match[2]), start: match[3].replace(/\s+/g, ' '), command: match[4] };
+  } catch (error) { return error.status === 1 ? null : undefined; }
+}
+
+/** This process, as a lock records it. */
+let self = null;
+export function selfIdentity() {
+  return (self ??= processIdentity(process.pid) || { uid: uid(), start: null, command: process.argv.join(' ') });
+}
+
+/** Whether `pid` is still the process that was recorded as `{start}` and is this user's, and its command matches
+ *  `command` (a RegExp) when given. False when it is gone, someone else's, another process now, or unknown. */
+export function isProcess(pid, { start = null, command = null } = {}) {
+  const found = processIdentity(pid);
+  if (!found) return false;
+  if (uid() !== null && found.uid !== uid()) return false;
+  if (start !== null && found.start !== start) return false;
+  if (command && !command.test(found.command)) return false;
+  return true;
+}
+
+/** `gone` (no such process, or another one now under that pid), `alive` (the recorded one), or `unknown`. */
+export function processState(pid, { start = null } = {}) {
+  const found = processIdentity(pid);
+  if (found === null) return 'gone';
+  if (found === undefined || start === null) return 'unknown';
+  return found.start === start ? 'alive' : 'gone';
+}
+
+/** This user's process whose command line matches `pattern`, if there is one (the first found): how a process is
+ *  found when only something it was started with is known. */
+export function findProcess(pattern) {
+  if (process.platform === 'linux') {
+    let entries = [];
+    try { entries = readdirSync('/proc').filter(name => /^\d+$/.test(name)); } catch { return null; }
+    for (const name of entries) {
+      const pid = Number(name);
+      if (pid === process.pid) continue;
+      try {
+        const command = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean).join(' ');
+        if (pattern.test(command) && isProcess(pid, { command: pattern })) return pid;
+      } catch {}
+    }
+    return null;
+  }
+  try {
+    const lines = execFileSync('ps', ['-axo', 'pid=', '-o', 'command='], { encoding: 'utf8', timeout: 5000 }).split('\n');
+    for (const line of lines) {
+      const match = line.trim().match(/^(\d+)\s+(.*)$/);
+      if (match && Number(match[1]) !== process.pid && pattern.test(match[2]) && isProcess(Number(match[1]), { command: pattern })) return Number(match[1]);
+    }
+  } catch {}
+  return null;
+}
+
+/** Signal a pid only if it is still the process described; returns whether it was signalled. */
+export function signalVerified(pid, signal, expected) {
+  if (!isProcess(pid, expected)) return false;
+  try { process.kill(pid, signal); return true; } catch { return false; }
+}
+
+/** How long `pid` has run, in seconds (`ps -o etime=`: `[[dd-]hh:]mm:ss`), or null when it cannot be told. */
+export function processAge(pid) {
+  if (!validPid(pid)) return null;
+  try {
+    const text = execFileSync('ps', ['-o', 'etime=', '-p', String(pid)], { encoding: 'utf8', timeout: 3000 }).trim();
+    const match = text.match(/^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/);
+    if (!match) return null;
+    const [, days = 0, hours = 0, minutes, seconds] = match;
+    return ((Number(days) * 24 + Number(hours)) * 60 + Number(minutes)) * 60 + Number(seconds);
+  } catch { return null; }
+}

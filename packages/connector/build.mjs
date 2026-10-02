@@ -42,8 +42,18 @@ const code = await readFile(bundle, 'utf8');
 await writeFile(bundle, code.replace(/^#!.*\n/, line => line + REQUIRE), { mode: 0o755 });
 
 // The modules inside read their own version from the `package.json` beside them, and that is as
-// true of the bundle as of the source it was built from.
-await copyFile(fileURLToPath(new URL('./package.json', here)), fileURLToPath(new URL('./package.json', out)));
+// true of the bundle as of the source it was built from. What kind of build it is travels there too: the
+// installer orders two builds of one version by it (`release.mjs`) — `SIDEVOICE_CHANNEL` (`release` or
+// `nightly`) and `SIDEVOICE_BUILD_SEQ` (CI's run number), stamped by CI; a build without them is a release, 0.
+const shipped = JSON.parse(await readFile(fileURLToPath(new URL('./package.json', here)), 'utf8'));
+if (process.env.SIDEVOICE_CHANNEL || process.env.SIDEVOICE_BUILD_SEQ) {
+  const channel = process.env.SIDEVOICE_CHANNEL || 'release';
+  if (!['release', 'nightly'].includes(channel)) throw new Error(`SIDEVOICE_CHANNEL is ${channel}: release or nightly`);
+  const build_seq = Number(process.env.SIDEVOICE_BUILD_SEQ || 0);
+  if (!Number.isInteger(build_seq) || build_seq < 0) throw new Error(`SIDEVOICE_BUILD_SEQ is ${process.env.SIDEVOICE_BUILD_SEQ}: a non-negative integer`);
+  shipped.sidevoice = { channel, build_seq };
+}
+await writeFile(fileURLToPath(new URL('./package.json', out)), JSON.stringify(shipped, null, 2) + '\n');
 
 // The core this version pins, as a wheel inside the package, when the build is handed one
 // (`SIDEVOICE_CORE_WHEEL`, built from sidevoice/sidevoice-core with `uv build`): the connector then

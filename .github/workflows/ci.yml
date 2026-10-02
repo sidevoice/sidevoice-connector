@@ -11,6 +11,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      core-ref:
+        description: The sidevoice-core commit the interop job runs against (default below).
+        type: string
+        required: false
   workflow_call:
     inputs:
       release-tag:
@@ -20,6 +25,10 @@ on:
 
 permissions:
   contents: read
+
+env:
+  # The real core the interop job runs against: R1-a (sidevoice/sidevoice-core#29) until it merges, then main.
+  CORE_REF: ${{ inputs.core-ref || '8b7d2beb8b066763b32feb54f22de954ebd36dbe' }}
 
 concurrency:
   # Per ref. A release (github.workflow is the caller's, release-please) never shares a group with a push.
@@ -47,9 +56,114 @@ jobs:
       # so a list only ever checked the first name (and a deleted file went unnoticed for two releases).
       - run: for f in packages/connector/*.mjs packages/connector/dist/*.mjs; do node --check "$f"; done
       - run: npm test
+      # The trust boundary is the OS user (design §4.1): another user on this machine must reach neither the core's
+      # socket — the connector link and the local routes are only there — nor the connector's, and the core's TCP
+      # listener must not offer the link. The data dir is opened up on purpose, so the core's own 0700 directory and
+      # the sockets' own modes are what refuse, not the home directory. The fake core plays the core.
+      - name: A second OS user cannot reach this user's core or connector
+        working-directory: packages/connector
+        run: |
+          set -euo pipefail
+          printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$(command -v node)" "$PWD/test/fake-sidevoice-core.mjs" > "$RUNNER_TEMP/sidevoice-core"
+          chmod 755 "$RUNNER_TEMP/sidevoice-core"
+          export SIDEVOICE_SERVICE_MANAGER=none SIDEVOICE_CORE_PORT=0
+          # The two jobs as their manager would run them: the core, then the connector, which links to it.
+          mkdir -m 700 -p "$HOME/.sidevoice/core"
+          "$RUNNER_TEMP/sidevoice-core" --data-dir "$HOME/.sidevoice/core" --port 0 --socket "$HOME/.sidevoice/core/local.sock" --idle-exit 0 &
+          node cli.mjs connector --service &
+          for i in $(seq 1 60); do [ -f "$HOME/.sidevoice/core/core.json" ] && [ -S "$HOME/.sidevoice/connector.sock" ] && break; sleep 1; done
+          url=$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.env.HOME + '/.sidevoice/core/core.json', 'utf8')).url)")
+          chmod o+x "$HOME"; chmod 755 "$HOME/.sidevoice"
+          ls -la "$HOME/.sidevoice" "$HOME/.sidevoice/core" || true
+          sudo useradd -m sidevoice-other
+          install -m 644 test/second-uid-probe.mjs /tmp/second-uid-probe.mjs
+          sudo -u sidevoice-other "$(command -v node)" /tmp/second-uid-probe.mjs "$HOME/.sidevoice" "$url"
+          kill %1 %2
       - name: Package contents (dry run)
         run: npm pack --dry-run
         working-directory: packages/connector
+
+  # The connector against the real core, not the fake: the connector job links to a core it did not start, on its
+  # socket (no Origin, a loopback Host), registers a binding and gets a device code minted there, and finds the link
+  # gone from TCP; and the core holds its data directory (a second start exits 75) and exits 0 after a failed start.
+  # Required here: a core that is not there fails the job instead of skipping the test.
+  interop-core:
+    name: Interop with the real core
+    if: ${{ !inputs.release-tag }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: sidevoice/sidevoice-core
+          ref: ${{ env.CORE_REF }}
+          path: core
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: astral-sh/setup-uv@v6
+      - run: npm ci
+      - name: The core, installed as its own CI installs it
+        working-directory: core
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python -e .
+          .venv/bin/python -m sidevoice_core.server --self-test
+      - name: Interop test (required)
+        env:
+          SIDEVOICE_INTEROP_CORE_DIR: ${{ github.workspace }}/core
+          SIDEVOICE_INTEROP_REQUIRED: '1'
+        run: node --test --test-name-pattern=interop packages/connector/test/test_core.mjs
+
+  # The two jobs under the real service managers, end to end (packages/connector/test/service-integration.mjs):
+  # install with no agents → both jobs up with no harness → kill -9 the core: the manager restarts it → a core that
+  # fails its import: failed, and no new process for 3× the throttle → service restart → running → a login,
+  # approximated → stop (the launcher refuses) → start → upgrade A→B → upgrade B→C (its core cannot serve): back on B
+  # → uninstall with a client connected → no job, process, socket or release, and nothing after the next login.
+  # Three real builds of the package; the fake core plays the core.
+  service-linux:
+    name: Node service (systemd user manager)
+    needs: client
+    if: ${{ !inputs.release-tag }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # The runner's user has no login session, so no user manager: lingering gives it one, as on a headless machine.
+      - name: A user manager for the runner
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$USER"
+          for i in $(seq 1 30); do [ -S "/run/user/$(id -u)/bus" ] && break; sleep 1; done
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - run: systemctl --user show-environment >/dev/null && systemctl --user is-system-running || true
+      - run: node packages/connector/test/service-integration.mjs
+
+  service-macos:
+    name: Node service (launchd)
+    needs: client
+    if: ${{ !inputs.release-tag }}
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: launchctl print "gui/$(id -u)" >/dev/null && echo "gui domain present"
+      # The locks are the kernel's: on macOS the lock file opened O_EXLOCK|O_NONBLOCK through libuv (Linux: util-linux
+      # flock on the same descriptor). Proved here, on the platform: three contenders never hold it at once, a SIGKILLed
+      # holder frees it at once, a held lock is refused, a link is never followed.
+      - name: Kernel-held locks on macOS
+        run: node --test --test-name-pattern="^lock|install lock" packages/connector/test/test_security.mjs
+      - run: node packages/connector/test/service-integration.mjs
 
   package:
     name: npm tarball with the core inside
@@ -95,13 +209,21 @@ jobs:
         env:
           SIDEVOICE_CORE_WHEEL: ${{ steps.core.outputs.wheel }}
           KIND: ${{ steps.kind.outputs.publish }}
+          # Which build this is, for the installer's ordering (release.mjs): a nightly carries the version of the
+          # last release, so two nightlies of one version are ordered by this run number. build.mjs stamps both into
+          # dist/package.json; the package's own manifest is stamped here too.
+          SIDEVOICE_CHANNEL: ${{ steps.kind.outputs.publish == 'nightly' && 'nightly' || 'release' }}
+          SIDEVOICE_BUILD_SEQ: ${{ github.run_number }}
         run: |
           set -euo pipefail
+          npm pkg set "sidevoice.channel=$SIDEVOICE_CHANNEL"
+          npm pkg set "sidevoice.build_seq=$SIDEVOICE_BUILD_SEQ" --json
           mkdir -p "$GITHUB_WORKSPACE/dist-release"
           npm pack --pack-destination "$GITHUB_WORKSPACE/dist-release"
           TGZ=$(ls "$GITHUB_WORKSPACE"/dist-release/sidevoice-uplink-*.tgz)
           WHEEL=$(basename "$SIDEVOICE_CORE_WHEEL")
           tar -tzf "$TGZ" | grep -x 'package/dist/cli.mjs' >/dev/null
+          tar -xzOf "$TGZ" package/dist/package.json | node -e "const m = JSON.parse(require('fs').readFileSync(0, 'utf8')); if (m.sidevoice?.channel !== process.env.SIDEVOICE_CHANNEL || m.sidevoice?.build_seq !== Number(process.env.SIDEVOICE_BUILD_SEQ)) { console.error('unstamped manifest', m.sidevoice); process.exit(1); }"
           tar -xzOf "$TGZ" "package/dist/core/$WHEEL" | cmp - "$SIDEVOICE_CORE_WHEEL"
           if [ "$KIND" = nightly ]; then
             # The nightly carries the version of the last release, so it says it is not that version.

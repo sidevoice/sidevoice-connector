@@ -179,16 +179,22 @@ test('cursor install: our one key in ~/.cursor/mcp.json, everything else kept, a
   registerWithCursor(done, env);
   assert.match(done.at(-1), /already runs this version/);
 
-  // An older version of ours is re-pointed, keeping what the person added to it; their other servers stay.
-  writeFileSync(file, JSON.stringify({ mcpServers: { other: { url: 'https://x' }, sidevoice: { command: 'node', args: ['/old/sidevoice/0.5.0/dist/cli.mjs', 'mcp'], env: { A: '1' } } }, extra: true }));
+  // An older copy of ours (under the copies directory) is re-pointed, keeping what the person added to it; their
+  // other servers stay.
+  writeFileSync(file, JSON.stringify({ mcpServers: { other: { url: 'https://x' }, sidevoice: { command: 'node', args: [path.join(env.XDG_DATA_HOME, 'sidevoice', '0.5.0', 'dist', 'cli.mjs'), 'mcp'], env: { A: '1' } } }, extra: true }));
   registerWithCursor(done, env);
   assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { mcpServers: { other: { url: 'https://x' }, sidevoice: { command, args, env: { A: '1' } } }, extra: true });
   assert.match(done.at(-1), /Re-pointed/);
 
-  // Not ours: printed, not touched. Not JSON: printed, not touched.
+  // Not ours: printed, not touched — a program merely called cli.mjs is not Sidevoice's. Not JSON: printed, not touched.
   const foreign = JSON.stringify({ mcpServers: { sidevoice: { command: 'my-wrapper', args: [] } } });
   writeFileSync(file, foreign); registerWithCursor(done, env);
   assert.equal(readFileSync(file, 'utf8'), foreign); assert.match(done.at(-1), /not touched/);
+  const lookalike = JSON.stringify({ mcpServers: { sidevoice: { command: 'node', args: ['/opt/unrelated/cli.mjs', 'mcp'] } } });
+  writeFileSync(file, lookalike); registerWithCursor(done, env);
+  assert.equal(readFileSync(file, 'utf8'), lookalike, 'an unrelated cli.mjs is not ours'); assert.match(done.at(-1), /not touched/);
+  unregisterFromCursor(done, [], env);
+  assert.equal(readFileSync(file, 'utf8'), lookalike, 'and is never removed');
   writeFileSync(file, '{ // comment'); registerWithCursor(done, env);
   assert.equal(readFileSync(file, 'utf8'), '{ // comment'); assert.match(done.at(-1), /not valid JSON/);
 
@@ -239,7 +245,7 @@ test('tail: a transcript that disappears and comes back short is read again, not
   } finally { stop(); }
 });
 
-test('cursor install: the person\'s mcp.json keeps its permissions and its symlink, and an install for another harness keeps Cursor pointing at a copy that exists', async () => {
+test('cursor install: the person\'s mcp.json keeps its permissions and its symlink; an install for another harness re-points ours from before through current, and uninstall takes it out', async () => {
   const { install, uninstall, registerWithCursor, cursorMcpFile, serverCommand } = await import('../install.mjs');
   const home = mkdtempSync(path.join(os.tmpdir(), 'sv-home-'));
   const env = { ...process.env, HOME: home, SIDEVOICE_DATA_DIR: path.join(home, '.sidevoice'), CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
@@ -259,9 +265,12 @@ test('cursor install: the person\'s mcp.json keeps its permissions and its symli
   mkdirSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1'), { recursive: true });
   const installed = await install(['--harness', 'claude', '--no-core'], env);
   assert.deepEqual(JSON.parse(readFileSync(real, 'utf8')).mcpServers.sidevoice.args, serverCommand(env).args);
-  assert.match(installed.done.join('\n'), /Re-pointed Cursor/);
-  const gone = await uninstall(['--harness', 'claude', '--no-core'], env);
-  assert.match(gone.next.join('\n'), /Cursor still lists the sidevoice MCP server .* points at nothing/);
+  assert.match(installed.done.join('\n'), /Registered the MCP server with Cursor/);
+  // Uninstalling takes our entry out of every harness that has one, not only the one named: nothing is left
+  // pointing at releases that are gone.
+  const gone = await uninstall([], env);
+  assert.match(gone.done.join('\n'), /Unregistered the MCP server from Cursor/);
+  assert.equal(JSON.parse(readFileSync(real, 'utf8')).mcpServers.sidevoice, undefined);
 });
 
 test('cursor: an explicitly configured receiver wins over Cursor, and ~/.cursor makes Cursor present', () => {

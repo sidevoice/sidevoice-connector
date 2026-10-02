@@ -4,7 +4,7 @@ import http from 'node:http';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { appendFileSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { appendFileSync, chmodSync, rmSync, mkdtempSync, mkdirSync, readdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { startRoom, PROTOCOL } from './room.mjs';
@@ -15,17 +15,24 @@ import { remove as removeSkill, status as skillStatus } from '../skill.mjs';
 import './test_harness_contract.mjs';
 import './test_harness_claude.mjs';
 import './test_core.mjs';
+import './test_node.mjs';
+import './test_install.mjs';
+import './test_security.mjs';
 import { chatStore, fakeDesktopBridge, fakePersist, fakeStateDb, runView, TMUX } from './test_harness_cursor.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const connectorPath = path.join(here, '..', 'connector.mjs');
-const mcpPath = path.join(here, '..', 'mcp.mjs');
+// No test reaches this machine's own service manager: a service installed here must not be started by a test.
+process.env.SIDEVOICE_SERVICE_MANAGER ??= 'none';
+// Modules do nothing on import: the CLI runs them, as a harness and the launcher do.
+const cliPath = path.join(here, '..', 'cli.mjs');
+const connectorPath = [cliPath, 'connector'];
+const mcpPath = [cliPath, 'mcp'];
 const wait = ms => new Promise(r => setTimeout(r, ms));
 async function until(check, timeout = 5000) { const start = Date.now(); while (Date.now() - start < timeout) { const value = await check(); if (value) return value; await wait(25); } throw new Error('timed out waiting'); }
 
 function ipcClient(socketPath) {
   const socket = net.createConnection(socketPath); let buffer = ''; let serial = 0; const waiting = new Map();
-  socket.on('data', chunk => { buffer += chunk; let i; while ((i = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, i); buffer = buffer.slice(i + 1); if (!line) continue; const reply = JSON.parse(line); const w = waiting.get(reply.id); waiting.delete(reply.id); reply.ok ? w.resolve(reply.result) : w.reject(new Error(reply.error)); } });
+  socket.on('data', chunk => { buffer += chunk; let i; while ((i = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, i); buffer = buffer.slice(i + 1); if (!line) continue; const reply = JSON.parse(line); const w = waiting.get(reply.id); if (!w) continue; waiting.delete(reply.id); reply.ok ? w.resolve(reply.result) : w.reject(new Error(reply.error)); } });
   return { socket, ready: new Promise((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); }),
     call: (method, params) => new Promise((resolve, reject) => { const id = ++serial; waiting.set(id, { resolve, reject }); socket.write(JSON.stringify({ id, method, params }) + '\n'); }), end: () => socket.end() };
 }
@@ -36,7 +43,7 @@ function ipcClient(socketPath) {
  *  knowledge, and a test that wrote them would be asserting its own copy. */
 function startConnector(origin, dataDir, extraEnv = {}) {
   const socketPath = path.join(dataDir, 'connector.sock');
-  const child = spawn(process.execPath, [connectorPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CONNECTOR_IDLE_MS: '400',
+  const child = spawn(process.execPath, connectorPath, { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CONNECTOR_IDLE_MS: '400',
     SIDEVOICE_URL: origin, SIDEVOICE_CONNECTOR_ID: 'c-1', SIDEVOICE_CONNECTOR_TOKEN: 't-1', ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'] });
   let stderr = ''; child.stderr.on('data', d => { stderr += d; });
   return { child, socketPath, stderr: () => stderr };
@@ -229,22 +236,23 @@ test('connector: a second instance defers to the live one', async () => {
     const code = await until(() => second.child.exitCode !== null ? second.child.exitCode + 1 : null);
     assert.equal(code - 1, 0);
     assert.match(second.stderr(), /a connector is already running \(pid \d+/, 'it says whom it defers to, never silently');
-    assert.equal(readFileSync(path.join(dataDir, 'connector.sock.lock'), 'utf8'), String(first.child.pid));
+    assert.equal(JSON.parse(readFileSync(path.join(dataDir, 'connector.lock'), 'utf8')).pid, first.child.pid);
     const facade = ipcClient(first.socketPath); await facade.ready; assert.equal((await facade.call('status', {})).host.length > 0, true); facade.end();
   } finally { if (first.child.exitCode === null) first.child.kill(); await room.close(); }
 });
 
 test('connector: a lock left by a pid that is now something else is stale, not a live connector', async () => {
   // Pids are reused; on macOS a reused pid of another user even answers EPERM. The lock names this test's own
-  // node process — alive, but not a connector — so a connector must take over instead of exiting.
+  // node process — alive, but not the process that took the lock (another start time) — so a connector must take
+  // over instead of exiting.
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
-  writeFileSync(path.join(dataDir, 'connector.sock.lock'), String(process.pid));
+  writeFileSync(path.join(dataDir, 'connector.lock'), JSON.stringify({ pid: process.pid, start: 'another-process', kind: 'connector', nonce: 'stale', at: new Date().toISOString() }), { mode: 0o600 });
   const only = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '5000' });
   try {
+    // The lock is the kernel's: a record naming another process is only information, and blocks nothing.
     await until(() => existsSync(only.socketPath));
-    assert.match(only.stderr(), /stale lock .* taking over/);
-    assert.equal(readFileSync(path.join(dataDir, 'connector.sock.lock'), 'utf8'), String(only.child.pid));
+    assert.equal(JSON.parse(readFileSync(path.join(dataDir, 'connector.lock'), 'utf8')).pid, only.child.pid);
   } finally { if (only.child.exitCode === null) only.child.kill(); await room.close(); }
 });
 
@@ -254,8 +262,9 @@ test('mcp façade: identity comes from the harness, tools are exposed, instructi
   const commands = [];
   const fake = net.createServer(socket => { let buffer = ''; socket.on('data', chunk => { buffer += chunk; let i; while ((i = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, i); buffer = buffer.slice(i + 1); if (!line) continue; const input = JSON.parse(line); commands.push(input); const result = input.method === 'register' ? { binding_id: 'b-9', thread: input.params.thread, connected: true } : input.method === 'publish' ? { status: 'queued', text_saved: true } : { connected: true, bindings: [] }; socket.write(JSON.stringify({ id: input.id, ok: true, result }) + '\n'); } }); });
   await new Promise(r => fake.listen(socketPath, r));
+  chmodSync(socketPath, 0o600);   // as the connector binds it: a socket others could open is refused by clients
   writeFileSync(path.join(dataDir, 'credentials.json'), JSON.stringify({ url: 'wss://room.example/api/connectors/ws', connector_id: 'c-1', token: 't-1' }));
-  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'sess-abc', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/x.sock', CLAUDE_CODE_MESSAGING_TOKEN: 'tok' }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, mcpPath, { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'sess-abc', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/x.sock', CLAUDE_CODE_MESSAGING_TOKEN: 'tok' }, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
   const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   try {
@@ -303,7 +312,8 @@ test('mcp façade: with no room paired a conversation joins this machine\'s core
   const commands = [];
   const fake = net.createServer(socket => { let buffer = ''; socket.on('data', chunk => { buffer += chunk; let i; while ((i = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, i); buffer = buffer.slice(i + 1); if (!line) continue; const input = JSON.parse(line); commands.push(input); const result = input.method === 'register' ? { binding_id: 'b-1', thread: input.params.thread, connected: false } : { connected: false, bindings: [] }; socket.write(JSON.stringify({ id: input.id, ok: true, result }) + '\n'); } }); });
   await new Promise(r => fake.listen(socketPath, r));
-  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'sess-local', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/x.sock', CLAUDE_CODE_MESSAGING_TOKEN: 'tok' }, stdio: ['pipe', 'pipe', 'pipe'] });
+  chmodSync(socketPath, 0o600);   // as the connector binds it: a socket others could open is refused by clients
+  const child = spawn(process.execPath, mcpPath, { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'sess-local', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/x.sock', CLAUDE_CODE_MESSAGING_TOKEN: 'tok' }, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
   const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   try {
@@ -327,10 +337,11 @@ test('mcp façade: pairing a room keeps the conversations already joined — the
   const commands = [];
   const fake = net.createServer(socket => { let buffer = ''; socket.on('data', chunk => { buffer += chunk; let i; while ((i = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, i); buffer = buffer.slice(i + 1); if (!line) continue; const input = JSON.parse(line); commands.push(input); const result = input.method === 'register' ? { binding_id: 'b-1', thread: input.params.thread, connected: false } : input.method === 'publish' ? { status: 'queued', text_saved: true } : { connected: false, bindings: [] }; socket.write(JSON.stringify({ id: input.id, ok: true, result }) + '\n'); } }); });
   await new Promise(r => fake.listen(socketPath, r));
+  chmodSync(socketPath, 0o600);   // as the connector binds it: a socket others could open is refused by clients
   const roomHttp = http.createServer((req, res) => { req.resume(); req.on('end', () => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ connector_id: 'c-new', token: 't-new', protocol: 3 })); }); });
   await new Promise(r => roomHttp.listen(0, '127.0.0.1', r));
   const room = `http://127.0.0.1:${roomHttp.address().port}`;
-  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'sess-keep', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/x.sock', CLAUDE_CODE_MESSAGING_TOKEN: 'tok' }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, mcpPath, { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, CLAUDE_CODE_SESSION_ID: 'sess-keep', CLAUDE_CODE_MESSAGING_SOCKET: '/tmp/x.sock', CLAUDE_CODE_MESSAGING_TOKEN: 'tok' }, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
   const call = async (id, name, args) => { child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }) + '\n'); const reply = await until(() => replies.find(x => x.id === id)); if (reply.error) throw new Error(reply.error.message); return JSON.parse(reply.result.content[0].text); };
   try {
@@ -523,6 +534,7 @@ async function fakeConnector(dataDir, answer) {
     });
   });
   await new Promise(r => server.listen(path.join(dataDir, 'connector.sock'), r));
+  chmodSync(path.join(dataDir, 'connector.sock'), 0o600);
   return { asked, close: () => server.close() };
 }
 
@@ -530,7 +542,7 @@ test('mcp façade and CLI: voice_pair_device and `sidevoice pair-device` show th
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
   const issued = issuedCode('estudio');
   const connector = await fakeConnector(dataDir, issued);
-  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, mcpPath, { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
   const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   try {
@@ -549,13 +561,30 @@ test('mcp façade and CLI: voice_pair_device and `sidevoice pair-device` show th
     assert.equal(lines.at(-1), 'Paste it in the Sidevoice app under Máquinas → Emparejar.');
     assert.deepEqual(connector.asked.map(c => c.method), ['pair_device']);
 
-    // The command says the same, on stdout.
-    const cli = spawn(process.execPath, [path.join(here, '..', 'cli.mjs'), 'pair-device'], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['ignore', 'pipe', 'pipe'] });
-    let printed = ''; cli.stdout.on('data', d => { printed += d; });
-    const code = await new Promise(resolve => cli.on('exit', resolve));
-    assert.equal(code, 0);
-    assert.equal(printed, text + '\n');
+    // The command says the same, on stdout — and, the code carrying only this computer's address, that it
+    // works only here, with the way to reach it from elsewhere (F3).
+    const command = async (...args) => {
+      const cli = spawn(process.execPath, [path.join(here, '..', 'cli.mjs'), 'pair-device', ...args], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['ignore', 'pipe', 'pipe'] });
+      let printed = ''; cli.stdout.on('data', d => { printed += d; });
+      return { code: await new Promise(resolve => cli.on('exit', resolve)), printed };
+    };
+    const shown = await command();
+    assert.equal(shown.code, 0);
+    assert.ok(shown.printed.startsWith(text + '\n'));
+    assert.match(shown.printed.slice(text.length), /only works on this computer.*sidevoice pair <room-url> <code>/s);
+    // For the app: one JSON object, the reach worked out from the payload.
+    const json = await command('--json');
+    assert.equal(json.code, 0);
+    assert.deepEqual(JSON.parse(json.printed), { ok: true, code: issued.code, expires_in: 600, reach: 'local-only', payload: issued.payload });
   } finally { child.kill(); connector.close(); }
+});
+
+test('pair-device: the reach of a code — the room it carries, an address beyond this computer, or this computer only', async () => {
+  const { reach } = await import('../pair-device.mjs');
+  assert.equal(reach({ urls: ['http://127.0.0.1:8768'], rv: { room: 'https://room.example' } }), 'room');
+  assert.equal(reach({ urls: ['http://127.0.0.1:8768', 'https://nuc.example'], rv: null }), 'direct');
+  assert.equal(reach({ urls: ['http://127.0.0.1:8768', 'http://localhost:8768', 'http://[::1]:8768'], rv: null }), 'local-only');
+  assert.equal(reach(null), 'local-only');
 });
 
 test('link-room: this machine asks the room for a code as its page does, naming the room as the origin, and redeems it', async () => {
@@ -818,10 +847,11 @@ test('façade: in the Cursor CLI the chat is the store its parent holds open, an
   const commands = [];
   const fake = net.createServer(socket => { let buffer = ''; socket.on('data', chunk => { buffer += chunk; let i; while ((i = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, i); buffer = buffer.slice(i + 1); if (!line) continue; const input = JSON.parse(line); commands.push(input); const result = input.method === 'register' ? { binding_id: 'b-e2e', thread: input.params.thread, connected: true } : { connected: true, bindings: [], version: null }; socket.write(JSON.stringify({ id: input.id, ok: true, result }) + '\n'); } }); });
   await new Promise(r => fake.listen(socketPath, r));
+  chmodSync(socketPath, 0o600);   // as the connector binds it: a socket others could open is refused by clients
   writeFileSync(path.join(dataDir, 'credentials.json'), JSON.stringify({ url: 'wss://room.example/api/connectors/ws', connector_id: 'c-1', token: 't-1' }));
   // What Cursor gives an MCP server: a scrubbed environment, and nothing about the chat.
   const env = { HOME: process.env.HOME, PATH: process.env.PATH, SHELL: process.env.SHELL || '/bin/sh', SIDEVOICE_DATA_DIR: dataDir, CURSOR_CONFIG_DIR: cursorHome };
-  const child = spawn(process.execPath, [mcpPath], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, mcpPath, { env, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
   const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   try {
@@ -860,7 +890,7 @@ test('façade + connector: a chat of the Cursor editor joins through the view vo
   // A real connector, started as a façade would start it; then the façade, spawned as the editor spawns it.
   const { child: connector, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
   await until(() => existsSync(socketPath));
-  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, mcpPath, { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
   const ask = (id, method, params) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   let view = null;
@@ -927,7 +957,7 @@ test('façade + connector: four chats of one Cursor editor window join at once, 
   const { child: connector, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
   await until(() => existsSync(socketPath));
   // One MCP process, as the editor runs one per window.
-  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, mcpPath, { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
   let serial = 0;
   const call = async (name, args = {}) => { const id = ++serial; child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }) + '\n');
@@ -1021,7 +1051,7 @@ test('façade + connector: Cursor replaces a window\'s MCP process — the first
   await until(() => existsSync(socketPath));
   const editor = { name: 'cursor-vscode', version: '1.0.0' }, caps = { extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] } } };
   const facade = () => {
-    const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, mcpPath, { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
     const replies = []; let out = '', serial = 0;
     child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
     const send = (method, params) => { const id = ++serial; child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); return until(() => replies.find(r => r.id === id), 8000); };
@@ -1139,7 +1169,7 @@ test('façade + connector: with Cursor\'s Desktop Bridge on, an editor chat gets
   room.handle = (event, data) => { if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-d', thread: data.thread }; };
   const { child: connector, socketPath } = startConnector(room.origin, dataDir, { ...fake.env, SIDEVOICE_CURSOR_LOOKUP_AT: '800,2000,3500', SIDEVOICE_CURSOR_SCAN_MS: '50', SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
   await until(() => existsSync(socketPath));
-  const child = spawn(process.execPath, [mcpPath], { env: { ...process.env, ...fake.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, mcpPath, { env: { ...process.env, ...fake.env, SIDEVOICE_DATA_DIR: dataDir }, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = []; let out = ''; child.stdout.on('data', d => { out += d; let i; while ((i = out.indexOf('\n')) >= 0) { replies.push(JSON.parse(out.slice(0, i))); out = out.slice(i + 1); } });
   const ask = (id, method, params) => { child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); return until(() => replies.find(r => r.id === id), 8000); };
   let view = null;
@@ -1278,38 +1308,52 @@ test('install: puts this version in front of the harness, re-pins an older regis
   // Codex file and Claude Code's inbound safeguard are printed, never written.
   const { install, codexInstructions } = await import('../install.mjs');
   const home = mkdtempSync(path.join(os.tmpdir(), 'sv-home-'));
-  // A stand-in for `claude`: records every call, answers `mcp get` with whatever the test says is registered.
+  // A stand-in for `claude`: records every call, answers `mcp get` with what is registered — what the test wrote,
+  // or what `mcp add` added — and forgets it on `mcp remove`.
   const log = path.join(home, 'claude.log'), registered = path.join(home, 'registered.txt'), bin = path.join(home, 'claude');
-  writeFileSync(bin, `#!/bin/sh\necho "$@" >> "${log}"\nif [ "$2" = get ]; then [ -s "${registered}" ] && cat "${registered}" || exit 1; fi\n`, { mode: 0o755 });
+  writeFileSync(bin, `#!/bin/sh
+echo "$@" >> "${log}"
+case "$2" in
+  get) [ -s "${registered}" ] && cat "${registered}" || exit 1 ;;
+  remove) rm -f "${registered}" ;;
+  add) shift 6; cmd="$1"; shift; printf 'sidevoice:\\n  Scope: User config\\n  Type: stdio\\n  Command: %s\\n  Args: %s\\n' "$cmd" "$*" > "${registered}" ;;
+esac
+`, { mode: 0o755 });
   const calls = () => existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : [];
+  /** What changed Claude Code's registration: its adds and removes, in order. */
+  const changes = () => calls().filter(call => /^mcp (add|remove)/.test(call));
+  const line = () => { try { const text = readFileSync(registered, 'utf8'); return `${text.match(/Command: (.*)/)[1]} ${text.match(/Args: (.*)/)[1]}`; } catch { return null; } };
   // Not from a checkout: the package is copied under the XDG data home and the harness runs that copy with node.
   // HOME too: Cursor's mcp.json lives under it, and a test must never touch the real one.
   const env = { ...process.env, HOME: home, SIDEVOICE_DATA_DIR: path.join(home, '.sidevoice'), CLAUDE_CONFIG_DIR: path.join(home, '.claude'), SIDEVOICE_CLAUDE_BIN: bin,
                 SIDEVOICE_INSTALL_FROM_SOURCE: '0', XDG_DATA_HOME: path.join(home, 'xdg') };
   mkdirSync(env.CLAUDE_CONFIG_DIR);
-  mkdirSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1'), { recursive: true });   // a copy an older install left
+  mkdirSync(path.join(env.XDG_DATA_HOME, 'sidevoice', 'releases', '0.0.1'), { recursive: true });   // a release nothing selects
   const { command, args } = (await import('../install.mjs')).serverCommand(env);
   const wanted = [command, ...args].join(' ');
   const version = JSON.parse(readFileSync(path.join(here, '..', 'package.json'), 'utf8')).version;
   const manifest = JSON.parse(readFileSync(path.join(here, '..', 'package.json'), 'utf8'));
-  assert.equal(wanted, `node ${path.join(env.XDG_DATA_HOME, 'sidevoice', version, 'dist', 'cli.mjs')} mcp`, 'never npx at session start');
+  assert.equal(wanted, `node ${path.join(env.XDG_DATA_HOME, 'sidevoice', 'current', 'dist', 'cli.mjs')} mcp`, 'never npx at session start: the release current selects');
   assert.deepEqual(manifest.dependencies, undefined, 'the published package resolves nothing at install time');
 
   assert.rejects(install(['https://room.example', '--harness', 'claude'], env), /Pairing is not part of installing/, 'a room address is refused, with where pairing lives');
 
   const first = await install(['--harness', 'claude', '--no-core'], env);
-  assert.deepEqual(calls(), ['mcp get sidevoice', `mcp add --scope user sidevoice -- ${wanted}`], 'nothing registered: it registers this version');
+  assert.deepEqual(changes(), [`mcp add --scope user sidevoice -- ${wanted}`], 'nothing registered: it registers this version');
+  assert.equal(line(), wanted);
   assert.match(first.done.join('\n'), /Registered the MCP server/);
-  assert.match(first.done.join('\n'), /Copied this version to .*\(removed: 0\.0\.1\)/);
+  assert.match(first.done.join('\n'), new RegExp(`now runs ${version.replace(/\./g, '\\.')}-nocore`));
   // The copy is what the package ships and nothing more: the bundle, the manifest beside it, and
   // no step of its own — nothing is fetched, built or resolved on the machine being installed on.
   // That the bundle then runs is proved where it is run for real, in the room's interop test.
   for (const file of manifest.files.concat('package.json')) {
-    assert.ok(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', version, file)),
+    assert.ok(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', 'releases', `${version}-nocore`, file)),
       `${file} is in the copy (the bundle is built: npm run build -w @sidevoice/uplink)`);
   }
-  assert.equal(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', version, 'node_modules')), false);
-  assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', '0.0.1')), 'the older copy is gone');
+  assert.equal(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', 'releases', `${version}-nocore`, 'node_modules')), false);
+  // A release neither current nor previous names is pruned (§2.4 step 9); the selected one is not.
+  assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', 'releases', '0.0.1')), 'pruned');
+  assert.ok(existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice', 'releases', `${version}-nocore`, 'release.json')), 'the selected one stays');
   assert.match(first.done.join('\n'), /not paired with any room yet/);
   assert.match(first.next.join('\n'), /Emparejar máquina/, 'and it says the conversation will ask for the code');
   assert.ok(!existsSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room')), 'no skill is installed: the server carries the prompt');
@@ -1319,8 +1363,8 @@ test('install: puts this version in front of the harness, re-pins an older regis
   writeFileSync(registered, `sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: ${command}\n  Args: ${args.join(' ')}\n`);
   writeFileSync(log, '');
   const again = await install(['--harness', 'claude', '--no-core'], env);
-  assert.deepEqual(calls(), ['mcp get sidevoice']);
-  assert.match(again.done.join('\n'), /already runs this version/);
+  assert.deepEqual(changes(), [], 'already this version: nothing changed');
+  assert.match(again.done.join('\n'), /Installed already/);
   // A skill copy left by an earlier version is taken away; someone else's voice-room is not.
   mkdirSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room'), { recursive: true });
   writeFileSync(path.join(env.CLAUDE_CONFIG_DIR, 'skills', 'voice-room', 'SKILL.md'), '---\nname: voice-room\nmetadata:\n  sidevoice: installed copy\n---\nold');
@@ -1331,16 +1375,18 @@ test('install: puts this version in front of the harness, re-pins an older regis
   // An older pin: after an upgrade, running install again moves the harness to the new version.
   writeFileSync(registered, `sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: npx\n  Args: -y @sidevoice/uplink@0.1.0 mcp\n`);
   writeFileSync(log, '');
+  rmSync(path.join(env.SIDEVOICE_DATA_DIR, 'install.json'));   // an older installation's entry, re-pointed as the new one is installed
   const upgraded = await install(['--harness', 'claude', '--no-core'], env);
-  assert.deepEqual(calls(), ['mcp get sidevoice', 'mcp remove --scope user sidevoice', `mcp add --scope user sidevoice -- ${wanted}`]);
-  assert.match(upgraded.done.join('\n'), /Re-pointed .* \(was: npx -y @sidevoice\/uplink@0\.1\.0 mcp\)/);
+  assert.deepEqual(changes(), ['mcp remove --scope user sidevoice', `mcp add --scope user sidevoice -- ${wanted}`]);
+  assert.equal(line(), wanted);
+  assert.match(upgraded.done.join('\n'), /Registered the MCP server with Claude Code/);
 
   // Registered somewhere that is not ours to move: left alone, with the command to move it.
   writeFileSync(registered, `sidevoice:\n  Scope: Project config (shared via .mcp.json)\n  Type: stdio\n  Command: npx\n  Args: -y @sidevoice/uplink@0.1.0 mcp\n`);
   writeFileSync(log, '');
   const elsewhere = await install(['--harness', 'claude', '--no-core'], env);
-  assert.deepEqual(calls(), ['mcp get sidevoice']);
-  assert.match(elsewhere.done.join('\n'), /outside user scope .* not touched/);
+  assert.deepEqual(changes(), [], 'not ours to move');
+  assert.match(elsewhere.done.join('\n'), /not touched/);
 
   // A paired machine is reported as such, never re-paired.
   mkdirSync(env.SIDEVOICE_DATA_DIR, { recursive: true });
@@ -1355,9 +1401,9 @@ test('install: puts this version in front of the harness, re-pins an older regis
   writeFileSync(log, '');
   const { uninstall } = await import('../install.mjs');
   const gone = await uninstall(['--harness', 'claude', '--no-core'], env);
-  assert.deepEqual(calls(), ['mcp get sidevoice', 'mcp remove --scope user sidevoice']);
-  assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice')), 'installed copies are gone');
-  assert.ok(!existsSync(env.SIDEVOICE_DATA_DIR), 'credential, socket and log are gone');
+  assert.deepEqual(changes(), ['mcp remove --scope user sidevoice']);
+  assert.ok(!existsSync(path.join(env.XDG_DATA_HOME, 'sidevoice')), 'the releases are gone');
+  assert.deepEqual(readdirSync(env.SIDEVOICE_DATA_DIR).sort(), ['install.lock', 'node-stopped.json'], 'credential, socket and log are gone; the lock file is permanent, and the stop stays');
   assert.match(gone.next.join('\n'), /still lists this machine as paired .* revoke it under "Máquinas" on the room/);
   assert.match(gone.done.join('\n'), /Unregistered the MCP server/);
 

@@ -30,12 +30,14 @@ export function remove(dir) {
   return { state: 'absent', target: current.target, action: current.state === 'installed' ? 'removed' : 'nothing to remove' };
 }
 
-if (process.env.SIDEVOICE_SKILL_MAIN === '1') {
-  const [command] = process.argv.slice(2);
-  const dir = skillsDir();
+/** `sidevoice skill <remove|status> [--dir <skills dir>]`. */
+export function run(argv = [], env = process.env) {
+  const [command] = argv;
+  const dir = skillsDir(argv, env);
   try {
     const result = command === 'remove' ? remove(dir) : command === 'status' ? status(dir) : null;
-    if (!result) { console.error('usage: sidevoice skill <remove|status> [--dir <skills dir>]   (the skill is no longer installed: the MCP server offers the voice-room prompt)'); process.exit(2); }
+    if (!result) { console.error('usage: sidevoice skill <remove|status> [--dir <skills dir>]   (the skill is no longer installed: the MCP server offers the voice-room prompt)'); return 2; }
     console.log(`${result.action || result.state}: ${result.target}`);
-  } catch (error) { console.error(error.message); process.exit(1); }
+    return 0;
+  } catch (error) { console.error(error.message); return 1; }
 }

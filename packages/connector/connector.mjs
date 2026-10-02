@@ -1,49 +1,59 @@
-#!/usr/bin/env node
 /** One connector per host: a link to this machine's core, every binding multiplexed over it, and
  *  the last mile chosen per binding. Node 22+. Façades talk to it over a local socket; a binding
  *  lives exactly as long as the façade connection that registered it.
  *
- *  The core (`sidevoice-core`, Python) holds the conversations and runs voice; this connector installs
- *  it, starts it and links to it over loopback (`core.mjs`). The hosted room is the core's business:
+ *  The core (`sidevoice-core`, Python) holds the conversations and runs voice; this connector links to it
+ *  over the core's own Unix socket (`core.mjs`, `core-socket.mjs`). The hosted room is the core's business:
  *  the core dials it with this machine's pairing and tells this connector how that link is doing.
+ *
+ *  Two ways to run (§2.6), and nothing else. `connector --service` is the connector job (`service.mjs`): started
+ *  by launchd or systemd at login, it never leaves on its own and **never starts a core** — the core job does; it
+ *  links when the core answers and again whenever another launch of it answers, with a bounded backoff while none
+ *  does. Plain `connector` is what the launcher starts where there is no job: it starts a core, detached, if none
+ *  answers (one with a core job defined is only waited for), and leaves 15 s after its last conversation. Neither is
+ *  anyone's supervisor: restarts are the service manager's.
  *
  *  What carries the link, and how it comes back when it drops, is `link.mjs`'s business; nothing
  *  below this line knows what is underneath. What does not live there is the outbox: a library's
  *  buffer dies with this process, and speech the user was promised must not. */
 import net from 'node:net';
-import os from 'node:os';
 import path from 'node:path';
-import { appendFileSync, mkdirSync, openSync, closeSync, statSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, lstatSync, rmSync, statSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
 import { capabilityState, SUPPORTED, voiceEnvelope } from './harness-contract.mjs';
 import { harnessFor } from './harnesses.mjs';
 import { machineIdentity, VERSION } from './identity.mjs';
 import { pair, roomOrigin } from './pair.mjs';
 import { roomLink, UNREACHABLE } from './link.mjs';
-import { coreAlive, ensureRunning, installInProgress, readReady } from './core.mjs';
+import { compatible, coreRunning, ensureRunning, installInProgress, roomCredentialPath, serving } from './core.mjs';
+import { socketAgent } from './core-socket.mjs';
+import { appendLine } from './logfile.mjs';
+import { coreProgram } from './release.mjs';
+import { installedService, status as nodeStatusOf } from './service.mjs';
+import { connectorLockOf, connectorSocketOf, dataDirOf, nodeFiles } from './node-files.mjs';
+import { tryLock } from './lockfile.mjs';
+import { t } from './i18n.mjs';
+import { verifyPrivateDir } from './secure-fs.mjs';
+
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 export const PROTOCOL = 2;
-const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
-const socketPath = process.env.SIDEVOICE_CONNECTOR_SOCKET || path.join(dataDir, 'connector.sock');
-const lockPath = socketPath + '.lock';
-const outboxPath = path.join(dataDir, 'outbox.json');
-const credentialsPath = process.env.SIDEVOICE_CREDENTIALS || path.join(dataDir, 'credentials.json');
-const idleMs = Number(process.env.SIDEVOICE_CONNECTOR_IDLE_MS || 15_000);
-// Who this machine is, said at every connection: the room keeps the latest and lists it.
-const identity = machineIdentity();
-const hostId = identity.host;
-const logPath = process.env.SIDEVOICE_CONNECTOR_LOG || path.join(dataDir, 'connector.log');
+// Set by `run`: nothing here reads the environment, or does anything, on import.
+let env = process.env, dataDir, socketPath, lockPath, outboxPath, credentialsPath, idleMs, identity, hostId, logPath, files;
+/** `--service`: this process is the connector job. `ownsCore`: no core job is defined, so this connector starts one. */
+let serviceMode = false, ownsCore = true;
 const LOG_MAX = 1 << 20;
 
-/** One line per event, to stderr and to `connector.log` in the data dir: the façade starts this process
- *  with its output discarded, so the file is the only record of a connector nobody ran by hand. Rolls
- *  over once, at 1 MB. */
+/** One line per event. A plain connector writes to stderr and to `connector.log` in the data dir: the façade
+ *  starts it with its output discarded, so the file is the only record of a connector nobody ran by hand
+ *  (rolls over once, at 1 MB). The connector job writes `connector.log` only (rotated, `logfile.mjs`): launchd
+ *  already puts its stderr in that same file, so writing both would say everything twice. */
 /** An editor conversation's id is what lets a chat speak as it: the log names it by a hash. */
 const redact = line => String(line).replace(/cursor-editor-[0-9a-f-]{36}/g, id => 'cursor-editor-h:' + createHash('sha256').update(id).digest('hex').slice(0, 10));
 function log(line) {
   line = redact(line);
   const stamped = `${new Date().toISOString()} [sidevoice] ${line}`;
+  if (serviceMode) return appendLine(logPath, stamped);
   console.error(stamped);
   try {
     let size = 0; try { size = statSync(logPath).size; } catch {}
@@ -53,39 +63,19 @@ function log(line) {
 }
 
 /** A core somebody else runs — a checkout's, a test's — named whole in the environment: this connector
- *  then links to it and supervises nothing. Otherwise null, and the connector runs its own. */
+ *  then links to it over TCP and starts nothing. Otherwise null, and the connector links to this machine's own. */
 function externalCore() {
-  const { SIDEVOICE_URL: url, SIDEVOICE_CONNECTOR_ID: connector_id, SIDEVOICE_CONNECTOR_TOKEN: token } = process.env;
+  const { SIDEVOICE_URL: url, SIDEVOICE_CONNECTOR_ID: connector_id, SIDEVOICE_CONNECTOR_TOKEN: token } = env;
   return url && connector_id && token ? { room: roomOrigin(url), connector_id, token } : null;
 }
 
-/** Whether the pid in the lock is a live Sidevoice connector — not merely a live pid. Pids are reused,
- *  and on macOS a pid that now belongs to another user answers EPERM, which used to count as alive: a
- *  stale lock then made every new connector exit at once, silently (a laptop, 2026-09-21). */
-function connectorAlive(pid) {
-  try { process.kill(pid, 0); } catch (error) { if (error.code !== 'EPERM') return false; }
-  try {
-    const args = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', timeout: 3000 }).trim();
-    return /(^|[\s/])connector(\.mjs)?(\s|$)/.test(args);   // `…/connector.mjs` from a checkout, `sidevoice connector` from a package; not test_connector.mjs
-  } catch { return true; }                          // No ps to ask: a live pid is taken at its word.
+/** Where the link to this machine's own core goes: its socket, whatever the URL says (`core-socket.mjs`). */
+function coreLink(ready) {
+  return { room: 'http://localhost', connector_id: ready.connector_id, token: ready.token, core: ready, agent: socketAgent(ready.socket) };
 }
-function acquireLock() {
-  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try { const fd = openSync(lockPath, 'wx', 0o600); writeFileSync(fd, String(process.pid)); closeSync(fd); return true; }
-    catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-      let pid = 0; try { pid = Number(readFileSync(lockPath, 'utf8')); } catch {}
-      if (pid && connectorAlive(pid)) {              // A live connector holds it: we are redundant, and we say so.
-        log(`a connector is already running (pid ${pid}, lock ${lockPath}); this one exits`);
-        return false;
-      }
-      log(`stale lock ${lockPath} (pid ${pid || '?'} is not a connector); taking over`);
-      try { unlinkSync(lockPath); } catch {}
-    }
-  }
-  return false;
-}
+
+/** The connector's lock (`lockfile.mjs`, `D/connector.lock`): held by the kernel for as long as this process lives. */
+let lockHold = null;
 
 const bindings = new Map();        // binding_id -> { binding_id, client_ref, harness, thread, title, delivery, capabilities, owner, chain }
 const clients = new Set();         // façade IPC connections
@@ -99,9 +89,10 @@ let refusal = null;                // the room will not have this connector, and
 let waking = [];                   // whoever is waiting for the room to welcome this connector again
 let creds = null;                  // where the link to the core goes, and with which credential
 let rendezvous = null;             // the core's link with the hosted room, as the core last reported it
-const external = externalCore();
-let coreStarting = null;           // the core being installed or started, while it is
+let external = null;               // a core somebody else runs, named in the environment
+let coreStarting = null;           // the core being installed or started, while it is (plain connector)
 let coreError = null;              // why the local core could not be had, for whoever asks
+let coreFailure = null;            // the same, as the keyed failure `node.status` carries
 let coreCheckedAt = 0;
 
 function loadOutbox() { try { outbox = JSON.parse(readFileSync(outboxPath, 'utf8')); if (!Array.isArray(outbox)) outbox = []; } catch { outbox = []; } }
@@ -228,20 +219,23 @@ function refuse(reason) {
   scheduleExit();
 }
 
-/** The local core, installed and started if need be, and the credential its ready file names. Waiters
- *  are woken on failure too, so a conversation asking to join hears why rather than timing out. */
+/** The core this connector starts (no core job): the selected release's program when there is one, else this
+ *  package's own build, installed if need be — started detached, and the credential its ready file names. Waiters are
+ *  woken on failure too, so a conversation asking to join hears why rather than timing out. */
 function startCore() {
   if (coreStarting) return coreStarting;
-  coreError = null;
-  coreStarting = ensureRunning({ dataDir, log, roomCredential: credentialsPath })
+  coreError = null; coreFailure = null;
+  let selected = null; try { selected = coreProgram(env); } catch {}
+  coreStarting = ensureRunning({ dataDir, env, log, roomCredential: credentialsPath, bin: selected && existsSync(selected) ? selected : null })
     .then(ready => {
       coreError = null;
-      creds = { room: ready.url, connector_id: ready.connector_id, token: ready.token, core: ready };
-      log(`linking to this machine's core ${ready.version || '?'} at ${ready.url} (pid ${ready.pid})`);
+      creds = coreLink(ready);
+      log(`linking to this machine's core ${ready.version || '?'} on ${ready.socket} (pid ${ready.pid}, launch ${ready.launch_id})`);
       return ready;
     })
     .catch(error => {
       coreError = lastError = error.message;
+      coreFailure = error.failure || { key: error.key || 'launch.exited', message: error.message, at: new Date().toISOString() };
       log('the local core is not available: ' + error.message);
       for (const wake of waking.splice(0)) wake();
       return null;
@@ -250,17 +244,53 @@ function startCore() {
   return coreStarting;
 }
 
-/** A link that keeps failing to a core whose process is gone is a core to start again. The same
- *  credential and, on the fixed port, the same address come back with it; if the address moved, the
- *  link moves with it, and the welcome re-registers every binding as after any reconnect. */
+/** Whether a core is on its way: one this connector is starting, or — the core job's — one its manager is starting or
+ *  about to start again (`service.mjs`). A job that failed says why, for whoever is waiting. */
+async function coreComing() {
+  if (ownsCore) return !!coreStarting;
+  const now = await nodeStatusOf(env, { connectorRunning: true });
+  if (['failed', 'service-failed', 'stopped-by-person'].includes(now.state)) {
+    coreFailure = now.failure; coreError = now.failure ? (now.failure.message || now.failure.key) : t(`service.state.${now.state}`);
+  }
+  return ['starting', 'backoff'].includes(now.state);
+}
+
+/** A core this connector does not start (the core job's): linked when it answers, and linked again when another launch
+ *  of it answers — a restart, an upgrade. Never started, signalled or adopted here. While none answers it is looked for
+ *  again with a bounded backoff (0.5 s, doubling, at most 5 s); while one does, every 2 s. */
+let followTimer = null, followDelay = 500;
+async function followCore() {
+  clearTimeout(followTimer); followTimer = null;
+  if (closed || external) return;
+  const ready = await serving(dataDir, 1500).catch(() => null);
+  if (ready && !compatible(ready)) {
+    coreError = lastError = t('install.incompatible');
+    coreFailure = { key: 'install.incompatible', message: coreError, at: new Date().toISOString() };
+  } else if (ready && ready.launch_id !== creds?.core?.launch_id) {
+    coreError = null; coreFailure = null;
+    creds = coreLink(ready);
+    log(`linking to this machine's core ${ready.version || '?'} on ${ready.socket} (pid ${ready.pid}, launch ${ready.launch_id})`);
+    if (link) { const old = link; link = null; old.close(); }
+    open();
+  }
+  followDelay = ready ? 2000 : Math.min(followDelay * 2, 5000);
+  if (closed) return;
+  followTimer = setTimeout(() => followCore().catch(error => log('looking for the core failed: ' + error.message)), followDelay);
+  followTimer.unref?.();
+}
+
+/** The link keeps failing: a core this connector started whose process is gone is started again, and the link goes to
+ *  that launch (the welcome re-registers every binding as after any reconnect); the core job's is looked for again now. */
 async function superviseCore() {
   if (external || closed || coreStarting || Date.now() - coreCheckedAt < 2000) return;
   coreCheckedAt = Date.now();
-  if (creds?.core && coreAlive(creds.core.pid)) return;
+  if (!ownsCore) { followDelay = 500; return followCore(); }
+  if (creds?.core && coreRunning(dataDir, creds.core.pid)) return;
   log('the local core is gone; starting it again');
-  const previous = creds?.room;
+  const previous = creds?.core?.launch_id;
   const ready = await startCore();
-  if (ready && ready.url !== previous && link) { const old = link; link = null; old.close(); open(); }
+  // Another launch, perhaps another credential: the link is opened again to it.
+  if (ready && ready.launch_id !== previous && link) { const old = link; link = null; old.close(); open(); }
 }
 
 /** Open the one link to this machine's room. Idempotent: it is called whenever a conversation
@@ -268,9 +298,10 @@ async function superviseCore() {
 function open() {
   if (closed || link) return;
   if (!creds && external) creds = external;
-  if (!creds) { startCore().then(ready => { if (ready) open(); }); return; }
+  // A core this connector starts is started now; the core job's is linked when it answers (`followCore`).
+  if (!creds) { if (ownsCore) startCore().then(ready => { if (ready) open(); }); else if (!followTimer) followCore().catch(() => {}); return; }
   link = roomLink({
-    origin: creds.room, connector_id: creds.connector_id, token: creds.token,
+    origin: creds.room, connector_id: creds.connector_id, token: creds.token, agent: creds.agent,
     protocol: PROTOCOL, identity,
     onConnected: welcome => {
       connected = true; lastError = null; socketError = null;
@@ -343,7 +374,7 @@ async function devicePairingCode() {
   if (!connected) await welcomed(CORE_WAIT_MS);
   // A first install still running is waited for, up to a bound: the code comes as soon as the core does.
   const waitedSince = Date.now();
-  while (!connected && !coreError && (coreStarting || installInProgress(dataDir)) && Date.now() - waitedSince < CORE_INSTALL_WAIT_MS) await welcomed(2000);
+  while (!connected && !coreError && ((await coreComing()) || installInProgress(dataDir)) && Date.now() - waitedSince < CORE_INSTALL_WAIT_MS) await welcomed(2000);
   if (!connected && !coreError) await welcomed(5000);   // started a moment ago: the link is on its way
   if (!connected) {
     if (coreError) throw new Error(coreError);
@@ -493,17 +524,39 @@ function snapshot() {
       return { binding_id, client_ref, harness, thread, title, delivery: delivery.kind, capabilities, ...(state ? { delivery_state: state } : {}) };
     }) };
 }
+/** What only asks how things are: the app polls it every 2 s on a fresh connection. A client that asks nothing
+ *  else does not keep a plain connector alive, and neither its arrival nor its leaving touches the idle timer —
+ *  only conversations and façades that asked for real work do. */
+const PROBES = new Set(['status', 'node.status']);
+const engaged = () => [...clients].filter(client => client.engaged).length;
+
+/** A plain connector leaves once nothing has used it for a while; the connector job never does. */
 function scheduleExit() {
+  if (serviceMode) return;
   if (idleTimer) clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => { if (clients.size === 0 && bindings.size === 0) { log(`idle for ${idleMs} ms with no conversation; exiting`); shutdown(); } }, idleMs);
+  idleTimer = setTimeout(() => { if (engaged() === 0 && bindings.size === 0) { log(`idle for ${idleMs} ms with no conversation; exiting`); shutdown(); } }, idleMs);
 }
-function shutdown() {
-  if (!closed) log(`shutting down (${bindings.size} binding(s), ${clients.size} façade(s))`);
+let server = null;
+async function shutdown(code = 0) {
+  if (closed) return;
+  log(`shutting down (${bindings.size} binding(s), ${clients.size} façade(s))`);
   closed = true; clearTimeout(idleTimer);
   try { link?.close(); } catch {}
-  server.close();
-  try { if (Number(readFileSync(lockPath, 'utf8')) === process.pid) { unlinkSync(socketPath); unlinkSync(lockPath); } } catch {}
-  process.exit(0);
+  server?.close();
+  releaseLock({ socket: true });
+  process.exit(code);
+}
+
+function releaseLock({ socket }) {
+  // The socket is ours to remove only while the lock is.
+  if (!lockHold) return;
+  if (socket) { try { unlinkSync(socketPath); } catch {} }
+  lockHold.release(); lockHold = null;
+}
+
+/** `node.status` (SEAMS §4): the node's state derived on read, as `service status --json` answers it. */
+function nodeStatus() {
+  return nodeStatusOf(env, { connectorRunning: true });
 }
 
 /** Conversations kept without a façade leave once their card has not been heard from for this long (or, never
@@ -526,6 +579,21 @@ function keepOrphans() {
   }, Math.min(60_000, Math.max(50, ORPHAN_TTL_MS / 4)));
   orphanTimer.unref?.();
 }
+/** What the harness must have open before anything is delivered (Cursor's editor: the view's bridge), for a
+ *  binding that already exists — so a command right behind `register` finds it. */
+async function prepareBinding(binding, { port = null } = {}) {
+  const module = harnessFor(binding.harness);
+  if (typeof module.prepare !== 'function') return null;
+  // `admitted`: the harness itself answered that the conversation took a message (Cursor's editor answers a
+  // card's ui/message when the turn it started has run) — as good a second tick as seeing it recorded.
+  const admitted = message_id => { const sent = binding.pending?.get(message_id); if (sent) reportRead(binding, { message_id, session_id: sent.session_id, revision: sent.revision }); };
+  let prepared = null;
+  try { prepared = await module.prepare(binding.delivery, { log, admitted, port }) || null; } catch (error) { log(`${binding.thread} could not be prepared for delivery: ${error.message}`); }
+  if (prepared && bindings.get(binding.binding_id) === binding) { binding.release = prepared.release; binding.detachable = !!prepared.detachable; binding.prepared = prepared.info || null; }
+  else prepared?.release?.();
+  return prepared;
+}
+
 /** A façade taking over a conversation kept without one. Only one that says it speaks for editor chats, and
  *  only a conversation of that kind: the id is what the chat was handed by its own voice_connect. */
 function adopt(client, client_ref) {
@@ -566,25 +634,18 @@ async function command(client, input) {
       closedByRoom.delete(client_ref);   // joining again is the user's explicit request
       const existing = [...bindings.values()].find(b => b.client_ref === client_ref);
       if (existing) {
-        Object.assign(existing, { owner: client, delivery, inbound, capabilities, experimental, route });
+        // The same conversation again — its façade after a reconnect, or a second voice_connect: only the owner
+        // is attached; the binding, its watch and its preparation are the ones already there.
+        Object.assign(existing, { owner: client, delivery, inbound, capabilities, experimental, route, orphanedAt: null });
+        clearTimeout(existing.ownerTimer); existing.ownerTimer = null;
         client.bindings.add(existing);
-        return { binding_id: existing.binding_id, thread, connected: reachable() };
+        return { binding_id: existing.binding_id, thread, connected: reachable(), ...(existing.prepared ? { prepared: existing.prepared } : {}) };
       }
       const local_id = 'local-' + randomUUID();
       log(`${harness} ${thread} joins ("${title || ''}", delivery ${delivery.kind}, inbound ${inbound ? (inbound.ok ? 'ok' : 'held') : 'n/a'})`);
       const binding = { binding_id: local_id, client_ref, harness, thread, title, delivery, inbound, capabilities, experimental, engine, route, owner: client };
       bindings.set(local_id, binding); client.bindings.add(binding); clearTimeout(idleTimer); open(); watch(binding);
-      // What the harness must have open before anything is delivered (Cursor's editor: the view's bridge).
-      // Asked after the binding exists, so a command right behind this one finds it.
-      let prepared = null;
-      const module = harnessFor(harness);
-      if (typeof module.prepare === 'function') {
-        // `admitted`: the harness itself answered that the conversation took a message (Cursor's editor answers a
-        // card's ui/message when the turn it started has run) — as good a second tick as seeing it recorded.
-        const admitted = message_id => { const sent = binding.pending?.get(message_id); if (sent) reportRead(binding, { message_id, session_id: sent.session_id, revision: sent.revision }); };
-        try { prepared = await module.prepare(delivery, { log, admitted }) || null; } catch (error) { log(`${thread} could not be prepared for delivery: ${error.message}`); }
-        if (prepared && bindings.get(binding.binding_id) === binding) { binding.release = prepared.release; binding.detachable = !!prepared.detachable; } else prepared?.release?.();
-      }
+      const prepared = await prepareBinding(binding);
       // A room that is not there yet is not a failure: the binding is registered on the next welcome.
       const reply = await joinRoom(binding).catch(error => { if (!connected && !refusal && !coreError) return null; bindings.delete(binding.binding_id); client.bindings.delete(binding); unwatch(binding); throw error; });
       return { binding_id: reply?.binding_id || binding.binding_id, thread, connected: reachable(), pending: !reply, ...(prepared?.info ? { prepared: prepared.info } : {}) };
@@ -620,6 +681,7 @@ async function command(client, input) {
       scheduleExit(); return { ...snapshot(), left: !!binding };
     }
     case 'adopt': return adopt(client, params.client_ref) || { adopted: false };
+    case 'node.status': return nodeStatus();
     case 'status': return snapshot();
     case 'pair_device': return devicePairingCode();
     default: throw new Error('Unknown connector command');
@@ -628,8 +690,8 @@ async function command(client, input) {
 
 function serve(socket) {
   const client = { socket, bindings: new Set() };
-  clients.add(client); clearTimeout(idleTimer);
-  log(`façade attached (${clients.size} now)`);
+  clients.add(client);
+
   let buffer = '';
   socket.on('data', chunk => {
     buffer += chunk;
@@ -639,14 +701,16 @@ function serve(socket) {
       const line = buffer.slice(0, index); buffer = buffer.slice(index + 1);
       if (!line.trim()) continue;
       let input; try { input = JSON.parse(line); } catch { socket.write(JSON.stringify({ ok: false, error: 'Invalid JSON' }) + '\n'); continue; }
-      command(client, input).then(result => socket.write(JSON.stringify({ id: input.id, ok: true, result }) + '\n'))
-        .catch(error => socket.write(JSON.stringify({ id: input.id, ok: false, error: error.message }) + '\n'));
+      if (!PROBES.has(input.method) && !client.engaged) { client.engaged = true; clearTimeout(idleTimer); log(`façade attached (${engaged()} now)`); }
+      const job = command(client, input);
+      job.then(result => { if (!socket.destroyed) socket.write(JSON.stringify({ id: input.id, ok: true, result }) + '\n'); })
+        .catch(error => { if (!socket.destroyed) socket.write(JSON.stringify({ id: input.id, ok: false, error: error.message }) + '\n'); });
     }
   });
   socket.on('error', () => {});
   socket.on('close', () => {
     clients.delete(client);
-    log(`façade detached (${clients.size} left); dropping ${client.bindings.size} binding(s)`);
+    if (client.engaged) log(`façade detached (${engaged()} left); dropping ${client.bindings.size} binding(s)`);
     // The façade is gone: so is every conversation it spoke for.
     for (const binding of client.bindings) {
       // A conversation whose delivery does not go through its façade (an editor chat's card) outlives it:
@@ -654,17 +718,64 @@ function serve(socket) {
       if (binding.detachable) { binding.owner = null; binding.orphanedAt = Date.now(); keepOrphans(); log(`${binding.thread} kept without a façade (its card delivers)`); continue; }
       bindings.delete(binding.binding_id); unwatch(binding); if (!binding.binding_id.startsWith('local-')) send('binding.unregister', { binding_id: binding.binding_id });
     }
-    scheduleExit();
+    // A probe leaving changes nothing: the idle timer runs on as it was.
+    if (client.engaged) scheduleExit();
   });
 }
 
-if (!acquireLock()) process.exit(0);
-log(`connector ${VERSION} starting: pid ${process.pid}, host ${hostId}, ${external ? 'core at ' + external.room : 'this machine\'s own core'}, socket ${socketPath}, log ${logPath}`);
-loadOutbox();
-if (outbox.length) log(`${outbox.length} speech frame(s) waiting in the outbox`);
-try { unlinkSync(socketPath); } catch {}
-const server = net.createServer(serve);
-await new Promise((resolve, reject) => server.once('error', reject).listen(socketPath, resolve));
-process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown);
-scheduleExit();
-open();
+/** `sidevoice connector [--service]`. */
+export async function run(argv = [], environment = process.env) {
+  env = environment;
+  serviceMode = argv.includes('--service');
+  dataDir = dataDirOf(env);
+  files = nodeFiles(dataDir);
+  socketPath = connectorSocketOf(env);
+  lockPath = connectorLockOf(env);
+  outboxPath = path.join(dataDir, 'outbox.json');
+  credentialsPath = roomCredentialPath(dataDir, env);
+  idleMs = Number(env.SIDEVOICE_CONNECTOR_IDLE_MS || 15_000);
+  // Who this machine is, said at every connection: the room keeps the latest and lists it.
+  identity = machineIdentity(env);
+  hostId = identity.host;
+  logPath = serviceMode ? files.connectorLog : env.SIDEVOICE_CONNECTOR_LOG || files.connectorLog;
+  external = externalCore();
+  // Refused, not repaired: a data directory others can write into is not one to serve from (`secure-fs.mjs`).
+  try { verifyPrivateDir(dataDir, { create: true }); }
+  catch (error) { log(`not starting: ${error.message}`); process.exitCode = 78; return; }
+  // The core is started here only where nobody else does: never by the connector job, never beside a core job.
+  try { ownsCore = !serviceMode && !installedService(env)?.core; }
+  catch (error) { log(`not starting: ${error.message}`); process.exitCode = 78; return; }
+  // One connector serves the socket. A plain one that finds it held leaves; the job waits for the holder to go (a
+  // connector somebody started by hand), rather than exiting into its manager's restart loop.
+  for (let said = false; ;) {
+    let taken;
+    try { taken = await tryLock(lockPath, { kind: 'connector', env }); }
+    catch (error) { log(`not starting: ${error.message}`); process.exit(1); }
+    if (taken.held) { lockHold = taken; break; }
+    if (!serviceMode) { log(`a connector is already running (pid ${taken.owner?.pid ?? '?'}, lock ${lockPath}); this one exits`); process.exit(0); }
+    if (!said) { log(`another connector holds ${lockPath} (pid ${taken.owner?.pid ?? '?'}); waiting for it to leave`); said = true; }
+    await wait(1000);
+  }
+  // A person's stop holds for every connector the launcher started, not only for the launcher: one spawned just before
+  // the stop, and starting only now, does not serve. The job starting is a login or `service start`: it clears it.
+  if (serviceMode) rmSync(files.stopped, { force: true });
+  else if (existsSync(files.stopped)) { log('Sidevoice is stopped on this machine: not serving'); releaseLock({ socket: false }); process.exit(0); }
+  log(`connector ${VERSION} starting${serviceMode ? ' as the connector job' : ''}: pid ${process.pid}, host ${hostId}, ${external ? 'core at ' + external.room : ownsCore ? 'this machine\'s own core, started on demand' : 'this machine\'s core job'}, socket ${socketPath}, log ${logPath}`);
+  loadOutbox();
+  if (outbox.length) log(`${outbox.length} speech frame(s) waiting in the outbox`);
+  try { unlinkSync(socketPath); } catch {}
+  server = net.createServer(serve);
+  // Created 0600 (a umask that lets nothing through while it is bound), and checked: a socket another user could
+  // open is not served on — every command on it is this user's authority.
+  const umask = process.umask(0o077);
+  try { await new Promise((resolve, reject) => server.once('error', reject).listen(socketPath, resolve)); }
+  finally { process.umask(umask); }
+  chmodSync(socketPath, 0o600);
+  const bound = lstatSync(socketPath);
+  if (!bound.isSocket() || bound.uid !== process.getuid() || (bound.mode & 0o077)) { log(`not serving: ${socketPath} is not this user's alone`); server.close(); process.exitCode = 78; return; }
+  // Node hands a signal handler the signal's name: the handlers take nothing, and the exit is clean.
+  process.on('SIGTERM', () => shutdown(0)); process.on('SIGINT', () => shutdown(0));
+  scheduleExit();
+  // The link opens now — the connector job's with no conversation needed: R2's agents reach this machine through it.
+  open();
+}

@@ -21,7 +21,7 @@ speaks its replies, and you answer by voice and can interrupt it — from the so
 
 **sidevoice-connector** is what you install on the machine where your agents run, published on npm as
 [`@sidevoice/uplink`](https://www.npmjs.com/package/@sidevoice/uplink). It gives each agent conversation its voice
-tools (an MCP server), delivers what you say into that same conversation, and installs, starts and supervises the
+tools (an MCP server), delivers what you say into that same conversation, and installs and starts the
 machine's [core](https://github.com/sidevoice/sidevoice-core).
 
 ## How it fits
@@ -31,7 +31,7 @@ app, a browser).
 
 | Piece | Role |
 |---|---|
-| **sidevoice-connector** (this repository) | Installed next to your agents: their voice tools and the core's supervisor. |
+| **sidevoice-connector** (this repository) | Installed next to your agents: their voice tools, and what installs and runs the core at login. |
 | [sidevoice-core](https://github.com/sidevoice/sidevoice-core) | The conversations and the voice pipeline, next to the agents. |
 | [sidevoice-desktop](https://github.com/sidevoice/sidevoice-desktop) | The app you call from. |
 | [sidevoice-web](https://github.com/sidevoice/sidevoice-web) | The call interface the app bundles; it can also be served as a static site. |

@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /** A one-time code for pairing a device — the desktop app, a browser — with this machine
  *  (sidevoice-core's `server/devices.py`). The node issues it and keeps the devices; this asks for one through the
  *  connector (`pair_device`, which starts the core if it is not running) and says it the way a person
@@ -8,6 +7,15 @@
  *  (`sidevoice pair-device`). Pairing is the person's act: nothing here runs unless they asked. */
 import QRCode from 'qrcode';
 import { connectorClient } from './ipc.mjs';
+import { t } from './i18n.mjs';
+
+/** Where a device holding this code can reach the machine: through its room (`room`), at an address that
+ *  is not this computer's (`direct`), or only from this computer (`local-only`). */
+export function reach(payload) {
+  if (payload?.rv) return 'room';
+  const loopback = url => { try { const host = new URL(url).hostname.replace(/^\[|\]$/g, ''); return host === 'localhost' || host === '::1' || /^127\./.test(host); } catch { return true; } };
+  return (payload?.urls || []).some(url => !loopback(url)) ? 'direct' : 'local-only';
+}
 
 /** The code as text blocks a terminal shows as they are: two modules per character (UTF-8 half blocks). */
 export function qrText(code) {
@@ -40,10 +48,22 @@ export async function pairDevice(rpc) {
   return { ...answer, text: await pairDeviceText(answer) };
 }
 
-if (process.env.SIDEVOICE_PAIR_DEVICE_MAIN === '1') {
-  const connector = connectorClient();
+/** `sidevoice pair-device [--json]`: through the launcher, like any façade. */
+export async function run(argv = [], env = process.env) {
+  const json = argv.includes('--json');
+  const connector = connectorClient(env);
   try {
-    console.log((await pairDevice(connector.rpc)).text);
-    connector.end();
-  } catch (error) { console.error(error.message); connector.end(); process.exit(1); }
+    const answer = await pairDevice(connector.rpc);
+    const where = reach(answer.payload);
+    if (json) console.log(JSON.stringify({ ok: true, code: answer.code, expires_in: answer.expires_in, reach: where, payload: answer.payload }));
+    else {
+      console.log(answer.text);
+      if (where === 'local-only') console.log('\n' + t('pair-device.local-only'));
+    }
+    return 0;
+  } catch (error) {
+    if (json) console.log(JSON.stringify({ ok: false, error: { key: error.key || 'pair-device.failed', message: error.message } }));
+    else console.error(error.message);
+    return 1;
+  } finally { connector.end(); }
 }

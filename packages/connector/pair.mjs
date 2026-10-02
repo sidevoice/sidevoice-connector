@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /** One-time pairing: redeem a room's code for this host's connector credential — the credential this
  *  machine's core links with the room by.
  *
@@ -9,8 +8,9 @@
  *  for a code: linking a room is still the person's act, by hand. */
 import os from 'node:os';
 import path from 'node:path';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { readTrustedJson, writePrivateFile } from './secure-fs.mjs';
 import { machineIdentity } from './identity.mjs';
+import { t } from './i18n.mjs';
 
 export function dataDir(env = process.env) {
   return env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
@@ -47,7 +47,7 @@ export function roomOrigin(address) {
 /** Which room this machine is paired with, or null. */
 export function pairedRoom(env = process.env) {
   try {
-    const saved = JSON.parse(readFileSync(path.join(dataDir(env), 'credentials.json'), 'utf8'));
+    const saved = readTrustedJson(path.join(dataDir(env), 'credentials.json'));
     if (!saved.url || !saved.connector_id || !saved.token) return null;
     return { origin: roomOrigin(saved.url), connector_id: saved.connector_id };
   } catch { return null; }
@@ -74,14 +74,14 @@ export async function pair(room, code, env = process.env) {
   });
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error('Pairing failed: ' + (body.detail || response.status));
-  const directory = dataDir(env);
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const file = path.join(directory, 'credentials.json');
+  const file = path.join(dataDir(env), 'credentials.json');
   // Where the room is, not how to reach it: the path and namespace that carry the link belong to
   // the client and move with its version, so an upgrade never has to rewrite what pairing wrote.
   // The dial key is what the room shows this machine's core if the room is ever the one to open the link.
-  writeFileSync(file, JSON.stringify({ url: base.origin, connector_id: body.connector_id, token: body.token, protocol: body.protocol,
-    ...(body.dial_key ? { dial_key: body.dial_key } : {}) }, null, 2), { mode: 0o600 });
+  // Through a fresh private file renamed into place: an existing file's permissions or a link there never decide
+  // who can read this machine's credential (`secure-fs.mjs`).
+  writePrivateFile(file, JSON.stringify({ url: base.origin, connector_id: body.connector_id, token: body.token, protocol: body.protocol,
+    ...(body.dial_key ? { dial_key: body.dial_key } : {}) }, null, 2));
   return { file, connector_id: body.connector_id, origin: base.origin };
 }
 
@@ -97,20 +97,38 @@ export async function linkRoom(room, env = process.env) {
   return pair(base.origin, body.code, env);
 }
 
-if (process.env.SIDEVOICE_PAIR_MAIN === '1') {
-  const [room, code] = process.argv.slice(2);
-  if (!room || !code) { console.error('usage: sidevoice pair <room-url> <pairing-code>   (the code is shown in the room under "Emparejar máquina")'); process.exit(2); }
+/* The core follows this machine's pairing itself (`--room-credential`): it reads the file again when it changes, and
+ * links with a new pairing, a changed one, or none — so pairing restarts nothing (SEAMS §3). */
+
+/** `sidevoice pair <room-url> <code> [--json]`. */
+export async function runPair(argv = [], env = process.env) {
+  const json = argv.includes('--json');
+  const [room, code] = argv.filter(item => !item.startsWith('--'));
+  if (!room || !code) {
+    if (json) { console.log(JSON.stringify({ ok: false, error: { key: 'pair.usage', message: t('pair.usage') } })); return 1; }
+    console.error(t('pair.usage')); return 2;
+  }
   try {
-    const result = await pair(room, code);
-    console.log(`Paired with ${result.origin} as connector ${result.connector_id}; credential saved to ${result.file}`);
-  } catch (error) { console.error(error.message); process.exit(1); }
+    const result = await pair(room, code, env);
+    if (json) console.log(JSON.stringify({ ok: true, room: result.origin, connector_id: result.connector_id }));
+    else {
+      console.log(`Paired with ${result.origin} as connector ${result.connector_id}; credential saved to ${result.file}`);
+    }
+    return 0;
+  } catch (error) {
+    if (json) console.log(JSON.stringify({ ok: false, error: { key: error.key || 'pair.failed', message: error.message } }));
+    else console.error(error.message);
+    return 1;
+  }
 }
 
-if (process.env.SIDEVOICE_LINK_ROOM_MAIN === '1') {
-  const [room] = process.argv.slice(2);
-  if (!room) { console.error('usage: sidevoice link-room <room-url>   (links this machine with that room; no code needed)'); process.exit(2); }
+/** `sidevoice link-room <room-url>`. */
+export async function runLinkRoom(argv = [], env = process.env) {
+  const [room] = argv;
+  if (!room) { console.error('usage: sidevoice link-room <room-url>   (links this machine with that room; no code needed)'); return 2; }
   try {
-    const result = await linkRoom(room);
+    const result = await linkRoom(room, env);
     console.log(`Linked with ${result.origin} as connector ${result.connector_id}; credential saved to ${result.file}`);
-  } catch (error) { console.error(error.message); process.exit(1); }
+    return 0;
+  } catch (error) { console.error(error.message); return 1; }
 }
