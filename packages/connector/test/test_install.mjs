@@ -278,7 +278,7 @@ test('blocker 3: a full uninstall keeps the stop — a connector already on its 
     for (let i = 0; i < 300 && !existsSync(path.join(hooks, 'paused-lock-before-connector')); i++) await wait(20);
     const removed = node.run(cli, ['uninstall']);
     assert.equal(removed.status, 0, JSON.stringify(removed.answer));
-    assert.deepEqual(readdirSync(node.dataDir).sort(), ['install.lock', 'node-stopped.json'], 'the stop stays, with the permanent lock');
+    assert.deepEqual(readdirSync(node.dataDir).sort(), ['agents.lock', 'install.lock', 'node-stopped.json'], 'the stop stays, with the permanent locks');
     writeFileSync(path.join(hooks, 'resume-lock-before-connector'), '');
     const code = await new Promise(resolve => (child.exitCode !== null ? resolve(child.exitCode) : child.once('exit', resolve)));
     assert.equal(code, 0, 'the connector on its way finds the stop and leaves');
