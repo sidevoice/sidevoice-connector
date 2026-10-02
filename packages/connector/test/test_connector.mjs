@@ -1410,7 +1410,7 @@ esac
   // Manual Codex setup remains available, while explicit connection delegates configuration changes to Codex itself.
   const codex = codexInstructions(env);
   assert.match(codex, /\[mcp_servers\.sidevoice\]/);
-  assert.match(codex, /command = "node"/);
+  assert.ok(codex.includes(`command = ${JSON.stringify(process.execPath)}`));
   assert.ok(!codex.includes('hooks'), 'nothing but the MCP server is asked of Codex');
   assert.match(codex, /leaves Codex configuration changes to Codex itself/);
 });

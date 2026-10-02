@@ -53,7 +53,7 @@ if [ "$1" = "mcp" ] && [ "$2" = "get" ] && [ "$3" = "sidevoice" ] && [ "$4" = "-
   if [ -n "$CODEX_GET_DELAY" ]; then sleep "$CODEX_GET_DELAY"; fi
   if [ ! -s ${JSON.stringify(codexConfig)} ]; then echo 'No MCP server named sidevoice' >&2; exit 1; fi
   command=$(sed -n 's/^command = "\\(.*\\)"/\\1/p' ${JSON.stringify(codexConfig)})
-  args=$(sed -n 's/^args = \\["\\(.*\\)", "\\(.*\\)"\\]/\\1 \\2/p' ${JSON.stringify(codexConfig)})
+  args=$(sed -n 's/^args = \\["\\(.*\\)", *"\\(.*\\)"\\]/\\1 \\2/p' ${JSON.stringify(codexConfig)})
   set -- $args
   enabled=true; if [ "$CODEX_DISABLED" = "1" ] && [ ! -e "$CODEX_ENABLED_FILE" ]; then enabled=false; fi
   printf '{"name":"sidevoice","enabled":%s,"transport":{"type":"stdio","command":"%s","args":["%s","%s"]}}\\n' "$enabled" "$command" "$1" "$2"
@@ -145,6 +145,20 @@ test('Codex connects an old Sidevoice release to the selected install, then Conn
   const afterSecondConnect = readFileSync(f.codexInvocations, 'utf8').trim().split('\n');
   assert.equal(afterSecondConnect.slice(afterFirstConnect.length).some(line => line.startsWith('mcp add sidevoice') || line.startsWith('mcp remove sidevoice')), false,
     'the current enabled entry is not rewritten by a repeated Connect');
+});
+
+test('manual Codex configuration round-trips through scan/watch for a Node install', () => {
+  const f = fixture();
+  const manual = listAgents(f.env, { rescan: true }).agents.find(agent => agent.id === 'codex');
+  assert.equal(manual.registration, 'not-connected');
+  assert.equal(manual.instructions.command.split(' ')[0], `'${process.execPath}'`, 'the command uses the executable recorded by install');
+  const table = manual.instructions.snippet;
+  assert.ok(table.includes(`command = ${JSON.stringify(process.execPath)}\n`), 'the TOML command is the absolute installed Node executable');
+
+  writeFileSync(f.codexConfig, table + '\n');
+  const watched = listAgents(f.env, { rescan: true, watch: 'codex' }).agents.find(agent => agent.id === 'codex');
+  assert.equal(watched.registration, 'connected', 'the exact host-returned manual table is recognized as the selected installation');
+  assert.equal(watched.actionable, false);
 });
 
 test('a disabled Codex entry for the selected install is not connected and explicit Connect re-enables it', () => {

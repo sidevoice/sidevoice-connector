@@ -151,7 +151,12 @@ export function unregisterFromClaude(done, next, env = process.env) {
 
 /** Codex keeps one machine-wide file that may hold anything its user put there: we never rewrite it. */
 export function codexInstructions(env = process.env, record = selected(env)) {
-  const { command, args } = registration(record);
+  const installedCommand = record.command;
+  const launch = Array.isArray(installedCommand) && installedCommand.length === 2
+    && installedCommand.every(value => typeof value === 'string' && path.isAbsolute(value))
+    ? { command: installedCommand[0], args: [installedCommand[1], 'mcp'] }
+    : registration(record);
+  const { command, args } = launch;
   const file = path.join(env.CODEX_HOME || path.join(env.HOME || os.homedir(), '.codex'), 'config.toml');
   return [
     t('agents.manual.codex.title', { file }),
@@ -240,8 +245,15 @@ export function codexRegistration(env = process.env) {
 export function codexState(env = process.env) {
   const registration = codexRegistration(env);
   const installed = serverCommand(env);
+  const selectedCommand = selected(env).command;
+  const installedNode = Array.isArray(selectedCommand) && selectedCommand.length === 2
+    && selectedCommand.every(value => typeof value === 'string' && path.isAbsolute(value))
+    && ['node', 'node.exe'].includes(path.basename(selectedCommand[0]).toLowerCase());
+  const equivalentNodeCommand = installedNode && installed.command === 'node'
+    && registration.command === selectedCommand[0];
   const connected = registration.state === 'ours' && registration.enabled !== false
-    && registration.command === installed.command && JSON.stringify(registration.args) === JSON.stringify(installed.args);
+    && (registration.command === installed.command || equivalentNodeCommand)
+    && JSON.stringify(registration.args) === JSON.stringify(installed.args);
   return { state: registration.state, connected, ...(registration.enabled !== undefined ? { enabled: registration.enabled } : {}),
     ...(registration.file ? { file: registration.file } : {}),
     ...(registration.why ? { why: registration.why } : {}), ...(registration.command ? { command: registration.command, args: registration.args } : {}) };

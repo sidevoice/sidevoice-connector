@@ -34,6 +34,8 @@ function sessionIdentity({ meta, env = process.env, payload } = {}) {
 function detectAgent(env, { binary = null, includeVersion = true } = {}) {
   const currentEnv = binary ? { ...env, SIDEVOICE_CODEX_BIN: binary } : env;
   const current = codexState(currentEnv);
+  // The host-returned setup uses the executable recorded at install, so it remains runnable even when
+  // Codex was launched with a PATH that does not contain Node.
   const launch = connectorMcpCommand(env);
   const command = shellCommand(launch.command, launch.args);
   const file = path.join(env.CODEX_HOME || path.join(env.HOME || os.homedir(), '.codex'), 'config.toml');
