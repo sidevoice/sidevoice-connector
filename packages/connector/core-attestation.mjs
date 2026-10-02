@@ -65,10 +65,12 @@ export function enforceCoreProvenance({ signer, statement, digest, channel, labe
   const expectedPath = expectedBuildConfig.slice(CORE_REPOSITORY.length + '/.github/workflows/'.length).split('@')[0];
   failIf(workflow?.repository === CORE_REPOSITORY && workflow?.ref === 'refs/heads/main' && workflow?.path === `.github/workflows/${expectedPath}`,
     'build-config', `${label} SLSA workflow`);
-  failIf(statement?.predicate?.runDetails?.builder?.id === 'https://github.com/actions/runner/github-hosted',
-    'runner', `${label} SLSA builder`);
+  failIf(statement?.predicate?.runDetails?.builder?.id === expectedBuildConfig,
+    'build-config', `${label} SLSA builder workflow`);
   failIf(statement?.predicate?.buildDefinition?.internalParameters?.github?.repository_id === CORE_REPOSITORY_ID,
     'repository-id', `${label} SLSA repository id`);
+  failIf(statement?.predicate?.buildDefinition?.internalParameters?.github?.runner_environment === 'github-hosted',
+    'runner', `${label} SLSA runner environment`);
 
   const subjects = statement?.subject;
   failIf(Array.isArray(subjects) && subjects.length === 1, 'subject', `${label} must have one subject`);
