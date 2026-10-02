@@ -7,9 +7,9 @@
  *    R/previous → releases/<id>   what was verified before the selection: the rollback target
  *
  *  `R` is `$XDG_DATA_HOME/sidevoice`. Everything that runs Sidevoice — both job definitions, every harness
- *  registration, `install.json`'s `command` — names a path through `R/current`, so it is written once and never
- *  re-pointed: switching is replacing one link, `symlink(tmp)` + `rename(tmp, link)` (never `ln -sfn`, which unlinks
- *  first on macOS), then `fsync(R)`. A crash anywhere leaves `current` naming a complete release, old or new. A
+ *  registration, `install.json`'s `command` — names a path through `R/current`; a format switch repoints owned
+ *  registrations while holding the install lock. Switching is replacing one link, `symlink(tmp)` + `rename(tmp, link)`
+ *  (never `ln -sfn`, which unlinks first on macOS), then `fsync(R)`. A crash anywhere leaves `current` naming a complete release, old or new. A
  *  process started through `current` keeps running its own release after a switch (Node runs a module by its real
  *  path; the core's console script names its real venv), and the next start runs the new one.
  *
@@ -19,22 +19,20 @@
 import path from 'node:path';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { closeSync, cpSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync } from 'node:fs';
+import { closeSync, cpSync, copyFileSync, chmodSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
-import { CORE_VERSION, installRuntime, runtimeRoot, selfTest } from './core.mjs';
+import { CORE_VERSION, installCoreRuntime, isBundleCore, runtimeRoot, selfTest } from './core.mjs';
 import { keyed, t } from './i18n.mjs';
 import { recordedInstallation } from './node-files.mjs';
 import { readTrustedJson, verifyPrivateDir, writePrivateFile } from './secure-fs.mjs';
 import { crash } from './testpoint.mjs';
+import { BUILD_PACKAGE, BUILD_PACKAGE_DIR } from './build-info.mjs';
+import { runningAsSea } from './sea-runtime.mjs';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
+const here = BUILD_PACKAGE_DIR;
 /** Where the package's own root is: next to these modules in the checkout, and one level up once they have been
  *  bundled into `dist/`. */
 const packageRoot = () => (existsSync(path.join(here, '..', 'package.json')) ? path.dirname(here) : here);
-let manifestCache = null;
-const manifest = () => (manifestCache ??= JSON.parse(readFileSync(path.join(here, 'package.json'), 'utf8')));
-
 /** `R`: where the installation recorded it was made (`install.json`'s `releases`), else `$XDG_DATA_HOME/sidevoice`. */
 export function releaseRoot(env = process.env) {
   const recorded = recordedInstallation(env)?.releases;
@@ -45,16 +43,27 @@ export function releaseLayout(env = process.env) {
   const root = releaseRoot(env);
   return { root, releases: path.join(root, 'releases'), current: path.join(root, 'current'), previous: path.join(root, 'previous'), verified: path.join(root, 'verified') };
 }
-/** The program each job and harness runs, through `current` (R1: node + `cli.mjs`; R4 swaps it for the executable). */
+/** The program each job and harness runs for the selected release. Older metadata without a format is R1's ESM. */
 export function stableCommand(env = process.env) {
-  return [process.execPath, path.join(releaseLayout(env).current, 'dist', 'cli.mjs')];
+  const selected = selection(env, 'current')?.release;
+  const format = selected?.format ?? (!selected && runningAsSea() ? 'sea' : 'esm');
+  if (format === 'sea') return [path.join(releaseLayout(env).current, 'dist', 'sidevoice')];
+  const installed = recordedInstallation(env);
+  const legacyNode = Array.isArray(installed?.command) && installed.command.length === 2
+    && path.isAbsolute(installed.command[0]) && path.basename(installed.command[1]) === 'cli.mjs' ? installed.command[0] : null;
+  const node = installed?.nodeExecutable || legacyNode || (!runningAsSea() ? process.execPath : null);
+  if (!node) throw keyed('install.node-runtime-missing');
+  return [node, path.join(releaseLayout(env).current, 'dist', 'cli.mjs')];
 }
 export function coreProgram(env = process.env) {
-  return path.join(releaseLayout(env).current, 'core', 'bin', 'sidevoice-core');
+  const root = path.join(releaseLayout(env).current, 'core');
+  const bundled = path.join(root, 'python', 'bin', 'python3');
+  return existsSync(bundled) ? bundled : path.join(root, 'bin', 'sidevoice-core');
 }
 
 /** A checkout installs itself: its release links to it instead of copying it. */
 export function fromSource(env = process.env) {
+  if (runningAsSea()) return false;
   if (env.SIDEVOICE_INSTALL_FROM_SOURCE === '0') return false;
   return env.SIDEVOICE_INSTALL_FROM_SOURCE === '1' || existsSync(path.join(packageRoot(), '..', '..', '.git'));
 }
@@ -62,12 +71,14 @@ export function fromSource(env = process.env) {
 /** The release this package would make: its version, channel and build (`sidevoice` in the manifest, stamped by CI;
  *  a checkout's is `source`). A nightly carries the version of the last release, so its id names its build. */
 export function candidate(env = process.env) {
-  const { version, sidevoice = {} } = manifest();
+  const { version, sidevoice = {} } = BUILD_PACKAGE;
   const source = fromSource(env);
+  const format = runningAsSea() ? 'sea' : 'esm';
   const channel = source ? 'source' : sidevoice.channel || 'release';
   const build_seq = Number(sidevoice.build_seq) || 0;
-  const id = channel === 'nightly' ? `${version}-nightly.${build_seq}` : source ? `${version}-source` : version;
-  return { id, connector: version, core: CORE_VERSION, channel, build_seq, source: source ? packageRoot() : null };
+  const baseId = channel === 'nightly' ? `${version}-nightly.${build_seq}` : source ? `${version}-source` : version;
+  const id = format === 'sea' ? `${baseId}-sea` : baseId;
+  return { id, connector: version, core: CORE_VERSION, channel, build_seq, format, source: source ? packageRoot() : null };
 }
 
 const parts = version => String(version || '0').split(/[.+-]/).slice(0, 3).map(part => Number(part) || 0);
@@ -85,7 +96,12 @@ export function decide(current, next) {
   const order = compareVersions(next.connector, current.connector);
   if (order > 0) return 'upgrade';
   if (order < 0) return 'noop';
-  return next.channel === 'nightly' && next.build_seq > (Number(current.build_seq) || 0) ? 'upgrade' : 'noop';
+  if (next.channel === 'nightly' && next.build_seq > (Number(current.build_seq) || 0)) return 'upgrade';
+  // A format change is a tie-breaker only within the same release ordering. It cannot move between channels or
+  // replace a newer nightly with an older one.
+  const sameBuild = current.channel === next.channel && (next.channel !== 'nightly' || Number(next.build_seq) === Number(current.build_seq));
+  if (sameBuild && (current.format ?? 'esm') !== (next.format ?? 'esm')) return next.format === 'sea' ? 'upgrade' : 'noop';
+  return 'noop';
 }
 
 /** What a link selects: `{id, dir, release}`, or null when there is no link or what it names is not a release. */
@@ -138,7 +154,11 @@ export async function stage(env, next, { dataDir, core = true, log = () => {}, p
   const temporary = `${final}.tmp-${randomBytes(4).toString('hex')}`;
   mkdirSync(temporary, { mode: 0o700 });
   if (next.source) symlinkSync(next.source, path.join(temporary, 'dist'));
-  else for (const file of manifest().files.concat('package.json')) {
+  else if (runningAsSea()) {
+    mkdirSync(path.join(temporary, 'dist'), { mode: 0o700 });
+    copyFileSync(process.execPath, path.join(temporary, 'dist', 'sidevoice'));
+    chmodSync(path.join(temporary, 'dist', 'sidevoice'), 0o755);
+  } else for (const file of BUILD_PACKAGE.files.concat('package.json')) {
     const from = path.join(packageRoot(), file);
     if (existsSync(from)) cpSync(from, path.join(temporary, file), { recursive: true });
   }
@@ -147,15 +167,21 @@ export async function stage(env, next, { dataDir, core = true, log = () => {}, p
   let runtime = { id: null };
   if (core) {
     progress(t('install.progress.core', { version: CORE_VERSION }));
-    runtime = await installRuntime({ dataDir, env, log: line => progress('  ' + line),
+    runtime = await installCoreRuntime({ dataDir, env, channel: next.channel, log: line => progress('  ' + line),
       progress: line => { if (line.trim() && !/^\s*[+-] /.test(line)) progress('    uv: ' + line.trim()); } });
     if (runtime.venv) symlinkSync(runtime.venv, path.join(temporary, 'core'));
+    else if (runtime.kind === 'bundle') symlinkSync(runtime.root, path.join(temporary, 'core'));
     else { mkdirSync(path.join(temporary, 'core', 'bin'), { recursive: true }); symlinkSync(path.resolve(runtime.bin), path.join(temporary, 'core', 'bin', 'sidevoice-core')); }
-    selfTest(path.join(temporary, 'core', 'bin', 'sidevoice-core'), env);
+    const stagedCore = runtime.kind === 'bundle' ? path.join(temporary, 'core', 'python', 'bin', 'python3') : path.join(temporary, 'core', 'bin', 'sidevoice-core');
+    selfTest(stagedCore, env, { bundle: runtime.kind === 'bundle' });
   }
-  const reported = spawnSync(process.execPath, [path.join(temporary, 'dist', 'cli.mjs'), '--version'], { encoding: 'utf8', timeout: 30_000 });
+  const reported = runningAsSea()
+    ? spawnSync(path.join(temporary, 'dist', 'sidevoice'), ['--version'], { encoding: 'utf8', timeout: 30_000 })
+    : spawnSync(process.execPath, [path.join(temporary, 'dist', 'cli.mjs'), '--version'], { encoding: 'utf8', timeout: 30_000 });
   if (reported.stdout.trim() !== next.connector) throw keyed('install.self-test', { detail: `the staged connector says ${reported.stdout.trim() || reported.stderr.trim() || '?'}, not ${next.connector}` });
-  const release = { id: next.id, connector: next.connector, core: next.core, core_build: runtime.id, channel: next.channel, build_seq: next.build_seq, ...(next.source ? { source: next.source } : {}) };
+  const release = { id: next.id, connector: next.connector, core: next.core, core_build: runtime.id,
+    channel: next.channel, build_seq: next.build_seq, format: next.format ?? (runningAsSea() ? 'sea' : 'esm'),
+    ...(next.source ? { source: next.source } : {}) };
   writePrivateFile(path.join(temporary, 'release.json'), JSON.stringify(release, null, 2) + '\n');
   syncTree(temporary);
   if (existsSync(final)) rmSync(final, { recursive: true, force: true });   // not a complete release (no release.json)

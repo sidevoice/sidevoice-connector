@@ -11,7 +11,8 @@
  *  names is pruned. Run again, it verifies the selection and flips back if it does not run: the recovery.
  *
  *  Then the harnesses — each one found, or `--harness`, or none with `--no-agents` (the app's install: it connects agents
- *  only when the person picks them) — registered once, through `R/current`, so an update never touches them.
+ *  only when the person picks them) — registered through `R/current`. Owned entries are changed under the install lock
+ *  only when the selected executable format changes or rollback selects another format.
  *
  *  It pairs with nothing. Pairing is a person's act — the room shows a one-time code to whoever is in it, and a
  *  conversation asks for it the first time it joins — so the installer only reports whether this machine is
@@ -26,7 +27,7 @@ import path from 'node:path';
 import { readdirSync, readFileSync, rmSync } from 'node:fs';
 import { harnessesPresent } from './identity.mjs';
 import { pairedRoom } from './pair.mjs';
-import { CORE_VERSION, NO_UV, ensureRunning, findUv, readReady, takeInstallLock } from './core.mjs';
+import { CORE_VERSION, NO_UV, ensureRunning, findUv, hasEmbeddedCoreBundle, readReady, takeInstallLock } from './core.mjs';
 import { keyed, t } from './i18n.mjs';
 import { remove as removeSkill, skillsDir, status as skillStatus } from './skill.mjs';
 import { candidate, coreProgram, decide, flipBack, markVerified, prune, removeLeftovers, removeReleases, selection, stableCommand, stage, switchTo } from './release.mjs';
@@ -117,8 +118,41 @@ async function runsSelection(env, release) {
 
 /** Step 6 for whatever is selected now: the jobs restarted on it (with a manager), or what runs on demand stopped. */
 async function restartOn(env, kind) {
+  recordInstallation(env);
   if (kind === 'none') { await stopOnDemand(env); return; }
-  await startJobs(env, { restart: true });
+  const changed = writeDefinitions(kind, env);
+  recordInstallation(env, { definitions: jobDefinitions(kind, env) });
+  await startJobs(env, { changed, restart: true });
+}
+
+/** Re-point only registrations that still belong to us after a format-changing rollback. */
+function reconcileOwnedRegistrations(env) {
+  const record = { command: stableCommand(env) };
+  const failures = [];
+  for (const [name, operations] of Object.entries(HARNESS_REGISTRATIONS)) {
+    if (operations.state(env).state !== 'ours') continue;
+    try { if (operations.set(env, record) === 'invalid') failures.push(name); }
+    catch { failures.push(name); }
+  }
+  return failures;
+}
+
+/** Set the selected command while `apply` still holds the install lock, so an older install cannot write after a newer
+ *  format switch. The caller formats these outcomes for its response after the transaction returns. */
+function selectRegistrations(env, harnesses) {
+  const record = { command: stableCommand(env) };
+  const results = {};
+  for (const [name, operations] of Object.entries(HARNESS_REGISTRATIONS)) {
+    const before = operations.state(env).state;
+    if (!harnesses.includes(name) && before !== 'ours') continue;
+    if (name === 'claude' && before === 'absent' && !operations.reachable(env)) {
+      results[name] = { before, outcome: 'manual' };
+      continue;
+    }
+    try { results[name] = { before, outcome: operations.set(env, record) }; }
+    catch (error) { results[name] = { before, error: String(error.message || error).split('\n')[0] }; }
+  }
+  return results;
 }
 
 /** Step 8: back to the last verified release (`flipBack`), restarted, verified again. Null when there is nothing to go
@@ -145,7 +179,7 @@ async function callsEnd(env, progress) {
 
 /** Steps 1–9 under the install lock. `core: false` (`--no-core`) stages no core: nothing to run, nothing verified.
  *  Returns `{action: 'install'|'upgrade'|'noop'|'rollback'|'failed', release, from, failure?, back?, kind}`. */
-export async function apply(env, { core = true, service = false, applyNow = false, progress = () => {}, log = () => {} } = {}) {
+export async function apply(env, { core = true, service = false, applyNow = false, progress = () => {}, log = () => {}, afterSelection = null } = {}) {
   const dataDir = dataDirOf(env), files = nodeFiles(dataDir);
   const release = await takeInstallLock(dataDir, log);
   try {
@@ -166,7 +200,11 @@ export async function apply(env, { core = true, service = false, applyNow = fals
     }
     recordInstallation(env);
     const kind = core && (service || installedService(env)) ? managerKind(env) : 'none';
-    if (!core || !chosen.core_build) { prune(env, dataDir); return { action, release: chosen, from: current, kind: 'none' }; }
+    if (!core || !chosen.core_build) {
+      const registrations = afterSelection?.();
+      prune(env, dataDir);
+      return { action, release: chosen, from: current, kind: 'none', registrations };
+    }
     if (kind !== 'none') {
       const had = installedService(env);
       const changed = writeDefinitions(kind, env);
@@ -182,11 +220,18 @@ export async function apply(env, { core = true, service = false, applyNow = fals
     const fresh = kind === 'none' && (action !== 'noop' || selection(env, 'verified')?.id !== chosen.id);
     if (fresh) await stopOnDemand(env);
     const verified = await verify(env, chosen, kind, { fresh });
-    if (verified.ok) { markVerified(env, chosen.id); prune(env, dataDir); return { action, release: chosen, from: current, kind }; }
+    if (verified.ok) {
+      markVerified(env, chosen.id);
+      const registrations = afterSelection?.();
+      prune(env, dataDir);
+      return { action, release: chosen, from: current, kind, registrations };
+    }
     const back = await goBack(env, kind);
     if (!back) return { action: 'failed', release: chosen, from: current, failure: verified.failure, kind };
+    const registrationFailures = reconcileOwnedRegistrations(env);
     if (back.ok) prune(env, dataDir);
-    return { action: 'rollback', release: back.release, from: current, failed: chosen, failure: verified.failure, back: back.ok, backFailure: back.failure ?? null, kind };
+    return { action: 'rollback', release: back.release, from: current, failed: chosen, failure: verified.failure,
+      back: back.ok, backFailure: back.failure ?? null, registrationFailures, kind };
   } finally { release(); }
 }
 
@@ -205,12 +250,17 @@ export async function install(argv = [], env = process.env, { progress = () => {
   // A core somebody else runs (`SIDEVOICE_URL`…) is not this installer's; `--no-core` leaves it for later.
   const externalCore = env.SIDEVOICE_URL && env.SIDEVOICE_CONNECTOR_ID && env.SIDEVOICE_CONNECTOR_TOKEN;
   const core = !argv.includes('--no-core') && !externalCore;
-  if (core && !env.SIDEVOICE_CORE_BIN && !findUv(env)) throw new Error(NO_UV);
-  const result = await apply(env, { core, service: argv.includes('--service'), applyNow: argv.includes('--apply-now'), progress });
+  const localCoreOverride = !!(env.SIDEVOICE_CORE_SPEC || env.SIDEVOICE_CORE_WHEEL_DIR);
+  if (core && !env.SIDEVOICE_CORE_BIN && !findUv(env) && (localCoreOverride || !hasEmbeddedCoreBundle())) throw new Error(NO_UV);
+  const result = await apply(env, { core, service: argv.includes('--service'), applyNow: argv.includes('--apply-now'), progress,
+    afterSelection: () => selectRegistrations(env, harnesses) });
   const record = result.release;
   done.push(t('install.version', { version: candidate(env).connector }));
   if (result.action === 'rollback') {
     const words = { to: result.failed.id, from: result.release.id, cause: result.failure?.key ?? '?', back: result.backFailure?.key ?? '?' };
+    if (result.registrationFailures?.length) throw keyed('install.rollback-registration', {
+      ...words, back: result.back ? 'running' : result.backFailure?.key ?? 'failed', harnesses: result.registrationFailures.join(', '),
+    }, { result });
     throw keyed(result.back ? 'install.rollback' : 'install.rollback-failed', words, { failure: result.failure, result });
   }
   if (result.action === 'failed') throw keyed('install.verify', { cause: result.failure?.key ?? '?' }, { failure: result.failure, result });
@@ -231,12 +281,11 @@ export async function install(argv = [], env = process.env, { progress = () => {
   const selectedRecord = { command: stableCommand(env) };
   const { command: shown, args } = registration(selectedRecord);
   for (const [name, operations] of Object.entries(HARNESS_REGISTRATIONS)) {
-    const before = operations.state(env).state;
-    if (!harnesses.includes(name) && before !== 'ours') continue;
-    if (name === 'claude' && before === 'absent' && !operations.reachable(env)) { done.push(t('install.claude-unreachable', { manual: `claude mcp add --scope user sidevoice -- ${[shown, ...args].join(' ')}` })); continue; }
-    let outcome;
-    try { outcome = operations.set(env, selectedRecord); }
-    catch (error) { done.push(t(`install.${name}-failed`, { detail: String(error.message || error).split('\n')[0] })); continue; }
+    const selected = result.registrations?.[name];
+    if (!selected) continue;
+    const { before, outcome, error } = selected;
+    if (outcome === 'manual') { done.push(t('install.claude-unreachable', { manual: `claude mcp add --scope user sidevoice -- ${[shown, ...args].join(' ')}` })); continue; }
+    if (error) { done.push(t(`install.${name}-failed`, { detail: error })); continue; }
     if (outcome === 'added' || outcome === 'repointed') done.push(t(`install.${name}-registered`, { file: cursorMcpFile(env) }));
     else if (outcome === 'foreign') done.push(name === 'claude'
       ? t('install.claude-foreign', { line: operations.state(env).line, manual: `claude mcp add --scope user sidevoice -- ${[shown, ...args].join(' ')}` })
@@ -296,6 +345,11 @@ export async function rollback(env = process.env) {
     const from = selection(env, 'current')?.release ?? null;
     const back = await goBack(env, kind);
     if (!back) throw keyed('install.no-previous');
+    const registrationFailures = reconcileOwnedRegistrations(env);
+    if (registrationFailures.length) throw keyed('install.rollback-registration', {
+      to: 'rollback', from: back.release.id, cause: from?.id ?? '?', back: back.ok ? 'running' : back.failure?.key ?? 'failed',
+      harnesses: registrationFailures.join(', '),
+    }, { failure: back.failure });
     if (!back.ok) throw keyed('install.rollback-failed', { to: from?.id ?? '?', from: back.release.id, cause: 'rollback', back: back.failure?.key ?? '?' }, { failure: back.failure });
     return { ok: true, action: 'rollback', installed: back.release.id, from: from?.id ?? null, service: kind };
   } finally { release(); }

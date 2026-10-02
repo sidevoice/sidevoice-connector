@@ -27,7 +27,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { accessSync, constants, existsSync, readFileSync, rmSync } from 'node:fs';
-import { API_RANGE, LINK_RANGE, coreArgs, coreProcesses, coreRunning, describeFailure, failurePath, logTail, readFailure, readReady,
+import { API_RANGE, LINK_RANGE, coreArgs, coreProcesses, coreRunning, describeFailure, failurePath, isBundleCore, logTail, readFailure, readReady,
   roomCredentialPath, socketPathOf, takeInstallLock, terminateCore } from './core.mjs';
 import { localHealth } from './core-socket.mjs';
 import { readLock, tryLock } from './lockfile.mjs';
@@ -226,8 +226,9 @@ export function jobPrograms(env = process.env) {
   const dataDir = dataDirOf(env);
   const record = readJson(nodeFiles(dataDir).install);
   if (!Array.isArray(record?.command) || !record.command.length) throw keyed('service.no-installation');
+  const core = coreProgram(env);
   return {
-    core: [coreProgram(env), ...coreArgs({ dataDir, env, idleExit: 0, roomCredential: roomCredentialPath(dataDir, env) })],
+    core: [core, ...coreArgs({ dataDir, env, idleExit: 0, roomCredential: roomCredentialPath(dataDir, env), bundle: isBundleCore(core) })],
     connector: [...record.command, 'connector', '--service'],
   };
 }
@@ -263,7 +264,11 @@ export function writeDefinitions(kind, env = process.env) {
 export function recordInstallation(env = process.env, { definitions } = {}) {
   const file = nodeFiles(dataDirOf(env)).install;
   let now = null; try { now = readJson(file); } catch {}
-  const next = { command: stableCommand(env), releases: releaseRoot(env), definitions: definitions ?? (Array.isArray(now?.definitions) ? now.definitions : []) };
+  const command = stableCommand(env);
+  const legacyNode = Array.isArray(now?.command) && now.command.length > 1 && path.basename(now.command[1]) === 'cli.mjs'
+    && path.isAbsolute(now.command[0]) ? now.command[0] : null;
+  const nodeExecutable = now?.nodeExecutable || legacyNode || (path.basename(command[1] || '') === 'cli.mjs' ? command[0] : null);
+  const next = { command, ...(nodeExecutable ? { nodeExecutable } : {}), releases: releaseRoot(env), definitions: definitions ?? (Array.isArray(now?.definitions) ? now.definitions : []) };
   if (JSON.stringify(now) !== JSON.stringify(next)) writePrivate(file, next);
 }
 /** The definitions of both jobs for this manager, as paths. */

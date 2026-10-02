@@ -1,0 +1,46 @@
+name: R4-b Node SEA
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: r4-sea-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sea:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: macos-aarch64
+          - runner: ubuntu-24.04
+            target: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            target: linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: v22.23.3
+          cache: npm
+      - run: test "$(node --version)" = v22.23.3
+      - run: npm ci
+      - name: Build this runner's CommonJS SEA
+        run: npm run build:sea -w @sidevoice/uplink
+      - name: Run SEA, Sigstore, TUF, archive and self-spawn tests
+        run: npm test -w @sidevoice/uplink
+      - name: Record the built executable size
+        env:
+          SEA_TARGET: ${{ matrix.target }}
+        run: |
+          node --input-type=module -e 'import { stat, appendFile } from "node:fs/promises"; import path from "node:path"; const f=path.join("packages/connector/dist-sea",process.env.SEA_TARGET,"sidevoice"); const s=await stat(f); console.log(`${f}: ${s.size} bytes`); await appendFile(process.env.GITHUB_STEP_SUMMARY,`- ${process.env.SEA_TARGET}: ${s.size} bytes\n`);'

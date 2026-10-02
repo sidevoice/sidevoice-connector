@@ -1,0 +1,374 @@
+import assert from 'node:assert/strict';
+import { spawn, spawnSync } from 'node:child_process';
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { createZstdCompress } from 'node:zlib';
+import { pipeline } from 'node:stream/promises';
+import tar from 'tar-stream';
+import test, { after, before } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { enforceCoreProvenance, CORE_ISSUER, CORE_REPOSITORY, CORE_REPOSITORY_ID, CORE_SIGNER, SLSA_PREDICATE, sha256, verifyCoreArtifact } from '../core-attestation.mjs';
+import { unpackCoreArchive } from '../core-archive.mjs';
+import { coreTarget, fetchVerifiedCoreWheel, validateCoreManifest } from '../core-bundle.mjs';
+import { readLock } from '../lockfile.mjs';
+import { connectorSocketOf, dataDirOf, nodeFiles, writePrivate } from '../node-files.mjs';
+import { VERSION } from '../identity.mjs';
+import { CORE_VERSION, hasEmbeddedCoreBundle, installCoreRuntime, installRuntime, runtimeIdentity, runtimeRoot, verifiedWheelCachePath } from '../core.mjs';
+import { decide, point, releaseLayout, stableCommand } from '../release.mjs';
+import { definitionTexts, recordInstallation } from '../service.mjs';
+import { oursInCursor } from '../registrations.mjs';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const fixture = path.join(here, 'fixtures', 'r4', 'sigstore-5.0.0.sigstore.json');
+const fixtureArtifact = path.join(here, 'fixtures', 'r4', 'sigstore-5.0.0.tgz');
+const helper = path.join(here, 'r4-sigstore-helper.mjs');
+const connectorPackage = path.dirname(here);
+const targetName = process.platform === 'darwin' && process.arch === 'arm64' ? 'macos-aarch64'
+  : process.platform === 'linux' && process.arch === 'x64' ? 'linux-x86_64'
+    : process.platform === 'linux' && process.arch === 'arm64' ? 'linux-aarch64' : null;
+const sea = targetName ? path.join(connectorPackage, 'dist-sea', targetName, 'sidevoice') : null;
+let scratch;
+
+before(async () => { scratch = await mkdtemp(path.join(os.tmpdir(), 'sidevoice-r4-')); });
+after(async () => { if (scratch) await rm(scratch, { recursive: true, force: true }); });
+
+const OIDS = {
+  issuer: '1.3.6.1.4.1.57264.1.1', buildSigner: '1.3.6.1.4.1.57264.1.9',
+  runner: '1.3.6.1.4.1.57264.1.11', source: '1.3.6.1.4.1.57264.1.12',
+  repositoryId: '1.3.6.1.4.1.57264.1.15', buildConfig: '1.3.6.1.4.1.57264.1.18',
+};
+const buildConfig = `${CORE_REPOSITORY}/.github/workflows/release-please.yml@refs/heads/main`;
+const textOid = value => {
+  const bytes = Buffer.from(value, 'utf8');
+  return Buffer.concat([Buffer.from([0x0c, bytes.length]), bytes]);
+};
+function signer(overrides = {}) {
+  const values = { issuer: CORE_ISSUER, buildSigner: CORE_SIGNER, runner: 'github-hosted', source: CORE_REPOSITORY,
+    repositoryId: CORE_REPOSITORY_ID, buildConfig, ...overrides };
+  return { identity: { extensions: { issuer: values.issuer }, subjectAlternativeName: values.buildSigner,
+    oids: Object.entries(values).map(([key, value]) => ({ oid: { id: OIDS[key].split('.').map(Number) },
+      value: key === 'issuer' ? Buffer.from(value, 'utf8') : textOid(value) })) } };
+}
+function statement({ digest = 'a'.repeat(64), channel = 'release', predicateType = SLSA_PREDICATE,
+  workflowPath = channel === 'release' ? '.github/workflows/release-please.yml' : '.github/workflows/test.yml',
+  repositoryId = CORE_REPOSITORY_ID, subjects = [{ name: 'sidevoice-core-linux-x86_64', digest: { sha256: digest } }] } = {}) {
+  return { _type: 'https://in-toto.io/Statement/v1', subject: subjects, predicateType,
+    predicate: { buildDefinition: { externalParameters: { workflow: { repository: CORE_REPOSITORY, ref: 'refs/heads/main', path: workflowPath } },
+      internalParameters: { github: { repository_id: repositoryId } } },
+      runDetails: { builder: { id: 'https://github.com/actions/runner/github-hosted' } } } };
+}
+const expectRefusal = (run, check) => assert.throws(run, error => error.key === 'install.authenticity' && error.check === check);
+
+test('Fulcio and in-toto pins accept only the core repository, expected workflows, hosted runner and SHA-256 subject', () => {
+  const digest = 'b'.repeat(64);
+  const result = enforceCoreProvenance({ signer: signer(), statement: statement({ digest }), digest, channel: 'release' });
+  assert.deepEqual(result, { issuer: CORE_ISSUER, signer: CORE_SIGNER, source: CORE_REPOSITORY,
+    repositoryId: CORE_REPOSITORY_ID, runner: 'github-hosted', buildConfig, predicateType: SLSA_PREDICATE, sha256: digest });
+
+  expectRefusal(() => enforceCoreProvenance({ signer: signer({ issuer: 'https://example.invalid' }), statement: statement({ digest }), digest, channel: 'release' }), 'issuer');
+  expectRefusal(() => enforceCoreProvenance({ signer: signer({ buildSigner: `${CORE_REPOSITORY}/.github/workflows/other.yml@refs/heads/main` }), statement: statement({ digest }), digest, channel: 'release' }), 'workflow');
+  expectRefusal(() => enforceCoreProvenance({ signer: signer({ source: 'https://github.com/sidevoice/sidevoice-core-fork' }), statement: statement({ digest }), digest, channel: 'release' }), 'source');
+  expectRefusal(() => enforceCoreProvenance({ signer: signer({ repositoryId: '1' }), statement: statement({ digest }), digest, channel: 'release' }), 'repository-id');
+  expectRefusal(() => enforceCoreProvenance({ signer: signer({ runner: 'self-hosted' }), statement: statement({ digest }), digest, channel: 'release' }), 'runner');
+  expectRefusal(() => enforceCoreProvenance({ signer: signer({ buildConfig: `${CORE_REPOSITORY}/.github/workflows/test.yml@refs/heads/main` }), statement: statement({ digest }), digest, channel: 'release' }), 'build-config');
+  expectRefusal(() => enforceCoreProvenance({ signer: signer(), statement: statement({ digest, workflowPath: '.github/workflows/attacker.yml' }), digest, channel: 'release' }), 'build-config');
+  expectRefusal(() => enforceCoreProvenance({ signer: signer(), statement: statement({ digest, predicateType: 'https://example.invalid/predicate' }), digest, channel: 'release' }), 'predicate');
+  expectRefusal(() => enforceCoreProvenance({ signer: signer(), statement: statement({ digest, subjects: [{ digest: { sha512: 'c'.repeat(128) } }] }), digest, channel: 'release' }), 'subject');
+  expectRefusal(() => enforceCoreProvenance({ signer: signer(), statement: statement({ digest, subjects: [{ digest: { sha256: digest } }, { digest: { sha256: digest } }] }), digest, channel: 'release' }), 'subject');
+});
+
+test('nightly build config is pinned independently from release provenance', () => {
+  const digest = 'c'.repeat(64);
+  const expected = `${CORE_REPOSITORY}/.github/workflows/test.yml@refs/heads/main`;
+  const passed = enforceCoreProvenance({ signer: signer({ buildConfig: expected }),
+    statement: statement({ digest, channel: 'nightly' }), digest, channel: 'nightly' });
+  assert.equal(passed.buildConfig, expected);
+  expectRefusal(() => enforceCoreProvenance({ signer: signer(), statement: statement({ digest }), digest, channel: 'nightly' }), 'build-config');
+});
+
+test('tampered bytes and a missing Sigstore sidecar have named refusals', async () => {
+  const bytes = Buffer.from('verified core candidate');
+  await assert.rejects(() => verifyCoreArtifact({ bytes, expectedSha256: '0'.repeat(64), bundleBytes: '{}', channel: 'release', tufCachePath: path.join(scratch, 'unused') }),
+    error => error.key === 'install.authenticity' && error.check === 'sha256');
+  await assert.rejects(() => verifyCoreArtifact({ bytes, bundleBytes: '', channel: 'release', tufCachePath: path.join(scratch, 'unused') }),
+    error => error.key === 'install.authenticity' && error.check === 'sigstore-bundle');
+  assert.equal(sha256(bytes), '78905b65670587ef7d4d03527aef0a6586fba0333a31c1cf046e8cae6688b380');
+});
+
+test('a missing release .sigstore.json sidecar is refused before installation', async () => {
+  const manifest = { version: '0.1.0', bundles: [], wheel: {
+    url: 'https://github.com/sidevoice/sidevoice-core/releases/download/v0.1.0/sidevoice_core-0.1.0-py3-none-any.whl',
+    sha256: 'f'.repeat(64) } };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async url => {
+    if (String(url).endsWith('.sigstore.json')) return new Response(null, { status: 404 });
+    const response = new Response(Buffer.from('wheel bytes'), { status: 200 });
+    Object.defineProperty(response, 'url', { value: String(url) });
+    return response;
+  };
+  try {
+    await assert.rejects(() => fetchVerifiedCoreWheel({ manifest, coreVersion: '0.1.0', directory: scratch,
+      channel: 'release', tufCachePath: path.join(scratch, 'missing-sidecar-tuf') }),
+    error => error.key === 'install.authenticity' && error.check === 'sigstore-bundle');
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('R4-a manifest schema and platform mapping fail closed', () => {
+  const manifest = { version: '0.1.0', bundles: [
+    { os: 'macos', arch: 'aarch64', url: 'https://github.com/sidevoice/sidevoice-core/releases/download/v0.1.0/sidevoice-core-0.1.0-macos-aarch64.tar.zst', sha256: 'd'.repeat(64), size: 123 },
+    { os: 'linux', arch: 'x86_64', url: 'https://github.com/sidevoice/sidevoice-core/releases/download/v0.1.0/sidevoice-core-0.1.0-linux-x86_64.tar.zst', sha256: 'e'.repeat(64), size: 124 },
+  ], wheel: { url: 'https://github.com/sidevoice/sidevoice-core/releases/download/v0.1.0/sidevoice_core-0.1.0-py3-none-any.whl', sha256: 'f'.repeat(64) } };
+  assert.equal(validateCoreManifest(manifest, '0.1.0'), manifest);
+  assert.equal(hasEmbeddedCoreBundle(manifest, { os: 'linux', arch: 'x86_64' }), true);
+  assert.equal(hasEmbeddedCoreBundle(manifest, { os: 'windows', arch: 'x64' }), false);
+  assert.deepEqual(coreTarget('darwin', 'arm64'), { os: 'macos', arch: 'aarch64' });
+  assert.deepEqual(coreTarget('linux', 'x64'), { os: 'linux', arch: 'x86_64' });
+  assert.equal(coreTarget('win32', 'x64'), null);
+  assert.throws(() => validateCoreManifest({ ...manifest, bundles: [{ ...manifest.bundles[0], url: 'https://evil.invalid/core.tar.zst' }] }, '0.1.0'), /manifest/);
+});
+
+test('verified wheel cache location and runtime identity are stable for the same embedded digest', () => {
+  const digest = 'a'.repeat(64), dataDir = path.join(scratch, 'wheel-runtime');
+  const cachedWheel = verifiedWheelCachePath(dataDir, digest);
+  assert.equal(cachedWheel, verifiedWheelCachePath(dataDir, digest));
+  assert.ok(!cachedWheel.startsWith(runtimeRoot(dataDir) + path.sep), 'release pruning cannot delete the verified wheel cache');
+  const first = runtimeIdentity({ SIDEVOICE_CORE_SPEC: path.join(dataDir, 'download-a.whl'), SIDEVOICE_INSTALL_FROM_SOURCE: '0' }, digest).id;
+  const second = runtimeIdentity({ SIDEVOICE_CORE_SPEC: path.join(dataDir, 'download-b.whl'), SIDEVOICE_INSTALL_FROM_SOURCE: '0' }, digest).id;
+  assert.equal(first, `${CORE_VERSION}-wheel-${digest}`);
+  assert.equal(second, first, 'the complete verified SHA-256, independent of path/stat, names the runtime');
+  assert.ok(cachedWheel.endsWith(path.join(digest, `sidevoice_core-${CORE_VERSION}-py3-none-any.whl`)));
+});
+
+test('selected release format controls the recorded and service command across format changes and rollback', async () => {
+  const env = { HOME: scratch, XDG_DATA_HOME: path.join(scratch, 'xdg'), SIDEVOICE_DATA_DIR: path.join(scratch, 'install-data') };
+  const layout = releaseLayout(env);
+  await mkdir(layout.releases, { recursive: true, mode: 0o700 });
+  const makeRelease = async (id, format, files) => {
+    const dir = path.join(layout.releases, id);
+    await mkdir(path.join(dir, 'dist'), { recursive: true, mode: 0o700 });
+    for (const file of files) await writeFile(path.join(dir, 'dist', file), 'fixture');
+    await writeFile(path.join(dir, 'release.json'), JSON.stringify({ id, connector: VERSION, core: '0.1.0', core_build: 'external',
+      channel: 'release', build_seq: 0, format }) + '\n');
+  };
+  await makeRelease(`${VERSION}-sea`, 'sea', ['sidevoice']);
+  await makeRelease(VERSION, 'esm', ['cli.mjs']);
+  await symlink(path.join('releases', `${VERSION}-sea`), layout.current);
+  writePrivate(nodeFiles(dataDirOf(env)).install, { command: [process.execPath, path.join(layout.current, 'dist', 'cli.mjs')],
+    releases: layout.root, definitions: [] });
+  assert.deepEqual(stableCommand(env), [path.join(layout.current, 'dist', 'sidevoice')]);
+  recordInstallation(env);
+  const seaInstall = JSON.parse(await readFile(nodeFiles(dataDirOf(env)).install, 'utf8'));
+  assert.deepEqual(seaInstall.command, stableCommand(env));
+  assert.equal(seaInstall.nodeExecutable, process.execPath, 'the R1 Node interpreter survives the SEA switch for rollback');
+  assert.equal(oursInCursor({ command: path.join(layout.current, 'dist', 'sidevoice'), args: ['mcp'] }, env), true);
+  assert.match(definitionTexts('systemd', env).connector, new RegExp(path.join(layout.current, 'dist', 'sidevoice').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+
+  assert.equal(decide({ connector: VERSION, channel: 'release', format: 'sea' },
+    { connector: VERSION, channel: 'release', format: 'esm' }), 'noop');
+  assert.equal(decide({ connector: VERSION, channel: 'release', format: 'esm' },
+    { connector: VERSION, channel: 'release', format: 'sea' }), 'upgrade');
+  assert.equal(decide({ connector: '9.0.0', channel: 'release', format: 'sea' },
+    { connector: '1.0.0', channel: 'release', format: 'esm' }), 'noop');
+
+  await rm(layout.current);
+  await symlink(path.join('releases', VERSION), layout.current);
+  recordInstallation(env);
+  assert.deepEqual(stableCommand(env), [process.execPath, path.join(layout.current, 'dist', 'cli.mjs')]);
+  assert.deepEqual(JSON.parse(await readFile(nodeFiles(dataDirOf(env)).install, 'utf8')).command, stableCommand(env));
+  assert.equal(oursInCursor({ command: path.join(layout.current, 'dist', 'sidevoice'), args: ['mcp'] }, env), true,
+    'rollback retains ownership of an old SEA registration after install.json records ESM');
+  assert.match(definitionTexts('systemd', env).connector, new RegExp(path.join(layout.current, 'dist', 'cli.mjs').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+
+  if (sea && existsSync(sea)) {
+    writePrivate(nodeFiles(dataDirOf(env)).install, { command: [process.execPath, path.join(layout.current, 'dist', 'cli.mjs')], releases: layout.root, definitions: [] });
+    const legacy = spawnSync(sea, ['--sidevoice-selected-command'], { env: { ...process.env, ...env }, encoding: 'utf8', timeout: 10_000 });
+    assert.equal(legacy.status, 0, legacy.stderr || legacy.stdout);
+    assert.deepEqual(JSON.parse(legacy.stdout.trim()), [process.execPath, path.join(layout.current, 'dist', 'cli.mjs')],
+      'a SEA rolling back to a legacy R1 release recovers Node from the old two-element command record');
+    recordInstallation(env);
+  }
+
+  await rm(layout.current);
+  await symlink(path.join('releases', `${VERSION}-sea`), layout.current);
+  recordInstallation(env);
+  assert.deepEqual(JSON.parse(await readFile(nodeFiles(dataDirOf(env)).install, 'utf8')).command, [path.join(layout.current, 'dist', 'sidevoice')]);
+});
+
+test('a build without R4-a assets and a network developer override both fail closed', async () => {
+  await assert.rejects(() => installCoreRuntime({ dataDir: path.join(scratch, 'no-manifest'),
+    env: { SIDEVOICE_INSTALL_FROM_SOURCE: '0' } }),
+  error => error.key === 'install.authenticity' && error.check === 'manifest');
+  await assert.rejects(() => installRuntime({ dataDir: path.join(scratch, 'network-override'),
+    env: { SIDEVOICE_CORE_SPEC: 'sidevoice-core==0.1.0', SIDEVOICE_INSTALL_FROM_SOURCE: '0' } }),
+  error => error.key === 'install.authenticity' && error.check === 'developer-override');
+});
+
+async function makeArchive(filename, entries) {
+  const pack = tar.pack();
+  const done = pipeline(pack, createZstdCompress(), createWriteStream(filename));
+  for (const entry of entries) {
+    const body = entry.body ?? Buffer.alloc(0);
+    await new Promise((resolve, reject) => pack.entry({ name: entry.name, type: entry.type || 'file', linkname: entry.linkname,
+      mode: entry.mode ?? 0o644, size: body.length }, body, error => error ? reject(error) : resolve()));
+  }
+  pack.finalize();
+  await done;
+}
+
+test('safe archive extraction preserves executable files and internal relative links', async () => {
+  const archive = path.join(scratch, 'safe.tar.zst'), dest = path.join(scratch, 'safe-stage');
+  await makeArchive(archive, [
+    { name: 'python/bin/python3.12', body: Buffer.from('python'), mode: 0o755 },
+    { name: 'python/bin/python3', type: 'symlink', linkname: 'python3.12' },
+  ]);
+  await unpackCoreArchive(archive, dest);
+  assert.equal((await readFile(path.join(dest, 'python/bin/python3.12'))).toString(), 'python');
+  assert.equal((await stat(path.join(dest, 'python/bin/python3'))).mode & 0o111, 0o111);
+});
+
+test('archive traversal, absolute paths, composed escaping links, cycles, and device entries are refused before commit', async () => {
+  const cases = [
+    { name: '../outside', type: 'file', body: Buffer.from('escape'), check: 'archive-path' },
+    { name: '/absolute', type: 'file', body: Buffer.from('escape'), check: 'archive-path' },
+    { name: 'python/link', type: 'symlink', linkname: '../../../../outside', check: 'archive-link' },
+    { name: 'escape', type: 'symlink', linkname: 'pivot/../outside', check: 'archive-link',
+      extra: [{ name: 'pivot', type: 'symlink', linkname: '.' }] },
+    { name: 'python/first', type: 'symlink', linkname: 'second', check: 'archive-link',
+      extra: [{ name: 'python/second', type: 'symlink', linkname: 'first' }] },
+    { name: 'python/device', type: 'character-device', check: 'archive-type' },
+  ];
+  for (const [index, item] of cases.entries()) {
+    const archive = path.join(scratch, `unsafe-${index}.tar.zst`), dest = path.join(scratch, `unsafe-${index}-stage`);
+    await makeArchive(archive, [...(item.extra || []), item]);
+    await assert.rejects(() => unpackCoreArchive(archive, dest), error => error.key === 'install.authenticity' && error.check === item.check);
+    await rm(dest, { recursive: true, force: true });
+  }
+});
+
+function runVerifier(cachePath, offline) {
+  const env = { ...process.env };
+  for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_URL', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN']) delete env[key];
+  if (sea && existsSync(sea)) {
+    const result = spawnSync(sea, ['--sidevoice-verify-core', fixtureArtifact, fixture, 'release', cachePath, offline ? '1' : '0'],
+      { env, encoding: 'utf8', timeout: 120_000 });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    return JSON.parse(result.stdout.trim());
+  }
+  const result = spawnSync(process.execPath, [helper, fixture, fixtureArtifact, cachePath, offline ? '1' : '0'], { env, encoding: 'utf8', timeout: 120_000 });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  return JSON.parse(result.stdout.trim());
+}
+async function findFile(dir, basename) {
+  for (const entry of await readdir(dir, { withFileTypes: true })) {
+    const child = path.join(dir, entry.name);
+    if (entry.isFile() && entry.name === basename) return child;
+    if (entry.isDirectory()) { const found = await findFile(child, basename); if (found) return found; }
+  }
+  return null;
+}
+async function copyTree(from, to) {
+  await mkdir(to, { recursive: true });
+  for (const entry of await readdir(from, { withFileTypes: true })) {
+    const source = path.join(from, entry.name), target = path.join(to, entry.name);
+    if (entry.isDirectory()) await copyTree(source, target);
+    else await writeFile(target, await readFile(source));
+  }
+}
+
+test('public-good TUF cold and warm caches verify a genuine Sigstore bundle; wrong workflow is refused afterward', async () => {
+  const cache = path.join(scratch, 'tuf-warm');
+  const result = runVerifier(cache, false);
+  assert.equal(result.key, 'install.authenticity');
+  assert.equal(result.check, 'workflow', 'the unrelated, genuine npm bundle must reach and fail the core signer pin');
+  assert.ok(await findFile(cache, 'root.json'), 'a cold online cache receives the public-good TUF root');
+  assert.ok(await findFile(cache, 'timestamp.json'), 'a cold online cache receives timestamp metadata');
+  const warm = runVerifier(cache, true);
+  assert.equal(warm.check, 'workflow', 'the warm TUF cache permits offline cryptographic verification');
+});
+
+test('cold, expired, and corrupt offline TUF caches fail closed with the Sigstore check named', async () => {
+  const cold = runVerifier(path.join(scratch, 'tuf-cold-offline'), true);
+  assert.equal(cold.check, 'sigstore');
+
+  const warm = path.join(scratch, 'tuf-source');
+  const initialized = runVerifier(warm, false);
+  assert.equal(initialized.check, 'workflow');
+
+  const expired = path.join(scratch, 'tuf-expired');
+  await copyTree(warm, expired);
+  const timestamp = await findFile(expired, 'timestamp.json');
+  assert.ok(timestamp, 'timestamp metadata is present in the warm cache');
+  const metadata = JSON.parse(await readFile(timestamp, 'utf8'));
+  metadata.signed.expires = '2000-01-01T00:00:00Z';
+  await writeFile(timestamp, JSON.stringify(metadata));
+  assert.equal(runVerifier(expired, true).check, 'sigstore', 'expired metadata is not accepted offline');
+
+  const corrupt = path.join(scratch, 'tuf-corrupt');
+  await copyTree(warm, corrupt);
+  const corruptTimestamp = await findFile(corrupt, 'timestamp.json');
+  await writeFile(corruptTimestamp, '{');
+  assert.equal(runVerifier(corrupt, true).check, 'sigstore', 'corrupt metadata is not accepted offline');
+});
+
+test('native SEA runs directly, answers MCP stdio and self-spawns its connector without Node on PATH', async t => {
+  if (!sea) { t.skip(`no SEA target is configured for ${process.platform}/${process.arch}`); return; }
+  try { await stat(sea); } catch { t.skip('target SEA is built by the native target CI job'); return; }
+  const version = spawnSync(sea, ['--version'], { encoding: 'utf8', timeout: 10_000 });
+  assert.equal(version.status, 0, version.stderr);
+  assert.equal(version.stdout.trim(), VERSION);
+
+  const dataDir = path.join(scratch, 'mcp-machine'), emptyPath = path.join(scratch, 'empty-path');
+  await mkdir(emptyPath, { recursive: true });
+  const fakeCore = path.join(connectorPackage, 'test', 'fake-sidevoice-core.mjs');
+  const coreWrapper = path.join(scratch, 'sidevoice-core');
+  await writeFile(coreWrapper, `#!/bin/sh\nexec "${process.execPath}" "${fakeCore}" "$@"\n`, { mode: 0o755 });
+  const env = { ...process.env, PATH: emptyPath, HOME: scratch, XDG_DATA_HOME: path.join(scratch, 'xdg'),
+    SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CORE_BIN: coreWrapper, SIDEVOICE_SERVICE_MANAGER: 'none',
+    SIDEVOICE_CONNECTOR_IDLE_MS: '300', SIDEVOICE_CORE_PORT: '0', CLAUDE_CODE_SESSION_ID: 'r4-sea' };
+  for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_URL', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN']) delete env[key];
+  const child = spawn(sea, ['mcp'], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const replies = new Map(); let buffer = '', stderr = '';
+  child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+  child.stdout.on('data', chunk => { buffer += chunk; let index; while ((index = buffer.indexOf('\n')) >= 0) {
+    const line = buffer.slice(0, index); buffer = buffer.slice(index + 1); if (line) { const reply = JSON.parse(line); replies.set(reply.id, reply); }
+  } });
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  const waitFor = async predicate => { const deadline = Date.now() + 15_000; while (Date.now() < deadline) { if (predicate()) return; await new Promise(resolve => setTimeout(resolve, 25)); } throw new Error(`SEA MCP/supervisor timed out: ${stderr}`); };
+  try {
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18' } }) + '\n');
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }) + '\n');
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'voice_pair_device', arguments: {} } }) + '\n');
+    await waitFor(() => replies.has(3));
+    assert.equal(replies.get(1).result.serverInfo.name, 'sidevoice');
+    assert.deepEqual(replies.get(2).result.tools.map(item => item.name), ['voice_connect', 'voice_pair', 'voice_say', 'voice_disconnect', 'voice_pair_device', 'voice_status']);
+    assert.equal(replies.get(3).result.content[0].type, 'text');
+    assert.match(replies.get(3).result.content[0].text, /One-time code to pair a device/);
+    await waitFor(() => existsSync(connectorSocketOf({ SIDEVOICE_DATA_DIR: dataDir })));
+    const ready = JSON.parse(await readFile(path.join(dataDir, 'core', 'core.json'), 'utf8'));
+    assert.ok(ready.pid, 'the self-spawned connector starts the core it supervises');
+  } finally {
+    child.stdin.end();
+    await new Promise(resolve => child.once('exit', resolve));
+    const readyPath = path.join(dataDir, 'core', 'core.json');
+    try { const ready = JSON.parse(await readFile(readyPath, 'utf8')); process.kill(ready.pid, 'SIGTERM'); } catch {}
+    const lockPath = path.join(dataDir, 'connector.lock');
+    try { const lock = readLock(lockPath); if (lock?.pid) process.kill(lock.pid, 'SIGTERM'); } catch {}
+  }
+});
+
+test('SEA private Cursor SQLite helper reads a chat without treating the executable as node -e', async t => {
+  if (!sea) { t.skip(`no SEA target is configured for ${process.platform}/${process.arch}`); return; }
+  try { await stat(sea); } catch { t.skip('target SEA is built by the native target CI job'); return; }
+  const { DatabaseSync } = await import('node:sqlite');
+  const database = path.join(scratch, 'cursor-state.vscdb'), marker = 'c'.repeat(64);
+  const db = new DatabaseSync(database);
+  db.exec('CREATE TABLE cursorDiskKV (key TEXT, value BLOB)');
+  db.prepare('INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)').run('bubbleId:thread-from-sea:message-1', Buffer.from(JSON.stringify({ marker })));
+  db.close();
+  const query = spawnSync(sea, ['--sidevoice-cursor-db-query', database, marker, 'bubbleId:', 'bubbleId;'], { encoding: 'utf8', timeout: 15_000 });
+  assert.equal(query.status, 0, query.stderr);
+  assert.deepEqual(JSON.parse(query.stdout), ['thread-from-sea']);
+});

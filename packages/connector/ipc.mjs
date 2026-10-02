@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { launch } from './launcher.mjs';
 import { connectorSocketOf } from './node-files.mjs';
 import { verifyConnectorSocket } from './secure-fs.mjs';
+import { runningAsSea } from './sea-runtime.mjs';
 
 // The connector is started through the same entry the façade came in by — `cli.mjs connector` —
 // because published there is one bundled file and no `connector.mjs` beside it to point at.
@@ -20,7 +21,7 @@ export function connectorSocket(env = process.env) {
 const gone = message => Object.assign(new Error(message), { gone: true });
 
 /** `self`: the argv prefix that runs the CLI a plain connector is started from — this package's own by default. */
-export function connectorClient(env = process.env, { onLost = () => {}, self = [process.execPath, cliPath] } = {}) {
+export function connectorClient(env = process.env, { onLost = () => {}, self = runningAsSea() ? [process.execPath] : [process.execPath, cliPath] } = {}) {
   const socketPath = connectorSocket(env);
   let socket = null, buffer = '', serial = 0;
   const waiting = new Map();

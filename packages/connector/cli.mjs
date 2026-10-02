@@ -15,6 +15,16 @@ import { run as service } from './service.mjs';
 import { run as skill } from './skill.mjs';
 import { t } from './i18n.mjs';
 import { VERSION } from './identity.mjs';
+import { realpathSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+import { cursorDatabaseMatches } from './harness-cursor-desktop.mjs';
+import { verifyCoreArtifact } from './core-attestation.mjs';
+import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
+import tls from 'node:tls';
+import { readFile } from 'node:fs/promises';
+import { stableCommand } from './release.mjs';
 
 const COMMANDS = { install: runInstall, uninstall: runUninstall, rollback: runRollback, mcp, pair: runPair, 'link-room': runLinkRoom,
   'pair-device': pairDevice, connector, service, skill };
@@ -22,9 +32,36 @@ const COMMANDS = { install: runInstall, uninstall: runUninstall, rollback: runRo
 /** With `--json`, every failure is one object on stdout — `{ok: false, error: {key, message}}` — and exit 1. */
 const failJson = (key, message) => { console.log(JSON.stringify({ ok: false, error: { key, message } })); return 1; };
 
-async function main([command, ...argv]) {
+export async function main([command, ...argv] = process.argv.slice(2)) {
   // What an installer asks a staged release (`release.mjs`): this package's version, and nothing else.
   if (command === '--version') { console.log(VERSION); return 0; }
+  if (command === '--sidevoice-cursor-db-query') {
+    try { process.stdout.write(JSON.stringify(await cursorDatabaseMatches(...argv))); return 0; }
+    catch (error) { console.error(error?.message || error); return 1; }
+  }
+  if (command === '--sidevoice-selected-command') {
+    try { console.log(JSON.stringify(stableCommand(process.env))); return 0; }
+    catch (error) { console.log(JSON.stringify({ error: error.key ?? 'install.failed' })); return 1; }
+  }
+  // Exercise the same bundled Sigstore path production core installation uses. This private command intentionally
+  // returns only machine-readable verification outcomes; the public verification test uses a genuine unrelated bundle.
+  if (command === '--sidevoice-verify-core') {
+    const [artifactPath, bundlePath, channel, tufCachePath, offline] = argv;
+    if (!artifactPath || !bundlePath || !channel || !tufCachePath) return 2;
+    if (offline === '1') {
+      const deny = () => { const error = new Error('network disabled for the TUF cache test'); error.name = 'NetworkDisabledError'; throw error; };
+      globalThis.fetch = deny;
+      http.request = deny; http.get = deny; https.request = deny; https.get = deny; net.connect = deny; tls.connect = deny;
+    }
+    try {
+      await verifyCoreArtifact({ bytes: await readFile(artifactPath), bundleBytes: await readFile(bundlePath),
+        channel, tufCachePath, tufForceCache: offline === '1', label: 'SEA Sigstore fixture' });
+      console.log(JSON.stringify({ ok: true }));
+    } catch (error) {
+      console.log(JSON.stringify({ ok: false, key: error.key ?? null, check: error.check ?? null }));
+    }
+    return 0;
+  }
   const json = argv.includes('--json');
   const entry = COMMANDS[command];
   if (!entry) {
@@ -35,6 +72,12 @@ async function main([command, ...argv]) {
   catch (error) { if (json) return failJson(error?.key || `${command}.failed`, error?.message || String(error)); throw error; }
 }
 
-main(process.argv.slice(2)).then(
+function invokedAsCli() {
+  if (!process.argv[1]) return false;
+  try { return import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href; }
+  catch { return false; }
+}
+
+if (invokedAsCli()) main().then(
   code => { if (typeof code === 'number') process.exitCode = code; },
   error => { console.error(error?.message || error); process.exitCode = 1; });

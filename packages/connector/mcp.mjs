@@ -16,8 +16,9 @@ import { pair, pairedRoom } from './pair.mjs';
 import { connectorClient } from './ipc.mjs';
 import { pairDevice } from './pair-device.mjs';
 import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync } from 'node:fs';
+import { BUILD_PACKAGE } from './build-info.mjs';
 
-const VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
+const VERSION = BUILD_PACKAGE.version;
 
 const dataDir = process.env.SIDEVOICE_DATA_DIR || path.join(os.homedir(), '.sidevoice');
 

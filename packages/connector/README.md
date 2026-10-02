@@ -104,3 +104,16 @@ releases, the switch and rollback; `test_security.mjs` the locks and the trust b
 the checkout and from the bundle. `SIDEVOICE_CORE_WHEEL=<wheel> npm run build`
 puts the pinned core's wheel inside `dist/core/`, so the published package
 installs it without any index.
+
+R4 adds a second output and leaves the npm ESM entry point in place. On a native
+runner with Node `v22.23.3`, `npm run build:sea -w @sidevoice/uplink` emits
+`dist-sea/<target>/sidevoice` for macOS arm64 and Linux x86_64/arm64. To make an
+installable production executable, set `SIDEVOICE_CORE_MANIFEST` to R4-a's
+signed `core-manifest.json` and provide its adjacent `.sigstore.json`; the build
+verifies the manifest and embeds its exact bytes. `SIDEVOICE_CHANNEL` may be
+`release` or `nightly`, and `SIDEVOICE_BUILD_SEQ` sets the build sequence recorded
+by the install transaction. A build without the manifest is useful for build and
+runtime tests, but refuses core installation. At runtime, supported platforms use
+the signed core bundle; only unsupported platforms take the verified-wheel uv
+path. Local developer overrides can name local files or directories and cannot
+select a network requirement.

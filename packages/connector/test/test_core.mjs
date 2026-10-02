@@ -140,7 +140,8 @@ test('core: a device pairing code is the core\'s to issue: asked with nothing ru
 
 test('core: with no uv on the machine, joining says how to install it, and nothing else breaks', async () => {
   const empty = mkdtempSync(path.join(os.tmpdir(), 'sv-home-'));
-  const node = machine({ SIDEVOICE_UV: undefined, PATH: path.dirname(process.execPath), HOME: empty });
+  const node = machine({ SIDEVOICE_UV: undefined, PATH: path.dirname(process.execPath), HOME: empty,
+    SIDEVOICE_CORE_SPEC: '/wheels/sidevoice_core-' + CORE_VERSION + '-py3-none-any.whl' });
   try {
     await until(() => existsSync(node.socketPath));
     const facade = ipc(node.socketPath); await facade.ready;
