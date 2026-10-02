@@ -138,8 +138,9 @@ export function explainUvFailure(step, code, lines, log) {
 }
 
 /** Run uv, its output appended to the log and handed line by line to `progress`. */
-function run(command, args, { log, env, progress = () => {} }) {
+function run(command, args, { log, env, progress = () => {}, signal }) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(keyed('install.cancelled')); return; }
     const out = openSync(log, 'a', 0o600);
     const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], env });
     const tail = []; let partial = '';
@@ -155,11 +156,20 @@ function run(command, args, { log, env, progress = () => {} }) {
     };
     child.stdout.on('data', take); child.stderr.on('data', take);
     const timer = setTimeout(() => child.kill('SIGTERM'), INSTALL_TIMEOUT_MS);
-    child.on('error', error => { clearTimeout(timer); closeSync(out); reject(error); });
+    let forceTimer;
+    const abort = () => {
+      child.kill('SIGTERM');
+      forceTimer = setTimeout(() => child.kill('SIGKILL'), 2000);
+      forceTimer.unref?.();
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+    const cleanup = () => { clearTimeout(timer); clearTimeout(forceTimer); signal?.removeEventListener('abort', abort); closeSync(out); };
+    child.on('error', error => { cleanup(); reject(signal?.aborted ? keyed('install.cancelled') : error); });
     child.on('close', code => {
-      clearTimeout(timer); closeSync(out);
+      cleanup();
       if (partial) tail.push(partial);
-      code === 0 ? resolve() : reject(explainUvFailure(args[0], code, tail, log));
+      if (signal?.aborted) reject(keyed('install.cancelled'));
+      else code === 0 ? resolve() : reject(explainUvFailure(args[0], code, tail, log));
     });
   });
 }
@@ -214,7 +224,8 @@ const runtimeComplete = paths => {
 };
 
 /** This package's build of the core, installed if it is not there: `{id, bin, venv}` (`venv` null for an external one). */
-export async function installRuntime({ dataDir, env = process.env, log = () => {}, progress = () => {}, verifiedSha256 = null }) {
+export async function installRuntime({ dataDir, env = process.env, log = () => {}, progress = () => {}, verifiedSha256 = null,
+  signal, progressEvent = () => {} }) {
   if (env.SIDEVOICE_CORE_BIN) return { id: 'external', bin: env.SIDEVOICE_CORE_BIN, venv: null };
   const { id, spec } = runtimeIdentity(env, verifiedSha256);
   if (!localSpecPath(spec)) throw refusal('developer-override', 'unverified network core specifications are disabled');
@@ -222,7 +233,7 @@ export async function installRuntime({ dataDir, env = process.env, log = () => {
   if (runtimeComplete(paths)) return { id, bin: paths.bin, venv: paths.venv, kind: 'uv' };
   const uv = findUv(env);
   if (!uv) throw new Error(NO_UV);
-  const release = await takeInstallLock(dataDir, log);
+  const release = await takeInstallLock(dataDir, log, { signal, onWait: () => progressEvent({ step: 'wait-lock', done: null, total: null }) });
   try {
     if (runtimeComplete(paths)) return { id, bin: paths.bin, venv: paths.venv, kind: 'uv' };   // whoever held the lock installed this very build
     // A directory of this build with no marker is an install of it that did not finish: nothing links to or runs it.
@@ -230,7 +241,7 @@ export async function installRuntime({ dataDir, env = process.env, log = () => {
     mkdirSync(paths.home, { recursive: true, mode: 0o700 });
     log(`installing sidevoice-core ${CORE_VERSION} with ${uv} from ${spec} (first time only; output in ${logPath(dataDir)})`);
     const started = Date.now();
-    const options = { log: logPath(dataDir), env: { ...env, UV_NO_PROGRESS: '1' }, progress };
+    const options = { log: logPath(dataDir), env: { ...env, UV_NO_PROGRESS: '1' }, progress, signal };
     // uv's own Python, never the machine's: the core then runs on one known build everywhere, whatever a
     // system Python, Homebrew or a version manager left on the PATH.
     await run(uv, ['venv', '--python-preference', 'only-managed', '--python', '3.12', paths.venv], options);
@@ -251,7 +262,7 @@ function syncRuntimeTree(dir) {
   const fd = openSync(dir, 'r'); try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
-async function installVerifiedBundle({ dataDir, env, log, progress, channel, target }) {
+async function installVerifiedBundle({ dataDir, env, log, progress, channel, target, signal, progressEvent }) {
   validateCoreManifest(CORE_MANIFEST, CORE_VERSION, channel);
   const entry = CORE_MANIFEST.bundles.find(item => item.os === target.os && item.arch === target.arch);
   if (!entry) throw refusal('platform', `the embedded manifest has no core bundle for ${target.os}/${target.arch}`);
@@ -259,7 +270,7 @@ async function installVerifiedBundle({ dataDir, env, log, progress, channel, tar
   const paths = runtimePaths(dataDir, id);
   if (runtimeComplete(paths)) return { id, bin: paths.bundlePython, venv: null, kind: 'bundle', root: paths.home };
   verifyPrivateDir(runtimeRoot(dataDir), { create: true });
-  const release = await takeInstallLock(dataDir, log);
+  const release = await takeInstallLock(dataDir, log, { signal, onWait: () => progressEvent({ step: 'wait-lock', done: null, total: null }) });
   const temporary = `${paths.home}.staging-${randomUUID()}`;
   try {
     if (runtimeComplete(paths)) return { id, bin: paths.bundlePython, venv: null, kind: 'bundle', root: paths.home };
@@ -267,10 +278,10 @@ async function installVerifiedBundle({ dataDir, env, log, progress, channel, tar
     mkdirSync(temporary, { mode: 0o700 });
     progress(t('install.progress.bundle', { platform: `${target.os}/${target.arch}` }, env));
     const prepared = await prepareVerifiedCoreBundle({ manifest: CORE_MANIFEST, coreVersion: CORE_VERSION, target,
-      directory: temporary, channel, tufCachePath: path.join(dataDir, 'sigstore') });
+      directory: temporary, channel, tufCachePath: path.join(dataDir, 'sigstore'), signal, progressEvent });
     const python = path.join(prepared.payload, 'python', 'bin', 'python3');
     if (!executable(python)) throw keyed('install.self-test', { detail: `the verified bundle has no executable ${python}` });
-    selfTest(python, env, { bundle: true });
+    await selfTest(python, env, { bundle: true, signal });
     writePrivateFile(path.join(prepared.payload, '.sidevoice-runtime.json'), JSON.stringify({ kind: 'bundle', id,
       core: CORE_VERSION, sha256: entry.sha256, at: new Date().toISOString() }) + '\n');
     syncRuntimeTree(prepared.payload);
@@ -283,7 +294,7 @@ async function installVerifiedBundle({ dataDir, env, log, progress, channel, tar
   }
 }
 
-async function installVerifiedWheel({ dataDir, env, log, progress, channel }) {
+async function installVerifiedWheel({ dataDir, env, log, progress, channel, signal, progressEvent }) {
   validateCoreManifest(CORE_MANIFEST, CORE_VERSION, channel);
   const uv = findUv(env);
   if (!uv) throw keyed('install.no-bundle', { platform: `${process.platform}/${process.arch}` });
@@ -306,24 +317,25 @@ async function installVerifiedWheel({ dataDir, env, log, progress, channel }) {
       rmSync(wheelPath, { force: true });
       progress(t('install.progress.wheel', {}, env));
       const wheel = await fetchVerifiedCoreWheel({ manifest: CORE_MANIFEST, coreVersion: CORE_VERSION, directory: temporary,
-        channel, tufCachePath: path.join(dataDir, 'sigstore') });
+        channel, tufCachePath: path.join(dataDir, 'sigstore'), signal, progressEvent });
       renameSync(wheel.path, wheelPath);
       const parent = openSync(cacheDir, 'r'); try { fsyncSync(parent); } finally { closeSync(parent); }
     }
-    return await installRuntime({ dataDir, env: wheelEnv, log, progress, verifiedSha256: entry.sha256 });
+    return await installRuntime({ dataDir, env: wheelEnv, log, progress, verifiedSha256: entry.sha256, signal, progressEvent });
   } finally { rmSync(temporary, { recursive: true, force: true }); }
 }
 
 /** One selected core source: explicit local developer override, platform bundle, or verified-wheel uv fallback. */
-export async function installCoreRuntime({ dataDir, env = process.env, log = () => {}, progress = () => {}, channel = BUILD_PACKAGE.sidevoice?.channel || 'release' }) {
+export async function installCoreRuntime({ dataDir, env = process.env, log = () => {}, progress = () => {}, signal,
+  progressEvent = () => {}, channel = BUILD_PACKAGE.sidevoice?.channel || 'release' }) {
   if (env.SIDEVOICE_CORE_BIN) return { id: 'external', bin: env.SIDEVOICE_CORE_BIN, venv: null, kind: 'external' };
   const override = localDeveloperSpec(env);
-  if (override) return { ...(await installRuntime({ dataDir, env: { ...env, SIDEVOICE_CORE_SPEC: override }, log, progress })), kind: 'uv' };
+  if (override) return { ...(await installRuntime({ dataDir, env: { ...env, SIDEVOICE_CORE_SPEC: override }, log, progress, signal, progressEvent })), kind: 'uv' };
   if (!CORE_MANIFEST) throw refusal('manifest', 'this executable has no R4-a core manifest embedded');
   const target = coreTarget();
   validateCoreManifest(CORE_MANIFEST, CORE_VERSION, channel);
-  if (coreInstallSource(CORE_MANIFEST, target) === 'bundle') return installVerifiedBundle({ dataDir, env, log, progress, channel, target });
-  return installVerifiedWheel({ dataDir, env, log, progress, channel });
+  if (coreInstallSource(CORE_MANIFEST, target) === 'bundle') return installVerifiedBundle({ dataDir, env, log, progress, channel, target, signal, progressEvent });
+  return installVerifiedWheel({ dataDir, env, log, progress, channel, signal, progressEvent });
 }
 
 /** The core program this package would run with no installation selected: named, or its verified build — installed now if needed. */
@@ -336,14 +348,39 @@ export function isBundleCore(bin) {
 }
 
 /** `sidevoice-core --self-test`: imports everything serving needs, binds nothing, writes nothing. */
-export function selfTest(bin, env = process.env, { bundle = false } = {}) {
-  let output = '';
+export function selfTest(bin, env = process.env, { bundle = false, signal } = {}) {
   const args = bundle ? ['-I', '-m', 'sidevoice_core.server', '--self-test'] : ['--self-test'];
-  try { output = execFileSync(bin, args, { encoding: 'utf8', timeout: 120_000, env, stdio: ['ignore', 'pipe', 'pipe'] }); }
-  catch (error) { output = String(error.stdout || ''); if (!output.trim()) throw keyed('install.self-test', { detail: String(error.stderr || error.message).trim().split('\n').at(-1) }); }
-  let report = null; try { report = JSON.parse(output.trim().split('\n').at(-1)); } catch {}
-  if (!report?.ok) throw keyed(report?.key || 'install.self-test', { detail: report?.message || output.trim().slice(0, 200) });
-  return report;
+  if (signal?.aborted) return Promise.reject(keyed('install.cancelled'));
+  return new Promise((resolve, reject) => {
+    let child;
+    try { child = spawn(bin, args, { env, stdio: ['ignore', 'pipe', 'pipe'] }); }
+    catch (error) { reject(error); return; }
+    let stdout = '', stderr = '', timedOut = false, forceTimer;
+    const append = (current, chunk) => (current + chunk.toString('utf8')).slice(-64 * 1024);
+    child.stdout.on('data', chunk => { stdout = append(stdout, chunk); });
+    child.stderr.on('data', chunk => { stderr = append(stderr, chunk); });
+    const stop = () => {
+      child.kill('SIGTERM');
+      forceTimer = setTimeout(() => child.kill('SIGKILL'), 2000);
+      forceTimer.unref?.();
+    };
+    const timer = setTimeout(() => { timedOut = true; stop(); }, 120_000);
+    signal?.addEventListener('abort', stop, { once: true });
+    const cleanup = () => { clearTimeout(timer); clearTimeout(forceTimer); signal?.removeEventListener('abort', stop); };
+    child.once('error', error => { cleanup(); reject(signal?.aborted ? keyed('install.cancelled') : error); });
+    child.once('close', code => {
+      cleanup();
+      if (signal?.aborted) { reject(keyed('install.cancelled')); return; }
+      if (timedOut) { reject(keyed('install.self-test', { detail: 'core self-test timed out after 120 seconds' })); return; }
+      let report = null;
+      try { report = JSON.parse(stdout.trim().split('\n').at(-1)); } catch {}
+      if (code !== 0 || !report?.ok) {
+        reject(keyed(report?.key || 'install.self-test', { detail: report?.message || stderr.trim().split('\n').at(-1) || stdout.trim().slice(0, 200) }));
+        return;
+      }
+      resolve(report);
+    });
+  });
 }
 
 /** The file the core dials the room with: this machine's pairing, followed by the core (it may not exist yet). */

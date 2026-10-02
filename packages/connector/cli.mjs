@@ -25,6 +25,8 @@ import net from 'node:net';
 import tls from 'node:tls';
 import { readFile } from 'node:fs/promises';
 import { stableCommand } from './release.mjs';
+import { connectorMetadata, versionMetadata } from './metadata.mjs';
+import { pause } from './testpoint.mjs';
 
 const COMMANDS = { install: runInstall, uninstall: runUninstall, rollback: runRollback, mcp, pair: runPair, 'link-room': runLinkRoom,
   'pair-device': pairDevice, connector, service, skill };
@@ -34,7 +36,15 @@ const failJson = (key, message) => { console.log(JSON.stringify({ ok: false, err
 
 export async function main([command, ...argv] = process.argv.slice(2)) {
   // What an installer asks a staged release (`release.mjs`): this package's version, and nothing else.
-  if (command === '--version') { console.log(VERSION); return 0; }
+  if (command === '--version') {
+    if (argv.includes('--json')) console.log(JSON.stringify(versionMetadata()));
+    else console.log(VERSION);
+    return 0;
+  }
+  if (command === 'metadata') {
+    console.log(JSON.stringify(connectorMetadata()));
+    return 0;
+  }
   if (command === '--sidevoice-cursor-db-query') {
     try { process.stdout.write(JSON.stringify(await cursorDatabaseMatches(...argv))); return 0; }
     catch (error) { console.error(error?.message || error); return 1; }
@@ -46,7 +56,7 @@ export async function main([command, ...argv] = process.argv.slice(2)) {
   // Exercise the same bundled Sigstore path production core installation uses. This private command intentionally
   // returns only machine-readable verification outcomes; the public verification test uses a genuine unrelated bundle.
   if (command === '--sidevoice-verify-core') {
-    const [artifactPath, bundlePath, channel, tufCachePath, offline] = argv;
+    const [artifactPath, bundlePath, channel, tufCachePath, offline, expectedSha256] = argv;
     if (!artifactPath || !bundlePath || !channel || !tufCachePath) return 2;
     if (offline === '1') {
       const deny = () => { const error = new Error('network disabled for the TUF cache test'); error.name = 'NetworkDisabledError'; throw error; };
@@ -54,8 +64,9 @@ export async function main([command, ...argv] = process.argv.slice(2)) {
       http.request = deny; http.get = deny; https.request = deny; https.get = deny; net.connect = deny; tls.connect = deny;
     }
     try {
+      await pause('verify-core');
       await verifyCoreArtifact({ bytes: await readFile(artifactPath), bundleBytes: await readFile(bundlePath),
-        channel, tufCachePath, tufForceCache: offline === '1', label: 'SEA Sigstore fixture' });
+        expectedSha256: expectedSha256 || undefined, channel, tufCachePath, tufForceCache: offline === '1', label: 'SEA Sigstore fixture' });
       console.log(JSON.stringify({ ok: true }));
     } catch (error) {
       console.log(JSON.stringify({ ok: false, key: error.key ?? null, check: error.check ?? null }));

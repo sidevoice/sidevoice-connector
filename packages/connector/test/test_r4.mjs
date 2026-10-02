@@ -21,6 +21,7 @@ import { CORE_VERSION, hasEmbeddedCoreBundle, installCoreRuntime, installRuntime
 import { decide, point, releaseLayout, stableCommand } from '../release.mjs';
 import { definitionTexts, recordInstallation } from '../service.mjs';
 import { oursInCursor } from '../registrations.mjs';
+import { connectorMetadata, versionMetadata } from '../metadata.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixture = path.join(here, 'fixtures', 'r4', 'sigstore-5.0.0.sigstore.json');
@@ -90,9 +91,27 @@ async function buildCoreRuntimeAndCliWithManifest(manifest) {
     define: {
       __SIDEVOICE_PACKAGE_JSON__: JSON.stringify(JSON.stringify(shipped)),
       __SIDEVOICE_CORE_MANIFEST_JSON__: JSON.stringify(JSON.stringify(manifest)),
+      __SIDEVOICE_CORE_MANIFEST_SHA256__: JSON.stringify(sha256(Buffer.from(JSON.stringify(manifest)))),
     },
   });
   return { coreRuntime: path.join(output, 'coreRuntime.mjs'), cli: path.join(output, 'cli.mjs') };
+}
+
+async function waitForPath(filename, timeout = 15_000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (existsSync(filename)) return;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  throw new Error(`timed out waiting for ${filename}`);
+}
+
+function testInstallEnv(home, extra = {}) {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) if (key.startsWith('SIDEVOICE_')) delete env[key];
+  for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_URL', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN']) delete env[key];
+  return Object.assign(env, { HOME: home, XDG_DATA_HOME: path.join(home, 'xdg'), XDG_CONFIG_HOME: path.join(home, 'config'),
+    SIDEVOICE_INSTALL_FROM_SOURCE: '0', SIDEVOICE_SERVICE_MANAGER: 'none' }, extra);
 }
 
 test('Fulcio and in-toto pins accept only the core repository, expected workflows, hosted runner and SHA-256 subject', () => {
@@ -182,6 +201,88 @@ test('cross-repo core PR #34 manifest matches its exact two-key producer schema 
   expectRefusal(() => validateCoreManifest(wrongBundleVersion, CORE_VERSION, 'release'), 'manifest');
   expectRefusal(() => validateCoreManifest({ ...manifest, wheel: { ...manifest.wheel,
     url: manifest.wheel.url.replace('/v0.1.0/', '/v0.1.1/') } }, CORE_VERSION, 'release'), 'manifest');
+});
+
+test('metadata reports desktop pin fields and hashes the producer manifest bytes without rewriting its schema', async () => {
+  const raw = await readFile(coreProducerManifestFixture);
+  const manifest = JSON.parse(raw);
+  const target = coreTarget();
+  const packageJson = JSON.parse(await readFile(path.join(connectorPackage, 'package.json'), 'utf8'));
+  const buildPackage = { ...packageJson, sidevoice: { channel: 'release', build_seq: 29, connector_sha: 'c'.repeat(40) } };
+  const metadata = connectorMetadata({ buildPackage, manifest, manifestSha256: sha256(raw), target, sea: true });
+  const version = versionMetadata({ buildPackage, target, sea: true });
+  assert.deepEqual(version, { ok: true, version: VERSION, target: `${target.os}-${target.arch}`, channel: 'release',
+    connector_sha: 'c'.repeat(40), build_seq: 29, format: 'sea', sea: true });
+  assert.deepEqual(Object.keys(metadata), ['ok', 'connector', 'embedded_core', 'protocols']);
+  assert.deepEqual(metadata.connector, { version: VERSION, sha: 'c'.repeat(40), channel: 'release', build_seq: 29,
+    target: `${target.os}-${target.arch}`, format: 'sea', sea: true, link_min: 2, link_max: 2 });
+  assert.equal(metadata.embedded_core.version, CORE_VERSION);
+  assert.equal(metadata.embedded_core.manifest_sha256, sha256(raw));
+  assert.equal(metadata.embedded_core.api, 1);
+  assert.equal(metadata.embedded_core.link, 2);
+  const pinned = manifest.bundles.find(asset => asset.os === target.os && asset.arch === target.arch);
+  assert.deepEqual(metadata.embedded_core.assets, pinned ? [{ name: path.posix.basename(new URL(pinned.url).pathname),
+    url: pinned.url, sha256: pinned.sha256, size: pinned.size }] : []);
+  assert.deepEqual(metadata.protocols, { metadata: 'sidevoice-metadata-v1', progress: 'sidevoice-progress-jsonl-v1' });
+
+  const nightly = { bundles: manifest.bundles.map(asset => ({ ...asset, url: asset.url.replace('/v0.1.0/', '/nightly/') })),
+    wheel: { ...manifest.wheel, url: manifest.wheel.url.replace('/v0.1.0/', '/nightly/') } };
+  assert.equal(connectorMetadata({ buildPackage: { ...buildPackage, sidevoice: { ...buildPackage.sidevoice, channel: 'nightly' } },
+    manifest: nightly, manifestSha256: 'd'.repeat(64), target, sea: true }).connector.channel, 'nightly');
+});
+
+test('verified asset downloads emit stable byte progress before a named digest refusal', async () => {
+  const manifest = JSON.parse(await readFile(coreProducerManifestFixture, 'utf8'));
+  const bytes = Buffer.from('tampered wheel fixture');
+  const events = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (rawUrl, options = {}) => {
+    const url = String(rawUrl);
+    const body = url.endsWith('.sigstore.json') ? Buffer.from('{}') : bytes;
+    const response = new Response(body, { status: 200, headers: { 'content-length': String(body.length) } });
+    Object.defineProperty(response, 'url', { value: url });
+    if (options.signal) options.signal.addEventListener('abort', () => response.body?.cancel().catch(() => {}), { once: true });
+    return response;
+  };
+  try {
+    await assert.rejects(() => fetchVerifiedCoreWheel({ manifest, coreVersion: CORE_VERSION, directory: scratch,
+      channel: 'release', tufCachePath: path.join(scratch, 'progress-tuf'), progressEvent: event => events.push(event) }),
+    error => error.key === 'install.authenticity' && error.check === 'sha256');
+  } finally { globalThis.fetch = originalFetch; }
+  assert.ok(events.some(event => event.step === 'download' && event.done === 0));
+  assert.deepEqual(events.filter(event => event.step === 'download').at(-1), { step: 'download', done: bytes.length, total: bytes.length });
+  assert.ok(events.some(event => event.step === 'verify' && event.done === null && event.total === null));
+});
+
+test('SIGINT aborts the isolated Sigstore/TUF verifier before the install commit point', async () => {
+  const hooks = path.join(scratch, 'cancel-verifier-hooks');
+  const directory = path.join(scratch, 'cancel-verifier-download');
+  await mkdir(hooks, { recursive: true, mode: 0o700 });
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await writeFile(path.join(hooks, 'pause-verify-core'), '');
+  const bytes = Buffer.from('test verifier cancellation payload');
+  const artifactUrl = 'https://github.com/sidevoice/sidevoice-core/releases/download/v0.1.0/sidevoice_core-0.1.0-py3-none-any.whl';
+  const manifest = { bundles: [], wheel: { url: artifactUrl, sha256: sha256(bytes) } };
+  const originalFetch = globalThis.fetch, originalHooks = process.env.SIDEVOICE_TEST_HOOKS;
+  const controller = new AbortController();
+  globalThis.fetch = async rawUrl => {
+    const url = String(rawUrl), body = url.endsWith('.sigstore.json') ? Buffer.from('{}') : bytes;
+    const response = new Response(body, { status: 200, headers: { 'content-length': String(body.length) } });
+    Object.defineProperty(response, 'url', { value: url });
+    return response;
+  };
+  process.env.SIDEVOICE_TEST_HOOKS = hooks;
+  try {
+    const verifying = fetchVerifiedCoreWheel({ manifest, coreVersion: CORE_VERSION, directory, channel: 'release',
+      tufCachePath: path.join(scratch, 'cancel-verifier-tuf'), signal: controller.signal, verifierEntry: path.join(connectorPackage, 'cli.mjs') });
+    await waitForPath(path.join(hooks, 'paused-verify-core'));
+    controller.abort();
+    await assert.rejects(verifying, error => error.key === 'install.cancelled');
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalHooks === undefined) delete process.env.SIDEVOICE_TEST_HOOKS;
+    else process.env.SIDEVOICE_TEST_HOOKS = originalHooks;
+  }
 });
 
 test('missing platform bundle falls back to the verified wheel and reports keyed no-uv or tampered-wheel refusals', async () => {
@@ -470,6 +571,26 @@ test('native SEA runs directly, answers MCP stdio and self-spawns its connector 
   const version = spawnSync(sea, ['--version'], { encoding: 'utf8', timeout: 10_000 });
   assert.equal(version.status, 0, version.stderr);
   assert.equal(version.stdout.trim(), VERSION);
+  const versionJson = spawnSync(sea, ['--version', '--json'], { encoding: 'utf8', timeout: 10_000 });
+  assert.equal(versionJson.status, 0, versionJson.stderr);
+  const versionInfo = JSON.parse(versionJson.stdout.trim());
+  assert.deepEqual(Object.keys(versionInfo), ['ok', 'version', 'target', 'channel', 'connector_sha', 'build_seq', 'format', 'sea']);
+  assert.equal(versionInfo.ok, true);
+  assert.equal(versionInfo.version, VERSION);
+  assert.equal(versionInfo.target, targetName);
+  assert.equal(versionInfo.sea, true);
+  assert.equal(versionInfo.format, 'sea');
+  assert.match(versionInfo.connector_sha, /^[0-9a-f]{40}$/);
+  const metadataResult = spawnSync(sea, ['metadata', '--json'], { encoding: 'utf8', timeout: 10_000 });
+  assert.equal(metadataResult.status, 0, metadataResult.stderr);
+  const metadata = JSON.parse(metadataResult.stdout.trim());
+  assert.equal(metadata.ok, true);
+  assert.equal(metadata.connector.sha, versionInfo.connector_sha);
+  assert.equal(metadata.connector.target, targetName);
+  assert.equal(metadata.connector.sea, true);
+  assert.equal(metadata.connector.version, versionInfo.version);
+  assert.equal(metadata.embedded_core.version, CORE_VERSION);
+  assert.deepEqual(metadata.protocols, { metadata: 'sidevoice-metadata-v1', progress: 'sidevoice-progress-jsonl-v1' });
 
   const dataDir = path.join(scratch, 'mcp-machine'), emptyPath = path.join(scratch, 'empty-path');
   await mkdir(emptyPath, { recursive: true });
@@ -521,8 +642,18 @@ test('native SEA uninstalls a no-core, no-agent install and removes all non-lock
   Object.assign(env, { HOME: home, XDG_DATA_HOME: path.join(home, 'xdg'), XDG_CONFIG_HOME: path.join(home, 'config'),
     SIDEVOICE_SERVICE_MANAGER: 'none' });
 
-  const installed = spawnSync(sea, ['install', '--no-core', '--no-agents'], { env, encoding: 'utf8', timeout: 120_000 });
+  const installed = spawnSync(sea, ['install', '--no-core', '--no-agents', '--json', '--progress=jsonl'], { env, encoding: 'utf8', timeout: 120_000 });
   assert.equal(installed.status, 0, installed.stderr || installed.stdout);
+  assert.equal(installed.stdout.trim().split(/\r?\n/).length, 1, 'stdout contains only the final install JSON');
+  assert.equal(JSON.parse(installed.stdout.trim()).ok, true);
+  const progress = installed.stderr.trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+  assert.ok(progress.length >= 3, 'install emits structured lifecycle progress');
+  assert.ok(progress.every(event => event.type === 'progress' && ['download', 'verify', 'stage', 'service-start',
+    'wait-calls', 'wait-lock', 'commit', 'pairing', 'rollback'].includes(event.step)));
+  assert.ok(progress.some(event => event.step === 'stage'));
+  assert.ok(progress.some(event => event.step === 'commit'));
+  assert.ok(progress.some(event => event.step === 'pairing'));
+  assert.ok(installed.stderr.trim().split(/\r?\n/).every(line => Buffer.byteLength(line) <= 1024), 'each progress record is bounded');
   const dataDir = dataDirOf(env);
   const installation = JSON.parse(await readFile(nodeFiles(dataDir).install, 'utf8'));
   assert.equal(installation.command.length, 1, 'a SEA install records the one-element executable command');
@@ -538,6 +669,53 @@ test('native SEA uninstalls a no-core, no-agent install and removes all non-lock
   const leftovers = await readdir(dataDir);
   const permanent = new Set(['install.lock', 'connector.lock', 'node-stopped.json']);
   assert.deepEqual(leftovers.filter(name => !permanent.has(name)), [], 'only the permanent locks and stop marker remain');
+});
+
+test('connector CLI acknowledges pre-commit cancellation and reports the committed outcome after SIGINT', async () => {
+  const runPausedInstall = async ({ name, resume }) => {
+    const home = path.join(scratch, `${name}-home`), hooks = path.join(scratch, `${name}-hooks`);
+    await mkdir(hooks, { recursive: true, mode: 0o700 });
+    await writeFile(path.join(hooks, `pause-${name}`), '');
+    const env = testInstallEnv(home, { SIDEVOICE_TEST_HOOKS: hooks, SIDEVOICE_INSTALL_FROM_SOURCE: '1' });
+    const child = spawn(process.execPath, [path.join(connectorPackage, 'cli.mjs'), 'install', '--no-core', '--no-agents', '--json', '--progress=jsonl'],
+      { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    child.stdout.setEncoding('utf8').on('data', chunk => { stdout += chunk; });
+    child.stderr.setEncoding('utf8').on('data', chunk => { stderr += chunk; });
+    const closed = new Promise(resolve => child.once('close', (code, childSignal) => resolve({ code, childSignal })));
+    try { await waitForPath(path.join(hooks, `paused-${name}`), 60_000); }
+    catch (error) {
+      child.kill('SIGKILL');
+      await closed;
+      throw new Error(`${error.message}; CLI stdout=${stdout}; stderr=${stderr}`);
+    }
+    child.kill('SIGINT');
+    if (resume) {
+      await new Promise(resolve => setTimeout(resolve, 75));
+      await writeFile(path.join(hooks, `resume-${name}`), '');
+    }
+    const outcome = await closed;
+    assert.equal(outcome.childSignal, null, 'the CLI handles SIGINT and returns a final JSON outcome');
+    assert.equal(stdout.trim().split(/\r?\n/).length, 1, 'stdout contains exactly one final JSON object');
+    const json = JSON.parse(stdout.trim());
+    const events = stderr.trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line));
+    assert.ok(events.every(event => event.type === 'progress' && Buffer.byteLength(JSON.stringify(event)) <= 1024));
+    return { home, env, json, events, code: outcome.code };
+  };
+
+  const before = await runPausedInstall({ name: 'install-before-commit', resume: false });
+  assert.equal(before.code, 1);
+  assert.equal(before.json.ok, false);
+  assert.equal(before.json.error.key, 'install.cancelled');
+  assert.ok(before.events.some(event => event.step === 'stage'));
+  assert.equal(existsSync(releaseLayout(before.env).current), false, 'cancelled candidate never becomes current');
+  assert.deepEqual(await readdir(releaseLayout(before.env).releases), [], 'staged candidate is cleaned after cancellation');
+
+  const after = await runPausedInstall({ name: 'install-after-commit', resume: true });
+  assert.equal(after.code, 0);
+  assert.equal(after.json.ok, true, 'SIGINT after commit does not report a cancellation');
+  assert.ok(existsSync(releaseLayout(after.env).current), 'the committed install completes and remains selected');
+  assert.ok(after.events.some(event => event.step === 'commit'));
 });
 
 test('SEA private Cursor SQLite helper reads a chat without treating the executable as node -e', async t => {

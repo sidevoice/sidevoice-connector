@@ -5,12 +5,18 @@ import { pipeline, finished } from 'node:stream/promises';
 import { createZstdDecompress } from 'node:zlib';
 import tar from 'tar-stream';
 import { refusal } from './core-attestation.mjs';
+import { keyed } from './i18n.mjs';
 
 const MAX_ARCHIVE_ENTRIES = 100_000;
 const MAX_UNPACKED_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_LINK_HOPS = 4096;
 const inside = (root, destination) => destination === root || destination.startsWith(root + path.sep);
-const drain = async stream => { stream.resume(); await finished(stream); };
+const drain = async (stream, signal) => {
+  if (signal?.aborted) throw keyed('install.cancelled');
+  stream.resume();
+  try { await finished(stream, signal ? { signal } : undefined); }
+  catch (error) { if (signal?.aborted) throw keyed('install.cancelled'); throw error; }
+};
 
 function cleanArchivePath(name, root) {
   if (typeof name !== 'string' || !name || name.includes('\0') || name.includes('\\') || name.startsWith('/')) {
@@ -70,7 +76,7 @@ function validateLinkTargets(root, links) {
 }
 
 /** Stream a zstd-compressed tar into a fresh private staging directory. Links are deferred until files finish. */
-export async function unpackCoreArchive(archivePath, destination) {
+export async function unpackCoreArchive(archivePath, destination, { signal } = {}) {
   const root = path.resolve(destination);
   mkdirSync(root, { recursive: false, mode: 0o700 });
   const seen = new Set(), links = [];
@@ -79,6 +85,7 @@ export async function unpackCoreArchive(archivePath, destination) {
   let entryError = null;
   extractor.on('entry', (header, stream, next) => {
     (async () => {
+      if (signal?.aborted) throw keyed('install.cancelled');
       if (++entryCount > MAX_ARCHIVE_ENTRIES) throw refusal('archive-size', 'archive has too many entries');
       const { normalized, full, parts } = cleanArchivePath(header.name, root);
       if (seen.has(normalized)) throw refusal('archive-path', `duplicate archive path ${normalized}`);
@@ -92,7 +99,7 @@ export async function unpackCoreArchive(archivePath, destination) {
           if (error.code !== 'ENOENT') throw error;
           mkdirSync(full, { mode: 0o700 });
         }
-        await drain(stream);
+        await drain(stream, signal);
         return;
       }
       if (header.type === 'symlink') {
@@ -102,7 +109,7 @@ export async function unpackCoreArchive(archivePath, destination) {
         }
         const resolvedTarget = path.resolve(path.dirname(full), ...target.split('/'));
         if (!inside(root, resolvedTarget)) throw refusal('archive-link', `symlink escapes the staging directory: ${normalized}`);
-        await drain(stream);
+        await drain(stream, signal);
         links.push({ full, normalized, target });
         return;
       }
@@ -112,11 +119,15 @@ export async function unpackCoreArchive(archivePath, destination) {
       unpackedBytes += header.size;
       if (unpackedBytes > MAX_UNPACKED_BYTES) throw refusal('archive-size', 'unpacked core exceeds the size limit');
       const mode = (Number(header.mode) & 0o111) ? 0o755 : 0o644;
-      await pipeline(stream, createWriteStream(full, { flags: 'wx', mode }));
+      await pipeline(stream, createWriteStream(full, { flags: 'wx', mode }), ...(signal ? [{ signal }] : []));
       if (lstatSync(full).size !== header.size) throw refusal('archive-size', `truncated tar entry ${normalized}`);
     })().then(next, error => { entryError = error; next(error); });
   });
-  await pipeline(createReadStream(archivePath), createZstdDecompress(), extractor).catch(error => { throw entryError ?? error; });
+  await pipeline(createReadStream(archivePath), createZstdDecompress(), extractor, ...(signal ? [{ signal }] : [])).catch(error => {
+    if (signal?.aborted) throw keyed('install.cancelled');
+    throw entryError ?? error;
+  });
+  if (signal?.aborted) throw keyed('install.cancelled');
   if (entryError) throw entryError;
   validateLinkTargets(root, links);
   for (const link of links) {

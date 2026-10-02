@@ -140,7 +140,8 @@ for (const kind of ['launchd', 'systemd']) {
       // Start: the marker goes, both jobs run again, and the façade's conversation is registered again by itself.
       const started = await node.service('start');
       assert.equal(started.ok, true, JSON.stringify(started));
-      assert.equal(started.state, 'running');
+      const startedStatus = await node.status(s => s.state === 'running', 60_000);
+      assert.equal(startedStatus.state, 'running', JSON.stringify({ started, startedStatus }));
       assert.equal(existsSync(path.join(node.dataDir, 'node-stopped.json')), false);
       await until(() => node.said().some(line => line.event === 'binding.register' && line.pid === node.pid('core') && line.data.client_ref === 'thread-s'), 20_000);
       // Restart (the person's «Reintentar»): the core job only, a new process.

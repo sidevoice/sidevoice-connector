@@ -12,3 +12,6 @@ export const BUILD_PACKAGE_DIR = path.dirname(fileURLToPath(import.meta.url));
 export const CORE_MANIFEST = typeof __SIDEVOICE_CORE_MANIFEST_JSON__ === 'string'
   ? JSON.parse(__SIDEVOICE_CORE_MANIFEST_JSON__)
   : null;
+export const CORE_MANIFEST_SHA256 = typeof __SIDEVOICE_CORE_MANIFEST_SHA256__ === 'string'
+  ? __SIDEVOICE_CORE_MANIFEST_SHA256__
+  : null;

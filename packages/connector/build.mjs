@@ -17,20 +17,26 @@ const original = JSON.parse(await readFile(packagePath, 'utf8'));
 const shipped = { ...original };
 delete shipped.devDependencies;
 
-// Build channel/order metadata is copied into ESM and compiled into the SEA executable.
-if (process.env.SIDEVOICE_CHANNEL || process.env.SIDEVOICE_BUILD_SEQ) {
-  const channel = process.env.SIDEVOICE_CHANNEL || 'release';
-  if (!['release', 'nightly'].includes(channel)) throw new Error(`SIDEVOICE_CHANNEL is ${channel}: release or nightly`);
-  const build_seq = Number(process.env.SIDEVOICE_BUILD_SEQ || 0);
-  if (!Number.isSafeInteger(build_seq) || build_seq < 0) throw new Error(`SIDEVOICE_BUILD_SEQ is ${process.env.SIDEVOICE_BUILD_SEQ}: a non-negative integer`);
-  shipped.sidevoice = { channel, build_seq };
+let connectorSha = process.env.SIDEVOICE_CONNECTOR_SHA || process.env.GITHUB_SHA || null;
+if (!connectorSha) {
+  try { connectorSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim(); }
+  catch { connectorSha = null; }
 }
+if (connectorSha !== null && !/^[0-9a-f]{40}$/.test(connectorSha)) throw new Error('connector build SHA must be 40 lowercase hexadecimal characters');
+
+// Build channel/order metadata is copied into ESM and compiled into the SEA executable.
+const channel = process.env.SIDEVOICE_CHANNEL || 'release';
+if (!['release', 'nightly'].includes(channel)) throw new Error(`SIDEVOICE_CHANNEL is ${channel}: release or nightly`);
+const build_seq = Number(process.env.SIDEVOICE_BUILD_SEQ || 0);
+if (!Number.isSafeInteger(build_seq) || build_seq < 0) throw new Error(`SIDEVOICE_BUILD_SEQ is ${process.env.SIDEVOICE_BUILD_SEQ}: a non-negative integer`);
+shipped.sidevoice = { ...(shipped.sidevoice || {}), channel, build_seq, connector_sha: connectorSha };
 
 if (process.env.SIDEVOICE_REQUIRE_CORE_MANIFEST === '1' && !process.env.SIDEVOICE_CORE_MANIFEST) {
   throw new Error('SIDEVOICE_CORE_MANIFEST is required for release and nightly builds');
 }
 
 let manifestText = null;
+let manifestSha256 = null;
 if (process.env.SIDEVOICE_CORE_MANIFEST) {
   const manifestPath = path.resolve(process.env.SIDEVOICE_CORE_MANIFEST);
   const sidecarPath = process.env.SIDEVOICE_CORE_MANIFEST_SIGSTORE
@@ -44,6 +50,7 @@ if (process.env.SIDEVOICE_CORE_MANIFEST) {
     tufCachePath: process.env.SIDEVOICE_TUF_CACHE || path.join(os.homedir(), '.sidevoice', 'sigstore-build'), label: 'core-manifest.json' });
   // Preserve the signed manifest's exact bytes in the generated JavaScript string.
   manifestText = raw.toString('utf8');
+  manifestSha256 = (await import('node:crypto')).createHash('sha256').update(raw).digest('hex');
 }
 
 await rm(out, { recursive: true, force: true });
@@ -59,6 +66,7 @@ await build({
   legalComments: 'none',
   define: {
     __SIDEVOICE_CORE_MANIFEST_JSON__: JSON.stringify(manifestText ?? 'null'),
+    __SIDEVOICE_CORE_MANIFEST_SHA256__: JSON.stringify(manifestSha256 ?? 'null'),
   },
 });
 
@@ -95,6 +103,7 @@ if (process.env.SIDEVOICE_BUILD_SEA === '1') {
     define: {
       __SIDEVOICE_PACKAGE_JSON__: JSON.stringify(JSON.stringify(shipped)),
       __SIDEVOICE_CORE_MANIFEST_JSON__: JSON.stringify(manifestText ?? 'null'),
+      __SIDEVOICE_CORE_MANIFEST_SHA256__: JSON.stringify(manifestSha256 ?? 'null'),
       'import.meta.url': JSON.stringify('file:///sidevoice-runtime/sea.mjs'),
     },
   });

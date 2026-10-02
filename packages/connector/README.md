@@ -105,6 +105,29 @@ the checkout and from the bundle. `SIDEVOICE_CORE_WHEEL=<wheel> npm run build`
 puts the pinned core's wheel inside `dist/core/`, so the published package
 installs it without any index.
 
+## Machine-readable install and build identity
+
+`install --json --progress=jsonl` keeps the install result as exactly one JSON object on stdout and writes bounded JSON
+Lines progress records to stderr (`sidevoice-progress-jsonl-v1`). Every progress record is
+`{type:"progress",step,done,total}`. Stable steps are `download`, `verify`, `stage`, `service-start`, `wait-calls`,
+`wait-lock`, `commit`, `pairing`, and `rollback`. `done` and `total` are byte counts for core artifact downloads (the
+Sigstore sidecar is not counted); other steps use `null` for both, and unknown download totals use `null` for `total`.
+SIGINT before the commit point returns one final
+`install.cancelled` JSON result and leaves the previous selection in place. Once `current` is switched, SIGINT is
+acknowledged by completing verification or rollback and the final JSON reports that actual result.
+
+`--version --json` reports `version`, `target`, `channel`, `connector_sha`, `build_seq`, `format`, and `sea`, with
+`ok: true`; plain `--version` remains the package version. `metadata --json` reports the `sidevoice-metadata-v1`
+identity. `connector` includes those build fields and `link_min`/`link_max`. `embedded_core` includes the pinned core
+version, SHA-256 of the exact embedded signed manifest bytes, current-target bundle assets (`name`, `url`, `sha256`,
+`size`), API and link ids. `protocols` reports the metadata and progress protocol ids.
+
+The signed manifest stays byte-for-byte as produced by sidevoice-core: its `{bundles,wheel}` schema has no version
+field. Exact asset URLs and versioned filenames bind it to this connector's `CORE_VERSION`, and the manifest digest
+also binds the wheel entry. The desktop pin currently validates a top-level manifest `version`; its `validate_ready()`
+must be aligned with the actual producer schema before a production pin can pass. A desktop pin for a no-bundle target
+also needs a size-bearing wheel asset contract because the current manifest producer does not include wheel size.
+
 R4 adds a second output and leaves the npm ESM entry point in place. On a native
 runner with Node `v22.23.3`, `npm run build:sea -w @sidevoice/uplink` emits
 `dist-sea/<target>/sidevoice` for macOS arm64 and Linux x86_64/arm64. To make an

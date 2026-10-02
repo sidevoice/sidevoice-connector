@@ -19,6 +19,7 @@ export const en = {
 
   // Install keys (the core's runtime could not be had).
   'install.no-bundle': 'There is no signed core build for this platform and uv is not installed: install uv (https://docs.astral.sh/uv/) and try again.',
+  'install.cancelled': 'Installation was cancelled before the new release was committed.',
   'install.node-runtime-missing': 'The Node runtime needed to start this older Sidevoice release is missing from the installation record.',
   'install.network': 'The core could not be downloaded: the network is not reachable.',
   'install.proxy': 'The core could not be downloaded: a proxy re-signs HTTPS and its certificate is not trusted.',

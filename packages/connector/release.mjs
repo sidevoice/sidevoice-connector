@@ -144,7 +144,8 @@ const safeList = dir => { try { return readdirSync(dir); } catch { return []; } 
 /** Step 3: `releases/<id>` made whole — this package (copied; a checkout linked), the core runtime installed or reused
  *  and linked as `core`, the core's `--self-test` and the connector's `--version` passing on what was staged,
  *  `release.json` written, everything flushed — and only then renamed into place. A complete one is reused. */
-export async function stage(env, next, { dataDir, core = true, log = () => {}, progress = () => {} }) {
+export async function stage(env, next, { dataDir, core = true, log = () => {}, progress = () => {}, signal,
+  progressEvent = () => {} }) {
   const { root, releases } = releaseLayout(env);
   verifyPrivateDir(root, { create: true });
   verifyPrivateDir(releases, { create: true });
@@ -153,6 +154,9 @@ export async function stage(env, next, { dataDir, core = true, log = () => {}, p
   if (existing?.id === next.id) return existing;
   const temporary = `${final}.tmp-${randomBytes(4).toString('hex')}`;
   mkdirSync(temporary, { mode: 0o700 });
+  progressEvent({ step: 'stage', done: null, total: null });
+  try {
+  if (signal?.aborted) throw keyed('install.cancelled');
   if (next.source) symlinkSync(next.source, path.join(temporary, 'dist'));
   else if (runningAsSea()) {
     mkdirSync(path.join(temporary, 'dist'), { mode: 0o700 });
@@ -167,18 +171,19 @@ export async function stage(env, next, { dataDir, core = true, log = () => {}, p
   let runtime = { id: null };
   if (core) {
     progress(t('install.progress.core', { version: CORE_VERSION }));
-    runtime = await installCoreRuntime({ dataDir, env, channel: next.channel, log: line => progress('  ' + line),
+    runtime = await installCoreRuntime({ dataDir, env, channel: next.channel, signal, progressEvent, log: line => progress('  ' + line),
       progress: line => { if (line.trim() && !/^\s*[+-] /.test(line)) progress('    uv: ' + line.trim()); } });
     if (runtime.venv) symlinkSync(runtime.venv, path.join(temporary, 'core'));
     else if (runtime.kind === 'bundle') symlinkSync(runtime.root, path.join(temporary, 'core'));
     else { mkdirSync(path.join(temporary, 'core', 'bin'), { recursive: true }); symlinkSync(path.resolve(runtime.bin), path.join(temporary, 'core', 'bin', 'sidevoice-core')); }
     const stagedCore = runtime.kind === 'bundle' ? path.join(temporary, 'core', 'python', 'bin', 'python3') : path.join(temporary, 'core', 'bin', 'sidevoice-core');
-    selfTest(stagedCore, env, { bundle: runtime.kind === 'bundle' });
+    await selfTest(stagedCore, env, { bundle: runtime.kind === 'bundle', signal });
   }
   const reported = runningAsSea()
     ? spawnSync(path.join(temporary, 'dist', 'sidevoice'), ['--version'], { encoding: 'utf8', timeout: 30_000 })
     : spawnSync(process.execPath, [path.join(temporary, 'dist', 'cli.mjs'), '--version'], { encoding: 'utf8', timeout: 30_000 });
   if (reported.stdout.trim() !== next.connector) throw keyed('install.self-test', { detail: `the staged connector says ${reported.stdout.trim() || reported.stderr.trim() || '?'}, not ${next.connector}` });
+  if (signal?.aborted) throw keyed('install.cancelled');
   const release = { id: next.id, connector: next.connector, core: next.core, core_build: runtime.id,
     channel: next.channel, build_seq: next.build_seq, format: next.format ?? (runningAsSea() ? 'sea' : 'esm'),
     ...(next.source ? { source: next.source } : {}) };
@@ -188,6 +193,7 @@ export async function stage(env, next, { dataDir, core = true, log = () => {}, p
   renameSync(temporary, final);
   syncDir(releases);
   return release;
+  } finally { rmSync(temporary, { recursive: true, force: true }); }
 }
 
 /** Step 5: `previous` ← the last verified release (never a selection nobody saw run — one an installer that died left

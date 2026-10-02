@@ -136,7 +136,9 @@ test('concurrent installers — two genuinely built packages, the app\'s and npx
   // Same version, stamped by the build as CI stamps a nightly: the higher run number wins, whichever runs last.
   const two = machine('none');
   const older = builtAs('0.6.0', { SIDEVOICE_CHANNEL: 'nightly', SIDEVOICE_BUILD_SEQ: '10' }), newer = builtAs('0.6.0', { SIDEVOICE_CHANNEL: 'nightly', SIDEVOICE_BUILD_SEQ: '12' });
-  assert.deepEqual(JSON.parse(readFileSync(path.join(path.dirname(newer), 'package.json'), 'utf8')).sidevoice, { channel: 'nightly', build_seq: 12 }, 'stamped into the shipped manifest');
+  const stamped = JSON.parse(readFileSync(path.join(path.dirname(newer), 'package.json'), 'utf8')).sidevoice;
+  assert.deepEqual({ channel: stamped.channel, build_seq: stamped.build_seq }, { channel: 'nightly', build_seq: 12 }, 'stamped into the shipped manifest');
+  assert.match(stamped.connector_sha, /^[0-9a-f]{40}$/, 'the shipped package carries the source commit identity');
   await Promise.all([older, newer].map(cli => new Promise(resolve => spawn(process.execPath, [cli, 'install', '--no-agents', '--no-core', '--json'], { env: two.env, stdio: 'ignore' }).on('exit', resolve))));
   assert.equal(realpathSync(path.join(two.R, 'current')), path.join(realpathSync(two.R), 'releases', '0.6.0-nightly.12-nocore'), 'a nightly build is a release of its own');
   assert.equal(two.run(older, ['install', '--no-agents', '--no-core']).answer.action, 'noop');

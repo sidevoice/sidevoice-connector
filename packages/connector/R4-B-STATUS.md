@@ -43,3 +43,38 @@ Focused regressions pass locally (5/5 for producer schema, fallback, and nightly
 - Core selection now uses a signed bundle only when the manifest contains the current platform entry. Missing or unmapped bundle targets use the signed wheel path. With no uv, the public install returns the keyed `install.no-bundle`; with uv, the wheel and its sidecar must still pass digest and Sigstore verification.
 - Actual R4-a bundle/wheel installation, no-runtime clean account, and macOS quarantine checks remain a later gate until genuine assets and sidecars are available.
 - Focused follow-up regressions pass 5/5; the complete connector suite passes 144 tests with 2 separate-core skips. Rebuilt on Node `v22.23.3` as Linux x86_64 SEA (`127,470,784` executable bytes, `2,597,643` preparation-blob bytes, `manifestEmbedded: false`); the rebuilt executable passes direct-run and uninstall regressions. Exact-head PR CI and independent Astra re-review are pending.
+
+## Desktop CLI handoff work after `e1a2dda`
+
+The connector implements the field names in the active desktop WIP's `pin.rs` and `connector-pin.json` contract:
+`--version --json` reports `ok`, `version`, `target`, `channel`, `connector_sha`, and `build_seq`; `metadata --json`
+reports connector `{version,sha,channel,build_seq,link_min,link_max}`, embedded core `{version,manifest_sha256,assets,api,link}`,
+and the exact `sidevoice-metadata-v1` / `sidevoice-progress-jsonl-v1` identifiers. Install progress uses only the desktop's
+stable step enum, bounded JSONL on stderr, and a single final JSON result on stdout. Downloads report artifact-byte
+counters; non-download work reports null counters. Pre-commit SIGINT returns keyed `install.cancelled`; after the
+selection switch it is ignored while verification or rollback produces the true final result.
+
+The signed-manifest identity has one unresolved cross-repository contract mismatch. Core PR #34 produces exactly
+`{bundles,wheel}`. Connector embeds those exact signed bytes, hashes them, and reports `CORE_VERSION` separately; it
+does not add an unsigned `version` property. Desktop `ConnectorPin::validate_ready()` currently insists that the
+decoded manifest contains `version == core_version`, so it cannot accept this authentic producer output as written.
+The safe options are: (1) update desktop validation to accept the producer's exact two-key schema and bind its version
+through the pinned `core_version`, exact versioned asset URLs, artifact hashes, and manifest SHA-256; or (2) revise the
+core producer schema, re-sign the changed manifest and assets, and update both consumer contracts. Option 1 preserves
+the producer's current signed bytes and is the connector's recommendation. Do not synthesize `version` into the
+manifest or its digest. Desktop pins also require `size` for every `CoreAssetPin`; the core wheel record currently has
+no size. The shipped macOS target's bundle record has the required size, but a desktop pin for a no-bundle target would
+need either a size-bearing wheel field from core or an explicitly optional wheel-size contract.
+
+Metadata lists only the bundle record for the executable's own target. Its manifest digest still binds all bundle and
+wheel records. This matches desktop pinning to the macOS arm64 executable; fallback-wheel installs on other/no-bundle
+targets remain covered by connector tests but cannot produce the current desktop `CoreAssetPin` array until its
+size contract is resolved.
+
+Local verification on Node `v22.23.3`, Linux x86_64: `npm run build:sea -w @sidevoice/uplink` produced a 127,470,784-byte
+executable and a 2,611,620-byte SEA blob; `manifestEmbedded: false`. `npm test -w @sidevoice/uplink` passed 148 tests,
+skipped the 2 separate-core `.venv` interop cases, and failed none. Focused runs also passed the metadata/progress,
+Sigstore verifier abort, install cancellation, and native SEA regressions. The local SEA remains manifestless because
+genuine R4-a assets and sidecars are unavailable; synthetic producer fixtures and the public Sigstore fixture are test
+evidence only, not R4-a integration. Fresh exact-head CI and independent GPT Sol review are pending. No merge or release
+was made.
