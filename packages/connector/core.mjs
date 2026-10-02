@@ -60,9 +60,9 @@ export function coreSpec(env = process.env) {
 }
 
 /** Whether this build carries a signed bundle for the current platform and can install its core without uv. */
-export function hasEmbeddedCoreBundle(manifest = CORE_MANIFEST, target = coreTarget()) {
+export function hasEmbeddedCoreBundle(manifest = CORE_MANIFEST, target = coreTarget(), channel = BUILD_PACKAGE.sidevoice?.channel || 'release') {
   if (!manifest || !target) return false;
-  validateCoreManifest(manifest, CORE_VERSION);
+  validateCoreManifest(manifest, CORE_VERSION, channel);
   return manifest.bundles.some(item => item.os === target.os && item.arch === target.arch);
 }
 
@@ -251,7 +251,7 @@ function syncRuntimeTree(dir) {
 }
 
 async function installVerifiedBundle({ dataDir, env, log, progress, channel, target }) {
-  validateCoreManifest(CORE_MANIFEST, CORE_VERSION);
+  validateCoreManifest(CORE_MANIFEST, CORE_VERSION, channel);
   const entry = CORE_MANIFEST.bundles.find(item => item.os === target.os && item.arch === target.arch);
   if (!entry) throw refusal('platform', `the embedded manifest has no core bundle for ${target.os}/${target.arch}`);
   const id = `${CORE_VERSION}-bundle-${entry.sha256.slice(0, 12)}`;
@@ -283,7 +283,7 @@ async function installVerifiedBundle({ dataDir, env, log, progress, channel, tar
 }
 
 async function installVerifiedWheel({ dataDir, env, log, progress, channel }) {
-  validateCoreManifest(CORE_MANIFEST, CORE_VERSION);
+  validateCoreManifest(CORE_MANIFEST, CORE_VERSION, channel);
   const uv = findUv(env);
   if (!uv) throw keyed('install.no-bundle', { platform: `${process.platform}/${process.arch}` });
   verifyPrivateDir(runtimeRoot(dataDir), { create: true });

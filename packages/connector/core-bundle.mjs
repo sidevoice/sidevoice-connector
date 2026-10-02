@@ -27,7 +27,18 @@ function releaseUrl(raw, label) {
   return url;
 }
 
-export function validateCoreManifest(manifest, coreVersion) {
+function coreAssetUrl(raw, label, coreVersion, basename, channel) {
+  const url = releaseUrl(raw, label);
+  const releaseTag = channel === 'release' ? `v${coreVersion}` : channel === 'nightly' ? 'nightly' : null;
+  if (!releaseTag) throw refusal('manifest', `unsupported core manifest channel ${channel}`);
+  const expectedPath = `${URL_PREFIX}${releaseTag}/${basename}`;
+  if (url.pathname !== expectedPath || path.posix.basename(url.pathname) !== basename) {
+    throw refusal('manifest', `${label} filename or release channel does not match the pinned ${channel}`);
+  }
+  return url;
+}
+
+export function validateCoreManifest(manifest, coreVersion, channel = 'release') {
   if (!manifest || manifest.version !== coreVersion || !Array.isArray(manifest.bundles) || !manifest.wheel || typeof manifest.wheel !== 'object') {
     throw refusal('manifest', 'embedded core manifest does not match the connector pin or expected schema');
   }
@@ -40,18 +51,12 @@ export function validateCoreManifest(manifest, coreVersion) {
     if (!allowedTargets.has(key)) throw refusal('manifest', `unsupported core bundle target ${key}`);
     if (seen.has(key)) throw refusal('manifest', `duplicate core bundle target ${key}`);
     seen.add(key);
-    const url = releaseUrl(bundle.url, `core bundle ${key}`);
     const basename = `sidevoice-core-${coreVersion}-${bundle.os}-${bundle.arch}.tar.zst`;
-    if (url.pathname !== `${URL_PREFIX}v${coreVersion}/${basename}` || path.posix.basename(url.pathname) !== basename) {
-      throw refusal('manifest', `core bundle filename does not match ${key}`);
-    }
+    coreAssetUrl(bundle.url, `core bundle ${key}`, coreVersion, basename, channel);
   }
   if (!/^[0-9a-f]{64}$/.test(manifest.wheel.sha256)) throw refusal('manifest', 'the core wheel digest is not lowercase SHA-256');
-  const wheelUrl = releaseUrl(manifest.wheel.url, 'core wheel');
   const wheelBasename = `sidevoice_core-${coreVersion}-py3-none-any.whl`;
-  if (wheelUrl.pathname !== `${URL_PREFIX}v${coreVersion}/${wheelBasename}` || path.posix.basename(wheelUrl.pathname) !== wheelBasename) {
-    throw refusal('manifest', 'core wheel filename does not match the pinned version');
-  }
+  coreAssetUrl(manifest.wheel.url, 'core wheel', coreVersion, wheelBasename, channel);
   return manifest;
 }
 
@@ -111,7 +116,7 @@ async function fetchAndVerify(entry, directory, { channel, tufCachePath, label, 
 }
 
 export async function prepareVerifiedCoreBundle({ manifest, coreVersion, target, directory, channel, tufCachePath }) {
-  validateCoreManifest(manifest, coreVersion);
+  validateCoreManifest(manifest, coreVersion, channel);
   const entry = manifest.bundles.find(item => item.os === target.os && item.arch === target.arch);
   if (!entry) throw refusal('platform', `the signed manifest has no bundle for ${target.os}/${target.arch}`);
   const archive = await fetchAndVerify(entry, directory, { channel, tufCachePath, label: `core bundle ${target.os}/${target.arch}`,
@@ -122,7 +127,7 @@ export async function prepareVerifiedCoreBundle({ manifest, coreVersion, target,
 }
 
 export async function fetchVerifiedCoreWheel({ manifest, coreVersion, directory, channel, tufCachePath }) {
-  validateCoreManifest(manifest, coreVersion);
+  validateCoreManifest(manifest, coreVersion, channel);
   const entry = manifest.wheel;
   return fetchAndVerify(entry, directory, { channel, tufCachePath, label: 'core wheel', maxBytes: MAX_WHEEL_BYTES });
 }

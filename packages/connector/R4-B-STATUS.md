@@ -24,3 +24,15 @@ Branch `feat/r4-single-executable` keeps the npm ESM client and adds a Node 22 C
 - Wheel installation follows §4.5: the wheel is checked against the embedded SHA-256 and Sigstore provenance, then uv applies its configured hash checking to PyPI dependencies. No separate dependency-lock asset is specified by that section.
 
 No minisign path was added. No merge or release was made.
+
+## Astra follow-up on PR #29
+
+The three concrete Astra blockers reported against `ab75dd9faa1a06892478fe3563b20676c787de6a` are addressed in the follow-up changes:
+
+- Uninstall snapshots the release root before deleting it, so one-element SEA commands do not cause a path lookup crash. A native SEA regression performs `install --no-core --no-agents`, then `uninstall --json`, and verifies release files, install state, logs, and credentials are removed; only the permanent locks and stop marker remain.
+- Core manifest validation accepts the exact pinned asset paths under either `/v<version>/` for release or `/nightly/` for nightly, while retaining the GitHub host, HTTPS, asset-name, and channel checks. Wrong-channel, wrong-tag, wrong-name, and query-string cases refuse.
+- npm release/nightly packaging downloads the R4-a manifest and Sigstore sidecar and passes both to the build. The build verifies the sidecar before embedding the signed manifest and refuses production packaging when the manifest input is absent. Main-branch SEA packaging likewise downloads and passes the genuine nightly pair and fails closed if missing.
+
+PR CI does not have R4-a assets: its SEA jobs exercise the public Sigstore/TUF fixture and fail-closed behavior, which tests the packaging boundary but is not genuine R4-a integration. Main-branch production packaging is wired to the R4-a nightly assets; release packaging is wired to the versioned R4-a assets. Repeat the real asset verification and installation checks when those assets are published.
+
+Focused regressions pass locally (4/4, including native SEA cleanup). `npm test -w @sidevoice/uplink` passes 142 tests, skips 2 real-core interop tests because the core `.venv` is absent, and has 0 failures. The SEA exercised here still has no genuine R4-a manifest, so this verifies the public fixture, fail-closed packaging boundary, and lifecycle fix; it does not claim a real R4-a install. PR CI results are recorded after they finish.

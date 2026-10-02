@@ -35,7 +35,30 @@ jobs:
           cache: npm
       - run: test "$(node --version)" = v22.23.3
       - run: npm ci
+      # PR runs use the public Sigstore fixture in test_r4 and deliberately have no R4-a production manifest.
+      # A main build is a production SEA and must embed the genuine signed nightly manifest.
+      - id: core
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DIR="$RUNNER_TEMP/core"
+          gh release download nightly -R sidevoice/sidevoice-core -D "$DIR" -p core-manifest.json -p core-manifest.json.sigstore.json
+          test -s "$DIR/core-manifest.json"
+          test -s "$DIR/core-manifest.json.sigstore.json"
+          echo "manifest=$DIR/core-manifest.json" >> "$GITHUB_OUTPUT"
+          echo "manifest_sigstore=$DIR/core-manifest.json.sigstore.json" >> "$GITHUB_OUTPUT"
+          echo "channel=nightly" >> "$GITHUB_OUTPUT"
+          echo "build_seq=$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "require_manifest=1" >> "$GITHUB_OUTPUT"
       - name: Build this runner's CommonJS SEA
+        env:
+          SIDEVOICE_CORE_MANIFEST: ${{ steps.core.outputs.manifest }}
+          SIDEVOICE_CORE_MANIFEST_SIGSTORE: ${{ steps.core.outputs.manifest_sigstore }}
+          SIDEVOICE_REQUIRE_CORE_MANIFEST: ${{ steps.core.outputs.require_manifest }}
+          SIDEVOICE_CHANNEL: ${{ steps.core.outputs.channel }}
+          SIDEVOICE_BUILD_SEQ: ${{ steps.core.outputs.build_seq }}
         run: npm run build:sea -w @sidevoice/uplink
       - name: Run SEA, Sigstore, TUF, archive and self-spawn tests
         run: npm test -w @sidevoice/uplink

@@ -26,6 +26,10 @@ if (process.env.SIDEVOICE_CHANNEL || process.env.SIDEVOICE_BUILD_SEQ) {
   shipped.sidevoice = { channel, build_seq };
 }
 
+if (process.env.SIDEVOICE_REQUIRE_CORE_MANIFEST === '1' && !process.env.SIDEVOICE_CORE_MANIFEST) {
+  throw new Error('SIDEVOICE_CORE_MANIFEST is required for release and nightly builds');
+}
+
 let manifestText = null;
 if (process.env.SIDEVOICE_CORE_MANIFEST) {
   const manifestPath = path.resolve(process.env.SIDEVOICE_CORE_MANIFEST);
@@ -34,8 +38,8 @@ if (process.env.SIDEVOICE_CORE_MANIFEST) {
   const raw = await readFile(manifestPath);
   const sidecar = await readFile(sidecarPath).catch(() => { throw new Error(`missing signed core manifest sidecar: ${sidecarPath}`); });
   const parsed = JSON.parse(raw.toString('utf8'));
-  validateCoreManifest(parsed, CORE_VERSION);
   const channel = shipped.sidevoice?.channel || 'release';
+  validateCoreManifest(parsed, CORE_VERSION, channel);
   await verifyCoreArtifact({ bytes: raw, bundleBytes: sidecar, channel,
     tufCachePath: process.env.SIDEVOICE_TUF_CACHE || path.join(os.homedir(), '.sidevoice', 'sigstore-build'), label: 'core-manifest.json' });
   // Preserve the signed manifest's exact bytes in the generated JavaScript string.

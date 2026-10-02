@@ -2,7 +2,7 @@ name: CI
 
 # What runs when (RELEASING.md):
 # - pull request: the client's suite on Linux and a dry run of the package. Nothing is packaged.
-# - push to main, manual run: the same, then the npm tarball with the core's wheel inside; a green run on main
+# - push to main, manual run on main: the same, then the npm tarball with the signed core manifest and wheel inside; a green run on main
 #   replaces the `nightly` pre-release.
 # - a release (called by release-please.yml with the tag it created): the same, attached to that draft release;
 #   release-please.yml then takes it to npm and publishes the release.
@@ -168,7 +168,7 @@ jobs:
   package:
     name: npm tarball with the core inside
     needs: client
-    if: github.event_name != 'pull_request'
+    if: ${{ inputs.release-tag || ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04
     outputs:
       # Where the assets go: the release that called this, or the rolling `nightly` pre-release on a push to main.
@@ -182,9 +182,9 @@ jobs:
           node-version: 22
           cache: npm
       - id: kind
-        run: echo "publish=${{ inputs.release-tag && 'release' || (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'nightly' || '' }}" >> "$GITHUB_OUTPUT"
+        run: echo "publish=${{ inputs.release-tag && 'release' || ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main') && 'nightly' || '' }}" >> "$GITHUB_OUTPUT"
       - run: npm ci
-      - name: The core's wheel this version pins (a release takes the core's vX.Y.Z, anything else its nightly)
+      - name: The core's signed manifest and wheel this version pins
         id: core
         env:
           GH_TOKEN: ${{ github.token }}
@@ -194,8 +194,16 @@ jobs:
           CORE_VERSION=$(node --input-type=module -e "import { CORE_VERSION } from './packages/connector/core.mjs'; console.log(CORE_VERSION)")
           CORE_TAG=$([ "$KIND" = release ] && echo "v$CORE_VERSION" || echo nightly)
           WHEEL="sidevoice_core-${CORE_VERSION}-py3-none-any.whl"
+          MANIFEST=core-manifest.json
+          MANIFEST_SIGSTORE=core-manifest.json.sigstore.json
           DIR="$RUNNER_TEMP/core"
-          gh release download "$CORE_TAG" -R sidevoice/sidevoice-core -D "$DIR" -p 'sidevoice_core-*-py3-none-any.whl' -p SHA256SUMS
+          gh release download "$CORE_TAG" -R sidevoice/sidevoice-core -D "$DIR" -p 'sidevoice_core-*-py3-none-any.whl' -p "$MANIFEST" -p "$MANIFEST_SIGSTORE" -p SHA256SUMS
+          for asset in "$MANIFEST" "$MANIFEST_SIGSTORE"; do
+            if [ ! -s "$DIR/$asset" ]; then
+              echo "::error::sidevoice-core's $CORE_TAG is missing required asset $asset."
+              exit 1
+            fi
+          done
           if [ ! -f "$DIR/$WHEEL" ]; then
             echo "::error::sidevoice-core's $CORE_TAG carries $(cd "$DIR" && ls -- *.whl), but packages/connector/core.mjs pins CORE_VERSION $CORE_VERSION."
             exit 1
@@ -203,11 +211,16 @@ jobs:
           grep -q "  $WHEEL\$" "$DIR/SHA256SUMS"
           (cd "$DIR" && sha256sum -c --ignore-missing SHA256SUMS)
           echo "wheel=$DIR/$WHEEL" >> "$GITHUB_OUTPUT"
+          echo "manifest=$DIR/$MANIFEST" >> "$GITHUB_OUTPUT"
+          echo "manifest_sigstore=$DIR/$MANIFEST_SIGSTORE" >> "$GITHUB_OUTPUT"
           echo "core=$CORE_TAG" >> "$GITHUB_OUTPUT"
-      - name: Pack the client, the wheel inside (prepack runs `npm run build`, which takes SIDEVOICE_CORE_WHEEL)
+      - name: Pack the client with the verified manifest and pinned wheel
         working-directory: packages/connector
         env:
           SIDEVOICE_CORE_WHEEL: ${{ steps.core.outputs.wheel }}
+          SIDEVOICE_CORE_MANIFEST: ${{ steps.core.outputs.manifest }}
+          SIDEVOICE_CORE_MANIFEST_SIGSTORE: ${{ steps.core.outputs.manifest_sigstore }}
+          SIDEVOICE_REQUIRE_CORE_MANIFEST: '1'
           KIND: ${{ steps.kind.outputs.publish }}
           # Which build this is, for the installer's ordering (release.mjs): a nightly carries the version of the
           # last release, so two nightlies of one version are ordered by this run number. build.mjs stamps both into
@@ -232,7 +245,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/dist-release"
           sha256sum -- * > SHA256SUMS
           ls -la; cat SHA256SUMS
-          echo "Core wheel: $WHEEL from sidevoice/sidevoice-core ${{ steps.core.outputs.core }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Core manifest: $SIDEVOICE_CORE_MANIFEST with its Sigstore sidecar; wheel: $WHEEL from sidevoice/sidevoice-core ${{ steps.core.outputs.core }}" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: sidevoice-connector-dist
@@ -272,7 +285,7 @@ jobs:
           else
             gh api -X POST "repos/$GH_REPO/git/refs" -f ref=refs/tags/nightly -f sha="$GITHUB_SHA" >/dev/null
           fi
-          NOTES="Snapshot of \`main\` at $GITHUB_SHA (committed $WHEN), with sidevoice-core's nightly wheel inside. Not a versioned release: the \`nightly\` tag moves to every commit on \`main\` whose CI passes, and these assets are replaced each time. It is never published to npm. Versioned releases are the \`vX.Y.Z\` ones."
+          NOTES="Snapshot of \`main\` at $GITHUB_SHA (committed $WHEN), with sidevoice-core's signed nightly manifest embedded and its pinned wheel inside. Not a versioned release: the \`nightly\` tag moves to every commit on \`main\` whose CI passes, and these assets are replaced each time. It is never published to npm. Versioned releases are the \`vX.Y.Z\` ones."
           if gh release view nightly >/dev/null 2>&1; then
             gh release edit nightly --title "Nightly (main)" --notes "$NOTES" --prerelease --latest=false
             gh release upload nightly assets/* --clobber

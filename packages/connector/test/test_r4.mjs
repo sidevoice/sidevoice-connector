@@ -130,6 +130,28 @@ test('R4-a manifest schema and platform mapping fail closed', () => {
   assert.throws(() => validateCoreManifest({ ...manifest, bundles: [{ ...manifest.bundles[0], url: 'https://evil.invalid/core.tar.zst' }] }, '0.1.0'), /manifest/);
 });
 
+test('R4-a manifests accept the exact nightly release path and refuse other tags or asset names', () => {
+  const bundleName = 'sidevoice-core-0.1.0-linux-x86_64.tar.zst';
+  const wheelName = 'sidevoice_core-0.1.0-py3-none-any.whl';
+  const base = 'https://github.com/sidevoice/sidevoice-core/releases/download';
+  const nightly = { version: '0.1.0', bundles: [{ os: 'linux', arch: 'x86_64',
+    url: `${base}/nightly/${bundleName}`, sha256: 'a'.repeat(64), size: 123 }],
+  wheel: { url: `${base}/nightly/${wheelName}`, sha256: 'b'.repeat(64) } };
+  assert.equal(validateCoreManifest(nightly, '0.1.0', 'nightly'), nightly);
+
+  const release = { ...nightly, bundles: nightly.bundles.map(bundle => ({ ...bundle, url: bundle.url.replace('/nightly/', '/v0.1.0/') })),
+    wheel: { ...nightly.wheel, url: nightly.wheel.url.replace('/nightly/', '/v0.1.0/') } };
+  assert.equal(validateCoreManifest(release, '0.1.0', 'release'), release);
+  expectRefusal(() => validateCoreManifest(nightly, '0.1.0', 'release'), 'manifest');
+  expectRefusal(() => validateCoreManifest(release, '0.1.0', 'nightly'), 'manifest');
+  expectRefusal(() => validateCoreManifest({ ...nightly,
+    wheel: { ...nightly.wheel, url: `${base}/v0.1.1/${wheelName}` } }, '0.1.0', 'nightly'), 'manifest');
+  expectRefusal(() => validateCoreManifest({ ...nightly,
+    bundles: [{ ...nightly.bundles[0], url: `${base}/nightly/other-core.tar.zst` }] }, '0.1.0', 'nightly'), 'manifest');
+  expectRefusal(() => validateCoreManifest({ ...nightly,
+    wheel: { ...nightly.wheel, url: `${base}/nightly/${wheelName}?download=1` } }, '0.1.0', 'nightly'), 'manifest');
+});
+
 test('verified wheel cache location and runtime identity are stable for the same embedded digest', () => {
   const digest = 'a'.repeat(64), dataDir = path.join(scratch, 'wheel-runtime');
   const cachedWheel = verifiedWheelCachePath(dataDir, digest);
@@ -204,6 +226,36 @@ test('a build without R4-a assets and a network developer override both fail clo
   await assert.rejects(() => installRuntime({ dataDir: path.join(scratch, 'network-override'),
     env: { SIDEVOICE_CORE_SPEC: 'sidevoice-core==0.1.0', SIDEVOICE_INSTALL_FROM_SOURCE: '0' } }),
   error => error.key === 'install.authenticity' && error.check === 'developer-override');
+});
+
+test('release and nightly package builds refuse to omit the signed core manifest', () => {
+  for (const channel of ['release', 'nightly']) {
+    const env = { ...process.env, SIDEVOICE_CHANNEL: channel, SIDEVOICE_BUILD_SEQ: '7' };
+    for (const key of ['SIDEVOICE_CORE_MANIFEST', 'SIDEVOICE_CORE_MANIFEST_SIGSTORE', 'SIDEVOICE_REQUIRE_CORE_MANIFEST', 'SIDEVOICE_BUILD_SEA']) delete env[key];
+    env.SIDEVOICE_REQUIRE_CORE_MANIFEST = '1';
+    const result = spawnSync(process.execPath, [path.join(connectorPackage, 'build.mjs')], {
+      cwd: connectorPackage, env, encoding: 'utf8', timeout: 30_000,
+    });
+    assert.equal(result.status, 1, result.stdout || result.stderr);
+    assert.match(result.stderr, /SIDEVOICE_CORE_MANIFEST is required for release and nightly builds/);
+  }
+});
+
+test('production npm and main-branch SEA workflows pass the signed core manifest and sidecar to the build', async () => {
+  const repoRoot = path.resolve(connectorPackage, '..', '..');
+  const ci = await readFile(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8');
+  const seaWorkflow = await readFile(path.join(repoRoot, '.github', 'workflows', 'r4-sea.yml'), 'utf8');
+  assert.match(ci, /MANIFEST=core-manifest\.json/);
+  assert.match(ci, /MANIFEST_SIGSTORE=core-manifest\.json\.sigstore\.json/);
+  assert.match(ci, /gh release download[\s\S]*?-p "\$MANIFEST" -p "\$MANIFEST_SIGSTORE"/);
+  assert.match(ci, /SIDEVOICE_CORE_MANIFEST:\s*\$\{\{\s*steps\.core\.outputs\.manifest\s*\}\}/);
+  assert.match(ci, /SIDEVOICE_CORE_MANIFEST_SIGSTORE:\s*\$\{\{\s*steps\.core\.outputs\.manifest_sigstore\s*\}\}/);
+  assert.match(ci, /SIDEVOICE_REQUIRE_CORE_MANIFEST:\s*'1'/);
+  assert.match(seaWorkflow, /if: github\.ref == 'refs\/heads\/main'/);
+  assert.match(seaWorkflow, /gh release download nightly[\s\S]*?-p core-manifest\.json -p core-manifest\.json\.sigstore\.json/);
+  assert.match(seaWorkflow, /SIDEVOICE_CORE_MANIFEST:\s*\$\{\{\s*steps\.core\.outputs\.manifest\s*\}\}/);
+  assert.match(seaWorkflow, /SIDEVOICE_CORE_MANIFEST_SIGSTORE:\s*\$\{\{\s*steps\.core\.outputs\.manifest_sigstore\s*\}\}/);
+  assert.match(seaWorkflow, /SIDEVOICE_REQUIRE_CORE_MANIFEST:\s*\$\{\{\s*steps\.core\.outputs\.require_manifest\s*\}\}/);
 });
 
 async function makeArchive(filename, entries) {
@@ -357,6 +409,36 @@ test('native SEA runs directly, answers MCP stdio and self-spawns its connector 
     const lockPath = path.join(dataDir, 'connector.lock');
     try { const lock = readLock(lockPath); if (lock?.pid) process.kill(lock.pid, 'SIGTERM'); } catch {}
   }
+});
+
+test('native SEA uninstalls a no-core, no-agent install and removes all non-lock state', async t => {
+  if (!sea) { t.skip(`no SEA target is configured for ${process.platform}/${process.arch}`); return; }
+  try { await stat(sea); } catch { t.skip('target SEA is built by the native target CI job'); return; }
+
+  const home = path.join(scratch, 'sea-uninstall-home');
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) if (key.startsWith('SIDEVOICE_')) delete env[key];
+  for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_URL', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN']) delete env[key];
+  Object.assign(env, { HOME: home, XDG_DATA_HOME: path.join(home, 'xdg'), XDG_CONFIG_HOME: path.join(home, 'config'),
+    SIDEVOICE_SERVICE_MANAGER: 'none' });
+
+  const installed = spawnSync(sea, ['install', '--no-core', '--no-agents'], { env, encoding: 'utf8', timeout: 120_000 });
+  assert.equal(installed.status, 0, installed.stderr || installed.stdout);
+  const dataDir = dataDirOf(env);
+  const installation = JSON.parse(await readFile(nodeFiles(dataDir).install, 'utf8'));
+  assert.equal(installation.command.length, 1, 'a SEA install records the one-element executable command');
+  assert.ok((await readdir(releaseLayout(env).releases)).length > 0, 'the install staged a release before uninstall');
+
+  const removed = spawnSync(sea, ['uninstall', '--json'], { env, encoding: 'utf8', timeout: 120_000 });
+  assert.equal(removed.status, 0, removed.stderr || removed.stdout);
+  assert.deepEqual(JSON.parse(removed.stdout.trim()), { ok: true, state: 'absent' });
+  assert.equal(existsSync(releaseLayout(env).root), false, 'the release tree is gone');
+  for (const name of ['install.json', 'mcp.log', 'connector.log', 'core.log', 'core.stderr.log', 'credentials.json']) {
+    assert.equal(existsSync(path.join(dataDir, name)), false, `${name} is removed`);
+  }
+  const leftovers = await readdir(dataDir);
+  const permanent = new Set(['install.lock', 'connector.lock', 'node-stopped.json']);
+  assert.deepEqual(leftovers.filter(name => !permanent.has(name)), [], 'only the permanent locks and stop marker remain');
 });
 
 test('SEA private Cursor SQLite helper reads a chat without treating the executable as node -e', async t => {

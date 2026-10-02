@@ -30,7 +30,7 @@ import { pairedRoom } from './pair.mjs';
 import { CORE_VERSION, NO_UV, ensureRunning, findUv, hasEmbeddedCoreBundle, readReady, takeInstallLock } from './core.mjs';
 import { keyed, t } from './i18n.mjs';
 import { remove as removeSkill, skillsDir, status as skillStatus } from './skill.mjs';
-import { candidate, coreProgram, decide, flipBack, markVerified, prune, removeLeftovers, removeReleases, selection, stableCommand, stage, switchTo } from './release.mjs';
+import { candidate, coreProgram, decide, flipBack, markVerified, prune, releaseRoot, removeLeftovers, removeReleases, selection, stableCommand, stage, switchTo } from './release.mjs';
 import { HARNESS_REGISTRATIONS, codexInstructions, cursorMcpFile, registration, unregisterFromClaude, unregisterFromCursor } from './registrations.mjs';
 import { askConnector, compatibleCore, installedService, jobDefinitions, linger, managerKind, recordInstallation, settledState, startJobs, status, stopOnDemand, uninstall as uninstallService, writeDefinitions } from './service.mjs';
 import { dataDirOf, nodeFiles } from './node-files.mjs';
@@ -394,8 +394,9 @@ export async function uninstall(argv = [], env = process.env) {
       if (skillStatus(skillsDir([], env)).state === 'installed') done.push(`Removed the voice-room skill copy at ${removeSkill(skillsDir([], env)).target}.`);
     }
     if (harnesses.includes('cursor')) unregisterFromCursor(done, next, env);
+    const releasesRoot = releaseRoot(env);
     removeReleases(env);
-    done.push(t('uninstall.releases-removed', { root: path.dirname(path.dirname(stableCommand(env)[1])) }));
+    done.push(t('uninstall.releases-removed', { root: releasesRoot }));
     const paired = pairedRoom(env);
     // Kept: the two lock files (permanent inodes) and the stop, so that a connector already on its way — a façade's
     // launcher that started one just before — finds it and does not serve. Only an install, `service start` or the
