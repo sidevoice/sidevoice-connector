@@ -18,6 +18,7 @@
  *  buffer dies with this process, and speech the user was promised must not. */
 import net from 'node:net';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { appendFileSync, chmodSync, existsSync, lstatSync, rmSync, statSync, writeFileSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { capabilityState, SUPPORTED, voiceEnvelope } from './harness-contract.mjs';
@@ -34,6 +35,9 @@ import { connectorLockOf, connectorSocketOf, dataDirOf, nodeFiles } from './node
 import { tryLock } from './lockfile.mjs';
 import { t } from './i18n.mjs';
 import { verifyPrivateDir } from './secure-fs.mjs';
+import { handleAgentRequest } from './agents.mjs';
+import { runningAsSea } from './sea-runtime.mjs';
+import { BUILD_PACKAGE_DIR } from './build-info.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -60,6 +64,29 @@ function log(line) {
     if (size > LOG_MAX) renameSync(logPath, logPath + '.1');
     appendFileSync(logPath, stamped + '\n', { mode: 0o600 });
   } catch {}
+}
+
+/** Run startup and periodic scans in a separate CLI process so agent CLIs cannot stall connector traffic. */
+function scanAgentsInBackground() {
+  const scanArgs = [];
+  if (runningAsSea()) scanArgs.push('--sidevoice-agent-scan');
+  else {
+    const invoked = process.argv[1];
+    let cli = invoked && /(?:^|[\\/])cli\.mjs$/.test(invoked) ? path.resolve(invoked) : null;
+    if (!cli || !existsSync(cli)) {
+      const packaged = path.join(BUILD_PACKAGE_DIR, 'cli.mjs');
+      cli = existsSync(packaged) ? packaged : null;
+    }
+    if (cli) scanArgs.push(cli);
+    else {
+      log('agent scan was skipped because the running CLI path could not be resolved');
+      return;
+    }
+    scanArgs.push('--sidevoice-agent-scan');
+  }
+  const child = spawn(process.execPath, scanArgs, { detached: true, stdio: 'ignore', windowsHide: true, env: { ...process.env, ...env, SIDEVOICE_CONNECTOR_LOG: logPath } });
+  child.once('error', error => log(`agent scan could not start: ${error.message}`));
+  child.unref();
 }
 
 /** A core somebody else runs — a checkout's, a test's — named whole in the environment: this connector
@@ -468,6 +495,11 @@ async function asked(route, frame) {
       } catch (error) { return { ok: false, detail: error.message }; }
     }
     case 'connector.error': lastError = frame.error; log('room says: ' + frame.error); return;
+    case 'agents.list': case 'agents.connect': case 'agents.disconnect': case 'agents.dismiss':
+      return handleAgentRequest(route, frame, env, error => {
+        const details = [error?.message, error?.stdout, error?.stderr].filter(Boolean).map(value => String(value).trim()).filter(Boolean).join('\n');
+        log(`agent request ${route} failed${details ? `:\n${details}` : ''}`);
+      });
   }
 }
 
@@ -540,7 +572,7 @@ let server = null;
 async function shutdown(code = 0) {
   if (closed) return;
   log(`shutting down (${bindings.size} binding(s), ${clients.size} façade(s))`);
-  closed = true; clearTimeout(idleTimer);
+  closed = true; clearTimeout(idleTimer); clearInterval(agentScanTimer); agentScanTimer = null;
   try { link?.close(); } catch {}
   server?.close();
   releaseLock({ socket: true });
@@ -563,6 +595,7 @@ function nodeStatus() {
  *  heard from, this long after their façade went): a chat whose window closed does not stay listed for ever. */
 const ORPHAN_TTL_MS = Number(process.env.SIDEVOICE_ORPHAN_TTL_MS || 30 * 60_000);
 let orphanTimer = null;
+let agentScanTimer = null;
 function keepOrphans() {
   if (orphanTimer) return;
   orphanTimer = setInterval(() => {
@@ -776,6 +809,13 @@ export async function run(argv = [], environment = process.env) {
   // Node hands a signal handler the signal's name: the handlers take nothing, and the exit is clean.
   process.on('SIGTERM', () => shutdown(0)); process.on('SIGINT', () => shutdown(0));
   scheduleExit();
+  // A service is the six-hour host scanner. A one-shot connector also refreshes on startup; the CLI and an
+  // explicit host-page rescan cover its short lifetime. The scan writes only the connector-owned agents.json.
+  setImmediate(scanAgentsInBackground);
+  if (serviceMode) {
+    agentScanTimer = setInterval(scanAgentsInBackground, Number(env.SIDEVOICE_AGENT_SCAN_INTERVAL_MS || 6 * 60 * 60 * 1000));
+    agentScanTimer.unref?.();
+  }
   // The link opens now — the connector job's with no conversation needed: R2's agents reach this machine through it.
   open();
 }

@@ -26,6 +26,8 @@ export function nodeFiles(dataDir) {
   const at = name => path.join(dataDir, name);
   return {
     install: at('install.json'),           // {command, releases, definitions}: what runs it (through `R/current`), and where it is
+    agents: at('agents.json'),             // captured login-shell PATH, last scan and agent dismissal generations
+    agentsLock: at('agents.lock'),         // kernel-held lock for agents.json read/modify/write transactions
     stopped: at('node-stopped.json'),      // a person stopped Sidevoice: {at}
     connectorLog: at('connector.log'),
     coreStderr: at('core.stderr.log'),     // what launchd catches from the core job: a crash's output

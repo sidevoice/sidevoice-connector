@@ -32,10 +32,11 @@ import { keyed, t } from './i18n.mjs';
 import { normalizeInstallFailure } from './install-errors.mjs';
 import { remove as removeSkill, skillsDir, status as skillStatus } from './skill.mjs';
 import { candidate, coreProgram, decide, discardRuntimeIfUnselected, flipBack, markVerified, prune, releaseRoot, removeLeftovers, removeReleases, selection, stableCommand, stage, switchTo } from './release.mjs';
-import { HARNESS_REGISTRATIONS, codexInstructions, cursorMcpFile, registration, unregisterFromClaude, unregisterFromCursor } from './registrations.mjs';
+import { HARNESS_REGISTRATIONS, codexInstructions, cursorMcpFile, registration, unregisterFromClaude, unregisterFromCodex, unregisterFromCursor } from './registrations.mjs';
 import { askConnector, compatibleCore, installedService, jobDefinitions, linger, managerKind, recordInstallation, settledState, startJobs, status, stopOnDemand, uninstall as uninstallService, writeDefinitions } from './service.mjs';
 import { dataDirOf, nodeFiles } from './node-files.mjs';
 import { crash, pause } from './testpoint.mjs';
+import { captureAgentEnvironment, withAgentStateLock } from './agents.mjs';
 
 export { claudeRegistration, codexInstructions, copiesDir, cursorHasOurs, cursorMcpFile, registerWithCursor, serverCommand,
   unregisterFromCursor } from './registrations.mjs';
@@ -189,6 +190,8 @@ export async function apply(env, { core = true, service = false, applyNow = fals
   const release = await takeInstallLock(dataDir, log, { signal, onWait: () => progressEvent({ step: 'wait-lock', done: null, total: null }) });
   try {
     if (signal?.aborted) throw keyed('install.cancelled');
+    // Capture login-shell agent paths after taking the install lock, before any selected service can start.
+    captureAgentEnvironment(env);
     removeLeftovers(env);
     const current = selection(env, 'current')?.release ?? null;
     // A release without a core (`--no-core`) is one of its own, and does not satisfy an install that needs the core:
@@ -309,13 +312,26 @@ export async function install(argv = [], env = process.env, { progress = () => {
     const selected = result.registrations?.[name];
     if (!selected) continue;
     const { before, outcome, error } = selected;
-    if (outcome === 'manual') { done.push(t('install.claude-unreachable', { manual: `claude mcp add --scope user sidevoice -- ${[shown, ...args].join(' ')}` })); continue; }
-    if (error) { done.push(t(`install.${name}-failed`, { detail: error })); continue; }
+    if (outcome === 'manual') {
+      if (name === 'claude') done.push(t('install.claude-unreachable', { manual: `claude mcp add --scope user sidevoice -- ${[shown, ...args].join(' ')}` }));
+      continue;
+    }
+    if (error) {
+      done.push(name === 'codex' ? t('install.codex-failed') : t(`install.${name}-failed`, { detail: error }));
+      continue;
+    }
+    if (name === 'codex' && outcome === 'unknown') {
+      done.push(t('agents.registration-unknown', { agent: t('harness.codex', {}, env) }));
+      continue;
+    }
     if (outcome === 'added' || outcome === 'repointed') done.push(t(`install.${name}-registered`, { file: cursorMcpFile(env) }));
     else if (outcome === 'foreign') done.push(name === 'claude'
       ? t('install.claude-foreign', { line: operations.state(env).line, manual: `claude mcp add --scope user sidevoice -- ${[shown, ...args].join(' ')}` })
-      : t('cursor.foreign', { file: cursorMcpFile(env), manual: '' }));
-    else if (outcome === 'invalid') done.push(t('cursor.invalid', { file: cursorMcpFile(env), why: operations.state(env).why, manual: '' }));
+      : name === 'codex' ? t('agents.foreign', { agent: t('harness.codex', {}, env) })
+        : t('cursor.foreign', { file: cursorMcpFile(env), manual: '' }));
+    else if (outcome === 'invalid') done.push(name === 'codex'
+      ? t('agents.invalid', { agent: t('harness.codex', {}, env) })
+      : t('cursor.invalid', { file: cursorMcpFile(env), why: operations.state(env).why, manual: '' }));
   }
   // The join shortcut is a prompt the server offers; a skill copy from an earlier version is taken away.
   if (harnesses.includes('claude') && skillStatus(skillsDir([], env)).state === 'installed') done.push(t('install.skill-removed', { target: removeSkill(skillsDir([], env)).target }));
@@ -332,7 +348,7 @@ export async function install(argv = [], env = process.env, { progress = () => {
     const warning = inboundWarning(env);
     if (warning) next.push(warning);
   }
-  if (harnesses.includes('codex')) next.push(codexInstructions(env, selectedRecord));
+  if (harnesses.includes('codex') && result.registrations?.codex?.outcome === 'manual') next.push(codexInstructions(env, selectedRecord));
   if (harnesses.includes('cursor')) next.push(cursorNotes());
   if (!harnesses.length && !argv.includes('--no-agents')) next.push('No harness found on this machine. Pass --harness claude, --harness codex or --harness cursor.');
   return { done, next, result, service: serviceStatus };
@@ -433,9 +449,9 @@ export async function runRollback(argv = [], env = process.env) {
 /** `sidevoice uninstall`: the reverse of install, in the order that leaves nothing pointing at what is gone — under the
  *  install lock, the stop written, both jobs unloaded (a refusal stops everything here: nothing deleted), what runs on
  *  demand stopped, the definitions deleted (`service.mjs`); then our harness registrations; then the releases (`R`) and
- *  the data directory — all of it but the two lock files, which are permanent (SEAMS §1), and the stop. The room keeps this machine's
- *  pairing until it is revoked under "Máquinas" on the room's page — said, with where. Codex's machine-wide file is, as
- *  always, printed and not touched. */
+ *  the data directory — all of it but its permanent lock files (SEAMS §1) and the stop. The room keeps this machine's
+ *  pairing until it is revoked under "Máquinas" on the room's page — said, with where. Codex removes only an entry
+ *  confirmed as ours through its own CLI. */
 export async function uninstall(argv = [], env = process.env) {
   const wanted = flag(argv, '--harness');
   const harnesses = wanted ? [wanted] : [...new Set([...Object.keys(HARNESS_REGISTRATIONS), ...harnessesPresent(env)])];
@@ -454,24 +470,26 @@ export async function uninstall(argv = [], env = process.env) {
       unregisterFromClaude(done, next, env);
       if (skillStatus(skillsDir([], env)).state === 'installed') done.push(`Removed the voice-room skill copy at ${removeSkill(skillsDir([], env)).target}.`);
     }
+    if (harnesses.includes('codex')) unregisterFromCodex(done, next, env);
     if (harnesses.includes('cursor')) unregisterFromCursor(done, next, env);
     const releasesRoot = releaseRoot(env);
     removeReleases(env);
     done.push(t('uninstall.releases-removed', { root: releasesRoot }));
     const paired = pairedRoom(env);
-    // Kept: the two lock files (permanent inodes) and the stop, so that a connector already on its way — a façade's
+    // Kept: the permanent lock files and the stop, so that a connector already on its way — a façade's
     // launcher that started one just before — finds it and does not serve. Only an install, `service start` or the
     // connector job at a login clears it.
-    const kept = new Set(['install.lock', 'connector.lock', 'node-stopped.json']);
+    const kept = new Set(['install.lock', 'connector.lock', 'agents.lock', 'node-stopped.json']);
     let entries = [];
-    try { entries = readdirSync(dataDir); } catch {}
-    for (const name of entries) if (!kept.has(name)) rmSync(path.join(dataDir, name), { recursive: true, force: true });
+    withAgentStateLock(env, () => {
+      try { entries = readdirSync(dataDir); } catch {}
+      for (const name of entries) if (!kept.has(name)) rmSync(path.join(dataDir, name), { recursive: true, force: true });
+    });
     if (entries.length) {
       done.push(`Removed what was in ${dataDir} (credential, socket, outbox, logs, the core and its environment).`);
       if (paired) next.push(`The room at ${paired.origin} still lists this machine as paired (connector ${paired.connector_id}) until you revoke it under "Máquinas" on the room's page.`);
     }
   } finally { release(); }
-  if (harnesses.includes('codex')) next.push(`Remove the [mcp_servers.sidevoice] table from ${env.CODEX_HOME || path.join(os.homedir(), '.codex')}/config.toml — it is machine-wide and this package does not rewrite it.`);
   next.push('Sessions already open keep their MCP server until they end.');
   return { done, next };
 }

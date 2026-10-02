@@ -12,6 +12,7 @@ import { dataDirOf, nodeFiles, readJson } from './node-files.mjs';
 import { t } from './i18n.mjs';
 import { crash } from './testpoint.mjs';
 import { releaseRoot, stableCommand } from './release.mjs';
+import { agentTimeout } from './agent-support.mjs';
 
 /** Where installations live (`R`): `$XDG_DATA_HOME/sidevoice`. */
 export function copiesDir(env = process.env) {
@@ -69,7 +70,7 @@ export function oursEntry(entry, env = process.env) {
 /* ----- Claude Code ----- */
 
 function claude(args, env) {
-  return execFileSync(env.SIDEVOICE_CLAUDE_BIN || 'claude', args, { encoding: 'utf8', timeout: 30_000, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  return execFileSync(env.SIDEVOICE_CLAUDE_BIN || 'claude', args, { encoding: 'utf8', timeout: agentTimeout(env), env, stdio: ['ignore', 'pipe', 'pipe'] });
 }
 /** Whether there is a `claude` to ask: an entry can only be added through it. */
 export function claudeReachable(env = process.env) {
@@ -78,20 +79,33 @@ export function claudeReachable(env = process.env) {
 
 /** What Claude Code currently runs for `sidevoice`, read from its own `mcp get`: null when nothing is registered
  *  or there is no `claude` to ask. Only a user-scope entry is ours to move. */
-export function claudeRegistration(env = process.env) {
+function claudeResult(env = process.env) {
   let output;
-  try { output = claude(['mcp', 'get', 'sidevoice'], env); } catch { return null; }
+  try { output = claude(['mcp', 'get', 'sidevoice'], env); }
+  catch (error) {
+    const detail = `${error.stdout || ''}\n${error.stderr || ''}`.trim();
+    if ((error.status === 1 && !detail) || /(?:no|not)\s+(?:such\s+)?(?:mcp\s+)?(?:server|entry)|not found|does not exist/i.test(detail)) return { state: 'absent', entry: null };
+    return { state: 'unknown', entry: null, why: detail || error.message || 'command failed' };
+  }
   const field = name => (output.match(new RegExp(`^\\s*${name}:\\s*(.*)$`, 'm')) || [])[1]?.trim() ?? '';
   const command = field('Command'), args = field('Args');
-  if (!command) return null;
-  return { scope: /user/i.test(field('Scope')) ? 'user' : 'other', line: [command, args].filter(Boolean).join(' '), command, args: args ? args.split(/\s+/) : [] };
+  if (!command) {
+    if (/not found|no mcp|does not exist/i.test(output)) return { state: 'absent', entry: null };
+    return { state: 'unknown', entry: null, why: 'unrecognized command output' };
+  }
+  const entry = { scope: /user/i.test(field('Scope')) ? 'user' : 'other', line: [command, args].filter(Boolean).join(' '), command, args: args ? args.split(/\s+/) : [] };
+  return { state: entry.scope === 'user' && oursEntry(entry, env) ? 'ours' : 'foreign', entry };
+}
+
+export function claudeRegistration(env = process.env) {
+  return claudeResult(env).entry || null;
 }
 
 /** Claude Code's entry, judged: `absent`, `ours` (with its line) or `foreign`. */
 export function claudeState(env = process.env) {
-  const current = claudeRegistration(env);
-  if (!current) return { state: 'absent' };
-  return { state: current.scope === 'user' && oursEntry(current, env) ? 'ours' : 'foreign', line: current.line };
+  const result = claudeResult(env);
+  if (!result.entry) return { state: result.state, ...(result.why ? { why: result.why } : {}) };
+  return { state: result.state, line: result.entry.line };
 }
 
 /** Make Claude Code run this installation. Replacing is two steps of Claude's own (remove, add): an installer
@@ -100,6 +114,7 @@ export function setClaude(env, record) {
   const { command, args } = registration(record);
   const current = claudeState(env);
   if (current.state === 'foreign') return 'foreign';
+  if (current.state === 'unknown') return 'unknown';
   if (current.state === 'ours' && current.line === [command, ...args].join(' ')) return 'unchanged';
   if (current.state === 'ours') { claude(['mcp', 'remove', '--scope', 'user', 'sidevoice'], env); crash('claude-removed'); }
   claude(['mcp', 'add', '--scope', 'user', 'sidevoice', '--', command, ...args], env);
@@ -136,24 +151,153 @@ export function unregisterFromClaude(done, next, env = process.env) {
 
 /** Codex keeps one machine-wide file that may hold anything its user put there: we never rewrite it. */
 export function codexInstructions(env = process.env, record = selected(env)) {
-  const { command, args } = registration(record);
+  const installedCommand = record.command;
+  const launch = Array.isArray(installedCommand) && installedCommand.length === 2
+    && installedCommand.every(value => typeof value === 'string' && path.isAbsolute(value))
+    ? { command: installedCommand[0], args: [installedCommand[1], 'mcp'] }
+    : registration(record);
+  const { command, args } = launch;
+  const file = path.join(env.CODEX_HOME || path.join(env.HOME || os.homedir(), '.codex'), 'config.toml');
   return [
-    `Add to ${env.CODEX_HOME || path.join(os.homedir(), '.codex')}/config.toml — it is machine-wide and`,
-    'this package does not rewrite it:',
+    t('agents.manual.codex.title', { file }),
     '',
     '  [mcp_servers.sidevoice]',
-    `  command = "${command}"`,
-    `  args = [${args.map(a => `"${a}"`).join(', ')}]`,
+    `  command = ${JSON.stringify(command)}`,
+    `  args = ${JSON.stringify(args)}`,
     '',
-    'Then restart Codex. That is all: read receipts and working state come from what Codex records about the thread.',
+    t('agents.manual.codex.restart'),
   ].join('\n');
+}
+
+function codex(args, env) {
+  return execFileSync(env.SIDEVOICE_CODEX_BIN || 'codex', args, { encoding: 'utf8', timeout: agentTimeout(env), env, stdio: ['ignore', 'pipe', 'pipe'] });
+}
+
+function codexConfigFile(env = process.env) {
+  return path.join(env.CODEX_HOME || path.join(env.HOME || os.homedir(), '.codex'), 'config.toml');
+}
+
+function tomlString(value) {
+  const text = value.trim();
+  if (text.startsWith('"')) { try { return JSON.parse(text); } catch { return null; } }
+  if (text.startsWith("'")) return text.endsWith("'") ? text.slice(1, -1) : null;
+  return null;
+}
+
+/** Read only Codex's config file so a malformed or foreign entry is never overwritten. */
+function codexFileRegistration(env = process.env) {
+  const file = codexConfigFile(env);
+  if (!existsSync(file)) return { state: 'absent', file };
+  let text;
+  try { text = readFileSync(file, 'utf8'); } catch (error) { return { state: 'invalid', file, why: error.message }; }
+  const lines = text.split(/\r?\n/);
+  const start = lines.findIndex(line => /^\s*\[mcp_servers\.sidevoice\]\s*(?:#.*)?$/.test(line));
+  if (start < 0) return { state: 'absent', file };
+  const body = [];
+  for (let i = start + 1; i < lines.length && !/^\s*\[/.test(lines[i]); i++) body.push(lines[i]);
+  const source = body.join('\n');
+  const commandRaw = (source.match(/^\s*command\s*=\s*(.+?)\s*$/m) || [])[1];
+  const argsRaw = (source.match(/^\s*args\s*=\s*(\[[\s\S]*?\])\s*(?:#.*)?$/m) || [])[1];
+  const command = commandRaw ? tomlString(commandRaw) : null;
+  let args = null;
+  if (argsRaw) {
+    try {
+      // MCP args are an array of TOML strings. JSON covers the common double-quoted form; the small
+      // fallback handles TOML's literal single-quoted strings without interpreting escapes.
+      args = JSON.parse(argsRaw);
+      if (!Array.isArray(args) || args.some(value => typeof value !== 'string')) args = null;
+    } catch {
+      const values = argsRaw.slice(1, -1).split(',').map(tomlString);
+      if (values.every(value => value !== null)) args = values;
+    }
+  }
+  return command && args ? { state: oursEntry({ command, args }, env) ? 'ours' : 'foreign', file, command, args }
+    : { state: 'invalid', file, why: 'invalid MCP server table' };
+}
+
+/** Query the entry through Codex, then retain the file parser as a guard against touching a foreign entry. */
+export function codexRegistration(env = process.env) {
+  const file = codexFileRegistration(env);
+  let output;
+  try { output = codex(['mcp', 'get', 'sidevoice', '--json'], env); }
+  catch (error) {
+    const detail = `${error.stderr || ''}\n${error.stdout || ''}`.trim();
+    const missing = error.status === 1 && /(?:no|not)\s+(?:such\s+)?(?:mcp\s+)?server|not found|does not exist/i.test(detail);
+    if (missing && file.state === 'absent') return { state: 'absent', file: file.file };
+    if (file.state === 'foreign' || file.state === 'invalid') return file;
+    return { state: 'unknown', file: file.file, why: detail || error.message || 'Codex could not inspect its MCP configuration' };
+  }
+
+  let entry;
+  try { entry = JSON.parse(output); } catch { return { state: 'unknown', file: file.file, why: 'Codex returned unrecognized MCP configuration' }; }
+  const transport = entry?.transport;
+  if (entry?.name !== 'sidevoice' || transport?.type !== 'stdio' || typeof transport.command !== 'string'
+      || !Array.isArray(transport.args) || transport.args.some(value => typeof value !== 'string')) {
+    return { state: 'invalid', file: file.file, why: 'Codex returned an unsupported Sidevoice MCP entry' };
+  }
+  if (file.state === 'foreign' || file.state === 'invalid') return file;
+  const registration = { command: transport.command, args: transport.args };
+  return { state: oursEntry(registration, env) ? 'ours' : 'foreign', enabled: entry.enabled !== false,
+    file: file.file, ...registration };
+}
+
+/** Codex CLI's identity and own configuration; the config is read only, and Codex performs every write. */
+export function codexState(env = process.env) {
+  const registration = codexRegistration(env);
+  const installed = serverCommand(env);
+  const selectedCommand = selected(env).command;
+  const installedNode = Array.isArray(selectedCommand) && selectedCommand.length === 2
+    && selectedCommand.every(value => typeof value === 'string' && path.isAbsolute(value))
+    && ['node', 'node.exe'].includes(path.basename(selectedCommand[0]).toLowerCase());
+  const equivalentNodeCommand = installedNode && installed.command === 'node'
+    && registration.command === selectedCommand[0];
+  const connected = registration.state === 'ours' && registration.enabled !== false
+    && (registration.command === installed.command || equivalentNodeCommand)
+    && JSON.stringify(registration.args) === JSON.stringify(installed.args);
+  return { state: registration.state, connected, ...(registration.enabled !== undefined ? { enabled: registration.enabled } : {}),
+    ...(registration.file ? { file: registration.file } : {}),
+    ...(registration.why ? { why: registration.why } : {}), ...(registration.command ? { command: registration.command, args: registration.args } : {}) };
+}
+
+export function codexReachable(env = process.env) {
+  try { codex(['--version'], env); return true; } catch (error) { return error.code !== 'ENOENT' && error.code !== 'EACCES'; }
+}
+
+export function setCodex(env, record) {
+  const before = codexState(env);
+  if (before.state === 'foreign') return 'foreign';
+  if (before.state === 'invalid') return 'invalid';
+  if (before.state === 'unknown') return codexReachable(env) ? 'unknown' : 'manual';
+  const { command, args } = registration(record);
+  const current = before;
+  if (current.state === 'ours' && current.enabled !== false && current.command === command
+      && JSON.stringify(current.args) === JSON.stringify(args)) return 'unchanged';
+  if (current.state === 'ours') codex(['mcp', 'remove', 'sidevoice'], env);
+  codex(['mcp', 'add', 'sidevoice', '--', command, ...args], env);
+  return current.state === 'ours' ? 'repointed' : 'added';
+}
+
+export function removeCodex(env = process.env) {
+  const current = codexState(env);
+  if (current.state !== 'ours') return current.state;
+  codex(['mcp', 'remove', 'sidevoice'], env);
+  return 'removed';
+}
+
+export function unregisterFromCodex(done, next, env = process.env) {
+  const current = codexState(env);
+  if (current.state === 'ours') {
+    try { removeCodex(env); done.push(t('agents.disconnect.codex')); }
+    catch { next.push(t('agents.disconnect.codex-failed')); }
+  } else if (current.state === 'foreign') next.push(t('agents.foreign', { agent: t('harness.codex') }));
+  else if (current.state === 'invalid') next.push(t('agents.invalid', { agent: t('harness.codex'), file: current.file }));
 }
 
 /* ----- Cursor ----- */
 
 /** Where Cursor reads its user-wide MCP servers — the CLI and the editor alike: `~/.cursor/mcp.json`. */
 export function cursorMcpFile(env = process.env) {
-  return path.join(env.HOME || os.homedir(), '.cursor', 'mcp.json');
+  return path.join(env.CURSOR_CONFIG_DIR || path.join(env.HOME || os.homedir(), '.cursor'), 'mcp.json');
 }
 
 /** An entry this package wrote. Anything else is the person's. */
@@ -245,5 +389,6 @@ export function unregisterFromCursor(done, next, env = process.env) {
 /** The harnesses whose registration an installation owns, with their operations. */
 export const HARNESS_REGISTRATIONS = {
   claude: { state: claudeState, set: setClaude, remove: removeClaude, reachable: claudeReachable },
+  codex: { state: codexState, set: setCodex, remove: removeCodex, reachable: codexReachable },
   cursor: { state: cursorState, set: setCursor, remove: removeCursor, reachable: () => true },
 };

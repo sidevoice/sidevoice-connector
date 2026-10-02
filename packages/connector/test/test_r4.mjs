@@ -961,7 +961,7 @@ test('native SEA uninstalls a no-core, no-agent install and removes all non-lock
     assert.equal(existsSync(path.join(dataDir, name)), false, `${name} is removed`);
   }
   const leftovers = await readdir(dataDir);
-  const permanent = new Set(['install.lock', 'connector.lock', 'node-stopped.json']);
+  const permanent = new Set(['install.lock', 'connector.lock', 'agents.lock', 'node-stopped.json']);
   assert.deepEqual(leftovers.filter(name => !permanent.has(name)), [], 'only the permanent locks and stop marker remain');
 });
 

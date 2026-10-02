@@ -6,6 +6,8 @@ import { cursorHarness, isCursorClient } from './harness-cursor.mjs';
 import { httpHarness } from './harness-http.mjs';
 
 export const harnesses = Object.freeze({ claude: claudeHarness, codex: codexHarness, cursor: cursorHarness, http: httpHarness });
+/** The known coding agents and their host-side registration adapters. */
+export const agentHarnesses = Object.freeze({ claude: claudeHarness.agent, codex: codexHarness.agent, cursor: cursorHarness.agent });
 
 export function harnessFor(name) {
   return harnesses[name] || httpHarness;

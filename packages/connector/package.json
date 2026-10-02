@@ -18,7 +18,7 @@
     "build": "node build.mjs",
     "build:sea": "SIDEVOICE_BUILD_SEA=1 node build.mjs",
     "prepack": "npm run build",
-    "test": "node --test test/test_connector.mjs test/test_r4.mjs"
+    "test": "node --test test/test_agents.mjs test/test_connector.mjs test/test_r4.mjs"
   },
   "repository": {
     "type": "git",
