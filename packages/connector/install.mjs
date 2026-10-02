@@ -27,7 +27,7 @@ import path from 'node:path';
 import { readdirSync, readFileSync, rmSync } from 'node:fs';
 import { harnessesPresent } from './identity.mjs';
 import { pairedRoom } from './pair.mjs';
-import { CORE_VERSION, NO_UV, ensureRunning, findUv, hasEmbeddedCoreBundle, readReady, takeInstallLock } from './core.mjs';
+import { CORE_VERSION, NO_UV, ensureRunning, findUv, readReady, takeInstallLock } from './core.mjs';
 import { keyed, t } from './i18n.mjs';
 import { remove as removeSkill, skillsDir, status as skillStatus } from './skill.mjs';
 import { candidate, coreProgram, decide, flipBack, markVerified, prune, releaseRoot, removeLeftovers, removeReleases, selection, stableCommand, stage, switchTo } from './release.mjs';
@@ -251,7 +251,7 @@ export async function install(argv = [], env = process.env, { progress = () => {
   const externalCore = env.SIDEVOICE_URL && env.SIDEVOICE_CONNECTOR_ID && env.SIDEVOICE_CONNECTOR_TOKEN;
   const core = !argv.includes('--no-core') && !externalCore;
   const localCoreOverride = !!(env.SIDEVOICE_CORE_SPEC || env.SIDEVOICE_CORE_WHEEL_DIR);
-  if (core && !env.SIDEVOICE_CORE_BIN && !findUv(env) && (localCoreOverride || !hasEmbeddedCoreBundle())) throw new Error(NO_UV);
+  if (core && !env.SIDEVOICE_CORE_BIN && !findUv(env) && localCoreOverride) throw new Error(NO_UV);
   const result = await apply(env, { core, service: argv.includes('--service'), applyNow: argv.includes('--apply-now'), progress,
     afterSelection: () => selectRegistrations(env, harnesses) });
   const record = result.release;

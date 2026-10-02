@@ -113,7 +113,7 @@ signed `core-manifest.json` and provide its adjacent `.sigstore.json`; the build
 verifies the manifest and embeds its exact bytes. `SIDEVOICE_CHANNEL` may be
 `release` or `nightly`, and `SIDEVOICE_BUILD_SEQ` sets the build sequence recorded
 by the install transaction. A build without the manifest is useful for build and
-runtime tests, but refuses core installation. At runtime, supported platforms use
-the signed core bundle; only unsupported platforms take the verified-wheel uv
-path. Local developer overrides can name local files or directories and cannot
-select a network requirement.
+runtime tests, but refuses core installation. At runtime, a platform uses its
+signed core bundle when the embedded manifest contains one; otherwise it takes
+the verified-wheel uv path. Local developer overrides can name local files or
+directories and cannot select a network requirement.

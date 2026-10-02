@@ -38,14 +38,19 @@ function coreAssetUrl(raw, label, coreVersion, basename, channel) {
   return url;
 }
 
+const hasExactKeys = (value, keys) => value && typeof value === 'object' &&
+  Object.keys(value).sort().join(',') === [...keys].sort().join(',');
+
 export function validateCoreManifest(manifest, coreVersion, channel = 'release') {
-  if (!manifest || manifest.version !== coreVersion || !Array.isArray(manifest.bundles) || !manifest.wheel || typeof manifest.wheel !== 'object') {
-    throw refusal('manifest', 'embedded core manifest does not match the connector pin or expected schema');
+  if (!hasExactKeys(manifest, ['bundles', 'wheel']) || !Array.isArray(manifest.bundles) ||
+      !hasExactKeys(manifest.wheel, ['url', 'sha256'])) {
+    throw refusal('manifest', 'embedded core manifest does not match the producer schema');
   }
   const seen = new Set();
   const allowedTargets = new Set(['macos/aarch64', 'linux/x86_64', 'linux/aarch64']);
   for (const bundle of manifest.bundles) {
-    if (!bundle || typeof bundle.os !== 'string' || typeof bundle.arch !== 'string' || !Number.isSafeInteger(bundle.size) || bundle.size < 1 ||
+    if (!hasExactKeys(bundle, ['os', 'arch', 'url', 'sha256', 'size']) || typeof bundle.os !== 'string' ||
+        typeof bundle.arch !== 'string' || !Number.isSafeInteger(bundle.size) || bundle.size < 1 ||
         !/^[0-9a-f]{64}$/.test(bundle.sha256)) throw refusal('manifest', 'a core bundle record is incomplete');
     const key = `${bundle.os}/${bundle.arch}`;
     if (!allowedTargets.has(key)) throw refusal('manifest', `unsupported core bundle target ${key}`);
@@ -58,6 +63,11 @@ export function validateCoreManifest(manifest, coreVersion, channel = 'release')
   const wheelBasename = `sidevoice_core-${coreVersion}-py3-none-any.whl`;
   coreAssetUrl(manifest.wheel.url, 'core wheel', coreVersion, wheelBasename, channel);
   return manifest;
+}
+
+/** Pick a platform bundle only when the signed manifest actually contains it; otherwise use the signed wheel. */
+export function coreInstallSource(manifest, target) {
+  return target && manifest?.bundles?.some(item => item.os === target.os && item.arch === target.arch) ? 'bundle' : 'wheel';
 }
 
 async function responseFor(url, label) {

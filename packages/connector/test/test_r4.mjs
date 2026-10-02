@@ -9,10 +9,11 @@ import { createZstdCompress } from 'node:zlib';
 import { pipeline } from 'node:stream/promises';
 import tar from 'tar-stream';
 import test, { after, before } from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { build as buildWithEsbuild } from 'esbuild';
 import { enforceCoreProvenance, CORE_ISSUER, CORE_REPOSITORY, CORE_REPOSITORY_ID, CORE_SIGNER, SLSA_PREDICATE, sha256, verifyCoreArtifact } from '../core-attestation.mjs';
 import { unpackCoreArchive } from '../core-archive.mjs';
-import { coreTarget, fetchVerifiedCoreWheel, validateCoreManifest } from '../core-bundle.mjs';
+import { coreInstallSource, coreTarget, fetchVerifiedCoreWheel, validateCoreManifest } from '../core-bundle.mjs';
 import { readLock } from '../lockfile.mjs';
 import { connectorSocketOf, dataDirOf, nodeFiles, writePrivate } from '../node-files.mjs';
 import { VERSION } from '../identity.mjs';
@@ -26,6 +27,7 @@ const fixture = path.join(here, 'fixtures', 'r4', 'sigstore-5.0.0.sigstore.json'
 const fixtureArtifact = path.join(here, 'fixtures', 'r4', 'sigstore-5.0.0.tgz');
 const helper = path.join(here, 'r4-sigstore-helper.mjs');
 const connectorPackage = path.dirname(here);
+const coreProducerManifestFixture = path.join(here, 'fixtures', 'r4', 'core-manifest-core34.json');
 const targetName = process.platform === 'darwin' && process.arch === 'arm64' ? 'macos-aarch64'
   : process.platform === 'linux' && process.arch === 'x64' ? 'linux-x86_64'
     : process.platform === 'linux' && process.arch === 'arm64' ? 'linux-aarch64' : null;
@@ -61,6 +63,37 @@ function statement({ digest = 'a'.repeat(64), channel = 'release', predicateType
       runDetails: { builder: { id: 'https://github.com/actions/runner/github-hosted' } } } };
 }
 const expectRefusal = (run, check) => assert.throws(run, error => error.key === 'install.authenticity' && error.check === check);
+
+async function buildCoreRuntimeAndCliWithManifest(manifest) {
+  // Test-only bundle injection exercises runtime source selection. This intentionally bypasses build-time signature
+  // verification with synthetic fixture data; it is not evidence of a production or genuine R4-a installation.
+  const output = path.join(scratch, 'manifest-fallback-build');
+  await rm(output, { recursive: true, force: true });
+  await mkdir(output, { recursive: true, mode: 0o700 });
+  const shipped = JSON.parse(await readFile(path.join(connectorPackage, 'package.json'), 'utf8'));
+  shipped.sidevoice = { channel: 'release', build_seq: 1 };
+  await buildWithEsbuild({
+    entryPoints: {
+      coreRuntime: path.join(connectorPackage, 'core.mjs'),
+      cli: path.join(connectorPackage, 'cli.mjs'),
+    },
+    outdir: output,
+    entryNames: '[name]',
+    outExtension: { '.js': '.mjs' },
+    bundle: true,
+    platform: 'node',
+    format: 'esm',
+    target: 'node22',
+    external: ['node:*'],
+    banner: { js: 'import { createRequire as __sidevoiceCreateRequire } from "node:module"; const require = __sidevoiceCreateRequire(import.meta.url);' },
+    legalComments: 'none',
+    define: {
+      __SIDEVOICE_PACKAGE_JSON__: JSON.stringify(JSON.stringify(shipped)),
+      __SIDEVOICE_CORE_MANIFEST_JSON__: JSON.stringify(JSON.stringify(manifest)),
+    },
+  });
+  return { coreRuntime: path.join(output, 'coreRuntime.mjs'), cli: path.join(output, 'cli.mjs') };
+}
 
 test('Fulcio and in-toto pins accept only the core repository, expected workflows, hosted runner and SHA-256 subject', () => {
   const digest = 'b'.repeat(64);
@@ -99,7 +132,7 @@ test('tampered bytes and a missing Sigstore sidecar have named refusals', async 
 });
 
 test('a missing release .sigstore.json sidecar is refused before installation', async () => {
-  const manifest = { version: '0.1.0', bundles: [], wheel: {
+  const manifest = { bundles: [], wheel: {
     url: 'https://github.com/sidevoice/sidevoice-core/releases/download/v0.1.0/sidevoice_core-0.1.0-py3-none-any.whl',
     sha256: 'f'.repeat(64) } };
   const originalFetch = globalThis.fetch;
@@ -117,7 +150,7 @@ test('a missing release .sigstore.json sidecar is refused before installation', 
 });
 
 test('R4-a manifest schema and platform mapping fail closed', () => {
-  const manifest = { version: '0.1.0', bundles: [
+  const manifest = { bundles: [
     { os: 'macos', arch: 'aarch64', url: 'https://github.com/sidevoice/sidevoice-core/releases/download/v0.1.0/sidevoice-core-0.1.0-macos-aarch64.tar.zst', sha256: 'd'.repeat(64), size: 123 },
     { os: 'linux', arch: 'x86_64', url: 'https://github.com/sidevoice/sidevoice-core/releases/download/v0.1.0/sidevoice-core-0.1.0-linux-x86_64.tar.zst', sha256: 'e'.repeat(64), size: 124 },
   ], wheel: { url: 'https://github.com/sidevoice/sidevoice-core/releases/download/v0.1.0/sidevoice_core-0.1.0-py3-none-any.whl', sha256: 'f'.repeat(64) } };
@@ -130,11 +163,77 @@ test('R4-a manifest schema and platform mapping fail closed', () => {
   assert.throws(() => validateCoreManifest({ ...manifest, bundles: [{ ...manifest.bundles[0], url: 'https://evil.invalid/core.tar.zst' }] }, '0.1.0'), /manifest/);
 });
 
+test('cross-repo core PR #34 manifest matches its exact two-key producer schema and remains bound to CORE_VERSION', async () => {
+  const manifest = JSON.parse(await readFile(coreProducerManifestFixture, 'utf8'));
+  assert.deepEqual(Object.keys(manifest).sort(), ['bundles', 'wheel']);
+  assert.equal(validateCoreManifest(manifest, CORE_VERSION, 'release'), manifest);
+  assert.equal(hasEmbeddedCoreBundle(manifest, { os: 'linux', arch: 'x86_64' }), true);
+  assert.equal(coreInstallSource(manifest, { os: 'macos', arch: 'aarch64' }), 'bundle');
+  assert.equal(coreInstallSource(manifest, { os: 'windows', arch: 'x86_64' }), 'wheel');
+  assert.equal(coreInstallSource(manifest, null), 'wheel', 'unmapped platforms use the wheel path');
+  assert.equal(coreInstallSource({ ...manifest, bundles: [] }, { os: 'linux', arch: 'x86_64' }), 'wheel',
+    'a missing platform bundle uses the wheel path');
+  assert.equal(hasEmbeddedCoreBundle({ ...manifest, bundles: [] }, { os: 'linux', arch: 'x86_64' }), false);
+
+  expectRefusal(() => validateCoreManifest({ ...manifest, version: CORE_VERSION }, CORE_VERSION, 'release'), 'manifest');
+  expectRefusal(() => validateCoreManifest(manifest, '0.1.1', 'release'), 'manifest');
+  const wrongBundleVersion = { ...manifest, bundles: manifest.bundles.map(bundle => ({ ...bundle,
+    url: bundle.url.replace('/v0.1.0/', '/v0.1.1/') })) };
+  expectRefusal(() => validateCoreManifest(wrongBundleVersion, CORE_VERSION, 'release'), 'manifest');
+  expectRefusal(() => validateCoreManifest({ ...manifest, wheel: { ...manifest.wheel,
+    url: manifest.wheel.url.replace('/v0.1.0/', '/v0.1.1/') } }, CORE_VERSION, 'release'), 'manifest');
+});
+
+test('missing platform bundle falls back to the verified wheel and reports keyed no-uv or tampered-wheel refusals', async () => {
+  const producerManifest = JSON.parse(await readFile(coreProducerManifestFixture, 'utf8'));
+  const manifest = { ...producerManifest, bundles: [] };
+  const built = await buildCoreRuntimeAndCliWithManifest(manifest);
+  const core = await import(pathToFileURL(built.coreRuntime).href);
+
+  const cleanEnv = home => {
+    const env = { ...process.env };
+    for (const key of Object.keys(env)) if (key.startsWith('SIDEVOICE_')) delete env[key];
+    for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'ACTIONS_ID_TOKEN_REQUEST_URL', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN']) delete env[key];
+    Object.assign(env, { HOME: home, XDG_DATA_HOME: path.join(home, 'xdg'), XDG_CONFIG_HOME: path.join(home, 'config'),
+      PATH: '', SIDEVOICE_INSTALL_FROM_SOURCE: '0', SIDEVOICE_SERVICE_MANAGER: 'none' });
+    return env;
+  };
+
+  const cliHome = path.join(scratch, 'missing-bundle-no-uv-cli');
+  await mkdir(cliHome, { recursive: true, mode: 0o700 });
+  const cliEnv = { ...cleanEnv(cliHome), SIDEVOICE_UV: path.join(scratch, 'no-such-uv') };
+  const cliResult = spawnSync(process.execPath, [built.cli, 'install', '--no-agents', '--json'], {
+    env: cliEnv, encoding: 'utf8', timeout: 60_000,
+  });
+  assert.equal(cliResult.status, 1, cliResult.stderr || cliResult.stdout);
+  assert.equal(JSON.parse(cliResult.stdout.trim()).error.key, 'install.no-bundle', cliResult.stdout);
+
+  const originalFetch = globalThis.fetch;
+  const fetches = [];
+  globalThis.fetch = async raw => {
+    const url = String(raw);
+    fetches.push(url);
+    const response = new Response(Buffer.from(url.endsWith('.sigstore.json') ? '{}' : 'tampered wheel bytes'), { status: 200 });
+    Object.defineProperty(response, 'url', { value: url });
+    return response;
+  };
+  try {
+    const uvHome = path.join(scratch, 'missing-bundle-uv-present');
+    const dataDir = path.join(uvHome, '.sidevoice');
+    await mkdir(uvHome, { recursive: true, mode: 0o700 });
+    await assert.rejects(() => core.installCoreRuntime({ dataDir, env: { ...cleanEnv(uvHome), SIDEVOICE_UV: process.execPath } }),
+      error => error.key === 'install.authenticity' && error.check === 'sha256');
+    assert.equal(fetches.length, 2, 'with uv present, the fallback downloads both wheel and sidecar before rejecting tampered bytes');
+    assert.ok(fetches.includes(producerManifest.wheel.url));
+    assert.ok(fetches.includes(producerManifest.wheel.url + '.sigstore.json'));
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test('R4-a manifests accept the exact nightly release path and refuse other tags or asset names', () => {
   const bundleName = 'sidevoice-core-0.1.0-linux-x86_64.tar.zst';
   const wheelName = 'sidevoice_core-0.1.0-py3-none-any.whl';
   const base = 'https://github.com/sidevoice/sidevoice-core/releases/download';
-  const nightly = { version: '0.1.0', bundles: [{ os: 'linux', arch: 'x86_64',
+  const nightly = { bundles: [{ os: 'linux', arch: 'x86_64',
     url: `${base}/nightly/${bundleName}`, sha256: 'a'.repeat(64), size: 123 }],
   wheel: { url: `${base}/nightly/${wheelName}`, sha256: 'b'.repeat(64) } };
   assert.equal(validateCoreManifest(nightly, '0.1.0', 'nightly'), nightly);

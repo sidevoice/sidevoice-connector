@@ -1,7 +1,7 @@
-/** This machine's core — installed from the signed R4-a platform bundle, or as an attested wheel with uv on an
- *  unsupported platform. Source checkouts retain local wheel/spec overrides; an installed connector accepts an
- *  explicit local path but never a network requirement as a developer override. `SIDEVOICE_CORE_BIN` names an
- *  executable installed by hand and skips installation altogether.
+/** This machine's core — installed from a signed R4-a platform bundle when one is present, or as an attested wheel
+ *  with uv when the platform bundle is missing or unmapped. Source checkouts retain local wheel/spec overrides; an
+ *  installed connector accepts an explicit local path but never a network requirement as a developer override.
+ *  `SIDEVOICE_CORE_BIN` names an executable installed by hand and skips installation altogether.
  *
  *  Each immutable runtime is stored under `core-runtime/<build>` and linked by a release (`release.mjs`). Models
  *  are not part of it; the core loads Silero and smart-turn from its wheels, and nothing else unless a person picks
@@ -26,7 +26,7 @@ import { keyed, t } from './i18n.mjs';
 import { nodeFiles, readJson } from './node-files.mjs';
 import { BUILD_PACKAGE, BUILD_PACKAGE_DIR, CORE_MANIFEST } from './build-info.mjs';
 import { runningAsSea } from './sea-runtime.mjs';
-import { coreTarget, fetchVerifiedCoreWheel, prepareVerifiedCoreBundle, validateCoreManifest } from './core-bundle.mjs';
+import { coreInstallSource, coreTarget, fetchVerifiedCoreWheel, prepareVerifiedCoreBundle, validateCoreManifest } from './core-bundle.mjs';
 import { refusal, sha256 } from './core-attestation.mjs';
 import { verifyPrivateDir, writePrivateFile } from './secure-fs.mjs';
 
@@ -63,7 +63,7 @@ export function coreSpec(env = process.env) {
 export function hasEmbeddedCoreBundle(manifest = CORE_MANIFEST, target = coreTarget(), channel = BUILD_PACKAGE.sidevoice?.channel || 'release') {
   if (!manifest || !target) return false;
   validateCoreManifest(manifest, CORE_VERSION, channel);
-  return manifest.bundles.some(item => item.os === target.os && item.arch === target.arch);
+  return coreInstallSource(manifest, target) === 'bundle';
 }
 
 function sourceCheckout(env = process.env) {
@@ -114,8 +114,9 @@ function executable(file) {
  *  connector started by a harness may have a thinner PATH than the person's shell. */
 export function findUv(env = process.env) {
   const name = process.platform === 'win32' ? 'uv.exe' : 'uv';
+  if (env.SIDEVOICE_UV) return executable(env.SIDEVOICE_UV) ? env.SIDEVOICE_UV : null;
   const home = env.HOME || os.homedir();
-  const candidates = [env.SIDEVOICE_UV,
+  const candidates = [
     ...(env.PATH || '').split(path.delimiter).filter(Boolean).map(dir => path.join(dir, name)),
     path.join(home, '.local', 'bin', name), path.join(home, '.cargo', 'bin', name),
     '/opt/homebrew/bin/uv', '/usr/local/bin/uv'];
@@ -320,7 +321,8 @@ export async function installCoreRuntime({ dataDir, env = process.env, log = () 
   if (override) return { ...(await installRuntime({ dataDir, env: { ...env, SIDEVOICE_CORE_SPEC: override }, log, progress })), kind: 'uv' };
   if (!CORE_MANIFEST) throw refusal('manifest', 'this executable has no R4-a core manifest embedded');
   const target = coreTarget();
-  if (target) return installVerifiedBundle({ dataDir, env, log, progress, channel, target });
+  validateCoreManifest(CORE_MANIFEST, CORE_VERSION, channel);
+  if (coreInstallSource(CORE_MANIFEST, target) === 'bundle') return installVerifiedBundle({ dataDir, env, log, progress, channel, target });
   return installVerifiedWheel({ dataDir, env, log, progress, channel });
 }
 
