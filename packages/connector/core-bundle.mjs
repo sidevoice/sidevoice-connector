@@ -86,7 +86,12 @@ async function responseFor(url, label, signal) {
   const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
   try { response = await fetch(url, { redirect: 'follow', signal: requestSignal }); }
   catch (error) { if (signal?.aborted) throw keyed('install.cancelled'); throw downloadFailure(error); }
-  if (!response.ok || !response.body) throw downloadFailure(null, response.status);
+  if (!response.ok || !response.body) {
+    if (label === 'Sigstore sidecar' && response.status !== 407) {
+      throw refusal('sigstore-bundle', `required Sigstore sidecar is unavailable (HTTP ${response.status})`);
+    }
+    throw downloadFailure(null, response.status);
+  }
   const finalUrl = new URL(response.url);
   if (finalUrl.protocol !== 'https:' || !['github.com', 'release-assets.githubusercontent.com'].includes(finalUrl.hostname)) {
     throw refusal('redirect', `${label} redirected outside GitHub Releases`);
@@ -96,8 +101,10 @@ async function responseFor(url, label, signal) {
 
 async function downloadToFile(response, filename, { expectedSize = null, maxBytes, signal, onProgress = () => {} }) {
   let total = 0;
-  const contentLength = Number(response.headers?.get('content-length'));
-  const reportedTotal = expectedSize ?? (Number.isSafeInteger(contentLength) && contentLength >= 0 ? contentLength : null);
+  const rawContentLength = response.headers?.get('content-length');
+  const parsedContentLength = rawContentLength == null || rawContentLength.trim() === '' ? NaN : Number(rawContentLength);
+  const contentLength = Number.isSafeInteger(parsedContentLength) && parsedContentLength >= 0 ? parsedContentLength : null;
+  const reportedTotal = expectedSize ?? contentLength;
   let lastReport = 0;
   const counter = new Transform({ transform(chunk, encoding, callback) {
     if (signal?.aborted) { callback(keyed('install.cancelled')); return; }

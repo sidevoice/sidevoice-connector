@@ -259,6 +259,30 @@ test('verified asset downloads emit stable byte progress before a named digest r
   assert.ok(events.some(event => event.step === 'verify' && event.done === null && event.total === null));
 });
 
+test('wheel byte progress keeps known bytes numeric when Content-Length is absent', async () => {
+  const bytes = Buffer.from('wheel without a length header');
+  const progressDirectory = path.join(scratch, 'progress-without-content-length');
+  await mkdir(progressDirectory, { recursive: true });
+  const manifest = { bundles: [], wheel: {
+    url: 'https://github.com/sidevoice/sidevoice-core/releases/download/v0.1.0/sidevoice_core-0.1.0-py3-none-any.whl',
+    sha256: sha256(bytes),
+  } };
+  const originalFetch = globalThis.fetch, events = [];
+  globalThis.fetch = async rawUrl => {
+    const url = String(rawUrl), body = url.endsWith('.sigstore.json') ? Buffer.from('{}') : bytes;
+    const response = new Response(body, { status: 200 });
+    Object.defineProperty(response, 'url', { value: url });
+    return response;
+  };
+  try {
+    await assert.rejects(() => fetchVerifiedCoreWheel({ manifest, coreVersion: CORE_VERSION, directory: progressDirectory,
+      channel: 'release', tufCachePath: path.join(scratch, 'progress-unknown-total-tuf'), progressEvent: event => events.push(event) }),
+    error => error.key === 'install.authenticity' && error.check === 'sigstore-bundle');
+  } finally { globalThis.fetch = originalFetch; }
+  assert.ok(events.some(event => event.step === 'download' && event.done === 0 && event.total === null));
+  assert.ok(events.some(event => event.step === 'download' && event.done === bytes.length && event.total === null));
+});
+
 test('download and storage failures keep stable network, proxy, and disk keys separate from authenticity', async () => {
   const manifest = JSON.parse(await readFile(coreProducerManifestFixture, 'utf8'));
   const originalFetch = globalThis.fetch;
@@ -277,6 +301,13 @@ test('download and storage failures keep stable network, proxy, and disk keys se
 
     globalThis.fetch = async () => new Response('', { status: 407 });
     await assert.rejects(download(), error => error.key === 'install.proxy');
+
+    globalThis.fetch = async rawUrl => {
+      const url = String(rawUrl), response = new Response('', { status: url.endsWith('.sigstore.json') ? 404 : 200 });
+      Object.defineProperty(response, 'url', { value: url });
+      return response;
+    };
+    await assert.rejects(download(), error => error.key === 'install.authenticity' && error.check === 'sigstore-bundle');
   } finally { globalThis.fetch = originalFetch; }
 
   const noSpace = Object.assign(new Error('write failed'), { code: 'ENOSPC' });
@@ -374,6 +405,22 @@ test('missing platform bundle falls back to the verified wheel and reports keyed
       PATH: '', SIDEVOICE_INSTALL_FROM_SOURCE: '0', SIDEVOICE_SERVICE_MANAGER: 'none' });
     return env;
   };
+
+  const missingSidecarHome = path.join(scratch, 'missing-sidecar-json-cli');
+  const sidecarHook = path.join(scratch, 'sidecar-404-fetch.cjs');
+  await mkdir(missingSidecarHome, { recursive: true, mode: 0o700 });
+  await writeFile(sidecarHook, `globalThis.fetch = async raw => { const url = String(raw);\n` +
+    `const response = url.endsWith('.sigstore.json') ? new Response('', { status: 404 }) : new Response(Buffer.from('asset'), { status: 200 });\n` +
+    `Object.defineProperty(response, 'url', { value: url }); return response; };\n`);
+  const sidecarEnv = { ...cleanEnv(missingSidecarHome), NODE_OPTIONS: `--require=${sidecarHook}` };
+  const sidecarResult = spawnSync(process.execPath, [metadataManifestBuild.cli, 'install', '--no-agents', '--json'], {
+    env: sidecarEnv, encoding: 'utf8', timeout: 60_000,
+  });
+  assert.equal(sidecarResult.status, 1, sidecarResult.stderr || sidecarResult.stdout);
+  const sidecarFailure = JSON.parse(sidecarResult.stdout.trim());
+  assert.equal(sidecarFailure.error.key, 'install.authenticity');
+  assert.equal(sidecarFailure.error.params.check, 'sigstore-bundle');
+  assert.equal(existsSync(releaseLayout(sidecarEnv).current), false, 'a missing signature sidecar does not select a release');
 
   const cliHome = path.join(scratch, 'missing-bundle-no-uv-cli');
   await mkdir(cliHome, { recursive: true, mode: 0o700 });

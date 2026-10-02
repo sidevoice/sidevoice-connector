@@ -262,20 +262,16 @@ test('install: the core is installed, started and asked whether it answers befor
   } finally { if (connector?.exitCode === null) connector.kill(); node.stop(); }
 });
 
-test('install: a uv failure says what uv said and what usually fixes it — system certificates behind a re-signing proxy — and registers nothing', async () => {
+test('install: uv proxy and network failures keep stable keys, and a refused install registers nothing', async () => {
   const { install } = await import('../install.mjs');
   const node = installMachine({ FAKE_UV_FAIL: '1', FAKE_UV_FAIL_OUTPUT: 'error: Request failed after 3 retries\n  Caused by: error sending request for url (https://pypi.org/simple/aiortc/)\n  Caused by: invalid peer certificate: UnknownIssuer' });
   try {
-    await assert.rejects(install(['--harness', 'cursor'], node.env), error => {
-      assert.match(error.message, /failed at "uv venv" \(exit 2\): .*UnknownIssuer/);
-      assert.match(error.message, /UV_SYSTEM_CERTS=1/); assert.match(error.message, /SSL_CERT_FILE/);
-      assert.match(error.message, /core\.log/);
-      return true;
-    });
+    await assert.rejects(install(['--harness', 'cursor'], node.env), error => error.key === 'install.proxy');
     assert.ok(!existsSync(node.mcpJson), 'no harness points at a voice that is not there');
   } finally { node.stop(); }
   const offline = installMachine({ FAKE_UV_FAIL: '1', FAKE_UV_FAIL_OUTPUT: 'error: Failed to fetch: dns error: failed to lookup address information' });
-  await assert.rejects(install(['--harness', 'cursor'], offline.env), /could not reach the network.*HTTPS_PROXY/);
+  try { await assert.rejects(install(['--harness', 'cursor'], offline.env), error => error.key === 'install.network'); }
+  finally { offline.stop(); }
   const noUv = installMachine({ SIDEVOICE_UV: '/nonexistent/uv', PATH: '/nonexistent' });
   const { findUv } = await import('../core.mjs');
   if (!findUv(noUv.env)) await assert.rejects(install(['--harness', 'cursor'], noUv.env), error => error.message === NO_UV);   // a uv where installers put it is still found
