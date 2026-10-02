@@ -7,6 +7,8 @@ import { validateCoreManifest } from './core-bundle.mjs';
 
 export const SEA_ARTIFACT_NAME = 'sidevoice-connector-macos-aarch64-r4b';
 export const PIN_ARTIFACT_NAME = 'sidevoice-connector-macos-aarch64-r4b-pin';
+export const CORE_INPUTS_ARTIFACT_NAME = 'sidevoice-connector-macos-aarch64-r4b-core-inputs';
+export const PROVENANCE_ARTIFACT_NAME = 'sidevoice-connector-macos-aarch64-r4b-provenance';
 export const PIN_METADATA_PROTOCOL = 'sidevoice-metadata-v1';
 export const PIN_PROGRESS_PROTOCOL = 'sidevoice-progress-jsonl-v1';
 
@@ -19,6 +21,26 @@ function requireValue(condition, message) {
   if (!condition) throw new Error(`Cannot create the R4-b desktop pin: ${message}`);
 }
 function positiveInteger(value) { return Number.isSafeInteger(value) && value > 0; }
+
+function runArtifact(listing, { name, repository, repositoryId, runId, connectorSha }) {
+  const records = listing?.artifacts;
+  requireValue(Array.isArray(records) && listing.total_count === records.length,
+    'the GitHub Actions run artifact listing is invalid or incomplete');
+  const matches = records.filter(record => record?.name === name);
+  requireValue(matches.length === 1, `the run must contain exactly one ${name} artifact`);
+  const artifact = matches[0];
+  requireValue(positiveInteger(artifact.id), `${name} has no valid artifact ID`);
+  requireValue(artifact.expired === false, `${name} is expired`);
+  requireValue(positiveInteger(artifact.size_in_bytes), `${name} has no valid archive size`);
+  requireValue(/^sha256:[0-9a-f]{64}$/i.test(artifact.digest || ''), `${name} has no SHA-256 archive digest`);
+  const run = artifact.workflow_run;
+  requireValue(run && Number(run.id) === runId && Number(run.repository_id) === Number(repositoryId)
+    && Number(run.head_repository_id) === Number(repositoryId) && run.head_branch === 'main' && run.head_sha === connectorSha,
+  `${name} does not belong to this repository, workflow run, and connector commit`);
+  const archiveUrl = `https://api.github.com/repos/${repository}/actions/artifacts/${artifact.id}/zip`;
+  requireValue(artifact.archive_download_url === archiveUrl, `${name} does not use GitHub's canonical artifact ZIP route`);
+  return { artifact, archiveUrl, sha256: artifact.digest.slice('sha256:'.length).toLowerCase(), size: artifact.size_in_bytes };
+}
 
 export function verifyProductionSea({ executableBytes, version, metadata, coreManifestBytes,
   coreManifestSidecarBytes, expectedConnectorSha, expectedBuildSeq }) {
@@ -84,14 +106,14 @@ export function verifyProductionSea({ executableBytes, version, metadata, coreMa
 
 export function createDesktopPinRecord({ executableBytes, version, metadata, coreManifestBytes,
   coreManifestSidecarBytes, expectedConnectorSha, expectedBuildSeq, repository, repositoryId,
-  workflow, runId, artifactId }) {
+  workflow, runId, artifactRecords }) {
   const verified = verifyProductionSea({ executableBytes, version, metadata, coreManifestBytes,
     coreManifestSidecarBytes, expectedConnectorSha, expectedBuildSeq });
   requireValue(repository === 'sidevoice/sidevoice-connector', 'the workflow repository is not the connector repository');
   requireValue(/^\d+$/.test(repositoryId || '') && positiveInteger(Number(repositoryId)), 'the GitHub repository ID is not numeric');
-  requireValue(typeof workflow === 'string' && workflow.startsWith('.github/workflows/') && workflow.includes('@refs/'),
-    'the workflow reference is incomplete');
-  requireValue(positiveInteger(runId) && positiveInteger(artifactId), 'the workflow run or artifact ID is invalid');
+  requireValue(workflow === '.github/workflows/r4-sea.yml@refs/heads/main',
+    'the pin was not produced by the protected main R4-b workflow');
+  requireValue(positiveInteger(runId), 'the workflow run ID is invalid');
   requireValue(metadata.connector.link_min <= metadata.embedded_core.link
     && metadata.embedded_core.link <= metadata.connector.link_max, 'the core link is outside the connector range');
 
@@ -99,7 +121,13 @@ export function createDesktopPinRecord({ executableBytes, version, metadata, cor
   const coreTag = version.channel === 'release' ? `v${coreVersion}` : 'nightly';
   const manifestUrl = `https://github.com/sidevoice/sidevoice-core/releases/download/${coreTag}/core-manifest.json`;
   const sidecarUrl = `${manifestUrl}.sigstore.json`;
-  const assetUrl = `https://api.github.com/repos/${repository}/actions/runs/${runId}/artifacts/${artifactId}/zip`;
+  const executableArtifact = runArtifact(artifactRecords, { name: SEA_ARTIFACT_NAME, repository,
+    repositoryId, runId, connectorSha: expectedConnectorSha });
+  const provenanceArtifact = runArtifact(artifactRecords, { name: PROVENANCE_ARTIFACT_NAME, repository,
+    repositoryId, runId, connectorSha: expectedConnectorSha });
+  requireValue(executableArtifact.artifact.id !== provenanceArtifact.artifact.id,
+    'the executable and provenance sidecar must be separate artifacts');
+  const assetUrl = executableArtifact.archiveUrl;
   return {
     schema: 1,
     status: 'ready',
@@ -125,7 +153,8 @@ export function createDesktopPinRecord({ executableBytes, version, metadata, cor
     link_min: metadata.connector.link_min,
     link_max: metadata.connector.link_max,
     provenance: { repository, repository_id: repositoryId, workflow, run_id: runId,
-      artifact_name: SEA_ARTIFACT_NAME, sidecars: [] },
+      artifact_name: SEA_ARTIFACT_NAME, sidecars: [{ name: 'sidevoice-provenance.zip',
+        url: provenanceArtifact.archiveUrl, sha256: provenanceArtifact.sha256, size: provenanceArtifact.size }] },
   };
 }
 
@@ -141,6 +170,19 @@ export async function verifyArtifactRoundTrip(sourceExecutable, artifactDirector
   requireValue(sourceBytes.length === downloadedBytes.length && sha256(sourceBytes) === sha256(downloadedBytes),
     'the artifact download bytes differ from the tested SEA executable');
   return { executable_size: sourceBytes.length, executable_sha256: sha256(sourceBytes) };
+}
+
+export async function verifyArtifactEntries(artifactDirectory, expectedNames) {
+  requireValue(Array.isArray(expectedNames) && expectedNames.length > 0
+    && expectedNames.every(name => typeof name === 'string' && /^[A-Za-z0-9._-]+$/.test(name)),
+  'the artifact entry names are invalid');
+  const entries = await readdir(artifactDirectory);
+  requireValue(entries.length === expectedNames.length && expectedNames.every(name => entries.includes(name)),
+    `the artifact must contain exactly the root entries ${expectedNames.join(', ')}`);
+  for (const name of expectedNames) {
+    const entry = await lstat(path.join(artifactDirectory, name));
+    requireValue(entry.isFile() && !entry.isSymbolicLink(), `the artifact entry ${name} is not a regular file`);
+  }
 }
 
 async function productionInputs() {
@@ -177,13 +219,15 @@ async function cli() {
     const repository = process.env.GITHUB_REPOSITORY || '';
     const repositoryPrefix = `${repository}/`;
     requireValue(workflowRef.startsWith(repositoryPrefix), 'GITHUB_WORKFLOW_REF does not name this repository');
+    const artifactsPath = process.env.SIDEVOICE_ARTIFACTS_JSON;
+    requireValue(typeof artifactsPath === 'string' && artifactsPath.length > 0, 'SIDEVOICE_ARTIFACTS_JSON is required');
     const record = createDesktopPinRecord({
       executableBytes: input.executableBytes, version: input.version, metadata: input.metadata,
       coreManifestBytes: input.coreManifestBytes, coreManifestSidecarBytes: input.coreManifestSidecarBytes,
       expectedConnectorSha: process.env.GITHUB_SHA, expectedBuildSeq: input.expectedBuildSeq,
       repository, repositoryId: process.env.GITHUB_REPOSITORY_ID,
       workflow: workflowRef.slice(repositoryPrefix.length), runId: Number(process.env.GITHUB_RUN_ID),
-      artifactId: Number(process.env.SIDEVOICE_ARTIFACT_ID),
+      artifactRecords: JSON.parse(await readFile(artifactsPath, 'utf8')),
     });
     const outputPath = path.resolve(process.env.SIDEVOICE_PIN_OUTPUT || '');
     requireValue(outputPath !== path.resolve(''), 'SIDEVOICE_PIN_OUTPUT is required');
@@ -197,7 +241,13 @@ async function cli() {
     process.stdout.write(`${JSON.stringify(result)}\n`);
     return;
   }
-  throw new Error('usage: node sea-artifact.mjs verify-build | write-pin | verify-copy <built-sidevoice> <download-directory>');
+  if (mode === 'verify-entries') {
+    const entries = process.argv.slice(4);
+    await verifyArtifactEntries(arg1, entries.length ? entries : [arg2]);
+    process.stdout.write(`${JSON.stringify({ ok: true, entries: entries.length ? entries : [arg2] })}\n`);
+    return;
+  }
+  throw new Error('usage: node sea-artifact.mjs verify-build | write-pin | verify-copy <built-sidevoice> <download-directory> | verify-entries <directory> <root-entry>...');
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {

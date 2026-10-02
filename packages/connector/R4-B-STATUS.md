@@ -80,14 +80,21 @@ execution and macOS quarantine remain later integration gates. No merge or relea
 
 ## Native CI artifact handoff for Desktop PR #21
 
-`.github/workflows/r4-sea.yml` keeps pull-request SEA builds manifestless and test-only, with no artifact upload.
-Main and manually dispatched production candidates require the genuine signed nightly core manifest before build; the
-macOS arm64 executable is uploaded only after the native SEA test suite passes. The stable executable artifact is
-`sidevoice-connector-macos-aarch64-r4b`; it contains a single root `sidevoice`. A second artifact,
-`sidevoice-connector-macos-aarch64-r4b-pin`, contains a ready-shaped Desktop `connector-pin.json` with the exact
-executable size/SHA, embedded manifest bytes/SHA, core assets, Sigstore sidecar digest, protocols and immutable Actions
-run/artifact provenance. The CI job downloads the executable artifact and checks the one-entry root layout and
-byte-for-byte identity against the tested SEA before generating the pin.
+`.github/workflows/r4-sea.yml` keeps pull-request and non-main dispatch SEA builds manifestless and test-only, with no
+production artifact upload. On protected `main`, all three native test jobs must pass before the macOS arm64 SEA is
+uploaded as `sidevoice-connector-macos-aarch64-r4b`; the ZIP contains only root `sidevoice` and its bytes are checked
+against the tested build. A separate post-test job uses `actions/attest@v4` to create a genuine public-good Sigstore
+build attestation for that executable, verifies it against the exact signer workflow, source ref/commit, and
+GitHub-hosted runner identity, then uploads the bundle in
+`sidevoice-connector-macos-aarch64-r4b-provenance`. The final macOS job verifies the downloaded bundle again and
+generates `sidevoice-connector-macos-aarch64-r4b-pin` from official run-artifact metadata.
+
+The pin uses the documented `https://api.github.com/repos/sidevoice/sidevoice-connector/actions/artifacts/<id>/zip`
+route. Its provenance sidecar URL points to the provenance artifact ZIP; its digest and size are the ZIP-level
+`digest`/`size_in_bytes` fields from GitHub's artifact API. That ZIP contains only root `sidevoice.sigstore.json`.
+Desktop must verify the ZIP bytes, extract the root bundle, then cryptographically verify the bundle against the SEA.
+The connector-side fetch/auth contract and exact Desktop follow-up requirements are recorded in
+[`R4-B-DESKTOP-HANDOFF-2026-10-02.md`](R4-B-DESKTOP-HANDOFF-2026-10-02.md).
 
 Actions artifacts are temporary dogfood inputs retained for 90 days, not a durable release source. The current
 `sidevoice/sidevoice-core` nightly release listing contains no `core-manifest.json`, its `.sigstore.json` sidecar, or

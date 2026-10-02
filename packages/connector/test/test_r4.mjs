@@ -23,7 +23,8 @@ import { decide, discardRuntimeIfUnselected, point, releaseLayout, stableCommand
 import { definitionTexts, recordInstallation } from '../service.mjs';
 import { oursInCursor } from '../registrations.mjs';
 import { connectorMetadata, versionMetadata } from '../metadata.mjs';
-import { createDesktopPinRecord, PIN_ARTIFACT_NAME, SEA_ARTIFACT_NAME, verifyArtifactRoundTrip } from '../sea-artifact.mjs';
+import { createDesktopPinRecord, CORE_INPUTS_ARTIFACT_NAME, PIN_ARTIFACT_NAME, PROVENANCE_ARTIFACT_NAME,
+  SEA_ARTIFACT_NAME, verifyArtifactEntries, verifyArtifactRoundTrip } from '../sea-artifact.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixture = path.join(here, 'fixtures', 'r4', 'sigstore-5.0.0.sigstore.json');
@@ -587,9 +588,16 @@ test('production npm and SEA workflows require the signed core manifest; only th
   assert.match(seaWorkflow, /actions\/download-artifact@v4/);
   assert.match(seaWorkflow, /sea-artifact\.mjs verify-copy/);
   assert.match(seaWorkflow, new RegExp(`name: ${PIN_ARTIFACT_NAME}`));
+  assert.match(seaWorkflow, new RegExp(`name: ${CORE_INPUTS_ARTIFACT_NAME}`));
+  assert.match(seaWorkflow, new RegExp(`name: ${PROVENANCE_ARTIFACT_NAME}`));
+  assert.match(seaWorkflow, /uses: actions\/attest@v4/);
+  assert.match(seaWorkflow, /gh attestation verify[\s\S]*--bundle[\s\S]*--signer-workflow github\.com\/sidevoice\/sidevoice-connector\/\.github\/workflows\/r4-sea\.yml[\s\S]*--source-ref refs\/heads\/main[\s\S]*--source-digest[\s\S]*--deny-self-hosted-runners/);
+  assert.match(seaWorkflow, /artifact-metadata: write/);
+  assert.match(seaWorkflow, /repos\/\$GITHUB_REPOSITORY\/actions\/runs\/\$GITHUB_RUN_ID\/artifacts\?per_page=100/);
+  assert.match(seaWorkflow, /github\.ref == 'refs\/heads\/main'/);
   assert.match(seaWorkflow, /actions\/upload-artifact@v4/);
   const productionSteps = seaWorkflow.match(/if: matrix\.target == 'macos-aarch64' && github\.event_name != 'pull_request'/g) || [];
-  assert.equal(productionSteps.length, 6, 'all production artifact and pin steps exclude manifestless PR runs');
+  assert.equal(productionSteps.length, 5, 'only production inputs and executable upload steps run on main after native tests');
 });
 
 test('production desktop pin metadata binds the exact SEA, signed manifest bytes, and immutable run artifact', async () => {
@@ -601,11 +609,21 @@ test('production desktop pin metadata binds the exact SEA, signed manifest bytes
   const metadata = connectorMetadata({ buildPackage, manifest, manifestSha256: sha256(coreManifestBytes), target, sea: true });
   const version = versionMetadata({ buildPackage, target, sea: true });
   const executableBytes = Buffer.from('test-only Mach-O bytes');
-  const coreManifestSidecarBytes = Buffer.from('{"mediaType":"application/vnd.dev.sigstore.bundle+json"}');
+  // Synthetic JSON exercises pin-schema hashing only; it is not a core signature or production evidence.
+  const coreManifestSidecarBytes = Buffer.from('{}');
+  const artifactRecord = (name, id, size, digestChar) => ({ id, name, size_in_bytes: size,
+    archive_download_url: `https://api.github.com/repos/sidevoice/sidevoice-connector/actions/artifacts/${id}/zip`,
+    digest: `sha256:${digestChar.repeat(64)}`, expired: false,
+    workflow_run: { id: 123, repository_id: 12345, head_repository_id: 12345,
+      head_branch: 'main', head_sha: buildPackage.sidevoice.connector_sha } });
+  // This fixture covers API metadata mapping only. It is not a connector attestation or production evidence.
+  const artifactRecords = [artifactRecord(SEA_ARTIFACT_NAME, 456, 1024, 'a'),
+    artifactRecord(PROVENANCE_ARTIFACT_NAME, 457, 512, 'b')];
+  const artifactListing = records => ({ total_count: records.length, artifacts: records });
   const pin = createDesktopPinRecord({ executableBytes, version, metadata, coreManifestBytes, coreManifestSidecarBytes,
     expectedConnectorSha: buildPackage.sidevoice.connector_sha, expectedBuildSeq: buildPackage.sidevoice.build_seq,
     repository: 'sidevoice/sidevoice-connector', repositoryId: '12345',
-    workflow: '.github/workflows/r4-sea.yml@refs/heads/feat/r4-single-executable', runId: 123, artifactId: 456 });
+    workflow: '.github/workflows/r4-sea.yml@refs/heads/main', runId: 123, artifactRecords: artifactListing(artifactRecords) });
 
   assert.equal(pin.status, 'ready');
   assert.equal(pin.target, 'macos-aarch64');
@@ -614,8 +632,11 @@ test('production desktop pin metadata binds the exact SEA, signed manifest bytes
   assert.equal(pin.core_manifest_bytes_base64, coreManifestBytes.toString('base64'));
   assert.equal(pin.executable_sha256, sha256(executableBytes));
   assert.equal(pin.executable_size, executableBytes.length);
-  assert.equal(pin.asset_url, 'https://api.github.com/repos/sidevoice/sidevoice-connector/actions/runs/123/artifacts/456/zip');
+  assert.equal(pin.asset_url, 'https://api.github.com/repos/sidevoice/sidevoice-connector/actions/artifacts/456/zip');
   assert.equal(pin.provenance.artifact_name, SEA_ARTIFACT_NAME);
+  assert.deepEqual(pin.provenance.sidecars, [{ name: 'sidevoice-provenance.zip',
+    url: 'https://api.github.com/repos/sidevoice/sidevoice-connector/actions/artifacts/457/zip',
+    sha256: 'b'.repeat(64), size: 512 }]);
   assert.equal(pin.core_manifest_sidecars[0].sha256, sha256(coreManifestSidecarBytes));
   assert.equal(pin.core_manifest_sidecars[0].url,
     'https://github.com/sidevoice/sidevoice-core/releases/download/nightly/core-manifest.json.sigstore.json');
@@ -632,11 +653,59 @@ test('production desktop pin metadata binds the exact SEA, signed manifest bytes
   await writeFile(path.join(downloaded, 'unexpected.txt'), 'not part of the root executable artifact');
   await assert.rejects(() => verifyArtifactRoundTrip(source, downloaded), /only root sidevoice/);
 
+  const provenanceDir = path.join(scratch, 'provenance-sidecar-artifact');
+  await mkdir(provenanceDir, { recursive: true });
+  // Layout placeholder only. The actual Sigstore bundle is generated and cryptographically checked in main CI.
+  await writeFile(path.join(provenanceDir, 'sidevoice.sigstore.json'), 'test-only root entry');
+  await verifyArtifactEntries(provenanceDir, ['sidevoice.sigstore.json']);
+  await writeFile(path.join(provenanceDir, 'extra.json'), '{}');
+  await assert.rejects(() => verifyArtifactEntries(provenanceDir, ['sidevoice.sigstore.json']), /exactly the root entries/);
+
+  const wrongRouteRecords = artifactRecords.map(record => ({ ...record }));
+  wrongRouteRecords[0].archive_download_url = 'https://api.github.com/repos/sidevoice/sidevoice-connector/actions/runs/123/artifacts/456/zip';
+  assert.throws(() => createDesktopPinRecord({ executableBytes, version, metadata, coreManifestBytes, coreManifestSidecarBytes,
+    expectedConnectorSha: buildPackage.sidevoice.connector_sha, expectedBuildSeq: buildPackage.sidevoice.build_seq,
+    repository: 'sidevoice/sidevoice-connector', repositoryId: '12345',
+    workflow: '.github/workflows/r4-sea.yml@refs/heads/main', runId: 123, artifactRecords: artifactListing(wrongRouteRecords) }),
+  /canonical artifact ZIP route/);
+
+  const wrongProvenanceRun = artifactRecords.map(record => ({ ...record }));
+  wrongProvenanceRun[1].workflow_run = { ...wrongProvenanceRun[1].workflow_run, head_sha: 'd'.repeat(40) };
+  assert.throws(() => createDesktopPinRecord({ executableBytes, version, metadata, coreManifestBytes, coreManifestSidecarBytes,
+    expectedConnectorSha: buildPackage.sidevoice.connector_sha, expectedBuildSeq: buildPackage.sidevoice.build_seq,
+    repository: 'sidevoice/sidevoice-connector', repositoryId: '12345',
+    workflow: '.github/workflows/r4-sea.yml@refs/heads/main', runId: 123, artifactRecords: artifactListing(wrongProvenanceRun) }),
+  /repository, workflow run, and connector commit/);
+
+  const expiredProvenance = artifactRecords.map(record => ({ ...record }));
+  expiredProvenance[1].expired = true;
+  assert.throws(() => createDesktopPinRecord({ executableBytes, version, metadata, coreManifestBytes, coreManifestSidecarBytes,
+    expectedConnectorSha: buildPackage.sidevoice.connector_sha, expectedBuildSeq: buildPackage.sidevoice.build_seq,
+    repository: 'sidevoice/sidevoice-connector', repositoryId: '12345',
+    workflow: '.github/workflows/r4-sea.yml@refs/heads/main', runId: 123, artifactRecords: artifactListing(expiredProvenance) }),
+  /r4b-provenance is expired/);
+
+  const incompleteListing = artifactListing(artifactRecords);
+  incompleteListing.total_count += 1;
+  assert.throws(() => createDesktopPinRecord({ executableBytes, version, metadata, coreManifestBytes, coreManifestSidecarBytes,
+    expectedConnectorSha: buildPackage.sidevoice.connector_sha, expectedBuildSeq: buildPackage.sidevoice.build_seq,
+    repository: 'sidevoice/sidevoice-connector', repositoryId: '12345',
+    workflow: '.github/workflows/r4-sea.yml@refs/heads/main', runId: 123, artifactRecords: incompleteListing }),
+  /listing is invalid or incomplete/);
+
+  assert.throws(() => createDesktopPinRecord({ executableBytes, version, metadata, coreManifestBytes, coreManifestSidecarBytes,
+    expectedConnectorSha: buildPackage.sidevoice.connector_sha, expectedBuildSeq: buildPackage.sidevoice.build_seq,
+    repository: 'sidevoice/sidevoice-connector', repositoryId: '12345',
+    workflow: '.github/workflows/r4-sea.yml@refs/heads/main', runId: 123,
+    artifactRecords: artifactListing(artifactRecords.filter(record => record.name !== PROVENANCE_ARTIFACT_NAME)) }),
+  /exactly one sidevoice-connector-macos-aarch64-r4b-provenance artifact/);
+
   assert.throws(() => createDesktopPinRecord({ executableBytes, version,
     metadata: { ...metadata, embedded_core: { ...metadata.embedded_core, manifest_sha256: null, assets: [] } },
     coreManifestBytes, coreManifestSidecarBytes, expectedConnectorSha: buildPackage.sidevoice.connector_sha,
     expectedBuildSeq: buildPackage.sidevoice.build_seq, repository: 'sidevoice/sidevoice-connector',
-    repositoryId: '12345', workflow: '.github/workflows/r4-sea.yml@refs/heads/main', runId: 123, artifactId: 456 }),
+    repositoryId: '12345', workflow: '.github/workflows/r4-sea.yml@refs/heads/main', runId: 123,
+    artifactRecords: artifactListing(artifactRecords) }),
   /embedded manifest SHA does not match/);
 });
 
