@@ -6,7 +6,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
-import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, symlinkSync, truncateSync, unlinkSync, writeFileSync } from 'node:fs';
 import { conversationCapabilities, envelope, experimentalCapabilities, tailJsonl } from '../harness-contract.mjs';
 import { harnessesPresent } from '../identity.mjs';
 import { httpHarness } from '../harness-http.mjs';
@@ -83,7 +83,11 @@ test('cursor: this process\'s own open chat store is seen through the operating 
   const root = mkdtempSync(path.join(os.tmpdir(), 'sv-cursor-'));
   const { db, store } = chatStore(root, 'chat-live');
   try {
-    assert.ok(openFiles(process.pid).includes(store), 'an open SQLite store shows among the process\'s files');
+    const canonicalStore = realpathSync(store);
+    const canonicalOpenFiles = openFiles(process.pid).map(file => {
+      try { return realpathSync(file); } catch { return file; }
+    });
+    assert.ok(canonicalOpenFiles.includes(canonicalStore), 'an open SQLite store shows among the process\'s files');
     assert.equal(chatOfProcess(process.pid).chat, 'chat-live');
   } finally { db.close(); }
 });
