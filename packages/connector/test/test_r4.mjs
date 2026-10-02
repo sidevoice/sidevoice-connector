@@ -11,6 +11,7 @@ import tar from 'tar-stream';
 import test, { after, before } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build as buildWithEsbuild } from 'esbuild';
+import { verify as verifySigstoreBundle } from 'sigstore';
 import { enforceCoreProvenance, CORE_ISSUER, CORE_REPOSITORY, CORE_REPOSITORY_ID, CORE_SIGNER, SLSA_PREDICATE, sha256, verifyCoreArtifact } from '../core-attestation.mjs';
 import { unpackCoreArchive } from '../core-archive.mjs';
 import { coreInstallSource, coreTarget, fetchVerifiedCoreWheel, validateCoreManifest } from '../core-bundle.mjs';
@@ -29,6 +30,7 @@ import { createDesktopPinRecord, CORE_INPUTS_ARTIFACT_NAME, PIN_ARTIFACT_NAME, P
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixture = path.join(here, 'fixtures', 'r4', 'sigstore-5.0.0.sigstore.json');
 const fixtureArtifact = path.join(here, 'fixtures', 'r4', 'sigstore-5.0.0.tgz');
+const genuineCoreManifestBundle = path.join(here, 'fixtures', 'r4', 'core-manifest-nightly.sigstore.json');
 const helper = path.join(here, 'r4-sigstore-helper.mjs');
 const connectorPackage = path.dirname(here);
 const coreProducerManifestFixture = path.join(here, 'fixtures', 'r4', 'core-manifest-core34.json');
@@ -60,11 +62,13 @@ function signer(overrides = {}) {
 }
 function statement({ digest = 'a'.repeat(64), channel = 'release', predicateType = SLSA_PREDICATE,
   workflowPath = channel === 'release' ? '.github/workflows/release-please.yml' : '.github/workflows/test.yml',
-  repositoryId = CORE_REPOSITORY_ID, subjects = [{ name: 'sidevoice-core-linux-x86_64', digest: { sha256: digest } }] } = {}) {
+  repositoryId = CORE_REPOSITORY_ID, runnerEnvironment = 'github-hosted',
+  builderId = `${CORE_REPOSITORY}/${workflowPath}@refs/heads/main`,
+  subjects = [{ name: 'sidevoice-core-linux-x86_64', digest: { sha256: digest } }] } = {}) {
   return { _type: 'https://in-toto.io/Statement/v1', subject: subjects, predicateType,
     predicate: { buildDefinition: { externalParameters: { workflow: { repository: CORE_REPOSITORY, ref: 'refs/heads/main', path: workflowPath } },
-      internalParameters: { github: { repository_id: repositoryId } } },
-      runDetails: { builder: { id: 'https://github.com/actions/runner/github-hosted' } } } };
+      internalParameters: { github: { repository_id: repositoryId, runner_environment: runnerEnvironment } } },
+      runDetails: { builder: { id: builderId } } } };
 }
 const expectRefusal = (run, check) => assert.throws(run, error => error.key === 'install.authenticity' && error.check === check);
 
@@ -128,7 +132,9 @@ test('Fulcio and in-toto pins accept only the core repository, expected workflow
   expectRefusal(() => enforceCoreProvenance({ signer: signer({ source: 'https://github.com/sidevoice/sidevoice-core-fork' }), statement: statement({ digest }), digest, channel: 'release' }), 'source');
   expectRefusal(() => enforceCoreProvenance({ signer: signer({ repositoryId: '1' }), statement: statement({ digest }), digest, channel: 'release' }), 'repository-id');
   expectRefusal(() => enforceCoreProvenance({ signer: signer({ runner: 'self-hosted' }), statement: statement({ digest }), digest, channel: 'release' }), 'runner');
+  expectRefusal(() => enforceCoreProvenance({ signer: signer(), statement: statement({ digest, runnerEnvironment: 'self-hosted' }), digest, channel: 'release' }), 'runner');
   expectRefusal(() => enforceCoreProvenance({ signer: signer({ buildConfig: `${CORE_REPOSITORY}/.github/workflows/test.yml@refs/heads/main` }), statement: statement({ digest }), digest, channel: 'release' }), 'build-config');
+  expectRefusal(() => enforceCoreProvenance({ signer: signer(), statement: statement({ digest, builderId: 'https://github.com/actions/runner/github-hosted' }), digest, channel: 'release' }), 'build-config');
   expectRefusal(() => enforceCoreProvenance({ signer: signer(), statement: statement({ digest, workflowPath: '.github/workflows/attacker.yml' }), digest, channel: 'release' }), 'build-config');
   expectRefusal(() => enforceCoreProvenance({ signer: signer(), statement: statement({ digest, predicateType: 'https://example.invalid/predicate' }), digest, channel: 'release' }), 'predicate');
   expectRefusal(() => enforceCoreProvenance({ signer: signer(), statement: statement({ digest, subjects: [{ digest: { sha512: 'c'.repeat(128) } }] }), digest, channel: 'release' }), 'subject');
@@ -142,6 +148,31 @@ test('nightly build config is pinned independently from release provenance', () 
     statement: statement({ digest, channel: 'nightly' }), digest, channel: 'nightly' });
   assert.equal(passed.buildConfig, expected);
   expectRefusal(() => enforceCoreProvenance({ signer: signer(), statement: statement({ digest }), digest, channel: 'nightly' }), 'build-config');
+});
+
+test('the genuine public nightly manifest attestation shape is accepted and non-hosted runner evidence is refused', async () => {
+  const bundle = JSON.parse(await readFile(genuineCoreManifestBundle, 'utf8'));
+  const verifiedSigner = await verifySigstoreBundle(bundle, { tufCachePath: path.join(scratch, 'genuine-core-attestation-tuf') });
+  const verifiedStatement = JSON.parse(Buffer.from(bundle.dsseEnvelope.payload, 'base64').toString('utf8'));
+  const digest = verifiedStatement.subject[0].digest.sha256;
+  assert.equal(bundle.dsseEnvelope.payloadType, 'application/vnd.in-toto+json');
+  assert.deepEqual(verifiedStatement.subject, [{ name: 'core-manifest.json', digest: { sha256: '2b71c746af06bee1f22cb3ac13ee09fa50b9ba254d1f54137d9ee22df447b0e1' } }]);
+  const runnerOid = verifiedSigner.identity.oids.find(extension => extension.oid.id.join('.') === OIDS.runner);
+  assert.equal(Buffer.from(runnerOid.value?.data ?? runnerOid.value ?? []).subarray(2).toString('utf8'), 'github-hosted');
+  assert.equal(verifiedStatement.predicate.runDetails.builder.id, `${CORE_REPOSITORY}/.github/workflows/test.yml@refs/heads/main`);
+  assert.equal(verifiedStatement.predicate.buildDefinition.internalParameters.github.runner_environment, 'github-hosted');
+
+  const accepted = enforceCoreProvenance({ signer: verifiedSigner, statement: verifiedStatement, digest, channel: 'nightly' });
+  assert.equal(accepted.runner, 'github-hosted');
+
+  const nonHostedSigner = { ...verifiedSigner, identity: { ...verifiedSigner.identity,
+    oids: verifiedSigner.identity.oids.map(extension => extension.oid.id.join('.') === OIDS.runner
+      ? { ...extension, value: textOid('self-hosted') } : extension) } };
+  expectRefusal(() => enforceCoreProvenance({ signer: nonHostedSigner, statement: verifiedStatement, digest, channel: 'nightly' }), 'runner');
+  expectRefusal(() => enforceCoreProvenance({ signer: verifiedSigner,
+    statement: { ...verifiedStatement, predicate: { ...verifiedStatement.predicate, buildDefinition: {
+      ...verifiedStatement.predicate.buildDefinition, internalParameters: { github: { ...verifiedStatement.predicate.buildDefinition.internalParameters.github,
+        runner_environment: 'self-hosted' } } } } }, digest, channel: 'nightly' }), 'runner');
 });
 
 test('tampered bytes and a missing Sigstore sidecar have named refusals', async () => {
