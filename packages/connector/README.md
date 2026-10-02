@@ -148,9 +148,10 @@ directories and cannot select a network requirement.
 
 ## macOS arm64 Desktop dogfood artifact
 
-`.github/workflows/r4-sea.yml` uploads `sidevoice-connector-macos-aarch64-r4b` only on protected `main`, after all
-native SEA tests pass. Its artifact ZIP contains exactly one root file, `sidevoice`. A later job creates and verifies a
-genuine GitHub public-good Sigstore build attestation for those executable bytes and uploads the root bundle as
+`.github/workflows/r4-sea.yml` uploads `sidevoice-connector-macos-aarch64-r4b` only on protected `main`, after the
+native macOS SEA test suite passes. Its artifact ZIP contains exactly one root file, `sidevoice`. The later attestation
+and pin jobs wait for all three native matrix jobs, then create and verify a genuine GitHub public-good Sigstore build
+attestation for those executable bytes and upload the root bundle as
 `sidevoice-connector-macos-aarch64-r4b-provenance`. A final macOS job verifies the bundle against the same executable,
 reads the official run-artifact metadata, and writes `connector-pin.json` to
 `sidevoice-connector-macos-aarch64-r4b-pin`. The pin records the executable SHA-256/size, connector and embedded-core

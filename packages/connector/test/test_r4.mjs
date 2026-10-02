@@ -661,6 +661,16 @@ test('production desktop pin metadata binds the exact SEA, signed manifest bytes
   await writeFile(path.join(provenanceDir, 'extra.json'), '{}');
   await assert.rejects(() => verifyArtifactEntries(provenanceDir, ['sidevoice.sigstore.json']), /exactly the root entries/);
 
+  const coreInputsDir = path.join(scratch, 'core-input-artifact');
+  await mkdir(coreInputsDir, { recursive: true });
+  await writeFile(path.join(coreInputsDir, 'core-manifest.json'), '{}');
+  await writeFile(path.join(coreInputsDir, 'core-manifest.json.sigstore.json'), '{}');
+  const verifyEntries = spawnSync(process.execPath, [path.join(connectorPackage, 'sea-artifact.mjs'), 'verify-entries',
+    coreInputsDir, 'core-manifest.json', 'core-manifest.json.sigstore.json'], { encoding: 'utf8' });
+  assert.equal(verifyEntries.status, 0, verifyEntries.stderr);
+  assert.deepEqual(JSON.parse(verifyEntries.stdout), { ok: true,
+    entries: ['core-manifest.json', 'core-manifest.json.sigstore.json'] });
+
   const wrongRouteRecords = artifactRecords.map(record => ({ ...record }));
   wrongRouteRecords[0].archive_download_url = 'https://api.github.com/repos/sidevoice/sidevoice-connector/actions/runs/123/artifacts/456/zip';
   assert.throws(() => createDesktopPinRecord({ executableBytes, version, metadata, coreManifestBytes, coreManifestSidecarBytes,

@@ -1,10 +1,11 @@
 # R4-b artifact handoff for Desktop
 
 This handoff describes the connector producer output. It does not change Desktop. The workflow keeps PR and
-non-main dispatch builds manifestless and test-only. On protected `main`, after all three native SEA test jobs pass,
-it uploads the macOS arm64 executable, signs that exact executable with GitHub's public-good Sigstore attestation,
-verifies the bundle, and emits a pin from GitHub's run artifact metadata. A ready production pin still depends on the
-genuine R4-a manifest, its Sigstore bundle, and platform core assets.
+non-main dispatch builds manifestless and test-only. On protected `main`, the macOS arm64 executable artifact is
+uploaded after its native tests pass. The attestation and pin jobs wait for all three native SEA test jobs, then sign
+that exact executable with GitHub's public-good Sigstore attestation, verify the bundle, and emit a pin from GitHub's
+run artifact metadata. A ready production pin still depends on the genuine R4-a manifest, its Sigstore bundle, and
+platform core assets.
 
 ## Pin and artifact records
 

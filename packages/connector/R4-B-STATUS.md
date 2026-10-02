@@ -81,9 +81,10 @@ execution and macOS quarantine remain later integration gates. No merge or relea
 ## Native CI artifact handoff for Desktop PR #21
 
 `.github/workflows/r4-sea.yml` keeps pull-request and non-main dispatch SEA builds manifestless and test-only, with no
-production artifact upload. On protected `main`, all three native test jobs must pass before the macOS arm64 SEA is
-uploaded as `sidevoice-connector-macos-aarch64-r4b`; the ZIP contains only root `sidevoice` and its bytes are checked
-against the tested build. A separate post-test job uses `actions/attest@v4` to create a genuine public-good Sigstore
+production artifact upload. On protected `main`, the macOS arm64 SEA is uploaded as
+`sidevoice-connector-macos-aarch64-r4b` after its native test suite passes; the ZIP contains only root `sidevoice` and
+its bytes are checked against the tested build. The attestation and pin jobs wait for all three native test jobs. The
+attestation job uses `actions/attest@v4` to create a genuine public-good Sigstore
 build attestation for that executable, verifies it against the exact signer workflow, source ref/commit, and
 GitHub-hosted runner identity, then uploads the bundle in
 `sidevoice-connector-macos-aarch64-r4b-provenance`. The final macOS job verifies the downloaded bundle again and
