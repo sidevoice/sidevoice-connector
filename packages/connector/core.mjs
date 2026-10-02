@@ -23,6 +23,7 @@ import { ensureCoreDirectory, localHealth } from './core-socket.mjs';
 import { installLockPath, readLock, takeLock } from './lockfile.mjs';
 import { findProcess, isProcess, signalVerified } from './proc.mjs';
 import { keyed, t } from './i18n.mjs';
+import { classifyInstallFailure } from './install-errors.mjs';
 import { nodeFiles, readJson } from './node-files.mjs';
 import { BUILD_PACKAGE, BUILD_PACKAGE_DIR, CORE_MANIFEST } from './build-info.mjs';
 import { runningAsSea } from './sea-runtime.mjs';
@@ -127,14 +128,12 @@ export function findUv(env = process.env) {
  *  proxy that re-signs HTTPS (UnknownIssuer) was the first real one, 2026-09-30. */
 export function explainUvFailure(step, code, lines, log) {
   const text = lines.join('\n');
+  const category = classifyInstallFailure(text);
+  if (category === 'disk') return keyed('install.disk');
+  if (category === 'proxy') return keyed('install.proxy');
+  if (category === 'network') return keyed('install.network');
   const last = lines.filter(line => line.trim()).slice(-3).map(line => line.trim()).join(' | ');
-  let hint = '';
-  if (/UnknownIssuer|invalid peer certificate|certificate verify|CERTIFICATE_VERIFY_FAILED|self[- ]signed certificate|unable to get local issuer/i.test(text)) {
-    hint = ' uv could not verify a TLS certificate — usually a corporate proxy that re-signs HTTPS. Use the system\'s certificate store: run it again with UV_SYSTEM_CERTS=1 (uv 0.12 or later; older uv: UV_NATIVE_TLS=1), or point SSL_CERT_FILE at your organisation\'s CA bundle.';
-  } else if (/dns error|failed to lookup address|could not connect|connection refused|connection reset|timed out|error sending request|network is unreachable|tcp connect error/i.test(text)) {
-    hint = ' uv could not reach the network (PyPI, and GitHub for its Python): check the connection, and set HTTPS_PROXY if this machine goes through a proxy.';
-  }
-  return new Error(`Installing this machine's Sidevoice core failed at "uv ${step}" (exit ${code})${last ? ': ' + last : ''}.${hint} Full output: ${log}`);
+  return new Error(`Installing this machine's Sidevoice core failed at "uv ${step}" (exit ${code})${last ? ': ' + last : ''}. Full output: ${log}`);
 }
 
 /** Run uv, its output appended to the log and handed line by line to `progress`. */
@@ -234,8 +233,12 @@ export async function installRuntime({ dataDir, env = process.env, log = () => {
   const uv = findUv(env);
   if (!uv) throw new Error(NO_UV);
   const release = await takeInstallLock(dataDir, log, { signal, onWait: () => progressEvent({ step: 'wait-lock', done: null, total: null }) });
+  let installed = false;
   try {
-    if (runtimeComplete(paths)) return { id, bin: paths.bin, venv: paths.venv, kind: 'uv' };   // whoever held the lock installed this very build
+    if (runtimeComplete(paths)) {
+      installed = true; // another installer completed this immutable runtime while we waited
+      return { id, bin: paths.bin, venv: paths.venv, kind: 'uv' };
+    }
     // A directory of this build with no marker is an install of it that did not finish: nothing links to or runs it.
     rmSync(paths.home, { recursive: true, force: true });
     mkdirSync(paths.home, { recursive: true, mode: 0o700 });
@@ -248,9 +251,13 @@ export async function installRuntime({ dataDir, env = process.env, log = () => {
     await run(uv, ['pip', 'install', '--python', paths.python, spec], options);
     if (!executable(paths.bin)) throw new Error(`uv installed ${spec} but there is no ${paths.bin}; see ${logPath(dataDir)}`);
     writeFileSync(paths.marker, JSON.stringify({ version: CORE_VERSION, id, spec: specIdentity(spec), at: new Date().toISOString() }), { mode: 0o600 });
+    installed = true;
     log(`sidevoice-core ${CORE_VERSION} installed in ${Math.round((Date.now() - started) / 1000)} s`);
     return { id, bin: paths.bin, venv: paths.venv, kind: 'uv' };
-  } finally { release(); }
+  } finally {
+    try { if (!installed) rmSync(paths.home, { recursive: true, force: true }); }
+    finally { release(); }
+  }
 }
 
 function syncRuntimeTree(dir) {

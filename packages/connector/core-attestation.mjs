@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { verify } from 'sigstore';
 import { keyed } from './i18n.mjs';
+import { classifyInstallFailure } from './install-errors.mjs';
 
 export const CORE_REPOSITORY = 'https://github.com/sidevoice/sidevoice-core';
 export const CORE_REPOSITORY_ID = '1399406535';
@@ -95,7 +96,13 @@ export async function verifyCoreArtifact({ bytes, expectedSha256 = null, bundleB
   }
   let signer;
   try { signer = await verify(bundle, { tufCachePath, tufForceCache }); }
-  catch (error) { throw refusal('sigstore', `${label} Sigstore verification failed (${error?.name ?? 'Error'}: ${error?.message ?? error})`); }
+  catch (error) {
+    // Prose about a refused signing certificate is authenticity evidence, not proxy detection. During TUF access,
+    // classify proxy interception from transport error codes; generic certificate wording remains a Sigstore refusal.
+    const category = classifyInstallFailure(error, null, { proxyText: false });
+    if (category === 'network' || category === 'proxy' || category === 'disk') throw keyed(`install.${category}`);
+    throw refusal('sigstore', `${label} Sigstore verification failed (${error?.name ?? 'Error'}: ${error?.message ?? error})`);
+  }
 
   let payload;
   try {

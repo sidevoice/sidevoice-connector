@@ -21,8 +21,9 @@ export const en = {
   'install.no-bundle': 'There is no signed core build for this platform and uv is not installed: install uv (https://docs.astral.sh/uv/) and try again.',
   'install.cancelled': 'Installation was cancelled before the new release was committed.',
   'install.node-runtime-missing': 'The Node runtime needed to start this older Sidevoice release is missing from the installation record.',
-  'install.network': 'The core could not be downloaded: the network is not reachable.',
-  'install.proxy': 'The core could not be downloaded: a proxy re-signs HTTPS and its certificate is not trusted.',
+  'install.network': 'The core could not be downloaded from GitHub. Check the network connection and retry.',
+  'install.proxy': 'The core could not be downloaded through the configured proxy. Check its URL, credentials, or TLS certificate trust.',
+  'install.disk': 'There is not enough available disk space to install the Sidevoice core.',
   'install.authenticity': 'The downloaded Sidevoice core was refused at check "{check}".',
 
   // The launcher and the node service (§4.2). `node.stopped` also reaches agents, so it stays plain English.

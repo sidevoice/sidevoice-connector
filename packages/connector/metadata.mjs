@@ -10,12 +10,11 @@ const targetName = target => target
   ? `${target.os === 'macos' ? 'macos' : target.os}-${target.arch}`
   : `${process.platform}-${process.arch}`;
 
-function embeddedAssets(target, channel, manifest) {
-  if (!manifest || !target) return [];
+function embeddedAssets(channel, manifest) {
+  if (!manifest) return [];
   validateCoreManifest(manifest, CORE_VERSION, channel);
   return manifest.bundles
-    .filter(asset => asset.os === target.os && asset.arch === target.arch)
-    .map(({ os, arch, url, sha256, size }) => ({ name: new URL(url).pathname.split('/').at(-1), url, sha256, size }));
+    .map(({ url, sha256, size }) => ({ name: new URL(url).pathname.split('/').at(-1), url, sha256, size }));
 }
 
 export function versionMetadata({ buildPackage = BUILD_PACKAGE, target = coreTarget(), sea = runningAsSea() } = {}) {
@@ -51,7 +50,8 @@ export function connectorMetadata({ buildPackage = BUILD_PACKAGE, manifest = COR
     embedded_core: {
       version: CORE_VERSION,
       manifest_sha256: manifest ? manifestSha256 : null,
-      assets: embeddedAssets(target, version.channel, manifest),
+      // Desktop validates metadata against the complete signed producer manifest, regardless of host target.
+      assets: embeddedAssets(version.channel, manifest),
       api: API_RANGE[0],
       link: LINK_RANGE[0],
     },

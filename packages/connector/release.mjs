@@ -145,7 +145,7 @@ const safeList = dir => { try { return readdirSync(dir); } catch { return []; } 
  *  and linked as `core`, the core's `--self-test` and the connector's `--version` passing on what was staged,
  *  `release.json` written, everything flushed — and only then renamed into place. A complete one is reused. */
 export async function stage(env, next, { dataDir, core = true, log = () => {}, progress = () => {}, signal,
-  progressEvent = () => {} }) {
+  progressEvent = () => {}, onRuntime = () => {} }) {
   const { root, releases } = releaseLayout(env);
   verifyPrivateDir(root, { create: true });
   verifyPrivateDir(releases, { create: true });
@@ -173,6 +173,7 @@ export async function stage(env, next, { dataDir, core = true, log = () => {}, p
     progress(t('install.progress.core', { version: CORE_VERSION }));
     runtime = await installCoreRuntime({ dataDir, env, channel: next.channel, signal, progressEvent, log: line => progress('  ' + line),
       progress: line => { if (line.trim() && !/^\s*[+-] /.test(line)) progress('    uv: ' + line.trim()); } });
+    onRuntime(runtime);
     if (runtime.venv) symlinkSync(runtime.venv, path.join(temporary, 'core'));
     else if (runtime.kind === 'bundle') symlinkSync(runtime.root, path.join(temporary, 'core'));
     else { mkdirSync(path.join(temporary, 'core', 'bin'), { recursive: true }); symlinkSync(path.resolve(runtime.bin), path.join(temporary, 'core', 'bin', 'sidevoice-core')); }
@@ -236,6 +237,16 @@ export function prune(env, dataDir) {
     rmSync(path.join(runtimeRoot(dataDir), name), { recursive: true, force: true }); removed.push(path.join(runtimeRoot(dataDir), name));
   }
   return removed;
+}
+
+/** A pre-commit candidate runtime may be complete but unreferenced. Remove only that candidate, never one a selected
+ *  release can still run from. */
+export function discardRuntimeIfUnselected(env, dataDir, id) {
+  if (typeof id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$/.test(id) || id === 'external') return false;
+  const selected = ['current', 'verified', 'previous'].some(name => selection(env, name)?.release.core_build === id);
+  if (selected) return false;
+  rmSync(path.join(runtimeRoot(dataDir), id), { recursive: true, force: true });
+  return true;
 }
 
 /** `R` itself — releases, both links, anything else Sidevoice put there — taken out by `uninstall`. */

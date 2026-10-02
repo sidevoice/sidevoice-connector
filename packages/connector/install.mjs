@@ -29,8 +29,9 @@ import { harnessesPresent } from './identity.mjs';
 import { pairedRoom } from './pair.mjs';
 import { CORE_VERSION, NO_UV, ensureRunning, findUv, readReady, takeInstallLock } from './core.mjs';
 import { keyed, t } from './i18n.mjs';
+import { normalizeInstallFailure } from './install-errors.mjs';
 import { remove as removeSkill, skillsDir, status as skillStatus } from './skill.mjs';
-import { candidate, coreProgram, decide, flipBack, markVerified, prune, releaseRoot, removeLeftovers, removeReleases, selection, stableCommand, stage, switchTo } from './release.mjs';
+import { candidate, coreProgram, decide, discardRuntimeIfUnselected, flipBack, markVerified, prune, releaseRoot, removeLeftovers, removeReleases, selection, stableCommand, stage, switchTo } from './release.mjs';
 import { HARNESS_REGISTRATIONS, codexInstructions, cursorMcpFile, registration, unregisterFromClaude, unregisterFromCursor } from './registrations.mjs';
 import { askConnector, compatibleCore, installedService, jobDefinitions, linger, managerKind, recordInstallation, settledState, startJobs, status, stopOnDemand, uninstall as uninstallService, writeDefinitions } from './service.mjs';
 import { dataDirOf, nodeFiles } from './node-files.mjs';
@@ -184,12 +185,11 @@ async function callsEnd(env, progress, { signal, progressEvent = () => {} } = {}
 export async function apply(env, { core = true, service = false, applyNow = false, progress = () => {}, log = () => {},
   afterSelection = null, signal, progressEvent = () => {}, beginCommit = () => {} } = {}) {
   const dataDir = dataDirOf(env), files = nodeFiles(dataDir);
+  let stagedRuntimeId = null;
   const release = await takeInstallLock(dataDir, log, { signal, onWait: () => progressEvent({ step: 'wait-lock', done: null, total: null }) });
   try {
     if (signal?.aborted) throw keyed('install.cancelled');
     removeLeftovers(env);
-    // An explicit install is a person's start: a stop (or the one an uninstall left) no longer holds.
-    rmSync(files.stopped, { force: true });
     const current = selection(env, 'current')?.release ?? null;
     // A release without a core (`--no-core`) is one of its own, and does not satisfy an install that needs the core:
     // that one stages a complete release instead.
@@ -198,7 +198,9 @@ export async function apply(env, { core = true, service = false, applyNow = fals
     if (action === 'noop' && core && current && !current.core_build) action = 'upgrade';
     let chosen = current;
     if (action !== 'noop') {
-      chosen = await stage(env, next, { dataDir, core, log, progress, signal, progressEvent });
+      chosen = await stage(env, next, { dataDir, core, log, progress, signal, progressEvent,
+        onRuntime: runtime => { stagedRuntimeId = runtime.id; } });
+      stagedRuntimeId = chosen.core_build ?? stagedRuntimeId;
       if (current && !applyNow && current.core_build !== chosen.core_build) await callsEnd(env, progress, { signal, progressEvent });
       if (signal?.aborted) throw keyed('install.cancelled');
       await pause('install-before-commit', { signal });
@@ -210,6 +212,8 @@ export async function apply(env, { core = true, service = false, applyNow = fals
       progressEvent({ step: 'commit', done: null, total: null });
       beginCommit();
     }
+    // Clearing the stop intent is part of the committed start. Cancellation while staging leaves it untouched.
+    rmSync(files.stopped, { force: true });
     await pause('install-after-commit');
     recordInstallation(env);
     const kind = core && (service || installedService(env)) ? managerKind(env) : 'none';
@@ -247,7 +251,10 @@ export async function apply(env, { core = true, service = false, applyNow = fals
     return { action: 'rollback', release: back.release, from: current, failed: chosen, failure: verified.failure,
       back: back.ok, backFailure: back.failure ?? null, registrationFailures, kind };
   } catch (error) {
-    if (signal?.aborted) prune(env, dataDir);
+    if (signal?.aborted) {
+      prune(env, dataDir);
+      discardRuntimeIfUnselected(env, dataDir, stagedRuntimeId);
+    }
     throw error;
   } finally { release(); }
 }
@@ -377,6 +384,7 @@ export async function runInstall(argv = [], env = process.env) {
     }
     return 0;
   } catch (error) {
+    error = normalizeInstallFailure(error);
     if (json) {
       const key = error.key || 'install.failed';
       const params = key === 'install.authenticity' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(error.check || '') ? { check: error.check } : undefined;

@@ -113,20 +113,25 @@ Lines progress records to stderr (`sidevoice-progress-jsonl-v1`). Every progress
 `wait-lock`, `commit`, `pairing`, and `rollback`. `done` and `total` are byte counts for core artifact downloads (the
 Sigstore sidecar is not counted); other steps use `null` for both, and unknown download totals use `null` for `total`.
 SIGINT before the commit point returns one final
-`install.cancelled` JSON result and leaves the previous selection in place. Once `current` is switched, SIGINT is
-acknowledged by completing verification or rollback and the final JSON reports that actual result.
+`install.cancelled` JSON result, removes staged releases and partial uv runtimes, preserves the previous selection and
+any existing stop intent. Once `current` is switched, SIGINT is acknowledged by completing verification or rollback
+and the final JSON reports that actual result. Download transport failures use `install.network`; an HTTP 407 or
+recognized TLS certificate interception failure uses `install.proxy`; filesystem exhaustion (`ENOSPC`/`EDQUOT`) uses
+`install.disk`. Digest, manifest, Sigstore and provenance failures retain `install.authenticity` with a named check.
 
 `--version --json` reports `version`, `target`, `channel`, `connector_sha`, `build_seq`, `format`, and `sea`, with
 `ok: true`; plain `--version` remains the package version. `metadata --json` reports the `sidevoice-metadata-v1`
 identity. `connector` includes those build fields and `link_min`/`link_max`. `embedded_core` includes the pinned core
-version, SHA-256 of the exact embedded signed manifest bytes, current-target bundle assets (`name`, `url`, `sha256`,
-`size`), API and link ids. `protocols` reports the metadata and progress protocol ids.
+version, SHA-256 of the exact embedded signed manifest bytes, all signed bundle assets (`name`, `url`, `sha256`,
+`size`) in producer order, API and link ids. The asset list is independent of the executable target so Desktop can
+compare the complete manifest. `protocols` reports the metadata and progress protocol ids.
 
 The signed manifest stays byte-for-byte as produced by sidevoice-core: its `{bundles,wheel}` schema has no version
 field. Exact asset URLs and versioned filenames bind it to this connector's `CORE_VERSION`, and the manifest digest
-also binds the wheel entry. The desktop pin currently validates a top-level manifest `version`; its `validate_ready()`
-must be aligned with the actual producer schema before a production pin can pass. A desktop pin for a no-bundle target
-also needs a size-bearing wheel asset contract because the current manifest producer does not include wheel size.
+also binds the wheel entry. The active Desktop pin validates this exact producer schema, binds the separate pinned core
+version through versioned bundle/wheel URLs, and compares its bundle list to `metadata --json`. Its macOS arm64 pin
+requires the signed bundle entries, each of which carries a size. The current core manifest does not include wheel
+size, so a future Desktop pin targeting a platform that uses the wheel would need an explicit wheel-size contract.
 
 R4 adds a second output and leaves the npm ESM entry point in place. On a native
 runner with Node `v22.23.3`, `npm run build:sea -w @sidevoice/uplink` emits

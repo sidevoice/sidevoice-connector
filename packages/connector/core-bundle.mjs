@@ -7,6 +7,7 @@ import path from 'node:path';
 import { refusal, verifyCoreArtifact } from './core-attestation.mjs';
 import { unpackCoreArchive } from './core-archive.mjs';
 import { keyed } from './i18n.mjs';
+import { downloadFailure, normalizeInstallFailure } from './install-errors.mjs';
 import { runningAsSea } from './sea-runtime.mjs';
 
 const URL_PREFIX = '/sidevoice/sidevoice-core/releases/download/';
@@ -84,11 +85,11 @@ async function responseFor(url, label, signal) {
   const timeout = AbortSignal.timeout(20 * 60_000);
   const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
   try { response = await fetch(url, { redirect: 'follow', signal: requestSignal }); }
-  catch (error) { if (signal?.aborted) throw keyed('install.cancelled'); throw refusal('download', `${label} download failed (${error?.message ?? error})`); }
-  if (!response.ok || !response.body) throw refusal(label === 'Sigstore sidecar' ? 'sigstore-bundle' : 'download', `${label} returned HTTP ${response.status}`);
+  catch (error) { if (signal?.aborted) throw keyed('install.cancelled'); throw downloadFailure(error); }
+  if (!response.ok || !response.body) throw downloadFailure(null, response.status);
   const finalUrl = new URL(response.url);
   if (finalUrl.protocol !== 'https:' || !['github.com', 'release-assets.githubusercontent.com'].includes(finalUrl.hostname)) {
-    throw refusal('download', `${label} redirected outside GitHub Releases`);
+    throw refusal('redirect', `${label} redirected outside GitHub Releases`);
   }
   return response;
 }
@@ -109,7 +110,7 @@ async function downloadToFile(response, filename, { expectedSize = null, maxByte
     }
   } });
   try { await pipeline(Readable.fromWeb(response.body), counter, createWriteStream(filename, { flags: 'wx', mode: 0o600 }), { signal }); }
-  catch (error) { if (signal?.aborted) throw keyed('install.cancelled'); throw error; }
+  catch (error) { if (signal?.aborted) throw keyed('install.cancelled'); throw normalizeInstallFailure(error); }
   if (expectedSize !== null && total !== expectedSize) throw refusal('download-size', `download size ${total} did not match ${expectedSize}`);
   onProgress(total, reportedTotal);
   const fd = openSync(filename, 'r');
@@ -164,7 +165,10 @@ async function verifyDownloaded({ artifactPath, bundleBytes, expectedSha256, cha
     }
     let report;
     try { report = JSON.parse(result.stdout); } catch { throw refusal('sigstore-bundle', 'Sigstore verifier helper returned invalid output'); }
-    if (!report.ok) throw refusal(report.check || report.key || 'sigstore-bundle', 'core artifact failed Sigstore verification');
+    if (!report.ok) {
+      if (['install.network', 'install.proxy', 'install.disk'].includes(report.key)) throw keyed(report.key);
+      throw refusal(report.check || report.key || 'sigstore-bundle', 'core artifact failed Sigstore verification');
+    }
   } finally { rmSync(sidecarPath, { force: true }); }
 }
 
