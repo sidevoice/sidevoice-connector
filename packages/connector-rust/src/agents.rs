@@ -9,11 +9,11 @@ use fs2::FileExt;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::collections::HashMap;
 
 mod claude;
 mod codex;
@@ -116,7 +116,7 @@ impl AgentId {
         agent_message(&format!("harness.{}", self.as_str()), &Value::Null)
     }
 
-    fn config_root<'a>(self, profile: &'a Profile) -> &'a Path {
+    fn config_root(self, profile: &Profile) -> &Path {
         match self {
             Self::Claude => &profile.claude,
             Self::Codex => &profile.codex,

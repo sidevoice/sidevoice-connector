@@ -99,20 +99,20 @@ impl HostAgents {
             return Ok("invalid".into());
         }
         match fs::symlink_metadata(&self.profile.codex) {
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Ok("not-connected".into())
-            }
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok("not-connected".into()),
             Err(_) => return Ok("invalid".into()),
             Ok(_) => {}
         }
-        if self.profile.validate_for_agent(&self.profile.codex).is_err() {
+        if self
+            .profile
+            .validate_for_agent(&self.profile.codex)
+            .is_err()
+        {
             return Ok("invalid".into());
         }
         let file = self.profile.codex.join("config.toml");
         match fs::symlink_metadata(&file) {
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Ok("not-connected".into())
-            }
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok("not-connected".into()),
             Err(_) => return Ok("invalid".into()),
             Ok(_) => {}
         }

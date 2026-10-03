@@ -407,13 +407,8 @@ async fn replacing_cursor_profile_with_symlink_refuses_connect_without_touching_
     fs::remove_dir_all(&fixture.profile.cursor).unwrap();
     symlink(&external, &fixture.profile.cursor).unwrap();
 
-    let answer = host
-        .handle("agents.connect", json!({"id":"cursor"}))
-        .await;
-    assert_eq!(
-        answer.pointer("/error/key"),
-        Some(&json!("agents.invalid"))
-    );
+    let answer = host.handle("agents.connect", json!({"id":"cursor"})).await;
+    assert_eq!(answer.pointer("/error/key"), Some(&json!("agents.invalid")));
     assert_eq!(fs::read(&config).unwrap(), before);
     host.shutdown().await;
     let _ = fs::remove_dir_all(external);
@@ -446,14 +441,12 @@ async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn()
     fs::remove_dir_all(&fixture.profile.codex).unwrap();
     symlink(&external, &fixture.profile.codex).unwrap();
 
-    let answer = host
-        .handle("agents.connect", json!({"id":"codex"}))
-        .await;
-    assert_eq!(
-        answer.pointer("/error/key"),
-        Some(&json!("agents.invalid"))
+    let answer = host.handle("agents.connect", json!({"id":"codex"})).await;
+    assert_eq!(answer.pointer("/error/key"), Some(&json!("agents.invalid")));
+    assert!(
+        !marker.exists(),
+        "Codex CLI ran with a replaced private profile"
     );
-    assert!(!marker.exists(), "Codex CLI ran with a replaced private profile");
     assert_eq!(fs::read(&config).unwrap(), before);
 
     // The spawn boundary also rejects replacement after binary resolution by an earlier request.
@@ -467,7 +460,10 @@ async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn()
     )
     .await;
     assert!(matches!(direct, Err(CommandFailure::Start)));
-    assert!(!marker.exists(), "CLI spawn boundary accepted a replaced profile");
+    assert!(
+        !marker.exists(),
+        "CLI spawn boundary accepted a replaced profile"
+    );
     host.shutdown().await;
     let _ = fs::remove_dir_all(external);
 }
@@ -478,13 +474,8 @@ async fn dangling_codex_config_symlink_is_invalid_not_absent() {
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let missing = fixture.root.join("missing-config-target.toml");
     symlink(missing, fixture.profile.codex.join("config.toml")).unwrap();
-    let answer = host
-        .handle("agents.connect", json!({"id":"codex"}))
-        .await;
-    assert_eq!(
-        answer.pointer("/error/key"),
-        Some(&json!("agents.invalid"))
-    );
+    let answer = host.handle("agents.connect", json!({"id":"codex"})).await;
+    assert_eq!(answer.pointer("/error/key"), Some(&json!("agents.invalid")));
     host.shutdown().await;
 }
 
@@ -633,10 +624,11 @@ raise SystemExit(2)
     let final_state = host.handle("agents.list", json!({})).await;
     assert_eq!(row(&final_state, "codex")["registration"], "not-connected");
 
-    private_write(&fixture.profile.codex.join("leave-unregistered-after-add"), b"1");
-    let unconfirmed_connect = host
-        .handle("agents.connect", json!({"id":"codex"}))
-        .await;
+    private_write(
+        &fixture.profile.codex.join("leave-unregistered-after-add"),
+        b"1",
+    );
+    let unconfirmed_connect = host.handle("agents.connect", json!({"id":"codex"})).await;
     assert_eq!(
         unconfirmed_connect.pointer("/error/key"),
         Some(&json!("agents.registration-not-confirmed"))

@@ -8,19 +8,12 @@ on:
       - 'packages/connector/messages/agent-errors.json'
       - '.github/workflows/rust-proof.yml'
   workflow_dispatch:
-    inputs:
-      format_sources:
-        description: Temporary source formatting pass
-        type: boolean
-        required: false
-        default: false
 
 permissions:
   contents: read
 
 jobs:
   native:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.format_sources != true }}
     name: Native Rust proof
     runs-on: ubuntu-24.04
     defaults:
@@ -62,7 +55,6 @@ jobs:
           retention-days: 7
 
   interop-core:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.format_sources != true }}
     name: Rust proof with real Core v3 and modelled Codex queue
     needs: native
     runs-on: ubuntu-24.04
@@ -97,23 +89,3 @@ jobs:
           SIDEVOICE_CORE_PYTHON: ${{ github.workspace }}/core/.venv/bin/python
           SIDEVOICE_RUST_PROOF_BIN: ${{ github.workspace }}/proof-bin/sidevoice-rust-proof
         run: core/.venv/bin/python packages/connector-rust/test/interop_core.py
-
-  format-sources:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.format_sources == true }}
-    name: Temporary Rust source formatting pass
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Format Rust source tree
-        run: cargo fmt --manifest-path packages/connector-rust/Cargo.toml --all
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rust-host-agents-formatted-${{ github.sha }}
-          path: packages/connector-rust/src/
-          if-no-files-found: error
-          retention-days: 1
