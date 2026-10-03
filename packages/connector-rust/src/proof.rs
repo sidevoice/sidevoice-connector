@@ -40,10 +40,13 @@ pub struct Evidence<'a> {
     pub socket: String,
 }
 
-fn uid() -> u32 { unsafe { libc::geteuid() } }
+fn uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
 
 pub fn private_dir(path: &Path) -> Result<()> {
-    let m = fs::symlink_metadata(path).with_context(|| format!("missing private directory {}", path.display()))?;
+    let m = fs::symlink_metadata(path)
+        .with_context(|| format!("missing private directory {}", path.display()))?;
     if !m.is_dir() || m.file_type().is_symlink() || m.uid() != uid() || m.mode() & 0o077 != 0 {
         bail!("unsafe private directory {}", path.display());
     }
@@ -69,37 +72,80 @@ pub fn verify_socket(path: &Path) -> Result<()> {
 
 impl Profile {
     pub fn from_env() -> Result<Self> {
-        let data = PathBuf::from(std::env::var_os("SIDEVOICE_DATA_DIR").context("SIDEVOICE_DATA_DIR required for proof")?);
-        let codex = PathBuf::from(std::env::var_os("CODEX_HOME").context("CODEX_HOME required for proof")?);
-        if !data.is_absolute() || !codex.is_absolute() { bail!("proof paths must be absolute"); }
+        let data = PathBuf::from(
+            std::env::var_os("SIDEVOICE_DATA_DIR")
+                .context("SIDEVOICE_DATA_DIR required for proof")?,
+        );
+        let codex =
+            PathBuf::from(std::env::var_os("CODEX_HOME").context("CODEX_HOME required for proof")?);
+        if !data.is_absolute() || !codex.is_absolute() {
+            bail!("proof paths must be absolute");
+        }
         let root = data.parent().context("data root")?;
         private_dir(root)?;
         private_dir(&data)?;
         private_dir(&codex)?;
-        if codex.parent() != Some(root) || data == codex { bail!("proof paths must be separate siblings under one private root"); }
-        if data.join("install.json").exists() { bail!("selected installation data is forbidden in proof profile"); }
+        if codex.parent() != Some(root) || data == codex {
+            bail!("proof paths must be separate siblings under one private root");
+        }
+        if data.join("install.json").exists() {
+            bail!("selected installation data is forbidden in proof profile");
+        }
         let core = data.join("core");
         private_dir(&core)?;
-        Ok(Self { socket: data.join("connector.sock"), core_socket: core.join("local.sock"), core_ready: core.join("core.json"), data, codex })
+        Ok(Self {
+            socket: data.join("connector.sock"),
+            core_socket: core.join("local.sock"),
+            core_ready: core.join("core.json"),
+            data,
+            codex,
+        })
     }
 
     pub async fn ready(&self) -> Result<Ready> {
         private_file(&self.core_ready)?;
         let bytes = fs::read(&self.core_ready)?;
-        if bytes.len() > 65536 { bail!("Core ready file too large"); }
+        if bytes.len() > 65536 {
+            bail!("Core ready file too large");
+        }
         let ready: Ready = serde_json::from_slice(&bytes)?;
-        if ready.socket != self.core_socket || ready.launch_id.is_empty() || ready.pid == 0 { bail!("Core ready identity mismatch"); }
-        if !ready.connector_protocols.as_ref().is_some_and(|v| v.contains(&3)) { bail!("Core v3 upgrade required"); }
+        if ready.socket != self.core_socket || ready.launch_id.is_empty() || ready.pid == 0 {
+            bail!("Core ready identity mismatch");
+        }
+        if !ready
+            .connector_protocols
+            .as_ref()
+            .is_some_and(|v| v.contains(&3))
+        {
+            bail!("Core v3 upgrade required");
+        }
         verify_socket(&ready.socket)?;
-        let mut stream = timeout(Duration::from_secs(2), UnixStream::connect(&ready.socket)).await??;
-        stream.write_all(b"GET /api/local/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await?;
+        let mut stream =
+            timeout(Duration::from_secs(2), UnixStream::connect(&ready.socket)).await??;
+        stream
+            .write_all(
+                b"GET /api/local/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await?;
         let mut body = Vec::new();
-        timeout(Duration::from_secs(2), stream.take(65536).read_to_end(&mut body)).await??;
+        timeout(
+            Duration::from_secs(2),
+            stream.take(65536).read_to_end(&mut body),
+        )
+        .await??;
         let response = String::from_utf8(body)?;
-        if !response.starts_with("HTTP/1.1 200 ") && !response.starts_with("HTTP/1.0 200 ") { bail!("Core health refused"); }
-        let (_, payload) = response.split_once("\r\n\r\n").context("Core health body missing")?;
+        if !response.starts_with("HTTP/1.1 200 ") && !response.starts_with("HTTP/1.0 200 ") {
+            bail!("Core health refused");
+        }
+        let (_, payload) = response
+            .split_once("\r\n\r\n")
+            .context("Core health body missing")?;
         let health: Value = serde_json::from_str(payload)?;
-        if health.get("launch_id").and_then(Value::as_str) != Some(&ready.launch_id) || health.get("pid").and_then(Value::as_u64) != Some(ready.pid as u64) { bail!("Core health identity mismatch"); }
+        if health.get("launch_id").and_then(Value::as_str) != Some(&ready.launch_id)
+            || health.get("pid").and_then(Value::as_u64) != Some(ready.pid as u64)
+        {
+            bail!("Core health identity mismatch");
+        }
         Ok(ready)
     }
 
@@ -108,8 +154,22 @@ impl Profile {
         let mut input = File::open(&exe)?;
         let mut hasher = Sha256::new();
         let mut block = [0u8; 65536];
-        loop { let n = input.read(&mut block)?; if n == 0 { break; } hasher.update(&block[..n]); }
-        let evidence = Evidence { pid: std::process::id(), executable: exe.display().to_string(), executable_sha256: hex::encode(hasher.finalize()), core_launch_id: &ready.launch_id, core_pid: ready.pid, protocol: 3, socket: self.socket.display().to_string() };
+        loop {
+            let n = input.read(&mut block)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&block[..n]);
+        }
+        let evidence = Evidence {
+            pid: std::process::id(),
+            executable: exe.display().to_string(),
+            executable_sha256: hex::encode(hasher.finalize()),
+            core_launch_id: &ready.launch_id,
+            core_pid: ready.pid,
+            protocol: 3,
+            socket: self.socket.display().to_string(),
+        };
         atomic_json(&self.data.join("proof.json"), &evidence)
     }
 }
@@ -117,15 +177,25 @@ impl Profile {
 pub fn atomic_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
     let parent = path.parent().context("file parent")?;
     private_dir(parent)?;
-    let tmp = parent.join(format!(".{}.{}.tmp", path.file_name().unwrap().to_string_lossy(), uuid::Uuid::new_v4()));
+    let tmp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name().unwrap().to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
     let result = (|| -> Result<()> {
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
         serde_json::to_writer(&mut file, value)?;
         file.sync_all()?;
         fs::rename(&tmp, path)?;
         File::open(parent)?.sync_all()?;
         Ok(())
     })();
-    if result.is_err() { let _ = fs::remove_file(&tmp); }
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
     result
 }

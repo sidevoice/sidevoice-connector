@@ -30,26 +30,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: packages/connector-rust
-      - run: cargo fmt --all
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
-      - run: cargo build --release
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked --release
       - uses: actions/upload-artifact@v4
         with:
           name: sidevoice-rust-proof-linux-x86_64
           path: packages/connector-rust/target/release/sidevoice-rust-proof
-          if-no-files-found: error
-          retention-days: 7
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sidevoice-rust-proof-lockfile
-          path: packages/connector-rust/Cargo.lock
-          if-no-files-found: error
-          retention-days: 7
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sidevoice-rust-proof-formatted-sources
-          path: packages/connector-rust/src
           if-no-files-found: error
           retention-days: 7
 
