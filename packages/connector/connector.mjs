@@ -742,6 +742,7 @@ async function command(client, input) {
       const speech = { event_id: speechEventId, binding_id: binding.binding_id,
         session_id: params.session_id, revision: params.revision, utterance_id: params.utterance_id || randomUUID(), text: params.text, language: params.language,
         client_ref: binding.client_ref, harness: binding.harness, thread: binding.thread };
+      if (!validOutboxRow(speech)) throw new Error('Invalid speech outbox row');
       outbox.push(speech); saveOutbox();
       // What the room never confirmed stays in the outbox and goes again on the next welcome; the
       // conversation is told it is queued rather than left waiting on a room that is not there.

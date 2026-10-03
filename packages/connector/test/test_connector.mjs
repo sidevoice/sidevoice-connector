@@ -179,6 +179,59 @@ test('connector: speech while offline is queued durably and replayed on reconnec
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
 });
 
+test('connector: malformed speech is rejected before saving and restart remains healthy', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const port = room.port;
+  room.handle = (event, data) => event === 'binding.register'
+    ? { client_ref: data.client_ref, binding_id: 'b-one', thread: data.thread }
+    : event === 'speech.publish' ? savedSpeechAck(data) : undefined;
+  const first = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  let second = null;
+  let roomStopped = false;
+  try {
+    await until(() => existsSync(first.socketPath));
+    const facade = ipcClient(first.socketPath); await facade.ready;
+    await until(async () => (await facade.call('status', {})).connected);
+    await facade.call('register', { client_ref: 'r', harness: 'test', thread: 'thread-1', delivery: { kind: 'http', url: 'http://127.0.0.1:1/' } });
+    await room.stop();
+    roomStopped = true;
+    await until(async () => !(await facade.call('status', {})).connected);
+    const outboxPath = path.join(dataDir, 'outbox.json');
+    const validSpeech = { event_id: 'valid-event', utterance_id: 'utterance-one', session_id: 'session-one', revision: 0, text: 'valid reply' };
+    assert.equal((await facade.call('publish', { ...validSpeech, client_ref: 'r' })).status, 'queued');
+    const validRow = { ...validSpeech, binding_id: 'b-one', client_ref: 'r', harness: 'test', thread: 'thread-1' };
+    assert.deepEqual(JSON.parse(readFileSync(outboxPath, 'utf8')), [validRow]);
+    for (const invalidSpeech of [
+      { event_id: 'malformed-text', utterance_id: 'utterance-two', text: 42 },
+      { event_id: 'malformed-utterance', utterance_id: 42, text: 'valid text' },
+    ]) {
+      await assert.rejects(facade.call('publish', {
+        ...invalidSpeech, session_id: 'session-one', revision: 0, client_ref: 'r',
+      }), /Invalid speech outbox row/);
+      assert.deepEqual(JSON.parse(readFileSync(outboxPath, 'utf8')), [validRow], 'invalid input leaves existing pending rows unchanged');
+    }
+    facade.end();
+    first.child.kill(); await until(() => first.child.exitCode !== null);
+
+    second = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+    await until(() => existsSync(second.socketPath));
+    const restarted = ipcClient(second.socketPath); await restarted.ready;
+    assert.equal((await restarted.call('status', {})).connected, false, 'the connector restarted while Core was offline');
+    assert.deepEqual(JSON.parse(readFileSync(outboxPath, 'utf8')), [validRow], 'the valid pending row loaded and remained queued');
+    await room.start(port);
+    roomStopped = false;
+    await until(() => room.sent('speech.publish').some(data => data.text === validSpeech.text));
+    await until(() => JSON.parse(readFileSync(outboxPath, 'utf8')).length === 0);
+    restarted.end();
+  } finally {
+    if (first.child.exitCode === null) first.child.kill();
+    if (second && second.child.exitCode === null) second.child.kill();
+    if (roomStopped) await room.start(port).catch(() => {});
+    await room.close();
+  }
+});
+
 test('connector: a second JS process loads the same row and only the registered binding identity follows it', async () => {
   const room = await startRoom();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
