@@ -19,6 +19,9 @@ pub struct Profile {
     pub data: PathBuf,
     pub codex: PathBuf,
     pub cursor: PathBuf,
+    pub cursor_data: PathBuf,
+    pub xdg_config: PathBuf,
+    pub xdg_data: PathBuf,
     pub socket: PathBuf,
     pub core_socket: PathBuf,
     pub core_ready: PathBuf,
@@ -107,7 +110,16 @@ impl Profile {
         let home = child("home")?;
         let claude = child("claude")?;
         let codex = child("codex")?;
-        let cursor = child("cursor")?;
+        let cursor_root = child("cursor")?;
+        let cursor = cursor_root.join("config");
+        let cursor_data = cursor_root.join("data");
+        private_dir(&cursor)?;
+        private_dir(&cursor_data)?;
+        let xdg_root = child("xdg")?;
+        let xdg_config = xdg_root.join("config");
+        let xdg_data = xdg_root.join("data");
+        private_dir(&xdg_config)?;
+        private_dir(&xdg_data)?;
         let data = child("sidevoice")?;
         let core = data.join("core");
         private_dir(&core)?;
@@ -124,6 +136,9 @@ impl Profile {
             data,
             codex,
             cursor,
+            cursor_data,
+            xdg_config,
+            xdg_data,
         };
         profile.validate_private()?;
         Ok(profile)
@@ -146,6 +161,9 @@ impl Profile {
             ("CLAUDE_CONFIG_DIR", &profile.claude),
             ("CODEX_HOME", &profile.codex),
             ("CURSOR_CONFIG_DIR", &profile.cursor),
+            ("CURSOR_DATA_DIR", &profile.cursor_data),
+            ("XDG_CONFIG_HOME", &profile.xdg_config),
+            ("XDG_DATA_HOME", &profile.xdg_data),
             ("SIDEVOICE_DATA_DIR", &profile.data),
         ] {
             let supplied =
@@ -166,7 +184,44 @@ impl Profile {
             .env("CLAUDE_CONFIG_DIR", &self.claude)
             .env("CODEX_HOME", &self.codex)
             .env("CURSOR_CONFIG_DIR", &self.cursor)
+            .env("CURSOR_DATA_DIR", &self.cursor_data)
+            .env("XDG_CONFIG_HOME", &self.xdg_config)
+            .env("XDG_DATA_HOME", &self.xdg_data)
             .env("SIDEVOICE_DATA_DIR", &self.data)
+    }
+
+    pub fn validate_service_environment(&self, manager: &str) -> Result<()> {
+        for (key, expected) in [
+            ("HOME", &self.home),
+            ("CLAUDE_CONFIG_DIR", &self.claude),
+            ("CODEX_HOME", &self.codex),
+            ("CURSOR_CONFIG_DIR", &self.cursor),
+            ("CURSOR_DATA_DIR", &self.cursor_data),
+            ("XDG_CONFIG_HOME", &self.xdg_config),
+            ("XDG_DATA_HOME", &self.xdg_data),
+            ("SIDEVOICE_DATA_DIR", &self.data),
+        ] {
+            let supplied = std::env::var_os(key).context("managed profile environment is incomplete")?;
+            if Path::new(&supplied) != expected.as_path() {
+                bail!("managed profile environment does not match its root");
+            }
+        }
+        if std::env::var("SIDEVOICE_SERVICE").ok().as_deref() != Some(manager) {
+            bail!("managed service invocation is not identified by its manager");
+        }
+        Ok(())
+    }
+
+    pub fn service_stopped(&self) -> Result<bool> {
+        let marker = self.data.join("node-stopped.json");
+        match fs::symlink_metadata(&marker) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+            Ok(_) => {
+                private_file(&marker)?;
+                Ok(true)
+            }
+        }
     }
 
     /// Reject profile paths that were replaced after this process opened the isolated profile.
@@ -182,6 +237,11 @@ impl Profile {
         validate_profile_child(&root, &self.data)?;
         let core = self.data.join("core");
         validate_profile_child(&root, &core)?;
+        validate_profile_child(&root, self.cursor.parent().context("Cursor profile root")?)?;
+        validate_profile_child(&root, &self.cursor_data)?;
+        validate_profile_child(&root, self.xdg_config.parent().context("XDG profile root")?)?;
+        validate_profile_child(&root, &self.xdg_config)?;
+        validate_profile_child(&root, &self.xdg_data)?;
         for path in [&self.claude, &self.codex, &self.cursor] {
             match fs::symlink_metadata(path) {
                 Ok(_) => validate_profile_child(&root, path)?,
@@ -228,6 +288,10 @@ impl Profile {
     }
 
     pub async fn ready(&self) -> Result<Ready> {
+        self.health().await.map(|(ready, _)| ready)
+    }
+
+    pub async fn health(&self) -> Result<(Ready, Value)> {
         private_file(&self.core_ready)?;
         let bytes = fs::read(&self.core_ready)?;
         if bytes.len() > 65536 {
@@ -271,7 +335,7 @@ impl Profile {
         {
             bail!("Core health identity mismatch");
         }
-        Ok(ready)
+        Ok((ready, health))
     }
 
     pub fn write_evidence(&self, ready: &Ready) -> Result<()> {

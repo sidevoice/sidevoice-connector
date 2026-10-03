@@ -175,9 +175,10 @@ async def copied_state():
         root = Path(temporary)
         root.chmod(0o700)
         home, claude = root / 'home', root / 'claude'
-        data, codex, cursor = root / 'sidevoice', root / 'codex', root / 'cursor'
+        data, codex, cursor = root / 'sidevoice', root / 'codex', root / 'cursor/config'
         core_data = data / 'core'
-        for directory in (home, claude, codex, cursor, data, core_data):
+        for directory in (home, claude, codex, root / 'cursor', root / 'xdg', data, core_data,
+                          cursor, root / 'cursor/data', root / 'xdg/config', root / 'xdg/data'):
             directory.mkdir(mode=0o700)
         thread = str(uuid.uuid4())
         proof_args = ['mcp', '--profile-root', str(root)]
@@ -197,6 +198,8 @@ async def copied_state():
         env = {**os.environ, 'HOME': str(home), 'CLAUDE_CONFIG_DIR': str(claude),
                'SIDEVOICE_DATA_DIR': str(data), 'CODEX_HOME': str(codex),
                'CURSOR_CONFIG_DIR': str(cursor),
+               'CURSOR_DATA_DIR': str(root / 'cursor/data'),
+               'XDG_CONFIG_HOME': str(root / 'xdg/config'), 'XDG_DATA_HOME': str(root / 'xdg/data'),
                'SIDEVOICE_CODEX_BIN': str(fake_codex),
                'CODEX_THREAD_ID': thread, 'SIDEVOICE_SERVICE_MANAGER': 'none'}
         core_env, storage_flag, _, slow_flag = core_faults(root, env)
@@ -385,12 +388,14 @@ async def exercise():
         root = Path(temporary)
         root.chmod(0o700)
         home, claude = root / 'home', root / 'claude'
-        data, codex, cursor = root / 'sidevoice', root / 'codex', root / 'cursor'
+        data, codex, cursor = root / 'sidevoice', root / 'codex', root / 'cursor/config'
         core_data = data / 'core'
         rollout_dir = codex / 'sessions' / '2026' / '10' / '03'
-        for directory in (home, claude, data, core_data, codex, cursor, rollout_dir, root / 'bin'):
+        for directory in (home, claude, data, core_data, codex, root / 'cursor', root / 'xdg', rollout_dir, root / 'bin'):
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             directory.chmod(0o700)
+        for directory in (cursor, root / 'cursor/data', root / 'xdg/config', root / 'xdg/data'):
+            directory.mkdir(mode=0o700)
         fresh = await asyncio.create_subprocess_exec(str(binary), 'mcp', '--profile-root', str(root),
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             env={})
@@ -496,6 +501,8 @@ else:
         env = {**os.environ, 'HOME': str(home), 'CLAUDE_CONFIG_DIR': str(claude),
                'SIDEVOICE_DATA_DIR': str(data), 'CODEX_HOME': str(codex),
                'CURSOR_CONFIG_DIR': str(cursor),
+               'CURSOR_DATA_DIR': str(root / 'cursor/data'),
+               'XDG_CONFIG_HOME': str(root / 'xdg/config'), 'XDG_DATA_HOME': str(root / 'xdg/data'),
                'CODEX_THREAD_ID': thread, 'SIDEVOICE_CODEX_BIN': str(fake_codex),
                'SIDEVOICE_CLAUDE_BIN': str(fake_claude),
                'SIDEVOICE_TEST_QUEUE': str(queued), 'SIDEVOICE_TEST_SLOW': str(slow_started)}

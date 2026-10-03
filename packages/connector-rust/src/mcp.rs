@@ -406,6 +406,7 @@ impl ServerHandler for Facade {
 }
 
 pub async fn run(profile: Profile) -> Result<()> {
+    crate::service::ensure_connector(&profile).await?;
     let service = Facade::new(profile).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())

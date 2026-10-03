@@ -36,7 +36,10 @@ impl Fixture {
             Uuid::new_v4()
         ));
         private_mkdir(&root);
-        for name in ["home", "claude", "codex", "cursor", "sidevoice"] {
+        for name in ["home", "claude", "codex", "cursor", "xdg", "sidevoice"] {
+            private_mkdir(&root.join(name));
+        }
+        for name in ["cursor/config", "cursor/data", "xdg/config", "xdg/data"] {
             private_mkdir(&root.join(name));
         }
         private_mkdir(&root.join("sidevoice/core"));
@@ -46,7 +49,10 @@ impl Fixture {
             home: root.join("home"),
             claude: root.join("claude"),
             codex: root.join("codex"),
-            cursor: root.join("cursor"),
+            cursor: root.join("cursor/config"),
+            cursor_data: root.join("cursor/data"),
+            xdg_config: root.join("xdg/config"),
+            xdg_data: root.join("xdg/data"),
             socket: data.join("connector.sock"),
             core_socket: data.join("core/local.sock"),
             core_ready: data.join("core/core.json"),
