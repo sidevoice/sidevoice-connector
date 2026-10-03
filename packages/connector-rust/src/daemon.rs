@@ -742,9 +742,7 @@ fn rollout_path(home: &Path, thread: &str) -> Option<PathBuf> {
 }
 
 fn prune_binding_order(order: &mut HashMap<String, oneshot::Receiver<()>>) {
-    order.retain(|_, tail| {
-        matches!(tail.try_recv(), Err(oneshot::error::TryRecvError::Empty))
-    });
+    order.retain(|_, tail| matches!(tail.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
 }
 
 pub async fn run(profile: Profile) -> Result<()> {

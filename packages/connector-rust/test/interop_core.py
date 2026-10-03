@@ -271,7 +271,8 @@ async def copied_state():
             await facade.stdin.drain()
             started = time.monotonic()
             joined = await tool(facade, 'voice_connect', {'title': 'Orphan safety'}, 4, thread)
-            assert joined['binding_id'] == again and time.monotonic() - started < 10, (
+            registration_seconds = time.monotonic() - started
+            assert joined['binding_id'] == again and registration_seconds < 10, (
                 'registration waited for two slow speech ACKs')
             await until(lambda: orphan['event_id'] in (root / 'rust.log').read_text()
                         and 'retaining for explicit migration' in (root / 'rust.log').read_text(),
@@ -281,6 +282,8 @@ async def copied_state():
             rows = http_json(core_data / 'local.sock', 'GET', f'/api/presentation/history?thread_id={thread}', token=token)['messages']
             for speech in slow_rows:
                 assert sum(row['text'] == speech['text'] for row in rows) == 1
+            print(json.dumps({'registration_seconds': round(registration_seconds, 3),
+                              'historical_orphan_retained': True, 'slow_acks': 2}))
         except Exception:
             for handle in (core_log, js_log, rust_log):
                 handle.flush()
