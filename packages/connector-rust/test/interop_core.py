@@ -252,7 +252,9 @@ async def copied_state():
             await until(lambda: (data / 'outbox.json').exists() and len(json.loads((data / 'outbox.json').read_text())) == 1,
                         'JS-created queued outbox', seconds=25)
             original = json.loads((data / 'outbox.json').read_text())[0]
-            assert original['binding_id'] == old_id and 'client_ref' not in original
+            assert original['binding_id'] == old_id
+            assert (original['client_ref'], original['harness'], original['thread']) == (
+                thread, 'codex', thread), 'JS must save the complete binding identity on new speech rows'
             await finish(js)
             js = None
             js_writer.close()
