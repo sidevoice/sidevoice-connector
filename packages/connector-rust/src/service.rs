@@ -2,11 +2,10 @@
 //! user-manager path has been reviewed against an isolated runner.
 
 use crate::agents::message;
+use anyhow::Context;
 #[cfg(target_os = "macos")]
 use crate::proof::atomic_json;
 use crate::proof::{private_dir, private_file, Profile, Ready};
-#[cfg(target_os = "macos")]
-use anyhow::Context;
 #[cfg(target_os = "macos")]
 use fs2::FileExt;
 use serde_json::{json, Value};
