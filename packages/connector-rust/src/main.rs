@@ -34,7 +34,7 @@ async fn codex_state(profile: &Profile) -> Result<Value> {
     let config = profile.codex.join("config.toml");
     let parsed = if config.exists() {
         let text = fs::read_to_string(&config)?;
-        Some(toml::from_str::<toml::Value>(&text).map_err(|_| anyhow::anyhow!("invalid Codex config TOML"))?)
+        match toml::from_str::<toml::Value>(&text) { Ok(value) => Some(value), Err(_) => return Ok(json!({"state":"invalid"})) }
     } else { None };
     let has_entry = parsed.as_ref().and_then(|v| v.get("mcp_servers")).and_then(|v| v.get("sidevoice")).is_some();
     let output = Command::new(codex_binary()).env("CODEX_HOME", &profile.codex).args(["mcp", "get", "sidevoice", "--json"]).output().await?;

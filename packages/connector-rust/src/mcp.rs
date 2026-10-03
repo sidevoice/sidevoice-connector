@@ -1,7 +1,7 @@
 use crate::proof::{verify_socket, Profile};
 use anyhow::{bail, Context, Result};
 use rmcp::{model::*, service::RequestContext, transport::stdio, ErrorData as McpError, RoleServer, ServerHandler, ServiceExt};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -186,7 +186,7 @@ impl ServerHandler for Facade {
     fn get_tool(&self, name: &str) -> Option<Tool> { tools().into_iter().find(|tool| tool.name == name) }
 
     async fn call_tool(&self, request: CallToolRequestParams, _context: RequestContext<RoleServer>) -> std::result::Result<CallToolResponse, McpError> {
-        let args = Value::Object(request.arguments.unwrap_or_else(Map::new));
+        let args = Value::Object(request.arguments.unwrap_or_default());
         let meta = request.meta.and_then(|m| serde_json::to_value(m).ok()).unwrap_or(json!({}));
         let result = self.invoke(&request.name, args, meta).await;
         let value = match result {

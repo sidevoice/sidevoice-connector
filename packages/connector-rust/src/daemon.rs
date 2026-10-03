@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -55,6 +55,10 @@ impl Daemon {
         let reply = self.link.request("binding.register", frame, Duration::from_secs(10)).await?;
         if let Some(error) = reply.get("error") { bail!("Core binding refusal: {error}"); }
         let id = reply.get("binding_id").and_then(Value::as_str).context("Core binding ID missing")?;
+        if !self.bindings.lock().await.contains_key(&binding.client_ref) {
+            let _ = self.link.notify("binding.unregister", json!({"binding_id":id})).await;
+            bail!("façade left while Core registered binding");
+        }
         *binding.id.lock().await = id.to_owned();
         Ok(reply)
     }
@@ -272,31 +276,34 @@ impl Daemon {
         let owner = self.owner_serial.fetch_add(1, Ordering::Relaxed);
         let (read, mut write) = stream.into_split();
         let mut lines = BufReader::new(read).lines();
-        loop {
-            let Some(line) = lines.next_line().await? else { break; };
-            if line.len() > 1 << 20 { bail!("IPC line too large"); }
-            let request: Value = serde_json::from_str(&line)?;
-            let id = request.get("id").cloned().unwrap_or(Value::Null);
-            let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-            let params = request.get("params").cloned().unwrap_or(json!({}));
-            let answer = match self.command(owner, method, params).await {
-                Ok(result) => json!({"id":id,"ok":true,"result":result}),
-                Err(error) => json!({"id":id,"ok":false,"error":error.to_string()}),
-            };
-            write.write_all(answer.to_string().as_bytes()).await?;
-            write.write_all(b"\n").await?;
-        }
+        let result = async {
+            loop {
+                let Some(line) = lines.next_line().await? else { break; };
+                if line.len() > 1 << 20 { bail!("IPC line too large"); }
+                let request: Value = serde_json::from_str(&line)?;
+                let id = request.get("id").cloned().unwrap_or(Value::Null);
+                let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+                let params = request.get("params").cloned().unwrap_or(json!({}));
+                let answer = match self.command(owner, method, params).await {
+                    Ok(result) => json!({"id":id,"ok":true,"result":result}),
+                    Err(error) => json!({"id":id,"ok":false,"error":error.to_string()}),
+                };
+                write.write_all(answer.to_string().as_bytes()).await?;
+                write.write_all(b"\n").await?;
+            }
+            Ok(())
+        }.await;
         let owned: Vec<_> = self.bindings.lock().await.values().filter(|b| b.owner == owner).cloned().collect();
         for b in owned {
             b.stopped.store(true, Ordering::Relaxed);
             self.bindings.lock().await.remove(&b.client_ref);
             let _ = self.link.notify("binding.unregister", json!({"binding_id":*b.id.lock().await})).await;
         }
-        Ok(())
+        result
     }
 }
 
-fn rollout_path(home: &PathBuf, thread: &str) -> Option<PathBuf> {
+fn rollout_path(home: &Path, thread: &str) -> Option<PathBuf> {
     let root = home.join("sessions");
     let mut years: Vec<_> = fs::read_dir(root).ok()?.flatten().map(|e| e.path()).collect(); years.sort(); years.reverse();
     for year in years {
@@ -316,7 +323,7 @@ fn rollout_path(home: &PathBuf, thread: &str) -> Option<PathBuf> {
 pub async fn run(profile: Profile) -> Result<()> {
     private_dir(&profile.data)?;
     let lock_path = profile.data.join("connector.lock");
-    let lock = OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(lock_path)?;
+    let lock = OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(lock_path)?;
     lock.try_lock_exclusive().context("another connector holds the proof lock")?;
     if profile.socket.exists() { verify_socket(&profile.socket)?; fs::remove_file(&profile.socket)?; }
     let link = Link::new();
@@ -324,9 +331,10 @@ pub async fn run(profile: Profile) -> Result<()> {
     let (incoming_tx, mut incoming_rx) = mpsc::channel(128);
     let (ready_tx, ready_rx) = oneshot::channel();
     tokio::spawn(link.run(profile.clone(), incoming_tx, ready_tx));
-    ready_rx.await.context("Core hello did not complete")?.map_err(anyhow::Error::msg)?;
+    let ready = ready_rx.await.context("Core hello did not complete")?.map_err(anyhow::Error::msg)?;
     let listener = UnixListener::bind(&profile.socket)?;
     fs::set_permissions(&profile.socket, fs::Permissions::from_mode(0o600))?;
+    profile.write_evidence(&ready)?;
     loop {
         tokio::select! {
             accepted = listener.accept() => {
