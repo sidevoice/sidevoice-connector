@@ -221,15 +221,25 @@ impl Link {
                                 let id = value.get("id").cloned();
                                 if tasks.len() >= 65 { bail!("Core handler limit"); }
                                 let reply_tx = tx.clone();
-                                let method = method.to_owned(); let params = value.get("params").cloned().unwrap_or(Value::Null);
+                                let method = method.to_owned();
+                                let params = value.get("params").cloned().unwrap_or(Value::Null);
                                 let (answer_tx, answer_rx) = oneshot::channel();
-                                if !matches!(timeout(Duration::from_secs(2), incoming.send(Incoming { session, method, params, reply: id.as_ref().map(|_| answer_tx) })).await, Ok(Ok(()))) {
+                                let inbound = Incoming {
+                                    session,
+                                    method,
+                                    params,
+                                    reply: id.as_ref().map(|_| answer_tx),
+                                };
+                                if !matches!(timeout(Duration::from_secs(2), incoming.send(inbound)).await, Ok(Ok(()))) {
                                     bail!("Core inbound queue unavailable");
                                 }
                                 if let Some(id) = id {
                                     tasks.spawn(async move {
-                                        let result = timeout(Duration::from_secs(65), answer_rx).await.ok().and_then(|v| v.ok()).unwrap_or(json!({"status":"failed"}));
-                                        let _ = reply_tx.send(Message::Text(json!({"jsonrpc":"2.0","id":id,"result":result}).to_string().into())).await;
+                                        let result = timeout(Duration::from_secs(65), answer_rx)
+                                            .await.ok().and_then(|v| v.ok())
+                                            .unwrap_or(json!({"status":"failed"}));
+                                        let frame = json!({"jsonrpc":"2.0","id":id,"result":result});
+                                        let _ = reply_tx.send(Message::Text(frame.to_string().into())).await;
                                         false
                                     });
                                 }

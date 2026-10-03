@@ -10,4 +10,6 @@ The proof needs the active Codex thread ID for queued delivery. Codex 0.157.0 di
 
 The local speech outbox is synced to disk. Core's `text_saved: true` acknowledges admission into its current-process journal; Core intentionally keeps that journal in memory. This proof removes an outbox item on that ACK, so a Core crash immediately afterward can lose that speech text. Production use requires a separate privacy and retention decision and a restart-after-ACK test.
 
+The hosted handoff test runs the existing JS connector, this Rust proof, then JS again against one isolated Core launch. A copied JS speech row has no conversation reference; if Core later remints its binding ID, Rust retains and reports that unattributed row rather than assigning it to another conversation. [Connector issue #41](https://github.com/sidevoice/sidevoice-connector/issues/41) tracks that production migration rule, and [Core issue #43](https://github.com/sidevoice/sidevoice-core/issues/43) tracks crash-safe speech retention.
+
 The daemon writes `proof.json` with its PID, executable path and SHA-256, Core launch ID and successful protocol version. The file is evidence of what connected, not an installation record. No build from this directory is an upgrade artifact.

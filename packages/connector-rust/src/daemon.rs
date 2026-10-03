@@ -796,21 +796,30 @@ pub async fn run(profile: Profile) -> Result<()> {
                     core_session = item.session;
                 }
                 if core_tasks.len() >= 64 {
-                    if let Some(tx) = item.reply { let _ = tx.send(json!({"status":"failed","detail":"connector handler capacity reached"})); }
-                    else { eprintln!("[sidevoice rust proof] Core notification capacity reached"); }
+                    if let Some(tx) = item.reply {
+                        let _ = tx.send(json!({"status":"failed","detail":"connector handler capacity reached"}));
+                    } else {
+                        eprintln!("[sidevoice rust proof] Core notification capacity reached");
+                    }
                     continue;
                 }
                 let daemon = daemon.clone();
-                let ordered = item.method == "input.deliver";
-                let (previous, completed) = if ordered {
-                    let id = item.params.get("binding_id").and_then(Value::as_str).unwrap_or("").to_owned();
+                let (previous, completed) = if item.method == "input.deliver" {
+                    let id = item.params.get("binding_id")
+                        .and_then(Value::as_str).unwrap_or("").to_owned();
                     let (tx, rx) = oneshot::channel();
                     (binding_order.insert(id, rx), Some(tx))
-                } else { (None, None) };
+                } else {
+                    (None, None)
+                };
                 core_tasks.spawn(async move {
-                    if let Some(previous) = previous { let _ = previous.await; }
+                    if let Some(previous) = previous {
+                        let _ = previous.await;
+                    }
                     daemon.incoming(item).await;
-                    if let Some(completed) = completed { let _ = completed.send(()); }
+                    if let Some(completed) = completed {
+                        let _ = completed.send(());
+                    }
                 });
             }
             _ = tokio::signal::ctrl_c() => { break; }
