@@ -695,7 +695,7 @@ else:
                     await until(lambda: queued.exists() and json.loads(queued.read_text()).get('message', '').find(unrelated_text) >= 0,
                                 'unrelated input.deliver while host scan runs', seconds=3)
                     await until(lambda: next((row for row in history()
-                        if row['id'] == unrelated_message_id and row['status'] == 'delivered'), None),
+                        if row['id'] == unrelated_live['id'] and row['status'] == 'delivered'), None),
                         'Core accepted the concurrent input.deliver', seconds=3)
                     assert not agent_scan.done(), 'host scan completed before input.deliver was acknowledged'
                 except Exception as error:
