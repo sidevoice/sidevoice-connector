@@ -344,10 +344,15 @@ impl CoreAcquirer {
         check_cancel(cancel)?;
 
         let payload = stage_root.join("payload");
+        let payload_for_extract = payload.clone();
         let archive_for_extract = archive_path.clone();
         let cancel_for_extract = cancel.clone();
         tokio::task::spawn_blocking(move || {
-            extract_verified_archive(&archive_for_extract, &payload, &cancel_for_extract)
+            extract_verified_archive(
+                &archive_for_extract,
+                &payload_for_extract,
+                &cancel_for_extract,
+            )
         })
         .await
         .map_err(|error| CoreAcquisitionError::Archive(error.to_string()))??;
@@ -448,10 +453,15 @@ impl CoreAcquirer {
         .await?;
         check_cancel(cancel)?;
         let payload = stage_root.join("payload");
+        let payload_for_extract = payload.clone();
         let archive_for_extract = archive_path.clone();
         let cancel_for_extract = cancel.clone();
         tokio::task::spawn_blocking(move || {
-            extract_verified_archive(&archive_for_extract, &payload, &cancel_for_extract)
+            extract_verified_archive(
+                &archive_for_extract,
+                &payload_for_extract,
+                &cancel_for_extract,
+            )
         })
         .await
         .map_err(|error| CoreAcquisitionError::Archive(error.to_string()))??;
