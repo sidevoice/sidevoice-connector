@@ -85,7 +85,7 @@ impl Ipc {
         let answer = timeout(Duration::from_secs(20), rx).await;
         self.pending.lock().await.remove(&id);
         let value = answer.context("connector request timed out")??.map_err(anyhow::Error::msg)?;
-        if method == "register" { if let Some(client_ref) = params.get("client_ref").and_then(Value::as_str) { self.registrations.lock().await.insert(client_ref.to_owned(), params); } }
+        if method == "register" { if let Some(client_ref) = params.get("client_ref").and_then(Value::as_str) { self.registrations.lock().await.insert(client_ref.to_owned(), params.clone()); } }
         if method == "unregister" { if let Some(client_ref) = params.get("client_ref").and_then(Value::as_str) { self.registrations.lock().await.remove(client_ref); } }
         Ok(value)
     }
@@ -100,6 +100,7 @@ impl Facade {
     async fn invoke(&self, name: &str, args: Value, meta: Value) -> Result<Value> {
         match name {
             "voice_connect" => {
+                if args.get("room").and_then(Value::as_str).is_some() { bail!("Room selection is unavailable in the isolated Codex proof"); }
                 let thread = thread_from_meta(&meta).or_else(|| std::env::var("CODEX_THREAD_ID").ok()).context("Codex did not provide a thread ID")?;
                 let title = args.get("title").and_then(Value::as_str).unwrap_or("Voice conversation");
                 let params = json!({"client_ref":thread,"harness":"codex","thread":thread,"title":title,"delivery":{"kind":"codex-queue","thread":thread}});
@@ -150,8 +151,9 @@ impl Facade {
 
 fn thread_from_meta(meta: &Value) -> Option<String> {
     let turn = meta.get("x-codex-turn-metadata").and_then(|v| if v.is_string() { serde_json::from_str::<Value>(v.as_str().unwrap()).ok() } else { Some(v.clone()) });
-    [meta.get("openai/threadId"), meta.get("openai/thread_id"), meta.get("codexThreadId"), meta.get("codex_thread_id"), turn.as_ref().and_then(|v| v.get("thread_id"))]
-        .into_iter().flatten().find_map(|v| v.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
+    let found = [meta.get("openai/threadId"), meta.get("openai/thread_id"), meta.get("codexThreadId"), meta.get("codex_thread_id"), turn.as_ref().and_then(|v| v.get("thread_id"))]
+        .into_iter().flatten().find_map(|v| v.as_str().filter(|s| !s.is_empty()).map(str::to_owned));
+    found
 }
 
 fn tools() -> Vec<Tool> {

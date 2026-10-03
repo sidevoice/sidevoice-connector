@@ -85,7 +85,16 @@ impl Daemon {
         let result = self.link.request("speech.publish", speech.clone(), Duration::from_secs(15)).await;
         let reply = match result { Ok(v) => v, Err(error) => { eprintln!("[sidevoice rust proof] speech retry retained: {error}"); return Ok(None); } };
         if reply.get("status") == Some(&json!("unknown_binding")) {
-            if let Some(binding) = self.binding_for_id(speech.get("binding_id").and_then(Value::as_str).unwrap_or("")).await { let _ = self.register_core(&binding).await; }
+            if let Some(binding) = self.binding_for_id(speech.get("binding_id").and_then(Value::as_str).unwrap_or("")).await {
+                if self.register_core(&binding).await.is_ok() {
+                    let new_id = binding.id.lock().await.clone();
+                    let mut outbox = self.outbox.lock().await;
+                    let before = outbox.clone();
+                    for item in outbox.iter_mut().filter(|item| item.get("event_id") == speech.get("event_id")) { item["binding_id"] = json!(new_id); }
+                    if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) { *outbox = before; return Err(error); }
+                }
+            }
+            return Ok(None);
         }
         if Self::durable(speech, &reply) {
             let event_id = speech.get("event_id");
@@ -94,7 +103,7 @@ impl Daemon {
             outbox.retain(|item| item.get("event_id") != event_id);
             if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) { *outbox = before; return Err(error); }
         }
-        Ok(Some(reply))
+        if Self::durable(speech, &reply) { Ok(Some(reply)) } else { Ok(None) }
     }
 
     async fn flush_outbox(&self) {
