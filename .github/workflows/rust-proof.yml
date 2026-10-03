@@ -40,3 +40,29 @@ jobs:
           path: packages/connector-rust/target/release/sidevoice-rust-proof
           if-no-files-found: error
           retention-days: 7
+
+  interop-core:
+    name: Rust proof with real Core v3 and modelled Codex queue
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.core-ref != '' }}
+    needs: native
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: sidevoice/sidevoice-core
+          ref: ${{ inputs.core-ref }}
+          path: core
+      - uses: actions/download-artifact@v4
+        with:
+          name: sidevoice-rust-proof-linux-x86_64
+          path: proof-bin
+      - uses: astral-sh/setup-uv@v6
+      - run: chmod 700 proof-bin/sidevoice-rust-proof
+      - run: uv venv --python 3.12 core/.venv
+      - run: uv pip install --python core/.venv/bin/python -e ./core 'websockets>=15,<16'
+      - name: Real Core, Core-generated input, receipts and speech
+        env:
+          SIDEVOICE_CORE_PYTHON: ${{ github.workspace }}/core/.venv/bin/python
+          SIDEVOICE_RUST_PROOF_BIN: ${{ github.workspace }}/proof-bin/sidevoice-rust-proof
+        run: core/.venv/bin/python packages/connector-rust/test/interop_core.py
