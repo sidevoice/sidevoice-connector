@@ -727,6 +727,9 @@ async def exercise():
 
         # With the façade closed and no service jobs installed, frequent status probes must
         # leave the unmanaged daemon's 15 second idle exit untouched.
+        if facade:
+            await finish(facade)
+            facade = None
         (profile / 'releases/current').symlink_to(release.name)
         await service('start')
         idle_facade = await start_facade(str(uuid.uuid4()))
