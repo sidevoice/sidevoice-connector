@@ -580,7 +580,7 @@ main()
                     await wait_engine(core_data / 'local.sock', token, session, joined['conversation'], 'codex-fixture-model')
                     await wait_working(facade, joined['conversation'], True, 90)
                     await wait_room_working(room_events, joined['conversation'], True)
-                    core_json(core_data / 'local.sock', 'POST', '/api/test/connector-reconnect', {})
+                    core_json(core_data / 'local.sock', 'POST', '/api/test/connector-reconnect', {}, token)
                     await wait_participant(core_data / 'local.sock', token, session, joined['conversation'], available=False)
                     while not room_events.empty():
                         room_events.get_nowait()
@@ -787,7 +787,7 @@ main()
                 assert reopened['conversation'] == http_thread, reopened
                 await wait_core_connected(facade, http_thread, 121)
                 core_json(core_data / 'local.sock', 'POST', '/api/test/rendezvous-state',
-                    {'connected':False,'room':'https://fixture.invalid','refused':'fixture pairing revoked'})
+                    {'connected':False,'room':'https://fixture.invalid','refused':'fixture pairing revoked'}, token)
                 revoked = await wait_refusal_status(facade, http_thread, 115, True)
                 assert revoked['joined'] is False and revoked.get('closed_by_room') is True
                 assert 'pairing was revoked' in revoked.get('note', ''), revoked
@@ -797,7 +797,7 @@ main()
                 revoked_join = await tool_failure(facade, 'voice_connect', {'title':'Blocked while revoked'}, 117)
                 assert 'revoked this connector pairing' in revoked_join, revoked_join
                 core_json(core_data / 'local.sock', 'POST', '/api/test/rendezvous-state',
-                    {'connected':False,'room':None,'refused':None})
+                    {'connected':False,'room':None,'refused':None}, token)
                 await wait_refusal_status(facade, http_thread, 123, False)
                 reopened = await tool(facade, 'voice_connect', {'title':'HTTP after re-pair'}, 118)
                 assert reopened['conversation'] == http_thread, reopened
@@ -1058,14 +1058,14 @@ main()
                 assert history_rejoined['conversation'] == history_thread, history_rejoined
                 await wait_core_connected(history_facade, history_thread, 166)
                 core_json(core_data / 'local.sock', 'POST', '/api/test/rendezvous-state',
-                    {'connected':False,'room':'https://fixture.invalid','refused':'fixture pairing revoked'})
+                    {'connected':False,'room':'https://fixture.invalid','refused':'fixture pairing revoked'}, token)
                 revoked_after_latch = await wait_refusal_status(history_facade, history_thread, 167, True)
                 assert 'pairing was revoked' in revoked_after_latch.get('note', ''), revoked_after_latch
                 revoked_after_latch_say = await tool_failure(history_facade, 'voice_say', {'conversation':history_thread,
                     'session_id':'history:legacy','revision':0,'text':'must stay refused'}, 168)
                 assert 'pairing was revoked' in revoked_after_latch_say, revoked_after_latch_say
                 core_json(core_data / 'local.sock', 'POST', '/api/test/rendezvous-state',
-                    {'connected':False,'room':None,'refused':None})
+                    {'connected':False,'room':None,'refused':None}, token)
                 await wait_refusal_status(history_facade, history_thread, 169, False)
                 history_rejoined = await tool(history_facade, 'voice_connect', {'title':'History after re-pair'}, 170)
                 assert history_rejoined['conversation'] == history_thread, history_rejoined
