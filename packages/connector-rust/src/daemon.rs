@@ -24,7 +24,9 @@ struct Binding {
     thread: String,
     title: String,
     delivery: Value,
+    engine: Mutex<Option<Value>>,
     bridge_chat: Mutex<Option<String>>,
+    transcript_chat: Mutex<Option<String>>,
     route: Option<String>,
     capabilities: Value,
     experimental: Value,
@@ -37,6 +39,7 @@ struct Binding {
     turns: Mutex<HashMap<String, String>>,
     input_context: Mutex<HashMap<String, (String, i64)>>,
     read: Mutex<VecDeque<String>>,
+    working: Mutex<Option<bool>>,
     stopped: AtomicBool,
 }
 
@@ -54,6 +57,8 @@ pub struct Daemon {
     managed: bool,
     shutdown: watch::Sender<bool>,
     rendezvous: Mutex<Option<Value>>,
+    refusal: Mutex<Option<String>>,
+    closed_by_room: Mutex<HashMap<String, String>>,
 }
 
 impl Daemon {
@@ -77,7 +82,32 @@ impl Daemon {
             Vec::new()
         };
         let host_agents = HostAgents::new(profile.clone())?;
-        Ok(Arc::new(Self {
+        let state_path = profile.data.join("conversation-state.json");
+        let state = if state_path.exists() {
+            private_file(&state_path)?;
+            let bytes = fs::read(&state_path)?;
+            if bytes.len() > 1 << 20 {
+                bail!("conversation state too large");
+            }
+            serde_json::from_slice::<Value>(&bytes).context("invalid conversation state")?
+        } else {
+            json!({})
+        };
+        let closed_by_room = state
+            .get("closed_by_room")
+            .and_then(Value::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|(client_ref, reason)| {
+                        reason
+                            .as_str()
+                            .map(|reason| (client_ref.clone(), reason.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let daemon = Arc::new(Self {
             profile,
             link,
             bindings: Mutex::new(HashMap::new()),
@@ -91,14 +121,37 @@ impl Daemon {
             managed,
             shutdown,
             rendezvous: Mutex::new(None),
-        }))
+            refusal: Mutex::new(
+                state
+                    .get("refused")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            ),
+            closed_by_room: Mutex::new(closed_by_room),
+        });
+        let announcer = daemon.clone();
+        let mut stop = daemon.shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => announcer.reannounce_working().await,
+                    changed = stop.changed() => {
+                        if changed.is_err() || *stop.borrow() { break; }
+                    }
+                }
+            }
+        });
+        Ok(daemon)
     }
 
     async fn register_core(&self, binding: &Arc<Binding>) -> Result<Value> {
         let mut current = binding.id.lock().await;
+        let engine = binding.engine.lock().await.clone().unwrap_or(Value::Null);
         let mut frame = json!({"client_ref":binding.client_ref,"harness":binding.harness,"thread":binding.thread,"title":binding.title,"delivery":binding.delivery,
             "inbound":binding.inbound,"capabilities":binding.capabilities,
-            "experimental":binding.experimental,"route":binding.route,"engine":null,"focus":false});
+            "experimental":binding.experimental,"route":binding.route,"engine":engine,"focus":false});
         if !current.starts_with("local-") {
             frame["binding_id"] = json!(*current);
         }
@@ -149,6 +202,8 @@ impl Daemon {
         for binding in bindings {
             if let Err(error) = self.register_core(&binding).await {
                 eprintln!("[sidevoice rust proof] binding replay: {error}");
+            } else if let Some(working) = *binding.working.lock().await {
+                self.report_working(&binding, working).await;
             }
         }
         self.request_replay();
@@ -157,6 +212,78 @@ impl Daemon {
     fn request_replay(&self) {
         // A full slot already requests a pass; the run loop owns its one replay task.
         let _ = self.replay_tx.try_send(());
+    }
+
+    async fn save_conversation_state(&self) {
+        let state = json!({"refused":self.refusal.lock().await.clone(),
+            "closed_by_room":self.closed_by_room.lock().await.clone()});
+        if let Err(error) = atomic_json(&self.profile.data.join("conversation-state.json"), &state)
+        {
+            eprintln!("[sidevoice rust proof] conversation state: {error}");
+        }
+    }
+
+    async fn send_working_event(&self, binding: &Binding, mut event: Value) {
+        let current = binding.working.lock().await;
+        if event.get("working").and_then(Value::as_bool) != *current {
+            return;
+        }
+        let id = binding.id.lock().await.clone();
+        if id.starts_with("local-") {
+            return;
+        }
+        event["binding_id"] = json!(id);
+        let _ = self.link.notify("input.working", event).await;
+    }
+
+    async fn report_working_event(&self, binding: &Binding, event: Value) {
+        if let Some(working) = event.get("working").and_then(Value::as_bool) {
+            *binding.working.lock().await = Some(working);
+            self.send_working_event(binding, event).await;
+        }
+    }
+
+    async fn report_working(&self, binding: &Binding, working: bool) {
+        self.report_working_event(binding, json!({"working":working,"turn_id":Value::Null}))
+            .await;
+    }
+
+    async fn report_engine(&self, binding: &Binding, engine: Value) {
+        if !engine
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(|model| !model.is_empty())
+        {
+            return;
+        }
+        let mut current = binding.engine.lock().await;
+        let same = current.as_ref().is_some_and(|previous| {
+            ["model", "effort", "thinking"]
+                .iter()
+                .all(|key| previous.get(key) == engine.get(key))
+        });
+        if same {
+            return;
+        }
+        *current = Some(engine.clone());
+        drop(current);
+        let id = binding.id.lock().await.clone();
+        if !id.starts_with("local-") {
+            let _ = self
+                .link
+                .notify("input.engine", json!({"binding_id":id,"engine":engine}))
+                .await;
+        }
+    }
+
+    async fn reannounce_working(&self) {
+        let bindings: Vec<_> = self.bindings.lock().await.values().cloned().collect();
+        for binding in bindings {
+            if let Some(working) = *binding.working.lock().await {
+                self.send_working_event(&binding, json!({"working":working,"turn_id":Value::Null}))
+                    .await;
+            }
+        }
     }
 
     fn outbox_path(&self) -> PathBuf {
@@ -314,12 +441,44 @@ impl Daemon {
                 if let Some(binding) = self.binding_for_id(id).await {
                     binding.stopped.store(true, Ordering::Relaxed);
                     self.bindings.lock().await.remove(&binding.client_ref);
+                    self.closed_by_room.lock().await.insert(
+                        binding.client_ref.clone(),
+                        params
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("closed_from_room")
+                            .to_owned(),
+                    );
+                    self.save_conversation_state().await;
                     self.cursor_apps.close(&binding.thread).await;
                 }
                 json!({})
             }
             "node.rendezvous" => {
+                let previous_refusal = self.refusal.lock().await.clone();
                 *self.rendezvous.lock().await = Some(params.clone());
+                let refusal = params
+                    .get("refused")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                if let Some(reason) = refusal {
+                    *self.refusal.lock().await = Some(reason);
+                    let bindings: Vec<_> = self.bindings.lock().await.values().cloned().collect();
+                    for binding in bindings {
+                        binding.stopped.store(true, Ordering::Relaxed);
+                        self.bindings.lock().await.remove(&binding.client_ref);
+                        self.closed_by_room
+                            .lock()
+                            .await
+                            .insert(binding.client_ref.clone(), "connector_revoked".into());
+                        self.cursor_apps.close(&binding.thread).await;
+                    }
+                    self.save_conversation_state().await;
+                } else if previous_refusal.is_some() {
+                    *self.refusal.lock().await = None;
+                    self.save_conversation_state().await;
+                }
                 json!({})
             }
             "agents.list" | "agents.connect" | "agents.disconnect" | "agents.dismiss" => {
@@ -498,6 +657,18 @@ impl Daemon {
                     .and_then(Value::as_str)
                     .context("client_ref required")?
                     .to_owned();
+                if let Some(reason) = self.refusal.lock().await.clone() {
+                    if params.get("resume") == Some(&json!(true)) {
+                        bail!("CLOSED_BY_ROOM:connector_revoked:{client_ref}");
+                    }
+                    bail!("the room revoked this connector pairing: {reason}");
+                }
+                if params.get("resume") == Some(&json!(true)) {
+                    if let Some(reason) = self.closed_by_room.lock().await.get(&client_ref).cloned()
+                    {
+                        bail!("CLOSED_BY_ROOM:{reason}:{client_ref}");
+                    }
+                }
                 let thread = params
                     .get("thread")
                     .and_then(Value::as_str)
@@ -575,7 +746,14 @@ impl Daemon {
                     thread: thread.clone(),
                     title,
                     delivery: delivery.clone(),
+                    engine: Mutex::new(
+                        params
+                            .get("engine")
+                            .filter(|value| !value.is_null())
+                            .cloned(),
+                    ),
                     bridge_chat: Mutex::new(None),
+                    transcript_chat: Mutex::new(None),
                     route,
                     capabilities,
                     experimental,
@@ -588,6 +766,7 @@ impl Daemon {
                     turns: Mutex::new(HashMap::new()),
                     input_context: Mutex::new(HashMap::new()),
                     read: Mutex::new(VecDeque::new()),
+                    working: Mutex::new(None),
                     stopped: AtomicBool::new(false),
                 });
                 let prepared = if kind == "cursor-app" {
@@ -603,6 +782,8 @@ impl Daemon {
                     .lock()
                     .await
                     .insert(client_ref, binding.clone());
+                self.closed_by_room.lock().await.remove(&binding.client_ref);
+                self.save_conversation_state().await;
                 self.clone().watch_binding(binding.clone());
                 let result = self.register_core(&binding).await;
                 let id = binding.id.lock().await.clone();
@@ -614,6 +795,26 @@ impl Daemon {
                 )
             }
             "publish" => {
+                if let Some(reason) = self.refusal.lock().await.clone() {
+                    bail!("CLOSED_BY_ROOM:connector_revoked:{reason}");
+                }
+                if let Some(client_ref) = params.get("client_ref").and_then(Value::as_str) {
+                    if let Some(reason) = self.closed_by_room.lock().await.get(client_ref).cloned()
+                    {
+                        bail!("CLOSED_BY_ROOM:{reason}:{client_ref}");
+                    }
+                }
+                if let Some(refs) = params.get("client_refs").and_then(Value::as_array) {
+                    for item in refs {
+                        if let Some(client_ref) = item.as_str() {
+                            if let Some(reason) =
+                                self.closed_by_room.lock().await.get(client_ref).cloned()
+                            {
+                                bail!("CLOSED_BY_ROOM:{reason}:{client_ref}");
+                            }
+                        }
+                    }
+                }
                 let session_id = params
                     .get("session_id")
                     .and_then(Value::as_str)
@@ -714,27 +915,37 @@ impl Daemon {
                 Ok(
                     json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,"thread":binding.thread,
                     "harness":binding.harness,"title":binding.title,"delivery":binding.delivery,"route":binding.route,
-                    "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound,"detachable":binding.detachable}),
+                    "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound,"detachable":binding.detachable,
+                    "engine":binding.engine.lock().await.clone()}),
                 )
             }
             "status" => {
                 let bindings: Vec<_> = self.bindings.lock().await.values().cloned().collect();
                 let mut listed = Vec::with_capacity(bindings.len());
                 for binding in bindings {
+                    let engine = binding.engine.lock().await.clone();
+                    let working = *binding.working.lock().await;
                     let mut item = json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,
                         "harness":binding.harness,"thread":binding.thread,"title":binding.title,"delivery":binding.delivery,
-                        "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound});
+                        "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound,
+                        "engine":engine,"working":working});
                     if binding.delivery.get("kind").and_then(Value::as_str) == Some("cursor-app") {
                         let mut state = self.cursor_apps.status(&binding.thread).await;
                         state["bridge_chat_known"] =
                             json!(binding.bridge_chat.lock().await.is_some());
                         item["delivery_state"] = state;
+                        item["cursor_app_port"] = json!(self.cursor_apps.port().await);
                     }
                     listed.push(item);
                 }
+                let closed = self.closed_by_room.lock().await.clone();
+                let closed_by_room = closed.keys().cloned().collect::<Vec<_>>();
+                let room_reachable = self.rendezvous.lock().await.clone();
+                let refused = self.refusal.lock().await.clone();
                 Ok(
                     json!({"version":env!("CARGO_PKG_VERSION"),"connected":self.link.connected().await,
-                    "room_reachable":self.rendezvous.lock().await.clone(),"bindings":listed}),
+                    "room_reachable":room_reachable,"bindings":listed,
+                    "closed_by_room":closed_by_room,"closed_reasons":closed,"refused":refused}),
                 )
             }
             "pair_device" => {
@@ -847,7 +1058,7 @@ impl Daemon {
             while !binding.stopped.load(Ordering::Relaxed) {
                 let current = crate::adapters::claude::working_state(&binding.thread);
                 if current.is_some() && current != last {
-                    let _ = self.link.notify("input.working", json!({"binding_id":*binding.id.lock().await,"working":current,"turn_id":Value::Null})).await;
+                    self.report_working(&binding, current.unwrap()).await;
                     last = current;
                 }
                 tokio::time::sleep(Duration::from_millis(400)).await;
@@ -879,13 +1090,18 @@ impl Daemon {
                 });
             let started = tokio::time::Instant::now();
             let mut lookup_index = 0;
+            let mut last_bridge_lookup = None;
             loop {
                 if binding.stopped.load(Ordering::Relaxed) {
                     return;
                 }
                 let known_chat = { binding.bridge_chat.lock().await.clone() };
                 if let Some(chat) = known_chat {
-                    self.clone().watch_transcript_for(binding, false, chat);
+                    let observed = binding.transcript_chat.lock().await.clone();
+                    if observed.as_deref() != Some(chat.as_str()) {
+                        *binding.transcript_chat.lock().await = Some(chat.clone());
+                        self.clone().watch_transcript_for(binding, false, chat);
+                    }
                     return;
                 }
 
@@ -909,25 +1125,46 @@ impl Daemon {
                     if let Some(chat) = other.bridge_chat.lock().await.clone() {
                         excluded.insert(chat);
                     }
+                    if let Some(chat) = other.transcript_chat.lock().await.clone() {
+                        excluded.insert(chat);
+                    }
                 }
-                if let Some(chat) = crate::adapters::cursor::editor_transcript_chat(
-                    &binding.delivery,
-                    &expected,
-                    &excluded,
-                ) {
-                    *binding.bridge_chat.lock().await = Some(chat.clone());
-                    self.clone().watch_transcript_for(binding, false, chat);
-                    return;
+                if let Some((chat, pending_message_match)) =
+                    crate::adapters::cursor::editor_transcript_chat(
+                        &binding.delivery,
+                        &expected,
+                        &excluded,
+                    )
+                {
+                    let observed = binding.transcript_chat.lock().await.clone();
+                    if observed.as_deref() != Some(chat.as_str())
+                        && (observed.is_none() || pending_message_match)
+                    {
+                        *binding.transcript_chat.lock().await = Some(chat.clone());
+                        self.clone()
+                            .watch_transcript_for(binding.clone(), false, chat.clone());
+                    }
+                    if pending_message_match {
+                        *binding.bridge_chat.lock().await = Some(chat);
+                        continue;
+                    }
                 }
 
-                if lookup_index < lookup_at.len() && started.elapsed() >= lookup_at[lookup_index] {
-                    lookup_index += 1;
+                let lookup_due = if lookup_index < lookup_at.len() {
+                    started.elapsed() >= lookup_at[lookup_index]
+                } else {
+                    last_bridge_lookup.is_some_and(|last| last.elapsed() >= Duration::from_secs(5))
+                };
+                if lookup_due {
+                    if lookup_index < lookup_at.len() {
+                        lookup_index += 1;
+                    }
+                    last_bridge_lookup = Some(tokio::time::Instant::now());
                     if let Some(chat) =
                         crate::adapters::cursor::composer_holding(&binding.delivery).await
                     {
-                        *binding.bridge_chat.lock().await = Some(chat.clone());
-                        self.clone().watch_transcript_for(binding, false, chat);
-                        return;
+                        *binding.bridge_chat.lock().await = Some(chat);
+                        continue;
                     }
                 }
                 let scan_ms = std::env::var("SIDEVOICE_CURSOR_SCAN_MS")
@@ -943,13 +1180,20 @@ impl Daemon {
     fn watch_transcript_for(self: Arc<Self>, binding: Arc<Binding>, claude: bool, chat: String) {
         tokio::spawn(async move {
             while !binding.stopped.load(Ordering::Relaxed) {
+                if !claude
+                    && binding.delivery.get("kind").and_then(Value::as_str) == Some("cursor-app")
+                    && binding.transcript_chat.lock().await.as_deref() != Some(chat.as_str())
+                {
+                    return;
+                }
                 let path = if claude {
                     crate::adapters::claude::transcript_path(&chat)
                 } else {
                     crate::adapters::cursor::transcript_path(&chat)
                 };
                 if let Some(path) = path {
-                    self.watch_transcript_file(binding, path, claude).await;
+                    self.watch_transcript_file(binding, path, claude, chat)
+                        .await;
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(400)).await;
@@ -957,17 +1201,40 @@ impl Daemon {
         });
     }
 
-    async fn watch_transcript_file(&self, binding: Arc<Binding>, path: PathBuf, claude: bool) {
+    async fn watch_transcript_file(
+        &self,
+        binding: Arc<Binding>,
+        path: PathBuf,
+        claude: bool,
+        engine_chat: String,
+    ) {
         let mut file_id: Option<(u64, u64)> = None;
         let mut offset = 0u64;
         let mut partial = Vec::new();
         let mut tail = Vec::new();
         let mut working = None;
         let mut catching_up = true;
+        let mut announced_initial = false;
+        let mut engine_checked = false;
         let mut oversized = false;
         loop {
             if binding.stopped.load(Ordering::Relaxed) {
                 break;
+            }
+            if !claude
+                && binding.delivery.get("kind").and_then(Value::as_str) == Some("cursor-app")
+                && binding.transcript_chat.lock().await.as_deref() != Some(engine_chat.as_str())
+            {
+                break;
+            }
+            let editor = binding.delivery.get("kind").and_then(Value::as_str) == Some("cursor-app");
+            let authenticated = !editor
+                || binding.bridge_chat.lock().await.as_deref() == Some(engine_chat.as_str());
+            if authenticated && !claude && !engine_checked {
+                engine_checked = true;
+                if let Some(engine) = crate::adapters::cursor::engine(&engine_chat) {
+                    self.report_engine(&binding, engine).await;
+                }
             }
             let Ok(mut input) = fs::File::open(&path) else {
                 tokio::time::sleep(Duration::from_millis(400)).await;
@@ -984,6 +1251,7 @@ impl Daemon {
                 tail.clear();
                 working = None;
                 catching_up = true;
+                announced_initial = false;
                 oversized = false;
             }
             if !claude && !tail.is_empty() && offset >= tail.len() as u64 {
@@ -999,6 +1267,7 @@ impl Daemon {
                     tail.clear();
                     working = None;
                     catching_up = true;
+                    announced_initial = false;
                 }
             }
             if input.seek(SeekFrom::Start(offset)).is_ok() {
@@ -1024,15 +1293,36 @@ impl Daemon {
                         if segment.last() == Some(&b'\n') {
                             if !oversized {
                                 if let Ok(item) = serde_json::from_slice::<Value>(&partial) {
+                                    if claude {
+                                        if let Some(model) =
+                                            crate::adapters::claude::assistant_model(&item)
+                                        {
+                                            let launch = crate::adapters::claude::session_engine(
+                                                &binding.thread,
+                                            )
+                                            .unwrap_or_else(|| json!({}));
+                                            self.report_engine(&binding, json!({"model":model,
+                                                "effort":launch.get("effort").cloned().unwrap_or(Value::Null),
+                                                "thinking":launch.get("thinking").cloned().unwrap_or(Value::Null)})).await;
+                                        }
+                                    } else if authenticated
+                                        && transcript_user_text(&item, false).is_some()
+                                    {
+                                        if let Some(engine) =
+                                            crate::adapters::cursor::engine(&engine_chat)
+                                        {
+                                            self.report_engine(&binding, engine).await;
+                                        }
+                                    }
                                     if !claude {
                                         if item.get("type") == Some(&json!("turn_ended")) {
                                             working = Some(false);
-                                            if !catching_up {
+                                            if !catching_up && authenticated {
                                                 self.report_working(&binding, false).await;
                                             }
                                         } else if item.get("role") == Some(&json!("user")) {
                                             working = Some(true);
-                                            if !catching_up {
+                                            if !catching_up && authenticated {
                                                 self.report_working(&binding, true).await;
                                             }
                                         }
@@ -1052,18 +1342,15 @@ impl Daemon {
             }
             if catching_up && offset >= meta.len() {
                 catching_up = false;
-                if !claude {
-                    if let Some(state) = working {
-                        self.report_working(&binding, state).await;
-                    }
+            }
+            if !catching_up && authenticated && !announced_initial {
+                if let Some(state) = working {
+                    self.report_working(&binding, state).await;
                 }
+                announced_initial = true;
             }
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
-    }
-
-    async fn report_working(&self, binding: &Binding, working: bool) {
-        let _ = self.link.notify("input.working", json!({"binding_id":*binding.id.lock().await,"working":working,"turn_id":Value::Null})).await;
     }
 
     async fn report_read(&self, binding: &Binding, header: &Value) {
@@ -1175,8 +1462,9 @@ impl Daemon {
                             if catching_up && offset >= meta.len() {
                                 catching_up = false;
                                 if let Some(state) = working {
-                                    let _ = self.link.notify("input.working", json!({"binding_id":*binding.id.lock().await,
-                                        "working":state,"turn_id":if state { turn.clone() } else { None }})).await;
+                                    self.report_working_event(&binding, json!({
+                                        "working":state,"turn_id":if state { turn.clone() } else { None }
+                                    })).await;
                                 }
                             }
                         }
@@ -1201,15 +1489,17 @@ impl Daemon {
         catching_up: bool,
     ) {
         let id = binding.id.lock().await.clone();
-        if item.get("type") == Some(&json!("turn_context")) {
+        if matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("turn_context" | "session_meta")
+        ) {
             if let Some(model) = item.pointer("/payload/model").and_then(Value::as_str) {
-                let _ = self
-                    .link
-                    .notify(
-                        "input.engine",
-                        json!({"binding_id":id,"engine":{"model":model}}),
-                    )
-                    .await;
+                let effort = std::env::var("CODEX_REASONING_EFFORT").ok();
+                self.report_engine(
+                    binding,
+                    json!({"model":model,"effort":effort,"thinking":Value::Null}),
+                )
+                .await;
             }
         }
         if item.get("type") == Some(&json!("event_msg")) {
@@ -1223,13 +1513,11 @@ impl Daemon {
                     *turn = Some(turn_id.to_owned());
                     *working = Some(true);
                     if !catching_up {
-                        let _ = self
-                            .link
-                            .notify(
-                                "input.working",
-                                json!({"binding_id":id,"working":true,"turn_id":turn_id}),
-                            )
-                            .await;
+                        self.report_working_event(
+                            binding,
+                            json!({"working":true,"turn_id":turn_id}),
+                        )
+                        .await;
                     }
                 }
             }
@@ -1240,13 +1528,11 @@ impl Daemon {
                     }
                     *working = Some(false);
                     if !catching_up {
-                        let _ = self
-                            .link
-                            .notify(
-                                "input.working",
-                                json!({"binding_id":id,"working":false,"turn_id":turn_id}),
-                            )
-                            .await;
+                        self.report_working_event(
+                            binding,
+                            json!({"working":false,"turn_id":turn_id}),
+                        )
+                        .await;
                     }
                 }
             }

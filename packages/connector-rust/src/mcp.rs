@@ -140,6 +140,19 @@ impl Ipc {
         self.call_ready(method, params).await
     }
 
+    async fn remember_registration(&self, params: Value) {
+        if let Some(client_ref) = params.get("client_ref").and_then(Value::as_str) {
+            self.registrations
+                .lock()
+                .await
+                .insert(client_ref.to_owned(), params);
+        }
+    }
+
+    async fn forget_registration(&self, client_ref: &str) {
+        self.registrations.lock().await.remove(client_ref);
+    }
+
     async fn ensure_registered(self: &Arc<Self>) -> Result<()> {
         self.ensure().await?;
         let _guard = self.replay_lock.lock().await;
@@ -153,7 +166,19 @@ impl Ipc {
                 .get("client_ref")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let result = self.call_ready("register", params).await?;
+            let mut replay = params;
+            replay["resume"] = json!(true);
+            let result = match self.call_ready("register", replay).await {
+                Ok(result) => result,
+                Err(error) if error.to_string().starts_with("CLOSED_BY_ROOM:") => {
+                    if let Some(client_ref) = client_ref {
+                        self.registrations.lock().await.remove(&client_ref);
+                        self.joined.lock().await.remove(&client_ref);
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if let (Some(client_ref), Some(binding_id)) =
                 (client_ref, result.get("binding_id").and_then(Value::as_str))
             {
@@ -194,10 +219,14 @@ impl Ipc {
             .map_err(anyhow::Error::msg)?;
         if method == "register" {
             if let Some(client_ref) = params.get("client_ref").and_then(Value::as_str) {
+                let mut registration = params.clone();
+                if let Some(object) = registration.as_object_mut() {
+                    object.remove("resume");
+                }
                 self.registrations
                     .lock()
                     .await
-                    .insert(client_ref.to_owned(), params.clone());
+                    .insert(client_ref.to_owned(), registration);
             }
         }
         if method == "unregister" {
@@ -226,6 +255,14 @@ struct Joined {
     experimental: Vec<String>,
 }
 
+fn closed_note(reason: &str) -> &'static str {
+    if reason == "connector_revoked" {
+        "This machine's pairing was revoked from the room, so this conversation has no voice. Tell the user; to have voice again they must pair this machine with the one-time code the room shows under Emparejar máquina (voice_pair), and then you can call voice_connect. Continue in writing meanwhile."
+    } else {
+        "The user closed this conversation's voice channel from the room. Continue in writing and do not publish speech; call voice_connect again only if the user asks for voice."
+    }
+}
+
 impl Facade {
     fn new(profile: Profile) -> Self {
         let joined = Arc::new(Mutex::new(HashMap::new()));
@@ -234,6 +271,24 @@ impl Facade {
             joined,
             cursor_views: Arc::new(AtomicBool::new(false)),
             card_reads: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    async fn refresh_binding_ids(&self, status: &Value) {
+        let Some(bindings) = status.pointer("/bindings").and_then(Value::as_array) else {
+            return;
+        };
+        let mut joined = self.joined.lock().await;
+        for item in bindings {
+            let (Some(client_ref), Some(binding_id)) = (
+                item.get("client_ref").and_then(Value::as_str),
+                item.get("binding_id").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            if let Some(binding) = joined.get_mut(client_ref) {
+                binding.binding_id = binding_id.to_owned();
+            }
         }
     }
 
@@ -320,11 +375,14 @@ impl Facade {
                         self.joined.lock().await.remove(&thread);
                     }
                 }
-                let params = json!({
+                let mut params = json!({
                     "client_ref":identity.thread,"harness":identity.harness,"thread":identity.thread,"title":title,
                     "delivery":identity.delivery,"route":identity.route,"inbound":identity.inbound,
                     "capabilities":capabilities,"experimental":experimental,"detachable":identity.detachable
                 });
+                if let Some(engine) = adapters::engine(&identity) {
+                    params["engine"] = engine;
+                }
                 let result = self.ipc.call("register", params).await?;
                 let binding_id = result
                     .get("binding_id")
@@ -401,19 +459,62 @@ impl Facade {
                 if let Some(name) = named {
                     self.adopt_by_id(name, &client).await;
                 }
+                let status = self.ipc.call("status", json!({})).await?;
+                self.refresh_binding_ids(&status).await;
+                let closed_now = status
+                    .get("closed_by_room")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let closed_titles = {
+                    let joined = self.joined.lock().await;
+                    closed_now
+                        .iter()
+                        .filter_map(|item| {
+                            item.as_str().and_then(|name| {
+                                joined
+                                    .get(name)
+                                    .map(|binding| (name.to_owned(), binding.title.clone()))
+                            })
+                        })
+                        .collect::<HashMap<_, _>>()
+                };
+                let closed_reasons = status
+                    .get("closed_reasons")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                for item in &closed_now {
+                    if let Some(name) = item.as_str() {
+                        self.ipc.forget_registration(name).await;
+                        self.joined.lock().await.remove(name);
+                    }
+                }
+                if let Some(name) =
+                    named.filter(|name| closed_now.iter().any(|item| item.as_str() == Some(*name)))
+                {
+                    let reason = closed_reasons
+                        .get(name)
+                        .and_then(Value::as_str)
+                        .unwrap_or("closed_from_room");
+                    return Ok(
+                        json!({"joined":false,"conversation":name,"room_reachable":status.get("connected"),
+                        "connector":status,"closed_by_room":true,"note":closed_note(reason)}),
+                    );
+                }
                 if named.is_none()
                     && self.cursor_views.load(Ordering::Relaxed)
                     && !self.joined.lock().await.is_empty()
                 {
-                    let status = self.ipc.call("status", json!({})).await?;
                     let conversations = self.joined.lock().await.values().map(|binding| json!({"title":binding.title,"harness":binding.identity.harness})).collect::<Vec<_>>();
                     return Ok(
                         json!({"joined":Value::Null,"conversation":Value::Null,"room_reachable":status.get("connected"),"connector":status,
-                        "conversations":conversations,"note":"Chats of this Cursor window are joined, and this call does not say which chat is asking. If voice_connect returned a conversation id in this chat, pass it as conversation to ask about this one; if it never did, this chat is not joined."}),
+                        "conversations":conversations,"closed_by_room":closed_now.iter().filter_map(|item| item.as_str()).map(|name| json!({
+                            "title":closed_titles.get(name),"note":closed_note(closed_reasons.get(name).and_then(Value::as_str).unwrap_or("closed_from_room"))
+                        })).collect::<Vec<_>>(),
+                        "note":"Chats of this Cursor window are joined, and this call does not say which chat is asking. If voice_connect returned a conversation id in this chat, pass it as conversation to ask about this one; if it never did, this chat is not joined."}),
                     );
                 }
                 let chosen = self.pick(named).await?;
-                let status = self.ipc.call("status", json!({})).await?;
                 if let Some(name) = chosen {
                     let binding = self
                         .joined
@@ -422,7 +523,7 @@ impl Facade {
                         .get(&name)
                         .cloned()
                         .context("conversation disappeared")?;
-                    let delivery_state = status
+                    let daemon_binding = status
                         .pointer("/bindings")
                         .and_then(Value::as_array)
                         .and_then(|items| {
@@ -430,7 +531,8 @@ impl Facade {
                                 item.get("client_ref").and_then(Value::as_str)
                                     == Some(name.as_str())
                             })
-                        })
+                        });
+                    let delivery_state = daemon_binding
                         .and_then(|item| item.get("delivery_state"))
                         .cloned();
                     let mut response = json!({"joined":true,"conversation":name,"binding_id":binding.binding_id,"harness":binding.identity.harness,
@@ -444,11 +546,20 @@ impl Facade {
                             "note":if state.get("card_connected") == Some(&json!(true)) {"The card in this chat is connected."}
                                 else if reads > 0 {"Cursor read the card but it has not connected to this machine's connector: it may not be on screen, or it failed to load."}
                                 else {"Cursor never read the card, so it drew none: tell the user; ~/.sidevoice/mcp.log has what Cursor declared."}});
+                        if let Some(port) = daemon_binding
+                            .and_then(|item| item.get("cursor_app_port"))
+                            .and_then(Value::as_u64)
+                        {
+                            response["view_link"] = json!({"conversation":name,"port":port,"key":binding.identity.view_key});
+                        }
                     }
                     Ok(response)
                 } else {
                     Ok(
-                        json!({"joined":false,"conversation":Value::Null,"room_reachable":status.get("connected"),"connector":status}),
+                        json!({"joined":false,"conversation":Value::Null,"room_reachable":status.get("connected"),"connector":status,
+                            "closed_by_room":closed_now.iter().filter_map(|item| item.as_str()).map(|name| json!({
+                                "title":closed_titles.get(name),"note":closed_note(closed_reasons.get(name).and_then(Value::as_str).unwrap_or("closed_from_room"))
+                            })).collect::<Vec<_>>()}),
                     )
                 }
             }
@@ -459,6 +570,41 @@ impl Facade {
                     .filter(|name| !name.is_empty());
                 if let Some(name) = named {
                     self.adopt_by_id(name, &client).await;
+                }
+                let status = self.ipc.call("status", json!({})).await?;
+                self.refresh_binding_ids(&status).await;
+                if status.get("refused").and_then(Value::as_str).is_some() {
+                    bail!("{}", closed_note("connector_revoked"));
+                }
+                let closed_now = status
+                    .get("closed_by_room")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let closed_reasons = status
+                    .get("closed_reasons")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let closed_name = named
+                    .filter(|name| closed_now.iter().any(|item| item.as_str() == Some(*name)))
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        (named.is_none()
+                            && status
+                                .pointer("/bindings")
+                                .and_then(Value::as_array)
+                                .is_none_or(Vec::is_empty))
+                        .then(|| closed_now.iter().find_map(Value::as_str).map(str::to_owned))
+                        .flatten()
+                    });
+                if let Some(name) = closed_name {
+                    self.ipc.forget_registration(&name).await;
+                    self.joined.lock().await.remove(&name);
+                    let reason = closed_reasons
+                        .get(&name)
+                        .and_then(Value::as_str)
+                        .unwrap_or("closed_from_room");
+                    bail!("{}", closed_note(reason));
                 }
                 let text = args
                     .get("text")
@@ -504,7 +650,22 @@ impl Facade {
                     publish["binding_id"] = json!(joined.binding_id);
                     publish["client_ref"] = json!(chosen);
                 }
-                let result = self.ipc.call("publish", publish).await?;
+                let result = match self.ipc.call("publish", publish).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let detail = error.to_string();
+                        if let Some(rest) = detail.strip_prefix("CLOSED_BY_ROOM:") {
+                            let mut parts = rest.splitn(2, ':');
+                            let reason = parts.next().unwrap_or("closed_from_room");
+                            if let Some(name) = parts.next() {
+                                self.ipc.forget_registration(name).await;
+                                self.joined.lock().await.remove(name);
+                            }
+                            bail!("{}", closed_note(reason));
+                        }
+                        return Err(error);
+                    }
+                };
                 let adopted = result
                     .pointer("/adopted/client_ref")
                     .and_then(Value::as_str)
@@ -657,6 +818,11 @@ impl Facade {
             .cloned()
             .unwrap_or_else(|| adapters::advertised_capabilities("cursor"));
         let experimental = identity.experimental.clone();
+        let registration = json!({"client_ref":name,"harness":identity.harness,"thread":identity.thread,
+            "title":title,"delivery":identity.delivery,"route":identity.route,"inbound":identity.inbound,
+            "capabilities":capabilities,"experimental":experimental,"detachable":true,
+            "engine":result.get("engine").cloned().unwrap_or(Value::Null)});
+        self.ipc.remember_registration(registration).await;
         self.joined.lock().await.insert(
             name.to_owned(),
             Joined {

@@ -72,6 +72,31 @@ pub fn working_state(session_id: &str) -> Option<bool> {
     }
 }
 
+pub fn session_engine(session_id: &str) -> Option<Value> {
+    let pid = session_record(session_id)
+        .as_ref()
+        .and_then(|record| record.get("pid"))
+        .and_then(Value::as_i64);
+    let args = launch_args(pid);
+    if args.is_empty() {
+        return None;
+    }
+    let model = flag(&args, "--model");
+    let effort = flag(&args, "--effort");
+    let thinking = flag(&args, "--thinking");
+    if model.is_none() && effort.is_none() {
+        return None;
+    }
+    Some(json!({"model":model,"effort":effort,"thinking":thinking}))
+}
+
+pub fn assistant_model(entry: &Value) -> Option<&str> {
+    (entry.get("type") == Some(&json!("assistant")))
+        .then(|| entry.pointer("/message/model").and_then(Value::as_str))
+        .flatten()
+        .filter(|model| !model.is_empty())
+}
+
 pub fn transcript_path(session_id: &str) -> Option<PathBuf> {
     let projects = config_dir().join("projects");
     for entry in fs::read_dir(projects).ok()?.flatten() {

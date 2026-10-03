@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -228,6 +228,64 @@ pub fn transcript_path(chat_id: &str) -> Option<PathBuf> {
     None
 }
 
+pub fn engine(chat_id: &str) -> Option<Value> {
+    let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let mut roots = Vec::new();
+    if let Some(path) = env::var_os("CURSOR_CONFIG_DIR") {
+        roots.push(PathBuf::from(path));
+    }
+    if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
+        roots.push(PathBuf::from(path).join("cursor"));
+    }
+    roots.extend([home.join(".config/cursor"), home.join(".cursor")]);
+    for root in roots {
+        let chats = root.join("chats");
+        let Ok(workspaces) = fs::read_dir(chats) else {
+            continue;
+        };
+        for workspace in workspaces.flatten() {
+            let database = workspace.path().join(chat_id).join("store.db");
+            if !database.is_file() {
+                continue;
+            }
+            let Ok(output) = Command::new("sqlite3")
+                .args(["-readonly", "-json"])
+                .arg(&database)
+                .arg("SELECT value FROM meta WHERE key = '0';")
+                .output()
+            else {
+                continue;
+            };
+            if !output.status.success() {
+                continue;
+            }
+            let Ok(rows) = serde_json::from_slice::<Vec<Value>>(&output.stdout) else {
+                continue;
+            };
+            let Some(value) = rows
+                .first()
+                .and_then(|row| row.get("value"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let Some(metadata) = serde_json::from_str::<Value>(value).ok().or_else(|| {
+                let decoded = hex::decode(value).ok()?;
+                serde_json::from_slice::<Value>(&decoded).ok()
+            }) else {
+                continue;
+            };
+            let Some(model) = metadata.get("lastUsedModel").and_then(Value::as_str) else {
+                continue;
+            };
+            if !model.is_empty() {
+                return Some(json!({"model":model,"effort":Value::Null,"thinking":Value::Null}));
+            }
+        }
+    }
+    None
+}
+
 /// Find the Cursor chat whose transcript records this join or one of its pending inputs.
 /// Editor conversation ids are ours; Cursor's own chat id is only available in the transcript
 /// or in the Desktop Bridge state database.
@@ -235,7 +293,7 @@ pub fn editor_transcript_chat(
     delivery: &Value,
     expected_ids: &[String],
     excluded: &HashSet<String>,
-) -> Option<String> {
+) -> Option<(String, bool)> {
     let title = delivery
         .get("title")
         .and_then(Value::as_str)
@@ -247,10 +305,6 @@ pub fn editor_transcript_chat(
         .unwrap_or(0)
         .saturating_sub(5_000);
     let expected = expected_ids.iter().cloned().collect::<HashSet<_>>();
-    let candidate = delivery
-        .get("candidate")
-        .and_then(Value::as_str)
-        .filter(|chat| safe_chat_id(chat));
     let mut expected_matches = Vec::new();
     let mut title_matches = Vec::new();
 
@@ -316,27 +370,11 @@ pub fn editor_transcript_chat(
         }
     }
 
-    if let Some(candidate) = candidate {
-        if transcript_path(candidate).is_some_and(|path| {
-            fs::metadata(&path).is_ok_and(|metadata| {
-                metadata.mtime() as u64 * 1000 + metadata.mtime_nsec() as u64 / 1_000_000
-                    >= joined_at
-            }) && transcript_tail(&path).is_some_and(|text| {
-                text.lines().any(|line| {
-                    serde_json::from_str::<Value>(line)
-                        .ok()
-                        .is_some_and(|entry| cursor_join_matches(&entry, ""))
-                })
-            })
-        }) {
-            return Some(candidate.to_owned());
-        }
-    }
     if expected_matches.len() == 1 {
-        return expected_matches.pop();
+        return expected_matches.pop().map(|chat| (chat, true));
     }
     if title_matches.len() == 1 {
-        return title_matches.pop();
+        return title_matches.pop().map(|chat| (chat, false));
     }
     None
 }
@@ -761,7 +799,9 @@ pub async fn composer_holding(delivery: &Value) -> Option<String> {
     let instances = bridge_instances();
     if let Some(candidate) = candidate {
         if safe_chat_id(candidate) {
-            return query_bridge_chat(&instances, marker, Some(candidate)).await;
+            if let Some(chat) = query_bridge_chat(&instances, marker, Some(candidate)).await {
+                return Some(chat);
+            }
         }
     }
     query_bridge_chat(&instances, marker, None).await

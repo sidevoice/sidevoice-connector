@@ -59,6 +59,10 @@ impl CursorApps {
         })
     }
 
+    pub async fn port(&self) -> Option<u16> {
+        *self.port.lock().await
+    }
+
     pub async fn open(self: &Arc<Self>, thread: &str, key: &str) -> Result<u16> {
         if !thread.starts_with("cursor-editor-")
             || key.len() != 64

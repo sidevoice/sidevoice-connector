@@ -93,6 +93,22 @@ pub fn inspect_inbound(identity: &Identity) -> Result<Option<Value>> {
     }
 }
 
+pub fn engine(identity: &Identity) -> Option<Value> {
+    match identity.delivery.get("kind").and_then(Value::as_str) {
+        Some("claude-uds") => claude::session_engine(&identity.thread),
+        Some("codex-queue") => {
+            let model = std::env::var("CODEX_MODEL")
+                .ok()
+                .filter(|value| !value.is_empty())?;
+            Some(
+                json!({"model":model,"effort":std::env::var("CODEX_REASONING_EFFORT").ok(),"thinking":Value::Null}),
+            )
+        }
+        Some("cursor-tmux" | "none") => cursor::engine(&identity.thread),
+        _ => None,
+    }
+}
+
 pub fn conversation_capabilities(identity: &Identity) -> Value {
     let mut capabilities = identity.capabilities.clone();
     if let Some(overrides) = identity.capability_overrides.as_object() {

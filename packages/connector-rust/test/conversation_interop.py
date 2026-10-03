@@ -154,6 +154,86 @@ async def wait_status(core_socket, token, thread, message_id, status, seconds=30
         f'{thread} {message_id} status {status}', seconds)
 
 
+def participant(core_socket, session, thread):
+    response = core_json(core_socket, 'GET', '/api/presentation/participants?session_id=' + session)
+    return next((item for item in response['participants'] if item['thread_id'] == thread), None)
+
+
+async def wait_engine(core_socket, session, thread, model, seconds=10):
+    return await until(lambda: (item := participant(core_socket, session, thread))
+        if item and (item.get('engine') or {}).get('model') == model else None,
+        f'{thread} engine {model}', seconds)
+
+
+async def wait_participant(core_socket, session, thread, *, available):
+    return await until(lambda: (item := participant(core_socket, session, thread))
+        if item and item.get('available') is available else None,
+        f'{thread} participant available={available}')
+
+
+async def wait_working(process, thread, state, request_base):
+    async def current():
+        status = await tool(process, 'voice_status', {'conversation':thread}, request_base)
+        binding = next((item for item in status['connector']['bindings'] if item['client_ref'] == thread), None)
+        return status if binding and binding.get('working') is state else None
+    return await until_async(current, f'{thread} working={state}')
+
+
+async def wait_room_working(events, thread, state, seconds=10):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        event = await asyncio.wait_for(events.get(), max(.05, deadline - time.monotonic()))
+        if event.get('thread_id') == thread and event.get('working') is state:
+            return event
+    raise AssertionError(f'timed out: Core reported {thread} working={state}')
+
+
+async def wait_closed_status(process, thread, request_id):
+    async def current():
+        status = await tool(process, 'voice_status', {'conversation':thread}, request_id)
+        return status if status.get('closed_by_room') is True else None
+    return await until_async(current, f'{thread} room-close status')
+
+
+async def wait_core_connected(process, thread, request_id):
+    async def current():
+        status = await tool(process, 'voice_status', {'conversation':thread}, request_id)
+        return status if status.get('connector', {}).get('connected') is True else None
+    return await until_async(current, f'{thread} Core link')
+
+
+async def wait_refusal_status(process, thread, request_id, refused):
+    async def current():
+        status = await tool(process, 'voice_status', {'conversation':thread}, request_id)
+        present = status.get('connector', {}).get('refused') is not None
+        return status if present is refused else None
+    return await until_async(current, f'{thread} refusal={refused}')
+
+
+async def wait_bridge_chat(process, thread, request_id):
+    async def current():
+        status = await tool(process, 'voice_status', {'conversation':thread}, request_id)
+        return status if status.get('card', {}).get('bridge_chat_known') is True else None
+    return await until_async(current, f'{thread} authenticated Cursor destination')
+
+
+async def read_room_events(websocket, events):
+    while True:
+        frame = json.loads(await websocket.recv())
+        if frame.get('type') == 'voice-conversation':
+            events.put_nowait(frame.get('data') or {})
+
+
+async def until_async(predicate, description, seconds=30):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        value = await predicate()
+        if value:
+            return value
+        await asyncio.sleep(.1)
+    raise AssertionError(f'timed out: {description}')
+
+
 async def status_and_reply(process, thread, joined, input_row, expected_caps, request_id):
     status = await tool(process, 'voice_status', {'conversation': thread}, request_id)
     assert status['joined'] is True and status['capabilities'] == expected_caps, status
@@ -165,16 +245,57 @@ async def status_and_reply(process, thread, joined, input_row, expected_caps, re
     return said
 
 
+async def adopted_status(process, thread):
+    return await tool(process, 'voice_status', {'conversation':thread}, 41)
+
+
 def append_claude(transcript, text):
     transcript.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with transcript.open('a') as output:
         output.write(json.dumps({'type': 'user', 'message': {'role': 'user', 'content': text}}) + '\n')
 
 
+def append_claude_assistant(transcript, model):
+    transcript.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with transcript.open('a') as output:
+        output.write(json.dumps({'type': 'assistant', 'message': {'model': model}}) + '\n')
+
+
+def set_claude_session_status(record, status):
+    value = json.loads(record.read_text())
+    value['status'] = status
+    record.write_text(json.dumps(value))
+    record.chmod(0o600)
+
+
 def append_cursor(transcript, text):
     transcript.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with transcript.open('a') as output:
         output.write(json.dumps({'role': 'user', 'message': {'content': [{'type': 'text', 'text': text}]}}) + '\n')
+
+
+def append_cursor_connect(transcript, title):
+    transcript.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with transcript.open('a') as output:
+        output.write(json.dumps({'role':'assistant','message':{'content':[{'type':'tool_use',
+            'name':'voice_connect','input':{'title':title}}]}}) + '\n')
+
+
+def append_cursor_turn_ended(transcript):
+    with transcript.open('a') as output:
+        output.write(json.dumps({'type':'turn_ended','status':'success'}) + '\n')
+
+
+def make_cursor_store(config, workspace, chat, model):
+    store = config / 'chats' / workspace / chat / 'store.db'
+    store.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    db = sqlite3.connect(store)
+    db.execute('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)')
+    db.execute('INSERT INTO meta(key,value) VALUES(?,?)', ('0', json.dumps({'lastUsedModel':model})))
+    db.commit()
+    db.close()
+    store.chmod(0o600)
+    return store
 
 
 def test_sqlite_cli(root):
@@ -252,7 +373,8 @@ async def start_bridge(directory, user_data, socket_path, chat, received, transc
             length = int(next(line.split(':', 1)[1] for line in headers if line.lower().startswith('content-length:')))
             body = json.loads(await reader.readexactly(length))
             if body['type'] == 'listThreads':
-                response = {'threads': [{'id': chat, 'title': 'Synthetic Cursor', 'source': 'local', 'status': 'running'}]}
+                listed = getattr(received, 'listed_chat', chat)
+                response = {'threads': [{'id': listed, 'title': 'Synthetic Cursor', 'source': 'local', 'status': 'running'}]}
             elif body['type'] == 'sendMessage':
                 received.put_nowait(body)
                 response = {'outcome': 'submitted', 'threadTitle': 'Synthetic Cursor'}
@@ -291,6 +413,8 @@ async def test_route(binary, root, env, presentation, route, client_name, route_
         assert joined['binding_id'] and not joined['binding_id'].startswith('local-'), joined
         if expected_initial:
             expected_initial(joined)
+        core_json(presentation['socket'], 'POST', '/api/presentation/select',
+            {'session_id':presentation['session'], 'thread_id':thread})
         input_row = await core_text(presentation['socket'], presentation['token'], presentation['session'],
             joined['binding_id'], thread, 'Core input for ' + route)
         if after:
@@ -308,20 +432,24 @@ async def parity_fixture():
     with tempfile.TemporaryDirectory(prefix='sidevoice-rust-conversation-') as temporary:
         root = Path(temporary).resolve()
         root.chmod(0o700)
-        home, claude_home, codex_home, cursor_config = (root / name for name in ('home', 'claude', 'codex', 'cursor'))
+        home, claude_home, codex_home = (root / name for name in ('home', 'claude', 'codex'))
+        cursor_root = root / 'cursor'
+        cursor_config = cursor_root / 'config'
+        cursor_data = cursor_root / 'data'
+        xdg_config = root / 'xdg' / 'config'
+        xdg_data = root / 'xdg' / 'data'
         data = root / 'sidevoice'
         core_data = data / 'core'
         tool_dir = root / 'bin'
-        for directory in (home, claude_home, codex_home, cursor_config, data, core_data, tool_dir):
+        for directory in (home, claude_home, codex_home, cursor_config, cursor_data, xdg_config, xdg_data,
+                data, core_data, tool_dir):
             directory.mkdir(parents=True, mode=0o700, exist_ok=True)
             directory.chmod(0o700)
         cursor_chat = str(uuid.uuid4())
         test_sqlite_cli(root)
         codex_bin, tmux_bin = fake_tools(root, cursor_chat)
         workspace = 'a' * 32
-        store = cursor_config / 'chats' / workspace / cursor_chat / 'store.db'
-        store.parent.mkdir(parents=True, mode=0o700)
-        store.touch(mode=0o600)
+        store = make_cursor_store(cursor_config, workspace, cursor_chat, 'cursor-cli-fixture-model')
         store_handle = store.open('rb')
         cursor_project = home / '.cursor' / 'projects' / 'synthetic-workspace' / 'agent-transcripts' / cursor_chat
         cursor_transcript = cursor_project / f'{cursor_chat}.jsonl'
@@ -361,7 +489,8 @@ async def parity_fixture():
             'CODEX_THREAD_ID', 'SIDEVOICE_THREAD', 'SIDEVOICE_DELIVERY_URL', 'SIDEVOICE_HARNESS', 'SIDEVOICE_TITLE'}
         inherited_env = {key: value for key, value in os.environ.items() if key not in adapter_keys}
         base_env = {**inherited_env, 'HOME': str(home), 'CLAUDE_CONFIG_DIR': str(claude_home),
-            'CODEX_HOME': str(codex_home), 'CURSOR_CONFIG_DIR': str(cursor_config), 'CURSOR_DATA_DIR': str(home / '.cursor'),
+            'CODEX_HOME': str(codex_home), 'CURSOR_CONFIG_DIR': str(cursor_config), 'CURSOR_DATA_DIR': str(cursor_data),
+            'XDG_CONFIG_HOME': str(xdg_config), 'XDG_DATA_HOME': str(xdg_data),
             'CURSOR_DESKTOP_BRIDGE_DIR': str(bridge_dir), 'SIDEVOICE_DATA_DIR': str(data),
             'SIDEVOICE_SERVICE_MANAGER': 'none', 'SIDEVOICE_CODEX_BIN': str(codex_bin),
             'SIDEVOICE_CURSOR_LOOKUP_AT': '25,50,75,100', 'SIDEVOICE_CURSOR_SCAN_MS': '10',
@@ -369,11 +498,34 @@ async def parity_fixture():
             'PATH': str(tool_dir) + os.pathsep + os.environ.get('PATH', '/usr/bin:/bin')}
         core_log = (root / 'core.log').open('wb')
         launch_id = str(uuid.uuid4())
-        core = await asyncio.create_subprocess_exec(str(python), '-m', 'sidevoice_core.server', '--data-dir', str(core_data),
+        core_runner = root / 'core-fixture-runner.py'
+        core_runner.write_text('''import sidevoice_core.server.app as app_module
+original = app_module.create_app
+def create_app(room=None, **kwargs):
+    app = original(room, **kwargs)
+    @app.post('/api/test/rendezvous-state')
+    async def rendezvous_state(payload: dict):
+        await room.control.rendezvous_changed(payload)
+        return {'sent': True}
+    @app.post('/api/test/connector-reconnect')
+    async def connector_reconnect():
+        peers = list(room.control.peers.values())
+        if not peers:
+            return {'sent': False}
+        await peers[-1].disconnect()
+        return {'sent': True}
+    return app
+app_module.create_app = create_app
+from sidevoice_core.server.__main__ import main
+main()
+''')
+        core = await asyncio.create_subprocess_exec(str(python), str(core_runner), '--data-dir', str(core_data),
             '--socket', str(core_data / 'local.sock'), '--port', '0', '--idle-exit', '0', '--launch-id', launch_id,
             '--log-file', str(root / 'core-app.log'), stdout=core_log, stderr=core_log, env=base_env)
         daemon = None
         bridge_server = None
+        presentation_reader = None
+        room_events = asyncio.Queue()
         facades = []
         held_process = None
         try:
@@ -393,32 +545,63 @@ async def parity_fixture():
                     if frame.get('type') == 'voice-session':
                         session = frame['data']['session_id']
                         break
+                presentation_reader = asyncio.create_task(read_room_events(ws, room_events))
                 presentation = {'socket': core_data / 'local.sock', 'token': token, 'session': session}
 
                 async def claude_after(facade, joined, row, route_env):
                     envelope = await asyncio.wait_for(received_claude.get(), 5)
                     assert 'Core input for Claude' in envelope and '"message_id"' in envelope, envelope
+                    set_claude_session_status(sessions / 'allowed.json', 'busy')
+                    await wait_room_working(room_events, joined['conversation'], True)
                     await wait_status(core_data / 'local.sock', token, joined['conversation'], row['id'], 'unconfirmed')
                     await wait_status(core_data / 'local.sock', token, joined['conversation'], row['id'], 'read')
+                    set_claude_session_status(sessions / 'allowed.json', 'idle')
+                    await wait_room_working(room_events, joined['conversation'], False)
                     await status_and_reply(facade, joined['conversation'], joined, row, CLAUDE_CAPS, 40)
+                    append_claude_assistant(claude_transcript, 'claude-fixture-model')
+                    await wait_engine(core_data / 'local.sock', session, joined['conversation'], 'claude-fixture-model')
 
                 async def codex_after(facade, joined, row, route_env):
+                    await wait_engine(core_data / 'local.sock', session, joined['conversation'], 'codex-launch-model')
                     queued = await until(lambda: json.loads(codex_queue.read_text()) if codex_queue.exists() else None, 'Codex fixture queue')
                     assert queued['thread'] == codex_thread and 'Core input for Codex' in queued['message'], queued
                     await wait_status(core_data / 'local.sock', token, joined['conversation'], row['id'], 'delivered')
-                    rollout.write_text(json.dumps({'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'fixture-turn'}}) + '\n'
+                    rollout.write_text(json.dumps({'type':'session_meta','payload':{'model':'codex-session-meta-model'}}) + '\n')
+                    await wait_engine(core_data / 'local.sock', session, joined['conversation'], 'codex-session-meta-model')
+                    with rollout.open('a') as output:
+                        output.write(json.dumps({'type':'turn_context','payload':{'model':'codex-fixture-model'}}) + '\n'
+                        + json.dumps({'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'fixture-turn'}}) + '\n'
                         + json.dumps({'type': 'response_item', 'payload': {'type': 'message', 'role': 'user',
-                            'content': [{'type': 'input_text', 'text': queued['message']}]}}) + '\n'
-                        + json.dumps({'type': 'event_msg', 'payload': {'type': 'task_complete', 'turn_id': 'fixture-turn'}}) + '\n')
+                            'content': [{'type': 'input_text', 'text': queued['message']}]}}) + '\n')
+                    await wait_engine(core_data / 'local.sock', session, joined['conversation'], 'codex-fixture-model')
+                    await wait_working(facade, joined['conversation'], True, 90)
+                    await wait_room_working(room_events, joined['conversation'], True)
+                    core_json(core_data / 'local.sock', 'POST', '/api/test/connector-reconnect', {})
+                    await wait_participant(core_data / 'local.sock', session, joined['conversation'], available=False)
+                    while not room_events.empty():
+                        room_events.get_nowait()
+                    await wait_participant(core_data / 'local.sock', session, joined['conversation'], available=True)
+                    await wait_room_working(room_events, joined['conversation'], True)
+                    rebound = await tool(facade, 'voice_status', {'conversation':joined['conversation']}, 94)
+                    assert rebound['joined'] is True and rebound['binding_id'], rebound
+                    joined['binding_id'] = rebound['binding_id']
                     await wait_status(core_data / 'local.sock', token, joined['conversation'], row['id'], 'read')
+                    with rollout.open('a') as output:
+                        output.write(json.dumps({'type': 'event_msg', 'payload': {'type': 'task_complete', 'turn_id': 'fixture-turn'}}) + '\n')
+                    await wait_working(facade, joined['conversation'], False, 92)
+                    await wait_room_working(room_events, joined['conversation'], False)
                     await status_and_reply(facade, joined['conversation'], joined, row, CODEX_CAPS, 50)
 
                 async def cursor_cli_after(facade, joined, row, route_env):
+                    await wait_engine(core_data / 'local.sock', session, joined['conversation'], 'cursor-cli-fixture-model')
                     pasted = await until(lambda: cursor_sent.read_text() if cursor_sent.exists() else None, 'Cursor persist paste')
                     assert 'Core input for Cursor persist' in pasted, pasted
                     await wait_status(core_data / 'local.sock', token, joined['conversation'], row['id'], 'unconfirmed')
                     append_cursor(cursor_transcript, pasted)
+                    await wait_room_working(room_events, joined['conversation'], True)
                     await wait_status(core_data / 'local.sock', token, joined['conversation'], row['id'], 'read')
+                    append_cursor_turn_ended(cursor_transcript)
+                    await wait_room_working(room_events, joined['conversation'], False)
                     await status_and_reply(facade, joined['conversation'], joined, row, CURSOR_CAPS, 60)
 
                 # Claude Code: inbox delivery is unknown until its transcript proves it was read.
@@ -437,7 +620,8 @@ async def parity_fixture():
 
                 # Codex queue/rollout behavior and truthful capability status.
                 CODEX_CAPS = {'deliver':'supported','inspectInbound':'unsupported','working':'supported','endOfTurn':'supported','sessionIdentity':'supported'}
-                codex_env = {'CODEX_THREAD_ID': codex_thread, 'SIDEVOICE_TEST_CODEX_QUEUE': str(codex_queue)}
+                codex_env = {'CODEX_THREAD_ID': codex_thread, 'SIDEVOICE_TEST_CODEX_QUEUE': str(codex_queue),
+                    'CODEX_MODEL':'codex-launch-model'}
                 facade, joined, row = await test_route(binary, root, base_env, presentation, 'Codex', 'codex', codex_env,
                     thread=codex_thread, expected_caps=CODEX_CAPS, after=codex_after, request_base=20)
                 facades.append(facade)
@@ -559,7 +743,39 @@ async def parity_fixture():
                 await tool(facade, 'voice_disconnect', {}, 109)
                 reconnect = await tool(facade, 'voice_connect', {'title':'HTTP reconnect'}, 110)
                 assert reconnect['conversation'] == http_thread and reconnect['capabilities'] == HTTP_CAPS, reconnect
-                await tool(facade, 'voice_disconnect', {}, 111)
+                core_json(core_data / 'local.sock', 'POST', '/api/presentation/close', {'thread_id':http_thread})
+                await until(lambda: json.loads((data / 'conversation-state.json').read_text()).get('closed_by_room', {}).get(http_thread)
+                    if (data / 'conversation-state.json').exists() else None, 'Rust records room closure')
+                await finish(daemon)
+                daemon = None
+                daemon = await asyncio.create_subprocess_exec(str(binary), '--profile-root', str(root), 'connector',
+                    stdout=asyncio.subprocess.DEVNULL, stderr=core_log, env=base_env)
+                await until((data / 'connector.sock').exists, 'restarted Rust connector after room closure')
+                closed_status = await wait_closed_status(facade, http_thread, 112)
+                assert closed_status['joined'] is False and closed_status.get('closed_by_room') is True, closed_status
+                closed_say = await tool_failure(facade, 'voice_say', {'conversation':http_thread,
+                    'session_id':'typed:' + http_thread, 'revision':0, 'text':'Must not be published'}, 113)
+                assert 'closed this conversation' in closed_say, closed_say
+                reopened = await tool(facade, 'voice_connect', {'title':'HTTP re-enabled after room close'}, 114)
+                assert reopened['conversation'] == http_thread, reopened
+                await wait_core_connected(facade, http_thread, 121)
+                core_json(core_data / 'local.sock', 'POST', '/api/test/rendezvous-state',
+                    {'connected':False,'room':'https://fixture.invalid','refused':'fixture pairing revoked'})
+                revoked = await wait_refusal_status(facade, http_thread, 115, True)
+                assert revoked['joined'] is False and revoked.get('closed_by_room') is True
+                assert 'pairing was revoked' in revoked.get('note', ''), revoked
+                revoked_say = await tool_failure(facade, 'voice_say', {'conversation':http_thread,
+                    'session_id':'typed:' + http_thread, 'revision':0, 'text':'Must not be published'}, 116)
+                assert 'pairing was revoked' in revoked_say, revoked_say
+                revoked_join = await tool_failure(facade, 'voice_connect', {'title':'Blocked while revoked'}, 117)
+                assert 'revoked this connector pairing' in revoked_join, revoked_join
+                core_json(core_data / 'local.sock', 'POST', '/api/test/rendezvous-state',
+                    {'connected':False,'room':None,'refused':None})
+                await wait_refusal_status(facade, http_thread, 123, False)
+                reopened = await tool(facade, 'voice_connect', {'title':'HTTP after re-pair'}, 118)
+                assert reopened['conversation'] == http_thread, reopened
+                await wait_core_connected(facade, http_thread, 122)
+                await tool(facade, 'voice_disconnect', {}, 119)
                 await finish(facade)
                 facades.remove(facade)
 
@@ -604,6 +820,19 @@ async def parity_fixture():
                 facades.append(app_facade)
                 adopted = await tool(app_facade, 'voice_status', {'conversation':app_thread}, 37)
                 assert adopted['joined'] is True and adopted['binding_id'] == app_joined['binding_id'], adopted
+                old_daemon = daemon
+                await finish(old_daemon)
+                daemon = None
+                daemon = await asyncio.create_subprocess_exec(str(binary), '--profile-root', str(root), 'connector',
+                    stdout=asyncio.subprocess.DEVNULL, stderr=core_log, env=base_env)
+                await until((data / 'connector.sock').exists, 'restarted Rust connector after adopted binding')
+                replayed = await until_async(lambda: adopted_status(app_facade, app_thread), 'adopted binding replay')
+                assert replayed['joined'] is True and replayed['binding_id'] != adopted['binding_id'], replayed
+                replay_link = replayed.get('view_link')
+                assert replay_link and replay_link.get('port') and replay_link.get('key') == app_joined['view_link']['key'], replayed
+                replay_query = urlencode({'thread':app_thread, 'auth':hmac.new(bytes.fromhex(replay_link['key']),
+                    ('poll:' + app_thread).encode(), hashlib.sha256).hexdigest()})
+                assert card_get(replay_link['port'], replay_query).get('message') is None, replay_link
                 await tool(app_facade, 'voice_disconnect', {'conversation':app_thread}, 38)
                 app_again = await tool(app_facade, 'voice_connect', {'title':'Cursor card reconnect'}, 39)
                 await tool(app_facade, 'voice_disconnect', {'conversation':app_again['conversation']}, 40)
@@ -613,14 +842,20 @@ async def parity_fixture():
                 # Cursor Desktop Bridge is preferred only after its per-conversation key identifies one chat.
                 received_bridge = asyncio.Queue()
                 bridge_chat = str(uuid.uuid4())
+                stale_chat = str(uuid.uuid4())
+                received_bridge.listed_chat = stale_chat
+                bridge_transcript = home / '.cursor' / 'projects' / 'synthetic-workspace' / 'agent-transcripts' / bridge_chat / f'{bridge_chat}.jsonl'
+                stale_transcript = home / '.cursor' / 'projects' / 'old-workspace' / 'agent-transcripts' / stale_chat / f'{stale_chat}.jsonl'
+                make_cursor_store(cursor_config, workspace, bridge_chat, 'cursor-bridge-fixture-model')
                 bridge_server, _bridge_file = await start_bridge(bridge_dir, bridge_user_data, bridge_socket,
-                    bridge_chat, received_bridge, cursor_transcript)
+                    bridge_chat, received_bridge, bridge_transcript)
                 bridge_facade, listed = await start_facade(binary, root, base_env, 'cursor-vscode', UI_CAPS)
                 facades.append(bridge_facade)
                 bridge_joined = await tool(bridge_facade, 'voice_connect', {'title':'Cursor Desktop Bridge'}, 45)
                 assert bridge_joined['card']['bridge'] is True and bridge_joined['view_link'], bridge_joined
                 bridge_thread = bridge_joined['conversation']
                 bridge_key = bridge_joined['view_link']['key']
+                append_cursor_connect(stale_transcript, 'Cursor Desktop Bridge')
                 await asyncio.sleep(.25)  # let every scheduled bridge-state lookup miss
                 late_status = await tool(bridge_facade, 'voice_status', {'conversation':bridge_thread}, 46)
                 assert late_status['card']['bridge_chat_known'] is False, late_status
@@ -629,13 +864,15 @@ async def parity_fixture():
                     (f'bubbleId:{bridge_chat}:result', json.dumps({'voice_connect':bridge_key})))
                 state.commit()
                 state.close()
+                await wait_bridge_chat(bridge_facade, bridge_thread, 148)
                 bridge_row = await core_text(core_data / 'local.sock', token, session, bridge_joined['binding_id'], bridge_thread,
                     'Core input for Cursor Desktop Bridge')
                 sent = await asyncio.wait_for(received_bridge.get(), 12)
                 assert sent['threadId'] == bridge_chat and 'Core input for Cursor Desktop Bridge' in sent['text'], sent
                 await wait_status(core_data / 'local.sock', token, bridge_thread, bridge_row['id'], 'delivered')
-                append_cursor(cursor_transcript, sent['text'])
+                append_cursor(bridge_transcript, sent['text'])
                 await wait_status(core_data / 'local.sock', token, bridge_thread, bridge_row['id'], 'read', 15)
+                await wait_engine(core_data / 'local.sock', session, bridge_thread, 'cursor-bridge-fixture-model')
                 await status_and_reply(bridge_facade, bridge_thread, bridge_joined, bridge_row, editor_caps, 47)
                 await tool(bridge_facade, 'voice_disconnect', {'conversation':bridge_thread}, 48)
                 bridge_reconnect = await tool(bridge_facade, 'voice_connect', {'title':'Cursor Bridge reconnect'}, 49)
@@ -671,6 +908,7 @@ async def parity_fixture():
                         'generic_http':'accepted_without_read'},
                     'binding_disconnect_reconnect':True,'detached_editor_adopt':True,
                     'foreign_owner_refused':True,'claude_inbound_hold_refused':True,
+                    'room_close_and_revocation':True,'working_replay_state':True,'engine_observation':True,
                     'paid_prompts':False}))
         except Exception:
             core_log.flush()
