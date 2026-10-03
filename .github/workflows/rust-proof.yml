@@ -81,6 +81,7 @@ jobs:
           path: |
             ${{ runner.temp }}/sidevoice-rust-launchd-profile/service-evidence.json
             ${{ runner.temp }}/sidevoice-rust-launchd-profile/sidevoice/service/*.log
+            ${{ runner.temp }}/sidevoice-rust-launchd-profile/sidevoice/core/core-app.log
           if-no-files-found: ignore
           retention-days: 7
 

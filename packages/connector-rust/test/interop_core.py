@@ -417,7 +417,8 @@ async def exercise():
         staged_core.write_text('#!/bin/sh\nexit 0\n')
         staged_core.chmod(0o700)
         (releases / 'current').symlink_to('interop')
-        fresh_daemon_pid = None
+        fresh_connector_socket = data / 'connector.sock'
+        fresh_connector_started = False
         fresh = await asyncio.create_subprocess_exec(str(staged_binary), 'mcp', '--profile-root', str(root),
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             env={})
@@ -427,23 +428,18 @@ async def exercise():
             assert fresh_info['instructions']
             fresh_tools = await mcp_request(fresh, 'tools/list', {}, 91)
             assert len(fresh_tools['tools']) == 6, 'profile-root must reconstruct the selected command with no inherited profile env'
-            await until(lambda: (data / 'proof.json').exists(), 'on-demand private connector startup')
-            fresh_daemon_pid = json.loads((data / 'proof.json').read_text())['pid']
+            await until(fresh_connector_socket.exists, 'on-demand private connector startup')
+            fresh_connector_started = True
         except Exception as error:
             await finish(fresh)
             stderr = (await fresh.stderr.read()).decode(errors='replace')
             raise AssertionError(
                 f'fresh profile MCP exited {fresh.returncode}: {stderr.strip()}') from error
         finally:
-            if fresh_daemon_pid is None and (data / 'proof.json').exists():
-                fresh_daemon_pid = json.loads((data / 'proof.json').read_text())['pid']
-            if fresh_daemon_pid is not None:
-                try:
-                    os.kill(fresh_daemon_pid, 15)
-                except ProcessLookupError:
-                    pass
-                await until(lambda: not process_alive(fresh_daemon_pid), 'on-demand connector cleanup', seconds=8)
             await finish(fresh)
+            if fresh_connector_started:
+                await until(lambda: not fresh_connector_socket.exists(),
+                            'on-demand connector 15-second idle exit', seconds=22)
         thread = str(uuid.uuid4())
         rollout = rollout_dir / f'rollout-test-{thread}.jsonl'
         rollout.touch(mode=0o600)

@@ -330,6 +330,18 @@ async def exercise():
     async def wait_file(path, description, seconds=20):
         return await until(path.exists, description, seconds=seconds)
 
+    async def wait_core_host_link():
+        deadline = time.monotonic() + 25
+        last_error = None
+        while time.monotonic() < deadline:
+            try:
+                return await asyncio.to_thread(http_json, core_data / 'local.sock', 'GET',
+                    '/api/host/agents?rescan=1&watch=codex', None, token)
+            except Exception as error:
+                last_error = error
+                await asyncio.sleep(.2)
+        raise AssertionError(f'Core host API did not reconnect to Rust after restart: {last_error!r}') from last_error
+
     async def connector_pid(label):
         def read_pid():
             value = run(['/bin/launchctl', 'print', f'{domain}/{label}'], check=False)
@@ -500,12 +512,22 @@ async def exercise():
 
         # Start is the sole explicit transition that clears stop intent. A direct manager retry sees the
         # durable marker and cannot bind/reinitialize the managed connector.
+        await wait_core_host_link()
+        result['core_host_link_reconnected_after_explicit_retry'] = True
         slow_next_get.touch(mode=0o600)
         slow_get_started.unlink(missing_ok=True)
         stop_scan = asyncio.create_task(asyncio.to_thread(
             http_json, core_data / 'local.sock', 'GET', '/api/host/agents?rescan=1&watch=codex', None, token))
         scan_tasks.append(stop_scan)
-        await wait_file(slow_get_started, 'HostAgents scan before service stop', seconds=8)
+        try:
+            await wait_file(slow_get_started, 'HostAgents scan before service stop', seconds=8)
+        except Exception:
+            if stop_scan.done():
+                try:
+                    print(f'HostAgents scan before stop result: {stop_scan.result()!r}', file=sys.stderr)
+                except Exception as error:
+                    print(f'HostAgents scan before stop failed: {error!r}', file=sys.stderr)
+            raise
         stop_task = asyncio.create_task(service('stop', timeout_seconds=60))
         command_tasks.append(stop_task)
         await wait_file(data / 'node-stopped.json', 'durable stop-intent marker', seconds=10)
@@ -634,6 +656,7 @@ def main():
     except Exception:
         profile = Path(os.environ.get('SIDEVOICE_PROFILE_ROOT', '/nonexistent'))
         for path in (profile / 'sidevoice/service/core.log', profile / 'sidevoice/service/connector.log',
+                     profile / 'sidevoice/core/core-app.log',
                      profile / 'sidevoice/service/facade.log', profile / 'service-evidence.json'):
             if path.exists():
                 print(f'{path.name}: {path.read_text(errors="replace")[-12000:]}', file=sys.stderr)
