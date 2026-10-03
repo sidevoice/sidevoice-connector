@@ -414,7 +414,7 @@ async def test_route(binary, root, env, presentation, route, client_name, route_
         if expected_initial:
             expected_initial(joined)
         core_json(presentation['socket'], 'POST', '/api/presentation/select',
-            {'session_id':presentation['session'], 'thread_id':thread})
+            {'session_id':presentation['session'], 'thread_id':thread}, presentation['token'])
         input_row = await core_text(presentation['socket'], presentation['token'], presentation['session'],
             joined['binding_id'], thread, 'Core input for ' + route)
         if after:
@@ -751,11 +751,12 @@ main()
                     'SIDEVOICE_DELIVERY_URL':f'http://127.0.0.1:{receiver.server_port}/state-race'}
                 race_peer, _ = await start_facade(binary, root, base_env | race_env, 'fixture-http')
                 facades.append(race_peer)
-                core_json(core_data / 'local.sock', 'POST', '/api/presentation/select', {'session_id':session,'thread_id':http_thread})
+                core_json(core_data / 'local.sock', 'POST', '/api/presentation/select',
+                    {'session_id':session,'thread_id':http_thread}, token)
                 # A fresh registration and room close overlap as separate Core and MCP clients.
                 await asyncio.gather(
                     asyncio.to_thread(core_json, core_data / 'local.sock', 'POST',
-                        '/api/presentation/close', {'thread_id':http_thread}),
+                        '/api/presentation/close', {'thread_id':http_thread}, token),
                     tool(race_peer, 'voice_connect', {'title':'Concurrent state writer'}, 124),
                 )
                 def close_and_guard_persisted():
@@ -1030,8 +1031,9 @@ main()
                 state_backup.chmod(0o600)
                 state_path.mkdir(mode=0o700)
                 core_json(core_data / 'local.sock', 'POST', '/api/presentation/select',
-                    {'session_id':session,'thread_id':history_thread})
-                core_json(core_data / 'local.sock', 'POST', '/api/presentation/close', {'thread_id':history_thread})
+                    {'session_id':session,'thread_id':history_thread}, token)
+                core_json(core_data / 'local.sock', 'POST', '/api/presentation/close',
+                    {'thread_id':history_thread}, token)
                 guard_path = data / 'conversation-state.guard'
                 await until(lambda: guard_path.read_bytes()[8] == 1, 'emergency replay guard after state write failure')
                 failed_write_status = await wait_closed_status(history_facade, history_thread, 162)
@@ -1052,22 +1054,23 @@ main()
                 history_rejoined = await tool(history_facade, 'voice_connect', {'title':'Explicit storage recovery'}, 165)
                 assert history_rejoined['conversation'] == history_thread, history_rejoined
                 await wait_core_connected(history_facade, history_thread, 166)
-                await core_json(core_data / 'local.sock', 'POST', '/api/test/rendezvous-state',
+                core_json(core_data / 'local.sock', 'POST', '/api/test/rendezvous-state',
                     {'connected':False,'room':'https://fixture.invalid','refused':'fixture pairing revoked'})
                 revoked_after_latch = await wait_refusal_status(history_facade, history_thread, 167, True)
                 assert 'pairing was revoked' in revoked_after_latch.get('note', ''), revoked_after_latch
                 revoked_after_latch_say = await tool_failure(history_facade, 'voice_say', {'conversation':history_thread,
                     'session_id':'history:legacy','revision':0,'text':'must stay refused'}, 168)
                 assert 'pairing was revoked' in revoked_after_latch_say, revoked_after_latch_say
-                await core_json(core_data / 'local.sock', 'POST', '/api/test/rendezvous-state',
+                core_json(core_data / 'local.sock', 'POST', '/api/test/rendezvous-state',
                     {'connected':False,'room':None,'refused':None})
                 await wait_refusal_status(history_facade, history_thread, 169, False)
                 history_rejoined = await tool(history_facade, 'voice_connect', {'title':'History after re-pair'}, 170)
                 assert history_rejoined['conversation'] == history_thread, history_rejoined
                 await wait_core_connected(history_facade, history_thread, 171)
                 core_json(core_data / 'local.sock', 'POST', '/api/presentation/select',
-                    {'session_id':session,'thread_id':history_thread})
-                await core_json(core_data / 'local.sock', 'POST', '/api/presentation/close', {'thread_id':history_thread})
+                    {'session_id':session,'thread_id':history_thread}, token)
+                core_json(core_data / 'local.sock', 'POST', '/api/presentation/close',
+                    {'thread_id':history_thread}, token)
                 post_latch_close = await wait_closed_status(history_facade, history_thread, 172)
                 assert 'closed this conversation' in post_latch_close.get('note', ''), post_latch_close
                 post_latch_say = await tool_failure(history_facade, 'voice_say', {'conversation':history_thread,
