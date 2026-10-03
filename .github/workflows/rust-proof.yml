@@ -6,11 +6,6 @@ on:
       - 'packages/connector-rust/**'
       - '.github/workflows/rust-proof.yml'
   workflow_dispatch:
-    inputs:
-      core-ref:
-        description: Core v3 commit or branch for real interoperability
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -43,7 +38,6 @@ jobs:
 
   interop-core:
     name: Rust proof with real Core v3 and modelled Codex queue
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.core-ref != '' }}
     needs: native
     runs-on: ubuntu-24.04
     steps:
@@ -51,7 +45,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: sidevoice/sidevoice-core
-          ref: ${{ inputs.core-ref }}
+          ref: 7fabe4f455e263a81149bcb75f5bad94ff22ea77
           path: core
       - uses: actions/download-artifact@v4
         with:
