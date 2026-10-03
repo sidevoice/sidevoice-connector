@@ -29,6 +29,7 @@ const connectorPath = [cliPath, 'connector'];
 const mcpPath = [cliPath, 'mcp'];
 const wait = ms => new Promise(r => setTimeout(r, ms));
 async function until(check, timeout = 5000) { const start = Date.now(); while (Date.now() - start < timeout) { const value = await check(); if (value) return value; await wait(25); } throw new Error('timed out waiting'); }
+const savedSpeechAck = data => ({ event_id: data.event_id, status: 'queued', text_saved: true, utterance_id: data.utterance_id });
 
 function ipcClient(socketPath) {
   const socket = net.createConnection(socketPath); let buffer = ''; let serial = 0; const waiting = new Map();
@@ -41,9 +42,9 @@ function ipcClient(socketPath) {
  *  path) is a core somebody else runs, named whole in the environment, so nothing is installed or
  *  supervised. The address names only the origin: the path and the namespace are the connector's own
  *  knowledge, and a test that wrote them would be asserting its own copy. */
-function startConnector(origin, dataDir, extraEnv = {}) {
+function startConnector(origin, dataDir, extraEnv = {}, serviceMode = false) {
   const socketPath = path.join(dataDir, 'connector.sock');
-  const child = spawn(process.execPath, connectorPath, { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CONNECTOR_IDLE_MS: '400',
+  const child = spawn(process.execPath, [...connectorPath, ...(serviceMode ? ['--service'] : [])], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CONNECTOR_IDLE_MS: '400',
     SIDEVOICE_URL: origin, SIDEVOICE_CONNECTOR_ID: 'c-1', SIDEVOICE_CONNECTOR_TOKEN: 't-1', ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'] });
   let stderr = ''; child.stderr.on('data', d => { stderr += d; });
   return { child, socketPath, stderr: () => stderr };
@@ -78,7 +79,7 @@ test('connector: the handshake authenticates, registrations and speech are answe
       assert.ok(data.binding_id === undefined || data.binding_id === 'b-' + data.client_ref);
       return { client_ref: data.client_ref, binding_id: 'b-' + data.client_ref, thread: data.thread };
     }
-    if (event === 'speech.publish') return { status: 'queued', text_saved: true, utterance_id: data.utterance_id };
+    if (event === 'speech.publish') return savedSpeechAck(data);
   };
   const { child, socketPath, stderr } = startConnector(room.origin, dataDir);
   try {
@@ -159,7 +160,7 @@ test('connector: speech while offline is queued durably and replayed on reconnec
   await room.stop();
   room.handle = (event, data) => {
     if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-1', thread: data.thread };
-    if (event === 'speech.publish') return { status: 'queued', text_saved: true };
+    if (event === 'speech.publish') return savedSpeechAck(data);
   };
   const { child, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
   try {
@@ -176,6 +177,179 @@ test('connector: speech while offline is queued durably and replayed on reconnec
     const result = await registration; assert.equal(result.binding_id, 'b-1');
     facade.end();
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
+});
+
+test('connector: malformed speech is rejected before saving and restart remains healthy', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const port = room.port;
+  room.handle = (event, data) => event === 'binding.register'
+    ? { client_ref: data.client_ref, binding_id: 'b-one', thread: data.thread }
+    : event === 'speech.publish' ? savedSpeechAck(data) : undefined;
+  const first = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  let second = null;
+  let roomStopped = false;
+  try {
+    await until(() => existsSync(first.socketPath));
+    const facade = ipcClient(first.socketPath); await facade.ready;
+    await until(async () => (await facade.call('status', {})).connected);
+    await facade.call('register', { client_ref: 'r', harness: 'test', thread: 'thread-1', delivery: { kind: 'http', url: 'http://127.0.0.1:1/' } });
+    await room.stop();
+    roomStopped = true;
+    await until(async () => !(await facade.call('status', {})).connected);
+    const outboxPath = path.join(dataDir, 'outbox.json');
+    const validSpeech = { event_id: 'valid-event', utterance_id: 'utterance-one', session_id: 'session-one', revision: 0, text: 'valid reply' };
+    assert.equal((await facade.call('publish', { ...validSpeech, client_ref: 'r' })).status, 'queued');
+    const validRow = { ...validSpeech, binding_id: 'b-one', client_ref: 'r', harness: 'test', thread: 'thread-1' };
+    assert.deepEqual(JSON.parse(readFileSync(outboxPath, 'utf8')), [validRow]);
+    for (const invalidSpeech of [
+      { event_id: 'malformed-text', utterance_id: 'utterance-two', text: 42 },
+      { event_id: 'malformed-utterance', utterance_id: 42, text: 'valid text' },
+    ]) {
+      await assert.rejects(facade.call('publish', {
+        ...invalidSpeech, session_id: 'session-one', revision: 0, client_ref: 'r',
+      }), /Invalid speech outbox row/);
+      assert.deepEqual(JSON.parse(readFileSync(outboxPath, 'utf8')), [validRow], 'invalid input leaves existing pending rows unchanged');
+    }
+    facade.end();
+    first.child.kill(); await until(() => first.child.exitCode !== null);
+
+    second = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+    await until(() => existsSync(second.socketPath));
+    const restarted = ipcClient(second.socketPath); await restarted.ready;
+    assert.equal((await restarted.call('status', {})).connected, false, 'the connector restarted while Core was offline');
+    assert.deepEqual(JSON.parse(readFileSync(outboxPath, 'utf8')), [validRow], 'the valid pending row loaded and remained queued');
+    await room.start(port);
+    roomStopped = false;
+    await until(() => room.sent('speech.publish').some(data => data.text === validSpeech.text));
+    await until(() => JSON.parse(readFileSync(outboxPath, 'utf8')).length === 0);
+    restarted.end();
+  } finally {
+    if (first.child.exitCode === null) first.child.kill();
+    if (second && second.child.exitCode === null) second.child.kill();
+    if (roomStopped) await room.start(port).catch(() => {});
+    await room.close();
+  }
+});
+
+test('connector: a second JS process loads the same row and only the registered binding identity follows it', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  let holdAck = true;
+  room.handle = (event, data) => {
+    if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-' + data.client_ref, thread: data.thread };
+    if (event === 'speech.publish') {
+      if (holdAck) return new Promise(() => {});
+      // Protocol 2 does not always echo utterance_id; a matching event_id and text_saved are enough.
+      return { event_id: data.event_id, status: 'queued', text_saved: true };
+    }
+  };
+  const first = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  let second = null;
+  try {
+    await until(() => existsSync(first.socketPath));
+    const facade = ipcClient(first.socketPath); await facade.ready;
+    await facade.call('register', { client_ref: 'client-one', harness: 'codex', thread: 'thread-one', delivery: { kind: 'http', url: 'http://127.0.0.1:1/one' } });
+    await facade.call('register', { client_ref: 'client-two', harness: 'claude', thread: 'thread-two', delivery: { kind: 'http', url: 'http://127.0.0.1:1/two' } });
+
+    const speech = { event_id: 'event-two', utterance_id: 'utterance-two', session_id: 'session-two', revision: 9, text: 'private reply for two', language: 'en' };
+    void facade.call('publish', { ...speech, binding_id: 'b-client-two' }).catch(() => {}); // The room holds this ACK while the row is captured.
+    const outboxPath = path.join(dataDir, 'outbox.json');
+    const queued = await until(() => {
+      if (!existsSync(outboxPath)) return null;
+      const rows = JSON.parse(readFileSync(outboxPath, 'utf8'));
+      return rows.length === 1 ? rows[0] : null;
+    });
+    assert.deepEqual(queued, { ...speech, binding_id: 'b-client-two', client_ref: 'client-two', harness: 'claude', thread: 'thread-two' });
+    const firstFrame = room.sent('speech.publish').at(-1);
+    assert.deepEqual(firstFrame, { ...speech, binding_id: 'b-client-two' }, 'binding identity stays local to the outbox');
+
+    first.child.kill();
+    await until(() => first.child.exitCode !== null);
+    holdAck = false;
+    second = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+    await until(() => existsSync(second.socketPath));
+    await until(() => JSON.parse(readFileSync(path.join(dataDir, 'outbox.json'), 'utf8')).length === 0);
+    assert.deepEqual(room.sent('speech.publish').at(-1), firstFrame, 'the second JS process replayed the saved row unchanged');
+    assert.ok(!first.stderr().includes(speech.text));
+    assert.ok(!second.stderr().includes(speech.text));
+  } finally {
+    if (first.child.exitCode === null) first.child.kill();
+    if (second && second.child.exitCode === null) second.child.kill();
+    await room.close();
+  }
+});
+
+test('connector: rejected, unknown and invalid speech ACKs retain rows without logging text', async () => {
+  const room = await startRoom();
+  const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+  const replies = [
+    data => ({ event_id: data.event_id, status: 'rejected', text_saved: true, error: data.text }),
+    data => ({ event_id: data.event_id, status: 'unknown_binding', text_saved: true, error: data.text }),
+    data => ({}),
+    data => ({ event_id: 'different-event', status: 'queued', text_saved: true }),
+    data => ({ event_id: data.event_id, status: 'queued', text_saved: false }),
+    data => ({ event_id: data.event_id, status: 'queued', text_saved: true, utterance_id: 'different-utterance' }),
+    data => ({ event_id: data.event_id, status: '', text_saved: true }),
+    data => ({ event_id: data.event_id, status: 'future_core_status', text_saved: true }),
+  ];
+  let nextReply = 0;
+  room.handle = (event, data) => {
+    if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-one', thread: data.thread };
+    if (event === 'speech.publish') return replies[nextReply++](data);
+  };
+  const { child, socketPath, stderr } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
+  try {
+    await until(() => existsSync(socketPath));
+    const facade = ipcClient(socketPath); await facade.ready;
+    await facade.call('register', { client_ref: 'client-one', harness: 'test', thread: 'thread-one', delivery: { kind: 'http', url: 'http://127.0.0.1:1/' } });
+    const rows = [];
+    for (let i = 0; i < replies.length; i++) {
+      const speech = { event_id: `event-${i}`, text: `private reply ${i}`, session_id: 'session', revision: i };
+      const result = await facade.call('publish', { ...speech, binding_id: 'b-one' });
+      assert.equal(result.status, 'queued');
+      rows.push({ event_id: speech.event_id, text: speech.text });
+      assert.deepEqual(JSON.parse(readFileSync(path.join(dataDir, 'outbox.json'), 'utf8')).map(({ event_id, text }) => ({ event_id, text })), rows);
+    }
+    await assert.rejects(facade.call('publish', { event_id: 'event-0', binding_id: 'b-one', text: 'duplicate event' }), /already pending/);
+    assert.deepEqual(JSON.parse(readFileSync(path.join(dataDir, 'outbox.json'), 'utf8')).map(({ event_id, text }) => ({ event_id, text })), rows);
+    for (let i = 0; i < replies.length; i++) assert.ok(!stderr().includes(`private reply ${i}`));
+  } finally { if (child.exitCode === null) child.kill(); await room.close(); }
+});
+
+test('connector: malformed, non-array and unreadable outboxes stop startup without rewriting state', async () => {
+  const cases = [
+    { name: 'malformed JSON', prepare: dir => writeFileSync(path.join(dir, 'outbox.json'), '{"text":"private malformed reply"'),
+      assertState: dir => assert.equal(readFileSync(path.join(dir, 'outbox.json'), 'utf8'), '{"text":"private malformed reply"') },
+    { name: 'non-array JSON', prepare: dir => writeFileSync(path.join(dir, 'outbox.json'), '{"text":"private non-array reply"}'),
+      assertState: dir => assert.equal(readFileSync(path.join(dir, 'outbox.json'), 'utf8'), '{"text":"private non-array reply"}') },
+    { name: 'malformed row', prepare: dir => writeFileSync(path.join(dir, 'outbox.json'), '[{"event_id":"event","text":"private malformed row"}]'),
+      assertState: dir => assert.equal(readFileSync(path.join(dir, 'outbox.json'), 'utf8'), '[{"event_id":"event","text":"private malformed row"}]') },
+    { name: 'duplicate event IDs', service: true,
+      prepare: dir => writeFileSync(path.join(dir, 'outbox.json'), JSON.stringify([
+        { event_id: 'same-event', binding_id: 'b-one', utterance_id: 'u-one', text: 'private first row' },
+        { event_id: 'same-event', binding_id: 'b-two', utterance_id: 'u-two', text: 'private second row' },
+      ])),
+      assertState: dir => assert.equal(JSON.parse(readFileSync(path.join(dir, 'outbox.json'), 'utf8')).length, 2) },
+    { name: 'unreadable state', prepare: dir => { const outbox = path.join(dir, 'outbox.json'); mkdirSync(outbox); writeFileSync(path.join(outbox, 'sentinel'), 'private unreadable reply'); },
+      assertState: dir => assert.equal(readFileSync(path.join(dir, 'outbox.json', 'sentinel'), 'utf8'), 'private unreadable reply') },
+  ];
+  for (const item of cases) {
+    const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
+    item.prepare(dataDir);
+    const stoppedPath = path.join(dataDir, 'node-stopped.json');
+    const stoppedBefore = '{"at":"before malformed startup"}\n';
+    if (item.service) writeFileSync(stoppedPath, stoppedBefore);
+    const { child, socketPath, stderr } = startConnector('http://127.0.0.1:1', dataDir, {}, item.service);
+    await until(() => child.exitCode !== null, 5000);
+    assert.equal(child.exitCode, 78, item.name);
+    const diagnostic = item.service ? readFileSync(path.join(dataDir, 'connector.log'), 'utf8') : stderr();
+    assert.match(diagnostic, /speech outbox is malformed or unreadable; refusing to start without changing it/, item.name);
+    assert.ok(!diagnostic.includes('private '), item.name);
+    assert.equal(existsSync(socketPath), false, item.name);
+    item.assertState(dataDir);
+    if (item.service) assert.equal(readFileSync(stoppedPath, 'utf8'), stoppedBefore, 'failed service startup preserves the stop marker');
+  }
 });
 
 test('connector: keeps retrying while the room is down and connects once it appears', async () => {
@@ -383,7 +557,7 @@ test('connector: the room closing a conversation\'s voice removes the binding an
   const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
   room.handle = (event, data) => {
     if (event === 'binding.register') return { client_ref: data.client_ref, binding_id: 'b-' + data.client_ref, thread: data.thread };
-    if (event === 'speech.publish') return { status: 'queued', text_saved: true, utterance_id: data.utterance_id };
+    if (event === 'speech.publish') return savedSpeechAck(data);
   };
   const { child, socketPath } = startConnector(room.origin, dataDir);
   try {
@@ -952,7 +1126,7 @@ test('façade + connector: four chats of one Cursor editor window join at once, 
   const minted = [];
   room.handle = (event, data) => {
     if (event === 'binding.register') { minted.push(data.thread); return { client_ref: data.client_ref, binding_id: 'b-' + minted.length, thread: data.thread }; }
-    if (event === 'speech.publish') return { status: 'queued', text_saved: true, utterance_id: data.utterance_id };
+    if (event === 'speech.publish') return savedSpeechAck(data);
   };
   const { child: connector, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
   await until(() => existsSync(socketPath));
@@ -1045,7 +1219,7 @@ test('façade + connector: Cursor replaces a window\'s MCP process — the first
   const minted = [];
   room.handle = (event, data) => {
     if (event === 'binding.register') { minted.push(data.thread); return { client_ref: data.client_ref, binding_id: 'b-' + minted.length, thread: data.thread }; }
-    if (event === 'speech.publish') return { status: 'queued', text_saved: true, utterance_id: data.utterance_id };
+    if (event === 'speech.publish') return savedSpeechAck(data);
   };
   const { child: connector, socketPath } = startConnector(room.origin, dataDir, { SIDEVOICE_CONNECTOR_IDLE_MS: '20000' });
   await until(() => existsSync(socketPath));
