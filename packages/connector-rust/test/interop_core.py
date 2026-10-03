@@ -10,6 +10,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import sys
 import tempfile
@@ -91,6 +92,157 @@ async def finish(process):
             await process.wait()
 
 
+def core_faults(root, env):
+    """Faults live only in this temporary Core process, with no production hook."""
+    storage, late = root / 'fail-journal-once', root / 'delay-ack-once'
+    (root / 'sitecustomize.py').write_text('''import asyncio, os
+from pathlib import Path
+from sidevoice_core.control.history import RoomHistory
+from sidevoice_core.control.room import Room
+_put = RoomHistory.put
+_publish = Room.publish
+def put(self, **fields):
+    flag = Path(os.environ['SIDEVOICE_TEST_STORAGE_FLAG'])
+    if fields.get('role') == 'assistant' and flag.exists():
+        flag.unlink()
+        raise RuntimeError('isolated injected journal failure')
+    return _put(self, **fields)
+async def publish(self, payload):
+    result = await _publish(self, payload)
+    flag = Path(os.environ['SIDEVOICE_TEST_LATE_ACK_FLAG'])
+    if flag.exists():
+        flag.unlink()
+        await asyncio.sleep(17)
+    return result
+RoomHistory.put = put
+Room.publish = publish
+''')
+    return {**env, 'PYTHONPATH': str(root) + os.pathsep + env.get('PYTHONPATH', ''),
+            'SIDEVOICE_TEST_STORAGE_FLAG': str(storage), 'SIDEVOICE_TEST_LATE_ACK_FLAG': str(late)}, storage, late
+
+
+async def js_register(socket_path, thread):
+    reader, writer = await asyncio.open_unix_connection(str(socket_path))
+    writer.write((json.dumps({'id': 1, 'method': 'register', 'params': {
+        'client_ref': thread, 'harness': 'codex', 'thread': thread, 'title': 'Copied state',
+        'delivery': {'kind': 'codex-queue', 'thread': thread}}}) + '\n').encode())
+    await writer.drain()
+    reply = json.loads(await asyncio.wait_for(reader.readline(), 20))
+    assert reply['ok'] and not reply['result']['binding_id'].startswith('local-'), reply
+    return reader, writer, reply['result']['binding_id']
+
+
+async def copied_state():
+    """Run v2 JS, v3 Rust, then v2 JS against one Core launch and copied files."""
+    binary = Path(os.environ['SIDEVOICE_RUST_PROOF_BIN']).resolve()
+    python = Path(os.environ['SIDEVOICE_CORE_PYTHON']).absolute()
+    js_cli = Path(__file__).resolve().parents[2] / 'connector' / 'cli.mjs'
+    with tempfile.TemporaryDirectory(prefix='sidevoice-rust-copied-') as temporary:
+        root = Path(temporary)
+        root.chmod(0o700)
+        data, codex = root / 'sidevoice', root / 'codex'
+        core_data = data / 'core'
+        for directory in (data, codex, core_data):
+            directory.mkdir(mode=0o700)
+        thread = str(uuid.uuid4())
+        env = {**os.environ, 'SIDEVOICE_DATA_DIR': str(data), 'CODEX_HOME': str(codex),
+               'CODEX_THREAD_ID': thread, 'SIDEVOICE_SERVICE_MANAGER': 'none'}
+        core_env, storage_flag, _ = core_faults(root, env)
+        core_log = (root / 'core.log').open('wb')
+        js_log = (root / 'js.log').open('wb')
+        rust_log = (root / 'rust.log').open('wb')
+        launch = str(uuid.uuid4())
+        core = await asyncio.create_subprocess_exec(str(python), '-m', 'sidevoice_core.server',
+            '--data-dir', str(core_data), '--socket', str(core_data / 'local.sock'), '--port', '0',
+            '--idle-exit', '0', '--launch-id', launch, '--log-file', str(root / 'core-app.log'),
+            stdout=core_log, stderr=core_log, env=core_env)
+        js = daemon = facade = None
+        js_writer = None
+        try:
+            ready = core_data / 'core.json'
+            await until(ready.exists, 'copied-state Core ready', seconds=90)
+            assert json.loads(ready.read_text())['launch_id'] == launch
+            socket_path = data / 'connector.sock'
+            js = await asyncio.create_subprocess_exec('node', str(js_cli), 'connector', '--service',
+                stdout=js_log, stderr=js_log, env=env)
+            await until(socket_path.exists, 'first JS connector socket')
+            js_reader, js_writer, old_id = await js_register(socket_path, thread)
+            agents = data / 'agents.json'
+            await until(agents.exists, 'JS-generated agents state', seconds=30)
+            storage_flag.touch()
+            js_writer.write((json.dumps({'id': 2, 'method': 'publish', 'params': {
+                'client_ref': thread, 'session_id': 'copied-session', 'revision': 1,
+                'text': 'JS copied outbox speech'}}) + '\n').encode())
+            await js_writer.drain()
+            # Core's one injected journal failure leaves the actual JS-created row on disk.
+            queued_reply = json.loads(await asyncio.wait_for(js_reader.readline(), 25))
+            assert queued_reply['ok'] and queued_reply['result']['status'] == 'queued'
+            assert not storage_flag.exists(), 'injected Core journal failure was unused'
+            await until(lambda: (data / 'outbox.json').exists() and len(json.loads((data / 'outbox.json').read_text())) == 1,
+                        'JS-created queued outbox', seconds=25)
+            original = json.loads((data / 'outbox.json').read_text())[0]
+            assert original['binding_id'] == old_id and 'client_ref' not in original
+            await finish(js)
+            js = None
+            js_writer.close()
+            js_writer = None
+            await until(lambda: not socket_path.exists(), 'first JS lock/socket release')
+            copied = root / 'js-state'
+            copied.mkdir(mode=0o700)
+            for name in ('outbox.json', 'agents.json'):
+                shutil.copy2(data / name, copied / name)
+                (data / name).unlink()
+                shutil.copy2(copied / name, data / name)
+            agents_before = (data / 'agents.json').read_bytes()
+            daemon = await asyncio.create_subprocess_exec(str(binary), 'connector',
+                stdout=rust_log, stderr=rust_log, env=env)
+            await until(socket_path.exists, 'Rust copied-state socket')
+            facade = await asyncio.create_subprocess_exec(str(binary), 'mcp', stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=rust_log, env=env)
+            await mcp_request(facade, 'initialize', {'protocolVersion': '2025-06-18', 'capabilities': {},
+                'clientInfo': {'name': 'codex', 'version': '0.157.0'}}, 1)
+            facade.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+            await facade.stdin.drain()
+            joined = await tool(facade, 'voice_connect', {'title': 'Copied state'}, 2, thread)
+            assert joined['binding_id'] == old_id, 'Core must reuse the same-process binding'
+            await until(lambda: json.loads((data / 'outbox.json').read_text()) == [], 'copied JS speech admission')
+            token = http_json(core_data / 'local.sock', 'POST', '/api/device/local/pair', {'name': 'copied-state'})['token']
+            rows = http_json(core_data / 'local.sock', 'GET', f'/api/presentation/history?thread_id={thread}', token=token)['messages']
+            assert sum(row['text'] == original['text'] for row in rows) == 1
+            assert (data / 'agents.json').read_bytes() == agents_before, 'Rust changed JS agent state'
+            await finish(facade)
+            facade = None
+            await finish(daemon)
+            daemon = None
+            stale_inode = socket_path.stat().st_ino if socket_path.exists() else None
+            js = await asyncio.create_subprocess_exec('node', str(js_cli), 'connector', '--service',
+                stdout=js_log, stderr=js_log, env=env)
+            await until(lambda: socket_path.exists() and socket_path.stat().st_ino != stale_inode,
+                        'second JS connector socket')
+            _, js_writer, again = await js_register(socket_path, thread)
+            assert again == old_id and json.loads((data / 'outbox.json').read_text()) == []
+            assert json.loads(agents.read_text())['version'] == 1
+            print(json.dumps({'copied_state': 'JS_to_Rust_to_JS', 'core_launch_id': launch,
+                              'binding_reused': True, 'speech_once': True, 'agents_readable': True}))
+        except Exception:
+            for handle in (core_log, js_log, rust_log):
+                handle.flush()
+            for name in ('core.log', 'js.log', 'rust.log', 'core-app.log'):
+                path = root / name
+                if path.exists():
+                    print(name + ': ' + path.read_text(errors='replace')[-2000:], file=sys.stderr)
+            raise
+        finally:
+            if js_writer:
+                js_writer.close()
+            for process in (facade, daemon, js, core):
+                if process:
+                    await finish(process)
+            core_log.close()
+            js_log.close()
+            rust_log.close()
+
+
 async def exercise():
     binary = Path(os.environ['SIDEVOICE_RUST_PROOF_BIN']).resolve()
     python = Path(os.environ['SIDEVOICE_CORE_PYTHON']).absolute()
@@ -121,13 +273,14 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
         env = {**os.environ, 'SIDEVOICE_DATA_DIR': str(data), 'CODEX_HOME': str(codex),
                'CODEX_THREAD_ID': thread, 'SIDEVOICE_CODEX_BIN': str(fake_codex),
                'SIDEVOICE_TEST_QUEUE': str(queued), 'SIDEVOICE_TEST_SLOW': str(slow_started)}
+        core_env, storage_flag, late_flag = core_faults(root, env)
         launch_id = str(uuid.uuid4())
         core_log = (root / 'core.log').open('wb')
         daemon_log = (root / 'daemon.log').open('wb')
         async def start_core(identity):
             return await asyncio.create_subprocess_exec(str(python), '-m', 'sidevoice_core.server', '--data-dir', str(core_data),
                 '--socket', str(core_data / 'local.sock'), '--port', '0', '--idle-exit', '0', '--launch-id', identity,
-                '--log-file', str(root / 'core-app.log'), stdout=core_log, stderr=core_log, env=env)
+                '--log-file', str(root / 'core-app.log'), stdout=core_log, stderr=core_log, env=core_env)
         core = await start_core(launch_id)
         daemon = None
         facade = None
@@ -180,8 +333,27 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
                     output.write(json.dumps({'type': 'response_item', 'payload': {'type': 'message', 'role': 'user',
                         'content': [{'type': 'input_text', 'text': queued_message['message']}]}}) + '\n')
                 await until(lambda: next((row for row in history() if row['id'] == sent['id'] and row['status'] == 'read'), None), 'read receipt')
+                for call_id, flag, phrase in ((4, storage_flag, 'Journal failure retains speech'),
+                                               (5, late_flag, 'Late ACK replays once')):
+                    flag.touch()
+                    held = await tool(facade, 'voice_say', {'text': phrase,
+                        'session_id': session, 'revision': sent['revision']}, call_id)
+                    assert held['status'] == 'queued' and not flag.exists(), held
+                    saved = json.loads((data / 'outbox.json').read_text())
+                    assert len(saved) == 1 and saved[0]['text'] == phrase
+                    utterance = saved[0]['utterance_id']
+                    await finish(daemon)
+                    daemon = await asyncio.create_subprocess_exec(str(binary), 'connector',
+                        stdout=daemon_log, stderr=daemon_log, env=env)
+                    await until(lambda: json.loads((data / 'proof.json').read_text())['pid'] == daemon.pid,
+                                'same-Core Rust restart proof')
+                    await until(lambda: json.loads((data / 'outbox.json').read_text()) == [],
+                                'same-Core outbox replay', seconds=60)
+                    rows = history()
+                    assert sum(row['text'] == phrase for row in rows) == 1
+                    assert any(row['id'].endswith(':voice:' + utterance) for row in rows)
                 said = await tool(facade, 'voice_say', {'text': 'The Rust proof received your words',
-                    'session_id': session, 'revision': sent['revision']}, 4)
+                    'session_id': session, 'revision': sent['revision']}, 6)
                 assert said['status'] in {'published', 'queued'}
                 if said['status'] == 'published':
                     assert json.loads((data / 'outbox.json').read_text()) == []
@@ -195,7 +367,7 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
             await asyncio.sleep(6)
             assert 'SLOW_NO_QUEUE' not in json.loads(queued.read_text())['message'], 'old Core handler queued after disconnect'
             queued_reply = await tool(facade, 'voice_say', {'text': 'Speech queued across a Core restart',
-                'session_id': session, 'revision': sent['revision']}, 5)
+                'session_id': session, 'revision': sent['revision']}, 7)
             assert queued_reply['status'] == 'queued'
             before_restart = json.loads((data / 'outbox.json').read_text())
             assert len(before_restart) == 1 and before_restart[0]['text'] == 'Speech queued across a Core restart'
@@ -215,12 +387,16 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
                                  token=second_token)['messages']
             assert any(row['role'] == 'assistant' and row['text'] == 'Speech queued across a Core restart'
                        for row in replayed)
-            left = await tool(facade, 'voice_disconnect', {}, 6)
+            assert not any(row['text'] == 'The Rust proof received your words' for row in replayed), (
+                'Core process-only journal unexpectedly survived restart')
+            left = await tool(facade, 'voice_disconnect', {}, 8)
             assert left['status'] == 'left'
             print(json.dumps({'core_launch_id': launch_id, 'rust_pid': daemon.pid,
                               'rust_executable_sha256': evidence['executable_sha256'], 'mcp_tools': 6,
                               'core_input': 'accepted_then_read', 'speech': said['status'],
-                              'outbox_replayed_after_core_restart': True}))
+                              'outbox_replayed_after_core_restart': True,
+                              'storage_error_retained': True, 'lost_ack_replayed_once': True,
+                              'core_restart_after_ack_lost_text': True}))
         except Exception:
             core_log.flush()
             daemon_log.flush()
@@ -242,4 +418,7 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
 
 
 if __name__ == '__main__':
-    asyncio.run(exercise())
+    async def main():
+        await copied_state()
+        await exercise()
+    asyncio.run(main())

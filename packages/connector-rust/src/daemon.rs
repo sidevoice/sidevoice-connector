@@ -206,6 +206,9 @@ impl Daemon {
                     return Ok(None);
                 }
             } else {
+                if published.get("client_ref").is_none() {
+                    eprintln!("[sidevoice rust proof] copied speech {} has an unknown binding; retaining for explicit migration", published.get("event_id").and_then(Value::as_str).unwrap_or("?"));
+                }
                 return Ok(None);
             }
         }

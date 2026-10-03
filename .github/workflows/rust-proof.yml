@@ -57,8 +57,12 @@ jobs:
         with:
           name: sidevoice-rust-proof-linux-x86_64
           path: proof-bin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - uses: astral-sh/setup-uv@v6
       - run: chmod 700 proof-bin/sidevoice-rust-proof
+      - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: uv venv --python 3.12 core/.venv
       - run: uv pip install --python core/.venv/bin/python -e ./core 'websockets>=15,<16'
       - name: Real Core, Core-generated input, receipts and speech
