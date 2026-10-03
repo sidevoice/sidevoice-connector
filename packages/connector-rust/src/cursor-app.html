@@ -2,9 +2,15 @@
 body{margin:0;font:12px/1.4 system-ui,sans-serif;color:var(--vscode-foreground,#888)}
 p{margin:6px 10px}.dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#888;margin-right:6px}
 .on .dot{background:#8a6fd1}.err .dot{background:#d16f6f}
-</style></head><body><p id="s"><span class="dot"></span><span id="t">Sidevoice: conectando…</span></p><script>
+</style></head><body><p id="s"><span class="dot"></span><span id="t"></span></p><script>
 (() => {
+  const bundles = { en: __SIDEVOICE_EN__, es: __SIDEVOICE_ES__ };
+  const locale = (navigator.languages || [navigator.language || 'en'])
+    .map(value => value.toLowerCase().split('-')[0])
+    .find(value => Object.hasOwn(bundles, value)) || 'en';
+  const t = key => bundles[locale][key] || bundles.en[key];
   const status = (text, kind) => { document.getElementById('t').textContent = text; document.getElementById('s').className = kind || ''; };
+  status(t('connecting'));
   let serial = 0, link = null, toolCall = null, running = false, sign = null;
   const waiting = new Map();
   const post = message => window.parent.postMessage(message, '*');
@@ -33,11 +39,11 @@ p{margin:6px 10px}.dot{display:inline-block;width:7px;height:7px;border-radius:5
       try {
         const answer = await fetch(base + 'next?' + await query());
         if (answer.status === 200) message = await answer.json();
-        else if (answer.status !== 204) { status('Sidevoice: el conector ya no conoce esta conversación; pide unirte otra vez', 'err'); await wait(5000); continue; }
-        status('Sidevoice: esta conversación recibe la voz de la sala (experimental)', 'on');
-      } catch { status('Sidevoice: esperando al conector de este equipo…', 'err'); await wait(2000); continue; }
+        else if (answer.status !== 204) { status(t('conversationUnknown'), 'err'); await wait(5000); continue; }
+        status(t('connected'), 'on');
+      } catch { status(t('waitingForConnector'), 'err'); await wait(2000); continue; }
       if (!message) continue;
-      if (!message.sig || message.sig !== await sign('msg:' + message.message_id + '\n' + message.text)) { status('Sidevoice: descartado un mensaje sin firma', 'err'); continue; }
+      if (!message.sig || message.sig !== await sign('msg:' + message.message_id + '\n' + message.text)) { status(t('unsignedMessage'), 'err'); continue; }
       request('ui/message', { role: 'user', content: [{ type: 'text', text: message.text }] })
         .then(() => tell({ message_id: message.message_id, stage: 'answered', ok: true }),
               error => tell({ message_id: message.message_id, stage: 'answered', ok: false, error: String(error && error.message || error) }));
@@ -47,10 +53,10 @@ p{margin:6px 10px}.dot{display:inline-block;width:7px;height:7px;border-radius:5
   window.addEventListener('message', event => {
     const m = event.data; if (!m || m.jsonrpc !== '2.0') return;
     if (m.id !== undefined && waiting.has(m.id) && !m.method) { const w = waiting.get(m.id); waiting.delete(m.id); m.error ? w.reject(new Error(m.error.message)) : w.resolve(m.result); return; }
-    if (m.method === 'ui/notifications/tool-result') { link = link || find(m.params); if (link) loop(); else status('Sidevoice: esta llamada no unió la conversación', 'err'); }
+    if (m.method === 'ui/notifications/tool-result') { link = link || find(m.params); if (link) loop(); else status(t('notJoined'), 'err'); }
   });
   request('ui/initialize', { protocolVersion: '2026-01-26', appInfo: { name: 'sidevoice', version: '1' }, appCapabilities: {} })
     .then(result => { toolCall = result && result.hostContext && result.hostContext.toolInfo && result.hostContext.toolInfo.id || null; post({ jsonrpc: '2.0', method: 'ui/notifications/initialized', params: {} }); })
-    .catch(() => status('Sidevoice: Cursor no inició la vista', 'err'));
+    .catch(() => status(t('viewUnavailable'), 'err'));
 })();
 </script></body></html>

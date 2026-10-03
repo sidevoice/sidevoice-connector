@@ -15,8 +15,10 @@ use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 const POLL_TIMEOUT: Duration = Duration::from_secs(25);
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(20);
 
-pub fn resource_html() -> &'static str {
+pub fn resource_html() -> String {
     include_str!("cursor-app.html")
+        .replace("__SIDEVOICE_EN__", include_str!("../messages/en.json"))
+        .replace("__SIDEVOICE_ES__", include_str!("../messages/es.json"))
 }
 
 #[derive(Debug)]

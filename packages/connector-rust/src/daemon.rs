@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -240,11 +240,12 @@ impl Daemon {
                 &compacted,
             ) {
                 eprintln!("[sidevoice rust proof] compact conversation state: {error}");
+                let mut guard = daemon
+                    .conversation_guard
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("conversation guard lock poisoned"))?;
                 write_conversation_guard(
-                    &mut daemon
-                        .conversation_guard
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("conversation guard lock poisoned"))?,
+                    &mut guard,
                     if refusal.is_some() {
                         GUARD_REVOKED
                     } else {
@@ -252,13 +253,11 @@ impl Daemon {
                     },
                 )?;
             } else if guard_state != GUARD_CLEAR {
-                write_conversation_guard(
-                    &mut daemon
-                        .conversation_guard
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("conversation guard lock poisoned"))?,
-                    GUARD_CLEAR,
-                )?;
+                let mut guard = daemon
+                    .conversation_guard
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("conversation guard lock poisoned"))?;
+                write_conversation_guard(&mut guard, GUARD_CLEAR)?;
             }
         }
         let announcer = daemon.clone();
@@ -1383,7 +1382,7 @@ impl Daemon {
                 });
             let started = tokio::time::Instant::now();
             let mut lookup_index = 0;
-            let mut last_bridge_lookup = None;
+            let mut last_bridge_lookup: Option<tokio::time::Instant> = None;
             loop {
                 if binding.stopped.load(Ordering::Relaxed) {
                     return;
