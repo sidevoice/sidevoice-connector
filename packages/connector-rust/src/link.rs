@@ -15,6 +15,7 @@ use tokio_tungstenite::{
 };
 
 pub struct Incoming {
+    pub session: u64,
     pub method: String,
     pub params: Value,
     pub reply: Option<oneshot::Sender<Value>>,
@@ -24,6 +25,7 @@ pub struct Link {
     tx: RwLock<Option<mpsc::Sender<Message>>>,
     pending: Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>,
     serial: AtomicU64,
+    generation: AtomicU64,
 }
 
 impl Link {
@@ -32,6 +34,7 @@ impl Link {
             tx: RwLock::new(None),
             pending: Mutex::new(HashMap::new()),
             serial: AtomicU64::new(2),
+            generation: AtomicU64::new(1),
         })
     }
 
@@ -107,8 +110,10 @@ impl Link {
         let mut first = Some(first);
         let mut backoff = 100u64;
         loop {
-            let outcome = self.session(&profile, &incoming, &mut first).await;
+            let session = self.generation.fetch_add(1, Ordering::Relaxed);
+            let outcome = self.session(&profile, &incoming, &mut first, session).await;
             self.reset().await;
+            let _ = incoming.send(Incoming { session, method: "connector.lost".into(), params: Value::Null, reply: None }).await;
             match outcome {
                 Ok(()) => backoff = 100,
                 Err(error) => {
@@ -134,6 +139,7 @@ impl Link {
         profile: &Profile,
         incoming: &mpsc::Sender<Incoming>,
         first: &mut Option<oneshot::Sender<Result<Ready, String>>>,
+        session: u64,
     ) -> Result<()> {
         let ready = profile.ready().await?;
         verify_socket(&ready.socket)?;
@@ -202,7 +208,7 @@ impl Link {
                             if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") { bail!("invalid Core JSON-RPC"); }
                             if let Some(method) = value.get("method").and_then(Value::as_str) {
                                 if method == "connector.welcome" {
-                                    let _ = incoming.send(Incoming { method: method.into(), params: value.get("params").cloned().unwrap_or(Value::Null), reply: None }).await;
+                                    let _ = incoming.send(Incoming { session, method: method.into(), params: value.get("params").cloned().unwrap_or(Value::Null), reply: None }).await;
                                     continue;
                                 }
                                 let id = value.get("id").cloned();
@@ -211,7 +217,7 @@ impl Link {
                                 let method = method.to_owned(); let params = value.get("params").cloned().unwrap_or(Value::Null);
                                 tasks.spawn(async move {
                                     let (answer_tx, answer_rx) = oneshot::channel();
-                                    if inbound.send(Incoming { method, params, reply: id.as_ref().map(|_| answer_tx) }).await.is_err() { return false; }
+                                    if inbound.send(Incoming { session, method, params, reply: id.as_ref().map(|_| answer_tx) }).await.is_err() { return false; }
                                     if let Some(id) = id {
                                         let result = timeout(Duration::from_secs(65), answer_rx).await.ok().and_then(|v| v.ok()).unwrap_or(json!({"status":"failed"}));
                                         let _ = reply_tx.send(Message::Text(json!({"jsonrpc":"2.0","id":id,"result":result}).to_string().into())).await;

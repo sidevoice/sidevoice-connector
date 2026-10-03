@@ -107,23 +107,28 @@ async def exercise():
         rollout = rollout_dir / f'rollout-test-{thread}.jsonl'
         rollout.touch(mode=0o600)
         queued = root / 'queued.json'
+        slow_started = root / 'slow-started'
         fake_codex = root / 'bin' / 'codex'
         fake_codex.write_text('''#!/usr/bin/env python3
-import json, os, pathlib, sys
+import json, os, pathlib, sys, time
 assert sys.argv[1:3] == ['queue', '--thread'] and sys.argv[4] == '--message'
+if 'SLOW_NO_QUEUE' in sys.argv[5]:
+    pathlib.Path(os.environ['SIDEVOICE_TEST_SLOW']).touch()
+    time.sleep(5)
 pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread':sys.argv[3], 'message':sys.argv[5]}))
 ''')
         fake_codex.chmod(0o700)
         env = {**os.environ, 'SIDEVOICE_DATA_DIR': str(data), 'CODEX_HOME': str(codex),
                'CODEX_THREAD_ID': thread, 'SIDEVOICE_CODEX_BIN': str(fake_codex),
-               'SIDEVOICE_TEST_QUEUE': str(queued)}
+               'SIDEVOICE_TEST_QUEUE': str(queued), 'SIDEVOICE_TEST_SLOW': str(slow_started)}
         launch_id = str(uuid.uuid4())
         core_log = (root / 'core.log').open('wb')
         daemon_log = (root / 'daemon.log').open('wb')
-        core = await asyncio.create_subprocess_exec(str(python), '-m', 'sidevoice_core.server', '--data-dir', str(core_data),
-            '--socket', str(core_data / 'local.sock'), '--port', '0', '--idle-exit', '0', '--launch-id', launch_id,
-            '--log-file', str(root / 'core-app.log'),
-            stdout=core_log, stderr=core_log, env=env)
+        async def start_core(identity):
+            return await asyncio.create_subprocess_exec(str(python), '-m', 'sidevoice_core.server', '--data-dir', str(core_data),
+                '--socket', str(core_data / 'local.sock'), '--port', '0', '--idle-exit', '0', '--launch-id', identity,
+                '--log-file', str(root / 'core-app.log'), stdout=core_log, stderr=core_log, env=env)
+        core = await start_core(launch_id)
         daemon = None
         facade = None
         try:
@@ -180,11 +185,42 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
                 assert said['status'] in {'published', 'queued'}
                 if said['status'] == 'published':
                     assert json.loads((data / 'outbox.json').read_text()) == []
-                left = await tool(facade, 'voice_disconnect', {}, 5)
-                assert left['status'] == 'left'
+                http_json(core_data / 'local.sock', 'POST', '/api/presentation/text',
+                    {'text': 'SLOW_NO_QUEUE must die with its Core session', 'session_id': session, 'thread_id': thread,
+                     'binding_id': selected['binding']['binding_id'], 'message_id': str(uuid.uuid4())}, token)
+                await until(slow_started.exists, 'slow Codex queue process')
+                core.kill()
+                await core.wait()
+                core = None
+            await asyncio.sleep(6)
+            assert 'SLOW_NO_QUEUE' not in json.loads(queued.read_text())['message'], 'old Core handler queued after disconnect'
+            queued_reply = await tool(facade, 'voice_say', {'text': 'Speech queued across a Core restart',
+                'session_id': session, 'revision': sent['revision']}, 5)
+            assert queued_reply['status'] == 'queued'
+            before_restart = json.loads((data / 'outbox.json').read_text())
+            assert len(before_restart) == 1 and before_restart[0]['text'] == 'Speech queued across a Core restart'
+            await finish(daemon)
+            daemon = None
+            next_launch = str(uuid.uuid4())
+            core = await start_core(next_launch)
+            await until(lambda: ready_path.exists() and json.loads(ready_path.read_text())['launch_id'] == next_launch,
+                        'restarted Core ready file', seconds=90)
+            daemon = await asyncio.create_subprocess_exec(str(binary), 'connector', stdout=daemon_log, stderr=daemon_log, env=env)
+            await until(lambda: json.loads((data / 'proof.json').read_text())['core_launch_id'] == next_launch,
+                        'restarted Rust proof evidence')
+            await until(lambda: json.loads((data / 'outbox.json').read_text()) == [],
+                        'outbox replay after Core reminted binding', seconds=60)
+            second_token = http_json(core_data / 'local.sock', 'POST', '/api/device/local/pair', {'name': 'rust-v3-replay'})['token']
+            replayed = http_json(core_data / 'local.sock', 'GET', f'/api/presentation/history?thread_id={thread}',
+                                 token=second_token)['messages']
+            assert any(row['role'] == 'assistant' and row['text'] == 'Speech queued across a Core restart'
+                       for row in replayed)
+            left = await tool(facade, 'voice_disconnect', {}, 6)
+            assert left['status'] == 'left'
             print(json.dumps({'core_launch_id': launch_id, 'rust_pid': daemon.pid,
                               'rust_executable_sha256': evidence['executable_sha256'], 'mcp_tools': 6,
-                              'core_input': 'accepted_then_read', 'speech': said['status']}))
+                              'core_input': 'accepted_then_read', 'speech': said['status'],
+                              'outbox_replayed_after_core_restart': True}))
         except Exception:
             core_log.flush()
             daemon_log.flush()
@@ -199,7 +235,8 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
                 await finish(facade)
             if daemon:
                 await finish(daemon)
-            await finish(core)
+            if core:
+                await finish(core)
             core_log.close()
             daemon_log.close()
 

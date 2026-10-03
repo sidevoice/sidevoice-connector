@@ -13,6 +13,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::Duration;
 
 struct Binding {
@@ -152,9 +153,10 @@ impl Daemon {
         if !self.link.connected().await {
             return Ok(None);
         }
+        let mut published = self.outbox.lock().await.iter().find(|item| item.get("event_id") == speech.get("event_id")).cloned().unwrap_or_else(|| speech.clone());
         let result = self
             .link
-            .request("speech.publish", speech.clone(), Duration::from_secs(15))
+            .request("speech.publish", published.clone(), Duration::from_secs(15))
             .await;
         let mut reply = match result {
             Ok(v) => v,
@@ -163,11 +165,10 @@ impl Daemon {
                 return Ok(None);
             }
         };
-        let mut published = speech.clone();
         if reply.get("status") == Some(&json!("unknown_binding")) {
             if let Some(binding) = self
                 .binding_for_id(
-                    speech
+                    published
                         .get("binding_id")
                         .and_then(Value::as_str)
                         .unwrap_or(""),
@@ -175,21 +176,7 @@ impl Daemon {
                 .await
             {
                 if self.register_core(&binding).await.is_ok() {
-                    let new_id = binding.id.lock().await.clone();
-                    let mut outbox = self.outbox.lock().await;
-                    let before = outbox.clone();
-                    for item in outbox
-                        .iter_mut()
-                        .filter(|item| item.get("event_id") == speech.get("event_id"))
-                    {
-                        item["binding_id"] = json!(new_id);
-                    }
-                    if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
-                        *outbox = before;
-                        return Err(error);
-                    }
-                    published["binding_id"] = json!(new_id);
-                    drop(outbox);
+                    published = self.outbox.lock().await.iter().find(|item| item.get("event_id") == speech.get("event_id")).cloned().context("speech disappeared during binding repair")?;
                     reply = match self
                         .link
                         .request("speech.publish", published.clone(), Duration::from_secs(15))
@@ -242,16 +229,27 @@ impl Daemon {
         None
     }
 
-    async fn incoming(self: Arc<Self>, item: Incoming) {
-        let answer = match item.method.as_str() {
+    async fn incoming(self: Arc<Self>, mut item: Incoming) {
+        let answer = if let Some(reply) = item.reply.as_mut() {
+            tokio::select! {
+                _ = reply.closed() => return,
+                answer = self.handle_incoming(&item.method, &item.params) => answer,
+            }
+        } else {
+            self.handle_incoming(&item.method, &item.params).await
+        };
+        if let Some(tx) = item.reply { let _ = tx.send(answer); }
+    }
+
+    async fn handle_incoming(self: &Arc<Self>, method: &str, params: &Value) -> Value {
+        match method {
             "connector.welcome" => {
                 self.on_welcome().await;
                 json!({})
             }
-            "input.deliver" => self.deliver(&item.params).await,
+            "input.deliver" => self.deliver(params).await,
             "binding.close" => {
-                let id = item
-                    .params
+                let id = params
                     .get("binding_id")
                     .and_then(Value::as_str)
                     .unwrap_or("");
@@ -262,7 +260,7 @@ impl Daemon {
                 json!({})
             }
             "node.rendezvous" => {
-                *self.rendezvous.lock().await = Some(item.params);
+                *self.rendezvous.lock().await = Some(params.clone());
                 json!({})
             }
             "agents.list" | "agents.connect" | "agents.disconnect" | "agents.dismiss" => {
@@ -273,9 +271,6 @@ impl Daemon {
             }
             "connector.error" => json!({}),
             _ => json!({"error":{"key":"connector.unknown-method"}}),
-        };
-        if let Some(tx) = item.reply {
-            let _ = tx.send(answer);
         }
     }
 
@@ -372,7 +367,8 @@ impl Daemon {
                 {
                     bail!("delivery thread mismatch");
                 }
-                if let Some(existing) = self.bindings.lock().await.get(&client_ref).cloned() {
+                let existing = { self.bindings.lock().await.get(&client_ref).cloned() };
+                if let Some(existing) = existing {
                     if existing.owner != owner {
                         bail!("binding belongs to another façade");
                     }
@@ -398,6 +394,7 @@ impl Daemon {
                 self.clone().watch_rollout(binding.clone());
                 let result = self.register_core(&binding).await;
                 let id = binding.id.lock().await.clone();
+                if result.is_ok() { self.flush_outbox().await; }
                 Ok(
                     json!({"binding_id":id,"thread":thread,"connected":result.is_ok(),"pending":result.is_err()}),
                 )
@@ -736,6 +733,8 @@ pub async fn run(profile: Profile) -> Result<()> {
     let daemon = Daemon::new(profile.clone(), link.clone())?;
     let (incoming_tx, mut incoming_rx) = mpsc::channel(128);
     let clients = Arc::new(Semaphore::new(32));
+    let mut core_tasks = JoinSet::new();
+    let mut core_session = 0u64;
     let (ready_tx, ready_rx) = oneshot::channel();
     tokio::spawn(link.run(profile.clone(), incoming_tx, ready_tx));
     let ready = ready_rx
@@ -747,6 +746,9 @@ pub async fn run(profile: Profile) -> Result<()> {
     profile.write_evidence(&ready)?;
     loop {
         tokio::select! {
+            Some(result) = core_tasks.join_next(), if !core_tasks.is_empty() => {
+                if let Err(error) = result { eprintln!("[sidevoice rust proof] Core handler: {error}"); }
+            }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 if let Ok(permit) = clients.clone().try_acquire_owned() {
@@ -756,7 +758,26 @@ pub async fn run(profile: Profile) -> Result<()> {
             }
             item = incoming_rx.recv() => {
                 let Some(item) = item else { bail!("Core link task exited"); };
-                daemon.clone().incoming(item).await;
+                if item.method == "connector.lost" {
+                    if item.session == core_session {
+                        core_tasks.abort_all();
+                        while core_tasks.join_next().await.is_some() {}
+                        core_session = 0;
+                    }
+                    continue;
+                }
+                if item.session != core_session {
+                    core_tasks.abort_all();
+                    while core_tasks.join_next().await.is_some() {}
+                    core_session = item.session;
+                }
+                if core_tasks.len() >= 64 {
+                    if let Some(tx) = item.reply { let _ = tx.send(json!({"status":"failed","detail":"connector handler capacity reached"})); }
+                    else { eprintln!("[sidevoice rust proof] Core notification capacity reached"); }
+                    continue;
+                }
+                let daemon = daemon.clone();
+                core_tasks.spawn(async move { daemon.incoming(item).await; });
             }
             _ = tokio::signal::ctrl_c() => { break; }
         }
