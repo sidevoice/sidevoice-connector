@@ -108,6 +108,7 @@ export const en = {
   'agents.manual-required': '{agent} needs its manual Sidevoice configuration.',
   'agents.registration-unknown': 'Sidevoice could not determine whether {agent} already has a Sidevoice registration.',
   'agents.action-failed': 'Could not update {agent} agent configuration.',
+  'agents.busy': 'Another host agent request is still running. Try again shortly.',
   'agents.connector-not-installed': 'No installed Sidevoice command is available for agent configuration. Install Sidevoice first.',
   'agents.registration-not-confirmed': 'The Sidevoice registration for {agent} could not be confirmed after the command succeeded.',
   'agents.list.empty': 'No supported agents were found on this computer.',

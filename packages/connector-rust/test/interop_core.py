@@ -31,20 +31,27 @@ class UnixHTTP(http.client.HTTPConnection):
         self.sock.connect(self.path)
 
 
-def http_json(socket_path, method, path, body=None, token=None):
+def http_response(socket_path, method, path, body=None, token=None, origin=None):
     connection = UnixHTTP(str(socket_path))
     headers = {'Host': 'localhost'}
     if body is not None:
         headers['Content-Type'] = 'application/json'
     if token:
         headers['Authorization'] = 'Bearer ' + token
+    if origin:
+        headers['Origin'] = origin
     connection.request(method, path, json.dumps(body).encode() if body is not None else None, headers)
     response = connection.getresponse()
     payload = response.read()
     connection.close()
     result = json.loads(payload) if payload else None
-    if response.status >= 400:
-        raise AssertionError(f'{method} {path}: HTTP {response.status} {result}')
+    return response.status, result
+
+
+def http_json(socket_path, method, path, body=None, token=None):
+    status, result = http_response(socket_path, method, path, body, token)
+    if status >= 400:
+        raise AssertionError(f'{method} {path}: HTTP {status} {result}')
     return result
 
 
@@ -56,6 +63,16 @@ async def until(predicate, description, seconds=30):
             return value
         await asyncio.sleep(.1)
     raise AssertionError(f'timed out: {description}')
+
+
+def process_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
 
 
 async def mcp_request(process, method, params, id):
@@ -157,12 +174,15 @@ async def copied_state():
     with tempfile.TemporaryDirectory(prefix='sidevoice-rust-copied-') as temporary:
         root = Path(temporary)
         root.chmod(0o700)
-        data, codex = root / 'sidevoice', root / 'codex'
+        home, claude = root / 'home', root / 'claude'
+        data, codex, cursor = root / 'sidevoice', root / 'codex', root / 'cursor'
         core_data = data / 'core'
-        for directory in (data, codex, core_data):
+        for directory in (home, claude, codex, cursor, data, core_data):
             directory.mkdir(mode=0o700)
         thread = str(uuid.uuid4())
-        env = {**os.environ, 'SIDEVOICE_DATA_DIR': str(data), 'CODEX_HOME': str(codex),
+        env = {**os.environ, 'HOME': str(home), 'CLAUDE_CONFIG_DIR': str(claude),
+               'SIDEVOICE_DATA_DIR': str(data), 'CODEX_HOME': str(codex),
+               'CURSOR_CONFIG_DIR': str(cursor),
                'CODEX_THREAD_ID': thread, 'SIDEVOICE_SERVICE_MANAGER': 'none'}
         core_env, storage_flag, _, slow_flag = core_faults(root, env)
         core_log = (root / 'core.log').open('wb')
@@ -218,10 +238,10 @@ async def copied_state():
                 (data / name).unlink()
                 shutil.copy2(copied / name, data / name)
             agents_before = (data / 'agents.json').read_bytes()
-            daemon = await asyncio.create_subprocess_exec(str(binary), 'connector',
+            daemon = await asyncio.create_subprocess_exec(str(binary), 'connector', '--profile-root', str(root),
                 stdout=rust_log, stderr=rust_log, env=env)
             await until(socket_path.exists, 'Rust copied-state socket')
-            facade = await asyncio.create_subprocess_exec(str(binary), 'mcp', stdin=asyncio.subprocess.PIPE,
+            facade = await asyncio.create_subprocess_exec(str(binary), 'mcp', '--profile-root', str(root), stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=rust_log, env=env)
             await mcp_request(facade, 'initialize', {'protocolVersion': '2025-06-18', 'capabilities': {},
                 'clientInfo': {'name': 'codex', 'version': '0.157.0'}}, 1)
@@ -258,12 +278,12 @@ async def copied_state():
             (data / 'outbox.json').write_text(json.dumps([orphan, *slow_rows]))
             (data / 'outbox.json').chmod(0o600)
             slow_flag.write_text('2')
-            daemon = await asyncio.create_subprocess_exec(str(binary), 'connector',
+            daemon = await asyncio.create_subprocess_exec(str(binary), 'connector', '--profile-root', str(root),
                 stdout=rust_log, stderr=rust_log, env=env)
             await until(lambda: json.loads((data / 'proof.json').read_text())['pid'] == daemon.pid,
                         'Rust orphan proof startup')
             await until(socket_path.exists, 'Rust orphan socket')
-            facade = await asyncio.create_subprocess_exec(str(binary), 'mcp', stdin=asyncio.subprocess.PIPE,
+            facade = await asyncio.create_subprocess_exec(str(binary), 'mcp', '--profile-root', str(root), stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=rust_log, env=env)
             await mcp_request(facade, 'initialize', {'protocolVersion': '2025-06-18', 'capabilities': {},
                 'clientInfo': {'name': 'codex', 'version': '0.157.0'}}, 3)
@@ -309,12 +329,22 @@ async def exercise():
     with tempfile.TemporaryDirectory(prefix='sidevoice-rust-core-') as temporary:
         root = Path(temporary)
         root.chmod(0o700)
-        data, codex = root / 'sidevoice', root / 'codex'
+        home, claude = root / 'home', root / 'claude'
+        data, codex, cursor = root / 'sidevoice', root / 'codex', root / 'cursor'
         core_data = data / 'core'
         rollout_dir = codex / 'sessions' / '2026' / '10' / '03'
-        for directory in (data, core_data, codex, rollout_dir, root / 'bin'):
+        for directory in (home, claude, data, core_data, codex, cursor, rollout_dir, root / 'bin'):
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             directory.chmod(0o700)
+        fresh = await asyncio.create_subprocess_exec(str(binary), 'mcp', '--profile-root', str(root),
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env={})
+        fresh_info = await mcp_request(fresh, 'initialize', {'protocolVersion': '2025-06-18',
+            'capabilities': {}, 'clientInfo': {'name': 'codex', 'version': 'isolated-empty-env'}}, 90)
+        assert fresh_info['instructions']
+        fresh_tools = await mcp_request(fresh, 'tools/list', {}, 91)
+        assert len(fresh_tools['tools']) == 6, 'profile-root must reconstruct the selected command with no inherited profile env'
+        await finish(fresh)
         thread = str(uuid.uuid4())
         rollout = rollout_dir / f'rollout-test-{thread}.jsonl'
         rollout.touch(mode=0o600)
@@ -323,15 +353,96 @@ async def exercise():
         fake_codex = root / 'bin' / 'codex'
         fake_codex.write_text('''#!/usr/bin/env python3
 import json, os, pathlib, sys, time
-assert sys.argv[1:3] == ['queue', '--thread'] and sys.argv[4] == '--message'
-if 'SLOW_NO_QUEUE' in sys.argv[5]:
-    pathlib.Path(os.environ['SIDEVOICE_TEST_SLOW']).touch()
-    time.sleep(5)
-pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread':sys.argv[3], 'message':sys.argv[5]}))
+args = sys.argv[1:]
+home = pathlib.Path(os.environ['CODEX_HOME'])
+entry_file = home / 'fake-sidevoice.json'
+config_file = home / 'config.toml'
+if args == ['--version']:
+    print('codex interop fixture 1')
+elif args[:3] == ['mcp', 'get', 'sidevoice']:
+    entry = json.loads(entry_file.read_text()) if entry_file.exists() else None
+    unknown = home / 'unknown-next-get'
+    if unknown.exists():
+        unknown.unlink()
+        print('unrecognized Codex MCP response')
+        raise SystemExit(0)
+    slow = home / 'slow-next-get'
+    if slow.exists():
+        slow.unlink()
+        (home / 'slow-get-started').write_text(str(os.getpid()))
+        time.sleep(1.2)
+    if entry is None:
+        print('No such server: sidevoice', file=sys.stderr)
+        raise SystemExit(1)
+    print(json.dumps(entry))
+elif args[:3] == ['mcp', 'remove', 'sidevoice']:
+    entry_file.unlink(missing_ok=True)
+    config_file.unlink(missing_ok=True)
+elif args[:3] == ['mcp', 'add', 'sidevoice'] and '--' in args:
+    start = args.index('--') + 1
+    command, command_args = args[start], args[start + 1:]
+    fail = home / 'fail-next-add'
+    if fail.exists():
+        fail.unlink()
+        print('fixture private stdout secret')
+        print('fixture private stderr secret', file=sys.stderr)
+        raise SystemExit(17)
+    slow = home / 'slow-next-add'
+    if slow.exists():
+        slow.unlink()
+        (home / 'slow-add-started').write_text(str(os.getpid()))
+        delay = float((home / 'slow-add-seconds').read_text()) if (home / 'slow-add-seconds').exists() else 1.2
+        time.sleep(delay)
+    entry = {'name':'sidevoice','transport':{'type':'stdio','command':command,'args':command_args},'enabled':True}
+    entry_file.write_text(json.dumps(entry))
+    config_file.write_text('[mcp_servers.sidevoice]\\ncommand = ' + json.dumps(command) + '\\nargs = ' + json.dumps(command_args) + '\\n')
+    config_file.chmod(0o600)
+elif args[:2] == ['queue', '--thread'] and args[3] == '--message':
+    if 'SLOW_NO_QUEUE' in args[4]:
+        pathlib.Path(os.environ['SIDEVOICE_TEST_SLOW']).touch()
+        time.sleep(5)
+    pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread':args[2], 'message':args[4]}))
+else:
+    print('unsupported fixture command', file=sys.stderr)
+    raise SystemExit(2)
 ''')
         fake_codex.chmod(0o700)
-        env = {**os.environ, 'SIDEVOICE_DATA_DIR': str(data), 'CODEX_HOME': str(codex),
+        fake_claude = root / 'bin' / 'claude'
+        fake_claude.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+state_file = pathlib.Path(os.environ['CLAUDE_CONFIG_DIR']) / 'fake-sidevoice.json'
+if args == ['--version']:
+    print('claude interop fixture 1')
+elif args == ['mcp', 'get', 'sidevoice']:
+    if not state_file.exists():
+        print('No such MCP server: sidevoice', file=sys.stderr)
+        raise SystemExit(1)
+    entry = json.loads(state_file.read_text())
+    if entry.get('unrecognized'):
+        print('unrecognized Claude MCP response')
+        raise SystemExit(0)
+    print('Name: sidevoice')
+    print('Scope: ' + entry.get('scope', 'user'))
+    print('Command: ' + entry['command'])
+    print('Args: ' + ' '.join(entry['args']))
+elif args == ['mcp', 'remove', '--scope', 'user', 'sidevoice']:
+    state_file.unlink(missing_ok=True)
+elif args[:5] == ['mcp', 'add', '--scope', 'user', 'sidevoice'] and '--' in args:
+    start = args.index('--') + 1
+    entry = {'command':args[start], 'args':args[start + 1:]}
+    state_file.write_text(json.dumps(entry))
+    state_file.chmod(0o600)
+else:
+    print('unsupported fixture command', file=sys.stderr)
+    raise SystemExit(2)
+''')
+        fake_claude.chmod(0o700)
+        env = {**os.environ, 'HOME': str(home), 'CLAUDE_CONFIG_DIR': str(claude),
+               'SIDEVOICE_DATA_DIR': str(data), 'CODEX_HOME': str(codex),
+               'CURSOR_CONFIG_DIR': str(cursor),
                'CODEX_THREAD_ID': thread, 'SIDEVOICE_CODEX_BIN': str(fake_codex),
+               'SIDEVOICE_CLAUDE_BIN': str(fake_claude),
                'SIDEVOICE_TEST_QUEUE': str(queued), 'SIDEVOICE_TEST_SLOW': str(slow_started)}
         core_env, storage_flag, late_flag, _ = core_faults(root, env)
         launch_id = str(uuid.uuid4())
@@ -350,12 +461,12 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
             assert ready_path.exists(), f'Core exited before ready: {core.returncode}'
             ready = json.loads(ready_path.read_text())
             assert ready['launch_id'] == launch_id and 3 in ready['connector_protocols']
-            daemon = await asyncio.create_subprocess_exec(str(binary), 'connector', stdout=daemon_log, stderr=daemon_log, env=env)
+            daemon = await asyncio.create_subprocess_exec(str(binary), 'connector', '--profile-root', str(root), stdout=daemon_log, stderr=daemon_log, env=env)
             await until(lambda: (data / 'connector.sock').exists(), 'Rust connector socket')
             evidence = json.loads((data / 'proof.json').read_text())
             assert evidence['pid'] == daemon.pid and evidence['core_launch_id'] == launch_id and evidence['protocol'] == 3
             assert evidence['executable'] == str(binary) and len(evidence['executable_sha256']) == 64
-            facade = await asyncio.create_subprocess_exec(str(binary), 'mcp', stdin=asyncio.subprocess.PIPE,
+            facade = await asyncio.create_subprocess_exec(str(binary), 'mcp', '--profile-root', str(root), stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=daemon_log, env=env)
             initialized = await mcp_request(facade, 'initialize', {'protocolVersion': '2025-06-18', 'capabilities': {},
                 'clientInfo': {'name': 'codex', 'version': '0.157.0'}}, 1)
@@ -368,6 +479,112 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
             assert joined['conversation'] == thread and not joined['binding_id'].startswith('local-'), joined
             paired = http_json(core_data / 'local.sock', 'POST', '/api/device/local/pair', {'name': 'rust-v3-test'})
             token = paired['token']
+            default_agents = http_json(core_data / 'local.sock', 'GET', '/api/host/agents', token=token)
+            assert {agent['id'] for agent in default_agents['agents']} == {'claude', 'codex', 'cursor'}
+            assert isinstance(default_agents['scanned_at'], str) and default_agents['custom']['snippet']
+            rescanned = http_json(core_data / 'local.sock', 'GET', '/api/host/agents?rescan=1', token=token)
+            watched = http_json(core_data / 'local.sock', 'GET', '/api/host/agents?rescan=0&watch=codex', token=token)
+            assert {agent['id'] for agent in rescanned['agents']} == {'claude', 'codex', 'cursor'}
+            assert next(agent for agent in watched['agents'] if agent['id'] == 'codex')['id'] == 'codex'
+            unauth_status, _ = http_response(core_data / 'local.sock', 'GET', '/api/host/agents')
+            origin_status, _ = http_response(core_data / 'local.sock', 'GET', '/api/host/agents', token=token,
+                                             origin='https://untrusted.invalid')
+            malformed_status, malformed = http_response(core_data / 'local.sock', 'GET',
+                '/api/host/agents?rescan=maybe', token=token)
+            assert unauth_status in (401, 403) and origin_status == 403
+            assert malformed_status == 400 and malformed['key'] == 'invalid-rescan'
+            unknown_status, unknown = http_response(core_data / 'local.sock', 'POST',
+                '/api/host/agents/unknown/connect', token=token)
+            assert unknown_status == 409 and unknown['error']['key'] == 'agents.unknown'
+
+            proof_command = str(binary)
+            proof_args = ['mcp', '--profile-root', str(root)]
+            disabled_entry = {'name':'sidevoice','transport':{'type':'stdio','command':proof_command,
+                'args':proof_args},'enabled':False}
+            codex_entry = codex / 'fake-sidevoice.json'
+            codex_entry.write_text(json.dumps(disabled_entry))
+            codex_entry.chmod(0o600)
+            (codex / 'config.toml').write_text('[mcp_servers.sidevoice]\ncommand = ' + json.dumps(proof_command)
+                + '\nargs = ' + json.dumps(proof_args) + '\nenabled = false\n')
+            (codex / 'config.toml').chmod(0o600)
+            disabled = http_json(core_data / 'local.sock', 'GET',
+                '/api/host/agents?rescan=1&watch=codex', token=token)
+            assert next(agent for agent in disabled['agents'] if agent['id'] == 'codex')['registration'] == 'not-connected'
+            reenabled = http_json(core_data / 'local.sock', 'POST', '/api/host/agents/codex/connect', token=token)
+            assert next(agent for agent in reenabled['agents'] if agent['id'] == 'codex')['registration'] == 'connected'
+
+            http_json(core_data / 'local.sock', 'POST', '/api/host/agents/codex/disconnect', token=token)
+            (codex / 'fail-next-add').touch()
+            failure_status, failure = http_response(core_data / 'local.sock', 'POST',
+                '/api/host/agents/codex/connect', token=token)
+            assert failure_status == 409 and failure['error']['key'] == 'agents.action-failed'
+            assert 'fixture private' not in json.dumps(failure), 'raw CLI output escaped the keyed Core response'
+
+            (codex / 'unknown-next-get').touch()
+            unknown_cli_status, unknown_cli = http_response(core_data / 'local.sock', 'POST',
+                '/api/host/agents/codex/connect', token=token)
+            assert unknown_cli_status == 409 and unknown_cli['error']['key'] == 'agents.registration-unknown'
+
+            foreign_entry = {'name':'sidevoice','transport':{'type':'stdio','command':'/tmp/foreign-codex',
+                'args':['--keep-my-settings']},'enabled':True}
+            codex_entry.write_text(json.dumps(foreign_entry))
+            codex_entry.chmod(0o600)
+            codex_config = codex / 'config.toml'
+            codex_config.write_text('[mcp_servers.sidevoice]\ncommand = "/tmp/foreign-codex"\nargs = ["--keep-my-settings"]\n')
+            codex_config.chmod(0o600)
+            foreign_before = (codex_entry.read_bytes(), codex_config.read_bytes())
+            foreign_status, foreign = http_response(core_data / 'local.sock', 'POST',
+                '/api/host/agents/codex/connect', token=token)
+            assert foreign_status == 409 and foreign['error']['key'] == 'agents.foreign'
+            assert (codex_entry.read_bytes(), codex_config.read_bytes()) == foreign_before
+            codex_entry.unlink()
+            codex_config.unlink()
+            codex_config.write_text('mcp_servers.sidevoice = [invalid TOML\n')
+            codex_config.chmod(0o600)
+            invalid_before = codex_config.read_bytes()
+            invalid_status, invalid = http_response(core_data / 'local.sock', 'POST',
+                '/api/host/agents/codex/connect', token=token)
+            assert invalid_status == 409 and invalid['error']['key'] == 'agents.invalid'
+            assert codex_config.read_bytes() == invalid_before
+            codex_config.unlink()
+
+            claude_entry = claude / 'fake-sidevoice.json'
+            claude_entry.write_text(json.dumps({'scope':'project','command':'/tmp/foreign-claude','args':['mcp']}))
+            claude_entry.chmod(0o600)
+            claude_before = claude_entry.read_bytes()
+            foreign_status, foreign = http_response(core_data / 'local.sock', 'POST',
+                '/api/host/agents/claude/connect', token=token)
+            assert foreign_status == 409 and foreign['error']['key'] == 'agents.foreign'
+            assert claude_entry.read_bytes() == claude_before
+            claude_entry.write_text(json.dumps({'unrecognized':True}))
+            claude_entry.chmod(0o600)
+            unknown_status, unknown = http_response(core_data / 'local.sock', 'POST',
+                '/api/host/agents/claude/connect', token=token)
+            assert unknown_status == 409 and unknown['error']['key'] == 'agents.registration-unknown'
+            claude_entry.unlink()
+
+            for agent_id in ('claude', 'codex', 'cursor'):
+                path = f'/api/host/agents/{agent_id}'
+                connected = http_json(core_data / 'local.sock', 'POST', path + '/connect', token=token)
+                assert next(agent for agent in connected['agents'] if agent['id'] == agent_id)['registration'] == 'connected'
+                disconnected = http_json(core_data / 'local.sock', 'POST', path + '/disconnect', token=token)
+                assert next(agent for agent in disconnected['agents'] if agent['id'] == agent_id)['registration'] == 'not-connected'
+                dismissed = http_json(core_data / 'local.sock', 'POST', path + '/dismiss', token=token)
+                dismissed_row = next(agent for agent in dismissed['agents'] if agent['id'] == agent_id)
+                assert dismissed_row['dismissed'] and not dismissed_row['actionable']
+                connected = http_json(core_data / 'local.sock', 'POST', path + '/connect', token=token)
+                connected_row = next(agent for agent in connected['agents'] if agent['id'] == agent_id)
+                assert connected_row['registration'] == 'connected' and not connected_row['dismissed']
+                disconnected = http_json(core_data / 'local.sock', 'POST', path + '/disconnect', token=token)
+                assert next(agent for agent in disconnected['agents'] if agent['id'] == agent_id)['registration'] == 'not-connected'
+            (codex / 'slow-add-seconds').write_text('4.0')
+            (codex / 'slow-next-add').touch()
+            (codex / 'slow-add-started').unlink(missing_ok=True)
+            timeout_started = time.monotonic()
+            timeout_status, timeout_error = http_response(core_data / 'local.sock', 'POST',
+                '/api/host/agents/codex/connect', token=token)
+            assert timeout_status == 409 and timeout_error['error']['key'] == 'agents.action-failed'
+            assert time.monotonic() - timeout_started < 6 and not codex_entry.exists()
             async with unix_connect(path=str(core_data / 'local.sock'), uri='ws://localhost/api/presentation/ws',
                                     subprotocols=['sidevoice', 'sidevoice.token.' + token]) as ws:
                 await ws.send(json.dumps({'label': 'rtvi-ai', 'type': 'client-ready', 'id': 'x',
@@ -388,6 +605,26 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
                 history = lambda: http_json(core_data / 'local.sock', 'GET', f'/api/presentation/history?thread_id={thread}', token=token)['messages']
                 delivered = await until(lambda: next((row for row in history() if row['id'] == sent['id'] and row['status'] == 'delivered'), None), 'accepted receipt')
                 assert delivered['status'] == 'delivered'
+                (codex / 'slow-next-get').touch()
+                (codex / 'slow-get-started').unlink(missing_ok=True)
+                agent_scan = asyncio.create_task(asyncio.to_thread(http_json, core_data / 'local.sock',
+                    'GET', '/api/host/agents?rescan=1&watch=codex', None, token))
+                await until((codex / 'slow-get-started').exists, 'slow host-agent scan')
+                unrelated_text = 'Core input while Rust inspects Codex'
+                input_task = asyncio.create_task(asyncio.to_thread(http_json, core_data / 'local.sock',
+                    'POST', '/api/presentation/text', {'text': unrelated_text, 'session_id': session,
+                        'thread_id': thread, 'binding_id': selected['binding']['binding_id'],
+                        'message_id': str(uuid.uuid4())}, token))
+                second_thread = str(uuid.uuid4())
+                registration = await asyncio.wait_for(tool(facade, 'voice_connect',
+                    {'title': 'Concurrent link reply'}, 92, second_thread), 3)
+                assert registration['conversation'] == second_thread and not registration['binding_id'].startswith('local-')
+                unrelated = await asyncio.wait_for(input_task, 3)
+                assert unrelated['accepted'] is True
+                await until(lambda: queued.exists() and json.loads(queued.read_text()).get('message', '').find(unrelated_text) >= 0,
+                             'unrelated input.deliver while host scan runs')
+                scanned_during_input = await asyncio.wait_for(agent_scan, 5)
+                assert any(agent['id'] == 'codex' for agent in scanned_during_input['agents'])
                 with rollout.open('a') as output:
                     output.write(json.dumps({'type': 'noise', 'payload': 'x' * (1 << 20)}) + '\n')
                     output.write(json.dumps({'type': 'response_item', 'payload': {'type': 'message', 'role': 'user',
@@ -403,7 +640,7 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
                     assert len(saved) == 1 and saved[0]['text'] == phrase
                     utterance = saved[0]['utterance_id']
                     await finish(daemon)
-                    daemon = await asyncio.create_subprocess_exec(str(binary), 'connector',
+                    daemon = await asyncio.create_subprocess_exec(str(binary), 'connector', '--profile-root', str(root),
                         stdout=daemon_log, stderr=daemon_log, env=env)
                     await until(lambda: json.loads((data / 'proof.json').read_text())['pid'] == daemon.pid,
                                 'same-Core Rust restart proof')
@@ -421,11 +658,23 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
                     {'text': 'SLOW_NO_QUEUE must die with its Core session', 'session_id': session, 'thread_id': thread,
                      'binding_id': selected['binding']['binding_id'], 'message_id': str(uuid.uuid4())}, token)
                 await until(slow_started.exists, 'slow Codex queue process')
+                (codex / 'slow-add-seconds').write_text('2.0')
+                (codex / 'slow-next-add').touch()
+                (codex / 'slow-add-started').unlink(missing_ok=True)
+                abandoned_host_action = asyncio.create_task(asyncio.to_thread(http_response,
+                    core_data / 'local.sock', 'POST', '/api/host/agents/codex/connect', None, token))
+                await until((codex / 'slow-add-started').exists, 'delayed Codex add over Core host API')
+                abandoned_pid = int((codex / 'slow-add-started').read_text())
                 core.kill()
                 await core.wait()
                 core = None
+                abandoned_reply = await asyncio.gather(abandoned_host_action, return_exceptions=True)
+                assert isinstance(abandoned_reply[0], BaseException), 'Core disconnect should drop the in-flight host reply'
+                await until(lambda: not process_alive(abandoned_pid), 'cancelled Codex CLI reaped', seconds=4)
             await asyncio.sleep(6)
             assert 'SLOW_NO_QUEUE' not in json.loads(queued.read_text())['message'], 'old Core handler queued after disconnect'
+            assert not codex_entry.exists(), 'cancelled Codex add wrote after its Core link disappeared'
+            assert not process_alive(abandoned_pid), 'cancelled Codex process remained alive after reconnect delay'
             queued_reply = await tool(facade, 'voice_say', {'text': 'Speech queued across a Core restart',
                 'session_id': session, 'revision': sent['revision']}, 7)
             assert queued_reply['status'] == 'queued'
@@ -437,12 +686,19 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
             core = await start_core(next_launch)
             await until(lambda: ready_path.exists() and json.loads(ready_path.read_text())['launch_id'] == next_launch,
                         'restarted Core ready file', seconds=90)
-            daemon = await asyncio.create_subprocess_exec(str(binary), 'connector', stdout=daemon_log, stderr=daemon_log, env=env)
+            daemon = await asyncio.create_subprocess_exec(str(binary), 'connector', '--profile-root', str(root), stdout=daemon_log, stderr=daemon_log, env=env)
             await until(lambda: json.loads((data / 'proof.json').read_text())['core_launch_id'] == next_launch,
                         'restarted Rust proof evidence')
             await until(lambda: json.loads((data / 'outbox.json').read_text()) == [],
                         'outbox replay after Core reminted binding', seconds=60)
             second_token = http_json(core_data / 'local.sock', 'POST', '/api/device/local/pair', {'name': 'rust-v3-replay'})['token']
+            observed = http_json(core_data / 'local.sock', 'GET',
+                '/api/host/agents?rescan=1&watch=codex', token=second_token)
+            assert next(agent for agent in observed['agents'] if agent['id'] == 'codex')['registration'] == 'not-connected'
+            recovered = http_json(core_data / 'local.sock', 'POST',
+                '/api/host/agents/codex/connect', token=second_token)
+            assert next(agent for agent in recovered['agents'] if agent['id'] == 'codex')['registration'] == 'connected'
+            http_json(core_data / 'local.sock', 'POST', '/api/host/agents/codex/disconnect', token=second_token)
             replayed = http_json(core_data / 'local.sock', 'GET', f'/api/presentation/history?thread_id={thread}',
                                  token=second_token)['messages']
             assert any(row['role'] == 'assistant' and row['text'] == 'Speech queued across a Core restart'

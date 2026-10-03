@@ -1,8 +1,9 @@
 use anyhow::{bail, Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -12,8 +13,12 @@ use tokio::time::{timeout, Duration};
 
 #[derive(Clone, Debug)]
 pub struct Profile {
+    pub root: PathBuf,
+    pub home: PathBuf,
+    pub claude: PathBuf,
     pub data: PathBuf,
     pub codex: PathBuf,
+    pub cursor: PathBuf,
     pub socket: PathBuf,
     pub core_socket: PathBuf,
     pub core_ready: PathBuf,
@@ -71,6 +76,48 @@ pub fn verify_socket(path: &Path) -> Result<()> {
 }
 
 impl Profile {
+    pub fn from_root(path: &Path) -> Result<Self> {
+        if !path.is_absolute() {
+            bail!("proof root must be absolute");
+        }
+        let root_meta = fs::symlink_metadata(path).context("missing proof root")?;
+        if root_meta.file_type().is_symlink() {
+            bail!("proof root cannot be a symlink");
+        }
+        private_dir(path)?;
+        let root = path.canonicalize()?;
+        let child = |name: &str| -> Result<PathBuf> {
+            let path = root.join(name);
+            private_dir(&path)?;
+            let canonical = path.canonicalize()?;
+            if canonical != path || !canonical.starts_with(&root) {
+                bail!("proof profile directory escaped its root");
+            }
+            Ok(canonical)
+        };
+        let home = child("home")?;
+        let claude = child("claude")?;
+        let codex = child("codex")?;
+        let cursor = child("cursor")?;
+        let data = child("sidevoice")?;
+        let core = data.join("core");
+        private_dir(&core)?;
+        if data.join("install.json").exists() {
+            bail!("selected installation data is forbidden in proof profile");
+        }
+        Ok(Self {
+            root,
+            home,
+            claude,
+            socket: data.join("connector.sock"),
+            core_socket: core.join("local.sock"),
+            core_ready: core.join("core.json"),
+            data,
+            codex,
+            cursor,
+        })
+    }
+
     pub fn from_env() -> Result<Self> {
         let data = PathBuf::from(
             std::env::var_os("SIDEVOICE_DATA_DIR")
@@ -78,28 +125,49 @@ impl Profile {
         );
         let codex =
             PathBuf::from(std::env::var_os("CODEX_HOME").context("CODEX_HOME required for proof")?);
-        if !data.is_absolute() || !codex.is_absolute() {
-            bail!("proof paths must be absolute");
+        let root = data.parent().context("proof root")?;
+        if data != root.join("sidevoice") || codex != root.join("codex") {
+            bail!("proof profile paths must be fixed children of one private root");
         }
-        let root = data.parent().context("data root")?;
-        private_dir(root)?;
-        private_dir(&data)?;
-        private_dir(&codex)?;
-        if codex.parent() != Some(root) || data == codex {
-            bail!("proof paths must be separate siblings under one private root");
+        let profile = Self::from_root(root)?;
+        for (key, expected) in [
+            ("HOME", &profile.home),
+            ("CLAUDE_CONFIG_DIR", &profile.claude),
+            ("CODEX_HOME", &profile.codex),
+            ("CURSOR_CONFIG_DIR", &profile.cursor),
+            ("SIDEVOICE_DATA_DIR", &profile.data),
+        ] {
+            let supplied = std::env::var_os(key).context("isolated proof environment is incomplete")?;
+            if PathBuf::from(supplied) != *expected {
+                bail!("isolated proof environment does not match its root");
+            }
         }
-        if data.join("install.json").exists() {
-            bail!("selected installation data is forbidden in proof profile");
-        }
-        let core = data.join("core");
-        private_dir(&core)?;
-        Ok(Self {
-            socket: data.join("connector.sock"),
-            core_socket: core.join("local.sock"),
-            core_ready: core.join("core.json"),
-            data,
-            codex,
-        })
+        Ok(profile)
+    }
+
+    pub fn command_env(&self, command: &mut tokio::process::Command) -> &mut tokio::process::Command {
+        command
+            .env("HOME", &self.home)
+            .env("CLAUDE_CONFIG_DIR", &self.claude)
+            .env("CODEX_HOME", &self.codex)
+            .env("CURSOR_CONFIG_DIR", &self.cursor)
+            .env("SIDEVOICE_DATA_DIR", &self.data)
+    }
+
+    pub fn try_connector_lock(&self) -> Result<File> {
+        let path = self.data.join("connector.lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        private_file(&path)?;
+        lock.try_lock_exclusive()
+            .context("the isolated connector already owns this profile")?;
+        Ok(lock)
     }
 
     pub async fn ready(&self) -> Result<Ready> {
