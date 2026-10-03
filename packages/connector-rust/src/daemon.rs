@@ -1349,9 +1349,11 @@ impl Daemon {
             let mut last = None;
             while !binding.stopped.load(Ordering::Relaxed) {
                 let current = crate::adapters::claude::working_state(&binding.thread);
-                if current.is_some() && current != last {
-                    self.report_working(&binding, current.unwrap()).await;
-                    last = current;
+                if let Some(working) = current {
+                    if current != last {
+                        self.report_working(&binding, working).await;
+                        last = current;
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(400)).await;
             }

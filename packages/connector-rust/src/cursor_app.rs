@@ -10,10 +10,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify, Semaphore};
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(25);
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(20);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn resource_html() -> String {
     include_str!("cursor-app.html")
@@ -128,11 +129,16 @@ impl CursorApps {
                 *self.port.lock().await = Some(port);
                 let server = self.clone();
                 tokio::spawn(async move {
+                    let clients = Arc::new(Semaphore::new(32));
                     loop {
                         match listener.accept().await {
                             Ok((stream, _)) => {
+                                let Ok(permit) = clients.clone().try_acquire_owned() else {
+                                    continue;
+                                };
                                 let server = server.clone();
                                 tokio::spawn(async move {
+                                    let _permit = permit;
                                     let _ = server.handle(stream).await;
                                 });
                             }
@@ -210,7 +216,9 @@ impl CursorApps {
     }
 
     async fn handle(self: Arc<Self>, mut stream: TcpStream) -> Result<()> {
-        let request = read_request(&mut stream).await?;
+        let request = tokio::time::timeout(REQUEST_TIMEOUT, read_request(&mut stream))
+            .await
+            .context("Cursor card request timed out")??;
         let origin = request
             .headers
             .get("origin")
@@ -427,8 +435,12 @@ async fn write_response(
         headers.push_str(&format!("Content-Type: {mime}\r\n"));
     }
     headers.push_str("\r\n");
-    stream.write_all(headers.as_bytes()).await?;
-    stream.write_all(body.as_bytes()).await?;
+    tokio::time::timeout(REQUEST_TIMEOUT, async {
+        stream.write_all(headers.as_bytes()).await?;
+        stream.write_all(body.as_bytes()).await
+    })
+    .await
+    .context("Cursor card response timed out")??;
     Ok(())
 }
 

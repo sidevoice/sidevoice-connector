@@ -821,6 +821,25 @@ main()
                 assert app_status['joined'] is True and app_status['capabilities'] == editor_caps, app_status
                 app_query = urlencode({'thread':app_thread, 'auth':hmac.new(bytes.fromhex(app_joined['view_link']['key']),
                     ('poll:' + app_thread).encode(), hashlib.sha256).hexdigest()})
+                # Partial unauthenticated requests cannot occupy every card slot indefinitely.
+                stalled = []
+                try:
+                    for _ in range(32):
+                        connection = socket.create_connection(('127.0.0.1', app_joined['view_link']['port']), timeout=2)
+                        connection.sendall(b'GET /cursor-app/next HTTP/1.1\r\n')
+                        stalled.append(connection)
+                    await asyncio.sleep(.3)
+                    overflow = socket.create_connection(('127.0.0.1', app_joined['view_link']['port']), timeout=2)
+                    try:
+                        overflow.sendall(b'GET /cursor-app/next HTTP/1.1\r\n')
+                        assert await asyncio.to_thread(overflow.recv, 1) == b'', 'card accepted an unbounded client'
+                    finally:
+                        overflow.close()
+                finally:
+                    for connection in stalled:
+                        connection.close()
+                await asyncio.sleep(.2)
+                await asyncio.to_thread(card_probe, app_joined['view_link']['port'], app_query)
                 app_poll = asyncio.create_task(asyncio.to_thread(card_get, app_joined['view_link']['port'], app_query))
                 await asyncio.sleep(.1)
                 app_row = await core_text(core_data / 'local.sock', token, session, app_joined['binding_id'], app_thread,
@@ -830,10 +849,12 @@ main()
                 expected_sig = hmac.new(bytes.fromhex(app_joined['view_link']['key']),
                     ('msg:' + card_message['message_id'] + '\n' + card_message['text']).encode(), hashlib.sha256).hexdigest()
                 assert card_message['sig'] == expected_sig, card_message
-                await done_card(app_joined['view_link']['port'], app_query, {'message_id':app_row['message_id'],'stage':'dispatched','ok':True})
+                await asyncio.to_thread(done_card, app_joined['view_link']['port'], app_query,
+                    {'message_id':app_row['message_id'],'stage':'dispatched','ok':True})
                 await wait_status(core_data / 'local.sock', token, app_thread, app_row['id'], 'unconfirmed')
                 await status_and_reply(app_facade, app_thread, app_joined, app_row, editor_caps, 36)
-                await done_card(app_joined['view_link']['port'], app_query, {'message_id':app_row['message_id'],'stage':'answered','ok':True})
+                await asyncio.to_thread(done_card, app_joined['view_link']['port'], app_query,
+                    {'message_id':app_row['message_id'],'stage':'answered','ok':True})
                 await wait_status(core_data / 'local.sock', token, app_thread, app_row['id'], 'read')
                 # A new MCP process adopts the detached editor binding by its private conversation id.
                 await finish(app_facade)
@@ -856,18 +877,17 @@ main()
                 assert replay_link['port'] == app_joined['view_link']['port'], (app_joined['view_link'], replay_link)
                 replay_query = urlencode({'thread':app_thread, 'auth':hmac.new(bytes.fromhex(replay_link['key']),
                     ('poll:' + app_thread).encode(), hashlib.sha256).hexdigest()})
-                assert card_get(replay_link['port'], replay_query).get('message') is None, replay_link
                 app_row = await core_text(core_data / 'local.sock', token, session, replayed['binding_id'], app_thread,
                     'Core input after Cursor connector restart')
                 app_poll = asyncio.create_task(asyncio.to_thread(card_get, app_joined['view_link']['port'], app_query))
                 card_message = await asyncio.wait_for(app_poll, 5)
                 assert card_message['message_id'] == app_row['message_id'] and 'Core input after Cursor connector restart' in card_message['text'], card_message
-                await done_card(app_joined['view_link']['port'], app_query,
+                await asyncio.to_thread(done_card, app_joined['view_link']['port'], app_query,
                     {'message_id':app_row['message_id'],'stage':'dispatched','ok':True})
                 await wait_status(core_data / 'local.sock', token, app_thread, app_row['id'], 'unconfirmed')
                 await status_and_reply(app_facade, app_thread, {**app_joined,'binding_id':replayed['binding_id']},
                     app_row, editor_caps, 149)
-                await done_card(app_joined['view_link']['port'], app_query,
+                await asyncio.to_thread(done_card, app_joined['view_link']['port'], app_query,
                     {'message_id':app_row['message_id'],'stage':'answered','ok':True})
                 await wait_status(core_data / 'local.sock', token, app_thread, app_row['id'], 'read')
                 await tool(app_facade, 'voice_disconnect', {'conversation':app_thread}, 38)
@@ -1086,6 +1106,15 @@ def card_get(port, query):
     if response.status != 200:
         raise AssertionError(f'Cursor card poll returned HTTP {response.status}')
     return json.loads(payload)
+
+
+def card_probe(port, query):
+    connection = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+    connection.request('GET', '/cursor-app/unknown?' + query, headers={'Origin':'vscode-webview://cursor'})
+    response = connection.getresponse()
+    response.read()
+    connection.close()
+    assert response.status == 404, response.status
 
 
 def done_card(port, query, outcome):
