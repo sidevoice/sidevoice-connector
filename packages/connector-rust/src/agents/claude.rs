@@ -7,7 +7,9 @@ impl HostAgents {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<String, Failure> {
-        let Some(binary) = binary else { return Ok("unknown".into()) };
+        let Some(binary) = binary else {
+            return Ok("unknown".into());
+        };
         let output = match run_command(
             &self.profile,
             binary,
@@ -34,7 +36,8 @@ impl HostAgents {
         let field = |name: &str| -> Option<String> {
             detail.lines().find_map(|line| {
                 let (key, value) = line.trim().split_once(':')?;
-                key.eq_ignore_ascii_case(name).then(|| value.trim().to_owned())
+                key.eq_ignore_ascii_case(name)
+                    .then(|| value.trim().to_owned())
             })
         };
         let Some(command) = field("Command").filter(|value| !value.is_empty()) else {
@@ -46,20 +49,27 @@ impl HostAgents {
             .into());
         };
         let args = field("Args")
-            .map(|value| value.split_whitespace().map(str::to_owned).collect::<Vec<_>>())
+            .map(|value| {
+                value
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
-        let user_scope = field("Scope")
-            .is_some_and(|value| value.to_ascii_lowercase().contains("user"));
+        let user_scope =
+            field("Scope").is_some_and(|value| value.to_ascii_lowercase().contains("user"));
         if !user_scope {
             return Ok("foreign".into());
         }
         if self.selected.owns(AgentId::Claude, &command, &args, None) {
-            Ok(if command == self.selected.command && args == self.selected.args {
-                "connected"
-            } else {
-                "owned-old"
-            }
-            .into())
+            Ok(
+                if command == self.selected.command && args == self.selected.args {
+                    "connected"
+                } else {
+                    "owned-old"
+                }
+                .into(),
+            )
         } else {
             Ok("foreign".into())
         }
@@ -85,8 +95,11 @@ impl HostAgents {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<(), Failure> {
-        let binary = binary.ok_or_else(|| agent_failure("agents.manual-required", AgentId::Claude))?;
-        let state = self.claude_entry_state(Some(binary), cancel, deadline).await?;
+        let binary =
+            binary.ok_or_else(|| agent_failure("agents.manual-required", AgentId::Claude))?;
+        let state = self
+            .claude_entry_state(Some(binary), cancel, deadline)
+            .await?;
         if state == "connected" {
             return Ok(());
         }
@@ -97,12 +110,17 @@ impl HostAgents {
             return Err(agent_failure("agents.invalid", AgentId::Claude));
         }
         if state == "unknown" {
-            return Err(agent_failure("agents.registration-unknown", AgentId::Claude));
+            return Err(agent_failure(
+                "agents.registration-unknown",
+                AgentId::Claude,
+            ));
         }
         check_live(cancel, deadline)?;
         if state == "absent" || state == "owned-old" {
             // A second probe just before mutation closes the gap with an external CLI writer.
-            let again = self.claude_entry_state(Some(binary), cancel, deadline).await?;
+            let again = self
+                .claude_entry_state(Some(binary), cancel, deadline)
+                .await?;
             if again == "foreign" {
                 return Err(agent_failure("agents.foreign", AgentId::Claude));
             }
@@ -110,7 +128,10 @@ impl HostAgents {
                 return Err(agent_failure("agents.invalid", AgentId::Claude));
             }
             if again == "unknown" {
-                return Err(agent_failure("agents.registration-unknown", AgentId::Claude));
+                return Err(agent_failure(
+                    "agents.registration-unknown",
+                    AgentId::Claude,
+                ));
             }
             if again == "connected" {
                 return Ok(());
@@ -142,8 +163,11 @@ impl HostAgents {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<(), Failure> {
-        let binary = binary.ok_or_else(|| agent_failure("agents.registration-unknown", AgentId::Claude))?;
-        let state = self.claude_registration(Some(binary), cancel, deadline).await?;
+        let binary =
+            binary.ok_or_else(|| agent_failure("agents.registration-unknown", AgentId::Claude))?;
+        let state = self
+            .claude_registration(Some(binary), cancel, deadline)
+            .await?;
         match state.as_str() {
             "not-connected" => Ok(()),
             "connected" => {
@@ -158,9 +182,10 @@ impl HostAgents {
             }
             "foreign" => Err(agent_failure("agents.foreign", AgentId::Claude)),
             "invalid" => Err(agent_failure("agents.invalid", AgentId::Claude)),
-            _ => Err(agent_failure("agents.registration-unknown", AgentId::Claude)),
+            _ => Err(agent_failure(
+                "agents.registration-unknown",
+                AgentId::Claude,
+            )),
         }
     }
-
-
 }

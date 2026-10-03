@@ -137,7 +137,8 @@ impl Profile {
             ("CURSOR_CONFIG_DIR", &profile.cursor),
             ("SIDEVOICE_DATA_DIR", &profile.data),
         ] {
-            let supplied = std::env::var_os(key).context("isolated proof environment is incomplete")?;
+            let supplied =
+                std::env::var_os(key).context("isolated proof environment is incomplete")?;
             if Path::new(&supplied) != expected.as_path() {
                 bail!("isolated proof environment does not match its root");
             }

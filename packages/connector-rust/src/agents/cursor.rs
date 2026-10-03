@@ -3,7 +3,8 @@ use super::*;
 impl HostAgents {
     pub(super) fn cursor_registration(&self) -> Result<String> {
         let file = self.profile.cursor.join("mcp.json");
-        let Some((mut config, _mode, _target)) = read_cursor_config(&file, &self.profile.root)? else {
+        let Some((mut config, _mode, _target)) = read_cursor_config(&file, &self.profile.root)?
+        else {
             return Ok("not-connected".into());
         };
         let current = config
@@ -11,22 +12,31 @@ impl HostAgents {
             .and_then(Value::as_object_mut)
             .and_then(|servers| servers.get("sidevoice"))
             .cloned();
-        let Some(current) = current else { return Ok("not-connected".into()) };
+        let Some(current) = current else {
+            return Ok("not-connected".into());
+        };
         let command = current.get("command").and_then(Value::as_str).unwrap_or("");
         let args = current
             .get("args")
             .and_then(Value::as_array)
-            .and_then(|values| values.iter().map(|value| value.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>())
+            .and_then(|values| {
+                values
+                    .iter()
+                    .map(|value| value.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()
+            })
             .unwrap_or_default();
         if !self.selected.owns(AgentId::Cursor, command, &args, None) {
             return Ok("foreign".into());
         }
-        Ok(if command == self.selected.command && args == self.selected.args {
-            "connected"
-        } else {
-            "not-connected"
-        }
-        .into())
+        Ok(
+            if command == self.selected.command && args == self.selected.args {
+                "connected"
+            } else {
+                "not-connected"
+            }
+            .into(),
+        )
     }
 
     pub(super) fn cursor_connect(&self) -> std::result::Result<(), Failure> {
@@ -49,7 +59,12 @@ impl HostAgents {
             let args = current
                 .get("args")
                 .and_then(Value::as_array)
-                .and_then(|values| values.iter().map(|value| value.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>())
+                .and_then(|values| {
+                    values
+                        .iter()
+                        .map(|value| value.as_str().map(str::to_owned))
+                        .collect::<Option<Vec<_>>>()
+                })
                 .unwrap_or_default();
             if !self.selected.owns(AgentId::Cursor, command, &args, None) {
                 return Err(agent_failure("agents.foreign", AgentId::Cursor));
@@ -79,14 +94,21 @@ impl HostAgents {
             return Ok(());
         };
         let Some(servers) = config.get_mut("mcpServers").and_then(Value::as_object_mut) else {
-            return Ok(())
+            return Ok(());
         };
-        let Some(current) = servers.get("sidevoice") else { return Ok(()) };
+        let Some(current) = servers.get("sidevoice") else {
+            return Ok(());
+        };
         let command = current.get("command").and_then(Value::as_str).unwrap_or("");
         let args = current
             .get("args")
             .and_then(Value::as_array)
-            .and_then(|values| values.iter().map(|value| value.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>())
+            .and_then(|values| {
+                values
+                    .iter()
+                    .map(|value| value.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()
+            })
             .unwrap_or_default();
         if !self.selected.owns(AgentId::Cursor, command, &args, None) {
             return Err(agent_failure("agents.foreign", AgentId::Cursor));
@@ -94,6 +116,4 @@ impl HostAgents {
         servers.remove("sidevoice");
         write_cursor_config(&file, &self.profile.root, &config).map_err(|_| Failure::Internal)
     }
-
-
 }

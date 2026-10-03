@@ -347,7 +347,9 @@ impl HostAgents {
             return error_value("agents.busy", json!({}));
         }
         let task = tokio::spawn(async move {
-            let answer = this.run_request(&method, params, &worker_cancel, deadline).await;
+            let answer = this
+                .run_request(&method, params, &worker_cancel, deadline)
+                .await;
             let _ = answer_tx.send(answer);
         });
         operations.retain(|operation| !operation.task.is_finished());
@@ -358,9 +360,13 @@ impl HostAgents {
         drop(operations);
         match answer_rx.await {
             Ok(Ok(value)) => value,
-            Ok(Err(Failure::Cancelled)) => error_value("agents.action-failed", json!({"agent":"host agent"})),
+            Ok(Err(Failure::Cancelled)) => {
+                error_value("agents.action-failed", json!({"agent":"host agent"}))
+            }
             Ok(Err(Failure::Busy)) => error_value("agents.busy", json!({})),
-            Ok(Err(Failure::Internal)) => error_value("agents.action-failed", json!({"agent":"host agent"})),
+            Ok(Err(Failure::Internal)) => {
+                error_value("agents.action-failed", json!({"agent":"host agent"}))
+            }
             Ok(Err(Failure::Key(key, params))) => error_value(key, Value::Object(params)),
             Err(_) => error_value("agents.action-failed", json!({"agent":"host agent"})),
         }
@@ -412,7 +418,9 @@ impl HostAgents {
             };
             let rescan = params.get("rescan") == Some(&Value::Bool(true));
             let mut state = self.load_state(cancel, deadline).await?;
-            let has_cache = state.get("scanned_at").is_some_and(|value| !value.is_null());
+            let has_cache = state
+                .get("scanned_at")
+                .is_some_and(|value| !value.is_null());
             if rescan || watch.is_some() || !has_cache {
                 state = self.scan(state, watch, true, cancel, deadline).await?;
             }
@@ -426,15 +434,13 @@ impl HostAgents {
                 json!({"route":method.chars().take(120).collect::<String>()}),
             ));
         }
-        let id = params
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let id = params.get("id").and_then(Value::as_str).unwrap_or("");
         let agent = parse_id(id)?;
         let state = self.load_state(cancel, deadline).await?;
-        let mut state = self.scan(state, Some(agent), true, cancel, deadline).await?;
-        let current = seen_agent(&state, agent)
-            .ok_or_else(|| not_present(agent))?;
+        let mut state = self
+            .scan(state, Some(agent), true, cancel, deadline)
+            .await?;
+        let current = seen_agent(&state, agent).ok_or_else(|| not_present(agent))?;
         let registration = current
             .get("registration")
             .and_then(Value::as_str)
@@ -473,7 +479,8 @@ impl HostAgents {
                 .pointer(&format!("/binaries/{}", agent.as_str()))
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            self.connect(agent, binary.as_deref(), cancel, deadline).await?;
+            self.connect(agent, binary.as_deref(), cancel, deadline)
+                .await?;
             state = self
                 .scan(state, Some(agent), false, cancel, deadline)
                 .await?;
@@ -491,7 +498,9 @@ impl HostAgents {
                         .and_then(Value::as_str)
                         == Some("connected")
                     {
-                        if let Some(dismissed) = latest.get_mut("dismissed").and_then(Value::as_object_mut) {
+                        if let Some(dismissed) =
+                            latest.get_mut("dismissed").and_then(Value::as_object_mut)
+                        {
                             dismissed.remove(agent.as_str());
                         }
                     }
@@ -512,7 +521,8 @@ impl HostAgents {
             .pointer(&format!("/binaries/{}", agent.as_str()))
             .and_then(Value::as_str)
             .map(str::to_owned);
-        self.disconnect(agent, binary.as_deref(), cancel, deadline).await?;
+        self.disconnect(agent, binary.as_deref(), cancel, deadline)
+            .await?;
         state = self
             .scan(state, Some(agent), false, cancel, deadline)
             .await?;
@@ -535,10 +545,15 @@ impl HostAgents {
                         let dismissed = seen
                             .get("generation")
                             .and_then(Value::as_str)
-                            .zip(state.pointer(&format!("/dismissed/{id}")).and_then(Value::as_str))
+                            .zip(
+                                state
+                                    .pointer(&format!("/dismissed/{id}"))
+                                    .and_then(Value::as_str),
+                            )
                             .is_some_and(|(generation, saved)| generation == saved);
                         let actionable = row.get("present") == Some(&Value::Bool(true))
-                            && row.get("registration").and_then(Value::as_str) == Some("not-connected")
+                            && row.get("registration").and_then(Value::as_str)
+                                == Some("not-connected")
                             && !dismissed;
                         row["dismissed"] = json!(dismissed);
                         row["actionable"] = json!(actionable);
@@ -576,7 +591,10 @@ impl HostAgents {
         deadline: Instant,
     ) -> std::result::Result<Value, Failure> {
         let base = state.clone();
-        let mut login_path = state.get("login_path").and_then(Value::as_str).map(str::to_owned);
+        let mut login_path = state
+            .get("login_path")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         if watch.is_none() || login_path.is_none() {
             if let Some(captured) = self.capture_login_path(cancel, deadline).await? {
                 login_path = Some(captured);
@@ -635,7 +653,9 @@ impl HostAgents {
                 }
                 if let Some(binary) = &observation.binary {
                     latest["binaries"][id.as_str()] = json!(binary);
-                } else if let Some(binaries) = latest.get_mut("binaries").and_then(Value::as_object_mut) {
+                } else if let Some(binaries) =
+                    latest.get_mut("binaries").and_then(Value::as_object_mut)
+                {
                     binaries.remove(id.as_str());
                 }
                 let signature = observation.signature;
@@ -791,7 +811,10 @@ impl HostAgents {
         deadline: Instant,
         agent: AgentId,
     ) -> std::result::Result<(), Failure> {
-        let args = args.iter().map(|value| value.as_ref().to_owned()).collect::<Vec<_>>();
+        let args = args
+            .iter()
+            .map(|value| value.as_ref().to_owned())
+            .collect::<Vec<_>>();
         let output = match run_command(&self.profile, binary, &args, cancel, deadline).await {
             Ok(output) => output,
             Err(CommandFailure::Cancelled) => return Err(Failure::Cancelled),
@@ -874,10 +897,16 @@ fn normalized_state(mut value: Value) -> Value {
             value[key] = json!({});
         }
     }
-    if !value.as_object().is_some_and(|object| object.contains_key("scanned_at")) {
+    if !value
+        .as_object()
+        .is_some_and(|object| object.contains_key("scanned_at"))
+    {
         value["scanned_at"] = Value::Null;
     }
-    if !value.as_object().is_some_and(|object| object.contains_key("login_path")) {
+    if !value
+        .as_object()
+        .is_some_and(|object| object.contains_key("login_path"))
+    {
         value["login_path"] = Value::Null;
     }
     value
@@ -1003,7 +1032,9 @@ fn path_basename(value: &str) -> Option<&str> {
 #[cfg(test)]
 fn js_release_program(program: &str, root: &Path) -> bool {
     let path = Path::new(program);
-    let Ok(relative) = path.strip_prefix(root) else { return false };
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
     let components = relative
         .components()
         .map(|component| component.as_os_str().to_string_lossy().into_owned())
@@ -1035,9 +1066,7 @@ fn executable(value: &str) -> bool {
     if !path.is_absolute() {
         return false;
     }
-    fs::metadata(path).is_ok_and(|metadata| {
-        metadata.is_file() && (metadata.mode() & 0o111 != 0)
-    })
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && (metadata.mode() & 0o111 != 0))
 }
 
 fn find_in_path(names: &[&str], path: Option<&str>) -> Option<String> {
@@ -1082,7 +1111,10 @@ async fn kill_and_reap(child: &mut Child) {
         kill_process_group(pid);
     }
     let _ = child.start_kill();
-    if timeout(StdDuration::from_secs(2), child.wait()).await.is_err() {
+    if timeout(StdDuration::from_secs(2), child.wait())
+        .await
+        .is_err()
+    {
         let _ = child.kill().await;
         let _ = child.wait().await;
     }
@@ -1199,7 +1231,11 @@ fn read_cursor_config(file: &Path, root: &Path) -> Result<Option<(Value, u32, Pa
     if !config.is_object() {
         anyhow::bail!("Cursor configuration is not an object");
     }
-    Ok(Some((config, metadata.permissions().mode() & 0o777, target)))
+    Ok(Some((
+        config,
+        metadata.permissions().mode() & 0o777,
+        target,
+    )))
 }
 
 fn write_cursor_config(file: &Path, root: &Path, config: &Value) -> Result<()> {
@@ -1272,9 +1308,14 @@ fn iso_now() -> String {
 
 fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let shifted = days + 719_468;
-    let era = if shifted >= 0 { shifted } else { shifted - 146_096 } / 146_097;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
     let day_of_era = shifted - era * 146_097;
-    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
     let mut year = year_of_era + era * 400;
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_prime = (5 * day_of_year + 2) / 153;
@@ -1294,9 +1335,17 @@ impl HostAgents {
     ) -> std::result::Result<Observation, Failure> {
         let binary = self.resolve_binary(id, input.state, input.login_path);
         let registration = match id {
-            AgentId::Claude => self.claude_registration(binary.as_deref(), cancel, deadline).await?,
-            AgentId::Codex => self.codex_registration(binary.as_deref(), cancel, deadline).await?,
-            AgentId::Cursor => self.cursor_registration().unwrap_or_else(|_| "invalid".into()),
+            AgentId::Claude => {
+                self.claude_registration(binary.as_deref(), cancel, deadline)
+                    .await?
+            }
+            AgentId::Codex => {
+                self.codex_registration(binary.as_deref(), cancel, deadline)
+                    .await?
+            }
+            AgentId::Cursor => self
+                .cursor_registration()
+                .unwrap_or_else(|_| "invalid".into()),
         };
         let version = if input.include_version {
             match binary.as_deref() {
@@ -1326,7 +1375,9 @@ impl HostAgents {
         }
         if id == AgentId::Cursor
             && Path::new("/Applications/Cursor.app").exists()
-            && !evidence.iter().any(|item| item.path == "/Applications/Cursor.app")
+            && !evidence
+                .iter()
+                .any(|item| item.path == "/Applications/Cursor.app")
         {
             evidence.push(Evidence {
                 kind: "app",
@@ -1387,9 +1438,13 @@ impl HostAgents {
                 if registration == "foreign" {
                     let cli = binary.unwrap_or("codex");
                     let remove = vec!["mcp", "remove", "sidevoice"]
-                        .into_iter().map(str::to_owned).collect::<Vec<_>>();
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
                     let mut add = vec!["mcp", "add", "sidevoice", "--"]
-                        .into_iter().map(str::to_owned).collect::<Vec<_>>();
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
                     add.push(selected.command.clone());
                     add.extend(selected.args.clone());
                     return json!({
@@ -1428,7 +1483,12 @@ impl HostAgents {
         }
     }
 
-    fn resolve_binary(&self, id: AgentId, state: &Value, login_path: Option<&str>) -> Option<String> {
+    fn resolve_binary(
+        &self,
+        id: AgentId,
+        state: &Value,
+        login_path: Option<&str>,
+    ) -> Option<String> {
         let override_path = std::env::var(id.override_name()).ok();
         if let Some(path) = override_path.as_deref().filter(|path| executable(path)) {
             return Some(path.to_owned());
@@ -1443,7 +1503,9 @@ impl HostAgents {
         if let Some(path) = find_in_path(id.binary_names(), login_path) {
             return Some(path);
         }
-        self.known_paths(id).into_iter().find(|path| executable(path))
+        self.known_paths(id)
+            .into_iter()
+            .find(|path| executable(path))
     }
 
     fn known_paths(&self, id: AgentId) -> Vec<String> {
@@ -1473,7 +1535,10 @@ impl HostAgents {
                 local.join("Programs/cursor/resources/app/bin/cursor.cmd"),
             ],
         };
-        paths.drain(..).map(|path| path.to_string_lossy().into_owned()).collect()
+        paths
+            .drain(..)
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect()
     }
 
     async fn capture_login_path(
@@ -1481,7 +1546,10 @@ impl HostAgents {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<Option<String>, Failure> {
-        let Some(shell) = std::env::var("SHELL").ok().filter(|value| Path::new(value).is_absolute()) else {
+        let Some(shell) = std::env::var("SHELL")
+            .ok()
+            .filter(|value| Path::new(value).is_absolute())
+        else {
             return Ok(None);
         };
         let output = run_command(
@@ -1497,7 +1565,9 @@ impl HostAgents {
                 let value = output.stdout.trim();
                 Ok((!value.is_empty()).then(|| value.to_owned()))
             }
-            Ok(_) | Err(CommandFailure::Start | CommandFailure::Deadline | CommandFailure::Io) => Ok(None),
+            Ok(_) | Err(CommandFailure::Start | CommandFailure::Deadline | CommandFailure::Io) => {
+                Ok(None)
+            }
             Err(CommandFailure::Cancelled) => Err(Failure::Cancelled),
         }
     }
@@ -1508,16 +1578,25 @@ impl HostAgents {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<Option<String>, Failure> {
-        match run_command(&self.profile, binary, &["--version".into()], cancel, deadline).await {
+        match run_command(
+            &self.profile,
+            binary,
+            &["--version".into()],
+            cancel,
+            deadline,
+        )
+        .await
+        {
             Ok(output) if output.status.success() => Ok(output
                 .stdout
                 .lines()
                 .map(str::trim)
                 .find(|line| !line.is_empty())
                 .map(|line| line.chars().take(200).collect())),
-            Ok(_) | Err(CommandFailure::Start | CommandFailure::Deadline | CommandFailure::Io) => Ok(None),
+            Ok(_) | Err(CommandFailure::Start | CommandFailure::Deadline | CommandFailure::Io) => {
+                Ok(None)
+            }
             Err(CommandFailure::Cancelled) => Err(Failure::Cancelled),
         }
     }
-
 }

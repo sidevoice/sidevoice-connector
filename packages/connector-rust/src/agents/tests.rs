@@ -109,7 +109,10 @@ fn identity_signature(id: &str, version: Option<&str>, evidence: &[Evidence<'_>]
 #[test]
 fn proof_ownership_is_exact_and_js_release_fixtures_stay_narrow() {
     let fixture = Fixture::new();
-    assert_eq!(Profile::from_root(&fixture.root).unwrap().root, fixture.profile.root);
+    assert_eq!(
+        Profile::from_root(&fixture.root).unwrap().root,
+        fixture.profile.root
+    );
     let proof = InstalledCommand::proof(&fixture.profile).unwrap();
     let selected_args = proof.args.clone();
     for id in [AgentId::Claude, AgentId::Codex, AgentId::Cursor] {
@@ -126,8 +129,18 @@ fn proof_ownership_is_exact_and_js_release_fixtures_stay_narrow() {
         "SIDEVOICE_DATA_DIR":fixture.profile.data,
         "CODEX_HOME":fixture.profile.codex,
     });
-    assert!(proof.owns(AgentId::Codex, &proof.command, &["mcp".into()], Some(&old_codex_env)));
-    assert!(!proof.owns(AgentId::Cursor, &proof.command, &["mcp".into()], Some(&old_codex_env)));
+    assert!(proof.owns(
+        AgentId::Codex,
+        &proof.command,
+        &["mcp".into()],
+        Some(&old_codex_env)
+    ));
+    assert!(!proof.owns(
+        AgentId::Cursor,
+        &proof.command,
+        &["mcp".into()],
+        Some(&old_codex_env)
+    ));
     assert!(!proof.owns(
         AgentId::Codex,
         &proof.command,
@@ -139,7 +152,10 @@ fn proof_ownership_is_exact_and_js_release_fixtures_stay_narrow() {
     let releases = fixture.root.join("js-copies");
     let node_cli = releases.join("current/dist/cli.mjs");
     let node = InstalledCommand::selected(
-        vec!["/usr/bin/node".into(), node_cli.to_string_lossy().into_owned()],
+        vec![
+            "/usr/bin/node".into(),
+            node_cli.to_string_lossy().into_owned(),
+        ],
         releases.clone(),
     );
     assert!(node.owns(
@@ -150,23 +166,32 @@ fn proof_ownership_is_exact_and_js_release_fixtures_stay_narrow() {
     ));
     let old_native = releases.join("releases/1.2.3/dist/sidevoice");
     let native = InstalledCommand::selected(
-        vec![releases.join("current/dist/sidevoice").to_string_lossy().into_owned()],
+        vec![releases
+            .join("current/dist/sidevoice")
+            .to_string_lossy()
+            .into_owned()],
         releases.clone(),
     );
-    assert!(native.owns(AgentId::Claude, &old_native.to_string_lossy(), &["mcp".into()], None));
-    assert!(!native.owns(AgentId::Claude, "/tmp/other/dist/sidevoice", &["mcp".into()], None));
+    assert!(native.owns(
+        AgentId::Claude,
+        &old_native.to_string_lossy(),
+        &["mcp".into()],
+        None
+    ));
+    assert!(!native.owns(
+        AgentId::Claude,
+        "/tmp/other/dist/sidevoice",
+        &["mcp".into()],
+        None
+    ));
 }
 
 #[tokio::test]
 async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped_files() {
     let fixture = Fixture::new();
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
-    let old = fixture
-        .root
-        .join("selected/releases/1.2.3/dist/sidevoice");
-    let current = fixture
-        .root
-        .join("selected/current/dist/sidevoice");
+    let old = fixture.root.join("selected/releases/1.2.3/dist/sidevoice");
+    let current = fixture.root.join("selected/current/dist/sidevoice");
     let config_path = fixture.profile.cursor.join("mcp.json");
     write_json(
         &config_path,
@@ -203,50 +228,56 @@ async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped
     );
 
     let listed = host
-        .handle(
-            "agents.list",
-            json!({"rescan":true,"watch":"cursor"}),
-        )
+        .handle("agents.list", json!({"rescan":true,"watch":"cursor"}))
         .await;
     assert_eq!(row(&listed, "cursor")["registration"], "not-connected");
     assert_eq!(row(&listed, "cursor")["dismissed"], false);
     assert_eq!(row(&listed, "cursor")["actionable"], true);
-    let mut store: Value = serde_json::from_slice(
-        &fs::read(fixture.profile.data.join("agents.json")).unwrap(),
-    )
-    .unwrap();
+    let mut store: Value =
+        serde_json::from_slice(&fs::read(fixture.profile.data.join("agents.json")).unwrap())
+            .unwrap();
     store["dismissed"]["cursor"] = json!("same-generation");
     write_json(&fixture.profile.data.join("agents.json"), &store);
-    let dismissed = host
-        .handle("agents.dismiss", json!({"id":"cursor"}))
-        .await;
+    let dismissed = host.handle("agents.dismiss", json!({"id":"cursor"})).await;
     assert_eq!(row(&dismissed, "cursor")["dismissed"], true);
     assert_eq!(row(&dismissed, "cursor")["actionable"], false);
 
-    let connected = host
-        .handle("agents.connect", json!({"id":"cursor"}))
-        .await;
+    let connected = host.handle("agents.connect", json!({"id":"cursor"})).await;
     assert!(connected.get("error").is_none(), "{connected}");
     assert_eq!(row(&connected, "cursor")["registration"], "connected");
     assert_eq!(row(&connected, "cursor")["dismissed"], false);
     let saved_config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
-    assert_eq!(saved_config.pointer("/mcpServers/sidevoice/command"), Some(&json!(current)));
-    assert_eq!(saved_config.pointer("/mcpServers/sidevoice/description"), Some(&json!("preserve me")));
-    assert_eq!(saved_config.pointer("/mcpServers/other/private"), Some(&json!("untouched")));
+    assert_eq!(
+        saved_config.pointer("/mcpServers/sidevoice/command"),
+        Some(&json!(current))
+    );
+    assert_eq!(
+        saved_config.pointer("/mcpServers/sidevoice/description"),
+        Some(&json!("preserve me"))
+    );
+    assert_eq!(
+        saved_config.pointer("/mcpServers/other/private"),
+        Some(&json!("untouched"))
+    );
     assert_eq!(saved_config["editor"]["theme"], "dark");
 
     let disconnected = host
         .handle("agents.disconnect", json!({"id":"cursor"}))
         .await;
     assert!(disconnected.get("error").is_none(), "{disconnected}");
-    assert_eq!(row(&disconnected, "cursor")["registration"], "not-connected");
+    assert_eq!(
+        row(&disconnected, "cursor")["registration"],
+        "not-connected"
+    );
     let saved_config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
     assert!(saved_config.pointer("/mcpServers/sidevoice").is_none());
-    assert_eq!(saved_config.pointer("/mcpServers/other/private"), Some(&json!("untouched")));
-    let saved_store: Value = serde_json::from_slice(
-        &fs::read(fixture.profile.data.join("agents.json")).unwrap(),
-    )
-    .unwrap();
+    assert_eq!(
+        saved_config.pointer("/mcpServers/other/private"),
+        Some(&json!("untouched"))
+    );
+    let saved_store: Value =
+        serde_json::from_slice(&fs::read(fixture.profile.data.join("agents.json")).unwrap())
+            .unwrap();
     assert_eq!(saved_store["custom_notes"]["must"], "survive rewrites");
 
     let foreign = json!({"mcpServers":{
@@ -258,7 +289,10 @@ async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped
     let refusal = host
         .handle("agents.connect", json!({"id":"cursor","path":"/tmp/evil"}))
         .await;
-    assert_eq!(refusal.pointer("/error/key"), Some(&json!("agents.foreign")));
+    assert_eq!(
+        refusal.pointer("/error/key"),
+        Some(&json!("agents.foreign"))
+    );
     assert_eq!(fs::read(&config_path).unwrap(), foreign_before);
     assert!(refusal.to_string().contains("agents.foreign"));
     assert!(!refusal.to_string().contains("do not expose"));
@@ -266,10 +300,11 @@ async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped
 
     private_write(&config_path, b"{bad JSON");
     let invalid_before = fs::read(&config_path).unwrap();
-    let invalid = host
-        .handle("agents.connect", json!({"id":"cursor"}))
-        .await;
-    assert_eq!(invalid.pointer("/error/key"), Some(&json!("agents.invalid")));
+    let invalid = host.handle("agents.connect", json!({"id":"cursor"})).await;
+    assert_eq!(
+        invalid.pointer("/error/key"),
+        Some(&json!("agents.invalid"))
+    );
     assert_eq!(fs::read(&config_path).unwrap(), invalid_before);
 
     let escaped = fixture.root.parent().unwrap().join(format!(
@@ -281,10 +316,11 @@ async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped
     fs::remove_file(&config_path).unwrap();
     symlink(&escaped, &config_path).unwrap();
     let escaped_before = fs::read(&escaped).unwrap();
-    let escaped_result = host
-        .handle("agents.connect", json!({"id":"cursor"}))
-        .await;
-    assert_eq!(escaped_result.pointer("/error/key"), Some(&json!("agents.invalid")));
+    let escaped_result = host.handle("agents.connect", json!({"id":"cursor"})).await;
+    assert_eq!(
+        escaped_result.pointer("/error/key"),
+        Some(&json!("agents.invalid"))
+    );
     assert_eq!(fs::read(&escaped).unwrap(), escaped_before);
     let _ = fs::remove_file(escaped);
     host.shutdown().await;
@@ -302,10 +338,9 @@ async fn disappeared_and_reappeared_config_gets_a_new_generation() {
         .handle("agents.list", json!({"watch":"cursor","rescan":true}))
         .await;
     assert_eq!(row(&first, "cursor")["present"], true);
-    let state: Value = serde_json::from_slice(
-        &fs::read(fixture.profile.data.join("agents.json")).unwrap(),
-    )
-    .unwrap();
+    let state: Value =
+        serde_json::from_slice(&fs::read(fixture.profile.data.join("agents.json")).unwrap())
+            .unwrap();
     let first_generation = state["seen"]["cursor"]["generation"]
         .as_str()
         .unwrap()
@@ -314,21 +349,23 @@ async fn disappeared_and_reappeared_config_gets_a_new_generation() {
     let absent = host
         .handle("agents.list", json!({"watch":"cursor","rescan":true}))
         .await;
-    assert!(absent["agents"].as_array().unwrap().iter().all(|agent| agent["id"] != "cursor"));
-    let state: Value = serde_json::from_slice(
-        &fs::read(fixture.profile.data.join("agents.json")).unwrap(),
-    )
-    .unwrap();
+    assert!(absent["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|agent| agent["id"] != "cursor"));
+    let state: Value =
+        serde_json::from_slice(&fs::read(fixture.profile.data.join("agents.json")).unwrap())
+            .unwrap();
     assert_eq!(state["seen"]["cursor"]["present"], false);
     private_mkdir(&fixture.profile.cursor);
     let returned = host
         .handle("agents.list", json!({"watch":"cursor","rescan":true}))
         .await;
     assert_eq!(row(&returned, "cursor")["present"], true);
-    let state: Value = serde_json::from_slice(
-        &fs::read(fixture.profile.data.join("agents.json")).unwrap(),
-    )
-    .unwrap();
+    let state: Value =
+        serde_json::from_slice(&fs::read(fixture.profile.data.join("agents.json")).unwrap())
+            .unwrap();
     assert_ne!(state["seen"]["cursor"]["generation"], first_generation);
     host.shutdown().await;
 }
@@ -482,11 +519,13 @@ raise SystemExit(2)
     abandoned.abort();
     let _ = abandoned.await;
     tokio::time::sleep(StdDuration::from_millis(100)).await;
-    assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "cancelled CLI process was reaped");
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        -1,
+        "cancelled CLI process was reaped"
+    );
     assert!(!fixture.profile.codex.join("fake-entry.json").exists());
-    let recovered = host
-        .handle("agents.connect", json!({"id":"codex"}))
-        .await;
+    let recovered = host.handle("agents.connect", json!({"id":"codex"})).await;
     assert_eq!(row(&recovered, "codex")["registration"], "connected");
 
     host.shutdown().await;

@@ -11,11 +11,18 @@ impl HostAgents {
         if guard == "foreign" || guard == "invalid" {
             return Ok(guard);
         }
-        let Some(binary) = binary else { return Ok("unknown".into()) };
+        let Some(binary) = binary else {
+            return Ok("unknown".into());
+        };
         let output = match run_command(
             &self.profile,
             binary,
-            &["mcp".into(), "get".into(), "sidevoice".into(), "--json".into()],
+            &[
+                "mcp".into(),
+                "get".into(),
+                "sidevoice".into(),
+                "--json".into(),
+            ],
             cancel,
             deadline,
         )
@@ -43,9 +50,17 @@ impl HostAgents {
         let args = transport
             .and_then(|value| value.get("args"))
             .and_then(Value::as_array)
-            .and_then(|values| values.iter().map(|value| value.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>());
+            .and_then(|values| {
+                values
+                    .iter()
+                    .map(|value| value.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()
+            });
         if entry.get("name").and_then(Value::as_str) != Some("sidevoice")
-            || transport.and_then(|value| value.get("type")).and_then(Value::as_str) != Some("stdio")
+            || transport
+                .and_then(|value| value.get("type"))
+                .and_then(Value::as_str)
+                != Some("stdio")
             || command.is_none()
             || args.is_none()
         {
@@ -62,12 +77,14 @@ impl HostAgents {
             return Ok("foreign".into());
         }
         let enabled = entry.get("enabled").and_then(Value::as_bool) != Some(false);
-        Ok(if enabled && command == self.selected.command && args == self.selected.args {
-            "connected"
-        } else {
-            "not-connected"
-        }
-        .into())
+        Ok(
+            if enabled && command == self.selected.command && args == self.selected.args {
+                "connected"
+            } else {
+                "not-connected"
+            }
+            .into(),
+        )
     }
 
     fn codex_file_guard(&self) -> std::result::Result<String, Failure> {
@@ -109,7 +126,10 @@ impl HostAgents {
             return Ok("invalid".into());
         };
         let env = entry.get("env").and_then(toml_to_json);
-        Ok(if self.selected.owns(AgentId::Codex, command, &args, env.as_ref()) {
+        Ok(if self
+            .selected
+            .owns(AgentId::Codex, command, &args, env.as_ref())
+        {
             "ours"
         } else {
             "foreign"
@@ -123,8 +143,11 @@ impl HostAgents {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<(), Failure> {
-        let binary = binary.ok_or_else(|| agent_failure("agents.manual-required", AgentId::Codex))?;
-        let state = self.codex_registration(Some(binary), cancel, deadline).await?;
+        let binary =
+            binary.ok_or_else(|| agent_failure("agents.manual-required", AgentId::Codex))?;
+        let state = self
+            .codex_registration(Some(binary), cancel, deadline)
+            .await?;
         if state == "connected" {
             return Ok(());
         }
@@ -137,7 +160,9 @@ impl HostAgents {
         if state == "unknown" {
             return Err(agent_failure("agents.registration-unknown", AgentId::Codex));
         }
-        let again = self.codex_registration(Some(binary), cancel, deadline).await?;
+        let again = self
+            .codex_registration(Some(binary), cancel, deadline)
+            .await?;
         if again == "foreign" {
             return Err(agent_failure("agents.foreign", AgentId::Codex));
         }
@@ -176,8 +201,11 @@ impl HostAgents {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<(), Failure> {
-        let binary = binary.ok_or_else(|| agent_failure("agents.registration-unknown", AgentId::Codex))?;
-        let state = self.codex_registration(Some(binary), cancel, deadline).await?;
+        let binary =
+            binary.ok_or_else(|| agent_failure("agents.registration-unknown", AgentId::Codex))?;
+        let state = self
+            .codex_registration(Some(binary), cancel, deadline)
+            .await?;
         match state.as_str() {
             "not-connected" => Ok(()),
             "connected" => {
@@ -195,6 +223,4 @@ impl HostAgents {
             _ => Err(agent_failure("agents.registration-unknown", AgentId::Codex)),
         }
     }
-
-
 }

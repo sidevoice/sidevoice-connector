@@ -29,14 +29,7 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo build --locked --release
-      - name: Format Rust sources for the draft checkpoint
-        run: cargo fmt --all
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rust-formatted-source
-          path: packages/connector-rust/src/
-          if-no-files-found: error
-          retention-days: 1
+      - run: cargo fmt --all --check
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
