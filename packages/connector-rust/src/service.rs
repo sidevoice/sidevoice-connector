@@ -5,6 +5,7 @@ use crate::agents::message;
 use crate::proof::{private_dir, private_file, Profile, Ready};
 #[cfg(target_os = "macos")]
 use crate::proof::atomic_json;
+#[cfg(target_os = "macos")]
 use anyhow::Context;
 #[cfg(target_os = "macos")]
 use fs2::FileExt;
@@ -754,7 +755,7 @@ fn derive_status(observation: &Observation) -> Value {
         "window_started":Value::Null,"next_retry_at":Value::Null,"reachable":reachable,
         "connector":{"running":observation.connector_running}});
     let mut result=base;
-    let mut state="failed";
+    let state;
     let defined_core=observation.core.defined;
     let defined_any=defined_core||observation.connector.defined;
     if !observation.installed&&!defined_any {state="absent";}
@@ -849,8 +850,8 @@ async fn install(profile:&Profile,spec:&ServiceSpec)->Result<Value>{
     let connector_changed=write_definition(&spec.connector_definition,&connector_text)?;
     if core_changed&&manager_job(&spec.core_job,true).await?.loaded {bootout(&spec.core_job).await?;}
     if connector_changed&&manager_job(&spec.connector_job,true).await?.loaded {bootout(&spec.connector_job).await?;}
-    start_job(spec,&spec.core_job,&spec.core_definition).await?;
-    start_job(spec,&spec.connector_job,&spec.connector_definition).await?;
+    start_job(&spec.core_job,&spec.core_definition).await?;
+    start_job(&spec.connector_job,&spec.connector_definition).await?;
     wait_settled(profile,true).await
 }
 
@@ -862,8 +863,8 @@ async fn start(profile:&Profile,spec:&ServiceSpec)->Result<Value>{
     if core {spec.validate_programs(profile)?;}
     set_stopped(profile,false).await?;
     if core&&connector {
-        start_job(spec,&spec.core_job,&spec.core_definition).await?;
-        start_job(spec,&spec.connector_job,&spec.connector_definition).await?;
+        start_job(&spec.core_job,&spec.core_definition).await?;
+        start_job(&spec.connector_job,&spec.connector_definition).await?;
         wait_settled(profile,false).await
     } else { Ok(status(profile,false).await) }
 }
@@ -922,7 +923,7 @@ async fn stop(profile:&Profile,spec:&ServiceSpec,uninstall:bool)->Result<Value>{
 }
 
 #[cfg(target_os="macos")]
-async fn start_job(spec:&ServiceSpec,label:&str,definition:&Path)->Result<()> {
+async fn start_job(label:&str,definition:&Path)->Result<()> {
     let state=manager_job(label,existing_definition(definition)?).await?;
     if state.unknown {return Err(Failure::keyed("service.manager-unavailable",json!({"detail":"launchctl print"})));}
     if state.loaded&&state.running {return Ok(());}
