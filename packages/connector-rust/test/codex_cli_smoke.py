@@ -38,16 +38,21 @@ def main():
     with tempfile.TemporaryDirectory(prefix="sidevoice-codex-smoke-") as temporary:
         root = Path(temporary).resolve()
         root.chmod(0o700)
-        paths = {name: root / name for name in ("home", "claude", "codex", "cursor", "sidevoice")}
+        paths = {name: root / name for name in ("home", "claude", "codex", "cursor", "xdg", "sidevoice")}
         for path in paths.values():
             path.mkdir(mode=0o700)
+        for name in ("cursor/config", "cursor/data", "xdg/config", "xdg/data"):
+            (root / name).mkdir(mode=0o700)
         (paths["sidevoice"] / "core").mkdir(mode=0o700)
         env = {
             "PATH": safe_path,
             "HOME": str(paths["home"]),
             "CLAUDE_CONFIG_DIR": str(paths["claude"]),
             "CODEX_HOME": str(paths["codex"]),
-            "CURSOR_CONFIG_DIR": str(paths["cursor"]),
+            "CURSOR_CONFIG_DIR": str(root / "cursor/config"),
+            "CURSOR_DATA_DIR": str(root / "cursor/data"),
+            "XDG_CONFIG_HOME": str(root / "xdg/config"),
+            "XDG_DATA_HOME": str(root / "xdg/data"),
             "SIDEVOICE_DATA_DIR": str(paths["sidevoice"]),
             "SIDEVOICE_CODEX_BIN": codex,
             "SIDEVOICE_SERVICE_MANAGER": "none",

@@ -113,7 +113,7 @@ impl AgentId {
     }
 
     fn label(self) -> String {
-        agent_message(&format!("harness.{}", self.as_str()), &Value::Null)
+        message(&format!("harness.{}", self.as_str()), &Value::Null)
     }
 
     fn config_root(self, profile: &Profile) -> &Path {
@@ -453,7 +453,7 @@ impl HostAgents {
 
         if action == "dismiss" {
             let store = self
-                .update_state(cancel, deadline, |latest| {
+                .update_state(cancel, deadline, false, |latest| {
                     if let Some(fresh) = seen_entry(latest, agent) {
                         if fresh.pointer("/agent/registration").and_then(Value::as_str)
                             == Some("not-connected")
@@ -502,7 +502,7 @@ impl HostAgents {
                 _ => return Err(agent_failure("agents.registration-unknown", agent)),
             }
             let store = self
-                .update_state(cancel, deadline, |latest| {
+                .update_state(cancel, deadline, false, |latest| {
                     if seen_agent(latest, agent)
                         .and_then(|row| row.get("registration"))
                         .and_then(Value::as_str)
@@ -603,6 +603,13 @@ impl HostAgents {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<Value, Failure> {
+        if self
+            .profile
+            .service_stopped()
+            .map_err(|_| Failure::Internal)?
+        {
+            return Err(Failure::Cancelled);
+        }
         let base = state.clone();
         let mut login_path = state
             .get("login_path")
@@ -650,7 +657,7 @@ impl HostAgents {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<Value, Failure> {
-        self.update_state(cancel, deadline, move |latest| {
+        self.update_state(cancel, deadline, true, move |latest| {
             let path_unchanged = latest.get("login_path") == base.get("login_path");
             if path_unchanged {
                 if let Some(path) = captured_path {
@@ -729,6 +736,7 @@ impl HostAgents {
         &self,
         cancel: &Cancellation,
         deadline: Instant,
+        service_scan: bool,
         update: F,
     ) -> std::result::Result<Value, Failure>
     where
@@ -737,6 +745,14 @@ impl HostAgents {
         check_live(cancel, deadline)?;
         let _lock = self.state_lock(cancel, deadline).await?;
         check_live(cancel, deadline)?;
+        if service_scan
+            && self
+                .profile
+                .service_stopped()
+                .map_err(|_| Failure::Internal)?
+        {
+            return Err(Failure::Cancelled);
+        }
         let mut state = load_state_file(&self.profile)?;
         update(&mut state);
         check_live(cancel, deadline)?;
@@ -888,7 +904,7 @@ fn agent_failure(key: &'static str, id: AgentId) -> Failure {
     Failure::keyed(key, json!({"id":id.as_str(),"agent":id.label()}))
 }
 
-fn agent_message(key: &str, params: &Value) -> String {
+pub(crate) fn message(key: &str, params: &Value) -> String {
     static MESSAGES: OnceLock<HashMap<String, String>> = OnceLock::new();
     let messages = MESSAGES.get_or_init(|| {
         serde_json::from_str(include_str!("../../connector/messages/agent-errors.json"))
@@ -1016,7 +1032,7 @@ fn check_live(cancel: &Cancellation, deadline: Instant) -> std::result::Result<(
 }
 
 fn error_value(key: &str, params: Value) -> Value {
-    let message = agent_message(key, &params);
+    let message = message(key, &params);
     json!({"error":{"key":key,"params":params,"message":message}})
 }
 
@@ -1493,7 +1509,7 @@ impl HostAgents {
                         .collect::<Vec<_>>();
                     add.push(selected.command.clone());
                     add.extend(selected.args.clone());
-                    let replace_message = agent_message(
+                    let replace_message = message(
                         "agents.manual.codex.replace-existing",
                         &json!({
                             "remove":shell_command(cli, &remove),

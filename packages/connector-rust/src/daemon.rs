@@ -12,9 +12,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::Duration;
+use tokio::time::Instant;
 
 struct Binding {
     client_ref: String,
@@ -36,11 +37,21 @@ pub struct Daemon {
     replay_tx: mpsc::Sender<()>,
     host_agents: Arc<HostAgents>,
     owner_serial: AtomicU64,
+    client_count: AtomicU64,
+    activity_generation: AtomicU64,
+    managed: bool,
+    shutdown: watch::Sender<bool>,
     rendezvous: Mutex<Option<Value>>,
 }
 
 impl Daemon {
-    fn new(profile: Profile, link: Arc<Link>, replay_tx: mpsc::Sender<()>) -> Result<Arc<Self>> {
+    fn new(
+        profile: Profile,
+        link: Arc<Link>,
+        replay_tx: mpsc::Sender<()>,
+        managed: bool,
+        shutdown: watch::Sender<bool>,
+    ) -> Result<Arc<Self>> {
         let path = profile.data.join("outbox.json");
         let outbox = if path.exists() {
             private_file(&path)?;
@@ -61,6 +72,10 @@ impl Daemon {
             replay_tx,
             host_agents,
             owner_serial: AtomicU64::new(1),
+            client_count: AtomicU64::new(0),
+            activity_generation: AtomicU64::new(0),
+            managed,
+            shutdown,
             rendezvous: Mutex::new(None),
         }))
     }
@@ -299,6 +314,7 @@ impl Daemon {
                 json!({"error":{"key":"pair.proof-only","message":"Pairing is unavailable in the isolated Rust proof."}})
             }
             "connector.error" => json!({}),
+            "node.status" => crate::service::status(&self.profile, true).await,
             _ => json!({"error":{"key":"connector.unknown-method"}}),
         }
     }
@@ -475,6 +491,25 @@ impl Daemon {
             "status" => Ok(
                 json!({"version":env!("CARGO_PKG_VERSION"),"connected":self.link.connected().await,"room_reachable":self.rendezvous.lock().await.clone()}),
             ),
+            "node.status" => Ok(crate::service::status(&self.profile, true).await),
+            "identity" => {
+                let executable = std::env::current_exe()?.canonicalize()?;
+                Ok(json!({"pid":std::process::id(),"executable":executable,"managed":self.managed}))
+            }
+            "shutdown" => {
+                if self.managed {
+                    bail!("managed connector is stopped by its service manager");
+                }
+                let executable = std::env::current_exe()?.canonicalize()?;
+                if params.get("expected_pid").and_then(Value::as_u64)
+                    != Some(std::process::id() as u64)
+                    || params.get("expected_executable").and_then(Value::as_str)
+                        != Some(executable.to_string_lossy().as_ref())
+                {
+                    bail!("private connector identity changed");
+                }
+                Ok(json!({"pid":std::process::id(),"stopping":true}))
+            }
             "pair_device" => {
                 self.link
                     .request("device.pairing_code", json!({}), Duration::from_secs(10))
@@ -658,23 +693,42 @@ impl Daemon {
 
     async fn serve_client(self: Arc<Self>, stream: UnixStream) -> Result<()> {
         let owner = self.owner_serial.fetch_add(1, Ordering::Relaxed);
+        let mut active = false;
+        let mut shutdown = self.shutdown.subscribe();
         let (read, mut write) = stream.into_split();
         let mut reader = BufReader::new(read);
         let result = async {
             loop {
-                let Some(line) = crate::bounded_line(&mut reader, 1 << 20).await? else {
+                let line = tokio::select! {
+                    _ = shutdown.changed() => break,
+                    line = crate::bounded_line(&mut reader, 1 << 20) => line?,
+                };
+                let Some(line) = line else {
                     break;
                 };
                 let request: Value = serde_json::from_str(&line)?;
                 let id = request.get("id").cloned().unwrap_or(Value::Null);
                 let method = request.get("method").and_then(Value::as_str).unwrap_or("");
                 let params = request.get("params").cloned().unwrap_or(json!({}));
+                if !matches!(method, "status" | "node.status" | "identity") {
+                    self.activity_generation.fetch_add(1, Ordering::Relaxed);
+                    if !active {
+                        self.client_count.fetch_add(1, Ordering::Relaxed);
+                        active = true;
+                    }
+                }
                 let answer = match self.command(owner, method, params).await {
                     Ok(result) => json!({"id":id,"ok":true,"result":result}),
                     Err(error) => json!({"id":id,"ok":false,"error":error.to_string()}),
                 };
+                let shutdown_after_reply =
+                    method == "shutdown" && answer.get("ok") == Some(&json!(true));
                 write.write_all(answer.to_string().as_bytes()).await?;
                 write.write_all(b"\n").await?;
+                if shutdown_after_reply {
+                    self.shutdown.send_replace(true);
+                    break;
+                }
             }
             Ok(())
         }
@@ -698,7 +752,14 @@ impl Daemon {
                 )
                 .await;
         }
+        if active {
+            self.client_count.fetch_sub(1, Ordering::Relaxed);
+        }
         result
+    }
+
+    async fn is_idle(&self) -> bool {
+        self.client_count.load(Ordering::Relaxed) == 0 && self.bindings.lock().await.is_empty()
     }
 }
 
@@ -748,7 +809,21 @@ fn prune_binding_order(order: &mut HashMap<String, oneshot::Receiver<()>>) {
     order.retain(|_, tail| matches!(tail.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
 }
 
-pub async fn run(profile: Profile) -> Result<()> {
+pub async fn run(profile: Profile, managed: bool) -> Result<()> {
+    profile.validate_private()?;
+    if managed {
+        #[cfg(not(target_os = "macos"))]
+        bail!("the private managed connector is supported only by macOS launchd");
+        #[cfg(target_os = "macos")]
+        profile.validate_service_environment("launchd")?;
+    }
+    if profile.service_stopped()? {
+        eprintln!(
+            "{}",
+            crate::agents::message("service.node-stopped", &serde_json::Value::Null)
+        );
+        return Ok(());
+    }
     private_dir(&profile.data)?;
     let lock = profile.try_connector_lock()?;
     if profile.socket.exists() {
@@ -757,23 +832,54 @@ pub async fn run(profile: Profile) -> Result<()> {
     }
     let link = Link::new();
     let (replay_tx, mut replay_rx) = mpsc::channel(1);
-    let daemon = Daemon::new(profile.clone(), link.clone(), replay_tx)?;
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let daemon = Daemon::new(
+        profile.clone(),
+        link.clone(),
+        replay_tx,
+        managed,
+        shutdown_tx,
+    )?;
     let (incoming_tx, mut incoming_rx) = mpsc::channel(128);
     let clients = Arc::new(Semaphore::new(32));
     let mut core_tasks = JoinSet::new();
     let mut replay_tasks = JoinSet::new();
+    let mut client_tasks = JoinSet::new();
     let mut replay_again = false;
     let mut core_session = 0u64;
     let mut binding_order = HashMap::<String, oneshot::Receiver<()>>::new();
-    let (ready_tx, ready_rx) = oneshot::channel();
-    tokio::spawn(link.run(profile.clone(), incoming_tx, ready_tx));
-    let ready = ready_rx
-        .await
-        .context("Core hello did not complete")?
-        .map_err(anyhow::Error::msg)?;
+    // Accept MCP before Core is ready. The link task retries the private Core socket until the
+    // separately manager-owned Core job becomes healthy.
     let listener = UnixListener::bind(&profile.socket)?;
     fs::set_permissions(&profile.socket, fs::Permissions::from_mode(0o600))?;
-    profile.write_evidence(&ready)?;
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let link_task = tokio::spawn(link.run(profile.clone(), incoming_tx, ready_tx));
+    drop(ready_rx);
+    let scanner = if managed {
+        let host_agents = daemon.host_agents.clone();
+        let scan_profile = profile.clone();
+        Some(tokio::spawn(async move {
+            loop {
+                if !scan_profile.service_stopped().unwrap_or(true) {
+                    let _ = host_agents
+                        .handle("agents.list", serde_json::json!({"rescan":true}))
+                        .await;
+                }
+                tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
+            }
+        }))
+    } else {
+        None
+    };
+    let mut idle_since = Instant::now();
+    let mut last_activity = daemon.activity_generation.load(Ordering::Relaxed);
+    let mut idle_check = tokio::time::interval_at(
+        Instant::now() + Duration::from_millis(200),
+        Duration::from_millis(200),
+    );
+    idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut link_exited = false;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {
             Some(result) = replay_tasks.join_next(), if !replay_tasks.is_empty() => {
@@ -783,6 +889,9 @@ pub async fn run(profile: Profile) -> Result<()> {
                     let daemon = daemon.clone();
                     replay_tasks.spawn(async move { daemon.flush_outbox().await; });
                 }
+            }
+            Some(result) = client_tasks.join_next(), if !client_tasks.is_empty() => {
+                if let Err(error) = result { eprintln!("[sidevoice rust proof] IPC task: {error}"); }
             }
             Some(()) = replay_rx.recv() => {
                 if replay_tasks.is_empty() {
@@ -800,11 +909,11 @@ pub async fn run(profile: Profile) -> Result<()> {
                 let (stream, _) = accepted?;
                 if let Ok(permit) = clients.clone().try_acquire_owned() {
                     let daemon = daemon.clone();
-                    tokio::spawn(async move { let _permit = permit; if let Err(error) = daemon.serve_client(stream).await { eprintln!("[sidevoice rust proof] IPC: {error}"); } });
+                    client_tasks.spawn(async move { let _permit = permit; daemon.serve_client(stream).await });
                 }
             }
             item = incoming_rx.recv() => {
-                let Some(item) = item else { bail!("Core link task exited"); };
+                let Some(item) = item else { link_exited=true; break; };
                 if item.method == "connector.lost" {
                     if item.session == core_session {
                         core_tasks.abort_all();
@@ -859,8 +968,39 @@ pub async fn run(profile: Profile) -> Result<()> {
                 });
             }
             _ = tokio::signal::ctrl_c() => { break; }
+            _ = terminate.recv() => { break; }
+            _ = shutdown_rx.changed() => { break; }
+            _ = idle_check.tick(), if !managed => {
+                let activity = daemon.activity_generation.load(Ordering::Relaxed);
+                if activity != last_activity {
+                    idle_since = Instant::now();
+                    last_activity = activity;
+                }
+                if daemon.is_idle().await {
+                    if idle_since.elapsed() >= Duration::from_secs(15) { break; }
+                } else {
+                    idle_since = Instant::now();
+                }
+            }
         }
     }
+    daemon.shutdown.send_replace(true);
+    if !client_tasks.is_empty() {
+        let drained = tokio::time::timeout(Duration::from_secs(2), async {
+            while client_tasks.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            client_tasks.abort_all();
+            while client_tasks.join_next().await.is_some() {}
+        }
+    }
+    if let Some(scanner) = scanner {
+        scanner.abort();
+        let _ = scanner.await;
+    }
+    link_task.abort();
+    let _ = link_task.await;
     replay_tasks.abort_all();
     while replay_tasks.join_next().await.is_some() {}
     core_tasks.abort_all();
@@ -868,6 +1008,9 @@ pub async fn run(profile: Profile) -> Result<()> {
     daemon.host_agents.shutdown().await;
     fs::remove_file(&profile.socket)?;
     drop(lock);
+    if link_exited {
+        bail!("Core authentication was refused or its link task exited");
+    }
     Ok(())
 }
 

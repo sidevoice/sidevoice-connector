@@ -36,7 +36,11 @@ impl Fixture {
             Uuid::new_v4()
         ));
         private_mkdir(&root);
-        for name in ["home", "claude", "codex", "cursor", "sidevoice"] {
+        let root = root.canonicalize().unwrap();
+        for name in ["home", "claude", "codex", "cursor", "xdg", "sidevoice"] {
+            private_mkdir(&root.join(name));
+        }
+        for name in ["cursor/config", "cursor/data", "xdg/config", "xdg/data"] {
             private_mkdir(&root.join(name));
         }
         private_mkdir(&root.join("sidevoice/core"));
@@ -46,7 +50,10 @@ impl Fixture {
             home: root.join("home"),
             claude: root.join("claude"),
             codex: root.join("codex"),
-            cursor: root.join("cursor"),
+            cursor: root.join("cursor/config"),
+            cursor_data: root.join("cursor/data"),
+            xdg_config: root.join("xdg/config"),
+            xdg_data: root.join("xdg/data"),
             socket: data.join("connector.sock"),
             core_socket: data.join("core/local.sock"),
             core_ready: data.join("core/core.json"),
@@ -109,12 +116,12 @@ fn identity_signature(id: &str, version: Option<&str>, evidence: &[Evidence<'_>]
 #[test]
 fn agent_refusals_labels_and_manual_text_use_the_shared_english_bundle() {
     assert_eq!(
-        agent_message("agents.invalid", &json!({"agent":"Codex"})),
+        message("agents.invalid", &json!({"agent":"Codex"})),
         "Codex has an unreadable or malformed Sidevoice registration; it was left unchanged."
     );
     assert_eq!(AgentId::Claude.label(), "Claude Code");
     assert_eq!(
-        agent_message(
+        message(
             "agents.manual.codex.replace-existing",
             &json!({"remove":"codex mcp remove sidevoice","add":"codex mcp add sidevoice"})
         ),

@@ -175,9 +175,10 @@ async def copied_state():
         root = Path(temporary)
         root.chmod(0o700)
         home, claude = root / 'home', root / 'claude'
-        data, codex, cursor = root / 'sidevoice', root / 'codex', root / 'cursor'
+        data, codex, cursor = root / 'sidevoice', root / 'codex', root / 'cursor/config'
         core_data = data / 'core'
-        for directory in (home, claude, codex, cursor, data, core_data):
+        for directory in (home, claude, codex, root / 'cursor', root / 'xdg', data, core_data,
+                          cursor, root / 'cursor/data', root / 'xdg/config', root / 'xdg/data'):
             directory.mkdir(mode=0o700)
         thread = str(uuid.uuid4())
         proof_args = ['mcp', '--profile-root', str(root)]
@@ -197,6 +198,8 @@ async def copied_state():
         env = {**os.environ, 'HOME': str(home), 'CLAUDE_CONFIG_DIR': str(claude),
                'SIDEVOICE_DATA_DIR': str(data), 'CODEX_HOME': str(codex),
                'CURSOR_CONFIG_DIR': str(cursor),
+               'CURSOR_DATA_DIR': str(root / 'cursor/data'),
+               'XDG_CONFIG_HOME': str(root / 'xdg/config'), 'XDG_DATA_HOME': str(root / 'xdg/data'),
                'SIDEVOICE_CODEX_BIN': str(fake_codex),
                'CODEX_THREAD_ID': thread, 'SIDEVOICE_SERVICE_MANAGER': 'none'}
         core_env, storage_flag, _, slow_flag = core_faults(root, env)
@@ -249,7 +252,9 @@ async def copied_state():
             await until(lambda: (data / 'outbox.json').exists() and len(json.loads((data / 'outbox.json').read_text())) == 1,
                         'JS-created queued outbox', seconds=25)
             original = json.loads((data / 'outbox.json').read_text())[0]
-            assert original['binding_id'] == old_id and 'client_ref' not in original
+            assert original['binding_id'] == old_id
+            assert (original['client_ref'], original['harness'], original['thread']) == (
+                thread, 'codex', thread), 'JS must save the complete binding identity on new speech rows'
             await finish(js)
             js = None
             js_writer.close()
@@ -326,8 +331,11 @@ async def copied_state():
             js = None
             js_writer.close()
             js_writer = None
-            orphan = {**original, 'event_id': str(uuid.uuid4()), 'utterance_id': str(uuid.uuid4()),
-                      'binding_id': str(uuid.uuid4()), 'text': 'Unattributed historical speech'}
+            orphan = {key: value for key, value in original.items()
+                      if key not in ('client_ref', 'harness', 'thread')}
+            orphan.update({'event_id': str(uuid.uuid4()), 'utterance_id': str(uuid.uuid4()),
+                           'binding_id': str(uuid.uuid4()), 'text': 'Unattributed historical speech'})
+            assert not any(key in orphan for key in ('client_ref', 'harness', 'thread'))
             slow_rows = [{**original, 'event_id': str(uuid.uuid4()), 'utterance_id': str(uuid.uuid4()),
                           'binding_id': again, 'text': f'Slow admitted speech {i}'} for i in (1, 2)]
             (data / 'outbox.json').write_text(json.dumps([orphan, *slow_rows]))
@@ -385,21 +393,53 @@ async def exercise():
         root = Path(temporary)
         root.chmod(0o700)
         home, claude = root / 'home', root / 'claude'
-        data, codex, cursor = root / 'sidevoice', root / 'codex', root / 'cursor'
+        data, codex, cursor = root / 'sidevoice', root / 'codex', root / 'cursor/config'
         core_data = data / 'core'
         rollout_dir = codex / 'sessions' / '2026' / '10' / '03'
-        for directory in (home, claude, data, core_data, codex, cursor, rollout_dir, root / 'bin'):
+        for directory in (home, claude, data, core_data, codex, root / 'cursor', root / 'xdg', rollout_dir, root / 'bin'):
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             directory.chmod(0o700)
-        fresh = await asyncio.create_subprocess_exec(str(binary), 'mcp', '--profile-root', str(root),
+        for directory in (cursor, root / 'cursor/data', root / 'xdg/config', root / 'xdg/data'):
+            directory.mkdir(mode=0o700)
+        # MCP now starts the private connector from the same staged release the
+        # service manager owns. Give this selection-only fixture a private staged
+        # connector and harmless Core executable so it exercises that real path.
+        releases = root / 'releases'
+        release = releases / 'interop'
+        staged_binary = release / 'dist/sidevoice-rust-proof'
+        staged_core = release / 'core/bin/sidevoice-core'
+        for directory in (releases, release, release / 'core', staged_core.parent,
+                          staged_binary.parent):
+            directory.mkdir(mode=0o700)
+            directory.chmod(0o700)
+        shutil.copy2(binary, staged_binary)
+        staged_binary.chmod(0o700)
+        staged_core.write_text('#!/bin/sh\nexit 0\n')
+        staged_core.chmod(0o700)
+        (releases / 'current').symlink_to('interop')
+        fresh_connector_socket = data / 'connector.sock'
+        fresh_connector_started = False
+        fresh = await asyncio.create_subprocess_exec(str(staged_binary), 'mcp', '--profile-root', str(root),
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             env={})
-        fresh_info = await mcp_request(fresh, 'initialize', {'protocolVersion': '2025-06-18',
-            'capabilities': {}, 'clientInfo': {'name': 'codex', 'version': 'isolated-empty-env'}}, 90)
-        assert fresh_info['instructions']
-        fresh_tools = await mcp_request(fresh, 'tools/list', {}, 91)
-        assert len(fresh_tools['tools']) == 6, 'profile-root must reconstruct the selected command with no inherited profile env'
-        await finish(fresh)
+        try:
+            fresh_info = await mcp_request(fresh, 'initialize', {'protocolVersion': '2025-06-18',
+                'capabilities': {}, 'clientInfo': {'name': 'codex', 'version': 'isolated-empty-env'}}, 90)
+            assert fresh_info['instructions']
+            fresh_tools = await mcp_request(fresh, 'tools/list', {}, 91)
+            assert len(fresh_tools['tools']) == 6, 'profile-root must reconstruct the selected command with no inherited profile env'
+            await until(fresh_connector_socket.exists, 'on-demand private connector startup')
+            fresh_connector_started = True
+        except Exception as error:
+            await finish(fresh)
+            stderr = (await fresh.stderr.read()).decode(errors='replace')
+            raise AssertionError(
+                f'fresh profile MCP exited {fresh.returncode}: {stderr.strip()}') from error
+        finally:
+            await finish(fresh)
+            if fresh_connector_started:
+                await until(lambda: not fresh_connector_socket.exists(),
+                            'on-demand connector 15-second idle exit', seconds=22)
         thread = str(uuid.uuid4())
         rollout = rollout_dir / f'rollout-test-{thread}.jsonl'
         rollout.touch(mode=0o600)
@@ -496,6 +536,8 @@ else:
         env = {**os.environ, 'HOME': str(home), 'CLAUDE_CONFIG_DIR': str(claude),
                'SIDEVOICE_DATA_DIR': str(data), 'CODEX_HOME': str(codex),
                'CURSOR_CONFIG_DIR': str(cursor),
+               'CURSOR_DATA_DIR': str(root / 'cursor/data'),
+               'XDG_CONFIG_HOME': str(root / 'xdg/config'), 'XDG_DATA_HOME': str(root / 'xdg/data'),
                'CODEX_THREAD_ID': thread, 'SIDEVOICE_CODEX_BIN': str(fake_codex),
                'SIDEVOICE_CLAUDE_BIN': str(fake_claude),
                'SIDEVOICE_TEST_QUEUE': str(queued), 'SIDEVOICE_TEST_SLOW': str(slow_started)}
@@ -519,6 +561,7 @@ else:
             assert ready['launch_id'] == launch_id and 3 in ready['connector_protocols']
             daemon = await asyncio.create_subprocess_exec(str(binary), 'connector', '--profile-root', str(root), stdout=daemon_log, stderr=daemon_log, env=env)
             await until(lambda: (data / 'connector.sock').exists(), 'Rust connector socket')
+            await until(lambda: (data / 'proof.json').exists(), 'Rust Core link proof')
             evidence = json.loads((data / 'proof.json').read_text())
             assert evidence['pid'] == daemon.pid and evidence['core_launch_id'] == launch_id and evidence['protocol'] == 3
             assert evidence['executable'] == str(binary) and len(evidence['executable_sha256']) == 64
