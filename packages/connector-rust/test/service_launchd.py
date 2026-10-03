@@ -417,11 +417,12 @@ async def exercise():
 
         # A façade and local Core input exercise the manager-owned connector and its actual v3 link.
         thread = str(uuid.uuid4())
+        facade_env = {**control_env, 'CODEX_THREAD_ID': thread}
         daemon_log = (data / 'service' / 'facade.log').open('ab')
         facade = await asyncio.create_subprocess_exec(
             str(staged_binary), 'mcp', '--profile-root', str(profile),
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=daemon_log,
-            env=control_env,
+            env=facade_env,
         )
         await mcp_request(facade, 'initialize', {'protocolVersion': '2025-06-18', 'capabilities': {},
                          'clientInfo': {'name': 'codex', 'version': 'launchd-proof'}}, 1)
