@@ -408,7 +408,8 @@ async def exercise():
         release = releases / 'interop'
         staged_binary = release / 'dist/sidevoice-rust-proof'
         staged_core = release / 'core/bin/sidevoice-core'
-        for directory in (releases, release, staged_binary.parent, staged_core.parent):
+        for directory in (releases, release, release / 'core', staged_core.parent,
+                          release / 'dist', staged_binary.parent):
             directory.mkdir(mode=0o700)
             directory.chmod(0o700)
         shutil.copy2(binary, staged_binary)

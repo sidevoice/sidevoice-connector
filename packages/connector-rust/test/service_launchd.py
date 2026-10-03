@@ -117,7 +117,6 @@ def bootstrap_profile():
 
     (releases / 'current').symlink_to(release_id)
     hold_core = data / 'hold-core-start'
-    hold_core.touch(mode=0o600)
     wait_core = data / 'core-launch-waiting'
     fail_core = data / 'fail-core-start'
     failed_core = data / 'core-failed-start'
@@ -135,6 +134,7 @@ def bootstrap_profile():
     wrapper_self_test = run([str(wrapper), '--self-test'], timeout=60)
     if json.loads(wrapper_self_test.stdout).get('ok') is not True:
         raise AssertionError('the staged launchd Core entrypoint did not pass --self-test')
+    hold_core.touch(mode=0o600)
 
     sentinel = runner_temp / 'sidevoice-real-home-sentinel'
     shutil.rmtree(sentinel, ignore_errors=True)
