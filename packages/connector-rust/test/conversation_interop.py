@@ -143,7 +143,7 @@ async def core_text(core_socket, token, session, thread, phrase):
         'text': phrase, 'session_id': session, 'thread_id': thread,
         'binding_id': selected['binding']['binding_id'], 'message_id': message_id}, token)
     assert result.get('accepted') is True, result
-    return result
+    return {**result, 'session_id':session, 'message_id':message_id}
 
 
 def history(core_socket, token, thread):
