@@ -1,6 +1,14 @@
 # Isolated Rust connector proof
 
-This package is an experimental Rust connector proof. It remains outside the npm package, release selection, service jobs and Desktop pin. It cannot install or start Core. The JavaScript connector remains selected in production.
+This package is an experimental Rust connector proof. It remains outside the npm package, release selection, service jobs and Desktop pin. Its binary cannot install or start Core; `core_acquisition` can only stage a verified Core runtime into an unselected candidate release. The JavaScript connector remains selected in production.
+
+## Core acquisition handoff
+
+`core_acquisition::CorePin` binds a Core version, release channel and exact SHA-256 of the signed producer manifest. `CoreAcquirer::stage_macos_arm64` fetches that pinned manifest and its Sigstore sidecar, verifies the existing Core issuer/workflow/SLSA policy through the shared `sigstore-verify` adapter and public-good TUF root, validates the exact `{bundles,wheel}` schema, then fetches and verifies the signed macOS arm64 bundle. The bundle is safely unpacked into a private temporary directory and the current Python producer's `python/bin/python3 -I -B -m sidevoice_core.server --self-test` must pass before a `StagedCore` is returned. Dropping a staged value removes it. `promote_into_release_stage` only moves it into the caller's still-unselected candidate release and returns `VerifiedCoreRuntime`; it never changes `current` or starts a service.
+
+The API uses the present signed Python Core bundle as its test input. `VerifiedCoreRuntime::current_python_entrypoint` names that current producer's entrypoint explicitly; a future T7 native producer/consumer schema and runtime entrypoint must be coordinated with the Core team. The later release transaction owns pair selection and rollback: Connector requires its pinned compatible Core, and install/update/rollback must treat both artifacts as one user-facing transaction. Core and Connector stay separate processes and signed artifacts. There is no supported independent Core lifecycle for the beta.
+
+The path-filtered `rust-core-acquisition` Actions workflow runs on macOS arm64. It captures one coherent signed nightly fixture per run, verifies and self-tests the real Core bundle, and exercises representative digest, signer identity, transparency, unsafe archive, failed staging and cancellation refusals. It reuses the Sigstore spike's policy tests instead of repeating its large Linux archive matrix.
 
 Create a fresh `0700` profile root `$P` with private `home`, `claude`, `codex`, `cursor` and `sidevoice` directories, plus `sidevoice/core`. Launch a v3-enabled Core separately with `--data-dir $P/sidevoice/core --socket $P/sidevoice/core/local.sock`. Start this binary with `connector --profile-root $P`. Register MCP in the disposable Codex profile with `codex mcp add sidevoice -- /absolute/path/sidevoice-rust-proof mcp --profile-root $P`. The profile-root argument reconstructs all private paths in a fresh process without inherited profile variables.
 

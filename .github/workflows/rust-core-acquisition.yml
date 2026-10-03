@@ -1,0 +1,62 @@
+name: Rust Core acquisition
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/rust-core-acquisition.yml'
+      - 'packages/connector-rust/Cargo.toml'
+      - 'packages/connector-rust/Cargo.lock'
+      - 'packages/connector-rust/src/core_acquisition.rs'
+      - 'packages/connector-rust/src/lib.rs'
+      - 'tools/core-acquisition/**'
+      - 'tools/sigstore-spike/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-core-acquisition-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  macos-arm64-core-acquisition:
+    runs-on: macos-14
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: packages/connector-rust
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Check exact pull request head and runner architecture
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(uname -m)" = arm64
+          echo "PR head: $EXPECTED_HEAD"
+          echo "Runner architecture: $(uname -m)"
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt --component clippy && rustup default 1.89.0
+      - name: Check formatting and locked dependency graph
+        run: cargo fmt --all --check && cargo tree --locked -i sigstore-verify
+      - name: Compile and run unit tests
+        run: cargo clippy --locked --all-targets -- -D warnings && cargo test --locked && cargo build --locked --release
+      - name: Capture one coherent signed nightly Core fixture
+        working-directory: .
+        run: python3 tools/core-acquisition/snapshot.py "$RUNNER_TEMP/core-snapshot"
+      - name: Verify real Core signatures, safe staging and self-test
+        env:
+          SIDEVOICE_CORE_SNAPSHOT: ${{ runner.temp }}/core-snapshot
+          SIDEVOICE_CORE_TUF_CACHE: ${{ runner.temp }}/sigstore-tuf
+        run: |
+          mkdir -m 700 -p "$SIDEVOICE_CORE_TUF_CACHE"
+          cargo test --locked --lib core_acquisition::tests::real_signed_macos_core_snapshot_verifies_extracts_and_self_tests -- --ignored --exact --nocapture
+          cargo test --locked --lib core_acquisition::tests::real_core_snapshot_refuses_wrong_digest_and_transparency_mutation -- --ignored --exact --nocapture
+          cargo test --locked --lib core_acquisition::tests::failed_pin_and_cancellation_leave_no_candidate_core -- --ignored --exact --nocapture
+      - name: Remove downloaded Core fixture and trust cache
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/core-snapshot" "$RUNNER_TEMP/sigstore-tuf"
