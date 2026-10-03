@@ -1011,7 +1011,9 @@ fn looks_absent(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     [
         "no such server",
+        "no such mcp server",
         "no mcp server",
+        "no such mcp entry",
         "not found",
         "does not exist",
         "no entry",
