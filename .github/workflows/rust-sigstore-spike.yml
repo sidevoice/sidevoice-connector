@@ -24,17 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.86.0 --profile minimal --component rustfmt && rustup default 1.86.0
-      - name: Generate initial lockfile for review
-        run: cargo generate-lockfile
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sigstore-spike-cargo-lock
-          path: tools/sigstore-spike/Cargo.lock
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt && rustup default 1.88.0
       - name: Source and dependency revisions
-        run: git rev-parse HEAD && sha256sum Cargo.lock && cargo tree -i sigstore-verify
+        run: git rev-parse HEAD && sha256sum Cargo.lock && cargo tree --locked -i sigstore-verify
       - name: Compile and run pure policy and parser tests
-        run: cargo test
+        run: cargo test --locked && cargo build --locked
       - name: Snapshot one coherent nightly pair and archive bytes
         run: python3 snapshot.py "$RUNNER_TEMP/core-snapshot"
       - name: Rust positive chain and independent asset digest
@@ -95,11 +89,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.86.0 --profile minimal && rustup default 1.86.0
-      - name: Generate initial lockfile for review
-        run: cargo generate-lockfile
+        run: rustup toolchain install 1.88.0 --profile minimal && rustup default 1.88.0
       - name: Compile and run small policy fixture
-        run: cargo test
+        run: cargo test --locked && cargo build --locked
       - name: Verify genuine unrelated npm fixture with its own identity
         run: |
           target/debug/sidevoice-sigstore-spike \
