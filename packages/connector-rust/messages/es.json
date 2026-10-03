@@ -1,0 +1,9 @@
+{
+  "connecting": "Sidevoice: conectando…",
+  "conversationUnknown": "Sidevoice: el conector ya no conoce esta conversación; pide unirte otra vez",
+  "connected": "Sidevoice: esta conversación recibe la voz de la sala (experimental)",
+  "waitingForConnector": "Sidevoice: esperando al conector de este equipo…",
+  "unsignedMessage": "Sidevoice: descartado un mensaje sin firma",
+  "notJoined": "Sidevoice: esta llamada no unió la conversación",
+  "viewUnavailable": "Sidevoice: Cursor no inició la vista"
+}

@@ -1,14 +1,15 @@
 use crate::agents::HostAgents;
+use crate::cursor_app::{AppNotice, CursorApps};
 use crate::link::{Incoming, Link};
 use crate::proof::{atomic_json, private_dir, private_file, verify_socket, Profile};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -19,14 +20,80 @@ use tokio::time::Instant;
 
 struct Binding {
     client_ref: String,
+    harness: String,
     thread: String,
     title: String,
-    owner: u64,
+    delivery: Value,
+    engine: Mutex<Option<Value>>,
+    bridge_chat: Mutex<Option<String>>,
+    transcript_chat: Mutex<Option<String>>,
+    route: Option<String>,
+    capabilities: Value,
+    experimental: Value,
+    inbound: Value,
+    detachable: bool,
+    owner: AtomicU64,
     id: Mutex<String>,
     serial: Mutex<()>,
     pending: Mutex<VecDeque<String>>,
+    turns: Mutex<HashMap<String, String>>,
+    input_context: Mutex<HashMap<String, (String, i64)>>,
     read: Mutex<VecDeque<String>>,
+    working: Mutex<Option<bool>>,
     stopped: AtomicBool,
+}
+
+const CONVERSATION_STATE_MAX_BYTES: usize = 1 << 20;
+const CONVERSATION_GUARD_MAGIC: &[u8; 8] = b"SVGUARD1";
+const GUARD_CLEAR: u8 = 0;
+const GUARD_BLOCK_RESUME: u8 = 1;
+const GUARD_REVOKED: u8 = 2;
+const RESUME_REASON_NONE: u8 = 0;
+const RESUME_REASON_HISTORY: u8 = 1;
+const RESUME_REASON_STORAGE: u8 = 2;
+
+fn prepare_conversation_guard(path: &Path) -> Result<(u8, fs::File)> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            private_file(path)?;
+            let metadata = fs::metadata(path)?;
+            if metadata.len() != 16 || metadata.mode() & 0o200 == 0 {
+                bail!("invalid conversation state guard");
+            }
+            let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+            let mut bytes = [0; 16];
+            file.read_exact(&mut bytes)?;
+            if &bytes[..8] != CONVERSATION_GUARD_MAGIC || bytes[9..].iter().any(|byte| *byte != 0) {
+                bail!("invalid conversation state guard");
+            }
+            if !matches!(bytes[8], GUARD_CLEAR | GUARD_BLOCK_RESUME | GUARD_REVOKED) {
+                bail!("invalid conversation state guard");
+            }
+            Ok((bytes[8], file))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)?;
+            let mut bytes = [0; 16];
+            bytes[..8].copy_from_slice(CONVERSATION_GUARD_MAGIC);
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            fs::File::open(path.parent().context("conversation guard parent")?)?.sync_all()?;
+            file.seek(SeekFrom::Start(0))?;
+            Ok((GUARD_CLEAR, file))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_conversation_guard(file: &mut fs::File, state: u8) -> Result<()> {
+    file.seek(SeekFrom::Start(8))?;
+    file.write_all(&[state])?;
+    file.sync_all()?;
+    Ok(())
 }
 
 pub struct Daemon {
@@ -36,12 +103,20 @@ pub struct Daemon {
     outbox: Mutex<Vec<Value>>,
     replay_tx: mpsc::Sender<()>,
     host_agents: Arc<HostAgents>,
+    cursor_apps: Arc<CursorApps>,
     owner_serial: AtomicU64,
     client_count: AtomicU64,
     activity_generation: AtomicU64,
     managed: bool,
     shutdown: watch::Sender<bool>,
     rendezvous: Mutex<Option<Value>>,
+    refusal: Mutex<Option<String>>,
+    closed_by_room: Mutex<HashMap<String, String>>,
+    latest_closed: Mutex<Option<(String, String)>>,
+    resume_blocked: AtomicBool,
+    resume_block_reason: AtomicU8,
+    conversation_guard: std::sync::Mutex<fs::File>,
+    conversation_state_serial: Mutex<()>,
 }
 
 impl Daemon {
@@ -49,6 +124,7 @@ impl Daemon {
         profile: Profile,
         link: Arc<Link>,
         replay_tx: mpsc::Sender<()>,
+        cursor_apps: Arc<CursorApps>,
         managed: bool,
         shutdown: watch::Sender<bool>,
     ) -> Result<Arc<Self>> {
@@ -64,27 +140,149 @@ impl Daemon {
             Vec::new()
         };
         let host_agents = HostAgents::new(profile.clone())?;
-        Ok(Arc::new(Self {
+        let guard_path = profile.data.join("conversation-state.guard");
+        let (guard_state, conversation_guard) = prepare_conversation_guard(&guard_path)?;
+        let state_path = profile.data.join("conversation-state.json");
+        let state_bytes = if state_path.exists() {
+            private_file(&state_path)?;
+            let metadata = fs::metadata(&state_path)?;
+            if metadata.len() > 8 << 20 {
+                bail!("conversation state too large");
+            }
+            Some(fs::read(&state_path)?)
+        } else {
+            None
+        };
+        let state = state_bytes
+            .as_deref()
+            .map(serde_json::from_slice::<Value>)
+            .transpose()
+            .context("invalid conversation state")?
+            .unwrap_or_else(|| json!({}));
+        let legacy_state_oversized = state_bytes
+            .as_ref()
+            .is_some_and(|bytes| bytes.len() > CONVERSATION_STATE_MAX_BYTES);
+        let resume_blocked = state
+            .get("resume_blocked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || legacy_state_oversized
+            || guard_state != GUARD_CLEAR;
+        let resume_block_reason = if guard_state != GUARD_CLEAR
+            || state.get("resume_block_reason").and_then(Value::as_str)
+                == Some("state_write_failed")
+        {
+            RESUME_REASON_STORAGE
+        } else if resume_blocked {
+            RESUME_REASON_HISTORY
+        } else {
+            RESUME_REASON_NONE
+        };
+        let closed_by_room = state
+            .get("closed_by_room")
+            .and_then(Value::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|(client_ref, reason)| {
+                        reason
+                            .as_str()
+                            .map(|reason| (client_ref.clone(), reason.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut refusal = state
+            .get("refused")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if guard_state == GUARD_REVOKED {
+            refusal = Some("connector_revoked".to_owned());
+        }
+        if resume_blocked && refusal.as_ref().is_some_and(|reason| reason.len() > 4096) {
+            refusal = Some("connector_revoked".to_owned());
+        }
+        let daemon = Arc::new(Self {
             profile,
             link,
             bindings: Mutex::new(HashMap::new()),
             outbox: Mutex::new(outbox),
             replay_tx,
             host_agents,
+            cursor_apps,
             owner_serial: AtomicU64::new(1),
             client_count: AtomicU64::new(0),
             activity_generation: AtomicU64::new(0),
             managed,
             shutdown,
             rendezvous: Mutex::new(None),
-        }))
+            refusal: Mutex::new(refusal.clone()),
+            closed_by_room: Mutex::new(if resume_blocked {
+                if legacy_state_oversized {
+                    HashMap::new()
+                } else {
+                    closed_by_room
+                }
+            } else {
+                closed_by_room
+            }),
+            latest_closed: Mutex::new(None),
+            resume_blocked: AtomicBool::new(resume_blocked),
+            resume_block_reason: AtomicU8::new(resume_block_reason),
+            conversation_guard: std::sync::Mutex::new(conversation_guard),
+            conversation_state_serial: Mutex::new(()),
+        });
+        if legacy_state_oversized {
+            let compacted = json!({"refused":refusal.clone(),"closed_by_room":{},
+                "resume_blocked":true,"resume_block_reason":daemon.resume_block_reason()});
+            if let Err(error) = atomic_json(
+                &daemon.profile.data.join("conversation-state.json"),
+                &compacted,
+            ) {
+                eprintln!("[sidevoice rust proof] compact conversation state: {error}");
+                let mut guard = daemon
+                    .conversation_guard
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("conversation guard lock poisoned"))?;
+                write_conversation_guard(
+                    &mut guard,
+                    if refusal.is_some() {
+                        GUARD_REVOKED
+                    } else {
+                        GUARD_BLOCK_RESUME
+                    },
+                )?;
+            } else if guard_state != GUARD_CLEAR {
+                let mut guard = daemon
+                    .conversation_guard
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("conversation guard lock poisoned"))?;
+                write_conversation_guard(&mut guard, GUARD_CLEAR)?;
+            }
+        }
+        let announcer = daemon.clone();
+        let mut stop = daemon.shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => announcer.reannounce_working().await,
+                    changed = stop.changed() => {
+                        if changed.is_err() || *stop.borrow() { break; }
+                    }
+                }
+            }
+        });
+        Ok(daemon)
     }
 
     async fn register_core(&self, binding: &Arc<Binding>) -> Result<Value> {
         let mut current = binding.id.lock().await;
-        let mut frame = json!({"client_ref":binding.client_ref,"harness":"codex","thread":binding.thread,"title":binding.title,
-            "inbound":{"ok":true}, "capabilities":{"deliver":"supported","inspectInbound":"unsupported","working":"supported","endOfTurn":"supported","sessionIdentity":"supported"},
-            "experimental":[],"engine":null,"focus":false});
+        let engine = binding.engine.lock().await.clone().unwrap_or(Value::Null);
+        let mut frame = json!({"client_ref":binding.client_ref,"harness":binding.harness,"thread":binding.thread,"title":binding.title,"delivery":binding.delivery,
+            "inbound":binding.inbound,"capabilities":binding.capabilities,
+            "experimental":binding.experimental,"route":binding.route,"engine":engine,"focus":false});
         if !current.starts_with("local-") {
             frame["binding_id"] = json!(*current);
         }
@@ -135,6 +333,11 @@ impl Daemon {
         for binding in bindings {
             if let Err(error) = self.register_core(&binding).await {
                 eprintln!("[sidevoice rust proof] binding replay: {error}");
+                continue;
+            }
+            let working = *binding.working.lock().await;
+            if let Some(working) = working {
+                self.report_working(&binding, working).await;
             }
         }
         self.request_replay();
@@ -143,6 +346,194 @@ impl Daemon {
     fn request_replay(&self) {
         // A full slot already requests a pass; the run loop owns its one replay task.
         let _ = self.replay_tx.try_send(());
+    }
+
+    fn resume_block_reason(&self) -> Option<&'static str> {
+        match self.resume_block_reason.load(Ordering::Acquire) {
+            RESUME_REASON_STORAGE => Some("state_write_failed"),
+            RESUME_REASON_HISTORY => Some("conversation_history_limit"),
+            _ => None,
+        }
+    }
+
+    fn arm_conversation_guard(&self, revoked: bool) -> Result<()> {
+        let state = if revoked {
+            GUARD_REVOKED
+        } else {
+            GUARD_BLOCK_RESUME
+        };
+        let mut guard = self
+            .conversation_guard
+            .lock()
+            .map_err(|_| anyhow::anyhow!("conversation guard lock poisoned"))?;
+        write_conversation_guard(&mut guard, state)
+    }
+
+    async fn check_registration_allowed(&self, client_ref: &str, resume: bool) -> Result<()> {
+        if let Some(reason) = self.refusal.lock().await.clone() {
+            if resume {
+                bail!("CLOSED_BY_ROOM:connector_revoked:{client_ref}");
+            }
+            bail!("the room revoked this connector pairing: {reason}");
+        }
+        if resume {
+            let closed = self.closed_by_room.lock().await;
+            if self.resume_blocked.load(Ordering::Acquire) {
+                bail!("CLOSED_BY_ROOM:conversation_history_limit:{client_ref}");
+            }
+            if let Some(reason) = closed.get(client_ref) {
+                bail!("CLOSED_BY_ROOM:{reason}:{client_ref}");
+            }
+        }
+        Ok(())
+    }
+
+    fn mark_state_write_failed(&self, revoked: bool) {
+        self.resume_blocked.store(true, Ordering::Release);
+        self.resume_block_reason
+            .store(RESUME_REASON_STORAGE, Ordering::Release);
+        let guard = if revoked {
+            GUARD_REVOKED
+        } else {
+            GUARD_BLOCK_RESUME
+        };
+        let result = self
+            .conversation_guard
+            .lock()
+            .map_err(|_| anyhow::anyhow!("conversation guard lock poisoned"))
+            .and_then(|mut file| write_conversation_guard(&mut file, guard));
+        if let Err(error) = result {
+            eprintln!("[sidevoice rust proof] emergency conversation guard: {error}");
+            let _ = self.shutdown.send(true);
+        }
+    }
+
+    async fn persist_conversation_state(&self) {
+        let mut refused = self.refusal.lock().await.clone();
+        let mut closed = self.closed_by_room.lock().await;
+        let mut state = json!({"refused":refused.clone(),"closed_by_room":closed.clone(),
+            "resume_blocked":self.resume_blocked.load(Ordering::Acquire),
+            "resume_block_reason":self.resume_block_reason()});
+        let encoded = serde_json::to_vec(&state);
+        match encoded {
+            Ok(bytes) if bytes.len() > CONVERSATION_STATE_MAX_BYTES => {
+                if !self.resume_blocked.swap(true, Ordering::AcqRel) {
+                    self.resume_block_reason
+                        .store(RESUME_REASON_HISTORY, Ordering::Release);
+                }
+                let latest_closed = self.latest_closed.lock().await.clone();
+                closed.clear();
+                if let Some((client_ref, reason)) = latest_closed {
+                    closed.insert(client_ref, reason);
+                }
+                if refused.as_ref().is_some_and(|reason| reason.len() > 4096) {
+                    refused = Some("connector_revoked".to_owned());
+                    *self.refusal.lock().await = refused.clone();
+                }
+                state = json!({"refused":refused.clone(),
+                    "closed_by_room":closed.clone(),"resume_blocked":true,
+                    "resume_block_reason":self.resume_block_reason()});
+            }
+            Err(error) => {
+                eprintln!("[sidevoice rust proof] conversation state: {error}");
+                self.mark_state_write_failed(refused.is_some());
+                return;
+            }
+            _ => {}
+        }
+        if serde_json::to_vec(&state)
+            .map_or(true, |bytes| bytes.len() > CONVERSATION_STATE_MAX_BYTES)
+        {
+            closed.clear();
+            self.mark_state_write_failed(refused.is_some());
+            state = json!({"refused":refused.clone(),"closed_by_room":{},
+                "resume_blocked":true,"resume_block_reason":self.resume_block_reason()});
+            if serde_json::to_vec(&state)
+                .map_or(true, |bytes| bytes.len() > CONVERSATION_STATE_MAX_BYTES)
+            {
+                eprintln!(
+                    "[sidevoice rust proof] compact conversation state exceeds its size limit"
+                );
+                return;
+            }
+        }
+        if let Err(error) = atomic_json(&self.profile.data.join("conversation-state.json"), &state)
+        {
+            eprintln!("[sidevoice rust proof] conversation state: {error}");
+            self.mark_state_write_failed(refused.is_some());
+        } else if let Err(error) = self
+            .conversation_guard
+            .lock()
+            .map_err(|_| anyhow::anyhow!("conversation guard lock poisoned"))
+            .and_then(|mut file| write_conversation_guard(&mut file, GUARD_CLEAR))
+        {
+            eprintln!("[sidevoice rust proof] clear conversation guard: {error}");
+            self.mark_state_write_failed(refused.is_some());
+        }
+    }
+
+    async fn send_working_event(&self, binding: &Binding, mut event: Value) {
+        let current = binding.working.lock().await;
+        if event.get("working").and_then(Value::as_bool) != *current {
+            return;
+        }
+        let id = binding.id.lock().await.clone();
+        if id.starts_with("local-") {
+            return;
+        }
+        event["binding_id"] = json!(id);
+        let _ = self.link.notify("input.working", event).await;
+    }
+
+    async fn report_working_event(&self, binding: &Binding, event: Value) {
+        if let Some(working) = event.get("working").and_then(Value::as_bool) {
+            *binding.working.lock().await = Some(working);
+            self.send_working_event(binding, event).await;
+        }
+    }
+
+    async fn report_working(&self, binding: &Binding, working: bool) {
+        self.report_working_event(binding, json!({"working":working,"turn_id":Value::Null}))
+            .await;
+    }
+
+    async fn report_engine(&self, binding: &Binding, engine: Value) {
+        if !engine
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(|model| !model.is_empty())
+        {
+            return;
+        }
+        let mut current = binding.engine.lock().await;
+        let same = current.as_ref().is_some_and(|previous| {
+            ["model", "effort", "thinking"]
+                .iter()
+                .all(|key| previous.get(key) == engine.get(key))
+        });
+        if same {
+            return;
+        }
+        *current = Some(engine.clone());
+        drop(current);
+        let id = binding.id.lock().await.clone();
+        if !id.starts_with("local-") {
+            let _ = self
+                .link
+                .notify("input.engine", json!({"binding_id":id,"engine":engine}))
+                .await;
+        }
+    }
+
+    async fn reannounce_working(&self) {
+        let bindings: Vec<_> = self.bindings.lock().await.values().cloned().collect();
+        for binding in bindings {
+            let working = *binding.working.lock().await;
+            if let Some(working) = working {
+                self.send_working_event(&binding, json!({"working":working,"turn_id":Value::Null}))
+                    .await;
+            }
+        }
     }
 
     fn outbox_path(&self) -> PathBuf {
@@ -293,18 +684,72 @@ impl Daemon {
             }
             "input.deliver" => self.deliver(params).await,
             "binding.close" => {
+                let _state_transaction = self.conversation_state_serial.lock().await;
                 let id = params
                     .get("binding_id")
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 if let Some(binding) = self.binding_for_id(id).await {
+                    if let Err(error) = self.arm_conversation_guard(false) {
+                        eprintln!("[sidevoice rust proof] arm conversation guard: {error}");
+                        self.mark_state_write_failed(false);
+                        let _ = self.shutdown.send(true);
+                    }
                     binding.stopped.store(true, Ordering::Relaxed);
                     self.bindings.lock().await.remove(&binding.client_ref);
+                    let reason = params
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("closed_from_room")
+                        .to_owned();
+                    {
+                        let mut closed = self.closed_by_room.lock().await;
+                        closed.insert(binding.client_ref.clone(), reason.clone());
+                        *self.latest_closed.lock().await =
+                            Some((binding.client_ref.clone(), reason));
+                    }
+                    self.persist_conversation_state().await;
+                    self.cursor_apps.close(&binding.thread).await;
+                    drop(_state_transaction);
                 }
                 json!({})
             }
             "node.rendezvous" => {
+                let _state_transaction = self.conversation_state_serial.lock().await;
+                let previous_refusal = self.refusal.lock().await.clone();
                 *self.rendezvous.lock().await = Some(params.clone());
+                let refusal = params
+                    .get("refused")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned);
+                if let Some(reason) = refusal {
+                    if let Err(error) = self.arm_conversation_guard(true) {
+                        eprintln!("[sidevoice rust proof] arm revocation guard: {error}");
+                        self.mark_state_write_failed(true);
+                        let _ = self.shutdown.send(true);
+                    }
+                    *self.refusal.lock().await = Some(reason);
+                    let bindings: Vec<_> = self.bindings.lock().await.values().cloned().collect();
+                    for binding in &bindings {
+                        binding.stopped.store(true, Ordering::Relaxed);
+                        self.bindings.lock().await.remove(&binding.client_ref);
+                        {
+                            let mut closed = self.closed_by_room.lock().await;
+                            closed.insert(binding.client_ref.clone(), "connector_revoked".into());
+                            *self.latest_closed.lock().await =
+                                Some((binding.client_ref.clone(), "connector_revoked".into()));
+                        }
+                    }
+                    self.persist_conversation_state().await;
+                    for binding in bindings {
+                        self.cursor_apps.close(&binding.thread).await;
+                    }
+                    drop(_state_transaction);
+                } else if previous_refusal.is_some() {
+                    *self.refusal.lock().await = None;
+                    self.persist_conversation_state().await;
+                }
                 json!({})
             }
             "agents.list" | "agents.connect" | "agents.disconnect" | "agents.dismiss" => {
@@ -317,6 +762,52 @@ impl Daemon {
             "node.status" => crate::service::status(&self.profile, true).await,
             _ => json!({"error":{"key":"connector.unknown-method"}}),
         }
+    }
+
+    async fn handle_app_notice(&self, notice: AppNotice) {
+        let (thread, message_id, answered) = match notice {
+            AppNotice::Dispatched { thread, message_id } => (thread, message_id, None),
+            AppNotice::Answered {
+                thread,
+                message_id,
+                ok,
+            } => (thread, message_id, Some(ok)),
+        };
+        let binding = self.bindings.lock().await.get(&thread).cloned();
+        let Some(binding) = binding else {
+            return;
+        };
+        if answered.is_none() || answered == Some(false) {
+            return;
+        }
+        let context = binding.input_context.lock().await.get(&message_id).cloned();
+        let Some((session_id, revision)) = context else {
+            return;
+        };
+        let mut pending = binding.pending.lock().await;
+        if !pending.iter().any(|id| id == &message_id) {
+            return;
+        }
+        pending.retain(|id| id != &message_id);
+        drop(pending);
+        let mut read = binding.read.lock().await;
+        if read.iter().any(|id| id == &message_id) {
+            return;
+        }
+        read.push_back(message_id.clone());
+        if read.len() > 512 {
+            read.pop_front();
+        }
+        drop(read);
+        let binding_id = binding.id.lock().await.clone();
+        let _ = self
+            .link
+            .notify(
+                "input.read",
+                json!({"binding_id":binding_id,"message_id":message_id,
+            "session_id":session_id,"revision":revision,"turn_id":Value::Null}),
+            )
+            .await;
     }
 
     async fn deliver(&self, frame: &Value) -> Value {
@@ -350,36 +841,81 @@ impl Daemon {
                 pending.pop_front();
             }
         }
-        let channel = frame
-            .get("channel")
-            .and_then(Value::as_str)
-            .unwrap_or("voice");
-        let header = json!({"channel":channel,"session_id":session_id,"revision":revision,"message_id":message_id});
-        let note = if channel == "voice" {
-            format!("\n\n[Sidevoice] Voice from the room: acknowledge with voice_say (session_id \"{session_id}\", revision {revision}) before any other tool, then work and reply by voice, as the sidevoice server's instructions say.")
-        } else {
-            String::new()
-        };
-        let envelope = format!("{header}\n\n{text}{note}");
-        let binary = std::env::var("SIDEVOICE_CODEX_BIN").unwrap_or_else(|_| "codex".into());
-        let output = tokio::time::timeout(
-            Duration::from_secs(30),
-            tokio::process::Command::new(binary)
-                .kill_on_drop(true)
-                .env("CODEX_HOME", &self.profile.codex)
-                .args(["queue", "--thread", &binding.thread, "--message", &envelope])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status(),
-        )
-        .await;
-        match output {
-            Ok(Ok(result)) if result.success() => {
-                json!({"status":"accepted","detail":"codex queue confirmed the thread"})
+        {
+            let mut turns = binding.turns.lock().await;
+            turns.insert(format!("{session_id}:{revision}"), message_id.to_owned());
+            if turns.len() > 512 {
+                if let Some(oldest) = turns.keys().next().cloned() {
+                    turns.remove(&oldest);
+                }
             }
-            _ => {
+        }
+        binding
+            .input_context
+            .lock()
+            .await
+            .insert(message_id.to_owned(), (session_id.to_owned(), revision));
+        if binding.delivery.get("kind").and_then(Value::as_str) == Some("cursor-app") {
+            let mut delivery = binding.delivery.clone();
+            let composer = binding.bridge_chat.lock().await.clone().or_else(|| {
+                delivery
+                    .get("composer")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+            let composer = match composer {
+                Some(composer) => Some(composer),
+                None => crate::adapters::cursor::composer_holding(&delivery).await,
+            };
+            if let Some(composer) = composer {
+                delivery["composer"] = json!(composer);
+                *binding.bridge_chat.lock().await = Some(composer);
+                if let Some(result) =
+                    crate::adapters::cursor::deliver_editor(&delivery, frame).await
+                {
+                    return result;
+                }
+            }
+            return match self
+                .cursor_apps
+                .deliver(
+                    &binding.thread,
+                    message_id,
+                    crate::adapters::envelope(frame).unwrap_or_else(|_| text.to_owned()),
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    binding.pending.lock().await.retain(|id| id != message_id);
+                    binding
+                        .turns
+                        .lock()
+                        .await
+                        .remove(&format!("{session_id}:{revision}"));
+                    binding.input_context.lock().await.remove(message_id);
+                    json!({"status":"failed","detail":error.to_string()})
+                }
+            };
+        }
+        match crate::adapters::deliver(
+            &binding.delivery,
+            &binding.thread,
+            &self.profile.codex,
+            frame,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
                 binding.pending.lock().await.retain(|id| id != message_id);
-                json!({"status":"failed","detail":"codex queue failed"})
+                binding
+                    .turns
+                    .lock()
+                    .await
+                    .remove(&format!("{session_id}:{revision}"));
+                binding.input_context.lock().await.remove(message_id);
+                json!({"status":"failed","detail":error.to_string()})
             }
         }
     }
@@ -392,6 +928,7 @@ impl Daemon {
                     .and_then(Value::as_str)
                     .context("client_ref required")?
                     .to_owned();
+                let resume = params.get("resume") == Some(&json!(true));
                 let thread = params
                     .get("thread")
                     .and_then(Value::as_str)
@@ -402,52 +939,169 @@ impl Daemon {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_owned();
-                if params.get("harness") != Some(&json!("codex"))
-                    || params.pointer("/delivery/kind") != Some(&json!("codex-queue"))
-                {
-                    bail!("only Codex queued delivery is available in this proof");
+                let harness = params
+                    .get("harness")
+                    .and_then(Value::as_str)
+                    .context("harness required")?
+                    .to_owned();
+                let delivery = params
+                    .get("delivery")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"kind":"none"}));
+                let kind = delivery.get("kind").and_then(Value::as_str).unwrap_or("");
+                let route_ok = match kind {
+                    "codex-queue" => {
+                        harness == "codex"
+                            && delivery.get("thread").and_then(Value::as_str)
+                                == Some(thread.as_str())
+                    }
+                    "claude-uds" => {
+                        harness == "claude"
+                            && delivery.get("socket").and_then(Value::as_str).is_some()
+                    }
+                    "cursor-tmux" => {
+                        harness == "cursor"
+                            && delivery.get("chat").and_then(Value::as_str) == Some(thread.as_str())
+                    }
+                    "cursor-app" => {
+                        harness == "cursor"
+                            && delivery.get("thread").and_then(Value::as_str)
+                                == Some(thread.as_str())
+                    }
+                    "http" => {
+                        delivery.get("thread").and_then(Value::as_str) == Some(thread.as_str())
+                    }
+                    "none" => harness == "cursor",
+                    _ => false,
+                };
+                if !route_ok {
+                    bail!("harness identity does not match its delivery route");
                 }
-                if params.pointer("/delivery/thread").and_then(Value::as_str)
-                    != Some(thread.as_str())
-                {
-                    bail!("delivery thread mismatch");
-                }
+                let capabilities = params
+                    .get("capabilities")
+                    .cloned()
+                    .unwrap_or_else(|| crate::adapters::advertised_capabilities(&harness));
+                let experimental = params
+                    .get("experimental")
+                    .cloned()
+                    .unwrap_or_else(|| json!([]));
+                let inbound = params.get("inbound").cloned().unwrap_or(Value::Null);
+                let route = params
+                    .get("route")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let detachable = params.get("detachable") == Some(&json!(true));
+                let _state_transaction = self.conversation_state_serial.lock().await;
+                self.check_registration_allowed(&client_ref, resume).await?;
                 let existing = { self.bindings.lock().await.get(&client_ref).cloned() };
                 if let Some(existing) = existing {
-                    if existing.owner != owner {
+                    if existing.owner.load(Ordering::Relaxed) != owner {
                         bail!("binding belongs to another façade");
                     }
+                    let binding_id = existing.id.lock().await.clone();
+                    drop(_state_transaction);
                     return Ok(
-                        json!({"binding_id":*existing.id.lock().await,"thread":thread,"connected":self.link.connected().await}),
+                        json!({"binding_id":binding_id,"thread":thread,"connected":self.link.connected().await,"prepared":null}),
                     );
                 }
+                drop(_state_transaction);
                 let binding = Arc::new(Binding {
                     client_ref: client_ref.clone(),
+                    harness,
                     thread: thread.clone(),
                     title,
-                    owner,
+                    delivery: delivery.clone(),
+                    engine: Mutex::new(
+                        params
+                            .get("engine")
+                            .filter(|value| !value.is_null())
+                            .cloned(),
+                    ),
+                    bridge_chat: Mutex::new(None),
+                    transcript_chat: Mutex::new(None),
+                    route,
+                    capabilities,
+                    experimental,
+                    inbound,
+                    detachable,
+                    owner: AtomicU64::new(owner),
                     id: Mutex::new(format!("local-{}", uuid::Uuid::new_v4())),
                     serial: Mutex::new(()),
                     pending: Mutex::new(VecDeque::new()),
+                    turns: Mutex::new(HashMap::new()),
+                    input_context: Mutex::new(HashMap::new()),
                     read: Mutex::new(VecDeque::new()),
+                    working: Mutex::new(None),
                     stopped: AtomicBool::new(false),
                 });
+                let _state_transaction = self.conversation_state_serial.lock().await;
+                self.check_registration_allowed(&client_ref, resume).await?;
+                if let Some(existing) = self.bindings.lock().await.get(&client_ref).cloned() {
+                    if existing.owner.load(Ordering::Relaxed) != owner {
+                        bail!("binding belongs to another façade");
+                    }
+                    let binding_id = existing.id.lock().await.clone();
+                    drop(_state_transaction);
+                    return Ok(json!({"binding_id":binding_id,"thread":thread,
+                        "connected":self.link.connected().await,"prepared":null}));
+                }
+                let prepared = if kind == "cursor-app" {
+                    let key = delivery
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .context("Cursor card key missing")?;
+                    Some(json!({"port":self.cursor_apps.open(&thread, key).await?}))
+                } else {
+                    None
+                };
                 self.bindings
                     .lock()
                     .await
                     .insert(client_ref, binding.clone());
-                self.clone().watch_rollout(binding.clone());
+                {
+                    let mut closed = self.closed_by_room.lock().await;
+                    closed.remove(&binding.client_ref);
+                    let mut latest_closed = self.latest_closed.lock().await;
+                    if latest_closed
+                        .as_ref()
+                        .is_some_and(|(client_ref, _)| client_ref == &binding.client_ref)
+                    {
+                        *latest_closed = None;
+                    }
+                }
+                self.persist_conversation_state().await;
+                drop(_state_transaction);
+                self.clone().watch_binding(binding.clone());
                 let result = self.register_core(&binding).await;
                 let id = binding.id.lock().await.clone();
                 if result.is_ok() {
                     self.request_replay();
                 }
                 Ok(
-                    json!({"binding_id":id,"thread":thread,"connected":result.is_ok(),"pending":result.is_err()}),
+                    json!({"binding_id":id,"thread":thread,"connected":result.is_ok(),"pending":result.is_err(),"prepared":prepared}),
                 )
             }
             "publish" => {
-                let binding = self.find_owned(owner, &params).await?;
+                if let Some(reason) = self.refusal.lock().await.clone() {
+                    bail!("CLOSED_BY_ROOM:connector_revoked:{reason}");
+                }
+                if let Some(client_ref) = params.get("client_ref").and_then(Value::as_str) {
+                    if let Some(reason) = self.closed_by_room.lock().await.get(client_ref).cloned()
+                    {
+                        bail!("CLOSED_BY_ROOM:{reason}:{client_ref}");
+                    }
+                }
+                if let Some(refs) = params.get("client_refs").and_then(Value::as_array) {
+                    for item in refs {
+                        if let Some(client_ref) = item.as_str() {
+                            if let Some(reason) =
+                                self.closed_by_room.lock().await.get(client_ref).cloned()
+                            {
+                                bail!("CLOSED_BY_ROOM:{reason}:{client_ref}");
+                            }
+                        }
+                    }
+                }
                 let session_id = params
                     .get("session_id")
                     .and_then(Value::as_str)
@@ -456,6 +1110,14 @@ impl Daemon {
                     .get("revision")
                     .and_then(Value::as_i64)
                     .context("revision required")?;
+                let routed = params.get("client_refs").is_some()
+                    || params.get("adopt_orphans") == Some(&json!(true));
+                let (binding, adopted) = if routed {
+                    self.find_for_turn(owner, &params, session_id, revision)
+                        .await?
+                } else {
+                    (self.find_owned(owner, &params).await?, false)
+                };
                 let text = params
                     .get("text")
                     .and_then(Value::as_str)
@@ -471,14 +1133,23 @@ impl Daemon {
                 self.queue(speech.clone()).await?;
                 drop(id);
                 let answer = self.publish_one(&speech).await?;
-                Ok(answer.unwrap_or_else(
+                let mut result = answer.unwrap_or_else(
                     || json!({"status":"queued","utterance_id":speech["utterance_id"]}),
-                ))
+                );
+                if adopted {
+                    result["adopted"] = json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,
+                        "harness":binding.harness,"title":binding.title,"delivery":binding.delivery,"route":binding.route,
+                        "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound});
+                }
+                Ok(result)
             }
             "unregister" => {
+                let _state_transaction = self.conversation_state_serial.lock().await;
                 let binding = self.find_owned(owner, &params).await?;
                 binding.stopped.store(true, Ordering::Relaxed);
                 self.bindings.lock().await.remove(&binding.client_ref);
+                self.cursor_apps.close(&binding.thread).await;
+                drop(_state_transaction);
                 let _ = self
                     .link
                     .notify(
@@ -488,9 +1159,6 @@ impl Daemon {
                     .await;
                 Ok(json!({"left":true,"connected":self.link.connected().await}))
             }
-            "status" => Ok(
-                json!({"version":env!("CARGO_PKG_VERSION"),"connected":self.link.connected().await,"room_reachable":self.rendezvous.lock().await.clone()}),
-            ),
             "node.status" => Ok(crate::service::status(&self.profile, true).await),
             "identity" => {
                 let executable = std::env::current_exe()?.canonicalize()?;
@@ -510,6 +1178,68 @@ impl Daemon {
                 }
                 Ok(json!({"pid":std::process::id(),"stopping":true}))
             }
+            "adopt" => {
+                let client_ref = params
+                    .get("client_ref")
+                    .and_then(Value::as_str)
+                    .context("client_ref required")?;
+                let binding = self
+                    .bindings
+                    .lock()
+                    .await
+                    .get(client_ref)
+                    .cloned()
+                    .context("unknown editor conversation")?;
+                if !binding.detachable
+                    || binding.harness != "cursor"
+                    || !client_ref.starts_with("cursor-editor-")
+                {
+                    bail!("conversation cannot be adopted");
+                }
+                let previous = binding.owner.load(Ordering::Relaxed);
+                if previous != 0 && previous != owner {
+                    bail!("binding belongs to another façade");
+                }
+                binding.owner.store(owner, Ordering::Relaxed);
+                Ok(
+                    json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,"thread":binding.thread,
+                    "harness":binding.harness,"title":binding.title,"delivery":binding.delivery,"route":binding.route,
+                    "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound,"detachable":binding.detachable,
+                    "engine":binding.engine.lock().await.clone()}),
+                )
+            }
+            "status" => {
+                let bindings: Vec<_> = self.bindings.lock().await.values().cloned().collect();
+                let mut listed = Vec::with_capacity(bindings.len());
+                for binding in bindings {
+                    let engine = binding.engine.lock().await.clone();
+                    let working = *binding.working.lock().await;
+                    let mut item = json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,
+                        "harness":binding.harness,"thread":binding.thread,"title":binding.title,"delivery":binding.delivery,
+                        "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound,
+                        "engine":engine,"working":working});
+                    if binding.delivery.get("kind").and_then(Value::as_str) == Some("cursor-app") {
+                        let mut state = self.cursor_apps.status(&binding.thread).await;
+                        state["bridge_chat_known"] =
+                            json!(binding.bridge_chat.lock().await.is_some());
+                        item["delivery_state"] = state;
+                        item["cursor_app_port"] = json!(self.cursor_apps.port().await);
+                    }
+                    listed.push(item);
+                }
+                let closed = self.closed_by_room.lock().await.clone();
+                let closed_by_room = closed.keys().cloned().collect::<Vec<_>>();
+                let room_reachable = self.rendezvous.lock().await.clone();
+                let refused = self.refusal.lock().await.clone();
+                let resume_block_reason = self.resume_block_reason();
+                Ok(
+                    json!({"version":env!("CARGO_PKG_VERSION"),"connected":self.link.connected().await,
+                    "room_reachable":room_reachable,"bindings":listed,
+                    "closed_by_room":closed_by_room,"closed_reasons":closed,"refused":refused,
+                    "resume_blocked":self.resume_blocked.load(Ordering::Acquire),
+                    "resume_block_reason":resume_block_reason}),
+                )
+            }
             "pair_device" => {
                 self.link
                     .request("device.pairing_code", json!({}), Duration::from_secs(10))
@@ -525,12 +1255,430 @@ impl Daemon {
             let id = b.id.lock().await.clone();
             if (params.get("client_ref").and_then(Value::as_str) == Some(b.client_ref.as_str())
                 || params.get("binding_id").and_then(Value::as_str) == Some(id.as_str()))
-                && b.owner == owner
+                && b.owner.load(Ordering::Relaxed) == owner
             {
                 return Ok(b);
             }
         }
         bail!("unknown binding")
+    }
+
+    async fn find_for_turn(
+        &self,
+        owner: u64,
+        params: &Value,
+        session_id: &str,
+        revision: i64,
+    ) -> Result<(Arc<Binding>, bool)> {
+        let allowed = params
+            .get("client_refs")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let adopt_orphans = params.get("adopt_orphans") == Some(&json!(true));
+        let key = format!("{session_id}:{revision}");
+        let candidates: Vec<_> = self.bindings.lock().await.values().cloned().collect();
+        let mut matches = Vec::new();
+        for binding in candidates {
+            let previous = binding.owner.load(Ordering::Relaxed);
+            let is_allowed = allowed.contains(&binding.client_ref)
+                || (adopt_orphans
+                    && previous == 0
+                    && binding.detachable
+                    && binding.harness == "cursor");
+            if !is_allowed || !binding.turns.lock().await.contains_key(&key) {
+                continue;
+            }
+            if previous == owner {
+                matches.push((binding, false));
+            } else if previous == 0
+                && adopt_orphans
+                && binding.detachable
+                && binding.harness == "cursor"
+            {
+                matches.push((binding, true));
+            }
+        }
+        if matches.len() == 1 {
+            let (binding, adopted) = matches.pop().unwrap();
+            if adopted {
+                binding.owner.store(owner, Ordering::Relaxed);
+            }
+            return Ok((binding, adopted));
+        }
+        if matches.is_empty() {
+            bail!("no joined conversation received this voice message");
+        }
+        let titles = matches
+            .iter()
+            .map(|(binding, _)| format!("\"{}\"", binding.title))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("AMBIGUOUS: several conversations received this voice message ({titles}); pass the session_id and revision from its header")
+    }
+
+    fn watch_binding(self: Arc<Self>, binding: Arc<Binding>) {
+        match (
+            binding.harness.as_str(),
+            binding.delivery.get("kind").and_then(Value::as_str),
+        ) {
+            ("codex", Some("codex-queue")) => self.watch_rollout(binding),
+            ("codex", Some("http")) if binding.capabilities["working"] == "supported" => {
+                self.watch_rollout(binding)
+            }
+            (_, Some("claude-uds")) => {
+                self.clone().watch_transcript(binding.clone(), true);
+                self.watch_claude_working(binding);
+            }
+            (_, Some("cursor-tmux" | "none")) if binding.harness == "cursor" => {
+                self.watch_transcript(binding, false)
+            }
+            (_, Some("cursor-app")) => self.watch_editor_transcript(binding),
+            _ => {}
+        }
+    }
+
+    fn watch_claude_working(self: Arc<Self>, binding: Arc<Binding>) {
+        tokio::spawn(async move {
+            let mut last = None;
+            while !binding.stopped.load(Ordering::Relaxed) {
+                let current = crate::adapters::claude::working_state(&binding.thread);
+                if let Some(working) = current {
+                    if current != last {
+                        self.report_working(&binding, working).await;
+                        last = current;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+        });
+    }
+
+    fn watch_transcript(self: Arc<Self>, binding: Arc<Binding>, claude: bool) {
+        self.watch_transcript_for(binding.clone(), claude, binding.thread.clone());
+    }
+
+    fn watch_editor_transcript(self: Arc<Self>, binding: Arc<Binding>) {
+        tokio::spawn(async move {
+            let lookup_at = std::env::var("SIDEVOICE_CURSOR_LOOKUP_AT")
+                .ok()
+                .map(|value| {
+                    value
+                        .split(',')
+                        .filter_map(|part| part.trim().parse::<u64>().ok())
+                        .map(Duration::from_millis)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|times| !times.is_empty())
+                .unwrap_or_else(|| {
+                    [3_000, 15_000, 35_000, 70_000]
+                        .into_iter()
+                        .map(Duration::from_millis)
+                        .collect()
+                });
+            let started = tokio::time::Instant::now();
+            let mut lookup_index = 0;
+            let mut last_bridge_lookup: Option<tokio::time::Instant> = None;
+            loop {
+                if binding.stopped.load(Ordering::Relaxed) {
+                    return;
+                }
+                let known_chat = { binding.bridge_chat.lock().await.clone() };
+                if let Some(chat) = known_chat {
+                    let observed = binding.transcript_chat.lock().await.clone();
+                    if observed.as_deref() != Some(chat.as_str()) {
+                        *binding.transcript_chat.lock().await = Some(chat.clone());
+                        self.clone().watch_transcript_for(binding, false, chat);
+                    }
+                    return;
+                }
+
+                let expected = binding
+                    .input_context
+                    .lock()
+                    .await
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let others = self
+                    .bindings
+                    .lock()
+                    .await
+                    .values()
+                    .filter(|other| other.client_ref != binding.client_ref)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut excluded = std::collections::HashSet::new();
+                for other in others {
+                    if let Some(chat) = other.bridge_chat.lock().await.clone() {
+                        excluded.insert(chat);
+                    }
+                    if let Some(chat) = other.transcript_chat.lock().await.clone() {
+                        excluded.insert(chat);
+                    }
+                }
+                if let Some((chat, pending_message_match)) =
+                    crate::adapters::cursor::editor_transcript_chat(
+                        &binding.delivery,
+                        &expected,
+                        &excluded,
+                    )
+                {
+                    let observed = binding.transcript_chat.lock().await.clone();
+                    if observed.as_deref() != Some(chat.as_str())
+                        && (observed.is_none() || pending_message_match)
+                    {
+                        *binding.transcript_chat.lock().await = Some(chat.clone());
+                        self.clone()
+                            .watch_transcript_for(binding.clone(), false, chat.clone());
+                    }
+                    if pending_message_match {
+                        *binding.bridge_chat.lock().await = Some(chat);
+                        continue;
+                    }
+                }
+
+                let lookup_due = if lookup_index < lookup_at.len() {
+                    started.elapsed() >= lookup_at[lookup_index]
+                } else {
+                    last_bridge_lookup.is_some_and(|last| last.elapsed() >= Duration::from_secs(5))
+                };
+                if lookup_due {
+                    if lookup_index < lookup_at.len() {
+                        lookup_index += 1;
+                    }
+                    last_bridge_lookup = Some(tokio::time::Instant::now());
+                    if let Some(chat) =
+                        crate::adapters::cursor::composer_holding(&binding.delivery).await
+                    {
+                        *binding.bridge_chat.lock().await = Some(chat);
+                        continue;
+                    }
+                }
+                let scan_ms = std::env::var("SIDEVOICE_CURSOR_SCAN_MS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(2_000)
+                    .max(10);
+                tokio::time::sleep(Duration::from_millis(scan_ms)).await;
+            }
+        });
+    }
+
+    fn watch_transcript_for(self: Arc<Self>, binding: Arc<Binding>, claude: bool, chat: String) {
+        tokio::spawn(async move {
+            while !binding.stopped.load(Ordering::Relaxed) {
+                if !claude
+                    && binding.delivery.get("kind").and_then(Value::as_str) == Some("cursor-app")
+                    && binding.transcript_chat.lock().await.as_deref() != Some(chat.as_str())
+                {
+                    return;
+                }
+                let path = if claude {
+                    crate::adapters::claude::transcript_path(&chat)
+                } else {
+                    crate::adapters::cursor::transcript_path(&chat)
+                };
+                if let Some(path) = path {
+                    self.watch_transcript_file(binding, path, claude, chat)
+                        .await;
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+        });
+    }
+
+    async fn watch_transcript_file(
+        &self,
+        binding: Arc<Binding>,
+        path: PathBuf,
+        claude: bool,
+        engine_chat: String,
+    ) {
+        let mut file_id: Option<(u64, u64)> = None;
+        let mut offset = 0u64;
+        let mut partial = Vec::new();
+        let mut tail = Vec::new();
+        let mut working = None;
+        let mut catching_up = true;
+        let mut announced_initial = false;
+        let mut engine_checked = false;
+        let mut oversized = false;
+        loop {
+            if binding.stopped.load(Ordering::Relaxed) {
+                break;
+            }
+            if !claude
+                && binding.delivery.get("kind").and_then(Value::as_str) == Some("cursor-app")
+                && binding.transcript_chat.lock().await.as_deref() != Some(engine_chat.as_str())
+            {
+                break;
+            }
+            let editor = binding.delivery.get("kind").and_then(Value::as_str) == Some("cursor-app");
+            let authenticated = !editor
+                || binding.bridge_chat.lock().await.as_deref() == Some(engine_chat.as_str());
+            if authenticated && !claude && !engine_checked {
+                engine_checked = true;
+                if let Some(engine) = crate::adapters::cursor::engine(&engine_chat) {
+                    self.report_engine(&binding, engine).await;
+                }
+            }
+            let Ok(mut input) = fs::File::open(&path) else {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                continue;
+            };
+            let Ok(meta) = input.metadata() else {
+                continue;
+            };
+            let current = (meta.dev(), meta.ino());
+            if file_id != Some(current) || meta.len() < offset {
+                file_id = Some(current);
+                offset = 0;
+                partial.clear();
+                tail.clear();
+                working = None;
+                catching_up = true;
+                announced_initial = false;
+                oversized = false;
+            }
+            if !claude && !tail.is_empty() && offset >= tail.len() as u64 {
+                let mut current_tail = vec![0; tail.len()];
+                if input
+                    .seek(SeekFrom::Start(offset - tail.len() as u64))
+                    .is_ok()
+                    && input.read_exact(&mut current_tail).is_ok()
+                    && current_tail != tail
+                {
+                    offset = 0;
+                    partial.clear();
+                    tail.clear();
+                    working = None;
+                    catching_up = true;
+                    announced_initial = false;
+                }
+            }
+            if input.seek(SeekFrom::Start(offset)).is_ok() {
+                let mut bytes = [0u8; 65536];
+                let limit = bytes.len().min(meta.len().saturating_sub(offset) as usize);
+                if let Ok(count) = input.read(&mut bytes[..limit]) {
+                    offset += count as u64;
+                    if !claude && count > 0 {
+                        tail.extend_from_slice(&bytes[..count]);
+                        if tail.len() > 64 {
+                            tail.drain(..tail.len() - 64);
+                        }
+                    }
+                    for segment in bytes[..count].split_inclusive(|byte| *byte == b'\n') {
+                        if !oversized {
+                            if partial.len() + segment.len() > 1 << 20 {
+                                partial.clear();
+                                oversized = true;
+                            } else {
+                                partial.extend_from_slice(segment);
+                            }
+                        }
+                        if segment.last() == Some(&b'\n') {
+                            if !oversized {
+                                if let Ok(item) = serde_json::from_slice::<Value>(&partial) {
+                                    if claude {
+                                        if let Some(model) =
+                                            crate::adapters::claude::assistant_model(&item)
+                                        {
+                                            let launch = crate::adapters::claude::session_engine(
+                                                &binding.thread,
+                                            )
+                                            .unwrap_or_else(|| json!({}));
+                                            self.report_engine(&binding, json!({"model":model,
+                                                "effort":launch.get("effort").cloned().unwrap_or(Value::Null),
+                                                "thinking":launch.get("thinking").cloned().unwrap_or(Value::Null)})).await;
+                                        }
+                                    } else if authenticated
+                                        && transcript_user_text(&item, false).is_some()
+                                    {
+                                        if let Some(engine) =
+                                            crate::adapters::cursor::engine(&engine_chat)
+                                        {
+                                            self.report_engine(&binding, engine).await;
+                                        }
+                                    }
+                                    if !claude {
+                                        if item.get("type") == Some(&json!("turn_ended")) {
+                                            working = Some(false);
+                                            if !catching_up && authenticated {
+                                                self.report_working(&binding, false).await;
+                                            }
+                                        } else if item.get("role") == Some(&json!("user")) {
+                                            working = Some(true);
+                                            if !catching_up && authenticated {
+                                                self.report_working(&binding, true).await;
+                                            }
+                                        }
+                                    }
+                                    if let Some(text) = transcript_user_text(&item, claude) {
+                                        if let Some(header) = voice_header(&text) {
+                                            self.report_read(&binding, &header).await;
+                                        }
+                                    }
+                                }
+                            }
+                            partial.clear();
+                            oversized = false;
+                        }
+                    }
+                }
+            }
+            if catching_up && offset >= meta.len() {
+                catching_up = false;
+            }
+            if !catching_up && authenticated && !announced_initial {
+                if let Some(state) = working {
+                    self.report_working(&binding, state).await;
+                }
+                announced_initial = true;
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+    }
+
+    async fn report_read(&self, binding: &Binding, header: &Value) {
+        let Some(message_id) = header.get("message_id").and_then(Value::as_str) else {
+            return;
+        };
+        let mut pending = binding.pending.lock().await;
+        if !pending.iter().any(|id| id == message_id) {
+            return;
+        }
+        pending.retain(|id| id != message_id);
+        drop(pending);
+        let mut read = binding.read.lock().await;
+        if read.iter().any(|id| id == message_id) {
+            return;
+        }
+        read.push_back(message_id.to_owned());
+        if read.len() > 512 {
+            read.pop_front();
+        }
+        drop(read);
+        let session_id = header
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let revision = header.get("revision").and_then(Value::as_i64).unwrap_or(0);
+        let _ = self
+            .link
+            .notify(
+                "input.read",
+                json!({"binding_id":*binding.id.lock().await,"message_id":message_id,
+            "session_id":session_id,"revision":revision,"turn_id":Value::Null}),
+            )
+            .await;
     }
 
     fn watch_rollout(self: Arc<Self>, binding: Arc<Binding>) {
@@ -541,6 +1689,8 @@ impl Daemon {
             let mut partial = Vec::new();
             let mut oversized = false;
             let mut turn: Option<String> = None;
+            let mut working = None;
+            let mut catching_up = true;
             loop {
                 if binding.stopped.load(Ordering::Relaxed) {
                     break;
@@ -549,25 +1699,30 @@ impl Daemon {
                     path = rollout_path(&self.profile.codex, &binding.thread);
                     if let Some(file) = &path {
                         if let Ok(meta) = fs::metadata(file) {
-                            offset = meta.len();
+                            offset = 0;
                             file_id = Some((meta.dev(), meta.ino()));
                         }
                     }
                 }
                 if let Some(file) = &path {
                     if let Ok(mut input) = fs::File::open(file) {
-                        if let Ok(meta) = input.metadata() {
-                            let current = (meta.dev(), meta.ino());
-                            if file_id != Some(current) || meta.len() < offset {
-                                offset = 0;
-                                partial.clear();
-                                oversized = false;
-                            }
-                            file_id = Some(current);
+                        let Ok(meta) = input.metadata() else {
+                            continue;
+                        };
+                        let current = (meta.dev(), meta.ino());
+                        if file_id != Some(current) || meta.len() < offset {
+                            offset = 0;
+                            partial.clear();
+                            oversized = false;
+                            turn = None;
+                            working = None;
+                            catching_up = true;
                         }
+                        file_id = Some(current);
                         if input.seek(SeekFrom::Start(offset)).is_ok() {
                             let mut bytes = [0u8; 65536];
-                            if let Ok(n) = input.read(&mut bytes) {
+                            let limit = bytes.len().min(meta.len().saturating_sub(offset) as usize);
+                            if let Ok(n) = input.read(&mut bytes[..limit]) {
                                 offset += n as u64;
                                 for segment in bytes[..n].split_inclusive(|byte| *byte == b'\n') {
                                     if !oversized {
@@ -583,13 +1738,27 @@ impl Daemon {
                                             if let Ok(item) =
                                                 serde_json::from_slice::<Value>(&partial)
                                             {
-                                                self.observe_rollout(&binding, &item, &mut turn)
-                                                    .await;
+                                                self.observe_rollout(
+                                                    &binding,
+                                                    &item,
+                                                    &mut turn,
+                                                    &mut working,
+                                                    catching_up,
+                                                )
+                                                .await;
                                             }
                                         }
                                         partial.clear();
                                         oversized = false;
                                     }
+                                }
+                            }
+                            if catching_up && offset >= meta.len() {
+                                catching_up = false;
+                                if let Some(state) = working {
+                                    self.report_working_event(&binding, json!({
+                                        "working":state,"turn_id":if state { turn.clone() } else { None }
+                                    })).await;
                                 }
                             }
                         }
@@ -605,17 +1774,26 @@ impl Daemon {
         });
     }
 
-    async fn observe_rollout(&self, binding: &Binding, item: &Value, turn: &mut Option<String>) {
+    async fn observe_rollout(
+        &self,
+        binding: &Binding,
+        item: &Value,
+        turn: &mut Option<String>,
+        working: &mut Option<bool>,
+        catching_up: bool,
+    ) {
         let id = binding.id.lock().await.clone();
-        if item.get("type") == Some(&json!("turn_context")) {
+        if matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("turn_context" | "session_meta")
+        ) {
             if let Some(model) = item.pointer("/payload/model").and_then(Value::as_str) {
-                let _ = self
-                    .link
-                    .notify(
-                        "input.engine",
-                        json!({"binding_id":id,"engine":{"model":model}}),
-                    )
-                    .await;
+                let effort = std::env::var("CODEX_REASONING_EFFORT").ok();
+                self.report_engine(
+                    binding,
+                    json!({"model":model,"effort":effort,"thinking":Value::Null}),
+                )
+                .await;
             }
         }
         if item.get("type") == Some(&json!("event_msg")) {
@@ -625,24 +1803,32 @@ impl Daemon {
                 .unwrap_or("");
             let turn_id = item.pointer("/payload/turn_id").and_then(Value::as_str);
             if phase == "task_started" {
-                *turn = turn_id.map(str::to_owned);
-                let _ = self
-                    .link
-                    .notify(
-                        "input.working",
-                        json!({"binding_id":id,"working":true,"turn_id":turn_id}),
-                    )
-                    .await;
+                if let Some(turn_id) = turn_id {
+                    *turn = Some(turn_id.to_owned());
+                    *working = Some(true);
+                    if !catching_up {
+                        self.report_working_event(
+                            binding,
+                            json!({"working":true,"turn_id":turn_id}),
+                        )
+                        .await;
+                    }
+                }
             }
             if phase == "task_complete" || phase == "turn_aborted" {
-                *turn = None;
-                let _ = self
-                    .link
-                    .notify(
-                        "input.working",
-                        json!({"binding_id":id,"working":false,"turn_id":turn_id}),
-                    )
-                    .await;
+                if let Some(turn_id) = turn_id {
+                    if turn.as_deref() == Some(turn_id) {
+                        *turn = None;
+                    }
+                    *working = Some(false);
+                    if !catching_up {
+                        self.report_working_event(
+                            binding,
+                            json!({"working":false,"turn_id":turn_id}),
+                        )
+                        .await;
+                    }
+                }
             }
         }
         if item.get("type") == Some(&json!("response_item"))
@@ -655,6 +1841,9 @@ impl Daemon {
                 .map(|parts| {
                     parts
                         .iter()
+                        .filter(|part| {
+                            part.get("type").and_then(Value::as_str) == Some("input_text")
+                        })
                         .filter_map(|p| p.get("text").and_then(Value::as_str))
                         .collect::<Vec<_>>()
                         .join("\n")
@@ -738,10 +1927,14 @@ impl Daemon {
             .lock()
             .await
             .values()
-            .filter(|b| b.owner == owner)
+            .filter(|b| b.owner.load(Ordering::Relaxed) == owner)
             .cloned()
             .collect();
         for b in owned {
+            if b.detachable {
+                b.owner.store(0, Ordering::Relaxed);
+                continue;
+            }
             b.stopped.store(true, Ordering::Relaxed);
             self.bindings.lock().await.remove(&b.client_ref);
             let _ = self
@@ -761,6 +1954,69 @@ impl Daemon {
     async fn is_idle(&self) -> bool {
         self.client_count.load(Ordering::Relaxed) == 0 && self.bindings.lock().await.is_empty()
     }
+}
+
+fn transcript_user_text(item: &Value, claude: bool) -> Option<String> {
+    if claude
+        && item.get("type") == Some(&json!("attachment"))
+        && item.pointer("/attachment/type") == Some(&json!("queued_command"))
+    {
+        return item
+            .pointer("/attachment/prompt")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+    }
+    let is_user = if claude {
+        item.get("type") == Some(&json!("user"))
+            && item.pointer("/message/role") == Some(&json!("user"))
+    } else {
+        item.get("role") == Some(&json!("user"))
+    };
+    if !is_user {
+        return None;
+    }
+    let content = item
+        .pointer("/message/content")
+        .or_else(|| item.get("content"))?;
+    if let Some(text) = content.as_str() {
+        return Some(text.to_owned());
+    }
+    let parts = content.as_array()?;
+    let texts = parts
+        .iter()
+        .filter_map(|part| {
+            (part.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| part.get("text").and_then(Value::as_str))
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    (!texts.is_empty()).then(|| texts.join("\n"))
+}
+
+fn voice_header(text: &str) -> Option<Value> {
+    let start = text.find("{\"channel\":")?;
+    let tail = &text[start..];
+    let end = tail.find('}')?;
+    let header: Value = serde_json::from_str(&tail[..=end]).ok()?;
+    if !matches!(
+        header.get("channel").and_then(Value::as_str),
+        Some("voice" | "room-control")
+    ) || header
+        .get("session_id")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+        || header
+            .get("message_id")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || header
+            .get("revision")
+            .and_then(Value::as_i64)
+            .is_none_or(|revision| revision < 0)
+    {
+        return None;
+    }
+    Some(header)
 }
 
 fn rollout_path(home: &Path, thread: &str) -> Option<PathBuf> {
@@ -833,10 +2089,13 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     let link = Link::new();
     let (replay_tx, mut replay_rx) = mpsc::channel(1);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let (app_tx, mut app_rx) = mpsc::unbounded_channel();
+    let cursor_apps = CursorApps::new(app_tx, profile.data.join("cursor-card-port.json"))?;
     let daemon = Daemon::new(
         profile.clone(),
         link.clone(),
         replay_tx,
+        cursor_apps,
         managed,
         shutdown_tx,
     )?;
@@ -900,6 +2159,9 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
                 } else {
                     replay_again = true;
                 }
+            }
+            Some(notice) = app_rx.recv() => {
+                daemon.handle_app_notice(notice).await;
             }
             Some(result) = core_tasks.join_next(), if !core_tasks.is_empty() => {
                 if let Err(error) = result { eprintln!("[sidevoice rust proof] Core handler: {error}"); }

@@ -161,3 +161,34 @@ jobs:
           SIDEVOICE_CORE_PYTHON: ${{ github.workspace }}/core/.venv/bin/python
           SIDEVOICE_RUST_PROOF_BIN: ${{ github.workspace }}/proof-bin/sidevoice-rust-proof
         run: core/.venv/bin/python packages/connector-rust/test/interop_core.py
+
+  conversation-parity:
+    name: Rust MCP conversation and delivery parity
+    needs: native
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact pull request head
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 -c 'import os, subprocess, sys; actual = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(); expected = os.environ["EXPECTED_HEAD"]; print("checked out", actual, "expected", expected); sys.exit(actual != expected)'
+      - uses: actions/checkout@v4
+        with:
+          repository: sidevoice/sidevoice-core
+          ref: 4d6df599239602954a3c6ab503c642eeeab5ca12
+          path: core
+      - uses: actions/download-artifact@v4
+        with:
+          name: sidevoice-rust-proof-linux-x86_64
+          path: proof-bin
+      - uses: astral-sh/setup-uv@v6
+      - run: chmod 700 proof-bin/sidevoice-rust-proof
+      - run: uv venv --python 3.12 core/.venv
+      - run: uv pip install --python core/.venv/bin/python -e ./core 'websockets>=15,<16'
+      - name: Real Core, synthetic Claude, Codex, Cursor and HTTP clients
+        env:
+          SIDEVOICE_CORE_PYTHON: ${{ github.workspace }}/core/.venv/bin/python
+          SIDEVOICE_RUST_PROOF_BIN: ${{ github.workspace }}/proof-bin/sidevoice-rust-proof
+        run: core/.venv/bin/python packages/connector-rust/test/conversation_interop.py
