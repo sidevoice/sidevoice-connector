@@ -1,0 +1,66 @@
+name: Rust connector proof
+
+on:
+  pull_request:
+    paths:
+      - 'packages/connector-rust/**'
+      - '.github/workflows/rust-proof.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native Rust proof
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: packages/connector-rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/connector-rust
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sidevoice-rust-proof-linux-x86_64
+          path: packages/connector-rust/target/release/sidevoice-rust-proof
+          if-no-files-found: error
+          retention-days: 7
+
+  interop-core:
+    name: Rust proof with real Core v3 and modelled Codex queue
+    needs: native
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: sidevoice/sidevoice-core
+          ref: 4d6df599239602954a3c6ab503c642eeeab5ca12
+          path: core
+      - uses: actions/download-artifact@v4
+        with:
+          name: sidevoice-rust-proof-linux-x86_64
+          path: proof-bin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: astral-sh/setup-uv@v6
+      - run: chmod 700 proof-bin/sidevoice-rust-proof
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: uv venv --python 3.12 core/.venv
+      - run: uv pip install --python core/.venv/bin/python -e ./core 'websockets>=15,<16'
+      - name: Real Core, Core-generated input, receipts and speech
+        env:
+          SIDEVOICE_CORE_PYTHON: ${{ github.workspace }}/core/.venv/bin/python
+          SIDEVOICE_RUST_PROOF_BIN: ${{ github.workspace }}/proof-bin/sidevoice-rust-proof
+        run: core/.venv/bin/python packages/connector-rust/test/interop_core.py
