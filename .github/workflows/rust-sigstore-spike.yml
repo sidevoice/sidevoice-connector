@@ -1,0 +1,108 @@
+name: Rust Sigstore feasibility spike
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/rust-sigstore-spike.yml'
+      - 'tools/sigstore-spike/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-sigstore-spike-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  linux-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: tools/sigstore-spike
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.86.0 --profile minimal --component rustfmt && rustup default 1.86.0
+      - name: Generate initial lockfile for review
+        run: cargo generate-lockfile
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sigstore-spike-cargo-lock
+          path: tools/sigstore-spike/Cargo.lock
+      - name: Source and dependency revisions
+        run: git rev-parse HEAD && sha256sum Cargo.lock && cargo tree -i sigstore-verify
+      - name: Compile and run pure policy and parser tests
+        run: cargo test
+      - name: Snapshot one coherent nightly pair and archive bytes
+        run: python3 snapshot.py "$RUNNER_TEMP/core-snapshot"
+      - name: Rust positive chain and independent asset digest
+        run: |
+          set -euo pipefail
+          cache="$RUNNER_TEMP/sigstore-tuf"
+          snapshot="$RUNNER_TEMP/core-snapshot"
+          binary="target/debug/sidevoice-sigstore-spike"
+          "$binary" "$snapshot/core-manifest.json" "$snapshot/core-manifest.json.sigstore.json" nightly "$cache" online
+          digest=$(jq -r .asset_sha256 "$snapshot/snapshot.json")
+          size=$(jq -r .asset_size "$snapshot/snapshot.json")
+          "$binary" "$snapshot/core-linux-x86_64.tar.zst" "$snapshot/core-linux-x86_64.tar.zst.sigstore.json" nightly "$cache" offline "$digest" "$size"
+          sha256sum "$snapshot"/*.json "$snapshot/core-linux-x86_64.tar.zst"
+      - name: JS baseline on those exact signed manifest bytes
+        working-directory: .
+        run: |
+          npm ci
+          node --input-type=module -e '
+            import { readFile } from "node:fs/promises";
+            import { verifyCoreArtifact, sha256 } from "./packages/connector/core-attestation.mjs";
+            const base = process.env.RUNNER_TEMP + "/core-snapshot/";
+            const bytes = await readFile(base + "core-manifest.json");
+            const bundleBytes = await readFile(base + "core-manifest.json.sigstore.json");
+            const result = await verifyCoreArtifact({ bytes, bundleBytes, channel: "nightly", tufCachePath: process.env.RUNNER_TEMP + "/js-tuf" });
+            console.log(JSON.stringify({ sha256: sha256(bytes), result }));'
+      - name: Accepted controls and cryptographic refusal matrix
+        run: |
+          python3 negatives.py "$PWD/target/debug/sidevoice-sigstore-spike" "$RUNNER_TEMP/core-snapshot" "$RUNNER_TEMP/sigstore-tuf" "$GITHUB_WORKSPACE/packages/connector/test/fixtures/r4"
+      - name: TUF cold, corrupted metadata, tampered target, and true expiry
+        run: |
+          set -euo pipefail
+          binary="target/debug/sidevoice-sigstore-spike"
+          snapshot="$RUNNER_TEMP/core-snapshot"
+          cache="$RUNNER_TEMP/sigstore-tuf"
+          if "$binary" "$snapshot/core-manifest.json" "$snapshot/core-manifest.json.sigstore.json" nightly "$RUNNER_TEMP/cold-tuf" offline; then exit 1; fi
+          cp -a "$cache" "$RUNNER_TEMP/corrupt-tuf"
+          metadata=$(find "$RUNNER_TEMP/corrupt-tuf" -name timestamp.json -type f -print -quit)
+          test -n "$metadata"
+          printf x >> "$metadata"
+          if "$binary" "$snapshot/core-manifest.json" "$snapshot/core-manifest.json.sigstore.json" nightly "$RUNNER_TEMP/corrupt-tuf" offline; then exit 1; fi
+          cp -a "$cache" "$RUNNER_TEMP/tampered-target-tuf"
+          target=$(find "$RUNNER_TEMP/tampered-target-tuf" -name trusted_root.json -type f -print -quit)
+          test -n "$target"
+          printf x >> "$target"
+          if "$binary" "$snapshot/core-manifest.json" "$snapshot/core-manifest.json.sigstore.json" nightly "$RUNNER_TEMP/tampered-target-tuf" offline; then exit 1; fi
+          "$binary" tuf-future "$cache"
+      - name: Remove runner-local executable archive bytes
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/core-snapshot"
+
+  macos-fixture:
+    runs-on: macos-14
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: tools/sigstore-spike
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.86.0 --profile minimal && rustup default 1.86.0
+      - name: Generate initial lockfile for review
+        run: cargo generate-lockfile
+      - name: Compile and run small policy fixture
+        run: cargo test
+      - name: Verify genuine unrelated npm fixture with its own identity
+        run: |
+          target/debug/sidevoice-sigstore-spike \
+            "$GITHUB_WORKSPACE/packages/connector/test/fixtures/r4/sigstore-5.0.0.tgz" \
+            "$GITHUB_WORKSPACE/packages/connector/test/fixtures/r4/sigstore-5.0.0.sigstore.json" \
+            npm "$RUNNER_TEMP/sigstore-tuf" online
