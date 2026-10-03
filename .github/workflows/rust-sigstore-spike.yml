@@ -27,6 +27,12 @@ jobs:
         run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt && rustup default 1.88.0
       - name: Source and dependency revisions
         run: git rev-parse HEAD && sha256sum Cargo.lock && cargo tree --locked -i sigstore-verify
+      - name: Format proof source for review
+        run: cargo fmt --all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sigstore-spike-formatted-source
+          path: tools/sigstore-spike/src/*.rs
       - name: Compile and run pure policy and parser tests
         run: cargo test --locked && cargo build --locked
       - name: Snapshot one coherent nightly pair and archive bytes

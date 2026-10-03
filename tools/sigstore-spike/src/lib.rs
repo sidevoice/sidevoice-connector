@@ -216,14 +216,17 @@ mod tests {
         assert!(enforce_core_provenance(&changed, &statement, &digest, "nightly").is_err());
         for field in 0..6 {
             let mut changed = claims.clone();
-            let target = match field {
-                0 => &mut changed.san, 1 => &mut changed.build_signer,
-                2 => &mut changed.source, 3 => &mut changed.repository_id,
-                4 => &mut changed.runner, _ => &mut changed.build_config,
+            let update = |claims: &mut Claims, value: Option<String>| {
+                let target = match field {
+                    0 => &mut claims.san, 1 => &mut claims.build_signer,
+                    2 => &mut claims.source, 3 => &mut claims.repository_id,
+                    4 => &mut claims.runner, _ => &mut claims.build_config,
+                };
+                *target = value;
             };
-            *target = Some("wrong".into());
+            update(&mut changed, Some("wrong".into()));
             assert!(enforce_core_provenance(&changed, &statement, &digest, "nightly").is_err(), "field {field}");
-            *target = None;
+            update(&mut changed, None);
             assert!(enforce_core_provenance(&changed, &statement, &digest, "nightly").is_err(), "missing field {field}");
         }
     }
