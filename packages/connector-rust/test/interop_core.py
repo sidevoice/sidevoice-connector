@@ -94,7 +94,7 @@ async def finish(process):
 
 def core_faults(root, env):
     """Faults live only in this temporary Core process, with no production hook."""
-    storage, late = root / 'fail-journal-once', root / 'delay-ack-once'
+    storage, late, slow = root / 'fail-journal-once', root / 'delay-ack-once', root / 'slow-two-acks'
     (root / 'sitecustomize.py').write_text('''import asyncio, os
 from pathlib import Path
 from sidevoice_core.control.history import RoomHistory
@@ -113,12 +113,21 @@ async def publish(self, payload):
     if flag.exists():
         flag.unlink()
         await asyncio.sleep(17)
+    slow = Path(os.environ['SIDEVOICE_TEST_SLOW_ACK_FLAG'])
+    if slow.exists():
+        remaining = int(slow.read_text())
+        if remaining > 1:
+            slow.write_text(str(remaining - 1))
+        else:
+            slow.unlink()
+        await asyncio.sleep(12)
     return result
 RoomHistory.put = put
 Room.publish = publish
 ''')
     return {**env, 'PYTHONPATH': str(root) + os.pathsep + env.get('PYTHONPATH', ''),
-            'SIDEVOICE_TEST_STORAGE_FLAG': str(storage), 'SIDEVOICE_TEST_LATE_ACK_FLAG': str(late)}, storage, late
+            'SIDEVOICE_TEST_STORAGE_FLAG': str(storage), 'SIDEVOICE_TEST_LATE_ACK_FLAG': str(late),
+            'SIDEVOICE_TEST_SLOW_ACK_FLAG': str(slow)}, storage, late, slow
 
 
 async def js_register(socket_path, thread):
@@ -155,7 +164,7 @@ async def copied_state():
         thread = str(uuid.uuid4())
         env = {**os.environ, 'SIDEVOICE_DATA_DIR': str(data), 'CODEX_HOME': str(codex),
                'CODEX_THREAD_ID': thread, 'SIDEVOICE_SERVICE_MANAGER': 'none'}
-        core_env, storage_flag, _ = core_faults(root, env)
+        core_env, storage_flag, _, slow_flag = core_faults(root, env)
         core_log = (root / 'core.log').open('wb')
         js_log = (root / 'js.log').open('wb')
         rust_log = (root / 'rust.log').open('wb')
@@ -244,8 +253,11 @@ async def copied_state():
             js_writer = None
             orphan = {**original, 'event_id': str(uuid.uuid4()), 'utterance_id': str(uuid.uuid4()),
                       'binding_id': str(uuid.uuid4()), 'text': 'Unattributed historical speech'}
-            (data / 'outbox.json').write_text(json.dumps([orphan]))
+            slow_rows = [{**original, 'event_id': str(uuid.uuid4()), 'utterance_id': str(uuid.uuid4()),
+                          'binding_id': again, 'text': f'Slow admitted speech {i}'} for i in (1, 2)]
+            (data / 'outbox.json').write_text(json.dumps([orphan, *slow_rows]))
             (data / 'outbox.json').chmod(0o600)
+            slow_flag.write_text('2')
             daemon = await asyncio.create_subprocess_exec(str(binary), 'connector',
                 stdout=rust_log, stderr=rust_log, env=env)
             await until(lambda: json.loads((data / 'proof.json').read_text())['pid'] == daemon.pid,
@@ -257,11 +269,18 @@ async def copied_state():
                 'clientInfo': {'name': 'codex', 'version': '0.157.0'}}, 3)
             facade.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
             await facade.stdin.drain()
-            await tool(facade, 'voice_connect', {'title': 'Orphan safety'}, 4, thread)
+            started = time.monotonic()
+            joined = await tool(facade, 'voice_connect', {'title': 'Orphan safety'}, 4, thread)
+            assert joined['binding_id'] == again and time.monotonic() - started < 10, (
+                'registration waited for two slow speech ACKs')
             await until(lambda: orphan['event_id'] in (root / 'rust.log').read_text()
                         and 'retaining for explicit migration' in (root / 'rust.log').read_text(),
                         'historical orphan diagnostic')
-            assert json.loads((data / 'outbox.json').read_text()) == [orphan]
+            await until(lambda: json.loads((data / 'outbox.json').read_text()) == [orphan],
+                        'owned replay completed after registration', seconds=50)
+            rows = http_json(core_data / 'local.sock', 'GET', f'/api/presentation/history?thread_id={thread}', token=token)['messages']
+            for speech in slow_rows:
+                assert sum(row['text'] == speech['text'] for row in rows) == 1
         except Exception:
             for handle in (core_log, js_log, rust_log):
                 handle.flush()
@@ -311,7 +330,7 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
         env = {**os.environ, 'SIDEVOICE_DATA_DIR': str(data), 'CODEX_HOME': str(codex),
                'CODEX_THREAD_ID': thread, 'SIDEVOICE_CODEX_BIN': str(fake_codex),
                'SIDEVOICE_TEST_QUEUE': str(queued), 'SIDEVOICE_TEST_SLOW': str(slow_started)}
-        core_env, storage_flag, late_flag = core_faults(root, env)
+        core_env, storage_flag, late_flag, _ = core_faults(root, env)
         launch_id = str(uuid.uuid4())
         core_log = (root / 'core.log').open('wb')
         daemon_log = (root / 'daemon.log').open('wb')

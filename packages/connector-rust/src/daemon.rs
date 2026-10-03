@@ -33,12 +33,13 @@ pub struct Daemon {
     link: Arc<Link>,
     bindings: Mutex<HashMap<String, Arc<Binding>>>,
     outbox: Mutex<Vec<Value>>,
+    replay_tx: mpsc::Sender<()>,
     owner_serial: AtomicU64,
     rendezvous: Mutex<Option<Value>>,
 }
 
 impl Daemon {
-    fn new(profile: Profile, link: Arc<Link>) -> Result<Arc<Self>> {
+    fn new(profile: Profile, link: Arc<Link>, replay_tx: mpsc::Sender<()>) -> Result<Arc<Self>> {
         let path = profile.data.join("outbox.json");
         let outbox = if path.exists() {
             private_file(&path)?;
@@ -55,6 +56,7 @@ impl Daemon {
             link,
             bindings: Mutex::new(HashMap::new()),
             outbox: Mutex::new(outbox),
+            replay_tx,
             owner_serial: AtomicU64::new(1),
             rendezvous: Mutex::new(None),
         }))
@@ -117,7 +119,12 @@ impl Daemon {
                 eprintln!("[sidevoice rust proof] binding replay: {error}");
             }
         }
-        self.flush_outbox().await;
+        self.request_replay();
+    }
+
+    fn request_replay(&self) {
+        // A full slot already requests a pass; the run loop owns its one replay task.
+        let _ = self.replay_tx.try_send(());
     }
 
     fn outbox_path(&self) -> PathBuf {
@@ -414,7 +421,7 @@ impl Daemon {
                 let result = self.register_core(&binding).await;
                 let id = binding.id.lock().await.clone();
                 if result.is_ok() {
-                    self.flush_outbox().await;
+                    self.request_replay();
                 }
                 Ok(
                     json!({"binding_id":id,"thread":thread,"connected":result.is_ok(),"pending":result.is_err()}),
@@ -734,6 +741,12 @@ fn rollout_path(home: &Path, thread: &str) -> Option<PathBuf> {
     None
 }
 
+fn prune_binding_order(order: &mut HashMap<String, oneshot::Receiver<()>>) {
+    order.retain(|_, tail| {
+        matches!(tail.try_recv(), Err(oneshot::error::TryRecvError::Empty))
+    });
+}
+
 pub async fn run(profile: Profile) -> Result<()> {
     private_dir(&profile.data)?;
     let lock_path = profile.data.join("connector.lock");
@@ -751,10 +764,13 @@ pub async fn run(profile: Profile) -> Result<()> {
         fs::remove_file(&profile.socket)?;
     }
     let link = Link::new();
-    let daemon = Daemon::new(profile.clone(), link.clone())?;
+    let (replay_tx, mut replay_rx) = mpsc::channel(1);
+    let daemon = Daemon::new(profile.clone(), link.clone(), replay_tx)?;
     let (incoming_tx, mut incoming_rx) = mpsc::channel(128);
     let clients = Arc::new(Semaphore::new(32));
     let mut core_tasks = JoinSet::new();
+    let mut replay_tasks = JoinSet::new();
+    let mut replay_again = false;
     let mut core_session = 0u64;
     let mut binding_order = HashMap::<String, oneshot::Receiver<()>>::new();
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -768,8 +784,25 @@ pub async fn run(profile: Profile) -> Result<()> {
     profile.write_evidence(&ready)?;
     loop {
         tokio::select! {
+            Some(result) = replay_tasks.join_next(), if !replay_tasks.is_empty() => {
+                if let Err(error) = result { eprintln!("[sidevoice rust proof] outbox replay: {error}"); }
+                if replay_again {
+                    replay_again = false;
+                    let daemon = daemon.clone();
+                    replay_tasks.spawn(async move { daemon.flush_outbox().await; });
+                }
+            }
+            Some(()) = replay_rx.recv() => {
+                if replay_tasks.is_empty() {
+                    let daemon = daemon.clone();
+                    replay_tasks.spawn(async move { daemon.flush_outbox().await; });
+                } else {
+                    replay_again = true;
+                }
+            }
             Some(result) = core_tasks.join_next(), if !core_tasks.is_empty() => {
                 if let Err(error) = result { eprintln!("[sidevoice rust proof] Core handler: {error}"); }
+                prune_binding_order(&mut binding_order);
             }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
@@ -784,6 +817,9 @@ pub async fn run(profile: Profile) -> Result<()> {
                     if item.session == core_session {
                         core_tasks.abort_all();
                         while core_tasks.join_next().await.is_some() {}
+                        replay_tasks.abort_all();
+                        while replay_tasks.join_next().await.is_some() {}
+                        replay_again = false;
                         binding_order.clear();
                         core_session = 0;
                     }
@@ -792,6 +828,9 @@ pub async fn run(profile: Profile) -> Result<()> {
                 if item.session != core_session {
                     core_tasks.abort_all();
                     while core_tasks.join_next().await.is_some() {}
+                    replay_tasks.abort_all();
+                    while replay_tasks.join_next().await.is_some() {}
+                    replay_again = false;
                     binding_order.clear();
                     core_session = item.session;
                 }
@@ -802,6 +841,11 @@ pub async fn run(profile: Profile) -> Result<()> {
                         eprintln!("[sidevoice rust proof] Core notification capacity reached");
                     }
                     continue;
+                }
+                if item.method == "binding.close" {
+                    if let Some(id) = item.params.get("binding_id").and_then(Value::as_str) {
+                        binding_order.remove(id);
+                    }
                 }
                 let daemon = daemon.clone();
                 let (previous, completed) = if item.method == "input.deliver" {
@@ -825,6 +869,10 @@ pub async fn run(profile: Profile) -> Result<()> {
             _ = tokio::signal::ctrl_c() => { break; }
         }
     }
+    replay_tasks.abort_all();
+    while replay_tasks.join_next().await.is_some() {}
+    core_tasks.abort_all();
+    while core_tasks.join_next().await.is_some() {}
     fs::remove_file(&profile.socket)?;
     drop(lock);
     Ok(())
@@ -832,8 +880,25 @@ pub async fn run(profile: Profile) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Daemon;
+    use super::{prune_binding_order, Daemon};
     use serde_json::json;
+    use std::collections::HashMap;
+    use tokio::sync::oneshot;
+
+    #[test]
+    fn completed_binding_tails_do_not_accumulate() {
+        let mut order = HashMap::new();
+        for index in 0..100 {
+            let (done, tail) = oneshot::channel();
+            order.insert(index.to_string(), tail);
+            done.send(()).unwrap();
+        }
+        let (_pending, tail) = oneshot::channel();
+        order.insert("active".into(), tail);
+        prune_binding_order(&mut order);
+        assert_eq!(order.len(), 1);
+        assert!(order.contains_key("active"));
+    }
 
     #[test]
     fn outbox_requires_matching_admission_or_audited_terminal_result() {
