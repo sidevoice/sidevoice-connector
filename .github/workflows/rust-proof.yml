@@ -37,6 +37,52 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --locked --release
       - run: cargo fmt --all --check
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sidevoice-rust-proof-macos-arm64
+          path: packages/connector-rust/target/release/sidevoice-rust-proof
+          if-no-files-found: error
+          retention-days: 7
+
+  launchd-integration:
+    name: Pinned Core and real launchd private-profile proof
+    needs: native-macos
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact pull request head
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 -c 'import os, subprocess, sys; actual = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(); expected = os.environ["EXPECTED_HEAD"]; print("checked out", actual, "expected", expected); sys.exit(actual != expected)'
+      - uses: actions/checkout@v4
+        with:
+          repository: sidevoice/sidevoice-core
+          ref: 4d6df599239602954a3c6ab503c642eeeab5ca12
+          path: core
+      - uses: actions/download-artifact@v4
+        with:
+          name: sidevoice-rust-proof-macos-arm64
+          path: proof-bin
+      - uses: astral-sh/setup-uv@v6
+      - run: chmod 700 proof-bin/sidevoice-rust-proof
+      - name: Real Core v3 and launchd lifecycle in a private profile
+        env:
+          SIDEVOICE_CORE_SOURCE: ${{ github.workspace }}/core
+          SIDEVOICE_CORE_SHA: 4d6df599239602954a3c6ab503c642eeeab5ca12
+          SIDEVOICE_RUST_PROOF_BIN: ${{ github.workspace }}/proof-bin/sidevoice-rust-proof
+        run: python3 packages/connector-rust/test/service_launchd.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sidevoice-rust-launchd-evidence
+          path: |
+            ${{ runner.temp }}/sidevoice-rust-launchd-profile/service-evidence.json
+            ${{ runner.temp }}/sidevoice-rust-launchd-profile/sidevoice/service/*.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   native:
     name: Native Rust proof
