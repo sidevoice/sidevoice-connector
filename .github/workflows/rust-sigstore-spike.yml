@@ -124,7 +124,7 @@ jobs:
           json.loads(changed)
           target.write_bytes(changed)
           consistent_name = hashlib.sha256(original).hexdigest() + '.trusted_root.json'
-          (cache / consistent_name).write_bytes(changed)
+          (cache / 'targets' / consistent_name).write_bytes(changed)
           print('valid-JSON cached target changed with signed TUF metadata unchanged:', consistent_name)
           PY
           if error=$("$binary" "$snapshot/core-manifest.json" "$snapshot/core-manifest.json.sigstore.json" nightly "$RUNNER_TEMP/tampered-target-tuf" offline 2>&1); then exit 1; fi
