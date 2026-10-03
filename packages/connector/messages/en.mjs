@@ -1,5 +1,8 @@
 /** English, the fallback bundle: every key a person can be shown has its words here first. */
+import agentErrors from './agent-errors.json' with { type: 'json' };
+
 export const en = {
+  ...agentErrors,
   // The core's directory and socket (§4.1).
   'identity.unsafe-directory': 'The Sidevoice core directory {path} is not safe to use ({why}): it must be a directory owned by you with no access for anyone else (chmod 700).',
   'peer.uid-mismatch': 'The socket {path} is not a socket owned by you; Sidevoice will not talk to it.',
@@ -96,21 +99,8 @@ export const en = {
   'cursor.invalid': '{file} is {why}; not touched. {manual}',
   'cursor.foreign': 'Cursor has a sidevoice MCP server of its own in {file}; not touched. {manual}',
   'cursor.unreadable': '{file} could not be read; not touched.',
-  'harness.claude': 'Claude Code',
-  'harness.codex': 'Codex',
-  'harness.cursor': 'Cursor',
   'agents.usage': 'usage: sidevoice agents [--json] | sidevoice agents <connect|disconnect|dismiss> <claude|codex|cursor> [--json]',
-  'agents.unknown': 'Unknown agent: {id}.',
-  'agents.unknown-request': 'Unknown agent request: {route}.',
-  'agents.not-present': '{agent} is not detected on this computer.',
-  'agents.foreign': '{agent} already has a Sidevoice registration that Sidevoice did not create; it was left unchanged.',
-  'agents.invalid': '{agent} has an unreadable or malformed Sidevoice registration; it was left unchanged.',
-  'agents.manual-required': '{agent} needs its manual Sidevoice configuration.',
-  'agents.registration-unknown': 'Sidevoice could not determine whether {agent} already has a Sidevoice registration.',
-  'agents.action-failed': 'Could not update {agent} agent configuration.',
-  'agents.busy': 'Another host agent request is still running. Try again shortly.',
   'agents.connector-not-installed': 'No installed Sidevoice command is available for agent configuration. Install Sidevoice first.',
-  'agents.registration-not-confirmed': 'The Sidevoice registration for {agent} could not be confirmed after the command succeeded.',
   'agents.list.empty': 'No supported agents were found on this computer.',
   'agents.list.row': '{agent}: {state} ({version})',
   'agents.action.connect': 'Connected {agent} to Sidevoice.',
@@ -122,7 +112,6 @@ export const en = {
   'agents.state.unknown': 'registration state unknown',
   'agents.version.unknown': 'version unknown',
   'agents.manual.codex.title': 'Use this configuration in {file}. If a Sidevoice entry already exists, replace it instead of adding a duplicate. Sidevoice leaves Codex configuration changes to Codex itself.',
-  'agents.manual.codex.replace-existing': '# Replace the existing Sidevoice entry by running these Codex commands:\n{remove}\n{add}',
   'agents.manual.codex.restart': 'Then restart Codex.',
   'agents.disconnect.codex': 'Unregistered the Sidevoice MCP server from Codex.',
   'agents.disconnect.codex-failed': 'Could not confirm that the Sidevoice MCP server was unregistered from Codex. Check Codex configuration and retry, or run `codex mcp remove sidevoice`.',

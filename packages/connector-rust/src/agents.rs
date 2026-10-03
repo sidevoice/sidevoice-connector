@@ -13,6 +13,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 
 mod claude;
 mod codex;
@@ -21,7 +22,7 @@ mod cursor;
 mod tests;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
@@ -111,12 +112,8 @@ impl AgentId {
         }
     }
 
-    fn label(self) -> &'static str {
-        match self {
-            Self::Claude => "Claude Code",
-            Self::Codex => "Codex",
-            Self::Cursor => "Cursor",
-        }
+    fn label(self) -> String {
+        agent_message(&format!("harness.{}", self.as_str()), &Value::Null)
     }
 
     fn override_name(self) -> &'static str {
@@ -484,13 +481,18 @@ impl HostAgents {
             state = self
                 .scan(state, Some(agent), false, cancel, deadline)
                 .await?;
-            if seen_agent(&state, agent)
-                .and_then(|row| row.get("registration"))
-                .and_then(Value::as_str)
-                != Some("connected")
-            {
-                return Err(agent_failure("agents.registration-not-confirmed", agent));
+        match seen_agent(&state, agent)
+            .and_then(|row| row.get("registration"))
+            .and_then(Value::as_str)
+        {
+            Some("connected") => {
+                return Err(agent_failure("agents.registration-not-confirmed", agent))
             }
+            Some("not-connected") => {}
+            Some("foreign") => return Err(agent_failure("agents.foreign", agent)),
+            Some("invalid") => return Err(agent_failure("agents.invalid", agent)),
+            _ => return Err(agent_failure("agents.registration-unknown", agent)),
+        }
             let store = self
                 .update_state(cancel, deadline, |latest| {
                     if seen_agent(latest, agent)
@@ -526,12 +528,15 @@ impl HostAgents {
         state = self
             .scan(state, Some(agent), false, cancel, deadline)
             .await?;
-        if seen_agent(&state, agent)
+        match seen_agent(&state, agent)
             .and_then(|row| row.get("registration"))
             .and_then(Value::as_str)
-            == Some("connected")
         {
-            return Err(agent_failure("agents.action-failed", agent));
+            Some("not-connected") => {}
+            Some("connected") => return Err(agent_failure("agents.action-failed", agent)),
+            Some("foreign") => return Err(agent_failure("agents.foreign", agent)),
+            Some("invalid") => return Err(agent_failure("agents.invalid", agent)),
+            _ => return Err(agent_failure("agents.registration-unknown", agent)),
         }
         self.response(&state)
     }
@@ -866,6 +871,45 @@ fn agent_failure(key: &'static str, id: AgentId) -> Failure {
     Failure::keyed(key, json!({"id":id.as_str(),"agent":id.label()}))
 }
 
+fn agent_message(key: &str, params: &Value) -> String {
+    static MESSAGES: OnceLock<HashMap<String, String>> = OnceLock::new();
+    let messages = MESSAGES.get_or_init(|| {
+        serde_json::from_str(include_str!("../../connector/messages/agent-errors.json"))
+            .expect("embedded agent message bundle must be valid JSON")
+    });
+    let Some(template) = messages.get(key) else {
+        return key.to_owned();
+    };
+    let mut rendered = String::new();
+    let mut remaining = template.as_str();
+    loop {
+        let Some(open) = remaining.find('{') else {
+            rendered.push_str(remaining);
+            break;
+        };
+        rendered.push_str(&remaining[..open]);
+        let tail = &remaining[open + 1..];
+        let Some(close) = tail.find('}') else {
+            rendered.push_str(&remaining[open..]);
+            break;
+        };
+        let name = &tail[..close];
+        if let Some(value) = params.get(name) {
+            rendered.push_str(
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| value.to_string())
+                    .as_str(),
+            );
+        } else {
+            rendered.push_str(&remaining[open..open + close + 2]);
+        }
+        remaining = &tail[close + 1..];
+    }
+    rendered
+}
+
 fn seen_entry(state: &Value, id: AgentId) -> Option<&Value> {
     state.pointer(&format!("/seen/{}", id.as_str()))
 }
@@ -955,47 +999,7 @@ fn check_live(cancel: &Cancellation, deadline: Instant) -> std::result::Result<(
 }
 
 fn error_value(key: &str, params: Value) -> Value {
-    let params = params.as_object().cloned().unwrap_or_default();
-    let message = match key {
-        "agents.unknown" => format!(
-            "Unknown agent: {}.",
-            params.get("id").and_then(Value::as_str).unwrap_or("")
-        ),
-        "agents.not-present" => format!(
-            "{} is not detected on this computer.",
-            params.get("agent").and_then(Value::as_str).unwrap_or("The agent")
-        ),
-        "agents.foreign" => format!(
-            "{} already has a Sidevoice registration that Sidevoice did not create; it was left unchanged.",
-            params.get("agent").and_then(Value::as_str).unwrap_or("The agent")
-        ),
-        "agents.invalid" => format!(
-            "{} has an unreadable or malformed Sidevoice registration; it was left unchanged.",
-            params.get("agent").and_then(Value::as_str).unwrap_or("The agent")
-        ),
-        "agents.manual-required" => format!(
-            "{} needs its manual Sidevoice configuration.",
-            params.get("agent").and_then(Value::as_str).unwrap_or("The agent")
-        ),
-        "agents.registration-unknown" => format!(
-            "Sidevoice could not determine whether {} already has a Sidevoice registration.",
-            params.get("agent").and_then(Value::as_str).unwrap_or("the agent")
-        ),
-        "agents.registration-not-confirmed" => format!(
-            "The Sidevoice registration for {} could not be confirmed after the command succeeded.",
-            params.get("agent").and_then(Value::as_str).unwrap_or("the agent")
-        ),
-        "agents.unknown-request" => format!(
-            "Unknown agent request: {}.",
-            params.get("route").and_then(Value::as_str).unwrap_or("")
-        ),
-        "agents.busy" => "Another host agent request is still running. Try again shortly.".into(),
-        "agents.action-failed" => format!(
-            "Could not update {} agent configuration.",
-            params.get("agent").and_then(Value::as_str).unwrap_or("host agent")
-        ),
-        _ => "Could not update host agent configuration.".into(),
-    };
+    let message = agent_message(key, &params);
     json!({"error":{"key":key,"params":params,"message":message}})
 }
 
@@ -1138,6 +1142,9 @@ async fn run_command(
     if cancel.is_cancelled() {
         return Err(CommandFailure::Cancelled);
     }
+    profile
+        .validate_private()
+        .map_err(|_| CommandFailure::Start)?;
     let mut command = Command::new(binary);
     command
         .args(args)
@@ -1147,6 +1154,11 @@ async fn run_command(
         .kill_on_drop(true)
         .process_group(0);
     profile.command_env(&mut command);
+    // Recheck immediately before passing these profile roots to a host CLI. The binary may have
+    // been selected during an earlier scan, before an agent config directory was replaced.
+    profile
+        .validate_private()
+        .map_err(|_| CommandFailure::Start)?;
     let mut child = command.spawn().map_err(|_| CommandFailure::Start)?;
     let process_group = child.id().ok_or(CommandFailure::Io)?;
     let stdout = child.stdout.take().ok_or(CommandFailure::Io)?;
@@ -1240,7 +1252,9 @@ fn read_cursor_config(file: &Path, root: &Path) -> Result<Option<(Value, u32, Pa
     )))
 }
 
-fn write_cursor_config(file: &Path, root: &Path, config: &Value) -> Result<()> {
+fn write_cursor_config(profile: &Profile, file: &Path, config: &Value) -> Result<()> {
+    profile.validate_private()?;
+    let root = &profile.root;
     let (target, mode) = match read_cursor_config(file, root)? {
         Some((_, mode, target)) => (target, mode),
         None => (file.to_path_buf(), 0o600),
@@ -1252,6 +1266,7 @@ fn write_cursor_config(file: &Path, root: &Path, config: &Value) -> Result<()> {
     }
     let temporary = parent.join(format!(".mcp.json.{}.tmp", Uuid::new_v4()));
     let result = (|| -> Result<()> {
+        profile.validate_private()?;
         let mut output = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1263,6 +1278,7 @@ fn write_cursor_config(file: &Path, root: &Path, config: &Value) -> Result<()> {
         output.write_all(b"\n")?;
         output.sync_all()?;
         fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
+        profile.validate_private()?;
         fs::rename(&temporary, &target)?;
         File::open(parent)?.sync_all()?;
         Ok(())
@@ -1335,6 +1351,9 @@ impl HostAgents {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<Observation, Failure> {
+        self.profile
+            .validate_private()
+            .map_err(|_| agent_failure("agents.invalid", id))?;
         let binary = self.resolve_binary(id, input.state, input.login_path);
         let registration = match id {
             AgentId::Claude => {
@@ -1449,8 +1468,15 @@ impl HostAgents {
                         .collect::<Vec<_>>();
                     add.push(selected.command.clone());
                     add.extend(selected.args.clone());
+                    let replace_message = agent_message(
+                        "agents.manual.codex.replace-existing",
+                        &json!({
+                            "remove":shell_command(cli, &remove),
+                            "add":shell_command(cli, &add),
+                        }),
+                    );
                     return json!({
-                        "command":format!("# Replace the existing Sidevoice entry by running these Codex commands:\n{}\n{}",shell_command(cli,&remove),shell_command(cli,&add)),
+                        "command":replace_message,
                         "file":Value::Null,
                         "snippet":Value::Null,
                     });

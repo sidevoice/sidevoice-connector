@@ -107,6 +107,24 @@ fn identity_signature(id: &str, version: Option<&str>, evidence: &[Evidence<'_>]
 }
 
 #[test]
+fn agent_refusals_labels_and_manual_text_use_the_shared_english_bundle() {
+    assert_eq!(
+        agent_message("agents.invalid", &json!({"agent":"Codex"})),
+        "Codex has an unreadable or malformed Sidevoice registration; it was left unchanged."
+    );
+    assert_eq!(AgentId::Claude.label(), "Claude Code");
+    assert_eq!(
+        agent_message(
+            "agents.manual.codex.replace-existing",
+            &json!({"remove":"codex mcp remove sidevoice","add":"codex mcp add sidevoice"})
+        ),
+        "# Replace the existing Sidevoice entry by running these Codex commands:\n\
+         codex mcp remove sidevoice\n\
+         codex mcp add sidevoice"
+    );
+}
+
+#[test]
 fn proof_ownership_is_exact_and_js_release_fixtures_stay_narrow() {
     let fixture = Fixture::new();
     assert_eq!(
@@ -371,6 +389,105 @@ async fn disappeared_and_reappeared_config_gets_a_new_generation() {
 }
 
 #[tokio::test]
+async fn replacing_cursor_profile_with_symlink_refuses_connect_without_touching_target() {
+    let fixture = Fixture::new();
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let external = fixture.root.parent().unwrap().join(format!(
+        "sidevoice-agent-real-cursor-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    private_mkdir(&external);
+    let config = external.join("mcp.json");
+    private_write(
+        &config,
+        br#"{"mcpServers":{"other":{"command":"keep-me"}}}"#,
+    );
+    let before = fs::read(&config).unwrap();
+    fs::remove_dir_all(&fixture.profile.cursor).unwrap();
+    symlink(&external, &fixture.profile.cursor).unwrap();
+
+    let answer = host
+        .handle("agents.connect", json!({"id":"cursor"}))
+        .await;
+    assert_eq!(
+        answer.pointer("/error/key"),
+        Some(&json!("agents.invalid"))
+    );
+    assert_eq!(fs::read(&config).unwrap(), before);
+    host.shutdown().await;
+    let _ = fs::remove_dir_all(external);
+}
+
+#[tokio::test]
+async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn() {
+    let fixture = Fixture::new();
+    let executable = fixture.root.join("bin/codex");
+    private_mkdir(executable.parent().unwrap());
+    let marker = fixture.root.join("codex-was-started");
+    private_write(
+        &executable,
+        format!("#!/bin/sh\nprintf started > '{}'\n", marker.display()).as_bytes(),
+    );
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut state = empty_state();
+    state["binaries"]["codex"] = json!(executable);
+    write_json(&fixture.profile.data.join("agents.json"), &state);
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let external = fixture.root.parent().unwrap().join(format!(
+        "sidevoice-agent-real-codex-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    private_mkdir(&external);
+    let config = external.join("config.toml");
+    private_write(&config, b"[mcp_servers.other]\ncommand = 'keep-me'\n");
+    let before = fs::read(&config).unwrap();
+    fs::remove_dir_all(&fixture.profile.codex).unwrap();
+    symlink(&external, &fixture.profile.codex).unwrap();
+
+    let answer = host
+        .handle("agents.connect", json!({"id":"codex"}))
+        .await;
+    assert_eq!(
+        answer.pointer("/error/key"),
+        Some(&json!("agents.invalid"))
+    );
+    assert!(!marker.exists(), "Codex CLI ran with a replaced private profile");
+    assert_eq!(fs::read(&config).unwrap(), before);
+
+    // The spawn boundary also rejects replacement after binary resolution by an earlier request.
+    let direct = run_command(
+        &fixture.profile,
+        executable.to_str().unwrap(),
+        &["mcp".into(), "get".into(), "sidevoice".into()],
+        &Cancellation::new(),
+        Instant::now() + StdDuration::from_secs(1),
+    )
+    .await;
+    assert!(matches!(direct, Err(CommandFailure::Start)));
+    assert!(!marker.exists(), "CLI spawn boundary accepted a replaced profile");
+    host.shutdown().await;
+    let _ = fs::remove_dir_all(external);
+}
+
+#[tokio::test]
+async fn dangling_codex_config_symlink_is_invalid_not_absent() {
+    let fixture = Fixture::new();
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let missing = fixture.root.join("missing-config-target.toml");
+    symlink(missing, fixture.profile.codex.join("config.toml")).unwrap();
+    let answer = host
+        .handle("agents.connect", json!({"id":"codex"}))
+        .await;
+    assert_eq!(
+        answer.pointer("/error/key"),
+        Some(&json!("agents.invalid"))
+    );
+    host.shutdown().await;
+}
+
+#[tokio::test]
 async fn complete_request_gate_orders_scans_mutations_and_external_dismissals() {
     let fixture = Fixture::new();
     let binary = fixture.root.join("bin/codex");
@@ -388,6 +505,10 @@ if args == ['--version']:
     raise SystemExit(0)
 if args[:3] == ['mcp', 'get', 'sidevoice']:
     state = json.loads(state_file.read_text()) if state_file.exists() else None
+    timeout_next = home / 'timeout-next-get'
+    if timeout_next.exists():
+        timeout_next.unlink()
+        time.sleep(4)
     slow = home / 'slow-next-get'
     if slow.exists():
         slow.unlink()
@@ -401,6 +522,10 @@ if args[:3] == ['mcp', 'get', 'sidevoice']:
 if args[:3] == ['mcp', 'remove', 'sidevoice']:
     state_file.unlink(missing_ok=True)
     config_file.unlink(missing_ok=True)
+    uncertain = home / 'timeout-after-remove'
+    if uncertain.exists():
+        uncertain.unlink()
+        (home / 'timeout-next-get').write_text('1')
     raise SystemExit(0)
 if args[:3] == ['mcp', 'add', 'sidevoice'] and '--' in args:
     command = args[args.index('--') + 1]
@@ -502,6 +627,18 @@ raise SystemExit(2)
     assert_eq!(row(&disconnected, "codex")["registration"], "not-connected");
     let final_state = host.handle("agents.list", json!({})).await;
     assert_eq!(row(&final_state, "codex")["registration"], "not-connected");
+
+    let restored = host.handle("agents.connect", json!({"id":"codex"})).await;
+    assert_eq!(row(&restored, "codex")["registration"], "connected");
+    private_write(&fixture.profile.codex.join("timeout-after-remove"), b"1");
+    let uncertain_disconnect = host
+        .handle("agents.disconnect", json!({"id":"codex"}))
+        .await;
+    assert_eq!(
+        uncertain_disconnect.pointer("/error/key"),
+        Some(&json!("agents.registration-unknown"))
+    );
+    assert!(!fixture.profile.codex.join("fake-entry.json").exists());
 
     // Dropping the link-side waiter cancels the owned operation. The delayed add is killed before
     // it can write, and a subsequent request re-inspects the actual entry before connecting.

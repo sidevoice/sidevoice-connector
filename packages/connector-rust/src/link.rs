@@ -252,7 +252,16 @@ impl Link {
                                 } // A response to a timed-out request is harmless.
                             } else { bail!("Core frame has no method or ID"); }
                         }
-                        Message::Close(_) => break,
+                        Message::Close(frame) => {
+                            if let Some(frame) = frame {
+                                bail!(
+                                    "Core WebSocket closed with code {}: {}",
+                                    frame.code,
+                                    frame.reason
+                                );
+                            }
+                            bail!("Core WebSocket closed without a close frame");
+                        }
                         _ => {}
                     }
                 }

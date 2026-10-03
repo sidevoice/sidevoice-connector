@@ -88,9 +88,16 @@ impl HostAgents {
     }
 
     fn codex_file_guard(&self) -> std::result::Result<String, Failure> {
+        if self.profile.validate_private().is_err() {
+            return Ok("invalid".into());
+        }
         let file = self.profile.codex.join("config.toml");
-        if !file.exists() {
-            return Ok("not-connected".into());
+        match fs::symlink_metadata(&file) {
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok("not-connected".into())
+            }
+            Err(_) => return Ok("invalid".into()),
+            Ok(_) => {}
         }
         let text = match read_profile_file(&file, &self.profile.root, 1 << 20) {
             Ok(text) => text,

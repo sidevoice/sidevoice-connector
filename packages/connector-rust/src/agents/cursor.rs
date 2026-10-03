@@ -2,6 +2,7 @@ use super::*;
 
 impl HostAgents {
     pub(super) fn cursor_registration(&self) -> Result<String> {
+        self.profile.validate_private()?;
         let file = self.profile.cursor.join("mcp.json");
         let Some((mut config, _mode, _target)) = read_cursor_config(&file, &self.profile.root)?
         else {
@@ -40,6 +41,9 @@ impl HostAgents {
     }
 
     pub(super) fn cursor_connect(&self) -> std::result::Result<(), Failure> {
+        self.profile
+            .validate_private()
+            .map_err(|_| agent_failure("agents.invalid", AgentId::Cursor))?;
         let file = self.profile.cursor.join("mcp.json");
         let mut config = match read_cursor_config(&file, &self.profile.root) {
             Ok(Some((config, _, _))) => config,
@@ -83,10 +87,14 @@ impl HostAgents {
         entry.insert("args".into(), json!(self.selected.args));
         servers.insert("sidevoice".into(), Value::Object(entry));
         config["mcpServers"] = Value::Object(servers);
-        write_cursor_config(&file, &self.profile.root, &config).map_err(|_| Failure::Internal)
+        write_cursor_config(&self.profile, &file, &config)
+            .map_err(|_| agent_failure("agents.invalid", AgentId::Cursor))
     }
 
     pub(super) fn cursor_disconnect(&self) -> std::result::Result<(), Failure> {
+        self.profile
+            .validate_private()
+            .map_err(|_| agent_failure("agents.invalid", AgentId::Cursor))?;
         let file = self.profile.cursor.join("mcp.json");
         let Some((mut config, _, _)) = read_cursor_config(&file, &self.profile.root)
             .map_err(|_| agent_failure("agents.invalid", AgentId::Cursor))?
@@ -114,6 +122,7 @@ impl HostAgents {
             return Err(agent_failure("agents.foreign", AgentId::Cursor));
         }
         servers.remove("sidevoice");
-        write_cursor_config(&file, &self.profile.root, &config).map_err(|_| Failure::Internal)
+        write_cursor_config(&self.profile, &file, &config)
+            .map_err(|_| agent_failure("agents.invalid", AgentId::Cursor))
     }
 }

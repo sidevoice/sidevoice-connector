@@ -208,7 +208,15 @@ async def copied_state():
             # The service scanner intentionally skips uninstalled profiles. Invoke the
             # same JS store writer directly so the copied fixture is genuinely JS state.
             scan = await asyncio.create_subprocess_exec('node', '--input-type=module', '-e',
-                "import {listAgents} from './packages/connector/agents.mjs'; listAgents(process.env, {rescan:true, watch:'codex'});",
+                "import {listAgents, agentAction} from './packages/connector/agents.mjs'; "
+                "listAgents(process.env, {rescan:true, watch:'cursor'}); "
+                "const result = agentAction('dismiss', 'cursor', process.env); "
+                "if (!result.agents.find(agent => agent.id === 'cursor')?.dismissed) throw Error('JS dismissal was not saved'); "
+                "const fs = await import('node:fs'); "
+                "const file = process.env.SIDEVOICE_DATA_DIR + '/agents.json'; "
+                "const state = JSON.parse(fs.readFileSync(file, 'utf8')); "
+                "state.fixture_unrelated = {owner:'JS fixture', preserved:true}; "
+                "fs.writeFileSync(file, JSON.stringify(state)); fs.chmodSync(file, 0o600);",
                 cwd=str(js_cli.parents[2]), env=env, stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE)
             _, scan_error = await asyncio.wait_for(scan.communicate(), 30)
@@ -237,7 +245,30 @@ async def copied_state():
                 shutil.copy2(data / name, copied / name)
                 (data / name).unlink()
                 shutil.copy2(copied / name, data / name)
-            agents_before = (data / 'agents.json').read_bytes()
+            js_agents_state = json.loads(agents.read_text())
+            js_cursor_generation = js_agents_state['seen']['cursor']['generation']
+            rust_scan = await asyncio.create_subprocess_exec(str(binary), '--profile-root', str(root),
+                'codex', 'inspect', stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)
+            rust_scan_stdout, rust_scan_stderr = await asyncio.wait_for(rust_scan.communicate(), 30)
+            assert rust_scan.returncode == 0, rust_scan_stderr.decode(errors='replace')[-2000:]
+            rust_listing = json.loads(rust_scan_stdout)
+            rust_cursor = next(agent for agent in rust_listing['agents'] if agent['id'] == 'cursor')
+            assert rust_cursor['dismissed'] is True and rust_cursor['actionable'] is False, rust_cursor
+            js_reread = await asyncio.create_subprocess_exec('node', '--input-type=module', '-e',
+                "import {listAgents} from './packages/connector/agents.mjs'; "
+                "const result=listAgents(process.env, {rescan:false}); "
+                "const cursor=result.agents.find(agent => agent.id === 'cursor'); "
+                "const fs=await import('node:fs'); const state=JSON.parse(fs.readFileSync(process.env.SIDEVOICE_DATA_DIR + '/agents.json','utf8')); "
+                "if (!cursor?.dismissed || cursor.actionable || state.fixture_unrelated?.preserved !== true) throw Error('Rust host scan did not preserve JS state'); "
+                "console.log(JSON.stringify({dismissed:cursor.dismissed, generation:state.seen.cursor.generation, unrelated:state.fixture_unrelated}));",
+                cwd=str(js_cli.parents[2]), env=env, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE)
+            reread_stdout, reread_stderr = await asyncio.wait_for(js_reread.communicate(), 30)
+            assert js_reread.returncode == 0, reread_stderr.decode(errors='replace')[-1000:]
+            reread = json.loads(reread_stdout)
+            assert reread['generation'] == js_cursor_generation and reread['dismissed'] is True, reread
+            agents_after_rust = (data / 'agents.json').read_bytes()
+            assert agents_after_rust != (copied / 'agents.json').read_bytes(), 'Rust did not rescan and rewrite JS host state'
             daemon = await asyncio.create_subprocess_exec(str(binary), 'connector', '--profile-root', str(root),
                 stdout=rust_log, stderr=rust_log, env=env)
             await until(socket_path.exists, 'Rust copied-state socket')
@@ -253,7 +284,6 @@ async def copied_state():
             token = http_json(core_data / 'local.sock', 'POST', '/api/device/local/pair', {'name': 'copied-state'})['token']
             rows = http_json(core_data / 'local.sock', 'GET', f'/api/presentation/history?thread_id={thread}', token=token)['messages']
             assert sum(row['text'] == original['text'] for row in rows) == 1
-            assert (data / 'agents.json').read_bytes() == agents_before, 'Rust changed JS agent state'
             await finish(facade)
             facade = None
             await finish(daemon)
@@ -266,7 +296,8 @@ async def copied_state():
             assert sum(row['text'] == original['text'] for row in rows) == 1
             assert json.loads(agents.read_text())['version'] == 1
             print(json.dumps({'copied_state': 'JS_to_Rust_to_JS', 'core_launch_id': launch,
-                              'binding_reused': True, 'speech_once': True, 'agents_readable': True}))
+                              'binding_reused': True, 'speech_once': True,
+                              'agents_dismissal_preserved': True, 'agents_unknown_field_preserved': True}))
             await finish(js)
             js = None
             js_writer.close()
@@ -618,7 +649,7 @@ else:
                 second_thread = str(uuid.uuid4())
                 registration = await asyncio.wait_for(tool(facade, 'voice_connect',
                     {'title': 'Concurrent link reply'}, 92, second_thread), 3)
-                assert registration['conversation'] == second_thread and not registration['binding_id'].startswith('local-')
+                assert registration['conversation'] == second_thread and not registration['binding_id'].startswith('local-'), registration
                 unrelated = await asyncio.wait_for(input_task, 3)
                 assert unrelated['accepted'] is True
                 await until(lambda: queued.exists() and json.loads(queued.read_text()).get('message', '').find(unrelated_text) >= 0,
@@ -716,11 +747,21 @@ else:
         except Exception:
             core_log.flush()
             daemon_log.flush()
-            print('Core process:', core.returncode, file=sys.stderr)
+            for name, process in (('Core', core), ('Rust daemon', daemon), ('MCP façade', facade)):
+                print(f'{name} returncode: {process.returncode if process else None}', file=sys.stderr)
+            proof_path = data / 'proof.json'
+            if proof_path.exists():
+                print('Rust proof evidence: ' + proof_path.read_text(errors='replace'), file=sys.stderr)
+            if facade and facade.returncode is None:
+                try:
+                    status = await asyncio.wait_for(tool(facade, 'voice_status', {}, 99), 2)
+                    print('Rust voice_status: ' + json.dumps(status), file=sys.stderr)
+                except Exception as status_error:
+                    print(f'Rust voice_status failed: {status_error!r}', file=sys.stderr)
             for name in ('core.log', 'daemon.log', 'core-app.log'):
                 path = root / name
                 if path.exists():
-                    print(name + ': ' + path.read_text(errors='replace')[-2000:], file=sys.stderr)
+                    print(name + ':\n' + path.read_text(errors='replace'), file=sys.stderr)
             raise
         finally:
             if facade:

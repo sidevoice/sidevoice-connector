@@ -158,6 +158,37 @@ impl Profile {
             .env("SIDEVOICE_DATA_DIR", &self.data)
     }
 
+    /// Reject profile paths that were replaced after this process opened the isolated profile.
+    /// All of these roots are passed to host CLIs or used for profile writes, so check them again
+    /// at each operation boundary rather than trusting startup-time validation.
+    pub fn validate_private(&self) -> Result<()> {
+        private_dir(&self.root)?;
+        let root = self.root.canonicalize()?;
+        if root != self.root {
+            bail!("proof root changed after startup");
+        }
+        for path in [
+            &self.home,
+            &self.claude,
+            &self.codex,
+            &self.cursor,
+            &self.data,
+        ] {
+            private_dir(path)?;
+            let canonical = path.canonicalize()?;
+            if canonical != *path || !canonical.starts_with(&root) {
+                bail!("proof profile directory escaped its root");
+            }
+        }
+        let core = self.data.join("core");
+        private_dir(&core)?;
+        let canonical = core.canonicalize()?;
+        if canonical != core || !canonical.starts_with(&root) {
+            bail!("proof Core profile directory escaped its root");
+        }
+        Ok(())
+    }
+
     pub fn try_connector_lock(&self) -> Result<File> {
         let path = self.data.join("connector.lock");
         let lock = OpenOptions::new()

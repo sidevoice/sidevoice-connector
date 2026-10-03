@@ -5,6 +5,7 @@ on:
     paths:
       - 'packages/connector-rust/**'
       - 'packages/connector/messages/en.mjs'
+      - 'packages/connector/messages/agent-errors.json'
       - '.github/workflows/rust-proof.yml'
   workflow_dispatch:
 
@@ -20,6 +21,12 @@ jobs:
         working-directory: packages/connector-rust
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact pull request head
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 -c 'import os, subprocess, sys; actual = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(); expected = os.environ["EXPECTED_HEAD"]; print("checked out", actual, "expected", expected); sys.exit(actual != expected)'
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -53,6 +60,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify exact pull request head
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 -c 'import os, subprocess, sys; actual = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(); expected = os.environ["EXPECTED_HEAD"]; print("checked out", actual, "expected", expected); sys.exit(actual != expected)'
       - uses: actions/checkout@v4
         with:
           repository: sidevoice/sidevoice-core
