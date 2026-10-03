@@ -322,7 +322,16 @@ async def exercise():
             raise AssertionError(f'service {action} must print exactly one JSON line: {text[-1000:]!r}; {stderr[-1000:]!r}')
         value = json.loads(text)
         if expect_ok and (process.returncode != 0 or value.get('ok') is not True):
-            raise AssertionError(f'service {action} failed: {value}; {stderr.decode(errors="replace")[-2000:]}')
+            manager = []
+            for label in labels:
+                snapshot = run(['/bin/launchctl', 'print', f'{domain}/{label}'], check=False)
+                manager.append(f'{label}: rc={snapshot.returncode} '
+                               f'{snapshot.stdout[-4000:]} {snapshot.stderr[-1000:]}')
+            status = run_status_sync(staged_binary, profile, control_env)
+            raise AssertionError(
+                f'service {action} failed: {value}; {stderr.decode(errors="replace")[-2000:]}\n'
+                f'current service status: {status}\nlaunchd snapshots:\n' + '\n'.join(manager)
+            )
         if not expect_ok and (process.returncode == 0 and value.get('ok') is True):
             raise AssertionError(f'service {action} unexpectedly succeeded: {value}')
         return value
