@@ -459,6 +459,7 @@ async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn()
     // The spawn boundary also rejects replacement after binary resolution by an earlier request.
     let direct = run_command(
         &fixture.profile,
+        Some(&fixture.profile.codex),
         executable.to_str().unwrap(),
         &["mcp".into(), "get".into(), "sidevoice".into()],
         &Cancellation::new(),
@@ -530,6 +531,10 @@ if args[:3] == ['mcp', 'remove', 'sidevoice']:
 if args[:3] == ['mcp', 'add', 'sidevoice'] and '--' in args:
     command = args[args.index('--') + 1]
     command_args = args[args.index('--') + 2:]
+    unregistered = home / 'leave-unregistered-after-add'
+    if unregistered.exists():
+        unregistered.unlink()
+        raise SystemExit(0)
     slow = home / 'slow-next-add'
     if slow.exists():
         slow.unlink()
@@ -627,6 +632,16 @@ raise SystemExit(2)
     assert_eq!(row(&disconnected, "codex")["registration"], "not-connected");
     let final_state = host.handle("agents.list", json!({})).await;
     assert_eq!(row(&final_state, "codex")["registration"], "not-connected");
+
+    private_write(&fixture.profile.codex.join("leave-unregistered-after-add"), b"1");
+    let unconfirmed_connect = host
+        .handle("agents.connect", json!({"id":"codex"}))
+        .await;
+    assert_eq!(
+        unconfirmed_connect.pointer("/error/key"),
+        Some(&json!("agents.registration-not-confirmed"))
+    );
+    assert!(!fixture.profile.codex.join("fake-entry.json").exists());
 
     let restored = host.handle("agents.connect", json!({"id":"codex"})).await;
     assert_eq!(row(&restored, "codex")["registration"], "connected");

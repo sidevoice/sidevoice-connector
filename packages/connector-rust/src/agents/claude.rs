@@ -7,11 +7,17 @@ impl HostAgents {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<String, Failure> {
+        match fs::symlink_metadata(&self.profile.claude) {
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok("absent".into()),
+            Err(_) => return Ok("invalid".into()),
+            Ok(_) => {}
+        }
         let Some(binary) = binary else {
             return Ok("unknown".into());
         };
         let output = match run_command(
             &self.profile,
+            Some(&self.profile.claude),
             binary,
             &["mcp".into(), "get".into(), "sidevoice".into()],
             cancel,

@@ -49,6 +49,15 @@ fn uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+fn validate_profile_child(root: &Path, path: &Path) -> Result<()> {
+    private_dir(path)?;
+    let canonical = path.canonicalize()?;
+    if canonical != path || !canonical.starts_with(root) {
+        bail!("proof profile directory escaped its root");
+    }
+    Ok(())
+}
+
 pub fn private_dir(path: &Path) -> Result<()> {
     let m = fs::symlink_metadata(path)
         .with_context(|| format!("missing private directory {}", path.display()))?;
@@ -105,7 +114,7 @@ impl Profile {
         if data.join("install.json").exists() {
             bail!("selected installation data is forbidden in proof profile");
         }
-        Ok(Self {
+        let profile = Self {
             root,
             home,
             claude,
@@ -115,7 +124,9 @@ impl Profile {
             data,
             codex,
             cursor,
-        })
+        };
+        profile.validate_private()?;
+        Ok(profile)
     }
 
     pub fn from_env() -> Result<Self> {
@@ -161,30 +172,41 @@ impl Profile {
     /// Reject profile paths that were replaced after this process opened the isolated profile.
     /// All of these roots are passed to host CLIs or used for profile writes, so check them again
     /// at each operation boundary rather than trusting startup-time validation.
-    pub fn validate_private(&self) -> Result<()> {
+    pub fn validate_existing_private(&self) -> Result<()> {
         private_dir(&self.root)?;
         let root = self.root.canonicalize()?;
         if root != self.root {
             bail!("proof root changed after startup");
         }
-        for path in [
-            &self.home,
-            &self.claude,
-            &self.codex,
-            &self.cursor,
-            &self.data,
-        ] {
-            private_dir(path)?;
-            let canonical = path.canonicalize()?;
-            if canonical != *path || !canonical.starts_with(&root) {
-                bail!("proof profile directory escaped its root");
+        validate_profile_child(&root, &self.home)?;
+        validate_profile_child(&root, &self.data)?;
+        let core = self.data.join("core");
+        validate_profile_child(&root, &core)?;
+        for path in [&self.claude, &self.codex, &self.cursor] {
+            match fs::symlink_metadata(path) {
+                Ok(_) => validate_profile_child(&root, path)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
         }
-        let core = self.data.join("core");
-        private_dir(&core)?;
-        let canonical = core.canonicalize()?;
-        if canonical != core || !canonical.starts_with(&root) {
-            bail!("proof Core profile directory escaped its root");
+        Ok(())
+    }
+
+    pub fn validate_for_agent(&self, config_root: &Path) -> Result<()> {
+        self.validate_existing_private()?;
+        if config_root != self.claude.as_path()
+            && config_root != self.codex.as_path()
+            && config_root != self.cursor.as_path()
+        {
+            bail!("unknown proof agent configuration directory");
+        }
+        validate_profile_child(&self.root, config_root)
+    }
+
+    pub fn validate_private(&self) -> Result<()> {
+        self.validate_existing_private()?;
+        for path in [&self.claude, &self.codex, &self.cursor] {
+            validate_profile_child(&self.root, path)?;
         }
         Ok(())
     }

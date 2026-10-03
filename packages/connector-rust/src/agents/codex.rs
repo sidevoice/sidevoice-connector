@@ -11,11 +11,18 @@ impl HostAgents {
         if guard == "foreign" || guard == "invalid" {
             return Ok(guard);
         }
+        if matches!(
+            fs::symlink_metadata(&self.profile.codex),
+            Err(ref error) if error.kind() == ErrorKind::NotFound
+        ) {
+            return Ok("not-connected".into());
+        }
         let Some(binary) = binary else {
             return Ok("unknown".into());
         };
         let output = match run_command(
             &self.profile,
+            Some(&self.profile.codex),
             binary,
             &[
                 "mcp".into(),
@@ -88,7 +95,17 @@ impl HostAgents {
     }
 
     fn codex_file_guard(&self) -> std::result::Result<String, Failure> {
-        if self.profile.validate_private().is_err() {
+        if self.profile.validate_existing_private().is_err() {
+            return Ok("invalid".into());
+        }
+        match fs::symlink_metadata(&self.profile.codex) {
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok("not-connected".into())
+            }
+            Err(_) => return Ok("invalid".into()),
+            Ok(_) => {}
+        }
+        if self.profile.validate_for_agent(&self.profile.codex).is_err() {
             return Ok("invalid".into());
         }
         let file = self.profile.codex.join("config.toml");

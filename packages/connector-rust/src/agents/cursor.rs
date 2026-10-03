@@ -2,7 +2,7 @@ use super::*;
 
 impl HostAgents {
     pub(super) fn cursor_registration(&self) -> Result<String> {
-        self.profile.validate_private()?;
+        self.profile.validate_existing_private()?;
         let file = self.profile.cursor.join("mcp.json");
         let Some((mut config, _mode, _target)) = read_cursor_config(&file, &self.profile.root)?
         else {
@@ -42,7 +42,7 @@ impl HostAgents {
 
     pub(super) fn cursor_connect(&self) -> std::result::Result<(), Failure> {
         self.profile
-            .validate_private()
+            .validate_for_agent(&self.profile.cursor)
             .map_err(|_| agent_failure("agents.invalid", AgentId::Cursor))?;
         let file = self.profile.cursor.join("mcp.json");
         let mut config = match read_cursor_config(&file, &self.profile.root) {
@@ -93,7 +93,7 @@ impl HostAgents {
 
     pub(super) fn cursor_disconnect(&self) -> std::result::Result<(), Failure> {
         self.profile
-            .validate_private()
+            .validate_for_agent(&self.profile.cursor)
             .map_err(|_| agent_failure("agents.invalid", AgentId::Cursor))?;
         let file = self.profile.cursor.join("mcp.json");
         let Some((mut config, _, _)) = read_cursor_config(&file, &self.profile.root)

@@ -116,6 +116,14 @@ impl AgentId {
         agent_message(&format!("harness.{}", self.as_str()), &Value::Null)
     }
 
+    fn config_root<'a>(self, profile: &'a Profile) -> &'a Path {
+        match self {
+            Self::Claude => &profile.claude,
+            Self::Codex => &profile.codex,
+            Self::Cursor => &profile.cursor,
+        }
+    }
+
     fn override_name(self) -> &'static str {
         match self {
             Self::Claude => "SIDEVOICE_CLAUDE_BIN",
@@ -481,18 +489,18 @@ impl HostAgents {
             state = self
                 .scan(state, Some(agent), false, cancel, deadline)
                 .await?;
-        match seen_agent(&state, agent)
-            .and_then(|row| row.get("registration"))
-            .and_then(Value::as_str)
-        {
-            Some("connected") => {
-                return Err(agent_failure("agents.registration-not-confirmed", agent))
+            match seen_agent(&state, agent)
+                .and_then(|row| row.get("registration"))
+                .and_then(Value::as_str)
+            {
+                Some("connected") => {}
+                Some("not-connected") => {
+                    return Err(agent_failure("agents.registration-not-confirmed", agent))
+                }
+                Some("foreign") => return Err(agent_failure("agents.foreign", agent)),
+                Some("invalid") => return Err(agent_failure("agents.invalid", agent)),
+                _ => return Err(agent_failure("agents.registration-unknown", agent)),
             }
-            Some("not-connected") => {}
-            Some("foreign") => return Err(agent_failure("agents.foreign", agent)),
-            Some("invalid") => return Err(agent_failure("agents.invalid", agent)),
-            _ => return Err(agent_failure("agents.registration-unknown", agent)),
-        }
             let store = self
                 .update_state(cancel, deadline, |latest| {
                     if seen_agent(latest, agent)
@@ -820,7 +828,16 @@ impl HostAgents {
             .iter()
             .map(|value| value.as_ref().to_owned())
             .collect::<Vec<_>>();
-        let output = match run_command(&self.profile, binary, &args, cancel, deadline).await {
+        let output = match run_command(
+            &self.profile,
+            Some(agent.config_root(&self.profile)),
+            binary,
+            &args,
+            cancel,
+            deadline,
+        )
+        .await
+        {
             Ok(output) => output,
             Err(CommandFailure::Cancelled) => return Err(Failure::Cancelled),
             Err(_) => return Err(agent_failure("agents.action-failed", agent)),
@@ -1132,8 +1149,20 @@ fn kill_process_group(pid: u32) {
     }
 }
 
+fn validate_command_profile(
+    profile: &Profile,
+    agent_config: Option<&Path>,
+) -> std::result::Result<(), CommandFailure> {
+    let validation = match agent_config {
+        Some(config) => profile.validate_for_agent(config),
+        None => profile.validate_existing_private(),
+    };
+    validation.map_err(|_| CommandFailure::Start)
+}
+
 async fn run_command(
     profile: &Profile,
+    agent_config: Option<&Path>,
     binary: &str,
     args: &[String],
     cancel: &Cancellation,
@@ -1142,9 +1171,7 @@ async fn run_command(
     if cancel.is_cancelled() {
         return Err(CommandFailure::Cancelled);
     }
-    profile
-        .validate_private()
-        .map_err(|_| CommandFailure::Start)?;
+    validate_command_profile(profile, agent_config)?;
     let mut command = Command::new(binary);
     command
         .args(args)
@@ -1156,9 +1183,7 @@ async fn run_command(
     profile.command_env(&mut command);
     // Recheck immediately before passing these profile roots to a host CLI. The binary may have
     // been selected during an earlier scan, before an agent config directory was replaced.
-    profile
-        .validate_private()
-        .map_err(|_| CommandFailure::Start)?;
+    validate_command_profile(profile, agent_config)?;
     let mut child = command.spawn().map_err(|_| CommandFailure::Start)?;
     let process_group = child.id().ok_or(CommandFailure::Io)?;
     let stdout = child.stdout.take().ok_or(CommandFailure::Io)?;
@@ -1253,7 +1278,7 @@ fn read_cursor_config(file: &Path, root: &Path) -> Result<Option<(Value, u32, Pa
 }
 
 fn write_cursor_config(profile: &Profile, file: &Path, config: &Value) -> Result<()> {
-    profile.validate_private()?;
+    profile.validate_for_agent(&profile.cursor)?;
     let root = &profile.root;
     let (target, mode) = match read_cursor_config(file, root)? {
         Some((_, mode, target)) => (target, mode),
@@ -1266,7 +1291,7 @@ fn write_cursor_config(profile: &Profile, file: &Path, config: &Value) -> Result
     }
     let temporary = parent.join(format!(".mcp.json.{}.tmp", Uuid::new_v4()));
     let result = (|| -> Result<()> {
-        profile.validate_private()?;
+        profile.validate_for_agent(&profile.cursor)?;
         let mut output = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1278,7 +1303,7 @@ fn write_cursor_config(profile: &Profile, file: &Path, config: &Value) -> Result
         output.write_all(b"\n")?;
         output.sync_all()?;
         fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
-        profile.validate_private()?;
+        profile.validate_for_agent(&profile.cursor)?;
         fs::rename(&temporary, &target)?;
         File::open(parent)?.sync_all()?;
         Ok(())
@@ -1352,7 +1377,7 @@ impl HostAgents {
         deadline: Instant,
     ) -> std::result::Result<Observation, Failure> {
         self.profile
-            .validate_private()
+            .validate_existing_private()
             .map_err(|_| agent_failure("agents.invalid", id))?;
         let binary = self.resolve_binary(id, input.state, input.login_path);
         let registration = match id {
@@ -1370,7 +1395,7 @@ impl HostAgents {
         };
         let version = if input.include_version {
             match binary.as_deref() {
-                Some(binary) => self.binary_version(binary, cancel, deadline).await?,
+                Some(binary) => self.binary_version(id, binary, cancel, deadline).await?,
                 None => None,
             }
         } else {
@@ -1582,6 +1607,7 @@ impl HostAgents {
         };
         let output = run_command(
             &self.profile,
+            None,
             &shell,
             &["-lc".into(), "printf %s \"$PATH\"".into()],
             cancel,
@@ -1602,12 +1628,14 @@ impl HostAgents {
 
     async fn binary_version(
         &self,
+        id: AgentId,
         binary: &str,
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<Option<String>, Failure> {
         match run_command(
             &self.profile,
+            Some(id.config_root(&self.profile)),
             binary,
             &["--version".into()],
             cancel,

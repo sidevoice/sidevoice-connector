@@ -180,9 +180,24 @@ async def copied_state():
         for directory in (home, claude, codex, cursor, data, core_data):
             directory.mkdir(mode=0o700)
         thread = str(uuid.uuid4())
+        proof_args = ['mcp', '--profile-root', str(root)]
+        fake_codex = root / 'codex-bin'
+        codex_entry = {'name': 'sidevoice', 'transport': {'type': 'stdio',
+            'command': str(binary), 'args': proof_args}, 'enabled': True}
+        fake_codex.write_text('#!/usr/bin/python3\nimport sys\n'
+            "if sys.argv[1:] == ['--version']:\n print('Codex fixture 1')\n"
+            "elif sys.argv[1:] == ['mcp', 'get', 'sidevoice', '--json']:\n print(" +
+            repr(json.dumps(codex_entry)) + ")\n"
+            "else:\n raise SystemExit(2)\n")
+        fake_codex.chmod(0o700)
+        (codex / 'config.toml').write_text(
+            '[mcp_servers.sidevoice]\ncommand = ' + json.dumps(str(binary)) +
+            '\nargs = ' + json.dumps(proof_args) + '\n')
+        (codex / 'config.toml').chmod(0o600)
         env = {**os.environ, 'HOME': str(home), 'CLAUDE_CONFIG_DIR': str(claude),
                'SIDEVOICE_DATA_DIR': str(data), 'CODEX_HOME': str(codex),
                'CURSOR_CONFIG_DIR': str(cursor),
+               'SIDEVOICE_CODEX_BIN': str(fake_codex),
                'CODEX_THREAD_ID': thread, 'SIDEVOICE_SERVICE_MANAGER': 'none'}
         core_env, storage_flag, _, slow_flag = core_faults(root, env)
         core_log = (root / 'core.log').open('wb')
@@ -209,7 +224,8 @@ async def copied_state():
             # same JS store writer directly so the copied fixture is genuinely JS state.
             scan = await asyncio.create_subprocess_exec('node', '--input-type=module', '-e',
                 "import {listAgents, agentAction} from './packages/connector/agents.mjs'; "
-                "listAgents(process.env, {rescan:true, watch:'cursor'}); "
+                "const before=listAgents(process.env, {rescan:true}); "
+                "if (before.agents.find(agent => agent.id === 'codex')?.registration !== 'foreign') throw Error('JS must keep the proof-only Codex entry foreign'); "
                 "const result = agentAction('dismiss', 'cursor', process.env); "
                 "if (!result.agents.find(agent => agent.id === 'cursor')?.dismissed) throw Error('JS dismissal was not saved'); "
                 "const fs = await import('node:fs'); "
@@ -254,19 +270,23 @@ async def copied_state():
             rust_listing = json.loads(rust_scan_stdout)
             rust_cursor = next(agent for agent in rust_listing['agents'] if agent['id'] == 'cursor')
             assert rust_cursor['dismissed'] is True and rust_cursor['actionable'] is False, rust_cursor
+            rust_codex = next(agent for agent in rust_listing['agents'] if agent['id'] == 'codex')
+            assert rust_codex['registration'] == 'connected', rust_codex
             js_reread = await asyncio.create_subprocess_exec('node', '--input-type=module', '-e',
                 "import {listAgents} from './packages/connector/agents.mjs'; "
                 "const result=listAgents(process.env, {rescan:false}); "
                 "const cursor=result.agents.find(agent => agent.id === 'cursor'); "
+                "const codex=result.agents.find(agent => agent.id === 'codex'); "
                 "const fs=await import('node:fs'); const state=JSON.parse(fs.readFileSync(process.env.SIDEVOICE_DATA_DIR + '/agents.json','utf8')); "
-                "if (!cursor?.dismissed || cursor.actionable || state.fixture_unrelated?.preserved !== true) throw Error('Rust host scan did not preserve JS state'); "
-                "console.log(JSON.stringify({dismissed:cursor.dismissed, generation:state.seen.cursor.generation, unrelated:state.fixture_unrelated}));",
+                "if (!cursor?.dismissed || cursor.actionable || codex?.registration !== 'connected' || state.fixture_unrelated?.preserved !== true) throw Error('Rust host scan did not preserve JS state and ownership'); "
+                "console.log(JSON.stringify({dismissed:cursor.dismissed, generation:state.seen.cursor.generation, codex:codex.registration, unrelated:state.fixture_unrelated}));",
                 cwd=str(js_cli.parents[2]), env=env, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE)
             reread_stdout, reread_stderr = await asyncio.wait_for(js_reread.communicate(), 30)
             assert js_reread.returncode == 0, reread_stderr.decode(errors='replace')[-1000:]
             reread = json.loads(reread_stdout)
-            assert reread['generation'] == js_cursor_generation and reread['dismissed'] is True, reread
+            assert reread['generation'] == js_cursor_generation and reread['dismissed'] is True \
+                and reread['codex'] == 'connected', reread
             agents_after_rust = (data / 'agents.json').read_bytes()
             assert agents_after_rust != (copied / 'agents.json').read_bytes(), 'Rust did not rescan and rewrite JS host state'
             daemon = await asyncio.create_subprocess_exec(str(binary), 'connector', '--profile-root', str(root),
