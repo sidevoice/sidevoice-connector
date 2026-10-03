@@ -122,7 +122,27 @@ let coreError = null;              // why the local core could not be had, for w
 let coreFailure = null;            // the same, as the keyed failure `node.status` carries
 let coreCheckedAt = 0;
 
-function loadOutbox() { try { outbox = JSON.parse(readFileSync(outboxPath, 'utf8')); if (!Array.isArray(outbox)) outbox = []; } catch { outbox = []; } }
+const OUTBOX_LOAD_ERROR = 'speech outbox is malformed or unreadable; refusing to start without changing it';
+function validOutboxRow(row) {
+  if (!row || typeof row !== 'object' || Array.isArray(row) || typeof row.event_id !== 'string' || !row.event_id ||
+      typeof row.binding_id !== 'string' || !row.binding_id || typeof row.utterance_id !== 'string' || !row.utterance_id ||
+      typeof row.text !== 'string') return false;
+  // Older JS rows have none of these identity fields; new rows carry the complete binding tuple.
+  const identity = [row.client_ref, row.harness, row.thread];
+  return identity.every(value => value === undefined) || identity.every(value => typeof value === 'string' && value.length > 0);
+}
+function loadOutbox() {
+  let contents;
+  try { contents = readFileSync(outboxPath, 'utf8'); }
+  catch (error) {
+    if (error?.code === 'ENOENT') { outbox = []; return; }
+    throw new Error(OUTBOX_LOAD_ERROR);
+  }
+  let saved;
+  try { saved = JSON.parse(contents); } catch { throw new Error(OUTBOX_LOAD_ERROR); }
+  if (!Array.isArray(saved) || !saved.every(validOutboxRow)) throw new Error(OUTBOX_LOAD_ERROR);
+  outbox = saved;
+}
 function saveOutbox() {
   const temporary = outboxPath + '.' + process.pid + '.tmp';
   writeFileSync(temporary, JSON.stringify(outbox), { mode: 0o600 }); renameSync(temporary, outboxPath);
@@ -443,11 +463,22 @@ async function announce(binding) {
   return reply;
 }
 
-/** Speech leaves the durable outbox only when the room says it has it — or says it never will. */
+const SPEECH_REJECTION_STATUSES = new Set(['rejected', 'unknown', 'unknown_binding']);
+function speechAckConfirmed(reply, speech) {
+  return !!reply && typeof reply === 'object' && !Array.isArray(reply) &&
+    reply.event_id === speech.event_id && typeof reply.status === 'string' && !SPEECH_REJECTION_STATUSES.has(reply.status) &&
+    reply.text_saved === true && (!Object.hasOwn(reply, 'utterance_id') || reply.utterance_id === speech.utterance_id);
+}
+
+/** Speech leaves the durable outbox only when the room confirms this exact event was saved. */
 async function publish(speech) {
-  const { type, ...frame } = speech;
+  const { type, client_ref, harness, thread, ...frame } = speech;
   const reply = await request('speech.publish', frame, { timeout: 15_000 });
-  log(`speech ${reply.utterance_id || speech.utterance_id} ${reply.status || 'published'}${reply.reason ? ' (' + reply.reason + ')' : ''}`);
+  if (!speechAckConfirmed(reply, speech)) {
+    log('speech acknowledgement was not confirmed; retaining the queued item');
+    throw new Error('Speech acknowledgement was not confirmed.');
+  }
+  log('speech acknowledgement confirmed');
   outbox = outbox.filter(queued => queued.event_id !== speech.event_id); saveOutbox();
   return reply;
 }
@@ -695,7 +726,8 @@ async function command(client, input) {
       // same news for the conversation, and only it can say the right one to the person.
       if (!binding) throw new Error(closedByRoom.has(params.client_ref) ? 'CLOSED_BY_ROOM:' + closedByRoom.get(params.client_ref) + ':' + params.client_ref : 'Unknown binding');
       const speech = { event_id: params.event_id || randomUUID(), binding_id: binding.binding_id,
-        session_id: params.session_id, revision: params.revision, utterance_id: params.utterance_id || randomUUID(), text: params.text, language: params.language };
+        session_id: params.session_id, revision: params.revision, utterance_id: params.utterance_id || randomUUID(), text: params.text, language: params.language,
+        client_ref: binding.client_ref, harness: binding.harness, thread: binding.thread };
       outbox.push(speech); saveOutbox();
       // What the room never confirmed stays in the outbox and goes again on the next welcome; the
       // conversation is told it is queued rather than left waiting on a room that is not there.
@@ -794,7 +826,8 @@ export async function run(argv = [], environment = process.env) {
   if (serviceMode) rmSync(files.stopped, { force: true });
   else if (existsSync(files.stopped)) { log('Sidevoice is stopped on this machine: not serving'); releaseLock({ socket: false }); process.exit(0); }
   log(`connector ${VERSION} starting${serviceMode ? ' as the connector job' : ''}: pid ${process.pid}, host ${hostId}, ${external ? 'core at ' + external.room : ownsCore ? 'this machine\'s own core, started on demand' : 'this machine\'s core job'}, socket ${socketPath}, log ${logPath}`);
-  loadOutbox();
+  try { loadOutbox(); }
+  catch (error) { log(`not starting: ${error.message}`); releaseLock({ socket: false }); process.exitCode = 78; return; }
   if (outbox.length) log(`${outbox.length} speech frame(s) waiting in the outbox`);
   try { unlinkSync(socketPath); } catch {}
   server = net.createServer(serve);
