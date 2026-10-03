@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
         Action::Connector { service } => {
             if service && !explicit_profile {
                 eprintln!("{}",crate::agents::message("service.proof-profile-required",&serde_json::Value::Null));
-                return Ok(());
+                std::process::exit(1);
             }
             daemon::run(profile, service).await
         }

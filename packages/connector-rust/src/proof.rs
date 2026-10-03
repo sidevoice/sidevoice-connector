@@ -190,6 +190,7 @@ impl Profile {
             .env("SIDEVOICE_DATA_DIR", &self.data)
     }
 
+    #[cfg(target_os = "macos")]
     pub fn validate_service_environment(&self, manager: &str) -> Result<()> {
         for (key, expected) in [
             ("HOME", &self.home),

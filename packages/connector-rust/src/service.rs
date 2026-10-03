@@ -2,27 +2,42 @@
 //! user-manager path has been reviewed against an isolated runner.
 
 use crate::agents::message;
-use crate::proof::{atomic_json, private_dir, private_file, Profile, Ready};
-use anyhow::{anyhow, Context};
+use crate::proof::{private_dir, private_file, Profile, Ready};
+#[cfg(target_os = "macos")]
+use crate::proof::atomic_json;
+use anyhow::Context;
+#[cfg(target_os = "macos")]
 use fs2::FileExt;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::fs::{self, File, OpenOptions};
+use std::fs;
+#[cfg(target_os = "macos")]
+use std::fs::OpenOptions;
 use std::io;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
+#[cfg(target_os = "macos")]
+use std::fs::File;
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
+#[cfg(target_os = "macos")]
+use tokio::process::Child;
 use tokio::time::{sleep, timeout, Duration, Instant};
 
+#[cfg(target_os = "macos")]
 const MANAGER_LIMIT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "macos")]
 const START_LIMIT: Duration = Duration::from_secs(60);
+#[cfg(target_os = "macos")]
 const STOP_LIMIT: Duration = Duration::from_secs(20);
 const STARTING_LIMIT: u64 = 60;
+#[cfg(target_os = "macos")]
 const OUTPUT_LIMIT: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,13 +94,16 @@ type Result<T> = std::result::Result<T, Failure>;
 
 #[derive(Clone, Debug)]
 pub struct ServiceSpec {
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     pub data_dir: PathBuf,
     pub release_root: PathBuf,
     pub core_argv: Vec<String>,
     pub connector_argv: Vec<String>,
     pub core_definition: PathBuf,
     pub connector_definition: PathBuf,
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     pub core_job: String,
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     pub connector_job: String,
     pub core_environment: BTreeMap<String, String>,
     pub connector_environment: BTreeMap<String, String>,
@@ -245,6 +263,7 @@ fn safe_value(value: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn xml(value: &str, what: &str) -> Result<String> {
     safe_value(value, what)?;
     Ok(value
@@ -323,6 +342,7 @@ fn check_file_under(root: &Path, path: &Path) -> Result<()> {
     private_file(path).map_err(Failure::plain)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn plist(spec: &ServiceSpec, core: bool) -> Result<String> {
     let (label, argv, env, log, keep_alive) = if core {
         (&spec.core_job, &spec.core_argv, &spec.core_environment,
@@ -340,6 +360,7 @@ fn plist(spec: &ServiceSpec, core: bool) -> Result<String> {
         xml(label,"Label")?,args,variables,keep_alive,xml(&log.to_string_lossy(),"StandardOutPath")?,xml(&log.to_string_lossy(),"StandardErrorPath")?))
 }
 
+#[cfg(target_os = "macos")]
 fn write_definition(file: &Path, contents: &str) -> Result<bool> {
     let parent = file.parent().context("definition parent").map_err(Failure::plain)?;
     private_dir(parent).map_err(Failure::plain)?;
@@ -382,6 +403,7 @@ fn existing_definition(path: &Path) -> Result<bool> {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct ManagerOutput {
     success: bool,
@@ -390,6 +412,7 @@ struct ManagerOutput {
     stderr: String,
 }
 
+#[cfg(target_os = "macos")]
 async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> io::Result<String> {
     let mut kept = Vec::with_capacity(OUTPUT_LIMIT.min(4096));
     let mut scratch = [0u8; 4096];
@@ -402,11 +425,13 @@ async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> io::Res
     Ok(String::from_utf8_lossy(&kept).into_owned())
 }
 
+#[cfg(target_os = "macos")]
 async fn reap(child: &mut Child) {
     let _ = child.kill().await;
     let _ = child.wait().await;
 }
 
+#[cfg(target_os = "macos")]
 async fn launchctl(args: &[String]) -> Result<ManagerOutput> {
     let mut child = Command::new("/bin/launchctl")
         .args(args)
@@ -437,9 +462,12 @@ async fn launchctl(args: &[String]) -> Result<ManagerOutput> {
     Ok(ManagerOutput { success:status.success(), code:status.code(), stdout, stderr })
 }
 
+#[cfg(target_os = "macos")]
 fn launchd_domain() -> String { format!("gui/{}", unsafe { libc::geteuid() }) }
+#[cfg(target_os = "macos")]
 fn target(label: &str) -> String { format!("{}/{}",launchd_domain(),label) }
 
+#[cfg(target_os = "macos")]
 fn parse_job(output: &ManagerOutput, defined: bool) -> Job {
     let combined = format!("{}\n{}",output.stdout,output.stderr);
     if !output.success {
@@ -464,6 +492,7 @@ fn parse_job(output: &ManagerOutput, defined: bool) -> Job {
     Job { defined, loaded:true, running, unknown:false, pid:if running {pid}else{None},exit,signal,runs,restarting,reason:None }
 }
 
+#[cfg(target_os = "macos")]
 async fn manager_job(label: &str, defined: bool) -> Result<Job> {
     let output = launchctl(&["print".into(),target(label)]).await?;
     Ok(parse_job(&output,defined))
@@ -478,6 +507,7 @@ fn stop_marker(profile: &Profile) -> Result<bool> {
     }
 }
 
+#[cfg(target_os = "macos")]
 async fn install_lock(profile: &Profile) -> Result<File> {
     let path = profile.data.join("install.lock");
     let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
@@ -495,6 +525,7 @@ async fn install_lock(profile: &Profile) -> Result<File> {
     Ok(file)
 }
 
+#[cfg(target_os = "macos")]
 async fn agents_lock(profile: &Profile) -> Result<File> {
     let path = profile.data.join("agents.lock");
     let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
@@ -512,6 +543,7 @@ async fn agents_lock(profile: &Profile) -> Result<File> {
     Ok(file)
 }
 
+#[cfg(target_os = "macos")]
 async fn set_stopped(profile: &Profile, stopped: bool) -> Result<()> {
     let _agents = agents_lock(profile).await?;
     let marker = profile.data.join("node-stopped.json");
@@ -532,6 +564,7 @@ async fn set_stopped(profile: &Profile, stopped: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn chrono_free_iso() -> String {
     // A stable RFC3339 UTC marker; no date crate is needed for this private stop-intent record.
     let seconds = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -646,11 +679,6 @@ pub async fn ensure_connector(profile: &Profile) -> anyhow::Result<()> {
         let now=status(profile,false).await;
         let state=now.get("state").and_then(Value::as_str).unwrap_or("service-failed");
         return Err(anyhow::Error::new(Failure::keyed("service.not-loaded",json!({"detail":state}))));
-    }
-    if !profile.root.join("releases/current").exists() {
-        // HostAgents/Core interoperability fixtures may use MCP without staging a release. The
-        // quarantined service launcher only starts an on-demand process for its staged binary.
-        return Ok(());
     }
     spec.validate_programs(profile).map_err(anyhow::Error::new)?;
     let executable=std::env::current_exe()?.canonicalize()?;
@@ -774,7 +802,7 @@ fn derive_status(observation: &Observation) -> Value {
 pub async fn run(profile: Profile, action: Action) -> Value {
     if action==Action::Status {return status(&profile,false).await;}
     #[cfg(not(target_os="macos"))]
-    { let _=profile; return Failure::keyed("service.unsupported",json!({})).value(); }
+    { let _=profile; Failure::keyed("service.unsupported",json!({})).value() }
     #[cfg(target_os="macos")]
     {
         match mutate(&profile,action).await {
@@ -868,7 +896,7 @@ async fn stop(profile:&Profile,spec:&ServiceSpec,uninstall:bool)->Result<Value>{
     let deadline=Instant::now()+STOP_LIMIT;
     while Instant::now()<deadline {
         let connector_lock_gone=connector_stopped(profile);
-        let core_gone=core_stopped(profile,&mut core_pids).await;
+        let core_gone=core_stopped(profile,&mut core_pids);
         if connector_lock_gone&&profile.socket.exists() {let _=remove_stale_socket(&profile.socket);}
         if core_gone&&profile.core_socket.exists() {let _=remove_stale_socket(&profile.core_socket);}
         let socket_gone=!profile.socket.exists();
@@ -879,7 +907,7 @@ async fn stop(profile:&Profile,spec:&ServiceSpec,uninstall:bool)->Result<Value>{
         }
         sleep(Duration::from_millis(100)).await;
     }
-    if !connector_stopped(profile)||!core_stopped(profile,&mut core_pids).await||profile.socket.exists()||profile.core_socket.exists() {
+    if !connector_stopped(profile)||!core_stopped(profile,&mut core_pids)||profile.socket.exists()||profile.core_socket.exists() {
         return Err(Failure::keyed("service.unload-failed",json!({"detail":"private processes or sockets remain"})));
     }
     if uninstall {
@@ -935,15 +963,22 @@ async fn bootout(label:&str)->Result<()> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn connector_stopped(profile:&Profile)->bool {
     let path=profile.data.join("connector.lock");
-    if !path.exists() {return true;}
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+        Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => return false,
+        Ok(_) => {}
+    }
     let Ok(file)=OpenOptions::new().read(true).write(true).custom_flags(libc::O_NOFOLLOW).open(&path) else {return false;};
     if private_file(&path).is_err() {return false;}
     match file.try_lock_exclusive() {Ok(())=>true,Err(_)=>false}
 }
 
-async fn core_stopped(profile:&Profile,pids:&mut Vec<u32>)->bool {
+#[cfg(target_os = "macos")]
+fn core_stopped(profile:&Profile,pids:&mut Vec<u32>)->bool {
     if let Ok(bytes)=fs::read(&profile.core_ready) {
         if let Ok(ready)=serde_json::from_slice::<Ready>(&bytes) {pids.push(ready.pid);}
     }
@@ -952,6 +987,7 @@ async fn core_stopped(profile:&Profile,pids:&mut Vec<u32>)->bool {
     !pids.iter().copied().any(process_alive)
 }
 
+#[cfg(target_os = "macos")]
 fn remove_stale_socket(path:&Path)->io::Result<()> {
     crate::proof::verify_socket(path).map_err(|error|io::Error::new(io::ErrorKind::PermissionDenied,error))?;
     fs::remove_file(path)?;
@@ -959,6 +995,7 @@ fn remove_stale_socket(path:&Path)->io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn remove_stale_ready(path:&Path)->io::Result<()> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind()==io::ErrorKind::NotFound=>Ok(()),
@@ -967,13 +1004,19 @@ fn remove_stale_ready(path:&Path)->io::Result<()> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn process_alive(pid:u32)->bool { unsafe {libc::kill(pid as i32,0)==0 || io::Error::last_os_error().kind()==io::ErrorKind::PermissionDenied} }
 
+#[cfg(target_os = "macos")]
 async fn wait_settled(profile:&Profile,sixty_seconds:bool)->Result<Value>{
     let deadline=Instant::now()+if sixty_seconds {START_LIMIT}else{Duration::from_secs(10)};
     loop {
         let now=status(profile,false).await;
-        if now.get("state").and_then(Value::as_str)==Some("running") {return Ok(now);}
+        if now.get("state").and_then(Value::as_str)==Some("running")
+            && now.pointer("/connector/running").and_then(Value::as_bool)==Some(true)
+        {
+            return Ok(now);
+        }
         if now.get("state").and_then(Value::as_str).is_some_and(|state|matches!(state,"failed"|"service-failed"|"stopped-by-person")) {
             return Err(Failure::keyed("service.not-loaded",json!({"detail":now.pointer("/failure/key").and_then(Value::as_str).unwrap_or("core health not confirmed")})));
         }

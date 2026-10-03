@@ -115,12 +115,12 @@ fn identity_signature(id: &str, version: Option<&str>, evidence: &[Evidence<'_>]
 #[test]
 fn agent_refusals_labels_and_manual_text_use_the_shared_english_bundle() {
     assert_eq!(
-        agent_message("agents.invalid", &json!({"agent":"Codex"})),
+        message("agents.invalid", &json!({"agent":"Codex"})),
         "Codex has an unreadable or malformed Sidevoice registration; it was left unchanged."
     );
     assert_eq!(AgentId::Claude.label(), "Claude Code");
     assert_eq!(
-        agent_message(
+        message(
             "agents.manual.codex.replace-existing",
             &json!({"remove":"codex mcp remove sidevoice","add":"codex mcp add sidevoice"})
         ),
