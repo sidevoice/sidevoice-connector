@@ -25,9 +25,10 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 #[cfg(target_os = "macos")]
 use tokio::process::Child;
+use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::time::{sleep, timeout, Duration, Instant};
 
@@ -281,6 +282,13 @@ struct Observation {
     program_error: Option<&'static str>,
 }
 
+#[derive(Clone, Debug)]
+struct ConnectorIdentity {
+    pid: u32,
+    executable: PathBuf,
+    managed: bool,
+}
+
 fn clean(value: &str, limit: usize) -> String {
     value
         .chars()
@@ -429,22 +437,41 @@ fn plist(spec: &ServiceSpec, core: bool) -> Result<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn write_definition(file: &Path, contents: &str) -> Result<bool> {
+fn preflight_definition(file: &Path) -> Result<()> {
     let parent = file
         .parent()
         .context("definition parent")
         .map_err(Failure::plain)?;
-    private_dir(parent).map_err(Failure::plain)?;
+    match fs::symlink_metadata(parent) {
+        Ok(_) => private_dir(parent).map_err(|_| {
+            Failure::keyed(
+                "service.definition-unsafe",
+                json!({"detail":"service directory"}),
+            )
+        })?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(Failure::plain(error)),
+    }
     match fs::symlink_metadata(file) {
         Ok(_) => private_file(file).map_err(|_| {
             Failure::keyed(
                 "service.definition-unsafe",
                 json!({"detail":file.file_name().unwrap_or_default().to_string_lossy()}),
             )
-        })?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(Failure::plain(error)),
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Failure::plain(error)),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn write_definition(file: &Path, contents: &str) -> Result<bool> {
+    let parent = file
+        .parent()
+        .context("definition parent")
+        .map_err(Failure::plain)?;
+    preflight_definition(file)?;
+    private_dir(parent).map_err(Failure::plain)?;
     if fs::read(file).ok().as_deref() == Some(contents.as_bytes()) {
         return Ok(false);
     }
@@ -837,11 +864,172 @@ fn read_failure(profile: &Profile) -> Option<Value> {
     Some(result)
 }
 
-async fn connector_running(profile: &Profile) -> bool {
-    let Ok(()) = verify_connector_socket(profile).await else {
-        return false;
+async fn connector_request(
+    profile: &Profile,
+    method: &str,
+    params: Value,
+) -> anyhow::Result<Option<Value>> {
+    profile.validate_existing_private()?;
+    if !profile.socket.exists() {
+        return Ok(None);
+    }
+    crate::proof::verify_socket(&profile.socket)?;
+    let mut stream = match timeout(
+        Duration::from_millis(800),
+        UnixStream::connect(&profile.socket),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) if matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+        ) => return Ok(None),
+        Ok(Err(error)) => return Err(error.into()),
+        Err(_) => return Ok(None),
     };
-    true
+    stream
+        .write_all(json!({"id":1,"method":method,"params":params}).to_string().as_bytes())
+        .await?;
+    stream.write_all(b"\n").await?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    timeout(Duration::from_secs(2), reader.read_line(&mut line)).await??;
+    if line.is_empty() {
+        return Ok(None);
+    }
+    if line.len() > 65536 {
+        anyhow::bail!("connector IPC reply exceeded its limit");
+    }
+    let response: Value = serde_json::from_str(&line)?;
+    if response.get("ok") != Some(&json!(true)) {
+        anyhow::bail!("connector IPC request was refused");
+    }
+    Ok(response.get("result").cloned())
+}
+
+async fn connector_identity(profile: &Profile) -> anyhow::Result<Option<ConnectorIdentity>> {
+    let Some(value) = connector_request(profile, "identity", json!({})).await? else {
+        return Ok(None);
+    };
+    let pid = value
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+        .context("connector PID missing")?;
+    let executable = value
+        .get("executable")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .context("connector executable missing")?;
+    let managed = value
+        .get("managed")
+        .and_then(Value::as_bool)
+        .context("connector manager identity missing")?;
+    Ok(Some(ConnectorIdentity {
+        pid,
+        executable,
+        managed,
+    }))
+}
+
+fn verified_profile_executable(profile: &Profile, path: &Path) -> bool {
+    validate_executable(&profile.root, path).is_ok()
+        && path
+            .canonicalize()
+            .ok()
+            .and_then(|canonical| canonical.strip_prefix(&profile.root).ok().map(Path::to_path_buf))
+            .is_some_and(|relative| {
+                let parts = relative.components().collect::<Vec<_>>();
+                parts.len() == 4
+                    && parts[0].as_os_str() == "releases"
+                    && parts[2].as_os_str() == "dist"
+                    && parts[3].as_os_str() == "sidevoice-rust-proof"
+            })
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_connector_gone(profile: &Profile, pid: Option<u32>) -> Result<()> {
+    let deadline = Instant::now() + STOP_LIMIT;
+    while Instant::now() < deadline {
+        let lock_free = connector_stopped(profile);
+        if lock_free && profile.socket.exists() {
+            remove_stale_socket(&profile.socket).map_err(Failure::plain)?;
+        }
+        let process_gone = pid.map_or(true, |pid| !process_alive(pid));
+        if lock_free && process_gone && !profile.socket.exists() {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    Err(Failure::keyed(
+        "service.unload-failed",
+        json!({"detail":"verified on-demand connector did not stop"}),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+async fn stop_on_demand_connector(profile: &Profile, spec: &ServiceSpec) -> Result<()> {
+    let socket_exists = profile.socket.exists();
+    let lock_held = !connector_stopped(profile);
+    if !socket_exists && !lock_held {
+        return Ok(());
+    }
+
+    let identity = connector_identity(profile).await;
+    let identity = match identity {
+        Ok(Some(identity)) => identity,
+        Ok(None) if !lock_held => return wait_connector_gone(profile, None).await,
+        Ok(None) => {
+            return Err(Failure::keyed(
+                "service.unload-failed",
+                json!({"detail":"connector socket owner could not be verified"}),
+            ));
+        }
+        Err(_) if !lock_held => return wait_connector_gone(profile, None).await,
+        Err(error) => {
+            return Err(Failure::keyed(
+                "service.unload-failed",
+                json!({"detail":clean(&error.to_string(),240)}),
+            ));
+        }
+    };
+
+    if identity.managed {
+        let state = manager_job(&spec.connector_job, true).await?;
+        if state.running && state.pid == Some(identity.pid) {
+            return Ok(());
+        }
+        if state.running {
+            return Err(Failure::keyed(
+                "service.unload-failed",
+                json!({"detail":"connector socket PID does not match its launchd job"}),
+            ));
+        }
+        return wait_connector_gone(profile, Some(identity.pid)).await;
+    }
+
+    if !verified_profile_executable(profile, &identity.executable) {
+        return Err(Failure::keyed(
+            "service.unload-failed",
+            json!({"detail":"on-demand connector executable is outside the private release"}),
+        ));
+    }
+    let shutdown = connector_request(
+        profile,
+        "shutdown",
+        json!({"expected_pid":identity.pid,"expected_executable":identity.executable}),
+    )
+    .await;
+    if let Ok(Some(value)) = shutdown {
+        if value.get("stopping") == Some(&json!(true))
+            && value.get("pid").and_then(Value::as_u64) == Some(identity.pid as u64)
+        {
+            return wait_connector_gone(profile, Some(identity.pid)).await;
+        }
+    }
+    wait_connector_gone(profile, Some(identity.pid)).await
 }
 
 fn parse_elapsed(value: &str) -> Option<u64> {
@@ -886,23 +1074,7 @@ async fn process_age(pid: u32) -> Option<u64> {
 }
 
 async fn verify_connector_socket(profile: &Profile) -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
-    profile.validate_existing_private()?;
-    crate::proof::verify_socket(&profile.socket)?;
-    let mut stream = timeout(
-        Duration::from_millis(800),
-        UnixStream::connect(&profile.socket),
-    )
-    .await??;
-    stream
-        .write_all(b"{\"id\":1,\"method\":\"status\",\"params\":{}}\n")
-        .await?;
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    timeout(Duration::from_millis(1000), reader.read_line(&mut line)).await??;
-    let response: Value = serde_json::from_str(&line)?;
-    if response.get("ok") != Some(&json!(true)) {
+    if connector_identity(profile).await?.is_none() {
         anyhow::bail!("connector status refused");
     }
     Ok(())
@@ -1065,9 +1237,10 @@ async fn observe(profile: &Profile, connector_self: bool) -> anyhow::Result<Obse
         definition_error = Some(error.to_string());
         connector.unknown = true;
     }
-    let (ready, health) = match profile.health().await {
-        Ok((ready, health)) => (Some(ready), Some(health)),
-        Err(_) => (None, None),
+    let ready = profile.read_ready().ok();
+    let health = match ready.as_ref() {
+        Some(ready) => profile.health_ready(ready).await.ok(),
+        None => None,
     };
     let stopped = stop_marker(profile).unwrap_or(true);
     let failure = read_failure(profile);
@@ -1075,7 +1248,28 @@ async fn observe(profile: &Profile, connector_self: bool) -> anyhow::Result<Obse
         Some(pid) => process_age(pid).await,
         None => None,
     };
-    let connector_is_running = connector_self || connector_running(profile).await;
+    let identity = if connector_self {
+        None
+    } else {
+        connector_identity(profile).await.ok().flatten()
+    };
+    let connector_pid = if connector_self {
+        Some(std::process::id())
+    } else {
+        identity.as_ref().map(|identity| identity.pid)
+    };
+    let connector_is_running = match connector_pid {
+        Some(pid) if connector.defined => {
+            connector.running
+                && connector.pid == Some(pid)
+                && (connector_self || identity.as_ref().is_some_and(|identity| identity.managed))
+        }
+        Some(_) if connector_self => true,
+        Some(_) => identity.as_ref().is_some_and(|identity| {
+            !identity.managed && verified_profile_executable(profile, &identity.executable)
+        }),
+        None => false,
+    };
     let program_error = if core_defined
         && !profile
             .root
@@ -1109,7 +1303,19 @@ async fn observe(profile: &Profile, connector_self: bool) -> anyhow::Result<Obse
 
 fn derive_status(observation: &Observation) -> Value {
     let health = observation.health.as_ref();
-    let body = health.filter(|_| health.and_then(|v| v.get("pid")).is_some());
+    let health_pid = health
+        .and_then(|value| value.get("pid"))
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok());
+    let ready_pid = observation.ready.as_ref().map(|ready| ready.pid);
+    let core_identity_matches = if observation.core.defined {
+        observation.core.running
+            && observation.core.pid == ready_pid
+            && observation.core.pid == health_pid
+    } else {
+        ready_pid.is_some() && ready_pid == health_pid
+    };
+    let body = health.filter(|_| health_pid.is_some() && core_identity_matches);
     let reachable = body.is_some();
     let core=body.map(|body|json!({"pid":body.get("pid").cloned().unwrap_or(Value::Null),
         "version":body.get("version").cloned().unwrap_or(Value::Null),"api":body.get("api").cloned().unwrap_or(Value::Null),
@@ -1246,8 +1452,12 @@ async fn mutate(profile: &Profile, action: Action) -> Result<Value> {
 #[cfg(target_os = "macos")]
 async fn install(profile: &Profile, spec: &ServiceSpec) -> Result<Value> {
     spec.validate_programs(profile)?;
-    set_stopped(profile, false).await?;
+    let core_text = plist(spec, true)?;
+    let connector_text = plist(spec, false)?;
     let service_dir = profile.data.join("service");
+    preflight_definition(&spec.core_definition)?;
+    preflight_definition(&spec.connector_definition)?;
+    set_stopped(profile, false).await?;
     match fs::symlink_metadata(&service_dir) {
         Ok(_) => private_dir(&service_dir).map_err(|_| {
             Failure::keyed(
@@ -1263,8 +1473,6 @@ async fn install(profile: &Profile, spec: &ServiceSpec) -> Result<Value> {
         }
         Err(error) => return Err(Failure::plain(error)),
     }
-    let core_text = plist(spec, true)?;
-    let connector_text = plist(spec, false)?;
     let core_changed = write_definition(&spec.core_definition, &core_text)?;
     let connector_changed = write_definition(&spec.connector_definition, &connector_text)?;
     if core_changed && manager_job(&spec.core_job, true).await?.loaded {
@@ -1273,6 +1481,7 @@ async fn install(profile: &Profile, spec: &ServiceSpec) -> Result<Value> {
     if connector_changed && manager_job(&spec.connector_job, true).await?.loaded {
         bootout(&spec.connector_job).await?;
     }
+    stop_on_demand_connector(profile, spec).await?;
     start_job(&spec.core_job, &spec.core_definition).await?;
     start_job(&spec.connector_job, &spec.connector_definition).await?;
     wait_settled(profile, true).await
@@ -1293,6 +1502,7 @@ async fn start(profile: &Profile, spec: &ServiceSpec) -> Result<Value> {
     }
     set_stopped(profile, false).await?;
     if core && connector {
+        stop_on_demand_connector(profile, spec).await?;
         start_job(&spec.core_job, &spec.core_definition).await?;
         start_job(&spec.connector_job, &spec.connector_definition).await?;
         wait_settled(profile, false).await
@@ -1352,6 +1562,7 @@ async fn stop(profile: &Profile, spec: &ServiceSpec, uninstall: bool) -> Result<
             json!({"detail":clean(&errors.join("; "),400)}),
         ));
     }
+    stop_on_demand_connector(profile, spec).await?;
     let deadline = Instant::now() + STOP_LIMIT;
     while Instant::now() < deadline {
         let connector_lock_gone = connector_stopped(profile);
@@ -1622,7 +1833,14 @@ mod tests {
             },
             stopped: false,
             health: Some(json!({"pid":7,"version":"0.1.0","api":1,"launch_id":"launch","calls":3})),
-            ready: None,
+            ready: Some(Ready {
+                pid: 7,
+                launch_id: "launch".into(),
+                socket: "/tmp/socket".into(),
+                connector_id: "id".into(),
+                token: "secret".into(),
+                connector_protocols: Some(vec![3]),
+            }),
             failure: None,
             core_age: Some(4),
             connector_running: true,
@@ -1732,6 +1950,20 @@ mod tests {
         assert_eq!(derive_status(&current)["state"], "starting");
         current.core_age = Some(61);
         assert_eq!(derive_status(&current)["failure"]["key"], "ready.timeout");
+        current = observation();
+        current.ready = Some(Ready {
+            pid: 9,
+            launch_id: "other-launch".into(),
+            socket: "/tmp/socket".into(),
+            connector_id: "id".into(),
+            token: "secret".into(),
+            connector_protocols: Some(vec![3]),
+        });
+        current.health = Some(json!({"pid":9,"version":"0.1.0","api":1,"launch_id":"other-launch","calls":3}));
+        assert_eq!(derive_status(&current)["reachable"], false);
+        assert_eq!(derive_status(&current)["state"], "starting");
+        current.core_age = Some(61);
+        assert_eq!(derive_status(&current)["failure"]["key"], "ready.timeout");
         current.core.loaded = false;
         current.core.running = false;
         assert_eq!(derive_status(&current)["state"], "service-failed");
@@ -1741,5 +1973,15 @@ mod tests {
         assert_eq!(derive_status(&current)["state"], "absent");
         current.installed = true;
         assert_eq!(derive_status(&current)["state"], "not-installed");
+    }
+
+    #[test]
+    fn ready_core_with_failed_health_is_reported_as_a_hang() {
+        let mut current = observation();
+        current.health = None;
+        let status = derive_status(&current);
+        assert_eq!(status["state"], "failed");
+        assert_eq!(status["failure"]["key"], "hang");
+        assert_eq!(status["reachable"], false);
     }
 }

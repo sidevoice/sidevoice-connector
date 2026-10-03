@@ -293,7 +293,7 @@ impl Profile {
         self.health().await.map(|(ready, _)| ready)
     }
 
-    pub async fn health(&self) -> Result<(Ready, Value)> {
+    pub fn read_ready(&self) -> Result<Ready> {
         private_file(&self.core_ready)?;
         let bytes = fs::read(&self.core_ready)?;
         if bytes.len() > 65536 {
@@ -307,6 +307,21 @@ impl Profile {
             .connector_protocols
             .as_ref()
             .is_some_and(|v| v.contains(&3))
+        {
+            bail!("Core v3 upgrade required");
+        }
+        verify_socket(&ready.socket)?;
+        Ok(ready)
+    }
+
+    pub async fn health_ready(&self, ready: &Ready) -> Result<Value> {
+        if ready.socket != self.core_socket || ready.launch_id.is_empty() || ready.pid == 0 {
+            bail!("Core ready identity mismatch");
+        }
+        if !ready
+            .connector_protocols
+            .as_ref()
+            .is_some_and(|versions| versions.contains(&3))
         {
             bail!("Core v3 upgrade required");
         }
@@ -337,6 +352,12 @@ impl Profile {
         {
             bail!("Core health identity mismatch");
         }
+        Ok(health)
+    }
+
+    pub async fn health(&self) -> Result<(Ready, Value)> {
+        let ready = self.read_ready()?;
+        let health = self.health_ready(&ready).await?;
         Ok((ready, health))
     }
 

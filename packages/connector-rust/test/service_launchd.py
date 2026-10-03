@@ -372,15 +372,107 @@ async def exercise():
             writer.close()
             await writer.wait_closed()
 
+    async def wait_identity(predicate, description, seconds=15):
+        deadline = time.monotonic() + seconds
+        last = None
+        while time.monotonic() < deadline:
+            try:
+                last = await ipc('identity')
+                if predicate(last):
+                    return last
+            except (FileNotFoundError, ConnectionRefusedError, asyncio.TimeoutError, OSError):
+                pass
+            await asyncio.sleep(.1)
+        raise AssertionError(f'timed out waiting for {description}; last identity: {last!r}')
+
+    async def start_on_demand():
+        process = await asyncio.create_subprocess_exec(
+            str(staged_binary), '--profile-root', str(profile), 'connector',
+            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL, env={**control_env, **expected_connector_env},
+        )
+        identity = await wait_identity(lambda value: value.get('managed') is False,
+                                       'private on-demand connector identity')
+        assert identity['pid'] == process.pid, (identity, process.pid)
+        return process, identity
+
+    async def stop_process(process, description):
+        await asyncio.wait_for(process.wait(), 25)
+        assert not process_alive(process.pid), f'{description} PID still exists: {process.pid}'
+        assert not connector_socket.exists(), f'{description} left connector socket behind'
+
+    async def start_facade(thread):
+        process = await asyncio.create_subprocess_exec(
+            str(staged_binary), '--profile-root', str(profile), 'mcp',
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=daemon_log,
+            env={**control_env, 'CODEX_THREAD_ID': thread},
+        )
+        await mcp_request(process, 'initialize', {'protocolVersion': '2025-06-18', 'capabilities': {},
+                         'clientInfo': {'name': 'codex', 'version': 'launchd-proof'}}, 1)
+        process.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+        await process.stdin.drain()
+        return process
+
     try:
         for name, value in manager_environment_from_profile(profile, sentinel).items():
             set_launchctl_env(name, value)
+
+        # Refusing an unsafe second definition must leave both stop intent and the first
+        # definition untouched. This exercises install's preflight while install.lock is held.
+        suffix = hashlib.sha256(os.fsencode(str(profile))).hexdigest()[:16]
+        services.mkdir(mode=0o700)
+        core_definition = services / f'dev.sidevoice.rustproof.{suffix}.core.plist'
+        connector_definition = services / f'dev.sidevoice.rustproof.{suffix}.connector.plist'
+        unsafe_target = data / 'unsafe-connector-definition.plist'
+        unsafe_target.write_bytes(b'foreign target must not be opened\n')
+        unsafe_target.chmod(0o600)
+        core_definition.write_bytes(b'original private Core definition\n')
+        core_definition.chmod(0o600)
+        connector_definition.symlink_to(unsafe_target)
+        stop_marker = data / 'node-stopped.json'
+        stop_marker.write_bytes(b'{"stopped":true,"sentinel":"preserve-on-refusal"}\n')
+        stop_marker.chmod(0o600)
+        original_core_definition = core_definition.read_bytes()
+        original_stop_marker = stop_marker.read_bytes()
+        refusal = await service('install', expect_ok=False)
+        assert refusal.get('error', {}).get('key') == 'service.definition-unsafe', refusal
+        assert stop_marker.read_bytes() == original_stop_marker
+        assert core_definition.read_bytes() == original_core_definition
+        assert connector_definition.is_symlink() and connector_definition.resolve() == unsafe_target
+        connector_definition.unlink()
+        core_definition.unlink()
+        stop_marker.unlink()
+        result['unsafe_connector_preflight_preserves_stop_and_core_definition'] = True
+
+        # Open an on-demand façade and create a real pending binding before install. Installing
+        # the two launchd jobs must shut down that verified daemon, then hand socket ownership
+        # to the running launchd Connector while Core is still behind its gate.
+        thread = str(uuid.uuid4())
+        daemon_log = (data / 'service' / 'facade.log').open('ab')
+        facade = await start_facade(thread)
+        on_demand = await wait_identity(lambda value: value.get('managed') is False,
+                                       'initial on-demand connector')
+        assert process_alive(on_demand['pid']), on_demand
+        local_join = await tool(facade, 'voice_connect', {'title': 'Private launchd service proof'}, 2, thread)
+        assert local_join['conversation'] == thread and local_join['binding_id'].startswith('local-'), local_join
+        result['on_demand_facade_binding_before_install'] = True
 
         # Check the full environment and exact argv serialized by the immutable private spec.
         install_task = asyncio.create_task(service('install', timeout_seconds=90))
         command_tasks.append(install_task)
         await wait_file(wait_core, 'Core job reached its deliberate pre-start gate', seconds=30)
         await until(connector_socket.exists, 'managed connector socket before Core is ready', seconds=30)
+        connector_label = f'dev.sidevoice.rustproof.{suffix}.connector'
+        managed_pid = await connector_pid(connector_label)
+        managed_identity = await wait_identity(
+            lambda value: value.get('managed') is True and value.get('pid') == managed_pid,
+            'launchd-owned connector socket after on-demand handoff', seconds=20,
+        )
+        assert managed_identity['pid'] != on_demand['pid'], (managed_identity, on_demand)
+        await until(lambda: not process_alive(on_demand['pid']), 'old on-demand daemon exit', seconds=10)
+        result['install_handed_socket_to_launchd_connector'] = {
+            'old_pid': on_demand['pid'], 'managed_pid': managed_identity['pid'],
+        }
         assert not (core_data / 'core.json').exists(), 'Core became ready before the test released its gate'
         early = await service('status')
         assert early['state'] == 'starting' and early['connector']['running'] is True, early
@@ -429,6 +521,18 @@ async def exercise():
         assert process_alive(connector_process), 'managed connector exited while no conversation was open'
         result['zero_facade_after_16s'] = True
 
+        # A real ready Core that cannot answer health is a hang, not merely a missing-ready startup.
+        os.kill(core_before, signal.SIGSTOP)
+        try:
+            hung = await service('status')
+            assert hung['state'] == 'failed' and hung.get('failure', {}).get('key') == 'hang', hung
+            assert hung['reachable'] is False, hung
+        finally:
+            os.kill(core_before, signal.SIGCONT)
+        await until(lambda: run_status_sync(staged_binary, profile, control_env).get('state') == 'running',
+                    'Core health after SIGCONT', seconds=15)
+        result['ready_but_hung_core_is_reported_as_hang'] = True
+
         captured_env = await until(lambda: env_capture_path(data).exists(), 'private Codex scan environment')
         captured = env_capture_path(data).read_text().splitlines()
         assert captured == [expected_connector_env[name] for name in (
@@ -437,19 +541,16 @@ async def exercise():
         result['agent_child_environment_private'] = True
 
         # A façade and local Core input exercise the manager-owned connector and its actual v3 link.
-        thread = str(uuid.uuid4())
-        facade_env = {**control_env, 'CODEX_THREAD_ID': thread}
-        daemon_log = (data / 'service' / 'facade.log').open('ab')
-        facade = await asyncio.create_subprocess_exec(
-            str(staged_binary), 'mcp', '--profile-root', str(profile),
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=daemon_log,
-            env=facade_env,
-        )
-        await mcp_request(facade, 'initialize', {'protocolVersion': '2025-06-18', 'capabilities': {},
-                         'clientInfo': {'name': 'codex', 'version': 'launchd-proof'}}, 1)
-        facade.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
-        await facade.stdin.drain()
-        joined = await tool(facade, 'voice_connect', {'title': 'Private launchd service proof'}, 2, thread)
+        joined = None
+        binding_deadline = time.monotonic() + 20
+        while time.monotonic() < binding_deadline:
+            try:
+                joined = await tool(facade, 'voice_connect', {'title': 'Private launchd service proof'}, 3, thread)
+                if not joined['binding_id'].startswith('local-'):
+                    break
+            except Exception:
+                await asyncio.sleep(.2)
+        assert joined is not None, 'MCP façade did not reconnect after service install'
         assert joined['conversation'] == thread and not joined['binding_id'].startswith('local-'), joined
         token = http_json(core_data / 'local.sock', 'POST', '/api/device/local/pair', {'name': 'launchd-proof'})['token']
         history = lambda: http_json(core_data / 'local.sock', 'GET',
@@ -569,6 +670,16 @@ async def exercise():
         assert (data / 'node-stopped.json').exists()
         result['stop_marker_retry_and_no_late_scan_commit'] = True
 
+        # Once launchd has stopped, the private unmanaged process is still stoppable through
+        # the service command. This verifies the second half of the same bounded handoff path.
+        stop_marker.unlink()
+        on_demand_stop, on_demand_stop_identity = await start_on_demand()
+        stopped_on_demand = await service('stop')
+        assert stopped_on_demand['state'] == 'stopped-by-person', stopped_on_demand
+        await stop_process(on_demand_stop, 'service stop of on-demand Connector')
+        assert (data / 'node-stopped.json').exists()
+        result['stop_shuts_down_verified_on_demand_connector'] = on_demand_stop_identity['pid']
+
         started = await service('start')
         assert started['state'] == 'running' and not (data / 'node-stopped.json').exists(), started
         connector_after_start = await connector_pid(connector_plist['Label'])
@@ -591,8 +702,11 @@ async def exercise():
         (profile / 'releases/current').unlink()
         missing_current = await service('status')
         assert missing_current['state'] == 'stopped-by-person' and missing_current['installed'] is False
+        stop_marker.unlink()
+        on_demand_uninstall, on_demand_uninstall_identity = await start_on_demand()
         uninstalled = await service('uninstall')
         assert not list(services.glob('*.plist')) and not connector_socket.exists()
+        await stop_process(on_demand_uninstall, 'uninstall of on-demand Connector')
         assert (data / 'node-stopped.json').exists()
         second_uninstall = await service('uninstall')
         absent = await service('status')
@@ -602,12 +716,39 @@ async def exercise():
             assert result_manager.returncode != 0, f'launchd job survived uninstall: {label}'
         assert not any(process_alive(pid) for pid in
                        (connector_process, connector_after_start, core_before, restarted_status['core']['pid']))
-        result['uninstall_missing_current_and_idempotent'] = True
+        result['uninstall_missing_current_and_idempotent'] = {
+            'on_demand_pid': on_demand_uninstall_identity['pid'],
+        }
 
         actual_sentinel = {str(path): sha256(path) for path in sentinel.rglob('*') if path.is_file()}
         assert actual_sentinel == saved_sentinel, {'before': saved_sentinel, 'after': actual_sentinel}
         result['foreign_home_sentinels_unchanged'] = True
         result['final_state'] = absent['state']
+
+        # With the façade closed and no service jobs installed, frequent status probes must
+        # leave the unmanaged daemon's 15 second idle exit untouched.
+        (profile / 'releases/current').symlink_to(release.name)
+        await service('start')
+        idle_facade = await start_facade(str(uuid.uuid4()))
+        await finish(idle_facade)
+        idle_identity = await wait_identity(lambda value: value.get('managed') is False,
+                                            'idle on-demand daemon for status polling')
+        poll_deadline = time.monotonic() + 22
+        polls = 0
+        while time.monotonic() < poll_deadline and (
+            connector_socket.exists() or process_alive(idle_identity['pid'])
+        ):
+            await asyncio.to_thread(run_status_sync, staged_binary, profile, control_env)
+            polls += 1
+            await asyncio.sleep(.5)
+        assert polls >= 20, f'expected repeated status probes across idle window, got {polls}'
+        assert not connector_socket.exists() and not process_alive(idle_identity['pid']), {
+            'polls': polls, 'identity': idle_identity,
+            'status': await asyncio.to_thread(run_status_sync, staged_binary, profile, control_env),
+        }
+        result['status_probes_do_not_extend_on_demand_idle_deadline'] = {
+            'polls': polls, 'pid': idle_identity['pid'],
+        }
         write_evidence(profile, result)
         print(json.dumps(result, sort_keys=True))
     finally:
