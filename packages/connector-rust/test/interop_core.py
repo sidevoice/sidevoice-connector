@@ -122,7 +122,15 @@ Room.publish = publish
 
 
 async def js_register(socket_path, thread):
-    reader, writer = await asyncio.open_unix_connection(str(socket_path))
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            reader, writer = await asyncio.open_unix_connection(str(socket_path))
+            break
+        except (FileNotFoundError, ConnectionRefusedError):
+            if time.monotonic() >= deadline:
+                raise
+            await asyncio.sleep(.1)
     writer.write((json.dumps({'id': 1, 'method': 'register', 'params': {
         'client_ref': thread, 'harness': 'codex', 'thread': thread, 'title': 'Copied state',
         'delivery': {'kind': 'codex-queue', 'thread': thread}}}) + '\n').encode())
@@ -221,11 +229,8 @@ async def copied_state():
             facade = None
             await finish(daemon)
             daemon = None
-            stale_inode = socket_path.stat().st_ino if socket_path.exists() else None
             js = await asyncio.create_subprocess_exec('node', str(js_cli), 'connector', '--service',
                 stdout=js_log, stderr=js_log, env=env)
-            await until(lambda: socket_path.exists() and socket_path.stat().st_ino != stale_inode,
-                        'second JS connector socket')
             _, js_writer, again = await js_register(socket_path, thread)
             assert again == old_id and json.loads((data / 'outbox.json').read_text()) == []
             assert json.loads(agents.read_text())['version'] == 1
@@ -234,7 +239,7 @@ async def copied_state():
         except Exception:
             for handle in (core_log, js_log, rust_log):
                 handle.flush()
-            for name in ('core.log', 'js.log', 'rust.log', 'core-app.log'):
+            for name in ('core.log', 'js.log', 'rust.log', 'connector.log', 'core-app.log'):
                 path = root / name
                 if path.exists():
                     print(name + ': ' + path.read_text(errors='replace')[-2000:], file=sys.stderr)
