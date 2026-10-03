@@ -1,7 +1,11 @@
+use crate::proof::{atomic_json, private_file};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
+use std::fs;
+use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -45,18 +49,41 @@ struct Mailbox {
 pub struct CursorApps {
     boxes: Mutex<HashMap<String, Arc<Mailbox>>>,
     port: Mutex<Option<u16>>,
+    port_file: PathBuf,
+    saved_port: Option<u16>,
     start_lock: Mutex<()>,
     notices: mpsc::UnboundedSender<AppNotice>,
 }
 
 impl CursorApps {
-    pub fn new(notices: mpsc::UnboundedSender<AppNotice>) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(notices: mpsc::UnboundedSender<AppNotice>, port_file: PathBuf) -> Result<Arc<Self>> {
+        let saved_port = match fs::symlink_metadata(&port_file) {
+            Ok(_) => {
+                private_file(&port_file)?;
+                if fs::metadata(&port_file)?.len() > 1024 {
+                    anyhow::bail!("saved Cursor card port file is too large");
+                }
+                let value: Value = serde_json::from_slice(&fs::read(&port_file)?)
+                    .context("invalid saved Cursor card port")?;
+                let port = value
+                    .get("port")
+                    .and_then(Value::as_u64)
+                    .and_then(|port| u16::try_from(port).ok())
+                    .filter(|port| *port != 0)
+                    .context("invalid saved Cursor card port")?;
+                Some(port)
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Arc::new(Self {
             boxes: Mutex::new(HashMap::new()),
             port: Mutex::new(None),
+            port_file,
+            saved_port,
             start_lock: Mutex::new(()),
             notices,
-        })
+        }))
     }
 
     pub async fn port(&self) -> Option<u16> {
@@ -70,15 +97,32 @@ impl CursorApps {
         {
             anyhow::bail!("Cursor editor conversation needs a valid id and view key");
         }
-        let port = if let Some(port) = *self.port.lock().await {
+        let current_port = *self.port.lock().await;
+        let port = if let Some(port) = current_port {
             port
         } else {
             let _guard = self.start_lock.lock().await;
-            if let Some(port) = *self.port.lock().await {
+            let current_port = *self.port.lock().await;
+            if let Some(port) = current_port {
                 port
             } else {
-                let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+                let requested_port = self.saved_port.unwrap_or(0);
+                let listener = TcpListener::bind(("127.0.0.1", requested_port))
+                    .await
+                    .with_context(|| {
+                        if requested_port == 0 {
+                            "could not open Cursor card listener on loopback".to_owned()
+                        } else {
+                            format!(
+                                "could not restore Cursor card listener on 127.0.0.1:{requested_port}"
+                            )
+                        }
+                    })?;
                 let port = listener.local_addr()?.port();
+                if self.saved_port.is_none() {
+                    atomic_json(&self.port_file, &json!({"port":port}))
+                        .context("could not persist Cursor card listener port")?;
+                }
                 *self.port.lock().await = Some(port);
                 let server = self.clone();
                 tokio::spawn(async move {

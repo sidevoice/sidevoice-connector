@@ -256,7 +256,11 @@ struct Joined {
 }
 
 fn closed_note(reason: &str) -> &'static str {
-    if reason == "connector_revoked" {
+    if reason == "conversation_history_limit" {
+        "The connector reached its private conversation history limit and cannot safely restore this older conversation automatically. Its prior room state may be unavailable. Call voice_connect again if the user wants to rejoin."
+    } else if reason == "state_write_failed" {
+        "The connector could not save conversation state and cannot safely restore this older conversation automatically. Call voice_connect again if the user wants to rejoin; confirm the connector can write to its private data folder."
+    } else if reason == "connector_revoked" {
         "This machine's pairing was revoked from the room, so this conversation has no voice. Tell the user; to have voice again they must pair this machine with the one-time code the room shows under Emparejar máquina (voice_pair), and then you can call voice_connect. Continue in writing meanwhile."
     } else {
         "The user closed this conversation's voice channel from the room. Continue in writing and do not publish speech; call voice_connect again only if the user asks for voice."
@@ -289,6 +293,25 @@ impl Facade {
             if let Some(binding) = joined.get_mut(client_ref) {
                 binding.binding_id = binding_id.to_owned();
             }
+        }
+    }
+
+    async fn has_active_binding(&self, status: &Value, named: Option<&str>) -> bool {
+        let Some(bindings) = status.pointer("/bindings").and_then(Value::as_array) else {
+            return false;
+        };
+        let joined = self.joined.lock().await;
+        if let Some(name) = named {
+            joined.contains_key(name)
+                && bindings
+                    .iter()
+                    .any(|binding| binding.get("client_ref").and_then(Value::as_str) == Some(name))
+        } else {
+            joined.keys().any(|name| {
+                bindings.iter().any(|binding| {
+                    binding.get("client_ref").and_then(Value::as_str) == Some(name.as_str())
+                })
+            })
         }
     }
 
@@ -461,6 +484,11 @@ impl Facade {
                 }
                 let status = self.ipc.call("status", json!({})).await?;
                 self.refresh_binding_ids(&status).await;
+                if status.get("refused").and_then(Value::as_str).is_some() {
+                    return Ok(json!({"joined":false,"conversation":named,
+                        "room_reachable":status.get("connected"),"connector":status,
+                        "closed_by_room":true,"note":closed_note("connector_revoked")}));
+                }
                 let closed_now = status
                     .get("closed_by_room")
                     .and_then(Value::as_array)
@@ -500,6 +528,13 @@ impl Facade {
                         json!({"joined":false,"conversation":name,"room_reachable":status.get("connected"),
                         "connector":status,"closed_by_room":true,"note":closed_note(reason)}),
                     );
+                }
+                if status.get("resume_blocked") == Some(&json!(true))
+                    && !self.has_active_binding(&status, named).await
+                {
+                    return Ok(json!({"joined":false,"conversation":named,
+                        "room_reachable":status.get("connected"),"connector":status,
+                        "note":closed_note(status.pointer("/resume_block_reason").and_then(Value::as_str).unwrap_or("conversation_history_limit"))}));
                 }
                 if named.is_none()
                     && self.cursor_views.load(Ordering::Relaxed)
@@ -605,6 +640,19 @@ impl Facade {
                         .and_then(Value::as_str)
                         .unwrap_or("closed_from_room");
                     bail!("{}", closed_note(reason));
+                }
+                if status.get("resume_blocked") == Some(&json!(true))
+                    && !self.has_active_binding(&status, named).await
+                {
+                    bail!(
+                        "{}",
+                        closed_note(
+                            status
+                                .pointer("/resume_block_reason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("conversation_history_limit")
+                        )
+                    );
                 }
                 let text = args
                     .get("text")

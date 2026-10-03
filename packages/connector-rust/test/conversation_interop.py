@@ -638,8 +638,10 @@ main()
                 codex_http_rollout = codex_sessions / f'fixture-http-{codex_http_thread}.jsonl'
                 codex_http_rollout.touch(mode=0o600)
                 codex_http_env = {'CODEX_THREAD_ID':codex_http_thread,
-                    'SIDEVOICE_DELIVERY_URL':f'http://127.0.0.1:{receiver.server_port}/codex-input'}
+                    'SIDEVOICE_DELIVERY_URL':f'http://127.0.0.1:{receiver.server_port}/codex-input',
+                    'CODEX_MODEL':'codex-http-launch-model'}
                 async def codex_http_after(http_facade, http_joined, http_row, _route_env):
+                    await wait_engine(core_data / 'local.sock', session, codex_http_thread, 'codex-http-launch-model')
                     request = await asyncio.to_thread(receiver.messages.get, True, 10)
                     assert request['thread_id'] == codex_http_thread and request['text'] == 'Core input for Codex HTTP', request
                     await wait_status(core_data / 'local.sock', token, codex_http_thread, http_row['id'], 'delivered')
@@ -743,9 +745,26 @@ main()
                 await tool(facade, 'voice_disconnect', {}, 109)
                 reconnect = await tool(facade, 'voice_connect', {'title':'HTTP reconnect'}, 110)
                 assert reconnect['conversation'] == http_thread and reconnect['capabilities'] == HTTP_CAPS, reconnect
-                core_json(core_data / 'local.sock', 'POST', '/api/presentation/close', {'thread_id':http_thread})
-                await until(lambda: json.loads((data / 'conversation-state.json').read_text()).get('closed_by_room', {}).get(http_thread)
-                    if (data / 'conversation-state.json').exists() else None, 'Rust records room closure')
+                race_thread = str(uuid.uuid4())
+                race_env = {'SIDEVOICE_THREAD':race_thread,
+                    'SIDEVOICE_DELIVERY_URL':f'http://127.0.0.1:{receiver.server_port}/state-race'}
+                race_peer, _ = await start_facade(binary, root, base_env | race_env, 'fixture-http')
+                facades.append(race_peer)
+                core_json(core_data / 'local.sock', 'POST', '/api/presentation/select', {'session_id':session,'thread_id':http_thread})
+                # A fresh registration and room close overlap as separate Core and MCP clients.
+                await asyncio.gather(
+                    asyncio.to_thread(core_json, core_data / 'local.sock', 'POST',
+                        '/api/presentation/close', {'thread_id':http_thread}),
+                    tool(race_peer, 'voice_connect', {'title':'Concurrent state writer'}, 124),
+                )
+                def close_and_guard_persisted():
+                    if not (data / 'conversation-state.json').exists():
+                        return None
+                    state = json.loads((data / 'conversation-state.json').read_text())
+                    if state.get('closed_by_room', {}).get(http_thread) and (data / 'conversation-state.guard').read_bytes()[8] == 0:
+                        return state
+                    return None
+                await until(close_and_guard_persisted, 'Rust records room closure and clears its guard')
                 await finish(daemon)
                 daemon = None
                 daemon = await asyncio.create_subprocess_exec(str(binary), '--profile-root', str(root), 'connector',
@@ -756,6 +775,9 @@ main()
                 closed_say = await tool_failure(facade, 'voice_say', {'conversation':http_thread,
                     'session_id':'typed:' + http_thread, 'revision':0, 'text':'Must not be published'}, 113)
                 assert 'closed this conversation' in closed_say, closed_say
+                await tool(race_peer, 'voice_disconnect', {}, 126)
+                await finish(race_peer)
+                facades.remove(race_peer)
                 reopened = await tool(facade, 'voice_connect', {'title':'HTTP re-enabled after room close'}, 114)
                 assert reopened['conversation'] == http_thread, reopened
                 await wait_core_connected(facade, http_thread, 121)
@@ -823,6 +845,7 @@ main()
                 old_daemon = daemon
                 await finish(old_daemon)
                 daemon = None
+                (data / 'connector.sock').unlink(missing_ok=True)
                 daemon = await asyncio.create_subprocess_exec(str(binary), '--profile-root', str(root), 'connector',
                     stdout=asyncio.subprocess.DEVNULL, stderr=core_log, env=base_env)
                 await until((data / 'connector.sock').exists, 'restarted Rust connector after adopted binding')
@@ -830,9 +853,23 @@ main()
                 assert replayed['joined'] is True and replayed['binding_id'] != adopted['binding_id'], replayed
                 replay_link = replayed.get('view_link')
                 assert replay_link and replay_link.get('port') and replay_link.get('key') == app_joined['view_link']['key'], replayed
+                assert replay_link['port'] == app_joined['view_link']['port'], (app_joined['view_link'], replay_link)
                 replay_query = urlencode({'thread':app_thread, 'auth':hmac.new(bytes.fromhex(replay_link['key']),
                     ('poll:' + app_thread).encode(), hashlib.sha256).hexdigest()})
                 assert card_get(replay_link['port'], replay_query).get('message') is None, replay_link
+                app_row = await core_text(core_data / 'local.sock', token, session, replayed['binding_id'], app_thread,
+                    'Core input after Cursor connector restart')
+                app_poll = asyncio.create_task(asyncio.to_thread(card_get, app_joined['view_link']['port'], app_query))
+                card_message = await asyncio.wait_for(app_poll, 5)
+                assert card_message['message_id'] == app_row['message_id'] and 'Core input after Cursor connector restart' in card_message['text'], card_message
+                await done_card(app_joined['view_link']['port'], app_query,
+                    {'message_id':app_row['message_id'],'stage':'dispatched','ok':True})
+                await wait_status(core_data / 'local.sock', token, app_thread, app_row['id'], 'unconfirmed')
+                await status_and_reply(app_facade, app_thread, {**app_joined,'binding_id':replayed['binding_id']},
+                    app_row, editor_caps, 149)
+                await done_card(app_joined['view_link']['port'], app_query,
+                    {'message_id':app_row['message_id'],'stage':'answered','ok':True})
+                await wait_status(core_data / 'local.sock', token, app_thread, app_row['id'], 'read')
                 await tool(app_facade, 'voice_disconnect', {'conversation':app_thread}, 38)
                 app_again = await tool(app_facade, 'voice_connect', {'title':'Cursor card reconnect'}, 39)
                 await tool(app_facade, 'voice_disconnect', {'conversation':app_again['conversation']}, 40)
@@ -900,6 +937,104 @@ main()
                 await held_process.wait()
                 held_process = None
 
+                # Oversized legacy closure state blocks automatic replay but permits an explicit rejoin.
+                history_thread = str(uuid.uuid4())
+                history_env = {**base_env, 'SIDEVOICE_THREAD':history_thread,
+                    'SIDEVOICE_DELIVERY_URL':f'http://127.0.0.1:{receiver.server_port}/history-limit'}
+                history_facade, _ = await start_facade(binary, root, history_env, 'fixture-http')
+                facades.append(history_facade)
+                history_joined = await tool(history_facade, 'voice_connect', {'title':'History bound fixture'}, 150)
+                await finish(daemon)
+                daemon = None
+                (data / 'connector.sock').unlink(missing_ok=True)
+                oversized_state = data / 'conversation-state.json'
+                oversized_state.write_text(json.dumps({'closed_by_room':{
+                    'legacy-' + ('x' * (1 << 20)):'closed_from_room'}}))
+                oversized_state.chmod(0o600)
+                daemon = await asyncio.create_subprocess_exec(str(binary), '--profile-root', str(root), 'connector',
+                    stdout=asyncio.subprocess.DEVNULL, stderr=core_log, env=base_env)
+                await until((data / 'connector.sock').exists, 'Rust connector restarted with oversized legacy state')
+                await until(lambda: json.loads(oversized_state.read_text()).get('resume_blocked') is True,
+                    'oversized state compacted and resume blocked')
+                old_status = await tool(history_facade, 'voice_status', {'conversation':history_thread}, 151)
+                assert old_status['joined'] is False and 'history limit' in old_status['note'], old_status
+                old_speech = await tool_failure(history_facade, 'voice_say', {
+                    'conversation':history_thread,'session_id':'history:legacy','revision':0,'text':'stale reply'}, 155)
+                assert 'history limit' in old_speech, old_speech
+                other_thread = str(uuid.uuid4())
+                other_env = {**base_env, 'SIDEVOICE_THREAD':other_thread,
+                    'SIDEVOICE_DELIVERY_URL':f'http://127.0.0.1:{receiver.server_port}/history-peer'}
+                other_facade, _ = await start_facade(binary, root, other_env, 'fixture-http')
+                facades.append(other_facade)
+                await tool(other_facade, 'voice_connect', {'title':'Other façade'}, 160)
+                unnamed_status = await tool(history_facade, 'voice_status', {}, 156)
+                assert unnamed_status['joined'] is False and 'history limit' in unnamed_status.get('note', ''), unnamed_status
+                unnamed_speech = await tool_failure(history_facade, 'voice_say', {
+                    'session_id':'history:legacy','revision':0,'text':'stale unnamed reply'}, 157)
+                assert 'history limit' in unnamed_speech, unnamed_speech
+                history_rejoined = await tool(history_facade, 'voice_connect', {'title':'Explicit history rejoin'}, 152)
+                assert history_rejoined['conversation'] == history_thread, history_rejoined
+                rejoined_status = await tool(history_facade, 'voice_status', {'conversation':history_thread}, 153)
+                assert rejoined_status['joined'] is True and rejoined_status['connector']['resume_blocked'] is True, rejoined_status
+                await tool(other_facade, 'voice_disconnect', {'conversation':other_thread}, 161)
+                await finish(other_facade)
+                facades.remove(other_facade)
+
+                # If the closure-state rename fails, the preallocated guard still blocks replay after restart.
+                state_path = data / 'conversation-state.json'
+                state_backup = data / 'conversation-state.backup'
+                state_path.replace(state_backup)
+                state_backup.write_text(json.dumps({'refused':None,'closed_by_room':{},
+                    'resume_blocked':False,'resume_block_reason':None}))
+                state_backup.chmod(0o600)
+                state_path.mkdir(mode=0o700)
+                core_json(core_data / 'local.sock', 'POST', '/api/presentation/select',
+                    {'session_id':session,'thread_id':history_thread})
+                core_json(core_data / 'local.sock', 'POST', '/api/presentation/close', {'thread_id':history_thread})
+                guard_path = data / 'conversation-state.guard'
+                await until(lambda: guard_path.read_bytes()[8] == 1, 'emergency replay guard after state write failure')
+                failed_write_status = await wait_closed_status(history_facade, history_thread, 162)
+                assert 'closed this conversation' in failed_write_status.get('note', ''), failed_write_status
+                state_path.rmdir()
+                state_backup.replace(state_path)
+                await finish(daemon)
+                daemon = None
+                (data / 'connector.sock').unlink(missing_ok=True)
+                daemon = await asyncio.create_subprocess_exec(str(binary), '--profile-root', str(root), 'connector',
+                    stdout=asyncio.subprocess.DEVNULL, stderr=core_log, env=base_env)
+                await until((data / 'connector.sock').exists, 'Rust connector restarted under emergency replay guard')
+                failed_write_replay = await tool(history_facade, 'voice_status', {'conversation':history_thread}, 163)
+                assert failed_write_replay['joined'] is False and 'could not save conversation state' in failed_write_replay.get('note', ''), failed_write_replay
+                failed_write_say = await tool_failure(history_facade, 'voice_say', {
+                    'conversation':history_thread,'session_id':'history:legacy','revision':0,'text':'unsafe replay'}, 164)
+                assert 'could not save conversation state' in failed_write_say, failed_write_say
+                history_rejoined = await tool(history_facade, 'voice_connect', {'title':'Explicit storage recovery'}, 165)
+                assert history_rejoined['conversation'] == history_thread, history_rejoined
+                await wait_core_connected(history_facade, history_thread, 166)
+                await core_json(core_data / 'local.sock', 'POST', '/api/test/rendezvous-state',
+                    {'connected':False,'room':'https://fixture.invalid','refused':'fixture pairing revoked'})
+                revoked_after_latch = await wait_refusal_status(history_facade, history_thread, 167, True)
+                assert 'pairing was revoked' in revoked_after_latch.get('note', ''), revoked_after_latch
+                revoked_after_latch_say = await tool_failure(history_facade, 'voice_say', {'conversation':history_thread,
+                    'session_id':'history:legacy','revision':0,'text':'must stay refused'}, 168)
+                assert 'pairing was revoked' in revoked_after_latch_say, revoked_after_latch_say
+                await core_json(core_data / 'local.sock', 'POST', '/api/test/rendezvous-state',
+                    {'connected':False,'room':None,'refused':None})
+                await wait_refusal_status(history_facade, history_thread, 169, False)
+                history_rejoined = await tool(history_facade, 'voice_connect', {'title':'History after re-pair'}, 170)
+                assert history_rejoined['conversation'] == history_thread, history_rejoined
+                await wait_core_connected(history_facade, history_thread, 171)
+                core_json(core_data / 'local.sock', 'POST', '/api/presentation/select',
+                    {'session_id':session,'thread_id':history_thread})
+                await core_json(core_data / 'local.sock', 'POST', '/api/presentation/close', {'thread_id':history_thread})
+                post_latch_close = await wait_closed_status(history_facade, history_thread, 172)
+                assert 'closed this conversation' in post_latch_close.get('note', ''), post_latch_close
+                post_latch_say = await tool_failure(history_facade, 'voice_say', {'conversation':history_thread,
+                    'session_id':'history:legacy','revision':0,'text':'must remain closed'}, 173)
+                assert 'closed this conversation' in post_latch_say, post_latch_say
+                await finish(history_facade)
+                facades.remove(history_facade)
+
                 print(json.dumps({'pinned_core':launch_id,'mcp_tools':6,
                     'routes':{'claude':'unknown_then_read','codex':'accepted_then_read',
                         'codex_http':'accepted_then_read',
@@ -909,6 +1044,8 @@ main()
                     'binding_disconnect_reconnect':True,'detached_editor_adopt':True,
                     'foreign_owner_refused':True,'claude_inbound_hold_refused':True,
                     'room_close_and_revocation':True,'working_replay_state':True,'engine_observation':True,
+                    'conversation_history_limit_fail_closed':True,'state_write_failure_guard':True,
+                    'post_latch_room_close_and_revocation':True,'cursor_card_survives_restart':True,
                     'paid_prompts':False}))
         except Exception:
             core_log.flush()

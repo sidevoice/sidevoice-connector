@@ -96,7 +96,7 @@ pub fn inspect_inbound(identity: &Identity) -> Result<Option<Value>> {
 pub fn engine(identity: &Identity) -> Option<Value> {
     match identity.delivery.get("kind").and_then(Value::as_str) {
         Some("claude-uds") => claude::session_engine(&identity.thread),
-        Some("codex-queue") => {
+        Some("codex-queue") | Some("http") if identity.harness == "codex" => {
             let model = std::env::var("CODEX_MODEL")
                 .ok()
                 .filter(|value| !value.is_empty())?;
