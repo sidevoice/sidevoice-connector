@@ -677,16 +677,33 @@ else:
                     'GET', '/api/host/agents?rescan=1&watch=codex', None, token))
                 await until((codex / 'slow-get-started').exists, 'slow host-agent scan')
                 unrelated_text = 'Core input while Rust inspects Codex'
+                unrelated_message_id = str(uuid.uuid4())
                 input_task = asyncio.create_task(asyncio.to_thread(http_json, core_data / 'local.sock',
                     'POST', '/api/presentation/text', {'text': unrelated_text, 'session_id': session,
                         'thread_id': thread, 'binding_id': selected['binding']['binding_id'],
-                        'message_id': str(uuid.uuid4())}, token))
+                        'message_id': unrelated_message_id}, token))
+                registration_task = asyncio.create_task(tool(second_facade, 'voice_connect',
+                    {'title': 'Concurrent link reply'}, 92))
+                concurrent_failure = None
+                try:
+                    registration_live = await asyncio.wait_for(asyncio.shield(registration_task), 3)
+                    assert registration_live['conversation'] == second_thread \
+                        and not registration_live['binding_id'].startswith('local-'), registration_live
+                    assert not agent_scan.done(), 'host scan completed before the independent link reply'
+                    unrelated_live = await asyncio.wait_for(asyncio.shield(input_task), 3)
+                    assert unrelated_live['accepted'] is True
+                    await until(lambda: queued.exists() and json.loads(queued.read_text()).get('message', '').find(unrelated_text) >= 0,
+                                'unrelated input.deliver while host scan runs', seconds=3)
+                    await until(lambda: next((row for row in history()
+                        if row['id'] == unrelated_message_id and row['status'] == 'delivered'), None),
+                        'Core accepted the concurrent input.deliver', seconds=3)
+                    assert not agent_scan.done(), 'host scan completed before input.deliver was acknowledged'
+                except Exception as error:
+                    concurrent_failure = error
                 registration, unrelated, scanned_during_input = await asyncio.gather(
-                    asyncio.wait_for(tool(second_facade, 'voice_connect',
-                        {'title': 'Concurrent link reply'}, 92), 3),
-                    input_task,
-                    agent_scan,
-                    return_exceptions=True)
+                    registration_task, input_task, agent_scan, return_exceptions=True)
+                if concurrent_failure is not None:
+                    raise AssertionError(f'concurrent Core link check failed: {concurrent_failure!r}') from concurrent_failure
                 for label, result in (('second voice_connect', registration),
                                       ('concurrent presentation input', unrelated),
                                       ('concurrent host scan', scanned_during_input)):
@@ -694,8 +711,6 @@ else:
                         raise AssertionError(f'{label} failed during the concurrent link check: {result!r}') from result
                 assert registration['conversation'] == second_thread and not registration['binding_id'].startswith('local-'), registration
                 assert unrelated['accepted'] is True
-                await until(lambda: queued.exists() and json.loads(queued.read_text()).get('message', '').find(unrelated_text) >= 0,
-                             'unrelated input.deliver while host scan runs')
                 assert any(agent['id'] == 'codex' for agent in scanned_during_input['agents'])
                 await finish(second_facade)
                 second_facade = None
@@ -783,6 +798,7 @@ else:
             assert left['status'] == 'left'
             print(json.dumps({'core_launch_id': launch_id, 'rust_pid': daemon.pid,
                               'rust_executable_sha256': evidence['executable_sha256'], 'mcp_tools': 6,
+                              'concurrent_link_reply_and_delivery_before_host_scan': True,
                               'core_input': 'accepted_then_read', 'speech': said['status'],
                               'outbox_replayed_after_core_restart': True,
                               'storage_error_retained': True, 'lost_ack_replayed_once': True,
