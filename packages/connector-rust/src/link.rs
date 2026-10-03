@@ -162,7 +162,7 @@ impl Link {
         let hello = json!({"jsonrpc":"2.0","id":"c:1","method":"connector.hello","params":{
             "protocol":3,"connector_id":ready.connector_id,"token":ready.token,
             "host":std::env::var("SIDEVOICE_HOST_ID").unwrap_or_else(|_| "rust-proof".into()),
-            "platform":std::env::consts::OS,"version":env!("CARGO_PKG_VERSION"),"harnesses":["codex"]
+            "platform":std::env::consts::OS,"version":env!("CARGO_PKG_VERSION"),"harnesses":["claude","codex","cursor","http"]
         }});
         ws.send(Message::Text(hello.to_string().into())).await?;
         let reply = timeout(Duration::from_secs(5), ws.next())

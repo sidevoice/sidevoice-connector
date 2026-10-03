@@ -1,4 +1,6 @@
+mod adapters;
 mod agents;
+mod cursor_app;
 mod daemon;
 mod link;
 mod mcp;
@@ -45,7 +47,7 @@ async fn bounded_line<R: AsyncBufRead + Unpin>(
 #[command(
     name = "sidevoice-rust-proof",
     version,
-    about = "Isolated Codex connector proof"
+    about = "Isolated Rust connector proof"
 )]
 struct Cli {
     /// Reconstruct the complete isolated profile in a fresh process.
@@ -57,7 +59,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Serve MCP over stdio for one isolated Codex conversation.
+    /// Serve MCP over stdio for one supported conversation adapter.
     Mcp,
     /// Link the isolated Core to Codex sessions; --service is for its private launchd job.
     Connector {
