@@ -6,4 +6,8 @@ Set `SIDEVOICE_DATA_DIR` to a fresh private directory such as `$P/sidevoice` and
 
 `codex inspect` checks whether the isolated profile's `sidevoice` entry is absent, owned, foreign, or invalid. `codex connect` only adds the entry when absent; it never overwrites a foreign or invalid entry. The command is explicitly run by the test operator and never touches the default Codex profile.
 
+The proof needs the active Codex thread ID for queued delivery. Codex 0.157.0 did not provide it in MCP request metadata in the isolated live test, so the disposable profile set `CODEX_THREAD_ID` after its session was created. A queued message can be accepted before Codex reads it; the connector sends `input.read` only after the same message appears in that thread's rollout.
+
+The local speech outbox is synced to disk. Core's `text_saved: true` acknowledges admission into its current-process journal; Core intentionally keeps that journal in memory. This proof removes an outbox item on that ACK, so a Core crash immediately afterward can lose that speech text. Production use requires a separate privacy and retention decision and a restart-after-ACK test.
+
 The daemon writes `proof.json` with its PID, executable path and SHA-256, Core launch ID and successful protocol version. The file is evidence of what connected, not an installation record. No build from this directory is an upgrade artifact.

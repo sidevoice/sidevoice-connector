@@ -113,7 +113,14 @@ impl Link {
             let session = self.generation.fetch_add(1, Ordering::Relaxed);
             let outcome = self.session(&profile, &incoming, &mut first, session).await;
             self.reset().await;
-            let _ = incoming.send(Incoming { session, method: "connector.lost".into(), params: Value::Null, reply: None }).await;
+            let _ = incoming
+                .send(Incoming {
+                    session,
+                    method: "connector.lost".into(),
+                    params: Value::Null,
+                    reply: None,
+                })
+                .await;
             match outcome {
                 Ok(()) => backoff = 100,
                 Err(error) => {
@@ -213,17 +220,19 @@ impl Link {
                                 }
                                 let id = value.get("id").cloned();
                                 if tasks.len() >= 65 { bail!("Core handler limit"); }
-                                let inbound = incoming.clone(); let reply_tx = tx.clone();
+                                let reply_tx = tx.clone();
                                 let method = method.to_owned(); let params = value.get("params").cloned().unwrap_or(Value::Null);
-                                tasks.spawn(async move {
-                                    let (answer_tx, answer_rx) = oneshot::channel();
-                                    if inbound.send(Incoming { session, method, params, reply: id.as_ref().map(|_| answer_tx) }).await.is_err() { return false; }
-                                    if let Some(id) = id {
+                                let (answer_tx, answer_rx) = oneshot::channel();
+                                if !matches!(timeout(Duration::from_secs(2), incoming.send(Incoming { session, method, params, reply: id.as_ref().map(|_| answer_tx) })).await, Ok(Ok(()))) {
+                                    bail!("Core inbound queue unavailable");
+                                }
+                                if let Some(id) = id {
+                                    tasks.spawn(async move {
                                         let result = timeout(Duration::from_secs(65), answer_rx).await.ok().and_then(|v| v.ok()).unwrap_or(json!({"status":"failed"}));
                                         let _ = reply_tx.send(Message::Text(json!({"jsonrpc":"2.0","id":id,"result":result}).to_string().into())).await;
-                                    }
-                                    false
-                                });
+                                        false
+                                    });
+                                }
                             } else if let Some(id) = value.get("id").and_then(Value::as_str) {
                                 if !id.starts_with("c:") { bail!("Core response ID prefix invalid"); }
                                 if let Some(waiting) = self.pending.lock().await.remove(id) {

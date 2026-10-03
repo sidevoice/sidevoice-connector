@@ -138,7 +138,7 @@ impl Daemon {
         Ok(())
     }
 
-    fn durable(speech: &Value, reply: &Value) -> bool {
+    fn ack_allows_removal(speech: &Value, reply: &Value) -> bool {
         let ids_match = ["event_id", "utterance_id"].iter().all(|key| {
             speech.get(key).and_then(Value::as_str).is_some() && speech.get(key) == reply.get(key)
         });
@@ -153,7 +153,14 @@ impl Daemon {
         if !self.link.connected().await {
             return Ok(None);
         }
-        let mut published = self.outbox.lock().await.iter().find(|item| item.get("event_id") == speech.get("event_id")).cloned().unwrap_or_else(|| speech.clone());
+        let mut published = self
+            .outbox
+            .lock()
+            .await
+            .iter()
+            .find(|item| item.get("event_id") == speech.get("event_id"))
+            .cloned()
+            .unwrap_or_else(|| speech.clone());
         let result = self
             .link
             .request("speech.publish", published.clone(), Duration::from_secs(15))
@@ -176,7 +183,14 @@ impl Daemon {
                 .await
             {
                 if self.register_core(&binding).await.is_ok() {
-                    published = self.outbox.lock().await.iter().find(|item| item.get("event_id") == speech.get("event_id")).cloned().context("speech disappeared during binding repair")?;
+                    published = self
+                        .outbox
+                        .lock()
+                        .await
+                        .iter()
+                        .find(|item| item.get("event_id") == speech.get("event_id"))
+                        .cloned()
+                        .context("speech disappeared during binding repair")?;
                     reply = match self
                         .link
                         .request("speech.publish", published.clone(), Duration::from_secs(15))
@@ -195,7 +209,7 @@ impl Daemon {
                 return Ok(None);
             }
         }
-        if Self::durable(&published, &reply) {
+        if Self::ack_allows_removal(&published, &reply) {
             let event_id = speech.get("event_id");
             let mut outbox = self.outbox.lock().await;
             let before = outbox.clone();
@@ -205,7 +219,7 @@ impl Daemon {
                 return Err(error);
             }
         }
-        if Self::durable(&published, &reply) {
+        if Self::ack_allows_removal(&published, &reply) {
             Ok(Some(reply))
         } else {
             Ok(None)
@@ -238,7 +252,9 @@ impl Daemon {
         } else {
             self.handle_incoming(&item.method, &item.params).await
         };
-        if let Some(tx) = item.reply { let _ = tx.send(answer); }
+        if let Some(tx) = item.reply {
+            let _ = tx.send(answer);
+        }
     }
 
     async fn handle_incoming(self: &Arc<Self>, method: &str, params: &Value) -> Value {
@@ -394,7 +410,9 @@ impl Daemon {
                 self.clone().watch_rollout(binding.clone());
                 let result = self.register_core(&binding).await;
                 let id = binding.id.lock().await.clone();
-                if result.is_ok() { self.flush_outbox().await; }
+                if result.is_ok() {
+                    self.flush_outbox().await;
+                }
                 Ok(
                     json!({"binding_id":id,"thread":thread,"connected":result.is_ok(),"pending":result.is_err()}),
                 )
@@ -735,6 +753,7 @@ pub async fn run(profile: Profile) -> Result<()> {
     let clients = Arc::new(Semaphore::new(32));
     let mut core_tasks = JoinSet::new();
     let mut core_session = 0u64;
+    let mut binding_order = HashMap::<String, oneshot::Receiver<()>>::new();
     let (ready_tx, ready_rx) = oneshot::channel();
     tokio::spawn(link.run(profile.clone(), incoming_tx, ready_tx));
     let ready = ready_rx
@@ -762,6 +781,7 @@ pub async fn run(profile: Profile) -> Result<()> {
                     if item.session == core_session {
                         core_tasks.abort_all();
                         while core_tasks.join_next().await.is_some() {}
+                        binding_order.clear();
                         core_session = 0;
                     }
                     continue;
@@ -769,6 +789,7 @@ pub async fn run(profile: Profile) -> Result<()> {
                 if item.session != core_session {
                     core_tasks.abort_all();
                     while core_tasks.join_next().await.is_some() {}
+                    binding_order.clear();
                     core_session = item.session;
                 }
                 if core_tasks.len() >= 64 {
@@ -777,7 +798,17 @@ pub async fn run(profile: Profile) -> Result<()> {
                     continue;
                 }
                 let daemon = daemon.clone();
-                core_tasks.spawn(async move { daemon.incoming(item).await; });
+                let ordered = item.method == "input.deliver";
+                let (previous, completed) = if ordered {
+                    let id = item.params.get("binding_id").and_then(Value::as_str).unwrap_or("").to_owned();
+                    let (tx, rx) = oneshot::channel();
+                    (binding_order.insert(id, rx), Some(tx))
+                } else { (None, None) };
+                core_tasks.spawn(async move {
+                    if let Some(previous) = previous { let _ = previous.await; }
+                    daemon.incoming(item).await;
+                    if let Some(completed) = completed { let _ = completed.send(()); }
+                });
             }
             _ = tokio::signal::ctrl_c() => { break; }
         }
@@ -793,13 +824,13 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn outbox_requires_matching_durable_or_audited_terminal_result() {
+    fn outbox_requires_matching_admission_or_audited_terminal_result() {
         let speech = json!({"event_id":"e","utterance_id":"u"});
-        assert!(Daemon::durable(
+        assert!(Daemon::ack_allows_removal(
             &speech,
             &json!({"event_id":"e","utterance_id":"u","text_saved":true})
         ));
-        assert!(Daemon::durable(
+        assert!(Daemon::ack_allows_removal(
             &speech,
             &json!({"event_id":"e","utterance_id":"u","status":"rejected","terminal":true,"reason_code":"application_refusal"})
         ));
@@ -810,7 +841,7 @@ mod tests {
             json!({"event_id":"e","utterance_id":"wrong","text_saved":true}),
             json!({"event_id":"e","utterance_id":"u","status":"rejected","terminal":true}),
         ] {
-            assert!(!Daemon::durable(&speech, &reply));
+            assert!(!Daemon::ack_allows_removal(&speech, &reply));
         }
     }
 }
