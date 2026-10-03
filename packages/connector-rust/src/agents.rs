@@ -1050,7 +1050,7 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> std::io:
 }
 
 async fn collect_pipe(task: &mut JoinHandle<std::io::Result<Vec<u8>>>) -> Option<Vec<u8>> {
-    match timeout(StdDuration::from_secs(1), task).await {
+    match timeout(StdDuration::from_secs(1), &mut *task).await {
         Ok(Ok(Ok(output))) => Some(output),
         _ => {
             task.abort();
@@ -1320,7 +1320,7 @@ impl HostAgents {
             });
         }
         let present = !evidence.is_empty();
-        let instructions = self.instructions(id, registration, binary.as_deref());
+        let instructions = self.instructions(id, &registration, binary.as_deref());
         let evidence_json = serde_json::to_value(&evidence).map_err(|_| Failure::Internal)?;
         let signature = if present {
             let identity = format!(
@@ -1372,7 +1372,7 @@ impl HostAgents {
             AgentId::Codex => {
                 if registration == "foreign" {
                     let cli = binary.unwrap_or("codex");
-                    let mut remove = vec!["mcp", "remove", "sidevoice"]
+                    let remove = vec!["mcp", "remove", "sidevoice"]
                         .into_iter().map(str::to_owned).collect::<Vec<_>>();
                     let mut add = vec!["mcp", "add", "sidevoice", "--"]
                         .into_iter().map(str::to_owned).collect::<Vec<_>>();

@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;

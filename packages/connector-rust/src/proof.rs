@@ -145,7 +145,10 @@ impl Profile {
         Ok(profile)
     }
 
-    pub fn command_env(&self, command: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    pub fn command_env<'a>(
+        &self,
+        command: &'a mut tokio::process::Command,
+    ) -> &'a mut tokio::process::Command {
         command
             .env("HOME", &self.home)
             .env("CLAUDE_CONFIG_DIR", &self.claude)

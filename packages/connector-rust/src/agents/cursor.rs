@@ -31,7 +31,7 @@ impl HostAgents {
 
     pub(super) fn cursor_connect(&self) -> std::result::Result<(), Failure> {
         let file = self.profile.cursor.join("mcp.json");
-        let config = match read_cursor_config(&file, &self.profile.root) {
+        let mut config = match read_cursor_config(&file, &self.profile.root) {
             Ok(Some((config, _, _))) => config,
             Ok(None) => json!({}),
             Err(_) => return Err(agent_failure("agents.invalid", AgentId::Cursor)),
