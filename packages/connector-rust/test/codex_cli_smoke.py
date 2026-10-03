@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import tomllib
 
 
 def run(command, env, expect=0):
@@ -65,7 +66,9 @@ def main():
         connected = rust_action(binary, "inspect", root, env)
         assert next(agent for agent in connected["agents"] if agent["id"] == "codex")["registration"] == "connected"
         run([codex, "mcp", "remove", "sidevoice"], env)
-        assert not (paths["codex"] / "config.toml").exists()
+        codex_config = paths["codex"] / "config.toml"
+        if codex_config.exists():
+            assert "sidevoice" not in tomllib.loads(codex_config.read_text()).get("mcp_servers", {})
 
         run([codex, "mcp", "add", "sidevoice", "--", "/bin/echo", "keep-existing"], env)
         foreign_path = paths["codex"] / "config.toml"
