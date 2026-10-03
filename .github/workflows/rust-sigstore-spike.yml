@@ -29,7 +29,9 @@ jobs:
       - name: Check exact pull request head
         env:
           EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA" && echo "PR head: $EXPECTED_HEAD_SHA"
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
+          echo "PR head: $EXPECTED_HEAD_SHA"
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt && rustup default 1.88.0
       - name: Source and dependency revisions
@@ -148,7 +150,9 @@ jobs:
       - name: Check exact pull request head
         env:
           EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA" && echo "PR head: $EXPECTED_HEAD_SHA"
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
+          echo "PR head: $EXPECTED_HEAD_SHA"
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal && rustup default 1.88.0
       - name: Compile and run small policy fixture
