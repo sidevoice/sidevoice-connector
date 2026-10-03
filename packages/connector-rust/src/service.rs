@@ -956,7 +956,7 @@ async fn wait_connector_gone(profile: &Profile, pid: Option<u32>) -> Result<()> 
         if lock_free && profile.socket.exists() {
             remove_stale_socket(&profile.socket).map_err(Failure::plain)?;
         }
-        let process_gone = pid.map_or(true, |pid| !process_alive(pid));
+        let process_gone = pid.is_none_or(|pid| !process_alive(pid));
         if lock_free && process_gone && !profile.socket.exists() {
             return Ok(());
         }
