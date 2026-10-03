@@ -1,5 +1,5 @@
 use crate::link::{Incoming, Link};
-use crate::proof::{atomic_json, private_dir, verify_socket, Profile};
+use crate::proof::{atomic_json, private_dir, private_file, verify_socket, Profile};
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use serde_json::{json, Value};
@@ -39,6 +39,7 @@ impl Daemon {
     fn new(profile: Profile, link: Arc<Link>) -> Result<Arc<Self>> {
         let path = profile.data.join("outbox.json");
         let outbox = if path.exists() {
+            private_file(&path)?;
             let bytes = fs::read(&path)?;
             if bytes.len() > 8 << 20 { bail!("outbox too large"); }
             serde_json::from_slice::<Vec<Value>>(&bytes).context("invalid existing outbox")?
@@ -87,7 +88,8 @@ impl Daemon {
     async fn publish_one(&self, speech: &Value) -> Result<Option<Value>> {
         if !self.link.connected().await { return Ok(None); }
         let result = self.link.request("speech.publish", speech.clone(), Duration::from_secs(15)).await;
-        let reply = match result { Ok(v) => v, Err(error) => { eprintln!("[sidevoice rust proof] speech retry retained: {error}"); return Ok(None); } };
+        let mut reply = match result { Ok(v) => v, Err(error) => { eprintln!("[sidevoice rust proof] speech retry retained: {error}"); return Ok(None); } };
+        let mut published = speech.clone();
         if reply.get("status") == Some(&json!("unknown_binding")) {
             if let Some(binding) = self.binding_for_id(speech.get("binding_id").and_then(Value::as_str).unwrap_or("")).await {
                 if self.register_core(&binding).await.is_ok() {
@@ -96,18 +98,27 @@ impl Daemon {
                     let before = outbox.clone();
                     for item in outbox.iter_mut().filter(|item| item.get("event_id") == speech.get("event_id")) { item["binding_id"] = json!(new_id); }
                     if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) { *outbox = before; return Err(error); }
+                    published["binding_id"] = json!(new_id);
+                    drop(outbox);
+                    reply = match self.link.request("speech.publish", published.clone(), Duration::from_secs(15)).await {
+                        Ok(value) => value,
+                        Err(error) => { eprintln!("[sidevoice rust proof] speech retry retained: {error}"); return Ok(None); }
+                    };
+                } else {
+                    return Ok(None);
                 }
+            } else {
+                return Ok(None);
             }
-            return Ok(None);
         }
-        if Self::durable(speech, &reply) {
+        if Self::durable(&published, &reply) {
             let event_id = speech.get("event_id");
             let mut outbox = self.outbox.lock().await;
             let before = outbox.clone();
             outbox.retain(|item| item.get("event_id") != event_id);
             if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) { *outbox = before; return Err(error); }
         }
-        if Self::durable(speech, &reply) { Ok(Some(reply)) } else { Ok(None) }
+        if Self::durable(&published, &reply) { Ok(Some(reply)) } else { Ok(None) }
     }
 
     async fn flush_outbox(&self) {
@@ -206,9 +217,8 @@ impl Daemon {
                 let _ = self.link.notify("binding.unregister", json!({"binding_id":*binding.id.lock().await})).await;
                 Ok(json!({"left":true,"connected":self.link.connected().await}))
             }
-            "status" | "node.status" => Ok(json!({"version":env!("CARGO_PKG_VERSION"),"connected":self.link.connected().await,"room_reachable":self.rendezvous.lock().await.clone()})),
+            "status" => Ok(json!({"version":env!("CARGO_PKG_VERSION"),"connected":self.link.connected().await,"room_reachable":self.rendezvous.lock().await.clone()})),
             "pair_device" => self.link.request("device.pairing_code", json!({}), Duration::from_secs(10)).await,
-            "adopt" => Ok(json!({"adopted":false})),
             _ => bail!("unknown IPC method"),
         }
     }

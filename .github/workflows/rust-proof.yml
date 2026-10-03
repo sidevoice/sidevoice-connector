@@ -40,6 +40,12 @@ jobs:
           path: packages/connector-rust/target/release/sidevoice-rust-proof
           if-no-files-found: error
           retention-days: 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sidevoice-rust-proof-lockfile
+          path: packages/connector-rust/Cargo.lock
+          if-no-files-found: error
+          retention-days: 7
 
   interop-core:
     name: Rust proof with real Core v3 and modelled Codex queue

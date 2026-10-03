@@ -131,8 +131,9 @@ impl Facade {
             }
             "voice_disconnect" => {
                 let chosen = self.pick(args.get("conversation").and_then(Value::as_str)).await?.context("not connected")?;
-                let id = self.joined.lock().await.remove(&chosen).context("not connected")?;
+                let id = self.joined.lock().await.get(&chosen).cloned().context("not connected")?;
                 let result = self.ipc.call("unregister", json!({"binding_id":id,"client_ref":chosen})).await?;
+                self.joined.lock().await.remove(&chosen);
                 Ok(json!({"status":"left","conversation":chosen,"room_reachable":result.get("connected")}))
             }
             "voice_pair_device" => self.ipc.call("pair_device", json!({})).await,

@@ -50,7 +50,7 @@ pub fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn private_file(path: &Path) -> Result<()> {
+pub fn private_file(path: &Path) -> Result<()> {
     let m = fs::symlink_metadata(path)?;
     if !m.is_file() || m.file_type().is_symlink() || m.uid() != uid() || m.mode() & 0o077 != 0 {
         bail!("unsafe private file {}", path.display());

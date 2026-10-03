@@ -10,9 +10,7 @@ import http.client
 import json
 import os
 from pathlib import Path
-import signal
 import socket
-import subprocess
 import sys
 import tempfile
 import time
@@ -95,7 +93,7 @@ async def finish(process):
 
 async def exercise():
     binary = Path(os.environ['SIDEVOICE_RUST_PROOF_BIN']).resolve()
-    python = Path(os.environ['SIDEVOICE_CORE_PYTHON']).resolve()
+    python = Path(os.environ['SIDEVOICE_CORE_PYTHON']).absolute()
     with tempfile.TemporaryDirectory(prefix='sidevoice-rust-core-') as temporary:
         root = Path(temporary)
         root.chmod(0o700)
@@ -117,18 +115,21 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
 ''')
         fake_codex.chmod(0o700)
         env = {**os.environ, 'SIDEVOICE_DATA_DIR': str(data), 'CODEX_HOME': str(codex),
-               'SIDEVOICE_CODEX_BIN': str(fake_codex), 'SIDEVOICE_TEST_QUEUE': str(queued)}
+               'CODEX_THREAD_ID': thread, 'SIDEVOICE_CODEX_BIN': str(fake_codex),
+               'SIDEVOICE_TEST_QUEUE': str(queued)}
         launch_id = str(uuid.uuid4())
         core_log = (root / 'core.log').open('wb')
         daemon_log = (root / 'daemon.log').open('wb')
         core = await asyncio.create_subprocess_exec(str(python), '-m', 'sidevoice_core.server', '--data-dir', str(core_data),
             '--socket', str(core_data / 'local.sock'), '--port', '0', '--idle-exit', '0', '--launch-id', launch_id,
+            '--log-file', str(root / 'core-app.log'),
             stdout=core_log, stderr=core_log, env=env)
         daemon = None
         facade = None
         try:
             ready_path = core_data / 'core.json'
-            await until(lambda: ready_path.exists(), 'Core ready file')
+            await until(lambda: ready_path.exists() or core.returncode is not None, 'Core ready file', seconds=90)
+            assert ready_path.exists(), f'Core exited before ready: {core.returncode}'
             ready = json.loads(ready_path.read_text())
             assert ready['launch_id'] == launch_id and 3 in ready['connector_protocols']
             daemon = await asyncio.create_subprocess_exec(str(binary), 'connector', stdout=daemon_log, stderr=daemon_log, env=env)
@@ -146,7 +147,7 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
             listed = await mcp_request(facade, 'tools/list', {}, 2)
             assert {tool['name'] for tool in listed['tools']} == {'voice_connect', 'voice_pair', 'voice_say', 'voice_disconnect', 'voice_pair_device', 'voice_status'}
             joined = await tool(facade, 'voice_connect', {'title': 'Rust v3 interop'}, 3, thread)
-            assert joined['conversation'] == thread and not joined['binding_id'].startswith('local-')
+            assert joined['conversation'] == thread and not joined['binding_id'].startswith('local-'), joined
             paired = http_json(core_data / 'local.sock', 'POST', '/api/device/local/pair', {'name': 'rust-v3-test'})
             token = paired['token']
             async with unix_connect(path=str(core_data / 'local.sock'), uri='ws://localhost/api/presentation/ws',
@@ -158,12 +159,12 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
                     if frame.get('type') == 'voice-session':
                         session = frame['data']['session_id']
                         break
-                http_json(core_data / 'local.sock', 'POST', '/api/presentation/select',
+                selected = http_json(core_data / 'local.sock', 'POST', '/api/presentation/select',
                     {'session_id': session, 'thread_id': thread}, token)
                 message_id = str(uuid.uuid4())
                 sent = http_json(core_data / 'local.sock', 'POST', '/api/presentation/text',
                     {'text': 'Core generated this input', 'session_id': session, 'thread_id': thread,
-                     'binding_id': joined['binding_id'], 'message_id': message_id}, token)
+                     'binding_id': selected['binding']['binding_id'], 'message_id': message_id}, token)
                 queued_message = await until(lambda: queued.exists() and json.loads(queued.read_text()), 'Codex queue call')
                 assert queued_message['thread'] == thread and 'Core generated this input' in queued_message['message']
                 history = lambda: http_json(core_data / 'local.sock', 'GET', f'/api/presentation/history?thread_id={thread}', token=token)['messages']
@@ -184,8 +185,13 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
                               'rust_executable_sha256': evidence['executable_sha256'], 'mcp_tools': 6,
                               'core_input': 'accepted_then_read', 'speech': said['status']}))
         except Exception:
-            print('Core log tail:', core_log.name, file=sys.stderr)
-            print('Daemon log:', daemon_log.name, file=sys.stderr)
+            core_log.flush()
+            daemon_log.flush()
+            print('Core process:', core.returncode, file=sys.stderr)
+            for name in ('core.log', 'daemon.log', 'core-app.log'):
+                path = root / name
+                if path.exists():
+                    print(name + ': ' + path.read_text(errors='replace')[-2000:], file=sys.stderr)
             raise
         finally:
             if facade:
