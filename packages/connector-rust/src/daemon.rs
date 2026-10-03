@@ -721,7 +721,8 @@ impl Daemon {
                     Ok(result) => json!({"id":id,"ok":true,"result":result}),
                     Err(error) => json!({"id":id,"ok":false,"error":error.to_string()}),
                 };
-                let shutdown_after_reply = method == "shutdown" && answer.get("ok") == Some(&json!(true));
+                let shutdown_after_reply =
+                    method == "shutdown" && answer.get("ok") == Some(&json!(true));
                 write.write_all(answer.to_string().as_bytes()).await?;
                 write.write_all(b"\n").await?;
                 if shutdown_after_reply {
@@ -832,7 +833,13 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     let link = Link::new();
     let (replay_tx, mut replay_rx) = mpsc::channel(1);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-    let daemon = Daemon::new(profile.clone(), link.clone(), replay_tx, managed, shutdown_tx)?;
+    let daemon = Daemon::new(
+        profile.clone(),
+        link.clone(),
+        replay_tx,
+        managed,
+        shutdown_tx,
+    )?;
     let (incoming_tx, mut incoming_rx) = mpsc::channel(128);
     let clients = Arc::new(Semaphore::new(32));
     let mut core_tasks = JoinSet::new();
@@ -976,7 +983,8 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     if !client_tasks.is_empty() {
         let drained = tokio::time::timeout(Duration::from_secs(2), async {
             while client_tasks.join_next().await.is_some() {}
-        }).await;
+        })
+        .await;
         if drained.is_err() {
             client_tasks.abort_all();
             while client_tasks.join_next().await.is_some() {}

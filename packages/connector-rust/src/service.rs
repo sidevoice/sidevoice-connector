@@ -2,10 +2,10 @@
 //! user-manager path has been reviewed against an isolated runner.
 
 use crate::agents::message;
-use anyhow::Context;
 #[cfg(target_os = "macos")]
 use crate::proof::atomic_json;
 use crate::proof::{private_dir, private_file, Profile, Ready};
+use anyhow::Context;
 #[cfg(target_os = "macos")]
 use fs2::FileExt;
 use serde_json::{json, Value};
@@ -25,9 +25,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 #[cfg(target_os = "macos")]
 use tokio::process::Child;
-use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::time::{sleep, timeout, Duration, Instant};
 
@@ -880,15 +880,23 @@ async fn connector_request(
     .await
     {
         Ok(Ok(stream)) => stream,
-        Ok(Err(error)) if matches!(
-            error.kind(),
-            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-        ) => return Ok(None),
+        Ok(Err(error))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(None)
+        }
         Ok(Err(error)) => return Err(error.into()),
         Err(_) => return Ok(None),
     };
     stream
-        .write_all(json!({"id":1,"method":method,"params":params}).to_string().as_bytes())
+        .write_all(
+            json!({"id":1,"method":method,"params":params})
+                .to_string()
+                .as_bytes(),
+        )
         .await?;
     stream.write_all(b"\n").await?;
     let mut reader = BufReader::new(stream);
@@ -938,7 +946,12 @@ fn verified_profile_executable(profile: &Profile, path: &Path) -> bool {
         && path
             .canonicalize()
             .ok()
-            .and_then(|canonical| canonical.strip_prefix(&profile.root).ok().map(Path::to_path_buf))
+            .and_then(|canonical| {
+                canonical
+                    .strip_prefix(&profile.root)
+                    .ok()
+                    .map(Path::to_path_buf)
+            })
             .is_some_and(|relative| {
                 let parts = relative.components().collect::<Vec<_>>();
                 parts.len() == 4
@@ -1958,7 +1971,8 @@ mod tests {
             token: "secret".into(),
             connector_protocols: Some(vec![3]),
         });
-        current.health = Some(json!({"pid":9,"version":"0.1.0","api":1,"launch_id":"other-launch","calls":3}));
+        current.health =
+            Some(json!({"pid":9,"version":"0.1.0","api":1,"launch_id":"other-launch","calls":3}));
         assert_eq!(derive_status(&current)["reachable"], false);
         assert_eq!(derive_status(&current)["state"], "starting");
         current.core_age = Some(61);
