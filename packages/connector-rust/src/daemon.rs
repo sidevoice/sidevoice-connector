@@ -3,10 +3,10 @@ use crate::proof::{atomic_json, private_dir, private_file, verify_socket, Profil
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -22,8 +22,8 @@ struct Binding {
     owner: u64,
     id: Mutex<String>,
     serial: Mutex<()>,
-    pending: Mutex<HashMap<String, (String, i64)>>,
-    read: Mutex<HashSet<String>>,
+    pending: Mutex<VecDeque<String>>,
+    read: Mutex<VecDeque<String>>,
     stopped: AtomicBool,
 }
 
@@ -91,6 +91,7 @@ impl Daemon {
     async fn queue(&self, speech: Value) -> Result<()> {
         let mut outbox = self.outbox.lock().await;
         outbox.push(speech);
+        if serde_json::to_vec(&*outbox)?.len() > 8 << 20 { outbox.pop(); bail!("outbox full"); }
         if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) { outbox.pop(); return Err(error); }
         Ok(())
     }
@@ -178,7 +179,11 @@ impl Daemon {
         let revision = frame.get("revision").and_then(Value::as_i64).unwrap_or(0);
         let text = frame.get("text").and_then(Value::as_str).unwrap_or("");
         if message_id.is_empty() || session_id.is_empty() || text.is_empty() { return json!({"status":"failed","detail":"invalid input"}); }
-        binding.pending.lock().await.insert(message_id.to_owned(), (session_id.to_owned(), revision));
+        {
+            let mut pending = binding.pending.lock().await;
+            if !pending.iter().any(|id| id == message_id) { pending.push_back(message_id.to_owned()); }
+            if pending.len() > 64 { pending.pop_front(); }
+        }
         let channel = frame.get("channel").and_then(Value::as_str).unwrap_or("voice");
         let header = json!({"channel":channel,"session_id":session_id,"revision":revision,"message_id":message_id});
         let note = if channel == "voice" { format!("\n\n[Sidevoice] Voice from the room: acknowledge with voice_say (session_id \"{session_id}\", revision {revision}) before any other tool, then work and reply by voice, as the sidevoice server's instructions say.") } else { String::new() };
@@ -186,10 +191,11 @@ impl Daemon {
         let binary = std::env::var("SIDEVOICE_CODEX_BIN").unwrap_or_else(|_| "codex".into());
         let output = tokio::time::timeout(Duration::from_secs(30), tokio::process::Command::new(binary)
             .kill_on_drop(true).env("CODEX_HOME", &self.profile.codex)
-            .args(["queue", "--thread", &binding.thread, "--message", &envelope]).output()).await;
+            .args(["queue", "--thread", &binding.thread, "--message", &envelope])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status()).await;
         match output {
-            Ok(Ok(result)) if result.status.success() => json!({"status":"accepted","detail":"codex queue confirmed the thread"}),
-            _ => { binding.pending.lock().await.remove(message_id); json!({"status":"failed","detail":"codex queue failed"}) }
+            Ok(Ok(result)) if result.success() => json!({"status":"accepted","detail":"codex queue confirmed the thread"}),
+            _ => { binding.pending.lock().await.retain(|id| id != message_id); json!({"status":"failed","detail":"codex queue failed"}) }
         }
     }
 
@@ -206,7 +212,7 @@ impl Daemon {
                     return Ok(json!({"binding_id":*existing.id.lock().await,"thread":thread,"connected":self.link.connected().await}));
                 }
                 let binding = Arc::new(Binding { client_ref: client_ref.clone(), thread: thread.clone(), title, owner,
-                    id: Mutex::new(format!("local-{}", uuid::Uuid::new_v4())), serial: Mutex::new(()), pending: Mutex::new(HashMap::new()), read: Mutex::new(HashSet::new()), stopped: AtomicBool::new(false) });
+                    id: Mutex::new(format!("local-{}", uuid::Uuid::new_v4())), serial: Mutex::new(()), pending: Mutex::new(VecDeque::new()), read: Mutex::new(VecDeque::new()), stopped: AtomicBool::new(false) });
                 self.bindings.lock().await.insert(client_ref, binding.clone());
                 self.clone().watch_rollout(binding.clone());
                 let result = self.register_core(&binding).await;
@@ -255,15 +261,22 @@ impl Daemon {
         tokio::spawn(async move {
             let mut path: Option<PathBuf> = None;
             let mut offset = 0u64;
+            let mut file_id: Option<(u64, u64)> = None;
             let mut partial = Vec::new();
             let mut oversized = false;
             let mut turn: Option<String> = None;
             loop {
                 if binding.stopped.load(Ordering::Relaxed) { break; }
-                if path.is_none() { path = rollout_path(&self.profile.codex, &binding.thread); if let Some(file) = &path { offset = fs::metadata(file).map(|m| m.len()).unwrap_or(0); } }
+                if path.is_none() { path = rollout_path(&self.profile.codex, &binding.thread); if let Some(file) = &path {
+                    if let Ok(meta) = fs::metadata(file) { offset = meta.len(); file_id = Some((meta.dev(), meta.ino())); }
+                } }
                 if let Some(file) = &path {
                     if let Ok(mut input) = fs::File::open(file) {
-                        if input.metadata().is_ok_and(|m| m.len() < offset) { offset = 0; partial.clear(); oversized = false; }
+                        if let Ok(meta) = input.metadata() {
+                            let current = (meta.dev(), meta.ino());
+                            if file_id != Some(current) || meta.len() < offset { offset = 0; partial.clear(); oversized = false; }
+                            file_id = Some(current);
+                        }
                         if input.seek(SeekFrom::Start(offset)).is_ok() {
                             let mut bytes = [0u8; 65536];
                             if let Ok(n) = input.read(&mut bytes) {
@@ -284,7 +297,7 @@ impl Daemon {
                                 }
                             }
                         }
-                    }
+                    } else { path = None; file_id = None; partial.clear(); oversized = false; }
                 }
                 tokio::time::sleep(Duration::from_millis(400)).await;
             }
@@ -308,8 +321,15 @@ impl Daemon {
             let Some(end) = text[start..].find('}') else { return; };
             let Ok(header) = serde_json::from_str::<Value>(&text[start..=start + end]) else { return; };
             let Some(message_id) = header.get("message_id").and_then(Value::as_str) else { return; };
-            if binding.pending.lock().await.remove(message_id).is_none() { return; }
-            if !binding.read.lock().await.insert(message_id.to_owned()) { return; }
+            let mut pending = binding.pending.lock().await;
+            if !pending.iter().any(|id| id == message_id) { return; }
+            pending.retain(|id| id != message_id);
+            drop(pending);
+            let mut read = binding.read.lock().await;
+            if read.iter().any(|id| id == message_id) { return; }
+            read.push_back(message_id.to_owned());
+            if read.len() > 512 { read.pop_front(); }
+            drop(read);
             let _ = self.link.notify("input.read", json!({"binding_id":id,"message_id":message_id,"session_id":header["session_id"],"revision":header["revision"],"turn_id":turn})).await;
         }
     }

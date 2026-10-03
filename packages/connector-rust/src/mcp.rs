@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, timeout_at, Duration, Instant};
 
 const INSTRUCTIONS: &str = "Sidevoice connects this conversation to the user's voice room.\n- Call voice_connect only when the user asks to join the room or enable voice; never as a side effect.\n- Voice input is a user message: a JSON header ({\"channel\":\"voice\",\"session_id\",\"revision\",\"message_id\"}), the user's literal words, then a [Sidevoice] line that is not the user's. A repeated message_id is a redelivery: do not act on it again.\n- Reply by voice with voice_say, using that message's session_id and revision for every publication. For substantive work: first a short acknowledgement, then meaningful checkpoints, then the result.\n- Between steps, take in newly arrived user input before starting the next step.\n- 'published' means the room stored it, not that the user heard it. If publishing fails, continue in writing.\n- Read receipts and working state come from the Codex transcript; accepted delivery is not a read receipt.\n- This is an isolated Codex proof. Pairing a room is unavailable here.";
 
@@ -78,12 +78,14 @@ impl Ipc {
 
     async fn call(self: &Arc<Self>, method: &str, params: Value) -> Result<Value> {
         self.ensure().await?;
+        let deadline = Instant::now() + Duration::from_secs(20);
         let id = self.serial.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
         let sender = self.tx.lock().await.clone().context("connector went away")?;
-        sender.send(json!({"id":id,"method":method,"params":params})).await?;
-        let answer = timeout(Duration::from_secs(20), rx).await;
+        let sent = timeout_at(deadline, sender.send(json!({"id":id,"method":method,"params":params}))).await;
+        if !matches!(sent, Ok(Ok(()))) { self.pending.lock().await.remove(&id); bail!("connector IPC send timed out or disconnected"); }
+        let answer = timeout_at(deadline, rx).await;
         self.pending.lock().await.remove(&id);
         let value = answer.context("connector request timed out")??.map_err(anyhow::Error::msg)?;
         if method == "register" { if let Some(client_ref) = params.get("client_ref").and_then(Value::as_str) { self.registrations.lock().await.insert(client_ref.to_owned(), params.clone()); } }
