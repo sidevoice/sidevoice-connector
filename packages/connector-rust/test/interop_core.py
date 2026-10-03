@@ -272,13 +272,19 @@ async def copied_state():
             assert rust_cursor['dismissed'] is True and rust_cursor['actionable'] is False, rust_cursor
             rust_codex = next(agent for agent in rust_listing['agents'] if agent['id'] == 'codex')
             assert rust_codex['registration'] == 'connected', rust_codex
+            agents_after_rust = agents.read_bytes()
+            rust_written_state = json.loads(agents_after_rust)
+            assert rust_written_state['seen']['codex']['agent']['registration'] == 'connected'
+            assert rust_written_state['dismissed']['cursor'] == js_cursor_generation
+            assert rust_written_state['fixture_unrelated']['preserved'] is True
+            assert agents_after_rust != (copied / 'agents.json').read_bytes(), 'Rust did not rescan and rewrite JS host state'
             js_reread = await asyncio.create_subprocess_exec('node', '--input-type=module', '-e',
                 "import {listAgents} from './packages/connector/agents.mjs'; "
-                "const result=listAgents(process.env, {rescan:false}); "
+                "const result=listAgents(process.env, {rescan:true}); "
                 "const cursor=result.agents.find(agent => agent.id === 'cursor'); "
                 "const codex=result.agents.find(agent => agent.id === 'codex'); "
                 "const fs=await import('node:fs'); const state=JSON.parse(fs.readFileSync(process.env.SIDEVOICE_DATA_DIR + '/agents.json','utf8')); "
-                "if (!cursor?.dismissed || cursor.actionable || codex?.registration !== 'connected' || state.fixture_unrelated?.preserved !== true) throw Error('Rust host scan did not preserve JS state and ownership'); "
+                "if (!cursor?.dismissed || cursor.actionable || codex?.registration !== 'foreign' || state.fixture_unrelated?.preserved !== true) throw Error('JS rescan did not preserve dismissal and keep the proof-only entry foreign'); "
                 "console.log(JSON.stringify({dismissed:cursor.dismissed, generation:state.seen.cursor.generation, codex:codex.registration, unrelated:state.fixture_unrelated}));",
                 cwd=str(js_cli.parents[2]), env=env, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE)
@@ -286,9 +292,7 @@ async def copied_state():
             assert js_reread.returncode == 0, reread_stderr.decode(errors='replace')[-1000:]
             reread = json.loads(reread_stdout)
             assert reread['generation'] == js_cursor_generation and reread['dismissed'] is True \
-                and reread['codex'] == 'connected', reread
-            agents_after_rust = (data / 'agents.json').read_bytes()
-            assert agents_after_rust != (copied / 'agents.json').read_bytes(), 'Rust did not rescan and rewrite JS host state'
+                and reread['codex'] == 'foreign', reread
             daemon = await asyncio.create_subprocess_exec(str(binary), 'connector', '--profile-root', str(root),
                 stdout=rust_log, stderr=rust_log, env=env)
             await until(socket_path.exists, 'Rust copied-state socket')
@@ -506,6 +510,7 @@ else:
         core = await start_core(launch_id)
         daemon = None
         facade = None
+        second_facade = None
         try:
             ready_path = core_data / 'core.json'
             await until(lambda: ready_path.exists() or core.returncode is not None, 'Core ready file', seconds=90)
@@ -628,6 +633,16 @@ else:
                 assert connected_row['registration'] == 'connected' and not connected_row['dismissed']
                 disconnected = http_json(core_data / 'local.sock', 'POST', path + '/disconnect', token=token)
                 assert next(agent for agent in disconnected['agents'] if agent['id'] == agent_id)['registration'] == 'not-connected'
+
+            second_thread = str(uuid.uuid4())
+            second_env = {**env, 'CODEX_THREAD_ID': second_thread}
+            second_facade = await asyncio.create_subprocess_exec(str(binary), 'mcp', '--profile-root', str(root),
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=daemon_log, env=second_env)
+            await mcp_request(second_facade, 'initialize', {'protocolVersion': '2025-06-18', 'capabilities': {},
+                'clientInfo': {'name': 'codex', 'version': '0.157.0'}}, 91)
+            second_facade.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+            await second_facade.stdin.drain()
+
             (codex / 'slow-add-seconds').write_text('4.0')
             (codex / 'slow-next-add').touch()
             (codex / 'slow-add-started').unlink(missing_ok=True)
@@ -666,16 +681,24 @@ else:
                     'POST', '/api/presentation/text', {'text': unrelated_text, 'session_id': session,
                         'thread_id': thread, 'binding_id': selected['binding']['binding_id'],
                         'message_id': str(uuid.uuid4())}, token))
-                second_thread = str(uuid.uuid4())
-                registration = await asyncio.wait_for(tool(facade, 'voice_connect',
-                    {'title': 'Concurrent link reply'}, 92, second_thread), 3)
+                registration, unrelated, scanned_during_input = await asyncio.gather(
+                    asyncio.wait_for(tool(second_facade, 'voice_connect',
+                        {'title': 'Concurrent link reply'}, 92), 3),
+                    input_task,
+                    agent_scan,
+                    return_exceptions=True)
+                for label, result in (('second voice_connect', registration),
+                                      ('concurrent presentation input', unrelated),
+                                      ('concurrent host scan', scanned_during_input)):
+                    if isinstance(result, BaseException):
+                        raise AssertionError(f'{label} failed during the concurrent link check: {result!r}') from result
                 assert registration['conversation'] == second_thread and not registration['binding_id'].startswith('local-'), registration
-                unrelated = await asyncio.wait_for(input_task, 3)
                 assert unrelated['accepted'] is True
                 await until(lambda: queued.exists() and json.loads(queued.read_text()).get('message', '').find(unrelated_text) >= 0,
                              'unrelated input.deliver while host scan runs')
-                scanned_during_input = await asyncio.wait_for(agent_scan, 5)
                 assert any(agent['id'] == 'codex' for agent in scanned_during_input['agents'])
+                await finish(second_facade)
+                second_facade = None
                 with rollout.open('a') as output:
                     output.write(json.dumps({'type': 'noise', 'payload': 'x' * (1 << 20)}) + '\n')
                     output.write(json.dumps({'type': 'response_item', 'payload': {'type': 'message', 'role': 'user',
@@ -767,7 +790,8 @@ else:
         except Exception:
             core_log.flush()
             daemon_log.flush()
-            for name, process in (('Core', core), ('Rust daemon', daemon), ('MCP façade', facade)):
+            for name, process in (('Core', core), ('Rust daemon', daemon), ('MCP façade', facade),
+                                  ('Second MCP façade', second_facade)):
                 print(f'{name} returncode: {process.returncode if process else None}', file=sys.stderr)
             proof_path = data / 'proof.json'
             if proof_path.exists():
@@ -786,6 +810,8 @@ else:
         finally:
             if facade:
                 await finish(facade)
+            if second_facade:
+                await finish(second_facade)
             if daemon:
                 await finish(daemon)
             if core:
