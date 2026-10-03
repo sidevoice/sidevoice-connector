@@ -22,7 +22,12 @@ struct Ipc {
 }
 
 impl Ipc {
-    fn new(profile: Profile) -> Arc<Self> { Arc::new(Self { profile, tx: Mutex::new(None), pending: Mutex::new(HashMap::new()), registrations: Mutex::new(HashMap::new()), serial: AtomicU64::new(1), connect_lock: Mutex::new(()) }) }
+    fn new(profile: Profile) -> Arc<Self> {
+        let client = Arc::new(Self { profile, tx: Mutex::new(None), pending: Mutex::new(HashMap::new()), registrations: Mutex::new(HashMap::new()), serial: AtomicU64::new(1), connect_lock: Mutex::new(()) });
+        let supervisor = client.clone();
+        tokio::spawn(async move { supervisor.supervise().await; });
+        client
+    }
 
     async fn ensure(self: &Arc<Self>) -> Result<()> {
         let _guard = self.connect_lock.lock().await;
@@ -52,24 +57,20 @@ impl Ipc {
             }
             *this.tx.lock().await = None;
             for (_, waiter) in this.pending.lock().await.drain() { let _ = waiter.send(Err("connector went away".into())); }
-            if !this.registrations.lock().await.is_empty() {
-                let retry = this.clone();
-                tokio::spawn(async move { retry.reconnect().await; });
-            }
         });
         Ok(())
     }
 
-    async fn reconnect(self: Arc<Self>) {
+    async fn supervise(self: Arc<Self>) {
         let mut delay = 100;
         loop {
             tokio::time::sleep(Duration::from_millis(delay)).await;
-            if self.registrations.lock().await.is_empty() { break; }
+            if self.registrations.lock().await.is_empty() || self.tx.lock().await.is_some() { delay = 100; continue; }
             if self.ensure().await.is_ok() {
                 let saved: Vec<_> = self.registrations.lock().await.values().cloned().collect();
                 let mut all = true;
                 for params in saved { if self.call("register", params).await.is_err() { all = false; break; } }
-                if all { break; }
+                if all { delay = 100; continue; }
             }
             delay = (delay * 2).min(5000);
         }
