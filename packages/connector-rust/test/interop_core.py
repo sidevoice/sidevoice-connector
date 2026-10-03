@@ -168,7 +168,14 @@ async def copied_state():
             await until(socket_path.exists, 'first JS connector socket')
             js_reader, js_writer, old_id = await js_register(socket_path, thread)
             agents = data / 'agents.json'
-            await until(agents.exists, 'JS-generated agents state', seconds=30)
+            # The service scanner intentionally skips uninstalled profiles. Invoke the
+            # same JS store writer directly so the copied fixture is genuinely JS state.
+            scan = await asyncio.create_subprocess_exec('node', '--input-type=module', '-e',
+                "import {listAgents} from './packages/connector/agents.mjs'; listAgents(process.env, {rescan:true, watch:'codex'});",
+                cwd=str(js_cli.parents[2]), env=env, stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE)
+            _, scan_error = await asyncio.wait_for(scan.communicate(), 30)
+            assert scan.returncode == 0 and agents.exists(), scan_error.decode(errors='replace')[-500:]
             storage_flag.touch()
             js_writer.write((json.dumps({'id': 2, 'method': 'publish', 'params': {
                 'client_ref': thread, 'session_id': 'copied-session', 'revision': 1,
