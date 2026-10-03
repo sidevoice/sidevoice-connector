@@ -895,8 +895,17 @@ main()
                 daemon = await asyncio.create_subprocess_exec(str(binary), '--profile-root', str(root), 'connector',
                     stdout=asyncio.subprocess.DEVNULL, stderr=core_log, env=base_env)
                 await until((data / 'connector.sock').exists, 'restarted Rust connector after adopted binding')
-                replayed = await until_async(lambda: adopted_status(app_facade, app_thread), 'adopted binding replay')
-                assert replayed['joined'] is True and replayed['binding_id'] != adopted['binding_id'], replayed
+                async def cursor_replay_ready():
+                    status = await adopted_status(app_facade, app_thread)
+                    binding = next((item for item in status['connector']['bindings']
+                        if item['client_ref'] == app_thread), None)
+                    # Core may retain or replace the ID; the façade must track the live daemon binding.
+                    if (status['joined'] is True and status['room_reachable'] is True and binding
+                            and status['binding_id'] == binding['binding_id']
+                            and not status['binding_id'].startswith('local-')):
+                        return status
+                    return None
+                replayed = await until_async(cursor_replay_ready, 'adopted binding replay')
                 replay_link = replayed.get('view_link')
                 assert replay_link and replay_link.get('port') and replay_link.get('key') == app_joined['view_link']['key'], replayed
                 assert replay_link['port'] == app_joined['view_link']['port'], (app_joined['view_link'], replay_link)
