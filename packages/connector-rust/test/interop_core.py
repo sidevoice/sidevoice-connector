@@ -232,10 +232,36 @@ async def copied_state():
             js = await asyncio.create_subprocess_exec('node', str(js_cli), 'connector', '--service',
                 stdout=js_log, stderr=js_log, env=env)
             _, js_writer, again = await js_register(socket_path, thread)
-            assert again == old_id and json.loads((data / 'outbox.json').read_text()) == []
+            assert again and json.loads((data / 'outbox.json').read_text()) == []
+            rows = http_json(core_data / 'local.sock', 'GET', f'/api/presentation/history?thread_id={thread}', token=token)['messages']
+            assert sum(row['text'] == original['text'] for row in rows) == 1
             assert json.loads(agents.read_text())['version'] == 1
             print(json.dumps({'copied_state': 'JS_to_Rust_to_JS', 'core_launch_id': launch,
                               'binding_reused': True, 'speech_once': True, 'agents_readable': True}))
+            await finish(js)
+            js = None
+            js_writer.close()
+            js_writer = None
+            orphan = {**original, 'event_id': str(uuid.uuid4()), 'utterance_id': str(uuid.uuid4()),
+                      'binding_id': str(uuid.uuid4()), 'text': 'Unattributed historical speech'}
+            (data / 'outbox.json').write_text(json.dumps([orphan]))
+            (data / 'outbox.json').chmod(0o600)
+            daemon = await asyncio.create_subprocess_exec(str(binary), 'connector',
+                stdout=rust_log, stderr=rust_log, env=env)
+            await until(lambda: json.loads((data / 'proof.json').read_text())['pid'] == daemon.pid,
+                        'Rust orphan proof startup')
+            await until(socket_path.exists, 'Rust orphan socket')
+            facade = await asyncio.create_subprocess_exec(str(binary), 'mcp', stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=rust_log, env=env)
+            await mcp_request(facade, 'initialize', {'protocolVersion': '2025-06-18', 'capabilities': {},
+                'clientInfo': {'name': 'codex', 'version': '0.157.0'}}, 3)
+            facade.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+            await facade.stdin.drain()
+            await tool(facade, 'voice_connect', {'title': 'Orphan safety'}, 4, thread)
+            await until(lambda: orphan['event_id'] in (root / 'rust.log').read_text()
+                        and 'retaining for explicit migration' in (root / 'rust.log').read_text(),
+                        'historical orphan diagnostic')
+            assert json.loads((data / 'outbox.json').read_text()) == [orphan]
         except Exception:
             for handle in (core_log, js_log, rust_log):
                 handle.flush()
