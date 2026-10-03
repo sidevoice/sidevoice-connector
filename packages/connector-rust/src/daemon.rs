@@ -1,12 +1,12 @@
+use crate::agents::HostAgents;
 use crate::link::{Incoming, Link};
 use crate::proof::{atomic_json, private_dir, private_file, verify_socket, Profile};
 use anyhow::{bail, Context, Result};
-use fs2::FileExt;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -34,6 +34,7 @@ pub struct Daemon {
     bindings: Mutex<HashMap<String, Arc<Binding>>>,
     outbox: Mutex<Vec<Value>>,
     replay_tx: mpsc::Sender<()>,
+    host_agents: Arc<HostAgents>,
     owner_serial: AtomicU64,
     rendezvous: Mutex<Option<Value>>,
 }
@@ -51,12 +52,14 @@ impl Daemon {
         } else {
             Vec::new()
         };
+        let host_agents = HostAgents::new(profile.clone())?;
         Ok(Arc::new(Self {
             profile,
             link,
             bindings: Mutex::new(HashMap::new()),
             outbox: Mutex::new(outbox),
             replay_tx,
+            host_agents,
             owner_serial: AtomicU64::new(1),
             rendezvous: Mutex::new(None),
         }))
@@ -290,7 +293,7 @@ impl Daemon {
                 json!({})
             }
             "agents.list" | "agents.connect" | "agents.disconnect" | "agents.dismiss" => {
-                json!({"error":{"key":"agents.proof-only","message":"Host agent management is unavailable in the isolated Rust proof."}})
+                self.host_agents.handle(method, params.clone()).await
             }
             "pair.request" => {
                 json!({"error":{"key":"pair.proof-only","message":"Pairing is unavailable in the isolated Rust proof."}})
@@ -747,16 +750,7 @@ fn prune_binding_order(order: &mut HashMap<String, oneshot::Receiver<()>>) {
 
 pub async fn run(profile: Profile) -> Result<()> {
     private_dir(&profile.data)?;
-    let lock_path = profile.data.join("connector.lock");
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(lock_path)?;
-    lock.try_lock_exclusive()
-        .context("another connector holds the proof lock")?;
+    let lock = profile.try_connector_lock()?;
     if profile.socket.exists() {
         verify_socket(&profile.socket)?;
         fs::remove_file(&profile.socket)?;
@@ -871,6 +865,7 @@ pub async fn run(profile: Profile) -> Result<()> {
     while replay_tasks.join_next().await.is_some() {}
     core_tasks.abort_all();
     while core_tasks.join_next().await.is_some() {}
+    daemon.host_agents.shutdown().await;
     fs::remove_file(&profile.socket)?;
     drop(lock);
     Ok(())
