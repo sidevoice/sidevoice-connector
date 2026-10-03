@@ -58,5 +58,13 @@ print("refused missing-sidecar")
 npm_artifact = npm_dir / "sigstore-5.0.0.tgz"
 npm_sidecar = npm_dir / "sigstore-5.0.0.sigstore.json"
 run(npm_artifact, npm_sidecar, "npm", True)
-run(npm_artifact, npm_sidecar, "nightly", False)
-print("accepted unrelated signer under its own exact policy; refused under Core policy")
+identity_result = subprocess.run(
+    [str(binary), str(npm_artifact), str(npm_sidecar), "nightly", str(cache), "offline"],
+    capture_output=True, text=True,
+)
+if identity_result.returncode != 1 or "cryptographic verification: identity mismatch:" not in identity_result.stderr:
+    raise AssertionError(
+        f"expected Sigstore identity refusal: exit={identity_result.returncode}\n"
+        f"stdout={identity_result.stdout}\nstderr={identity_result.stderr}"
+    )
+print("accepted unrelated signer under its own exact policy; Core refusal:", identity_result.stderr.strip())
