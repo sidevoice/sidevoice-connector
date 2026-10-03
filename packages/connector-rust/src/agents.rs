@@ -306,6 +306,13 @@ struct Observation {
     signature: Option<String>,
 }
 
+struct InspectionInput<'a> {
+    state: &'a Value,
+    login_path: Option<&'a str>,
+    include_version: bool,
+    old_version: Option<&'a str>,
+}
+
 impl HostAgents {
     pub fn new(profile: Profile) -> Result<Arc<Self>> {
         let selected = InstalledCommand::proof(&profile)?;
@@ -586,8 +593,18 @@ impl HostAgents {
                 .map(str::to_owned);
             observations.push((
                 agent,
-                self.inspect(agent, &base, login_path.as_deref(), include_version, previous_version.as_deref(), cancel, deadline)
-                    .await?,
+                self.inspect(
+                    agent,
+                    InspectionInput {
+                        state: &base,
+                        login_path: login_path.as_deref(),
+                        include_version,
+                        old_version: previous_version.as_deref(),
+                    },
+                    cancel,
+                    deadline,
+                )
+                .await?,
             ));
         }
         self.merge_scan(base, observations, login_path, cancel, deadline)
@@ -1271,26 +1288,23 @@ impl HostAgents {
     async fn inspect(
         &self,
         id: AgentId,
-        state: &Value,
-        login_path: Option<&str>,
-        include_version: bool,
-        old_version: Option<&str>,
+        input: InspectionInput<'_>,
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<Observation, Failure> {
-        let binary = self.resolve_binary(id, state, login_path);
+        let binary = self.resolve_binary(id, input.state, input.login_path);
         let registration = match id {
             AgentId::Claude => self.claude_registration(binary.as_deref(), cancel, deadline).await?,
             AgentId::Codex => self.codex_registration(binary.as_deref(), cancel, deadline).await?,
             AgentId::Cursor => self.cursor_registration().unwrap_or_else(|_| "invalid".into()),
         };
-        let version = if include_version {
+        let version = if input.include_version {
             match binary.as_deref() {
                 Some(binary) => self.binary_version(binary, cancel, deadline).await?,
                 None => None,
             }
         } else {
-            old_version.map(str::to_owned)
+            input.old_version.map(str::to_owned)
         };
         let mut evidence = Vec::new();
         let config = match id {

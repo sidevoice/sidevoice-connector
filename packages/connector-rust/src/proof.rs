@@ -138,7 +138,7 @@ impl Profile {
             ("SIDEVOICE_DATA_DIR", &profile.data),
         ] {
             let supplied = std::env::var_os(key).context("isolated proof environment is incomplete")?;
-            if PathBuf::from(supplied) != *expected {
+            if Path::new(&supplied) != expected.as_path() {
                 bail!("isolated proof environment does not match its root");
             }
         }
