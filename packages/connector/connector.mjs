@@ -131,6 +131,14 @@ function validOutboxRow(row) {
   const identity = [row.client_ref, row.harness, row.thread];
   return identity.every(value => value === undefined) || identity.every(value => typeof value === 'string' && value.length > 0);
 }
+function validOutboxRows(rows) {
+  const eventIds = new Set();
+  for (const row of rows) {
+    if (!validOutboxRow(row) || eventIds.has(row.event_id)) return false;
+    eventIds.add(row.event_id);
+  }
+  return true;
+}
 function loadOutbox() {
   let contents;
   try { contents = readFileSync(outboxPath, 'utf8'); }
@@ -140,7 +148,7 @@ function loadOutbox() {
   }
   let saved;
   try { saved = JSON.parse(contents); } catch { throw new Error(OUTBOX_LOAD_ERROR); }
-  if (!Array.isArray(saved) || !saved.every(validOutboxRow)) throw new Error(OUTBOX_LOAD_ERROR);
+  if (!Array.isArray(saved) || !validOutboxRows(saved)) throw new Error(OUTBOX_LOAD_ERROR);
   outbox = saved;
 }
 function saveOutbox() {
@@ -463,10 +471,13 @@ async function announce(binding) {
   return reply;
 }
 
-const SPEECH_REJECTION_STATUSES = new Set(['rejected', 'unknown', 'unknown_binding']);
+const SPEECH_SAVED_STATUSES = new Set([
+  'text_only', 'disconnected', 'failed', 'interrupted', 'queued', 'waiting_for_turn', 'waiting_for_pause',
+  'synthesizing', 'playing', 'playback_finished',
+]);
 function speechAckConfirmed(reply, speech) {
   return !!reply && typeof reply === 'object' && !Array.isArray(reply) &&
-    reply.event_id === speech.event_id && typeof reply.status === 'string' && !SPEECH_REJECTION_STATUSES.has(reply.status) &&
+    reply.event_id === speech.event_id && SPEECH_SAVED_STATUSES.has(reply.status) &&
     reply.text_saved === true && (!Object.hasOwn(reply, 'utterance_id') || reply.utterance_id === speech.utterance_id);
 }
 
@@ -725,7 +736,10 @@ async function command(client, input) {
       // Why it is gone travels with the refusal: a pairing revoked and a channel closed are not the
       // same news for the conversation, and only it can say the right one to the person.
       if (!binding) throw new Error(closedByRoom.has(params.client_ref) ? 'CLOSED_BY_ROOM:' + closedByRoom.get(params.client_ref) + ':' + params.client_ref : 'Unknown binding');
-      const speech = { event_id: params.event_id || randomUUID(), binding_id: binding.binding_id,
+      const speechEventId = params.event_id || randomUUID();
+      if (typeof speechEventId !== 'string' || !speechEventId) throw new Error('Invalid event ID');
+      if (outbox.some(queued => queued.event_id === speechEventId)) throw new Error('Speech event ID is already pending');
+      const speech = { event_id: speechEventId, binding_id: binding.binding_id,
         session_id: params.session_id, revision: params.revision, utterance_id: params.utterance_id || randomUUID(), text: params.text, language: params.language,
         client_ref: binding.client_ref, harness: binding.harness, thread: binding.thread };
       outbox.push(speech); saveOutbox();
@@ -823,11 +837,11 @@ export async function run(argv = [], environment = process.env) {
   }
   // A person's stop holds for every connector the launcher started, not only for the launcher: one spawned just before
   // the stop, and starting only now, does not serve. The job starting is a login or `service start`: it clears it.
-  if (serviceMode) rmSync(files.stopped, { force: true });
-  else if (existsSync(files.stopped)) { log('Sidevoice is stopped on this machine: not serving'); releaseLock({ socket: false }); process.exit(0); }
+  if (!serviceMode && existsSync(files.stopped)) { log('Sidevoice is stopped on this machine: not serving'); releaseLock({ socket: false }); process.exit(0); }
   log(`connector ${VERSION} starting${serviceMode ? ' as the connector job' : ''}: pid ${process.pid}, host ${hostId}, ${external ? 'core at ' + external.room : ownsCore ? 'this machine\'s own core, started on demand' : 'this machine\'s core job'}, socket ${socketPath}, log ${logPath}`);
   try { loadOutbox(); }
   catch (error) { log(`not starting: ${error.message}`); releaseLock({ socket: false }); process.exitCode = 78; return; }
+  if (serviceMode) rmSync(files.stopped, { force: true });
   if (outbox.length) log(`${outbox.length} speech frame(s) waiting in the outbox`);
   try { unlinkSync(socketPath); } catch {}
   server = net.createServer(serve);

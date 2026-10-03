@@ -42,9 +42,9 @@ function ipcClient(socketPath) {
  *  path) is a core somebody else runs, named whole in the environment, so nothing is installed or
  *  supervised. The address names only the origin: the path and the namespace are the connector's own
  *  knowledge, and a test that wrote them would be asserting its own copy. */
-function startConnector(origin, dataDir, extraEnv = {}) {
+function startConnector(origin, dataDir, extraEnv = {}, serviceMode = false) {
   const socketPath = path.join(dataDir, 'connector.sock');
-  const child = spawn(process.execPath, connectorPath, { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CONNECTOR_IDLE_MS: '400',
+  const child = spawn(process.execPath, [...connectorPath, ...(serviceMode ? ['--service'] : [])], { env: { ...process.env, SIDEVOICE_DATA_DIR: dataDir, SIDEVOICE_CONNECTOR_IDLE_MS: '400',
     SIDEVOICE_URL: origin, SIDEVOICE_CONNECTOR_ID: 'c-1', SIDEVOICE_CONNECTOR_TOKEN: 't-1', ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'] });
   let stderr = ''; child.stderr.on('data', d => { stderr += d; });
   return { child, socketPath, stderr: () => stderr };
@@ -237,6 +237,8 @@ test('connector: rejected, unknown and invalid speech ACKs retain rows without l
     data => ({ event_id: 'different-event', status: 'queued', text_saved: true }),
     data => ({ event_id: data.event_id, status: 'queued', text_saved: false }),
     data => ({ event_id: data.event_id, status: 'queued', text_saved: true, utterance_id: 'different-utterance' }),
+    data => ({ event_id: data.event_id, status: '', text_saved: true }),
+    data => ({ event_id: data.event_id, status: 'future_core_status', text_saved: true }),
   ];
   let nextReply = 0;
   room.handle = (event, data) => {
@@ -256,6 +258,8 @@ test('connector: rejected, unknown and invalid speech ACKs retain rows without l
       rows.push({ event_id: speech.event_id, text: speech.text });
       assert.deepEqual(JSON.parse(readFileSync(path.join(dataDir, 'outbox.json'), 'utf8')).map(({ event_id, text }) => ({ event_id, text })), rows);
     }
+    await assert.rejects(facade.call('publish', { event_id: 'event-0', binding_id: 'b-one', text: 'duplicate event' }), /already pending/);
+    assert.deepEqual(JSON.parse(readFileSync(path.join(dataDir, 'outbox.json'), 'utf8')).map(({ event_id, text }) => ({ event_id, text })), rows);
     for (let i = 0; i < replies.length; i++) assert.ok(!stderr().includes(`private reply ${i}`));
   } finally { if (child.exitCode === null) child.kill(); await room.close(); }
 });
@@ -268,19 +272,30 @@ test('connector: malformed, non-array and unreadable outboxes stop startup witho
       assertState: dir => assert.equal(readFileSync(path.join(dir, 'outbox.json'), 'utf8'), '{"text":"private non-array reply"}') },
     { name: 'malformed row', prepare: dir => writeFileSync(path.join(dir, 'outbox.json'), '[{"event_id":"event","text":"private malformed row"}]'),
       assertState: dir => assert.equal(readFileSync(path.join(dir, 'outbox.json'), 'utf8'), '[{"event_id":"event","text":"private malformed row"}]') },
+    { name: 'duplicate event IDs', service: true,
+      prepare: dir => writeFileSync(path.join(dir, 'outbox.json'), JSON.stringify([
+        { event_id: 'same-event', binding_id: 'b-one', utterance_id: 'u-one', text: 'private first row' },
+        { event_id: 'same-event', binding_id: 'b-two', utterance_id: 'u-two', text: 'private second row' },
+      ])),
+      assertState: dir => assert.equal(JSON.parse(readFileSync(path.join(dir, 'outbox.json'), 'utf8')).length, 2) },
     { name: 'unreadable state', prepare: dir => { const outbox = path.join(dir, 'outbox.json'); mkdirSync(outbox); writeFileSync(path.join(outbox, 'sentinel'), 'private unreadable reply'); },
       assertState: dir => assert.equal(readFileSync(path.join(dir, 'outbox.json', 'sentinel'), 'utf8'), 'private unreadable reply') },
   ];
   for (const item of cases) {
     const dataDir = mkdtempSync(path.join(os.tmpdir(), 'sv-'));
     item.prepare(dataDir);
-    const { child, socketPath, stderr } = startConnector('http://127.0.0.1:1', dataDir);
+    const stoppedPath = path.join(dataDir, 'node-stopped.json');
+    const stoppedBefore = '{"at":"before malformed startup"}\n';
+    if (item.service) writeFileSync(stoppedPath, stoppedBefore);
+    const { child, socketPath, stderr } = startConnector('http://127.0.0.1:1', dataDir, {}, item.service);
     await until(() => child.exitCode !== null, 5000);
     assert.equal(child.exitCode, 78, item.name);
-    assert.match(stderr(), /speech outbox is malformed or unreadable; refusing to start without changing it/, item.name);
-    assert.ok(!stderr().includes('private '), item.name);
+    const diagnostic = item.service ? readFileSync(path.join(dataDir, 'connector.log'), 'utf8') : stderr();
+    assert.match(diagnostic, /speech outbox is malformed or unreadable; refusing to start without changing it/, item.name);
+    assert.ok(!diagnostic.includes('private '), item.name);
     assert.equal(existsSync(socketPath), false, item.name);
     item.assertState(dataDir);
+    if (item.service) assert.equal(readFileSync(stoppedPath, 'utf8'), stoppedBefore, 'failed service startup preserves the stop marker');
   }
 });
 
