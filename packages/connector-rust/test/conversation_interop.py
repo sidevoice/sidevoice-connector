@@ -156,21 +156,22 @@ async def wait_status(core_socket, token, thread, message_id, status, seconds=30
         f'{thread} {message_id} status {status}', seconds)
 
 
-def participant(core_socket, session, thread):
-    response = core_json(core_socket, 'GET', '/api/presentation/participants?session_id=' + session)
+def participant(core_socket, token, session, thread):
+    response = core_json(core_socket, 'GET', '/api/presentation/participants?session_id=' + session,
+        token=token)
     return next((item for item in response['participants'] if item['thread_id'] == thread), None)
 
 
-async def wait_engine(core_socket, session, thread, model, seconds=10):
+async def wait_engine(core_socket, token, session, thread, model, seconds=10):
     def matching():
-        item = participant(core_socket, session, thread)
+        item = participant(core_socket, token, session, thread)
         return item if item and (item.get('engine') or {}).get('model') == model else None
     return await until(matching, f'{thread} engine {model}', seconds)
 
 
-async def wait_participant(core_socket, session, thread, *, available):
+async def wait_participant(core_socket, token, session, thread, *, available):
     def matching():
-        item = participant(core_socket, session, thread)
+        item = participant(core_socket, token, session, thread)
         return item if item and item.get('available') is available else None
     return await until(matching, f'{thread} participant available={available}')
 
@@ -562,28 +563,28 @@ main()
                     await wait_room_working(room_events, joined['conversation'], False)
                     await status_and_reply(facade, joined['conversation'], joined, row, CLAUDE_CAPS, 40)
                     append_claude_assistant(claude_transcript, 'claude-fixture-model')
-                    await wait_engine(core_data / 'local.sock', session, joined['conversation'], 'claude-fixture-model')
+                    await wait_engine(core_data / 'local.sock', token, session, joined['conversation'], 'claude-fixture-model')
 
                 async def codex_after(facade, joined, row, route_env):
-                    await wait_engine(core_data / 'local.sock', session, joined['conversation'], 'codex-launch-model')
+                    await wait_engine(core_data / 'local.sock', token, session, joined['conversation'], 'codex-launch-model')
                     queued = await until(lambda: json.loads(codex_queue.read_text()) if codex_queue.exists() else None, 'Codex fixture queue')
                     assert queued['thread'] == codex_thread and 'Core input for Codex' in queued['message'], queued
                     await wait_status(core_data / 'local.sock', token, joined['conversation'], row['id'], 'delivered')
                     rollout.write_text(json.dumps({'type':'session_meta','payload':{'model':'codex-session-meta-model'}}) + '\n')
-                    await wait_engine(core_data / 'local.sock', session, joined['conversation'], 'codex-session-meta-model')
+                    await wait_engine(core_data / 'local.sock', token, session, joined['conversation'], 'codex-session-meta-model')
                     with rollout.open('a') as output:
                         output.write(json.dumps({'type':'turn_context','payload':{'model':'codex-fixture-model'}}) + '\n'
                         + json.dumps({'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'fixture-turn'}}) + '\n'
                         + json.dumps({'type': 'response_item', 'payload': {'type': 'message', 'role': 'user',
                             'content': [{'type': 'input_text', 'text': queued['message']}]}}) + '\n')
-                    await wait_engine(core_data / 'local.sock', session, joined['conversation'], 'codex-fixture-model')
+                    await wait_engine(core_data / 'local.sock', token, session, joined['conversation'], 'codex-fixture-model')
                     await wait_working(facade, joined['conversation'], True, 90)
                     await wait_room_working(room_events, joined['conversation'], True)
                     core_json(core_data / 'local.sock', 'POST', '/api/test/connector-reconnect', {})
-                    await wait_participant(core_data / 'local.sock', session, joined['conversation'], available=False)
+                    await wait_participant(core_data / 'local.sock', token, session, joined['conversation'], available=False)
                     while not room_events.empty():
                         room_events.get_nowait()
-                    await wait_participant(core_data / 'local.sock', session, joined['conversation'], available=True)
+                    await wait_participant(core_data / 'local.sock', token, session, joined['conversation'], available=True)
                     await wait_room_working(room_events, joined['conversation'], True)
                     rebound = await tool(facade, 'voice_status', {'conversation':joined['conversation']}, 94)
                     assert rebound['joined'] is True and rebound['binding_id'], rebound
@@ -596,7 +597,7 @@ main()
                     await status_and_reply(facade, joined['conversation'], joined, row, CODEX_CAPS, 50)
 
                 async def cursor_cli_after(facade, joined, row, route_env):
-                    await wait_engine(core_data / 'local.sock', session, joined['conversation'], 'cursor-cli-fixture-model')
+                    await wait_engine(core_data / 'local.sock', token, session, joined['conversation'], 'cursor-cli-fixture-model')
                     pasted = await until(lambda: cursor_sent.read_text() if cursor_sent.exists() else None, 'Cursor persist paste')
                     assert 'Core input for Cursor persist' in pasted, pasted
                     await wait_status(core_data / 'local.sock', token, joined['conversation'], row['id'], 'unconfirmed')
@@ -644,7 +645,7 @@ main()
                     'SIDEVOICE_DELIVERY_URL':f'http://127.0.0.1:{receiver.server_port}/codex-input',
                     'CODEX_MODEL':'codex-http-launch-model'}
                 async def codex_http_after(http_facade, http_joined, http_row, _route_env):
-                    await wait_engine(core_data / 'local.sock', session, codex_http_thread, 'codex-http-launch-model')
+                    await wait_engine(core_data / 'local.sock', token, session, codex_http_thread, 'codex-http-launch-model')
                     request = await asyncio.to_thread(receiver.messages.get, True, 10)
                     assert request['thread_id'] == codex_http_thread and request['text'] == 'Core input for Codex HTTP', request
                     await wait_status(core_data / 'local.sock', token, codex_http_thread, http_row['id'], 'delivered')
@@ -953,7 +954,7 @@ main()
                 await wait_status(core_data / 'local.sock', token, bridge_thread, bridge_row['id'], 'delivered')
                 append_cursor(bridge_transcript, sent['text'])
                 await wait_status(core_data / 'local.sock', token, bridge_thread, bridge_row['id'], 'read', 15)
-                await wait_engine(core_data / 'local.sock', session, bridge_thread, 'cursor-bridge-fixture-model')
+                await wait_engine(core_data / 'local.sock', token, session, bridge_thread, 'cursor-bridge-fixture-model')
                 await status_and_reply(bridge_facade, bridge_thread, bridge_joined, bridge_row, editor_caps, 47)
                 await tool(bridge_facade, 'voice_disconnect', {'conversation':bridge_thread}, 48)
                 bridge_reconnect = await tool(bridge_facade, 'voice_connect', {'title':'Cursor Bridge reconnect'}, 49)
