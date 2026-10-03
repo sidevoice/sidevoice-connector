@@ -60,7 +60,10 @@ enum Action {
     /// Serve MCP over stdio for one isolated Codex conversation.
     Mcp,
     /// Link the isolated Core to Codex sessions; --service is for its private launchd job.
-    Connector { #[arg(long)] service: bool },
+    Connector {
+        #[arg(long)]
+        service: bool,
+    },
     /// Inspect or explicitly register only this isolated Codex profile.
     Codex {
         #[command(subcommand)]
@@ -75,12 +78,30 @@ enum Action {
 
 #[derive(Subcommand)]
 enum ServiceAction {
-    Install { #[arg(long)] json: bool },
-    Start { #[arg(long)] json: bool },
-    Stop { #[arg(long)] json: bool },
-    Restart { #[arg(long)] json: bool },
-    Status { #[arg(long)] json: bool },
-    Uninstall { #[arg(long)] json: bool },
+    Install {
+        #[arg(long)]
+        json: bool,
+    },
+    Start {
+        #[arg(long)]
+        json: bool,
+    },
+    Stop {
+        #[arg(long)]
+        json: bool,
+    },
+    Restart {
+        #[arg(long)]
+        json: bool,
+    },
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Uninstall {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -101,7 +122,13 @@ async fn main() -> Result<()> {
         Action::Mcp => mcp::run(profile).await,
         Action::Connector { service } => {
             if service && !explicit_profile {
-                eprintln!("{}",crate::agents::message("service.proof-profile-required",&serde_json::Value::Null));
+                eprintln!(
+                    "{}",
+                    crate::agents::message(
+                        "service.proof-profile-required",
+                        &serde_json::Value::Null
+                    )
+                );
                 std::process::exit(1);
             }
             daemon::run(profile, service).await
@@ -123,7 +150,7 @@ async fn main() -> Result<()> {
         }
         Action::Service { command } => {
             if !explicit_profile {
-                let answer=service::proof_profile_required();
+                let answer = service::proof_profile_required();
                 println!("{answer}");
                 std::process::exit(1);
             }
@@ -138,7 +165,9 @@ async fn main() -> Result<()> {
             let answer = service::run(profile, action).await;
             let failed = answer.get("ok") != Some(&serde_json::Value::Bool(true));
             println!("{answer}");
-            if failed { std::process::exit(1); }
+            if failed {
+                std::process::exit(1);
+            }
             Ok(())
         }
     }

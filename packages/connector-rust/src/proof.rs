@@ -202,7 +202,8 @@ impl Profile {
             ("XDG_DATA_HOME", &self.xdg_data),
             ("SIDEVOICE_DATA_DIR", &self.data),
         ] {
-            let supplied = std::env::var_os(key).context("managed profile environment is incomplete")?;
+            let supplied =
+                std::env::var_os(key).context("managed profile environment is incomplete")?;
             if Path::new(&supplied) != expected.as_path() {
                 bail!("managed profile environment does not match its root");
             }

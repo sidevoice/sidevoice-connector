@@ -768,7 +768,10 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
         profile.validate_service_environment("launchd")?;
     }
     if profile.service_stopped()? {
-        eprintln!("{}",crate::agents::message("service.node-stopped",&serde_json::Value::Null));
+        eprintln!(
+            "{}",
+            crate::agents::message("service.node-stopped", &serde_json::Value::Null)
+        );
         return Ok(());
     }
     private_dir(&profile.data)?;
@@ -795,21 +798,25 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     let link_task = tokio::spawn(link.run(profile.clone(), incoming_tx, ready_tx));
     drop(ready_rx);
     let scanner = if managed {
-        let host_agents=daemon.host_agents.clone();
-        let scan_profile=profile.clone();
+        let host_agents = daemon.host_agents.clone();
+        let scan_profile = profile.clone();
         Some(tokio::spawn(async move {
             loop {
                 if !scan_profile.service_stopped().unwrap_or(true) {
-                    let _=host_agents.handle("agents.list",serde_json::json!({"rescan":true})).await;
+                    let _ = host_agents
+                        .handle("agents.list", serde_json::json!({"rescan":true}))
+                        .await;
                 }
-                tokio::time::sleep(Duration::from_secs(6*60*60)).await;
+                tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
             }
         }))
-    } else {None};
-    let mut idle_since=Instant::now();
-    let mut was_idle=true;
-    let mut link_exited=false;
-    let mut terminate=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    } else {
+        None
+    };
+    let mut idle_since = Instant::now();
+    let mut was_idle = true;
+    let mut link_exited = false;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {
             Some(result) = replay_tasks.join_next(), if !replay_tasks.is_empty() => {
@@ -906,9 +913,12 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
             }
         }
     }
-    if let Some(scanner)=scanner {scanner.abort();let _=scanner.await;}
+    if let Some(scanner) = scanner {
+        scanner.abort();
+        let _ = scanner.await;
+    }
     link_task.abort();
-    let _=link_task.await;
+    let _ = link_task.await;
     replay_tasks.abort_all();
     while replay_tasks.join_next().await.is_some() {}
     core_tasks.abort_all();
@@ -916,7 +926,9 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     daemon.host_agents.shutdown().await;
     fs::remove_file(&profile.socket)?;
     drop(lock);
-    if link_exited { bail!("Core authentication was refused or its link task exited"); }
+    if link_exited {
+        bail!("Core authentication was refused or its link task exited");
+    }
     Ok(())
 }
 

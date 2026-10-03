@@ -603,7 +603,11 @@ impl HostAgents {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<Value, Failure> {
-        if self.profile.service_stopped().map_err(|_| Failure::Internal)? {
+        if self
+            .profile
+            .service_stopped()
+            .map_err(|_| Failure::Internal)?
+        {
             return Err(Failure::Cancelled);
         }
         let base = state.clone();
@@ -741,7 +745,12 @@ impl HostAgents {
         check_live(cancel, deadline)?;
         let _lock = self.state_lock(cancel, deadline).await?;
         check_live(cancel, deadline)?;
-        if service_scan && self.profile.service_stopped().map_err(|_| Failure::Internal)? {
+        if service_scan
+            && self
+                .profile
+                .service_stopped()
+                .map_err(|_| Failure::Internal)?
+        {
             return Err(Failure::Cancelled);
         }
         let mut state = load_state_file(&self.profile)?;
