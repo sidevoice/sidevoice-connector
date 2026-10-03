@@ -388,7 +388,8 @@ fn cursor_message_id(text: &str) -> Option<String> {
     let start = text.find("{\"channel\":")?;
     let tail = &text[start..];
     let end = tail.find('}')?;
-    serde_json::from_str::<Value>(&tail[..=end])?
+    serde_json::from_str::<Value>(&tail[..=end])
+        .ok()?
         .get("message_id")?
         .as_str()
         .map(str::to_owned)
