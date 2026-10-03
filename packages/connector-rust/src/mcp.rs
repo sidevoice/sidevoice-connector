@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{timeout, Duration};
@@ -44,9 +44,9 @@ impl Ipc {
             }
         });
         tokio::spawn(async move {
-            let mut lines = BufReader::new(read).lines();
+            let mut reader = BufReader::new(read);
             loop {
-                let line = match lines.next_line().await { Ok(Some(v)) if v.len() <= 1 << 20 => v, _ => break };
+                let line = match crate::bounded_line(&mut reader, 1 << 20).await { Ok(Some(v)) => v, _ => break };
                 let Ok(reply) = serde_json::from_str::<Value>(&line) else { break; };
                 let Some(id) = reply.get("id").and_then(Value::as_u64) else { continue; };
                 if let Some(waiting) = this.pending.lock().await.remove(&id) {

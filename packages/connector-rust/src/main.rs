@@ -4,6 +4,27 @@ mod mcp;
 mod proof;
 
 use anyhow::{bail, Context, Result};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+
+async fn bounded_line<R: AsyncBufRead + Unpin>(reader: &mut R, limit: usize) -> Result<Option<String>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if line.is_empty() { return Ok(None); }
+            bail!("truncated IPC frame");
+        }
+        let length = available.iter().position(|byte| *byte == b'\n').map_or(available.len(), |index| index + 1);
+        if line.len() + length > limit { bail!("IPC frame too large"); }
+        line.extend_from_slice(&available[..length]);
+        reader.consume(length);
+        if line.last() == Some(&b'\n') {
+            line.pop();
+            return Ok(Some(String::from_utf8(line)?));
+        }
+    }
+}
+
 use clap::{Parser, Subcommand};
 use proof::Profile;
 use serde_json::{json, Value};

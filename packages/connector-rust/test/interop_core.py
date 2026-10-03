@@ -1,6 +1,6 @@
 """Hosted real-Core/v3 test with a deliberately modelled Codex queue.
 
-This checks Core-originated input, durable Core receipts, the Rust façade and
+This checks Core-originated input, Core acknowledgements, the Rust façade and
 outbox. It does not claim a real authenticated Codex session; that is a
 separate acceptance gate.
 """
@@ -171,6 +171,7 @@ pathlib.Path(os.environ['SIDEVOICE_TEST_QUEUE']).write_text(json.dumps({'thread'
                 delivered = await until(lambda: next((row for row in history() if row['id'] == sent['id'] and row['status'] == 'delivered'), None), 'accepted receipt')
                 assert delivered['status'] == 'delivered'
                 with rollout.open('a') as output:
+                    output.write(json.dumps({'type': 'noise', 'payload': 'x' * (1 << 20)}) + '\n')
                     output.write(json.dumps({'type': 'response_item', 'payload': {'type': 'message', 'role': 'user',
                         'content': [{'type': 'input_text', 'text': queued_message['message']}]}}) + '\n')
                 await until(lambda: next((row for row in history() if row['id'] == sent['id'] and row['status'] == 'read'), None), 'read receipt')

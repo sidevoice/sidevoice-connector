@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::{timeout, Duration, Instant};
-use tokio_tungstenite::{client_async, tungstenite::Message};
+use tokio_tungstenite::{client_async_with_config, tungstenite::{protocol::WebSocketConfig, Message}};
 
 pub struct Incoming {
     pub method: String,
@@ -84,7 +85,8 @@ impl Link {
         let ready = profile.ready().await?;
         verify_socket(&ready.socket)?;
         let stream = timeout(Duration::from_secs(2), UnixStream::connect(&ready.socket)).await??;
-        let (mut ws, _) = timeout(Duration::from_secs(3), client_async("ws://localhost/api/connectors/v3", stream)).await??;
+        let config = WebSocketConfig { max_message_size: Some(1 << 20), max_frame_size: Some(1 << 20), ..Default::default() };
+        let (mut ws, _) = timeout(Duration::from_secs(3), client_async_with_config("ws://localhost/api/connectors/v3", stream, Some(config))).await??;
         let hello = json!({"jsonrpc":"2.0","id":"c:1","method":"connector.hello","params":{
             "protocol":3,"connector_id":ready.connector_id,"token":ready.token,
             "host":std::env::var("SIDEVOICE_HOST_ID").unwrap_or_else(|_| "rust-proof".into()),
@@ -101,9 +103,11 @@ impl Link {
         let (mut write, mut read) = ws.split();
         let (tx, mut rx) = mpsc::channel::<Message>(128);
         *self.tx.write().await = Some(tx.clone());
-        let writer = tokio::spawn(async move {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
             while let Some(message) = rx.recv().await { if write.send(message).await.is_err() { break; } }
             let _ = write.close().await;
+            true
         });
         let handlers = Arc::new(Semaphore::new(64));
         let mut ping = tokio::time::interval(Duration::from_secs(15));
@@ -111,6 +115,9 @@ impl Link {
         let mut unanswered: Option<Instant> = None;
         loop {
             tokio::select! {
+                Some(result) = tasks.join_next() => {
+                    if result? { bail!("Core writer ended"); }
+                }
                 _ = ping.tick() => {
                     if unanswered.is_some_and(|at| at.elapsed() > Duration::from_secs(30)) { bail!("Core Pong timeout"); }
                     tx.send(Message::Ping(b"sidevoice".to_vec().into())).await?;
@@ -135,14 +142,15 @@ impl Link {
                                 let permit = handlers.clone().acquire_owned().await?;
                                 let inbound = incoming.clone(); let reply_tx = tx.clone();
                                 let method = method.to_owned(); let params = value.get("params").cloned().unwrap_or(Value::Null);
-                                tokio::spawn(async move {
+                                tasks.spawn(async move {
                                     let _permit = permit;
                                     let (answer_tx, answer_rx) = oneshot::channel();
-                                    if inbound.send(Incoming { method, params, reply: id.as_ref().map(|_| answer_tx) }).await.is_err() { return; }
+                                    if inbound.send(Incoming { method, params, reply: id.as_ref().map(|_| answer_tx) }).await.is_err() { return false; }
                                     if let Some(id) = id {
                                         let result = timeout(Duration::from_secs(65), answer_rx).await.ok().and_then(|v| v.ok()).unwrap_or(json!({"status":"failed"}));
                                         let _ = reply_tx.send(Message::Text(json!({"jsonrpc":"2.0","id":id,"result":result}).to_string().into())).await;
                                     }
+                                    false
                                 });
                             } else if let Some(id) = value.get("id").and_then(Value::as_str) {
                                 if !id.starts_with("c:") { bail!("Core response ID prefix invalid"); }
@@ -159,7 +167,6 @@ impl Link {
                 }
             }
         }
-        writer.abort();
         Ok(())
     }
 }

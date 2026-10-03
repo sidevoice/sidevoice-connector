@@ -5,13 +5,14 @@ use fs2::FileExt;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use tokio::time::Duration;
 
 struct Binding {
@@ -48,11 +49,11 @@ impl Daemon {
     }
 
     async fn register_core(&self, binding: &Arc<Binding>) -> Result<Value> {
-        let current = binding.id.lock().await.clone();
+        let mut current = binding.id.lock().await;
         let mut frame = json!({"client_ref":binding.client_ref,"harness":"codex","thread":binding.thread,"title":binding.title,
             "inbound":{"ok":true}, "capabilities":{"deliver":"supported","inspectInbound":"unsupported","working":"supported","endOfTurn":"supported","sessionIdentity":"supported"},
             "experimental":[],"engine":null,"focus":false});
-        if !current.starts_with("local-") { frame["binding_id"] = json!(current); }
+        if !current.starts_with("local-") { frame["binding_id"] = json!(*current); }
         let reply = self.link.request("binding.register", frame, Duration::from_secs(10)).await?;
         if let Some(error) = reply.get("error") { bail!("Core binding refusal: {error}"); }
         let id = reply.get("binding_id").and_then(Value::as_str).context("Core binding ID missing")?;
@@ -60,7 +61,22 @@ impl Daemon {
             let _ = self.link.notify("binding.unregister", json!({"binding_id":id})).await;
             bail!("façade left while Core registered binding");
         }
-        *binding.id.lock().await = id.to_owned();
+        if *current != id {
+            let mut outbox = self.outbox.lock().await;
+            let old = outbox.clone();
+            let mut changed = false;
+            for item in outbox.iter_mut() {
+                if item.get("binding_id").and_then(Value::as_str) == Some(current.as_str())
+                    || item.get("client_ref").and_then(Value::as_str) == Some(binding.client_ref.as_str()) {
+                    item["binding_id"] = json!(id);
+                    changed = true;
+                }
+            }
+            if changed {
+                if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) { *outbox = old; return Err(error); }
+            }
+        }
+        *current = id.to_owned();
         Ok(reply)
     }
 
@@ -169,7 +185,8 @@ impl Daemon {
         let envelope = format!("{header}\n\n{text}{note}");
         let binary = std::env::var("SIDEVOICE_CODEX_BIN").unwrap_or_else(|_| "codex".into());
         let output = tokio::time::timeout(Duration::from_secs(30), tokio::process::Command::new(binary)
-            .env("CODEX_HOME", &self.profile.codex).args(["queue", "--thread", &binding.thread, "--message", &envelope]).output()).await;
+            .kill_on_drop(true).env("CODEX_HOME", &self.profile.codex)
+            .args(["queue", "--thread", &binding.thread, "--message", &envelope]).output()).await;
         match output {
             Ok(Ok(result)) if result.status.success() => json!({"status":"accepted","detail":"codex queue confirmed the thread"}),
             _ => { binding.pending.lock().await.remove(message_id); json!({"status":"failed","detail":"codex queue failed"}) }
@@ -202,11 +219,13 @@ impl Daemon {
                 let revision = params.get("revision").and_then(Value::as_i64).context("revision required")?;
                 let text = params.get("text").and_then(Value::as_str).context("text required")?;
                 if text.is_empty() || text.len() > 65536 { bail!("text length invalid"); }
+                let id = binding.id.lock().await;
                 let speech = json!({"event_id":params.get("event_id").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                    "binding_id":*binding.id.lock().await,"session_id":session_id,"revision":revision,
+                    "binding_id":*id,"client_ref":binding.client_ref,"session_id":session_id,"revision":revision,
                     "utterance_id":params.get("utterance_id").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     "text":text,"language":params.get("language")});
                 self.queue(speech.clone()).await?;
+                drop(id);
                 let answer = self.publish_one(&speech).await?;
                 Ok(answer.unwrap_or_else(|| json!({"status":"queued","utterance_id":speech["utterance_id"]})))
             }
@@ -235,21 +254,34 @@ impl Daemon {
     fn watch_rollout(self: Arc<Self>, binding: Arc<Binding>) {
         tokio::spawn(async move {
             let mut path: Option<PathBuf> = None;
-            let mut offset = 0usize;
+            let mut offset = 0u64;
+            let mut partial = Vec::new();
+            let mut oversized = false;
             let mut turn: Option<String> = None;
             loop {
                 if binding.stopped.load(Ordering::Relaxed) { break; }
-                if path.is_none() { path = rollout_path(&self.profile.codex, &binding.thread); if let Some(file) = &path { offset = fs::metadata(file).map(|m| m.len() as usize).unwrap_or(0); } }
+                if path.is_none() { path = rollout_path(&self.profile.codex, &binding.thread); if let Some(file) = &path { offset = fs::metadata(file).map(|m| m.len()).unwrap_or(0); } }
                 if let Some(file) = &path {
-                    if let Ok(bytes) = fs::read(file) {
-                        if bytes.len() < offset { offset = bytes.len(); }
-                        if bytes.len() > offset && bytes.len() - offset <= 1 << 20 {
-                            let new = &bytes[offset..];
-                            if let Some(last) = new.iter().rposition(|b| *b == b'\n') {
-                                for line in new[..=last].split(|b| *b == b'\n') {
-                                    if let Ok(item) = serde_json::from_slice::<Value>(line) { self.observe_rollout(&binding, &item, &mut turn).await; }
+                    if let Ok(mut input) = fs::File::open(file) {
+                        if input.metadata().is_ok_and(|m| m.len() < offset) { offset = 0; partial.clear(); oversized = false; }
+                        if input.seek(SeekFrom::Start(offset)).is_ok() {
+                            let mut bytes = [0u8; 65536];
+                            if let Ok(n) = input.read(&mut bytes) {
+                                offset += n as u64;
+                                for segment in bytes[..n].split_inclusive(|byte| *byte == b'\n') {
+                                    if !oversized {
+                                        if partial.len() + segment.len() > 1 << 20 { partial.clear(); oversized = true; }
+                                        else { partial.extend_from_slice(segment); }
+                                    }
+                                    if segment.last() == Some(&b'\n') {
+                                        if !oversized {
+                                            if let Ok(item) = serde_json::from_slice::<Value>(&partial) {
+                                                self.observe_rollout(&binding, &item, &mut turn).await;
+                                            }
+                                        }
+                                        partial.clear(); oversized = false;
+                                    }
                                 }
-                                offset += last + 1;
                             }
                         }
                     }
@@ -285,11 +317,10 @@ impl Daemon {
     async fn serve_client(self: Arc<Self>, stream: UnixStream) -> Result<()> {
         let owner = self.owner_serial.fetch_add(1, Ordering::Relaxed);
         let (read, mut write) = stream.into_split();
-        let mut lines = BufReader::new(read).lines();
+        let mut reader = BufReader::new(read);
         let result = async {
             loop {
-                let Some(line) = lines.next_line().await? else { break; };
-                if line.len() > 1 << 20 { bail!("IPC line too large"); }
+                let Some(line) = crate::bounded_line(&mut reader, 1 << 20).await? else { break; };
                 let request: Value = serde_json::from_str(&line)?;
                 let id = request.get("id").cloned().unwrap_or(Value::Null);
                 let method = request.get("method").and_then(Value::as_str).unwrap_or("");
@@ -339,6 +370,7 @@ pub async fn run(profile: Profile) -> Result<()> {
     let link = Link::new();
     let daemon = Daemon::new(profile.clone(), link.clone())?;
     let (incoming_tx, mut incoming_rx) = mpsc::channel(128);
+    let clients = Arc::new(Semaphore::new(32));
     let (ready_tx, ready_rx) = oneshot::channel();
     tokio::spawn(link.run(profile.clone(), incoming_tx, ready_tx));
     let ready = ready_rx.await.context("Core hello did not complete")?.map_err(anyhow::Error::msg)?;
@@ -349,13 +381,14 @@ pub async fn run(profile: Profile) -> Result<()> {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
-                let daemon = daemon.clone();
-                tokio::spawn(async move { if let Err(error) = daemon.serve_client(stream).await { eprintln!("[sidevoice rust proof] IPC: {error}"); } });
+                if let Ok(permit) = clients.clone().try_acquire_owned() {
+                    let daemon = daemon.clone();
+                    tokio::spawn(async move { let _permit = permit; if let Err(error) = daemon.serve_client(stream).await { eprintln!("[sidevoice rust proof] IPC: {error}"); } });
+                }
             }
             item = incoming_rx.recv() => {
                 let Some(item) = item else { bail!("Core link task exited"); };
-                let daemon = daemon.clone();
-                tokio::spawn(async move { daemon.incoming(item).await; });
+                daemon.clone().incoming(item).await;
             }
             _ = tokio::signal::ctrl_c() => { break; }
         }
