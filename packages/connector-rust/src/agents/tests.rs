@@ -36,6 +36,7 @@ impl Fixture {
             Uuid::new_v4()
         ));
         private_mkdir(&root);
+        let root = root.canonicalize().unwrap();
         for name in ["home", "claude", "codex", "cursor", "xdg", "sidevoice"] {
             private_mkdir(&root.join(name));
         }
