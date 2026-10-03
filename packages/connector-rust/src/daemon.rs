@@ -873,6 +873,11 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     };
     let mut idle_since = Instant::now();
     let mut last_activity = daemon.activity_generation.load(Ordering::Relaxed);
+    let mut idle_check = tokio::time::interval_at(
+        Instant::now() + Duration::from_millis(200),
+        Duration::from_millis(200),
+    );
+    idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut link_exited = false;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
@@ -965,7 +970,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
             _ = tokio::signal::ctrl_c() => { break; }
             _ = terminate.recv() => { break; }
             _ = shutdown_rx.changed() => { break; }
-            _ = tokio::time::sleep(Duration::from_millis(200)), if !managed => {
+            _ = idle_check.tick(), if !managed => {
                 let activity = daemon.activity_generation.load(Ordering::Relaxed);
                 if activity != last_activity {
                     idle_since = Instant::now();

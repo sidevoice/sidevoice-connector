@@ -737,20 +737,28 @@ async def exercise():
         idle_identity = await wait_identity(lambda value: value.get('managed') is False,
                                             'idle on-demand daemon for status polling')
         poll_deadline = time.monotonic() + 22
-        polls = 0
+        poll_starts = []
         while time.monotonic() < poll_deadline and (
             connector_socket.exists() or process_alive(idle_identity['pid'])
         ):
+            poll_starts.append(time.monotonic())
             await asyncio.to_thread(run_status_sync, staged_binary, profile, control_env)
-            polls += 1
-            await asyncio.sleep(.5)
-        assert polls >= 20, f'expected repeated status probes across idle window, got {polls}'
+            await asyncio.sleep(.08)
+        poll_gaps = [after - before for before, after in zip(poll_starts, poll_starts[1:])]
+        polls = len(poll_starts)
+        max_poll_gap = max(poll_gaps, default=0)
+        assert polls >= 80, f'expected frequent status probes across idle window, got {polls}'
+        assert max_poll_gap < .2, (
+            f'status probes were not spaced below the idle-check interval: {max_poll_gap:.3f}s'
+        )
         assert not connector_socket.exists() and not process_alive(idle_identity['pid']), {
             'polls': polls, 'identity': idle_identity,
+            'max_poll_gap_ms': round(max_poll_gap * 1000),
             'status': await asyncio.to_thread(run_status_sync, staged_binary, profile, control_env),
         }
         result['status_probes_do_not_extend_on_demand_idle_deadline'] = {
             'polls': polls, 'pid': idle_identity['pid'],
+            'max_poll_gap_ms': round(max_poll_gap * 1000),
         }
         write_evidence(profile, result)
         print(json.dumps(result, sort_keys=True))
