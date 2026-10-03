@@ -1573,6 +1573,7 @@ async fn wait_settled(profile: &Profile, sixty_seconds: bool) -> Result<Value> {
             .get("state")
             .and_then(Value::as_str)
             .is_some_and(|state| matches!(state, "failed" | "service-failed" | "stopped-by-person"))
+            && !manager_restart_transient(&now)
         {
             return Err(Failure::keyed(
                 "service.not-loaded",
@@ -1587,6 +1588,14 @@ async fn wait_settled(profile: &Profile, sixty_seconds: bool) -> Result<Value> {
         }
         sleep(Duration::from_millis(250)).await;
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn manager_restart_transient(status: &Value) -> bool {
+    matches!(
+        status.get("state").and_then(Value::as_str),
+        Some("failed" | "service-failed")
+    ) && status.pointer("/failure/key").and_then(Value::as_str) == Some("launch.exited")
 }
 
 #[cfg(test)]
@@ -1621,6 +1630,22 @@ mod tests {
             manager_error: None,
             program_error: None,
         }
+    }
+
+    #[test]
+    fn launchd_exit_observation_is_retryable_until_health_settles() {
+        assert!(manager_restart_transient(
+            &json!({"state":"failed","failure":{"key":"launch.exited"}})
+        ));
+        assert!(manager_restart_transient(
+            &json!({"state":"service-failed","failure":{"key":"launch.exited"}})
+        ));
+        assert!(!manager_restart_transient(
+            &json!({"state":"service-failed","failure":{"key":"service.not-loaded"}})
+        ));
+        assert!(!manager_restart_transient(
+            &json!({"state":"stopped-by-person","failure":{"key":"launch.exited"}})
+        ));
     }
 
     #[test]
