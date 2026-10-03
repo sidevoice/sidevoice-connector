@@ -571,6 +571,8 @@ async def exercise():
 
         started = await service('start')
         assert started['state'] == 'running' and not (data / 'node-stopped.json').exists(), started
+        connector_after_start = await connector_pid(connector_plist['Label'])
+        assert process_alive(connector_after_start), connector_after_start
         result['explicit_start_cleared_marker'] = True
 
         # Core-only restart maintains the same connector PID. Existing install is idempotent and does not
@@ -579,7 +581,7 @@ async def exercise():
         core_id = started['core']['launch_id']
         restarted = await service('restart')
         assert restarted['state'] == 'running' and restarted['core']['launch_id'] != core_id
-        assert await connector_pid(connector_plist['Label']) == connector_process
+        assert await connector_pid(connector_plist['Label']) == connector_after_start
         await service('install')
         assert before_definitions == {path.name: path.read_bytes() for path in services.glob('*.plist')}
         result['core_only_restart_and_idempotent_install'] = True
@@ -598,7 +600,8 @@ async def exercise():
         for label in labels:
             result_manager = run(['/bin/launchctl', 'print', f'{domain}/{label}'], check=False)
             assert result_manager.returncode != 0, f'launchd job survived uninstall: {label}'
-        assert not any(process_alive(pid) for pid in (connector_process, core_before, restarted_status['core']['pid']))
+        assert not any(process_alive(pid) for pid in
+                       (connector_process, connector_after_start, core_before, restarted_status['core']['pid']))
         result['uninstall_missing_current_and_idempotent'] = True
 
         actual_sentinel = {str(path): sha256(path) for path in sentinel.rglob('*') if path.is_file()}

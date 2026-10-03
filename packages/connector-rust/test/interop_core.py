@@ -561,6 +561,7 @@ else:
             assert ready['launch_id'] == launch_id and 3 in ready['connector_protocols']
             daemon = await asyncio.create_subprocess_exec(str(binary), 'connector', '--profile-root', str(root), stdout=daemon_log, stderr=daemon_log, env=env)
             await until(lambda: (data / 'connector.sock').exists(), 'Rust connector socket')
+            await until(lambda: (data / 'proof.json').exists(), 'Rust Core link proof')
             evidence = json.loads((data / 'proof.json').read_text())
             assert evidence['pid'] == daemon.pid and evidence['core_launch_id'] == launch_id and evidence['protocol'] == 3
             assert evidence['executable'] == str(binary) and len(evidence['executable_sha256']) == 64
