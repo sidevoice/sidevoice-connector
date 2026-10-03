@@ -331,8 +331,11 @@ async def copied_state():
             js = None
             js_writer.close()
             js_writer = None
-            orphan = {**original, 'event_id': str(uuid.uuid4()), 'utterance_id': str(uuid.uuid4()),
-                      'binding_id': str(uuid.uuid4()), 'text': 'Unattributed historical speech'}
+            orphan = {key: value for key, value in original.items()
+                      if key not in ('client_ref', 'harness', 'thread')}
+            orphan.update({'event_id': str(uuid.uuid4()), 'utterance_id': str(uuid.uuid4()),
+                           'binding_id': str(uuid.uuid4()), 'text': 'Unattributed historical speech'})
+            assert not any(key in orphan for key in ('client_ref', 'harness', 'thread'))
             slow_rows = [{**original, 'event_id': str(uuid.uuid4()), 'utterance_id': str(uuid.uuid4()),
                           'binding_id': again, 'text': f'Slow admitted speech {i}'} for i in (1, 2)]
             (data / 'outbox.json').write_text(json.dumps([orphan, *slow_rows]))
