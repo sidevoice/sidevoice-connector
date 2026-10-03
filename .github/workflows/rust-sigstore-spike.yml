@@ -23,6 +23,13 @@ jobs:
         working-directory: tools/sigstore-spike
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Check exact pull request head
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA" && echo "PR head: $EXPECTED_HEAD_SHA"
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt && rustup default 1.88.0
       - name: Source and dependency revisions
@@ -72,10 +79,55 @@ jobs:
           printf x >> "$metadata"
           if "$binary" "$snapshot/core-manifest.json" "$snapshot/core-manifest.json.sigstore.json" nightly "$RUNNER_TEMP/corrupt-tuf" offline; then exit 1; fi
           cp -a "$cache" "$RUNNER_TEMP/tampered-target-tuf"
-          target=$(find "$RUNNER_TEMP/tampered-target-tuf" -name trusted_root.json -type f -print -quit)
-          test -n "$target"
-          printf x >> "$target"
-          if "$binary" "$snapshot/core-manifest.json" "$snapshot/core-manifest.json.sigstore.json" nightly "$RUNNER_TEMP/tampered-target-tuf" offline; then exit 1; fi
+          target="$RUNNER_TEMP/tampered-target-tuf/targets/trusted_root.json"
+          test -f "$target"
+          python3 - "$target" "$RUNNER_TEMP/tampered-target-tuf" <<'PY'
+          import hashlib, json, pathlib, sys
+          target, cache = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+          original = target.read_bytes()
+          changed = bytearray(original)
+          quoted = escaped = False
+          altered = False
+          for index, byte in enumerate(changed):
+              if quoted:
+                  if escaped:
+                      escaped = False
+                  elif byte == 92:
+                      escaped = True
+                  elif byte == 34:
+                      quoted = False
+              elif byte == 34:
+                  quoted = True
+              elif byte in (9, 10, 13, 32):
+                  changed[index] = 9 if byte == 32 else 32
+                  altered = True
+                  break
+          if not altered:
+              quoted = escaped = False
+              for index, byte in enumerate(changed):
+                  if quoted:
+                      if escaped:
+                          escaped = False
+                      elif byte == 92:
+                          escaped = True
+                      elif byte == 34:
+                          quoted = False
+                      elif 65 <= byte <= 90 or 97 <= byte <= 122:
+                          changed[index] = 65 if byte != 65 else 66
+                          altered = True
+                          break
+                  elif byte == 34:
+                      quoted = True
+          assert altered and changed != original and len(changed) == len(original)
+          json.loads(changed)
+          target.write_bytes(changed)
+          consistent_name = hashlib.sha256(original).hexdigest() + '.trusted_root.json'
+          (cache / consistent_name).write_bytes(changed)
+          print('valid-JSON cached target changed with signed TUF metadata unchanged:', consistent_name)
+          PY
+          if error=$("$binary" "$snapshot/core-manifest.json" "$snapshot/core-manifest.json.sigstore.json" nightly "$RUNNER_TEMP/tampered-target-tuf" offline 2>&1); then exit 1; fi
+          printf '%s\n' "$error"
+          [[ "$error" == *"sha256 mismatch"* ]]
           "$binary" tuf-future "$cache"
       - name: Remove runner-local executable archive bytes
         if: always()
@@ -90,6 +142,13 @@ jobs:
         working-directory: tools/sigstore-spike
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Check exact pull request head
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA" && echo "PR head: $EXPECTED_HEAD_SHA"
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal && rustup default 1.88.0
       - name: Compile and run small policy fixture
