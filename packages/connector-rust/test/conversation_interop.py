@@ -162,15 +162,17 @@ def participant(core_socket, session, thread):
 
 
 async def wait_engine(core_socket, session, thread, model, seconds=10):
-    return await until(lambda: (item := participant(core_socket, session, thread))
-        if item and (item.get('engine') or {}).get('model') == model else None,
-        f'{thread} engine {model}', seconds)
+    def matching():
+        item = participant(core_socket, session, thread)
+        return item if item and (item.get('engine') or {}).get('model') == model else None
+    return await until(matching, f'{thread} engine {model}', seconds)
 
 
 async def wait_participant(core_socket, session, thread, *, available):
-    return await until(lambda: (item := participant(core_socket, session, thread))
-        if item and item.get('available') is available else None,
-        f'{thread} participant available={available}')
+    def matching():
+        item = participant(core_socket, session, thread)
+        return item if item and item.get('available') is available else None
+    return await until(matching, f'{thread} participant available={available}')
 
 
 async def wait_working(process, thread, state, request_base):
