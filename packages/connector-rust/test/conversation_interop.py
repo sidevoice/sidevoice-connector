@@ -135,11 +135,13 @@ class HttpReceiver(ThreadingHTTPServer):
             pass
 
 
-async def core_text(core_socket, token, session, binding, thread, phrase):
+async def core_text(core_socket, token, session, thread, phrase):
+    selected = core_json(core_socket, 'POST', '/api/presentation/select',
+        {'session_id':session, 'thread_id':thread}, token)
     message_id = str(uuid.uuid4())
     result = core_json(core_socket, 'POST', '/api/presentation/text', {
         'text': phrase, 'session_id': session, 'thread_id': thread,
-        'binding_id': binding, 'message_id': message_id}, token)
+        'binding_id': selected['binding']['binding_id'], 'message_id': message_id}, token)
     assert result.get('accepted') is True, result
     return result
 
@@ -413,10 +415,8 @@ async def test_route(binary, root, env, presentation, route, client_name, route_
         assert joined['binding_id'] and not joined['binding_id'].startswith('local-'), joined
         if expected_initial:
             expected_initial(joined)
-        core_json(presentation['socket'], 'POST', '/api/presentation/select',
-            {'session_id':presentation['session'], 'thread_id':thread}, presentation['token'])
         input_row = await core_text(presentation['socket'], presentation['token'], presentation['session'],
-            joined['binding_id'], thread, 'Core input for ' + route)
+            thread, 'Core input for ' + route)
         if after:
             await after(facade, joined, input_row, route_env)
         return facade, joined, input_row
@@ -673,7 +673,7 @@ main()
                 joined = await tool(facade, 'voice_connect', {'title':'Synthetic Cursor persist'}, 30)
                 assert joined['conversation'] == cursor_chat and joined['capabilities'] == CURSOR_CAPS, joined
                 assert joined.get('experimental') == ['deliver'], joined
-                input_row = await core_text(core_data / 'local.sock', token, session, joined['binding_id'], cursor_chat, 'Core input for Cursor persist')
+                input_row = await core_text(core_data / 'local.sock', token, session, cursor_chat, 'Core input for Cursor persist')
                 await cursor_cli_after(facade, joined, input_row, {})
                 await tool(facade, 'voice_disconnect', {}, 62)
                 reconnect = await tool(facade, 'voice_connect', {'title':'Cursor persist reconnect'}, 63)
@@ -686,7 +686,7 @@ main()
                 facades.append(plain)
                 held = await tool(plain, 'voice_connect', {'title':'Synthetic Cursor plain CLI'}, 31)
                 assert held['conversation'] == cursor_chat and held['capabilities']['deliver'] == 'unsupported', held
-                plain_row = await core_text(core_data / 'local.sock', token, session, held['binding_id'], cursor_chat, 'Held unsupported Cursor message')
+                plain_row = await core_text(core_data / 'local.sock', token, session, cursor_chat, 'Held unsupported Cursor message')
                 await wait_status(core_data / 'local.sock', token, cursor_chat, plain_row['id'], 'not_sent')
                 plain_status = await tool(plain, 'voice_status', {'conversation':cursor_chat}, 33)
                 assert plain_status['joined'] is True and plain_status['capabilities']['deliver'] == 'unsupported', plain_status
@@ -738,7 +738,7 @@ main()
                 assert rebound['binding_id'] != old_binding_id, rebound
                 assert next(item for item in rebound['connector']['bindings']
                     if item['client_ref'] == http_thread)['binding_id'] == rebound['binding_id'], rebound
-                restarted_row = await core_text(core_data / 'local.sock', token, session, rebound['binding_id'],
+                restarted_row = await core_text(core_data / 'local.sock', token, session,
                     http_thread, 'Core input after connector restart')
                 restarted_request = await asyncio.to_thread(receiver.messages.get, True, 10)
                 assert restarted_request['thread_id'] == http_thread and restarted_request['text'] == 'Core input after connector restart', restarted_request
@@ -864,7 +864,7 @@ main()
                 await until_async(card_capacity_recovered, 'Cursor card capacity after partial requests', seconds=6)
                 app_poll = asyncio.create_task(asyncio.to_thread(card_get, app_joined['view_link']['port'], app_query))
                 await asyncio.sleep(.1)
-                app_row = await core_text(core_data / 'local.sock', token, session, app_joined['binding_id'], app_thread,
+                app_row = await core_text(core_data / 'local.sock', token, session, app_thread,
                     'Core input for Cursor editor card')
                 card_message = await asyncio.wait_for(app_poll, 5)
                 assert card_message['message_id'] == app_row['message_id'] and 'Core input for Cursor editor card' in card_message['text'], card_message
@@ -899,7 +899,7 @@ main()
                 assert replay_link['port'] == app_joined['view_link']['port'], (app_joined['view_link'], replay_link)
                 replay_query = urlencode({'thread':app_thread, 'auth':hmac.new(bytes.fromhex(replay_link['key']),
                     ('poll:' + app_thread).encode(), hashlib.sha256).hexdigest()})
-                app_row = await core_text(core_data / 'local.sock', token, session, replayed['binding_id'], app_thread,
+                app_row = await core_text(core_data / 'local.sock', token, session, app_thread,
                     'Core input after Cursor connector restart')
                 app_poll = asyncio.create_task(asyncio.to_thread(card_get, app_joined['view_link']['port'], app_query))
                 card_message = await asyncio.wait_for(app_poll, 5)
@@ -944,7 +944,7 @@ main()
                 state.commit()
                 state.close()
                 await wait_bridge_chat(bridge_facade, bridge_thread, 148)
-                bridge_row = await core_text(core_data / 'local.sock', token, session, bridge_joined['binding_id'], bridge_thread,
+                bridge_row = await core_text(core_data / 'local.sock', token, session, bridge_thread,
                     'Core input for Cursor Desktop Bridge')
                 sent = await asyncio.wait_for(received_bridge.get(), 12)
                 assert sent['threadId'] == bridge_chat and 'Core input for Cursor Desktop Bridge' in sent['text'], sent
