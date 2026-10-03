@@ -441,7 +441,8 @@ async def parity_fixture():
         data = root / 'sidevoice'
         core_data = data / 'core'
         tool_dir = root / 'bin'
-        for directory in (home, claude_home, codex_home, cursor_config, cursor_data, xdg_config, xdg_data,
+        for directory in (home, claude_home, codex_home, cursor_root, cursor_config, cursor_data,
+                root / 'xdg', xdg_config, xdg_data,
                 data, core_data, tool_dir):
             directory.mkdir(parents=True, mode=0o700, exist_ok=True)
             directory.chmod(0o700)
@@ -832,14 +833,34 @@ main()
                     overflow = socket.create_connection(('127.0.0.1', app_joined['view_link']['port']), timeout=2)
                     try:
                         overflow.sendall(b'GET /cursor-app/next HTTP/1.1\r\n')
-                        assert await asyncio.to_thread(overflow.recv, 1) == b'', 'card accepted an unbounded client'
+                        try:
+                            rejected = await asyncio.to_thread(overflow.recv, 1)
+                        except ConnectionResetError:
+                            rejected = b''
+                        assert rejected == b'', 'card accepted an unbounded client'
                     finally:
                         overflow.close()
                 finally:
+                    held = stalled.pop() if stalled else None
                     for connection in stalled:
                         connection.close()
-                await asyncio.sleep(.2)
-                await asyncio.to_thread(card_probe, app_joined['view_link']['port'], app_query)
+                if held:
+                    try:
+                        held.settimeout(7)
+                        try:
+                            timed_out = await asyncio.to_thread(held.recv, 1)
+                        except ConnectionResetError:
+                            timed_out = b''
+                        assert timed_out == b'', 'partial card request did not expire'
+                    finally:
+                        held.close()
+                async def card_capacity_recovered():
+                    try:
+                        await asyncio.to_thread(card_probe, app_joined['view_link']['port'], app_query)
+                        return True
+                    except (OSError, AssertionError):
+                        return False
+                await until_async(card_capacity_recovered, 'Cursor card capacity after partial requests', seconds=6)
                 app_poll = asyncio.create_task(asyncio.to_thread(card_get, app_joined['view_link']['port'], app_query))
                 await asyncio.sleep(.1)
                 app_row = await core_text(core_data / 'local.sock', token, session, app_joined['binding_id'], app_thread,
