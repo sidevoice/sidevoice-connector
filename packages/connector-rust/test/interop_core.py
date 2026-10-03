@@ -401,15 +401,48 @@ async def exercise():
             directory.chmod(0o700)
         for directory in (cursor, root / 'cursor/data', root / 'xdg/config', root / 'xdg/data'):
             directory.mkdir(mode=0o700)
-        fresh = await asyncio.create_subprocess_exec(str(binary), 'mcp', '--profile-root', str(root),
+        # MCP now starts the private connector from the same staged release the
+        # service manager owns. Give this selection-only fixture a private staged
+        # connector and harmless Core executable so it exercises that real path.
+        releases = root / 'releases'
+        release = releases / 'interop'
+        staged_binary = release / 'dist/sidevoice-rust-proof'
+        staged_core = release / 'core/bin/sidevoice-core'
+        for directory in (releases, release, staged_binary.parent, staged_core.parent):
+            directory.mkdir(mode=0o700)
+            directory.chmod(0o700)
+        shutil.copy2(binary, staged_binary)
+        staged_binary.chmod(0o700)
+        staged_core.write_text('#!/bin/sh\nexit 0\n')
+        staged_core.chmod(0o700)
+        (releases / 'current').symlink_to('interop')
+        fresh_daemon_pid = None
+        fresh = await asyncio.create_subprocess_exec(str(staged_binary), 'mcp', '--profile-root', str(root),
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             env={})
-        fresh_info = await mcp_request(fresh, 'initialize', {'protocolVersion': '2025-06-18',
-            'capabilities': {}, 'clientInfo': {'name': 'codex', 'version': 'isolated-empty-env'}}, 90)
-        assert fresh_info['instructions']
-        fresh_tools = await mcp_request(fresh, 'tools/list', {}, 91)
-        assert len(fresh_tools['tools']) == 6, 'profile-root must reconstruct the selected command with no inherited profile env'
-        await finish(fresh)
+        try:
+            fresh_info = await mcp_request(fresh, 'initialize', {'protocolVersion': '2025-06-18',
+                'capabilities': {}, 'clientInfo': {'name': 'codex', 'version': 'isolated-empty-env'}}, 90)
+            assert fresh_info['instructions']
+            fresh_tools = await mcp_request(fresh, 'tools/list', {}, 91)
+            assert len(fresh_tools['tools']) == 6, 'profile-root must reconstruct the selected command with no inherited profile env'
+            await until(lambda: (data / 'proof.json').exists(), 'on-demand private connector startup')
+            fresh_daemon_pid = json.loads((data / 'proof.json').read_text())['pid']
+        except Exception as error:
+            await finish(fresh)
+            stderr = (await fresh.stderr.read()).decode(errors='replace')
+            raise AssertionError(
+                f'fresh profile MCP exited {fresh.returncode}: {stderr.strip()}') from error
+        finally:
+            if fresh_daemon_pid is None and (data / 'proof.json').exists():
+                fresh_daemon_pid = json.loads((data / 'proof.json').read_text())['pid']
+            if fresh_daemon_pid is not None:
+                try:
+                    os.kill(fresh_daemon_pid, 15)
+                except ProcessLookupError:
+                    pass
+                await until(lambda: not process_alive(fresh_daemon_pid), 'on-demand connector cleanup', seconds=8)
+            await finish(fresh)
         thread = str(uuid.uuid4())
         rollout = rollout_dir / f'rollout-test-{thread}.jsonl'
         rollout.touch(mode=0o600)
