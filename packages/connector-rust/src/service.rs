@@ -795,8 +795,7 @@ async fn set_stopped(profile: &Profile, stopped: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn chrono_free_iso() -> String {
+pub(crate) fn chrono_free_iso() -> String {
     // A stable RFC3339 UTC marker; no date crate is needed for this private stop-intent record.
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1119,6 +1118,25 @@ async fn verify_connector_socket(profile: &Profile) -> anyhow::Result<()> {
     let identity = connector_identity(profile)
         .await?
         .context("connector status refused")?;
+    if profile.control_mode {
+        let selected = crate::release::Paths::from_profile(profile)
+            .selected("current")?
+            .context("selected release missing")?;
+        let executable = profile
+            .root
+            .join("current/dist/sidevoice-rust")
+            .canonicalize()?;
+        if identity.executable != executable
+            || identity.release_id.as_deref() != selected["id"].as_str()
+            || identity.runtime_sha256.as_deref() != selected["runtime_sha256"].as_str()
+            || identity.runtime_build_sha.as_deref() != selected["runtime_build_sha"].as_str()
+        {
+            return Err(crate::release::refusal(
+                "control.connector-owner-differs-from-selected-release",
+                json!({}),
+            ));
+        }
+    }
     if let Some(selected) = &profile.installed {
         let executable = profile
             .root
@@ -1140,10 +1158,9 @@ async fn verify_connector_socket(profile: &Profile) -> anyhow::Result<()> {
 
 pub async fn status(profile: &Profile, connector_self: bool) -> Value {
     if profile.is_installed() {
-        return match selected_control(
-            profile,
-            &["service", "status", "--json"],
-            Duration::from_secs(35),
+        return match crate::installed_service::status(
+            &crate::release::Paths::from_profile(profile),
+            connector_self,
         )
         .await
         {
@@ -1249,48 +1266,12 @@ pub async fn ensure_connector(profile: &Profile) -> anyhow::Result<()> {
     )))
 }
 
-async fn selected_control(
-    profile: &Profile,
-    args: &[&str],
-    limit: Duration,
-) -> anyhow::Result<Value> {
-    let mut command = Command::new(profile.control_executable()?);
-    command
-        .args(args)
-        .env_clear()
-        .env(
-            "PATH",
-            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        )
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-    for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
-        if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
-        }
-    }
-    profile.command_env(&mut command);
-    let output = timeout(limit, command.output()).await??;
-    if output.stdout.len() > 65536 || !output.status.success() {
-        anyhow::bail!("selected Sidevoice control command failed");
-    }
-    Ok(serde_json::from_slice(&output.stdout)?)
-}
-
 pub(crate) async fn runtime_switching(profile: &Profile) -> anyhow::Result<bool> {
-    selected_control(
-        profile,
-        &["--sidevoice-runtime-switching"],
-        Duration::from_secs(10),
-    )
-    .await?
-    .get("switching")
-    .and_then(Value::as_bool)
-    .ok_or_else(|| anyhow::anyhow!("runtime switch status missing"))
+    crate::installed_service::runtime_switching(&crate::release::Paths::from_profile(profile))
 }
 
 async fn ensure_installed_connector(profile: &Profile) -> anyhow::Result<()> {
-    if profile.service_stopped()? {
+    if crate::installed_service::stopped(&crate::release::Paths::from_profile(profile))? {
         return Err(anyhow::Error::new(Failure::keyed(
             "service.node-stopped",
             json!({}),
@@ -1300,41 +1281,28 @@ async fn ensure_installed_connector(profile: &Profile) -> anyhow::Result<()> {
         anyhow::bail!("Sidevoice is updating the Connector. Try again in a moment.");
     }
     let current = profile.root.join("current").canonicalize()?;
-    if current.file_name().and_then(|name| name.to_str())
-        != profile
-            .installed
-            .as_ref()
-            .map(|release| release.id.as_str())
+    if !profile.control_mode
+        && current.file_name().and_then(|name| name.to_str())
+            != profile
+                .installed
+                .as_ref()
+                .map(|release| release.id.as_str())
     {
         anyhow::bail!("the selected release changed; restart this MCP process");
     }
-    let management = selected_control(
-        profile,
-        &["--sidevoice-connector-management"],
-        Duration::from_secs(35),
-    )
-    .await?;
-    match management.get("state").and_then(Value::as_str) {
-        Some("defined") => {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline {
-                if verify_connector_socket(profile).await.is_ok() {
-                    return Ok(());
-                }
-                sleep(Duration::from_millis(100)).await;
+    let paths = crate::release::Paths::from_profile(profile);
+    if crate::installed_service::defined(&paths)? {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if verify_connector_socket(profile).await.is_ok() {
+                return Ok(());
             }
-            anyhow::bail!("the selected Sidevoice service did not answer its local socket");
+            sleep(Duration::from_millis(100)).await;
         }
-        Some("absent") => {}
-        _ => anyhow::bail!("the selected Sidevoice service manager could not be observed"),
+        anyhow::bail!("the selected Sidevoice service did not answer its local socket");
     }
     let connector_up = verify_connector_socket(profile).await.is_ok();
-    selected_control(
-        profile,
-        &["--sidevoice-ensure-core"],
-        Duration::from_secs(60),
-    )
-    .await?;
+    crate::installed_service::ensure_core(&paths).await?;
     if connector_up && verify_connector_socket(profile).await.is_ok() {
         return Ok(());
     }
@@ -1609,6 +1577,18 @@ fn derive_status(observation: &Observation) -> Value {
 }
 
 pub async fn run(profile: Profile, action: Action) -> Value {
+    if profile.is_installed() {
+        return match crate::installed_service::run(
+            &crate::release::Paths::from_profile(&profile),
+            action,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => Failure::plain(error).value(),
+        };
+    }
+
     if action == Action::Status {
         return status(&profile, false).await;
     }
