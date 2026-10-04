@@ -196,7 +196,7 @@ jobs:
       - name: Prove disposable pairing and native launchd pair
         if: matrix.target == 'macos-aarch64'
         env:
-          SIDEVOICE_TEST_SEA: ${{ github.workspace }}/packages/connector/dist-sea/macos-arm64/sidevoice
+          SIDEVOICE_TEST_SEA: ${{ github.workspace }}/packages/connector/dist-sea/macos-aarch64/sidevoice
         run: |
           uv venv --python 3.12 "$RUNNER_TEMP/pairing-test"
           uv pip install --python "$RUNNER_TEMP/pairing-test/bin/python" python-socketio uvicorn

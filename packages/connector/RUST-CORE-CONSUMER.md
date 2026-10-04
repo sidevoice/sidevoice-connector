@@ -35,7 +35,7 @@ Cancellation and verification failures remove the temporary sibling release befo
 
 - `runtime_kind: "rust-native-v1"`, `runtime_build_sha`, and the exact staged `runtime_sha256` for the selected daemon/MCP runtime;
 - `core_kind: "rust-native-v1"`, Core source and Cargo lock SHAs, manifest SHA, target, archive SHA and size, fixed entrypoint, and `core_build`;
-- `pair_id`, derived from the selected JavaScript runtime identity and native Core identity.
+- `pair_id`, derived from the selected runtime identity and native Core identity.
 
 The selected Rust pair embeds and hashes both executables and records their distinct identities under one release pointer. Runtime changes must quiesce the previous writer and refuse a nonempty outbox before selection; automatic recovery quarantines uncertain cross-runtime rows. No old pending row is remapped.
 
