@@ -570,13 +570,6 @@ impl Profile {
         }
     }
 
-    pub fn control_executable(&self) -> Result<PathBuf> {
-        if self.installed.is_none() {
-            bail!("the proof profile has no selected control executable");
-        }
-        Ok(self.root.join("current/dist/sidevoice"))
-    }
-
     pub fn command_env<'a>(
         &self,
         command: &'a mut tokio::process::Command,

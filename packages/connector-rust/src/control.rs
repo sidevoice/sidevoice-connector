@@ -72,6 +72,7 @@ pub async fn run(args: &[String]) -> Option<i32> {
             if error
                 .downcast_ref::<crate::release::ControlError>()
                 .is_some()
+                || (matches!(command, "install" | "rollback" | "uninstall") && disk_error(&error))
             {
                 let answer = crate::lifecycle::error_value(&error);
                 if json_output {
@@ -197,12 +198,18 @@ async fn dispatch(command: &str, args: &[String]) -> Result<Value> {
                     signal.store(true, Ordering::SeqCst);
                 }
             });
-            let result = install(args, cancel).await;
+            let result = install(args, cancel)
+                .await
+                .map(|value| presented("install", value));
             task.abort();
             result
         }
-        "rollback" => crate::lifecycle::rollback(flag(args, "--progress=jsonl")).await,
-        "uninstall" => crate::lifecycle::uninstall().await,
+        "rollback" => crate::lifecycle::rollback(flag(args, "--progress=jsonl"))
+            .await
+            .map(|value| presented("rollback", value)),
+        "uninstall" => crate::lifecycle::uninstall()
+            .await
+            .map(|value| presented("uninstall", value)),
         "service" => {
             let action = match args.first().map(String::as_str) {
                 Some("install") => crate::service::Action::Install,
@@ -213,7 +220,9 @@ async fn dispatch(command: &str, args: &[String]) -> Result<Value> {
                 Some("status") => crate::service::Action::Status,
                 _ => bail!("service.usage"),
             };
-            crate::installed_service::run(&crate::release::Paths::environment()?, action).await
+            crate::installed_service::run(&crate::release::Paths::environment()?, action)
+                .await
+                .map(|value| presented("service", value))
         }
         _ => bail!("command.unknown"),
     }
@@ -287,9 +296,65 @@ fn validate_install_args(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn disk_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|source| source.downcast_ref::<std::io::Error>())
+        .any(|source| matches!(source.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT)))
+}
+
+fn presented(command: &str, result: Value) -> Value {
+    let mut lines = Vec::new();
+    if result.get("ok") == Some(&Value::Bool(false)) || result.get("error").is_some() {
+        lines.push(
+            result
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+        );
+    } else {
+        match command {
+            "install" => {
+                lines.push(message("install.version", &json!({"version":result["connector"]})));
+                let key = if result["action"] == "noop" { "install.noop" } else { "install.selected" };
+                lines.push(message(key, &json!({"id":result["installed"],"channel":result["channel"],
+                    "previous":result.get("previous").filter(|v| !v.is_null()).cloned().unwrap_or_else(||json!(message("install.nothing",&Value::Null)))})));
+                let key = if result["service"] == "none" { "install.on-demand" } else { "install.service" };
+                lines.push(message(key, &json!({"service":result["service"],"state":result["state"]})));
+            }
+            "rollback" => lines.push(message("install.rolled-back", &json!({"id":result["installed"],
+                "from":result.get("from").filter(|v| !v.is_null()).cloned().unwrap_or_else(||json!(message("install.nothing",&Value::Null)))}))),
+            "service" => {
+                if let Some(state) = result["state"].as_str() {
+                    lines.push(message(&format!("service.state.{state}"), &json!({"service":result["service"]})));
+                }
+                if let Some(failure) = result.pointer("/failure/message").and_then(Value::as_str) { lines.push(failure.into()); }
+            }
+            "uninstall" => lines.push(message("uninstall.done", &Value::Null)),
+            _ => {}
+        }
+        for section in [&result, &result["agents"]] {
+            for field in ["done", "next"] {
+                if let Some(values) = section[field].as_array() {
+                    lines.extend(values.iter().filter_map(Value::as_str).map(str::to_owned));
+                }
+            }
+        }
+        if result.pointer("/linger/enabled") == Some(&Value::Bool(false)) {
+            lines.push(message("service.linger-reason", &Value::Null));
+            if let Some(command) = result.pointer("/linger/command").and_then(Value::as_str) {
+                lines.push(command.into());
+            }
+        }
+    }
+    json!({"_text":lines.join("\n"),"result":result})
+}
+
 #[cfg(test)]
 mod tests {
-    use super::validate_install_args;
+    use super::{disk_error, presented, validate_install_args};
+    use serde_json::json;
     #[test]
     fn rejects_missing_or_unknown_harness_and_progress_without_side_effects() {
         for args in [
@@ -310,5 +375,37 @@ mod tests {
             "--progress=jsonl".into()
         ])
         .is_ok());
+    }
+    #[test]
+    fn human_lifecycle_output_preserves_machine_result_and_manual_steps() {
+        let result = json!({"ok":true,"action":"noop","installed":"release-1","connector":"0.6.0","channel":"release",
+            "service":"none","state":"running","agents":{"next":["manual agent command"]}});
+        let output = presented("install", result.clone());
+        assert_eq!(output["result"], result);
+        let text = output["_text"].as_str().unwrap();
+        assert!(text.contains("Installed already:"));
+        assert!(text.contains("manual agent command"));
+        assert!(!text.starts_with('{'));
+        let service = presented(
+            "service",
+            json!({"ok":true,"state":"running","service":"systemd",
+            "linger":{"enabled":false,"command":"loginctl enable-linger example"}}),
+        );
+        assert!(service["_text"]
+            .as_str()
+            .unwrap()
+            .contains("loginctl enable-linger example"));
+    }
+    #[test]
+    fn contextual_disk_errors_keep_the_machine_refusal_key() {
+        for code in [libc::ENOSPC, libc::EDQUOT] {
+            let error = anyhow::Error::new(std::io::Error::from_raw_os_error(code))
+                .context("staging candidate");
+            assert!(disk_error(&error));
+            assert_eq!(
+                crate::lifecycle::error_value(&error)["error"]["key"],
+                "install.disk"
+            );
+        }
     }
 }
