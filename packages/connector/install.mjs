@@ -273,7 +273,7 @@ async function goBack(env, kind, progressEvent = () => {}, { explicit = false } 
     }
     const back = flipBack(env);
     if (!back) return null;
-    uninhibit?.commit(back.id);
+    uninhibit?.commit(back.id, back.runtime_kind);
     restoreSelectedLaunchGate(dataDirOf(env), back.id);
     await restartOn(env, kind);
     const verified = await verify(env, back, kind, { fresh: kind === 'none' });
@@ -340,7 +340,7 @@ export async function apply(env, { core = true, service = false, applyNow = fals
         progressEvent({ step: 'commit', done: null, total: null });
         beginCommit();
         switchTo(env, chosen.id);
-        uninhibit?.commit(chosen.id);
+        uninhibit?.commit(chosen.id, chosen.runtime_kind);
       } catch (error) { uninhibit?.restore(); if (resume) await resume(); throw error; }
       finally { uninhibit?.restore(); }
     }
@@ -372,7 +372,7 @@ export async function apply(env, { core = true, service = false, applyNow = fals
       recordInstallation(env, { definitions: jobDefinitions(kind, env) });
       crash('definitions-written');
       if (!had && !conversionResume) await stopOnDemand(env);
-      conversionUninhibit?.commit(chosen.id); conversionUninhibit = null;
+      conversionUninhibit?.commit(chosen.id, chosen.runtime_kind); conversionUninhibit = null;
       // The files may match after a definitions-written crash while the manager still has the prior release cached.
       // An unverified selection must reload both definitions before the restart can verify that selection.
       if (selection(env, 'verified')?.id !== chosen.id) {

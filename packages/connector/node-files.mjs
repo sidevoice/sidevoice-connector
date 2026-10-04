@@ -48,8 +48,8 @@ export function runtimeSwitching(dataDir) {
     && isProcess(owner.pid, { start: owner.start ?? null });
 }
 
-/** Older JS facades recognize only node-stopped.json. A committed migration marker blocks those facades while the
- *  selected release ignores it; a human stop (or any mismatched marker) still stops the selected release. */
+/** Older JS facades recognize only node-stopped.json. A committed Rust migration marker blocks those facades while
+ *  the selected Rust release ignores it; a human stop (or any mismatched marker) still stops the selected release. */
 export function nodeStopped(dataDir, selectedId) {
   const files = nodeFiles(dataDir);
   if (!existsSync(files.stopped)) return false;
@@ -77,9 +77,15 @@ export function inhibitRuntimeLaunch(dataDir) {
   writePrivateFile(files.stopped, JSON.stringify({ runtime_switch_token: token }));
   let committed = false;
   return {
-    commit(to) {
-      writePrivateFile(files.switching, JSON.stringify({ phase: 'committed', token, to }));
-      restoreSelectedLaunchGate(dataDir, to);
+    commit(to, runtimeKind) {
+      if ((runtimeKind ?? 'javascript') === 'javascript') {
+        // The selected older JS daemon also reads this marker literally, so it must be cleared for JS rollback.
+        rmSync(files.switching, { force: true });
+        rmSync(files.stopped, { force: true });
+      } else {
+        writePrivateFile(files.switching, JSON.stringify({ phase: 'committed', token, to }));
+        restoreSelectedLaunchGate(dataDir, to);
+      }
       committed = true;
     },
     restore() {

@@ -172,6 +172,16 @@ test('runtime switch refuses a queued or unreadable outbox before staging or mov
   assert.equal(readlinkSync(layout.current), path.join('releases', oldId));
   assert.equal(existsSync(outbox), false, 'the previous JS runtime cannot replay the failed Rust row');
   assert.match(readFileSync(recovery.quarantined, 'utf8'), /queued-by-failed-rust/);
+  assert.equal(existsSync(path.join(data, 'node-stopped.json')), false,
+    'the selected baseline JS daemon must not inherit the Rust compatibility gate');
+  const legacyStarted = path.join(home, 'legacy-started');
+  const legacySelf = path.join(home, 'legacy-self.mjs');
+  writeFileSync(legacySelf, `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(legacyStarted)}, 'started');\n`);
+  assert.equal(await legacyLaunch({ connect: async () => {
+    if (existsSync(legacyStarted)) return true;
+    throw new Error('socket closed');
+  }, self: [process.execPath, legacySelf], env }), true,
+  'the actual base launcher can start the selected JS runtime after unmanaged rollback');
 });
 
 test('explicit rollback refuses queued speech in either cross-runtime direction', async t => {
