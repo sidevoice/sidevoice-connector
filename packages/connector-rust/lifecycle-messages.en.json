@@ -52,5 +52,7 @@
   "control.connector-socket-remained-active": "Connector socket remained active.",
   "control.process-identity-unavailable": "Process identity unavailable.",
   "control.foreign-process-owner": "Foreign process owner.",
-  "control.process-did-not-exit": "Process did not exit."
+  "control.process-did-not-exit": "Process did not exit.",
+  "control.core-lock-owner-unverified": "Core lock owner unverified.",
+  "control.core-process-started-during-shutdown": "Core process started during shutdown."
 }

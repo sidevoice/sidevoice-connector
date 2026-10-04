@@ -251,34 +251,34 @@ impl ServiceSpec {
 }
 
 #[derive(Clone, Debug, Default)]
-struct Job {
-    defined: bool,
-    loaded: bool,
-    running: bool,
-    unknown: bool,
-    pid: Option<u32>,
-    exit: Option<i64>,
-    signal: Option<String>,
-    runs: Option<u64>,
-    restarting: bool,
-    reason: Option<String>,
+pub(crate) struct Job {
+    pub(crate) defined: bool,
+    pub(crate) loaded: bool,
+    pub(crate) running: bool,
+    pub(crate) unknown: bool,
+    pub(crate) pid: Option<u32>,
+    pub(crate) exit: Option<i64>,
+    pub(crate) signal: Option<String>,
+    pub(crate) runs: Option<u64>,
+    pub(crate) restarting: bool,
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Clone, Debug)]
-struct Observation {
-    service: &'static str,
-    installed: bool,
-    core: Job,
-    connector: Job,
-    stopped: bool,
-    health: Option<Value>,
-    ready: Option<Ready>,
-    failure: Option<Value>,
-    core_age: Option<u64>,
-    connector_running: bool,
-    definition_error: Option<String>,
-    manager_error: Option<String>,
-    program_error: Option<&'static str>,
+pub(crate) struct Observation {
+    pub(crate) service: &'static str,
+    pub(crate) installed: bool,
+    pub(crate) core: Job,
+    pub(crate) connector: Job,
+    pub(crate) stopped: bool,
+    pub(crate) health: Option<Value>,
+    pub(crate) ready: Option<Ready>,
+    pub(crate) failure: Option<Value>,
+    pub(crate) core_age: Option<u64>,
+    pub(crate) connector_running: bool,
+    pub(crate) definition_error: Option<String>,
+    pub(crate) manager_error: Option<String>,
+    pub(crate) program_error: Option<&'static str>,
 }
 
 #[derive(Clone, Debug)]
@@ -1463,7 +1463,7 @@ async fn observe(profile: &Profile, connector_self: bool) -> anyhow::Result<Obse
     })
 }
 
-fn derive_status(observation: &Observation) -> Value {
+pub(crate) fn derive_status(observation: &Observation) -> Value {
     let health = observation.health.as_ref();
     let health_pid = health
         .and_then(|value| value.get("pid"))
@@ -1556,6 +1556,9 @@ fn derive_status(observation: &Observation) -> Value {
             .clone()
             .or_else(|| observation.core.exit.map(|code| code.to_string()))
             .unwrap_or_else(|| "?".into());
+        if observation.service == "systemd" {
+            result["limit"] = json!(5);
+        }
         result["attempts"] = observation
             .core
             .runs

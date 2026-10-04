@@ -1,5 +1,5 @@
 //! Native release storage. Pointer replacement is the sole selection commit point.
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -337,61 +337,56 @@ pub fn unpack_core(archive: &[u8], manifest: &Value, target: &str, root: &Path) 
         || bundle["size"].as_u64() != Some(archive.len() as u64)
         || bundle["sha256"].as_str() != Some(digest(archive).as_str())
     {
-        return Err(crate::release::refusal(
-            "control.native-core-archive-digest-mismatch",
-            json!({}),
-        ));
+        return Err(authenticity("sha256"));
     }
-    let decoder = zstd::stream::read::Decoder::new(archive)?;
+    let decoder =
+        zstd::stream::read::Decoder::new(archive).map_err(|_| authenticity("archive-type"))?;
     let mut tar = tar::Archive::new(decoder.take(1_010_000_000));
     private_directory(root)?;
     let mut inventory = None;
+    let mut paths_seen = std::collections::BTreeSet::new();
+    let mut dirs_seen = std::collections::BTreeSet::new();
     let mut seen = std::collections::BTreeMap::new();
     let mut total = 0u64;
     let mut count = 0usize;
-    for entry in tar.entries()? {
-        let mut entry = entry?;
+    for entry in tar.entries().map_err(|_| authenticity("archive-type"))? {
+        let mut entry = entry.map_err(|_| authenticity("archive-type"))?;
         count += 1;
         if count > 2000 {
-            return Err(crate::release::refusal(
-                "control.native-core-archive-entry-limit",
-                json!({}),
-            ));
-        }
-        let path = entry.path()?.into_owned();
-        let relative = path
-            .strip_prefix("sidevoice-core-rust")
-            .context("native Core archive root")?;
-        if path
-            .components()
-            .any(|c| !matches!(c, std::path::Component::Normal(_)))
-        {
-            return Err(crate::release::refusal(
-                "control.unsafe-native-core-archive-path",
-                json!({}),
-            ));
-        }
-        let name = relative
-            .to_str()
-            .context("native Core archive path encoding")?;
-        if name.len() > 240
-            || !name
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"._+@/-".contains(&c))
-        {
-            return Err(crate::release::refusal(
-                "control.unsafe-native-core-archive-path",
-                json!({}),
-            ));
+            return Err(authenticity("archive-size"));
         }
         let kind = entry.header().entry_type();
+        let raw = entry.path_bytes().into_owned();
+        let raw = std::str::from_utf8(&raw).map_err(|_| authenticity("archive-path"))?;
+        let normalized = if kind.is_dir() {
+            raw.strip_suffix('/').unwrap_or(raw)
+        } else {
+            raw
+        };
+        let mut parts = normalized.split('/');
+        if parts.next() != Some("sidevoice-core-rust")
+            || normalized.len() > 260
+            || normalized
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+            || !normalized
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._+@/-".contains(&b))
+        {
+            return Err(authenticity("archive-path"));
+        }
+        if !paths_seen.insert(normalized.to_string()) {
+            return Err(authenticity("archive-path"));
+        }
+        let name = normalized
+            .strip_prefix("sidevoice-core-rust/")
+            .unwrap_or("");
+        let relative = Path::new(name);
         if name.is_empty() {
             if !kind.is_dir() {
-                return Err(crate::release::refusal(
-                    "control.archive-root-is-not-a-directory",
-                    json!({}),
-                ));
+                return Err(authenticity("archive-type"));
             }
+            dirs_seen.insert(normalized.to_string());
             continue;
         }
         if name != "native-core.json"
@@ -403,57 +398,45 @@ pub fn unpack_core(archive: &[u8], manifest: &Value, target: &str, root: &Path) 
                 Some("bin" | "lib" | "models" | "checks" | "notices")
             )
         {
-            return Err(crate::release::refusal(
-                "control.native-core-archive-unexpected-root",
-                json!({}),
-            ));
+            return Err(authenticity("archive-path"));
         }
         let file = root.join(relative);
         if kind.is_dir() {
+            dirs_seen.insert(normalized.to_string());
             private_directory(&file)?;
             continue;
         }
         if !kind.is_file() {
-            return Err(crate::release::refusal(
-                "control.native-core-archive-links-or-special-files-are-forbidden",
-                json!({}),
-            ));
+            return Err(authenticity("archive-type"));
         }
         let size = entry.size();
-        total = total.checked_add(size).context("archive size overflow")?;
+        total = total
+            .checked_add(size)
+            .ok_or_else(|| authenticity("archive-size"))?;
         if size > 500_000_000 || total > 1_000_000_000 {
-            return Err(crate::release::refusal(
-                "control.native-core-archive-size-limit",
-                json!({}),
-            ));
+            return Err(authenticity("archive-size"));
         }
         if name == "native-core.json" {
             if inventory.is_some() || size > 4_000_000 {
-                return Err(crate::release::refusal(
-                    "control.native-core-inventory-limit",
-                    json!({}),
-                ));
+                return Err(authenticity("archive-size"));
             }
             let mut bytes = Vec::new();
-            entry.read_to_end(&mut bytes)?;
-            let value: Value = serde_json::from_slice(&bytes)?;
+            entry
+                .read_to_end(&mut bytes)
+                .map_err(|_| authenticity("archive-size"))?;
+            let value: Value =
+                serde_json::from_slice(&bytes).map_err(|_| authenticity("manifest"))?;
             let mut canonical = serde_json::to_vec(&value)?;
             canonical.push(b'\n');
             if canonical != bytes {
-                return Err(crate::release::refusal(
-                    "control.native-core-inventory-is-not-canonical",
-                    json!({}),
-                ));
+                return Err(authenticity("manifest"));
             }
             write(&file, &bytes, 0o600)?;
             inventory = Some(value);
             continue;
         }
         if seen.contains_key(name) {
-            return Err(crate::release::refusal(
-                "control.duplicate-native-core-archive-file",
-                json!({}),
-            ));
+            return Err(authenticity("archive-path"));
         }
         private_directory(file.parent().context("archive parent")?)?;
         let executable = name.starts_with("bin/");
@@ -467,7 +450,9 @@ pub fn unpack_core(archive: &[u8], manifest: &Value, target: &str, root: &Path) 
         let mut bytes = [0u8; 65536];
         let mut copied = 0u64;
         loop {
-            let n = entry.read(&mut bytes)?;
+            let n = entry
+                .read(&mut bytes)
+                .map_err(|_| authenticity("archive-size"))?;
             if n == 0 {
                 break;
             }
@@ -477,54 +462,60 @@ pub fn unpack_core(archive: &[u8], manifest: &Value, target: &str, root: &Path) 
         }
         out.sync_all()?;
         if copied != size {
-            return Err(crate::release::refusal(
-                "control.native-core-truncated-archive-file",
-                json!({}),
-            ));
+            return Err(authenticity("archive-size"));
         }
         seen.insert(name.to_string(), (size, hex::encode(h.finalize())));
     }
-    let inventory = inventory.context("native Core inventory missing")?;
-    if inventory["schema"] != 1
+    let inventory = inventory.ok_or_else(|| authenticity("archive-inventory"))?;
+    if !exact_keys(
+        &inventory,
+        &[
+            "schema",
+            "kind",
+            "target",
+            "source_sha",
+            "entrypoint",
+            "files",
+        ],
+    ) || inventory["schema"] != 1
         || inventory["kind"] != "rust-native-v1"
         || inventory["target"] != target
         || inventory["source_sha"] != manifest["source_sha"]
         || inventory["entrypoint"] != "bin/sidevoice-core-rust"
     {
-        return Err(crate::release::refusal(
-            "control.native-core-inventory-identity-mismatch",
-            json!({}),
-        ));
+        return Err(authenticity("archive-inventory"));
     }
     let files = inventory["files"]
         .as_array()
-        .context("native Core inventory files")?;
+        .ok_or_else(|| authenticity("archive-inventory"))?;
     if files.len() != seen.len() {
-        return Err(crate::release::refusal(
-            "control.native-core-inventory-differs-from-archive",
-            json!({}),
-        ));
+        return Err(authenticity("archive-inventory"));
     }
+    let mut expected_dirs = std::collections::BTreeSet::from(["sidevoice-core-rust".to_string()]);
     let mut previous = "";
     for file in files {
+        if !exact_keys(file, &["name", "size", "sha256"]) {
+            return Err(authenticity("archive-inventory"));
+        }
         let name = file["name"]
             .as_str()
-            .context("native Core inventory file name")?;
+            .ok_or_else(|| authenticity("archive-inventory"))?;
         if name <= previous {
-            return Err(crate::release::refusal(
-                "control.native-core-inventory-files-not-unique-and-sorted",
-                json!({}),
-            ));
+            return Err(authenticity("archive-inventory"));
         }
         previous = name;
+        let components: Vec<_> = name.split('/').collect();
+        for end in 1..components.len() {
+            expected_dirs.insert(format!(
+                "sidevoice-core-rust/{}",
+                components[..end].join("/")
+            ));
+        }
         let (size, sha) = seen
             .get(name)
-            .context("native Core inventory omitted file")?;
+            .ok_or_else(|| authenticity("archive-inventory"))?;
         if file["size"].as_u64() != Some(*size) || file["sha256"].as_str() != Some(sha) {
-            return Err(crate::release::refusal(
-                "control.native-core-inventory-digest-mismatch",
-                json!({}),
-            ));
+            return Err(authenticity("archive-inventory"));
         }
     }
     for required in [
@@ -535,17 +526,14 @@ pub fn unpack_core(archive: &[u8], manifest: &Value, target: &str, root: &Path) 
         "models/smart_turn_weights.bin.gz",
     ] {
         if !seen.contains_key(required) {
-            return Err(crate::release::refusal(
-                "control.native-core-required-file-missing",
-                json!({}),
-            ));
+            return Err(authenticity("archive-inventory"));
         }
     }
     if !seen.keys().any(|k| k.starts_with("notices/")) {
-        return Err(crate::release::refusal(
-            "control.native-core-notices-missing",
-            json!({}),
-        ));
+        return Err(authenticity("archive-inventory"));
+    }
+    if dirs_seen != expected_dirs {
+        return Err(authenticity("archive-inventory"));
     }
     sync_tree(root)?;
     Ok(())
@@ -581,63 +569,6 @@ impl std::fmt::Display for ControlError {
 impl std::error::Error for ControlError {}
 pub fn refusal(key: &'static str, params: Value) -> anyhow::Error {
     ControlError { key, params }.into()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn nightly_order_precedes_runtime_and_format_changes() {
-        let current = json!({"connector":"1.2.3","channel":"nightly","build_seq":20,"format":"sea","pair_id":"old"});
-        let next = json!({"connector":"1.2.3","channel":"nightly","build_seq":19,"format":"rust-native","pair_id":"new"});
-        assert_eq!(decide(Some(&current), &next), "noop");
-        let mut next = next;
-        next["build_seq"] = json!(20);
-        assert_eq!(decide(Some(&current), &next), "upgrade");
-    }
-    #[test]
-    fn pointers_commit_atomically_and_reject_escaping_targets() {
-        let root =
-            std::env::temp_dir().join(format!("sidevoice-release-test-{}", uuid::Uuid::new_v4()));
-        private_directory(&root).unwrap();
-        let p = Paths {
-            home: root.clone(),
-            data: root.join("data"),
-            root: root.join("sidevoice"),
-            config: root.join("config"),
-        };
-        p.prepare().unwrap();
-        for id in ["before", "after"] {
-            private_directory(&p.root.join("releases").join(id)).unwrap();
-            write_json(
-                &p.root.join("releases").join(id).join("release.json"),
-                &json!({"id":id}),
-            )
-            .unwrap();
-        }
-        p.point("current", "before").unwrap();
-        p.point("verified", "before").unwrap();
-        p.point("previous", "before").unwrap();
-        p.point("current", "after").unwrap();
-        assert_eq!(p.selected("current").unwrap().unwrap()["id"], "after");
-        assert_eq!(p.selected("verified").unwrap().unwrap()["id"], "before");
-        assert!(p.point("current", "../outside").is_err());
-        fs::remove_file(p.root.join("current")).unwrap();
-        symlink("../outside", p.root.join("current")).unwrap();
-        assert!(p.selected("current").is_err());
-        fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn private_directory_does_not_follow_user_symlinks() {
-        let root =
-            std::env::temp_dir().join(format!("sidevoice-dir-test-{}", uuid::Uuid::new_v4()));
-        private_directory(&root).unwrap();
-        private_directory(&root.join("real")).unwrap();
-        symlink(root.join("real"), root.join("linked")).unwrap();
-        assert!(private_directory(&root.join("linked/child")).is_err());
-        assert!(!root.join("real/child").exists());
-        fs::remove_dir_all(root).unwrap();
-    }
 }
 
 /// Remove interrupted staging only while the caller holds install.lock.
@@ -695,5 +626,255 @@ pub fn prune(p: &Paths) -> Result<()> {
             fs::remove_dir_all(entry.path())?;
         }
     }
+    cleanup_legacy_runtimes(p, false)?;
     Ok(())
+}
+
+pub fn authenticity(check: &'static str) -> anyhow::Error {
+    refusal("install.authenticity", json!({"check":check}))
+}
+pub fn exact_keys(value: &Value, keys: &[&str]) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == keys.len() && keys.iter().all(|key| object.contains_key(*key))
+    })
+}
+
+/// Legacy runtimes carry an installer-written identity marker. Unmarked siblings are not ours to reclaim.
+fn owned_legacy_runtimes(p: &Paths) -> Result<Vec<(String, PathBuf)>> {
+    let root = p.data.join("core-runtime");
+    match fs::symlink_metadata(&root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    crate::proof::private_dir(&root)?;
+    let mut owned = Vec::new();
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !valid_id(&name) || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if crate::proof::private_dir(&entry.path()).is_err() {
+            continue;
+        }
+        let marker = |name: &str| -> Option<Value> {
+            read_json(&entry.path().join(name))
+                .ok()
+                .filter(|value| !value.is_null())
+        };
+        let wheel = marker("installed.json").is_some_and(|record| {
+            record["id"].as_str() == Some(name.as_str())
+                && record["version"].as_str().is_some_and(|v| !v.is_empty())
+                && record["spec"].as_str().is_some_and(|v| !v.is_empty())
+        });
+        let bundle = marker(".sidevoice-runtime.json").is_some_and(|record| {
+            record["kind"] == "bundle"
+                && record["id"].as_str() == Some(name.as_str())
+                && record["core"].as_str().is_some_and(|v| !v.is_empty())
+                && record["sha256"]
+                    .as_str()
+                    .is_some_and(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+        });
+        if wheel || bundle {
+            owned.push((name, entry.path()));
+        }
+    }
+    Ok(owned)
+}
+pub fn cleanup_legacy_runtimes(p: &Paths, uninstall: bool) -> Result<()> {
+    let mut kept = std::collections::BTreeSet::new();
+    if !uninstall {
+        for name in ["current", "previous", "verified"] {
+            if let Some(record) = p.selected(name)? {
+                if let Some(runtime) = record["core_build"].as_str() {
+                    kept.insert(runtime.to_owned());
+                }
+            }
+        }
+    }
+    for (id, path) in owned_legacy_runtimes(p)? {
+        if kept.contains(&id) {
+            continue;
+        }
+        // remove_dir_all unlinks Python/venv symlinks themselves; it never follows their external targets.
+        fs::remove_dir_all(path)?;
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn nightly_order_precedes_runtime_and_format_changes() {
+        let current = json!({"connector":"1.2.3","channel":"nightly","build_seq":20,"format":"sea","pair_id":"old"});
+        let next = json!({"connector":"1.2.3","channel":"nightly","build_seq":19,"format":"rust-native","pair_id":"new"});
+        assert_eq!(decide(Some(&current), &next), "noop");
+        let mut next = next;
+        next["build_seq"] = json!(20);
+        assert_eq!(decide(Some(&current), &next), "upgrade");
+    }
+    #[test]
+    fn pointers_commit_atomically_and_reject_escaping_targets() {
+        let root =
+            std::env::temp_dir().join(format!("sidevoice-release-test-{}", uuid::Uuid::new_v4()));
+        private_directory(&root).unwrap();
+        let p = Paths {
+            home: root.clone(),
+            data: root.join("data"),
+            root: root.join("sidevoice"),
+            config: root.join("config"),
+        };
+        p.prepare().unwrap();
+        for id in ["before", "after"] {
+            private_directory(&p.root.join("releases").join(id)).unwrap();
+            write_json(
+                &p.root.join("releases").join(id).join("release.json"),
+                &json!({"id":id}),
+            )
+            .unwrap();
+        }
+        p.point("current", "before").unwrap();
+        p.point("verified", "before").unwrap();
+        p.point("previous", "before").unwrap();
+        p.point("current", "after").unwrap();
+        assert_eq!(p.selected("current").unwrap().unwrap()["id"], "after");
+        assert_eq!(p.selected("verified").unwrap().unwrap()["id"], "before");
+        assert!(p.point("current", "../outside").is_err());
+        fs::remove_file(p.root.join("current")).unwrap();
+        symlink("../outside", p.root.join("current")).unwrap();
+        assert!(p.selected("current").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn private_directory_does_not_follow_user_symlinks() {
+        let root =
+            std::env::temp_dir().join(format!("sidevoice-dir-test-{}", uuid::Uuid::new_v4()));
+        private_directory(&root).unwrap();
+        private_directory(&root.join("real")).unwrap();
+        symlink(root.join("real"), root.join("linked")).unwrap();
+        assert!(private_directory(&root.join("linked/child")).is_err());
+        assert!(!root.join("real/child").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_runtime_cleanup_keeps_selected_and_foreign_state() {
+        let root =
+            std::env::temp_dir().join(format!("sidevoice-runtime-test-{}", uuid::Uuid::new_v4()));
+        let p = Paths {
+            home: root.join("home"),
+            data: root.join("data"),
+            root: root.join("sidevoice"),
+            config: root.join("config"),
+        };
+        p.prepare().unwrap();
+        for id in ["owned-old", "owned-kept", "foreign", "mismatched"] {
+            private_directory(&p.data.join("core-runtime").join(id)).unwrap();
+        }
+        for id in ["owned-old", "owned-kept"] {
+            write_json(
+                &p.data.join("core-runtime").join(id).join("installed.json"),
+                &json!({"id":id,"version":"0.1.0","spec":"/trusted/core.whl"}),
+            )
+            .unwrap();
+        }
+        write_json(
+            &p.data.join("core-runtime/mismatched/installed.json"),
+            &json!({"id":"someone-else","version":"0.1.0","spec":"external"}),
+        )
+        .unwrap();
+        private_directory(&root.join("outside")).unwrap();
+        fs::write(root.join("outside/personal.txt"), "keep").unwrap();
+        symlink(
+            root.join("outside"),
+            p.data.join("core-runtime/owned-old/python"),
+        )
+        .unwrap();
+        symlink(
+            root.join("outside"),
+            p.data.join("core-runtime/foreign-link"),
+        )
+        .unwrap();
+        private_directory(&p.root.join("releases/legacy")).unwrap();
+        write_json(
+            &p.root.join("releases/legacy/release.json"),
+            &json!({"id":"legacy","core_build":"owned-kept"}),
+        )
+        .unwrap();
+        p.point("previous", "legacy").unwrap();
+        cleanup_legacy_runtimes(&p, false).unwrap();
+        assert!(!p.data.join("core-runtime/owned-old").exists());
+        assert!(p.data.join("core-runtime/owned-kept").exists());
+        assert!(root.join("outside/personal.txt").exists());
+        cleanup_legacy_runtimes(&p, true).unwrap();
+        assert!(!p.data.join("core-runtime/owned-kept").exists());
+        for name in ["foreign", "mismatched", "foreign-link"] {
+            assert!(p.data.join("core-runtime").join(name).exists());
+        }
+        assert!(root.join("outside/personal.txt").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    fn archive_entry(name: &str, kind: tar::EntryType, bytes: &[u8]) -> Vec<u8> {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o600);
+        header.set_entry_type(kind);
+        // Set raw names so a traversal fixture reaches our extractor, rather than the builder refusing it first.
+        let field = &mut header.as_mut_bytes()[..100];
+        field.fill(0);
+        field[..name.len()].copy_from_slice(name.as_bytes());
+        header.set_cksum();
+        let mut builder = tar::Builder::new(Vec::new());
+        builder.append(&header, bytes).unwrap();
+        let tar = builder.into_inner().unwrap();
+        zstd::stream::encode_all(tar.as_slice(), 0).unwrap()
+    }
+    #[test]
+    fn malformed_archives_report_stable_authenticity_checks() {
+        let root =
+            std::env::temp_dir().join(format!("sidevoice-archive-test-{}", uuid::Uuid::new_v4()));
+        private_directory(&root).unwrap();
+        let cases = [
+            (
+                "archive-type",
+                archive_entry("sidevoice-core-rust/bin/evil", tar::EntryType::Symlink, b""),
+            ),
+            (
+                "archive-path",
+                archive_entry(
+                    "sidevoice-core-rust/bin/../evil",
+                    tar::EntryType::Regular,
+                    b"",
+                ),
+            ),
+            (
+                "archive-inventory",
+                archive_entry("sidevoice-core-rust", tar::EntryType::Directory, b""),
+            ),
+        ];
+        for (index, (check, archive)) in cases.into_iter().enumerate() {
+            let manifest =
+                json!({"bundles":{"test":{"size":archive.len(),"sha256":digest(&archive)}}});
+            let error = unpack_core(&archive, &manifest, "test", &root.join(index.to_string()))
+                .unwrap_err();
+            let error = error.downcast_ref::<ControlError>().unwrap();
+            assert_eq!(error.key, "install.authenticity");
+            assert_eq!(error.params["check"], check);
+        }
+        let archive = b"not-the-expected-bytes";
+        let error = unpack_core(
+            archive,
+            &json!({"bundles":{"test":{"size":archive.len(),"sha256":"0".repeat(64)}}}),
+            "test",
+            &root.join("digest"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<ControlError>().unwrap().params["check"],
+            "sha256"
+        );
+        assert!(!root.join("digest").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 }

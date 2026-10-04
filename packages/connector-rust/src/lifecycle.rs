@@ -3,7 +3,7 @@ use crate::{
     installed_service as service,
     release::{self, Paths},
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -57,35 +57,61 @@ fn kind(v: &Value) -> &str {
     v["runtime_kind"].as_str().unwrap_or("javascript")
 }
 fn manifest(payload: &Payload<'_>) -> Result<Value> {
-    let manifest: Value = serde_json::from_slice(payload.manifest)?;
-    let mut canonical = serde_json::to_vec(&manifest)?;
-    canonical.push(b'\n');
-    if canonical != payload.manifest
-        || manifest["schema"] != 1
-        || manifest["kind"] != "rust-native-v1"
-        || manifest["entrypoint"] != "bin/sidevoice-core-rust"
-    {
-        return Err(crate::release::refusal(
-            "control.native-core-manifest-identity-mismatch",
-            json!({}),
-        ));
-    }
-    for (key, len) in [("source_sha", 40), ("cargo_lock_sha256", 64)] {
-        let s = manifest[key]
-            .as_str()
-            .context("native Core source identity")?;
-        if s.len() != len
-            || !s
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    let parse = || -> Result<Value> {
+        let manifest: Value = serde_json::from_slice(payload.manifest)?;
+        let mut canonical = serde_json::to_vec(&manifest)?;
+        canonical.push(b'\n');
+        if canonical != payload.manifest
+            || !release::exact_keys(
+                &manifest,
+                &[
+                    "schema",
+                    "kind",
+                    "source_sha",
+                    "cargo_lock_sha256",
+                    "entrypoint",
+                    "bundles",
+                ],
+            )
+            || manifest["schema"] != 1
+            || manifest["kind"] != "rust-native-v1"
+            || manifest["entrypoint"] != "bin/sidevoice-core-rust"
         {
-            return Err(crate::release::refusal(
-                "control.native-core-source-identity-invalid",
-                json!({}),
-            ));
+            return Err(release::authenticity("manifest"));
         }
-    }
-    Ok(manifest)
+        let hex = |value: &Value, length: usize| {
+            value.as_str().is_some_and(|s| {
+                s.len() == length
+                    && s.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        };
+        if !hex(&manifest["source_sha"], 40) || !hex(&manifest["cargo_lock_sha256"], 64) {
+            return Err(release::authenticity("manifest"));
+        }
+        let targets = ["macos-aarch64", "linux-x86_64", "linux-aarch64"];
+        if !release::exact_keys(&manifest["bundles"], &targets) {
+            return Err(release::authenticity("manifest"));
+        }
+        for target in targets {
+            let bundle = &manifest["bundles"][target];
+            let expected = format!(
+                "sidevoice-core-rust-{}-{target}.tar.zst",
+                manifest["source_sha"].as_str().unwrap()
+            );
+            if !release::exact_keys(bundle, &["name", "size", "sha256"])
+                || bundle["name"] != expected
+                || !bundle["size"]
+                    .as_u64()
+                    .is_some_and(|n| n > 0 && n <= 250_000_000)
+                || !hex(&bundle["sha256"], 64)
+            {
+                return Err(release::authenticity("manifest"));
+            }
+        }
+        Ok(manifest)
+    };
+    parse().map_err(|_| release::authenticity("manifest"))
 }
 fn candidate(payload: &Payload<'_>, manifest: &Value) -> Result<Value> {
     let executable = std::env::current_exe()?;
@@ -228,6 +254,7 @@ struct Gate {
     paths: Paths,
     previous_stop: Value,
     previous_switch: Value,
+    previous_id: Option<String>,
     token: String,
     committed: bool,
 }
@@ -236,9 +263,12 @@ impl Gate {
         let old_stop = release::read_json(&p.data.join("node-stopped.json"))?;
         let old_switch = release::read_json(&p.data.join("runtime-switch.json"))?;
         let token = uuid::Uuid::new_v4().to_string();
+        let previous_id = p
+            .selected("current")?
+            .and_then(|value| value["id"].as_str().map(str::to_owned));
         release::write_json(
             &p.data.join("runtime-switch.json"),
-            &json!({"phase":"active","token":token,"pid":std::process::id(),"start":null,"to":next["id"],"runtimeKind":kind(next),"previousSwitch":if old_switch.is_null(){Value::Null}else{json!(old_switch.to_string())},"previousStop":if old_stop.is_null(){Value::Null}else{json!(old_stop.to_string())}}),
+            &json!({"phase":"active","token":token,"pid":std::process::id(),"start":null,"from":previous_id,"to":next["id"],"runtimeKind":kind(next),"previousSwitch":if old_switch.is_null(){Value::Null}else{json!(old_switch.to_string())},"previousStop":if old_stop.is_null(){Value::Null}else{json!(old_stop.to_string())}}),
         )?;
         release::write_json(
             &p.data.join("node-stopped.json"),
@@ -248,6 +278,7 @@ impl Gate {
             paths: p.clone(),
             previous_stop: old_stop,
             previous_switch: old_switch,
+            previous_id,
             token,
             committed: false,
         })
@@ -272,6 +303,13 @@ impl Drop for Gate {
         if self.committed {
             return;
         }
+        // A pointer already committed must retain its barrier for recovery, never restore the old gate.
+        match self.paths.selected("current") {
+            Ok(value)
+                if value.and_then(|value| value["id"].as_str().map(str::to_owned))
+                    == self.previous_id => {}
+            _ => return,
+        }
         for (name, value) in [
             ("runtime-switch.json", &self.previous_switch),
             ("node-stopped.json", &self.previous_stop),
@@ -290,7 +328,10 @@ fn recover_gate(p: &Paths) -> Result<()> {
         return Ok(());
     }
     let current = p.selected("current")?.unwrap_or(Value::Null);
-    if v["to"] == current["id"] && !current.is_null() {
+    if v["to"] == current["id"]
+        && !current.is_null()
+        && (v.get("from").is_none() || v["from"] != v["to"])
+    {
         if kind(&current) == "javascript" {
             release::remove_file(&p.data.join("runtime-switch.json"))?;
             release::remove_file(&p.data.join("node-stopped.json"))?;
@@ -357,33 +398,120 @@ async fn start_selection(p: &Paths, managed: bool) -> Result<()> {
     }
     Ok(())
 }
-async fn verify(p: &Paths, selected: &Value, previous_launch: Option<&str>) -> Result<()> {
+fn native_identity_matches(selected: &Value, identity: &Value, managed: bool) -> bool {
+    identity["release_id"] == selected["id"]
+        && identity["runtime_kind"] == selected["runtime_kind"]
+        && identity["version"] == selected["connector"]
+        && identity["runtime_sha256"] == selected["runtime_sha256"]
+        && identity["runtime_build_sha"] == selected["runtime_build_sha"]
+        && identity["runtime_target"] == selected["runtime_target"]
+        && identity["managed"].as_bool() == Some(managed)
+}
+async fn selection_running(
+    p: &Paths,
+    selected: &Value,
+    managed: bool,
+    previous_launch: Option<&str>,
+) -> Result<bool> {
+    let Some(health) = service::health(p).await? else {
+        return Ok(false);
+    };
+    if health["version"] != selected["core"]
+        || health["api"] != 1
+        || previous_launch.is_some_and(|id| health["launch_id"].as_str() == Some(id))
+    {
+        return Ok(false);
+    }
+    let connector_pid = if kind(selected) == "rust-native-v1" {
+        let Some(identity) = service::ipc(p, "identity", json!({})).await? else {
+            return Ok(false);
+        };
+        let expected = p.root.join("current/dist/sidevoice-rust").canonicalize()?;
+        if !native_identity_matches(selected, &identity, managed)
+            || identity["executable"].as_str() != expected.to_str()
+        {
+            return Ok(false);
+        }
+        identity["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+    } else {
+        if !service::ipc(p, "status", json!({}))
+            .await?
+            .is_some_and(|v| v["version"] == selected["connector"])
+        {
+            return Ok(false);
+        }
+        release::read_json(&p.data.join("connector.lock"))?["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+    };
+    if managed {
+        service::managed_owners(
+            p,
+            health["pid"]
+                .as_u64()
+                .and_then(|pid| u32::try_from(pid).ok()),
+            connector_pid,
+        )
+        .await
+    } else {
+        Ok(true)
+    }
+}
+async fn verify(
+    p: &Paths,
+    selected: &Value,
+    managed: bool,
+    previous_launch: Option<&str>,
+) -> Result<()> {
     let end = Instant::now() + Duration::from_secs(60);
     while Instant::now() < end {
-        if let Some(h) = service::health(p).await? {
-            let same_launch =
-                previous_launch.is_some() && h["launch_id"].as_str() == previous_launch;
-            if h["version"] == selected["core"] && !same_launch {
-                let connector = service::ipc(p, "identity", json!({})).await?;
-                let correct = if kind(selected) == "rust-native-v1" {
-                    connector.is_some_and(|i| {
-                        i["release_id"] == selected["id"]
-                            && i["runtime_sha256"] == selected["runtime_sha256"]
-                            && i["runtime_build_sha"] == selected["runtime_build_sha"]
-                    })
-                } else {
-                    service::ipc(p, "status", json!({}))
-                        .await?
-                        .is_some_and(|v| v["version"] == selected["connector"])
-                };
-                if correct {
-                    return Ok(());
-                }
-            }
+        if selection_running(p, selected, managed, previous_launch).await? {
+            return Ok(());
         }
         sleep(Duration::from_millis(200)).await;
     }
-    bail!("{}", crate::agents::message("install.verify", &json!({})))
+    Err(release::refusal("install.verify", json!({})))
+}
+fn needs_handoff(
+    action: &str,
+    verified: Option<&Value>,
+    chosen: &Value,
+    mode_change: bool,
+    running: bool,
+) -> bool {
+    action != "noop" || verified.is_none_or(|v| v["id"] != chosen["id"]) || mode_change || !running
+}
+async fn reconcile() -> Result<Value> {
+    let result = crate::agents::reconcile_owned(crate::proof::Profile::for_control_env()?).await?;
+    require_reconciled(&result)?;
+    Ok(result)
+}
+fn require_reconciled(result: &Value) -> Result<()> {
+    if result["ok"] != true {
+        return Err(release::refusal(
+            "agents.reconciliation-failed",
+            json!({"failures":result["failures"],"next":result["next"]}),
+        ));
+    }
+    Ok(())
+}
+async fn resume_unchanged(
+    p: &Paths,
+    current: &Value,
+    managed: bool,
+    was_running: bool,
+    was_stopped: bool,
+) -> Result<()> {
+    if was_running
+        && !was_stopped
+        && p.selected("current")?
+            .is_some_and(|selected| selected["id"] == current["id"])
+    {
+        start_selection(p, managed).await?;
+    }
+    Ok(())
 }
 async fn go_back(p: &Paths, managed: bool, show: bool, explicit: bool) -> Result<Option<Value>> {
     let current = p.selected("current")?.unwrap_or(Value::Null);
@@ -392,26 +520,45 @@ async fn go_back(p: &Paths, managed: bool, show: bool, explicit: bool) -> Result
         .flatten()
         .find(|v| v["id"] != current["id"]);
     let Some(back) = back else { return Ok(None) };
-    progress(show, "rollback");
-    let mut gate = Gate::begin(p, &back)?;
-    quiesce(p).await?;
-    if kind(&current) != kind(&back) {
-        if explicit {
-            empty_outbox(p)?;
-        } else if empty_outbox(p).is_err() {
-            fs::rename(
-                p.data.join("outbox.json"),
-                p.data
-                    .join(format!("outbox.{}.quarantine.json", uuid::Uuid::new_v4())),
-            )?;
-        }
+    let cross_runtime = kind(&current) != kind(&back);
+    if cross_runtime && explicit {
+        empty_outbox(p)?;
     }
-    p.point("current", id(&back)?)?;
-    gate.commit(&back)?;
+    let was_stopped = service::stopped(p)?;
+    let was_running = managed || service::runtime_present(p).await?;
+    progress(show, "rollback");
+    let old_launch = service::health(p)
+        .await?
+        .and_then(|h| h["launch_id"].as_str().map(str::to_owned));
+    let mut gate = Gate::begin(p, &back)?;
+    let switching = async {
+        quiesce(p).await?;
+        if cross_runtime {
+            if explicit {
+                empty_outbox(p)?;
+            } else if empty_outbox(p).is_err() {
+                fs::rename(
+                    p.data.join("outbox.json"),
+                    p.data
+                        .join(format!("outbox.{}.quarantine.json", uuid::Uuid::new_v4())),
+                )?;
+            }
+        }
+        p.point("current", id(&back)?)?;
+        gate.commit(&back)?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = switching {
+        drop(gate);
+        resume_unchanged(p, &current, managed, was_running, was_stopped).await?;
+        return Err(error);
+    }
     start_selection(p, managed).await?;
-    verify(p, &back, None).await?;
+    verify(p, &back, managed, old_launch.as_deref()).await?;
     p.point("verified", id(&back)?)?;
-    crate::agents::reconcile_owned(crate::proof::Profile::for_control_env()?).await?;
+    reconcile().await?;
+
     Ok(Some(back))
 }
 pub async fn install(
@@ -437,7 +584,9 @@ pub async fn install(
     } else {
         next
     };
-    let managed = options.service || service::defined(&p)?;
+    let managed_before = service::defined(&p)?;
+    let managed = options.service || managed_before;
+    let mode_change = managed && !managed_before;
     let _candidate_cleanup = CandidateCleanup {
         paths: p.clone(),
         candidate: if action != "noop" {
@@ -459,31 +608,34 @@ pub async fn install(
             options.progress,
         )
         .await?;
-        if current.is_some() && !options.apply_now {
-            loop {
-                cancelled(&cancellation)?;
-                if service::health(&p)
-                    .await?
-                    .and_then(|h| h["calls"].as_u64())
-                    .unwrap_or(0)
-                    == 0
-                {
-                    break;
-                }
-                progress(options.progress, "wait-calls");
-                sleep(Duration::from_secs(2)).await;
-            }
-        }
     }
     cancelled(&cancellation)?;
     let old_launch = service::health(&p)
         .await?
         .and_then(|h| h["launch_id"].as_str().map(str::to_owned));
     let verified = p.selected("verified")?;
-    let needs_restart = action != "noop"
-        || verified.as_ref().map(|v| v["id"].clone()) != Some(chosen["id"].clone());
+    let running = action == "noop"
+        && !service::stopped(&p)?
+        && selection_running(&p, &chosen, managed_before, None).await?;
+    let needs_restart = needs_handoff(action, verified.as_ref(), &chosen, mode_change, running);
+    if needs_restart && current.is_some() && !options.apply_now {
+        loop {
+            cancelled(&cancellation)?;
+            if service::health(&p)
+                .await?
+                .and_then(|h| h["calls"].as_u64())
+                .unwrap_or(0)
+                == 0
+            {
+                break;
+            }
+            progress(options.progress, "wait-calls");
+            sleep(Duration::from_secs(2)).await;
+        }
+    }
     if needs_restart {
         let was_stopped = service::stopped(&p)?;
+        let was_running = managed_before || service::runtime_present(&p).await?;
         let mut gate = Gate::begin(&p, &chosen)?;
         let switching = async {
             quiesce(&p).await?;
@@ -492,34 +644,40 @@ pub async fn install(
             }
             cancelled(&cancellation)?;
             progress(options.progress, "commit");
-            if let Some(v) = verified {
-                p.point("previous", id(&v)?)?;
+            if current
+                .as_ref()
+                .is_none_or(|value| value["id"] != chosen["id"])
+            {
+                if let Some(v) = verified {
+                    p.point("previous", id(&v)?)?;
+                }
+                p.point("current", id(&chosen)?)?;
             }
-            p.point("current", id(&chosen)?)?;
             gate.commit(&chosen)?;
             Ok::<_, anyhow::Error>(())
         }
         .await;
         if let Err(error) = switching {
             drop(gate);
-            if !was_stopped
-                && current.is_some()
-                && p.selected("current")?.as_ref().map(|v| v["id"].clone())
-                    == current.as_ref().map(|v| v["id"].clone())
-            {
-                start_selection(&p, managed).await?;
+            if let Some(current) = &current {
+                resume_unchanged(&p, current, managed_before, was_running, was_stopped).await?;
             }
             return Err(error);
         }
     }
     service::restore_gate(&p)?;
-    progress(options.progress, "service-start");
-    let started = start_selection(&p, managed).await;
+    let started = if needs_restart {
+        progress(options.progress, "service-start");
+        start_selection(&p, managed).await
+    } else {
+        Ok(())
+    };
     let verification = match started {
         Ok(()) => {
             verify(
                 &p,
                 &chosen,
+                managed,
                 if needs_restart {
                     old_launch.as_deref()
                 } else {
@@ -537,8 +695,8 @@ pub async fn install(
         );
     }
     p.point("verified", id(&chosen)?)?;
-    crate::agents::reconcile_owned(crate::proof::Profile::for_control_env()?).await?;
-    let registrations = if options.no_agents {
+    reconcile().await?;
+    let mut registrations = if options.no_agents {
         json!({})
     } else {
         crate::agents::register_requested(
@@ -547,6 +705,15 @@ pub async fn install(
         )
         .await?
     };
+    if !options.no_agents
+        && (options.harnesses.iter().any(|id| id == "claude")
+            || registrations["requested"]
+                .as_array()
+                .is_some_and(|ids| ids.iter().any(|id| id == "claude")))
+    {
+        let skill = crate::skill::cleanup_owned(&crate::proof::Profile::for_control_env()?)?;
+        merge_notices(&mut registrations, &skill);
+    }
     release::prune(&p)?;
     progress(options.progress, "pairing");
     let paired = release::read_json(&p.data.join("credentials.json"))?;
@@ -579,11 +746,13 @@ pub async fn uninstall() -> Result<Value> {
     )?;
     service::unload(&p, true).await?;
     service::stop_on_demand(&p).await?;
-    let registrations =
+    let mut registrations =
         crate::agents::cleanup_owned(crate::proof::Profile::for_control_env()?).await?;
     if registrations.get("error").is_some() {
         return Err(release::refusal("install.failed", json!({})));
     }
+    let skill = crate::skill::cleanup_owned(&crate::proof::Profile::for_control_env()?)?;
+    merge_notices(&mut registrations, &skill);
     for core in [true, false] {
         release::remove_file(&service::definition(&p, core)?)?;
     }
@@ -614,6 +783,7 @@ pub async fn uninstall() -> Result<Value> {
             release::remove_file(&path)?;
         }
     }
+    release::cleanup_legacy_runtimes(&p, true)?;
     if p.root.join("releases").exists() {
         for entry in fs::read_dir(p.root.join("releases"))? {
             let entry = entry?;
@@ -698,6 +868,19 @@ fn clean_core_state(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn merge_notices(target: &mut Value, source: &Value) {
+    for key in ["done", "next"] {
+        if let Some(values) = source[key].as_array() {
+            if !target[key].is_array() {
+                target[key] = json!([]);
+            }
+            target[key]
+                .as_array_mut()
+                .unwrap()
+                .extend(values.iter().cloned());
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,5 +957,127 @@ mod tests {
         assert!(!p.root.join("releases/new").exists());
         assert!(p.root.join("releases/old").exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn healthy_noop_is_verify_only_but_mode_conversion_requires_handoff() {
+        let current = json!({"id":"verified"});
+        assert!(!needs_handoff(
+            "noop",
+            Some(&current),
+            &current,
+            false,
+            true
+        ));
+        assert!(needs_handoff("noop", Some(&current), &current, true, true));
+        assert!(needs_handoff(
+            "noop",
+            Some(&current),
+            &current,
+            false,
+            false
+        ));
+        assert!(needs_handoff(
+            "upgrade",
+            Some(&current),
+            &json!({"id":"new"}),
+            false,
+            true
+        ));
+        let selected = json!({"id":"same","runtime_sha256":"digest","runtime_build_sha":"source","runtime_target":"target"});
+        let identity = json!({"release_id":"same","runtime_sha256":"digest","runtime_build_sha":"source","runtime_target":"target","managed":false});
+        assert!(native_identity_matches(&selected, &identity, false));
+        assert!(!native_identity_matches(&selected, &identity, true));
+    }
+    #[tokio::test]
+    async fn refused_cross_runtime_rollback_never_quiesces_or_changes_selection() {
+        let (root, p) = fixture();
+        release::write_json(
+            &p.root.join("releases/new/release.json"),
+            &json!({"id":"new","runtime_kind":"javascript"}),
+        )
+        .unwrap();
+        p.point("previous", "new").unwrap();
+        p.point("verified", "old").unwrap();
+        let pending = json!([{"id":"pending-speech","text":"keep"}]);
+        release::write_json(&p.data.join("outbox.json"), &pending).unwrap();
+        let marker = json!({"at":"stopped-by-person"});
+        release::write_json(&p.data.join("node-stopped.json"), &marker).unwrap();
+        let _lock = p.lock().await.unwrap();
+        let error = go_back(&p, false, false, true).await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<release::ControlError>().unwrap().key,
+            "install.runtime-switch-outbox"
+        );
+        assert_eq!(p.selected("current").unwrap().unwrap()["id"], "old");
+        assert_eq!(p.selected("previous").unwrap().unwrap()["id"], "new");
+        assert_eq!(
+            release::read_json(&p.data.join("node-stopped.json")).unwrap(),
+            marker
+        );
+        assert_eq!(
+            release::read_json(&p.data.join("outbox.json")).unwrap(),
+            pending
+        );
+        assert!(!p.data.join("runtime-switch.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn unverified_core_lock_refuses_rollback_before_pointer_or_data_mutation() {
+        use fs2::FileExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let (root, p) = fixture();
+        p.point("previous", "new").unwrap();
+        let stop = json!({"at":"human"});
+        release::write_json(&p.data.join("node-stopped.json"), &stop).unwrap();
+        release::write_json(
+            &p.data.join("core/keep.json"),
+            &json!({"secret":"preserve"}),
+        )
+        .unwrap();
+        let core_lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(p.data.join("core/core.lock"))
+            .unwrap();
+        core_lock.try_lock_exclusive().unwrap();
+        let _install = p.lock().await.unwrap();
+        assert!(go_back(&p, false, false, true).await.is_err());
+        assert_eq!(p.selected("current").unwrap().unwrap()["id"], "old");
+        assert_eq!(
+            release::read_json(&p.data.join("node-stopped.json")).unwrap(),
+            stop
+        );
+        assert!(p.data.join("core/keep.json").exists());
+        drop(core_lock);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn reconciliation_failure_is_actionable_and_never_success() {
+        let result = json!({"ok":false,"failures":[{"id":"claude","error":{"key":"agents.registration-failed"}}],"next":["manual repair"]});
+        let error = require_reconciled(&result).unwrap_err();
+        let value = error_value(&error);
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["key"], "agents.reconciliation-failed");
+        assert_eq!(value["error"]["params"]["failures"][0]["id"], "claude");
+        assert!(require_reconciled(&json!({"done":[],"next":["failure"]})).is_err());
+    }
+    #[test]
+    fn invalid_manifest_keeps_authenticity_key_and_named_check() {
+        for bytes in [b"not-json".as_slice(), b"{\"schema\":1}\n".as_slice()] {
+            let payload = Payload {
+                manifest: bytes,
+                archive: &[],
+                core_version: "0.1.0",
+                channel: "nightly",
+                build_seq: 1,
+            };
+            let error = manifest(&payload).unwrap_err();
+            let value = error_value(&error);
+            assert_eq!(value["error"]["key"], "install.authenticity");
+            assert_eq!(value["error"]["params"]["check"], "manifest");
+        }
     }
 }

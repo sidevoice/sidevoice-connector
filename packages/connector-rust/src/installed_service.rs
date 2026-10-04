@@ -1,5 +1,6 @@
 //! Installed service policy shared by the CLI, daemon and MCP launcher.
 use crate::release::{self, Paths};
+use crate::service::{Job, Observation};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::{
@@ -164,17 +165,6 @@ async fn checked(args: Vec<String>) -> Result<()> {
     }
     Ok(())
 }
-#[derive(Default)]
-struct Job {
-    loaded: bool,
-    active: bool,
-    unknown: bool,
-    pid: Option<u32>,
-    reason: Option<&'static str>,
-    restarting: bool,
-    runs: Option<u64>,
-    exit: Option<i64>,
-}
 async fn job(core: bool) -> Result<Job> {
     if manager() == "launchd" {
         let (ok, out, code) = manage(&["print".into(), target(core)]).await?;
@@ -192,7 +182,10 @@ async fn job(core: bool) -> Result<Job> {
             loaded: true,
             runs: field("runs").and_then(|s| s.parse().ok()),
             exit: field("last exit code").and_then(|s| s.parse().ok()),
-            active: field("state") == Some("running"),
+            running: field("state") == Some("running")
+                && field("pid")
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .is_some_and(|pid| pid > 0),
             pid: field("pid").and_then(|s| s.parse().ok()),
             restarting: field("state") != Some("running") && field("last exit code") != Some("0"),
             ..Default::default()
@@ -214,18 +207,21 @@ async fn job(core: bool) -> Result<Job> {
             runs: field("NRestarts").and_then(|s| s.parse().ok()),
             exit: field("ExecMainStatus").and_then(|s| s.parse().ok()),
             loaded: field("LoadState") == Some("loaded"),
-            active: field("ActiveState") == Some("active")
-                || field("ActiveState") == Some("activating"),
+            running: field("ActiveState") == Some("active")
+                && field("MainPID")
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .is_some_and(|pid| pid > 0),
             unknown: !ok || field("LoadState").is_none(),
             pid: field("MainPID")
                 .and_then(|s| s.parse().ok())
                 .filter(|p| *p > 0),
             reason: if field("Result") == Some("start-limit-hit") {
-                Some("start-limit")
+                Some("service.start-limit".into())
             } else {
                 None
             },
             restarting: field("SubState") == Some("auto-restart"),
+            ..Default::default()
         })
     }
 }
@@ -366,67 +362,55 @@ pub async fn status(p: &Paths, connector_self: bool) -> Result<Value> {
     let installed = p.selected("current")?.is_some();
     let core_defined = definition(p, true)?.exists();
     let connector_defined = definition(p, false)?.exists();
-    let health = health(p).await?;
-    let j = if core_defined {
+    let mut core = if core_defined {
         job(true).await?
     } else {
         Job::default()
     };
-    let reachable = health.is_some();
-    let body = health.unwrap_or(Value::Null);
-    let ready = release::read_json(&p.data.join("core/core.json"))?;
-    let report = release::read_json(&p.data.join("core/core-failure.json"))?;
-    let program_missing = core_defined && core_program(p).is_ok_and(|program| !program.exists());
-    let mut failure = Value::Null;
-    let state = if !installed && !core_defined && !connector_defined {
-        "absent"
-    } else if !core_defined {
-        "not-installed"
-    } else if stopped(p)? {
-        "stopped-by-person"
-    } else if j.unknown || !j.loaded || j.reason.is_some() || program_missing {
-        failure = json!({"key":if program_missing{"program-missing"}else{j.reason.unwrap_or("not-loaded")}});
-        "service-failed"
-    } else if reachable {
-        "running"
-    } else if j.active {
-        if j.pid.map(u64::from) != ready["pid"].as_u64() {
-            if let Some(pid) = j.pid {
-                if crate::service::process_age(pid)
-                    .await
-                    .is_some_and(|age| age > 60)
-                {
-                    failure = json!({"key":"ready.timeout","step":"ready"});
-                    "failed"
-                } else {
-                    "starting"
-                }
-            } else {
-                "starting"
-            }
-        } else {
-            failure = json!({"key":"hang","step":"health"});
-            "failed"
-        }
-    } else if !report.is_null() {
-        failure = report;
-        "failed"
-    } else if j.restarting {
-        failure = json!({"key":"launch.exited","step":"run","detail":j.exit});
-        "backoff"
-    } else {
-        failure = json!({"key":"launch.exited","step":"run","detail":j.exit});
-        "failed"
+    core.defined = core_defined;
+    let connector = Job {
+        defined: connector_defined,
+        ..Default::default()
     };
+    let health = health(p).await?;
+    let ready = serde_json::from_value(release::read_json(&p.data.join("core/core.json"))?).ok();
+    let mut failure = release::read_json(&p.data.join("core/core-failure.json"))?;
     if let Some(key) = failure["key"].as_str().map(str::to_owned) {
         failure["message"] = json!(crate::agents::message(
             &key,
             &json!({"detail":failure["detail"]})
         ));
     }
-    Ok(
-        json!({"ok":true,"service":manager(),"installed":installed,"state":state,"core":if reachable{json!({"pid":body["pid"],"version":body["version"],"api":body["api"],"launch_id":body["launch_id"]})}else{Value::Null},"calls":body["calls"],"failure":failure,"attempts":if state=="backoff"{json!(j.runs)}else{Value::Null},"limit":if state=="backoff"&&manager()=="systemd"{json!(5)}else{Value::Null},"since":null,"window_started":null,"next_retry_at":null,"reachable":reachable,"connector":{"running":connector_self||ipc(p,"status",json!({})).await?.is_some()}}),
-    )
+    let core_age = if let Some(pid) = core.pid {
+        crate::service::process_age(pid).await
+    } else {
+        None
+    };
+    let program_error = if core_defined && core_program(p).is_ok_and(|path| !path.exists()) {
+        Some("service.executable-missing")
+    } else {
+        None
+    };
+    let observation = Observation {
+        service: manager(),
+        installed,
+        core,
+        connector,
+        stopped: stopped(p)?,
+        health,
+        ready,
+        failure: if failure.is_null() {
+            None
+        } else {
+            Some(failure)
+        },
+        core_age,
+        connector_running: connector_self || ipc(p, "status", json!({})).await?.is_some(),
+        definition_error: None,
+        manager_error: None,
+        program_error,
+    };
+    Ok(crate::service::derive_status(&observation))
 }
 pub fn core_program(p: &Paths) -> Result<PathBuf> {
     let selected = p.selected("current")?.context("no selected release")?;
@@ -737,7 +721,7 @@ pub async fn unload(p: &Paths, disable: bool) -> Result<()> {
             args.push(unit(core).into());
             let result = manage(&args).await?;
             let after = job(core).await?;
-            if after.unknown || after.active || (!result.0 && after.loaded) {
+            if after.unknown || after.running || (!result.0 && after.loaded) {
                 return Err(crate::release::refusal(
                     "control.service-unload-not-confirmed",
                     json!({}),
@@ -795,6 +779,7 @@ pub async fn ensure_core(p: &Paths) -> Result<Value> {
 struct ProcessIdentity {
     start: String,
     command: String,
+    argv: Vec<String>,
 }
 async fn process_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
     if pid <= 1 {
@@ -826,13 +811,11 @@ async fn process_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
         if owner != unsafe { libc::geteuid() } {
             return Err(release::refusal("control.foreign-process-owner", json!({})));
         }
+        let argv = process_arguments(pid)?;
         return Ok(Some(ProcessIdentity {
             start: fields[19].into(),
-            command: String::from_utf8(fs::read(path.join("cmdline"))?)?
-                .split('\0')
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>()
-                .join(" "),
+            command: argv.join(" "),
+            argv,
         }));
     }
     let output = timeout(
@@ -870,9 +853,11 @@ async fn process_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
     if fields[1].parse::<u32>()? != unsafe { libc::geteuid() } {
         return Err(release::refusal("control.foreign-process-owner", json!({})));
     }
+    let argv = process_arguments(pid)?;
     Ok(Some(ProcessIdentity {
         start: fields[2..7].join(" "),
-        command: fields[7..].join(" "),
+        command: argv.join(" "),
+        argv,
     }))
 }
 async fn terminate_verified(pid: u32, expected: &ProcessIdentity) -> Result<()> {
@@ -903,39 +888,257 @@ async fn terminate_verified(pid: u32, expected: &ProcessIdentity) -> Result<()> 
     }
     Err(release::refusal("control.process-did-not-exit", json!({})))
 }
-async fn stop_core(p: &Paths) -> Result<()> {
-    let ready = release::read_json(&p.data.join("core/core.json"))?;
-    let Some(pid) = ready["pid"]
-        .as_u64()
-        .filter(|v| *v > 1 && *v <= i32::MAX as u64)
-    else {
-        return Ok(());
-    };
-    let Some(identity) = process_identity(pid as u32).await? else {
-        return Ok(());
-    };
-    let binary = core_program(p)?;
-    let canonical = binary.canonicalize()?;
-    // Both the immutable binary and the explicit data-directory argument bind this process to this installation.
-    if !(identity.command.contains(&canonical.display().to_string())
-        || identity.command.contains(&binary.display().to_string()))
-        || !identity
-            .command
-            .contains(&format!("--data-dir {}", p.data.join("core").display()))
+#[cfg(target_os = "linux")]
+fn process_arguments(pid: u32) -> Result<Vec<String>> {
+    let raw = fs::read(format!("/proc/{pid}/cmdline"))?;
+    raw.split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8(arg.to_vec()).map_err(Into::into))
+        .collect()
+}
+#[cfg(target_os = "macos")]
+fn process_arguments(pid: u32) -> Result<Vec<String>> {
+    // KERN_PROCARGS2 preserves argv boundaries, unlike `ps command=` when paths contain spaces.
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size = 0usize;
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } < 0
     {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if !(4..=1024 * 1024).contains(&size) {
         return Err(release::refusal(
-            "control.core-process-does-not-belong-to-selected-release",
+            "control.process-identity-unavailable",
             json!({}),
         ));
     }
-    terminate_verified(pid as u32, &identity).await?;
-    if health(p).await?.is_some() {
+    let mut raw = vec![0u8; size];
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            raw.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    raw.truncate(size);
+    let argc = i32::from_ne_bytes(raw.get(..4).context("process argc")?.try_into()?);
+    if !(1..=4096).contains(&argc) {
         return Err(release::refusal(
+            "control.process-identity-unavailable",
+            json!({}),
+        ));
+    }
+    let mut offset = 4
+        + raw[4..]
+            .iter()
+            .position(|b| *b == 0)
+            .context("process executable")?
+        + 1;
+    while raw.get(offset) == Some(&0) {
+        offset += 1;
+    }
+    let mut argv = Vec::new();
+    for _ in 0..argc {
+        let end = offset
+            + raw
+                .get(offset..)
+                .context("process argv")?
+                .iter()
+                .position(|b| *b == 0)
+                .context("process argument terminator")?;
+        argv.push(String::from_utf8(raw[offset..end].to_vec())?);
+        offset = end + 1;
+    }
+    Ok(argv)
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_arguments(_pid: u32) -> Result<Vec<String>> {
+    Err(release::refusal(
+        "control.process-identity-unavailable",
+        json!({}),
+    ))
+}
+
+fn same_path(value: &str, expected: &Path) -> bool {
+    let candidate = Path::new(value);
+    candidate == expected
+        || candidate.is_absolute()
+            && candidate
+                .canonicalize()
+                .ok()
+                .zip(expected.canonicalize().ok())
+                .is_some_and(|(left, right)| left == right)
+}
+fn core_data_argument(argv: &[String], data: &Path) -> bool {
+    argv.iter().enumerate().any(|(index, arg)| {
+        if arg == "--data-dir" {
+            argv.get(index + 1)
+                .is_some_and(|value| same_path(value, data))
+        } else {
+            arg.strip_prefix("--data-dir=")
+                .is_some_and(|value| same_path(value, data))
+        }
+    })
+}
+fn core_program_argument(argv: &[String], program: &Path) -> bool {
+    // Native binary argv[0], or a legacy Python console script argv[1]. Never match arbitrary trailing text.
+    argv.first().is_some_and(|arg| same_path(arg, program))
+        || argv.get(1).is_some_and(|arg| same_path(arg, program))
+}
+async fn user_pids() -> Result<Vec<u32>> {
+    let user = unsafe { libc::geteuid() };
+    if cfg!(target_os = "linux") {
+        let mut pids = Vec::new();
+        for entry in fs::read_dir("/proc")? {
+            let entry = entry?;
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            match fs::metadata(entry.path()) {
+                Ok(metadata) if metadata.uid() == user => pids.push(pid),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        return Ok(pids);
+    }
+    let output = timeout(
+        Duration::from_secs(3),
+        Command::new("/bin/ps")
+            .args(["-U", &user.to_string(), "-o", "pid="])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await??;
+    if !output.status.success() || output.stdout.len() > 1024 * 1024 {
+        return Err(release::refusal(
+            "control.process-identity-unavailable",
+            json!({}),
+        ));
+    }
+    String::from_utf8(output.stdout)?
+        .split_whitespace()
+        .map(|value| value.parse().map_err(Into::into))
+        .collect()
+}
+async fn core_processes(p: &Paths) -> Result<Vec<(u32, ProcessIdentity)>> {
+    let data = p.data.join("core");
+    let program = core_program(p).ok();
+    let mut owned = Vec::new();
+    for pid in user_pids().await? {
+        if pid == std::process::id() {
+            continue;
+        }
+        let identity = match process_identity(pid).await {
+            Ok(Some(identity)) => identity,
+            Ok(None) => continue,
+            Err(error)
+                if error
+                    .chain()
+                    .filter_map(|e| e.downcast_ref::<std::io::Error>())
+                    .any(|e| matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        };
+        if !core_data_argument(&identity.argv, &data) {
+            continue;
+        }
+        if !program
+            .as_ref()
+            .is_some_and(|program| core_program_argument(&identity.argv, program))
+        {
+            return Err(release::refusal(
+                "control.core-process-does-not-belong-to-selected-release",
+                json!({}),
+            ));
+        }
+        owned.push((pid, identity));
+    }
+    Ok(owned)
+}
+fn core_lock_probe(p: &Paths) -> Result<fs::File> {
+    use fs2::FileExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = p.data.join("core/core.lock");
+    crate::proof::private_dir(path.parent().context("Core lock parent")?)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    crate::proof::private_file(&path)?;
+    file.try_lock_exclusive()
+        .map_err(|_| release::refusal("control.core-lock-owner-unverified", json!({})))?;
+    let opened = file.metadata()?;
+    let current = fs::symlink_metadata(&path)?;
+    if opened.ino() != current.ino() || opened.dev() != current.dev() {
+        return Err(release::refusal(
+            "control.core-lock-owner-unverified",
+            json!({}),
+        ));
+    }
+    Ok(file)
+}
+async fn raw_core_socket_silent(p: &Paths) -> Result<()> {
+    let socket = p.data.join("core/local.sock");
+    match fs::symlink_metadata(&socket) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    crate::proof::verify_socket(&socket)?;
+    match timeout(Duration::from_millis(800), UnixStream::connect(&socket)).await {
+        Ok(Err(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            Ok(())
+        }
+        _ => Err(release::refusal(
             "control.core-socket-remained-active",
             json!({}),
+        )),
+    }
+}
+async fn stop_core(p: &Paths) -> Result<()> {
+    // Native Core holds an empty flock before publishing ready. Enumerate exact argv, not a stale ready PID.
+    for (pid, identity) in core_processes(p).await? {
+        terminate_verified(pid, &identity).await?;
+    }
+    let _lock = core_lock_probe(p)?;
+    if !core_processes(p).await?.is_empty() {
+        return Err(release::refusal(
+            "control.core-process-started-during-shutdown",
+            json!({}),
         ));
     }
-    Ok(())
+    raw_core_socket_silent(p).await
 }
 
 pub async fn stop_on_demand(p: &Paths) -> Result<()> {
@@ -1129,6 +1332,52 @@ pub async fn reload_after_uninstall() -> Result<()> {
     Ok(())
 }
 
+pub async fn linger() -> Value {
+    let user = std::env::var("USER").unwrap_or_default();
+    let output = timeout(
+        Duration::from_secs(3),
+        Command::new(std::env::var("SIDEVOICE_LOGINCTL").unwrap_or("loginctl".into()))
+            .args(["show-user", &user, "-p", "Linger"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    let enabled = output.ok().and_then(Result::ok).is_some_and(|out| {
+        out.status.success()
+            && String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|l| l == "Linger=yes")
+    });
+    json!({"enabled":enabled,"command":format!("loginctl enable-linger {user}"),"reason":crate::agents::message("service.linger-reason",&json!({}))})
+}
+
+pub async fn managed_owners(
+    p: &Paths,
+    core_pid: Option<u32>,
+    connector_pid: Option<u32>,
+) -> Result<bool> {
+    if core_pid.is_none()
+        || connector_pid.is_none()
+        || !definition(p, true)?.exists()
+        || !definition(p, false)?.exists()
+    {
+        return Ok(false);
+    }
+    let core = job(true).await?;
+    let connector = job(false).await?;
+    Ok(core.loaded
+        && !core.unknown
+        && core.running
+        && core.pid == core_pid
+        && connector.loaded
+        && !connector.unknown
+        && connector.running
+        && connector.pid == connector_pid)
+}
+pub async fn runtime_present(p: &Paths) -> Result<bool> {
+    Ok(ipc(p, "status", json!({})).await?.is_some() || !core_processes(p).await?.is_empty())
+}
+
 #[cfg(test)]
 mod native_tests {
     use super::*;
@@ -1172,23 +1421,118 @@ mod native_tests {
         }
         fs::remove_dir_all(root).unwrap();
     }
-}
 
-pub async fn linger() -> Value {
-    let user = std::env::var("USER").unwrap_or_default();
-    let output = timeout(
-        Duration::from_secs(3),
-        Command::new(std::env::var("SIDEVOICE_LOGINCTL").unwrap_or("loginctl".into()))
-            .args(["show-user", &user, "-p", "Linger"])
+    #[test]
+    fn managed_status_rejects_another_healthy_process() {
+        let ready = crate::proof::Ready {
+            pid: 202,
+            launch_id: "old".into(),
+            socket: "/tmp/test.sock".into(),
+            connector_id: "id".into(),
+            token: "token".into(),
+            connector_protocols: Some(vec![3]),
+        };
+        let mut observation = Observation {
+            service: "systemd",
+            installed: true,
+            core: Job {
+                defined: true,
+                loaded: true,
+                running: true,
+                pid: Some(101),
+                ..Default::default()
+            },
+            connector: Job {
+                defined: true,
+                ..Default::default()
+            },
+            stopped: false,
+            health: Some(json!({"pid":202,"launch_id":"old","calls":1,"api":1})),
+            ready: Some(ready),
+            failure: None,
+            core_age: Some(1),
+            connector_running: true,
+            definition_error: None,
+            manager_error: None,
+            program_error: None,
+        };
+        let result = crate::service::derive_status(&observation);
+        assert_eq!(result["reachable"], false);
+        assert_eq!(result["state"], "starting");
+        observation.core.running = false;
+        let result = crate::service::derive_status(&observation);
+        assert_eq!(result["reachable"], false);
+        assert_ne!(result["state"], "running");
+    }
+    #[test]
+    fn process_matching_requires_exact_arguments_not_path_prefixes() {
+        let data = Path::new("/private/profile/core with spaces");
+        let program = Path::new("/private/release/core/bin/sidevoice-core-rust");
+        let args = vec![
+            program.display().to_string(),
+            "--data-dir".into(),
+            data.display().to_string(),
+        ];
+        assert!(core_data_argument(&args, data));
+        assert!(core_program_argument(&args, program));
+        let mut wrong = args.clone();
+        wrong[2].push_str("-foreign");
+        assert!(!core_data_argument(&wrong, data));
+        assert!(!core_program_argument(
+            &[
+                "unrelated".into(),
+                "--description".into(),
+                program.display().to_string()
+            ],
+            program
+        ));
+    }
+    #[tokio::test]
+    async fn stops_owned_core_before_ready_and_refuses_unknown_lock_holder() {
+        use fs2::FileExt;
+        let root =
+            std::env::temp_dir().join(format!("sidevoice-unready-test-{}", uuid::Uuid::new_v4()));
+        let p = Paths {
+            home: root.join("home"),
+            data: root.join("data"),
+            root: root.join("sidevoice"),
+            config: root.join("config"),
+        };
+        p.prepare().unwrap();
+        let executable = p.root.join("releases/native/core/bin/sidevoice-core-rust");
+        release::private_directory(executable.parent().unwrap()).unwrap();
+        release::write(&executable,b"import fcntl, os, pathlib, sys, time\ndata = pathlib.Path(sys.argv[sys.argv.index('--data-dir')+1])\nlock = os.open(data / 'core.lock', os.O_CREAT | os.O_RDWR, 0o600)\nfcntl.flock(lock, fcntl.LOCK_EX)\n(data / 'fixture-started').write_text('started')\ntime.sleep(60)\n",0o700).unwrap();
+        release::write_json(&p.root.join("releases/native/release.json"),&json!({"id":"native","core_kind":"rust-native-v1","runtime_kind":"rust-native-v1","format":"rust-native"})).unwrap();
+        p.point("current", "native").unwrap();
+        let mut child = Command::new("python3")
+            .arg(&executable)
+            .arg("--data-dir")
+            .arg(p.data.join("core"))
             .kill_on_drop(true)
-            .output(),
-    )
-    .await;
-    let enabled = output.ok().and_then(Result::ok).is_some_and(|out| {
-        out.status.success()
-            && String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .any(|l| l == "Linger=yes")
-    });
-    json!({"enabled":enabled,"command":format!("loginctl enable-linger {user}"),"reason":crate::agents::message("service.linger-reason",&json!({}))})
+            .spawn()
+            .unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        while !p.data.join("core/fixture-started").exists() && Instant::now() < end {
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert!(p.data.join("core/fixture-started").exists());
+        assert!(!p.data.join("core/core.json").exists());
+        stop_core(&p).await.unwrap();
+        assert!(!child.wait().await.unwrap().success());
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(p.data.join("core/core.lock"))
+            .unwrap();
+        lock.try_lock_exclusive().unwrap();
+        let error = stop_core(&p).await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<release::ControlError>().unwrap().key,
+            "control.core-lock-owner-unverified"
+        );
+        assert!(p.root.join("releases/native").exists());
+        assert!(p.data.join("core/fixture-started").exists());
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
