@@ -869,7 +869,12 @@ async fn terminate_verified(pid: u32, expected: &ProcessIdentity) -> Result<()> 
     }
     let end = Instant::now() + Duration::from_secs(15);
     while Instant::now() < end {
-        if process_identity(pid).await?.as_ref() != Some(expected) {
+        // Exiting processes can lose argv before releasing their open files and locks.
+        // After signalling, wait for this process lifetime to end, not merely argv to change.
+        if process_identity(pid)
+            .await?
+            .is_none_or(|identity| identity.start != expected.start)
+        {
             return Ok(());
         }
         sleep(Duration::from_millis(100)).await;
@@ -881,7 +886,12 @@ async fn terminate_verified(pid: u32, expected: &ProcessIdentity) -> Result<()> 
     }
     let end = Instant::now() + Duration::from_secs(5);
     while Instant::now() < end {
-        if process_identity(pid).await?.as_ref() != Some(expected) {
+        // Exiting processes can lose argv before releasing their open files and locks.
+        // After signalling, wait for this process lifetime to end, not merely argv to change.
+        if process_identity(pid)
+            .await?
+            .is_none_or(|identity| identity.start != expected.start)
+        {
             return Ok(());
         }
         sleep(Duration::from_millis(100)).await;
@@ -1515,10 +1525,16 @@ mod native_tests {
         while !p.data.join("core/fixture-started").exists() && Instant::now() < end {
             sleep(Duration::from_millis(20)).await;
         }
-        assert!(p.data.join("core/fixture-started").exists());
-        assert!(!p.data.join("core/core.json").exists());
-        stop_core(&p).await.unwrap();
-        assert!(!child.wait().await.unwrap().success());
+        let started = p.data.join("core/fixture-started").exists();
+        let ready = p.data.join("core/core.json").exists();
+        let stopped = stop_core(&p).await;
+        // Reap the fixture even when startup or shutdown assertions fail.
+        let _ = child.start_kill();
+        let exited = child.wait().await;
+        assert!(started);
+        assert!(!ready);
+        stopped.unwrap();
+        assert!(!exited.unwrap().success());
         let lock = fs::OpenOptions::new()
             .read(true)
             .write(true)
