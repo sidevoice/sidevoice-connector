@@ -82,6 +82,9 @@ jobs:
           echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
       - name: Exercise real native install, update, rollback and service lifecycle
         run: python3 packages/connector-rust/test/native_control.py --first "$RUNNER_TEMP/native-first/sidevoice" --second "$RUNNER_TEMP/native-second/sidevoice"
+      - name: Exercise transaction failure recovery on both user managers
+        if: matrix.target != 'linux-aarch64'
+        run: python3 packages/connector-rust/test/native_failures.py --first "$RUNNER_TEMP/native-first/sidevoice" --second "$RUNNER_TEMP/native-second/sidevoice"
       - name: Verify the accepted existing Mac SEA fixture
         if: runner.os == 'macOS'
         env:
