@@ -309,6 +309,7 @@ fn presented(command: &str, result: Value) -> Value {
         lines.push(
             result
                 .pointer("/error/message")
+                .or_else(|| result.pointer("/failure/message"))
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_owned(),
@@ -386,6 +387,11 @@ mod tests {
         assert!(text.contains("Installed already:"));
         assert!(text.contains("manual agent command"));
         assert!(!text.starts_with('{'));
+        let failure = presented(
+            "install",
+            json!({"ok":false,"failure":{"message":"verification failed"}}),
+        );
+        assert_eq!(failure["_text"], "verification failed");
         let service = presented(
             "service",
             json!({"ok":true,"state":"running","service":"systemd",
