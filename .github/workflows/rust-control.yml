@@ -82,6 +82,14 @@ jobs:
           echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
       - name: Exercise real native install, update, rollback and service lifecycle
         run: python3 packages/connector-rust/test/native_control.py --first "$RUNNER_TEMP/native-first/sidevoice" --second "$RUNNER_TEMP/native-second/sidevoice"
+      - name: Verify the accepted existing Mac SEA fixture
+        if: runner.os == 'macOS'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 packages/connector-rust/tools/legacy-proof-input.py --output "$RUNNER_TEMP/legacy-sidevoice"
+      - name: Upgrade and roll back an existing Mac installation
+        if: runner.os == 'macOS'
+        run: python3 packages/connector-rust/test/native_upgrade.py --legacy "$RUNNER_TEMP/legacy-sidevoice" --native "$RUNNER_TEMP/native-second/sidevoice"
       - name: Prepare disposable pairing fixture
         if: runner.os == 'macOS'
         run: |
