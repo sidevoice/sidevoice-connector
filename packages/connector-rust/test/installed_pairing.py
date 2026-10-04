@@ -36,9 +36,9 @@ def wait_until(check, timeout=25.0, message='timed out'):
 
 async def response(send, status, body):
     encoded = json.dumps(body, separators=(',', ':')).encode()
-    send({'type': 'http.response.start', 'status': status,
-          'headers': [(b'content-type', b'application/json'), (b'content-length', str(len(encoded)).encode())]})
-    send({'type': 'http.response.body', 'body': encoded})
+    await send({'type': 'http.response.start', 'status': status,
+                'headers': [(b'content-type', b'application/json'), (b'content-length', str(len(encoded)).encode())]})
+    await send({'type': 'http.response.body', 'body': encoded})
 
 
 def mcp_request(process, request_id, method, params):
