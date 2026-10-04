@@ -343,8 +343,11 @@ test('façade: the connector job restarted under it — a new voice turn reaches
     await owner.ready;
     assert.equal((await owner.call('voice_connect', {})).value.binding_id, 'core-thread-r');
     /** Ready for a turn: the connector job holds this conversation again, linked to the core. */
-    const registeredWith = pid => until(() => node.said().some(line => line.event === 'binding.register' && line.data.client_ref === 'thread-r') &&
-      JSON.parse(readFileSync(path.join(node.dataDir, 'connector.lock'), 'utf8')).pid === pid, 20_000);
+    const registeredWith = pid => until(() => {
+      if (!node.said().some(line => line.event === 'binding.register' && line.data.client_ref === 'thread-r')) return false;
+      try { return JSON.parse(readFileSync(path.join(node.dataDir, 'connector.lock'), 'utf8')).pid === pid; }
+      catch { return false; } // The in-place lock record can be briefly empty while a new process takes ownership.
+    }, 20_000);
     // The manager restarts the connector job (a crash, an upgrade): the old one is gone at once.
     const first = node.pid('connector');
     process.kill(first, 'SIGKILL');
