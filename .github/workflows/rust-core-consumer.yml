@@ -37,6 +37,8 @@ jobs:
             target: linux-aarch64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: '1.98.1'
     steps:
       - uses: actions/checkout@v4
         with:
