@@ -2,7 +2,8 @@
 
 This checks Core-originated input, Core acknowledgements, the Rust façade and
 outbox. It does not claim a real authenticated Codex session; that is a
-separate acceptance gate.
+separate acceptance gate. The first Rust Codex binding uses per-call
+`_meta.threadId` with identity environment variables removed.
 """
 
 import asyncio
@@ -89,9 +90,11 @@ async def mcp_request(process, method, params, id):
             return result['result']
 
 
-async def tool(process, name, args, id, thread=None):
+async def tool(process, name, args, id, thread=None, meta=None):
     params = {'name': name, 'arguments': args}
-    if thread:
+    if meta is not None:
+        params['_meta'] = meta
+    elif thread:
         params['_meta'] = {'openai/threadId': thread}
     result = await mcp_request(process, 'tools/call', params, id)
     if result.get('isError'):
@@ -538,9 +541,14 @@ else:
                'CURSOR_CONFIG_DIR': str(cursor),
                'CURSOR_DATA_DIR': str(root / 'cursor/data'),
                'XDG_CONFIG_HOME': str(root / 'xdg/config'), 'XDG_DATA_HOME': str(root / 'xdg/data'),
-               'CODEX_THREAD_ID': thread, 'SIDEVOICE_CODEX_BIN': str(fake_codex),
+               'SIDEVOICE_CODEX_BIN': str(fake_codex),
                'SIDEVOICE_CLAUDE_BIN': str(fake_claude),
                'SIDEVOICE_TEST_QUEUE': str(queued), 'SIDEVOICE_TEST_SLOW': str(slow_started)}
+        for identity_key in ('CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID',
+                             'CLAUDE_CODE_MESSAGING_SOCKET', 'SIDEVOICE_THREAD',
+                             'SIDEVOICE_DELIVERY_URL', 'SIDEVOICE_HARNESS'):
+            env.pop(identity_key, None)
+        assert 'CODEX_THREAD_ID' not in env
         core_env, storage_flag, late_flag, _ = core_faults(root, env)
         launch_id = str(uuid.uuid4())
         core_log = (root / 'core.log').open('wb')
@@ -574,7 +582,12 @@ else:
             await facade.stdin.drain()
             listed = await mcp_request(facade, 'tools/list', {}, 2)
             assert {tool['name'] for tool in listed['tools']} == {'voice_connect', 'voice_pair', 'voice_say', 'voice_disconnect', 'voice_pair_device', 'voice_status'}
-            joined = await tool(facade, 'voice_connect', {'title': 'Rust v3 interop'}, 3, thread)
+            missing_identity = await mcp_request(facade, 'tools/call', {
+                'name': 'voice_connect', 'arguments': {'title': 'Missing identity'}}, 30)
+            assert missing_identity.get('isError') is True, missing_identity
+            assert 'Cannot tell which conversation' in missing_identity['content'][0]['text'], missing_identity
+            joined = await tool(facade, 'voice_connect', {'title': 'Rust v3 interop'}, 3,
+                                meta={'threadId': thread})
             assert joined['conversation'] == thread and not joined['binding_id'].startswith('local-'), joined
             paired = http_json(core_data / 'local.sock', 'POST', '/api/device/local/pair', {'name': 'rust-v3-test'})
             token = paired['token']
@@ -841,6 +854,9 @@ else:
             assert left['status'] == 'left'
             print(json.dumps({'core_launch_id': launch_id, 'rust_pid': daemon.pid,
                               'rust_executable_sha256': evidence['executable_sha256'], 'mcp_tools': 6,
+                              'threadId_metadata_without_process_env': True,
+                              'missing_identity_refused': True,
+                              'first_text_queue_and_receipt': True,
                               'concurrent_link_reply_and_delivery_before_host_scan': True,
                               'core_input': 'accepted_then_read', 'speech': said['status'],
                               'outbox_replayed_after_core_restart': True,
