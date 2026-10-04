@@ -17,6 +17,12 @@ use tokio::{
 };
 
 pub fn manager() -> &'static str {
+    match std::env::var("SIDEVOICE_SERVICE_MANAGER").ok().as_deref() {
+        Some("launchd") => return "launchd",
+        Some("systemd") => return "systemd",
+        Some("none") => return "none",
+        _ => {}
+    }
     if cfg!(target_os = "macos") {
         "launchd"
     } else if cfg!(target_os = "linux") {
@@ -25,6 +31,7 @@ pub fn manager() -> &'static str {
         "none"
     }
 }
+
 fn label(core: bool) -> &'static str {
     if core {
         "dev.sidevoice.core"
@@ -1085,11 +1092,31 @@ pub async fn run(p: &Paths, action: crate::service::Action) -> Result<Value> {
         }
         Action::Status => {}
     }
-    let now = status(p, false).await?;
+    let mut now = status(p, false).await?;
+    if matches!(action, Action::Install | Action::Start | Action::Restart) {
+        let end =
+            Instant::now() + Duration::from_secs(if action == Action::Install { 60 } else { 10 });
+        while Instant::now() < end {
+            let state = now["state"].as_str().unwrap_or("");
+            let transient = matches!(state, "starting" | "backoff")
+                || state == "failed"
+                    && matches!(
+                        now["failure"]["step"].as_str(),
+                        Some("run" | "health" | "ready")
+                    );
+            if !transient {
+                break;
+            }
+            sleep(Duration::from_millis(200)).await;
+            now = status(p, false).await?;
+        }
+    }
     let mut result = json!({"ok":true,"state":now["state"],"service":manager()});
+    if !now["failure"].is_null() {
+        result["failure"] = now["failure"].clone();
+    }
     if action == Action::Install && manager() == "systemd" {
-        let user = std::env::var("USER").unwrap_or_default();
-        result["linger"] = json!({"enabled":false,"command":format!("loginctl enable-linger {user}"),"reason":crate::agents::message("service.linger-reason",&json!({}))});
+        result["linger"] = linger().await;
     }
     Ok(result)
 }
@@ -1099,4 +1126,68 @@ pub async fn reload_after_uninstall() -> Result<()> {
         checked(vec!["--user".into(), "daemon-reload".into()]).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    #[test]
+    fn manager_serializers_keep_values_in_their_directive() {
+        assert_eq!(
+            quote("/path with spaces/$HOME/%x/\"quoted\"", true).unwrap(),
+            "\"/path with spaces/$$HOME/%%x/\\\"quoted\\\"\""
+        );
+        assert_eq!(quote("KEY=$VALUE%", false).unwrap(), "\"KEY=$VALUE%%\"");
+        assert!(quote("path\nExecStartPre=/bin/false", true).is_err());
+        assert!(xml("path\r<key>Injected</key>").is_err());
+        assert_eq!(xml("A<&\"B").unwrap(), "A&lt;&amp;&quot;B");
+    }
+    #[test]
+    fn definitions_use_current_and_keep_managers_independent() {
+        let root =
+            std::env::temp_dir().join(format!("sidevoice-service-test-{}", uuid::Uuid::new_v4()));
+        let p = Paths {
+            home: root.join("home"),
+            data: root.join("data"),
+            root: root.join("sidevoice"),
+            config: root.join("config"),
+        };
+        p.prepare().unwrap();
+        release::private_directory(&p.root.join("releases/native")).unwrap();
+        release::write_json(&p.root.join("releases/native/release.json"),&json!({"id":"native","core_kind":"rust-native-v1","runtime_kind":"rust-native-v1","format":"rust-native"})).unwrap();
+        p.point("current", "native").unwrap();
+        write_definitions(&p).unwrap();
+        let core = fs::read_to_string(definition(&p, true).unwrap()).unwrap();
+        let connector = fs::read_to_string(definition(&p, false).unwrap()).unwrap();
+        assert!(core.contains("current/core/bin/sidevoice-core-rust"));
+        assert!(connector.contains("current/dist/sidevoice-rust"));
+        assert!(connector.contains("--installed"));
+        assert!(!core.contains("sidevoice-rust"));
+        assert!(!connector.contains("sidevoice-core-rust"));
+        if manager() == "systemd" {
+            assert!(core.contains("Restart=on-failure"));
+            assert!(connector.contains("Restart=always"));
+            assert!(core.contains("TimeoutStopSec=20"));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+pub async fn linger() -> Value {
+    let user = std::env::var("USER").unwrap_or_default();
+    let output = timeout(
+        Duration::from_secs(3),
+        Command::new(std::env::var("SIDEVOICE_LOGINCTL").unwrap_or("loginctl".into()))
+            .args(["show-user", &user, "-p", "Linger"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    let enabled = output.ok().and_then(Result::ok).is_some_and(|out| {
+        out.status.success()
+            && String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|l| l == "Linger=yes")
+    });
+    json!({"enabled":enabled,"command":format!("loginctl enable-linger {user}"),"reason":crate::agents::message("service.linger-reason",&json!({}))})
 }

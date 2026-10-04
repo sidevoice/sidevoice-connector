@@ -694,3 +694,82 @@ fn clean_core_state(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn fixture() -> (std::path::PathBuf, Paths) {
+        let root =
+            std::env::temp_dir().join(format!("sidevoice-lifecycle-test-{}", uuid::Uuid::new_v4()));
+        let p = Paths {
+            home: root.join("home"),
+            data: root.join("data"),
+            root: root.join("sidevoice"),
+            config: root.join("config"),
+        };
+        p.prepare().unwrap();
+        for name in ["old", "new"] {
+            release::private_directory(&p.root.join("releases").join(name)).unwrap();
+            release::write_json(
+                &p.root.join("releases").join(name).join("release.json"),
+                &json!({"id":name,"runtime_kind":"rust-native-v1"}),
+            )
+            .unwrap();
+        }
+        p.point("current", "old").unwrap();
+        (root, p)
+    }
+    #[test]
+    fn aborted_gate_preserves_persons_stop_and_previous_marker() {
+        let (root, p) = fixture();
+        let stop = json!({"at":"2026-10-04T00:00:00Z"});
+        let marker = json!({"phase":"committed","token":"older","to":"old"});
+        release::write_json(&p.data.join("node-stopped.json"), &stop).unwrap();
+        release::write_json(&p.data.join("runtime-switch.json"), &marker).unwrap();
+        {
+            let _gate =
+                Gate::begin(&p, &json!({"id":"new","runtime_kind":"rust-native-v1"})).unwrap();
+        }
+        assert_eq!(
+            release::read_json(&p.data.join("node-stopped.json")).unwrap(),
+            stop
+        );
+        assert_eq!(
+            release::read_json(&p.data.join("runtime-switch.json")).unwrap(),
+            marker
+        );
+        assert!(service::stopped(&p).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn interrupted_pointer_flip_recovers_selected_launch_gate() {
+        let (root, p) = fixture();
+        let gate = Gate::begin(&p, &json!({"id":"new","runtime_kind":"rust-native-v1"})).unwrap();
+        p.point("current", "new").unwrap();
+        std::mem::forget(gate);
+        recover_gate(&p).unwrap();
+        assert!(!service::stopped(&p).unwrap());
+        let marker = release::read_json(&p.data.join("runtime-switch.json")).unwrap();
+        assert_eq!(marker["phase"], "committed");
+        assert_eq!(marker["to"], "new");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn candidate_cleanup_never_deletes_verified_or_previous_release() {
+        let (root, p) = fixture();
+        p.point("previous", "new").unwrap();
+        drop(CandidateCleanup {
+            paths: p.clone(),
+            candidate: Some("new".into()),
+        });
+        assert!(p.root.join("releases/new").exists());
+        release::remove_file(&p.root.join("previous")).unwrap();
+        drop(CandidateCleanup {
+            paths: p.clone(),
+            candidate: Some("new".into()),
+        });
+        assert!(!p.root.join("releases/new").exists());
+        assert!(p.root.join("releases/old").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+}
