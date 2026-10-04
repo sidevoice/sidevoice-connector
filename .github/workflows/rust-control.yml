@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: native-control-${{ github.ref }}
@@ -34,3 +35,66 @@ jobs:
         run: cargo test --locked --manifest-path packages/connector-rust/Cargo.toml
       - name: Check native control warnings
         run: cargo clippy --locked --manifest-path packages/connector-rust/Cargo.toml --all-targets -- -D warnings
+
+  installed:
+    name: Native lifecycle (${{ matrix.target }})
+    needs: control
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            target: linux-aarch64
+          - runner: macos-14
+            target: macos-aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/connector-rust
+      - name: Verify and reuse accepted Core inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 packages/connector-rust/tools/core-proof-inputs.py --output "$RUNNER_TEMP/native-core-inputs"
+      - name: Build two native update candidates from the same source
+        env:
+          SIDEVOICE_CHANNEL: nightly
+        run: |
+          SIDEVOICE_BUILD_SEQ=0 python3 packages/connector-rust/tools/build-native.py --core-inputs "$RUNNER_TEMP/native-core-inputs" --output "$RUNNER_TEMP/native-first" > "$RUNNER_TEMP/native-first.json"
+          SIDEVOICE_BUILD_SEQ=${{ github.run_number }} python3 packages/connector-rust/tools/build-native.py --core-inputs "$RUNNER_TEMP/native-core-inputs" --output "$RUNNER_TEMP/native-second" > "$RUNNER_TEMP/native-second.json"
+      - name: Check native shipping closure
+        run: python3 packages/connector-rust/tools/check-native-shipment.py --artifact "$RUNNER_TEMP/native-second"
+      - name: Start the disposable Linux runner user manager
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$USER"
+          for i in $(seq 1 30); do [ -S "/run/user/$(id -u)/bus" ] && break; sleep 1; done
+          test -S "/run/user/$(id -u)/bus"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - name: Exercise real native install, update, rollback and service lifecycle
+        run: python3 packages/connector-rust/test/native_control.py --first "$RUNNER_TEMP/native-first/sidevoice" --second "$RUNNER_TEMP/native-second/sidevoice"
+      - name: Prepare disposable pairing fixture
+        if: runner.os == 'macOS'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pairing-venv"
+          "$RUNNER_TEMP/pairing-venv/bin/pip" install 'python-socketio>=5,<6' 'uvicorn>=0.30,<1'
+      - name: Pair through native MCP and authenticate the real Core
+        if: runner.os == 'macOS'
+        run: SIDEVOICE_TEST_SEA="$RUNNER_TEMP/native-second/sidevoice" "$RUNNER_TEMP/pairing-venv/bin/python" packages/connector-rust/test/installed_pairing.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-control-proof-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/native-second/sidevoice
+            ${{ runner.temp }}/native-first.json
+            ${{ runner.temp }}/native-second.json
+          retention-days: 2
