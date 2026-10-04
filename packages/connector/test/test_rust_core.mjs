@@ -11,6 +11,7 @@ import { spawnSync } from 'node:child_process';
 import { CORE_VERSION, coreArgs, isRustCoreProgram, rustCoreEnvironment, rustCoreRootForProgram, selfTest } from '../core.mjs';
 import { coreProgram, linkCoreRuntimeIntoRelease, point, releaseLayout, selectedMcpCommand } from '../release.mjs';
 import { matchesSelectedRustConnectorIdentity, RUST_CONNECTOR_KIND } from '../rust-connector.mjs';
+import { serverCommand } from '../registrations.mjs';
 import { writePrivateFile } from '../secure-fs.mjs';
 import { CORE_ISSUER, CORE_REPOSITORY, CORE_REPOSITORY_ID, RUST_CORE_SIGNER, SLSA_PREDICATE,
   enforceRustCoreProvenance, sha256, verifyRustCoreArtifact } from '../core-attestation.mjs';
@@ -178,6 +179,8 @@ test('selected Rust Connector identity binds the exact release executable and ru
 
   const selectedExecutable = path.join(layout.current, 'dist', 'sidevoice-rust');
   assert.deepEqual(selectedMcpCommand(env), [selectedExecutable, '--installed', 'mcp']);
+  assert.deepEqual(serverCommand(env, { command: ['node', '/old/cli.mjs'] }),
+    { command: selectedExecutable, args: ['--installed', 'mcp'] }, 'manual registration uses the selected Rust MCP');
   const identity = { version: release.connector, runtime_kind: release.runtime_kind,
     runtime_build_sha: release.runtime_build_sha, runtime_sha256: release.runtime_sha256,
     runtime_target: release.runtime_target, release_id: release.id,
@@ -186,6 +189,33 @@ test('selected Rust Connector identity binds the exact release executable and ru
   for (const field of ['version', 'runtime_kind', 'runtime_build_sha', 'runtime_sha256', 'runtime_target', 'release_id', 'executable']) {
     assert.equal(matchesSelectedRustConnectorIdentity({ ...identity, [field]: 'wrong' }, release, layout.root), false, field);
   }
+});
+
+test('installed connector management refuses a failed query and honors an unloaded definition', async t => {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'sidevoice-manager-state-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const runtime = path.join(home, 'runtime');
+  const config = path.join(home, 'config');
+  await mkdir(runtime, { recursive: true, mode: 0o700 });
+  await mkdir(config, { recursive: true, mode: 0o700 });
+  await writeFile(path.join(runtime, 'bus'), 'fixture');
+  const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: config, XDG_DATA_HOME: path.join(home, 'data'),
+    XDG_RUNTIME_DIR: runtime, SIDEVOICE_DATA_DIR: path.join(home, '.sidevoice'), SIDEVOICE_SERVICE_MANAGER: 'systemd',
+    SIDEVOICE_SYSTEMCTL: '/bin/false' };
+  const observe = () => {
+    const result = spawnSync(process.execPath, [new URL('../cli.mjs', import.meta.url).pathname,
+      '--sidevoice-connector-management'], { env, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout).state;
+  };
+  assert.equal(observe(), 'unknown');
+  const definition = path.join(config, 'systemd', 'user', 'sidevoice-connector.service');
+  await mkdir(path.dirname(definition), { recursive: true, mode: 0o700 });
+  await writeFile(definition, '[Service]\nExecStart=/bin/false\n');
+  assert.equal(observe(), 'defined');
+  await rm(definition);
+  await rm(path.join(runtime, 'bus'));
+  assert.equal(observe(), 'absent');
 });
 
 test('native self-test supplies fixed fixture/model paths and rejects a bad report or exit', async t => {

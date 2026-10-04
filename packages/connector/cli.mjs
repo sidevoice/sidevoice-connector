@@ -16,7 +16,8 @@ import { run as skill } from './skill.mjs';
 import { run as agents, scanInstalledAgents } from './agents.mjs';
 import { t } from './i18n.mjs';
 import { VERSION } from './identity.mjs';
-import { realpathSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
+import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { cursorDatabaseMatches } from './harness-cursor-desktop.mjs';
 import { verifyCoreArtifact } from './core-attestation.mjs';
@@ -25,7 +26,9 @@ import https from 'node:https';
 import net from 'node:net';
 import tls from 'node:tls';
 import { readFile } from 'node:fs/promises';
-import { stableCommand } from './release.mjs';
+import { coreProgram, selection, stableCommand } from './release.mjs';
+import { ensureRunning } from './core.mjs';
+import { installedService, managerKind, presence } from './service.mjs';
 import { connectorMetadata, versionMetadata } from './metadata.mjs';
 import { pause } from './testpoint.mjs';
 import { appendLine } from './logfile.mjs';
@@ -55,6 +58,27 @@ export async function main([command, ...argv] = process.argv.slice(2)) {
   if (command === '--sidevoice-selected-command') {
     try { console.log(JSON.stringify(stableCommand(process.env))); return 0; }
     catch (error) { console.log(JSON.stringify({ error: error.key ?? 'install.failed' })); return 1; }
+  }
+  if (command === '--sidevoice-connector-management') {
+    const service = installedService(process.env);
+    const kind = service?.kind ?? (process.platform === 'linux' ? 'systemd' : managerKind(process.env));
+    const observed = service?.connector ? { state: 'defined' } : presence(kind, 'connector', process.env);
+    const noUserBus = process.platform === 'linux' && !service?.connector
+      && (!process.env.XDG_RUNTIME_DIR || !existsSync(path.join(process.env.XDG_RUNTIME_DIR, 'bus')));
+    console.log(JSON.stringify({ state: service?.connector || observed.state === 'loaded' ? 'defined'
+      : noUserBus ? 'absent' : observed.state === 'unknown' ? 'unknown' : 'absent' }));
+    return 0;
+  }
+  if (command === '--sidevoice-ensure-core') {
+    try {
+      if (installedService(process.env)?.core || selection(process.env, 'current')?.release?.runtime_kind !== 'rust-native-v1') throw new Error('unmanaged Rust selection required');
+      await ensureRunning({ dataDir: dataDirOf(process.env), env: process.env, bin: coreProgram(process.env) });
+      console.log(JSON.stringify({ ok: true }));
+      return 0;
+    } catch (error) {
+      console.log(JSON.stringify({ ok: false, error: error.key ?? 'core.failed' }));
+      return 1;
+    }
   }
   if (command === '--sidevoice-agent-scan') {
     try { scanInstalledAgents(process.env); return 0; }

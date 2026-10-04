@@ -1139,6 +1139,18 @@ async fn verify_connector_socket(profile: &Profile) -> anyhow::Result<()> {
 }
 
 pub async fn status(profile: &Profile, connector_self: bool) -> Value {
+    if profile.is_installed() {
+        return match selected_control(
+            profile,
+            &["service", "status", "--json"],
+            Duration::from_secs(35),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => Failure::plain(error).value(),
+        };
+    }
     match observe(profile, connector_self).await {
         Ok(observation) => derive_status(&observation),
         Err(error) => {
@@ -1237,47 +1249,35 @@ pub async fn ensure_connector(profile: &Profile) -> anyhow::Result<()> {
     )))
 }
 
-#[cfg(target_os = "macos")]
-async fn installed_connector_service_loaded() -> bool {
-    let target = format!("gui/{}/dev.sidevoice.connector", unsafe { libc::geteuid() });
-    let mut command = Command::new("/bin/launchctl");
-    command.args(["print", &target]).kill_on_drop(true);
-    timeout(Duration::from_secs(3), command.output())
-        .await
-        .is_ok_and(|result| result.is_ok_and(|out| out.status.success()))
-}
-
-#[cfg(target_os = "linux")]
-async fn installed_connector_service_loaded() -> bool {
-    let mut command = Command::new("/usr/bin/systemctl");
+async fn selected_control(
+    profile: &Profile,
+    args: &[&str],
+    limit: Duration,
+) -> anyhow::Result<Value> {
+    let mut command = Command::new(profile.control_executable()?);
     command
-        .args([
-            "--user",
-            "show",
-            "-p",
-            "LoadState",
-            "sidevoice-connector.service",
-        ])
+        .args(args)
+        .env_clear()
+        .env(
+            "PATH",
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        )
+        .stdin(Stdio::null())
         .kill_on_drop(true);
-    timeout(Duration::from_secs(3), command.output())
-        .await
-        .is_ok_and(|result| {
-            result.is_ok_and(|out| {
-                out.status.success()
-                    && String::from_utf8_lossy(&out.stdout).trim() == "LoadState=loaded"
-            })
-        })
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-async fn installed_connector_service_loaded() -> bool {
-    false
+    for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    profile.command_env(&mut command);
+    let output = timeout(limit, command.output()).await??;
+    if output.stdout.len() > 65536 || !output.status.success() {
+        anyhow::bail!("selected Sidevoice control command failed");
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
 }
 
 async fn ensure_installed_connector(profile: &Profile) -> anyhow::Result<()> {
-    if verify_connector_socket(profile).await.is_ok() {
-        return Ok(());
-    }
     if profile.service_stopped()? {
         return Err(anyhow::Error::new(Failure::keyed(
             "service.node-stopped",
@@ -1293,16 +1293,35 @@ async fn ensure_installed_connector(profile: &Profile) -> anyhow::Result<()> {
     {
         anyhow::bail!("the selected release changed; restart this MCP process");
     }
-    let manager_loaded = installed_connector_service_loaded().await;
-    if manager_loaded {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if verify_connector_socket(profile).await.is_ok() {
-                return Ok(());
+    let management = selected_control(
+        profile,
+        &["--sidevoice-connector-management"],
+        Duration::from_secs(35),
+    )
+    .await?;
+    match management.get("state").and_then(Value::as_str) {
+        Some("defined") => {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if verify_connector_socket(profile).await.is_ok() {
+                    return Ok(());
+                }
+                sleep(Duration::from_millis(100)).await;
             }
-            sleep(Duration::from_millis(100)).await;
+            anyhow::bail!("the selected Sidevoice service did not answer its local socket");
         }
-        anyhow::bail!("the selected Sidevoice service did not answer its local socket");
+        Some("absent") => {}
+        _ => anyhow::bail!("the selected Sidevoice service manager could not be observed"),
+    }
+    let connector_up = verify_connector_socket(profile).await.is_ok();
+    selected_control(
+        profile,
+        &["--sidevoice-ensure-core"],
+        Duration::from_secs(60),
+    )
+    .await?;
+    if connector_up && verify_connector_socket(profile).await.is_ok() {
+        return Ok(());
     }
     let executable = profile.root.join("current/dist/sidevoice-rust");
     let mut command = Command::new(executable);
@@ -1315,16 +1334,15 @@ async fn ensure_installed_connector(profile: &Profile) -> anyhow::Result<()> {
         )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+        .stderr(Stdio::null());
     profile.command_env(&mut command);
     let mut child = command.spawn()?;
-    tokio::spawn(async move {
-        let _ = child.wait().await;
-    });
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if verify_connector_socket(profile).await.is_ok() {
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
             return Ok(());
         }
         if profile.service_stopped()? {
@@ -1332,6 +1350,8 @@ async fn ensure_installed_connector(profile: &Profile) -> anyhow::Result<()> {
         }
         sleep(Duration::from_millis(100)).await;
     }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
     anyhow::bail!("the selected Sidevoice connector did not start on demand")
 }
 

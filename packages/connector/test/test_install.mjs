@@ -12,7 +12,7 @@ import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, rea
 import { fileURLToPath } from 'node:url';
 import { decide, point, releaseLayout } from '../release.mjs';
 import { RUST_CORE_ENTRYPOINT, RUST_CORE_KIND, rustCoreTarget } from '../rust-core.mjs';
-import { apply } from '../install.mjs';
+import { apply, rollback } from '../install.mjs';
 import { writePrivateFile } from '../secure-fs.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -55,7 +55,8 @@ test('runtime switch refuses a queued or unreadable outbox before staging or mov
   const home = mkdtempSync(path.join(os.tmpdir(), 'sv-runtime-switch-outbox-'));
   const data = path.join(home, '.sidevoice');
   const env = { ...process.env, HOME: home, SIDEVOICE_DATA_DIR: data,
-    XDG_DATA_HOME: path.join(home, 'xdg'), SIDEVOICE_INSTALL_FROM_SOURCE: '0' };
+    XDG_DATA_HOME: path.join(home, 'xdg'), XDG_CONFIG_HOME: path.join(home, '.config'),
+    SIDEVOICE_SERVICE_MANAGER: 'none', SIDEVOICE_INSTALL_FROM_SOURCE: '0' };
   mkdirSync(data, { recursive: true, mode: 0o700 });
   const layout = releaseLayout(env), oldId = 'legacy-javascript';
   const oldDir = path.join(layout.releases, oldId);
@@ -82,6 +83,84 @@ test('runtime switch refuses a queued or unreadable outbox before staging or mov
   await assert.rejects(apply(env, { core: false, candidateRelease: next }), error => error.key === 'install.runtime-switch-outbox');
   assert.equal(readlinkSync(layout.current), path.join('releases', oldId));
   assert.equal(existsSync(path.join(layout.releases, next.id)), false, 'an unreadable queue still refuses before staging');
+
+  // The initial pre-stage read is empty. A writer adds speech while staging is paused, so the
+  // post-quiescence decision must still refuse without selecting the other runtime.
+  rmSync(outbox);
+  const staged = { ...next, id: `${next.id}-nocore` };
+  mkdirSync(path.join(layout.releases, staged.id), { mode: 0o700 });
+  writePrivateFile(path.join(layout.releases, staged.id, 'release.json'), `${JSON.stringify(staged)}\n`);
+  const hooks = mkdtempSync(path.join(os.tmpdir(), 'sv-switch-hooks-'));
+  writeFileSync(path.join(hooks, 'pause-install-before-commit'), '');
+  t.after(() => rmSync(hooks, { recursive: true, force: true }));
+  const source = `import { apply } from ${JSON.stringify(new URL('../install.mjs', import.meta.url).href)};
+    try { await apply(process.env, { core: false, candidateRelease: JSON.parse(process.env.SIDEVOICE_TEST_CANDIDATE) }); process.exitCode = 0; }
+    catch (error) { console.log(error.key); process.exitCode = 1; }`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', source], { env: { ...env, SIDEVOICE_TEST_HOOKS: hooks,
+    SIDEVOICE_TEST_CANDIDATE: JSON.stringify(next) }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = '', errors = '';
+  child.stdout.on('data', chunk => { output += chunk; });
+  child.stderr.on('data', chunk => { errors += chunk; });
+  for (let i = 0; i < 200 && !existsSync(path.join(hooks, 'paused-install-before-commit')); i++) await wait(25);
+  assert.equal(existsSync(path.join(hooks, 'paused-install-before-commit')), true,
+    `installer reached the final handoff: ${output} ${errors}`);
+  writePrivateFile(outbox, '[{"event_id":"arrived-during-stage"}]\n');
+  writeFileSync(path.join(hooks, 'resume-install-before-commit'), '');
+  assert.equal(await new Promise(resolve => child.on('exit', resolve)), 1);
+  assert.match(output, /install.runtime-switch-outbox/);
+  assert.equal(readlinkSync(layout.current), path.join('releases', oldId));
+
+  // A failed candidate may write its own durable row after selection. Recovery keeps that row
+  // available for diagnosis while the previous runtime starts with no shared outbox to replay.
+  rmSync(outbox);
+  point(env, 'verified', oldId);
+  mkdirSync(path.join(layout.releases, next.id), { mode: 0o700 });
+  writePrivateFile(path.join(layout.releases, next.id, 'release.json'), `${JSON.stringify(next)}\n`);
+  rmSync(path.join(hooks, 'pause-install-before-commit'));
+  writeFileSync(path.join(hooks, 'pause-install-after-commit'), '');
+  const recover = `import { apply } from ${JSON.stringify(new URL('../install.mjs', import.meta.url).href)};
+    const result = await apply(process.env, { candidateRelease: JSON.parse(process.env.SIDEVOICE_TEST_CANDIDATE) });
+    console.log(JSON.stringify({ action: result.action, quarantined: result.quarantined }));`;
+  const failed = spawn(process.execPath, ['--input-type=module', '-e', recover], { env: { ...env,
+    SIDEVOICE_TEST_HOOKS: hooks, SIDEVOICE_TEST_CANDIDATE: JSON.stringify(next), SIDEVOICE_INSTALL_VERIFY_MS: '1000' },
+  stdio: ['ignore', 'pipe', 'pipe'] });
+  let recovered = '', recoverErrors = '';
+  failed.stdout.on('data', chunk => { recovered += chunk; });
+  failed.stderr.on('data', chunk => { recoverErrors += chunk; });
+  for (let i = 0; i < 200 && !existsSync(path.join(hooks, 'paused-install-after-commit')); i++) await wait(25);
+  assert.equal(existsSync(path.join(hooks, 'paused-install-after-commit')), true,
+    `failed candidate reached the selected state: ${recovered} ${recoverErrors}`);
+  writePrivateFile(outbox, '[{"event_id":"queued-by-failed-rust"}]\n');
+  writeFileSync(path.join(hooks, 'resume-install-after-commit'), '');
+  assert.equal(await new Promise(resolve => failed.on('exit', resolve)), 0, recoverErrors);
+  const recovery = JSON.parse(recovered.trim());
+  assert.equal(recovery.action, 'rollback');
+  assert.equal(readlinkSync(layout.current), path.join('releases', oldId));
+  assert.equal(existsSync(outbox), false, 'the previous JS runtime cannot replay the failed Rust row');
+  assert.match(readFileSync(recovery.quarantined, 'utf8'), /queued-by-failed-rust/);
+});
+
+test('explicit rollback refuses queued speech in either cross-runtime direction', async t => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-rollback-outbox-'));
+  const data = path.join(home, '.sidevoice');
+  const env = { ...process.env, HOME: home, SIDEVOICE_DATA_DIR: data, XDG_DATA_HOME: path.join(home, 'xdg'),
+    XDG_CONFIG_HOME: path.join(home, '.config'),
+    SIDEVOICE_SERVICE_MANAGER: 'none' };
+  mkdirSync(data, { recursive: true, mode: 0o700 });
+  const layout = releaseLayout(env);
+  for (const [id, runtime_kind] of [['js', 'javascript'], ['rust', 'rust-native-v1']]) {
+    const directory = path.join(layout.releases, id);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    writePrivateFile(path.join(directory, 'release.json'), `${JSON.stringify({ id, runtime_kind })}\n`);
+  }
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  writePrivateFile(path.join(data, 'outbox.json'), '[{"event_id":"queued"}]\n');
+  for (const [current, previous] of [['js', 'rust'], ['rust', 'js']]) {
+    point(env, 'current', current);
+    point(env, 'previous', previous);
+    await assert.rejects(rollback(env), error => error.key === 'install.runtime-switch-outbox');
+    assert.equal(readlinkSync(layout.current), path.join('releases', current));
+  }
 });
 
 /** This package built for real — `build.mjs`, stamped as CI stamps it — and copied to stand as another package, as

@@ -780,18 +780,17 @@ impl Daemon {
     }
 
     async fn node_status(&self) -> Value {
-        if !self.profile.is_installed() {
-            return crate::service::status(&self.profile, true).await;
-        }
-        let connected = self.link.connected().await;
-        let mut connector = json!({"running":true,"version":self.profile.connector_version()});
-        if let Some(fields) = self.profile.runtime_identity().as_object() {
-            for (key, value) in fields {
-                connector[key] = value.clone();
+        let mut status = crate::service::status(&self.profile, true).await;
+        if self.profile.is_installed() {
+            if let Some(connector) = status.get_mut("connector") {
+                if let Some(fields) = self.profile.runtime_identity().as_object() {
+                    for (key, value) in fields {
+                        connector[key] = value.clone();
+                    }
+                }
             }
         }
-        json!({"ok":true,"installed":true,"service":std::env::var("SIDEVOICE_SERVICE").unwrap_or_else(|_|"on-demand".into()),
-            "state":"running","reachable":connected,"core":{"connected":connected},"connector":connector})
+        status
     }
 
     async fn handle_app_notice(&self, notice: AppNotice) {

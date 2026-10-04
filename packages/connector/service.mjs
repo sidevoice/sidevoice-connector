@@ -35,7 +35,7 @@ import { localHealth } from './core-socket.mjs';
 import { readLock, tryLock } from './lockfile.mjs';
 import { isProcess, processAge, signalVerified } from './proc.mjs';
 import { coreProgram, releaseRoot, selectedDaemonCommand, selection, stableCommand } from './release.mjs';
-import { RUST_CONNECTOR_KIND } from './rust-connector.mjs';
+import { matchesSelectedRustConnectorIdentity, RUST_CONNECTOR_KIND } from './rust-connector.mjs';
 import { keyed, t } from './i18n.mjs';
 import { connectorLockOf, connectorSocketOf, dataDirOf, nodeFiles, readJson, recordedInstallation, writePrivate } from './node-files.mjs';
 
@@ -494,18 +494,25 @@ async function lockHolder(env) {
 export async function stopOnDemand(env = process.env) {
   const dataDir = dataDirOf(env);
   const connector = await lockHolder(env);
+  const selected = selection(env, 'current')?.release;
+  const rust = !connector && selected?.runtime_kind === RUST_CONNECTOR_KIND
+    ? await askConnector('identity', {}, { env, timeout: 1000 }) : null;
+  const rustOwner = matchesSelectedRustConnectorIdentity(rust, selected, releaseRoot(env)) && !rust.managed
+    && Number.isInteger(rust.pid) && rust.pid > 0 ? { pid: rust.pid, executable: rust.executable } : null;
+  if (rustOwner) await askConnector('shutdown', { expected_pid: rustOwner.pid, expected_executable: rustOwner.executable }, { env, timeout: 1500 });
   if (connector) signalVerified(connector.pid, 'SIGTERM', { start: connector.start });
-  const connectorUp = () => !!connector && isProcess(connector.pid, { start: connector.start });
+  const connectorUp = () => connector ? isProcess(connector.pid, { start: connector.start })
+    : !!rustOwner && isProcess(rustOwner.pid);
   const deadline = Date.now() + TEARDOWN_MS();
   while (connectorUp() && Date.now() < deadline) await wait(100);
   const killed = [];
-  if (connectorUp() && signalVerified(connector.pid, 'SIGKILL', { start: connector.start })) killed.push(connector.pid);
+  if (connector && connectorUp() && signalVerified(connector.pid, 'SIGKILL', { start: connector.start })) killed.push(connector.pid);
   for (const pid of coreProcesses(dataDir)) {
     await terminateCore(dataDir, pid, { grace: TEARDOWN_MS() });
     if (coreRunning(dataDir, pid)) killed.push(pid);
   }
   for (let i = 0; i < 50 && (connectorUp() || (await askConnector('status', {}, { env, timeout: 300 }))); i++) await wait(100);
-  const left = [connectorUp() && connector.pid, ...coreProcesses(dataDir)].filter(Boolean);
+  const left = [connectorUp() && (connector?.pid ?? rustOwner?.pid), ...coreProcesses(dataDir)].filter(Boolean);
   return { killed, left };
 }
 
