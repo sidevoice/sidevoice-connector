@@ -147,6 +147,9 @@ async fn main() -> Result<()> {
         None => Profile::from_env()?,
     };
     match cli.command {
+        Action::RuntimeIdentity { .. } => {
+            unreachable!("runtime identity returned before profile setup")
+        }
         Action::Mcp => mcp::run(profile).await,
         Action::Connector { service } => {
             if service && (cli.installed || !explicit_profile) {

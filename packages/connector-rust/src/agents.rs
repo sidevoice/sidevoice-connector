@@ -3,7 +3,7 @@
 //! One gate owns a complete request. CLI children belong to its worker task so a vanished link reply can
 //! cancel the work without releasing the gate before the child has exited.
 
-use crate::proof::{atomic_json, private_dir, Profile};
+use crate::proof::{atomic_json, private_dir, validate_user_directory, Profile};
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::Serialize;
