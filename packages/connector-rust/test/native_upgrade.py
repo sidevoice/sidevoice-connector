@@ -9,6 +9,8 @@ from native_control import ready, run, selected, wait_running
 
 
 def main(legacy, native):
+    if os.environ.get('GITHUB_ACTIONS') != 'true':
+        raise SystemExit('native upgrade proof runs only on a disposable GitHub Actions runner')
     with tempfile.TemporaryDirectory(prefix='svnu-', dir='/tmp') as directory:
         home = Path(directory).resolve()
         data, xdg, config = home / '.sidevoice', home / 'data', home / 'config'

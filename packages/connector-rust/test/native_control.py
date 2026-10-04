@@ -57,14 +57,21 @@ def wait_running(binary, env):
 
 
 def main(first, second):
+    if os.environ.get('GITHUB_ACTIONS') != 'true':
+        raise SystemExit('native lifecycle proof runs only on a disposable GitHub Actions runner')
     with tempfile.TemporaryDirectory(prefix='svnc-', dir='/tmp') as directory:
         base = Path(directory).resolve()
         home = base / 'home'
         data = home / '.sidevoice'
         xdg = home / 'data'
         config = home / 'config'
+        # systemd resolves user units using its own login environment, not a client's HOME.
+        if os.uname().sysname == 'Linux':
+            config = Path(os.environ.get('XDG_CONFIG_HOME', str(Path(os.environ['HOME']) / '.config'))).resolve()
+            for unit in ['sidevoice-core.service', 'sidevoice-connector.service']:
+                assert not (config / 'systemd/user' / unit).exists(), 'runner has an existing Sidevoice unit'
         for path in [home, data, xdg, config]:
-            path.mkdir(mode=0o700)
+            path.mkdir(mode=0o700, exist_ok=True)
         env = {key: value for key, value in os.environ.items() if not key.startswith('SIDEVOICE_')}
         for key in ['CURSOR_CONFIG_DIR', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME']:
             env.pop(key, None)
