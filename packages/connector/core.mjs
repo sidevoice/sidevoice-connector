@@ -526,7 +526,7 @@ export function coreArgs({ dataDir, env = process.env, launchId = null, idleExit
   if (nativeRoot) {
     const args = ['--data-dir', coreData(dataDir), '--socket', socketPathOf(dataDir),
       '--ready-file', path.join(coreData(dataDir), 'core.json'), '--host', '127.0.0.1',
-      '--port', String(DEFAULT_PORT)];
+      '--port', String(env.SIDEVOICE_CORE_PORT ?? DEFAULT_PORT)];
     if (launchId) args.push('--launch-id', launchId);
     args.push('--log-file', logPath(dataDir));
     if (roomCredential) args.push('--room-credential', roomCredential);

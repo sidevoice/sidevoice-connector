@@ -79,7 +79,8 @@ def main():
             if name.startswith('SIDEVOICE_'):
                 env.pop(name)
         env.update({'HOME': str(home), 'XDG_DATA_HOME': str(xdg_data), 'XDG_CONFIG_HOME': str(xdg_config),
-                    'SIDEVOICE_DATA_DIR': str(data), 'SIDEVOICE_INSTALL_VERIFY_MS': '120000'})
+                    'SIDEVOICE_DATA_DIR': str(data), 'SIDEVOICE_INSTALL_VERIFY_MS': '120000',
+                    'SIDEVOICE_CORE_PORT': '0'})
 
         pair_request = {}
         auth_file = root / 'room-auth.json'
