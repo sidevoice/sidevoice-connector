@@ -355,6 +355,7 @@ impl Profile {
                 .core_manifest_sha256
                 .as_deref()
                 .is_some_and(|value| lower_hex(value, 64))
+            || !selected.core_archive_size.is_some_and(|size| size > 0)
             || selected.core_entrypoint.as_deref() != Some("bin/sidevoice-core-rust")
             || selected.core_build.as_deref() != Some(core_id.as_str())
             || selected.pair_id != format!("pair-v1:rust-native-v1:{runtime_sha}:core:{core_id}")
