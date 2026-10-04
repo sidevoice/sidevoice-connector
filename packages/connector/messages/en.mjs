@@ -20,6 +20,7 @@ export const en = {
   'install.authenticity': 'The downloaded Sidevoice core was refused at check "{check}".',
   'install.runtime-switch-outbox': 'Sidevoice cannot switch Connector runtimes while speech is queued or its outbox cannot be read. Let the queue empty, then retry the install.',
   'install.runtime-switching': 'Sidevoice is updating the Connector. Try again in a moment.',
+  'install.runtime-switch-service-required': 'Start this existing JavaScript installation as a login service before switching to the Rust Connector. Existing on-demand agent sessions cannot restart the new runtime safely; run `sidevoice service install`, then retry.',
   'install.outbox-quarantined': 'Queued speech from the failed release was retained at {path} and was not replayed by the previous Connector.',
 
   // The launcher and the node service (§4.2). `node.stopped` also reaches agents, so it stays plain English.

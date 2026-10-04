@@ -61,22 +61,52 @@ export function nodeStopped(dataDir, selectedId) {
 /** Clearing a human stop on an explicit start retains the old-facade compatibility gate. */
 export function restoreSelectedLaunchGate(dataDir, selectedId) {
   const files = nodeFiles(dataDir), migration = readTrustedJson(files.switching);
+  if (migration?.phase === 'active') return;
   if (migration?.phase === 'committed' && migration.to === selectedId) {
     writePrivateFile(files.stopped, JSON.stringify({ runtime_switch_token: migration.token, to: selectedId }));
   } else rmSync(files.stopped, { force: true });
 }
 
+/** A retry owns install.lock. Finish a killed pointer flip, or restore the stop state from before the killed switch. */
+export function reconcileRuntimeLaunch(dataDir, selectedId) {
+  const files = nodeFiles(dataDir), marker = readTrustedJson(files.switching);
+  if (marker?.phase !== 'active' || !marker.to || runtimeSwitching(dataDir)) return;
+  const ours = readTrustedJson(files.stopped)?.runtime_switch_token === marker.token;
+  if (marker.to === selectedId) {
+    if ((marker.runtimeKind ?? 'javascript') === 'javascript') {
+      rmSync(files.switching, { force: true });
+      if (ours) rmSync(files.stopped, { force: true });
+    } else {
+      writePrivateFile(files.switching, JSON.stringify({ phase: 'committed', token: marker.token, to: selectedId }));
+      if (ours) restoreSelectedLaunchGate(dataDir, selectedId);
+    }
+    return;
+  }
+  if (marker.previousSwitch === null) rmSync(files.switching, { force: true });
+  else if (typeof marker.previousSwitch === 'string') writePrivateFile(files.switching, marker.previousSwitch);
+  if (ours) {
+    if (marker.previousStop === null) rmSync(files.stopped, { force: true });
+    else if (typeof marker.previousStop === 'string') writePrivateFile(files.stopped, marker.previousStop);
+  }
+}
+
 /** Called with install.lock held. Refusal restores the exact previous marker and human stop intent. */
-export function inhibitRuntimeLaunch(dataDir) {
+export function inhibitRuntimeLaunch(dataDir, to, runtimeKind) {
   const owner = readLock(installLockPath(dataDir));
   if (!owner || owner.pid !== process.pid) throw new Error('install lock required for runtime switch');
   const token = randomUUID();
   const files = nodeFiles(dataDir);
   const previousSwitch = readTrusted(files.switching), previousStop = readTrusted(files.stopped);
-  writePrivateFile(files.switching, JSON.stringify({ phase: 'active', token, pid: owner.pid, start: owner.start }));
+  writePrivateFile(files.switching, JSON.stringify({ phase: 'active', token, pid: owner.pid, start: owner.start,
+    to, runtimeKind, previousSwitch, previousStop }));
   writePrivateFile(files.stopped, JSON.stringify({ runtime_switch_token: token }));
   let committed = false;
   return {
+    refresh() {
+      if (readTrustedJson(files.switching)?.token === token) {
+        writePrivateFile(files.stopped, JSON.stringify({ runtime_switch_token: token }));
+      }
+    },
     commit(to, runtimeKind) {
       if ((runtimeKind ?? 'javascript') === 'javascript') {
         // The selected older JS daemon also reads this marker literally, so it must be cleared for JS rollback.

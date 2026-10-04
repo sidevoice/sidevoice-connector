@@ -36,7 +36,7 @@ import { candidate, coreProgram, decide, discardRuntimeIfUnselected, flipBack, m
 import { matchesSelectedRustConnectorIdentity, RUST_CONNECTOR_KIND } from './rust-connector.mjs';
 import { HARNESS_REGISTRATIONS, codexInstructions, cursorMcpFile, serverCommand, unregisterFromClaude, unregisterFromCodex, unregisterFromCursor } from './registrations.mjs';
 import { askConnector, compatibleCore, installedService, jobDefinitions, linger, managerKind, recordInstallation, settledState, start as startService, startJobs, status, stop as stopService, stopOnDemand, uninstall as uninstallService, writeDefinitions } from './service.mjs';
-import { dataDirOf, inhibitRuntimeLaunch, nodeFiles, nodeStopped, restoreSelectedLaunchGate } from './node-files.mjs';
+import { dataDirOf, inhibitRuntimeLaunch, nodeFiles, nodeStopped, reconcileRuntimeLaunch, recordedInstallation, restoreSelectedLaunchGate } from './node-files.mjs';
 import { crash, pause } from './testpoint.mjs';
 import { captureAgentEnvironment, withAgentStateLock } from './agents.mjs';
 import { readTrusted } from './secure-fs.mjs';
@@ -259,13 +259,15 @@ async function goBack(env, kind, progressEvent = () => {}, { explicit = false } 
   const previous = ['verified', 'previous'].map(name => selection(env, name)?.release)
     .find(release => release && release.id !== current?.id);
   if (!previous) return null;
+  if ((current?.runtime_kind ?? 'javascript') === 'javascript' && previous.runtime_kind === RUST_CONNECTOR_KIND
+      && kind === 'none' && recordedInstallation(env)) throw keyed('install.runtime-switch-service-required');
   let resume = null, quarantined = null;
   const runtimeKindChanged = (current?.runtime_kind ?? 'javascript') !== (previous.runtime_kind ?? 'javascript');
   const quiesce = runtimeKindChanged || (current?.runtime_kind === RUST_CONNECTOR_KIND && current.id !== previous.id);
   const stoppedBefore = nodeStopped(dataDirOf(env), current?.id);
-  const uninhibit = quiesce ? inhibitRuntimeLaunch(dataDirOf(env)) : null;
+  const uninhibit = quiesce ? inhibitRuntimeLaunch(dataDirOf(env), previous.id, previous.runtime_kind) : null;
   try {
-    if (quiesce) resume = await quiesceRuntime(env, { stoppedBefore });
+    if (quiesce) { resume = await quiesceRuntime(env, { stoppedBefore }); uninhibit.refresh(); }
     await pause('rollback-after-quiesce');
     if (runtimeKindChanged) {
       if (explicit) requireEmptyOutbox(dataDirOf(env));
@@ -306,9 +308,7 @@ export async function apply(env, { core = true, service = false, applyNow = fals
   let conversionUninhibit = null, conversionResume = null;
   try {
     if (signal?.aborted) throw keyed('install.cancelled');
-    // Capture login-shell agent paths after taking the install lock, before any selected service can start.
-    captureAgentEnvironment(env);
-    removeLeftovers(env);
+    reconcileRuntimeLaunch(dataDir, selection(env, 'current')?.id);
     const current = selection(env, 'current')?.release ?? null;
     // A release without a core (`--no-core`) is one of its own, and does not satisfy an install that needs the core:
     // that one stages a complete release instead.
@@ -318,6 +318,13 @@ export async function apply(env, { core = true, service = false, applyNow = fals
     if (action === 'noop' && core && current && !current.core_build) action = 'upgrade';
     const runtimeKindChanged = (current?.runtime_kind ?? 'javascript') !== (next.runtime_kind ?? 'javascript');
     if (action !== 'noop' && runtimeKindChanged) requireEmptyOutbox(dataDir);
+    if (action !== 'noop' && current && (current.runtime_kind ?? 'javascript') === 'javascript'
+        && next.runtime_kind === RUST_CONNECTOR_KIND && recordedInstallation(env) && !installedService(env)) {
+      throw keyed('install.runtime-switch-service-required');
+    }
+    // Capture login-shell agent paths after taking the install lock, before any selected service can start.
+    captureAgentEnvironment(env);
+    removeLeftovers(env);
     let chosen = current;
     if (action !== 'noop') {
       chosen = await stage(env, next, { dataDir, core, log, progress, signal, progressEvent,
@@ -330,10 +337,10 @@ export async function apply(env, { core = true, service = false, applyNow = fals
       await pause('install-before-commit', { signal });
       const quiesce = runtimeKindChanged || (current?.runtime_kind === RUST_CONNECTOR_KIND && current.id !== chosen.id);
       const stoppedBefore = nodeStopped(dataDir, current?.id);
-      const uninhibit = quiesce ? inhibitRuntimeLaunch(dataDir) : null;
+      const uninhibit = quiesce ? inhibitRuntimeLaunch(dataDir, chosen.id, chosen.runtime_kind) : null;
       let resume = null;
       try {
-        if (quiesce) resume = await quiesceRuntime(env, { stoppedBefore });
+        if (quiesce) { resume = await quiesceRuntime(env, { stoppedBefore }); uninhibit.refresh(); }
         await pause('install-after-quiesce', { signal });
         if (runtimeKindChanged) requireEmptyOutbox(dataDir);
         if (signal?.aborted) throw keyed('install.cancelled');
@@ -348,8 +355,9 @@ export async function apply(env, { core = true, service = false, applyNow = fals
       const conversionKind = core && service && !installedService(env) ? managerKind(env) : 'none';
       if (conversionKind !== 'none' && current?.runtime_kind === RUST_CONNECTOR_KIND) {
         const stoppedBefore = nodeStopped(dataDir, current.id);
-        conversionUninhibit = inhibitRuntimeLaunch(dataDir);
+        conversionUninhibit = inhibitRuntimeLaunch(dataDir, chosen.id, chosen.runtime_kind);
         conversionResume = await quiesceRuntime(env, { stoppedBefore });
+        conversionUninhibit.refresh();
         await pause('install-after-quiesce', { signal });
       }
       progressEvent({ step: 'commit', done: null, total: null });
@@ -578,6 +586,7 @@ export async function rollback(env = process.env) {
   const dataDir = dataDirOf(env);
   const release = await takeInstallLock(dataDir);
   try {
+    reconcileRuntimeLaunch(dataDir, selection(env, 'current')?.id);
     const kind = installedService(env) ? managerKind(env) : 'none';
     const from = selection(env, 'current')?.release ?? null;
     const back = await goBack(env, kind, () => {}, { explicit: true });

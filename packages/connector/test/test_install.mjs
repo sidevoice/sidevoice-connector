@@ -237,17 +237,90 @@ test('a pre-lock JS daemon cannot serve after current switches to Rust', async t
   t.after(() => { old.kill('SIGKILL'); rmSync(home, { recursive: true, force: true }); });
   for (let i = 0; i < 200 && !existsSync(path.join(hooks, 'paused-lock-before-connector')); i++) await wait(25);
   assert.equal(existsSync(path.join(hooks, 'paused-lock-before-connector')), true);
-  const switched = await apply(env, { core: false, candidateRelease: next });
-  assert.equal(switched.action, 'upgrade');
+  // A process already past startup may wait here while a managed installer changes selection.
+  point(env, 'current', `${rustId}-nocore`);
   assert.equal(readlinkSync(layout.current), path.join('releases', `${rustId}-nocore`));
-  assert.equal(existsSync(path.join(data, 'node-stopped.json')), true, 'old base facades remain inhibited');
-  assert.equal(nodeStopped(data, `${rustId}-nocore`), false, 'the selected runtime can serve');
-  await assert.rejects(legacyLaunch({ connect: async () => { throw new Error('closed'); },
-    self: [process.execPath, path.join(packageDir, 'cli.mjs')], env }), error => error.key === 'node.stopped');
+  assert.equal(existsSync(path.join(data, 'node-stopped.json')), false,
+    'the release fence must work even after a service start clears stop intent');
   writeFileSync(path.join(hooks, 'resume-lock-before-connector'), '');
   assert.equal(await new Promise(resolve => old.on('exit', resolve)), 0);
   assert.equal(existsSync(path.join(data, 'connector.sock')), false, 'stale JS did not bind the socket');
   assert.equal(existsSync(path.join(data, 'outbox.json')), false, 'stale JS did not load or write speech');
+});
+
+test('an installed unmanaged JS profile refuses Rust promotion while a base facade may still run', async t => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-unmanaged-legacy-promotion-'));
+  const data = path.join(home, '.sidevoice'), marker = path.join(home, 'legacy-launched');
+  const env = { ...process.env, HOME: home, SIDEVOICE_DATA_DIR: data,
+    XDG_DATA_HOME: path.join(home, 'xdg'), XDG_CONFIG_HOME: path.join(home, '.config'),
+    SIDEVOICE_SERVICE_MANAGER: 'none' };
+  mkdirSync(data, { recursive: true, mode: 0o700 });
+  const layout = releaseLayout(env), old = { id: 'base-js', connector: '0.6.0', runtime_kind: 'javascript' };
+  mkdirSync(path.join(layout.releases, old.id), { recursive: true, mode: 0o700 });
+  writePrivateFile(path.join(layout.releases, old.id, 'release.json'), JSON.stringify(old));
+  point(env, 'current', old.id);
+  const installRecord = JSON.stringify({ releases: layout.root,
+    command: [process.execPath, path.join(layout.current, 'dist', 'cli.mjs')], definitions: [] });
+  writePrivateFile(path.join(data, 'install.json'), installRecord);
+  const outbox = path.join(data, 'outbox.json'), rows = '[]\n';
+  writePrivateFile(outbox, rows);
+  const selected = { ...old, id: 'next-rust', runtime_kind: 'rust-native-v1', format: 'sea' };
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  await assert.rejects(apply(env, { core: false, candidateRelease: selected }),
+    error => error.key === 'install.runtime-switch-service-required');
+  assert.equal(readlinkSync(layout.current), path.join('releases', old.id));
+  assert.equal(readFileSync(outbox, 'utf8'), rows);
+  assert.equal(readFileSync(path.join(data, 'install.json'), 'utf8'), installRecord);
+  assert.equal(existsSync(path.join(data, 'node-stopped.json')), false);
+  assert.equal(existsSync(path.join(layout.releases, `${selected.id}-nocore`)), false);
+  const self = path.join(home, 'legacy-self.mjs');
+  writeFileSync(self, `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(marker)}, 'started');\n`);
+  assert.equal(await legacyLaunch({ connect: async () => {
+    if (existsSync(marker)) return true;
+    throw new Error('socket closed');
+  }, self: [process.execPath, self], env }), true,
+  'the existing base facade still starts its selected JS path after refusal');
+});
+
+test('a switch-current crash and noop retry retain the old-base fence under Rust selection', async t => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-rust-switch-crash-'));
+  const data = path.join(home, '.sidevoice'), hooks = path.join(home, 'hooks');
+  const manager = path.join(home, 'systemctl');
+  const env = { ...process.env, HOME: home, SIDEVOICE_DATA_DIR: data,
+    XDG_DATA_HOME: path.join(home, 'xdg'), XDG_CONFIG_HOME: path.join(home, '.config'),
+    SIDEVOICE_SERVICE_MANAGER: 'systemd', SIDEVOICE_SYSTEMCTL: manager, SIDEVOICE_TEST_HOOKS: hooks };
+  mkdirSync(data, { recursive: true, mode: 0o700 }); mkdirSync(hooks);
+  writeFileSync(manager, '#!/bin/sh\ncase "$*" in *show*) printf "LoadState=not-found\\nActiveState=inactive\\n" ;; esac\n', { mode: 0o755 });
+  const definition = path.join(env.XDG_CONFIG_HOME, 'systemd', 'user', 'sidevoice-connector.service');
+  mkdirSync(path.dirname(definition), { recursive: true, mode: 0o700 });
+  writeFileSync(definition, '[Service]\nExecStart=/bin/true\n');
+  const layout = releaseLayout(env), old = { id: 'old-js', connector: '0.6.0', runtime_kind: 'javascript', format: 'esm' };
+  const next = { ...old, id: 'selected-rust', runtime_kind: 'rust-native-v1', format: 'sea' };
+  for (const release of [old, { ...next, id: `${next.id}-nocore` }]) {
+    const directory = path.join(layout.releases, release.id);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    writePrivateFile(path.join(directory, 'release.json'), JSON.stringify(release));
+  }
+  point(env, 'current', old.id);
+  writePrivateFile(path.join(data, 'install.json'), JSON.stringify({ releases: layout.root,
+    command: [process.execPath, path.join(layout.current, 'dist', 'cli.mjs')], definitions: [definition] }));
+  writeFileSync(path.join(hooks, 'crash-switch-current'), '');
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const source = `import { apply } from ${JSON.stringify(new URL('../install.mjs', import.meta.url).href)};
+    await apply(process.env, { core: false, candidateRelease: JSON.parse(process.env.SIDEVOICE_TEST_CANDIDATE) });`;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', source], { env: {
+    ...env, SIDEVOICE_TEST_CANDIDATE: JSON.stringify(next) }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const signal = await new Promise(resolve => child.on('exit', (_, exitSignal) => resolve(exitSignal)));
+  assert.equal(signal, 'SIGKILL');
+  assert.equal(readlinkSync(layout.current), path.join('releases', `${next.id}-nocore`));
+  assert.equal(existsSync(path.join(data, 'node-stopped.json')), true);
+  rmSync(path.join(hooks, 'crash-switch-current'));
+  const retried = await apply(env, { core: false, candidateRelease: next });
+  assert.equal(retried.action, 'noop');
+  assert.equal(nodeStopped(data, `${next.id}-nocore`), false, 'selected Rust may start');
+  await assert.rejects(legacyLaunch({ connect: async () => { throw new Error('socket closed'); },
+    self: [process.execPath, path.join(packageDir, 'cli.mjs')], env }), error => error.key === 'node.stopped',
+  'the frozen base facade still cannot start its old JS daemon');
 });
 
 test('noop Rust install --service without a manager leaves on-demand launch available', async t => {
