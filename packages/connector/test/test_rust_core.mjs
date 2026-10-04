@@ -199,9 +199,12 @@ test('installed connector management refuses a failed query and honors an unload
   await mkdir(runtime, { recursive: true, mode: 0o700 });
   await mkdir(config, { recursive: true, mode: 0o700 });
   await writeFile(path.join(runtime, 'bus'), 'fixture');
+  const manager = path.join(home, 'systemctl');
+  const absent = path.join(home, 'manager-absent');
+  await writeFile(manager, `#!/bin/sh\nif [ -f "${absent}" ]; then printf 'LoadState=not-found\\nActiveState=inactive\\n'; exit 0; fi\nexit 1\n`, { mode: 0o700 });
   const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: config, XDG_DATA_HOME: path.join(home, 'data'),
     XDG_RUNTIME_DIR: runtime, SIDEVOICE_DATA_DIR: path.join(home, '.sidevoice'), SIDEVOICE_SERVICE_MANAGER: 'systemd',
-    SIDEVOICE_SYSTEMCTL: '/bin/false' };
+    SIDEVOICE_SYSTEMCTL: manager };
   const observe = () => {
     const result = spawnSync(process.execPath, [new URL('../cli.mjs', import.meta.url).pathname,
       '--sidevoice-connector-management'], { env, encoding: 'utf8' });
@@ -214,7 +217,7 @@ test('installed connector management refuses a failed query and honors an unload
   await writeFile(definition, '[Service]\nExecStart=/bin/false\n');
   assert.equal(observe(), 'defined');
   await rm(definition);
-  await rm(path.join(runtime, 'bus'));
+  await writeFile(absent, '');
   assert.equal(observe(), 'absent');
 });
 
