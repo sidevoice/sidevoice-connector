@@ -1,6 +1,12 @@
 import { createRequire } from 'node:module';
 
-let sea = false;
-try { sea = createRequire(import.meta.url)('node:sea').isSea(); } catch {}
+let api = null;
+try { api = createRequire(import.meta.url)('node:sea'); } catch {}
 
-export const runningAsSea = () => sea;
+export const runningAsSea = () => !!api?.isSea();
+
+/** Read the one build-time Core payload. The caller still verifies its pinned digest before staging. */
+export function getSeaAsset(key) {
+  if (!runningAsSea()) return null;
+  return Buffer.from(api.getAsset(key));
+}

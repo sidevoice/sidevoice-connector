@@ -27,7 +27,7 @@ import path from 'node:path';
 import { readdirSync, readFileSync, rmSync, writeSync } from 'node:fs';
 import { harnessesPresent } from './identity.mjs';
 import { pairedRoom } from './pair.mjs';
-import { CORE_VERSION, NO_UV, ensureRunning, findUv, readReady, takeInstallLock } from './core.mjs';
+import { CORE_VERSION, NO_UV, embeddedRustCoreIdentity, ensureRunning, findUv, readReady, takeInstallLock } from './core.mjs';
 import { keyed, t } from './i18n.mjs';
 import { normalizeInstallFailure } from './install-errors.mjs';
 import { remove as removeSkill, skillsDir, status as skillStatus } from './skill.mjs';
@@ -185,6 +185,7 @@ async function callsEnd(env, progress, { signal, progressEvent = () => {} } = {}
  *  Returns `{action: 'install'|'upgrade'|'noop'|'rollback'|'failed', release, from, failure?, back?, kind}`. */
 export async function apply(env, { core = true, service = false, applyNow = false, progress = () => {}, log = () => {},
   afterSelection = null, signal, progressEvent = () => {}, beginCommit = () => {} } = {}) {
+  if (embeddedRustCoreIdentity() && !core) throw keyed('install.authenticity', { check: 'manifest' });
   const dataDir = dataDirOf(env), files = nodeFiles(dataDir);
   let stagedRuntimeId = null;
   const release = await takeInstallLock(dataDir, log, { signal, onWait: () => progressEvent({ step: 'wait-lock', done: null, total: null }) });
@@ -276,7 +277,12 @@ export async function install(argv = [], env = process.env, { progress = () => {
 
   // A core somebody else runs (`SIDEVOICE_URL`…) is not this installer's; `--no-core` leaves it for later.
   const externalCore = env.SIDEVOICE_URL && env.SIDEVOICE_CONNECTOR_ID && env.SIDEVOICE_CONNECTOR_TOKEN;
-  const core = !argv.includes('--no-core') && !externalCore;
+  const nativeCore = embeddedRustCoreIdentity();
+  if (nativeCore && (argv.includes('--no-core') || externalCore || env.SIDEVOICE_CORE_BIN
+      || env.SIDEVOICE_CORE_SPEC || env.SIDEVOICE_CORE_WHEEL_DIR)) {
+    throw keyed('install.authenticity', { check: 'manifest' });
+  }
+  const core = nativeCore ? true : !argv.includes('--no-core') && !externalCore;
   const localCoreOverride = !!(env.SIDEVOICE_CORE_SPEC || env.SIDEVOICE_CORE_WHEEL_DIR);
   if (core && !env.SIDEVOICE_CORE_BIN && !findUv(env) && localCoreOverride) throw new Error(NO_UV);
   const result = await apply(env, { core, service: argv.includes('--service'), applyNow: argv.includes('--apply-now'), progress,

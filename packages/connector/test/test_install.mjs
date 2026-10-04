@@ -34,6 +34,12 @@ test('versions: higher replaces, lower never does, and the same version only as 
   assert.equal(decide({ ...at('0.6.0', 'nightly', 100), format: 'esm' }, { ...at('0.6.0', 'nightly', 100), format: 'sea' }), 'upgrade', 'SEA is preferred only at the same nightly build');
   assert.equal(decide({ ...at('0.6.0', 'nightly', 100), format: 'esm' }, { ...at('0.6.0', 'release', 0), format: 'sea' }), 'noop', 'a release-format preference cannot cross from a newer nightly');
   assert.equal(decide({ ...at('0.6.0', 'release', 0), format: 'sea' }, { ...at('0.6.0', 'nightly', 100), format: 'esm' }), 'upgrade', 'a later nightly sequence wins across formats');
+  assert.equal(decide({ ...at('0.6.0'), runtime_kind: 'javascript' }, { ...at('0.6.0'), runtime_kind: 'rust-native-v1' }), 'upgrade',
+    'an equal package version cannot hide a daemon runtime switch');
+  assert.equal(decide(at('0.6.0'), { ...at('0.6.0'), runtime_kind: 'rust-native-v1' }), 'upgrade',
+    'legacy release metadata is treated as the JavaScript daemon');
+  assert.equal(decide({ ...at('0.6.0'), runtime_kind: 'rust-native-v1' }, { ...at('0.6.0'), runtime_kind: 'javascript' }), 'upgrade',
+    'runtime changes are bidirectional during verified rollback');
   assert.equal(decide(at('0.6.10'), at('0.6.9')), 'noop', 'numerically, not as text');
   const source = { ...at('0.6.0', 'source'), id: '0.6.0-source', source: '/checkout' };
   assert.equal(decide(at('0.6.0'), source), 'upgrade', 'a checkout selects itself');

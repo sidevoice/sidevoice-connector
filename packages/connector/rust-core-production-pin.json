@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "repository": "sidevoice/sidevoice-core",
+  "workflow": ".github/workflows/rust-t7.yml",
+  "ref": "refs/heads/main",
+  "run_id": "37165556340",
+  "source_sha": "b41840e41e3eb81905d285514c7deb35bd8efe57",
+  "manifest": {
+    "name": "native-core-manifest.json",
+    "size": 835,
+    "sha256": "537f834f1ce1e0135178d6b52310ad37c721fea1cc9dd15874e685c7498f8deb"
+  },
+  "bundles": {
+    "macos-aarch64": {
+      "name": "sidevoice-core-rust-b41840e41e3eb81905d285514c7deb35bd8efe57-macos-aarch64.tar.zst",
+      "size": 23365450,
+      "sha256": "7a1fa3483074257fb3235086a1ce22b89c8f9bf4810260c2c0ab8a1d6a1e7e9c"
+    },
+    "linux-x86_64": {
+      "name": "sidevoice-core-rust-b41840e41e3eb81905d285514c7deb35bd8efe57-linux-x86_64.tar.zst",
+      "size": 26194457,
+      "sha256": "d494218efe81be0385d2394fbaf1ccdb3e9da7868a5a41319608456ef225bbe0"
+    },
+    "linux-aarch64": {
+      "name": "sidevoice-core-rust-b41840e41e3eb81905d285514c7deb35bd8efe57-linux-aarch64.tar.zst",
+      "size": 25342648,
+      "sha256": "7779e9881a9442624fb6140f33f9e4ec4c59f2576810482fca14f35a87994ffa"
+    }
+  }
+}

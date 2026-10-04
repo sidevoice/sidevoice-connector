@@ -6,9 +6,11 @@
  *  | core `dev.sidevoice.core` / `sidevoice-core.service` | RunAtLoad; KeepAlive {SuccessfulExit false, Crashed true}; ThrottleInterval 10; output → `core.stderr.log` | Restart=on-failure, RestartSec=10, at most 5 starts in 10 min |
  *  | connector `dev.sidevoice.connector` / `sidevoice-connector.service` | RunAtLoad; KeepAlive; ThrottleInterval 10; output → `connector.log` | Restart=always, RestartSec=2, the same start limit |
  *
- *  The core runs `R/current/core/bin/sidevoice-core --data-dir C … --idle-exit 0`; the connector runs `install.json`'s
- *  `command` + `connector --service` (R1 `node R/current/dist/cli.mjs`; R4 only `command` changes). Both name paths
- *  through `R/current` (`release.mjs`), so a definition is rewritten only when its text would change. Neither job
+ *  The selected Python core runs `R/current/core/bin/sidevoice-core`; the native Core consumer runs
+ *  `R/current/core/bin/sidevoice-core-rust`. Each receives the same private data directory and fixed Core arguments.
+ *  The connector runs `install.json`'s `command` + `connector --service` (R1 `node R/current/dist/cli.mjs`; R4 only
+ *  `command` changes). Both name paths through `R/current` (`release.mjs`), so a definition is rewritten only when its
+ *  text would change. Neither job
  *  starts, signals or adopts the other: the connector links to the core when it answers, and the core's exit status
  *  tells the manager whether to restart it (SEAMS §2: 0 after a failed start — not again; 75 while another core holds
  *  its directory — later; a crash after ready — again). One instance of each: the manager's, plus the core's `flock`
@@ -28,7 +30,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { accessSync, constants, existsSync, readFileSync, rmSync } from 'node:fs';
 import { API_RANGE, LINK_RANGE, coreArgs, coreProcesses, coreRunning, describeFailure, failurePath, isBundleCore, logTail, readFailure, readReady,
-  roomCredentialPath, socketPathOf, takeInstallLock, terminateCore } from './core.mjs';
+  roomCredentialPath, rustCoreEnvironment, rustCoreRootForProgram, socketPathOf, takeInstallLock, terminateCore } from './core.mjs';
 import { localHealth } from './core-socket.mjs';
 import { readLock, tryLock } from './lockfile.mjs';
 import { isProcess, processAge, signalVerified } from './proc.mjs';
@@ -227,8 +229,10 @@ export function jobPrograms(env = process.env) {
   const record = readJson(nodeFiles(dataDir).install);
   if (!Array.isArray(record?.command) || !record.command.length) throw keyed('service.no-installation');
   const core = coreProgram(env);
+  const nativeRoot = rustCoreRootForProgram(core);
   return {
-    core: [core, ...coreArgs({ dataDir, env, idleExit: 0, roomCredential: roomCredentialPath(dataDir, env), bundle: isBundleCore(core) })],
+    core: [core, ...coreArgs({ dataDir, env, idleExit: 0, roomCredential: roomCredentialPath(dataDir, env),
+      bundle: isBundleCore(core), nativeRoot })],
     connector: [...record.command, 'connector', '--service'],
   };
 }
@@ -236,12 +240,14 @@ export function jobPrograms(env = process.env) {
 /** The text of both definitions for this manager. */
 export function definitionTexts(kind, env = process.env) {
   const programs = jobPrograms(env), environment = serviceEnvironment(kind, env), files = nodeFiles(dataDirOf(env));
+  const nativeRoot = rustCoreRootForProgram(programs.core[0]);
+  const coreEnvironment = nativeRoot ? rustCoreEnvironment(environment, nativeRoot) : environment;
   if (kind === 'launchd') return {
-    core: plistText({ label: JOBS.core.label, program: programs.core, log: files.coreStderr, environment, keepAlive: 'crashed' }),
+    core: plistText({ label: JOBS.core.label, program: programs.core, log: files.coreStderr, environment: coreEnvironment, keepAlive: 'crashed' }),
     connector: plistText({ label: JOBS.connector.label, program: programs.connector, log: files.connectorLog, environment, keepAlive: true }),
   };
   return {
-    core: unitText({ description: 'Sidevoice core (this machine\'s conversations and voice)', program: programs.core, environment, restart: 'on-failure', restartSec: 10 }),
+    core: unitText({ description: 'Sidevoice core (this machine\'s conversations and voice)', program: programs.core, environment: coreEnvironment, restart: 'on-failure', restartSec: 10 }),
     connector: unitText({ description: 'Sidevoice connector (the harnesses\' link to the core)', program: programs.connector, environment, restart: 'always', restartSec: 2 }),
   };
 }
