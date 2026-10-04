@@ -106,9 +106,14 @@ def main(first, second):
             cursor.chmod(0o600)
             run(first, ['agents', '--json'], env)
             old = ready(data)
-            run(first, ['install', '--no-agents', '--json'], env)
+            presentation = subprocess.run([str(first), 'install', '--no-agents'], env=env, capture_output=True, text=True, timeout=300)
+            assert presentation.returncode == 0, presentation.stderr
+            assert 'not paired with any room' in presentation.stdout and 'sidevoice pair <room-url> <code>' in presentation.stdout
             assert ready(data)['launch_id'] == old['launch_id'], 'no-op restarted Core'
-            run(first, ['install', '--service', '--no-agents', '--json'], env)
+            conversion, _ = run(first, ['install', '--service', '--no-agents', '--json'], env)
+            if os.uname().sysname == 'Linux':
+                assert isinstance(conversion['linger']['enabled'], bool)
+                assert conversion['linger']['command'].startswith('loginctl enable-linger ')
             managed = wait_running(first, env)
             assert ready(data)['launch_id'] != old['launch_id'], 'mode conversion kept unmanaged Core'
             assert ipc(data, 'identity').get('managed') is True, 'mode conversion kept unmanaged Connector'
@@ -117,6 +122,7 @@ def main(first, second):
             assert ready(data)['launch_id'] == before['launch_id'], 'managed no-op restarted Core'
             installed, _ = run(second, ['install', '--no-agents', '--json'], env)
             assert installed['action'] != 'noop', installed
+            assert installed['previous'] == release['id'], installed
             assert selected(root)['id'] != release['id']
             run(second, ['rollback', '--json'], env)
             assert selected(root)['id'] == release['id']

@@ -183,6 +183,10 @@ def main():
                                       message='the real native Core did not dial out with the new pairing')
                     if (auth.get('connector_id'), auth.get('token'), auth.get('protocol')) != (CONNECTOR_ID, TOKEN, 3):
                         raise AssertionError(f'native Core used different pairing credentials: {auth}')
+                    installed_text = subprocess.run([str(sea), 'install', '--no-agents'], env=env,
+                                                    capture_output=True, text=True, timeout=180)
+                    if installed_text.returncode or room_url not in installed_text.stdout:
+                        raise AssertionError(f'install did not present the paired room: {installed_text.stdout[-1000:]} {installed_text.stderr[-1000:]}')
                     print(json.dumps({'ok': True, 'runtime_kind': 'rust-native-v1', 'core_kind': 'rust-native-v1',
                                       'connector_id': CONNECTOR_ID, 'core_authenticated_with_pairing': True}))
                 finally:

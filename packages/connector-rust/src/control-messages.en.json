@@ -2,7 +2,6 @@
   "command.unknown": "Unknown command: {command}. Use sidevoice install, rollback, uninstall, service, agents, pair, link-room, pair-device, skill, metadata, mcp or connector.",
   "install.native-payload-missing": "This development executable has no embedded Core. Use a complete native Sidevoice package.",
   "install.native-core-required": "This native package installs Connector and Core together. --no-core is not supported.",
-  "install.failed": "Sidevoice installation failed: {detail}",
   "rollback.failed": "Sidevoice could not restore the previous release: {detail}",
   "uninstall.failed": "Sidevoice could not finish uninstalling: {detail}",
   "service.failed": "The Sidevoice service operation failed: {detail}",
