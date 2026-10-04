@@ -196,7 +196,24 @@ impl InstalledCommand {
                 .root
                 .join("current/dist/sidevoice-rust")
                 .canonicalize()?;
-            if executable != selected {
+            // Profile already verified both binaries against this selected release record.
+            // Only the byte-identical native public sibling is an additional MCP entrypoint.
+            let native_public_sibling = profile.installed.as_ref().is_some_and(|release| {
+                release.format.as_deref() == Some("rust-native")
+                    && release.runtime_kind == "rust-native-v1"
+                    && release
+                        .runtime_sha256
+                        .as_ref()
+                        .is_some_and(|digest| !digest.is_empty())
+                    && release.runtime_sha256 == release.distributor_sha256
+                    && release.runtime_size.is_some_and(|size| size > 0)
+                    && release.runtime_size == release.distributor_size
+            }) && profile
+                .root
+                .join("current/dist/sidevoice")
+                .canonicalize()
+                .is_ok_and(|public| public == executable);
+            if executable != selected && !native_public_sibling {
                 anyhow::bail!("Rust Connector is not the selected release executable");
             }
         }
@@ -566,9 +583,16 @@ impl HostAgents {
             _ = sleep_until(deadline) => return Err(Failure::Busy),
             permit = gate.lock_owned() => permit,
         };
-        self.profile
-            .validate_existing_private()
-            .map_err(|_| Failure::Internal)?;
+        self.profile.validate_existing_private().map_err(|_| {
+            let agent = params
+                .get("id")
+                .or_else(|| params.get("watch"))
+                .and_then(Value::as_str)
+                .and_then(AgentId::parse);
+            agent
+                .map(|id| agent_failure("agents.invalid", id))
+                .unwrap_or_else(|| Failure::keyed("agents.invalid", json!({"agent":"host agent"})))
+        })?;
         // The daemon and standalone control process must not mutate one registration concurrently.
         let _process_lock = self
             .lock_file("agents-operation.lock", cancel, deadline)

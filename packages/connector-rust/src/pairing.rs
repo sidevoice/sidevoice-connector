@@ -368,9 +368,26 @@ mod tests {
 
     #[tokio::test]
     async fn pairing_saves_private_credentials_and_failed_response_keeps_them() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         let root = std::env::temp_dir().join(format!("sidevoice-pair-{}", uuid::Uuid::new_v4()));
-        crate::proof::private_dir(&root).unwrap();
+        // The proof constructor validates an existing private profile; it creates nothing.
+        for child in [
+            "",
+            "home",
+            "claude",
+            "codex",
+            "cursor/config",
+            "cursor/data",
+            "xdg/config",
+            "xdg/data",
+            "sidevoice/core",
+        ] {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(root.join(child))
+                .unwrap();
+        }
         let profile = Profile::from_root(&root).unwrap();
         let (room, request) = serve_response(
             "200 OK",
