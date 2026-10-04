@@ -116,7 +116,11 @@ impl HostAgents {
             Err(_) => return Ok("invalid".into()),
             Ok(_) => {}
         }
-        let text = match read_profile_file(&file, &self.profile.root, 1 << 20) {
+        let root = match self.profile.agent_root(&self.profile.codex) {
+            Ok(root) => root,
+            Err(_) => return Ok("invalid".into()),
+        };
+        let text = match read_profile_file(&file, &root, 1 << 20) {
             Ok(text) => text,
             Err(_) => return Ok("invalid".into()),
         };

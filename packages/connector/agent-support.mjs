@@ -5,7 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { BUILD_PACKAGE_DIR } from './build-info.mjs';
 import { recordedInstallation } from './node-files.mjs';
-import { selection } from './release.mjs';
+import { selectedMcpCommand, selection } from './release.mjs';
+import { RUST_CONNECTOR_KIND } from './rust-connector.mjs';
 import { runningAsSea } from './sea-runtime.mjs';
 import { VERSION } from './identity.mjs';
 
@@ -95,6 +96,11 @@ export function executableVersion(binary, args = ['--version'], env = process.en
 /** The exact installed command and selected connector version, for manual MCP configuration. */
 export function connectorMcpCommand(env = process.env) {
   let command, args;
+  const selected = selection(env, 'current')?.release;
+  if (selected?.runtime_kind === RUST_CONNECTOR_KIND) {
+    [command, ...args] = selectedMcpCommand(env);
+    return { command, args, version: selected.connector || VERSION };
+  }
   let record = null;
   try { record = recordedInstallation(env); } catch {}
   const installedCommand = record?.command;

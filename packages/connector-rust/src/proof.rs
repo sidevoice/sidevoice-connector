@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
@@ -25,6 +25,31 @@ pub struct Profile {
     pub socket: PathBuf,
     pub core_socket: PathBuf,
     pub core_ready: PathBuf,
+    pub installed: Option<InstalledRelease>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct InstalledRelease {
+    pub id: String,
+    pub connector: String,
+    pub format: Option<String>,
+    pub core_kind: Option<String>,
+    pub core_build: Option<String>,
+    pub core_target: Option<String>,
+    pub core_source_sha: Option<String>,
+    pub core_cargo_lock_sha256: Option<String>,
+    pub core_manifest_sha256: Option<String>,
+    pub core_archive_sha256: Option<String>,
+    pub core_archive_size: Option<u64>,
+    pub core_entrypoint: Option<String>,
+    pub runtime_kind: String,
+    pub runtime_build_sha: Option<String>,
+    pub runtime_target: Option<String>,
+    pub runtime_sha256: Option<String>,
+    pub runtime_size: Option<u64>,
+    pub distributor_sha256: Option<String>,
+    pub distributor_size: Option<u64>,
+    pub pair_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -61,6 +86,57 @@ fn validate_profile_child(root: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn digest_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut block = [0u8; 65536];
+    loop {
+        let read = file.read(&mut block)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&block[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn safe_executable(path: &Path) -> Result<fs::Metadata> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != uid()
+        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o111 == 0
+    {
+        bail!("unsafe installed executable {}", path.display());
+    }
+    Ok(metadata)
+}
+
+fn compiled_target() -> Option<&'static str> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        return Some("macos-aarch64");
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        return Some("linux-x86_64");
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        return Some("linux-aarch64");
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+fn lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 pub fn private_dir(path: &Path) -> Result<()> {
     let m = fs::symlink_metadata(path)
         .with_context(|| format!("missing private directory {}", path.display()))?;
@@ -76,6 +152,19 @@ pub fn private_file(path: &Path) -> Result<()> {
         bail!("unsafe private file {}", path.display());
     }
     Ok(())
+}
+
+pub fn validate_user_directory(path: &Path) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("missing user directory {}", path.display()))?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != uid()
+        || metadata.mode() & 0o022 != 0
+    {
+        bail!("unsafe user directory {}", path.display());
+    }
+    path.canonicalize().map_err(Into::into)
 }
 
 pub fn verify_socket(path: &Path) -> Result<()> {
@@ -139,6 +228,7 @@ impl Profile {
             cursor_data,
             xdg_config,
             xdg_data,
+            installed: None,
         };
         profile.validate_private()?;
         Ok(profile)
@@ -173,6 +263,250 @@ impl Profile {
             }
         }
         Ok(profile)
+    }
+
+    pub fn from_installed_env() -> Result<Self> {
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let dist = executable.parent().context("installed dist directory")?;
+        let release_dir = dist
+            .parent()
+            .context("installed release directory")?
+            .to_path_buf();
+        if executable.file_name().and_then(|name| name.to_str()) != Some("sidevoice-rust")
+            || dist.file_name().and_then(|name| name.to_str()) != Some("dist")
+            || release_dir
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                != Some("releases")
+        {
+            bail!("Rust Connector is not inside a selected Sidevoice release");
+        }
+        let releases_dir = release_dir
+            .parent()
+            .context("release collection")?
+            .to_path_buf();
+        let root = releases_dir
+            .parent()
+            .context("Sidevoice release root")?
+            .to_path_buf();
+        private_dir(&root)?;
+        private_dir(&releases_dir)?;
+        private_dir(&release_dir)?;
+        private_dir(dist)?;
+        let current_link = root.join("current");
+        if !fs::symlink_metadata(&current_link)?
+            .file_type()
+            .is_symlink()
+            || current_link.canonicalize()? != release_dir
+        {
+            bail!("Rust Connector is not the current selected release");
+        }
+        let release_file = release_dir.join("release.json");
+        private_file(&release_file)?;
+        if fs::metadata(&release_file)?.len() > 65536 {
+            bail!("selected release record is oversized");
+        }
+        let selected: InstalledRelease = serde_json::from_slice(&fs::read(&release_file)?)?;
+        let target = compiled_target().context("unsupported installed Rust Connector target")?;
+        let runtime_sha = selected
+            .runtime_sha256
+            .as_deref()
+            .context("selected runtime digest missing")?;
+        let runtime_source = selected
+            .runtime_build_sha
+            .as_deref()
+            .context("selected Rust Connector source missing")?;
+        let core_target = selected
+            .core_target
+            .as_deref()
+            .context("selected Core target missing")?;
+        let core_source = selected
+            .core_source_sha
+            .as_deref()
+            .context("selected Core source missing")?;
+        let core_archive_sha = selected
+            .core_archive_sha256
+            .as_deref()
+            .context("selected Core archive digest missing")?;
+        let core_id = format!("rust-native-v1-{core_target}-{core_source}-{core_archive_sha}");
+        if selected.id
+            != release_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+            || selected.format.as_deref() != Some("sea")
+            || selected.runtime_kind != "rust-native-v1"
+            || selected.runtime_target.as_deref() != Some(target)
+            || runtime_source != env!("SIDEVOICE_CONNECTOR_BUILD_SHA")
+            || selected.connector != env!("SIDEVOICE_CONNECTOR_VERSION")
+            || env!("SIDEVOICE_CONNECTOR_TARGET") != target
+            || selected.core_kind.as_deref() != Some("rust-native-v1")
+            || core_target != target
+            || !lower_hex(runtime_sha, 64)
+            || !lower_hex(runtime_source, 40)
+            || !lower_hex(core_source, 40)
+            || !lower_hex(core_archive_sha, 64)
+            || !selected
+                .core_cargo_lock_sha256
+                .as_deref()
+                .is_some_and(|value| lower_hex(value, 64))
+            || !selected
+                .core_manifest_sha256
+                .as_deref()
+                .is_some_and(|value| lower_hex(value, 64))
+            || !selected.core_archive_size.is_some_and(|size| size > 0)
+            || selected.core_entrypoint.as_deref() != Some("bin/sidevoice-core-rust")
+            || selected.core_build.as_deref() != Some(core_id.as_str())
+            || selected.pair_id != format!("pair-v1:rust-native-v1:{runtime_sha}:core:{core_id}")
+        {
+            bail!("selected Rust Connector and Core release identity is invalid");
+        }
+        let runtime_size = selected
+            .runtime_size
+            .context("selected runtime size missing")?;
+        let runtime_info = safe_executable(&executable)?;
+        if runtime_info.len() != runtime_size || digest_file(&executable)? != runtime_sha {
+            bail!("selected Rust Connector bytes differ from the release record");
+        }
+        let control = dist.join("sidevoice");
+        let control_info = safe_executable(&control)?;
+        if control_info.len()
+            != selected
+                .distributor_size
+                .context("selected control SEA size missing")?
+            || digest_file(&control)?
+                != selected
+                    .distributor_sha256
+                    .as_deref()
+                    .context("selected control SEA digest missing")?
+        {
+            bail!("selected Sidevoice control executable differs from the release record");
+        }
+        let core_binary = release_dir.join("core/bin/sidevoice-core-rust");
+        let _ = safe_executable(&core_binary)?;
+        let home = PathBuf::from(
+            std::env::var_os("HOME").context("HOME is required for installed Sidevoice")?,
+        );
+        if !home.is_absolute() {
+            bail!("HOME must be absolute");
+        }
+        let data = std::env::var_os("SIDEVOICE_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".sidevoice"));
+        let claude = std::env::var_os("CLAUDE_CONFIG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".claude"));
+        let codex = std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".codex"));
+        let cursor = std::env::var_os("CURSOR_CONFIG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".cursor"));
+        let cursor_data = std::env::var_os("CURSOR_DATA_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cursor.join("data"));
+        let xdg_config = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        let xdg_data = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share"));
+        for (name, path) in [
+            ("SIDEVOICE_DATA_DIR", &data),
+            ("CLAUDE_CONFIG_DIR", &claude),
+            ("CODEX_HOME", &codex),
+            ("CURSOR_CONFIG_DIR", &cursor),
+            ("CURSOR_DATA_DIR", &cursor_data),
+            ("XDG_CONFIG_HOME", &xdg_config),
+            ("XDG_DATA_HOME", &xdg_data),
+        ] {
+            if !path.is_absolute() {
+                bail!("{name} must be absolute");
+            }
+        }
+        let core_data = data.join("core");
+        let profile = Self {
+            root,
+            home,
+            claude,
+            data: data.clone(),
+            codex,
+            cursor,
+            cursor_data,
+            xdg_config,
+            xdg_data,
+            socket: data.join("connector.sock"),
+            core_socket: core_data.join("local.sock"),
+            core_ready: core_data.join("core.json"),
+            installed: Some(selected),
+        };
+        profile.validate_existing_private()?;
+        Ok(profile)
+    }
+
+    pub fn is_installed(&self) -> bool {
+        self.installed.is_some()
+    }
+
+    pub fn connector_version(&self) -> &str {
+        self.installed
+            .as_ref()
+            .map(|selected| selected.connector.as_str())
+            .unwrap_or(env!("CARGO_PKG_VERSION"))
+    }
+
+    pub fn validate_installed_service_environment(&self) -> Result<()> {
+        if self.installed.is_none() {
+            bail!("installed service environment requires an installed release");
+        }
+        let service = std::env::var("SIDEVOICE_SERVICE")
+            .context("installed service manager is not identified")?;
+        if !matches!(service.as_str(), "launchd" | "systemd") {
+            bail!("unsupported installed service manager");
+        }
+        for (key, expected) in [
+            ("HOME", &self.home),
+            ("CLAUDE_CONFIG_DIR", &self.claude),
+            ("CODEX_HOME", &self.codex),
+            ("CURSOR_CONFIG_DIR", &self.cursor),
+            ("CURSOR_DATA_DIR", &self.cursor_data),
+            ("XDG_CONFIG_HOME", &self.xdg_config),
+            ("XDG_DATA_HOME", &self.xdg_data),
+            ("SIDEVOICE_DATA_DIR", &self.data),
+        ] {
+            let required = matches!(
+                key,
+                "HOME" | "XDG_CONFIG_HOME" | "XDG_DATA_HOME" | "SIDEVOICE_DATA_DIR"
+            );
+            let supplied = match std::env::var_os(key) {
+                Some(supplied) => supplied,
+                None if required => bail!("installed service environment is incomplete"),
+                // The existing JS service also derives these agent paths from HOME unless explicitly set.
+                None => continue,
+            };
+            if Path::new(&supplied) != expected.as_path() {
+                bail!("installed service environment differs from its profile");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn runtime_identity(&self) -> Value {
+        if let Some(selected) = &self.installed {
+            json!({"runtime_kind":selected.runtime_kind,"runtime_build_sha":selected.runtime_build_sha,
+                "runtime_sha256":selected.runtime_sha256,"runtime_target":selected.runtime_target,"release_id":selected.id})
+        } else {
+            json!({"runtime_kind":"rust-proof","runtime_build_sha":env!("SIDEVOICE_CONNECTOR_BUILD_SHA"),
+                "runtime_target":env!("SIDEVOICE_CONNECTOR_TARGET")})
+        }
+    }
+
+    pub fn control_executable(&self) -> Result<PathBuf> {
+        if self.installed.is_none() {
+            bail!("the proof profile has no selected control executable");
+        }
+        Ok(self.root.join("current/dist/sidevoice"))
     }
 
     pub fn command_env<'a>(
@@ -221,6 +555,21 @@ impl Profile {
             Err(error) => Err(error.into()),
             Ok(_) => {
                 private_file(&marker)?;
+                if let Some(installed) = &self.installed {
+                    let migration = self.data.join("runtime-switch.json");
+                    if migration.exists() {
+                        private_file(&migration)?;
+                        let stopped: Value = serde_json::from_slice(&fs::read(&marker)?)?;
+                        let switching: Value = serde_json::from_slice(&fs::read(&migration)?)?;
+                        if switching["phase"] == "committed"
+                            && switching["to"].as_str() == Some(installed.id.as_str())
+                            && stopped["to"].as_str() == Some(installed.id.as_str())
+                            && stopped["runtime_switch_token"] == switching["token"]
+                        {
+                            return Ok(false);
+                        }
+                    }
+                }
                 Ok(true)
             }
         }
@@ -230,6 +579,34 @@ impl Profile {
     /// All of these roots are passed to host CLIs or used for profile writes, so check them again
     /// at each operation boundary rather than trusting startup-time validation.
     pub fn validate_existing_private(&self) -> Result<()> {
+        if self.installed.is_some() {
+            private_dir(&self.root)?;
+            private_dir(&self.root.join("releases"))?;
+            private_dir(&self.data)?;
+            private_dir(&self.data.join("core"))?;
+            if self.root.canonicalize()? != self.root {
+                bail!("installed release root changed after startup");
+            }
+            for path in [
+                &self.home,
+                &self.claude,
+                &self.codex,
+                self.cursor.parent().context("Cursor config root")?,
+                &self.cursor_data,
+                self.xdg_config.parent().context("XDG config root")?,
+                &self.xdg_config,
+                &self.xdg_data,
+            ] {
+                match fs::symlink_metadata(path) {
+                    Ok(_) => {
+                        validate_user_directory(path)?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            return Ok(());
+        }
         private_dir(&self.root)?;
         let root = self.root.canonicalize()?;
         if root != self.root {
@@ -262,11 +639,27 @@ impl Profile {
         {
             bail!("unknown proof agent configuration directory");
         }
+        if self.installed.is_some() {
+            validate_user_directory(config_root)?;
+            return Ok(());
+        }
         validate_profile_child(&self.root, config_root)
+    }
+
+    pub fn agent_root(&self, config_root: &Path) -> Result<PathBuf> {
+        self.validate_for_agent(config_root)?;
+        if self.installed.is_some() {
+            config_root.canonicalize().map_err(Into::into)
+        } else {
+            Ok(self.root.clone())
+        }
     }
 
     pub fn validate_private(&self) -> Result<()> {
         self.validate_existing_private()?;
+        if self.installed.is_some() {
+            return Ok(());
+        }
         for path in [&self.claude, &self.codex, &self.cursor] {
             validate_profile_child(&self.root, path)?;
         }

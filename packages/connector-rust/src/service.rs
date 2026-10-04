@@ -286,6 +286,12 @@ struct ConnectorIdentity {
     pid: u32,
     executable: PathBuf,
     managed: bool,
+    version: Option<String>,
+    runtime_kind: Option<String>,
+    runtime_build_sha: Option<String>,
+    runtime_sha256: Option<String>,
+    runtime_target: Option<String>,
+    release_id: Option<String>,
 }
 
 fn clean(value: &str, limit: usize) -> String {
@@ -938,6 +944,30 @@ async fn connector_identity(profile: &Profile) -> anyhow::Result<Option<Connecto
         pid,
         executable,
         managed,
+        version: value
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        runtime_kind: value
+            .get("runtime_kind")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        runtime_build_sha: value
+            .get("runtime_build_sha")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        runtime_sha256: value
+            .get("runtime_sha256")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        runtime_target: value
+            .get("runtime_target")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        release_id: value
+            .get("release_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     }))
 }
 
@@ -1086,13 +1116,41 @@ async fn process_age(pid: u32) -> Option<u64> {
 }
 
 async fn verify_connector_socket(profile: &Profile) -> anyhow::Result<()> {
-    if connector_identity(profile).await?.is_none() {
-        anyhow::bail!("connector status refused");
+    let identity = connector_identity(profile)
+        .await?
+        .context("connector status refused")?;
+    if let Some(selected) = &profile.installed {
+        let executable = profile
+            .root
+            .join("current/dist/sidevoice-rust")
+            .canonicalize()?;
+        if identity.executable != executable
+            || identity.version.as_deref() != Some(selected.connector.as_str())
+            || identity.runtime_kind.as_deref() != Some(selected.runtime_kind.as_str())
+            || identity.runtime_build_sha.as_deref() != selected.runtime_build_sha.as_deref()
+            || identity.runtime_sha256.as_deref() != selected.runtime_sha256.as_deref()
+            || identity.runtime_target.as_deref() != selected.runtime_target.as_deref()
+            || identity.release_id.as_deref() != Some(selected.id.as_str())
+        {
+            anyhow::bail!("connector socket belongs to a different selected runtime");
+        }
     }
     Ok(())
 }
 
 pub async fn status(profile: &Profile, connector_self: bool) -> Value {
+    if profile.is_installed() {
+        return match selected_control(
+            profile,
+            &["service", "status", "--json"],
+            Duration::from_secs(35),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => Failure::plain(error).value(),
+        };
+    }
     match observe(profile, connector_self).await {
         Ok(observation) => derive_status(&observation),
         Err(error) => {
@@ -1108,6 +1166,9 @@ pub async fn status(profile: &Profile, connector_self: bool) -> Value {
 }
 
 pub async fn ensure_connector(profile: &Profile) -> anyhow::Result<()> {
+    if profile.is_installed() {
+        return ensure_installed_connector(profile).await;
+    }
     // The established Rust daemon wins the race first, including after a refused service bootout.
     if verify_connector_socket(profile).await.is_ok() {
         return Ok(());
@@ -1186,6 +1247,127 @@ pub async fn ensure_connector(profile: &Profile) -> anyhow::Result<()> {
         "service.not-loaded",
         json!({"detail":"connector socket did not appear"}),
     )))
+}
+
+async fn selected_control(
+    profile: &Profile,
+    args: &[&str],
+    limit: Duration,
+) -> anyhow::Result<Value> {
+    let mut command = Command::new(profile.control_executable()?);
+    command
+        .args(args)
+        .env_clear()
+        .env(
+            "PATH",
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        )
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    profile.command_env(&mut command);
+    let output = timeout(limit, command.output()).await??;
+    if output.stdout.len() > 65536 || !output.status.success() {
+        anyhow::bail!("selected Sidevoice control command failed");
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+pub(crate) async fn runtime_switching(profile: &Profile) -> anyhow::Result<bool> {
+    selected_control(
+        profile,
+        &["--sidevoice-runtime-switching"],
+        Duration::from_secs(10),
+    )
+    .await?
+    .get("switching")
+    .and_then(Value::as_bool)
+    .ok_or_else(|| anyhow::anyhow!("runtime switch status missing"))
+}
+
+async fn ensure_installed_connector(profile: &Profile) -> anyhow::Result<()> {
+    if profile.service_stopped()? {
+        return Err(anyhow::Error::new(Failure::keyed(
+            "service.node-stopped",
+            json!({}),
+        )));
+    }
+    if runtime_switching(profile).await? {
+        anyhow::bail!("Sidevoice is updating the Connector. Try again in a moment.");
+    }
+    let current = profile.root.join("current").canonicalize()?;
+    if current.file_name().and_then(|name| name.to_str())
+        != profile
+            .installed
+            .as_ref()
+            .map(|release| release.id.as_str())
+    {
+        anyhow::bail!("the selected release changed; restart this MCP process");
+    }
+    let management = selected_control(
+        profile,
+        &["--sidevoice-connector-management"],
+        Duration::from_secs(35),
+    )
+    .await?;
+    match management.get("state").and_then(Value::as_str) {
+        Some("defined") => {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if verify_connector_socket(profile).await.is_ok() {
+                    return Ok(());
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+            anyhow::bail!("the selected Sidevoice service did not answer its local socket");
+        }
+        Some("absent") => {}
+        _ => anyhow::bail!("the selected Sidevoice service manager could not be observed"),
+    }
+    let connector_up = verify_connector_socket(profile).await.is_ok();
+    selected_control(
+        profile,
+        &["--sidevoice-ensure-core"],
+        Duration::from_secs(60),
+    )
+    .await?;
+    if connector_up && verify_connector_socket(profile).await.is_ok() {
+        return Ok(());
+    }
+    let executable = profile.root.join("current/dist/sidevoice-rust");
+    let mut command = Command::new(executable);
+    command
+        .args(["--installed", "connector"])
+        .env_clear()
+        .env(
+            "PATH",
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    profile.command_env(&mut command);
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if verify_connector_socket(profile).await.is_ok() {
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+            return Ok(());
+        }
+        if profile.service_stopped()? {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    anyhow::bail!("the selected Sidevoice connector did not start on demand")
 }
 
 async fn observe(profile: &Profile, connector_self: bool) -> anyhow::Result<Observation> {

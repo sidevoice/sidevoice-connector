@@ -6,9 +6,11 @@
  *  | core `dev.sidevoice.core` / `sidevoice-core.service` | RunAtLoad; KeepAlive {SuccessfulExit false, Crashed true}; ThrottleInterval 10; output → `core.stderr.log` | Restart=on-failure, RestartSec=10, at most 5 starts in 10 min |
  *  | connector `dev.sidevoice.connector` / `sidevoice-connector.service` | RunAtLoad; KeepAlive; ThrottleInterval 10; output → `connector.log` | Restart=always, RestartSec=2, the same start limit |
  *
- *  The core runs `R/current/core/bin/sidevoice-core --data-dir C … --idle-exit 0`; the connector runs `install.json`'s
- *  `command` + `connector --service` (R1 `node R/current/dist/cli.mjs`; R4 only `command` changes). Both name paths
- *  through `R/current` (`release.mjs`), so a definition is rewritten only when its text would change. Neither job
+ *  The selected Python core runs `R/current/core/bin/sidevoice-core`; the native Core consumer runs
+ *  `R/current/core/bin/sidevoice-core-rust`. Each receives the same private data directory and fixed Core arguments.
+ *  The connector runs `install.json`'s `command` + `connector --service` (R1 `node R/current/dist/cli.mjs`; R4 only
+ *  `command` changes). Both name paths through `R/current` (`release.mjs`), so a definition is rewritten only when its
+ *  text would change. Neither job
  *  starts, signals or adopts the other: the connector links to the core when it answers, and the core's exit status
  *  tells the manager whether to restart it (SEAMS §2: 0 after a failed start — not again; 75 while another core holds
  *  its directory — later; a crash after ready — again). One instance of each: the manager's, plus the core's `flock`
@@ -28,13 +30,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { accessSync, constants, existsSync, readFileSync, rmSync } from 'node:fs';
 import { API_RANGE, LINK_RANGE, coreArgs, coreProcesses, coreRunning, describeFailure, failurePath, isBundleCore, logTail, readFailure, readReady,
-  roomCredentialPath, socketPathOf, takeInstallLock, terminateCore } from './core.mjs';
+  roomCredentialPath, rustCoreEnvironment, rustCoreRootForProgram, socketPathOf, takeInstallLock, terminateCore } from './core.mjs';
 import { localHealth } from './core-socket.mjs';
 import { readLock, tryLock } from './lockfile.mjs';
 import { isProcess, processAge, signalVerified } from './proc.mjs';
-import { coreProgram, releaseRoot, selection, stableCommand } from './release.mjs';
+import { coreProgram, releaseRoot, selectedDaemonCommand, selection, stableCommand } from './release.mjs';
+import { matchesSelectedRustConnectorIdentity, RUST_CONNECTOR_KIND } from './rust-connector.mjs';
 import { keyed, t } from './i18n.mjs';
-import { connectorLockOf, connectorSocketOf, dataDirOf, nodeFiles, readJson, recordedInstallation, writePrivate } from './node-files.mjs';
+import { connectorLockOf, connectorSocketOf, dataDirOf, nodeFiles, nodeStopped, readJson, recordedInstallation, restoreSelectedLaunchGate, writePrivate } from './node-files.mjs';
 
 export const JOBS = {
   core: { label: 'dev.sidevoice.core', unit: 'sidevoice-core.service' },
@@ -226,22 +229,29 @@ export function jobPrograms(env = process.env) {
   const dataDir = dataDirOf(env);
   const record = readJson(nodeFiles(dataDir).install);
   if (!Array.isArray(record?.command) || !record.command.length) throw keyed('service.no-installation');
+  const selected = selection(env, 'current')?.release;
   const core = coreProgram(env);
+  const nativeRoot = rustCoreRootForProgram(core);
+  const daemon = selectedDaemonCommand(env);
   return {
-    core: [core, ...coreArgs({ dataDir, env, idleExit: 0, roomCredential: roomCredentialPath(dataDir, env), bundle: isBundleCore(core) })],
-    connector: [...record.command, 'connector', '--service'],
+    core: [core, ...coreArgs({ dataDir, env, idleExit: 0, roomCredential: roomCredentialPath(dataDir, env),
+      bundle: isBundleCore(core), nativeRoot })],
+    connector: selected?.runtime_kind === RUST_CONNECTOR_KIND
+      ? [...daemon, 'connector'] : [...record.command, 'connector', '--service'],
   };
 }
 
 /** The text of both definitions for this manager. */
 export function definitionTexts(kind, env = process.env) {
   const programs = jobPrograms(env), environment = serviceEnvironment(kind, env), files = nodeFiles(dataDirOf(env));
+  const nativeRoot = rustCoreRootForProgram(programs.core[0]);
+  const coreEnvironment = nativeRoot ? rustCoreEnvironment(environment, nativeRoot) : environment;
   if (kind === 'launchd') return {
-    core: plistText({ label: JOBS.core.label, program: programs.core, log: files.coreStderr, environment, keepAlive: 'crashed' }),
+    core: plistText({ label: JOBS.core.label, program: programs.core, log: files.coreStderr, environment: coreEnvironment, keepAlive: 'crashed' }),
     connector: plistText({ label: JOBS.connector.label, program: programs.connector, log: files.connectorLog, environment, keepAlive: true }),
   };
   return {
-    core: unitText({ description: 'Sidevoice core (this machine\'s conversations and voice)', program: programs.core, environment, restart: 'on-failure', restartSec: 10 }),
+    core: unitText({ description: 'Sidevoice core (this machine\'s conversations and voice)', program: programs.core, environment: coreEnvironment, restart: 'on-failure', restartSec: 10 }),
     connector: unitText({ description: 'Sidevoice connector (the harnesses\' link to the core)', program: programs.connector, environment, restart: 'always', restartSec: 2 }),
   };
 }
@@ -390,7 +400,7 @@ export async function observe(env = process.env, { connectorRunning = null } = {
   const report = readFailure(dataDir);
   return {
     service: kind, installed: !!selection(env, 'current'), defined, jobs,
-    stopped: existsSync(files.stopped), health, ready,
+    stopped: nodeStopped(dataDir, selection(env, 'current')?.id), health, ready,
     failure: report ? describeFailure(dataDir, report) : null,
     coreAge: jobs.core?.running ? processAge(jobs.core.pid) : null,
     program: defined.core ? programProblem(definitionProgram(kind, service.core)) : null,
@@ -481,21 +491,33 @@ async function lockHolder(env) {
 /** Stop what runs outside a manager — an on-demand connector, and every core of this data directory (ready, or still
  *  starting) — each signalled only as its verified self, and wait until both are gone and their sockets silent. Returns
  *  `{killed, left}`. */
-export async function stopOnDemand(env = process.env) {
+export async function stopOnDemand(env = process.env, { selectedRelease = selection(env, 'current')?.release } = {}) {
   const dataDir = dataDirOf(env);
   const connector = await lockHolder(env);
+  const rust = !connector && selectedRelease?.runtime_kind === RUST_CONNECTOR_KIND
+    ? await askConnector('identity', {}, { env, timeout: 1000 }) : null;
+  const rustOwner = matchesSelectedRustConnectorIdentity(rust, selectedRelease, releaseRoot(env)) && !rust.managed
+    && Number.isInteger(rust.pid) && rust.pid > 0 ? { pid: rust.pid, executable: rust.executable } : null;
+  if (rustOwner) await askConnector('shutdown', { expected_pid: rustOwner.pid, expected_executable: rustOwner.executable }, { env, timeout: 1500 });
   if (connector) signalVerified(connector.pid, 'SIGTERM', { start: connector.start });
-  const connectorUp = () => !!connector && isProcess(connector.pid, { start: connector.start });
+  const connectorUp = () => connector ? isProcess(connector.pid, { start: connector.start })
+    : !!rustOwner && isProcess(rustOwner.pid);
   const deadline = Date.now() + TEARDOWN_MS();
   while (connectorUp() && Date.now() < deadline) await wait(100);
   const killed = [];
-  if (connectorUp() && signalVerified(connector.pid, 'SIGKILL', { start: connector.start })) killed.push(connector.pid);
+  if (connector && connectorUp() && signalVerified(connector.pid, 'SIGKILL', { start: connector.start })) killed.push(connector.pid);
   for (const pid of coreProcesses(dataDir)) {
     await terminateCore(dataDir, pid, { grace: TEARDOWN_MS() });
     if (coreRunning(dataDir, pid)) killed.push(pid);
   }
   for (let i = 0; i < 50 && (connectorUp() || (await askConnector('status', {}, { env, timeout: 300 }))); i++) await wait(100);
-  const left = [connectorUp() && connector.pid, ...coreProcesses(dataDir)].filter(Boolean);
+  // A replacement may acquire the lock/socket after the first owner exits. Do not report success for it.
+  const socketUp = !!(await askConnector('status', {}, { env, timeout: 300 }));
+  const probe = existsSync(connectorLockOf(env)) ? await tryLock(connectorLockOf(env), { kind: 'probe', env }) : null;
+  const lockUp = probe && !probe.held;
+  if (probe?.held) probe.release();
+  const left = [connectorUp() && (connector?.pid ?? rustOwner?.pid), ...coreProcesses(dataDir),
+    (socketUp || lockUp) && 'connector socket or lock'].filter(Boolean);
   return { killed, left };
 }
 
@@ -591,7 +613,8 @@ export function linger(env = process.env) {
 export async function start(env = process.env) {
   const service = installedService(env);
   await underLock(env, async () => {
-    rmSync(nodeFiles(dataDirOf(env)).stopped, { force: true });
+    if (service) rmSync(nodeFiles(dataDirOf(env)).stopped, { force: true });
+    else restoreSelectedLaunchGate(dataDirOf(env), selection(env, 'current')?.id);
     if (service) await startJobs(env);
   });
   const now = await settled(env);
@@ -615,7 +638,7 @@ export async function stop(env = process.env) {
 /** `service restart` — the person's «Reintentar»: the core job restarted (its start limit cleared first); stopped, it is
  *  a start. With no jobs, the core running on demand is ended, and the next conversation starts it again. */
 export async function restart(env = process.env) {
-  if (existsSync(nodeFiles(dataDirOf(env)).stopped)) return start(env);
+  if (nodeStopped(dataDirOf(env), selection(env, 'current')?.id)) return start(env);
   const service = installedService(env);
   await underLock(env, async () => {
     if (service?.core) await startJobs(env, { restart: true, jobs: ['core'] });
@@ -647,7 +670,7 @@ export async function uninstall(env = process.env, { keepStopped = false } = {})
         for (const job of ORDER) manage(env, kind, ['--user', 'reset-failed', JOBS[job].unit]);
       }
     }
-    if (!keepStopped) rmSync(files.stopped, { force: true });
+    if (!keepStopped) restoreSelectedLaunchGate(dataDirOf(env), selection(env, 'current')?.id);
     return { ok: true, state: selection(env, 'current') ? 'not-installed' : 'absent', service: kind,
       ...(down.killed.length ? { note: t('service.killed', { pids: down.killed.join(', ') }) } : {}) };
   });

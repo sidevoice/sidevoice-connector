@@ -1,18 +1,21 @@
 /** Build the unchanged npm ESM client and, on request, a native Node 22 CommonJS SEA executable. */
-import { chmod, copyFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, lstat, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 import { CORE_VERSION } from './core.mjs';
-import { verifyCoreArtifact } from './core-attestation.mjs';
+import { sha256, verifyCoreArtifact } from './core-attestation.mjs';
 import { validateCoreManifest } from './core-bundle.mjs';
+import { parseCanonicalRustCoreJson, RUST_CORE_TARGETS, rustCoreTarget, validateRustCoreManifest } from './rust-core.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const out = path.join(root, 'dist');
 const outSea = path.join(root, 'dist-sea');
 const packagePath = path.join(root, 'package.json');
+const exactKeys = (value, keys) => value && typeof value === 'object' && !Array.isArray(value)
+  && Object.keys(value).sort().join(',') === [...keys].sort().join(',');
 const original = JSON.parse(await readFile(packagePath, 'utf8'));
 const shipped = { ...original };
 delete shipped.devDependencies;
@@ -53,6 +56,94 @@ if (process.env.SIDEVOICE_CORE_MANIFEST) {
   manifestSha256 = (await import('node:crypto')).createHash('sha256').update(raw).digest('hex');
 }
 
+let rustManifestText = null;
+let rustManifestSha256 = null;
+let rustSourceSha = null;
+let rustTarget = null;
+let rustArchivePath = null;
+let rustArchiveSha256 = null;
+let rustArchiveSize = null;
+if (process.env.SIDEVOICE_REQUIRE_RUST_CORE === '1') {
+  if (process.env.SIDEVOICE_BUILD_SEA !== '1') throw new Error('native Core inputs may be embedded only in a target SEA');
+  if (manifestText !== null || process.env.SIDEVOICE_CORE_MANIFEST) throw new Error('Python and native Core manifests cannot be selected in the same SEA');
+  if (process.env.SIDEVOICE_RUST_CORE_SOURCE_BUILD !== '1') throw new Error('native Core must be built from its pinned source');
+  const pin = JSON.parse(await readFile(path.join(root, 'rust-core-production-pin.json'), 'utf8'));
+  const sourcePattern = /^[0-9a-f]{40}$/;
+  const digestPattern = /^[0-9a-f]{64}$/;
+  if (!exactKeys(pin, ['schema', 'repository', 'source_sha', 'cargo_lock_sha256'])
+      || pin.schema !== 1 || pin.repository !== 'sidevoice/sidevoice-core'
+      || !sourcePattern.test(pin.source_sha || '') || !digestPattern.test(pin.cargo_lock_sha256 || '')
+      || process.env.SIDEVOICE_RUST_CORE_SOURCE_SHA !== pin.source_sha) {
+    throw new Error('native Core source build does not match its pinned commit and lockfile');
+  }
+  rustTarget = rustCoreTarget();
+  if (!rustTarget || !RUST_CORE_TARGETS.includes(rustTarget)
+      || (process.env.SIDEVOICE_RUST_CORE_TARGET && process.env.SIDEVOICE_RUST_CORE_TARGET !== rustTarget)) {
+    throw new Error(`native Core has no exact input for this SEA target (${process.platform}/${process.arch})`);
+  }
+  const manifestPath = path.resolve(process.env.SIDEVOICE_RUST_CORE_MANIFEST || '');
+  const inputDirectory = path.dirname(manifestPath);
+  if (path.basename(manifestPath) !== 'native-core-manifest.json') throw new Error('native Core source manifest is missing');
+  const manifestBytes = await readFile(manifestPath);
+  const manifest = parseCanonicalRustCoreJson(manifestBytes, 'native Core manifest');
+  validateRustCoreManifest(manifest, { expectedSourceSha: pin.source_sha });
+  if (manifest.cargo_lock_sha256 !== pin.cargo_lock_sha256) throw new Error('native Core source lockfile differs from the pin');
+  const expectedInputNames = ['native-core-manifest.json', ...RUST_CORE_TARGETS.map(target => manifest.bundles[target].name)].sort();
+  if ((await readdir(inputDirectory)).sort().join('\n') !== expectedInputNames.join('\n')) {
+    throw new Error('native Core source build does not have its exact target archive membership');
+  }
+  for (const target of RUST_CORE_TARGETS) {
+    const record = manifest.bundles[target];
+    const file = path.join(inputDirectory, record.name);
+    const info = await lstat(file);
+    if (!info.isFile() || info.isSymbolicLink() || info.size !== record.size
+        || sha256(await readFile(file)) !== record.sha256) throw new Error(`native Core ${target} source archive differs from its manifest`);
+  }
+  const archiveRecord = manifest.bundles[rustTarget];
+  rustArchivePath = path.join(inputDirectory, archiveRecord.name);
+  rustManifestText = manifestBytes.toString('utf8');
+  rustManifestSha256 = sha256(manifestBytes);
+  rustSourceSha = pin.source_sha;
+  rustArchiveSha256 = archiveRecord.sha256;
+  rustArchiveSize = archiveRecord.size;
+}
+
+let rustConnectorPath = null;
+let rustConnectorTarget = null;
+let rustConnectorSourceSha = null;
+let rustConnectorSha256 = null;
+let rustConnectorSize = null;
+if (process.env.SIDEVOICE_REQUIRE_RUST_CONNECTOR === '1') {
+  if (process.env.SIDEVOICE_BUILD_SEA !== '1' || process.env.SIDEVOICE_REQUIRE_RUST_CORE !== '1') {
+    throw new Error('the Rust Connector can be embedded only beside its pinned native Core in a target SEA');
+  }
+  rustConnectorTarget = rustCoreTarget();
+  rustConnectorSourceSha = connectorSha;
+  if (!rustConnectorTarget || !RUST_CORE_TARGETS.includes(rustConnectorTarget)
+      || process.env.SIDEVOICE_RUST_CONNECTOR_TARGET !== rustConnectorTarget
+      || !/^[0-9a-f]{40}$/.test(connectorSha || '')
+      || process.env.SIDEVOICE_RUST_CONNECTOR_SOURCE_SHA !== connectorSha) {
+    throw new Error('Rust Connector build identity does not match this exact target and source commit');
+  }
+  rustConnectorPath = path.resolve(process.env.SIDEVOICE_RUST_CONNECTOR_BINARY || '');
+  const binary = await readFile(rustConnectorPath);
+  const binaryInfo = await lstat(rustConnectorPath);
+  rustConnectorSize = binary.length;
+  rustConnectorSha256 = (await import('node:crypto')).createHash('sha256').update(binary).digest('hex');
+  if (!binaryInfo.isFile() || binaryInfo.isSymbolicLink() || !(binaryInfo.mode & 0o111) || rustConnectorSize < 1 || rustConnectorSize > 100_000_000) {
+    throw new Error('Rust Connector binary is not a bounded executable');
+  }
+  const runtime = execFileSync(rustConnectorPath, ['runtime-identity', '--json'], {
+    encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let identity;
+  try { identity = JSON.parse(runtime); } catch { throw new Error('Rust Connector did not report valid runtime identity JSON'); }
+  if (!exactKeys(identity, ['kind', 'target', 'source_sha', 'version']) || identity.kind !== 'rust-native-v1'
+      || identity.target !== rustConnectorTarget || identity.source_sha !== connectorSha || identity.version !== shipped.version) {
+    throw new Error('Rust Connector binary does not match the exact candidate build identity');
+  }
+}
+
 await rm(out, { recursive: true, force: true });
 await mkdir(out, { recursive: true });
 await build({
@@ -67,6 +158,16 @@ await build({
   define: {
     __SIDEVOICE_CORE_MANIFEST_JSON__: JSON.stringify(manifestText ?? 'null'),
     __SIDEVOICE_CORE_MANIFEST_SHA256__: JSON.stringify(manifestSha256 ?? 'null'),
+    __SIDEVOICE_RUST_CORE_MANIFEST_JSON__: JSON.stringify(null),
+    __SIDEVOICE_RUST_CORE_MANIFEST_SHA256__: JSON.stringify(null),
+    __SIDEVOICE_RUST_CORE_SOURCE_SHA__: JSON.stringify(null),
+    __SIDEVOICE_RUST_CORE_TARGET__: JSON.stringify(null),
+    __SIDEVOICE_RUST_CORE_ARCHIVE_SHA256__: JSON.stringify(null),
+    __SIDEVOICE_RUST_CORE_ARCHIVE_SIZE__: 'null',
+    __SIDEVOICE_RUST_CONNECTOR_TARGET__: JSON.stringify(null),
+    __SIDEVOICE_RUST_CONNECTOR_SOURCE_SHA__: JSON.stringify(null),
+    __SIDEVOICE_RUST_CONNECTOR_BINARY_SHA256__: JSON.stringify(null),
+    __SIDEVOICE_RUST_CONNECTOR_BINARY_SIZE__: 'null',
   },
 });
 
@@ -104,11 +205,25 @@ if (process.env.SIDEVOICE_BUILD_SEA === '1') {
       __SIDEVOICE_PACKAGE_JSON__: JSON.stringify(JSON.stringify(shipped)),
       __SIDEVOICE_CORE_MANIFEST_JSON__: JSON.stringify(manifestText ?? 'null'),
       __SIDEVOICE_CORE_MANIFEST_SHA256__: JSON.stringify(manifestSha256 ?? 'null'),
+      __SIDEVOICE_RUST_CORE_MANIFEST_JSON__: JSON.stringify(rustManifestText),
+      __SIDEVOICE_RUST_CORE_MANIFEST_SHA256__: JSON.stringify(rustManifestSha256),
+      __SIDEVOICE_RUST_CORE_SOURCE_SHA__: JSON.stringify(rustSourceSha),
+      __SIDEVOICE_RUST_CORE_TARGET__: JSON.stringify(rustTarget),
+      __SIDEVOICE_RUST_CORE_ARCHIVE_SHA256__: JSON.stringify(rustArchiveSha256),
+      __SIDEVOICE_RUST_CORE_ARCHIVE_SIZE__: JSON.stringify(rustArchiveSize),
+      __SIDEVOICE_RUST_CONNECTOR_TARGET__: JSON.stringify(rustConnectorTarget),
+      __SIDEVOICE_RUST_CONNECTOR_SOURCE_SHA__: JSON.stringify(rustConnectorSourceSha),
+      __SIDEVOICE_RUST_CONNECTOR_BINARY_SHA256__: JSON.stringify(rustConnectorSha256),
+      __SIDEVOICE_RUST_CONNECTOR_BINARY_SIZE__: JSON.stringify(rustConnectorSize),
       'import.meta.url': JSON.stringify('file:///sidevoice-runtime/sea.mjs'),
     },
   });
   await writeFile(configPath, JSON.stringify({ main: cjs, output: blobPath,
-    disableExperimentalSEAWarning: true, useCodeCache: false }, null, 2) + '\n');
+    disableExperimentalSEAWarning: true, useCodeCache: false,
+    ...(rustArchivePath || rustConnectorPath ? { assets: {
+      ...(rustArchivePath ? { 'sidevoice-rust-core.tar.zst': rustArchivePath } : {}),
+      ...(rustConnectorPath ? { 'sidevoice-rust-connector': rustConnectorPath } : {}),
+    } } : {}) }, null, 2) + '\n');
   execFileSync(process.execPath, ['--experimental-sea-config', configPath], { cwd: root, stdio: 'inherit' });
   await copyFile(process.execPath, executablePath);
   await chmod(executablePath, 0o755);
@@ -125,7 +240,9 @@ if (process.env.SIDEVOICE_BUILD_SEA === '1') {
   await chmod(targetExecutable, 0o755);
   const [executable, blob] = await Promise.all([stat(targetExecutable), stat(blobPath)]);
   process.stdout.write(JSON.stringify({ node: process.version, target: target.name, executable: targetExecutable,
-    executableBytes: executable.size, seaBlobBytes: blob.size, manifestEmbedded: !!manifestText }) + '\n');
+    executableBytes: executable.size, seaBlobBytes: blob.size, manifestEmbedded: !!manifestText,
+    rustCoreTarget: rustTarget, rustCoreArchiveSha256: rustArchiveSha256,
+    rustConnectorTarget, rustConnectorSha256 }) + '\n');
 }
 
 // An explicitly named wheel is copied into the ESM artifact only for the existing developer workflow. Production

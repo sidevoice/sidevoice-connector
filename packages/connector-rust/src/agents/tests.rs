@@ -58,6 +58,7 @@ impl Fixture {
             core_socket: data.join("core/local.sock"),
             core_ready: data.join("core/core.json"),
             data,
+            installed: None,
         };
         Self { root, profile }
     }

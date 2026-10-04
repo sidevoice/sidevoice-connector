@@ -1,7 +1,7 @@
 /** What is installed, and which of it runs (§2.4, SEAMS §1): immutable release directories and two links.
  *
- *    R/releases/<id>/   immutable once renamed into place: `dist/` (this package), `core` (→ the core runtime it was
- *                       verified with), `release.json` {id, connector, core, core_build, channel, build_seq}
+ *    R/releases/<id>/   immutable once renamed into place: `dist/` (the distributor SEA), `core` (the selected Core),
+ *                       `release.json` with separate distributor format, daemon runtime, Core and pair identities
  *    R/current  → releases/<id>   the selection
  *    R/verified → releases/<id>   the last release seen running (written only after a verification)
  *    R/previous → releases/<id>   what was verified before the selection: the rollback target
@@ -19,17 +19,21 @@
 import path from 'node:path';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { closeSync, cpSync, copyFileSync, chmodSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync } from 'node:fs';
-import { randomBytes } from 'node:crypto';
-import { CORE_VERSION, installCoreRuntime, isBundleCore, runtimeRoot, selfTest } from './core.mjs';
+import { closeSync, cpSync, copyFileSync, chmodSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { CORE_VERSION, embeddedRustCoreIdentity, installCoreRuntime, isBundleCore, runtimeRoot, selfTest } from './core.mjs';
+import { RUST_CORE_ENTRYPOINT, RUST_CORE_KIND, RUST_CORE_TARGETS, rustCoreTarget } from './rust-core.mjs';
 import { keyed, t } from './i18n.mjs';
 import { recordedInstallation } from './node-files.mjs';
 import { readTrustedJson, verifyPrivateDir, writePrivateFile } from './secure-fs.mjs';
 import { crash } from './testpoint.mjs';
 import { BUILD_PACKAGE, BUILD_PACKAGE_DIR } from './build-info.mjs';
 import { runningAsSea } from './sea-runtime.mjs';
+import { embeddedRustConnectorIdentity, verifiedEmbeddedRustConnector, verifyStagedRustConnector,
+  RUST_CONNECTOR_KIND, selectedRustConnectorProgram } from './rust-connector.mjs';
 
 const here = BUILD_PACKAGE_DIR;
+const pairIdentity = (runtimeKind, runtimeBuild, coreBuild) => `pair-v1:${runtimeKind}:${runtimeBuild}:core:${coreBuild}`;
 /** Where the package's own root is: next to these modules in the checkout, and one level up once they have been
  *  bundled into `dist/`. */
 const packageRoot = () => (existsSync(path.join(here, '..', 'package.json')) ? path.dirname(here) : here);
@@ -55,8 +59,57 @@ export function stableCommand(env = process.env) {
   if (!node) throw keyed('install.node-runtime-missing');
   return [node, path.join(releaseLayout(env).current, 'dist', 'cli.mjs')];
 }
+
+/** The public installer/control CLI stays JavaScript; only the selected daemon and MCP entry use Rust. */
+export function selectedDaemonCommand(env = process.env) {
+  const selected = selection(env, 'current')?.release;
+  const program = selectedRustConnectorProgram(releaseRoot(env), selected);
+  return program ? [program, '--installed'] : stableCommand(env);
+}
+
+export function selectedMcpCommand(env = process.env) {
+  return [...selectedDaemonCommand(env), 'mcp'];
+}
+
 export function coreProgram(env = process.env) {
+  const selected = selection(env, 'current')?.release;
+  if (selected?.core_kind === RUST_CORE_KIND) {
+    const target = selected.core_target;
+    const coreId = `${RUST_CORE_KIND}-${target}-${selected.core_source_sha}-${selected.core_archive_sha256}`;
+    const complete = RUST_CORE_TARGETS.includes(target) && target === rustCoreTarget()
+      && /^[0-9a-f]{40}$/.test(selected.core_source_sha || '')
+      && /^[0-9a-f]{64}$/.test(selected.core_cargo_lock_sha256 || '')
+      && /^[0-9a-f]{64}$/.test(selected.core_manifest_sha256 || '')
+      && /^[0-9a-f]{64}$/.test(selected.core_archive_sha256 || '')
+      && Number.isSafeInteger(selected.core_archive_size) && selected.core_archive_size > 0
+      && selected.core_build === coreId && selected.core_entrypoint === RUST_CORE_ENTRYPOINT
+      && selected.core === CORE_VERSION && ['javascript', RUST_CONNECTOR_KIND].includes(selected.runtime_kind ?? 'javascript') && selected.format === 'sea'
+      && /^[0-9a-f]{64}$/.test(selected.runtime_sha256 || '')
+      && (selected.runtime_build_sha === null || /^[0-9a-f]{40}$/.test(selected.runtime_build_sha || ''))
+      && selected.pair_id === pairIdentity(selected.runtime_kind ?? 'javascript', selected.runtime_sha256, coreId);
+    const binary = path.join(releaseLayout(env).current, 'core', RUST_CORE_ENTRYPOINT);
+    let executable = false;
+    try {
+      const stat = lstatSync(binary);
+      executable = stat.isFile() && !stat.isSymbolicLink() && !!(stat.mode & 0o111);
+    } catch {}
+    if (!complete || !executable) throw keyed('install.not-selected', { detail: 'the selected native Core release identity or entrypoint is invalid' });
+    return binary;
+  }
+  if (selected?.core_kind && !['python-bundle', 'python-wheel', 'external'].includes(selected.core_kind)) {
+    throw keyed('install.not-selected', { detail: `unknown selected Core kind ${selected.core_kind}` });
+  }
+  // Keep an explicitly selected legacy release runnable through rollback after the native package is launched.
+  if (selected) {
+    const root = path.join(releaseLayout(env).current, 'core');
+    const bundled = path.join(root, 'python', 'bin', 'python3');
+    if (selected.core_kind === 'python-bundle' || (!selected.core_kind && existsSync(bundled))) return bundled;
+    return path.join(root, 'bin', 'sidevoice-core');
+  }
+  // With no selection, an embedded native SEA never falls through to Python.
+  const embedded = embeddedRustCoreIdentity();
   const root = path.join(releaseLayout(env).current, 'core');
+  if (embedded) return path.join(root, 'bin', RUST_CORE_ENTRYPOINT.split('/').at(-1));
   const bundled = path.join(root, 'python', 'bin', 'python3');
   return existsSync(bundled) ? bundled : path.join(root, 'bin', 'sidevoice-core');
 }
@@ -77,8 +130,28 @@ export function candidate(env = process.env) {
   const channel = source ? 'source' : sidevoice.channel || 'release';
   const build_seq = Number(sidevoice.build_seq) || 0;
   const baseId = channel === 'nightly' ? `${version}-nightly.${build_seq}` : source ? `${version}-source` : version;
-  const id = format === 'sea' ? `${baseId}-sea` : baseId;
-  return { id, connector: version, core: CORE_VERSION, channel, build_seq, format, source: source ? packageRoot() : null };
+  const nativeCore = embeddedRustCoreIdentity();
+  const nativeConnector = embeddedRustConnectorIdentity();
+  if (!!nativeCore !== !!nativeConnector) throw keyed('install.authenticity', { check: 'manifest' });
+  const runtimeKind = nativeConnector?.kind ?? 'javascript';
+  const runtimeBuildSha = nativeConnector?.sourceSha ?? sidevoice.connector_sha ?? null;
+  const distributorSha256 = runningAsSea() ? createHash('sha256').update(readFileSync(process.execPath)).digest('hex') : null;
+  const runtimeSha256 = nativeConnector?.binarySha256 ?? distributorSha256;
+  const runtimeBuild = runtimeSha256 || runtimeBuildSha || `${channel}:${version}:${build_seq}`;
+  const pair_id = pairIdentity(runtimeKind, runtimeBuild, nativeCore?.id ?? `python-${CORE_VERSION}`);
+  const id = format === 'sea'
+    ? nativeConnector
+      ? `${baseId}-rustd-${nativeConnector.target}-${nativeConnector.binarySha256.slice(0, 12)}-core-${nativeCore.target}-${nativeCore.archiveSha256.slice(0, 12)}-dist-${distributorSha256.slice(0, 12)}-sea`
+      : `${baseId}-sea`
+    : baseId;
+  return { id, connector: version, core: nativeCore?.version ?? CORE_VERSION,
+    core_kind: nativeCore?.kind ?? null, core_build: nativeCore?.id ?? null,
+    pair_id, runtime_kind: runtimeKind, runtime_build_sha: runtimeBuildSha, runtime_sha256: runtimeSha256,
+    runtime_target: nativeConnector?.target ?? null,
+    runtime_size: nativeConnector?.binarySize ?? (runningAsSea() ? statSync(process.execPath).size : null),
+    distributor_sha256: distributorSha256,
+    distributor_size: runningAsSea() ? statSync(process.execPath).size : null,
+    channel, build_seq, format, source: source ? packageRoot() : null };
 }
 
 const parts = version => String(version || '0').split(/[.+-]/).slice(0, 3).map(part => Number(part) || 0);
@@ -96,6 +169,14 @@ export function decide(current, next) {
   const order = compareVersions(next.connector, current.connector);
   if (order > 0) return 'upgrade';
   if (order < 0) return 'noop';
+  if (next.channel === 'nightly' && current.channel === 'nightly'
+      && Number(next.build_seq) < Number(current.build_seq)) return 'noop';
+  const currentRuntime = current.runtime_kind ?? 'javascript';
+  if (next.runtime_kind && next.runtime_kind !== currentRuntime) return 'upgrade';
+  if (next.pair_id && current.pair_id && next.pair_id !== current.pair_id) return 'upgrade';
+  const currentDistributor = current.distributor_sha256 ?? (currentRuntime === 'javascript' ? current.runtime_sha256 : null);
+  if (next.distributor_sha256 && currentDistributor && next.distributor_sha256 !== currentDistributor) return 'upgrade';
+  if (next.core_build && current.core_build !== next.core_build) return 'upgrade';
   if (next.channel === 'nightly' && next.build_seq > (Number(current.build_seq) || 0)) return 'upgrade';
   // A format change is a tie-breaker only within the same release ordering. It cannot move between channels or
   // replace a newer nightly with an older one.
@@ -141,17 +222,36 @@ export function removeLeftovers(env) {
 }
 const safeList = dir => { try { return readdirSync(dir); } catch { return []; } };
 
-/** Step 3: `releases/<id>` made whole — this package (copied; a checkout linked), the core runtime installed or reused
- *  and linked as `core`, the core's `--self-test` and the connector's `--version` passing on what was staged,
+/** Add the legacy Core alias inside a staged release. A native archive already supplies its fixed tree. */
+export function linkCoreRuntimeIntoRelease(releaseDirectory, runtime) {
+  if (runtime.kind === RUST_CORE_KIND) return;
+  if (runtime.venv) symlinkSync(runtime.venv, path.join(releaseDirectory, 'core'));
+  else if (runtime.kind === 'bundle') symlinkSync(runtime.root, path.join(releaseDirectory, 'core'));
+  else {
+    mkdirSync(path.join(releaseDirectory, 'core', 'bin'), { recursive: true });
+    symlinkSync(path.resolve(runtime.bin), path.join(releaseDirectory, 'core', 'bin', 'sidevoice-core'));
+  }
+}
+
+/** Step 3: `releases/<id>` made whole — this package (copied; a checkout linked), the core runtime verified and staged
+ *  inside its release or linked from its immutable runtime, the core's `--self-test` and connector's `--version` passing,
  *  `release.json` written, everything flushed — and only then renamed into place. A complete one is reused. */
 export async function stage(env, next, { dataDir, core = true, log = () => {}, progress = () => {}, signal,
   progressEvent = () => {}, onRuntime = () => {} }) {
+  const nativeCore = embeddedRustCoreIdentity();
+  const nativeConnector = verifiedEmbeddedRustConnector();
+  if (nativeCore && !core) throw keyed('install.authenticity', { check: 'manifest' });
+  if (!!nativeCore !== !!nativeConnector) throw keyed('install.authenticity', { check: 'manifest' });
   const { root, releases } = releaseLayout(env);
   verifyPrivateDir(root, { create: true });
   verifyPrivateDir(releases, { create: true });
   const final = path.join(releases, next.id);
   const existing = readTrustedJson(path.join(final, 'release.json'));
-  if (existing?.id === next.id) return existing;
+  if (existing?.id === next.id) {
+    if (existing.pair_id === next.pair_id
+        || (!existing.pair_id && !next.core_build && (existing.runtime_kind ?? 'javascript') === (next.runtime_kind ?? 'javascript'))) return existing;
+    throw keyed('install.not-selected', { detail: 'the release path already contains a different runtime pair identity' });
+  }
   const temporary = `${final}.tmp-${randomBytes(4).toString('hex')}`;
   mkdirSync(temporary, { mode: 0o700 });
   progressEvent({ step: 'stage', done: null, total: null });
@@ -166,27 +266,56 @@ export async function stage(env, next, { dataDir, core = true, log = () => {}, p
     const from = path.join(packageRoot(), file);
     if (existsSync(from)) cpSync(from, path.join(temporary, file), { recursive: true });
   }
+  let stagedRustRuntimeSha256 = null;
+  if (nativeConnector) {
+    const executable = path.join(temporary, 'dist', 'sidevoice-rust');
+    writeFileSync(executable, nativeConnector.bytes, { mode: 0o700, flag: 'wx' });
+    chmodSync(executable, 0o755);
+    stagedRustRuntimeSha256 = verifyStagedRustConnector(executable, nativeConnector.identity);
+  }
   crash('stage-copied');
   // `--no-core`: a release with no core of its own (the connector installs one the first time a conversation needs it).
   let runtime = { id: null };
   if (core) {
     progress(t('install.progress.core', { version: CORE_VERSION }));
-    runtime = await installCoreRuntime({ dataDir, env, channel: next.channel, signal, progressEvent, log: line => progress('  ' + line),
+    runtime = await installCoreRuntime({ dataDir, env, channel: next.channel, signal, releaseCoreDirectory: path.join(temporary, 'core'), progressEvent, log: line => progress('  ' + line),
       progress: line => { if (line.trim() && !/^\s*[+-] /.test(line)) progress('    uv: ' + line.trim()); } });
     onRuntime(runtime);
-    if (runtime.venv) symlinkSync(runtime.venv, path.join(temporary, 'core'));
-    else if (runtime.kind === 'bundle') symlinkSync(runtime.root, path.join(temporary, 'core'));
-    else { mkdirSync(path.join(temporary, 'core', 'bin'), { recursive: true }); symlinkSync(path.resolve(runtime.bin), path.join(temporary, 'core', 'bin', 'sidevoice-core')); }
-    const stagedCore = runtime.kind === 'bundle' ? path.join(temporary, 'core', 'python', 'bin', 'python3') : path.join(temporary, 'core', 'bin', 'sidevoice-core');
-    await selfTest(stagedCore, env, { bundle: runtime.kind === 'bundle', signal });
+    linkCoreRuntimeIntoRelease(temporary, runtime);
+    const stagedCore = runtime.kind === RUST_CORE_KIND ? runtime.bin
+      : runtime.kind === 'bundle' ? path.join(temporary, 'core', 'python', 'bin', 'python3')
+        : path.join(temporary, 'core', 'bin', 'sidevoice-core');
+    await selfTest(stagedCore, env, { bundle: runtime.kind === 'bundle',
+      ...(runtime.kind === RUST_CORE_KIND ? { nativeRoot: runtime.root } : {}), signal });
   }
   const reported = runningAsSea()
     ? spawnSync(path.join(temporary, 'dist', 'sidevoice'), ['--version'], { encoding: 'utf8', timeout: 30_000 })
     : spawnSync(process.execPath, [path.join(temporary, 'dist', 'cli.mjs'), '--version'], { encoding: 'utf8', timeout: 30_000 });
   if (reported.stdout.trim() !== next.connector) throw keyed('install.self-test', { detail: `the staged connector says ${reported.stdout.trim() || reported.stderr.trim() || '?'}, not ${next.connector}` });
   if (signal?.aborted) throw keyed('install.cancelled');
+  const stagedDistributorSha256 = runningAsSea()
+    ? createHash('sha256').update(readFileSync(path.join(temporary, 'dist', 'sidevoice'))).digest('hex') : null;
+  const stagedDistributorSize = runningAsSea() ? statSync(path.join(temporary, 'dist', 'sidevoice')).size : null;
+  const stagedRuntimeSha256 = stagedRustRuntimeSha256 ?? stagedDistributorSha256;
+  if (next.runtime_sha256 && stagedRuntimeSha256 !== next.runtime_sha256) {
+    throw keyed('install.self-test', { detail: 'the staged Connector runtime differs from its candidate digest' });
+  }
+  const coreKind = runtime.kind === RUST_CORE_KIND ? runtime.kind
+    : runtime.kind === 'bundle' ? 'python-bundle' : runtime.kind === 'external' ? 'external' : 'python-wheel';
   const release = { id: next.id, connector: next.connector, core: next.core, core_build: runtime.id,
     channel: next.channel, build_seq: next.build_seq, format: next.format ?? (runningAsSea() ? 'sea' : 'esm'),
+    pair_id: next.pair_id, runtime_kind: next.runtime_kind ?? 'javascript',
+    runtime_build_sha: next.runtime_build_sha ?? null,
+    runtime_sha256: stagedRuntimeSha256 ?? next.runtime_sha256 ?? null,
+    runtime_target: nativeConnector?.identity.target ?? null,
+    runtime_size: nativeConnector?.identity.binarySize ?? next.runtime_size ?? null,
+    distributor_sha256: stagedDistributorSha256 ?? next.distributor_sha256 ?? null,
+    distributor_size: stagedDistributorSize ?? next.distributor_size ?? null,
+    ...(runtime.id ? { core_kind: coreKind } : {}),
+    ...(runtime.kind === RUST_CORE_KIND ? { core_kind: runtime.kind, core_source_sha: runtime.sourceSha,
+      core_cargo_lock_sha256: runtime.cargoLockSha256, core_manifest_sha256: runtime.manifestSha256,
+      core_target: runtime.target, core_archive_sha256: runtime.archiveSha256,
+      core_archive_size: runtime.archiveSize, core_entrypoint: runtime.entrypoint } : {}),
     ...(next.source ? { source: next.source } : {}) };
   writePrivateFile(path.join(temporary, 'release.json'), JSON.stringify(release, null, 2) + '\n');
   syncTree(temporary);

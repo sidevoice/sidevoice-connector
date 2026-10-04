@@ -1,15 +1,14 @@
-/** This machine's core — installed from a signed R4-a platform bundle when one is present, or as an attested wheel
- *  with uv when the platform bundle is missing or unmapped. Source checkouts retain local wheel/spec overrides; an
- *  installed connector accepts an explicit local path but never a network requirement as a developer override.
- *  `SIDEVOICE_CORE_BIN` names an executable installed by hand and skips installation altogether.
+/** This machine's core — a selected native Core is unpacked from this target SEA's signed, verified asset inside its
+ *  release; existing releases may still use the signed Python bundle or attested wheel path. Source checkouts retain
+ *  local wheel/spec overrides; a selected native release rejects all external and local Core overrides.
  *
- *  Each immutable runtime is stored under `core-runtime/<build>` and linked by a release (`release.mjs`). Models
- *  are not part of it; the core loads Silero and smart-turn from its wheels, and nothing else unless a person picks
- *  a local engine.
+ *  Legacy Python runtimes are stored under `core-runtime/<build>` and linked by a release (`release.mjs`); their
+ *  models come from the wheel. A native Rust Core and its inventoried models stay together under `<release>/core`.
  *
  *  Who starts it (§2.6): the service manager, as the core job (`service.mjs`) — then nobody else does; with no
  *  job, a connector, detached and left running — that core outlives its connector on purpose (a call may be
- *  going on) and exits on its own when nothing has used it for a while. The handshake is the ready file,
+ *  going on) and exits on its own when nothing has used it for a while. The JS Connector remains the selected daemon
+ *  in this native-Core consumer slice. The handshake is the ready file,
  *  `core/core.json`: where it listens (its socket, `core-socket.mjs`), its launch id, and the credential the
  *  connector links with. A core that died before serving says why in `core/core-failure.json`; it writes its own
  *  log, `core.log`, and one data directory has one core (its `flock` on `core/core.lock`). */
@@ -25,10 +24,13 @@ import { findProcess, isProcess, signalVerified } from './proc.mjs';
 import { keyed, t } from './i18n.mjs';
 import { classifyInstallFailure } from './install-errors.mjs';
 import { nodeFiles, readJson } from './node-files.mjs';
-import { BUILD_PACKAGE, BUILD_PACKAGE_DIR, CORE_MANIFEST } from './build-info.mjs';
-import { runningAsSea } from './sea-runtime.mjs';
+import { BUILD_PACKAGE, BUILD_PACKAGE_DIR, CORE_MANIFEST, RUST_CORE_ARCHIVE_SHA256, RUST_CORE_ARCHIVE_SIZE,
+  RUST_CORE_MANIFEST_SHA256, RUST_CORE_MANIFEST_TEXT, RUST_CORE_SOURCE_SHA, RUST_CORE_TARGET } from './build-info.mjs';
+import { getSeaAsset, runningAsSea } from './sea-runtime.mjs';
 import { coreInstallSource, coreTarget, fetchVerifiedCoreWheel, prepareVerifiedCoreBundle, validateCoreManifest } from './core-bundle.mjs';
 import { refusal, sha256 } from './core-attestation.mjs';
+import { parseCanonicalRustCoreJson, RUST_CORE_ENTRYPOINT, RUST_CORE_KIND, rustCoreTarget,
+  unpackRustCoreArchive, validateRustCoreManifest } from './rust-core.mjs';
 import { verifyPrivateDir, writePrivateFile } from './secure-fs.mjs';
 
 export const CORE_VERSION = '0.1.0';
@@ -52,6 +54,67 @@ export function runtimeRoot(dataDir) { return path.join(dataDir, 'core-runtime')
 export function logPath(dataDir) { return path.join(dataDir, 'core.log'); }
 export function socketPathOf(dataDir) { return path.join(coreData(dataDir), 'local.sock'); }
 export function failurePath(dataDir) { return path.join(coreData(dataDir), 'core-failure.json'); }
+
+const RUST_CORE_ASSET_KEY = 'sidevoice-rust-core.tar.zst';
+const RUST_CORE_LOADER_ENV = ['LD_LIBRARY_PATH', 'LD_PRELOAD', 'LD_AUDIT', 'LD_DEBUG',
+  'DYLD_LIBRARY_PATH', 'DYLD_FALLBACK_LIBRARY_PATH', 'DYLD_FRAMEWORK_PATH', 'DYLD_INSERT_LIBRARIES',
+  'DYLD_VERSIONED_LIBRARY_PATH', 'DYLD_ROOT_PATH'];
+
+/** The closed native identity compiled into this target SEA, or null for a legacy/source build. */
+export function embeddedRustCoreIdentity() {
+  if (RUST_CORE_MANIFEST_TEXT === null) return null;
+  const raw = Buffer.from(RUST_CORE_MANIFEST_TEXT, 'utf8');
+  if (!/^[0-9a-f]{64}$/.test(RUST_CORE_MANIFEST_SHA256 || '') || sha256(raw) !== RUST_CORE_MANIFEST_SHA256) {
+    throw refusal('sha256', 'embedded native Core manifest differs from its build pin');
+  }
+  const manifest = parseCanonicalRustCoreJson(raw, 'embedded native Core manifest');
+  validateRustCoreManifest(manifest, { expectedSourceSha: RUST_CORE_SOURCE_SHA });
+  const hostTarget = rustCoreTarget();
+  if (!hostTarget || RUST_CORE_TARGET !== hostTarget || !/^[0-9a-f]{64}$/.test(RUST_CORE_ARCHIVE_SHA256 || '')
+      || !Number.isSafeInteger(RUST_CORE_ARCHIVE_SIZE)) {
+    throw refusal('platform', 'native Core target does not match this Connector executable');
+  }
+  const bundle = manifest.bundles[RUST_CORE_TARGET];
+  if (!bundle || bundle.sha256 !== RUST_CORE_ARCHIVE_SHA256 || bundle.size !== RUST_CORE_ARCHIVE_SIZE) {
+    throw refusal('manifest', 'embedded native Core bundle differs from its signed manifest');
+  }
+  const id = `${RUST_CORE_KIND}-${RUST_CORE_TARGET}-${manifest.source_sha}-${bundle.sha256}`;
+  return { kind: RUST_CORE_KIND, version: CORE_VERSION, id, sourceSha: manifest.source_sha,
+    cargoLockSha256: manifest.cargo_lock_sha256, manifestSha256: RUST_CORE_MANIFEST_SHA256,
+    target: RUST_CORE_TARGET, archiveSha256: bundle.sha256, archiveSize: bundle.size,
+    entrypoint: RUST_CORE_ENTRYPOINT, manifest };
+}
+
+/** Only the packaged native Core's loader-relative libraries may be used. */
+export function rustCoreEnvironment(env, coreRoot) {
+  const safe = { ...env };
+  for (const key of RUST_CORE_LOADER_ENV) delete safe[key];
+  safe.RUSTVANI_CACHE_DIR = path.join(coreRoot, 'models');
+  return safe;
+}
+
+export function isRustCoreProgram(bin) {
+  return typeof bin === 'string' && path.basename(bin) === 'sidevoice-core-rust'
+    && path.basename(path.dirname(bin)) === 'bin' && path.basename(path.dirname(path.dirname(bin))) === 'core';
+}
+
+export function rustCoreRootForProgram(bin) {
+  return isRustCoreProgram(bin) ? path.dirname(path.dirname(bin)) : null;
+}
+
+async function stageEmbeddedRustCore(directory, { signal } = {}) {
+  const identity = embeddedRustCoreIdentity();
+  if (!identity || !runningAsSea()) throw refusal('manifest', 'this executable has no embedded native Core payload');
+  if (signal?.aborted) throw keyed('install.cancelled');
+  const archive = getSeaAsset(RUST_CORE_ASSET_KEY);
+  if (!archive || archive.length !== identity.archiveSize || sha256(archive) !== identity.archiveSha256) {
+    throw refusal('sha256', 'embedded native Core archive differs from its signed target record');
+  }
+  await unpackRustCoreArchive(archive, directory, { manifest: identity.manifest, target: identity.target, signal });
+  const bin = path.join(directory, identity.entrypoint);
+  if (!executable(bin)) throw keyed('install.self-test', { detail: 'the verified native Core entrypoint is not executable' });
+  return { ...identity, bin, root: directory };
+}
 
 /** What `uv pip install` is given for the pinned version. */
 export function coreSpec(env = process.env) {
@@ -332,9 +395,16 @@ async function installVerifiedWheel({ dataDir, env, log, progress, channel, sign
   } finally { rmSync(temporary, { recursive: true, force: true }); }
 }
 
-/** One selected core source: explicit local developer override, platform bundle, or verified-wheel uv fallback. */
+/** One selected core source: packaged native archive, explicit legacy developer override, Python bundle or verified wheel. */
 export async function installCoreRuntime({ dataDir, env = process.env, log = () => {}, progress = () => {}, signal,
-  progressEvent = () => {}, channel = BUILD_PACKAGE.sidevoice?.channel || 'release' }) {
+  progressEvent = () => {}, channel = BUILD_PACKAGE.sidevoice?.channel || 'release', releaseCoreDirectory = null }) {
+  if (RUST_CORE_MANIFEST_TEXT !== null) {
+    if (env.SIDEVOICE_CORE_BIN || env.SIDEVOICE_CORE_SPEC || env.SIDEVOICE_CORE_WHEEL_DIR) {
+      throw refusal('developer-override', 'a packaged native Core cannot be replaced by a local or external Core');
+    }
+    if (!releaseCoreDirectory) throw refusal('manifest', 'native Core must be staged inside its Connector release');
+    return stageEmbeddedRustCore(releaseCoreDirectory, { signal });
+  }
   if (env.SIDEVOICE_CORE_BIN) return { id: 'external', bin: env.SIDEVOICE_CORE_BIN, venv: null, kind: 'external' };
   const override = localDeveloperSpec(env);
   if (override) return { ...(await installRuntime({ dataDir, env: { ...env, SIDEVOICE_CORE_SPEC: override }, log, progress, signal, progressEvent })), kind: 'uv' };
@@ -355,12 +425,15 @@ export function isBundleCore(bin) {
 }
 
 /** `sidevoice-core --self-test`: imports everything serving needs, binds nothing, writes nothing. */
-export function selfTest(bin, env = process.env, { bundle = false, signal } = {}) {
-  const args = bundle ? ['-I', '-m', 'sidevoice_core.server', '--self-test'] : ['--self-test'];
+export function selfTest(bin, env = process.env, { bundle = false, nativeRoot = null, signal } = {}) {
+  const args = nativeRoot
+    ? ['--self-test', path.join(nativeRoot, 'checks', 'detector-16k.wav'), path.join(nativeRoot, 'models')]
+    : bundle ? ['-I', '-m', 'sidevoice_core.server', '--self-test'] : ['--self-test'];
+  const childEnv = nativeRoot ? rustCoreEnvironment(env, nativeRoot) : env;
   if (signal?.aborted) return Promise.reject(keyed('install.cancelled'));
   return new Promise((resolve, reject) => {
     let child;
-    try { child = spawn(bin, args, { env, stdio: ['ignore', 'pipe', 'pipe'] }); }
+    try { child = spawn(bin, args, { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] }); }
     catch (error) { reject(error); return; }
     let stdout = '', stderr = '', timedOut = false, forceTimer;
     const append = (current, chunk) => (current + chunk.toString('utf8')).slice(-64 * 1024);
@@ -381,7 +454,14 @@ export function selfTest(bin, env = process.env, { bundle = false, signal } = {}
       if (timedOut) { reject(keyed('install.self-test', { detail: 'core self-test timed out after 120 seconds' })); return; }
       let report = null;
       try { report = JSON.parse(stdout.trim().split('\n').at(-1)); } catch {}
-      if (code !== 0 || !report?.ok) {
+      const nativeReportOk = report && typeof report === 'object' && !Array.isArray(report)
+        && report.detectors && typeof report.detectors === 'object'
+        && report.detectors.sample_rate === 16_000 && Number.isSafeInteger(report.detectors.frames)
+        && report.detectors.frames > 0 && Number.isFinite(report.detectors.max_voice_confidence)
+        && Number.isFinite(report.detectors.smart_turn_probability)
+        && typeof report.detectors.smart_turn_complete === 'boolean'
+        && report.opus_decoded_samples === 320;
+      if (code !== 0 || !(nativeRoot ? nativeReportOk : report?.ok)) {
         reject(keyed(report?.key || 'install.self-test', { detail: report?.message || stderr.trim().split('\n').at(-1) || stdout.trim().slice(0, 200) }));
         return;
       }
@@ -441,7 +521,18 @@ export async function serving(dataDir, timeout = 2000) {
 
 /** The arguments of one core: the job's (`idleExit` 0: it never leaves on its own; no launch id — the core makes one)
  *  or an on-demand launch's (its default idle exit, and a launch id to wait for). */
-export function coreArgs({ dataDir, env = process.env, launchId = null, idleExit = null, roomCredential = null, bundle = false }) {
+export function coreArgs({ dataDir, env = process.env, launchId = null, idleExit = null, roomCredential = null,
+  bundle = false, nativeRoot = null }) {
+  if (nativeRoot) {
+    const args = ['--data-dir', coreData(dataDir), '--socket', socketPathOf(dataDir),
+      '--ready-file', path.join(coreData(dataDir), 'core.json'), '--host', '127.0.0.1',
+      '--port', String(env.SIDEVOICE_CORE_PORT ?? DEFAULT_PORT)];
+    if (launchId) args.push('--launch-id', launchId);
+    args.push('--log-file', logPath(dataDir));
+    if (roomCredential) args.push('--room-credential', roomCredential);
+    args.push('--idle-exit', String(idleExit ?? 600));
+    return args;
+  }
   const args = ['--data-dir', coreData(dataDir), '--port', String(env.SIDEVOICE_CORE_PORT ?? DEFAULT_PORT), '--socket', socketPathOf(dataDir)];
   if (launchId) args.push('--launch-id', launchId);
   if (idleExit !== null) args.push('--idle-exit', String(idleExit));
@@ -452,11 +543,13 @@ export function coreArgs({ dataDir, env = process.env, launchId = null, idleExit
 /** Start one detached core (no service manager): its stdout and stderr appended to `core.stderr.log` — the core writes
  *  its own log — and a handle whose `exit` settles when it is gone, a spawn error (no such program, no permission)
  *  included. */
-export function spawnCore(bin, args, { dataDir, env = process.env }) {
+export function spawnCore(bin, args, { dataDir, env = process.env, nativeRoot = null }) {
   ensureCoreDirectory(coreData(dataDir));
   let child;
   const out = openSync(nodeFiles(dataDir).coreStderr, 'a', 0o600);
-  try { child = spawn(bin, args, { detached: true, stdio: ['ignore', out, out], env: { ...env, SIDEVOICE_CORE_DATA_DIR: coreData(dataDir) } }); }
+  const childEnv = { ...env, SIDEVOICE_CORE_DATA_DIR: coreData(dataDir) };
+  const safeChildEnv = nativeRoot ? rustCoreEnvironment(childEnv, nativeRoot) : childEnv;
+  try { child = spawn(bin, args, { detached: true, stdio: ['ignore', out, out], env: safeChildEnv }); }
   finally { closeSync(out); }
   const handle = { pid: child.pid ?? null, child, done: null };
   handle.exit = new Promise(resolve => {
@@ -542,7 +635,9 @@ export async function ensureRunning({ dataDir, env = process.env, log = () => {}
   if (running) return running;
   const program = bin || await ensureInstalled({ dataDir, env, log, progress });
   const launchId = randomUUID();
-  const handle = spawnCore(program, coreArgs({ dataDir, env, launchId, roomCredential, bundle: isBundleCore(program) }), { dataDir, env });
+  const nativeRoot = rustCoreRootForProgram(program);
+  const handle = spawnCore(program, coreArgs({ dataDir, env, launchId, roomCredential,
+    bundle: isBundleCore(program), nativeRoot }), { dataDir, env, nativeRoot });
   log(`started sidevoice-core (pid ${handle.pid ?? '?'}, launch ${launchId}); waiting for it to be ready`);
   let { ready, failure } = await awaitReady(handle, { dataDir, launchId });
   if (!ready && failure.key === 'bind.core-running' && !fresh) {

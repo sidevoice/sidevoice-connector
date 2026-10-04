@@ -343,8 +343,11 @@ test('façade: the connector job restarted under it — a new voice turn reaches
     await owner.ready;
     assert.equal((await owner.call('voice_connect', {})).value.binding_id, 'core-thread-r');
     /** Ready for a turn: the connector job holds this conversation again, linked to the core. */
-    const registeredWith = pid => until(() => node.said().some(line => line.event === 'binding.register' && line.data.client_ref === 'thread-r') &&
-      JSON.parse(readFileSync(path.join(node.dataDir, 'connector.lock'), 'utf8')).pid === pid, 20_000);
+    const registeredWith = pid => until(() => {
+      if (!node.said().some(line => line.event === 'binding.register' && line.data.client_ref === 'thread-r')) return false;
+      try { return JSON.parse(readFileSync(path.join(node.dataDir, 'connector.lock'), 'utf8')).pid === pid; }
+      catch { return false; } // The in-place lock record can be briefly empty while a new process takes ownership.
+    }, 20_000);
     // The manager restarts the connector job (a crash, an upgrade): the old one is gone at once.
     const first = node.pid('connector');
     process.kill(first, 'SIGKILL');
@@ -411,7 +414,10 @@ function printed(kind, { loaded = true, running = false, force = null } = {}) {
     const ran = spawnSync(process.execPath, [fakeManager, 'launchctl', 'print', `gui/${process.getuid()}/${job}`], { env: { ...process.env, FAKE_MANAGER_DIR: dir }, encoding: 'utf8' });
     output = parseLaunchd({ ok: ran.status === 0, output: ran.stdout + ran.stderr });
   } else {
-    if (loaded) { writeFileSync(path.join(dir, 'unit'), ''); writeFileSync(path.join(state, 'definition'), path.join(dir, 'unit')); }
+    if (loaded) {
+      writeFileSync(path.join(dir, 'unit'), ''); writeFileSync(path.join(state, 'definition'), path.join(dir, 'unit'));
+      writeFileSync(path.join(state, 'loaded-spec.json'), JSON.stringify({ program: ['/bin/true'], environment: {}, log: '/dev/null' }));
+    }
     const ran = spawnSync(process.execPath, [fakeManager, 'systemctl', '--user', 'show', '-p', 'x', job], { env: { ...process.env, FAKE_MANAGER_DIR: dir }, encoding: 'utf8' });
     output = parseSystemd(ran.stdout);
   }

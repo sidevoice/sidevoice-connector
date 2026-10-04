@@ -240,6 +240,7 @@ impl Ipc {
 
 #[derive(Clone)]
 struct Facade {
+    profile: Profile,
     ipc: Arc<Ipc>,
     joined: Arc<Mutex<HashMap<String, Joined>>>,
     cursor_views: Arc<AtomicBool>,
@@ -271,7 +272,8 @@ impl Facade {
     fn new(profile: Profile) -> Self {
         let joined = Arc::new(Mutex::new(HashMap::new()));
         Self {
-            ipc: Ipc::new(profile, joined.clone()),
+            ipc: Ipc::new(profile.clone(), joined.clone()),
+            profile,
             joined,
             cursor_views: Arc::new(AtomicBool::new(false)),
             card_reads: Arc::new(AtomicU64::new(0)),
@@ -433,7 +435,7 @@ impl Facade {
                     "delivery":if pushed {"push"} else {"none"},"room_reachable":result.get("connected"),
                     "capabilities":capabilities,"inbound":identity.inbound,
                     "local_only":"This machine is not paired with any room, so this conversation is reachable only from devices paired with this machine itself (the Sidevoice app on this computer, at this machine's own address). Tell the user in one line. Pairing the app is voice_pair_device, only if they ask; reaching it from elsewhere needs a room's address and code (voice_pair).",
-                    "version":env!("CARGO_PKG_VERSION"),"connector_version":connector.get("version")
+                    "version":self.profile.connector_version(),"connector_version":connector.get("version")
                 });
                 if !pushed {
                     response["voice_in"] = json!({"supported":false,"speak_with":{"session_id":format!("typed:{}", identity.thread),"revision":0},
@@ -767,7 +769,41 @@ impl Facade {
             }
             "voice_pair_device" => self.ipc.call("pair_device", json!({})).await,
             "voice_pair" => {
-                bail!("Room pairing is not available in this isolated Rust connector slice")
+                let room = args
+                    .get("room")
+                    .and_then(Value::as_str)
+                    .filter(|room| !room.is_empty())
+                    .context(
+                        "voice_pair needs the room's address and the code the user read from it.",
+                    )?;
+                let code = args
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .filter(|code| !code.is_empty())
+                    .context(
+                        "voice_pair needs the room's address and the code the user read from it.",
+                    )?;
+                let previous = crate::pairing::previous_room(&self.profile);
+                let result =
+                    crate::pairing::run_pair(&self.profile, room, &code.trim().to_uppercase())
+                        .await?;
+                let origin = result
+                    .get("room")
+                    .and_then(Value::as_str)
+                    .context("pairing result omitted the room")?;
+                let connector_id = result
+                    .get("connector_id")
+                    .and_then(Value::as_str)
+                    .context("pairing result omitted connector identity")?;
+                let active = !self.joined.lock().await.is_empty();
+                let mut paired = json!({"status":"paired","room":origin,"connector_id":connector_id,
+                    "next":if active {"Conversations already joined stay joined; the room reaches them within seconds."}
+                        else {"Call voice_connect to join."}});
+                if let Some(previous) = previous.filter(|previous| previous != origin) {
+                    paired["replaced"] = json!(previous);
+                    paired["note"] = json!(format!("Every conversation on this machine is reached through {origin} now, not {previous}."));
+                }
+                Ok(paired)
             }
             _ => bail!("unknown tool"),
         }
@@ -933,7 +969,10 @@ impl ServerHandler for Facade {
             capabilities.resources = Some(Default::default());
         }
         ServerConfig::new(capabilities)
-            .with_server_info(Implementation::new("sidevoice", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new(
+                "sidevoice",
+                self.profile.connector_version(),
+            ))
             .with_instructions(INSTRUCTIONS)
     }
 
