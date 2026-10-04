@@ -807,11 +807,17 @@ async fn process_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
         if matches!(fields[0], "Z" | "X" | "x") {
             return Ok(None);
         }
-        let owner = fs::metadata(&path)?.uid();
+        let owner = match fs::metadata(&path) {
+            Ok(metadata) => metadata.uid(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         if owner != unsafe { libc::geteuid() } {
             return Err(release::refusal("control.foreign-process-owner", json!({})));
         }
-        let argv = process_arguments(pid)?;
+        let Some(argv) = live_process_arguments(pid)? else {
+            return Ok(None);
+        };
         return Ok(Some(ProcessIdentity {
             start: fields[19].into(),
             command: argv.join(" "),
@@ -853,12 +859,29 @@ async fn process_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
     if fields[1].parse::<u32>()? != unsafe { libc::geteuid() } {
         return Err(release::refusal("control.foreign-process-owner", json!({})));
     }
-    let argv = process_arguments(pid)?;
+    let Some(argv) = live_process_arguments(pid)? else {
+        return Ok(None);
+    };
     Ok(Some(ProcessIdentity {
         start: fields[2..7].join(" "),
         command: argv.join(" "),
         argv,
     }))
+}
+fn live_process_arguments(pid: u32) -> Result<Option<Vec<String>>> {
+    match process_arguments(pid) {
+        Ok(arguments) => Ok(Some(arguments)),
+        // ps/stat and argv are separate observations. The process may exit in between,
+        // including just after our verified TERM. Only a missing process ends the wait.
+        Err(error) if process_missing(&error) => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read process {pid} arguments")),
+    }
+}
+fn process_missing(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|error| matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)))
 }
 async fn terminate_verified(pid: u32, expected: &ProcessIdentity) -> Result<()> {
     if process_identity(pid).await?.as_ref() != Some(expected) {
@@ -1147,17 +1170,28 @@ async fn raw_core_socket_silent(p: &Paths) -> Result<()> {
 }
 async fn stop_core(p: &Paths) -> Result<()> {
     // Native Core holds an empty flock before publishing ready. Enumerate exact argv, not a stale ready PID.
-    for (pid, identity) in core_processes(p).await? {
-        terminate_verified(pid, &identity).await?;
+    for (pid, identity) in core_processes(p)
+        .await
+        .context("discover selected Core processes")?
+    {
+        terminate_verified(pid, &identity)
+            .await
+            .with_context(|| format!("stop selected Core process {pid}"))?;
     }
-    let _lock = core_lock_probe(p)?;
-    if !core_processes(p).await?.is_empty() {
+    let _lock = core_lock_probe(p).context("confirm Core startup lock is released")?;
+    if !core_processes(p)
+        .await
+        .context("recheck Core processes after shutdown")?
+        .is_empty()
+    {
         return Err(release::refusal(
             "control.core-process-started-during-shutdown",
             json!({}),
         ));
     }
-    raw_core_socket_silent(p).await
+    raw_core_socket_silent(p)
+        .await
+        .context("confirm Core socket is silent after shutdown")
 }
 
 pub async fn stop_on_demand(p: &Paths) -> Result<()> {
@@ -1506,6 +1540,21 @@ mod native_tests {
             program
         ));
     }
+    #[test]
+    fn process_disappearance_never_hides_permission_or_invalid_snapshot_errors() {
+        for code in [libc::ENOENT, libc::ESRCH] {
+            let error = anyhow::Error::from(std::io::Error::from_raw_os_error(code))
+                .context("process snapshot");
+            assert!(process_missing(&error));
+        }
+        for code in [libc::EPERM, libc::EACCES, libc::EINVAL, libc::ENOMEM] {
+            assert!(!process_missing(
+                &std::io::Error::from_raw_os_error(code).into()
+            ));
+        }
+        assert!(!process_missing(&anyhow::anyhow!("invalid process argc")));
+    }
+
     #[tokio::test]
     async fn stops_owned_core_before_ready_and_refuses_unknown_lock_holder() {
         use fs2::FileExt;
