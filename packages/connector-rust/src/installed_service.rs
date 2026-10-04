@@ -993,7 +993,8 @@ pub async fn stop_on_demand(p: &Paths) -> Result<()> {
             .root
             .join("releases")
             .join(selected["id"].as_str().context("release id")?)
-            .join("dist/sidevoice-rust");
+            .join("dist/sidevoice-rust")
+            .canonicalize()?;
         if identity["managed"] != false
             || identity["release_id"] != selected["id"]
             || identity["runtime_sha256"] != selected["runtime_sha256"]

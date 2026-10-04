@@ -148,9 +148,12 @@ async fn stage(
         progress(show, "stage");
         release::private_directory(&temp.join("dist"))?;
         let bytes = fs::read(std::env::current_exe()?)?;
-        for name in ["sidevoice", "sidevoice-rust"] {
-            release::write(&temp.join("dist").join(name), &bytes, 0o700)?;
-        }
+        release::write(&temp.join("dist/sidevoice"), &bytes, 0o700)?;
+        // Both compatibility paths name the same native executable, without duplicating its embedded Core.
+        fs::hard_link(
+            temp.join("dist/sidevoice"),
+            temp.join("dist/sidevoice-rust"),
+        )?;
         release::unpack_core(
             payload.archive,
             manifest,
