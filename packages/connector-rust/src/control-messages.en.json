@@ -13,5 +13,7 @@
   "pair.failed": "Sidevoice could not pair with the room: {detail}",
   "pair.arguments": "Supply the room address and its one-time code; link-room needs only the room address.",
   "install.usage": "Use sidevoice install [--harness claude|codex|cursor] [--no-agents] [--service] [--apply-now] [--json] [--progress=jsonl].",
-  "uninstall.done": "Sidevoice was uninstalled."
+  "uninstall.done": "Sidevoice was uninstalled.",
+  "install.paired": "This machine is paired with {room}.",
+  "install.unpaired": "This machine is not paired with any room yet."
 }

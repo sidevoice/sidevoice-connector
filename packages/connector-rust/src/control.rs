@@ -323,6 +323,12 @@ fn presented(command: &str, result: Value) -> Value {
                     "previous":result.get("previous").filter(|v| !v.is_null()).cloned().unwrap_or_else(||json!(message("install.nothing",&Value::Null)))})));
                 let key = if result["service"] == "none" { "install.on-demand" } else { "install.service" };
                 lines.push(message(key, &json!({"service":result["service"],"state":result["state"]})));
+                if result["paired"] == true {
+                    lines.push(message("install.paired", &json!({"room":result["room"]})));
+                } else {
+                    lines.push(message("install.unpaired", &Value::Null));
+                    lines.push(message("install.route", &Value::Null));
+                }
             }
             "rollback" => lines.push(message("install.rolled-back", &json!({"id":result["installed"],
                 "from":result.get("from").filter(|v| !v.is_null()).cloned().unwrap_or_else(||json!(message("install.nothing",&Value::Null)))}))),
@@ -387,6 +393,8 @@ mod tests {
         assert!(text.contains("Installed already:"));
         assert!(text.contains("manual agent command"));
         assert!(!text.starts_with('{'));
+        assert!(text.contains("not paired with any room"));
+        assert!(text.contains("sidevoice pair <room-url> <code>"));
         let failure = presented(
             "install",
             json!({"ok":false,"failure":{"message":"verification failed"}}),
