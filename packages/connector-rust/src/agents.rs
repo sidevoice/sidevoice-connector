@@ -672,8 +672,11 @@ impl HostAgents {
                     .cursor_registration()
                     .map_err(|_| agent_failure("agents.invalid", agent))?,
             };
-            if owned != "owned-old" {
-                return self.response(&state);
+            match owned.as_str() {
+                "unknown" => return Err(agent_failure("agents.registration-unknown", agent)),
+                "invalid" => return Err(agent_failure("agents.invalid", agent)),
+                "owned-old" => {}
+                _ => return self.response(&state),
             }
         }
         if action == "connect" || action == "reconcile" {
@@ -2015,14 +2018,14 @@ pub async fn register_requested(profile: Profile, ids: &[String]) -> Result<Valu
     };
     let mut done = Vec::new();
     let mut next = Vec::new();
-    for id in selected {
+    for id in &selected {
         let result = agents.handle("agents.connect", json!({"id":id})).await;
         if let Some(error) = result.get("error") {
             next.push(error["message"].as_str().unwrap_or("").to_owned());
-            if let Some(row) = listed["agents"]
-                .as_array()
-                .and_then(|rows| rows.iter().find(|row| row["id"] == id))
-            {
+            if let Some(row) = listed["agents"].as_array().and_then(|rows| {
+                rows.iter()
+                    .find(|row| row["id"].as_str() == Some(id.as_str()))
+            }) {
                 if let Some(snippet) = row.pointer("/instructions/snippet").and_then(Value::as_str)
                 {
                     next.push(snippet.to_owned());
@@ -2036,7 +2039,7 @@ pub async fn register_requested(profile: Profile, ids: &[String]) -> Result<Valu
         }
     }
     agents.shutdown().await;
-    Ok(json!({"done":done,"next":next}))
+    Ok(json!({"done":done,"next":next,"requested":selected}))
 }
 
 /// Called before uninstall deletes selection/state; foreign registrations remain untouched.
@@ -2083,27 +2086,43 @@ pub async fn cleanup_owned(profile: Profile) -> Result<Value> {
 
 /// Repoint previously owned registrations after selection changes; never enroll a new agent.
 pub async fn reconcile_owned(profile: Profile) -> Result<Value> {
-    let agents = HostAgents::new(profile)?;
+    Ok(reconcile_agents(HostAgents::new(profile)?).await)
+}
+
+async fn reconcile_agents(agents: Arc<HostAgents>) -> Value {
     let listed = agents.handle("agents.list", json!({"rescan":true})).await;
-    if listed.get("error").is_some() {
-        agents.shutdown().await;
-        return Ok(listed);
-    }
-    let ids: Vec<String> = listed["agents"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|row| row["id"].as_str().map(str::to_owned))
-        .collect();
-    let mut next = Vec::new();
-    for id in ids {
-        let result = agents.handle("agents.reconcile", json!({"id":id})).await;
-        if let Some(error) = result.get("error") {
-            next.push(error["message"].as_str().unwrap_or("").to_owned());
+    let mut failures = Vec::new();
+    if let Some(error) = listed.get("error") {
+        failures.push(json!({"id":Value::Null,"error":error}));
+    } else {
+        let ids: Vec<String> = listed["agents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row["id"].as_str().map(str::to_owned))
+            .collect();
+        for id in ids {
+            let result = agents.handle("agents.reconcile", json!({"id":id})).await;
+            if let Some(error) = result.get("error") {
+                failures.push(json!({"id":id,"error":error}));
+            }
         }
     }
     agents.shutdown().await;
-    Ok(json!({"done":[],"next":next}))
+    let next: Vec<String> = failures
+        .iter()
+        .filter_map(|failure| {
+            failure
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    let mut result = json!({"ok":failures.is_empty(),"done":[],"next":next,"failures":failures});
+    if result["ok"] == false {
+        result["error"] = error_value("agents.reconciliation-failed", json!({}))["error"].clone();
+    }
+    result
 }
 
 /// Human CLI presentation is separate from the stable JSON/RPC object.

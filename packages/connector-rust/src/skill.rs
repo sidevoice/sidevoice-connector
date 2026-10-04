@@ -1,6 +1,6 @@
 //! Remove only legacy voice-room copies carrying Sidevoice's installation marker.
 use crate::{agents::message, proof::Profile};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::os::unix::fs::MetadataExt;
 use std::{
@@ -75,12 +75,20 @@ pub fn run_cli(profile: &Profile, argv: &[String]) -> Result<Value> {
     if action == "status" {
         return Ok(json!({"state":state,"target":target}));
     }
+    remove_target(&target)
+}
+
+fn remove_target(target: &Path) -> Result<Value> {
+    let state = target_state(target)?;
     if state == "foreign" {
         bail!("{}", message("skill.foreign", &json!({"target":target})));
     }
     if state == "installed" {
         // Recheck after canonicalizing the parent, so an exchanged parent cannot redirect removal.
-        let parent = directory.canonicalize()?;
+        let parent = target
+            .parent()
+            .context("legacy skill parent")?
+            .canonicalize()?;
         let selected = parent.join("voice-room");
         if target_state(&selected)? != "installed" {
             bail!("{}", message("skill.foreign", &json!({"target":target})));
@@ -99,6 +107,24 @@ pub fn cli_text(result: &Value) -> String {
     )
 }
 
+/// Lifecycle cleanup keeps foreign copies and reports them as a manual follow-up.
+pub fn cleanup_owned(profile: &Profile) -> Result<Value> {
+    cleanup_target(&profile.claude.join("skills/voice-room"))
+}
+
+fn cleanup_target(target: &Path) -> Result<Value> {
+    if target_state(target)? == "foreign" {
+        return Ok(json!({"done":[],"next":[message("skill.foreign", &json!({"target":target}))]}));
+    }
+    let result = remove_target(target)?;
+    let done: Vec<String> = if result["action"] == "removed" {
+        vec![message("skill.removed", &json!({"target":target}))]
+    } else {
+        Vec::new()
+    };
+    Ok(json!({"done":done,"next":[]}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +140,33 @@ mod tests {
         assert_eq!(target_state(&target).unwrap(), "installed");
         symlink(&target, root.join("linked")).unwrap();
         assert_eq!(target_state(&root.join("linked")).unwrap(), "foreign");
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn lifecycle_cleanup_removes_only_the_marker_owned_copy() {
+        let root =
+            std::env::temp_dir().join(format!("sidevoice-skill-cleanup-{}", uuid::Uuid::new_v4()));
+        let target = root.join("voice-room");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("SKILL.md"), "personal skill").unwrap();
+        let result = cleanup_target(&target).unwrap();
+        assert!(result["done"].as_array().unwrap().is_empty());
+        assert_eq!(result["next"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            fs::read_to_string(target.join("SKILL.md")).unwrap(),
+            "personal skill"
+        );
+        fs::write(target.join("SKILL.md"), MARKER).unwrap();
+        let result = cleanup_target(&target).unwrap();
+        assert_eq!(result["done"].as_array().unwrap().len(), 1);
+        assert!(!target.exists());
+        let outside = root.join("personal");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("SKILL.md"), MARKER).unwrap();
+        symlink(&outside, &target).unwrap();
+        let result = cleanup_target(&target).unwrap();
+        assert_eq!(result["next"].as_array().unwrap().len(), 1);
+        assert!(outside.join("SKILL.md").exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

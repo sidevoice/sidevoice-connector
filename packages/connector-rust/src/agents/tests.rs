@@ -873,3 +873,21 @@ async fn first_cursor_connect_creates_private_config_but_scan_does_not() {
     );
     host.shutdown().await;
 }
+
+#[tokio::test]
+async fn reconciliation_reports_structured_failures_for_unreadable_owned_config() {
+    let fixture = Fixture::new();
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let config = fixture.profile.cursor.join("mcp.json");
+    private_write(&config, b"{broken");
+    let result = reconcile_agents(host).await;
+    assert_eq!(result["ok"], false);
+    assert_eq!(result["error"]["key"], "agents.reconciliation-failed");
+    assert!(result["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|failure| failure["id"] == "cursor" && failure["error"]["key"] == "agents.invalid"));
+    assert!(!result["next"].as_array().unwrap().is_empty());
+    assert_eq!(fs::read(config).unwrap(), b"{broken");
+}
