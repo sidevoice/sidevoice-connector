@@ -566,6 +566,13 @@ impl HostAgents {
             _ = sleep_until(deadline) => return Err(Failure::Busy),
             permit = gate.lock_owned() => permit,
         };
+        self.profile
+            .validate_existing_private()
+            .map_err(|_| Failure::Internal)?;
+        // The daemon and standalone control process must not mutate one registration concurrently.
+        let _process_lock = self
+            .lock_file("agents-operation.lock", cancel, deadline)
+            .await?;
         let result = self.dispatch(method, params, cancel, deadline).await;
         drop(permit);
         result
@@ -951,7 +958,16 @@ impl HostAgents {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<File, Failure> {
-        let path = self.profile.data.join("agents.lock");
+        self.lock_file("agents.lock", cancel, deadline).await
+    }
+
+    async fn lock_file(
+        &self,
+        name: &str,
+        cancel: &Cancellation,
+        deadline: Instant,
+    ) -> std::result::Result<File, Failure> {
+        let path = self.profile.data.join(name);
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1362,12 +1378,46 @@ fn kill_process_group(pid: u32) {
     }
 }
 
+/// A first-run CLI may create its own absent configuration directory after explicit consent.
+/// Discovery itself does not create agent directories.
+fn validate_agent_config(profile: &Profile, config: &Path) -> Result<()> {
+    if profile.is_installed()
+        && matches!(fs::symlink_metadata(config), Err(ref error) if error.kind() == ErrorKind::NotFound)
+    {
+        profile.validate_existing_private()?;
+        if ![
+            profile.claude.as_path(),
+            profile.codex.as_path(),
+            profile.cursor.as_path(),
+        ]
+        .contains(&config)
+        {
+            anyhow::bail!("{}", message("agents.selection-invalid", &Value::Null));
+        }
+        let mut ancestor = config.parent().context("agent directory parent")?;
+        loop {
+            match fs::symlink_metadata(ancestor) {
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    ancestor = ancestor.parent().context("agent directory ancestor")?;
+                }
+                Err(error) => return Err(error.into()),
+                Ok(_) => {
+                    validate_user_directory(ancestor)?;
+                    break;
+                }
+            }
+        }
+        return Ok(());
+    }
+    profile.validate_for_agent(config)
+}
+
 fn validate_command_profile(
     profile: &Profile,
     agent_config: Option<&Path>,
 ) -> std::result::Result<(), CommandFailure> {
     let validation = match agent_config {
-        Some(config) => profile.validate_for_agent(config),
+        Some(config) => validate_agent_config(profile, config),
         None => profile.validate_existing_private(),
     };
     validation.map_err(|_| CommandFailure::Start)
@@ -1895,11 +1945,18 @@ pub async fn run_cli(profile: Profile, argv: &[String]) -> Result<Value> {
         [action @ ("connect" | "disconnect" | "dismiss"), id] => {
             (format!("agents.{action}"), json!({"id":id}))
         }
-        _ => return Ok(error_value("agents.usage", json!({}))),
+        _ => {
+            let mut error = error_value("agents.usage", json!({}));
+            error["ok"] = json!(false);
+            return Ok(error);
+        }
     };
     let agents = HostAgents::new(profile)?;
-    let result = agents.handle(&method, params).await;
+    let mut result = agents.handle(&method, params).await;
     agents.shutdown().await;
+    if result.get("error").is_some() {
+        result["ok"] = json!(false);
+    }
     Ok(result)
 }
 
@@ -1967,6 +2024,17 @@ pub async fn cleanup_owned(profile: Profile) -> Result<Value> {
         let result = agents.handle("agents.disconnect", json!({"id":id})).await;
         if let Some(error) = result.get("error") {
             next.push(error["message"].as_str().unwrap_or("").to_owned());
+            if id == "claude" || id == "codex" {
+                let row = listed["agents"]
+                    .as_array()
+                    .and_then(|rows| rows.iter().find(|row| row["id"] == id));
+                let binary_found = row
+                    .and_then(|row| row["evidence"].as_array())
+                    .is_some_and(|evidence| evidence.iter().any(|item| item["kind"] == "binary"));
+                if !binary_found {
+                    next.push(message(&format!("agents.cleanup.{id}-unavailable"), &json!({"file":if id == "codex" { agents.profile.codex.join("config.toml") } else { agents.profile.home.join(".claude.json") }})));
+                }
+            }
         } else {
             done.push(message(
                 "agents.action.disconnect",
@@ -2001,4 +2069,35 @@ pub async fn reconcile_owned(profile: Profile) -> Result<Value> {
     }
     agents.shutdown().await;
     Ok(json!({"done":[],"next":next}))
+}
+
+/// Human CLI presentation is separate from the stable JSON/RPC object.
+pub fn cli_text(result: &Value, argv: &[String]) -> String {
+    if let Some(error) = result.get("error") {
+        return error["message"].as_str().unwrap_or("").to_owned();
+    }
+    let args: Vec<&str> = argv
+        .iter()
+        .map(String::as_str)
+        .filter(|arg| *arg != "--json")
+        .collect();
+    if let [action @ ("connect" | "disconnect" | "dismiss"), id] = args.as_slice() {
+        return message(
+            &format!("agents.action.{action}"),
+            &json!({"agent":message(&format!("harness.{id}"), &Value::Null)}),
+        );
+    }
+    let rows = result["agents"].as_array();
+    if rows.map_or(true, |rows| rows.is_empty()) {
+        return message("agents.list.empty", &Value::Null);
+    }
+    rows.unwrap().iter().map(|row| {
+        let state = match row["registration"].as_str() {
+            Some("connected") => "agents.state.connected",
+            Some("not-connected") => "agents.state.not-connected",
+            Some("foreign") => "agents.state.foreign",
+            _ => "agents.state.unknown",
+        };
+        message("agents.list.row", &json!({"agent":row["label"],"state":message(state,&Value::Null),"version":row["version"].as_str().map(str::to_owned).unwrap_or_else(|| message("agents.version.unknown", &Value::Null))}))
+    }).collect::<Vec<_>>().join("\n")
 }

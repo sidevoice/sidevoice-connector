@@ -781,3 +781,47 @@ async fn reconcile_never_enrolls_but_disconnect_removes_old_owned_cursor_entry()
     assert!(saved["mcpServers"].get("sidevoice").is_none());
     host.shutdown().await;
 }
+
+#[test]
+fn public_agent_text_uses_existing_words_without_changing_json() {
+    assert_eq!(
+        cli_text(&json!({"agents":[]}), &[]),
+        "No supported agents were found on this computer."
+    );
+    let result = json!({"agents":[{"id":"codex","label":"Codex","registration":"connected","version":null}]});
+    assert_eq!(
+        cli_text(&result, &[]),
+        "Codex: connected to Sidevoice (version unknown)"
+    );
+    assert_eq!(
+        cli_text(&result, &["dismiss".into(), "codex".into()]),
+        "Dismissed the new-agent notice for Codex."
+    );
+    assert!(result.get("text").is_none());
+}
+
+#[tokio::test]
+async fn standalone_and_daemon_coordinators_share_an_operation_lock() {
+    let fixture = Fixture::new();
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let lock_path = fixture.profile.data.join("agents-operation.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+        .unwrap();
+    lock.lock_exclusive().unwrap();
+    let other = host.clone();
+    let request =
+        tokio::spawn(async move { other.handle("agents.list", json!({"rescan":true})).await });
+    sleep(StdDuration::from_millis(30)).await;
+    assert!(!request.is_finished());
+    assert!(!fixture.profile.data.join("agents.json").exists());
+    drop(lock);
+    let result = request.await.unwrap();
+    assert!(result.get("error").is_none(), "{result}");
+    host.shutdown().await;
+}

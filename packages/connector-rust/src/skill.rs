@@ -110,3 +110,10 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+pub fn cli_text(result: &Value) -> String {
+    message(
+        "skill.result",
+        &json!({"state":result.get("action").unwrap_or(&result["state"]),"target":result["target"]}),
+    )
+}

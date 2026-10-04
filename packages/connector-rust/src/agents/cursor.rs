@@ -3,6 +3,10 @@ use super::*;
 impl HostAgents {
     pub(super) fn cursor_registration(&self) -> Result<String> {
         self.profile.validate_existing_private()?;
+        if matches!(fs::symlink_metadata(&self.profile.cursor), Err(ref error) if error.kind() == ErrorKind::NotFound)
+        {
+            return Ok("not-connected".into());
+        }
         let file = self.profile.cursor.join("mcp.json");
         let root = self.profile.agent_root(&self.profile.cursor)?;
         let Some((mut config, _mode, _target)) = read_cursor_config(&file, &root)? else {
@@ -41,6 +45,12 @@ impl HostAgents {
     }
 
     pub(super) fn cursor_connect(&self) -> std::result::Result<(), Failure> {
+        if self.profile.is_installed() && !self.profile.cursor.exists() {
+            validate_agent_config(&self.profile, &self.profile.cursor)
+                .map_err(|_| agent_failure("agents.invalid", AgentId::Cursor))?;
+            private_dir(&self.profile.cursor)
+                .map_err(|_| agent_failure("agents.invalid", AgentId::Cursor))?;
+        }
         self.profile
             .validate_for_agent(&self.profile.cursor)
             .map_err(|_| agent_failure("agents.invalid", AgentId::Cursor))?;

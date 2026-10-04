@@ -29,5 +29,7 @@
   "agents.state.foreign": "another Sidevoice registration is present",
   "agents.state.unknown": "registration state unknown",
   "agents.version.unknown": "version unknown",
-  "agents.selection-invalid": "The selected Sidevoice release record is unsafe or invalid."
+  "agents.selection-invalid": "The selected Sidevoice release record is unsafe or invalid.",
+  "agents.cleanup.codex-unavailable": "Codex is unavailable, so its Sidevoice registration was left unchanged. Restore Codex and run `codex mcp remove sidevoice`, or inspect the Sidevoice table in {file} and remove only that entry.",
+  "agents.cleanup.claude-unavailable": "Claude Code is unavailable, so its Sidevoice registration was left unchanged. Restore Claude Code and run `claude mcp remove --scope user sidevoice` in the same user configuration."
 }
