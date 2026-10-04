@@ -153,6 +153,8 @@ def refused_second_outbox_check(binary, env, base, root, data, human_stopped):
             else:
                 wait_running(binary, env)
                 assert ready(data)['pid'] > 1
+            assert {'id': 'pending-fixture', 'text': 'retain'} in json.loads(outbox.read_bytes()), (
+                'second-precheck refusal or resume lost pending outbox row')
     finally:
         release_gate.touch()
         # Quiesce any resumed daemon before restoring its original persistent outbox.
@@ -221,7 +223,34 @@ def main(first, second):
                     assert child.returncode != 0
                     assert pointers(root) == before
                     assert stop_file.read_bytes() == stopped
-            run(first, ['install', '--no-agents', '--json'], env)
+            # A second cancellation happens after extraction at an observable precommit
+            # manager boundary, so it exercises candidate cleanup rather than only lock wait.
+            case = base / 'staged-cancel'
+            wrapper, arrived, staged_release = manager_gate(case, root, original, data)
+            releases_before = {path.name for path in (root / 'releases').iterdir()}
+            with installer(second, fault_environment(env, wrapper), case,
+                           'cancel-staged') as (child, out, err):
+                try:
+                    wait_for(arrived.exists, child, 'staged cancellation gate', timeout=180)
+                    marker = json.loads((data / 'runtime-switch.json').read_bytes())
+                    assert marker['phase'] == 'active'
+                    staged = root / 'releases' / marker['to']
+                    assert staged.is_dir() and marker['to'] != original
+                    assert pointers(root) == before
+                    child.send_signal(signal.SIGINT)
+                    staged_release.touch()
+                    answer = result(child, out, err)
+                    assert child.returncode != 0, answer
+                    assert answer.get('error', {}).get('key') == 'install.cancelled', answer
+                    assert pointers(root) == before
+                    assert stop_file.read_bytes() == stopped
+                    assert not staged.exists(), 'cancelled staged candidate survived'
+                    assert {path.name for path in (root / 'releases').iterdir()} == releases_before
+                finally:
+                    staged_release.touch()
+            run(second, ['install', '--no-agents', '--json'], env)
+            wait_running(second, env)
+            run(second, ['rollback', '--json'], env)
             wait_running(first, env)
             assert selected(root)['id'] == original
 
@@ -283,14 +312,31 @@ def main(first, second):
 
             # Invalid registration state must block success/pruning, then be repairable.
             run(first, ['agents', 'connect', 'cursor', '--json'], env)
-            cursor_saved = cursor.read_bytes()
-            registered = json.loads(cursor_saved)['mcpServers']['sidevoice']
+            # A valid unselected immutable copy is genuinely prune-eligible. Refer to
+            # it explicitly, not current/previous, before making that owned config invalid.
+            orphan_id = 'retention-fixture-unselected'
+            orphan = root / 'releases' / orphan_id
+            shutil.copytree(root / 'releases' / original, orphan, copy_function=os.link,
+                            symlinks=True)
+            orphan_record = orphan / 'release.json'
+            copied_record = json.loads(orphan_record.read_bytes())
+            copied_record['id'] = orphan_id
+            orphan_record.unlink()  # Do not rewrite the source record through its hard link.
+            orphan_record.write_text(json.dumps(copied_record))
+            orphan_record.chmod(0o600)
+            config_value = json.loads(cursor.read_bytes())
+            config_value['mcpServers']['sidevoice']['command'] = str(orphan / 'dist/sidevoice-rust')
+            cursor_saved = json.dumps(config_value).encode()
+            cursor.write_bytes(cursor_saved)
+            registered = config_value['mcpServers']['sidevoice']
+            assert all(value != f'releases/{orphan_id}' for value in pointers(root).values())
             cursor.write_text('{"mcpServers":')
             cursor.chmod(0o600)
             answer, output = run(second, ['install', '--no-agents', '--json'], env, success=False)
             assert output.returncode != 0, answer
             assert answer.get('error', {}).get('key') == 'agents.reconciliation-failed', answer
-            assert (root / 'releases' / original / 'release.json').is_file()
+            assert orphan_record.is_file(), 'reconciliation failure pruned unselected release'
+            assert all(value != f'releases/{orphan_id}' for value in pointers(root).values())
             assert Path(registered['command']).is_file(), 'failed reconciliation pruned its old command'
             cursor.write_bytes(cursor_saved)
             cursor.chmod(0o600)
@@ -300,12 +346,13 @@ def main(first, second):
             repaired = json.loads(cursor.read_bytes())['mcpServers']['sidevoice']
             assert Path(repaired['command']).is_file()
             assert Path(repaired['command']).resolve().is_relative_to((root / 'releases' / upgraded).resolve())
+            assert not orphan.exists(), 'successful repoint did not prune eligible fixture'
             cursor_saved = cursor.read_bytes()
             refused_second_outbox_check(second, env, base, root, data, human_stopped=False)
             refused_second_outbox_check(second, env, base, root, data, human_stopped=True)
             print(json.dumps({'ok': True, 'checked': ['postcommit-interruption-retry',
                               'synthetic-alternate-kind-second-outbox-check-running-and-stopped',
-                              'lock-cancellation-stop-preservation',
+                              'lock-and-staged-cancellation-stop-preservation',
                               'automatic-verification-rollback-retry', 'reconcile-failure-retention-retry']}))
         finally:
             release_gate.touch()
