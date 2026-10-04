@@ -411,7 +411,10 @@ function printed(kind, { loaded = true, running = false, force = null } = {}) {
     const ran = spawnSync(process.execPath, [fakeManager, 'launchctl', 'print', `gui/${process.getuid()}/${job}`], { env: { ...process.env, FAKE_MANAGER_DIR: dir }, encoding: 'utf8' });
     output = parseLaunchd({ ok: ran.status === 0, output: ran.stdout + ran.stderr });
   } else {
-    if (loaded) { writeFileSync(path.join(dir, 'unit'), ''); writeFileSync(path.join(state, 'definition'), path.join(dir, 'unit')); }
+    if (loaded) {
+      writeFileSync(path.join(dir, 'unit'), ''); writeFileSync(path.join(state, 'definition'), path.join(dir, 'unit'));
+      writeFileSync(path.join(state, 'loaded-spec.json'), JSON.stringify({ program: ['/bin/true'], environment: {}, log: '/dev/null' }));
+    }
     const ran = spawnSync(process.execPath, [fakeManager, 'systemctl', '--user', 'show', '-p', 'x', job], { env: { ...process.env, FAKE_MANAGER_DIR: dir }, encoding: 'utf8' });
     output = parseSystemd(ran.stdout);
   }

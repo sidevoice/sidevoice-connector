@@ -114,7 +114,7 @@ function machine(kind = 'systemd') {
   const selected = name => { try { return JSON.parse(readFileSync(path.join(R, name, 'release.json'), 'utf8')).connector; } catch { return null; } };
   const pid = job => { try { return Number(readFileSync(path.join(state, kind === 'launchd' ? `dev.sidevoice.${job}` : `sidevoice-${job}.service`, 'pid'), 'utf8')); } catch { return null; } };
   return {
-    home, dataDir, R, env, claude, run, selected, pid,
+    home, dataDir, R, state, env, claude, run, selected, pid,
     install: (cli, core = coreWrapper(), args = ['--harness', 'claude', '--service'], more = {}) => run(cli, ['install', ...args], { SIDEVOICE_CORE_BIN: String(core), ...more }),
     releases: () => readdirSync(path.join(R, 'releases')).sort(),
     status: () => run(path.join(packageDir, 'cli.mjs'), ['service', 'status']).answer,
@@ -268,12 +268,21 @@ for (const kind of ['launchd', 'systemd']) {
       assert.equal(killed.signal, 'SIGKILL', `crash after definitions (${killed.stderr})`);
       assert.equal(node.status().state, 'running', 'the old same-version Python Core is still live before retry');
       assert.equal(JSON.parse(readFileSync(dataCore, 'utf8')).launch_id, previousReady.launch_id);
+      const managerJob = kind === 'launchd' ? 'dev.sidevoice.core' : 'sidevoice-core.service';
+      const loadedBefore = JSON.parse(readFileSync(path.join(node.state, managerJob, 'loaded-spec.json'), 'utf8'));
+      const definitionFile = kind === 'launchd'
+        ? path.join(node.home, 'Library', 'LaunchAgents', 'dev.sidevoice.core.plist')
+        : path.join(node.home, '.config', 'systemd', 'user', 'sidevoice-core.service');
+      assert.equal(loadedBefore.program[0], path.join(node.R, 'current', 'core', 'bin', 'sidevoice-core'), 'the manager still has the prior Python command loaded');
+      assert.match(readFileSync(definitionFile, 'utf8'), /sidevoice-core-rust/, 'the on-disk definition already names the native command');
 
       const recovered = runApply(null);
       assert.equal(recovered.status, 0, recovered.stderr + recovered.stdout);
       const ready = JSON.parse(readFileSync(dataCore, 'utf8'));
       assert.notEqual(ready.launch_id, previousReady.launch_id, 'verification requires a Core launch created by the retry');
       assert.equal(node.pid('core'), ready.pid, 'the service manager owns that fresh launch');
+      const loaded = JSON.parse(readFileSync(path.join(node.state, managerJob, 'spec.json'), 'utf8'));
+      assert.equal(loaded.program[0], path.join(node.R, 'current', 'core', RUST_CORE_ENTRYPOINT), 'the manager loaded the selected native executable');
       assert.equal(JSON.parse(readFileSync(path.join(node.R, 'current', 'release.json'), 'utf8')).core_kind, RUST_CORE_KIND);
       assert.equal(JSON.parse(readFileSync(path.join(node.R, 'verified', 'release.json'), 'utf8')).id, id);
       assert.equal(node.status().state, 'running');

@@ -3,7 +3,8 @@
  *  the definition the connector wrote, starts its program detached with its environment (as RunAtLoad / `start` would)
  *  under a small monitor of its own that records the program's pid and, when it ends, its exit status or signal; stops
  *  it with SIGTERM and waits; and answers `print` / `show` with what it knows, in the managers' own formats. Its state
- *  is a directory (`FAKE_MANAGER_DIR`): one subdirectory per job (`loaded`, `definition`, `pid`, `exit`, `runs`), and
+ *  is a directory (`FAKE_MANAGER_DIR`): one subdirectory per job (`loaded`, on-disk `definition`, manager-cached
+ *  `loaded-spec.json`, `pid`, `exit`, `runs`), and
  *  every call in `calls.jsonl`. `FAKE_MANAGER_FAIL=<verb>` makes that verb fail and change nothing — an unload the
  *  manager refuses, a start it will not do. A job's `force.json` overrides what it answers (`{restarting, runs, exit,
  *  startLimit}`): how a test shows `deriveStatus` a manager that is about to start a job again, or gave up.
@@ -44,10 +45,9 @@ const running = job => !!pid(job) && alive(pid(job));
 const force = job => { try { return JSON.parse(read(job, 'force.json')) ?? {}; } catch { return {}; } };
 const ended = job => { try { return JSON.parse(read(job, 'exit')); } catch { return null; } };
 
-/** The definition `service.mjs` wrote: the program, its environment and its log. */
-function definition(job) {
-  const source = read(job, 'definition');
-  const text = source && existsSync(source) ? readFileSync(source, 'utf8') : null;
+/** Parse one definition file when the stand-in manager loads it. Later launches use the stored snapshot, like the OS. */
+function definitionFile(file, job) {
+  const text = file && existsSync(file) ? readFileSync(file, 'utf8') : null;
   if (!text) return null;
   if (kind === 'launchctl') {
     const decode = value => value.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
@@ -62,6 +62,11 @@ function definition(job) {
   const environment = Object.fromEntries(text.split('\n').filter(line => line.startsWith('Environment=')).map(line => { const [pair] = words(line.slice(12), false); const at = pair.indexOf('='); return [pair.slice(0, at), pair.slice(at + 1)]; }));
   // The journal, standing in: the job's output beside its state.
   return { program, environment, log: path.join(jobDir(job), 'journal.log') };
+}
+
+/** The manager's loaded definition, distinct from the file currently on disk. */
+function definition(job) {
+  try { return JSON.parse(read(job, 'loaded-spec.json')); } catch { return null; }
 }
 
 async function launch(job) {
@@ -100,18 +105,25 @@ if (kind === 'launchctl') {
   } else if (verb === 'bootstrap') {
     const file = args[2], name = path.basename(file, '.plist');
     if (read(name, 'loaded') === 'yes') { console.error('Bootstrap failed: 5: Input/output error'); process.exit(5); }
-    write(name, 'definition', file); write(name, 'loaded', 'yes'); write(name, 'runs', 0); await launch(name);
+    write(name, 'definition', file); write(name, 'loaded-spec.json', JSON.stringify(definitionFile(file, name)));
+    write(name, 'loaded', 'yes'); write(name, 'runs', 0); await launch(name);
   } else if (verb === 'kickstart') { if (!loaded()) { console.error('Could not find service'); process.exit(113); } if (args.includes('-k')) await halt(label); await launch(label); }
   else if (verb === 'bootout') { if (!loaded()) process.exit(3); await halt(label); rmSync(path.join(jobDir(label), 'loaded'), { force: true }); }
   else { console.error('fake launchctl: unknown ' + verb); process.exit(64); }
 } else {
   const unit = target;
   const source = name => path.join(process.env.XDG_CONFIG_HOME || path.join(process.env.HOME, '.config'), 'systemd', 'user', name);
-  const known = () => !!read(unit, 'definition') && existsSync(read(unit, 'definition'));
+  const known = () => !!read(unit, 'loaded-spec.json');
   if (verb === 'show-environment') console.log('HOME=' + process.env.HOME);
   else if (verb === 'daemon-reload') {
     for (const name of ['sidevoice-core.service', 'sidevoice-connector.service']) {
-      if (existsSync(source(name))) write(name, 'definition', source(name)); else rmSync(path.join(jobDir(name), 'definition'), { force: true });
+      if (existsSync(source(name))) {
+        write(name, 'definition', source(name));
+        write(name, 'loaded-spec.json', JSON.stringify(definitionFile(source(name), name)));
+      } else {
+        rmSync(path.join(jobDir(name), 'definition'), { force: true });
+        rmSync(path.join(jobDir(name), 'loaded-spec.json'), { force: true });
+      }
     }
   } else if (verb === 'enable' || verb === 'reset-failed') { if (verb === 'reset-failed') rmSync(path.join(jobDir(unit), 'force.json'), { force: true }); }
   else if (verb === 'start') { if (!known()) { console.error(`Unit ${unit} not found.`); process.exit(5); } await launch(unit); }

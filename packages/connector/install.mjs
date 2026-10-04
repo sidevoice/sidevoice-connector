@@ -243,6 +243,11 @@ export async function apply(env, { core = true, service = false, applyNow = fals
       recordInstallation(env, { definitions: jobDefinitions(kind, env) });
       crash('definitions-written');
       if (!had) await stopOnDemand(env);
+      // The files may match after a definitions-written crash while the manager still has the prior release cached.
+      // An unverified selection must reload both definitions before the restart can verify that selection.
+      if (selection(env, 'verified')?.id !== chosen.id) {
+        for (const job of ['core', 'connector']) if (!changed.includes(job)) changed.push(job);
+      }
       const oldLaunchId = readReady(dataDir)?.launch_id ?? null;
       const restart = action !== 'noop' || !(await runsSelection(env, chosen));
       if (restart) previousLaunchId = oldLaunchId;
