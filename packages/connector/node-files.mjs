@@ -7,8 +7,8 @@
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { rmSync } from 'node:fs';
-import { readTrustedJson, writePrivateFile } from './secure-fs.mjs';
+import { existsSync, rmSync } from 'node:fs';
+import { readTrusted, readTrustedJson, writePrivateFile } from './secure-fs.mjs';
 import { installLockPath, readLock } from './lockfile.mjs';
 import { isProcess } from './proc.mjs';
 
@@ -32,8 +32,8 @@ export function nodeFiles(dataDir) {
     install: at('install.json'),           // {command, releases, definitions}: what runs it (through `R/current`), and where it is
     agents: at('agents.json'),             // captured login-shell PATH, last scan and agent dismissal generations
     agentsLock: at('agents.lock'),         // kernel-held lock for agents.json read/modify/write transactions
-    stopped: at('node-stopped.json'),      // a person stopped Sidevoice: {at}
-    switching: at('runtime-switch.json'), // an installer temporarily inhibits on-demand launch
+    stopped: at('node-stopped.json'),      // human stop, or a marker understood by older JS launchers
+    switching: at('runtime-switch.json'), // the install transaction and its selected-release compatibility gate
     connectorLog: at('connector.log'),
     coreStderr: at('core.stderr.log'),     // what launchd catches from the core job: a crash's output
   };
@@ -42,20 +42,54 @@ export function nodeFiles(dataDir) {
 /** A live install transaction owns this launch barrier; a dead installer's marker cannot strand the node. */
 export function runtimeSwitching(dataDir) {
   const marker = readTrustedJson(nodeFiles(dataDir).switching);
-  if (!marker?.token) return false;
+  if (marker?.phase !== 'active' || !marker.token) return false;
   const owner = readLock(installLockPath(dataDir));
   return owner?.pid === marker.pid && owner?.start === marker.start
     && isProcess(owner.pid, { start: owner.start ?? null });
 }
 
-/** Called with install.lock held. Removing this token never clears a person's separate stop intent. */
+/** Older JS facades recognize only node-stopped.json. A committed migration marker blocks those facades while the
+ *  selected release ignores it; a human stop (or any mismatched marker) still stops the selected release. */
+export function nodeStopped(dataDir, selectedId) {
+  const files = nodeFiles(dataDir);
+  if (!existsSync(files.stopped)) return false;
+  const stopped = readTrustedJson(files.stopped), migration = readTrustedJson(files.switching);
+  return !(migration?.phase === 'committed' && migration.to === selectedId
+    && stopped?.runtime_switch_token === migration.token && stopped?.to === selectedId);
+}
+
+/** Clearing a human stop on an explicit start retains the old-facade compatibility gate. */
+export function restoreSelectedLaunchGate(dataDir, selectedId) {
+  const files = nodeFiles(dataDir), migration = readTrustedJson(files.switching);
+  if (migration?.phase === 'committed' && migration.to === selectedId) {
+    writePrivateFile(files.stopped, JSON.stringify({ runtime_switch_token: migration.token, to: selectedId }));
+  } else rmSync(files.stopped, { force: true });
+}
+
+/** Called with install.lock held. Refusal restores the exact previous marker and human stop intent. */
 export function inhibitRuntimeLaunch(dataDir) {
   const owner = readLock(installLockPath(dataDir));
   if (!owner || owner.pid !== process.pid) throw new Error('install lock required for runtime switch');
   const token = randomUUID();
-  const file = nodeFiles(dataDir).switching;
-  writePrivateFile(file, JSON.stringify({ token, pid: owner.pid, start: owner.start }));
-  return () => { if (readTrustedJson(file)?.token === token) rmSync(file, { force: true }); };
+  const files = nodeFiles(dataDir);
+  const previousSwitch = readTrusted(files.switching), previousStop = readTrusted(files.stopped);
+  writePrivateFile(files.switching, JSON.stringify({ phase: 'active', token, pid: owner.pid, start: owner.start }));
+  writePrivateFile(files.stopped, JSON.stringify({ runtime_switch_token: token }));
+  let committed = false;
+  return {
+    commit(to) {
+      writePrivateFile(files.switching, JSON.stringify({ phase: 'committed', token, to }));
+      restoreSelectedLaunchGate(dataDir, to);
+      committed = true;
+    },
+    restore() {
+      if (committed || readTrustedJson(files.switching)?.token !== token) return;
+      if (previousSwitch === null) rmSync(files.switching, { force: true });
+      else writePrivateFile(files.switching, previousSwitch);
+      if (previousStop === null) rmSync(files.stopped, { force: true });
+      else writePrivateFile(files.stopped, previousStop);
+    },
+  };
 }
 
 /** What `install.json` records (SEAMS §1): `{command, releases, definitions}` — the command everything runs, and the

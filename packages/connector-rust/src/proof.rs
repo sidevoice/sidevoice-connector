@@ -555,6 +555,21 @@ impl Profile {
             Err(error) => Err(error.into()),
             Ok(_) => {
                 private_file(&marker)?;
+                if let Some(installed) = &self.installed {
+                    let migration = self.data.join("runtime-switch.json");
+                    if migration.exists() {
+                        private_file(&migration)?;
+                        let stopped: Value = serde_json::from_slice(&fs::read(&marker)?)?;
+                        let switching: Value = serde_json::from_slice(&fs::read(&migration)?)?;
+                        if switching["phase"] == "committed"
+                            && switching["to"].as_str() == Some(installed.id.as_str())
+                            && stopped["to"].as_str() == Some(installed.id.as_str())
+                            && stopped["runtime_switch_token"] == switching["token"]
+                        {
+                            return Ok(false);
+                        }
+                    }
+                }
                 Ok(true)
             }
         }

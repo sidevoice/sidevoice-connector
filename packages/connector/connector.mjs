@@ -29,9 +29,9 @@ import { roomLink, UNREACHABLE } from './link.mjs';
 import { compatible, coreRunning, ensureRunning, installInProgress, roomCredentialPath, serving } from './core.mjs';
 import { socketAgent } from './core-socket.mjs';
 import { appendLine } from './logfile.mjs';
-import { coreProgram } from './release.mjs';
+import { coreProgram, selection } from './release.mjs';
 import { installedService, status as nodeStatusOf } from './service.mjs';
-import { connectorLockOf, connectorSocketOf, dataDirOf, nodeFiles, runtimeSwitching } from './node-files.mjs';
+import { connectorLockOf, connectorSocketOf, dataDirOf, nodeFiles, nodeStopped, recordedInstallation, runtimeSwitching } from './node-files.mjs';
 import { tryLock } from './lockfile.mjs';
 import { t } from './i18n.mjs';
 import { verifyPrivateDir } from './secure-fs.mjs';
@@ -825,6 +825,7 @@ export async function run(argv = [], environment = process.env) {
   // The core is started here only where nobody else does: never by the connector job, never beside a core job.
   try { ownsCore = !serviceMode && !installedService(env)?.core; }
   catch (error) { log(`not starting: ${error.message}`); process.exitCode = 78; return; }
+  const startupSelection = recordedInstallation(env) ? selection(env, 'current')?.release : null;
   // One connector serves the socket. A plain one that finds it held leaves; the job waits for the holder to go (a
   // connector somebody started by hand), rather than exiting into its manager's restart loop.
   for (let said = false; ;) {
@@ -836,9 +837,14 @@ export async function run(argv = [], environment = process.env) {
     if (!said) { log(`another connector holds ${lockPath} (pid ${taken.owner?.pid ?? '?'}); waiting for it to leave`); said = true; }
     await wait(1000);
   }
+  const currentSelection = startupSelection ? selection(env, 'current')?.release : null;
+  if (startupSelection && (currentSelection?.id !== startupSelection.id
+      || (currentSelection.runtime_kind ?? 'javascript') !== 'javascript')) {
+    log('selected Connector release changed before serving'); releaseLock({ socket: false }); process.exit(0);
+  }
   // A person's stop holds for every connector the launcher started, not only for the launcher: one spawned just before
   // the stop, and starting only now, does not serve. The job starting is a login or `service start`: it clears it.
-  if (!serviceMode && (existsSync(files.stopped) || runtimeSwitching(dataDir))) { log('Sidevoice is stopped or switching on this machine: not serving'); releaseLock({ socket: false }); process.exit(0); }
+  if (!serviceMode && (nodeStopped(dataDir, currentSelection?.id) || runtimeSwitching(dataDir))) { log('Sidevoice is stopped or switching on this machine: not serving'); releaseLock({ socket: false }); process.exit(0); }
   log(`connector ${VERSION} starting${serviceMode ? ' as the connector job' : ''}: pid ${process.pid}, host ${hostId}, ${external ? 'core at ' + external.room : ownsCore ? 'this machine\'s own core, started on demand' : 'this machine\'s core job'}, socket ${socketPath}, log ${logPath}`);
   try { loadOutbox(); }
   catch (error) { log(`not starting: ${error.message}`); releaseLock({ socket: false }); process.exitCode = 78; return; }

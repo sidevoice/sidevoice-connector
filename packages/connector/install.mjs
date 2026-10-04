@@ -25,7 +25,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
+import { readdirSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
 import { harnessesPresent } from './identity.mjs';
 import { pairedRoom } from './pair.mjs';
 import { CORE_VERSION, NO_UV, embeddedRustCoreIdentity, ensureRunning, findUv, readReady, takeInstallLock } from './core.mjs';
@@ -36,7 +36,7 @@ import { candidate, coreProgram, decide, discardRuntimeIfUnselected, flipBack, m
 import { matchesSelectedRustConnectorIdentity, RUST_CONNECTOR_KIND } from './rust-connector.mjs';
 import { HARNESS_REGISTRATIONS, codexInstructions, cursorMcpFile, serverCommand, unregisterFromClaude, unregisterFromCodex, unregisterFromCursor } from './registrations.mjs';
 import { askConnector, compatibleCore, installedService, jobDefinitions, linger, managerKind, recordInstallation, settledState, start as startService, startJobs, status, stop as stopService, stopOnDemand, uninstall as uninstallService, writeDefinitions } from './service.mjs';
-import { dataDirOf, inhibitRuntimeLaunch, nodeFiles } from './node-files.mjs';
+import { dataDirOf, inhibitRuntimeLaunch, nodeFiles, nodeStopped, restoreSelectedLaunchGate } from './node-files.mjs';
 import { crash, pause } from './testpoint.mjs';
 import { captureAgentEnvironment, withAgentStateLock } from './agents.mjs';
 import { readTrusted } from './secure-fs.mjs';
@@ -63,8 +63,7 @@ function requireEmptyOutbox(dataDir) {
 }
 
 /** Quiesce the only writer before the final cross-runtime outbox decision. */
-async function quiesceRuntime(env) {
-  const stoppedBefore = existsSync(nodeFiles(dataDirOf(env)).stopped);
+async function quiesceRuntime(env, { stoppedBefore = nodeStopped(dataDirOf(env), selection(env, 'current')?.id) } = {}) {
   if (installedService(env)) {
     let stopped;
     try { stopped = await stopService(env); }
@@ -263,9 +262,10 @@ async function goBack(env, kind, progressEvent = () => {}, { explicit = false } 
   let resume = null, quarantined = null;
   const runtimeKindChanged = (current?.runtime_kind ?? 'javascript') !== (previous.runtime_kind ?? 'javascript');
   const quiesce = runtimeKindChanged || (current?.runtime_kind === RUST_CONNECTOR_KIND && current.id !== previous.id);
+  const stoppedBefore = nodeStopped(dataDirOf(env), current?.id);
   const uninhibit = quiesce ? inhibitRuntimeLaunch(dataDirOf(env)) : null;
   try {
-    if (quiesce) resume = await quiesceRuntime(env);
+    if (quiesce) resume = await quiesceRuntime(env, { stoppedBefore });
     await pause('rollback-after-quiesce');
     if (runtimeKindChanged) {
       if (explicit) requireEmptyOutbox(dataDirOf(env));
@@ -273,14 +273,14 @@ async function goBack(env, kind, progressEvent = () => {}, { explicit = false } 
     }
     const back = flipBack(env);
     if (!back) return null;
-    uninhibit?.();
-    rmSync(nodeFiles(dataDirOf(env)).stopped, { force: true });
+    uninhibit?.commit(back.id);
+    restoreSelectedLaunchGate(dataDirOf(env), back.id);
     await restartOn(env, kind);
     const verified = await verify(env, back, kind, { fresh: kind === 'none' });
     if (verified.ok) markVerified(env, back.id);
     return { release: back, ...verified, ...(quarantined ? { quarantined } : {}) };
-  } catch (error) { uninhibit?.(); if (resume && selection(env, 'current')?.release?.id === current?.id) await resume(); throw error; }
-  finally { uninhibit?.(); }
+  } catch (error) { uninhibit?.restore(); if (resume && selection(env, 'current')?.release?.id === current?.id) await resume(); throw error; }
+  finally { uninhibit?.restore(); }
 }
 
 /** Wait for every call on this machine to end (an update that changes the core would end them). */
@@ -300,7 +300,7 @@ async function callsEnd(env, progress, { signal, progressEvent = () => {} } = {}
 export async function apply(env, { core = true, service = false, applyNow = false, progress = () => {}, log = () => {},
   afterSelection = null, signal, progressEvent = () => {}, beginCommit = () => {}, candidateRelease = null } = {}) {
   if (embeddedRustCoreIdentity() && !core) throw keyed('install.authenticity', { check: 'manifest' });
-  const dataDir = dataDirOf(env), files = nodeFiles(dataDir);
+  const dataDir = dataDirOf(env);
   let stagedRuntimeId = null;
   const release = await takeInstallLock(dataDir, log, { signal, onWait: () => progressEvent({ step: 'wait-lock', done: null, total: null }) });
   let conversionUninhibit = null, conversionResume = null;
@@ -329,30 +329,34 @@ export async function apply(env, { core = true, service = false, applyNow = fals
       if (signal?.aborted) throw keyed('install.cancelled');
       await pause('install-before-commit', { signal });
       const quiesce = runtimeKindChanged || (current?.runtime_kind === RUST_CONNECTOR_KIND && current.id !== chosen.id);
+      const stoppedBefore = nodeStopped(dataDir, current?.id);
       const uninhibit = quiesce ? inhibitRuntimeLaunch(dataDir) : null;
       let resume = null;
       try {
-        if (quiesce) resume = await quiesceRuntime(env);
+        if (quiesce) resume = await quiesceRuntime(env, { stoppedBefore });
         await pause('install-after-quiesce', { signal });
         if (runtimeKindChanged) requireEmptyOutbox(dataDir);
         if (signal?.aborted) throw keyed('install.cancelled');
         progressEvent({ step: 'commit', done: null, total: null });
         beginCommit();
         switchTo(env, chosen.id);
-      } catch (error) { uninhibit?.(); if (resume) await resume(); throw error; }
-      finally { uninhibit?.(); }
+        uninhibit?.commit(chosen.id);
+      } catch (error) { uninhibit?.restore(); if (resume) await resume(); throw error; }
+      finally { uninhibit?.restore(); }
     }
     if (action === 'noop') {
-      if (core && service && current?.runtime_kind === RUST_CONNECTOR_KIND && !installedService(env)) {
+      const conversionKind = core && service && !installedService(env) ? managerKind(env) : 'none';
+      if (conversionKind !== 'none' && current?.runtime_kind === RUST_CONNECTOR_KIND) {
+        const stoppedBefore = nodeStopped(dataDir, current.id);
         conversionUninhibit = inhibitRuntimeLaunch(dataDir);
-        conversionResume = await quiesceRuntime(env);
+        conversionResume = await quiesceRuntime(env, { stoppedBefore });
         await pause('install-after-quiesce', { signal });
       }
       progressEvent({ step: 'commit', done: null, total: null });
       beginCommit();
     }
     // Clearing the stop intent is part of the committed start. Cancellation while staging leaves it untouched.
-    rmSync(files.stopped, { force: true });
+    restoreSelectedLaunchGate(dataDir, chosen.id);
     await pause('install-after-commit');
     recordInstallation(env);
     const kind = core && (service || installedService(env)) ? managerKind(env) : 'none';
@@ -368,7 +372,7 @@ export async function apply(env, { core = true, service = false, applyNow = fals
       recordInstallation(env, { definitions: jobDefinitions(kind, env) });
       crash('definitions-written');
       if (!had && !conversionResume) await stopOnDemand(env);
-      conversionUninhibit?.(); conversionUninhibit = null;
+      conversionUninhibit?.commit(chosen.id); conversionUninhibit = null;
       // The files may match after a definitions-written crash while the manager still has the prior release cached.
       // An unverified selection must reload both definitions before the restart can verify that selection.
       if (selection(env, 'verified')?.id !== chosen.id) {
@@ -400,13 +404,13 @@ export async function apply(env, { core = true, service = false, applyNow = fals
       back: back.ok, backFailure: back.failure ?? null, registrationFailures, kind,
       ...(back.quarantined ? { quarantined: back.quarantined } : {}) };
   } catch (error) {
-    if (conversionUninhibit) { conversionUninhibit(); conversionUninhibit = null; await conversionResume?.(); }
+    if (conversionUninhibit) { conversionUninhibit.restore(); conversionUninhibit = null; await conversionResume?.(); }
     if (signal?.aborted || error?.key === 'install.runtime-switch-outbox') {
       prune(env, dataDir);
       discardRuntimeIfUnselected(env, dataDir, stagedRuntimeId);
     }
     throw error;
-  } finally { conversionUninhibit?.(); release(); }
+  } finally { conversionUninhibit?.restore(); release(); }
 }
 
 /* ----- install ----- */

@@ -2125,6 +2125,15 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     }
     private_dir(&profile.data)?;
     let lock = profile.try_connector_lock()?;
+    if let Some(installed) = &profile.installed {
+        let current = profile.root.join("current").canonicalize()?;
+        if current.file_name().and_then(|name| name.to_str()) != Some(installed.id.as_str()) {
+            bail!("selected Connector release changed before serving");
+        }
+    }
+    if profile.service_stopped()? {
+        return Ok(());
+    }
     if profile.is_installed() && !managed && crate::service::runtime_switching(&profile).await? {
         return Ok(());
     }

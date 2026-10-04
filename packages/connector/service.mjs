@@ -37,7 +37,7 @@ import { isProcess, processAge, signalVerified } from './proc.mjs';
 import { coreProgram, releaseRoot, selectedDaemonCommand, selection, stableCommand } from './release.mjs';
 import { matchesSelectedRustConnectorIdentity, RUST_CONNECTOR_KIND } from './rust-connector.mjs';
 import { keyed, t } from './i18n.mjs';
-import { connectorLockOf, connectorSocketOf, dataDirOf, nodeFiles, readJson, recordedInstallation, writePrivate } from './node-files.mjs';
+import { connectorLockOf, connectorSocketOf, dataDirOf, nodeFiles, nodeStopped, readJson, recordedInstallation, restoreSelectedLaunchGate, writePrivate } from './node-files.mjs';
 
 export const JOBS = {
   core: { label: 'dev.sidevoice.core', unit: 'sidevoice-core.service' },
@@ -400,7 +400,7 @@ export async function observe(env = process.env, { connectorRunning = null } = {
   const report = readFailure(dataDir);
   return {
     service: kind, installed: !!selection(env, 'current'), defined, jobs,
-    stopped: existsSync(files.stopped), health, ready,
+    stopped: nodeStopped(dataDir, selection(env, 'current')?.id), health, ready,
     failure: report ? describeFailure(dataDir, report) : null,
     coreAge: jobs.core?.running ? processAge(jobs.core.pid) : null,
     program: defined.core ? programProblem(definitionProgram(kind, service.core)) : null,
@@ -613,7 +613,8 @@ export function linger(env = process.env) {
 export async function start(env = process.env) {
   const service = installedService(env);
   await underLock(env, async () => {
-    rmSync(nodeFiles(dataDirOf(env)).stopped, { force: true });
+    if (service) rmSync(nodeFiles(dataDirOf(env)).stopped, { force: true });
+    else restoreSelectedLaunchGate(dataDirOf(env), selection(env, 'current')?.id);
     if (service) await startJobs(env);
   });
   const now = await settled(env);
@@ -637,7 +638,7 @@ export async function stop(env = process.env) {
 /** `service restart` — the person's «Reintentar»: the core job restarted (its start limit cleared first); stopped, it is
  *  a start. With no jobs, the core running on demand is ended, and the next conversation starts it again. */
 export async function restart(env = process.env) {
-  if (existsSync(nodeFiles(dataDirOf(env)).stopped)) return start(env);
+  if (nodeStopped(dataDirOf(env), selection(env, 'current')?.id)) return start(env);
   const service = installedService(env);
   await underLock(env, async () => {
     if (service?.core) await startJobs(env, { restart: true, jobs: ['core'] });
@@ -669,7 +670,7 @@ export async function uninstall(env = process.env, { keepStopped = false } = {})
         for (const job of ORDER) manage(env, kind, ['--user', 'reset-failed', JOBS[job].unit]);
       }
     }
-    if (!keepStopped) rmSync(files.stopped, { force: true });
+    if (!keepStopped) restoreSelectedLaunchGate(dataDirOf(env), selection(env, 'current')?.id);
     return { ok: true, state: selection(env, 'current') ? 'not-installed' : 'absent', service: kind,
       ...(down.killed.length ? { note: t('service.killed', { pids: down.killed.join(', ') }) } : {}) };
   });

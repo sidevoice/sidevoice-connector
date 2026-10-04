@@ -9,9 +9,8 @@
  *  4. No job (no user manager: containers, `su` shells, Linux without a session bus; or nothing installed as a
  *     service): a plain connector is spawned, detached, as before; two of them settle it by its lock. */
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
 import { keyed } from './i18n.mjs';
-import { dataDirOf, nodeFiles, recordedInstallation, runtimeSwitching } from './node-files.mjs';
+import { dataDirOf, nodeStopped, recordedInstallation, runtimeSwitching } from './node-files.mjs';
 import { selectedDaemonCommand, selection } from './release.mjs';
 import { installedService, status } from './service.mjs';
 
@@ -21,15 +20,15 @@ const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 /** Whether a person stopped Sidevoice on this machine. */
 export function stoppedByPerson(env = process.env) {
-  return existsSync(nodeFiles(dataDirOf(env)).stopped);
+  return nodeStopped(dataDirOf(env), selection(env, 'current')?.id);
 }
 
 /** A connection to this machine's connector, getting one started the only way allowed. `connect()` tries the
  *  socket once; `self` is the argv prefix that runs this package's CLI (a plain connector is `self + connector`). */
 export async function launch({ connect, self, env = process.env }) {
   try { return await connect(); } catch (error) { if (error.unsafe) throw error; }
-  if (stoppedByPerson(env)) throw keyed('node.stopped');
   if (runtimeSwitching(dataDirOf(env))) throw keyed('install.runtime-switching');
+  if (stoppedByPerson(env)) throw keyed('node.stopped');
   if (installedService(env)?.connector) {
     const deadline = Date.now() + SERVICE_WAIT_MS();
     while (Date.now() < deadline) {

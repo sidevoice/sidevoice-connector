@@ -17,7 +17,8 @@ import { RUST_CORE_ENTRYPOINT, RUST_CORE_KIND, rustCoreTarget } from '../rust-co
 import { apply, rollback } from '../install.mjs';
 import { connectorClient } from '../ipc.mjs';
 import { launch } from '../launcher.mjs';
-import { runtimeSwitching } from '../node-files.mjs';
+import { launch as legacyLaunch } from './fixtures/legacy-launcher-97940ed.mjs';
+import { nodeStopped, runtimeSwitching } from '../node-files.mjs';
 import { writePrivateFile } from '../secure-fs.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -132,6 +133,9 @@ test('runtime switch refuses a queued or unreadable outbox before staging or mov
   assert.equal(runtimeSwitching(data), true, 'the install lock owns a live launch barrier');
   await assert.rejects(facade.ensure(), error => error.key === 'install.runtime-switching',
   'an existing MCP facade cannot respawn the old daemon after quiescence');
+  await assert.rejects(legacyLaunch({ connect: async () => { throw new Error('socket closed'); },
+    self: [process.execPath, path.join(packageDir, 'cli.mjs')], env }), error => error.key === 'node.stopped',
+  'the already-running baseline facade recognizes the compatibility stop marker');
   assert.equal(existsSync(outbox), false, 'a refused reconnect cannot enqueue after quiescence');
   writePrivateFile(outbox, '[{"event_id":"arrived-during-stage"}]\n');
   writeFileSync(path.join(hooks, 'resume-install-after-quiesce'), '');
@@ -185,12 +189,122 @@ test('explicit rollback refuses queued speech in either cross-runtime direction'
   }
   t.after(() => rmSync(home, { recursive: true, force: true }));
   writePrivateFile(path.join(data, 'outbox.json'), '[{"event_id":"queued"}]\n');
+  const humanStop = '{"at":"before-rollback"}\n';
+  writePrivateFile(path.join(data, 'node-stopped.json'), humanStop);
   for (const [current, previous] of [['js', 'rust'], ['rust', 'js']]) {
     point(env, 'current', current);
     point(env, 'previous', previous);
     await assert.rejects(rollback(env), error => error.key === 'install.runtime-switch-outbox');
     assert.equal(readlinkSync(layout.current), path.join('releases', current));
+    assert.equal(readFileSync(path.join(data, 'node-stopped.json'), 'utf8'), humanStop,
+      'a refused rollback preserves the original human stop record');
   }
+});
+
+test('a pre-lock JS daemon cannot serve after current switches to Rust', async t => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-delayed-js-owner-'));
+  const data = path.join(home, '.sidevoice'), hooks = path.join(home, 'hooks');
+  const env = { ...process.env, HOME: home, SIDEVOICE_DATA_DIR: data,
+    XDG_DATA_HOME: path.join(home, 'xdg'), XDG_CONFIG_HOME: path.join(home, '.config'),
+    SIDEVOICE_SERVICE_MANAGER: 'none', SIDEVOICE_INSTALL_FROM_SOURCE: '0', SIDEVOICE_TEST_HOOKS: hooks };
+  mkdirSync(data, { recursive: true, mode: 0o700 }); mkdirSync(hooks);
+  const layout = releaseLayout(env), oldId = 'old-js', rustId = 'next-rust';
+  const oldRelease = { id: oldId, connector: '0.6.0', channel: 'release', build_seq: 0,
+    format: 'esm', runtime_kind: 'javascript', core_build: null };
+  const next = { ...oldRelease, id: rustId, runtime_kind: 'rust-native-v1', format: 'sea',
+    pair_id: 'pair-for-delayed-start' };
+  for (const release of [oldRelease, { ...next, id: `${rustId}-nocore` }]) {
+    const directory = path.join(layout.releases, release.id);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    writePrivateFile(path.join(directory, 'release.json'), `${JSON.stringify(release)}\n`);
+  }
+  point(env, 'current', oldId);
+  writePrivateFile(path.join(data, 'install.json'), JSON.stringify({ releases: layout.root,
+    command: [process.execPath, path.join(layout.current, 'dist', 'cli.mjs')], definitions: [] }));
+  writeFileSync(path.join(hooks, 'pause-lock-before-connector'), '');
+  const old = spawn(process.execPath, [path.join(packageDir, 'cli.mjs'), 'connector'], { env,
+    stdio: ['ignore', 'pipe', 'pipe'] });
+  t.after(() => { old.kill('SIGKILL'); rmSync(home, { recursive: true, force: true }); });
+  for (let i = 0; i < 200 && !existsSync(path.join(hooks, 'paused-lock-before-connector')); i++) await wait(25);
+  assert.equal(existsSync(path.join(hooks, 'paused-lock-before-connector')), true);
+  const switched = await apply(env, { core: false, candidateRelease: next });
+  assert.equal(switched.action, 'upgrade');
+  assert.equal(readlinkSync(layout.current), path.join('releases', `${rustId}-nocore`));
+  assert.equal(existsSync(path.join(data, 'node-stopped.json')), true, 'old base facades remain inhibited');
+  assert.equal(nodeStopped(data, `${rustId}-nocore`), false, 'the selected runtime can serve');
+  await assert.rejects(legacyLaunch({ connect: async () => { throw new Error('closed'); },
+    self: [process.execPath, path.join(packageDir, 'cli.mjs')], env }), error => error.key === 'node.stopped');
+  writeFileSync(path.join(hooks, 'resume-lock-before-connector'), '');
+  assert.equal(await new Promise(resolve => old.on('exit', resolve)), 0);
+  assert.equal(existsSync(path.join(data, 'connector.sock')), false, 'stale JS did not bind the socket');
+  assert.equal(existsSync(path.join(data, 'outbox.json')), false, 'stale JS did not load or write speech');
+});
+
+test('noop Rust install --service without a manager leaves on-demand launch available', async t => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-rust-no-manager-'));
+  const data = path.join(home, '.sidevoice'), hooks = path.join(home, 'hooks'), marker = path.join(home, 'launched');
+  const env = { ...process.env, HOME: home, SIDEVOICE_DATA_DIR: data,
+    XDG_DATA_HOME: path.join(home, 'xdg'), XDG_CONFIG_HOME: path.join(home, '.config'),
+    SIDEVOICE_SERVICE_MANAGER: 'none', SIDEVOICE_TEST_HOOKS: hooks, SIDEVOICE_LAUNCH_MARKER: marker };
+  mkdirSync(data, { recursive: true, mode: 0o700 }); mkdirSync(hooks);
+  const layout = releaseLayout(env), id = 'selected-rust', target = rustCoreTarget();
+  const sourceSha = 'a'.repeat(40), archiveSha = 'b'.repeat(64), coreBuild = `rust-native-v1-${target}-${sourceSha}-${archiveSha}`;
+  const executable = path.join(layout.releases, id, 'dist', 'sidevoice-rust');
+  mkdirSync(path.dirname(executable), { recursive: true, mode: 0o700 });
+  const bytes = `#!/bin/sh\necho launched > "${marker}"\n`;
+  writeFileSync(executable, bytes); chmodSync(executable, 0o700);
+  const sha = createHash('sha256').update(bytes).digest('hex');
+  const release = { id, connector: '0.6.0', core: '0.1.0', channel: 'release', build_seq: 0,
+    format: 'sea', runtime_kind: 'rust-native-v1', runtime_target: target, runtime_build_sha: sourceSha,
+    runtime_sha256: sha, runtime_size: Buffer.byteLength(bytes), core_kind: 'rust-native-v1',
+    core_target: target, core_source_sha: sourceSha, core_archive_sha256: archiveSha,
+    core_cargo_lock_sha256: 'c'.repeat(64), core_manifest_sha256: 'd'.repeat(64), core_archive_size: 1,
+    core_entrypoint: RUST_CORE_ENTRYPOINT, core_build: coreBuild,
+    pair_id: `pair-v1:rust-native-v1:${sha}:core:${coreBuild}` };
+  writePrivateFile(path.join(layout.releases, id, 'release.json'), `${JSON.stringify(release)}\n`);
+  const coreExecutable = path.join(layout.releases, id, 'core', RUST_CORE_ENTRYPOINT);
+  mkdirSync(path.dirname(coreExecutable), { recursive: true, mode: 0o700 });
+  writeFileSync(coreExecutable, `#!/bin/sh\nexec "${process.execPath}" "${fakeCore}" "$@"\n`);
+  chmodSync(coreExecutable, 0o700);
+  point(env, 'current', id);
+  point(env, 'verified', id);
+  writePrivateFile(path.join(data, 'install.json'), JSON.stringify({ releases: layout.root,
+    command: [path.join(layout.current, 'dist', 'sidevoice')], definitions: [] }));
+  writeFileSync(path.join(hooks, 'pause-install-after-quiesce'), '');
+  writeFileSync(path.join(hooks, 'pause-install-after-commit'), '');
+  const identity = { version: release.connector, runtime_kind: release.runtime_kind,
+    runtime_build_sha: release.runtime_build_sha, runtime_sha256: release.runtime_sha256,
+    runtime_target: release.runtime_target, release_id: release.id, executable: realpathSync(executable),
+    managed: false, pid: process.pid };
+  const server = net.createServer(socket => socket.on('data', chunk => {
+    const request = JSON.parse(String(chunk).split('\n')[0]);
+    socket.end(JSON.stringify({ id: request.id, ok: true, result: request.method === 'identity'
+      ? identity : { version: release.connector } }) + '\n');
+  }));
+  await new Promise(resolve => server.listen(path.join(data, 'connector.sock'), resolve));
+  chmodSync(path.join(data, 'connector.sock'), 0o600);
+  const source = `import { apply } from ${JSON.stringify(new URL('../install.mjs', import.meta.url).href)};
+    const result = await apply(process.env, { service: true, candidateRelease: JSON.parse(process.env.SIDEVOICE_TEST_CANDIDATE) });
+    console.log(result.action);`;
+  const installer = spawn(process.execPath, ['--input-type=module', '-e', source], { env: { ...env,
+    SIDEVOICE_TEST_CANDIDATE: JSON.stringify(release) }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = '', errors = '';
+  installer.stdout.on('data', chunk => { output += chunk; });
+  installer.stderr.on('data', chunk => { errors += chunk; });
+  t.after(() => { installer.kill('SIGKILL'); server.close();
+    try { const ready = JSON.parse(readFileSync(path.join(data, 'core', 'core.json'), 'utf8')); process.kill(ready.pid, 'SIGTERM'); } catch {}
+    rmSync(home, { recursive: true, force: true }); });
+  for (let i = 0; i < 200 && !existsSync(path.join(hooks, 'paused-install-after-commit')); i++) await wait(25);
+  assert.equal(existsSync(path.join(hooks, 'paused-install-after-commit')), true,
+    'a manager-none noop reaches verification without quiescing the same release');
+  assert.equal(existsSync(path.join(hooks, 'paused-install-after-quiesce')), false);
+  assert.equal(runtimeSwitching(data), false);
+  assert.equal(nodeStopped(data, id), false);
+  assert.equal(await launch({ connect: async () => { if (existsSync(marker)) return true; throw new Error('closed'); },
+    self: [process.execPath, path.join(packageDir, 'cli.mjs')], env }), true);
+  writeFileSync(path.join(hooks, 'resume-install-after-commit'), '');
+  assert.equal(await new Promise(resolve => installer.on('exit', resolve)), 0, `${output} ${errors}`);
+  assert.match(output, /noop/);
 });
 
 test('same-kind Rust rollback stops the old selected owner before changing current', async t => {
