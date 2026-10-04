@@ -4,6 +4,7 @@ mod cursor_app;
 mod daemon;
 mod link;
 mod mcp;
+mod pairing;
 mod proof;
 mod service;
 
@@ -53,12 +54,20 @@ struct Cli {
     /// Reconstruct the complete isolated profile in a fresh process.
     #[arg(long, global = true)]
     profile_root: Option<PathBuf>,
+    /// Use the currently selected production release and the user's normal profile paths.
+    #[arg(long, global = true)]
+    installed: bool,
     #[command(subcommand)]
     command: Action,
 }
 
 #[derive(Subcommand)]
 enum Action {
+    /// Report this target binary's build identity for the trusted SEA packager.
+    RuntimeIdentity {
+        #[arg(long)]
+        json: bool,
+    },
     /// Serve MCP over stdio for one supported conversation adapter.
     Mcp,
     /// Link the isolated Core to Codex sessions; --service is for its private launchd job.
@@ -115,15 +124,32 @@ enum CodexAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Action::RuntimeIdentity { json } = &cli.command {
+        let identity = json!({"kind":"rust-native-v1", "target":env!("SIDEVOICE_CONNECTOR_TARGET"),
+            "source_sha":env!("SIDEVOICE_CONNECTOR_BUILD_SHA"), "version":env!("SIDEVOICE_CONNECTOR_VERSION")});
+        if *json {
+            println!("{identity}");
+        } else {
+            println!(
+                "Rust Connector {} ({})",
+                identity["version"], identity["target"]
+            );
+        }
+        return Ok(());
+    }
     let explicit_profile = cli.profile_root.is_some();
+    if explicit_profile && cli.installed {
+        bail!("proof and installed profiles cannot be combined");
+    }
     let profile = match cli.profile_root {
         Some(root) => Profile::from_root(&root)?,
+        None if cli.installed => Profile::from_installed_env()?,
         None => Profile::from_env()?,
     };
     match cli.command {
         Action::Mcp => mcp::run(profile).await,
         Action::Connector { service } => {
-            if service && !explicit_profile {
+            if service && (cli.installed || !explicit_profile) {
                 eprintln!(
                     "{}",
                     crate::agents::message(
@@ -133,7 +159,15 @@ async fn main() -> Result<()> {
                 );
                 std::process::exit(1);
             }
-            daemon::run(profile, service).await
+            let managed = if profile.is_installed() {
+                matches!(
+                    std::env::var("SIDEVOICE_SERVICE").as_deref(),
+                    Ok("launchd" | "systemd")
+                )
+            } else {
+                service
+            };
+            daemon::run(profile, managed).await
         }
         Action::Codex { command } => {
             let host_agents = agents::HostAgents::new(profile.clone())?;

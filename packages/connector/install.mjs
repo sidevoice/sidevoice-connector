@@ -32,11 +32,13 @@ import { keyed, t } from './i18n.mjs';
 import { normalizeInstallFailure } from './install-errors.mjs';
 import { remove as removeSkill, skillsDir, status as skillStatus } from './skill.mjs';
 import { candidate, coreProgram, decide, discardRuntimeIfUnselected, flipBack, markVerified, prune, releaseRoot, removeLeftovers, removeReleases, selection, stableCommand, stage, switchTo } from './release.mjs';
+import { matchesSelectedRustConnectorIdentity, RUST_CONNECTOR_KIND } from './rust-connector.mjs';
 import { HARNESS_REGISTRATIONS, codexInstructions, cursorMcpFile, registration, unregisterFromClaude, unregisterFromCodex, unregisterFromCursor } from './registrations.mjs';
 import { askConnector, compatibleCore, installedService, jobDefinitions, linger, managerKind, recordInstallation, settledState, startJobs, status, stopOnDemand, uninstall as uninstallService, writeDefinitions } from './service.mjs';
 import { dataDirOf, nodeFiles } from './node-files.mjs';
 import { crash, pause } from './testpoint.mjs';
 import { captureAgentEnvironment, withAgentStateLock } from './agents.mjs';
+import { readTrusted } from './secure-fs.mjs';
 
 export { claudeRegistration, codexInstructions, copiesDir, cursorHasOurs, cursorMcpFile, registerWithCursor, serverCommand,
   unregisterFromCursor } from './registrations.mjs';
@@ -45,6 +47,19 @@ export { compareVersions, decide } from './release.mjs';
 const VERIFY_MS = () => Number(process.env.SIDEVOICE_INSTALL_VERIFY_MS || 60_000);
 const CALLS_POLL_MS = 2000;
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+/** Runtime-kind changes cannot carry an unclassified speech row across the JS/Rust ownership boundary. */
+function requireEmptyOutbox(dataDir) {
+  const file = path.join(dataDir, 'outbox.json');
+  let raw;
+  try { raw = readTrusted(file); }
+  catch { throw keyed('install.runtime-switch-outbox'); }
+  if (raw === null) return;
+  if (raw.length > 8 * 1024 * 1024) throw keyed('install.runtime-switch-outbox');
+  let queue;
+  try { queue = JSON.parse(raw); } catch { throw keyed('install.runtime-switch-outbox'); }
+  if (!Array.isArray(queue) || queue.length) throw keyed('install.runtime-switch-outbox');
+}
 
 export function flag(argv, name) {
   const index = argv.indexOf(name);
@@ -108,8 +123,13 @@ async function verify(env, release, kind, { fresh = false, previousLaunchId = nu
         continue;
       }
       if (!compatibleCore(last.core, readReady(dataDir))) return { ok: false, failure: { key: 'install.incompatible', message: t('install.incompatible') } };
-      const answered = await askConnector('status', {}, { env, timeout: 1500 });
-      if (answered?.version === release.connector) return { ok: true };
+      if (release.runtime_kind === RUST_CONNECTOR_KIND) {
+        const identity = await askConnector('identity', {}, { env, timeout: 1500 });
+        if (matchesSelectedRustConnectorIdentity(identity, release, releaseRoot(env))) return { ok: true };
+      } else {
+        const answered = await askConnector('status', {}, { env, timeout: 1500 });
+        if (answered?.version === release.connector) return { ok: true };
+      }
     }
     if (settledState(last) && last.state !== 'running') return { ok: false, failure: last.failure };
     await wait(250);
@@ -124,6 +144,9 @@ async function runsSelection(env, release) {
   if (selection(env, 'verified')?.id !== release.id) return false;
   const now = await status(env);
   if (now.state !== 'running' || now.core?.version !== release.core) return false;
+  if (release.runtime_kind === RUST_CONNECTOR_KIND) {
+    return matchesSelectedRustConnectorIdentity(await askConnector('identity', {}, { env, timeout: 1500 }), release, releaseRoot(env));
+  }
   return (await askConnector('status', {}, { env, timeout: 1500 }))?.version === release.connector;
 }
 
@@ -210,14 +233,20 @@ export async function apply(env, { core = true, service = false, applyNow = fals
     const next = { ...proposed, ...(core ? {} : { id: `${proposed.id}-nocore` }) };
     let action = decide(current, next);
     if (action === 'noop' && core && current && !current.core_build) action = 'upgrade';
+    const runtimeKindChanged = (current?.runtime_kind ?? 'javascript') !== (next.runtime_kind ?? 'javascript');
+    if (action !== 'noop' && runtimeKindChanged) requireEmptyOutbox(dataDir);
     let chosen = current;
     if (action !== 'noop') {
       chosen = await stage(env, next, { dataDir, core, log, progress, signal, progressEvent,
         onRuntime: runtime => { stagedRuntimeId = runtime.id; } });
       stagedRuntimeId = chosen.core_build ?? stagedRuntimeId;
-      if (current && !applyNow && current.core_build !== chosen.core_build) await callsEnd(env, progress, { signal, progressEvent });
+      const selectedRuntimeChanged = !current || (current.runtime_kind ?? 'javascript') !== (chosen.runtime_kind ?? 'javascript')
+        || (chosen.runtime_kind === 'rust-native-v1' && current.runtime_sha256 !== chosen.runtime_sha256);
+      if (current && !applyNow && (current.core_build !== chosen.core_build || selectedRuntimeChanged)) await callsEnd(env, progress, { signal, progressEvent });
       if (signal?.aborted) throw keyed('install.cancelled');
       await pause('install-before-commit', { signal });
+      if (runtimeKindChanged) requireEmptyOutbox(dataDir);
+      if (signal?.aborted) throw keyed('install.cancelled');
       progressEvent({ step: 'commit', done: null, total: null });
       beginCommit();
       switchTo(env, chosen.id);
@@ -273,7 +302,7 @@ export async function apply(env, { core = true, service = false, applyNow = fals
     return { action: 'rollback', release: back.release, from: current, failed: chosen, failure: verified.failure,
       back: back.ok, backFailure: back.failure ?? null, registrationFailures, kind };
   } catch (error) {
-    if (signal?.aborted) {
+    if (signal?.aborted || error?.key === 'install.runtime-switch-outbox') {
       prune(env, dataDir);
       discardRuntimeIfUnselected(env, dataDir, stagedRuntimeId);
     }

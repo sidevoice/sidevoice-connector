@@ -34,7 +34,8 @@ import { API_RANGE, LINK_RANGE, coreArgs, coreProcesses, coreRunning, describeFa
 import { localHealth } from './core-socket.mjs';
 import { readLock, tryLock } from './lockfile.mjs';
 import { isProcess, processAge, signalVerified } from './proc.mjs';
-import { coreProgram, releaseRoot, selection, stableCommand } from './release.mjs';
+import { coreProgram, releaseRoot, selectedDaemonCommand, selection, stableCommand } from './release.mjs';
+import { RUST_CONNECTOR_KIND } from './rust-connector.mjs';
 import { keyed, t } from './i18n.mjs';
 import { connectorLockOf, connectorSocketOf, dataDirOf, nodeFiles, readJson, recordedInstallation, writePrivate } from './node-files.mjs';
 
@@ -228,12 +229,15 @@ export function jobPrograms(env = process.env) {
   const dataDir = dataDirOf(env);
   const record = readJson(nodeFiles(dataDir).install);
   if (!Array.isArray(record?.command) || !record.command.length) throw keyed('service.no-installation');
+  const selected = selection(env, 'current')?.release;
   const core = coreProgram(env);
   const nativeRoot = rustCoreRootForProgram(core);
+  const daemon = selectedDaemonCommand(env);
   return {
     core: [core, ...coreArgs({ dataDir, env, idleExit: 0, roomCredential: roomCredentialPath(dataDir, env),
       bundle: isBundleCore(core), nativeRoot })],
-    connector: [...record.command, 'connector', '--service'],
+    connector: selected?.runtime_kind === RUST_CONNECTOR_KIND
+      ? [...daemon, 'connector'] : [...record.command, 'connector', '--service'],
   };
 }
 

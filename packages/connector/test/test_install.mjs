@@ -8,10 +8,11 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { decide } from '../release.mjs';
+import { decide, point, releaseLayout } from '../release.mjs';
 import { RUST_CORE_ENTRYPOINT, RUST_CORE_KIND, rustCoreTarget } from '../rust-core.mjs';
+import { apply } from '../install.mjs';
 import { writePrivateFile } from '../secure-fs.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -48,6 +49,39 @@ test('versions: higher replaces, lower never does, and the same version only as 
   const source = { ...at('0.6.0', 'source'), id: '0.6.0-source', source: '/checkout' };
   assert.equal(decide(at('0.6.0'), source), 'upgrade', 'a checkout selects itself');
   assert.equal(decide(source, source), 'noop');
+});
+
+test('runtime switch refuses a queued or unreadable outbox before staging or moving the release pointer', async t => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-runtime-switch-outbox-'));
+  const data = path.join(home, '.sidevoice');
+  const env = { ...process.env, HOME: home, SIDEVOICE_DATA_DIR: data,
+    XDG_DATA_HOME: path.join(home, 'xdg'), SIDEVOICE_INSTALL_FROM_SOURCE: '0' };
+  mkdirSync(data, { recursive: true, mode: 0o700 });
+  const layout = releaseLayout(env), oldId = 'legacy-javascript';
+  const oldDir = path.join(layout.releases, oldId);
+  mkdirSync(oldDir, { recursive: true, mode: 0o700 });
+  const oldRuntime = 'a'.repeat(64), oldCore = 'legacy-core';
+  const oldRelease = { id: oldId, connector: '0.6.0', core: '0.1.0', core_build: oldCore,
+    channel: 'release', build_seq: 0, format: 'sea', runtime_kind: 'javascript', runtime_sha256: oldRuntime,
+    pair_id: `pair-v1:javascript:${oldRuntime}:core:${oldCore}` };
+  writePrivateFile(path.join(oldDir, 'release.json'), `${JSON.stringify(oldRelease)}\n`);
+  point(env, 'current', oldId);
+  const next = { ...oldRelease, id: 'native-rust-pair', runtime_kind: 'rust-native-v1',
+    pair_id: `pair-v1:rust-native-v1:${'b'.repeat(64)}:core:${'c'.repeat(40)}` };
+  const outbox = path.join(data, 'outbox.json');
+  writePrivateFile(outbox, '[{"event_id":"pending"}]\n');
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+
+  await assert.rejects(apply(env, { core: false, candidateRelease: next }), error => error.key === 'install.runtime-switch-outbox');
+  assert.equal(readlinkSync(layout.current), path.join('releases', oldId));
+  assert.equal(existsSync(path.join(layout.releases, next.id)), false, 'the candidate was not staged');
+  assert.equal(existsSync(path.join(data, 'service')), false, 'service state was not changed');
+
+  rmSync(outbox);
+  writePrivateFile(outbox, '{malformed\n');
+  await assert.rejects(apply(env, { core: false, candidateRelease: next }), error => error.key === 'install.runtime-switch-outbox');
+  assert.equal(readlinkSync(layout.current), path.join('releases', oldId));
+  assert.equal(existsSync(path.join(layout.releases, next.id)), false, 'an unreadable queue still refuses before staging');
 });
 
 /** This package built for real — `build.mjs`, stamped as CI stamps it — and copied to stand as another package, as

@@ -4,8 +4,8 @@ impl HostAgents {
     pub(super) fn cursor_registration(&self) -> Result<String> {
         self.profile.validate_existing_private()?;
         let file = self.profile.cursor.join("mcp.json");
-        let Some((mut config, _mode, _target)) = read_cursor_config(&file, &self.profile.root)?
-        else {
+        let root = self.profile.agent_root(&self.profile.cursor)?;
+        let Some((mut config, _mode, _target)) = read_cursor_config(&file, &root)? else {
             return Ok("not-connected".into());
         };
         let current = config
@@ -45,7 +45,11 @@ impl HostAgents {
             .validate_for_agent(&self.profile.cursor)
             .map_err(|_| agent_failure("agents.invalid", AgentId::Cursor))?;
         let file = self.profile.cursor.join("mcp.json");
-        let mut config = match read_cursor_config(&file, &self.profile.root) {
+        let root = self
+            .profile
+            .agent_root(&self.profile.cursor)
+            .map_err(|_| agent_failure("agents.invalid", AgentId::Cursor))?;
+        let mut config = match read_cursor_config(&file, &root) {
             Ok(Some((config, _, _))) => config,
             Ok(None) => json!({}),
             Err(_) => return Err(agent_failure("agents.invalid", AgentId::Cursor)),
@@ -96,7 +100,11 @@ impl HostAgents {
             .validate_for_agent(&self.profile.cursor)
             .map_err(|_| agent_failure("agents.invalid", AgentId::Cursor))?;
         let file = self.profile.cursor.join("mcp.json");
-        let Some((mut config, _, _)) = read_cursor_config(&file, &self.profile.root)
+        let root = self
+            .profile
+            .agent_root(&self.profile.cursor)
+            .map_err(|_| agent_failure("agents.invalid", AgentId::Cursor))?;
+        let Some((mut config, _, _)) = read_cursor_config(&file, &root)
             .map_err(|_| agent_failure("agents.invalid", AgentId::Cursor))?
         else {
             return Ok(());

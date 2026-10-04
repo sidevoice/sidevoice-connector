@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - 'packages/connector/**'
+      - 'packages/connector-rust/**'
       - 'package.json'
       - 'package-lock.json'
       - '.github/workflows/rust-core-consumer.yml'
@@ -13,6 +14,7 @@ on:
     branches: [main]
     paths:
       - 'packages/connector/**'
+      - 'packages/connector-rust/**'
       - 'package.json'
       - 'package-lock.json'
       - '.github/workflows/rust-core-consumer.yml'
@@ -139,7 +141,7 @@ jobs:
             archive_size: 25342648
             archive_sha256: 7779e9881a9442624fb6140f33f9e4ec4c59f2576810482fca14f35a87994ffa
     runs-on: ${{ matrix.runner }}
-    cache-mode: read
+    timeout-minutes: 60
     permissions:
       actions: read
       contents: read
@@ -209,14 +211,29 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: v22.23.3
-          cache: npm
       - run: test "$(node --version)" = v22.23.3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - run: npm ci
+      - name: Build the exact target Rust Connector executable
+        env:
+          SIDEVOICE_CONNECTOR_BUILD_SHA: ${{ env.CANDIDATE_SHA }}
+          SIDEVOICE_CONNECTOR_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          SIDEVOICE_CONNECTOR_VERSION="$(node -p "require('./packages/connector/package.json').version")"
+          export SIDEVOICE_CONNECTOR_VERSION
+          cargo build --locked --release --manifest-path packages/connector-rust/Cargo.toml
       - name: Build this target SEA with its signed native Core asset
         env:
           SIDEVOICE_BUILD_SEA: '1'
           SIDEVOICE_REQUIRE_RUST_CORE: '1'
+          SIDEVOICE_REQUIRE_RUST_CONNECTOR: '1'
           SIDEVOICE_CONNECTOR_SHA: ${{ env.CANDIDATE_SHA }}
+          SIDEVOICE_RUST_CONNECTOR_SOURCE_SHA: ${{ env.CANDIDATE_SHA }}
+          SIDEVOICE_RUST_CONNECTOR_TARGET: ${{ matrix.target }}
+          SIDEVOICE_RUST_CONNECTOR_BINARY: ${{ github.workspace }}/packages/connector-rust/target/release/sidevoice-rust-proof
           SIDEVOICE_RUST_CORE_RUN_ID: ${{ env.CORE_RUN_ID }}
           SIDEVOICE_RUST_CORE_SOURCE_SHA: ${{ env.CORE_SOURCE_SHA }}
           SIDEVOICE_RUST_CORE_TARGET: ${{ matrix.target }}
@@ -235,3 +252,13 @@ jobs:
           SIDEVOICE_RUST_CORE_ARCHIVE_SIGSTORE: ${{ runner.temp }}/core-inputs/${{ matrix.archive }}.sigstore.json
           SIDEVOICE_TUF_CACHE: ${{ runner.temp }}/sidevoice-tuf
         run: npm test -w @sidevoice/uplink
+      - uses: astral-sh/setup-uv@v6
+        if: matrix.target == 'macos-aarch64'
+      - name: Run the disposable pairing room and native launchd pair acceptance
+        if: matrix.target == 'macos-aarch64'
+        env:
+          SIDEVOICE_TEST_SEA: ${{ github.workspace }}/packages/connector/dist-sea/macos-arm64/sidevoice
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/pairing-test"
+          uv pip install --python "$RUNNER_TEMP/pairing-test/bin/python" python-socketio uvicorn
+          "$RUNNER_TEMP/pairing-test/bin/python" packages/connector-rust/test/installed_pairing.py

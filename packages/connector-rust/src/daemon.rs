@@ -756,12 +756,42 @@ impl Daemon {
                 self.host_agents.handle(method, params.clone()).await
             }
             "pair.request" => {
-                json!({"error":{"key":"pair.proof-only","message":"Pairing is unavailable in the isolated Rust proof."}})
+                if !self.profile.is_installed() {
+                    json!({"error":{"key":"pair.proof-only","message":"Pairing is unavailable in the isolated Rust proof."}})
+                } else {
+                    let room = params.get("room").and_then(Value::as_str).unwrap_or("");
+                    let code = params.get("code").and_then(Value::as_str).unwrap_or("");
+                    if room.is_empty() || code.is_empty() {
+                        json!({"ok":false,"detail":"Hacen falta la dirección de la sala y el código."})
+                    } else {
+                        match crate::pairing::run_pair(&self.profile, room, code).await {
+                            Ok(result) => {
+                                json!({"ok":true,"origin":result["room"],"connector_id":result["connector_id"]})
+                            }
+                            Err(error) => json!({"ok":false,"detail":error.to_string()}),
+                        }
+                    }
+                }
             }
             "connector.error" => json!({}),
-            "node.status" => crate::service::status(&self.profile, true).await,
+            "node.status" => self.node_status().await,
             _ => json!({"error":{"key":"connector.unknown-method"}}),
         }
+    }
+
+    async fn node_status(&self) -> Value {
+        if !self.profile.is_installed() {
+            return crate::service::status(&self.profile, true).await;
+        }
+        let connected = self.link.connected().await;
+        let mut connector = json!({"running":true,"version":self.profile.connector_version()});
+        if let Some(fields) = self.profile.runtime_identity().as_object() {
+            for (key, value) in fields {
+                connector[key] = value.clone();
+            }
+        }
+        json!({"ok":true,"installed":true,"service":std::env::var("SIDEVOICE_SERVICE").unwrap_or_else(|_|"on-demand".into()),
+            "state":"running","reachable":connected,"core":{"connected":connected},"connector":connector})
     }
 
     async fn handle_app_notice(&self, notice: AppNotice) {
@@ -1159,10 +1189,17 @@ impl Daemon {
                     .await;
                 Ok(json!({"left":true,"connected":self.link.connected().await}))
             }
-            "node.status" => Ok(crate::service::status(&self.profile, true).await),
+            "node.status" => Ok(self.node_status().await),
             "identity" => {
                 let executable = std::env::current_exe()?.canonicalize()?;
-                Ok(json!({"pid":std::process::id(),"executable":executable,"managed":self.managed}))
+                let mut identity = json!({"pid":std::process::id(),"executable":executable,"managed":self.managed,
+                    "version":self.profile.connector_version()});
+                if let Some(fields) = self.profile.runtime_identity().as_object() {
+                    for (key, value) in fields {
+                        identity[key] = value.clone();
+                    }
+                }
+                Ok(identity)
             }
             "shutdown" => {
                 if self.managed {
@@ -1233,7 +1270,7 @@ impl Daemon {
                 let refused = self.refusal.lock().await.clone();
                 let resume_block_reason = self.resume_block_reason();
                 Ok(
-                    json!({"version":env!("CARGO_PKG_VERSION"),"connected":self.link.connected().await,
+                    json!({"version":self.profile.connector_version(),"connected":self.link.connected().await,
                     "room_reachable":room_reachable,"bindings":listed,
                     "closed_by_room":closed_by_room,"closed_reasons":closed,"refused":refused,
                     "resume_blocked":self.resume_blocked.load(Ordering::Acquire),
@@ -2066,12 +2103,19 @@ fn prune_binding_order(order: &mut HashMap<String, oneshot::Receiver<()>>) {
 }
 
 pub async fn run(profile: Profile, managed: bool) -> Result<()> {
-    profile.validate_private()?;
-    if managed {
-        #[cfg(not(target_os = "macos"))]
-        bail!("the private managed connector is supported only by macOS launchd");
-        #[cfg(target_os = "macos")]
-        profile.validate_service_environment("launchd")?;
+    if profile.is_installed() {
+        profile.validate_private()?;
+        if managed {
+            profile.validate_installed_service_environment()?;
+        }
+    } else {
+        profile.validate_private()?;
+        if managed {
+            #[cfg(not(target_os = "macos"))]
+            bail!("the private managed connector is supported only by macOS launchd");
+            #[cfg(target_os = "macos")]
+            profile.validate_service_environment("launchd")?;
+        }
     }
     if profile.service_stopped()? {
         eprintln!(

@@ -18,6 +18,7 @@ export const en = {
   'install.proxy': 'The core could not be downloaded through the configured proxy. Check its URL, credentials, or TLS certificate trust.',
   'install.disk': 'There is not enough available disk space to install the Sidevoice core.',
   'install.authenticity': 'The downloaded Sidevoice core was refused at check "{check}".',
+  'install.runtime-switch-outbox': 'Sidevoice cannot switch Connector runtimes while speech is queued or its outbox cannot be read. Let the queue empty, then retry the install.',
 
   // The launcher and the node service (§4.2). `node.stopped` also reaches agents, so it stays plain English.
   'node.stopped': 'Sidevoice is stopped on this computer: start it from the app or with `sidevoice service start`.',

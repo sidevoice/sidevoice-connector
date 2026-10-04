@@ -149,6 +149,9 @@ enum Ownership {
         data: PathBuf,
         codex: PathBuf,
     },
+    Installed {
+        release_root: PathBuf,
+    },
     #[cfg(test)]
     Selected {
         record: Vec<String>,
@@ -181,6 +184,29 @@ impl InstalledCommand {
                 root: profile.root.clone(),
                 data: profile.data.clone(),
                 codex: profile.codex.clone(),
+            },
+        })
+    }
+
+    fn installed(profile: &Profile) -> Result<Self> {
+        let executable = std::env::current_exe()?.canonicalize()?;
+        let selected = profile
+            .root
+            .join("current/dist/sidevoice-rust")
+            .canonicalize()?;
+        if executable != selected {
+            anyhow::bail!("Rust Connector is not the selected release executable");
+        }
+        Ok(Self {
+            command: profile
+                .root
+                .join("current/dist/sidevoice-rust")
+                .to_string_lossy()
+                .into_owned(),
+            args: vec!["--installed".into(), "mcp".into()],
+            version: profile.connector_version().into(),
+            ownership: Ownership::Installed {
+                release_root: profile.root.clone(),
             },
         })
     }
@@ -239,6 +265,27 @@ impl InstalledCommand {
                         .and_then(|env| env.get("CODEX_HOME"))
                         .and_then(Value::as_str)
                         == Some(codex.to_string_lossy().as_ref())
+            }
+            Ownership::Installed { release_root } => {
+                let Some(executable) = canonical(command) else {
+                    return false;
+                };
+                if args != ["--installed", "mcp"] {
+                    return false;
+                }
+                let Ok(relative) = executable.strip_prefix(release_root) else {
+                    return false;
+                };
+                let parts = relative.components().collect::<Vec<_>>();
+                parts.len() == 4
+                    && parts[0].as_os_str() == "releases"
+                    && parts[1]
+                        .as_os_str()
+                        .to_string_lossy()
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ".+-_".contains(ch))
+                    && parts[2].as_os_str() == "dist"
+                    && parts[3].as_os_str() == "sidevoice-rust"
             }
             #[cfg(test)]
             Ownership::Selected {
@@ -320,7 +367,11 @@ struct InspectionInput<'a> {
 
 impl HostAgents {
     pub fn new(profile: Profile) -> Result<Arc<Self>> {
-        let selected = InstalledCommand::proof(&profile)?;
+        let selected = if profile.is_installed() {
+            InstalledCommand::installed(&profile)?
+        } else {
+            InstalledCommand::proof(&profile)?
+        };
         Ok(Self::with_command(profile, selected))
     }
 
@@ -1295,14 +1346,18 @@ fn read_cursor_config(file: &Path, root: &Path) -> Result<Option<(Value, u32, Pa
 
 fn write_cursor_config(profile: &Profile, file: &Path, config: &Value) -> Result<()> {
     profile.validate_for_agent(&profile.cursor)?;
-    let root = &profile.root;
-    let (target, mode) = match read_cursor_config(file, root)? {
+    let root = profile.agent_root(&profile.cursor)?;
+    let (target, mode) = match read_cursor_config(file, &root)? {
         Some((_, mode, target)) => (target, mode),
         None => (file.to_path_buf(), 0o600),
     };
     let parent = target.parent().context("Cursor config parent")?;
-    private_dir(parent)?;
-    if !parent.canonicalize()?.starts_with(root) {
+    if profile.is_installed() {
+        validate_user_directory(parent)?;
+    } else {
+        private_dir(parent)?;
+    }
+    if !parent.canonicalize()?.starts_with(&root) {
         anyhow::bail!("Cursor config escaped proof root");
     }
     let temporary = parent.join(format!(".mcp.json.{}.tmp", Uuid::new_v4()));

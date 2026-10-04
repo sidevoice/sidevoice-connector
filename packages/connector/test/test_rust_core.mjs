@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, realpath, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createZstdCompress } from 'node:zlib';
@@ -9,7 +9,8 @@ import tar from 'tar-stream';
 import { finished } from 'node:stream/promises';
 import { spawnSync } from 'node:child_process';
 import { CORE_VERSION, coreArgs, isRustCoreProgram, rustCoreEnvironment, rustCoreRootForProgram, selfTest } from '../core.mjs';
-import { coreProgram, linkCoreRuntimeIntoRelease, point, releaseLayout } from '../release.mjs';
+import { coreProgram, linkCoreRuntimeIntoRelease, point, releaseLayout, selectedMcpCommand } from '../release.mjs';
+import { matchesSelectedRustConnectorIdentity, RUST_CONNECTOR_KIND } from '../rust-connector.mjs';
 import { writePrivateFile } from '../secure-fs.mjs';
 import { CORE_ISSUER, CORE_REPOSITORY, CORE_REPOSITORY_ID, RUST_CORE_SIGNER, SLSA_PREDICATE,
   enforceRustCoreProvenance, sha256, verifyRustCoreArtifact } from '../core-attestation.mjs';
@@ -153,6 +154,38 @@ test('a selected native release remains runnable through rollback when the invok
   point(env, 'current', id);
   t.after(() => rm(parent, { recursive: true, force: true }));
   assert.equal(coreProgram(env), path.join(layout.current, 'core', RUST_CORE_ENTRYPOINT));
+});
+
+test('selected Rust Connector identity binds the exact release executable and runtime fields', async t => {
+  const parent = await mkdtemp(path.join(os.tmpdir(), 'sidevoice-rust-connector-identity-'));
+  const env = { ...process.env, HOME: parent, XDG_DATA_HOME: parent };
+  const layout = releaseLayout(env), id = 'selected-rust-runtime';
+  const directory = path.join(layout.releases, id);
+  const executable = path.join(directory, 'dist', 'sidevoice-rust');
+  const bytes = Buffer.from('selected Rust Connector test executable');
+  await mkdir(path.dirname(executable), { recursive: true, mode: 0o700 });
+  await writeFile(executable, bytes, { mode: 0o700 });
+  const runtimeSha = digest(bytes), connectorSource = 'c'.repeat(40), coreSource = 'b'.repeat(40);
+  const archiveSha = 'a'.repeat(64), coreBuild = `${RUST_CORE_KIND}-${rustCoreTarget()}-${coreSource}-${archiveSha}`;
+  const release = { id, connector: '0.6.0', format: 'sea', runtime_kind: RUST_CONNECTOR_KIND,
+    runtime_build_sha: connectorSource, runtime_sha256: runtimeSha, runtime_target: rustCoreTarget(), runtime_size: bytes.length,
+    core_kind: RUST_CORE_KIND, core_target: rustCoreTarget(), core_source_sha: coreSource,
+    core_archive_sha256: archiveSha, core_build: coreBuild,
+    pair_id: `pair-v1:${RUST_CONNECTOR_KIND}:${runtimeSha}:core:${coreBuild}` };
+  writePrivateFile(path.join(directory, 'release.json'), `${JSON.stringify(release)}\n`);
+  point(env, 'current', id);
+  t.after(() => rm(parent, { recursive: true, force: true }));
+
+  const selectedExecutable = path.join(layout.current, 'dist', 'sidevoice-rust');
+  assert.deepEqual(selectedMcpCommand(env), [selectedExecutable, '--installed', 'mcp']);
+  const identity = { version: release.connector, runtime_kind: release.runtime_kind,
+    runtime_build_sha: release.runtime_build_sha, runtime_sha256: release.runtime_sha256,
+    runtime_target: release.runtime_target, release_id: release.id,
+    executable: await realpath(executable) };
+  assert.equal(matchesSelectedRustConnectorIdentity(identity, release, layout.root), true);
+  for (const field of ['version', 'runtime_kind', 'runtime_build_sha', 'runtime_sha256', 'runtime_target', 'release_id', 'executable']) {
+    assert.equal(matchesSelectedRustConnectorIdentity({ ...identity, [field]: 'wrong' }, release, layout.root), false, field);
+  }
 });
 
 test('native self-test supplies fixed fixture/model paths and rejects a bad report or exit', async t => {
