@@ -97,7 +97,14 @@ pub async fn run(args: &[String]) -> Option<i32> {
                     _ => "command.unknown",
                 }
             };
-            let rendered = message(key, &json!({"detail":detail,"command":command}));
+            let rendered = message(
+                if key == "install.failed" {
+                    "install.failed-detail"
+                } else {
+                    key
+                },
+                &json!({"detail":detail,"command":command}),
+            );
             if json_output {
                 println!(
                     "{}",

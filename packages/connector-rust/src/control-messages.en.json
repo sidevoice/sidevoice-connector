@@ -14,5 +14,6 @@
   "install.usage": "Use sidevoice install [--harness claude|codex|cursor] [--no-agents] [--service] [--apply-now] [--json] [--progress=jsonl].",
   "uninstall.done": "Sidevoice was uninstalled.",
   "install.paired": "This machine is paired with {room}.",
-  "install.unpaired": "This machine is not paired with any room yet."
+  "install.unpaired": "This machine is not paired with any room yet.",
+  "install.failed-detail": "Installing Sidevoice failed: {detail}"
 }
