@@ -2123,7 +2123,7 @@ pub fn cli_text(result: &Value, argv: &[String]) -> String {
         );
     }
     let rows = result["agents"].as_array();
-    if rows.map_or(true, |rows| rows.is_empty()) {
+    if rows.is_none_or(|rows| rows.is_empty()) {
         return message("agents.list.empty", &Value::Null);
     }
     rows.unwrap().iter().map(|row| {

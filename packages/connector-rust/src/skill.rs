@@ -92,6 +92,13 @@ pub fn run_cli(profile: &Profile, argv: &[String]) -> Result<Value> {
     )
 }
 
+pub fn cli_text(result: &Value) -> String {
+    message(
+        "skill.result",
+        &json!({"state":result.get("action").unwrap_or(&result["state"]),"target":result["target"]}),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,11 +116,4 @@ mod tests {
         assert_eq!(target_state(&root.join("linked")).unwrap(), "foreign");
         fs::remove_dir_all(root).unwrap();
     }
-}
-
-pub fn cli_text(result: &Value) -> String {
-    message(
-        "skill.result",
-        &json!({"state":result.get("action").unwrap_or(&result["state"]),"target":result["target"]}),
-    )
 }

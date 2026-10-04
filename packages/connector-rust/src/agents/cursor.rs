@@ -1,4 +1,5 @@
 use super::*;
+use std::os::unix::fs::DirBuilderExt;
 
 impl HostAgents {
     pub(super) fn cursor_registration(&self) -> Result<String> {
@@ -48,7 +49,10 @@ impl HostAgents {
         if self.profile.is_installed() && !self.profile.cursor.exists() {
             validate_agent_config(&self.profile, &self.profile.cursor)
                 .map_err(|_| agent_failure("agents.invalid", AgentId::Cursor))?;
-            private_dir(&self.profile.cursor)
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&self.profile.cursor)
                 .map_err(|_| agent_failure("agents.invalid", AgentId::Cursor))?;
         }
         self.profile

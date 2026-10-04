@@ -825,3 +825,51 @@ async fn standalone_and_daemon_coordinators_share_an_operation_lock() {
     assert!(result.get("error").is_none(), "{result}");
     host.shutdown().await;
 }
+
+#[tokio::test]
+async fn first_cursor_connect_creates_private_config_but_scan_does_not() {
+    let mut fixture = Fixture::new();
+    fixture.profile.control_mode = true;
+    fs::remove_dir(&fixture.profile.cursor).unwrap();
+    let binary = fixture.root.join("bin/cursor");
+    private_mkdir(binary.parent().unwrap());
+    private_write(&binary, b"#!/bin/sh\nprintf 'Cursor fixture\\n'\n");
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut state = empty_state();
+    state["binaries"]["cursor"] = json!(binary);
+    write_json(&fixture.profile.data.join("agents.json"), &state);
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+
+    let listed = host
+        .handle("agents.list", json!({"rescan":true,"watch":"cursor"}))
+        .await;
+    assert!(listed.get("error").is_none(), "{listed}");
+    assert_eq!(row(&listed, "cursor")["registration"], "not-connected");
+    assert!(
+        !fixture.profile.cursor.exists(),
+        "discovery created Cursor configuration"
+    );
+
+    let connected = host.handle("agents.connect", json!({"id":"cursor"})).await;
+    assert!(connected.get("error").is_none(), "{connected}");
+    assert_eq!(row(&connected, "cursor")["registration"], "connected");
+    assert_eq!(
+        fs::metadata(&fixture.profile.cursor)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let config = fixture.profile.cursor.join("mcp.json");
+    assert_eq!(
+        fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let config: Value = serde_json::from_slice(&fs::read(config).unwrap()).unwrap();
+    assert_eq!(
+        config["mcpServers"]["sidevoice"]["command"],
+        fixture.selected().command
+    );
+    host.shutdown().await;
+}

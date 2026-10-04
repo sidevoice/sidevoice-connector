@@ -284,6 +284,21 @@ pub fn device_text(answer: &Value) -> Result<String> {
         text("pair-device.paste", json!({}))
     ))
 }
+/// CLI pairing confirmation; credentials themselves never appear in the result text.
+pub fn cli_text(profile: &Profile, result: &Value, linked: bool) -> String {
+    if let Some(error) = result.get("error") {
+        return error["message"].as_str().unwrap_or("").to_owned();
+    }
+    text(
+        if linked {
+            "pair.linked"
+        } else {
+            "pair.success"
+        },
+        json!({"room":result["room"],"connector_id":result["connector_id"],"file":profile.data.join("credentials.json")}),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,19 +434,4 @@ mod tests {
         assert_eq!(fs::read(&file).unwrap(), original);
         fs::remove_dir_all(root).unwrap();
     }
-}
-
-/// CLI pairing confirmation; credentials themselves never appear in the result text.
-pub fn cli_text(profile: &Profile, result: &Value, linked: bool) -> String {
-    if let Some(error) = result.get("error") {
-        return error["message"].as_str().unwrap_or("").to_owned();
-    }
-    text(
-        if linked {
-            "pair.linked"
-        } else {
-            "pair.success"
-        },
-        json!({"room":result["room"],"connector_id":result["connector_id"],"file":profile.data.join("credentials.json")}),
-    )
 }
