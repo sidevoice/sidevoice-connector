@@ -165,6 +165,8 @@ struct Job {
     pid: Option<u32>,
     reason: Option<&'static str>,
     restarting: bool,
+    runs: Option<u64>,
+    exit: Option<i64>,
 }
 async fn job(core: bool) -> Result<Job> {
     if manager() == "launchd" {
@@ -181,6 +183,8 @@ async fn job(core: bool) -> Result<Job> {
         };
         Ok(Job {
             loaded: true,
+            runs: field("runs").and_then(|s| s.parse().ok()),
+            exit: field("last exit code").and_then(|s| s.parse().ok()),
             active: field("state") == Some("running"),
             pid: field("pid").and_then(|s| s.parse().ok()),
             restarting: field("state") != Some("running") && field("last exit code") != Some("0"),
@@ -191,7 +195,7 @@ async fn job(core: bool) -> Result<Job> {
             "--user".into(),
             "show".into(),
             "-p".into(),
-            "LoadState,ActiveState,SubState,MainPID,Result".into(),
+            "LoadState,ActiveState,SubState,MainPID,Result,NRestarts,ExecMainStatus".into(),
             unit(core).into(),
         ])
         .await?;
@@ -200,6 +204,8 @@ async fn job(core: bool) -> Result<Job> {
                 .find_map(|l| l.strip_prefix(&format!("{name}=")))
         };
         Ok(Job {
+            runs: field("NRestarts").and_then(|s| s.parse().ok()),
+            exit: field("ExecMainStatus").and_then(|s| s.parse().ok()),
             loaded: field("LoadState") == Some("loaded"),
             active: field("ActiveState") == Some("active")
                 || field("ActiveState") == Some("activating"),
@@ -361,6 +367,9 @@ pub async fn status(p: &Paths, connector_self: bool) -> Result<Value> {
     };
     let reachable = health.is_some();
     let body = health.unwrap_or(Value::Null);
+    let ready = release::read_json(&p.data.join("core/core.json"))?;
+    let report = release::read_json(&p.data.join("core/core-failure.json"))?;
+    let program_missing = core_defined && core_program(p).is_ok_and(|program| !program.exists());
     let mut failure = Value::Null;
     let state = if !installed && !core_defined && !connector_defined {
         "absent"
@@ -368,24 +377,48 @@ pub async fn status(p: &Paths, connector_self: bool) -> Result<Value> {
         "not-installed"
     } else if stopped(p)? {
         "stopped-by-person"
-    } else if j.unknown || !j.loaded || j.reason.is_some() {
-        failure = json!({"key":j.reason.unwrap_or("not-loaded")});
+    } else if j.unknown || !j.loaded || j.reason.is_some() || program_missing {
+        failure = json!({"key":if program_missing{"program-missing"}else{j.reason.unwrap_or("not-loaded")}});
         "service-failed"
     } else if reachable {
         "running"
     } else if j.active {
-        "starting"
+        if j.pid.map(u64::from) != ready["pid"].as_u64() {
+            if let Some(pid) = j.pid {
+                if crate::service::process_age(pid)
+                    .await
+                    .is_some_and(|age| age > 60)
+                {
+                    failure = json!({"key":"ready.timeout","step":"ready"});
+                    "failed"
+                } else {
+                    "starting"
+                }
+            } else {
+                "starting"
+            }
+        } else {
+            failure = json!({"key":"hang","step":"health"});
+            "failed"
+        }
+    } else if !report.is_null() {
+        failure = report;
+        "failed"
     } else if j.restarting {
+        failure = json!({"key":"launch.exited","step":"run","detail":j.exit});
         "backoff"
     } else {
-        failure = release::read_json(&p.data.join("core/core-failure.json"))?;
-        if failure.is_null() {
-            failure = json!({"key":"launch.exited","step":"run"});
-        }
+        failure = json!({"key":"launch.exited","step":"run","detail":j.exit});
         "failed"
     };
+    if let Some(key) = failure["key"].as_str().map(str::to_owned) {
+        failure["message"] = json!(crate::agents::message(
+            &key,
+            &json!({"detail":failure["detail"]})
+        ));
+    }
     Ok(
-        json!({"ok":true,"service":manager(),"installed":installed,"state":state,"core":if reachable{json!({"pid":body["pid"],"version":body["version"],"api":body["api"],"launch_id":body["launch_id"]})}else{Value::Null},"calls":body["calls"],"failure":failure,"attempts":null,"limit":null,"since":null,"window_started":null,"next_retry_at":null,"reachable":reachable,"connector":{"running":connector_self||ipc(p,"status",json!({})).await?.is_some()}}),
+        json!({"ok":true,"service":manager(),"installed":installed,"state":state,"core":if reachable{json!({"pid":body["pid"],"version":body["version"],"api":body["api"],"launch_id":body["launch_id"]})}else{Value::Null},"calls":body["calls"],"failure":failure,"attempts":if state=="backoff"{json!(j.runs)}else{Value::Null},"limit":if state=="backoff"&&manager()=="systemd"{json!(5)}else{Value::Null},"since":null,"window_started":null,"next_retry_at":null,"reachable":reachable,"connector":{"running":connector_self||ipc(p,"status",json!({})).await?.is_some()}}),
     )
 }
 pub fn core_program(p: &Paths) -> Result<PathBuf> {
@@ -1059,4 +1092,11 @@ pub async fn run(p: &Paths, action: crate::service::Action) -> Result<Value> {
         result["linger"] = json!({"enabled":false,"command":format!("loginctl enable-linger {user}"),"reason":crate::agents::message("service.linger-reason",&json!({}))});
     }
     Ok(result)
+}
+
+pub async fn reload_after_uninstall() -> Result<()> {
+    if manager() == "systemd" {
+        checked(vec!["--user".into(), "daemon-reload".into()]).await?;
+    }
+    Ok(())
 }

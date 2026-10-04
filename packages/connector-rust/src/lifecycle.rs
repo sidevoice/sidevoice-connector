@@ -160,6 +160,8 @@ async fn stage(
         cancelled(c)?;
         let mut core = Command::new(temp.join("core/bin/sidevoice-core-rust"));
         core.arg("--self-test")
+            .arg(temp.join("core/checks/detector-16k.wav"))
+            .arg(temp.join("core/models"))
             .env("RUSTVANI_CACHE_DIR", temp.join("core/models"))
             .kill_on_drop(true);
         for key in [
@@ -176,7 +178,7 @@ async fn stage(
         ] {
             core.env_remove(key);
         }
-        let output = timeout(Duration::from_secs(60), core.output()).await??;
+        let output = timeout(Duration::from_secs(120), core.output()).await??;
         if !output.status.success() {
             return Err(crate::release::refusal(
                 "control.core-self-test-failed",
@@ -421,7 +423,9 @@ pub async fn install(
     let _lock = lock;
     cancelled(&cancellation)?;
     recover_gate(&p)?;
-    let manifest = manifest(&payload)?;
+    release::remove_leftovers(&p)?;
+    let manifest = manifest(&payload)
+        .map_err(|_| release::refusal("install.authenticity", json!({"check":"manifest"})))?;
     let next = candidate(&payload, &manifest)?;
     let current = p.selected("current")?;
     let action = release::decide(current.as_ref(), &next);
@@ -540,6 +544,7 @@ pub async fn install(
         )
         .await?
     };
+    release::prune(&p)?;
     progress(options.progress, "pairing");
     let paired = release::read_json(&p.data.join("credentials.json"))?;
     let state = service::status(&p, false).await?;
@@ -573,9 +578,13 @@ pub async fn uninstall() -> Result<Value> {
     service::stop_on_demand(&p).await?;
     let registrations =
         crate::agents::cleanup_owned(crate::proof::Profile::for_control_env()?).await?;
+    if registrations.get("error").is_some() {
+        return Err(release::refusal("install.failed", json!({})));
+    }
     for core in [true, false] {
         release::remove_file(&service::definition(&p, core)?)?;
     }
+    service::reload_after_uninstall().await?;
     // Delete only known Sidevoice files; foreign state is preserved. Permanent lock inodes stay in place.
     for name in [
         "install.json",
@@ -586,6 +595,8 @@ pub async fn uninstall() -> Result<Value> {
         "outbox.json",
         "proof.json",
         "connector.log",
+        "core.log",
+        "core.stderr.log",
         "connector.sock",
     ] {
         let path = p.data.join(name);
@@ -613,6 +624,7 @@ pub async fn uninstall() -> Result<Value> {
     for name in ["current", "previous", "verified"] {
         release::remove_file(&p.root.join(name))?;
     }
+    clean_core_state(&p.data.join("core"))?;
     Ok(json!({"ok":true,"done":registrations["done"],"next":registrations["next"]}))
 }
 
@@ -653,4 +665,32 @@ impl Drop for CandidateCleanup {
             let _ = fs::remove_dir_all(path);
         }
     }
+}
+
+fn clean_core_state(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    crate::proof::private_dir(path)?;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_string_lossy().ends_with(".lock") {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            return Err(release::refusal(
+                "control.uninstall-state-contains-a-link",
+                json!({}),
+            ));
+        }
+        if kind.is_dir() {
+            clean_core_state(&entry.path())?;
+            let _ = fs::remove_dir(entry.path());
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }

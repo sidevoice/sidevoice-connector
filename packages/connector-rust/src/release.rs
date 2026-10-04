@@ -639,3 +639,61 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+/// Remove interrupted staging only while the caller holds install.lock.
+pub fn remove_leftovers(p: &Paths) -> Result<()> {
+    for entry in fs::read_dir(p.root.join("releases"))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some((id, suffix)) = name.rsplit_once(".tmp-") {
+            if valid_id(id)
+                && !suffix.is_empty()
+                && suffix.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+            {
+                crate::proof::private_dir(&entry.path())?;
+                fs::remove_dir_all(entry.path())?;
+            }
+        }
+    }
+    for entry in fs::read_dir(&p.root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if [".current.", ".previous.", ".verified."]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+            && name.ends_with(".tmp")
+        {
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.file_type().is_symlink() && metadata.uid() == unsafe { libc::geteuid() } {
+                fs::remove_file(entry.path())?;
+            }
+        }
+    }
+    Ok(())
+}
+pub fn prune(p: &Paths) -> Result<()> {
+    let mut kept = std::collections::BTreeSet::new();
+    for name in ["current", "previous", "verified"] {
+        if let Some(v) = p.selected(name)? {
+            kept.insert(v["id"].as_str().context("release id")?.to_owned());
+        }
+    }
+    if kept.is_empty() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(p.root.join("releases"))? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if kept.contains(&name) || !valid_id(&name) || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let record = read_json(&entry.path().join("release.json"))?;
+        if record["id"].as_str() == Some(name.as_str()) {
+            crate::proof::private_dir(&entry.path())?;
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}

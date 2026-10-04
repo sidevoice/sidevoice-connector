@@ -1093,7 +1093,7 @@ fn parse_elapsed(value: &str) -> Option<u64> {
     Some(days * 86400 + seconds)
 }
 
-async fn process_age(pid: u32) -> Option<u64> {
+pub(crate) async fn process_age(pid: u32) -> Option<u64> {
     let pid = pid.to_string();
     let mut child = Command::new("/bin/ps")
         .args(["-o", "etime=", "-p", pid.as_str()])
