@@ -782,6 +782,9 @@ struct ProcessIdentity {
     argv: Vec<String>,
 }
 async fn process_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
+    process_observation(pid, true).await
+}
+async fn process_observation(pid: u32, include_arguments: bool) -> Result<Option<ProcessIdentity>> {
     if pid <= 1 {
         return Ok(None);
     }
@@ -815,8 +818,13 @@ async fn process_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
         if owner != unsafe { libc::geteuid() } {
             return Err(release::refusal("control.foreign-process-owner", json!({})));
         }
-        let Some(argv) = live_process_arguments(pid)? else {
-            return Ok(None);
+        let argv = if include_arguments {
+            let Some(argv) = live_process_arguments(pid)? else {
+                return Ok(None);
+            };
+            argv
+        } else {
+            Vec::new()
         };
         return Ok(Some(ProcessIdentity {
             start: fields[19].into(),
@@ -847,7 +855,7 @@ async fn process_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
     }
     let line = String::from_utf8(output.stdout)?;
     let fields: Vec<_> = line.split_whitespace().collect();
-    if fields.len() < 8 {
+    if fields.len() < 7 {
         return Err(release::refusal(
             "control.process-identity-unavailable",
             json!({}),
@@ -859,8 +867,13 @@ async fn process_identity(pid: u32) -> Result<Option<ProcessIdentity>> {
     if fields[1].parse::<u32>()? != unsafe { libc::geteuid() } {
         return Err(release::refusal("control.foreign-process-owner", json!({})));
     }
-    let Some(argv) = live_process_arguments(pid)? else {
-        return Ok(None);
+    let argv = if include_arguments {
+        let Some(argv) = live_process_arguments(pid)? else {
+            return Ok(None);
+        };
+        argv
+    } else {
+        Vec::new()
     };
     Ok(Some(ProcessIdentity {
         start: fields[2..7].join(" "),
@@ -892,9 +905,10 @@ async fn terminate_verified(pid: u32, expected: &ProcessIdentity) -> Result<()> 
     }
     let end = Instant::now() + Duration::from_secs(15);
     while Instant::now() < end {
-        // Exiting processes can lose argv before releasing their open files and locks.
-        // After signalling, wait for this process lifetime to end, not merely argv to change.
-        if process_identity(pid)
+        // Wait on owner/start/state only. Darwin KERN_PROCARGS2 returns EINVAL for
+        // an exiting task as well as permission errors, so errno cannot prove exit.
+        // Full argv identity is still required immediately before either signal.
+        if process_observation(pid, false)
             .await?
             .is_none_or(|identity| identity.start != expected.start)
         {
@@ -909,9 +923,10 @@ async fn terminate_verified(pid: u32, expected: &ProcessIdentity) -> Result<()> 
     }
     let end = Instant::now() + Duration::from_secs(5);
     while Instant::now() < end {
-        // Exiting processes can lose argv before releasing their open files and locks.
-        // After signalling, wait for this process lifetime to end, not merely argv to change.
-        if process_identity(pid)
+        // Wait on owner/start/state only. Darwin KERN_PROCARGS2 returns EINVAL for
+        // an exiting task as well as permission errors, so errno cannot prove exit.
+        // Full argv identity is still required immediately before either signal.
+        if process_observation(pid, false)
             .await?
             .is_none_or(|identity| identity.start != expected.start)
         {
