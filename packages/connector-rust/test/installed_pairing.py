@@ -8,6 +8,7 @@ waits until the already-running native Core dials the room using the credential 
 import json
 import os
 from pathlib import Path
+import plistlib
 import select
 import socket
 import subprocess
@@ -65,7 +66,7 @@ def main():
     if not sea.is_file() or not os.access(sea, os.X_OK):
         raise AssertionError(f'missing target SEA: {sea}')
 
-    with tempfile.TemporaryDirectory(prefix='sidevoice-rust-pair-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='svrp-', dir='/tmp') as temporary:
         root = Path(temporary)
         home = root / 'home'
         xdg_data = home / 'xdg-data'
@@ -74,6 +75,9 @@ def main():
         for directory in (home, xdg_data, xdg_config, data):
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             directory.chmod(0o700)
+        socket_path = os.path.realpath(data / 'core' / 'local.sock')
+        if len(os.fsencode(socket_path)) >= 100:
+            raise AssertionError(f'disposable Core socket path is too long: {socket_path}')
         env = dict(os.environ)
         for name in list(env):
             if name.startswith('SIDEVOICE_'):
@@ -81,6 +85,7 @@ def main():
         env.update({'HOME': str(home), 'XDG_DATA_HOME': str(xdg_data), 'XDG_CONFIG_HOME': str(xdg_config),
                     'SIDEVOICE_DATA_DIR': str(data), 'SIDEVOICE_INSTALL_VERIFY_MS': '120000',
                     'SIDEVOICE_CORE_PORT': '0'})
+        definition = home / 'Library' / 'LaunchAgents' / 'dev.sidevoice.core.plist'
 
         pair_request = {}
         auth_file = root / 'room-auth.json'
@@ -130,7 +135,15 @@ def main():
             install = subprocess.run([str(sea), 'install', '--service', '--no-agents', '--json'], env=env,
                                      capture_output=True, text=True, timeout=300)
             if install.returncode:
-                raise AssertionError(f'install failed: {install.stdout[-3000:]}\n{install.stderr[-3000:]}')
+                program = plistlib.loads(definition.read_bytes()).get('ProgramArguments') if definition.exists() else None
+                log = data / 'core.log'
+                tail = log.read_text(encoding='utf8')[-3000:] if log.exists() else None
+                raise AssertionError(f'install failed: {install.stdout[-3000:]}\n{install.stderr[-3000:]}'
+                                     f'\ncore_program={program!r}\ncore_socket={socket_path!r}'
+                                     f'\ncore_log_tail={tail!r}')
+            program = plistlib.loads(definition.read_bytes())['ProgramArguments']
+            if '--port' not in program or program[program.index('--port') + 1] != '0':
+                raise AssertionError(f'launchd did not receive the disposable Core port: {program!r}')
             installed = json.loads(install.stdout.strip().splitlines()[-1])
             release_root = xdg_data / 'sidevoice'
             release = json.loads((release_root / 'current' / 'release.json').read_text(encoding='utf8'))
