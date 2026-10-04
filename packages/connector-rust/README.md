@@ -20,7 +20,7 @@ The public commands remain `install`, `rollback`, `uninstall`, `service`, `agent
 
 `current`, `previous`, and `verified` remain the only selection pointers. New native releases retain `runtime_kind: "rust-native-v1"`, `core_kind: "rust-native-v1"`, separate byte digests, and the established pair ID. `format: "rust-native"` distinguishes the distributor from legacy `sea` and `esm` selections. Existing legacy releases are recognized for safe rollback and owned-registration cleanup; Node is not embedded in the new release.
 
-The existing npm/SEA build scripts and legacy runtime source remain for comparison and compatibility fixtures. They are **not** the native shipment. New release wiring must cease publishing/selecting those JavaScript runtime outputs before this migration is declared complete; registry/publication design is a separate coordinated handoff.
+The existing npm/SEA build scripts and legacy runtime source remain for comparison and compatibility fixtures. They are **not** the native shipment. The native migration branch disables their automatic publication and npm packaging. Those guards must be integrated together with the parent-owned native distribution and Desktop handoff; registry/publication design remains separate.
 
 ## Validation
 
@@ -38,4 +38,4 @@ The local speech outbox is synced to disk. Core's `text_saved: true` acknowledge
 
 Hosted proof includes the JS agent compatibility suite, the actual Codex CLI in a disposable profile, and the JS→Rust→JS handoff against authenticated Core v3 host routes. A copied JS speech row has no conversation reference; if Core later remints its binding ID, Rust retains and reports that unattributed row rather than assigning it to another conversation. [Connector issue #41](https://github.com/sidevoice/sidevoice-connector/issues/41) tracks that production migration rule, and [Core issue #43](https://github.com/sidevoice/sidevoice-core/issues/43) tracks crash-safe speech retention.
 
-In proof mode, the daemon writes `proof.json` with its PID, executable path and SHA-256, Core launch ID and successful protocol version. The file is evidence of what connected, not an installation record. No build from this directory is an upgrade artifact.
+In proof mode, the daemon writes `proof.json` with its PID, executable path and SHA-256, Core launch ID and successful protocol version. The file is evidence of what connected, not an installation record. A development build without the required native payload is not an upgrade artifact; the native builder above supplies and verifies that payload.

@@ -1,4 +1,6 @@
-# Sidevoice uplink — the client side (`@sidevoice/uplink`)
+# Legacy Sidevoice uplink (`@sidevoice/uplink`)
+
+This directory retains the retired JavaScript implementation and compatibility fixtures. It is private and cannot be packaged for publication. The current native control implementation and build entrypoint are documented in [connector-rust](../connector-rust/README.md). The behavior described below is historical; it does not describe the native distributor.
 
 The client side. One bin (`sidevoice`), these entry points:
 
