@@ -11,7 +11,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { keyed } from './i18n.mjs';
-import { dataDirOf, nodeFiles, runtimeSwitching } from './node-files.mjs';
+import { dataDirOf, nodeFiles, recordedInstallation, runtimeSwitching } from './node-files.mjs';
 import { selectedDaemonCommand, selection } from './release.mjs';
 import { installedService, status } from './service.mjs';
 
@@ -42,7 +42,7 @@ export async function launch({ connect, self, env = process.env }) {
     throw keyed(reason ? `service.${reason}` : 'connector.service-down', { detail: reason ?? now.state, state: now.state }, { status: now });
   }
   // A façade can outlive the release that launched it. Always start the release selected now.
-  const command = selection(env, 'current') ? selectedDaemonCommand(env) : self;
+  const command = recordedInstallation(env) && selection(env, 'current') ? selectedDaemonCommand(env) : self;
   const child = spawn(command[0], [...command.slice(1), 'connector'], { detached: true, stdio: 'ignore', env });
   child.on('error', () => {});
   child.unref();

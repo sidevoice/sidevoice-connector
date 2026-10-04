@@ -16,6 +16,7 @@ import { decide, point, releaseLayout } from '../release.mjs';
 import { RUST_CORE_ENTRYPOINT, RUST_CORE_KIND, rustCoreTarget } from '../rust-core.mjs';
 import { apply, rollback } from '../install.mjs';
 import { connectorClient } from '../ipc.mjs';
+import { launch } from '../launcher.mjs';
 import { runtimeSwitching } from '../node-files.mjs';
 import { writePrivateFile } from '../secure-fs.mjs';
 
@@ -53,6 +54,25 @@ test('versions: higher replaces, lower never does, and the same version only as 
   const source = { ...at('0.6.0', 'source'), id: '0.6.0-source', source: '/checkout' };
   assert.equal(decide(at('0.6.0'), source), 'upgrade', 'a checkout selects itself');
   assert.equal(decide(source, source), 'noop');
+});
+
+test('a standalone facade starts its own SEA despite an unrelated selected release', async t => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-standalone-launch-'));
+  const data = path.join(home, 'other-machine'), marker = path.join(home, 'launched');
+  const env = { ...process.env, HOME: home, XDG_DATA_HOME: path.join(home, 'xdg'),
+    SIDEVOICE_DATA_DIR: data, SIDEVOICE_SERVICE_MANAGER: 'none', SIDEVOICE_LAUNCH_MARKER: marker };
+  mkdirSync(data, { recursive: true, mode: 0o700 });
+  const layout = releaseLayout(env), id = 'unrelated';
+  mkdirSync(path.join(layout.releases, id), { recursive: true, mode: 0o700 });
+  writePrivateFile(path.join(layout.releases, id, 'release.json'), JSON.stringify({ id, format: 'sea' }));
+  point(env, 'current', id);
+  const self = path.join(home, 'standalone.mjs');
+  writeFileSync(self, 'import { writeFileSync } from "node:fs"; writeFileSync(process.env.SIDEVOICE_LAUNCH_MARKER, "launched");\n');
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const connected = await launch({ connect: async () => { if (existsSync(marker)) return true; throw new Error('not up'); },
+    self: [process.execPath, self], env });
+  assert.equal(connected, true);
+  assert.equal(readFileSync(marker, 'utf8'), 'launched');
 });
 
 test('runtime switch refuses a queued or unreadable outbox before staging or moving the release pointer', async t => {
