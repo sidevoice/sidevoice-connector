@@ -1525,9 +1525,14 @@ pub(crate) fn derive_status(observation: &Observation) -> Value {
         let key = if observation.core.unknown {
             "service.manager-unavailable"
         } else {
-            "service.not-loaded"
+            observation
+                .core
+                .reason
+                .as_deref()
+                .unwrap_or("service.not-loaded")
         };
-        result["failure"] = json!({"key":key,"message":message(key,&json!({"detail":"launchd"}))});
+        let params = json!({"detail":observation.service});
+        result["failure"] = json!({"key":key,"params":params,"message":message(key,&params)});
     } else if reachable {
         state = "running";
     } else if observation.core.running {
@@ -2093,6 +2098,19 @@ mod tests {
         current.manager_error = Some("launchctl unavailable".into());
         assert_eq!(derive_status(&current)["state"], "service-failed");
         current.manager_error = None;
+        current.service = "systemd";
+        current.core.reason = Some("service.start-limit".into());
+        let limited = derive_status(&current);
+        assert_eq!(limited["state"], "service-failed");
+        assert_eq!(limited["failure"]["key"], "service.start-limit");
+        assert_eq!(limited["failure"]["params"]["detail"], "systemd");
+        current.core.reason = None;
+        current.core.loaded = false;
+        let unloaded = derive_status(&current);
+        assert_eq!(unloaded["failure"]["key"], "service.not-loaded");
+        assert_eq!(unloaded["failure"]["params"]["detail"], "systemd");
+        current.core.loaded = true;
+        current.service = "launchd";
         current.core.running = false;
         current.core.pid = None;
         current.health = None;

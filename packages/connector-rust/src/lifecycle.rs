@@ -306,7 +306,9 @@ impl Drop for Gate {
         // A pointer already committed must retain its barrier for recovery, never restore the old gate.
         match self.paths.selected("current") {
             Ok(value)
-                if value.and_then(|value| value["id"].as_str().map(str::to_owned))
+                if value
+                    .as_ref()
+                    .and_then(|value| value["id"].as_str().map(str::to_owned))
                     == self.previous_id => {}
             _ => return,
         }
@@ -718,9 +720,11 @@ pub async fn install(
     progress(options.progress, "pairing");
     let paired = release::read_json(&p.data.join("credentials.json"))?;
     let state = service::status(&p, false).await?;
-    Ok(
-        json!({"ok":true,"action":action,"installed":chosen["id"],"connector":chosen["connector"],"core":chosen["core"],"channel":chosen["channel"],"command":service::stable_command(&p)?,"service":if managed{service::manager()}else{"none"},"state":state["state"],"agents":registrations,"paired":!paired.is_null(),"room":paired["url"]}),
-    )
+    let mut result = json!({"ok":true,"action":action,"installed":chosen["id"],"previous":current.as_ref().map(|value| value["id"].clone()),"connector":chosen["connector"],"core":chosen["core"],"channel":chosen["channel"],"command":service::stable_command(&p)?,"service":if managed{service::manager()}else{"none"},"state":state["state"],"agents":registrations,"paired":!paired.is_null(),"room":paired["url"]});
+    if managed && service::manager() == "systemd" {
+        result["linger"] = service::linger().await;
+    }
+    Ok(result)
 }
 pub async fn rollback(show: bool) -> Result<Value> {
     let p = Paths::environment()?;
