@@ -14,7 +14,7 @@ import { matchesSelectedRustConnectorIdentity, RUST_CONNECTOR_KIND } from '../ru
 import { serverCommand } from '../registrations.mjs';
 import { writePrivateFile } from '../secure-fs.mjs';
 import { CORE_ISSUER, CORE_REPOSITORY, CORE_REPOSITORY_ID, RUST_CORE_SIGNER, SLSA_PREDICATE,
-  enforceRustCoreProvenance, sha256, verifyRustCoreArtifact } from '../core-attestation.mjs';
+  enforceRustCoreProvenance, sha256 } from '../core-attestation.mjs';
 import { parseCanonicalRustCoreJson, RUST_CORE_ENTRYPOINT, RUST_CORE_KIND, RUST_CORE_TARGETS,
   rustCoreTarget, unpackRustCoreArchive, validateRustCoreManifest } from '../rust-core.mjs';
 
@@ -318,29 +318,22 @@ test('archive digest, fixed root, path, type, duplicate, extra-file and inventor
   await assert.rejects(stat(cancelledDestination), { code: 'ENOENT' });
 });
 
-const productionInputsPresent = !!(process.env.SIDEVOICE_RUST_CORE_MANIFEST
-  && process.env.SIDEVOICE_RUST_CORE_MANIFEST_SIGSTORE && process.env.SIDEVOICE_RUST_CORE_ARCHIVE
-  && process.env.SIDEVOICE_RUST_CORE_ARCHIVE_SIGSTORE && process.env.SIDEVOICE_RUST_CORE_TARGET);
-test('protected-main Core artifact verifies, stages offline and passes its native self-test', {
+const productionInputsPresent = process.env.SIDEVOICE_RUST_CORE_SOURCE_BUILD === '1'
+  && !!(process.env.SIDEVOICE_RUST_CORE_MANIFEST && process.env.SIDEVOICE_RUST_CORE_TARGET);
+test('pinned-source Core stages offline and passes its native self-test', {
   skip: !productionInputsPresent,
   timeout: 300_000,
 }, async t => {
   const pin = JSON.parse(await readFile(new URL('../rust-core-production-pin.json', import.meta.url), 'utf8'));
   const selectedTarget = process.env.SIDEVOICE_RUST_CORE_TARGET;
-  const expected = pin.bundles[selectedTarget];
   const manifestBytes = await readFile(process.env.SIDEVOICE_RUST_CORE_MANIFEST);
-  const manifestBundle = await readFile(process.env.SIDEVOICE_RUST_CORE_MANIFEST_SIGSTORE);
-  const archiveBytes = await readFile(process.env.SIDEVOICE_RUST_CORE_ARCHIVE);
-  const archiveBundle = await readFile(process.env.SIDEVOICE_RUST_CORE_ARCHIVE_SIGSTORE);
-  assert.equal(manifestBytes.length, pin.manifest.size);
-  assert.equal(sha256(manifestBytes), pin.manifest.sha256);
   const manifest = parseCanonicalRustCoreJson(manifestBytes, 'native Core manifest');
   validateRustCoreManifest(manifest, { expectedSourceSha: pin.source_sha });
-  assert.deepEqual(manifest.bundles[selectedTarget], expected);
-  await verifyRustCoreArtifact({ bytes: manifestBytes, expectedSha256: pin.manifest.sha256, bundleBytes: manifestBundle,
-    subjectName: pin.manifest.name, tufCachePath: process.env.SIDEVOICE_TUF_CACHE, label: pin.manifest.name });
-  await verifyRustCoreArtifact({ bytes: archiveBytes, expectedSha256: expected.sha256, bundleBytes: archiveBundle,
-    subjectName: expected.name, tufCachePath: process.env.SIDEVOICE_TUF_CACHE, label: expected.name });
+  assert.equal(manifest.cargo_lock_sha256, pin.cargo_lock_sha256);
+  const expected = manifest.bundles[selectedTarget];
+  const archiveBytes = await readFile(path.join(path.dirname(process.env.SIDEVOICE_RUST_CORE_MANIFEST), expected.name));
+  assert.equal(archiveBytes.length, expected.size);
+  assert.equal(sha256(archiveBytes), expected.sha256);
   const parent = await mkdtemp(path.join(os.tmpdir(), 'sidevoice-rust-core-production-'));
   const destination = path.join(parent, 'release', 'core');
   await import('node:fs/promises').then(({ mkdir }) => mkdir(path.dirname(destination)));

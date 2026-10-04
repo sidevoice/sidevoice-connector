@@ -18,14 +18,9 @@ jobs:
     name: ${{ matrix.target }}
     strategy:
       fail-fast: false
+      # Routine PRs prove the Mac beta target. Exact-head dispatch and main prove all targets.
       matrix:
-        include:
-          - runner: macos-15
-            target: macos-aarch64
-          - runner: ubuntu-24.04
-            target: linux-x86_64
-          - runner: ubuntu-24.04-arm
-            target: linux-aarch64
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"runner":"macos-15","target":"macos-aarch64"}]' || '[{"runner":"macos-15","target":"macos-aarch64"},{"runner":"ubuntu-24.04","target":"linux-x86_64"},{"runner":"ubuntu-24.04-arm","target":"linux-aarch64"}]') }}
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
