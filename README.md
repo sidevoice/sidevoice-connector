@@ -9,7 +9,6 @@
   <a href="https://www.npmjs.com/package/@sidevoice/uplink"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/npm/v/@sidevoice/uplink.svg?variant=secondary&size=sm&mode=dark" /><img alt="npm version" src="https://shieldcn.dev/npm/v/@sidevoice/uplink.svg?variant=secondary&size=sm&mode=light" /></picture></a>
   <a href="https://github.com/sidevoice/sidevoice-connector/actions/workflows/ci.yml"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/ci/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&workflow=ci.yml&branch=main&mode=dark" /><img alt="CI status" src="https://shieldcn.dev/github/ci/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&workflow=ci.yml&branch=main&mode=light" /></picture></a>
   <a href="LICENSE"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/license/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&mode=dark" /><img alt="licence" src="https://shieldcn.dev/github/license/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&mode=light" /></picture></a>
-  <picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/node-22+.svg?variant=secondary&size=sm&logo=nodedotjs&mode=dark" /><img alt="requires Node.js 22 or newer" src="https://shieldcn.dev/badge/node-22+.svg?variant=secondary&size=sm&logo=nodedotjs&mode=light" /></picture>
   <picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/status-beta.svg?variant=secondary&size=sm&mode=dark" /><img alt="status: beta" src="https://shieldcn.dev/badge/status-beta.svg?variant=secondary&size=sm&mode=light" /></picture>
 </p>
 
@@ -19,8 +18,8 @@ Reading your coding agent's plans, diffs and summaries all day is tiring. **Side
 already have with your agent into a voice call. The agent keeps its context and keeps writing as usual; it also
 speaks its replies, and you answer by voice and can interrupt it — from the sofa or on a walk, not only at your desk.
 
-**sidevoice-connector** is what you install on the machine where your agents run, published on npm as
-[`@sidevoice/uplink`](https://www.npmjs.com/package/@sidevoice/uplink). It gives each agent conversation its voice
+**sidevoice-connector** is what you install on the machine where your agents run, delivered as a native executable. The historical npm package
+[`@sidevoice/uplink`](https://www.npmjs.com/package/@sidevoice/uplink) is retained as a legacy compatibility reference and is not the new native shipment. It gives each agent conversation its voice
 tools (an MCP server), delivers what you say into that same conversation, and installs and starts the
 machine's [core](https://github.com/sidevoice/sidevoice-core).
 
@@ -38,18 +37,18 @@ app, a browser).
 
 ## Get started
 
-You need Node.js 22 or newer and [uv](https://docs.astral.sh/uv/) (the core runs on Python, which uv provides).
+The native migration candidate is delivered as one `sidevoice` executable with its pinned Core embedded. Obtain it through the reviewed artifact handoff; native distribution and Desktop selection are coordinated separately. The current beta pin is unchanged. Node.js, Python and uv are not required by the new installed runtime.
 
 1. **Install**, on the machine where your agents run:
 
    ```sh
-   npx -y @sidevoice/uplink install
+   ./sidevoice install
    ```
 
    It installs and starts this machine's core, registers the voice tools with the agents it finds, and tells you
    what, if anything, needs a manual step (see [Supported agents](#supported-agents)).
 
-2. **Pair your device.** Ask your agent to pair a device, or run `npx @sidevoice/uplink pair-device`. You get a
+2. **Pair your device.** Ask your agent to pair a device, or run `./sidevoice pair-device`. You get a
    one-time code; enter it in the [desktop app](https://github.com/sidevoice/sidevoice-desktop). Pairing is always
    your act: nothing pairs on its own.
 
@@ -73,11 +72,11 @@ working. Reaching your machine from outside your network needs a relay, which is
 
 ## Commands
 
-The package installs one command, `sidevoice`:
+The native executable provides one command, `sidevoice`:
 
 | Command | What it does |
 |---|---|
-| `install` | Installs this machine's core, starts it, checks it answers, then registers the voice tools. `--no-core` skips the core. |
+| `install` | Installs this machine's core, starts it, checks it answers, then registers the voice tools. The native pair always includes Core. |
 | `uninstall` | The reverse of `install`: unregisters the voice tools, stops the connector and removes what it installed. Agent configuration files it did not write are never edited; it prints what to remove. |
 | `pair-device` | Prints a one-time code (and its QR) that pairs a device with this machine. |
 | `mcp` | The MCP server an agent starts, one per conversation. You do not run it yourself. |
@@ -89,13 +88,11 @@ The package installs one command, `sidevoice`:
 
 ```sh
 npm ci
-npm test               # node --test, on the source
-npm run build          # the bundled dist/cli.mjs that npm publishes
+npm test               # legacy JavaScript compatibility fixtures
+npm run build          # legacy fixture bundle only; packaging/publication is disabled
 ```
 
-The published package has no runtime dependencies: esbuild bundles everything into `dist/cli.mjs`.
-`SIDEVOICE_CORE_WHEEL=<wheel> npm run build` embeds the pinned core's wheel; installing it still lets uv download
-Python and the core's dependencies.
+Native build and hosted verification instructions are in [`packages/connector-rust/README.md`](packages/connector-rust/README.md). The private JavaScript workspace remains available for regression comparisons and legacy rollback fixtures; `npm pack` and legacy publishing fail closed.
 
 ## Contributing
 

@@ -7,17 +7,11 @@
   "engines": {
     "node": ">=22"
   },
-  "bin": {
-    "sidevoice": "./dist/cli.mjs"
-  },
-  "files": [
-    "dist",
-    "README.md"
-  ],
+  "files": [],
   "scripts": {
     "build": "node build.mjs",
     "build:sea": "SIDEVOICE_BUILD_SEA=1 node build.mjs",
-    "prepack": "npm run build",
+    "prepack": "node refuse-legacy-pack.mjs",
     "test": "node --test test/test_agents.mjs test/test_connector.mjs test/test_r4.mjs test/test_rust_core.mjs"
   },
   "repository": {
@@ -33,5 +27,6 @@
     "socket.io": "^4.8.3",
     "socket.io-client": "^4.8.3",
     "tar-stream": "3.1.7"
-  }
+  },
+  "private": true
 }

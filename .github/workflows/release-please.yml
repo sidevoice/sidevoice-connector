@@ -46,7 +46,7 @@ jobs:
   assets:
     name: Release assets
     needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    if: ${{ false }} # Retired JS/npm publisher; native handoff owns future publication.
     permissions:
       contents: write
     uses: ./.github/workflows/ci.yml
@@ -58,7 +58,7 @@ jobs:
   npm-gate:
     name: The npm environment asks for approval
     needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    if: ${{ false }} # Retired JS/npm publisher; native handoff owns future publication.
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -75,6 +75,7 @@ jobs:
           fi
 
   npm:
+    if: ${{ false }} # The JavaScript runtime is no longer a distributable.
     name: Client to npm (approved by a maintainer)
     needs: [release-please, assets, npm-gate]
     runs-on: ubuntu-24.04
@@ -106,6 +107,7 @@ jobs:
           npm publish "$TGZ" --access public --tag "$DIST_TAG"
 
   github-release:
+    if: ${{ false }} # Do not publish legacy assets while native distribution is coordinated.
     name: Publish the release (a version with -rc.N is a pre-release, never latest)
     needs: [release-please, npm]
     runs-on: ubuntu-24.04

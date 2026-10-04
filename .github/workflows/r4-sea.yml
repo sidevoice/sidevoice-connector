@@ -1,9 +1,7 @@
-name: R4-b Node SEA
+name: Legacy SEA compatibility fixture
 
+# Retained only for explicit legacy compatibility fixtures, never new shipment.
 on:
-  pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -15,6 +13,7 @@ concurrency:
 
 jobs:
   sea:
+    if: github.ref != 'refs/heads/main' # Legacy fixtures cannot produce a main artifact or pin.
     name: ${{ matrix.target }}
     strategy:
       fail-fast: false

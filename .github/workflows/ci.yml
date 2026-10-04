@@ -79,9 +79,8 @@ jobs:
           install -m 644 test/second-uid-probe.mjs /tmp/second-uid-probe.mjs
           sudo -u sidevoice-other "$(command -v node)" /tmp/second-uid-probe.mjs "$HOME/.sidevoice" "$url"
           kill %1 %2
-      - name: Package contents (dry run)
-        run: npm pack --dry-run
-        working-directory: packages/connector
+      - name: Legacy runtime cannot be packaged
+        run: python3 packages/connector-rust/tools/check-native-shipment.py --source-only
 
   # The connector against the real core, not the fake: the connector job links to a core it did not start, on its
   # socket (no Origin, a loopback Host), registers a binding and gets a device code minted there, and finds the link
@@ -172,7 +171,8 @@ jobs:
   package:
     name: npm tarball with the core inside
     needs: client
-    if: ${{ inputs.release-tag || ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main') }}
+    # Retired JS runtime: native publication is a separate coordinated handoff.
+    if: ${{ false }}
     runs-on: ubuntu-24.04
     outputs:
       # Where the assets go: the release that called this, or the rolling `nightly` pre-release on a push to main.
@@ -262,7 +262,7 @@ jobs:
   publish:
     name: Attach (release) or publish (nightly)
     needs: package
-    if: needs.package.outputs.publish != ''
+    if: ${{ false }} # Never publish the retired JS runtime.
     runs-on: ubuntu-24.04
     permissions:
       contents: write

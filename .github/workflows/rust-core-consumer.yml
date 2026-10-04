@@ -1,15 +1,8 @@
-name: Rust Core source dependency
+name: Legacy pair source compatibility fixture
 
+# Retained only for explicit legacy compatibility fixtures, never new shipment.
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - 'packages/connector/**'
-      - 'packages/connector-rust/**'
-      - 'package.json'
-      - 'package-lock.json'
-      - '.github/workflows/rust-core-consumer.yml'
 
 permissions:
   contents: read
@@ -24,6 +17,7 @@ env:
 
 jobs:
   core-native:
+    if: github.ref != 'refs/heads/main' # Legacy fixtures cannot produce a main artifact or pin.
     name: Build pinned Core (${{ matrix.target }})
     strategy:
       fail-fast: false
