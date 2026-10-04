@@ -87,7 +87,7 @@ export function inboundWarning(env = process.env) {
  *  job its manager will not run, ends the wait at once. With no manager, the core is started on demand from `current`
  *  (it leaves by itself when unused); `fresh`: it must be that very start — a core already serving, of whatever
  *  release, proves nothing about this one. `{ok}` or `{ok: false, failure}`. */
-async function verify(env, release, kind, { fresh = false } = {}) {
+async function verify(env, release, kind, { fresh = false, previousLaunchId = null } = {}) {
   const dataDir = dataDirOf(env);
   if (kind === 'none') {
     try {
@@ -98,9 +98,15 @@ async function verify(env, release, kind, { fresh = false } = {}) {
   }
   const deadline = Date.now() + VERIFY_MS();
   let last = null;
+  let staleLaunch = false;
   while (Date.now() < deadline) {
     last = await status(env);
     if (last.state === 'running' && last.core?.version === release.core) {
+      if (previousLaunchId && last.core.launch_id === previousLaunchId) {
+        staleLaunch = true;
+        await wait(250);
+        continue;
+      }
       if (!compatibleCore(last.core, readReady(dataDir))) return { ok: false, failure: { key: 'install.incompatible', message: t('install.incompatible') } };
       const answered = await askConnector('status', {}, { env, timeout: 1500 });
       if (answered?.version === release.connector) return { ok: true };
@@ -108,11 +114,14 @@ async function verify(env, release, kind, { fresh = false } = {}) {
     if (settledState(last) && last.state !== 'running') return { ok: false, failure: last.failure };
     await wait(250);
   }
-  return { ok: false, failure: last?.failure ?? { key: 'ready.timeout', message: t('ready.timeout') } };
+  return { ok: false, failure: staleLaunch
+    ? { key: 'install.not-selected', message: t('install.not-selected', { detail: 'the previous Core launch still serves' }) }
+    : last?.failure ?? { key: 'ready.timeout', message: t('ready.timeout') } };
 }
 
 /** Whether the jobs run the selection already (a re-run finds them on it, or on what ran before a crash). */
 async function runsSelection(env, release) {
+  if (selection(env, 'verified')?.id !== release.id) return false;
   const now = await status(env);
   if (now.state !== 'running' || now.core?.version !== release.core) return false;
   return (await askConnector('status', {}, { env, timeout: 1500 }))?.version === release.connector;
@@ -184,7 +193,7 @@ async function callsEnd(env, progress, { signal, progressEvent = () => {} } = {}
 /** Steps 1–9 under the install lock. `core: false` (`--no-core`) stages no core: nothing to run, nothing verified.
  *  Returns `{action: 'install'|'upgrade'|'noop'|'rollback'|'failed', release, from, failure?, back?, kind}`. */
 export async function apply(env, { core = true, service = false, applyNow = false, progress = () => {}, log = () => {},
-  afterSelection = null, signal, progressEvent = () => {}, beginCommit = () => {} } = {}) {
+  afterSelection = null, signal, progressEvent = () => {}, beginCommit = () => {}, candidateRelease = null } = {}) {
   if (embeddedRustCoreIdentity() && !core) throw keyed('install.authenticity', { check: 'manifest' });
   const dataDir = dataDirOf(env), files = nodeFiles(dataDir);
   let stagedRuntimeId = null;
@@ -197,7 +206,8 @@ export async function apply(env, { core = true, service = false, applyNow = fals
     const current = selection(env, 'current')?.release ?? null;
     // A release without a core (`--no-core`) is one of its own, and does not satisfy an install that needs the core:
     // that one stages a complete release instead.
-    const next = { ...candidate(env), ...(core ? {} : { id: `${candidate(env).id}-nocore` }) };
+    const proposed = candidateRelease ?? candidate(env);
+    const next = { ...proposed, ...(core ? {} : { id: `${proposed.id}-nocore` }) };
     let action = decide(current, next);
     if (action === 'noop' && core && current && !current.core_build) action = 'upgrade';
     let chosen = current;
@@ -221,6 +231,7 @@ export async function apply(env, { core = true, service = false, applyNow = fals
     await pause('install-after-commit');
     recordInstallation(env);
     const kind = core && (service || installedService(env)) ? managerKind(env) : 'none';
+    let previousLaunchId = null;
     if (!core || !chosen.core_build) {
       const registrations = afterSelection?.();
       prune(env, dataDir);
@@ -232,7 +243,9 @@ export async function apply(env, { core = true, service = false, applyNow = fals
       recordInstallation(env, { definitions: jobDefinitions(kind, env) });
       crash('definitions-written');
       if (!had) await stopOnDemand(env);
+      const oldLaunchId = readReady(dataDir)?.launch_id ?? null;
       const restart = action !== 'noop' || !(await runsSelection(env, chosen));
+      if (restart) previousLaunchId = oldLaunchId;
       if (restart) progressEvent({ step: 'service-start', done: null, total: null });
       await startJobs(env, { changed, restart });
     }
@@ -241,7 +254,7 @@ export async function apply(env, { core = true, service = false, applyNow = fals
     // demand is stopped first — a core of the release before would answer for it otherwise.
     const fresh = kind === 'none' && (action !== 'noop' || selection(env, 'verified')?.id !== chosen.id);
     if (fresh) await stopOnDemand(env);
-    const verified = await verify(env, chosen, kind, { fresh });
+    const verified = await verify(env, chosen, kind, { fresh, previousLaunchId });
     if (verified.ok) {
       markVerified(env, chosen.id);
       const registrations = afterSelection?.();

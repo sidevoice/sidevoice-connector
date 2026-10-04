@@ -1,14 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createZstdCompress } from 'node:zlib';
 import tar from 'tar-stream';
 import { finished } from 'node:stream/promises';
 import { spawnSync } from 'node:child_process';
-import { coreArgs, isRustCoreProgram, rustCoreEnvironment, rustCoreRootForProgram, selfTest } from '../core.mjs';
+import { CORE_VERSION, coreArgs, isRustCoreProgram, rustCoreEnvironment, rustCoreRootForProgram, selfTest } from '../core.mjs';
+import { coreProgram, linkCoreRuntimeIntoRelease, point, releaseLayout } from '../release.mjs';
+import { writePrivateFile } from '../secure-fs.mjs';
 import { CORE_ISSUER, CORE_REPOSITORY, CORE_REPOSITORY_ID, RUST_CORE_SIGNER, SLSA_PREDICATE,
   enforceRustCoreProvenance, sha256, verifyRustCoreArtifact } from '../core-attestation.mjs';
 import { parseCanonicalRustCoreJson, RUST_CORE_ENTRYPOINT, RUST_CORE_KIND, RUST_CORE_TARGETS,
@@ -131,6 +133,28 @@ test('native Core service launch is fixed to its release paths and clears ambien
   assert.equal(original.RUSTVANI_CACHE_DIR, '/untrusted/models', 'the caller environment stays unchanged');
 });
 
+test('a selected native release remains runnable through rollback when the invoking package embeds no Core', async t => {
+  const parent = await mkdtemp(path.join(os.tmpdir(), 'sidevoice-rust-core-rollback-'));
+  const env = { ...process.env, XDG_DATA_HOME: parent, HOME: parent };
+  const layout = releaseLayout(env), id = 'previous-native-release';
+  const directory = path.join(layout.releases, id), binary = path.join(directory, 'core', RUST_CORE_ENTRYPOINT);
+  await mkdir(path.dirname(binary), { recursive: true, mode: 0o700 });
+  await writeFile(binary, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+  const archiveSha = 'a'.repeat(64), runtimeSha = 'b'.repeat(64);
+  const coreBuild = `${RUST_CORE_KIND}-${rustCoreTarget()}-${sourceSha}-${archiveSha}`;
+  const release = { id, connector: '0.6.1', core: CORE_VERSION, core_build: coreBuild,
+    channel: 'release', build_seq: 0, format: 'sea', runtime_kind: 'javascript',
+    runtime_build_sha: null, runtime_sha256: runtimeSha,
+    pair_id: `pair-v1:javascript:${runtimeSha}:core:${coreBuild}`,
+    core_kind: RUST_CORE_KIND, core_source_sha: sourceSha, core_cargo_lock_sha256: '1'.repeat(64),
+    core_manifest_sha256: '2'.repeat(64), core_target: rustCoreTarget(), core_archive_sha256: archiveSha,
+    core_archive_size: 123, core_entrypoint: RUST_CORE_ENTRYPOINT };
+  writePrivateFile(path.join(directory, 'release.json'), `${JSON.stringify(release)}\n`);
+  point(env, 'current', id);
+  t.after(() => rm(parent, { recursive: true, force: true }));
+  assert.equal(coreProgram(env), path.join(layout.current, 'core', RUST_CORE_ENTRYPOINT));
+});
+
 test('native self-test supplies fixed fixture/model paths and rejects a bad report or exit', async t => {
   const parent = await mkdtemp(path.join(os.tmpdir(), 'sidevoice-rust-core-self-test-'));
   const binary = path.join(parent, 'sidevoice-core-rust');
@@ -183,6 +207,20 @@ test('fixed-root archive extraction verifies inventory and strips exactly one ro
   assert.equal((await stat(path.join(destination, RUST_CORE_ENTRYPOINT))).mode & 0o111, 0o111);
   const names = await (await import('node:fs/promises')).readdir(destination);
   assert.deepEqual(names.sort(), ['bin', 'checks', 'models', 'notices']);
+  const temporaryRelease = path.dirname(destination), finalRelease = path.join(parent, 'renamed-release');
+  linkCoreRuntimeIntoRelease(temporaryRelease, { kind: RUST_CORE_KIND, bin: path.join(destination, RUST_CORE_ENTRYPOINT) });
+  await rename(temporaryRelease, finalRelease);
+  const installedFiles = [];
+  async function walk(directory) {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      assert.equal(entry.isSymbolicLink(), false, `native release contains a symlink: ${path.join(directory, entry.name)}`);
+      const full = path.join(directory, entry.name);
+      if (entry.isDirectory()) await walk(full);
+      else { assert.equal(entry.isFile(), true); installedFiles.push(path.relative(path.join(finalRelease, 'core'), full)); }
+    }
+  }
+  await walk(path.join(finalRelease, 'core'));
+  assert.deepEqual(installedFiles.sort(), Object.keys(required).sort(), 'the renamed native release contains exactly the verified inventory');
 });
 
 test('archive digest, fixed root, path, type, duplicate, extra-file and inventory failures leave no stage', async t => {
