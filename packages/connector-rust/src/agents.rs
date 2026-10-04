@@ -1108,7 +1108,12 @@ pub(crate) fn message(key: &str, params: &Value) -> String {
         let mut messages: HashMap<String, String> =
             serde_json::from_str(include_str!("../../connector/messages/agent-errors.json"))
                 .expect("embedded agent message bundle must be valid JSON");
-        messages.extend(serde_json::from_str::<HashMap<String, String>>(include_str!("../../connector/messages/en.json")).expect("shared English messages"));
+        messages.extend(
+            serde_json::from_str::<HashMap<String, String>>(include_str!(
+                "../../connector/messages/en.json"
+            ))
+            .expect("shared English messages"),
+        );
         messages.extend(
             serde_json::from_str::<HashMap<String, String>>(include_str!(
                 "control-messages.en.json"
@@ -1120,6 +1125,12 @@ pub(crate) fn message(key: &str, params: &Value) -> String {
                 "interaction-messages.en.json"
             ))
             .expect("embedded interaction message bundle must be valid JSON"),
+        );
+        messages.extend(
+            serde_json::from_str::<HashMap<String, String>>(include_str!(
+                "../lifecycle-messages.en.json"
+            ))
+            .expect("lifecycle messages"),
         );
         messages
     });

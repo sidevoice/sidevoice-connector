@@ -58,13 +58,29 @@ pub async fn run(args: &[String]) -> Option<i32> {
                     println!("{answer}");
                 }
             }
-            if answer.get("ok") == Some(&Value::Bool(false)) || answer.get("error").is_some() {
+            let result = answer
+                .get("result")
+                .filter(|_| answer.get("_text").is_some())
+                .unwrap_or(&answer);
+            if result.get("ok") == Some(&Value::Bool(false)) || result.get("error").is_some() {
                 1
             } else {
                 0
             }
         }
         Err(error) => {
+            if error
+                .downcast_ref::<crate::release::ControlError>()
+                .is_some()
+            {
+                let answer = crate::lifecycle::error_value(&error);
+                if json_output {
+                    println!("{answer}");
+                } else {
+                    eprintln!("{}", answer["error"]["message"].as_str().unwrap_or(""));
+                }
+                return Some(1);
+            }
             let detail = error.to_string();
             let key = if detail.split_whitespace().count() == 1 && detail.contains('.') {
                 detail.as_str()
@@ -113,8 +129,14 @@ async fn dispatch(command: &str, args: &[String]) -> Result<Value> {
             crate::daemon::run(profile, flag(args, "--service")).await?;
             Ok(Value::Null)
         }
-        "agents" => agents::run_cli(Profile::for_control_env()?, args).await,
-        "skill" => crate::skill::run_cli(&Profile::for_control_env()?, args),
+        "agents" => {
+            let result = agents::run_cli(Profile::for_control_env()?, args).await?;
+            Ok(json!({"_text":agents::cli_text(&result,args),"result":result}))
+        }
+        "skill" => {
+            let result = crate::skill::run_cli(&Profile::for_control_env()?, args)?;
+            Ok(json!({"_text":crate::skill::cli_text(&result),"result":result}))
+        }
         "pair" | "link-room" => {
             let positional: Vec<&str> = args
                 .iter()
@@ -126,12 +148,14 @@ async fn dispatch(command: &str, args: &[String]) -> Result<Value> {
                 if positional.len() != 2 {
                     bail!("pair.arguments");
                 }
-                pairing::run_pair(&profile, positional[0], positional[1]).await
+                let result = pairing::run_pair(&profile, positional[0], positional[1]).await?;
+                Ok(json!({"_text":pairing::cli_text(&profile,&result,false),"result":result}))
             } else {
                 if positional.len() != 1 {
                     bail!("pair.arguments");
                 }
-                pairing::link_room(&profile, positional[0]).await
+                let result = pairing::link_room(&profile, positional[0]).await?;
+                Ok(json!({"_text":pairing::cli_text(&profile,&result,true),"result":result}))
             }
         }
         "pair-device" => {
