@@ -88,7 +88,7 @@ impl HostAgents {
             if enabled && command == self.selected.command && args == self.selected.args {
                 "connected"
             } else {
-                "not-connected"
+                "owned-old"
             }
             .into(),
         )
@@ -236,7 +236,7 @@ impl HostAgents {
             .await?;
         match state.as_str() {
             "not-connected" => Ok(()),
-            "connected" => {
+            "connected" | "owned-old" => {
                 self.run_cli_required(
                     binary,
                     &["mcp", "remove", "sidevoice"],

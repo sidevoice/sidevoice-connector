@@ -1,7 +1,7 @@
 use super::*;
 
 impl HostAgents {
-    async fn claude_entry_state(
+    pub(super) async fn claude_entry_state(
         &self,
         binary: Option<&str>,
         cancel: &Cancellation,
@@ -172,11 +172,11 @@ impl HostAgents {
         let binary =
             binary.ok_or_else(|| agent_failure("agents.registration-unknown", AgentId::Claude))?;
         let state = self
-            .claude_registration(Some(binary), cancel, deadline)
+            .claude_entry_state(Some(binary), cancel, deadline)
             .await?;
         match state.as_str() {
-            "not-connected" => Ok(()),
-            "connected" => {
+            "absent" => Ok(()),
+            "connected" | "owned-old" => {
                 self.run_cli_required(
                     binary,
                     &["mcp", "remove", "--scope", "user", "sidevoice"],

@@ -59,6 +59,7 @@ impl Fixture {
             core_ready: data.join("core/core.json"),
             data,
             installed: None,
+            control_mode: false,
         };
         Self { root, profile }
     }
@@ -692,4 +693,91 @@ async fn wait_for_file(path: &Path) {
         sleep(StdDuration::from_millis(10)).await;
     }
     panic!("timed out waiting for fixture marker {}", path.display());
+}
+
+#[test]
+fn installed_ownership_covers_legacy_without_accepting_unrelated_programs() {
+    let fixture = Fixture::new();
+    let root = fixture.root.join("selected");
+    let command = InstalledCommand {
+        command: root
+            .join("current/dist/sidevoice-rust")
+            .to_string_lossy()
+            .into_owned(),
+        args: vec!["--installed".into(), "mcp".into()],
+        version: "test".into(),
+        ownership: Ownership::Installed {
+            release_root: root.clone(),
+            recorded_program: None,
+        },
+    };
+    for path in ["current/dist/sidevoice", "releases/1.2.3/dist/sidevoice"] {
+        assert!(command.owns(
+            AgentId::Cursor,
+            &root.join(path).to_string_lossy(),
+            &["mcp".into()],
+            None
+        ));
+    }
+    assert!(command.owns(
+        AgentId::Codex,
+        "node",
+        &[
+            root.join("current/dist/cli.mjs")
+                .to_string_lossy()
+                .into_owned(),
+            "mcp".into()
+        ],
+        None
+    ));
+    assert!(command.owns(
+        AgentId::Claude,
+        "npx",
+        &["-y".into(), "@sidevoice/uplink@1.2.3".into(), "mcp".into()],
+        None
+    ));
+    assert!(!command.owns(
+        AgentId::Cursor,
+        "/tmp/foreign/sidevoice",
+        &["mcp".into()],
+        None
+    ));
+    assert!(!command.owns(
+        AgentId::Cursor,
+        &root.join("../dist/sidevoice").to_string_lossy(),
+        &["mcp".into()],
+        None
+    ));
+    assert!(!command.owns(
+        AgentId::Claude,
+        "arbitrary",
+        &["@sidevoice/uplink".into(), "mcp".into()],
+        None
+    ));
+}
+
+#[tokio::test]
+async fn reconcile_never_enrolls_but_disconnect_removes_old_owned_cursor_entry() {
+    let fixture = Fixture::new();
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let config = fixture.profile.cursor.join("mcp.json");
+    write_json(&config, &json!({"editor":{"keep":true},"mcpServers":{}}));
+    let result = host
+        .handle("agents.reconcile", json!({"id":"cursor"}))
+        .await;
+    assert!(result.get("error").is_none(), "{result}");
+    let saved: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert!(saved["mcpServers"].get("sidevoice").is_none());
+    write_json(
+        &config,
+        &json!({"editor":{"keep":true},"mcpServers":{"sidevoice":{"command":fixture.root.join("selected/releases/1.2.3/dist/sidevoice"),"args":["mcp"]}}}),
+    );
+    let result = host
+        .handle("agents.disconnect", json!({"id":"cursor"}))
+        .await;
+    assert!(result.get("error").is_none(), "{result}");
+    let saved: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(saved["editor"]["keep"], true);
+    assert!(saved["mcpServers"].get("sidevoice").is_none());
+    host.shutdown().await;
 }

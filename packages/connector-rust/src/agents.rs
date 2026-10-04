@@ -1,4 +1,4 @@
-//! The isolated proof's R2 host-agent coordinator.
+//! Native host-agent discovery, consent and owned registration coordinator.
 //!
 //! One gate owns a complete request. CLI children belong to its worker task so a vanished link reply can
 //! cancel the work without releasing the gate before the child has exited.
@@ -151,6 +151,7 @@ enum Ownership {
     },
     Installed {
         release_root: PathBuf,
+        recorded_program: Option<String>,
     },
     #[cfg(test)]
     Selected {
@@ -189,24 +190,83 @@ impl InstalledCommand {
     }
 
     fn installed(profile: &Profile) -> Result<Self> {
-        let executable = std::env::current_exe()?.canonicalize()?;
-        let selected = profile
-            .root
-            .join("current/dist/sidevoice-rust")
-            .canonicalize()?;
-        if executable != selected {
-            anyhow::bail!("Rust Connector is not the selected release executable");
-        }
-        Ok(Self {
-            command: profile
+        if !profile.control_mode {
+            let executable = std::env::current_exe()?.canonicalize()?;
+            let selected = profile
                 .root
                 .join("current/dist/sidevoice-rust")
-                .to_string_lossy()
-                .into_owned(),
-            args: vec!["--installed".into(), "mcp".into()],
-            version: profile.connector_version().into(),
+                .canonicalize()?;
+            if executable != selected {
+                anyhow::bail!("Rust Connector is not the selected release executable");
+            }
+        }
+        let stable = profile.root.join("current/dist");
+        let release_file = profile.root.join("current/release.json");
+        let selected: Value = if release_file.exists() {
+            crate::proof::private_file(&release_file)?;
+            if fs::metadata(&release_file)?.len() > 65536 {
+                anyhow::bail!("{}", message("agents.selection-invalid", &Value::Null));
+            }
+            let current = profile.root.join("current").canonicalize()?;
+            let releases = profile.root.join("releases").canonicalize()?;
+            if current.parent() != Some(releases.as_path()) {
+                anyhow::bail!("{}", message("agents.selection-invalid", &Value::Null));
+            }
+            serde_json::from_slice(&fs::read(&release_file)?)?
+        } else {
+            Value::Null
+        };
+        let (command, args) = if selected.is_null()
+            || selected["runtime_kind"] == "rust-native-v1"
+            || selected["format"] == "rust-native"
+        {
+            (
+                stable.join("sidevoice-rust").to_string_lossy().into_owned(),
+                vec!["--installed".into(), "mcp".into()],
+            )
+        } else if selected["format"] == "sea" {
+            (
+                stable.join("sidevoice").to_string_lossy().into_owned(),
+                vec!["mcp".into()],
+            )
+        } else {
+            // Rollback compatibility: point the agent at its selected legacy release;
+            // no legacy interpreter is invoked by this control implementation.
+            (
+                "node".to_owned(),
+                vec![
+                    stable.join("cli.mjs").to_string_lossy().into_owned(),
+                    "mcp".into(),
+                ],
+            )
+        };
+        let install_file = profile.data.join("install.json");
+        let recorded_program = if install_file.exists() {
+            crate::proof::private_file(&install_file)?;
+            if fs::metadata(&install_file)?.len() > 65536 {
+                anyhow::bail!("{}", message("agents.selection-invalid", &Value::Null));
+            }
+            let installed: Value = serde_json::from_slice(&fs::read(install_file)?)?;
+            installed
+                .get("command")
+                .and_then(Value::as_array)
+                .and_then(|command| command.get(1).or_else(|| command.first()))
+                .and_then(Value::as_str)
+                .filter(|program| Path::new(program).is_absolute())
+                .map(str::to_owned)
+        } else {
+            None
+        };
+        Ok(Self {
+            command,
+            args,
+            version: selected["connector"]
+                .as_str()
+                .unwrap_or(profile.connector_version())
+                .into(),
             ownership: Ownership::Installed {
                 release_root: profile.root.clone(),
+                recorded_program,
             },
         })
     }
@@ -266,26 +326,77 @@ impl InstalledCommand {
                         .and_then(Value::as_str)
                         == Some(codex.to_string_lossy().as_ref())
             }
-            Ownership::Installed { release_root } => {
-                let Some(executable) = canonical(command) else {
-                    return false;
-                };
+            Ownership::Installed {
+                release_root,
+                recorded_program,
+            } => {
+                if let Some(program) = recorded_program {
+                    if (command == program && args == ["mcp"])
+                        || (matches!(path_basename(command), Some("node" | "node.exe"))
+                            && args == [program.clone(), "mcp".into()])
+                    {
+                        return true;
+                    }
+                }
+                if path_basename(command) == Some("npx")
+                    && args.last().map(String::as_str) == Some("mcp")
+                    && args.iter().any(|arg| {
+                        arg == "@sidevoice/uplink"
+                            || arg
+                                .strip_prefix("@sidevoice/uplink@")
+                                .is_some_and(|version| {
+                                    !version.is_empty()
+                                        && version.chars().all(|ch| {
+                                            ch.is_ascii_alphanumeric() || ".-_".contains(ch)
+                                        })
+                                })
+                    })
+                {
+                    return true;
+                }
+                // Keep recognizing the launch forms written by earlier owned releases. This
+                // only grants permission to repoint/remove their registration, never to run JS.
+                if args == ["mcp"] && js_release_program(command, release_root) {
+                    return true;
+                }
+                if matches!(path_basename(command), Some("node" | "node.exe"))
+                    && args.len() == 2
+                    && args[1] == "mcp"
+                    && js_release_program(&args[0], release_root)
+                {
+                    return true;
+                }
                 if args != ["--installed", "mcp"] {
                     return false;
                 }
-                let Ok(relative) = executable.strip_prefix(release_root) else {
+                let path = Path::new(command);
+                let Ok(relative) = path.strip_prefix(release_root) else {
                     return false;
                 };
-                let parts = relative.components().collect::<Vec<_>>();
-                parts.len() == 4
-                    && parts[0].as_os_str() == "releases"
-                    && parts[1]
-                        .as_os_str()
-                        .to_string_lossy()
-                        .chars()
-                        .all(|ch| ch.is_ascii_alphanumeric() || ".+-_".contains(ch))
-                    && parts[2].as_os_str() == "dist"
-                    && parts[3].as_os_str() == "sidevoice-rust"
+                let parts = relative
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                let valid = |name: &str| {
+                    !name.is_empty()
+                        && name != "."
+                        && name != ".."
+                        && name
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphanumeric() || ".+-_".contains(ch))
+                };
+                match parts.as_slice() {
+                    [slot, dist, exe] => {
+                        slot == "current" && dist == "dist" && exe == "sidevoice-rust"
+                    }
+                    [releases, id, dist, exe] => {
+                        releases == "releases"
+                            && valid(id)
+                            && dist == "dist"
+                            && exe == "sidevoice-rust"
+                    }
+                    _ => false,
+                }
             }
             #[cfg(test)]
             Ownership::Selected {
@@ -484,7 +595,7 @@ impl HostAgents {
         }
 
         let action = method.strip_prefix("agents.").unwrap_or("");
-        if !matches!(action, "connect" | "disconnect" | "dismiss") {
+        if !matches!(action, "connect" | "disconnect" | "dismiss" | "reconcile") {
             return Err(Failure::keyed(
                 "agents.unknown-request",
                 json!({"route":method.chars().take(120).collect::<String>()}),
@@ -519,7 +630,22 @@ impl HostAgents {
             return self.response(&store);
         }
 
-        if action == "connect" {
+        if action == "reconcile" {
+            let binary = state
+                .pointer(&format!("/binaries/{}", agent.as_str()))
+                .and_then(Value::as_str);
+            let owned = match agent {
+                AgentId::Claude => self.claude_entry_state(binary, cancel, deadline).await?,
+                AgentId::Codex => self.codex_registration(binary, cancel, deadline).await?,
+                AgentId::Cursor => self
+                    .cursor_registration()
+                    .map_err(|_| agent_failure("agents.invalid", agent))?,
+            };
+            if owned != "owned-old" {
+                return self.response(&state);
+            }
+        }
+        if action == "connect" || action == "reconcile" {
             match registration {
                 "connected" => return self.response(&state),
                 "foreign" => return Err(agent_failure("agents.foreign", agent)),
@@ -571,7 +697,7 @@ impl HostAgents {
         }
 
         match registration {
-            "not-connected" => return self.response(&state),
+            "not-connected" => {}
             "foreign" => return Err(agent_failure("agents.foreign", agent)),
             "invalid" => return Err(agent_failure("agents.invalid", agent)),
             "unknown" => return Err(agent_failure("agents.registration-unknown", agent)),
@@ -582,6 +708,9 @@ impl HostAgents {
             .pointer(&format!("/binaries/{}", agent.as_str()))
             .and_then(Value::as_str)
             .map(str::to_owned);
+        if registration == "not-connected" && binary.is_none() && agent != AgentId::Cursor {
+            return self.response(&state);
+        }
         self.disconnect(agent, binary.as_deref(), cancel, deadline)
             .await?;
         state = self
@@ -654,10 +783,11 @@ impl HostAgents {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<Value, Failure> {
-        if self
-            .profile
-            .service_stopped()
-            .map_err(|_| Failure::Internal)?
+        if !self.profile.control_mode
+            && self
+                .profile
+                .service_stopped()
+                .map_err(|_| Failure::Internal)?
         {
             return Err(Failure::Cancelled);
         }
@@ -797,6 +927,7 @@ impl HostAgents {
         let _lock = self.state_lock(cancel, deadline).await?;
         check_live(cancel, deadline)?;
         if service_scan
+            && !self.profile.control_mode
             && self
                 .profile
                 .service_stopped()
@@ -958,8 +1089,16 @@ fn agent_failure(key: &'static str, id: AgentId) -> Failure {
 pub(crate) fn message(key: &str, params: &Value) -> String {
     static MESSAGES: OnceLock<HashMap<String, String>> = OnceLock::new();
     let messages = MESSAGES.get_or_init(|| {
-        serde_json::from_str(include_str!("../../connector/messages/agent-errors.json"))
-            .expect("embedded agent message bundle must be valid JSON")
+        let mut messages: HashMap<String, String> =
+            serde_json::from_str(include_str!("../../connector/messages/agent-errors.json"))
+                .expect("embedded agent message bundle must be valid JSON");
+        messages.extend(
+            serde_json::from_str::<HashMap<String, String>>(include_str!(
+                "interaction-messages.en.json"
+            ))
+            .expect("embedded interaction message bundle must be valid JSON"),
+        );
+        messages
     });
     let Some(template) = messages.get(key) else {
         return key.to_owned();
@@ -1114,12 +1253,10 @@ fn canonical(value: &str) -> Option<PathBuf> {
     Path::new(value).canonicalize().ok()
 }
 
-#[cfg(test)]
 fn path_basename(value: &str) -> Option<&str> {
     Path::new(value).file_name()?.to_str()
 }
 
-#[cfg(test)]
 fn js_release_program(program: &str, root: &Path) -> bool {
     let path = Path::new(program);
     let Ok(relative) = path.strip_prefix(root) else {
@@ -1131,6 +1268,8 @@ fn js_release_program(program: &str, root: &Path) -> bool {
         .collect::<Vec<_>>();
     let release_name = |value: &str| {
         !value.is_empty()
+            && value != "."
+            && value != ".."
             && value
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric() || ".+-_".contains(character))
@@ -1334,7 +1473,11 @@ fn read_cursor_config(file: &Path, root: &Path) -> Result<Option<(Value, u32, Pa
     }
     let text = fs::read_to_string(&target)?;
     let config: Value = serde_json::from_str(&text)?;
-    if !config.is_object() {
+    if !config.is_object()
+        || config
+            .get("mcpServers")
+            .is_some_and(|servers| !servers.is_object())
+    {
         anyhow::bail!("Cursor configuration is not an object");
     }
     Ok(Some((
@@ -1463,6 +1606,11 @@ impl HostAgents {
             AgentId::Cursor => self
                 .cursor_registration()
                 .unwrap_or_else(|_| "invalid".into()),
+        };
+        let registration = if registration == "owned-old" {
+            "not-connected".into()
+        } else {
+            registration
         };
         let version = if input.include_version {
             match binary.as_deref() {
@@ -1726,4 +1874,124 @@ impl HostAgents {
             Err(CommandFailure::Cancelled) => Err(Failure::Cancelled),
         }
     }
+}
+
+/// CLI and installation callers share the same discovery and consent path as host RPC.
+pub async fn run_cli(profile: Profile, argv: &[String]) -> Result<Value> {
+    let args: Vec<&str> = argv
+        .iter()
+        .map(String::as_str)
+        .filter(|arg| *arg != "--json")
+        .collect();
+    let (method, params) = match args.as_slice() {
+        [] => ("agents.list".to_owned(), json!({"rescan":true})),
+        [action @ ("connect" | "disconnect" | "dismiss"), id] => {
+            (format!("agents.{action}"), json!({"id":id}))
+        }
+        _ => return Ok(error_value("agents.usage", json!({}))),
+    };
+    let agents = HostAgents::new(profile)?;
+    let result = agents.handle(&method, params).await;
+    agents.shutdown().await;
+    Ok(result)
+}
+
+/// Install consent is supplied by the caller: empty IDs mean the agents found on this machine.
+pub async fn register_requested(profile: Profile, ids: &[String]) -> Result<Value> {
+    let agents = HostAgents::new(profile)?;
+    let listed = agents.handle("agents.list", json!({"rescan":true})).await;
+    if listed.get("error").is_some() {
+        agents.shutdown().await;
+        return Ok(listed);
+    }
+    let selected: Vec<String> = if ids.is_empty() {
+        listed["agents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row["id"].as_str().map(str::to_owned))
+            .collect()
+    } else {
+        ids.to_vec()
+    };
+    let mut done = Vec::new();
+    let mut next = Vec::new();
+    for id in selected {
+        let result = agents.handle("agents.connect", json!({"id":id})).await;
+        if let Some(error) = result.get("error") {
+            next.push(error["message"].as_str().unwrap_or("").to_owned());
+            if let Some(row) = listed["agents"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|row| row["id"] == id))
+            {
+                if let Some(snippet) = row.pointer("/instructions/snippet").and_then(Value::as_str)
+                {
+                    next.push(snippet.to_owned());
+                }
+            }
+        } else {
+            done.push(message(
+                "agents.action.connect",
+                &json!({"agent":message(&format!("harness.{id}"),&Value::Null)}),
+            ));
+        }
+    }
+    agents.shutdown().await;
+    Ok(json!({"done":done,"next":next}))
+}
+
+/// Called before uninstall deletes selection/state; foreign registrations remain untouched.
+pub async fn cleanup_owned(profile: Profile) -> Result<Value> {
+    let agents = HostAgents::new(profile)?;
+    let listed = agents.handle("agents.list", json!({"rescan":true})).await;
+    if listed.get("error").is_some() {
+        agents.shutdown().await;
+        return Ok(listed);
+    }
+    let ids: Vec<String> = listed["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row["id"].as_str().map(str::to_owned))
+        .collect();
+    let mut done = Vec::new();
+    let mut next = Vec::new();
+    for id in ids {
+        let result = agents.handle("agents.disconnect", json!({"id":id})).await;
+        if let Some(error) = result.get("error") {
+            next.push(error["message"].as_str().unwrap_or("").to_owned());
+        } else {
+            done.push(message(
+                "agents.action.disconnect",
+                &json!({"agent":message(&format!("harness.{id}"),&Value::Null)}),
+            ));
+        }
+    }
+    agents.shutdown().await;
+    Ok(json!({"done":done,"next":next}))
+}
+
+/// Repoint previously owned registrations after selection changes; never enroll a new agent.
+pub async fn reconcile_owned(profile: Profile) -> Result<Value> {
+    let agents = HostAgents::new(profile)?;
+    let listed = agents.handle("agents.list", json!({"rescan":true})).await;
+    if listed.get("error").is_some() {
+        agents.shutdown().await;
+        return Ok(listed);
+    }
+    let ids: Vec<String> = listed["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row["id"].as_str().map(str::to_owned))
+        .collect();
+    let mut next = Vec::new();
+    for id in ids {
+        let result = agents.handle("agents.reconcile", json!({"id":id})).await;
+        if let Some(error) = result.get("error") {
+            next.push(error["message"].as_str().unwrap_or("").to_owned());
+        }
+    }
+    agents.shutdown().await;
+    Ok(json!({"done":[],"next":next}))
 }

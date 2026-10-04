@@ -34,7 +34,7 @@ impl HostAgents {
             if command == self.selected.command && args == self.selected.args {
                 "connected"
             } else {
-                "not-connected"
+                "owned-old"
             }
             .into(),
         )
