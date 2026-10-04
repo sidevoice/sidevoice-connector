@@ -56,6 +56,15 @@ test('Codex identity comes from tool metadata, and its working state is observed
   assert.equal(capabilityState(codexHarness, 'inspectInbound'), 'unsupported');
 });
 
+test('Codex identity accepts the app-server per-call threadId without process environment', () => {
+  const identity = codexHarness.sessionIdentity({ meta: { threadId: 'fixture-codex-thread' }, env: {} });
+  assert.deepEqual(
+    { harness: identity.harness, thread: identity.thread, delivery: identity.delivery },
+    { harness: 'codex', thread: 'fixture-codex-thread', delivery: { kind: 'codex-queue', thread: 'fixture-codex-thread' } },
+  );
+  assert.equal(codexHarness.sessionIdentity({ meta: {}, env: {} }), null, 'missing identity stays fail-closed');
+});
+
 test('the generic HTTP module identifies an explicitly configured external harness', () => {
   const identity = identifyHarness({}, { SIDEVOICE_THREAD: 'external-1', SIDEVOICE_DELIVERY_URL: 'http://127.0.0.1:9/inbox', SIDEVOICE_HARNESS: 'custom' });
   assert.equal(identity.module, httpHarness);

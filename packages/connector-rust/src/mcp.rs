@@ -1012,10 +1012,7 @@ impl ServerHandler for Facade {
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, McpError> {
         let args = Value::Object(request.arguments.unwrap_or_default());
-        let meta = request
-            .meta
-            .and_then(|m| serde_json::to_value(m).ok())
-            .unwrap_or(json!({}));
+        let meta = tool_call_meta(&context.meta);
         let client = context
             .client_info()
             .and_then(|value| serde_json::to_value(value).ok())
@@ -1089,6 +1086,46 @@ impl ServerHandler for Facade {
                 .with_meta(meta)])
             .into(),
         )
+    }
+}
+
+fn tool_call_meta(meta: &RequestMetaObject) -> Value {
+    serde_json::to_value(meta).unwrap_or_else(|_| json!({}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tool_call_meta;
+    use rmcp::model::{ClientJsonRpcMessage, ClientRequest, GetMeta};
+    use serde_json::json;
+
+    #[test]
+    fn tool_call_forwards_wire_meta_from_rmcp_request_context() {
+        let message: ClientJsonRpcMessage = serde_json::from_value(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "voice_connect",
+                "_meta": {"threadId": "fixture-codex-thread"}
+            }
+        }))
+        .expect("fixture is a valid MCP JSON-RPC request");
+        let ClientJsonRpcMessage::Request(envelope) = message else {
+            panic!("fixture is an MCP request");
+        };
+        let ClientRequest::CallToolRequest(request) = &envelope.request else {
+            panic!("fixture is an MCP tools/call");
+        };
+
+        // rmcp 3.5 extracts wire params._meta into the request envelope. The
+        // server loop copies this get_meta() value into RequestContext.meta;
+        // the typed CallToolRequestParams.meta remains empty.
+        assert!(request.params.meta.is_none());
+        assert_eq!(
+            tool_call_meta(envelope.request.get_meta()),
+            json!({"threadId": "fixture-codex-thread"})
+        );
     }
 }
 

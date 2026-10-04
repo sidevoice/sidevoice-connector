@@ -11,31 +11,7 @@ pub fn capabilities() -> Value {
 }
 
 pub fn identity(meta: &Value) -> Result<Option<Identity>> {
-    let turn = meta.get("x-codex-turn-metadata").and_then(|value| {
-        if let Some(text) = value.as_str() {
-            serde_json::from_str::<Value>(text).ok()
-        } else {
-            Some(value.clone())
-        }
-    });
-    let thread = [
-        meta.get("openai/threadId"),
-        meta.get("openai/thread_id"),
-        meta.get("codexThreadId"),
-        meta.get("codex_thread_id"),
-        turn.as_ref().and_then(|value| value.get("thread_id")),
-        meta.get("session_id"),
-        meta.get("thread_id"),
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(|value| {
-        value
-            .as_str()
-            .filter(|text| !text.is_empty())
-            .map(str::to_owned)
-    })
-    .or_else(|| {
+    let thread = thread_from_meta(meta).or_else(|| {
         env::var("CODEX_THREAD_ID")
             .ok()
             .filter(|text| !text.is_empty())
@@ -52,6 +28,50 @@ pub fn identity(meta: &Value) -> Result<Option<Identity>> {
         json!({"kind":"codex-queue","thread":thread})
     };
     Ok(Some(Identity::new("codex", thread, delivery)))
+}
+
+fn thread_from_meta(meta: &Value) -> Option<String> {
+    let turn = meta.get("x-codex-turn-metadata").and_then(|value| {
+        if let Some(text) = value.as_str() {
+            serde_json::from_str::<Value>(text).ok()
+        } else {
+            Some(value.clone())
+        }
+    });
+    [
+        meta.get("threadId"),
+        meta.get("openai/threadId"),
+        meta.get("openai/thread_id"),
+        meta.get("codexThreadId"),
+        meta.get("codex_thread_id"),
+        turn.as_ref().and_then(|value| value.get("thread_id")),
+        meta.get("session_id"),
+        meta.get("thread_id"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|value| {
+        value
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::thread_from_meta;
+    use serde_json::json;
+
+    #[test]
+    fn codex_app_server_thread_id_is_read_from_per_call_meta() {
+        assert_eq!(
+            thread_from_meta(&json!({"threadId": "fixture-codex-thread"})).as_deref(),
+            Some("fixture-codex-thread")
+        );
+        assert_eq!(thread_from_meta(&json!({"threadId": ""})), None);
+        assert_eq!(thread_from_meta(&json!({})), None);
+    }
 }
 
 pub async fn deliver(delivery: &Value, event: &Value, codex_home: &Path) -> Result<Value> {

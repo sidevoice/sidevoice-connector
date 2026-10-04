@@ -21,7 +21,7 @@ function turnMetadata(meta) {
 
 function sessionIdentity({ meta, env = process.env, payload } = {}) {
   const turn = turnMetadata(meta);
-  const thread = meta?.['openai/threadId'] || meta?.['openai/thread_id'] || meta?.codexThreadId
+  const thread = meta?.threadId || meta?.['openai/threadId'] || meta?.['openai/thread_id'] || meta?.codexThreadId
     || meta?.codex_thread_id || turn.thread_id || payload?.session_id || payload?.thread_id
     || env.CODEX_THREAD_ID;
   if (!thread) return null;
