@@ -11,6 +11,8 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { decide } from '../release.mjs';
+import { RUST_CORE_ENTRYPOINT, RUST_CORE_KIND, rustCoreTarget } from '../rust-core.mjs';
+import { writePrivateFile } from '../secure-fs.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const packageDir = path.join(here, '..');
@@ -29,11 +31,19 @@ test('versions: higher replaces, lower never does, and the same version only as 
   assert.equal(decide(at('0.6.0', 'nightly', 7), at('0.6.0', 'nightly', 9)), 'upgrade');
   assert.equal(decide(at('0.6.0', 'nightly', 9), at('0.6.0', 'nightly', 9)), 'noop');
   assert.equal(decide(at('0.6.0', 'nightly', 9), at('0.6.0', 'nightly', 7)), 'noop', 'two builds never replace each other in a loop');
+  assert.equal(decide({ ...at('0.6.0', 'nightly', 20), core_build: 'core-new' },
+    { ...at('0.6.0', 'nightly', 19), core_build: 'core-old' }), 'noop', 'a changed Core identity cannot replace a newer nightly');
   assert.equal(decide({ ...at('0.6.0', 'nightly', 100), format: 'esm' }, { ...at('0.6.0', 'nightly', 1), format: 'sea' }), 'noop', 'format preference cannot replace a later nightly with an older build');
   assert.equal(decide({ ...at('0.6.0', 'nightly', 1), format: 'sea' }, { ...at('0.6.0', 'nightly', 100), format: 'esm' }), 'upgrade', 'the next nightly build wins even when it uses ESM');
   assert.equal(decide({ ...at('0.6.0', 'nightly', 100), format: 'esm' }, { ...at('0.6.0', 'nightly', 100), format: 'sea' }), 'upgrade', 'SEA is preferred only at the same nightly build');
   assert.equal(decide({ ...at('0.6.0', 'nightly', 100), format: 'esm' }, { ...at('0.6.0', 'release', 0), format: 'sea' }), 'noop', 'a release-format preference cannot cross from a newer nightly');
   assert.equal(decide({ ...at('0.6.0', 'release', 0), format: 'sea' }, { ...at('0.6.0', 'nightly', 100), format: 'esm' }), 'upgrade', 'a later nightly sequence wins across formats');
+  assert.equal(decide({ ...at('0.6.0'), runtime_kind: 'javascript' }, { ...at('0.6.0'), runtime_kind: 'rust-native-v1' }), 'upgrade',
+    'an equal package version cannot hide a daemon runtime switch');
+  assert.equal(decide(at('0.6.0'), { ...at('0.6.0'), runtime_kind: 'rust-native-v1' }), 'upgrade',
+    'legacy release metadata is treated as the JavaScript daemon');
+  assert.equal(decide({ ...at('0.6.0'), runtime_kind: 'rust-native-v1' }, { ...at('0.6.0'), runtime_kind: 'javascript' }), 'upgrade',
+    'runtime changes are bidirectional during verified rollback');
   assert.equal(decide(at('0.6.10'), at('0.6.9')), 'noop', 'numerically, not as text');
   const source = { ...at('0.6.0', 'source'), id: '0.6.0-source', source: '/checkout' };
   assert.equal(decide(at('0.6.0'), source), 'upgrade', 'a checkout selects itself');
@@ -83,13 +93,16 @@ function machine(kind = 'systemd') {
   const tools = mkdtempSync(path.join(os.tmpdir(), 'sv-mgr-'));
   const state = path.join(tools, 'state');
   const manager = path.join(tools, 'systemctl');
+  const launchctl = path.join(tools, 'launchctl');
   writeFileSync(manager, `#!/bin/sh\nFAKE_MANAGER_DIR="${state}" exec "${process.execPath}" "${fakeManager}" systemctl "$@"\n`, { mode: 0o755 });
+  writeFileSync(launchctl, `#!/bin/sh\nFAKE_MANAGER_DIR="${state}" exec "${process.execPath}" "${fakeManager}" launchctl "$@"\n`, { mode: 0o755 });
   mkdirSync(path.join(home, '.cursor'));
   const claude = fakeClaude(home);
   const dataDir = path.join(home, '.sidevoice');
   const R = path.join(home, 'xdg', 'sidevoice');
   const env = { ...process.env, HOME: home, XDG_DATA_HOME: path.join(home, 'xdg'), XDG_CONFIG_HOME: path.join(home, '.config'), SIDEVOICE_DATA_DIR: dataDir,
-    SIDEVOICE_CLAUDE_BIN: claude.bin, SIDEVOICE_INSTALL_FROM_SOURCE: '0', SIDEVOICE_SERVICE_MANAGER: kind, SIDEVOICE_SYSTEMCTL: manager, SIDEVOICE_LOGINCTL: '/bin/false',
+    SIDEVOICE_CLAUDE_BIN: claude.bin, SIDEVOICE_INSTALL_FROM_SOURCE: '0', SIDEVOICE_SERVICE_MANAGER: kind, SIDEVOICE_SYSTEMCTL: manager,
+    SIDEVOICE_LAUNCHCTL: launchctl, SIDEVOICE_LOGINCTL: '/bin/false',
     SIDEVOICE_CORE_PORT: '0', SIDEVOICE_INSTALL_VERIFY_MS: '15000', SIDEVOICE_TEARDOWN_MS: '3000', SIDEVOICE_SERVICE_START_WAIT_MS: '3000' };
   for (const key of ['SIDEVOICE_URL', 'SIDEVOICE_CONNECTOR_ID', 'SIDEVOICE_CONNECTOR_TOKEN', 'SIDEVOICE_CORE_BIN', 'SIDEVOICE_TEST_HOOKS', 'FAKE_CORE_MODE', 'FAKE_CORE_MODES']) delete env[key];
   /** `<cli> <args…> --json` (a built package's, or this checkout's): its exit, its signal, and its one JSON line. */
@@ -99,9 +112,9 @@ function machine(kind = 'systemd') {
     return { status: ran.status, signal: ran.signal, answer, stderr: ran.stderr };
   };
   const selected = name => { try { return JSON.parse(readFileSync(path.join(R, name, 'release.json'), 'utf8')).connector; } catch { return null; } };
-  const pid = job => { try { return Number(readFileSync(path.join(state, `sidevoice-${job}.service`, 'pid'), 'utf8')); } catch { return null; } };
+  const pid = job => { try { return Number(readFileSync(path.join(state, kind === 'launchd' ? `dev.sidevoice.${job}` : `sidevoice-${job}.service`, 'pid'), 'utf8')); } catch { return null; } };
   return {
-    home, dataDir, R, env, claude, run, selected, pid,
+    home, dataDir, R, state, env, claude, run, selected, pid,
     install: (cli, core = coreWrapper(), args = ['--harness', 'claude', '--service'], more = {}) => run(cli, ['install', ...args], { SIDEVOICE_CORE_BIN: String(core), ...more }),
     releases: () => readdirSync(path.join(R, 'releases')).sort(),
     status: () => run(path.join(packageDir, 'cli.mjs'), ['service', 'status']).answer,
@@ -216,6 +229,63 @@ for (const point of ['stage-copied', 'switch-previous', 'switch-current', 'defin
       assert.equal(node.status().state, 'running');
       assert.deepEqual(readdirSync(node.R).filter(name => name.endsWith('.tmp')), []);
       assert.deepEqual(node.releases().filter(name => name.includes('.tmp-')), []);
+    } finally { node.stop(); }
+  });
+}
+
+for (const kind of ['launchd', 'systemd']) {
+  test(`same-version Core switch recovery (${kind}): a crash after definitions leaves the old Core running, retry restarts the selected native pair`, async () => {
+    const node = machine(kind), oldPackage = builtAs('0.6.1'), oldCore = coreWrapper();
+    try {
+      assert.equal(node.install(oldPackage, oldCore).status, 0);
+      const dataCore = path.join(node.dataDir, 'core', 'core.json');
+      const previousReady = JSON.parse(readFileSync(dataCore, 'utf8'));
+      const target = rustCoreTarget(), sourceSha = 'b41840e41e3eb81905d285514c7deb35bd8efe57';
+      const archiveSha = 'a'.repeat(64), runtimeSha = 'c'.repeat(64);
+      const coreBuild = `${RUST_CORE_KIND}-${target}-${sourceSha}-${archiveSha}`;
+      const id = `0.6.1-native-${target}`;
+      const release = { id, connector: '0.6.1', core: '0.1.0', core_build: coreBuild,
+        channel: 'release', build_seq: 0, format: 'sea', pair_id: `pair-v1:javascript:${runtimeSha}:core:${coreBuild}`,
+        runtime_kind: 'javascript', runtime_build_sha: null, runtime_sha256: runtimeSha,
+        core_kind: RUST_CORE_KIND, core_source_sha: sourceSha, core_cargo_lock_sha256: '1'.repeat(64),
+        core_manifest_sha256: '2'.repeat(64), core_target: target, core_archive_sha256: archiveSha,
+        core_archive_size: 123, core_entrypoint: RUST_CORE_ENTRYPOINT };
+      const releaseDir = path.join(node.R, 'releases', id);
+      const nativeBin = path.join(releaseDir, 'core', RUST_CORE_ENTRYPOINT);
+      mkdirSync(path.dirname(nativeBin), { recursive: true, mode: 0o700 });
+      cpSync(path.dirname(oldPackage), path.join(releaseDir, 'dist'), { recursive: true });
+      writeFileSync(path.join(releaseDir, 'dist', 'sidevoice'),
+        `#!/bin/sh\nexec "${process.execPath}" "${path.join(releaseDir, 'dist', 'cli.mjs')}" "$@"\n`, { mode: 0o755 });
+      writeFileSync(nativeBin, `#!/bin/sh\nexec "${process.execPath}" "${fakeCore}" "$@"\n`, { mode: 0o755 });
+      writePrivateFile(path.join(releaseDir, 'release.json'), `${JSON.stringify(release)}\n`);
+
+      const candidate = { ...release, source: null };
+      const applyUrl = new URL('../install.mjs', import.meta.url).href;
+      const source = `import { apply } from ${JSON.stringify(applyUrl)}; await apply(process.env, { candidateRelease: JSON.parse(process.env.SIDEVOICE_TEST_CANDIDATE) });`;
+      const runApply = hooks => spawnSync(process.execPath, ['--input-type=module', '-e', source], { encoding: 'utf8', env: {
+        ...node.env, SIDEVOICE_TEST_CANDIDATE: JSON.stringify(candidate), ...(hooks ? { SIDEVOICE_TEST_HOOKS: hooks } : {}) } });
+      const killed = runApply(crashAt('definitions-written'));
+      assert.equal(killed.signal, 'SIGKILL', `crash after definitions (${killed.stderr})`);
+      assert.equal(node.status().state, 'running', 'the old same-version Python Core is still live before retry');
+      assert.equal(JSON.parse(readFileSync(dataCore, 'utf8')).launch_id, previousReady.launch_id);
+      const managerJob = kind === 'launchd' ? 'dev.sidevoice.core' : 'sidevoice-core.service';
+      const loadedBefore = JSON.parse(readFileSync(path.join(node.state, managerJob, 'loaded-spec.json'), 'utf8'));
+      const definitionFile = kind === 'launchd'
+        ? path.join(node.home, 'Library', 'LaunchAgents', 'dev.sidevoice.core.plist')
+        : path.join(node.home, '.config', 'systemd', 'user', 'sidevoice-core.service');
+      assert.equal(loadedBefore.program[0], path.join(node.R, 'current', 'core', 'bin', 'sidevoice-core'), 'the manager still has the prior Python command loaded');
+      assert.match(readFileSync(definitionFile, 'utf8'), /sidevoice-core-rust/, 'the on-disk definition already names the native command');
+
+      const recovered = runApply(null);
+      assert.equal(recovered.status, 0, recovered.stderr + recovered.stdout);
+      const ready = JSON.parse(readFileSync(dataCore, 'utf8'));
+      assert.notEqual(ready.launch_id, previousReady.launch_id, 'verification requires a Core launch created by the retry');
+      assert.equal(node.pid('core'), ready.pid, 'the service manager owns that fresh launch');
+      const loaded = JSON.parse(readFileSync(path.join(node.state, managerJob, 'spec.json'), 'utf8'));
+      assert.equal(loaded.program[0], path.join(node.R, 'current', 'core', RUST_CORE_ENTRYPOINT), 'the manager loaded the selected native executable');
+      assert.equal(JSON.parse(readFileSync(path.join(node.R, 'current', 'release.json'), 'utf8')).core_kind, RUST_CORE_KIND);
+      assert.equal(JSON.parse(readFileSync(path.join(node.R, 'verified', 'release.json'), 'utf8')).id, id);
+      assert.equal(node.status().state, 'running');
     } finally { node.stop(); }
   });
 }

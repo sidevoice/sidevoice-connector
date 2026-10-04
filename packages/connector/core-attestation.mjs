@@ -7,7 +7,10 @@ export const CORE_REPOSITORY = 'https://github.com/sidevoice/sidevoice-core';
 export const CORE_REPOSITORY_ID = '1399406535';
 export const CORE_ISSUER = 'https://token.actions.githubusercontent.com';
 export const CORE_SIGNER = `${CORE_REPOSITORY}/.github/workflows/test.yml@refs/heads/main`;
+// The native Rust Core producer is a separate trust channel from the Python Core workflows above.
+export const RUST_CORE_SIGNER = `${CORE_REPOSITORY}/.github/workflows/rust-t7.yml@refs/heads/main`;
 export const SLSA_PREDICATE = 'https://slsa.dev/provenance/v1';
+const RUST_CORE_BUILD_CONFIG = RUST_CORE_SIGNER;
 const BUILD_CONFIGS = Object.freeze({
   release: `${CORE_REPOSITORY}/.github/workflows/release-please.yml@refs/heads/main`,
   nightly: `${CORE_REPOSITORY}/.github/workflows/test.yml@refs/heads/main`,
@@ -113,6 +116,73 @@ export async function verifyCoreArtifact({ bytes, expectedSha256 = null, bundleB
     payload = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
   } catch { throw refusal('predicate', `${label} verified payload is not a valid in-toto statement`); }
   return enforceCoreProvenance({ signer, statement: payload, digest, channel, label });
+}
+
+/** Enforce the native producer's protected-main workflow without changing the Python artifact policy. */
+export function enforceRustCoreProvenance({ signer, statement, digest, subjectName, label = 'native core asset' }) {
+  const identity = signer?.identity;
+  failIf(identity?.extensions?.issuer === CORE_ISSUER && oidText(signer, OID.issuer) === CORE_ISSUER,
+    'issuer', `${label} certificate issuer`);
+  failIf(identity?.subjectAlternativeName === RUST_CORE_SIGNER && oidText(signer, OID.buildSigner) === RUST_CORE_SIGNER,
+    'workflow', `${label} signer workflow`);
+  failIf(oidText(signer, OID.source) === CORE_REPOSITORY, 'source', `${label} source repository`);
+  failIf(oidText(signer, OID.repositoryId) === CORE_REPOSITORY_ID, 'repository-id', `${label} numeric repository id`);
+  failIf(oidText(signer, OID.runner) === 'github-hosted', 'runner', `${label} runner environment`);
+  failIf(oidText(signer, OID.buildConfig) === RUST_CORE_BUILD_CONFIG, 'build-config', `${label} certificate build config`);
+
+  failIf(statement?._type === 'https://in-toto.io/Statement/v1', 'predicate', `${label} statement type`);
+  failIf(statement?.predicateType === SLSA_PREDICATE, 'predicate', `${label} predicate type`);
+  const workflow = statement?.predicate?.buildDefinition?.externalParameters?.workflow;
+  failIf(workflow?.repository === CORE_REPOSITORY && workflow?.ref === 'refs/heads/main'
+    && workflow?.path === '.github/workflows/rust-t7.yml', 'build-config', `${label} SLSA workflow`);
+  failIf(statement?.predicate?.runDetails?.builder?.id === RUST_CORE_BUILD_CONFIG,
+    'build-config', `${label} SLSA builder workflow`);
+  failIf(statement?.predicate?.buildDefinition?.internalParameters?.github?.repository_id === CORE_REPOSITORY_ID,
+    'repository-id', `${label} SLSA repository id`);
+  failIf(statement?.predicate?.buildDefinition?.internalParameters?.github?.runner_environment === 'github-hosted',
+    'runner', `${label} SLSA runner environment`);
+
+  const subjects = statement?.subject;
+  failIf(Array.isArray(subjects) && subjects.length === 1, 'subject', `${label} must have one subject`);
+  const subject = subjects[0];
+  const subjectDigest = subject?.digest;
+  failIf(subject?.name === subjectName, 'subject', `${label} subject name does not match the pinned artifact`);
+  failIf(subjectDigest && Object.keys(subjectDigest).length === 1 && /^[0-9a-f]{64}$/.test(subjectDigest.sha256),
+    'subject', `${label} subject must contain only SHA-256`);
+  failIf(subjectDigest.sha256 === digest, 'subject', `${label} SHA-256 subject does not match the local bytes`);
+  return { issuer: CORE_ISSUER, signer: RUST_CORE_SIGNER, source: CORE_REPOSITORY,
+    repositoryId: CORE_REPOSITORY_ID, runner: 'github-hosted', buildConfig: RUST_CORE_BUILD_CONFIG,
+    predicateType: SLSA_PREDICATE, subjectName, sha256: digest };
+}
+
+/** Verify one protected-main native Core attestation and bind it to the exact bytes supplied by the build job. */
+export async function verifyRustCoreArtifact({ bytes, expectedSha256, bundleBytes, subjectName, tufCachePath,
+  tufForceCache = false, label = 'native core asset' }) {
+  const digest = sha256(bytes);
+  if (!/^[0-9a-f]{64}$/.test(expectedSha256 || '')) {
+    throw refusal('sha256', `${label} pinned digest is not lowercase SHA-256`);
+  }
+  if (digest !== expectedSha256) throw refusal('sha256', `${label} bytes differ from the pinned digest`);
+  let bundle;
+  try { bundle = JSON.parse(Buffer.isBuffer(bundleBytes) ? bundleBytes.toString('utf8') : String(bundleBytes)); }
+  catch { throw refusal('sigstore-bundle', `${label} Sigstore sidecar is not JSON`); }
+  if (!bundle?.dsseEnvelope || !Array.isArray(bundle.dsseEnvelope.signatures)) {
+    throw refusal('sigstore-bundle', `${label} Sigstore sidecar is not a DSSE bundle`);
+  }
+  let signer;
+  try { signer = await verify(bundle, { tufCachePath, tufForceCache }); }
+  catch (error) {
+    const category = classifyInstallFailure(error, null, { proxyText: false });
+    if (category === 'network' || category === 'proxy' || category === 'disk') throw keyed(`install.${category}`);
+    throw refusal('sigstore', `${label} Sigstore verification failed (${error?.name ?? 'Error'}: ${error?.message ?? error})`);
+  }
+  let payload;
+  try {
+    const encoded = bundle.dsseEnvelope.payload;
+    if (typeof encoded !== 'string' || !encoded || Buffer.from(encoded, 'base64').toString('base64') !== encoded) throw new Error('non-canonical payload');
+    payload = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+  } catch { throw refusal('predicate', `${label} verified payload is not a valid in-toto statement`); }
+  return enforceRustCoreProvenance({ signer, statement: payload, digest, subjectName, label });
 }
 
 export function expectedBuildConfig(channel) { return BUILD_CONFIGS[channel] ?? null; }

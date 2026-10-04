@@ -143,6 +143,8 @@ jobs:
           echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
           echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
       - run: systemctl --user show-environment >/dev/null && systemctl --user is-system-running || true
+      - name: Same-version Core recovery after an interrupted systemd definition switch
+        run: node --test --test-name-pattern="same-version Core switch recovery \(systemd\)" packages/connector/test/test_install.mjs
       - run: node packages/connector/test/service-integration.mjs
 
   service-macos:
@@ -158,6 +160,8 @@ jobs:
           cache: npm
       - run: npm ci
       - run: launchctl print "gui/$(id -u)" >/dev/null && echo "gui domain present"
+      - name: Same-version Core recovery after an interrupted launchd definition switch
+        run: node --test --test-name-pattern="same-version Core switch recovery \(launchd\)" packages/connector/test/test_install.mjs
       # The locks are the kernel's: on macOS the lock file opened O_EXLOCK|O_NONBLOCK through libuv (Linux: util-linux
       # flock on the same descriptor). Proved here, on the platform: three contenders never hold it at once, a SIGKILLed
       # holder frees it at once, a held lock is refused, a link is never followed.
