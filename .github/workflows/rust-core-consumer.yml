@@ -1,23 +1,21 @@
 name: Rust Core consumer
 
 on:
+  # Fork PRs are outside this privileged Core-artifact gate; ordinary CI still runs for them.
   pull_request_target:
     branches: [main]
     paths:
       - 'packages/connector/**'
+      - 'package.json'
+      - 'package-lock.json'
       - '.github/workflows/rust-core-consumer.yml'
   push:
     branches: [main]
     paths:
       - 'packages/connector/**'
+      - 'package.json'
+      - 'package-lock.json'
       - '.github/workflows/rust-core-consumer.yml'
-  workflow_dispatch:
-    inputs:
-      candidate_sha:
-        description: Full Connector commit SHA to test from the trusted main workflow
-        required: true
-        type: string
-
 permissions:
   contents: read
 
@@ -35,7 +33,7 @@ env:
 jobs:
   verify-core-inputs:
     name: Verify fixed protected-main Core inputs
-    if: github.event_name == 'pull_request_target' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -120,7 +118,7 @@ jobs:
   consumer:
     name: ${{ matrix.target }} candidate build and tests
     needs: verify-core-inputs
-    if: github.event_name == 'pull_request_target' || github.ref == 'refs/heads/main'
+    if: needs.verify-core-inputs.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -141,12 +139,13 @@ jobs:
             archive_size: 25342648
             archive_sha256: 7779e9881a9442624fb6140f33f9e4ec4c59f2576810482fca14f35a87994ffa
     runs-on: ${{ matrix.runner }}
+    cache-mode: read
     permissions:
       actions: read
       contents: read
     env:
-      CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || inputs.candidate_sha || github.sha }}
-      CANDIDATE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+      CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CANDIDATE_REPOSITORY: ${{ github.repository }}
     steps:
       - name: Check out the exact candidate commit without persisted credentials
         uses: actions/checkout@v4
