@@ -1,12 +1,18 @@
 mod adapters;
 mod agents;
+mod control;
 mod cursor_app;
 mod daemon;
+mod installed_service;
+mod lifecycle;
 mod link;
 mod mcp;
 mod pairing;
+mod payload;
 mod proof;
+mod release;
 mod service;
+mod skill;
 
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
@@ -123,6 +129,15 @@ enum CodexAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if !arguments
+        .iter()
+        .any(|arg| arg == "--profile-root" || arg.starts_with("--profile-root="))
+    {
+        if let Some(code) = control::run(&arguments).await {
+            std::process::exit(code);
+        }
+    }
     let cli = Cli::parse();
     if let Action::RuntimeIdentity { json } = &cli.command {
         let identity = json!({"kind":"rust-native-v1", "target":env!("SIDEVOICE_CONNECTOR_TARGET"),

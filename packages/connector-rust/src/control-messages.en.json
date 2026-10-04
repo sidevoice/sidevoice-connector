@@ -1,0 +1,16 @@
+{
+  "command.unknown": "Unknown command: {command}. Use sidevoice install, rollback, uninstall, service, agents, pair, link-room, pair-device, skill, metadata, mcp or connector.",
+  "install.native-payload-missing": "This development executable has no embedded Core. Use a complete native Sidevoice package.",
+  "install.native-core-required": "This native package installs Connector and Core together. --no-core is not supported.",
+  "install.failed": "Sidevoice installation failed: {detail}",
+  "rollback.failed": "Sidevoice could not restore the previous release: {detail}",
+  "uninstall.failed": "Sidevoice could not finish uninstalling: {detail}",
+  "service.failed": "The Sidevoice service operation failed: {detail}",
+  "service.usage": "Use sidevoice service install, uninstall, start, stop, restart or status.",
+  "agents.failed": "Sidevoice could not inspect or update agent registrations: {detail}",
+  "pair-device.failed": "Sidevoice could not obtain a device pairing code: {detail}",
+  "pair-device.timeout": "Timed out waiting for the device pairing code.",
+  "pair.failed": "Sidevoice could not pair with the room: {detail}",
+  "pair.arguments": "Supply the room address and its one-time code; link-room needs only the room address.",
+  "install.usage": "Use sidevoice install [--harness claude|codex|cursor] [--no-agents] [--service] [--apply-now] [--json] [--progress=jsonl]."
+}

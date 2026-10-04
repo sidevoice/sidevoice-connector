@@ -767,7 +767,11 @@ impl Facade {
                     json!({"status":"left","conversation":chosen,"room_reachable":result.get("connected")}),
                 )
             }
-            "voice_pair_device" => self.ipc.call("pair_device", json!({})).await,
+            "voice_pair_device" => {
+                let mut answer = self.ipc.call("pair_device", json!({})).await?;
+                answer["text"] = json!(crate::pairing::device_text(&answer)?);
+                Ok(answer)
+            }
             "voice_pair" => {
                 let room = args
                     .get("room")

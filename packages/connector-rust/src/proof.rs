@@ -26,6 +26,8 @@ pub struct Profile {
     pub core_socket: PathBuf,
     pub core_ready: PathBuf,
     pub installed: Option<InstalledRelease>,
+    /// Public control commands use user paths even before the first installation.
+    pub control_mode: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -229,6 +231,7 @@ impl Profile {
             xdg_config,
             xdg_data,
             installed: None,
+            control_mode: false,
         };
         profile.validate_private()?;
         Ok(profile)
@@ -272,8 +275,10 @@ impl Profile {
             .parent()
             .context("installed release directory")?
             .to_path_buf();
-        if executable.file_name().and_then(|name| name.to_str()) != Some("sidevoice-rust")
-            || dist.file_name().and_then(|name| name.to_str()) != Some("dist")
+        if !matches!(
+            executable.file_name().and_then(|name| name.to_str()),
+            Some("sidevoice-rust" | "sidevoice")
+        ) || dist.file_name().and_then(|name| name.to_str()) != Some("dist")
             || release_dir
                 .parent()
                 .and_then(Path::file_name)
@@ -335,7 +340,7 @@ impl Profile {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or_default()
-            || selected.format.as_deref() != Some("sea")
+            || !matches!(selected.format.as_deref(), Some("sea" | "rust-native"))
             || selected.runtime_kind != "rust-native-v1"
             || selected.runtime_target.as_deref() != Some(target)
             || runtime_source != env!("SIDEVOICE_CONNECTOR_BUILD_SHA")
@@ -374,12 +379,12 @@ impl Profile {
         if control_info.len()
             != selected
                 .distributor_size
-                .context("selected control SEA size missing")?
+                .context("selected control size missing")?
             || digest_file(&control)?
                 != selected
                     .distributor_sha256
                     .as_deref()
-                    .context("selected control SEA digest missing")?
+                    .context("selected control digest missing")?
         {
             bail!("selected Sidevoice control executable differs from the release record");
         }
@@ -440,16 +445,79 @@ impl Profile {
             core_socket: core_data.join("local.sock"),
             core_ready: core_data.join("core.json"),
             installed: Some(selected),
+            control_mode: false,
+        };
+        profile.validate_existing_private()?;
+        Ok(profile)
+    }
+
+    /// Resolve public command paths without claiming that this process is the selected daemon.
+    pub fn for_control_env() -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        let home = PathBuf::from(std::env::var_os("HOME").context("HOME is required")?);
+        validate_user_directory(&home)?;
+        let path = |key: &str, fallback: PathBuf| -> Result<PathBuf> {
+            let value = std::env::var_os(key).map(PathBuf::from).unwrap_or(fallback);
+            if !value.is_absolute() {
+                bail!("{key} must be absolute");
+            }
+            Ok(value)
+        };
+        let data = path("SIDEVOICE_DATA_DIR", home.join(".sidevoice"))?;
+        if !data.try_exists()? {
+            let parent = data.parent().context("data parent")?;
+            validate_user_directory(parent)?;
+            fs::DirBuilder::new().mode(0o700).create(&data)?;
+        }
+        private_dir(&data)?;
+        let xdg_data = path("XDG_DATA_HOME", home.join(".local/share"))?;
+        let mut root = xdg_data.join("sidevoice");
+        let install_file = data.join("install.json");
+        if install_file.try_exists()? {
+            private_file(&install_file)?;
+            if fs::metadata(&install_file)?.len() > 65536 {
+                bail!("install record too large");
+            }
+            let install: Value = serde_json::from_slice(&fs::read(&install_file)?)?;
+            if let Some(recorded) = install.get("releases").and_then(Value::as_str) {
+                let recorded = PathBuf::from(recorded);
+                if !recorded.is_absolute()
+                    || recorded.file_name().and_then(|s| s.to_str()) != Some("sidevoice")
+                {
+                    bail!("invalid release root");
+                }
+                root = recorded;
+            }
+        }
+        let cursor = path("CURSOR_CONFIG_DIR", home.join(".cursor"))?;
+        let profile = Self {
+            root,
+            claude: path("CLAUDE_CONFIG_DIR", home.join(".claude"))?,
+            codex: path("CODEX_HOME", home.join(".codex"))?,
+            cursor_data: path("CURSOR_DATA_DIR", cursor.join("data"))?,
+            cursor,
+            xdg_config: path("XDG_CONFIG_HOME", home.join(".config"))?,
+            xdg_data,
+            socket: data.join("connector.sock"),
+            core_socket: data.join("core/local.sock"),
+            core_ready: data.join("core/core.json"),
+            data,
+            home,
+            installed: None,
+            control_mode: true,
         };
         profile.validate_existing_private()?;
         Ok(profile)
     }
 
     pub fn is_installed(&self) -> bool {
-        self.installed.is_some()
+        self.control_mode || self.installed.is_some()
     }
 
     pub fn connector_version(&self) -> &str {
+        if self.control_mode {
+            return env!("SIDEVOICE_CONNECTOR_VERSION");
+        }
         self.installed
             .as_ref()
             .map(|selected| selected.connector.as_str())
@@ -579,6 +647,27 @@ impl Profile {
     /// All of these roots are passed to host CLIs or used for profile writes, so check them again
     /// at each operation boundary rather than trusting startup-time validation.
     pub fn validate_existing_private(&self) -> Result<()> {
+        if self.control_mode {
+            private_dir(&self.data)?;
+            for path in [
+                &self.home,
+                &self.claude,
+                &self.codex,
+                &self.cursor,
+                &self.cursor_data,
+                &self.xdg_config,
+                &self.xdg_data,
+            ] {
+                match fs::symlink_metadata(path) {
+                    Ok(_) => {
+                        validate_user_directory(path)?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            return Ok(());
+        }
         if self.installed.is_some() {
             private_dir(&self.root)?;
             private_dir(&self.root.join("releases"))?;
@@ -639,7 +728,7 @@ impl Profile {
         {
             bail!("unknown proof agent configuration directory");
         }
-        if self.installed.is_some() {
+        if self.is_installed() {
             validate_user_directory(config_root)?;
             return Ok(());
         }
@@ -648,7 +737,7 @@ impl Profile {
 
     pub fn agent_root(&self, config_root: &Path) -> Result<PathBuf> {
         self.validate_for_agent(config_root)?;
-        if self.installed.is_some() {
+        if self.is_installed() {
             config_root.canonicalize().map_err(Into::into)
         } else {
             Ok(self.root.clone())
@@ -657,7 +746,7 @@ impl Profile {
 
     pub fn validate_private(&self) -> Result<()> {
         self.validate_existing_private()?;
-        if self.installed.is_some() {
+        if self.is_installed() {
             return Ok(());
         }
         for path in [&self.claude, &self.codex, &self.cursor] {
