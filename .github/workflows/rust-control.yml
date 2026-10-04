@@ -29,6 +29,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: packages/connector-rust
+          cache-on-failure: true
       - name: Check formatting
         run: cargo fmt --manifest-path packages/connector-rust/Cargo.toml --all --check
       - name: Compile and test the native control paths
@@ -59,6 +60,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: packages/connector-rust
+          cache-on-failure: true
+      - name: Check macOS native process ownership and shutdown
+        if: runner.os == 'macOS'
+        run: cargo test --locked --manifest-path packages/connector-rust/Cargo.toml installed_service::native_tests -- --nocapture
       - name: Verify and reuse accepted Core inputs
         env:
           GH_TOKEN: ${{ github.token }}

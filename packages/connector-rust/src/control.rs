@@ -82,7 +82,7 @@ pub async fn run(args: &[String]) -> Option<i32> {
                 }
                 return Some(1);
             }
-            let detail = error.to_string();
+            let detail: String = format!("{error:#}").chars().take(4096).collect();
             let key = if detail.split_whitespace().count() == 1 && detail.contains('.') {
                 detail.as_str()
             } else {
