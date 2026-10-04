@@ -1,28 +1,30 @@
-# Rust Connector proof and installed runtime
+# Native Connector control and runtime
 
-This package has two modes. The isolated proof mode remains separate from the npm package and release selection. A target SEA built with the trusted Rust Core and Rust Connector inputs can also install the experimental `rust-native-v1` pair: the existing JavaScript SEA stays the user-facing control and installer, while the Rust binary serves MCP and the local daemon and the Rust Core runs from the same selected release. This branch has not been selected for beta or production. The final Rust Connector promotion and Desktop switch remain separate gates.
+The isolated migration candidate replaces the shipped JavaScript control layer with Rust: public CLI, installation and update, rollback, uninstall, launchd/systemd service operations, agent discovery and owned registrations, room/device pairing, and runtime-policy calls. The current accepted beta keeps its existing Node SEA; this candidate does not change its pin. Native migration acceptance requires hosted functional proof, independent functional and simplicity reviews, and a coordinated shipping handoff.
+
+## Native executable
+
+`tools/build-native.py --core-inputs <verified-input-directory> --output <artifact-directory>` builds a single `sidevoice` executable on its native GitHub Actions runner. Rust embeds the complete Core manifest and the matching target archive, checked against `packages/connector/rust-core-production-pin.json`. Installation fetches neither Core nor a language runtime. `--version --json` and `metadata --json` report `format: "rust-native"` and `sea: false`; metadata/progress protocol IDs remain unchanged. A Desktop pin must explicitly support this new format before integration.
+
+The public commands remain `install`, `rollback`, `uninstall`, `service`, `agents`, `pair`, `link-room`, `pair-device`, `skill`, `metadata`, `mcp`, and `connector`. Updating means running `install` from the new executable. The native pair requires Core; `--no-core` is refused. JSON command results stay on stdout and `--progress=jsonl` writes progress to stderr. Pairing uses native HTTP and the existing private credential file; runtime policy does not launch a JavaScript control executable.
 
 ## Installed pair
 
-The trusted target build verifies the protected-main Core T7 manifest and target archive, verifies the exact Rust Connector target binary and its build identity, then embeds both assets in the existing target SEA. Installation downloads neither native binary. It extracts the Core archive root `sidevoice-core-rust/` into `<release>/core`, producing these fixed paths:
-
-| Path | Selected program or data |
+| Path | Program or data |
 | --- | --- |
-| `<release>/core/bin/sidevoice-core-rust` | Native Core entrypoint |
-| `<release>/core/models` | Core models |
-| `<release>/core/checks` | Core checks |
-| `<release>/core/lib` | Core libraries |
-| `<release>/dist/sidevoice` | JavaScript installer and control SEA |
-| `<release>/dist/sidevoice-rust` | Rust daemon and MCP executable |
-| `<release>/release.json` | Closed release and pair identity record |
+| `<release>/dist/sidevoice` | Native public CLI |
+| `<release>/dist/sidevoice-rust` | Same native executable under the existing daemon/MCP path |
+| `<release>/core/bin/sidevoice-core-rust` | Native Core |
+| `<release>/core/models`, `checks`, `lib`, `notices` | Verified Core archive contents |
+| `<release>/release.json` | Distributor/runtime/Core/pair identity |
 
-`release.json` keeps the distributor, runtime and Core identities distinct. The intermediate pair uses `runtime_kind: "rust-native-v1"`, `core_kind: "rust-native-v1"`, and a `pair_id` of `pair-v1:rust-native-v1:<runtime_sha256>:core:rust-native-v1-<target>-<core_source_sha>-<core_archive_sha256>`. Runtime fields are `runtime_build_sha`, `runtime_sha256`, `runtime_size`, and `runtime_target`; `distributor_sha256` and `distributor_size` identify the JavaScript control SEA. The Core fields are `core_source_sha`, `core_cargo_lock_sha256`, `core_manifest_sha256`, `core_archive_sha256`, `core_archive_size`, `core_target`, and `core_entrypoint` (`bin/sidevoice-core-rust`). The selected Rust process revalidates the release record, paths, executable digests, target and pair identity at startup. A runtime-kind or pair change remains an upgrade even when the package version is unchanged.
+`current`, `previous`, and `verified` remain the only selection pointers. New native releases retain `runtime_kind: "rust-native-v1"`, `core_kind: "rust-native-v1"`, separate byte digests, and the established pair ID. `format: "rust-native"` distinguishes the distributor from legacy `sea` and `esm` selections. Existing legacy releases are recognized for safe rollback and owned-registration cleanup; Node is not embedded in the new release.
 
-The existing `current`, `previous` and `verified` release links are the only selection and rollback mechanism. Installation stages and self-tests the embedded Core and Rust Connector before changing `current`; failed readiness uses the existing rollback path. A JavaScript-to-Rust runtime-kind change requires a valid empty `outbox.json` before staging and again under the install lock immediately before commit. It refuses malformed, unreadable or nonempty outboxes without switching the release. Same-runtime upgrades retain the existing speech and acknowledgement behavior.
+The existing npm/SEA build scripts and legacy runtime source remain for comparison and compatibility fixtures. They are **not** the native shipment. New release wiring must cease publishing/selecting those JavaScript runtime outputs before this migration is declared complete; registry/publication design is a separate coordinated handoff.
 
-The installed Rust MCP command is `<release>/dist/sidevoice-rust --installed mcp`; the daemon is `<release>/dist/sidevoice-rust --installed connector`. Harness registration and both service-manager definitions select those commands through `current`. The Node SEA retains install, service administration, pairing CLI and updates. Rust `voice_pair` invokes the fixed selected `<release>/dist/sidevoice pair --json -- <room> <exact-user-code>` path directly, with no shell, and maps its JSON success/error result to the MCP result. Pairing is refused in isolated proof mode. `voice_pair_device` continues over the existing local Core route. Installed Rust identity replies include `runtime_kind`, `runtime_build_sha`, `runtime_sha256`, `runtime_target` and `release_id`; service readiness and install verification require those fields to match the selected release.
+## Validation
 
-The trusted `rust-core-consumer.yml` workflow fetches and verifies only the fixed protected-main Core run in its secret-bearing job. The candidate job receives the same-run verified bytes, checks exact membership and pins again, builds the matching Rust target, packages the SEA, and runs offline stage/self-test coverage for macOS arm64, Linux x86_64 and Linux arm64. Mac acceptance additionally installs the pair into a disposable profile under real launchd, invokes Rust `voice_pair` against a local test room, and checks the running native Core authenticates with the newly written credential. The workflow fails closed unless `SIDEVOICE_CORE_ACTIONS_READ` has Actions:read access to the Core repository; the Connector secret is currently absent, so no signed-positive consumer run or beta selection is established.
+`rust-control.yml` is an isolated migration gate. Native compilation and tests run only in GitHub Actions. `tools/core-proof-inputs.py` verifies and reuses the exact accepted Core artifact for migration tests while it is available; it is an expiring test input, not a production download mechanism. The installed pairing fixture runs against a disposable profile and local room, never an operator installation.
 
 ## Isolated proof mode
 

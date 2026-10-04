@@ -120,6 +120,27 @@ async fn dispatch(command: &str, args: &[String]) -> Result<Value> {
             json!({"_text":env!("SIDEVOICE_CONNECTOR_VERSION"),"result":payload::version_metadata()}),
         ),
         "metadata" => Ok(payload::connector_metadata()),
+        "--sidevoice-selected-command" => Ok(json!(crate::installed_service::stable_command(
+            &crate::release::Paths::environment()?
+        )?)),
+        "--sidevoice-runtime-switching" => Ok(
+            json!({"switching":crate::installed_service::runtime_switching(&crate::release::Paths::environment()?)?}),
+        ),
+        "--sidevoice-connector-management" => Ok(
+            json!({"state":if crate::installed_service::defined(&crate::release::Paths::environment()?)? { "defined" } else { "absent" }}),
+        ),
+        "--sidevoice-ensure-core" => {
+            crate::installed_service::ensure_core(&crate::release::Paths::environment()?).await?;
+            Ok(json!({"ok":true}))
+        }
+        "--sidevoice-agent-scan" => {
+            let answer = agents::run_cli(Profile::for_control_env()?, &[]).await?;
+            if answer.get("error").is_some() {
+                bail!("agents.failed");
+            }
+            Ok(Value::Null)
+        }
+
         "mcp" => {
             crate::mcp::run(Profile::from_installed_env()?).await?;
             Ok(Value::Null)
