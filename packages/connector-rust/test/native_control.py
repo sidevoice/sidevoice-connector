@@ -70,6 +70,12 @@ def main(first, second):
             env.pop(key, None)
         env.update(HOME=str(home), XDG_DATA_HOME=str(xdg), XDG_CONFIG_HOME=str(config),
                    SIDEVOICE_DATA_DIR=str(data), SIDEVOICE_CORE_PORT='0')
+        # Cursor's registration is file-based; this stub supplies discovery/version only.
+        bin_dir = home / '.local/bin'
+        bin_dir.mkdir(parents=True, mode=0o700)
+        cursor_cli = bin_dir / 'cursor'
+        cursor_cli.write_text('#!/bin/sh\n[ "$1" = "--version" ] || exit 2\nprintf "cursor-fixture 1.0\\n"\n')
+        cursor_cli.chmod(0o700)
         root = xdg / 'sidevoice'
         try:
             initial, output = run(first, ['install', '--no-agents', '--json', '--progress=jsonl'], env)
