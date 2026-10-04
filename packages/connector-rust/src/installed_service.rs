@@ -1061,6 +1061,15 @@ async fn core_processes(p: &Paths) -> Result<Vec<(u32, ProcessIdentity)>> {
         let identity = match process_identity(pid).await {
             Ok(Some(identity)) => identity,
             Ok(None) => continue,
+            // macOS ps -U selects real UID; setuid processes may have another effective
+            // owner. Discovery must skip them; targeted signalling still refuses them.
+            Err(error)
+                if error
+                    .downcast_ref::<release::ControlError>()
+                    .is_some_and(|error| error.key == "control.foreign-process-owner") =>
+            {
+                continue
+            }
             Err(error)
                 if error
                     .chain()

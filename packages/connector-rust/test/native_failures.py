@@ -38,12 +38,12 @@ def progress_seen(path, step):
 
 
 @contextmanager
-def installer(binary, env, base, name):
+def installer(binary, env, base, name, command='install'):
     stdout = base / f'{name}.stdout'
     stderr = base / f'{name}.stderr'
     with stdout.open('w') as out, stderr.open('w') as err:
-        child = subprocess.Popen([str(binary), 'install', '--no-agents', '--json',
-                                  '--progress=jsonl'], env=env, stdout=out, stderr=err,
+        child = subprocess.Popen([str(binary), command, *(['--no-agents'] if command == 'install' else []),
+                                  '--json', '--progress=jsonl'], env=env, stdout=out, stderr=err,
                                  start_new_session=True)
         try:
             yield child, stdout, stderr
@@ -67,12 +67,14 @@ def pointers(root):
             for name in ['current', 'previous', 'verified']}
 
 
-def manager_gate(base, root, original):
+def manager_gate(base, root, original, data=None):
     """Pause a real manager command before it starts the committed candidate."""
+    base.mkdir(mode=0o700, parents=True, exist_ok=True)
     manager = '/bin/launchctl' if sys.platform == 'darwin' else shutil.which('systemctl')
     assert manager, 'systemctl is unavailable'
     script = base / 'manager-gate'
     config = {'root': str(root), 'original': original, 'manager': manager,
+              'data': str(data) if data else None,
               'arrived': str(base / 'manager-arrived'), 'release': str(base / 'manager-release')}
     script.write_text(f'#!{sys.executable}\n' + 'CONFIG = ' + repr(config) + '\n' + r'''
 import json, os, pathlib, sys, time
@@ -83,7 +85,15 @@ args = sys.argv[1:]
 selection = json.loads((root / 'current/release.json').read_bytes())
 is_start = ('bootstrap' in args and any(arg.endswith('/dev.sidevoice.core.plist') for arg in args)) or (
     any(arg in ('start', 'restart') for arg in args) and 'sidevoice-core.service' in args)
-if is_start and selection['id'] != CONFIG['original'] and not release.exists():
+gate = is_start and selection['id'] != CONFIG['original']
+if CONFIG['data']:
+    marker = pathlib.Path(CONFIG['data']) / 'runtime-switch.json'
+    active = marker.exists() and json.loads(marker.read_bytes()).get('phase') == 'active'
+    # Core observation occurs after Connector unload, even if a human stopped both jobs.
+    core_query = ('print' in args and any(arg.endswith('/dev.sidevoice.core') for arg in args)) or (
+        'show' in args and 'sidevoice-core.service' in args)
+    gate = active and core_query
+if gate and not release.exists():
     arrived.write_text(json.dumps({'pid': os.getpid(), 'selected': selection['id'], 'args': args}))
     end = time.monotonic() + 25
     while not release.exists():
@@ -95,6 +105,74 @@ os.execv(CONFIG['manager'], [CONFIG['manager'], *args])
     script.chmod(0o700)
     return script, Path(config['arrived']), Path(config['release'])
 
+
+
+def fault_environment(env, wrapper):
+    return env | {('SIDEVOICE_LAUNCHCTL' if sys.platform == 'darwin'
+                   else 'SIDEVOICE_SYSTEMCTL'): str(wrapper)}
+
+
+def refused_second_outbox_check(binary, env, base, root, data, human_stopped):
+    """Synthetic alternate-kind target is rejection-only: never selected or executed."""
+    case = base / ('outbox-stopped' if human_stopped else 'outbox-running')
+    if human_stopped:
+        run(binary, ['service', 'stop', '--json'], env)
+    prior_record = root / 'previous/release.json'
+    saved_record = prior_record.read_bytes()
+    alternate = json.loads(saved_record)
+    current = selected(root)['id']
+    assert alternate['id'] != current
+    alternate['runtime_kind'] = 'synthetic-rejection-only'
+    outbox = data / 'outbox.json'
+    saved_outbox = outbox.read_bytes() if outbox.exists() else None
+    before = pointers(root)
+    stop_file = data / 'node-stopped.json'
+    saved_stop = stop_file.read_bytes() if stop_file.exists() else None
+    wrapper, arrived, release_gate = manager_gate(case, root, current, data)
+    try:
+        # Empty at precheck; the controlled manager boundary injects after Gate::begin.
+        outbox.write_text('[]')
+        outbox.chmod(0o600)
+        prior_record.write_text(json.dumps(alternate))
+        with installer(binary, fault_environment(env, wrapper), case, 'rollback',
+                       command='rollback') as (child, out, err):
+            wait_for(arrived.exists, child, 'rollback Core observation after Connector unload')
+            assert json.loads((data / 'runtime-switch.json').read_bytes())['phase'] == 'active'
+            assert pointers(root) == before
+            outbox.write_text('[{"id":"pending-fixture","text":"retain"}]')
+            outbox.chmod(0o600)
+            release_gate.touch()
+            answer = result(child, out, err)
+            assert child.returncode != 0, answer
+            assert answer.get('error', {}).get('key') == 'install.runtime-switch-outbox', answer
+            assert pointers(root) == before, 'rejected synthetic target was selected'
+            assert (stop_file.read_bytes() if stop_file.exists() else None) == saved_stop
+            status, _ = run(binary, ['service', 'status', '--json'], env)
+            if human_stopped:
+                assert status['state'] == 'stopped-by-person', status
+            else:
+                wait_running(binary, env)
+                assert ready(data)['pid'] > 1
+    finally:
+        release_gate.touch()
+        # Quiesce any resumed daemon before restoring its original persistent outbox.
+        try:
+            run(binary, ['service', 'stop', '--json'], env)
+        finally:
+            prior_record.write_bytes(saved_record)
+            if saved_outbox is None:
+                outbox.unlink(missing_ok=True)
+            else:
+                outbox.write_bytes(saved_outbox)
+                outbox.chmod(0o600)
+            if saved_stop is None:
+                stop_file.unlink(missing_ok=True)
+            else:
+                stop_file.write_bytes(saved_stop)
+                stop_file.chmod(0o600)
+        if not human_stopped:
+            run(binary, ['service', 'start', '--json'], env)
+            wait_running(binary, env)
 
 def main(first, second):
     if os.environ.get('GITHUB_ACTIONS') != 'true':
@@ -144,6 +222,26 @@ def main(first, second):
                     assert pointers(root) == before
                     assert stop_file.read_bytes() == stopped
             run(first, ['install', '--no-agents', '--json'], env)
+            wait_running(first, env)
+            assert selected(root)['id'] == original
+
+            # Kill the installer and its gated manager child after commit, then resume
+            # through an ordinary install. No candidate binary or release record is changed.
+            interruption = base / 'interruption'
+            wrapper, arrived, interruption_release = manager_gate(interruption, root, original)
+            with installer(second, fault_environment(env, wrapper), interruption,
+                           'interrupted') as (child, out, err):
+                try:
+                    wait_for(arrived.exists, child, 'postcommit interruption gate', timeout=180)
+                    assert progress_seen(err, 'service-start'), err.read_text()
+                    assert selected(root)['id'] != original
+                    os.killpg(child.pid, signal.SIGKILL)
+                    child.wait(timeout=10)
+                finally:
+                    interruption_release.touch()
+            run(second, ['install', '--no-agents', '--json'], env)
+            wait_running(second, env)
+            run(second, ['rollback', '--json'], env)
             wait_running(first, env)
             assert selected(root)['id'] == original
 
@@ -203,7 +301,11 @@ def main(first, second):
             assert Path(repaired['command']).is_file()
             assert Path(repaired['command']).resolve().is_relative_to((root / 'releases' / upgraded).resolve())
             cursor_saved = cursor.read_bytes()
-            print(json.dumps({'ok': True, 'checked': ['lock-cancellation-stop-preservation',
+            refused_second_outbox_check(second, env, base, root, data, human_stopped=False)
+            refused_second_outbox_check(second, env, base, root, data, human_stopped=True)
+            print(json.dumps({'ok': True, 'checked': ['postcommit-interruption-retry',
+                              'synthetic-alternate-kind-second-outbox-check-running-and-stopped',
+                              'lock-cancellation-stop-preservation',
                               'automatic-verification-rollback-retry', 'reconcile-failure-retention-retry']}))
         finally:
             release_gate.touch()
