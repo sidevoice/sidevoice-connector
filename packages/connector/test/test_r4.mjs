@@ -860,6 +860,9 @@ test('cold, expired, and corrupt offline TUF caches fail closed with the Sigstor
 });
 
 test('native SEA runs directly, answers MCP stdio and self-spawns its connector without Node on PATH', async t => {
+  if (process.env.SIDEVOICE_RUST_CORE_SOURCE_BUILD === '1') {
+    t.skip('the required Rust pair uses the installed native pairing acceptance'); return;
+  }
   if (!sea) { t.skip(`no SEA target is configured for ${process.platform}/${process.arch}`); return; }
   try { await stat(sea); } catch { t.skip('target SEA is built by the native target CI job'); return; }
   const version = spawnSync(sea, ['--version'], { encoding: 'utf8', timeout: 10_000 });
@@ -926,6 +929,9 @@ test('native SEA runs directly, answers MCP stdio and self-spawns its connector 
 });
 
 test('native SEA uninstalls a no-core, no-agent install and removes all non-lock state', async t => {
+  if (process.env.SIDEVOICE_RUST_CORE_SOURCE_BUILD === '1') {
+    t.skip('a native Core SEA refuses --no-core by design'); return;
+  }
   if (!sea) { t.skip(`no SEA target is configured for ${process.platform}/${process.arch}`); return; }
   try { await stat(sea); } catch { t.skip('target SEA is built by the native target CI job'); return; }
 
