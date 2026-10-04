@@ -1278,7 +1278,7 @@ async fn selected_control(
 }
 
 pub(crate) async fn runtime_switching(profile: &Profile) -> anyhow::Result<bool> {
-    Ok(selected_control(
+    selected_control(
         profile,
         &["--sidevoice-runtime-switching"],
         Duration::from_secs(10),
@@ -1286,7 +1286,7 @@ pub(crate) async fn runtime_switching(profile: &Profile) -> anyhow::Result<bool>
     .await?
     .get("switching")
     .and_then(Value::as_bool)
-    .ok_or_else(|| anyhow::anyhow!("runtime switch status missing"))?)
+    .ok_or_else(|| anyhow::anyhow!("runtime switch status missing"))
 }
 
 async fn ensure_installed_connector(profile: &Profile) -> anyhow::Result<()> {
