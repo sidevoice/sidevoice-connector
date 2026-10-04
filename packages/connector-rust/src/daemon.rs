@@ -2125,6 +2125,9 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     }
     private_dir(&profile.data)?;
     let lock = profile.try_connector_lock()?;
+    if profile.is_installed() && !managed && crate::service::runtime_switching(&profile).await? {
+        return Ok(());
+    }
     if profile.socket.exists() {
         verify_socket(&profile.socket)?;
         fs::remove_file(&profile.socket)?;

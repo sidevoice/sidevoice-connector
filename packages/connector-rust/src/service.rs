@@ -1277,12 +1277,27 @@ async fn selected_control(
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
+pub(crate) async fn runtime_switching(profile: &Profile) -> anyhow::Result<bool> {
+    Ok(selected_control(
+        profile,
+        &["--sidevoice-runtime-switching"],
+        Duration::from_secs(10),
+    )
+    .await?
+    .get("switching")
+    .and_then(Value::as_bool)
+    .ok_or_else(|| anyhow::anyhow!("runtime switch status missing"))?)
+}
+
 async fn ensure_installed_connector(profile: &Profile) -> anyhow::Result<()> {
     if profile.service_stopped()? {
         return Err(anyhow::Error::new(Failure::keyed(
             "service.node-stopped",
             json!({}),
         )));
+    }
+    if runtime_switching(profile).await? {
+        anyhow::bail!("Sidevoice is updating the Connector. Try again in a moment.");
     }
     let current = profile.root.join("current").canonicalize()?;
     if current.file_name().and_then(|name| name.to_str())

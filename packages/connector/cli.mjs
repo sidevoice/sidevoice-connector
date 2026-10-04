@@ -32,7 +32,7 @@ import { installedService, managerKind, presence } from './service.mjs';
 import { connectorMetadata, versionMetadata } from './metadata.mjs';
 import { pause } from './testpoint.mjs';
 import { appendLine } from './logfile.mjs';
-import { dataDirOf, nodeFiles } from './node-files.mjs';
+import { dataDirOf, nodeFiles, runtimeSwitching } from './node-files.mjs';
 
 const COMMANDS = { install: runInstall, uninstall: runUninstall, rollback: runRollback, mcp, pair: runPair, 'link-room': runLinkRoom,
   'pair-device': pairDevice, connector, service, skill, agents };
@@ -58,6 +58,10 @@ export async function main([command, ...argv] = process.argv.slice(2)) {
   if (command === '--sidevoice-selected-command') {
     try { console.log(JSON.stringify(stableCommand(process.env))); return 0; }
     catch (error) { console.log(JSON.stringify({ error: error.key ?? 'install.failed' })); return 1; }
+  }
+  if (command === '--sidevoice-runtime-switching') {
+    console.log(JSON.stringify({ switching: runtimeSwitching(dataDirOf(process.env)) }));
+    return 0;
   }
   if (command === '--sidevoice-connector-management') {
     const service = installedService(process.env);

@@ -31,7 +31,7 @@ import { socketAgent } from './core-socket.mjs';
 import { appendLine } from './logfile.mjs';
 import { coreProgram } from './release.mjs';
 import { installedService, status as nodeStatusOf } from './service.mjs';
-import { connectorLockOf, connectorSocketOf, dataDirOf, nodeFiles } from './node-files.mjs';
+import { connectorLockOf, connectorSocketOf, dataDirOf, nodeFiles, runtimeSwitching } from './node-files.mjs';
 import { tryLock } from './lockfile.mjs';
 import { t } from './i18n.mjs';
 import { verifyPrivateDir } from './secure-fs.mjs';
@@ -838,7 +838,7 @@ export async function run(argv = [], environment = process.env) {
   }
   // A person's stop holds for every connector the launcher started, not only for the launcher: one spawned just before
   // the stop, and starting only now, does not serve. The job starting is a login or `service start`: it clears it.
-  if (!serviceMode && existsSync(files.stopped)) { log('Sidevoice is stopped on this machine: not serving'); releaseLock({ socket: false }); process.exit(0); }
+  if (!serviceMode && (existsSync(files.stopped) || runtimeSwitching(dataDir))) { log('Sidevoice is stopped or switching on this machine: not serving'); releaseLock({ socket: false }); process.exit(0); }
   log(`connector ${VERSION} starting${serviceMode ? ' as the connector job' : ''}: pid ${process.pid}, host ${hostId}, ${external ? 'core at ' + external.room : ownsCore ? 'this machine\'s own core, started on demand' : 'this machine\'s core job'}, socket ${socketPath}, log ${logPath}`);
   try { loadOutbox(); }
   catch (error) { log(`not starting: ${error.message}`); releaseLock({ socket: false }); process.exitCode = 78; return; }

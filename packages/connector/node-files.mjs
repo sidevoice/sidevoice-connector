@@ -6,7 +6,11 @@
  *  run, and is refused. */
 import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { rmSync } from 'node:fs';
 import { readTrustedJson, writePrivateFile } from './secure-fs.mjs';
+import { installLockPath, readLock } from './lockfile.mjs';
+import { isProcess } from './proc.mjs';
 
 export function dataDirOf(env = process.env) {
   return env.SIDEVOICE_DATA_DIR || path.join(env.HOME || os.homedir(), '.sidevoice');
@@ -29,9 +33,29 @@ export function nodeFiles(dataDir) {
     agents: at('agents.json'),             // captured login-shell PATH, last scan and agent dismissal generations
     agentsLock: at('agents.lock'),         // kernel-held lock for agents.json read/modify/write transactions
     stopped: at('node-stopped.json'),      // a person stopped Sidevoice: {at}
+    switching: at('runtime-switch.json'), // an installer temporarily inhibits on-demand launch
     connectorLog: at('connector.log'),
     coreStderr: at('core.stderr.log'),     // what launchd catches from the core job: a crash's output
   };
+}
+
+/** A live install transaction owns this launch barrier; a dead installer's marker cannot strand the node. */
+export function runtimeSwitching(dataDir) {
+  const marker = readTrustedJson(nodeFiles(dataDir).switching);
+  if (!marker?.token) return false;
+  const owner = readLock(installLockPath(dataDir));
+  return owner?.pid === marker.pid && owner?.start === marker.start
+    && isProcess(owner.pid, { start: owner.start ?? null });
+}
+
+/** Called with install.lock held. Removing this token never clears a person's separate stop intent. */
+export function inhibitRuntimeLaunch(dataDir) {
+  const owner = readLock(installLockPath(dataDir));
+  if (!owner || owner.pid !== process.pid) throw new Error('install lock required for runtime switch');
+  const token = randomUUID();
+  const file = nodeFiles(dataDir).switching;
+  writePrivateFile(file, JSON.stringify({ token, pid: owner.pid, start: owner.start }));
+  return () => { if (readTrustedJson(file)?.token === token) rmSync(file, { force: true }); };
 }
 
 /** What `install.json` records (SEAMS §1): `{command, releases, definitions}` — the command everything runs, and the

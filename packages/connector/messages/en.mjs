@@ -19,6 +19,7 @@ export const en = {
   'install.disk': 'There is not enough available disk space to install the Sidevoice core.',
   'install.authenticity': 'The downloaded Sidevoice core was refused at check "{check}".',
   'install.runtime-switch-outbox': 'Sidevoice cannot switch Connector runtimes while speech is queued or its outbox cannot be read. Let the queue empty, then retry the install.',
+  'install.runtime-switching': 'Sidevoice is updating the Connector. Try again in a moment.',
   'install.outbox-quarantined': 'Queued speech from the failed release was retained at {path} and was not replayed by the previous Connector.',
 
   // The launcher and the node service (§4.2). `node.stopped` also reaches agents, so it stays plain English.

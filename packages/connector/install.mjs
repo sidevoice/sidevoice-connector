@@ -25,7 +25,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { readdirSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
 import { harnessesPresent } from './identity.mjs';
 import { pairedRoom } from './pair.mjs';
 import { CORE_VERSION, NO_UV, embeddedRustCoreIdentity, ensureRunning, findUv, readReady, takeInstallLock } from './core.mjs';
@@ -36,7 +36,7 @@ import { candidate, coreProgram, decide, discardRuntimeIfUnselected, flipBack, m
 import { matchesSelectedRustConnectorIdentity, RUST_CONNECTOR_KIND } from './rust-connector.mjs';
 import { HARNESS_REGISTRATIONS, codexInstructions, cursorMcpFile, serverCommand, unregisterFromClaude, unregisterFromCodex, unregisterFromCursor } from './registrations.mjs';
 import { askConnector, compatibleCore, installedService, jobDefinitions, linger, managerKind, recordInstallation, settledState, start as startService, startJobs, status, stop as stopService, stopOnDemand, uninstall as uninstallService, writeDefinitions } from './service.mjs';
-import { dataDirOf, nodeFiles } from './node-files.mjs';
+import { dataDirOf, inhibitRuntimeLaunch, nodeFiles } from './node-files.mjs';
 import { crash, pause } from './testpoint.mjs';
 import { captureAgentEnvironment, withAgentStateLock } from './agents.mjs';
 import { readTrusted } from './secure-fs.mjs';
@@ -64,16 +64,31 @@ function requireEmptyOutbox(dataDir) {
 
 /** Quiesce the only writer before the final cross-runtime outbox decision. */
 async function quiesceRuntime(env) {
+  const stoppedBefore = existsSync(nodeFiles(dataDirOf(env)).stopped);
   if (installedService(env)) {
     let stopped;
     try { stopped = await stopService(env); }
-    catch (error) { await startService(env); throw error; }
-    if (!stopped.ok) { await startService(env); throw keyed('service.unload-failed', { detail: 'the previous connector did not exit' }); }
-    return async () => startService(env);
+    catch (error) { if (!stoppedBefore) await startService(env); throw error; }
+    if (!stopped.ok) { if (!stoppedBefore) await startService(env); throw keyed('service.unload-failed', { detail: 'the previous connector did not exit' }); }
+    return async () => { if (!stoppedBefore) await startService(env); };
   }
-  const down = await stopOnDemand(env);
+  const wasRunning = !!(await askConnector('status', {}, { env, timeout: 1000 }))?.version;
+  const down = await stopOnDemand(env, { selectedRelease: selection(env, 'current')?.release });
   if (down.left.length) throw keyed('service.unload-failed', { detail: `pid ${down.left.join(', ')} still running` });
-  return async () => {};
+  return async () => {
+    if (!wasRunning || stoppedBefore) return;
+    await ensureRunning({ dataDir: dataDirOf(env), env, bin: coreProgram(env) });
+    const [program, ...args] = selectedDaemonCommand(env);
+    const child = spawn(program, [...args, 'connector'], { detached: true, stdio: 'ignore', env });
+    child.on('error', () => {});
+    child.unref();
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      if ((await askConnector('status', {}, { env, timeout: 500 }))?.version) return;
+      await wait(100);
+    }
+    throw keyed('connector.not-started');
+  };
 }
 
 async function verifyUnmanagedRustConnector(env, release) {
@@ -246,20 +261,26 @@ async function goBack(env, kind, progressEvent = () => {}, { explicit = false } 
     .find(release => release && release.id !== current?.id);
   if (!previous) return null;
   let resume = null, quarantined = null;
-  if ((current?.runtime_kind ?? 'javascript') !== (previous.runtime_kind ?? 'javascript')) {
-    resume = await quiesceRuntime(env);
-    try {
+  const runtimeKindChanged = (current?.runtime_kind ?? 'javascript') !== (previous.runtime_kind ?? 'javascript');
+  const quiesce = runtimeKindChanged || (current?.runtime_kind === RUST_CONNECTOR_KIND && current.id !== previous.id);
+  const uninhibit = quiesce ? inhibitRuntimeLaunch(dataDirOf(env)) : null;
+  try {
+    if (quiesce) resume = await quiesceRuntime(env);
+    await pause('rollback-after-quiesce');
+    if (runtimeKindChanged) {
       if (explicit) requireEmptyOutbox(dataDirOf(env));
       else quarantined = quarantineOutbox(dataDirOf(env), current, previous);
-    } catch (error) { await resume(); throw error; }
-  }
-  const back = flipBack(env);
-  if (!back) { if (resume) await resume(); return null; }
-  rmSync(nodeFiles(dataDirOf(env)).stopped, { force: true });
-  await restartOn(env, kind);
-  const verified = await verify(env, back, kind, { fresh: kind === 'none' });
-  if (verified.ok) markVerified(env, back.id);
-  return { release: back, ...verified, ...(quarantined ? { quarantined } : {}) };
+    }
+    const back = flipBack(env);
+    if (!back) return null;
+    uninhibit?.();
+    rmSync(nodeFiles(dataDirOf(env)).stopped, { force: true });
+    await restartOn(env, kind);
+    const verified = await verify(env, back, kind, { fresh: kind === 'none' });
+    if (verified.ok) markVerified(env, back.id);
+    return { release: back, ...verified, ...(quarantined ? { quarantined } : {}) };
+  } catch (error) { uninhibit?.(); if (resume && selection(env, 'current')?.release?.id === current?.id) await resume(); throw error; }
+  finally { uninhibit?.(); }
 }
 
 /** Wait for every call on this machine to end (an update that changes the core would end them). */
@@ -282,6 +303,7 @@ export async function apply(env, { core = true, service = false, applyNow = fals
   const dataDir = dataDirOf(env), files = nodeFiles(dataDir);
   let stagedRuntimeId = null;
   const release = await takeInstallLock(dataDir, log, { signal, onWait: () => progressEvent({ step: 'wait-lock', done: null, total: null }) });
+  let conversionUninhibit = null, conversionResume = null;
   try {
     if (signal?.aborted) throw keyed('install.cancelled');
     // Capture login-shell agent paths after taking the install lock, before any selected service can start.
@@ -306,16 +328,26 @@ export async function apply(env, { core = true, service = false, applyNow = fals
       if (current && !applyNow && (current.core_build !== chosen.core_build || selectedRuntimeChanged)) await callsEnd(env, progress, { signal, progressEvent });
       if (signal?.aborted) throw keyed('install.cancelled');
       await pause('install-before-commit', { signal });
-      const resume = runtimeKindChanged ? await quiesceRuntime(env) : null;
+      const quiesce = runtimeKindChanged || (current?.runtime_kind === RUST_CONNECTOR_KIND && current.id !== chosen.id);
+      const uninhibit = quiesce ? inhibitRuntimeLaunch(dataDir) : null;
+      let resume = null;
       try {
+        if (quiesce) resume = await quiesceRuntime(env);
+        await pause('install-after-quiesce', { signal });
         if (runtimeKindChanged) requireEmptyOutbox(dataDir);
         if (signal?.aborted) throw keyed('install.cancelled');
         progressEvent({ step: 'commit', done: null, total: null });
         beginCommit();
         switchTo(env, chosen.id);
-      } catch (error) { if (resume) await resume(); throw error; }
+      } catch (error) { uninhibit?.(); if (resume) await resume(); throw error; }
+      finally { uninhibit?.(); }
     }
     if (action === 'noop') {
+      if (core && service && current?.runtime_kind === RUST_CONNECTOR_KIND && !installedService(env)) {
+        conversionUninhibit = inhibitRuntimeLaunch(dataDir);
+        conversionResume = await quiesceRuntime(env);
+        await pause('install-after-quiesce', { signal });
+      }
       progressEvent({ step: 'commit', done: null, total: null });
       beginCommit();
     }
@@ -335,7 +367,8 @@ export async function apply(env, { core = true, service = false, applyNow = fals
       const changed = writeDefinitions(kind, env);
       recordInstallation(env, { definitions: jobDefinitions(kind, env) });
       crash('definitions-written');
-      if (!had) await stopOnDemand(env);
+      if (!had && !conversionResume) await stopOnDemand(env);
+      conversionUninhibit?.(); conversionUninhibit = null;
       // The files may match after a definitions-written crash while the manager still has the prior release cached.
       // An unverified selection must reload both definitions before the restart can verify that selection.
       if (selection(env, 'verified')?.id !== chosen.id) {
@@ -367,12 +400,13 @@ export async function apply(env, { core = true, service = false, applyNow = fals
       back: back.ok, backFailure: back.failure ?? null, registrationFailures, kind,
       ...(back.quarantined ? { quarantined: back.quarantined } : {}) };
   } catch (error) {
+    if (conversionUninhibit) { conversionUninhibit(); conversionUninhibit = null; await conversionResume?.(); }
     if (signal?.aborted || error?.key === 'install.runtime-switch-outbox') {
       prune(env, dataDir);
       discardRuntimeIfUnselected(env, dataDir, stagedRuntimeId);
     }
     throw error;
-  } finally { release(); }
+  } finally { conversionUninhibit?.(); release(); }
 }
 
 /* ----- install ----- */

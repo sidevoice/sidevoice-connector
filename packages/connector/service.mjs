@@ -491,13 +491,12 @@ async function lockHolder(env) {
 /** Stop what runs outside a manager — an on-demand connector, and every core of this data directory (ready, or still
  *  starting) — each signalled only as its verified self, and wait until both are gone and their sockets silent. Returns
  *  `{killed, left}`. */
-export async function stopOnDemand(env = process.env) {
+export async function stopOnDemand(env = process.env, { selectedRelease = selection(env, 'current')?.release } = {}) {
   const dataDir = dataDirOf(env);
   const connector = await lockHolder(env);
-  const selected = selection(env, 'current')?.release;
-  const rust = !connector && selected?.runtime_kind === RUST_CONNECTOR_KIND
+  const rust = !connector && selectedRelease?.runtime_kind === RUST_CONNECTOR_KIND
     ? await askConnector('identity', {}, { env, timeout: 1000 }) : null;
-  const rustOwner = matchesSelectedRustConnectorIdentity(rust, selected, releaseRoot(env)) && !rust.managed
+  const rustOwner = matchesSelectedRustConnectorIdentity(rust, selectedRelease, releaseRoot(env)) && !rust.managed
     && Number.isInteger(rust.pid) && rust.pid > 0 ? { pid: rust.pid, executable: rust.executable } : null;
   if (rustOwner) await askConnector('shutdown', { expected_pid: rustOwner.pid, expected_executable: rustOwner.executable }, { env, timeout: 1500 });
   if (connector) signalVerified(connector.pid, 'SIGTERM', { start: connector.start });
@@ -512,7 +511,13 @@ export async function stopOnDemand(env = process.env) {
     if (coreRunning(dataDir, pid)) killed.push(pid);
   }
   for (let i = 0; i < 50 && (connectorUp() || (await askConnector('status', {}, { env, timeout: 300 }))); i++) await wait(100);
-  const left = [connectorUp() && (connector?.pid ?? rustOwner?.pid), ...coreProcesses(dataDir)].filter(Boolean);
+  // A replacement may acquire the lock/socket after the first owner exits. Do not report success for it.
+  const socketUp = !!(await askConnector('status', {}, { env, timeout: 300 }));
+  const probe = existsSync(connectorLockOf(env)) ? await tryLock(connectorLockOf(env), { kind: 'probe', env }) : null;
+  const lockUp = probe && !probe.held;
+  if (probe?.held) probe.release();
+  const left = [connectorUp() && (connector?.pid ?? rustOwner?.pid), ...coreProcesses(dataDir),
+    (socketUp || lockUp) && 'connector socket or lock'].filter(Boolean);
   return { killed, left };
 }
 

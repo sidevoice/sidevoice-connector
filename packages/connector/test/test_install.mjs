@@ -7,12 +7,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
+import net from 'node:net';
+import { createHash } from 'node:crypto';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { decide, point, releaseLayout } from '../release.mjs';
 import { RUST_CORE_ENTRYPOINT, RUST_CORE_KIND, rustCoreTarget } from '../rust-core.mjs';
 import { apply, rollback } from '../install.mjs';
+import { connectorClient } from '../ipc.mjs';
+import { runtimeSwitching } from '../node-files.mjs';
 import { writePrivateFile } from '../secure-fs.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -91,7 +95,7 @@ test('runtime switch refuses a queued or unreadable outbox before staging or mov
   mkdirSync(path.join(layout.releases, staged.id), { mode: 0o700 });
   writePrivateFile(path.join(layout.releases, staged.id, 'release.json'), `${JSON.stringify(staged)}\n`);
   const hooks = mkdtempSync(path.join(os.tmpdir(), 'sv-switch-hooks-'));
-  writeFileSync(path.join(hooks, 'pause-install-before-commit'), '');
+  writeFileSync(path.join(hooks, 'pause-install-after-quiesce'), '');
   t.after(() => rmSync(hooks, { recursive: true, force: true }));
   const source = `import { apply } from ${JSON.stringify(new URL('../install.mjs', import.meta.url).href)};
     try { await apply(process.env, { core: false, candidateRelease: JSON.parse(process.env.SIDEVOICE_TEST_CANDIDATE) }); process.exitCode = 0; }
@@ -101,14 +105,20 @@ test('runtime switch refuses a queued or unreadable outbox before staging or mov
   let output = '', errors = '';
   child.stdout.on('data', chunk => { output += chunk; });
   child.stderr.on('data', chunk => { errors += chunk; });
-  for (let i = 0; i < 200 && !existsSync(path.join(hooks, 'paused-install-before-commit')); i++) await wait(25);
-  assert.equal(existsSync(path.join(hooks, 'paused-install-before-commit')), true,
+  const facade = connectorClient(env, { self: [process.execPath, path.join(packageDir, 'cli.mjs')] });
+  for (let i = 0; i < 200 && !existsSync(path.join(hooks, 'paused-install-after-quiesce')); i++) await wait(25);
+  assert.equal(existsSync(path.join(hooks, 'paused-install-after-quiesce')), true,
     `installer reached the final handoff: ${output} ${errors}`);
+  assert.equal(runtimeSwitching(data), true, 'the install lock owns a live launch barrier');
+  await assert.rejects(facade.ensure(), error => error.key === 'install.runtime-switching',
+  'an existing MCP facade cannot respawn the old daemon after quiescence');
+  assert.equal(existsSync(outbox), false, 'a refused reconnect cannot enqueue after quiescence');
   writePrivateFile(outbox, '[{"event_id":"arrived-during-stage"}]\n');
-  writeFileSync(path.join(hooks, 'resume-install-before-commit'), '');
+  writeFileSync(path.join(hooks, 'resume-install-after-quiesce'), '');
   assert.equal(await new Promise(resolve => child.on('exit', resolve)), 1);
   assert.match(output, /install.runtime-switch-outbox/);
   assert.equal(readlinkSync(layout.current), path.join('releases', oldId));
+  assert.equal(runtimeSwitching(data), false, 'refusal releases only the transaction launch barrier');
 
   // A failed candidate may write its own durable row after selection. Recovery keeps that row
   // available for diagnosis while the previous runtime starts with no shared outbox to replay.
@@ -116,7 +126,7 @@ test('runtime switch refuses a queued or unreadable outbox before staging or mov
   point(env, 'verified', oldId);
   mkdirSync(path.join(layout.releases, next.id), { mode: 0o700 });
   writePrivateFile(path.join(layout.releases, next.id, 'release.json'), `${JSON.stringify(next)}\n`);
-  rmSync(path.join(hooks, 'pause-install-before-commit'));
+  rmSync(path.join(hooks, 'pause-install-after-quiesce'));
   writeFileSync(path.join(hooks, 'pause-install-after-commit'), '');
   const recover = `import { apply } from ${JSON.stringify(new URL('../install.mjs', import.meta.url).href)};
     const result = await apply(process.env, { candidateRelease: JSON.parse(process.env.SIDEVOICE_TEST_CANDIDATE) });
@@ -161,6 +171,80 @@ test('explicit rollback refuses queued speech in either cross-runtime direction'
     await assert.rejects(rollback(env), error => error.key === 'install.runtime-switch-outbox');
     assert.equal(readlinkSync(layout.current), path.join('releases', current));
   }
+});
+
+test('same-kind Rust rollback stops the old selected owner before changing current', async t => {
+  const home = mkdtempSync(path.join(os.tmpdir(), 'sv-rust-rollback-owner-'));
+  const data = path.join(home, '.sidevoice');
+  const hooks = path.join(home, 'hooks');
+  const env = { ...process.env, HOME: home, SIDEVOICE_DATA_DIR: data, SIDEVOICE_TEST_HOOKS: hooks,
+    XDG_DATA_HOME: path.join(home, 'xdg'), XDG_CONFIG_HOME: path.join(home, '.config'),
+    SIDEVOICE_SERVICE_MANAGER: 'none', SIDEVOICE_INSTALL_VERIFY_MS: '1000', SIDEVOICE_TEARDOWN_MS: '1000' };
+  mkdirSync(data, { recursive: true, mode: 0o700 });
+  mkdirSync(hooks);
+  writeFileSync(path.join(hooks, 'pause-rollback-after-quiesce'), '');
+  const layout = releaseLayout(env);
+  const target = rustCoreTarget(), sourceSha = 'a'.repeat(40), archiveSha = 'b'.repeat(64);
+  const coreBuild = `rust-native-v1-${target}-${sourceSha}-${archiveSha}`;
+  const releases = ['old-rust', 'new-rust'].map((id, index) => {
+    const dir = path.join(layout.releases, id), executable = path.join(dir, 'dist', 'sidevoice-rust');
+    mkdirSync(path.dirname(executable), { recursive: true, mode: 0o700 });
+    const bytes = `#!/bin/sh\n# ${id}\nexit 0\n`;
+    writeFileSync(executable, bytes); chmodSync(executable, 0o700);
+    const sha = createHash('sha256').update(bytes).digest('hex');
+    const release = { id, connector: `0.6.${index}`, core: '0.1.0', channel: 'release', build_seq: 0,
+      format: 'sea', runtime_kind: 'rust-native-v1', runtime_target: target, runtime_build_sha: sourceSha,
+      runtime_sha256: sha, runtime_size: Buffer.byteLength(bytes), core_kind: 'rust-native-v1',
+      core_target: target, core_source_sha: sourceSha, core_archive_sha256: archiveSha, core_build: coreBuild,
+      pair_id: `pair-v1:rust-native-v1:${sha}:core:${coreBuild}` };
+    writePrivateFile(path.join(dir, 'release.json'), `${JSON.stringify(release)}\n`);
+    return release;
+  });
+  point(env, 'current', releases[0].id);
+  point(env, 'previous', releases[1].id);
+  const owner = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  let shutdown = false;
+  const connections = new Set();
+  const identity = { ...releases[0], version: releases[0].connector, release_id: releases[0].id,
+    executable: realpathSync(path.join(layout.current, 'dist', 'sidevoice-rust')), managed: false, pid: owner.pid };
+  const server = net.createServer(socket => {
+    connections.add(socket);
+    socket.on('close', () => connections.delete(socket));
+    let input = '';
+    socket.on('data', chunk => {
+      input += chunk;
+      const end = input.indexOf('\n');
+      if (end < 0) return;
+      const request = JSON.parse(input.slice(0, end));
+      const result = request.method === 'identity' ? identity : request.method === 'status' ? { version: identity.version } : { ok: true };
+      if (request.method === 'shutdown') {
+        shutdown = true;
+        assert.equal(readlinkSync(layout.current), path.join('releases', releases[0].id));
+        owner.kill('SIGTERM');
+      }
+      socket.end(JSON.stringify({ id: request.id, ok: true, result }) + '\n');
+      if (request.method === 'shutdown') {
+        server.close();
+        setImmediate(() => { for (const connection of connections) connection.destroy(); });
+      }
+    });
+  });
+  await new Promise(resolve => server.listen(path.join(data, 'connector.sock'), resolve));
+  chmodSync(path.join(data, 'connector.sock'), 0o600);
+  const facade = connectorClient(env);
+  await facade.ensure();
+  t.after(() => { facade.end(); owner.kill('SIGKILL'); server.close(); rmSync(home, { recursive: true, force: true }); });
+  const source = `import { rollback } from ${JSON.stringify(new URL('../install.mjs', import.meta.url).href)};
+    try { await rollback(process.env); } catch (error) { console.log(error.key); }`;
+  const back = spawn(process.execPath, ['--input-type=module', '-e', source], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  for (let i = 0; i < 200 && !existsSync(path.join(hooks, 'paused-rollback-after-quiesce')); i++) await wait(25);
+  assert.equal(existsSync(path.join(hooks, 'paused-rollback-after-quiesce')), true, 'rollback reached its pre-switch barrier');
+  assert.equal(shutdown, true, 'the selected old Rust daemon received identity-checked shutdown');
+  assert.equal(facade.connected, false, 'the old socket closed with a facade connected');
+  assert.equal(readlinkSync(layout.current), path.join('releases', releases[0].id));
+  writeFileSync(path.join(hooks, 'resume-rollback-after-quiesce'), '');
+  await new Promise(resolve => back.on('exit', resolve));
+  assert.equal(readlinkSync(layout.current), path.join('releases', releases[1].id));
 });
 
 /** This package built for real — `build.mjs`, stamped as CI stamps it — and copied to stand as another package, as

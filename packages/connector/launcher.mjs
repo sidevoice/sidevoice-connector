@@ -11,7 +11,8 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { keyed } from './i18n.mjs';
-import { dataDirOf, nodeFiles } from './node-files.mjs';
+import { dataDirOf, nodeFiles, runtimeSwitching } from './node-files.mjs';
+import { selectedDaemonCommand, selection } from './release.mjs';
 import { installedService, status } from './service.mjs';
 
 const SERVICE_WAIT_MS = () => Number(process.env.SIDEVOICE_SERVICE_START_WAIT_MS || 10_000);
@@ -28,6 +29,7 @@ export function stoppedByPerson(env = process.env) {
 export async function launch({ connect, self, env = process.env }) {
   try { return await connect(); } catch (error) { if (error.unsafe) throw error; }
   if (stoppedByPerson(env)) throw keyed('node.stopped');
+  if (runtimeSwitching(dataDirOf(env))) throw keyed('install.runtime-switching');
   if (installedService(env)?.connector) {
     const deadline = Date.now() + SERVICE_WAIT_MS();
     while (Date.now() < deadline) {
@@ -39,7 +41,9 @@ export async function launch({ connect, self, env = process.env }) {
     const reason = now.state === 'service-failed' ? now.failure?.key : null;
     throw keyed(reason ? `service.${reason}` : 'connector.service-down', { detail: reason ?? now.state, state: now.state }, { status: now });
   }
-  const child = spawn(self[0], [...self.slice(1), 'connector'], { detached: true, stdio: 'ignore', env });
+  // A façade can outlive the release that launched it. Always start the release selected now.
+  const command = selection(env, 'current') ? selectedDaemonCommand(env) : self;
+  const child = spawn(command[0], [...command.slice(1), 'connector'], { detached: true, stdio: 'ignore', env });
   child.on('error', () => {});
   child.unref();
   const deadline = Date.now() + SPAWN_WAIT_MS;
