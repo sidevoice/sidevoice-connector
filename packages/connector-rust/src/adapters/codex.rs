@@ -38,7 +38,7 @@ fn thread_from_meta(meta: &Value) -> Option<String> {
             Some(value.clone())
         }
     });
-    [
+    let thread = [
         meta.get("threadId"),
         meta.get("openai/threadId"),
         meta.get("openai/thread_id"),
@@ -55,7 +55,8 @@ fn thread_from_meta(meta: &Value) -> Option<String> {
             .as_str()
             .filter(|text| !text.is_empty())
             .map(str::to_owned)
-    })
+    });
+    thread
 }
 
 #[cfg(test)]
