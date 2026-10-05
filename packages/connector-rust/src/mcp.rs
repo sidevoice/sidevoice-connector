@@ -24,7 +24,8 @@ const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the user's
 - Pairing is the user's act. If voice_connect says this machine is not paired with the room, ask the user for the room's address and the one-time code the room shows under "Emparejar máquina", then call voice_pair and voice_connect again. Never try to obtain a code from the room yourself.
 - If voice_connect returns inbound.ok false, voice will look sent and never arrive: tell the user inbound.reason, offer inbound.remedy in your own words including the safeguard the machine-wide option removes, and change no settings unasked.
 - Read receipts and working state need nothing from you: the room observes what the harness records.
-- Pairing a device is the user's act: voice_pair_device only when asked; show just its result."#;
+- Pairing a device is the user's act: voice_pair_device only when asked; show just its result.
+- Only when the user asks for pulled voice input, pass input "pull" to voice_connect. Voice messages then wait in the room until you fetch them: voice_has_pending says whether any wait, voice_get_messages returns them. Handle each fetched message as a voice message, then pass its message_id in ack_ids on your next voice_get_messages call; until then it is returned again."#;
 
 struct Ipc {
     profile: Profile,
@@ -405,6 +406,14 @@ impl Facade {
                     "delivery":identity.delivery,"route":identity.route,"inbound":identity.inbound,
                     "capabilities":capabilities,"experimental":experimental,"detachable":identity.detachable
                 });
+                let pulled = match args.get("input").and_then(Value::as_str) {
+                    None | Some("push") => false,
+                    Some("pull") => true,
+                    Some(_) => bail!("input is \"push\" or \"pull\""),
+                };
+                if pulled {
+                    params["input_mode"] = json!("pull");
+                }
                 if let Some(engine) = adapters::engine(&identity) {
                     params["engine"] = engine;
                 }
@@ -423,7 +432,7 @@ impl Facade {
                         experimental: experimental.clone(),
                     },
                 );
-                let pushed = capabilities["deliver"] == "supported";
+                let pushed = !pulled && capabilities["deliver"] == "supported";
                 let connector = self
                     .ipc
                     .call("status", json!({}))
@@ -432,12 +441,14 @@ impl Facade {
                 let mut response = json!({
                     "status":if result.get("pending") == Some(&json!(true)) {"joining"} else {"joined"},
                     "harness":identity.harness,"conversation":identity.thread,"binding_id":binding_id,
-                    "delivery":if pushed {"push"} else {"none"},"room_reachable":result.get("connected"),
+                    "delivery":if pulled {"pull"} else if pushed {"push"} else {"none"},"room_reachable":result.get("connected"),
                     "capabilities":capabilities,"inbound":identity.inbound,
                     "local_only":"This machine is not paired with any room, so this conversation is reachable only from devices paired with this machine itself (the Sidevoice app on this computer, at this machine's own address). Tell the user in one line. Pairing the app is voice_pair_device, only if they ask; reaching it from elsewhere needs a room's address and code (voice_pair).",
                     "version":self.profile.connector_version(),"connector_version":connector.get("version")
                 });
-                if !pushed {
+                if pulled {
+                    response["pull"] = json!(PULL_NOTE);
+                } else if !pushed {
                     response["voice_in"] = json!({"supported":false,"speak_with":{"session_id":format!("typed:{}", identity.thread),"revision":0},
                         "reason":format!("What the user says in the room cannot reach this conversation: {} The user types here as usual.", identity.deliver_note.as_deref().unwrap_or("this harness offers no way to put a message into it.")),
                         "how":format!("Reply by voice to what the user types, as the server's instructions say for voice messages, calling voice_say with session_id \"typed:{}\" and revision 0. Tell the user once that the room hears this conversation but cannot talk to it.", identity.thread)});
@@ -767,6 +778,42 @@ impl Facade {
                     json!({"status":"left","conversation":chosen,"room_reachable":result.get("connected")}),
                 )
             }
+            "voice_has_pending" => {
+                let named = args
+                    .get("conversation")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty());
+                let Some(chosen) = self.pick(named).await? else {
+                    return Ok(json!({"connected":false,"pending":false,"count":0}));
+                };
+                let result = self
+                    .ipc
+                    .call("pull", json!({"client_ref":chosen,"operation":"check"}))
+                    .await?;
+                Ok(json!({"connected":true,"pending":result.get("pending"),
+                    "count":result.get("count"),"unfetched":result.get("fresh")}))
+            }
+            "voice_get_messages" => {
+                let named = args
+                    .get("conversation")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty());
+                let chosen = self.pick(named).await?.context("not connected")?;
+                let mut request = json!({"client_ref":chosen,"operation":"get"});
+                for key in ["after", "ack_ids"] {
+                    if let Some(value) = args.get(key) {
+                        request[key] = value.clone();
+                    }
+                }
+                let result = self.ipc.call("pull", request).await?;
+                let mut response = json!({"messages":result.get("messages"),
+                    "acknowledged":result.get("acknowledged"),"remaining":result.get("count"),
+                    "cursor":result.get("cursor"),"more":result.get("more"),"note":PULL_NOTE});
+                if result.get("more") == Some(&json!(true)) {
+                    response["next"] = json!("More messages wait: call voice_get_messages again with after set to cursor.");
+                }
+                Ok(response)
+            }
             "voice_pair_device" => self.ipc.call("pair_device", json!({})).await,
             "voice_pair" => {
                 let room = args
@@ -920,14 +967,18 @@ impl Facade {
     }
 }
 
+const PULL_NOTE: &str = "Each message is the user's literal words by voice, with the session_id and revision to answer it with voice_say: acknowledge by voice before any other tool, then work and reply by voice, as the sidevoice server's instructions say. Pass each handled message_id in ack_ids on your next voice_get_messages call; until then it is returned again, and a repeated message_id is the same message. Messages are held only in the voice server's memory: one never fetched expires after ten minutes, and all are lost if it restarts.";
+
 fn tools(cursor_views: bool) -> Vec<Tool> {
     let spec = [
-        ("voice_connect", "Connect this conversation to the voice room. Only on an explicit request to join or enable voice. Fails, saying what to ask the user, when a room is named that this machine is not paired with; with no room paired it joins this machine only (local_only).", json!({"title":{"type":"string","description":"Short label for this conversation in the room"},"room":{"type":"string","description":"The room's address (https://…) when the user names one; omitted, the room this machine is paired with"}}), vec![]),
+        ("voice_connect", "Connect this conversation to the voice room. Only on an explicit request to join or enable voice. Fails, saying what to ask the user, when a room is named that this machine is not paired with; with no room paired it joins this machine only (local_only).", json!({"title":{"type":"string","description":"Short label for this conversation in the room"},"room":{"type":"string","description":"The room's address (https://…) when the user names one; omitted, the room this machine is paired with"},"input":{"type":"string","enum":["push","pull"],"description":"Only when the user asks for pulled input: \"pull\" keeps voice messages in the room until fetched with voice_get_messages; omitted, they arrive by themselves where this harness allows"}}), vec![]),
         ("voice_pair", "Pair this machine with a room using the one-time code the user read from the room's interface (\"Emparejar máquina\"). Only with a code the user gave you; one room per machine, a new pairing replaces the previous one.", json!({"room":{"type":"string","description":"The room's address (https://…)"},"code":{"type":"string","description":"The one-time pairing code shown by the room"}}), vec!["room","code"]),
         ("voice_say", "Publish a concise spoken version of your reply to the room, with the session_id and revision from the voice message header. To speak before any voice message arrived, pass instead the conversation id voice_connect returned in this chat.", json!({"text":{"type":"string"},"session_id":{"type":"string"},"revision":{"type":"integer","minimum":0},"conversation":{"type":"string","description":"The conversation id voice_connect returned in this chat: to speak with no voice message to answer"},"utterance_id":{"type":"string"},"language":{"type":"string","enum":["es","en","fr","it","pt","hi"]}}), vec!["text"]),
         ("voice_disconnect", "Leave the voice room. The conversation and its work continue in writing.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
         ("voice_pair_device", "Show a one-time code to pair a device (the desktop app or a browser) with this machine: the code, a QR of it and how long it is valid. Only when the user asks to pair a device, never on your own initiative; show the user the result as it is.", json!({}), vec![]),
         ("voice_status", "Whether the room can currently reach this conversation.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
+        ("voice_has_pending", "For a conversation joined with input \"pull\": whether voice messages wait for it, and how many. Returns no text and changes nothing.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
+        ("voice_get_messages", "For a conversation joined with input \"pull\": the waiting voice messages, oldest first, at most 32 at a time. Pass the message_id of every message you handled in ack_ids; until acknowledged a message is returned again.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"},"ack_ids":{"type":"array","items":{"type":"string"},"maxItems":32,"description":"message_id of each message already handled"},"after":{"type":"integer","minimum":0,"description":"The cursor of the previous result, to fetch the messages after it when more is true"}}), vec![]),
     ];
     spec.into_iter().map(|(name, description, properties, required)| {
         let schema = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});

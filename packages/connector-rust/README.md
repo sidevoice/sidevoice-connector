@@ -37,3 +37,16 @@ The local speech outbox is synced to disk. Core's `text_saved: true` acknowledge
 Hosted proof includes the JS agent compatibility suite, the actual Codex CLI in a disposable profile, and the JS→Rust→JS handoff against authenticated Core v3 host routes. A copied JS speech row has no conversation reference; if Core later remints its binding ID, Rust retains and reports that unattributed row rather than assigning it to another conversation. [Connector issue #41](https://github.com/sidevoice/sidevoice-connector/issues/41) tracks that production migration rule, and [Core issue #43](https://github.com/sidevoice/sidevoice-core/issues/43) tracks crash-safe speech retention.
 
 In proof mode, the daemon writes `proof.json` with its PID, executable path and SHA-256, Core launch ID and successful protocol version. The file is evidence of what connected, not an installation record. No build from this directory is an upgrade artifact.
+
+## Pulled voice input (unreleased, #58)
+
+`voice_connect` with `input: "pull"` registers the conversation with `input_mode: "pull"`. Core then never pushes that conversation's voice input; it keeps it in its existing in-memory journal until the conversation reads it over the same authenticated link (`input.pull`). The Connector holds no message text and writes none to disk. Pushed input is unchanged for every other conversation, and a conversation keeps one mode until it leaves.
+
+- `voice_has_pending` returns `connected`, `pending`, `count` and `unfetched`, with no text and no side effect. An unjoined conversation gets `connected: false` and a zero count.
+- `voice_get_messages` returns up to 32 messages, oldest first, with `cursor` and `more` for the next page. A fetched message is returned again on every call until its `message_id` is passed in `ack_ids`; acknowledging marks it read in the room. Repeating an acknowledgement, or naming an ID the conversation does not hold, changes nothing.
+- Only the conversation's current delivery binding (the thread's newest live one) may read it, and Core never pushes a thread whose delivery binding pulls. When the pulling binding leaves, disconnects, is superseded or rejoins with push, its unacknowledged messages return to the queue, so the same `message_id` can be fetched again.
+- Limits of this slice: input never fetched expires after ten minutes, as pushed input does, and everything is lost if Core restarts. Nothing wakes an idle client.
+
+`hook claude-pre-tool-use` is a Claude Code `PreToolUse` command hook. It reads the hook's JSON from stdin, asks the local connector (`pull_check`) whether the hook's own `session_id`, joined for pulled input on this machine, has messages no call has fetched yet, and only then denies the attempted tool with a reason that tells the agent to call `voice_get_messages`. It never sees message text, never denies the Sidevoice tools, does not deny again for messages already fetched, and lets every call through when the connector cannot answer. A real Claude Code proof, and Codex or Cursor hook adapters, are still to come.
+
+`test/pull_interop.py` exercises this against a real Rust Core build (`.github/workflows/rust-pull-interop.yml`).

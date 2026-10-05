@@ -2,6 +2,7 @@ mod adapters;
 mod agents;
 mod cursor_app;
 mod daemon;
+mod hook;
 mod link;
 mod mcp;
 mod pairing;
@@ -80,6 +81,11 @@ enum Action {
         #[command(subcommand)]
         command: CodexAction,
     },
+    /// Run as a harness command hook: report waiting pulled voice input for the hook's conversation.
+    Hook {
+        /// The hook event: claude-pre-tool-use
+        event: String,
+    },
     /// Manage this proof profile's private launchd service.
     Service {
         #[command(subcommand)]
@@ -151,6 +157,7 @@ async fn main() -> Result<()> {
             unreachable!("runtime identity returned before profile setup")
         }
         Action::Mcp => mcp::run(profile).await,
+        Action::Hook { event } => hook::run(profile, &event).await,
         Action::Connector { service } => {
             if service && (cli.installed || !explicit_profile) {
                 eprintln!(

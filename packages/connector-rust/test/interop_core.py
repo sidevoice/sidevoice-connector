@@ -427,7 +427,7 @@ async def exercise():
                 'capabilities': {}, 'clientInfo': {'name': 'codex', 'version': 'isolated-empty-env'}}, 90)
             assert fresh_info['instructions']
             fresh_tools = await mcp_request(fresh, 'tools/list', {}, 91)
-            assert len(fresh_tools['tools']) == 6, 'profile-root must reconstruct the selected command with no inherited profile env'
+            assert len(fresh_tools['tools']) == 8, 'profile-root must reconstruct the selected command with no inherited profile env'
             await until(fresh_connector_socket.exists, 'on-demand private connector startup')
             fresh_connector_started = True
         except Exception as error:
@@ -573,7 +573,7 @@ else:
             facade.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
             await facade.stdin.drain()
             listed = await mcp_request(facade, 'tools/list', {}, 2)
-            assert {tool['name'] for tool in listed['tools']} == {'voice_connect', 'voice_pair', 'voice_say', 'voice_disconnect', 'voice_pair_device', 'voice_status'}
+            assert {tool['name'] for tool in listed['tools']} == {'voice_connect', 'voice_pair', 'voice_say', 'voice_disconnect', 'voice_pair_device', 'voice_status', 'voice_has_pending', 'voice_get_messages'}
             joined = await tool(facade, 'voice_connect', {'title': 'Rust v3 interop'}, 3, thread)
             assert joined['conversation'] == thread and not joined['binding_id'].startswith('local-'), joined
             paired = http_json(core_data / 'local.sock', 'POST', '/api/device/local/pair', {'name': 'rust-v3-test'})

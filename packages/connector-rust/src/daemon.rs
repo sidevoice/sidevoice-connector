@@ -32,6 +32,8 @@ struct Binding {
     experimental: Value,
     inbound: Value,
     detachable: bool,
+    /// Input is read from Core's journal by the conversation (input.pull), never pushed.
+    pull: bool,
     owner: AtomicU64,
     id: Mutex<String>,
     serial: Mutex<()>,
@@ -285,6 +287,9 @@ impl Daemon {
             "experimental":binding.experimental,"route":binding.route,"engine":engine,"focus":false});
         if !current.starts_with("local-") {
             frame["binding_id"] = json!(*current);
+        }
+        if binding.pull {
+            frame["input_mode"] = json!("pull");
         }
         let reply = self
             .link
@@ -870,20 +875,7 @@ impl Daemon {
                 pending.pop_front();
             }
         }
-        {
-            let mut turns = binding.turns.lock().await;
-            turns.insert(format!("{session_id}:{revision}"), message_id.to_owned());
-            if turns.len() > 512 {
-                if let Some(oldest) = turns.keys().next().cloned() {
-                    turns.remove(&oldest);
-                }
-            }
-        }
-        binding
-            .input_context
-            .lock()
-            .await
-            .insert(message_id.to_owned(), (session_id.to_owned(), revision));
+        remember_turn(&binding, message_id, session_id, revision).await;
         if binding.delivery.get("kind").and_then(Value::as_str) == Some("cursor-app") {
             let mut delivery = binding.delivery.clone();
             let composer = binding.bridge_chat.lock().await.clone().or_else(|| {
@@ -1020,12 +1012,20 @@ impl Daemon {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 let detachable = params.get("detachable") == Some(&json!(true));
+                let pull = match params.get("input_mode").and_then(Value::as_str) {
+                    None | Some("push") => false,
+                    Some("pull") => true,
+                    Some(_) => bail!("unknown input mode"),
+                };
                 let _state_transaction = self.conversation_state_serial.lock().await;
                 self.check_registration_allowed(&client_ref, resume).await?;
                 let existing = { self.bindings.lock().await.get(&client_ref).cloned() };
                 if let Some(existing) = existing {
                     if existing.owner.load(Ordering::Relaxed) != owner {
                         bail!("binding belongs to another façade");
+                    }
+                    if existing.pull != pull {
+                        bail!("conversation already joined with another input mode; leave first");
                     }
                     let binding_id = existing.id.lock().await.clone();
                     drop(_state_transaction);
@@ -1053,6 +1053,7 @@ impl Daemon {
                     experimental,
                     inbound,
                     detachable,
+                    pull,
                     owner: AtomicU64::new(owner),
                     id: Mutex::new(format!("local-{}", uuid::Uuid::new_v4())),
                     serial: Mutex::new(()),
@@ -1068,6 +1069,9 @@ impl Daemon {
                 if let Some(existing) = self.bindings.lock().await.get(&client_ref).cloned() {
                     if existing.owner.load(Ordering::Relaxed) != owner {
                         bail!("binding belongs to another façade");
+                    }
+                    if existing.pull != pull {
+                        bail!("conversation already joined with another input mode; leave first");
                     }
                     let binding_id = existing.id.lock().await.clone();
                     drop(_state_transaction);
@@ -1187,6 +1191,65 @@ impl Daemon {
                     )
                     .await;
                 Ok(json!({"left":true,"connected":self.link.connected().await}))
+            }
+            "pull" => {
+                let binding = self.find_owned(owner, &params).await?;
+                if !binding.pull {
+                    bail!("this conversation joined with pushed input, not pulled input");
+                }
+                let mut request = json!({"binding_id":*binding.id.lock().await,
+                    "operation":params.get("operation").cloned().unwrap_or(Value::Null)});
+                for key in ["after", "ack_ids"] {
+                    if let Some(value) = params.get(key) {
+                        request[key] = value.clone();
+                    }
+                }
+                let reply = self
+                    .link
+                    .request("input.pull", request, Duration::from_secs(10))
+                    .await?;
+                for message in reply
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let (Some(message_id), Some(session_id), Some(revision)) = (
+                        message.get("message_id").and_then(Value::as_str),
+                        message.get("session_id").and_then(Value::as_str),
+                        message.get("revision").and_then(Value::as_i64),
+                    ) {
+                        remember_turn(&binding, message_id, session_id, revision).await;
+                    }
+                }
+                Ok(reply)
+            }
+            // The mechanical hook check: a separate local process names the conversation its
+            // host gave it. It learns only whether that conversation, if joined for pulled
+            // input on this machine, has messages waiting; never their text.
+            "pull_check" => {
+                let harness = params.get("harness").and_then(Value::as_str).unwrap_or("");
+                let thread = params.get("thread").and_then(Value::as_str).unwrap_or("");
+                let binding = self
+                    .bindings
+                    .lock()
+                    .await
+                    .values()
+                    .find(|b| b.pull && b.harness == harness && b.thread == thread)
+                    .cloned();
+                let Some(binding) = binding else {
+                    return Ok(json!({"connected":false,"pending":false,"count":0,"fresh":0}));
+                };
+                let reply = self
+                    .link
+                    .request(
+                        "input.pull",
+                        json!({"binding_id":*binding.id.lock().await,"operation":"check"}),
+                        Duration::from_secs(5),
+                    )
+                    .await?;
+                Ok(json!({"connected":true,"pending":reply.get("pending"),
+                    "count":reply.get("count"),"fresh":reply.get("fresh")}))
             }
             "node.status" => Ok(self.node_status().await),
             "identity" => {
@@ -1935,7 +1998,7 @@ impl Daemon {
                 let id = request.get("id").cloned().unwrap_or(Value::Null);
                 let method = request.get("method").and_then(Value::as_str).unwrap_or("");
                 let params = request.get("params").cloned().unwrap_or(json!({}));
-                if !matches!(method, "status" | "node.status" | "identity") {
+                if !matches!(method, "status" | "node.status" | "identity" | "pull_check") {
                     self.activity_generation.fetch_add(1, Ordering::Relaxed);
                     if !active {
                         self.client_count.fetch_add(1, Ordering::Relaxed);
@@ -1990,6 +2053,24 @@ impl Daemon {
     async fn is_idle(&self) -> bool {
         self.client_count.load(Ordering::Relaxed) == 0 && self.bindings.lock().await.is_empty()
     }
+}
+
+/// Record which binding received a voice turn, so voice_say can answer it by session and revision.
+async fn remember_turn(binding: &Binding, message_id: &str, session_id: &str, revision: i64) {
+    {
+        let mut turns = binding.turns.lock().await;
+        turns.insert(format!("{session_id}:{revision}"), message_id.to_owned());
+        if turns.len() > 512 {
+            if let Some(oldest) = turns.keys().next().cloned() {
+                turns.remove(&oldest);
+            }
+        }
+    }
+    binding
+        .input_context
+        .lock()
+        .await
+        .insert(message_id.to_owned(), (session_id.to_owned(), revision));
 }
 
 fn transcript_user_text(item: &Value, claude: bool) -> Option<String> {
