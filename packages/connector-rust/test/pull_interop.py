@@ -69,7 +69,7 @@ class Caller:
 
 async def hook(binary, root, env, session, tool):
     process = await asyncio.create_subprocess_exec(str(binary), '--profile-root', str(root), 'hook',
-        'claude-pre-tool-use', stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        'claude', 'pre-tool-use', stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE, env=env)
     stdout, stderr = await asyncio.wait_for(process.communicate(json.dumps(
         {'session_id': session, 'hook_event_name': 'PreToolUse', 'tool_name': tool,
