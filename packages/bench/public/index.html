@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title data-i18n="app.title">Sidevoice connector bench</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1 data-i18n="app.title"></h1>
+    <div id="status" class="status"></div>
+    <div class="header-actions">
+      <button id="connector-start" data-i18n="process.start"></button>
+      <button id="connector-stop" data-i18n="process.stop"></button>
+      <button id="new-session" data-i18n="session.new"></button>
+    </div>
+  </header>
+
+  <main>
+    <section id="bindings-panel" class="panel">
+      <h2 data-i18n="bindings.title"></h2>
+      <label class="inline"><input type="checkbox" id="show-gone" /> <span data-i18n="bindings.showGone"></span></label>
+      <div id="bindings"></div>
+    </section>
+
+    <section id="conversation-panel" class="panel">
+      <h2><span data-i18n="conversation.title"></span> <code id="thread-label"></code></h2>
+      <div id="timeline" class="timeline"></div>
+      <form id="composer">
+        <input id="thread-input" data-i18n-placeholder="conversation.threadPlaceholder" />
+        <textarea id="text-input" rows="2" data-i18n-placeholder="conversation.textPlaceholder"></textarea>
+        <div class="row">
+          <button type="submit" data-i18n="conversation.send"></button>
+          <label class="inline"><input type="checkbox" id="auto-speak" /> <span data-i18n="conversation.autoSpeak"></span></label>
+        </div>
+      </form>
+    </section>
+
+    <section id="commands-panel" class="panel">
+      <h2 data-i18n="commands.title"></h2>
+      <div class="group">
+        <h3 data-i18n="commands.agents"></h3>
+        <select id="agent-id">
+          <option value="claude">claude</option>
+          <option value="codex">codex</option>
+          <option value="cursor">cursor</option>
+        </select>
+        <button data-command="agents.list" data-i18n="commands.agentsList"></button>
+        <button data-command="agents.connect" data-i18n="commands.agentsConnect"></button>
+        <button data-command="agents.disconnect" data-i18n="commands.agentsDisconnect"></button>
+        <button data-command="agents.dismiss" data-i18n="commands.agentsDismiss"></button>
+      </div>
+      <div class="group">
+        <h3 data-i18n="commands.node"></h3>
+        <button data-command="node.status" data-i18n="commands.nodeStatus"></button>
+        <input id="pair-room" data-i18n-placeholder="commands.pairRoom" />
+        <input id="pair-code" data-i18n-placeholder="commands.pairCode" />
+        <button data-command="pair.request" data-i18n="commands.pairRequest"></button>
+      </div>
+      <div class="group">
+        <h3 data-i18n="rendezvous.title"></h3>
+        <div id="rendezvous-state" class="muted"></div>
+        <button id="rv-connected" data-i18n="rendezvous.connected"></button>
+        <button id="rv-disconnected" data-i18n="rendezvous.disconnected"></button>
+        <button id="rv-refused" data-i18n="rendezvous.refused"></button>
+      </div>
+      <div class="group">
+        <h3 data-i18n="policies.title"></h3>
+        <p class="muted" data-i18n="policies.help"></p>
+        <div id="policies"></div>
+      </div>
+      <div class="group">
+        <h3 data-i18n="raw.title"></h3>
+        <textarea id="raw-input" rows="5" spellcheck="false">{"method": "node.status", "params": {}}</textarea>
+        <div class="row">
+          <button id="raw-request" data-i18n="raw.request"></button>
+          <button id="raw-notify" data-i18n="raw.notify"></button>
+          <button id="raw-frame" data-i18n="raw.frame"></button>
+        </div>
+      </div>
+      <h3 data-i18n="commands.result"></h3>
+      <pre id="command-result" class="result"></pre>
+    </section>
+
+    <section id="frames-panel" class="panel wide">
+      <h2 data-i18n="frames.title"></h2>
+      <div class="row">
+        <input id="frame-filter" data-i18n-placeholder="frames.filter" />
+        <label class="inline"><input type="checkbox" id="hide-handshake" checked /> <span data-i18n="frames.hideHandshake"></span></label>
+        <label class="inline"><input type="checkbox" id="pause-frames" /> <span data-i18n="frames.pause"></span></label>
+        <button id="clear-frames" data-i18n="frames.clear"></button>
+      </div>
+      <div id="frames" class="frames"></div>
+    </section>
+
+    <section id="setup-panel" class="panel">
+      <h2 data-i18n="setup.title"></h2>
+      <p class="muted" data-i18n="setup.help"></p>
+      <div id="setup"></div>
+    </section>
+
+    <section id="log-panel" class="panel">
+      <h2 data-i18n="log.title"></h2>
+      <pre id="connector-log" class="log"></pre>
+    </section>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

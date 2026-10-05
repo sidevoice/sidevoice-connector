@@ -1,0 +1,21 @@
+{
+  "name": "@sidevoice/bench",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "A fake Sidevoice Core with a web UI, for driving a real connector by hand and in tests.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "sidevoice-bench": "bench.mjs"
+  },
+  "scripts": {
+    "start": "node bench.mjs",
+    "test": "node --test 'test/*.test.mjs'"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

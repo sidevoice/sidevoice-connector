@@ -22,3 +22,4 @@ coverage/
 packages/connector/core/
 packages/connector/dist-sea/
 .legacy-*/
+target/

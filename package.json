@@ -4,10 +4,13 @@
   "license": "Apache-2.0",
   "private": true,
   "workspaces": [
-    "packages/connector"
+    "packages/connector",
+    "packages/bench"
   ],
   "scripts": {
     "build": "npm run build -w @sidevoice/uplink",
-    "test": "npm run test -w @sidevoice/uplink"
+    "test": "npm run test -w @sidevoice/uplink",
+    "bench": "npm run start -w @sidevoice/bench --",
+    "test:bench": "npm run test -w @sidevoice/bench"
   }
 }
