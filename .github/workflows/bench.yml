@@ -1,0 +1,41 @@
+name: Connector bench
+
+# The fake-Core protocol tests and the real Rust connector's harness connectivity tests
+# (packages/bench/README.md). Runs only when the bench, the Rust connector or this workflow changes.
+on:
+  pull_request:
+    paths:
+      - 'packages/bench/**'
+      - 'packages/connector-rust/**'
+      - '.github/workflows/bench.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    name: Fake Core and harness connectivity (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/connector-rust
+      - run: cargo build --locked --release
+        working-directory: packages/connector-rust
+      - name: Bench tests (a missing connector binary fails)
+        env:
+          BENCH_REQUIRE_CONNECTOR: '1'
+        run: npm run test:bench

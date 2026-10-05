@@ -83,7 +83,9 @@ async function run(action, body) {
     showResult(value);
     return value;
   } catch (error) {
-    showResult(tr('error.request', { error: error.value ? JSON.stringify(error.value) : error.message }));
+    const value = error.value ?? {};
+    const reason = value.key ? tr(`error.${value.key}`, value.params) : value.rpc ? JSON.stringify(value.rpc) : error.message;
+    showResult(tr('error.request', { error: reason }));
     return null;
   }
 }
@@ -364,8 +366,9 @@ function wire() {
     const thread = $('thread-input').value.trim();
     const text = $('text-input').value;
     if (!thread || !text.trim()) return;
+    if (!(await run('say', { thread, text }))) return;
+    $('text-input').value = '';
     if (thread !== selectedThread) selectThread(thread);
-    if (await run('say', { thread, text })) $('text-input').value = '';
   });
   $('text-input').addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && !event.shiftKey) {
@@ -376,6 +379,7 @@ function wire() {
   $('connector-start').addEventListener('click', () => run('connector', { action: 'start' }));
   $('connector-stop').addEventListener('click', () => run('connector', { action: 'stop' }));
   $('new-session').addEventListener('click', () => run('session'));
+  $('drop-link').addEventListener('click', () => run('drop'));
   $('show-gone').addEventListener('change', renderBindings);
   $('auto-speak').checked = localStorage.getItem('bench.autoSpeak') === '1';
   $('auto-speak').addEventListener('change', () => localStorage.setItem('bench.autoSpeak', $('auto-speak').checked ? '1' : '0'));

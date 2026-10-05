@@ -177,6 +177,62 @@ describe('harness connectivity (real connector, fake Core, fake harness)', { tim
     await leave(r, binding);
   });
 
+  test('outbox: speech Core refused is kept and replayed when the link comes back', async (t) => {
+    const receiver = await httpReceiver();
+    cleanups.push(() => receiver.close());
+    const r = await rig(t, { mcpEnv: { SIDEVOICE_THREAD: 'outbox', SIDEVOICE_DELIVERY_URL: receiver.url } });
+    if (!r) return;
+    const { binding } = await join(r, 'outbox');
+    const message = r.core.say('outbox', 'say something');
+    await waitFor(() => message.status === 'delivered', 'delivered');
+    r.core.setPolicy('speech.publish', 'error');
+    const { payload } = await r.mcp.call('voice_say', {
+      text: 'kept for later',
+      session_id: message.session_id,
+      revision: message.revision,
+    });
+    assert.equal(payload.status, 'queued', JSON.stringify(payload));
+    assert.equal(r.core.speech.length, 0);
+    const outbox = JSON.parse(readFileSync(path.join(r.paths.data, 'outbox.json'), 'utf8'));
+    assert.equal(outbox.length, 1, 'the speech is on disk');
+    r.core.setPolicy('speech.publish', 'normal');
+    r.core.dropLink();
+    await waitFor(() => r.core.speech.find((s) => s.text === 'kept for later'), 'the replayed speech');
+    await waitFor(() => r.core.bindings.get(binding.binding_id)?.live, 'the binding re-registered with its id');
+    await waitFor(
+      () => JSON.parse(readFileSync(path.join(r.paths.data, 'outbox.json'), 'utf8')).length === 0,
+      'the outbox emptied',
+    );
+  });
+
+  test('connector restart: the façade registers its conversation again by itself', async (t) => {
+    const receiver = await httpReceiver();
+    cleanups.push(() => receiver.close());
+    const r = await rig(t, { mcpEnv: { SIDEVOICE_THREAD: 'restart', SIDEVOICE_DELIVERY_URL: receiver.url } });
+    if (!r) return;
+    await join(r, 'restart');
+    await r.supervisor.stop();
+    await waitFor(() => !r.core.peer, 'the link to drop');
+    r.supervisor.start();
+    await waitFor(() => r.core.snapshot().bindings.find((b) => b.thread === 'restart' && b.live), 're-registered');
+    const message = r.core.say('restart', 'after the restart');
+    await waitFor(() => message.status === 'delivered', 'delivered after the restart', 20_000);
+    assert.equal(receiver.received.at(-1).text, 'after the restart');
+  });
+
+  test('revoked pairing: the room refusing this machine closes its conversations', async (t) => {
+    const receiver = await httpReceiver();
+    cleanups.push(() => receiver.close());
+    const r = await rig(t, { mcpEnv: { SIDEVOICE_THREAD: 'revoked', SIDEVOICE_DELIVERY_URL: receiver.url } });
+    if (!r) return;
+    await join(r, 'revoked');
+    r.core.setRendezvous({ connected: false, refused: 'connector_revoked' });
+    await waitFor(async () => {
+      const { payload } = await r.mcp.call('voice_status', {});
+      return JSON.stringify(payload).includes('connector_revoked');
+    }, 'voice_status to report the revocation');
+  });
+
   test('room close: binding.close from Core ends the conversation for the agent', async (t) => {
     const receiver = await httpReceiver();
     cleanups.push(() => receiver.close());

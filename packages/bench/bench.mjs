@@ -8,7 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { ConnectorSupervisor, findConnector } from './lib/connector.mjs';
-import { FakeCore } from './lib/fake-core.mjs';
+import { FakeCore, keyed } from './lib/fake-core.mjs';
 import { harnessSetup, writeHarnessFiles } from './lib/harness-setup.mjs';
 import { LANGUAGES, MESSAGES_DIR, t } from './lib/i18n.mjs';
 import { createProfile, defaultProfileRoot } from './lib/profile.mjs';
@@ -91,7 +91,7 @@ async function readJson(req) {
   const chunks = [];
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > BODY_LIMIT) throw new Error('body too large');
+    if (size > BODY_LIMIT) throw keyed('bench.body_too_large');
     chunks.push(chunk);
   }
   return chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
@@ -100,7 +100,7 @@ async function readJson(req) {
 const actions = {
   say: ({ thread, text }) => core.say(thread, text),
   command: async ({ method, params = {}, notify = false, timeout_ms: timeoutMs = 20_000 }) => {
-    if (typeof method !== 'string' || !method) throw new Error('method required');
+    if (typeof method !== 'string' || !method) throw keyed('bench.method_required');
     if (notify) return core.notify(method, params) ?? { sent: true };
     return { result: await core.request(method, params, timeoutMs) };
   },
@@ -108,12 +108,13 @@ const actions = {
   policy: ({ method, mode }) => core.setPolicy(method, mode),
   rendezvous: (update) => core.setRendezvous(update),
   close: ({ binding_id: bindingId, reason }) => core.closeBinding(bindingId, reason),
+  drop: () => core.dropLink(),
   session: () => ({ session_id: core.newSession() }),
   connector: ({ action }) => {
-    if (!supervisor) throw new Error('no connector binary');
+    if (!supervisor) throw keyed('bench.no_connector_binary');
     if (action === 'start') supervisor.start();
     else if (action === 'stop') supervisor.stop();
-    else throw new Error('unknown action');
+    else throw keyed('bench.unknown_action');
     return supervisor.status();
   },
 };
@@ -154,7 +155,11 @@ const server = http.createServer(async (req, res) => {
     }
     send(res, 405, { error: 'method' });
   } catch (error) {
-    send(res, 400, { error: error.message, ...(error.rpc ? { rpc: error.rpc } : {}) });
+    send(res, 400, {
+      error: error.message,
+      ...(error.key ? { key: error.key, params: error.params } : {}),
+      ...(error.rpc ? { rpc: error.rpc } : {}),
+    });
   }
 });
 

@@ -93,6 +93,11 @@ npm test               # node --test, on the source
 npm run build          # the bundled dist/cli.mjs that npm publishes
 ```
 
+To drive a real connector by hand, or to test it against each agent without a room, use the bench:
+`npm run bench` (a fake core with a web UI) and `npm run test:bench`. See
+[`packages/bench/README.md`](packages/bench/README.md), and [`docs/TESTING-SEAMS.md`](docs/TESTING-SEAMS.md) for what
+each piece owns and what can be faked.
+
 The published package has no runtime dependencies: esbuild bundles everything into `dist/cli.mjs`.
 `SIDEVOICE_CORE_WHEEL=<wheel> npm run build` embeds the pinned core's wheel; installing it still lets uv download
 Python and the core's dependencies.

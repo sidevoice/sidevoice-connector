@@ -56,6 +56,7 @@
   "commands.agentsDismiss": "Dismiss",
   "commands.node": "Node",
   "commands.nodeStatus": "node.status",
+  "commands.dropLink": "Drop the link",
   "commands.pairRoom": "Room address (https://…)",
   "commands.pairCode": "One-time code",
   "commands.pairRequest": "pair.request",
@@ -110,5 +111,17 @@
   "cli.connectorSkipped": "Connector not started (--no-connector).",
   "cli.connectorMissing": "No connector binary found. Build it: (cd packages/connector-rust && cargo build --release), or pass --connector <path>.",
   "cli.harnesses": "Point an agent at it (only the bench profile is written):",
-  "cli.reset": "To remove everything: {command}"
+  "cli.reset": "To remove everything: {command}",
+  "error.bench.disconnected": "The connector disconnected before answering.",
+  "error.bench.no_connector_linked": "No connector is linked to the bench.",
+  "error.bench.too_many_pending": "Too many requests are waiting for the connector.",
+  "error.bench.request_timed_out": "The connector did not answer {method} in time.",
+  "error.bench.unknown_binding": "The bench does not know that conversation.",
+  "error.bench.unknown_policy": "There is no policy {mode} for {method}.",
+  "error.bench.invalid_thread": "A thread id is 1–200 letters, digits, dots, colons, underscores or hyphens.",
+  "error.bench.empty_text": "Write something to send.",
+  "error.bench.body_too_large": "The request is too large.",
+  "error.bench.method_required": "Name the method to send.",
+  "error.bench.no_connector_binary": "There is no connector binary to start.",
+  "error.bench.unknown_action": "Unknown action."
 }

@@ -37,6 +37,11 @@ export const POLICIES = {
   'device.pairing_code': ['normal', 'error', 'silent'],
 };
 
+/** A refusal a person may see: a stable i18n key (messages/en.json `error.<key>`) and its parameters. */
+export function keyed(key, params = {}) {
+  return Object.assign(new Error(key), { key, params });
+}
+
 class RpcError extends Error {
   constructor(code, message) {
     super(message);
@@ -205,7 +210,7 @@ export class FakeCore extends EventEmitter {
     });
     ws.on('close', (code, reason) => {
       clearTimeout(helloTimer);
-      for (const waiter of conn.pending.values()) waiter.reject(new Error('disconnected'));
+      for (const waiter of conn.pending.values()) waiter.reject(keyed('bench.disconnected'));
       conn.pending.clear();
       if (this.peer === conn) {
         this.peer = null;
@@ -552,13 +557,13 @@ export class FakeCore extends EventEmitter {
   /** Sends a request to the linked connector and resolves with its result (rejects on error or timeout). */
   request(method, params = {}, timeoutMs = 20_000) {
     const conn = this.peer;
-    if (!conn) return Promise.reject(new Error('no connector linked'));
+    if (!conn) return Promise.reject(keyed('bench.no_connector_linked'));
     const id = `s:${++conn.serial}`;
-    if (conn.pending.size >= 128) return Promise.reject(new Error('too many pending requests'));
+    if (conn.pending.size >= 128) return Promise.reject(keyed('bench.too_many_pending'));
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         conn.pending.delete(id);
-        reject(new Error(`${method} timed out`));
+        reject(keyed('bench.request_timed_out', { method }));
       }, timeoutMs);
       conn.pending.set(id, {
         resolve: (value) => (clearTimeout(timer), resolve(value)),
@@ -569,13 +574,13 @@ export class FakeCore extends EventEmitter {
   }
 
   notify(method, params = {}) {
-    if (!this.peer) throw new Error('no connector linked');
+    if (!this.peer) throw keyed('bench.no_connector_linked');
     this.#send(this.peer.ws, { jsonrpc: '2.0', method, params });
   }
 
   /** Any frame, verbatim; for probing the connector with things real Core would never send. */
   sendRaw(frame) {
-    if (!this.peer) throw new Error('no connector linked');
+    if (!this.peer) throw keyed('bench.no_connector_linked');
     this.#send(this.peer.ws, frame);
   }
 
@@ -588,15 +593,21 @@ export class FakeCore extends EventEmitter {
   /** What `POST /api/presentation/close` does in real Core: the room closes a conversation. */
   closeBinding(bindingId, reason = 'closed_from_room') {
     const binding = this.bindings.get(bindingId);
-    if (!binding) throw new Error('unknown binding');
+    if (!binding) throw keyed('bench.unknown_binding');
     binding.live = false;
     this.#releaseClaims(bindingId);
     if (this.peer) this.notify('binding.close', { binding_id: bindingId, thread: binding.thread, reason });
     this.#emitState();
   }
 
+  /** Drops the connector's link, as a Core restart would; the connector reconnects and replays by itself. */
+  dropLink() {
+    if (!this.peer) throw keyed('bench.no_connector_linked');
+    this.peer.ws.terminate();
+  }
+
   setPolicy(method, mode) {
-    if (!POLICIES[method]?.includes(mode)) throw new Error(`unknown policy ${method}=${mode}`);
+    if (!POLICIES[method]?.includes(mode)) throw keyed('bench.unknown_policy', { method, mode });
     this.policies[method] = mode;
     this.#emitState();
   }
@@ -611,8 +622,8 @@ export class FakeCore extends EventEmitter {
 
   /** What the person says, as text standing in for voice. Queued for the thread's current binding. */
   say(thread, text) {
-    if (typeof thread !== 'string' || !THREAD.test(thread)) throw new Error('invalid thread');
-    if (typeof text !== 'string' || !text.trim()) throw new Error('empty text');
+    if (typeof thread !== 'string' || !THREAD.test(thread)) throw keyed('bench.invalid_thread');
+    if (typeof text !== 'string' || !text.trim()) throw keyed('bench.empty_text');
     const message = {
       message_id: randomUUID(),
       event_id: randomUUID(),

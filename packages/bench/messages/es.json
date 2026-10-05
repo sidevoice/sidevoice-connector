@@ -57,6 +57,7 @@
   "commands.node": "Nodo",
   "commands.pairRoom": "Dirección de la sala (https://…)",
   "commands.nodeStatus": "node.status",
+  "commands.dropLink": "Cortar el enlace",
   "commands.pairCode": "Código de un solo uso",
   "commands.pairRequest": "pair.request",
   "commands.result": "Respuesta",
@@ -110,5 +111,17 @@
   "cli.connectorSkipped": "Conector no arrancado (--no-connector).",
   "cli.connectorMissing": "No se encontró el binario del conector. Compílalo: (cd packages/connector-rust && cargo build --release), o pasa --connector <ruta>.",
   "cli.harnesses": "Apunta un agente a él (solo se escribe en el perfil del banco):",
-  "cli.reset": "Para borrarlo todo: {command}"
+  "cli.reset": "Para borrarlo todo: {command}",
+  "error.bench.disconnected": "El conector se desconectó antes de responder.",
+  "error.bench.no_connector_linked": "No hay ningún conector enlazado al banco.",
+  "error.bench.too_many_pending": "Hay demasiadas peticiones esperando al conector.",
+  "error.bench.request_timed_out": "El conector no respondió a {method} a tiempo.",
+  "error.bench.unknown_binding": "El banco no conoce esa conversación.",
+  "error.bench.unknown_policy": "No existe la política {mode} para {method}.",
+  "error.bench.invalid_thread": "Un id de hilo tiene de 1 a 200 letras, dígitos, puntos, dos puntos, guiones bajos o guiones.",
+  "error.bench.empty_text": "Escribe algo para enviar.",
+  "error.bench.body_too_large": "La petición es demasiado grande.",
+  "error.bench.method_required": "Indica el método que quieres enviar.",
+  "error.bench.no_connector_binary": "No hay binario del conector que arrancar.",
+  "error.bench.unknown_action": "Acción desconocida."
 }
