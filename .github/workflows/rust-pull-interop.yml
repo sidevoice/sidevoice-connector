@@ -22,7 +22,7 @@ concurrency:
 jobs:
   pull-interop:
     name: Rust Connector pull with real Rust Core
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04  # glibc 2.35: the binaries also run on older hosts for manual proofs
     timeout-minutes: 60
     env:
       RUSTVANI_CACHE_DIR: /tmp/sidevoice-rustvani-cache
@@ -68,3 +68,21 @@ jobs:
           uv pip install --python "$RUNNER_TEMP/venv/bin/python" 'websockets>=15,<16'
           cd packages/connector-rust/test
           "$RUNNER_TEMP/venv/bin/python" pull_interop.py
+      - name: Stage the tested binaries for a manual harness proof
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/pull-proof"
+          mkdir -p "$STAGE/lib"
+          cp core/target/debug/sidevoice-core-rust packages/connector-rust/target/release/sidevoice-rust-proof "$STAGE/"
+          ldd "$STAGE/sidevoice-core-rust"
+          cp -L /usr/lib/x86_64-linux-gnu/libopus.so.0 "$STAGE/lib/"
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/pull-proof.tgz" pull-proof
+          tar -C "$(dirname "$RUSTVANI_CACHE_DIR")" -czf "$RUNNER_TEMP/pull-proof-models.tgz" "$(basename "$RUSTVANI_CACHE_DIR")"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pull-proof-linux-x86_64
+          path: |
+            ${{ runner.temp }}/pull-proof.tgz
+            ${{ runner.temp }}/pull-proof-models.tgz
+          if-no-files-found: error
+          retention-days: 3
