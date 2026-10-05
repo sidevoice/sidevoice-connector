@@ -27,7 +27,9 @@ SUN_PATH_MAX = 104
 
 
 def private_root():
-    return tempfile.TemporaryDirectory(prefix='sv-', dir='/tmp')
+    # Canonical, because Rust resolves --profile-root: macOS /tmp is a symlink to
+    # /private/tmp, and a registration naming /tmp would read as foreign.
+    return tempfile.TemporaryDirectory(prefix='sv-', dir=os.path.realpath('/tmp'))
 
 
 def socket_path_fits(path):
