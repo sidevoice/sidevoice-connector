@@ -1,12 +1,15 @@
 name: Connector bench
 
 # The fake-Core protocol tests and the real Rust connector's harness connectivity tests
-# (packages/bench/README.md). Runs only when the bench, the Rust connector or this workflow changes.
+# (packages/bench/README.md). Runs only when the bench, the Rust connector, the root package files or this
+# workflow changes.
 on:
   pull_request:
     paths:
       - 'packages/bench/**'
       - 'packages/connector-rust/**'
+      - 'package.json'
+      - 'package-lock.json'
       - '.github/workflows/bench.yml'
   workflow_dispatch:
 

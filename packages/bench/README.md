@@ -67,7 +67,7 @@ npm run test:bench
 The suite takes a few seconds and needs no model calls and no real agent. It has two parts:
 
 - **`test/fake-core.test.mjs`: protocol v3 as the fake Core serves it.** Each case is the behaviour of sidevoice-core at 0a9da38:
-  - discovery;
+  - discovery, and a Core restart;
   - the handshake and its refusals;
   - binding validation;
   - push delivery and the receipts it produces;
@@ -98,7 +98,7 @@ The automated tests prove the connector's half of each route against the artefac
 |---|---|
 | **Conversations** | One card per binding: harness, push/pull, live or closed, working, capabilities (an `*` marks experimental), delivery route, Cursor route, engine, last turn, inbound check. Click a card to talk to it. *Close from the room* sends `binding.close`. |
 | **Conversation** | Type and send (Enter). Each message shows its receipt as it moves (pending → delivered or unconfirmed → read, or not sent), with the history in its tooltip. The agent's replies show with *Play* (browser speech synthesis); *Speak replies aloud* plays new ones as they arrive. |
-| **Core → connector** | Host agents: `agents.list`, `agents.connect`, `agents.disconnect`, `agents.dismiss`. Also `node.status`, `pair.request`, *Drop the link* (as a Core restart would; the connector reconnects and replays its outbox), and the room link (`node.rendezvous`: reachable, unreachable, revoked). |
+| **Core → connector** | Host agents: `agents.list`, `agents.connect`, `agents.disconnect`, `agents.dismiss`. Also `node.status`, `pair.request`, *Drop the link* (the connector reconnects, registers again and replays its outbox), *Restart Core* (also forgets every binding and changes the launch id, as a real Core restart does), and the room link (`node.rendezvous`: reachable, unreachable, revoked). |
 | **How Core answers** | For `binding.register`, `speech.publish`, `input.pull` and `device.pairing_code`, choose `normal`, `refuse`, JSON-RPC `error`, `silent` (never answers), `text_only`, `unknown_binding` or `rejected`. Use this to watch the connector's outbox, retries and refusals. |
 | **Raw JSON-RPC** | Send any request, notification or verbatim frame. |
 | **Protocol frames** | Every frame in both directions, live. Filter it, hide the handshake (on by default, because the connector reconnects each time the bench restarts it), or pause. `GET /api/frames` returns the same log as JSON. |

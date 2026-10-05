@@ -109,6 +109,7 @@ const actions = {
   rendezvous: (update) => core.setRendezvous(update),
   close: ({ binding_id: bindingId, reason }) => core.closeBinding(bindingId, reason),
   drop: () => core.dropLink(),
+  restart: () => core.restart(),
   session: () => ({ session_id: core.newSession() }),
   connector: ({ action }) => {
     if (!supervisor) throw keyed('bench.no_connector_binary');
@@ -148,8 +149,9 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && url.pathname.startsWith('/api/')) {
       if (req.headers['x-sidevoice-bench'] !== '1') return send(res, 403, { error: 'forbidden' });
-      const action = actions[url.pathname.slice('/api/'.length)];
-      if (!action) return send(res, 404, { error: 'not_found' });
+      const name = url.pathname.slice('/api/'.length);
+      if (!Object.hasOwn(actions, name)) return send(res, 404, { error: 'not_found' });
+      const action = actions[name];
       const result = await action(await readJson(req));
       return send(res, 200, result ?? { ok: true });
     }

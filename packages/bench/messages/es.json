@@ -58,6 +58,7 @@
   "commands.pairRoom": "Dirección de la sala (https://…)",
   "commands.nodeStatus": "node.status",
   "commands.dropLink": "Cortar el enlace",
+  "commands.restartCore": "Reiniciar el Core",
   "commands.pairCode": "Código de un solo uso",
   "commands.pairRequest": "pair.request",
   "commands.result": "Respuesta",

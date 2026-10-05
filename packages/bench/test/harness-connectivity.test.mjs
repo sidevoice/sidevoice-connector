@@ -177,7 +177,7 @@ describe('harness connectivity (real connector, fake Core, fake harness)', { tim
     await leave(r, binding);
   });
 
-  test('outbox: speech Core refused is kept and replayed when the link comes back', async (t) => {
+  test('outbox: speech Core refused is kept, and replayed under the new binding after a Core restart', async (t) => {
     const receiver = await httpReceiver();
     cleanups.push(() => receiver.close());
     const r = await rig(t, { mcpEnv: { SIDEVOICE_THREAD: 'outbox', SIDEVOICE_DELIVERY_URL: receiver.url } });
@@ -196,9 +196,11 @@ describe('harness connectivity (real connector, fake Core, fake harness)', { tim
     const outbox = JSON.parse(readFileSync(path.join(r.paths.data, 'outbox.json'), 'utf8'));
     assert.equal(outbox.length, 1, 'the speech is on disk');
     r.core.setPolicy('speech.publish', 'normal');
-    r.core.dropLink();
-    await waitFor(() => r.core.speech.find((s) => s.text === 'kept for later'), 'the replayed speech');
-    await waitFor(() => r.core.bindings.get(binding.binding_id)?.live, 'the binding re-registered with its id');
+    r.core.restart();
+    const replayed = await waitFor(() => r.core.speech.find((s) => s.text === 'kept for later'), 'the replayed speech');
+    const current = r.core.snapshot().bindings.find((b) => b.thread === 'outbox' && b.live);
+    assert.notEqual(current.binding_id, binding.binding_id, 'real Core forgets bindings when it restarts');
+    assert.equal(replayed.binding_id, current.binding_id, 'the outbox was re-keyed to the new binding');
     await waitFor(
       () => JSON.parse(readFileSync(path.join(r.paths.data, 'outbox.json'), 'utf8')).length === 0,
       'the outbox emptied',
@@ -227,10 +229,12 @@ describe('harness connectivity (real connector, fake Core, fake harness)', { tim
     if (!r) return;
     await join(r, 'revoked');
     r.core.setRendezvous({ connected: false, refused: 'connector_revoked' });
-    await waitFor(async () => {
+    const status = await waitFor(async () => {
       const { payload } = await r.mcp.call('voice_status', {});
-      return JSON.stringify(payload).includes('connector_revoked');
-    }, 'voice_status to report the revocation');
+      return payload?.connector?.closed_reasons?.revoked === 'connector_revoked' ? payload : null;
+    }, 'voice_status to report the conversation closed by the revocation');
+    assert.equal(status.joined, false);
+    assert.deepEqual(status.connector.bindings, []);
   });
 
   test('room close: binding.close from Core ends the conversation for the agent', async (t) => {
@@ -242,7 +246,7 @@ describe('harness connectivity (real connector, fake Core, fake harness)', { tim
     r.core.closeBinding(binding.binding_id);
     await waitFor(async () => {
       const { payload } = await r.mcp.call('voice_status', {});
-      return JSON.stringify(payload).includes('closed_from_room');
+      return payload?.connector?.closed_reasons?.closing === 'closed_from_room';
     }, 'voice_status to report the room closed it');
   });
 });

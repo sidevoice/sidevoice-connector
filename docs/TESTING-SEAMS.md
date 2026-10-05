@@ -80,17 +80,21 @@ Messages in each direction:
 
 **Faked by** `packages/bench/lib/fake-core.mjs`. Its scope:
 
-- **The wire, faithfully:** framing, refusals, close codes and capacity limits.
+- **The wire:** framing, refusals, close codes and capacity limits, as `connectors_v3.rs` has them.
 - **What Core does, only as far as a connector can observe it:**
-  - bindings, with the newest live binding on a thread being the one that receives;
-  - the journal: one message in flight per thread, the 2/5/15/60 s retries and the 600 s TTL;
+  - bindings, given out as `register` does: a known id is reused, otherwise the connector's active binding on the thread, otherwise a new id; the newest active, live binding by creation is the thread's delivery binding;
+  - the journal: one delivery in flight per binding, acknowledgements checked as `valid_delivery_ack` checks them, the 2/5/15/60 s retries, the 600 s TTL, and redelivery at once when a link drops;
   - pull claims and acknowledgements;
   - receipts;
   - speech admission and its de-duplication by `utterance_id`.
 - **Policies** let it answer the way a degraded Core would: refuse, a JSON-RPC error, no answer at all, `unknown_binding`, `text_only` or `rejected`.
 
+- **A Core restart** (*Restart Core*): a new launch id, and every binding forgotten, as real Core keeps them in memory only.
+
 **Not modelled:**
 - calls, focus and audience (speech is `queued` unless a policy says otherwise);
+- more than one connector: the bench issues one credential, so `room.binding_foreign` and `room.pull_binding_superseded` cannot happen;
+- the journal surviving a restart: real Core loses it; the bench keeps the rows for display and marks what was waiting as not sent;
 - devices;
 - the hosted room.
 

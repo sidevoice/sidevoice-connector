@@ -1,5 +1,6 @@
-// The fake Core's side of protocol v3, driven by a raw WebSocket peer. Each refusal and shape here mirrors
-// sidevoice-core rust/server/connectors_v3.rs and rust/control/room.rs at 0a9da38; no Rust is needed.
+// The fake Core's side of protocol v3, driven by a raw WebSocket peer. Each case follows sidevoice-core
+// rust/server/connectors_v3.rs and rust/control/room.rs at 0a9da38 (the function is named where it helps);
+// no Rust is needed.
 
 import assert from 'node:assert/strict';
 import { readFileSync, statSync } from 'node:fs';
@@ -79,15 +80,15 @@ describe('handshake', () => {
     assert.equal((await p.closed).code, 1008);
   });
 
-  test('another protocol, or another first method, needs a protocol 3 hello', async () => {
+  test('another protocol is answered -32002; another first method is closed with 1008 and no answer', async () => {
     const p = peer();
     const answer = await p.hello(env.core, { protocol: 2 });
     assert.equal(answer.error.code, -32002);
     const q = peer();
     await q.opened;
-    const other = await q.request('binding.register', { thread: 'x' });
-    assert.equal(other.error.code, -32002);
+    q.send({ jsonrpc: '2.0', id: 'c:1', method: 'binding.register', params: { thread: 'x' } });
     assert.equal((await q.closed).code, 1008);
+    assert.equal(q.frames.length, 0);
   });
 
   test('a second hello with the same connector id replaces the first with 1000', async () => {
@@ -127,13 +128,22 @@ describe('bindings', () => {
     assert.deepEqual(binding.experimental, ['deliver']);
   });
 
-  test('an invalid thread, mode or foreign binding id is refused in the result', async () => {
+  test('an invalid thread or mode is refused in the result', async () => {
     const p = await linked();
     assert.deepEqual(await register(p, { thread: 'bad thread' }), { error: 'room.thread_invalid' });
     assert.deepEqual(await register(p, { input_mode: 'poll' }), { error: 'room.input_mode_invalid' });
+  });
+
+  test('binding ids as room.rs register gives them out', async () => {
+    const p = await linked();
     const { binding_id: id } = await register(p);
-    assert.deepEqual(await register(p, { thread: 'other', binding_id: id }), { error: 'room.binding_foreign' });
-    assert.equal((await register(p, { binding_id: id })).binding_id, id);
+    assert.equal((await register(p)).binding_id, id, 'no id: the active binding on the thread is reused');
+    assert.equal((await register(p, { binding_id: 'stale' })).binding_id, id, 'an unknown id is never adopted');
+    const other = await register(p, { thread: 'other', binding_id: id });
+    assert.deepEqual([other.binding_id, other.thread], [id, 'thread-1'], 'a known id keeps its own thread');
+    p.send({ jsonrpc: '2.0', method: 'binding.unregister', params: { binding_id: id } });
+    await waitFor(() => !env.core.bindings.get(id).active, 'unregister');
+    assert.notEqual((await register(p)).binding_id, id, 'after leaving, a new binding');
   });
 
   test('working, engine and unregister update what the room shows', async () => {
@@ -150,10 +160,13 @@ describe('bindings', () => {
     await waitFor(() => !env.core.snapshot().bindings[0].live, 'unregister');
   });
 
-  test('closing from the room tells the connector', async () => {
+  test('closing from the room tells the connector and drops what was waiting', async () => {
     const p = await linked();
     const { binding_id: id } = await register(p);
+    const waiting = env.core.say('thread-1', 'never sent');
+    await p.next((f) => f.method === 'input.deliver');
     env.core.closeBinding(id);
+    assert.equal(waiting.status, 'not_sent');
     const close = await p.next((f) => f.method === 'binding.close');
     assert.deepEqual(close.params, { binding_id: id, thread: 'thread-1', reason: 'closed_from_room' });
   });
@@ -185,6 +198,40 @@ describe('push delivery and receipts', () => {
     await waitFor(() => message.status === 'delivered', 'delivered');
     p.send({ jsonrpc: '2.0', method: 'input.read', params: { binding_id: id, message_id: message.message_id } });
     await waitFor(() => message.status === 'read', 'read');
+  });
+
+  test('an acknowledgement real Core would not accept is a failed delivery', async () => {
+    const p = await linked();
+    await register(p);
+    const message = env.core.say('thread-1', 'odd ack');
+    const frame = await delivery(p);
+    p.send({ jsonrpc: '2.0', id: frame.id, result: { status: 'accepted', extra: true } });
+    await waitFor(() => message.receipts.some((r) => r.status === 'retry'), 'retry');
+    assert.equal(message.status, 'pending');
+  });
+
+  test('a delivery in flight when the link drops is redelivered at once, no attempt counted', async () => {
+    const first = await linked();
+    await register(first);
+    const message = env.core.say('thread-1', 'in flight');
+    await delivery(first);
+    const second = await linked();
+    await register(second);
+    const again = await delivery(second);
+    assert.equal(again.params.message_id, message.message_id);
+    assert.equal(message.attempts, 0);
+  });
+
+  test('read never revives a message that was not sent', async () => {
+    const p = await linked();
+    const { binding_id: id } = await register(p);
+    const message = env.core.say('thread-1', 'refused');
+    const frame = await delivery(p);
+    p.send({ jsonrpc: '2.0', id: frame.id, result: { status: 'unsupported' } });
+    await waitFor(() => message.status === 'not_sent', 'not sent');
+    p.send({ jsonrpc: '2.0', method: 'input.read', params: { binding_id: id, message_id: message.message_id } });
+    await p.request('no.such.method');
+    assert.equal(message.status, 'not_sent');
   });
 
   test('unknown → unconfirmed, unsupported → not sent, failed → retried', async () => {
@@ -245,10 +292,20 @@ describe('speech', () => {
     const p = await linked();
     const { binding_id: id } = await register(p);
     assert.equal((await p.request('speech.publish', speech('nope'))).result.status, 'unknown_binding');
-    const rejected = (await p.request('speech.publish', speech(id, { language: 'xx' }))).result;
-    assert.equal(rejected.status, 'rejected');
-    assert.equal(rejected.terminal, true);
+    for (const bad of [{ language: 'xx' }, { revision: -1 }, { revision: undefined }, { text: '' }]) {
+      const rejected = (await p.request('speech.publish', speech(id, { utterance_id: 'bad', ...bad }))).result;
+      assert.equal(rejected.status, 'rejected', JSON.stringify(bad));
+      assert.equal(rejected.terminal, true);
+    }
     assert.equal((await p.request('speech.publish', speech(id, { event_id: '' }))).error.code, -32602);
+  });
+
+  test('the same utterance with other words is rejected', async () => {
+    const p = await linked();
+    const { binding_id: id } = await register(p);
+    await p.request('speech.publish', speech(id));
+    const answer = (await p.request('speech.publish', speech(id, { text: 'different' }))).result;
+    assert.equal(answer.status, 'rejected');
   });
 
   test('policies change the answer, including never answering', async () => {
@@ -286,16 +343,26 @@ describe('pull delivery', () => {
     assert.equal(message.status, 'read');
   });
 
-  test('refusals: a push binding, a superseded one, a bad operation, acks on check', async () => {
+  test('refusals: a push binding, a bad operation, acks on check', async () => {
+    // room.pull_binding_superseded (-409) needs a second connector on the thread; the bench links one.
     const p = await linked();
     const { binding_id: push } = await register(p, { thread: 'push-thread' });
     assert.equal((await p.request('input.pull', { binding_id: push, operation: 'check' })).error.code, -403);
-    const { binding_id: old } = await register(p, { input_mode: 'pull' });
     const { binding_id: current } = await register(p, { input_mode: 'pull' });
-    assert.equal((await p.request('input.pull', { binding_id: old, operation: 'check' })).error.code, -409);
     assert.equal((await p.request('input.pull', { binding_id: current, operation: 'peek' })).error.code, -400);
     const acks = await p.request('input.pull', { binding_id: current, operation: 'check', ack_ids: ['x'] });
     assert.equal(acks.error.message, 'room.pull_ack_invalid');
+  });
+
+  test('re-registering in pull keeps its own claims; switching to push releases them', async () => {
+    const p = await linked();
+    const { binding_id: id } = await register(p, { input_mode: 'pull' });
+    const message = env.core.say('thread-1', 'claimed');
+    await p.request('input.pull', { binding_id: id, operation: 'get' });
+    await register(p, { input_mode: 'pull' });
+    assert.equal(message.status, 'delivered');
+    await register(p, { input_mode: 'push' });
+    assert.equal(message.status, 'pending');
   });
 
   test('claims go back to pending when the binding leaves', async () => {
@@ -306,6 +373,21 @@ describe('pull delivery', () => {
     assert.equal(message.status, 'delivered');
     p.send({ jsonrpc: '2.0', method: 'binding.unregister', params: { binding_id: id } });
     await waitFor(() => message.status === 'pending', 'released claim');
+  });
+});
+
+describe('restart', () => {
+  test('a Core restart drops the link, forgets bindings and changes the launch id', async () => {
+    const p = await linked();
+    const { binding_id: id } = await register(p);
+    const before = env.core.launchId;
+    env.core.restart();
+    await p.closed;
+    assert.equal(env.core.bindings.size, 0);
+    const ready = JSON.parse(readFileSync(env.core.readyPath, 'utf8'));
+    assert.notEqual(ready.launch_id, before);
+    const q = await linked();
+    assert.notEqual((await register(q, { binding_id: id })).binding_id, id);
   });
 });
 

@@ -380,6 +380,7 @@ function wire() {
   $('connector-stop').addEventListener('click', () => run('connector', { action: 'stop' }));
   $('new-session').addEventListener('click', () => run('session'));
   $('drop-link').addEventListener('click', () => run('drop'));
+  $('restart-core').addEventListener('click', () => run('restart'));
   $('show-gone').addEventListener('change', renderBindings);
   $('auto-speak').checked = localStorage.getItem('bench.autoSpeak') === '1';
   $('auto-speak').addEventListener('change', () => localStorage.setItem('bench.autoSpeak', $('auto-speak').checked ? '1' : '0'));

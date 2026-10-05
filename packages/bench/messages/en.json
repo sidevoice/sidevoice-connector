@@ -57,6 +57,7 @@
   "commands.node": "Node",
   "commands.nodeStatus": "node.status",
   "commands.dropLink": "Drop the link",
+  "commands.restartCore": "Restart Core",
   "commands.pairRoom": "Room address (https://…)",
   "commands.pairCode": "One-time code",
   "commands.pairRequest": "pair.request",
