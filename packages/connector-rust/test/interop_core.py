@@ -21,6 +21,21 @@ import uuid
 from websockets.asyncio.client import unix_connect
 
 
+# macOS sockaddr_un.sun_path is 104 bytes including the NUL; its default
+# $TMPDIR (/var/folders/...) leaves too little room for the fixtures' sockets.
+SUN_PATH_MAX = 104
+
+
+def private_root():
+    return tempfile.TemporaryDirectory(prefix='sv-', dir='/tmp')
+
+
+def socket_path_fits(path):
+    size = len(os.fsencode(path))
+    assert size < SUN_PATH_MAX, f'Unix socket path {path} is {size} bytes; macOS allows {SUN_PATH_MAX - 1}'
+    return path
+
+
 class UnixHTTP(http.client.HTTPConnection):
     def __init__(self, path):
         super().__init__('localhost', timeout=3)
@@ -174,12 +189,14 @@ async def copied_state():
     binary = Path(os.environ['SIDEVOICE_RUST_PROOF_BIN']).resolve()
     python = Path(os.environ['SIDEVOICE_CORE_PYTHON']).absolute()
     js_cli = Path(__file__).resolve().parents[2] / 'connector' / 'cli.mjs'
-    with tempfile.TemporaryDirectory(prefix='sidevoice-rust-copied-') as temporary:
+    with private_root() as temporary:
         root = Path(temporary)
         root.chmod(0o700)
         home, claude = root / 'home', root / 'claude'
         data, codex, cursor = root / 'sidevoice', root / 'codex', root / 'cursor/config'
         core_data = data / 'core'
+        core_socket = socket_path_fits(core_data / 'local.sock')
+        socket_path_fits(data / 'connector.sock')
         for directory in (home, claude, codex, root / 'cursor', root / 'xdg', data, core_data,
                           cursor, root / 'cursor/data', root / 'xdg/config', root / 'xdg/data'):
             directory.mkdir(mode=0o700)
@@ -211,7 +228,7 @@ async def copied_state():
         rust_log = (root / 'rust.log').open('wb')
         launch = str(uuid.uuid4())
         core = await asyncio.create_subprocess_exec(str(python), '-m', 'sidevoice_core.server',
-            '--data-dir', str(core_data), '--socket', str(core_data / 'local.sock'), '--port', '0',
+            '--data-dir', str(core_data), '--socket', str(core_socket), '--port', '0',
             '--idle-exit', '0', '--launch-id', launch, '--log-file', str(root / 'core-app.log'),
             stdout=core_log, stderr=core_log, env=core_env)
         js = daemon = facade = None
@@ -392,12 +409,14 @@ async def copied_state():
 async def exercise():
     binary = Path(os.environ['SIDEVOICE_RUST_PROOF_BIN']).resolve()
     python = Path(os.environ['SIDEVOICE_CORE_PYTHON']).absolute()
-    with tempfile.TemporaryDirectory(prefix='sidevoice-rust-core-') as temporary:
+    with private_root() as temporary:
         root = Path(temporary)
         root.chmod(0o700)
         home, claude = root / 'home', root / 'claude'
         data, codex, cursor = root / 'sidevoice', root / 'codex', root / 'cursor/config'
         core_data = data / 'core'
+        socket_path_fits(core_data / 'local.sock')
+        socket_path_fits(data / 'connector.sock')
         rollout_dir = codex / 'sessions' / '2026' / '10' / '03'
         for directory in (home, claude, data, core_data, codex, root / 'cursor', root / 'xdg', rollout_dir, root / 'bin'):
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
