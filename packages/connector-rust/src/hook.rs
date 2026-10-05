@@ -9,9 +9,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::{timeout, Duration};
 
-/// Tools the guard never stops: the agent must always be able to fetch what it is told about.
+/// Tools the guard never stops: the agent must always be able to fetch what it is told about,
+/// including loading the Sidevoice tools when the harness defers their schemas (ToolSearch).
 fn exempt(tool: &str) -> bool {
-    tool.starts_with("mcp__sidevoice__")
+    tool == "ToolSearch"
+        || tool.starts_with("mcp__sidevoice__")
         || tool.ends_with("voice_get_messages")
         || tool.ends_with("voice_has_pending")
 }
@@ -121,6 +123,7 @@ mod tests {
             "mcp__sidevoice__voice_get_messages",
             "mcp__sidevoice__voice_say",
             "mcp__other__voice_get_messages",
+            "ToolSearch",
         ] {
             let input = json!({"session_id":"s","tool_name":tool});
             assert!(claude_pre_tool_use(&input, Some(&waiting)).is_none());
