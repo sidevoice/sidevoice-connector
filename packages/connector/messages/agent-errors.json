@@ -15,6 +15,8 @@
   "agents.manual.codex.replace-existing": "# Replace the existing Sidevoice entry by running these Codex commands:\n{remove}\n{add}",
   "service.usage": "usage: sidevoice service <install|uninstall|start|stop|restart|status> [--json]",
   "service.unsupported": "The private Rust service proof supports macOS launchd only on this build.",
+  "hook.voice-waiting": "Sidevoice: {count} new voice messages are waiting for this conversation.",
+  "hook.check-unavailable": "Sidevoice could not check for waiting voice messages ({detail}); the tool call continues.",
   "service.proof-profile-required": "The Rust service commands are available only with an explicit private proof profile (`--profile-root P`).",
   "service.manager-unavailable": "The Sidevoice service manager could not be queried ({detail}).",
   "service.no-installation": "Sidevoice is not installed on this computer: run `sidevoice install` first.",

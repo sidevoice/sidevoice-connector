@@ -1,0 +1,88 @@
+name: Rust pulled-input interop
+
+# The Connector's pulled voice input against a real Rust Core build of one Core commit. Not
+# part of pull request CI until Core ships input.pull; the branch trigger exists only while the
+# feature branch is unmerged (a dispatch-only workflow cannot run before it reaches main).
+on:
+  push:
+    branches: [feat/mcp-pull-voice]
+  workflow_dispatch:
+    inputs:
+      core_sha:
+        description: sidevoice/sidevoice-core commit with input.pull
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-pull-interop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pull-interop:
+    name: Rust Connector pull with real Rust Core
+    runs-on: ubuntu-22.04  # glibc 2.35: the binaries also run on older hosts for manual proofs
+    timeout-minutes: 60
+    env:
+      RUSTVANI_CACHE_DIR: /tmp/sidevoice-rustvani-cache
+      CORE_SHA: ${{ inputs.core_sha || 'ed8a9c9b01088076657be9d6639b4f391ec26b0d' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: sidevoice/sidevoice-core
+          ref: ${{ env.CORE_SHA }}
+          path: core
+          persist-credentials: false
+      - name: Verify the requested Core commit
+        run: test "$(git -C core rev-parse HEAD)" = "$CORE_SHA"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Build the Rust Core
+        working-directory: core
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.98.1 --profile minimal
+          sudo apt-get update
+          sudo apt-get install -y libopus-dev pkg-config
+          python3 scripts/stage_rust_models.py "$RUSTVANI_CACHE_DIR"
+          cargo +1.98.1 build --locked --bin sidevoice-core-rust
+      - name: Lint, test and build the Rust Connector
+        working-directory: packages/connector-rust
+        run: |
+          set -euo pipefail
+          cargo fmt --all --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          cargo build --locked --release
+      - uses: astral-sh/setup-uv@v6
+      - name: Pulled input through the real Core, hook check included
+        env:
+          SIDEVOICE_RUST_PROOF_BIN: ${{ github.workspace }}/packages/connector-rust/target/release/sidevoice-rust-proof
+          SIDEVOICE_CORE_RUST_BIN: ${{ github.workspace }}/core/target/debug/sidevoice-core-rust
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 "$RUNNER_TEMP/venv"
+          uv pip install --python "$RUNNER_TEMP/venv/bin/python" 'websockets>=15,<16'
+          cd packages/connector-rust/test
+          "$RUNNER_TEMP/venv/bin/python" pull_interop.py
+      - name: Stage the tested binaries for a manual harness proof
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/pull-proof"
+          mkdir -p "$STAGE/lib"
+          cp core/target/debug/sidevoice-core-rust packages/connector-rust/target/release/sidevoice-rust-proof "$STAGE/"
+          ldd "$STAGE/sidevoice-core-rust"
+          cp -L /usr/lib/x86_64-linux-gnu/libopus.so.0 "$STAGE/lib/"
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/pull-proof.tgz" pull-proof
+          tar -C "$(dirname "$RUSTVANI_CACHE_DIR")" -czf "$RUNNER_TEMP/pull-proof-models.tgz" "$(basename "$RUSTVANI_CACHE_DIR")"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pull-proof-linux-x86_64
+          path: |
+            ${{ runner.temp }}/pull-proof.tgz
+            ${{ runner.temp }}/pull-proof-models.tgz
+          if-no-files-found: error
+          retention-days: 3

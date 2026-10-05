@@ -108,7 +108,7 @@ async def start_facade(binary, root, env, client_name, capabilities=None):
     await process.stdin.drain()
     listed = await mcp_request(process, 'tools/list', {}, 2)
     assert {entry['name'] for entry in listed['tools']} == {
-        'voice_connect', 'voice_pair', 'voice_say', 'voice_disconnect', 'voice_pair_device', 'voice_status'}, listed
+        'voice_connect', 'voice_pair', 'voice_say', 'voice_disconnect', 'voice_pair_device', 'voice_status', 'voice_has_pending', 'voice_get_messages'}, listed
     prompts = await mcp_request(process, 'prompts/list', {}, 3)
     assert [item['name'] for item in prompts['prompts']] == ['voice-room'], prompts
     prompt = await mcp_request(process, 'prompts/get', {'name': 'voice-room', 'arguments': {'title': 'fixture'}}, 4)
