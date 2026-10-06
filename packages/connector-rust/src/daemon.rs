@@ -782,17 +782,7 @@ impl Daemon {
     }
 
     async fn node_status(&self) -> Value {
-        let mut status = crate::service::node_status(&self.profile).await;
-        if self.profile.is_installed() {
-            if let Some(connector) = status.get_mut("connector") {
-                if let Some(fields) = self.profile.runtime_identity().as_object() {
-                    for (key, value) in fields {
-                        connector[key] = value.clone();
-                    }
-                }
-            }
-        }
-        status
+        crate::service::node_status(&self.profile).await
     }
 
     async fn handle_app_notice(&self, notice: AppNotice) {
@@ -2134,12 +2124,6 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     }
     private_dir(&profile.data)?;
     let lock = profile.try_connector_lock()?;
-    if let Some(installed) = &profile.installed {
-        let current = profile.root.join("current").canonicalize()?;
-        if current.file_name().and_then(|name| name.to_str()) != Some(installed.id.as_str()) {
-            bail!("selected Connector release changed before serving");
-        }
-    }
     if profile.service_stopped()? {
         return Ok(());
     }

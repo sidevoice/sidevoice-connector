@@ -117,7 +117,7 @@ fn data_dir(layout: &Layout) -> Result<()> {
 }
 
 /// The install lock, waited for up to 30 s.
-async fn install_lock(layout: &Layout) -> Result<Lock> {
+pub async fn install_lock(layout: &Layout) -> Result<Lock> {
     data_dir(layout)?;
     crate::lock::wait_lock(&layout.install_lock(), "service", LOCK_WAIT)
         .await
@@ -139,7 +139,7 @@ fn write_stop(layout: &Layout) -> Result<()> {
     .map_err(Failure::plain)
 }
 
-fn clear_stop(layout: &Layout) -> Result<()> {
+pub fn clear_stop(layout: &Layout) -> Result<()> {
     match fs::remove_file(layout.stop_marker()) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => Err(Failure::plain(error)),
         _ => Ok(()),
@@ -177,22 +177,9 @@ pub async fn install(layout: &Layout) -> Result<Value> {
     if kind == Kind::None {
         return Err(Failure::keyed("service.no-manager", json!({})));
     }
-    let texts = definition::texts(layout, kind)?;
+    definition::texts(layout, kind)?;
     clear_stop(layout)?;
-    let had = manager::installed(layout).await;
-    let mut changed = Vec::new();
-    for job in Job::ALL {
-        let file = manager::definition_path(layout, kind, job)
-            .await
-            .expect("a manager has definition paths");
-        if definition::write(&file, &texts[&job])? {
-            changed.push(job);
-        }
-    }
-    if had.is_none() {
-        stop_on_demand_or_fail(layout).await?;
-    }
-    manager::start(layout, kind, &changed, false, &Job::ALL).await?;
+    define_and_start(layout, kind, false).await?;
     let now = settle(layout, INSTALL_SETTLE).await;
     let mut result = answer(&now, kind);
     if kind == Kind::Systemd {
@@ -201,7 +188,29 @@ pub async fn install(layout: &Layout) -> Result<Value> {
     Ok(result)
 }
 
-async fn stop_on_demand_or_fail(layout: &Layout) -> Result<launcher::Teardown> {
+/// Both definitions written for the selected installation and both jobs started; with `restart`, restarted even
+/// when their definitions did not change, so that both run what `current` names now. When no job was defined,
+/// anything running on demand is stopped first. The caller holds the install lock.
+pub async fn define_and_start(layout: &Layout, kind: Kind, restart: bool) -> Result<()> {
+    let texts = definition::texts(layout, kind)?;
+    let had = manager::installed(layout).await;
+    let mut changed = Vec::new();
+    for job in Job::ALL {
+        let file = manager::definition_path(layout, kind, job)
+            .await
+            .ok_or_else(|| Failure::keyed("service.no-manager", json!({})))?;
+        if definition::write(&file, &texts[&job])? {
+            changed.push(job);
+        }
+    }
+    if had.is_none() {
+        stop_on_demand_or_fail(layout).await?;
+    }
+    manager::start(layout, kind, &changed, restart, &Job::ALL).await
+}
+
+/// What runs outside a manager stopped (`launcher::stop_on_demand`), or the refusal naming what is still running.
+pub async fn stop_on_demand_or_fail(layout: &Layout) -> Result<launcher::Teardown> {
     let down = launcher::stop_on_demand(layout).await;
     if !down.left.is_empty() {
         return Err(Failure::keyed(
@@ -299,6 +308,11 @@ pub async fn restart(layout: &Layout) -> Result<Value> {
 /// taking the installation apart and clears the marker itself. Idempotent.
 pub async fn uninstall(layout: &Layout, keep_stopped: bool) -> Result<Value> {
     let _lock = install_lock(layout).await?;
+    uninstall_held(layout, keep_stopped).await
+}
+
+/// `uninstall`, for a caller that already holds the install lock.
+pub async fn uninstall_held(layout: &Layout, keep_stopped: bool) -> Result<Value> {
     write_stop(layout)?;
     let installed = manager::installed(layout).await;
     let kind = installed.as_ref().map_or(Kind::None, |found| found.kind);
@@ -420,12 +434,7 @@ pub fn core_supervisor(profile: &Profile) -> launcher::CoreSupervisor {
 /// Get this machine's connector answering for an MCP server.
 pub async fn ensure_connector(profile: &Profile) -> anyhow::Result<()> {
     let layout = Layout::from_profile(profile);
-    let executable = std::env::current_exe()?.to_string_lossy().into_owned();
-    let fallback = if profile.is_installed() {
-        vec![executable, "--installed".into()]
-    } else {
-        vec![executable]
-    };
+    let fallback = vec![std::env::current_exe()?.to_string_lossy().into_owned()];
     let environment: Vec<(String, PathBuf)> = [
         ("HOME", &profile.home),
         ("CLAUDE_CONFIG_DIR", &profile.claude),
@@ -444,25 +453,10 @@ pub async fn ensure_connector(profile: &Profile) -> anyhow::Result<()> {
         .map_err(anyhow::Error::new)
 }
 
-/// The connector on the socket answers, and (installed) runs the selected release.
+/// The connector on the socket answers.
 async fn verify_connector(profile: &Profile) -> bool {
     let layout = Layout::from_profile(profile);
-    let Some(identity) =
-        launcher::ask_connector(&layout, "identity", json!({}), Duration::from_secs(1)).await
-    else {
-        return false;
-    };
-    let Some(selected) = &profile.installed else {
-        return true;
-    };
-    let text = |name: &str| {
-        identity
-            .get(name)
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    };
-    text("version").as_deref() == Some(selected.connector.as_str())
-        && text("runtime_kind").as_deref() == Some(selected.runtime_kind.as_str())
-        && text("runtime_sha256") == selected.runtime_sha256
-        && text("release_id").as_deref() == Some(selected.id.as_str())
+    launcher::ask_connector(&layout, "identity", json!({}), Duration::from_secs(1))
+        .await
+        .is_some()
 }

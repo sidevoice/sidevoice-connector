@@ -6,15 +6,13 @@
 //!   `connector.sock`, `connector.lock`, `connector.log`, `agents.json`, `agents.lock`, `install.lock`,
 //!   `node-stopped.json` (a person's stop), `credentials.json` (the room pairing), `outbox.json`, `core/core.json`
 //!   and `core/local.sock`.
-//! - `R`, the release root: `$XDG_DATA_HOME/sidevoice` (else `~/.local/share/sidevoice`), or, for the installed
-//!   release this binary runs from, the root that release lives in (`release.rs`).
+//! - `R`, the release root: `$XDG_DATA_HOME/sidevoice` (else `~/.local/share/sidevoice`), as `service/layout.rs` names it.
 //! - The agents' homes: `$CLAUDE_CONFIG_DIR` (`~/.claude`), `$CODEX_HOME` (`~/.codex`), `$CURSOR_CONFIG_DIR`
 //!   (`~/.cursor`) and `$CURSOR_DATA_DIR` (`<cursor>/data`).
 //!
 //! Every path is absolute. The directories are checked again at each operation boundary, not trusted from startup:
 //! they are passed to agents' command lines and written into.
 
-use crate::release::InstalledRelease;
 use crate::secure_fs::{private_dir, private_file, validate_user_directory};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -24,8 +22,6 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
 pub struct Profile {
-    /// `R`, the release root.
-    pub root: PathBuf,
     pub home: PathBuf,
     pub claude: PathBuf,
     /// `D`, the data directory.
@@ -38,17 +34,15 @@ pub struct Profile {
     pub socket: PathBuf,
     pub core_socket: PathBuf,
     pub core_ready: PathBuf,
-    /// The installed release this binary runs from, when started as one (`--installed`).
-    pub installed: Option<InstalledRelease>,
 }
 
 impl Profile {
-    /// This user's profile from the environment, optionally as the installed release this binary runs from.
-    pub fn from_env(installed: bool) -> Result<Self> {
-        Self::from_vars(|key| std::env::var_os(key), installed)
+    /// This user's profile from the environment.
+    pub fn from_env() -> Result<Self> {
+        Self::from_vars(|key| std::env::var_os(key))
     }
 
-    fn from_vars(var: impl Fn(&str) -> Option<OsString>, installed: bool) -> Result<Self> {
+    fn from_vars(var: impl Fn(&str) -> Option<OsString>) -> Result<Self> {
         let home = PathBuf::from(var("HOME").context("HOME is not set")?);
         if !home.is_absolute() {
             bail!("HOME must be absolute");
@@ -74,15 +68,8 @@ impl Profile {
                 bail!("{name} must be absolute");
             }
         }
-        let (root, installed) = if installed {
-            let (root, release) = crate::release::selected()?;
-            (root, Some(release))
-        } else {
-            (xdg_data.join("sidevoice"), None)
-        };
         let core = data.join("core");
         let profile = Self {
-            root,
             home,
             claude,
             socket: data.join("connector.sock"),
@@ -94,33 +81,20 @@ impl Profile {
             cursor_data,
             xdg_config,
             xdg_data,
-            installed,
         };
         profile.validate_existing_private()?;
         Ok(profile)
     }
 
-    pub fn is_installed(&self) -> bool {
-        self.installed.is_some()
-    }
-
-    /// The version this connector reports: its installed release's, else the build's.
+    /// The version this connector reports: the build's.
     pub fn connector_version(&self) -> &str {
-        self.installed
-            .as_ref()
-            .map(|selected| selected.connector.as_str())
-            .unwrap_or(crate::identity::VERSION)
+        crate::identity::VERSION
     }
 
-    /// What identifies the running build to a client that checks it (`identity`, `node.status`).
+    /// What identifies the running build to a client that checks it (`identity`).
     pub fn runtime_identity(&self) -> Value {
-        if let Some(selected) = &self.installed {
-            json!({"runtime_kind":selected.runtime_kind,"runtime_build_sha":selected.runtime_build_sha,
-                "runtime_sha256":selected.runtime_sha256,"runtime_target":selected.runtime_target,"release_id":selected.id})
-        } else {
-            json!({"runtime_build_sha":env!("SIDEVOICE_CONNECTOR_BUILD_SHA"),
-                "runtime_target":env!("SIDEVOICE_CONNECTOR_TARGET")})
-        }
+        json!({"runtime_build_sha":env!("SIDEVOICE_CONNECTOR_BUILD_SHA"),
+            "runtime_target":env!("SIDEVOICE_CONNECTOR_TARGET")})
     }
 
     /// Passes this profile on to a child, whatever the child's own environment was cleared to.
@@ -180,23 +154,6 @@ impl Profile {
             Err(error) => Err(error.into()),
             Ok(_) => {
                 private_file(&marker)?;
-                if let Some(installed) = &self.installed {
-                    // The JavaScript installer's runtime switch leaves a stop marker for its own older launchers;
-                    // the release it switched to is not stopped by it.
-                    let migration = self.data.join("runtime-switch.json");
-                    if migration.exists() {
-                        private_file(&migration)?;
-                        let stopped: Value = serde_json::from_slice(&fs::read(&marker)?)?;
-                        let switching: Value = serde_json::from_slice(&fs::read(&migration)?)?;
-                        if switching["phase"] == "committed"
-                            && switching["to"].as_str() == Some(installed.id.as_str())
-                            && stopped["to"].as_str() == Some(installed.id.as_str())
-                            && stopped["runtime_switch_token"] == switching["token"]
-                        {
-                            return Ok(false);
-                        }
-                    }
-                }
                 Ok(true)
             }
         }
@@ -206,13 +163,6 @@ impl Profile {
     /// core's are private when they exist (they are created private by whoever needs them first), and every
     /// directory of the person's we read or write is theirs and writable by nobody else.
     pub fn validate_existing_private(&self) -> Result<()> {
-        if self.installed.is_some() {
-            private_dir(&self.root)?;
-            private_dir(&self.root.join("releases"))?;
-            if self.root.canonicalize()? != self.root {
-                bail!("the installed release root changed after startup");
-            }
-        }
         for dir in [&self.data, &self.data.join("core")] {
             match fs::symlink_metadata(dir) {
                 Ok(_) => private_dir(dir)?,
@@ -304,15 +254,12 @@ impl Profile {
             ("XDG_DATA_HOME", path("xdg/data")),
             ("SIDEVOICE_DATA_DIR", path("sidevoice")),
         ];
-        Self::from_vars(
-            |key| {
-                variables
-                    .iter()
-                    .find(|(name, _)| *name == key)
-                    .map(|(_, value)| value.clone())
-            },
-            false,
-        )
+        Self::from_vars(|key| {
+            variables
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.clone())
+        })
         .unwrap()
     }
 }
@@ -340,7 +287,7 @@ mod tests {
     fn the_layout_derives_from_home_unless_each_place_is_named() {
         let scratch = Scratch::new("layout");
         let home = scratch.0.to_string_lossy().into_owned();
-        let profile = Profile::from_vars(vars(&[("HOME", &home)]), false).unwrap();
+        let profile = Profile::from_vars(vars(&[("HOME", &home)])).unwrap();
         assert_eq!(profile.data, scratch.0.join(".sidevoice"));
         assert_eq!(profile.socket, scratch.0.join(".sidevoice/connector.sock"));
         assert_eq!(
@@ -355,33 +302,25 @@ mod tests {
         assert_eq!(profile.codex, scratch.0.join(".codex"));
         assert_eq!(profile.cursor, scratch.0.join(".cursor"));
         assert_eq!(profile.cursor_data, scratch.0.join(".cursor/data"));
-        assert_eq!(profile.root, scratch.0.join(".local/share/sidevoice"));
-        assert!(!profile.is_installed());
         assert_eq!(profile.connector_version(), crate::identity::VERSION);
 
         let data = scratch.0.join("elsewhere");
-        let named = Profile::from_vars(
-            vars(&[
-                ("HOME", &home),
-                ("SIDEVOICE_DATA_DIR", data.to_str().unwrap()),
-                ("XDG_DATA_HOME", "/xdg-data"),
-            ]),
-            false,
-        )
+        let named = Profile::from_vars(vars(&[
+            ("HOME", &home),
+            ("SIDEVOICE_DATA_DIR", data.to_str().unwrap()),
+            ("XDG_DATA_HOME", "/xdg-data"),
+        ]))
         .unwrap();
         assert_eq!(named.data, data);
-        assert_eq!(named.root, Path::new("/xdg-data/sidevoice"));
     }
 
     #[test]
     fn relative_or_missing_places_are_refused() {
-        assert!(Profile::from_vars(vars(&[]), false).is_err());
-        assert!(Profile::from_vars(vars(&[("HOME", "relative")]), false).is_err());
-        assert!(Profile::from_vars(
-            vars(&[("HOME", "/tmp"), ("SIDEVOICE_DATA_DIR", "data")]),
-            false
-        )
-        .is_err());
+        assert!(Profile::from_vars(vars(&[])).is_err());
+        assert!(Profile::from_vars(vars(&[("HOME", "relative")])).is_err());
+        assert!(
+            Profile::from_vars(vars(&[("HOME", "/tmp"), ("SIDEVOICE_DATA_DIR", "data")])).is_err()
+        );
     }
 
     #[test]
@@ -408,7 +347,7 @@ mod tests {
     fn missing_directories_are_not_unsafe_and_one_connector_holds_the_data_directory() {
         let scratch = Scratch::new("fresh");
         let home = scratch.0.to_string_lossy().into_owned();
-        let profile = Profile::from_vars(vars(&[("HOME", &home)]), false).unwrap();
+        let profile = Profile::from_vars(vars(&[("HOME", &home)])).unwrap();
         assert!(!profile.data.exists());
         crate::secure_fs::ensure_private_dir(&profile.data).unwrap();
         let held = profile.try_connector_lock().unwrap();

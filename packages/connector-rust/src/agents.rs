@@ -144,12 +144,13 @@ impl AgentId {
 
 #[derive(Clone)]
 enum Ownership {
-    /// This very binary, run by path: what a connector that is not an installed release registers.
-    Executable {
-        executable: PathBuf,
-    },
+    /// This very binary, run by path: what a connector registers when nothing is installed.
+    Executable { executable: PathBuf },
+    /// The installation's stable command (`install.json`'s, through `R/current`): an entry naming it, a release's
+    /// binary below `R/releases`, or this very binary is ours.
     Installed {
-        release_root: PathBuf,
+        releases: PathBuf,
+        executable: Option<PathBuf>,
     },
     #[cfg(test)]
     Selected {
@@ -178,25 +179,23 @@ impl InstalledCommand {
         })
     }
 
-    fn installed(profile: &Profile) -> Result<Self> {
-        let executable = std::env::current_exe()?.canonicalize()?;
-        let selected = profile
-            .root
-            .join("current/dist/sidevoice-rust")
-            .canonicalize()?;
-        if executable != selected {
-            anyhow::bail!("Rust Connector is not the selected release executable");
-        }
-        Ok(Self {
-            command: profile
-                .root
-                .join("current/dist/sidevoice-rust")
-                .to_string_lossy()
-                .into_owned(),
-            args: vec!["--installed".into(), "mcp".into()],
+    /// The installation's command, when `install.json` names one program (what `install` writes): what every
+    /// agent registers, so that an upgrade changes no registration.
+    fn installed(profile: &Profile) -> Option<Self> {
+        let layout = crate::service::layout::Layout::from_profile(profile);
+        let command = layout.connector_command()?;
+        let [program] = command.as_slice() else {
+            return None;
+        };
+        Some(Self {
+            command: program.clone(),
+            args: vec!["mcp".into()],
             version: profile.connector_version().into(),
             ownership: Ownership::Installed {
-                release_root: profile.root.clone(),
+                releases: layout.releases.join("releases"),
+                executable: std::env::current_exe()
+                    .and_then(|path| path.canonicalize())
+                    .ok(),
             },
         })
     }
@@ -224,26 +223,35 @@ impl InstalledCommand {
             Ownership::Executable { executable } => {
                 canonical(command).as_deref() == Some(executable.as_path()) && args == ["mcp"]
             }
-            Ownership::Installed { release_root } => {
-                let Some(executable) = canonical(command) else {
-                    return false;
-                };
-                if args != ["--installed", "mcp"] {
+            Ownership::Installed {
+                releases,
+                executable,
+            } => {
+                if args != ["mcp"] {
                     return false;
                 }
-                let Ok(relative) = executable.strip_prefix(release_root) else {
+                if command == self.command {
+                    return true;
+                }
+                let Some(found) = canonical(command) else {
+                    return false;
+                };
+                if executable.as_ref() == Some(&found) {
+                    return true;
+                }
+                let releases = canonical(&releases.to_string_lossy()).unwrap_or(releases.clone());
+                let Ok(relative) = found.strip_prefix(&releases) else {
                     return false;
                 };
                 let parts = relative.components().collect::<Vec<_>>();
-                parts.len() == 4
-                    && parts[0].as_os_str() == "releases"
-                    && parts[1]
+                parts.len() == 3
+                    && parts[0]
                         .as_os_str()
                         .to_string_lossy()
                         .chars()
                         .all(|ch| ch.is_ascii_alphanumeric() || ".+-_".contains(ch))
-                    && parts[2].as_os_str() == "dist"
-                    && parts[3].as_os_str() == "sidevoice-rust"
+                    && parts[1].as_os_str() == "bin"
+                    && parts[2].as_os_str() == "sidevoice-connector"
             }
             #[cfg(test)]
             Ownership::Selected {
@@ -273,6 +281,8 @@ pub struct HostAgents {
     gate: Arc<Mutex<()>>,
     operations: Arc<Mutex<Vec<ActiveOperation>>>,
     stopping: Arc<AtomicBool>,
+    /// The installer's own requests (`install`, `uninstall`): a person's stop does not hold them back.
+    installer: bool,
 }
 
 #[derive(Debug)]
@@ -325,10 +335,9 @@ struct InspectionInput<'a> {
 
 impl HostAgents {
     pub fn new(profile: Profile) -> Result<Arc<Self>> {
-        let selected = if profile.is_installed() {
-            InstalledCommand::installed(&profile)?
-        } else {
-            InstalledCommand::executable()?
+        let selected = match InstalledCommand::installed(&profile) {
+            Some(installed) => installed,
+            None => InstalledCommand::executable()?,
         };
         Ok(Self::with_command(profile, selected))
     }
@@ -340,7 +349,26 @@ impl HostAgents {
             gate: Arc::new(Mutex::new(())),
             operations: Arc::new(Mutex::new(Vec::new())),
             stopping: Arc::new(AtomicBool::new(false)),
+            installer: false,
         })
+    }
+
+    /// For `install` and `uninstall`: the installation's command, and requests that go ahead while Sidevoice is
+    /// stopped (uninstall stops it first).
+    pub fn for_installer(profile: Profile) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            installer: true,
+            ..Arc::unwrap_or_clone(Self::new(profile)?)
+        }))
+    }
+
+    /// Whether a person's stop cancels this request.
+    fn stopped(&self) -> std::result::Result<bool, Failure> {
+        Ok(!self.installer
+            && self
+                .profile
+                .service_stopped()
+                .map_err(|_| Failure::Internal)?)
     }
 
     #[cfg(test)]
@@ -612,11 +640,7 @@ impl HostAgents {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<Value, Failure> {
-        if self
-            .profile
-            .service_stopped()
-            .map_err(|_| Failure::Internal)?
-        {
+        if self.stopped()? {
             return Err(Failure::Cancelled);
         }
         let base = state.clone();
@@ -754,12 +778,7 @@ impl HostAgents {
         check_live(cancel, deadline)?;
         let _lock = self.state_lock(cancel, deadline).await?;
         check_live(cancel, deadline)?;
-        if service_scan
-            && self
-                .profile
-                .service_stopped()
-                .map_err(|_| Failure::Internal)?
-        {
+        if service_scan && self.stopped()? {
             return Err(Failure::Cancelled);
         }
         let mut state = load_state_file(&self.profile)?;

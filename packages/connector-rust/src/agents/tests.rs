@@ -47,7 +47,6 @@ impl Fixture {
         private_mkdir(&root.join("sidevoice/core"));
         let data = root.join("sidevoice");
         let profile = Profile {
-            root: root.clone(),
             home: root.join("home"),
             claude: root.join("claude"),
             codex: root.join("codex"),
@@ -59,7 +58,6 @@ impl Fixture {
             core_socket: data.join("core/local.sock"),
             core_ready: data.join("core/core.json"),
             data,
-            installed: None,
         };
         Self { root, profile }
     }
@@ -665,4 +663,64 @@ async fn wait_for_file(path: &Path) {
         sleep(StdDuration::from_millis(10)).await;
     }
     panic!("timed out waiting for fixture marker {}", path.display());
+}
+
+#[tokio::test]
+async fn the_installed_command_is_registered_and_owns_every_release_of_it() {
+    let fixture = Fixture::new();
+    let profile = &fixture.profile;
+    let releases = profile.xdg_data.join("sidevoice");
+    let binary = releases.join("releases/1.0.0/bin/sidevoice-connector");
+    private_mkdir(binary.parent().unwrap());
+    private_write(&binary, b"#!/bin/sh\n");
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    symlink("releases/1.0.0", releases.join("current")).unwrap();
+    let stable = releases.join("current/bin/sidevoice-connector");
+    assert!(
+        InstalledCommand::installed(profile).is_none(),
+        "nothing recorded"
+    );
+    write_json(
+        &profile.data.join("install.json"),
+        &json!({"command":[stable],"releases":releases}),
+    );
+    let installed = InstalledCommand::installed(profile).unwrap();
+    assert_eq!(installed.command, stable.to_string_lossy());
+    assert_eq!(installed.args, ["mcp"]);
+    let mcp = ["mcp".to_owned()];
+    assert!(installed.owns(&stable.to_string_lossy(), &mcp));
+    assert!(
+        installed.owns(&binary.to_string_lossy(), &mcp),
+        "a release's own binary"
+    );
+    assert!(!installed.owns(&stable.to_string_lossy(), &["connector".into()]));
+    assert!(!installed.owns("/usr/local/bin/sidevoice-connector", &mcp));
+    let elsewhere = fixture.root.join("elsewhere/bin/sidevoice-connector");
+    private_mkdir(elsewhere.parent().unwrap());
+    private_write(&elsewhere, b"#!/bin/sh\n");
+    assert!(!installed.owns(&elsewhere.to_string_lossy(), &mcp));
+
+    // The installer registers while a person's stop holds (uninstall writes one first); the CLI does not.
+    write_json(&profile.data.join("node-stopped.json"), &json!({}));
+    let stopped = HostAgents::new(profile.clone()).unwrap();
+    let refused = stopped
+        .handle("agents.connect", json!({"id":"cursor"}))
+        .await;
+    assert!(refused.get("error").is_some(), "{refused}");
+    let installer = HostAgents::for_installer(profile.clone()).unwrap();
+    let connected = installer
+        .handle("agents.connect", json!({"id":"cursor"}))
+        .await;
+    assert!(connected.get("error").is_none(), "{connected}");
+    let config: Value =
+        serde_json::from_slice(&fs::read(profile.cursor.join("mcp.json")).unwrap()).unwrap();
+    assert_eq!(config["mcpServers"]["sidevoice"]["command"], json!(stable));
+    assert_eq!(config["mcpServers"]["sidevoice"]["args"], json!(["mcp"]));
+    let removed = installer
+        .handle("agents.disconnect", json!({"id":"cursor"}))
+        .await;
+    assert!(removed.get("error").is_none(), "{removed}");
+    let config: Value =
+        serde_json::from_slice(&fs::read(profile.cursor.join("mcp.json")).unwrap()).unwrap();
+    assert!(config["mcpServers"].get("sidevoice").is_none(), "{config}");
 }
