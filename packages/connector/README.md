@@ -105,7 +105,7 @@ so installing it copies files and fetches nothing. Tests run on the source:
 against a fake `uv` and a fake core, and the two jobs' contract; `test_node.mjs` the jobs,
 the launcher and `deriveStatus` against stand-ins of launchd and systemd; `test_install.mjs`
 releases, the switch and rollback; `test_security.mjs` the locks and the trust boundary;
-`test/service-integration.mjs` runs the real service managers in CI); sidevoice-core's
+`test/service-integration.mjs` runs the real service managers, by hand); sidevoice-core's
 `test_connector_interop.py` runs this connector for real against the core, from
 the checkout and from the bundle. `SIDEVOICE_CORE_WHEEL=<wheel> npm run build`
 puts the pinned core's wheel inside `dist/core/`, so the published package
@@ -154,25 +154,6 @@ directories and cannot select a network requirement.
 
 ## macOS arm64 Desktop dogfood artifact
 
-`.github/workflows/r4-sea.yml` uploads `sidevoice-connector-macos-aarch64-r4b` only on protected `main`, after the
-native macOS SEA test suite passes. Its artifact ZIP contains exactly one root file, `sidevoice`. The later attestation
-and pin jobs wait for all three native matrix jobs, then create and verify a genuine GitHub public-good Sigstore build
-attestation for those executable bytes and upload the root bundle as
-`sidevoice-connector-macos-aarch64-r4b-provenance`. A final macOS job verifies the bundle against the same executable,
-reads the official run-artifact metadata, and writes `connector-pin.json` to
-`sidevoice-connector-macos-aarch64-r4b-pin`. The pin records the executable SHA-256/size, connector and embedded-core
-identity, exact signed manifest bytes/digest, core assets, and nonempty provenance sidecar metadata.
-
-Pull request builds and non-main manual dispatches are test-only: they have no R4-a production manifest and upload no
-production artifact or pin. Main handoff runs only after the genuine signed nightly manifest and sidecar are available
-and verified at build time. A manifest-less SEA must not be pinned or shipped.
-
-The pin `asset_url` and provenance sidecar URL use GitHub's canonical
-`https://api.github.com/repos/sidevoice/sidevoice-connector/actions/artifacts/<artifact-id>/zip` route. The executable
-digest/size describe root `sidevoice`; the provenance sidecar digest/size describe the sidecar artifact ZIP, which
-contains root `sidevoice.sigstore.json`. Desktop must verify the ZIP, extract the bundle, and cryptographically verify
-the attestation against the executable. Fetch/auth requirements and the exact verification identity are in
-[`R4-B-DESKTOP-HANDOFF-2026-10-02.md`](R4-B-DESKTOP-HANDOFF-2026-10-02.md).
-
-These artifacts are dogfood handoff inputs, not durable release assets. The workflow retains them for 90 days, the
-maximum available for public-repository Actions artifacts; a durable immutable source is a separate release gate.
+No longer produced: CI builds and releases the Rust connector binary instead ([`RELEASING.md`](../../RELEASING.md)), and this package
+leaves with the move to it. [`R4-B-DESKTOP-HANDOFF-2026-10-02.md`](R4-B-DESKTOP-HANDOFF-2026-10-02.md) records what
+the `r4-sea.yml` workflow used to hand over.

@@ -1,303 +1,61 @@
-name: CI
+name: ci
 
-# What runs when (RELEASING.md):
-# - pull request: the client's suite on Linux and a dry run of the package. Nothing is packaged.
-# - push to main, manual run on main: the same, then the npm tarball with the signed core manifest and wheel inside; a green run on main
-#   replaces the `nightly` pre-release.
-# - a release (called by release-please.yml with the tag it created): the same, attached to that draft release;
-#   release-please.yml then takes it to npm and publishes the release.
+# Every pull request: lint, then on every target the tests (against what `cargo xtask fixtures` fetches:
+# sidevoice-core's published nightly and the pinned Codex CLI) and the release packaging, exactly as a release builds
+# it, publishing nothing. What passes here is what merging publishes (release.yml). RELEASING.md.
 on:
-  push:
-    branches: [main]
   pull_request:
+    branches: [main]
+  # release-please.yml dispatches it on the release PR, whose pushes start no workflow.
   workflow_dispatch:
-    inputs:
-      core-ref:
-        description: The sidevoice-core commit the interop job runs against (R2 host-agent interop pins core #38 below).
-        type: string
-        required: false
-  workflow_call:
-    inputs:
-      release-tag:
-        description: The draft release release-please created (vX.Y.Z); its assets are built from that tag.
-        type: string
-        required: true
 
 permissions:
   contents: read
 
-env:
-  # R2 host-agent interop is pinned to the reviewed sidevoice-core#38 head.
-  CORE_REF: ${{ inputs.core-ref || '59e32df778c7ac68590f05310b2df8db91f5873f' }}
-
 concurrency:
-  # Per ref. A release (github.workflow is the caller's, release-please) never shares a group with a push.
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  client:
-    name: Client (Node)
+  lint:
+    name: Format and Clippy (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each OS compiles code the other does not (launchd on macOS).
+        runner: [ubuntu-24.04, macos-14]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  test:
+    name: Test and package (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: macos-aarch64, runner: macos-14 }
+          - { target: linux-x86_64, runner: ubuntu-24.04 }
+          - { target: linux-aarch64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup
+      - run: cargo xtask fixtures
+      - run: cargo test --locked
+      - run: cargo xtask dist
+
+  # The Node installer (packages/connector) until the connector is one Rust binary; then this job goes.
+  node:
+    name: Node installer (npm test)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.release-tag }}
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
-      # The published client is one bundled file, so it is built before anything checks or packs
-      # it: `npm pack` would build it again through `prepack`, and a suite that ran first would be
-      # testing a `dist/` from whenever somebody last built by hand.
-      - run: npm run build
-      # One file per invocation: `node --check` takes a single script and treats the rest as its arguments,
-      # so a list only ever checked the first name (and a deleted file went unnoticed for two releases).
-      - run: for f in packages/connector/*.mjs packages/connector/dist/*.mjs; do node --check "$f"; done
-      - run: npm test
-      # The trust boundary is the OS user (design §4.1): another user on this machine must reach neither the core's
-      # socket — the connector link and the local routes are only there — nor the connector's, and the core's TCP
-      # listener must not offer the link. The data dir is opened up on purpose, so the core's own 0700 directory and
-      # the sockets' own modes are what refuse, not the home directory. The fake core plays the core.
-      - name: A second OS user cannot reach this user's core or connector
-        working-directory: packages/connector
-        run: |
-          set -euo pipefail
-          printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' "$(command -v node)" "$PWD/test/fake-sidevoice-core.mjs" > "$RUNNER_TEMP/sidevoice-core"
-          chmod 755 "$RUNNER_TEMP/sidevoice-core"
-          export SIDEVOICE_SERVICE_MANAGER=none SIDEVOICE_CORE_PORT=0
-          # The two jobs as their manager would run them: the core, then the connector, which links to it.
-          mkdir -m 700 -p "$HOME/.sidevoice/core"
-          "$RUNNER_TEMP/sidevoice-core" --data-dir "$HOME/.sidevoice/core" --port 0 --socket "$HOME/.sidevoice/core/local.sock" --idle-exit 0 &
-          node cli.mjs connector --service &
-          for i in $(seq 1 60); do [ -f "$HOME/.sidevoice/core/core.json" ] && [ -S "$HOME/.sidevoice/connector.sock" ] && break; sleep 1; done
-          url=$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.env.HOME + '/.sidevoice/core/core.json', 'utf8')).url)")
-          chmod o+x "$HOME"; chmod 755 "$HOME/.sidevoice"
-          ls -la "$HOME/.sidevoice" "$HOME/.sidevoice/core" || true
-          sudo useradd -m sidevoice-other
-          install -m 644 test/second-uid-probe.mjs /tmp/second-uid-probe.mjs
-          sudo -u sidevoice-other "$(command -v node)" /tmp/second-uid-probe.mjs "$HOME/.sidevoice" "$url"
-          kill %1 %2
-      - name: Package contents (dry run)
-        run: npm pack --dry-run
-        working-directory: packages/connector
-
-  # The connector against the real core, not the fake: the connector job links to a core it did not start, on its
-  # socket (no Origin, a loopback Host), registers a binding and gets a device code minted there, and finds the link
-  # gone from TCP; and the core holds its data directory (a second start exits 75) and exits 0 after a failed start.
-  # Required here: a core that is not there fails the job instead of skipping the test.
-  interop-core:
-    name: Interop with the real core
-    if: ${{ !inputs.release-tag }}
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: sidevoice/sidevoice-core
-          ref: ${{ env.CORE_REF }}
-          path: core
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - uses: astral-sh/setup-uv@v6
-      - run: npm ci
-      - name: The core, installed as its own CI installs it
-        working-directory: core
-        run: |
-          uv venv --python 3.12 .venv
-          uv pip install --python .venv/bin/python -e .
-          .venv/bin/python -m sidevoice_core.server --self-test
-      - name: Interop test (required)
-        env:
-          SIDEVOICE_INTEROP_CORE_DIR: ${{ github.workspace }}/core
-          SIDEVOICE_INTEROP_REQUIRED: '1'
-        run: node --test --test-name-pattern=interop packages/connector/test/test_core.mjs
-
-  # The two jobs under the real service managers, end to end (packages/connector/test/service-integration.mjs):
-  # install with no agents → both jobs up with no harness → kill -9 the core: the manager restarts it → a core that
-  # fails its import: failed, and no new process for 3× the throttle → service restart → running → a login,
-  # approximated → stop (the launcher refuses) → start → upgrade A→B → upgrade B→C (its core cannot serve): back on B
-  # → uninstall with a client connected → no job, process, socket or release, and nothing after the next login.
-  # Three real builds of the package; the fake core plays the core.
-  service-linux:
-    name: Node service (systemd user manager)
-    needs: client
-    if: ${{ !inputs.release-tag }}
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      # The runner's user has no login session, so no user manager: lingering gives it one, as on a headless machine.
-      - name: A user manager for the runner
-        run: |
-          set -euo pipefail
-          sudo loginctl enable-linger "$USER"
-          for i in $(seq 1 30); do [ -S "/run/user/$(id -u)/bus" ] && break; sleep 1; done
-          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
-          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
-      - run: systemctl --user show-environment >/dev/null && systemctl --user is-system-running || true
-      - name: Same-version Core recovery after an interrupted systemd definition switch
-        run: node --test --test-name-pattern="same-version Core switch recovery \(systemd\)" packages/connector/test/test_install.mjs
-      - run: node packages/connector/test/service-integration.mjs
-
-  service-macos:
-    name: Node service (launchd)
-    needs: client
-    if: ${{ !inputs.release-tag }}
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: launchctl print "gui/$(id -u)" >/dev/null && echo "gui domain present"
-      - name: Same-version Core recovery after an interrupted launchd definition switch
-        run: node --test --test-name-pattern="same-version Core switch recovery \(launchd\)" packages/connector/test/test_install.mjs
-      # The locks are the kernel's: on macOS the lock file opened O_EXLOCK|O_NONBLOCK through libuv (Linux: util-linux
-      # flock on the same descriptor). Proved here, on the platform: three contenders never hold it at once, a SIGKILLed
-      # holder frees it at once, a held lock is refused, a link is never followed.
-      - name: Kernel-held locks on macOS
-        run: node --test --test-name-pattern="^lock|install lock" packages/connector/test/test_security.mjs
-      - run: node packages/connector/test/service-integration.mjs
-
-  package:
-    name: npm tarball with the core inside
-    needs: client
-    if: ${{ inputs.release-tag || ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main') }}
-    runs-on: ubuntu-24.04
-    outputs:
-      # Where the assets go: the release that called this, or the rolling `nightly` pre-release on a push to main.
-      publish: ${{ steps.kind.outputs.publish }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.release-tag }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - id: kind
-        run: echo "publish=${{ inputs.release-tag && 'release' || ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main') && 'nightly' || '' }}" >> "$GITHUB_OUTPUT"
-      - run: npm ci
-      - name: The core's signed manifest and wheel this version pins
-        id: core
-        env:
-          GH_TOKEN: ${{ github.token }}
-          KIND: ${{ steps.kind.outputs.publish }}
-        run: |
-          set -euo pipefail
-          CORE_VERSION=$(node --input-type=module -e "import { CORE_VERSION } from './packages/connector/core.mjs'; console.log(CORE_VERSION)")
-          CORE_TAG=$([ "$KIND" = release ] && echo "v$CORE_VERSION" || echo nightly)
-          WHEEL="sidevoice_core-${CORE_VERSION}-py3-none-any.whl"
-          MANIFEST=core-manifest.json
-          MANIFEST_SIGSTORE=core-manifest.json.sigstore.json
-          DIR="$RUNNER_TEMP/core"
-          gh release download "$CORE_TAG" -R sidevoice/sidevoice-core -D "$DIR" -p 'sidevoice_core-*-py3-none-any.whl' -p "$MANIFEST" -p "$MANIFEST_SIGSTORE" -p SHA256SUMS
-          for asset in "$MANIFEST" "$MANIFEST_SIGSTORE"; do
-            if [ ! -s "$DIR/$asset" ]; then
-              echo "::error::sidevoice-core's $CORE_TAG is missing required asset $asset."
-              exit 1
-            fi
-          done
-          if [ ! -f "$DIR/$WHEEL" ]; then
-            echo "::error::sidevoice-core's $CORE_TAG carries $(cd "$DIR" && ls -- *.whl), but packages/connector/core.mjs pins CORE_VERSION $CORE_VERSION."
-            exit 1
-          fi
-          grep -q "  $WHEEL\$" "$DIR/SHA256SUMS"
-          (cd "$DIR" && sha256sum -c --ignore-missing SHA256SUMS)
-          echo "wheel=$DIR/$WHEEL" >> "$GITHUB_OUTPUT"
-          echo "manifest=$DIR/$MANIFEST" >> "$GITHUB_OUTPUT"
-          echo "manifest_sigstore=$DIR/$MANIFEST_SIGSTORE" >> "$GITHUB_OUTPUT"
-          echo "core=$CORE_TAG" >> "$GITHUB_OUTPUT"
-      - name: Pack the client with the verified manifest and pinned wheel
-        working-directory: packages/connector
-        env:
-          SIDEVOICE_CORE_WHEEL: ${{ steps.core.outputs.wheel }}
-          SIDEVOICE_CORE_MANIFEST: ${{ steps.core.outputs.manifest }}
-          SIDEVOICE_CORE_MANIFEST_SIGSTORE: ${{ steps.core.outputs.manifest_sigstore }}
-          SIDEVOICE_REQUIRE_CORE_MANIFEST: '1'
-          KIND: ${{ steps.kind.outputs.publish }}
-          # Which build this is, for the installer's ordering (release.mjs): a nightly carries the version of the
-          # last release, so two nightlies of one version are ordered by this run number. build.mjs stamps both into
-          # dist/package.json; the package's own manifest is stamped here too.
-          SIDEVOICE_CHANNEL: ${{ steps.kind.outputs.publish == 'nightly' && 'nightly' || 'release' }}
-          SIDEVOICE_BUILD_SEQ: ${{ github.run_number }}
-        run: |
-          set -euo pipefail
-          npm pkg set "sidevoice.channel=$SIDEVOICE_CHANNEL"
-          npm pkg set "sidevoice.build_seq=$SIDEVOICE_BUILD_SEQ" --json
-          mkdir -p "$GITHUB_WORKSPACE/dist-release"
-          npm pack --pack-destination "$GITHUB_WORKSPACE/dist-release"
-          TGZ=$(ls "$GITHUB_WORKSPACE"/dist-release/sidevoice-uplink-*.tgz)
-          WHEEL=$(basename "$SIDEVOICE_CORE_WHEEL")
-          tar -tzf "$TGZ" | grep -x 'package/dist/cli.mjs' >/dev/null
-          tar -xzOf "$TGZ" package/dist/package.json | node -e "const m = JSON.parse(require('fs').readFileSync(0, 'utf8')); if (m.sidevoice?.channel !== process.env.SIDEVOICE_CHANNEL || m.sidevoice?.build_seq !== Number(process.env.SIDEVOICE_BUILD_SEQ)) { console.error('unstamped manifest', m.sidevoice); process.exit(1); }"
-          tar -xzOf "$TGZ" "package/dist/core/$WHEEL" | cmp - "$SIDEVOICE_CORE_WHEEL"
-          if [ "$KIND" = nightly ]; then
-            # The nightly carries the version of the last release, so it says it is not that version.
-            mv "$TGZ" "${TGZ%.tgz}-nightly.tgz"
-          fi
-          cd "$GITHUB_WORKSPACE/dist-release"
-          sha256sum -- * > SHA256SUMS
-          ls -la; cat SHA256SUMS
-          echo "Core manifest: $SIDEVOICE_CORE_MANIFEST with its Sigstore sidecar; wheel: $WHEEL from sidevoice/sidevoice-core ${{ steps.core.outputs.core }}" >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sidevoice-connector-dist
-          path: dist-release/
-          retention-days: 7
-          if-no-files-found: error
-
-  # Only after the suite and the package passed. Pull requests never get here. A release is only attached
-  # here, as a draft: release-please.yml publishes it after npm.
-  publish:
-    name: Attach (release) or publish (nightly)
-    needs: package
-    if: needs.package.outputs.publish != ''
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      TAG: ${{ inputs.release-tag }}
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: sidevoice-connector-dist
-          path: assets
-      - name: Attach to the draft release
-        if: needs.package.outputs.publish == 'release'
-        run: gh release upload "$TAG" assets/* --clobber
-      - name: Replace the nightly pre-release (move its tag here, replace every asset)
-        if: needs.package.outputs.publish == 'nightly'
-        env:
-          WHEN: ${{ github.event.head_commit.timestamp }}
-        run: |
-          set -euo pipefail
-          if gh api "repos/$GH_REPO/git/ref/tags/nightly" >/dev/null 2>&1; then
-            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/nightly" -f sha="$GITHUB_SHA" -F force=true >/dev/null
-          else
-            gh api -X POST "repos/$GH_REPO/git/refs" -f ref=refs/tags/nightly -f sha="$GITHUB_SHA" >/dev/null
-          fi
-          NOTES="Snapshot of \`main\` at $GITHUB_SHA (committed $WHEN), with sidevoice-core's signed nightly manifest embedded and its pinned wheel inside. Not a versioned release: the \`nightly\` tag moves to every commit on \`main\` whose CI passes, and these assets are replaced each time. It is never published to npm. Versioned releases are the \`vX.Y.Z\` ones."
-          if gh release view nightly >/dev/null 2>&1; then
-            gh release edit nightly --title "Nightly (main)" --notes "$NOTES" --prerelease --latest=false
-            gh release upload nightly assets/* --clobber
-            # Anything left from an older snapshot that this one did not replace (the tarball is named after the version).
-            gh release view nightly --json assets -q '.assets[].name' | while read -r name; do
-              [ -e "assets/$name" ] || gh release delete-asset nightly "$name" --yes
-            done
-          else
-            gh release create nightly assets/* --verify-tag --title "Nightly (main)" --notes "$NOTES" \
-              --prerelease --latest=false
-          fi
+      - run: npm ci && npm test

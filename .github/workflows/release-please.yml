@@ -1,9 +1,9 @@
 name: release-please
 
 # On every push to main: keep the "release X.Y.Z" PR up to date (version from feat/fix, changelog from the squashed
-# PR titles). Merging that PR is the release: this run then creates the tag and a draft GitHub Release; ci.yml
-# (called below) builds the npm tarball from the tag, the core's matching wheel inside, and attaches it; the client
-# goes to npm once a maintainer approves the `npm` environment; the Release is published last. RELEASING.md.
+# PR titles). Merging that PR is the release: this run then creates the tag and a draft GitHub Release, and
+# release.yml (called below) tests and builds the connector from the tag, attaches the attested assets and publishes
+# the Release. RELEASING.md.
 on:
   push:
     branches: [main]
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
-      - name: Run the PR-title check on the release PR (its own pushes start no workflow)
+      - name: Run the PR checks on the release PR (its own pushes start no workflow)
         if: steps.release.outputs.prs_created == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -41,6 +41,7 @@ jobs:
         run: |
           for branch in $(gh pr list --state open --label 'autorelease: pending' --json headRefName --jq '.[].headRefName'); do
             gh workflow run pr-title.yml --ref "$branch"
+            gh workflow run ci.yml --ref "$branch"
           done
 
   assets:
@@ -49,77 +50,8 @@ jobs:
     if: needs.release-please.outputs.release_created == 'true'
     permissions:
       contents: write
-    uses: ./.github/workflows/ci.yml
+      attestations: write
+      id-token: write
+    uses: ./.github/workflows/release.yml
     with:
-      release-tag: ${{ needs.release-please.outputs.tag_name }}
-
-  # A job naming an environment that does not exist creates it, unprotected: this one refuses to go on unless
-  # `npm` exists and asks a person to approve, so publishing is never this workflow's own decision.
-  npm-gate:
-    name: The npm environment asks for approval
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
-    runs-on: ubuntu-24.04
-    permissions:
-      actions: read
-    steps:
-      - env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          REVIEWERS=$(gh api "repos/$GH_REPO/environments/npm" --jq '[.protection_rules[]? | select(.type == "required_reviewers")] | length' 2>/dev/null) || REVIEWERS=0
-          if ! [[ "$REVIEWERS" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::The environment npm does not exist or has no required reviewers (RELEASING.md). Nothing goes to npm."
-            exit 1
-          fi
-
-  npm:
-    name: Client to npm (approved by a maintainer)
-    needs: [release-please, assets, npm-gate]
-    runs-on: ubuntu-24.04
-    # The approval is the publication. The trusted publisher on npm names this workflow and this environment.
-    environment: npm
-    permissions:
-      contents: read
-      id-token: write  # Trusted publishing: npm takes this run's OIDC identity; there is no token to hold.
-    env:
-      TAG: ${{ needs.release-please.outputs.tag_name }}
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: sidevoice-connector-dist
-          path: assets
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-      # Node 22 bundles npm 10; publishing over OIDC needs 11.5.1 or later.
-      - run: npm install -g npm@11
-      # The tarball attached to the release, byte for byte (the wheel inside), not a rebuild. A pre-release must not
-      # become what `npm install` picks: it goes out under `next`, and only a final release moves `latest`.
-      - run: |
-          set -euo pipefail
-          (cd assets && sha256sum -c SHA256SUMS)
-          TGZ=$(ls assets/sidevoice-uplink-*.tgz)
-          case "$TAG" in *-*) DIST_TAG=next ;; *) DIST_TAG=latest ;; esac
-          npm publish "$TGZ" --access public --tag "$DIST_TAG"
-
-  github-release:
-    name: Publish the release (a version with -rc.N is a pre-release, never latest)
-    needs: [release-please, npm]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      TAG: ${{ needs.release-please.outputs.tag_name }}
-    steps:
-      - run: |
-          set -euo pipefail
-          if [[ "$TAG" == *-* ]]; then
-            gh release edit "$TAG" --draft=false --prerelease --latest=false
-          else
-            gh release edit "$TAG" --draft=false --prerelease=false --latest
-          fi
+      tag: ${{ needs.release-please.outputs.tag_name }}

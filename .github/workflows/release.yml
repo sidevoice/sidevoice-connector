@@ -1,0 +1,85 @@
+name: release
+
+# Merging is publishing. Every push to main replaces the `nightly` pre-release; release-please.yml calls this with
+# the vX.Y.Z tag it created. Per target: the tests (against `cargo xtask fixtures`: the core's nightly, Codex), then
+# `cargo xtask dist` (release binary, archive, verified by running the connector from it). Then
+# `cargo xtask manifest`, one attestation over every asset, and `cargo xtask publish` (attach, read back, verify,
+# publish). RELEASING.md.
+on:
+  push:
+    branches: [main]
+  workflow_call:
+    inputs:
+      tag:
+        description: The draft vX.Y.Z release release-please created; its assets are built from that tag.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+# Never cancelled half-way. Nightlies queue behind each other (a newer one replaces a waiting one); each version
+# has its own group.
+concurrency:
+  group: release-${{ inputs.tag || 'nightly' }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ inputs.tag || 'nightly' }}
+
+jobs:
+  dist:
+    name: Test and package (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: macos-aarch64, runner: macos-14 }
+          - { target: linux-x86_64, runner: ubuntu-24.04 }
+          - { target: linux-aarch64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+      - uses: ./.github/actions/setup
+      - run: cargo xtask fixtures
+      - run: cargo test --locked
+      - run: cargo xtask dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: target/dist/*.tar.zst
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    name: Manifest, attest, publish
+    needs: dist
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+      - uses: ./.github/actions/setup
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - run: cargo xtask manifest dist ${{ inputs.tag && format('--tag {0}', inputs.tag) || '' }}
+      - id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.zst
+            dist/sidevoice-connector-manifest.json
+      - run: cp "${{ steps.attest.outputs.bundle-path }}" dist/attestation.sigstore.json
+      - run: cargo xtask publish dist "$TAG"
