@@ -1,11 +1,11 @@
 [package]
-name = "sidevoice-rust-proof"
-version = "0.1.0"
+name = "sidevoice-connector"
+version = "0.6.0"
 edition = "2021"
 publish = false
 
 [[bin]]
-name = "sidevoice-rust-proof"
+name = "sidevoice-connector"
 path = "src/main.rs"
 
 [dependencies]
