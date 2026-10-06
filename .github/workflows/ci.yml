@@ -3,7 +3,7 @@ name: ci
 # Every pull request: lint, then on every target the tests (against what `cargo xtask fixtures` fetches: the
 # sidevoice-core release pinned in core.pin and the pinned Codex CLI) and the release packaging, exactly as a
 # release builds it (on Linux also run on the oldest distribution it supports), publishing nothing. What passes here
-# is what merging publishes (release.yml). RELEASING.md.
+# is what merging publishes (release.yml), npm packages included. RELEASING.md.
 on:
   pull_request:
     branches: [main]
@@ -51,4 +51,7 @@ jobs:
       # The Linux binary on the oldest distribution it supports (glibc floor, xtask/src/glibc.rs).
       - if: runner.os == 'Linux'
         run: cargo xtask verify-floor target/dist/sidevoice-connector-${{ matrix.target }}.tar.zst
-
+      # The npm packages of that archive and the launcher, installed into a temporary prefix as a person installs
+      # them: `npx sidevoice --version --json` must run this build (xtask/src/npm.rs).
+      - run: cargo xtask npm target/dist/sidevoice-connector-${{ matrix.target }}.tar.zst
+      - run: cargo xtask npm-smoke

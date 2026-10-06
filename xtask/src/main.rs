@@ -19,6 +19,12 @@
 //!   with the checked archive beside it: where the connector's tests find the real core.
 //! - `codex [DIR]`: install the pinned Codex CLI from npm into DIR (default `target/codex`), where the registration
 //!   test finds it.
+//! - `npm ARCHIVE...`: the npm packages of those archives (`@sidevoice/sidevoice-<os>-<cpu>` each) and the launcher
+//!   `sidevoice`, packed into `target/npm` (xtask/src/npm.rs).
+//! - `npm-smoke`: install the launcher and this machine's package from `target/npm` as a person does and run
+//!   `npx sidevoice --version --json` from there.
+//! - `npm-publish TAG`: the npm packages of the GitHub release TAG's checked assets, published by trusted publishing:
+//!   the platform packages, then the launcher as a staged version a maintainer approves.
 //! - `fixtures`: `core` and `codex`, into their default directories: what `cargo test` runs against.
 
 mod archive;
@@ -28,6 +34,7 @@ mod dist;
 mod glibc;
 mod manifest;
 mod notices;
+mod npm;
 mod publish;
 mod util;
 mod verify;
@@ -37,7 +44,47 @@ use std::path::Path;
 
 pub(crate) type Result<T> = std::result::Result<T, String>;
 
-pub(crate) const TARGETS: [&str; 3] = ["linux-aarch64", "linux-x86_64", "macos-aarch64"];
+/// A release target: its name in archive names and inventories, the `std::env::consts::OS` and `ARCH` of the machine
+/// that builds it (each target is built on its own runner), and npm's `os` and `cpu` for its package.
+pub(crate) struct Target {
+    pub(crate) name: &'static str,
+    pub(crate) os: &'static str,
+    pub(crate) arch: &'static str,
+    pub(crate) npm_os: &'static str,
+    pub(crate) npm_cpu: &'static str,
+}
+
+/// Every release target: the one list the tooling reads (archives, manifest, npm packages, the launcher's
+/// dependencies). Adding a target is a line here and its runner in the `ci.yml` and `release.yml` matrices
+/// (RELEASING.md, "npm: what is published and how to add a platform").
+pub(crate) const TARGETS: &[Target] = &[
+    Target {
+        name: "linux-aarch64",
+        os: "linux",
+        arch: "aarch64",
+        npm_os: "linux",
+        npm_cpu: "arm64",
+    },
+    Target {
+        name: "linux-x86_64",
+        os: "linux",
+        arch: "x86_64",
+        npm_os: "linux",
+        npm_cpu: "x64",
+    },
+    Target {
+        name: "macos-aarch64",
+        os: "macos",
+        arch: "aarch64",
+        npm_os: "darwin",
+        npm_cpu: "arm64",
+    },
+];
+
+/// The names of [`TARGETS`], in order.
+pub(crate) fn target_names() -> impl Iterator<Item = &'static str> {
+    TARGETS.iter().map(|target| target.name)
+}
 /// The crate whose binary is released.
 pub(crate) const PACKAGE: &str = "sidevoice-connector";
 /// The archive's single root directory.
@@ -51,7 +98,7 @@ pub(crate) const MANIFEST: &str = "sidevoice-connector-manifest.json";
 pub(crate) const KIND: &str = "sidevoice-connector-v1";
 
 const USAGE: &str =
-    "usage: cargo xtask dist | verify ARCHIVE | verify-floor ARCHIVE | manifest DIR [--tag vX.Y.Z] | publish DIR TAG | fixtures | core [DIR] | codex [DIR]";
+    "usage: cargo xtask dist | verify ARCHIVE | verify-floor ARCHIVE | manifest DIR [--tag vX.Y.Z] | publish DIR TAG | npm ARCHIVE... | npm-smoke | npm-publish TAG | fixtures | core [DIR] | codex [DIR]";
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -69,6 +116,12 @@ fn main() {
         ["codex", dir] => codex::codex(Path::new(dir)),
         ["fixtures"] => core::core(&util::repo().join(core::DEFAULT_DIR))
             .and_then(|()| codex::codex(&util::repo().join(codex::DEFAULT_DIR))),
+        ["npm", archives @ ..] if !archives.is_empty() => {
+            let archives: Vec<&Path> = archives.iter().map(Path::new).collect();
+            npm::npm_packages(&archives)
+        }
+        ["npm-smoke"] => npm::smoke(),
+        ["npm-publish", tag] => npm::publish(tag),
         _ => Err(USAGE.into()),
     };
     if let Err(error) = result {

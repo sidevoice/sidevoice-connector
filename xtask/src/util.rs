@@ -116,12 +116,12 @@ pub(crate) fn download(url: &str) -> Result<Vec<u8>> {
 
 /// This machine as a release target name.
 pub(crate) fn host_target() -> Result<&'static str> {
-    match (env::consts::OS, env::consts::ARCH) {
-        ("linux", "x86_64") => Ok("linux-x86_64"),
-        ("linux", "aarch64") => Ok("linux-aarch64"),
-        ("macos", "aarch64") => Ok("macos-aarch64"),
-        (os, arch) => Err(format!("unsupported build host {os}-{arch}")),
-    }
+    let (os, arch) = (env::consts::OS, env::consts::ARCH);
+    crate::TARGETS
+        .iter()
+        .find(|target| target.os == os && target.arch == arch)
+        .map(|target| target.name)
+        .ok_or_else(|| format!("unsupported build host {os}-{arch}"))
 }
 
 pub(crate) fn cargo() -> String {

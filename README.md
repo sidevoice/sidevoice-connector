@@ -6,10 +6,10 @@
 </picture>
 
 <p>
-  <a href="https://www.npmjs.com/package/@sidevoice/uplink"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/npm/v/@sidevoice/uplink.svg?variant=secondary&size=sm&mode=dark" /><img alt="npm version" src="https://shieldcn.dev/npm/v/@sidevoice/uplink.svg?variant=secondary&size=sm&mode=light" /></picture></a>
+  <a href="https://www.npmjs.com/package/sidevoice"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/npm/v/sidevoice.svg?variant=secondary&size=sm&mode=dark" /><img alt="npm version" src="https://shieldcn.dev/npm/v/sidevoice.svg?variant=secondary&size=sm&mode=light" /></picture></a>
   <a href="https://github.com/sidevoice/sidevoice-connector/actions/workflows/release.yml"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/ci/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&workflow=release.yml&branch=main&mode=dark" /><img alt="release build status" src="https://shieldcn.dev/github/ci/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&workflow=release.yml&branch=main&mode=light" /></picture></a>
   <a href="LICENSE"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/license/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&mode=dark" /><img alt="licence" src="https://shieldcn.dev/github/license/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&mode=light" /></picture></a>
-  <picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/node-22+.svg?variant=secondary&size=sm&logo=nodedotjs&mode=dark" /><img alt="requires Node.js 22 or newer" src="https://shieldcn.dev/badge/node-22+.svg?variant=secondary&size=sm&logo=nodedotjs&mode=light" /></picture>
+  <picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/node-18+.svg?variant=secondary&size=sm&logo=nodedotjs&mode=dark" /><img alt="requires Node.js 18 or newer" src="https://shieldcn.dev/badge/node-18+.svg?variant=secondary&size=sm&logo=nodedotjs&mode=light" /></picture>
   <picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/status-beta.svg?variant=secondary&size=sm&mode=dark" /><img alt="status: beta" src="https://shieldcn.dev/badge/status-beta.svg?variant=secondary&size=sm&mode=light" /></picture>
 </p>
 
@@ -20,7 +20,7 @@ already have with your agent into a voice call. The agent keeps its context and 
 speaks its replies, and you answer by voice and can interrupt it — from the sofa or on a walk, not only at your desk.
 
 **sidevoice-connector** is what you install on the machine where your agents run, published on npm as
-[`@sidevoice/uplink`](https://www.npmjs.com/package/@sidevoice/uplink). It gives each agent conversation its voice
+[`sidevoice`](https://www.npmjs.com/package/sidevoice). It gives each agent conversation its voice
 tools (an MCP server), delivers what you say into that same conversation, and installs and starts the
 machine's [core](https://github.com/sidevoice/sidevoice-core).
 
@@ -38,18 +38,22 @@ app, a browser).
 
 ## Get started
 
-You need Node.js 22 or newer and [uv](https://docs.astral.sh/uv/) (the core runs on Python, which uv provides).
+You need macOS on Apple silicon, or Linux on x64 or arm64 with glibc (see [Status](#status)), and Node.js 18 or
+newer for `npx`. The npm package `sidevoice` is a small launcher: npm installs beside it the connector built for
+your machine (`@sidevoice/sidevoice-<os>-<cpu>`, with the core inside); installing downloads nothing else.
 
 1. **Install**, on the machine where your agents run:
 
    ```sh
-   npx -y @sidevoice/uplink install
+   npx sidevoice install
    ```
 
    It installs and starts this machine's core, registers the voice tools with the agents it finds, and tells you
    what, if anything, needs a manual step (see [Supported agents](#supported-agents)).
 
-2. **Pair your device.** Ask your agent to pair a device, or run `npx @sidevoice/uplink pair-device`. You get a
+   A release candidate, when there is one: `npx sidevoice@next install`.
+
+2. **Pair your device.** Ask your agent to pair a device, or run `npx sidevoice pair-device`. You get a
    one-time code; enter it in the [desktop app](https://github.com/sidevoice/sidevoice-desktop). Pairing is always
    your act: nothing pairs on its own.
 

@@ -3,22 +3,24 @@
 One version for the connector, tagged `vX.Y.Z`. It lives in `packages/connector-rust/Cargo.toml` (the build tooling at
 the workspace root carries the same one, and `Cargo.lock` both); release-please moves them together
 (`release-please-config.json`). Never edit it by hand. The connector is distributed as GitHub Releases of this
-repository: one binary per target.
+repository, one archive per target, and on npm as the package `sidevoice` with one package per platform built from
+those very archives ([npm](#npm-what-is-published-and-how-to-add-a-platform)).
 
-The Node package (`packages/connector`, `@sidevoice/uplink` on npm) is not built, tested or published here any more;
-it leaves with the move to one Rust binary, and npm per-platform packages of the binary come with that migration.
+The old Node package (`packages/connector`, `@sidevoice/uplink` on npm, deprecated) is not built, tested or published
+here any more.
 
 ## What each act means
 
 | Act | Who | What happens |
 |---|---|---|
-| Open / update a PR | anyone | `ci`: format and Clippy (Linux and macOS), then on every target the tests and the release packaging (`cargo xtask dist`), publishing nothing. **PR title is a conventional commit**. |
+| Open / update a PR | anyone | `ci`: format and Clippy (Linux and macOS), then on every target the tests, the release packaging (`cargo xtask dist`) and its npm packages, installed and run (`cargo xtask npm`, `npm-smoke`), publishing nothing. **PR title is a conventional commit**. |
 | Squash-merge into `main` | reviewer | The PR title becomes the commit. `release` runs: per target it runs the tests, builds and packages the connector; then it attests the assets, attaches them to the `nightly` pre-release, reads them back, verifies them and publishes. release-please opens or updates the **release PR** ("chore(main): release X.Y.Z"). |
-| Merge the release PR | a maintainer | **This is the release.** release-please tags `vX.Y.Z` and creates a draft GitHub Release whose notes are that version's changelog; `release` runs from the tag, attaches and verifies the assets, and publishes the Release. |
+| Merge the release PR | a maintainer | **This is the release.** release-please tags `vX.Y.Z` and creates a draft GitHub Release whose notes are that version's changelog; `release` runs from the tag, attaches and verifies the assets, and publishes the Release; then it publishes the platform packages to npm and **stages** the launcher `sidevoice`. |
+| Approve the staged `sidevoice` on npmjs.com | a maintainer (2FA) | The version reaches people: `npx sidevoice` installs it (dist-tag `latest`, or `next` for a candidate). |
 
 The tests are part of the build: an asset is only produced on a target where the whole suite passed. Everything
 besides the GitHub steps is code in `xtask/` (`cargo xtask fixtures | dist | verify | verify-floor | manifest |
-publish`):
+publish | npm | npm-smoke | npm-publish`):
 
 - `cargo xtask fixtures` fetches what the tests run against: the sidevoice-core release whose version is in
   `core.pin` (one line, `X.Y.Z`), its archive for this machine checked against that release's `SHA256SUMS`,
@@ -37,6 +39,11 @@ publish`):
   `.github/actions/setup`): see [Linux: the glibc floor](#linux-the-glibc-floor).
 - `cargo xtask verify-floor <archive>` (Linux, needs Docker) verifies a Linux archive again, running the connector
   in a container of the oldest distribution it supports. CI runs it after `dist` on both Linux targets.
+- `cargo xtask npm <archive>...` makes the npm packages of those archives and the launcher, in `target/npm`;
+  `cargo xtask npm-smoke` installs the launcher and this machine's package from there into a temporary prefix, as a
+  person installs them, and runs `npx sidevoice --version --json`: it must be that package's build. It also checks
+  the exit status passes through and that another platform gets a clear refusal. CI runs both after `dist` on every
+  target. See [npm](#npm-what-is-published-and-how-to-add-a-platform).
 
 ## Linux: the glibc floor
 
@@ -89,6 +96,83 @@ The changelog is written from the squashed PR titles. To change it, edit `CHANGE
 before merging it: any later merge into `main` regenerates the PR. After the release, fix the notes on the
 Release itself.
 
+## npm: what is published and how to add a platform
+
+### What is published
+
+Every `vX.Y.Z` release (never the nightly) is also published to npm, as four packages of the same version
+(`xtask/src/npm.rs`, the pattern esbuild and Biome use):
+
+| Package | What it carries | dist-tag | How it is published |
+|---|---|---|---|
+| `@sidevoice/sidevoice-darwin-arm64`, `@sidevoice/sidevoice-linux-x64`, `@sidevoice/sidevoice-linux-arm64` | That target's release archive unpacked as it is (`bin/sidevoice-connector`, `connector.json`, the core archive under `core/`, `LICENSE`, `notices/`), a `package.json` with `os`, `cpu` and on Linux `libc: ["glibc"]`, and a README. **No `bin`**: the binary just lives in the package. | `platform` | directly, with provenance |
+| `sidevoice` | `optionalDependencies` on the three at **exactly** its own version (no ranges), and one script, `bin/sidevoice.js` (`xtask/npm/sidevoice.js`, plain JavaScript, no dependencies): it runs the installed platform package's binary with the same arguments, standard streams and exit status, and says clearly when the platform is unsupported or its package is missing. The only package with a `bin`: `sidevoice`. | `latest` for `X.Y.Z`, `next` for `X.Y.Z-rc.N` | **staged**, with provenance; a maintainer approves it |
+
+npm installs, of the launcher's optional dependencies, only the one matching the machine. The connector finds its
+package by its own path (the directory above its `bin/`), so it runs from `node_modules` exactly as from the archive.
+
+### Who publishes, and how
+
+Only the release workflow publishes, by npm's **trusted publishing** (OIDC): no npm token exists, and the packages
+are set to require 2FA and disallow tokens. The job `npm` in `release.yml` runs after the GitHub Release is
+published, for versioned releases only, as one step, `cargo xtask npm-publish vX.Y.Z`:
+
+1. It downloads the Release's archives, `SHA256SUMS` and attestation and checks every archive against both: npm gets
+   the bytes GitHub Releases has, nothing rebuilt.
+2. It packs the packages with the npm CLI pinned in `xtask/src/npm.rs` (`NPM_VERSION`; trusted publishing needs
+   11.5.1 or later), run with a configuration of its own: no `.npmrc`, no token from the environment.
+3. It checks that trusted publishing accepts this run for **every** package (the same OIDC exchange `npm publish`
+   makes) before publishing any. If one is not configured the job fails, naming the packages and what to set, and
+   nothing is published. There is no token to fall back to.
+4. It publishes the three platform packages directly, under the dist-tag `platform`, with `--provenance`; then
+   **stages** `sidevoice` (`npm stage publish`, `--provenance`, dist-tag `latest` or `next`). A version already
+   published with the same bytes is skipped, so a re-run carries on; with other bytes it fails.
+
+Success means **"platform packages published, launcher staged awaiting approval"**; the job's last line says so,
+with the stage id. A maintainer approves it on npmjs.com (`sidevoice` → staged versions) or with
+`npm stage approve <id>`, both with 2FA. Until then `npx sidevoice` keeps installing the previous version.
+
+Why this shape:
+
+- **One approval per release.** Only the launcher is staged. It pins the platform packages' exact version, so
+  approving it approves every byte it will run; a range would let it pick up a platform version nobody approved.
+- **A new platform version reaches nobody until the launcher that pins it is approved.** The platform packages are
+  published directly but under `platform`, never `latest` or `next`, and declare no `bin`: `npm i
+  @sidevoice/sidevoice-<os>-<cpu>` resolves nothing new by default. Only the launcher brings them.
+- **npm versions are immutable.** A published version can never be replaced (only deprecated), so every check runs
+  before the first publish, and a bad release is fixed by the next version. A staged launcher can still be rejected.
+
+The trusted publisher of each package (npmjs.com → the package → Settings → Trusted publisher → GitHub Actions):
+organisation `sidevoice`, repository `sidevoice-connector`, no environment, and the workflow filename npm checks.
+**npm checks the workflow that starts the run, not one it calls**: a version is released by `release-please.yml`,
+which calls `release.yml` (`workflow_call`), so the filename npm sees is `release-please.yml`. The job prints it
+before publishing, and its error names it when it does not match. Platform packages: "Allow npm publish";
+`sidevoice`: staged publishing. Every workflow on the way grants `id-token: write`, and the job sets up Node.js 24
+(trusted publishing needs 22.14 or later).
+
+### Adding a platform
+
+Say Windows x64 or macOS x86_64:
+
+1. **Reserve the name.** Publish `@sidevoice/sidevoice-<os>-<cpu>` (npm's `process.platform` and `process.arch`:
+   `win32-x64`, `darwin-x64`) once by hand as a public `0.0.1` placeholder, so the name is ours.
+2. **Configure its trusted publisher** as above: `sidevoice` / `sidevoice-connector` / the workflow filename npm
+   checks (see above), no environment, "Allow npm publish" checked; in its access settings, require 2FA and
+   disallow tokens.
+3. **Add the target to `TARGETS` in `xtask/src/main.rs`**, the one list the tooling reads: its name (as in archive
+   names, `<os>-<arch>`), the Rust `std::env::consts` OS and ARCH of the machine that builds it, and npm's `os` and
+   `cpu`. The manifest, the npm packages and the launcher's `optionalDependencies` follow from it.
+4. **Add its runner** to the matrices of `ci.yml` (`test`) and `release.yml` (`dist`), and to `lint` in `ci.yml` if
+   it compiles code no other runner does.
+5. **What is specific to the platform**, each a change of its own:
+   - the connector's own target name (`packages/connector-rust/src/identity.rs`) and its service manager
+     (`src/service/`: launchd and systemd today; Windows needs its own);
+   - a pinned sidevoice-core release built for that target (`core.pin`, `xtask/src/core.rs`);
+   - linking: on Linux the glibc floor (`xtask/src/glibc.rs`, cargo-zigbuild in `.github/actions/setup`); on
+     musl, a separate target with `libc: ["musl"]`; the libraries a binary may load (`xtask/src/verify.rs`);
+   - the archive: `bin/sidevoice-connector` gets `.exe` on Windows, which the inventory's `entrypoint`, `verify`
+     and the launcher (it reads `entrypoint` from `connector.json`) must follow;
+   - the README's supported platforms and the launcher package's README (`xtask/src/npm.rs`).
 ## Which version comes next
 
 `fix:` → patch, `feat:` → minor. While the version is 0.x a breaking change (`feat!:` or a `BREAKING CHANGE:`
@@ -124,6 +208,9 @@ Build artifacts on Actions runs are kept 7 days, for debugging only. Download fr
 - A release build or its verification fails: the Release stays a draft, its tag in place. Fix forward if needed,
   then re-run the failed jobs of that `release-please` run. Nothing is published until every check passed.
 - A `nightly` run fails: the previous snapshot stays. The next green push replaces it.
+- The npm job fails: the GitHub Release is already published and stays. Fix the cause (usually the trusted
+  publisher settings: the error names them) and re-run that job; packages already published with the same bytes are
+  skipped. If the launcher is already staged, approve or reject it on npmjs.com instead.
 - A release run is never cancelled half-way; nightlies queue behind each other.
 - Moving to a new core release is a PR that changes `core.pin` (by hand or by a dependency bot); its CI is the
   connector's tests against that core.
@@ -135,5 +222,6 @@ Build artifacts on Actions runs are kept 7 days, for debugging only. Download fr
 - Squash merging, with the PR title as the commit message.
 - `ci` and **PR title is a conventional commit** run on every PR; release-please's own PR gets both through a
   dispatched run (its pushes start no workflow by themselves). Make both required in a ruleset to enforce them.
-- The `npm` environment is no longer used by any workflow; delete it, or keep it for the npm packages that come with
-  the migration.
+- The `npm` environment is not used: publishing to npm runs in no environment, and its approval is the staged
+  launcher's (see [npm](#npm-what-is-published-and-how-to-add-a-platform)). Delete it.
+- On npmjs.com, a trusted publisher for each npm package ([Trusted publishing](#who-publishes-and-how)).

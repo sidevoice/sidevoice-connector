@@ -5,7 +5,7 @@ name: release
 # `cargo xtask dist` (release binary, archive, verified by running the connector from it; on Linux
 # `cargo xtask verify-floor` runs it again on the oldest distribution it supports). Then
 # `cargo xtask manifest`, one attestation over every asset, and `cargo xtask publish` (attach, read back, verify,
-# publish). RELEASING.md.
+# publish); for a vX.Y.Z release, `cargo xtask npm-publish` then puts it on npm. RELEASING.md.
 on:
   push:
     branches: [main]
@@ -87,3 +87,30 @@ jobs:
             dist/sidevoice-connector-manifest.json
       - run: cp "${{ steps.attest.outputs.bundle-path }}" dist/attestation.sigstore.json
       - run: cargo xtask publish dist "$TAG"
+
+  # Versioned releases only, never the nightly: the npm packages of the assets the Release just published (read back
+  # and checked against SHA256SUMS and the attestation), by trusted publishing (OIDC; no token exists): the three
+  # platform packages, then the launcher `sidevoice` staged for a maintainer's approval on npmjs.com. RELEASING.md.
+  npm:
+    name: Publish to npm
+    needs: publish
+    if: inputs.tag
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: ./.github/actions/setup
+      # Trusted publishing needs Node.js 22.14 or later; no registry-url, so no .npmrc and no token.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      # Platforms published, launcher staged for approval; what, why, and how to add a platform: RELEASING.md,
+      # "npm: what is published and how to add a platform".
+      - run: cargo xtask npm-publish "$TAG"
