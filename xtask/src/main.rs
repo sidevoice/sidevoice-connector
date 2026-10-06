@@ -8,9 +8,9 @@
 //!   `sidevoice-connector-manifest.json` and `SHA256SUMS`; with a tag, the crate version must be that release.
 //! - `publish DIR TAG`: attach every file in DIR to the release TAG (for `nightly`, move the tag here first and drop
 //!   older assets), download them back, check them against `SHA256SUMS` and the attestation, and publish.
-//! - `core [DIR]`: download sidevoice-core's `nightly` archive for this host, check it against the release's
-//!   `SHA256SUMS`, its manifest and its attestation, and unpack it into DIR (default `target/sidevoice-core`), where
-//!   the connector's tests find the real core.
+//! - `core [DIR]`: download the sidevoice-core release pinned in `core.pin` for this host, check it against that
+//!   release's `SHA256SUMS`, manifest and attestation, and unpack it into DIR (default `target/sidevoice-core`),
+//!   where the connector's tests find the real core.
 //! - `codex [DIR]`: install the pinned Codex CLI from npm into DIR (default `target/codex`), where the registration
 //!   test finds it.
 //! - `fixtures`: `core` and `codex`, into their default directories: what `cargo test` runs against.

@@ -1,4 +1,4 @@
-//! The connector against the real core (sidevoice-core's published nightly), end to end, in a private profile:
+//! The connector against the real core (the sidevoice-core release pinned in core.pin), end to end, in a private profile:
 //! the connector links to a core it did not start, over the core's own socket; a conversation joins through the
 //! MCP server; what the person says in a call reaches the conversation; the conversation's reply reaches the core;
 //! and when the core restarts the connector links to the new one by itself.

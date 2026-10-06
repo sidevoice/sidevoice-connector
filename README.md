@@ -88,10 +88,10 @@ The package installs one command, `sidevoice`:
 ## Develop
 
 The connector is becoming one Rust binary (`packages/connector-rust`); the Node package (`packages/connector`) is
-the installer until then.
+the installer until then, and is no longer part of CI.
 
 ```sh
-cargo xtask fixtures   # what the tests run against: sidevoice-core's published nightly, the pinned Codex CLI
+cargo xtask fixtures   # what the tests run against: the sidevoice-core release pinned in core.pin, the pinned Codex CLI
 cargo test --locked    # unit tests, and the connector against the real core, Codex and (macOS) launchd
 cargo xtask dist       # this machine's release archive, built and verified as a release builds it
 

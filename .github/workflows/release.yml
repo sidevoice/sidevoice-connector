@@ -1,7 +1,7 @@
 name: release
 
 # Merging is publishing. Every push to main replaces the `nightly` pre-release; release-please.yml calls this with
-# the vX.Y.Z tag it created. Per target: the tests (against `cargo xtask fixtures`: the core's nightly, Codex), then
+# the vX.Y.Z tag it created. Per target: the tests (against `cargo xtask fixtures`: the pinned core release, Codex), then
 # `cargo xtask dist` (release binary, archive, verified by running the connector from it). Then
 # `cargo xtask manifest`, one attestation over every asset, and `cargo xtask publish` (attach, read back, verify,
 # publish). RELEASING.md.

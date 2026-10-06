@@ -5,24 +5,24 @@ the workspace root carries the same one, and `Cargo.lock` both); release-please 
 (`release-please-config.json`). Never edit it by hand. The connector is distributed as GitHub Releases of this
 repository: one binary per target.
 
-The Node package (`packages/connector`, `@sidevoice/uplink` on npm) is no longer built or published here: it keeps
-its tests in CI until the connector is one Rust binary, and npm per-platform packages of the binary come with that
-migration.
+The Node package (`packages/connector`, `@sidevoice/uplink` on npm) is not built, tested or published here any more;
+it leaves with the move to one Rust binary, and npm per-platform packages of the binary come with that migration.
 
 ## What each act means
 
 | Act | Who | What happens |
 |---|---|---|
-| Open / update a PR | anyone | `ci`: format and Clippy (Linux and macOS), then on every target the tests and the release packaging (`cargo xtask dist`), publishing nothing; and the Node package's `npm test` on Linux. **PR title is a conventional commit**. |
+| Open / update a PR | anyone | `ci`: format and Clippy (Linux and macOS), then on every target the tests and the release packaging (`cargo xtask dist`), publishing nothing. **PR title is a conventional commit**. |
 | Squash-merge into `main` | reviewer | The PR title becomes the commit. `release` runs: per target it runs the tests, builds and packages the connector; then it attests the assets, attaches them to the `nightly` pre-release, reads them back, verifies them and publishes. release-please opens or updates the **release PR** ("chore(main): release X.Y.Z"). |
 | Merge the release PR | a maintainer | **This is the release.** release-please tags `vX.Y.Z` and creates a draft GitHub Release whose notes are that version's changelog; `release` runs from the tag, attaches and verifies the assets, and publishes the Release. |
 
 The tests are part of the build: an asset is only produced on a target where the whole suite passed. Everything
 besides the GitHub steps is code in `xtask/` (`cargo xtask fixtures | dist | verify | manifest | publish`):
 
-- `cargo xtask fixtures` fetches what the tests run against: sidevoice-core's published `nightly` for this machine
-  (checked against that release's `SHA256SUMS`, manifest and attestation, signed by the core's `release.yml` on
-  `main`) into `target/sidevoice-core`, and the pinned Codex CLI into `target/codex`. Without them the tests that
+- `cargo xtask fixtures` fetches what the tests run against: the sidevoice-core release whose version is in
+  `core.pin` (one line, `X.Y.Z`), its archive for this machine checked against that release's `SHA256SUMS`,
+  `native-core-manifest.json` and `attestation.sigstore.json` (signed by the core's `release.yml` on `main`), into
+  `target/sidevoice-core`; and the pinned Codex CLI into `target/codex`. Without them the tests that
   need them are skipped locally and fail in CI.
 - `cargo test --locked` runs the unit tests and the integration tests in `packages/connector-rust/tests/`: the
   connector against the real core, registration with the real Codex CLI, and (macOS) the login service under the
@@ -95,8 +95,8 @@ Build artifacts on Actions runs are kept 7 days, for debugging only. Download fr
   then re-run the failed jobs of that `release-please` run. Nothing is published until every check passed.
 - A `nightly` run fails: the previous snapshot stays. The next green push replaces it.
 - A release run is never cancelled half-way; nightlies queue behind each other.
-- The tests fail because sidevoice-core's `nightly` changed under them: the core's nightly is what the tests run
-  against, on purpose; fix the connector (or the core) forward.
+- Moving to a new core release is a PR that changes `core.pin` (by hand or by a dependency bot); its CI is the
+  connector's tests against that core.
 
 ## What this needs from the repository settings
 

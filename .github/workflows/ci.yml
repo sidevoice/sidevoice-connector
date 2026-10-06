@@ -1,8 +1,8 @@
 name: ci
 
-# Every pull request: lint, then on every target the tests (against what `cargo xtask fixtures` fetches:
-# sidevoice-core's published nightly and the pinned Codex CLI) and the release packaging, exactly as a release builds
-# it, publishing nothing. What passes here is what merging publishes (release.yml). RELEASING.md.
+# Every pull request: lint, then on every target the tests (against what `cargo xtask fixtures` fetches: the
+# sidevoice-core release pinned in core.pin and the pinned Codex CLI) and the release packaging, exactly as a
+# release builds it, publishing nothing. What passes here is what merging publishes (release.yml). RELEASING.md.
 on:
   pull_request:
     branches: [main]
@@ -48,14 +48,3 @@ jobs:
       - run: cargo test --locked
       - run: cargo xtask dist
 
-  # The Node installer (packages/connector) until the connector is one Rust binary; then this job goes.
-  node:
-    name: Node installer (npm test)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci && npm test
