@@ -14,7 +14,7 @@ use super::CONNECTOR;
 
 /// The checked core archive and its record (`core.json`), or `None` when the test must be skipped.
 pub fn pinned_core() -> Option<(PathBuf, Value)> {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/sidevoice-core");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/sidevoice-core");
     let record: Option<Value> = fs::read(dir.join("core.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok());

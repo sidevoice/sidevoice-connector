@@ -10,15 +10,17 @@ Rules for any coding agent (and person) working in this repository.
 - **What a program reads carries keys.** Machine-readable output (`--json`, answers over the connector socket and
   the core link) says a failure as a stable key, its parameters and an English message:
   `{"ok":false,"error":{"key","params","message"}}`. The client translates by key; the message is never parsed.
-  The keys and their English texts live in `packages/connector-rust/messages/errors.json`; adding a keyed failure
-  means adding its key there.
+  The keys and their English texts live in `connector/messages/errors.json`; adding a keyed failure means adding
+  its key there.
 - **UI keeps per-language bundles.** Text shown in an interface we draw (the Cursor card) goes through a key looked
-  up in per-language message bundles (`packages/connector-rust/messages/card/`), with English as the fallback when
-  a key is missing; other languages may lag. Language default: the device's language when we support it,
-  otherwise English.
+  up in per-language message bundles (`connector/messages/card/`), with English as the fallback when a key is
+  missing; other languages may lag. Language default: the device's language when we support it, otherwise English.
 - What reaches the agent (MCP instructions, tool results, the `[Sidevoice]` trailer) is English; it is not UI.
 
 ## Before changing things
 
-Read `packages/connector-rust/README.md`. The web client's move to English-keyed bundles is
-sidevoice/sidevoice-web#17.
+Read `connector/README.md` (what the binary does and where things are) and `RELEASING.md` (how it is built,
+tested and published). The repository is Rust only: the connector is the crate in `connector/`, the build tooling
+is `cargo xtask` (`xtask/`). The one JavaScript file, `xtask/npm/sidevoice.js`, is the npm launcher: plain, no
+dependencies, it only runs the platform package's binary. Nothing else is written in JavaScript or Python. The web
+client's move to English-keyed bundles is sidevoice/sidevoice-web#17.

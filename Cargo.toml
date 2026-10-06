@@ -1,5 +1,5 @@
 # The workspace, and at its root the build tooling run as `cargo xtask <command>` (xtask/src/main.rs, alias in
-# .cargo/config.toml). The connector itself is packages/connector-rust. release-please gives every package here the
+# .cargo/config.toml). The connector itself is the crate in connector/. release-please gives every package here the
 # release's version (RELEASING.md): the root needs a package of its own for that, and the tooling is it.
 [package]
 name = "xtask"
@@ -21,6 +21,6 @@ zstd = "0.13"
 
 [workspace]
 resolver = "2"
-members = ["packages/connector-rust"]
+members = ["connector"]
 # `cargo test`, `cargo clippy` and `cargo fmt` at the root cover the connector and the tooling.
-default-members = [".", "packages/connector-rust"]
+default-members = [".", "connector"]

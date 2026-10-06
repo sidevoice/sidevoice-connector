@@ -15,7 +15,7 @@ fn codex_cli() -> Option<PathBuf> {
     let path = std::env::var_os("SIDEVOICE_TEST_CODEX")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/codex/node_modules/.bin/codex")
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/codex/node_modules/.bin/codex")
         });
     if path.is_file() {
         return Some(path.canonicalize().unwrap());

@@ -1,25 +1,15 @@
 .env
 .env.*
 !.env.example
-.venv*/
-.voice-poc/
 .codex/
 .claude/
 node_modules/
 dist/
-__pycache__/
-*.py[cod]
 *.log
-*.tsbuildinfo
 *.sqlite*
 *.db
 .DS_Store
 *.pem
 *.key
 coverage/
-.pytest_cache/
-# A checkout's copy of the pinned core wheel (packages/connector/core.mjs)
-packages/connector/core/
-packages/connector/dist-sea/
-.legacy-*/
 target/

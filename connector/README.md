@@ -1,9 +1,9 @@
-# Sidevoice connector (Rust)
+# Sidevoice connector
 
 One binary, `sidevoice-connector`, that links this machine's agent conversations (Claude Code, Codex, Cursor) to the
-Sidevoice core: it serves MCP to each conversation and runs the machine's connector daemon, which holds the link to
-the core. It is migrating to stand alone (sidevoice/sidevoice-connector#68): it installs itself (`install`, below);
-the JavaScript package (`packages/connector`) is still in the repository until that is done.
+Sidevoice core: it installs itself and the core it carries (`install`, below), serves MCP to each conversation and
+runs the machine's connector daemon, which holds the link to the core. On npm it is `sidevoice`, whose launcher runs
+this binary from the platform package (RELEASING.md); the command is then `sidevoice`.
 
 ## Commands
 
