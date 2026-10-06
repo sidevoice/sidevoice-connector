@@ -780,7 +780,7 @@ impl Daemon {
     }
 
     async fn node_status(&self) -> Value {
-        let mut status = crate::service::status(&self.profile, true).await;
+        let mut status = crate::service::node_status(&self.profile).await;
         if self.profile.is_installed() {
             if let Some(connector) = status.get_mut("connector") {
                 if let Some(fields) = self.profile.runtime_identity().as_object() {
@@ -2109,6 +2109,10 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     profile.validate_existing_private()?;
     if managed {
         profile.validate_service_environment()?;
+        // Started by its manager (at login, or by `service start`): a person's stop from before no longer holds.
+        if !crate::service::managed_start_clears_stop(&profile).await? {
+            return Ok(());
+        }
     }
     if profile.service_stopped()? {
         crate::logfile::log(&crate::messages::message(
@@ -2126,9 +2130,6 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
         }
     }
     if profile.service_stopped()? {
-        return Ok(());
-    }
-    if profile.is_installed() && !managed && crate::service::runtime_switching(&profile).await? {
         return Ok(());
     }
     if profile.socket.exists() {
@@ -2161,7 +2162,8 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     let listener = UnixListener::bind(&profile.socket)?;
     fs::set_permissions(&profile.socket, fs::Permissions::from_mode(0o600))?;
     let (ready_tx, ready_rx) = oneshot::channel();
-    let link_task = tokio::spawn(link.run(profile.clone(), incoming_tx, ready_tx));
+    let supervisor = Arc::new(crate::service::core_supervisor(&profile));
+    let link_task = tokio::spawn(link.run(profile.clone(), incoming_tx, ready_tx, supervisor));
     drop(ready_rx);
     let scanner = if managed {
         let host_agents = daemon.host_agents.clone();

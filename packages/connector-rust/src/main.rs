@@ -89,7 +89,7 @@ enum Action {
         #[command(subcommand)]
         action: Option<AgentsAction>,
     },
-    /// Manage the Sidevoice login service.
+    /// Run Sidevoice at login (launchd, systemd --user), or stop, restart or report it.
     Service {
         #[command(subcommand)]
         command: ServiceAction,
@@ -179,6 +179,31 @@ async fn main() -> ExitCode {
 }
 
 async fn run(action: Action, installed: bool, json: bool) -> Result<ExitCode> {
+    // The service commands act on the installation the environment names, whatever binary runs them.
+    if let Action::Service { command } = &action {
+        let action = match command {
+            ServiceAction::Install => service::Action::Install,
+            ServiceAction::Start => service::Action::Start,
+            ServiceAction::Stop => service::Action::Stop,
+            ServiceAction::Restart => service::Action::Restart,
+            ServiceAction::Status => service::Action::Status,
+            ServiceAction::Uninstall => service::Action::Uninstall,
+        };
+        let answer = service::run(action).await;
+        let ok = answer.get("ok") == Some(&Value::Bool(true));
+        if json {
+            println!("{answer}");
+        } else if ok {
+            println!("{}", service::human(&answer));
+        } else {
+            eprintln!("sidevoice: {}", service::human(&answer));
+        }
+        return Ok(if ok {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
+    }
     let profile = Profile::from_env(installed)?;
     match action {
         Action::Mcp => mcp::run(profile).await.map(|()| ExitCode::SUCCESS),
@@ -193,23 +218,7 @@ async fn run(action: Action, installed: bool, json: bool) -> Result<ExitCode> {
                 .map(|()| ExitCode::SUCCESS)
         }
         Action::Agents { action } => agents_command(profile, action, json).await,
-        Action::Service { command } => {
-            let action = match command {
-                ServiceAction::Install => service::Action::Install,
-                ServiceAction::Start => service::Action::Start,
-                ServiceAction::Stop => service::Action::Stop,
-                ServiceAction::Restart => service::Action::Restart,
-                ServiceAction::Status => service::Action::Status,
-                ServiceAction::Uninstall => service::Action::Uninstall,
-            };
-            let answer = service::run(profile, action).await;
-            println!("{answer}");
-            Ok(if answer.get("ok") == Some(&Value::Bool(true)) {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            })
-        }
+        Action::Service { .. } => unreachable!("service commands run before the profile"),
     }
 }
 
