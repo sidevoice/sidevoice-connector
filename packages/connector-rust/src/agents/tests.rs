@@ -494,57 +494,71 @@ async fn complete_request_gate_orders_scans_mutations_and_external_dismissals() 
     private_mkdir(binary.parent().unwrap());
     private_write(
         &binary,
-        br##"#!/usr/bin/python3
-import json, os, pathlib, sys, time
-home = pathlib.Path(os.environ['CODEX_HOME'])
-state_file = home / 'fake-entry.json'
-config_file = home / 'config.toml'
-args = sys.argv[1:]
-if args == ['--version']:
-    print('codex fixture 1')
-    raise SystemExit(0)
-if args[:3] == ['mcp', 'get', 'sidevoice']:
-    state = json.loads(state_file.read_text()) if state_file.exists() else None
-    timeout_next = home / 'timeout-next-get'
-    if timeout_next.exists():
-        timeout_next.unlink()
-        time.sleep(4)
-    slow = home / 'slow-next-get'
-    if slow.exists():
-        slow.unlink()
-        (home / 'slow-get-started').write_text(str(os.getpid()))
-        time.sleep(.8)
-    if state is None:
-        print('No such server: sidevoice', file=sys.stderr)
-        raise SystemExit(1)
-    print(json.dumps(state))
-    raise SystemExit(0)
-if args[:3] == ['mcp', 'remove', 'sidevoice']:
-    state_file.unlink(missing_ok=True)
-    config_file.unlink(missing_ok=True)
-    uncertain = home / 'timeout-after-remove'
-    if uncertain.exists():
-        uncertain.unlink()
-        (home / 'timeout-next-get').write_text('1')
-    raise SystemExit(0)
-if args[:3] == ['mcp', 'add', 'sidevoice'] and '--' in args:
-    command = args[args.index('--') + 1]
-    command_args = args[args.index('--') + 2:]
-    unregistered = home / 'leave-unregistered-after-add'
-    if unregistered.exists():
-        unregistered.unlink()
-        raise SystemExit(0)
-    slow = home / 'slow-next-add'
-    if slow.exists():
-        slow.unlink()
-        (home / 'slow-add-started').write_text(str(os.getpid()))
-        time.sleep(.8)
-    state = {'name':'sidevoice','transport':{'type':'stdio','command':command,'args':command_args},'enabled':True}
-    state_file.write_text(json.dumps(state))
-    config_file.write_text('[mcp_servers.sidevoice]\ncommand = ' + json.dumps(command) + '\nargs = ' + json.dumps(command_args) + '\n')
-    raise SystemExit(0)
-print('unsupported fixture command', file=sys.stderr)
-raise SystemExit(2)
+        br##"#!/bin/sh
+home="$CODEX_HOME"
+state_file="$home/fake-entry.json"
+config_file="$home/config.toml"
+quote() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
+if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
+    echo 'codex fixture 1'
+    exit 0
+fi
+if [ "$1 $2 $3" = "mcp get sidevoice" ]; then
+    if [ -e "$home/timeout-next-get" ]; then
+        rm -f "$home/timeout-next-get"
+        sleep 4
+    fi
+    if [ -e "$home/slow-next-get" ]; then
+        rm -f "$home/slow-next-get"
+        printf '%s' "$$" > "$home/slow-get-started"
+        sleep 0.8
+    fi
+    if [ ! -e "$state_file" ]; then
+        echo 'No such server: sidevoice' >&2
+        exit 1
+    fi
+    cat "$state_file"
+    exit 0
+fi
+if [ "$1 $2 $3" = "mcp remove sidevoice" ]; then
+    rm -f "$state_file" "$config_file"
+    if [ -e "$home/timeout-after-remove" ]; then
+        rm -f "$home/timeout-after-remove"
+        printf '1' > "$home/timeout-next-get"
+    fi
+    exit 0
+fi
+if [ "$1 $2 $3" = "mcp add sidevoice" ]; then
+    shift 3
+    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+    if [ "$#" -lt 2 ]; then
+        echo 'unsupported fixture command' >&2
+        exit 2
+    fi
+    shift
+    command="$1"
+    shift
+    args=""
+    for arg in "$@"; do
+        if [ -n "$args" ]; then args="$args, "; fi
+        args="$args$(quote "$arg")"
+    done
+    if [ -e "$home/leave-unregistered-after-add" ]; then
+        rm -f "$home/leave-unregistered-after-add"
+        exit 0
+    fi
+    if [ -e "$home/slow-next-add" ]; then
+        rm -f "$home/slow-next-add"
+        printf '%s' "$$" > "$home/slow-add-started"
+        sleep 0.8
+    fi
+    printf '{"name": "sidevoice", "transport": {"type": "stdio", "command": %s, "args": [%s]}, "enabled": true}' \
+        "$(quote "$command")" "$args" > "$state_file"
+    printf '[mcp_servers.sidevoice]\ncommand = %s\nargs = [%s]\n' "$(quote "$command")" "$args" > "$config_file"
+    exit 0
+fi
+echo 'unsupported fixture command' >&2
+exit 2
 "##,
     );
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();

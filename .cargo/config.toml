@@ -1,0 +1,4 @@
+[alias]
+# Build tooling (release archives, their manifest, publishing, the core for the tests): `cargo xtask <command>`,
+# see xtask/src/main.rs.
+xtask = "run --quiet --locked --package xtask --bin xtask --"

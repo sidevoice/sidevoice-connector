@@ -128,7 +128,7 @@ impl ServiceSpec {
         let service_dir = profile.data.join("service");
         let room_credential = profile.data.join("credentials.json");
         let core_program = current.join("core/bin/sidevoice-core");
-        let connector_program = current.join("dist/sidevoice-rust-proof");
+        let connector_program = current.join("dist/sidevoice-connector");
         let core_argv = vec![
             core_program.to_string_lossy().into_owned(),
             "--data-dir".into(),
@@ -222,7 +222,7 @@ impl ServiceSpec {
         }
         let release = profile.root.join("releases/current");
         let core = release.join("core/bin/sidevoice-core");
-        let connector = release.join("dist/sidevoice-rust-proof");
+        let connector = release.join("dist/sidevoice-connector");
         let credential = profile.data.join("credentials.json");
         validate_executable(&profile.root, &core)?;
         validate_executable(&profile.root, &connector)?;
@@ -987,7 +987,7 @@ fn verified_profile_executable(profile: &Profile, path: &Path) -> bool {
                 parts.len() == 4
                     && parts[0].as_os_str() == "releases"
                     && parts[2].as_os_str() == "dist"
-                    && parts[3].as_os_str() == "sidevoice-rust-proof"
+                    && parts[3].as_os_str() == "sidevoice-connector"
             })
 }
 
@@ -1205,7 +1205,7 @@ pub async fn ensure_connector(profile: &Profile) -> anyhow::Result<()> {
     let executable = std::env::current_exe()?.canonicalize()?;
     let staged = profile
         .root
-        .join("releases/current/dist/sidevoice-rust-proof");
+        .join("releases/current/dist/sidevoice-connector");
     let selected = staged.canonicalize()?;
     if executable != selected || !executable.starts_with(&profile.root) {
         return Err(anyhow::Error::new(Failure::keyed(
@@ -2071,7 +2071,7 @@ mod tests {
                 "0".into(),
             ],
             connector_argv: vec![
-                "/tmp/p/releases/current/dist/sidevoice-rust-proof".into(),
+                "/tmp/p/releases/current/dist/sidevoice-connector".into(),
                 "connector".into(),
                 "--service".into(),
                 "--profile-root".into(),

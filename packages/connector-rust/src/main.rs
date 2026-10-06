@@ -46,7 +46,7 @@ async fn bounded_line<R: AsyncBufRead + Unpin>(
 
 #[derive(Parser)]
 #[command(
-    name = "sidevoice-rust-proof",
+    name = "sidevoice-connector",
     version,
     about = "Isolated Rust connector proof"
 )]

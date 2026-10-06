@@ -7,7 +7,7 @@
 
 <p>
   <a href="https://www.npmjs.com/package/@sidevoice/uplink"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/npm/v/@sidevoice/uplink.svg?variant=secondary&size=sm&mode=dark" /><img alt="npm version" src="https://shieldcn.dev/npm/v/@sidevoice/uplink.svg?variant=secondary&size=sm&mode=light" /></picture></a>
-  <a href="https://github.com/sidevoice/sidevoice-connector/actions/workflows/ci.yml"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/ci/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&workflow=ci.yml&branch=main&mode=dark" /><img alt="CI status" src="https://shieldcn.dev/github/ci/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&workflow=ci.yml&branch=main&mode=light" /></picture></a>
+  <a href="https://github.com/sidevoice/sidevoice-connector/actions/workflows/release.yml"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/ci/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&workflow=release.yml&branch=main&mode=dark" /><img alt="release build status" src="https://shieldcn.dev/github/ci/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&workflow=release.yml&branch=main&mode=light" /></picture></a>
   <a href="LICENSE"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/license/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&mode=dark" /><img alt="licence" src="https://shieldcn.dev/github/license/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&mode=light" /></picture></a>
   <picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/node-22+.svg?variant=secondary&size=sm&logo=nodedotjs&mode=dark" /><img alt="requires Node.js 22 or newer" src="https://shieldcn.dev/badge/node-22+.svg?variant=secondary&size=sm&logo=nodedotjs&mode=light" /></picture>
   <picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/status-beta.svg?variant=secondary&size=sm&mode=dark" /><img alt="status: beta" src="https://shieldcn.dev/badge/status-beta.svg?variant=secondary&size=sm&mode=light" /></picture>
@@ -87,10 +87,17 @@ The package installs one command, `sidevoice`:
 
 ## Develop
 
+The connector is becoming one Rust binary (`packages/connector-rust`); the Node package (`packages/connector`) is
+the installer until then, and is no longer part of CI.
+
 ```sh
+cargo xtask fixtures   # what the tests run against: the sidevoice-core release pinned in core.pin, the pinned Codex CLI
+cargo test --locked    # unit tests, and the connector against the real core, Codex and (macOS) launchd
+cargo xtask dist       # this machine's release archive, built and verified as a release builds it
+
 npm ci
-npm test               # node --test, on the source
-npm run build          # the bundled dist/cli.mjs that npm publishes
+npm test               # the Node package: node --test, on the source
+npm run build          # its bundled dist/cli.mjs
 ```
 
 The published package has no runtime dependencies: esbuild bundles everything into `dist/cli.mjs`.

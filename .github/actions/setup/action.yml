@@ -1,0 +1,15 @@
+name: Set up the Rust build
+description: Installs the pinned Rust toolchain (with rustfmt and Clippy) and restores the build cache.
+
+runs:
+  using: composite
+  steps:
+    - name: Toolchain
+      shell: bash
+      env:
+        RUST_VERSION: "1.98.1"
+      run: |
+        set -euo pipefail
+        rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy --component rustfmt
+        echo "RUSTUP_TOOLCHAIN=$RUST_VERSION" >> "$GITHUB_ENV"
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
