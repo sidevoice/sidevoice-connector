@@ -1,7 +1,8 @@
 //! The connector's login service under the real launchd, with the real core, in a private profile (its jobs carry
 //! profile-specific labels, never the installed ones): install → both jobs up and linked → the core killed: launchd
 //! starts it again and the connector links to it → a person's stop → start → uninstall: no job, definition or
-//! socket left. Nothing is written outside the profile.
+//! socket left, the installation still there (`not-installed`) and, once it is removed too, `absent`. Nothing is
+//! written outside the profile.
 //!
 //! macOS only. It loads jobs into this user's launchd domain, so outside CI it runs only when asked
 //! (`SIDEVOICE_TEST_LAUNCHD=1`).
@@ -189,8 +190,15 @@ fn the_login_service_runs_recovers_stops_and_leaves_nothing_behind() {
 
     service.ok("uninstall");
     service.installed = false;
+    // Uninstalling the service removes its jobs, not the installation (the release it ran): the state names that.
+    let unserviced = service.run("status");
+    assert_eq!(unserviced["state"], "not-installed", "{unserviced}");
+    assert_eq!(unserviced["installed"], true, "{unserviced}");
+    // Without the installation either, nothing is left.
+    fs::remove_file(profile.root.join("releases/current")).unwrap();
     let absent = service.run("status");
     assert_eq!(absent["state"], "absent", "{absent}");
+    assert_eq!(absent["installed"], false, "{absent}");
     assert!(service.labels().is_empty());
     for label in &labels {
         assert!(!launchd_has(label), "{label} survived uninstall");
