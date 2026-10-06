@@ -107,18 +107,28 @@ fn common_fields(name: &str, version: &str, description: &str) -> Value {
     json!({"name": name, "version": version, "description": description, "license": "Apache-2.0",
            "homepage": format!("https://github.com/{REPOSITORY}#readme"),
            "bugs": {"url": format!("https://github.com/{REPOSITORY}/issues")},
-           // npm checks provenance against this: it must be the repository the workflow runs in.
+           // npm checks provenance against this: it must be the repository the workflow runs in. No `directory`:
+           // the packages are generated from the release archives, not a directory of the repository.
            "repository": {"type": "git", "url": format!("git+https://github.com/{REPOSITORY}.git")}})
 }
 
-/// `package.json` of a target's platform package.
+/// `<os>/<cpu>` of a target, as npm names them.
+fn platform_label(target: &str) -> Result<String> {
+    let (os, cpu) = platform(target)?;
+    Ok(format!("{os}/{cpu}"))
+}
+
+/// `package.json` of a target's platform package: no `bin`, nothing to run by itself.
 pub(crate) fn platform_manifest(target: &str, version: &str) -> Result<Value> {
     let (os, cpu) = platform(target)?;
     let name = platform_package(target)?;
     let mut manifest = common_fields(
         &name,
         version,
-        &format!("The Sidevoice connector for {os}-{cpu}. Install the `sidevoice` package, which runs it."),
+        &format!(
+            "Platform binary for sidevoice ({}). Do not install directly: install sidevoice.",
+            platform_label(target)?
+        ),
     );
     manifest["os"] = json!([os]);
     manifest["cpu"] = json!([cpu]);
@@ -135,32 +145,78 @@ pub(crate) fn launcher_manifest(version: &str) -> Result<Value> {
     let mut manifest = common_fields(
         LAUNCHER,
         version,
-        "Sidevoice: give your coding agent a voice. Installs and runs the Sidevoice connector on this machine.",
+        "Give your coding agent a voice: Sidevoice turns your Claude Code, Codex or Cursor conversation into a voice \
+         call. Run `npx sidevoice install` on the machine where your agents run.",
     );
     let mut dependencies = serde_json::Map::new();
     for target in target_names() {
         dependencies.insert(platform_package(target)?, version.into());
     }
+    manifest["keywords"] = json!([
+        "sidevoice",
+        "voice",
+        "speech",
+        "mcp",
+        "coding-agent",
+        "claude-code",
+        "codex",
+        "cursor",
+        "cli"
+    ]);
     manifest["bin"] = json!({LAUNCHER: LAUNCHER_BIN});
     manifest["optionalDependencies"] = dependencies.into();
     manifest["engines"] = json!({"node": ">=18"});
     Ok(manifest)
 }
 
-fn platform_readme(target: &str) -> Result<String> {
+fn platform_readme(target: &str, version: &str) -> Result<String> {
     Ok(format!(
-        "# {}\n\nThe [Sidevoice](https://github.com/{REPOSITORY}) connector built for `{target}`, with the Sidevoice \
-         core it installs. Do not install it directly: install `sidevoice` (`npx sidevoice install`), which depends \
-         on it and runs it.\n",
-        platform_package(target)?
+        "# {}\n\nPlatform binary for [`sidevoice`](https://www.npmjs.com/package/sidevoice) ({}), version {version}. \
+         Do not install directly — install `sidevoice`:\n\n```sh\nnpx sidevoice install\n```\n\nIt holds the \
+         Sidevoice connector built for this platform and the Sidevoice core it installs. Source and documentation: \
+         https://github.com/{REPOSITORY}\n",
+        platform_package(target)?,
+        platform_label(target)?
     ))
 }
 
-const LAUNCHER_README: &str = "# sidevoice\n\nSidevoice turns the conversation you already have with your coding \
-     agent into a voice call. Install it on the machine where your agents run:\n\n```sh\nnpx sidevoice install\n```\n\n\
-     This package is a small launcher: npm installs, beside it, the connector built for this machine \
-     (`@sidevoice/sidevoice-<os>-<cpu>`), and the `sidevoice` command runs it. Supported: macOS on Apple silicon \
-     (`darwin-arm64`), Linux with glibc on x64 and arm64.\n\nDocumentation: https://github.com/sidevoice/sidevoice-connector\n";
+fn launcher_readme(version: &str) -> Result<String> {
+    let platforms: Vec<String> = TARGETS
+        .iter()
+        .map(|target| match target.npm_os {
+            "darwin" => format!("- macOS on {} (`darwin-{}`)", mac_cpu(target.npm_cpu), target.npm_cpu),
+            "linux" => format!(
+                "- Linux on {} (`linux-{}`) with glibc {} or newer (Debian 10, Ubuntu 20.04, RHEL 8 and later; \
+                 not musl-based distributions such as Alpine)",
+                target.npm_cpu,
+                target.npm_cpu,
+                crate::glibc::FLOOR
+            ),
+            os => format!("- {os} on {}", target.npm_cpu),
+        })
+        .collect();
+    Ok(format!(
+        "# sidevoice\n\nGive your coding agent a voice. Sidevoice turns the conversation you already have with your \
+         agent (Claude Code, Codex, Cursor) into a voice call: it keeps its context and keeps writing as usual, \
+         speaks its replies, and you answer by voice.\n\n## Install\n\nOn the machine where your agents run:\n\n\
+         ```sh\nnpx sidevoice install\n```\n\nThen pair the Sidevoice app with `npx sidevoice pair-device`. A release \
+         candidate, when there is one: `npx sidevoice@next install`.\n\n## Requirements\n\nOne of these platforms:\n\n{}\n\nand Node.js 18 or newer, \
+         for `npx`\n\nThis package ({version}) is a small launcher: npm installs beside it the connector built for \
+         your machine (`@sidevoice/sidevoice-<os>-<cpu>`, with the core inside), and the `sidevoice` command runs \
+         it. Installing with optional dependencies omitted leaves it nothing to run.\n\n## More\n\nSource, \
+         documentation and issues: https://github.com/{REPOSITORY}\n\nApache-2.0. Sidevoice is a trademark; see \
+         TRADEMARKS.md in the repository.\n",
+        platforms.join("\n")
+    ))
+}
+
+fn mac_cpu(cpu: &str) -> &str {
+    match cpu {
+        "arm64" => "Apple silicon",
+        "x64" => "Intel",
+        other => other,
+    }
+}
 
 /// One packed package.
 pub(crate) struct Packed {
@@ -324,7 +380,7 @@ pub(crate) fn build(archives: &[&Path], out: &Path) -> Result<Vec<Packed>> {
         write(&root.join("package.json"), &pretty(&manifest))?;
         write(
             &root.join("README.md"),
-            platform_readme(&target)?.as_bytes(),
+            platform_readme(&target, &this)?.as_bytes(),
         )?;
         // Exactly the archive's files (its inventory and every file it lists), and the two npm needs.
         let mut expected: Vec<String> = inventory["files"]
@@ -347,7 +403,10 @@ pub(crate) fn build(archives: &[&Path], out: &Path) -> Result<Vec<Packed>> {
     )?;
     write(&launcher.join(LAUNCHER_BIN), LAUNCHER_JS.as_bytes())?;
     chmod(&launcher.join(LAUNCHER_BIN), 0o755)?;
-    write(&launcher.join("README.md"), LAUNCHER_README.as_bytes())?;
+    write(
+        &launcher.join("README.md"),
+        launcher_readme(&version)?.as_bytes(),
+    )?;
     write(&launcher.join("LICENSE"), &read(&repo().join("LICENSE"))?)?;
     let files = ["package.json", LAUNCHER_BIN, "README.md", "LICENSE"].map(String::from);
     packed.push(pack(&launcher, out, &files)?);
@@ -847,6 +906,47 @@ mod tests {
             "",
         ] {
             assert!(dist_tag(refused).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn every_package_carries_its_metadata_and_readme() {
+        let launcher = launcher_manifest("0.7.0").unwrap();
+        let platform = platform_manifest("linux-x86_64", "0.7.0").unwrap();
+        for manifest in [&launcher, &platform] {
+            assert_eq!(manifest["license"], "Apache-2.0");
+            for field in ["description", "homepage"] {
+                assert!(manifest[field]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty()));
+            }
+            assert!(manifest["bugs"]["url"].is_string());
+        }
+        assert!(launcher["keywords"]
+            .as_array()
+            .is_some_and(|words| !words.is_empty()));
+        assert!(platform["description"]
+            .as_str()
+            .unwrap()
+            .contains("Platform binary for sidevoice (linux/x64)"));
+
+        let readme = platform_readme("macos-aarch64", "0.7.0").unwrap();
+        assert!(
+            readme.contains("Platform binary for [`sidevoice`]"),
+            "{readme}"
+        );
+        assert!(readme.contains("(darwin/arm64), version 0.7.0"), "{readme}");
+        assert!(readme.contains("Do not install directly"), "{readme}");
+        let readme = launcher_readme("0.7.0").unwrap();
+        for wanted in [
+            "npx sidevoice install",
+            "macOS on Apple silicon (`darwin-arm64`)",
+            "Linux on x64 (`linux-x64`) with glibc 2.28 or newer",
+            "Linux on arm64 (`linux-arm64`)",
+            "(0.7.0)",
+            "https://github.com/sidevoice/sidevoice-connector",
+        ] {
+            assert!(readme.contains(wanted), "{wanted}: {readme}");
         }
     }
 
