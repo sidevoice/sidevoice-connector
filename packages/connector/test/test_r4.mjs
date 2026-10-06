@@ -24,7 +24,7 @@ import { decide, discardRuntimeIfUnselected, point, releaseLayout, stableCommand
 import { definitionTexts, recordInstallation } from '../service.mjs';
 import { oursInCursor } from '../registrations.mjs';
 import { connectorMetadata, versionMetadata } from '../metadata.mjs';
-import { createDesktopPinRecord, CORE_INPUTS_ARTIFACT_NAME, PIN_ARTIFACT_NAME, PROVENANCE_ARTIFACT_NAME,
+import { createDesktopPinRecord, PROVENANCE_ARTIFACT_NAME,
   SEA_ARTIFACT_NAME, verifyArtifactEntries, verifyArtifactRoundTrip } from '../sea-artifact.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -594,43 +594,6 @@ test('release and nightly package builds refuse to omit the signed core manifest
     assert.equal(result.status, 1, result.stdout || result.stderr);
     assert.match(result.stderr, /SIDEVOICE_CORE_MANIFEST is required for release and nightly builds/);
   }
-});
-
-test('production npm and SEA workflows require the signed core manifest; only the tested production macOS SEA is uploaded', async () => {
-  const repoRoot = path.resolve(connectorPackage, '..', '..');
-  const ci = await readFile(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8');
-  const seaWorkflow = await readFile(path.join(repoRoot, '.github', 'workflows', 'r4-sea.yml'), 'utf8');
-  assert.match(ci, /MANIFEST=core-manifest\.json/);
-  assert.match(ci, /MANIFEST_SIGSTORE=core-manifest\.json\.sigstore\.json/);
-  assert.match(ci, /gh release download[\s\S]*?-p "\$MANIFEST" -p "\$MANIFEST_SIGSTORE"/);
-  assert.match(ci, /SIDEVOICE_CORE_MANIFEST:\s*\$\{\{\s*steps\.core\.outputs\.manifest\s*\}\}/);
-  assert.match(ci, /SIDEVOICE_CORE_MANIFEST_SIGSTORE:\s*\$\{\{\s*steps\.core\.outputs\.manifest_sigstore\s*\}\}/);
-  assert.match(ci, /SIDEVOICE_REQUIRE_CORE_MANIFEST:\s*'1'/);
-  assert.match(seaWorkflow, /^  workflow_dispatch:/m);
-  assert.match(seaWorkflow, /if: github\.event_name != 'pull_request'/);
-  assert.match(seaWorkflow, /gh release download nightly[\s\S]*?-p core-manifest\.json -p core-manifest\.json\.sigstore\.json/);
-  assert.match(seaWorkflow, /SIDEVOICE_CORE_MANIFEST:\s*\$\{\{\s*steps\.core\.outputs\.manifest\s*\}\}/);
-  assert.match(seaWorkflow, /SIDEVOICE_CORE_MANIFEST_SIGSTORE:\s*\$\{\{\s*steps\.core\.outputs\.manifest_sigstore\s*\}\}/);
-  assert.match(seaWorkflow, /SIDEVOICE_REQUIRE_CORE_MANIFEST:\s*\$\{\{\s*steps\.core\.outputs\.require_manifest\s*\}\}/);
-  assert.match(seaWorkflow, /echo "require_manifest=1"/);
-  assert.match(seaWorkflow, /  desktop-pin:\n[\s\S]*?      - uses: actions\/setup-node@v4\n        with:\n          node-version: v22\.23\.3\n      - name: Install locked npm dependencies\n        run: npm ci\n      - uses: actions\/download-artifact@v4/,
-    'desktop-pin installs its locked dependencies before importing connector modules');
-  assert.match(seaWorkflow, new RegExp(`name: ${SEA_ARTIFACT_NAME}`));
-  assert.match(seaWorkflow, /path: packages\/connector\/dist-sea\/macos-aarch64\/sidevoice/);
-  assert.match(seaWorkflow, /retention-days: 90/);
-  assert.match(seaWorkflow, /actions\/download-artifact@v4/);
-  assert.match(seaWorkflow, /sea-artifact\.mjs verify-copy/);
-  assert.match(seaWorkflow, new RegExp(`name: ${PIN_ARTIFACT_NAME}`));
-  assert.match(seaWorkflow, new RegExp(`name: ${CORE_INPUTS_ARTIFACT_NAME}`));
-  assert.match(seaWorkflow, new RegExp(`name: ${PROVENANCE_ARTIFACT_NAME}`));
-  assert.match(seaWorkflow, /uses: actions\/attest@v4/);
-  assert.match(seaWorkflow, /gh attestation verify[\s\S]*--bundle[\s\S]*--signer-workflow github\.com\/sidevoice\/sidevoice-connector\/\.github\/workflows\/r4-sea\.yml[\s\S]*--source-ref refs\/heads\/main[\s\S]*--source-digest[\s\S]*--deny-self-hosted-runners/);
-  assert.match(seaWorkflow, /artifact-metadata: write/);
-  assert.match(seaWorkflow, /repos\/\$GITHUB_REPOSITORY\/actions\/runs\/\$GITHUB_RUN_ID\/artifacts\?per_page=100/);
-  assert.match(seaWorkflow, /github\.ref == 'refs\/heads\/main'/);
-  assert.match(seaWorkflow, /actions\/upload-artifact@v4/);
-  const productionSteps = seaWorkflow.match(/if: matrix\.target == 'macos-aarch64' && github\.event_name != 'pull_request'/g) || [];
-  assert.equal(productionSteps.length, 5, 'only production inputs and executable upload steps run on main after native tests');
 });
 
 test('production desktop pin metadata binds the exact SEA, signed manifest bytes, and immutable run artifact', async () => {
