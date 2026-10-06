@@ -45,6 +45,8 @@ struct Binding {
 }
 
 const CONVERSATION_STATE_MAX_BYTES: usize = 1 << 20;
+/// How long `pair_device` waits for the link to the core (the code itself has 10 s more).
+const PAIR_DEVICE_LINK_WAIT: Duration = Duration::from_secs(15);
 const CONVERSATION_GUARD_MAGIC: &[u8; 8] = b"SVGUARD1";
 const GUARD_CLEAR: u8 = 0;
 const GUARD_BLOCK_RESUME: u8 = 1;
@@ -763,9 +765,9 @@ impl Daemon {
             "pair.request" => {
                 let room = params.get("room").and_then(Value::as_str).unwrap_or("");
                 let code = params.get("code").and_then(Value::as_str).unwrap_or("");
-                match crate::pairing::run_pair(&self.profile, room, code).await {
-                    Ok(result) => {
-                        json!({"ok":true,"origin":result["room"],"connector_id":result["connector_id"]})
+                match crate::pairing::pair(&self.profile, room, code).await {
+                    Ok(paired) => {
+                        json!({"ok":true,"origin":paired.origin,"connector_id":paired.connector_id})
                     }
                     Err(error) => {
                         let keyed = crate::messages::keyed(&error);
@@ -1278,6 +1280,15 @@ impl Daemon {
                 )
             }
             "pair_device" => {
+                // A connector started a moment ago (on demand, or with its core) links within seconds: the code
+                // waits for that link, up to a bound, instead of failing while it comes.
+                let deadline = Instant::now() + PAIR_DEVICE_LINK_WAIT;
+                while !self.link.connected().await {
+                    if Instant::now() >= deadline {
+                        bail!("this machine's core did not come up in time; ask again in a moment");
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
                 self.link
                     .request("device.pairing_code", json!({}), Duration::from_secs(10))
                     .await

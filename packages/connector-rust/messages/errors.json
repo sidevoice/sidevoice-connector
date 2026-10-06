@@ -55,5 +55,10 @@
   "connector.failed": "Sidevoice could not complete the command: {detail}",
   "connector.usage": "Unknown or incomplete command: {detail}",
   "pair.missing": "Pairing needs the room's address and the one-time code.",
-  "pair.unavailable": "This Sidevoice connector cannot pair from here yet: pair it with the installed `sidevoice pair <room> <code>`."
+  "pair.bad-url": "{room} is not a room address: give the room's https:// URL.",
+  "pair.insecure": "{origin} would carry this machine's credential in clear; the room must be https:// (plain http only to loopback or a host in SIDEVOICE_TRUSTED_CLUSTER_HOSTS).",
+  "pair.unreachable": "The room at {origin} could not be reached: {detail}",
+  "pair.refused": "The room at {origin} refused the pairing: {detail}",
+  "pair.bad-answer": "The room at {origin} answered the pairing without a credential.",
+  "pair-device.failed": "No pairing code could be had from this machine's core: {detail}"
 }

@@ -182,3 +182,62 @@ fn the_connector_and_core_sockets_are_this_users_alone() {
         );
     }
 }
+
+/// A device code, from the real core through the connector: `pair-device --json` gives the fields the desktop app
+/// reads, the text gives the code, its QR and where it works, and the MCP tool says the same text.
+#[test]
+fn pair_device_gives_the_cores_code_with_its_qr() {
+    let Some(core) = core_dir() else { return };
+    let profile = Profile::new("pairdev");
+    let _core = profile.start_core(&core, "pairdev-1");
+    let _connector = profile.start_connector();
+    profile.wait_linked("pairdev-1");
+
+    let output = profile
+        .connector(&["pair-device", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let answer: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(answer["ok"], true, "{answer}");
+    let code = answer["code"].as_str().unwrap_or("");
+    assert!(code.starts_with("SV1."), "{answer}");
+    assert!(
+        answer["expires_in"].as_u64().is_some_and(|s| s > 0),
+        "{answer}"
+    );
+    // The test's core has only its loopback address and no room.
+    assert_eq!(answer["reach"], "local-only", "{answer}");
+    assert!(answer["payload"]["urls"].is_array(), "{answer}");
+
+    let output = profile.connector(&["pair-device"]).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.starts_with("One-time code to pair a device with this machine"),
+        "{text}"
+    );
+    let printed = text.lines().nth(2).unwrap_or("");
+    assert!(
+        printed.starts_with("SV1.") && printed != code,
+        "a fresh code: {text}"
+    );
+    assert!(text.contains('█') && text.contains('▀'), "{text}");
+    assert!(text.contains("only works on this computer"), "{text}");
+
+    let mut mcp = Mcp::start(profile.connector(&["mcp"]));
+    mcp.initialize("connector-pair-device");
+    let result = mcp.request(
+        "tools/call",
+        json!({"name": "voice_pair_device", "arguments": {}}),
+    );
+    assert_ne!(result["isError"], true, "{result}");
+    let said = result["content"][0]["text"].as_str().unwrap_or("");
+    assert!(
+        said.starts_with("One-time code to pair a device with this machine")
+            && said.contains("\n\nSV1.")
+            && said.contains('█'),
+        "{result}"
+    );
+    mcp.stop();
+}

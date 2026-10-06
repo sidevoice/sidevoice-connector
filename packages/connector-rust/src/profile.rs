@@ -123,14 +123,6 @@ impl Profile {
         }
     }
 
-    /// The installed release's control program (the installer of the release format this binary is part of).
-    pub fn control_executable(&self) -> Result<PathBuf> {
-        if self.installed.is_none() {
-            bail!(crate::messages::Keyed::new("pair.unavailable", json!({})));
-        }
-        Ok(self.root.join("current/dist/sidevoice"))
-    }
-
     /// Passes this profile on to a child, whatever the child's own environment was cleared to.
     pub fn command_env<'a>(
         &self,
