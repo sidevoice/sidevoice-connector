@@ -1,4 +1,5 @@
 use super::*;
+use fs2::FileExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
 
 struct Fixture {
@@ -133,47 +134,17 @@ fn agent_refusals_labels_and_manual_text_use_the_shared_english_bundle() {
 }
 
 #[test]
-fn proof_ownership_is_exact_and_js_release_fixtures_stay_narrow() {
+fn ownership_is_exact_and_js_release_fixtures_stay_narrow() {
     let fixture = Fixture::new();
-    assert_eq!(
-        Profile::from_root(&fixture.root).unwrap().root,
-        fixture.profile.root
-    );
-    let proof = InstalledCommand::proof(&fixture.profile).unwrap();
-    let selected_args = proof.args.clone();
-    for id in [AgentId::Claude, AgentId::Codex, AgentId::Cursor] {
-        assert!(proof.owns(id, &proof.command, &selected_args, None));
-    }
-    assert!(!proof.owns(
-        AgentId::Codex,
-        &proof.command,
-        &["mcp".into(), "--profile-root".into(), "/tmp/other".into()],
-        None
+    let own = InstalledCommand::executable().unwrap();
+    assert_eq!(own.args, ["mcp"]);
+    assert!(own.owns(&own.command, &own.args));
+    assert!(!own.owns(
+        &own.command,
+        &["mcp".into(), "--profile-root".into(), "/tmp/other".into()]
     ));
-    assert!(!proof.owns(AgentId::Claude, &proof.command, &["mcp".into()], None));
-    let old_codex_env = json!({
-        "SIDEVOICE_DATA_DIR":fixture.profile.data,
-        "CODEX_HOME":fixture.profile.codex,
-    });
-    assert!(proof.owns(
-        AgentId::Codex,
-        &proof.command,
-        &["mcp".into()],
-        Some(&old_codex_env)
-    ));
-    assert!(!proof.owns(
-        AgentId::Cursor,
-        &proof.command,
-        &["mcp".into()],
-        Some(&old_codex_env)
-    ));
-    assert!(!proof.owns(
-        AgentId::Codex,
-        &proof.command,
-        &["mcp".into()],
-        Some(&json!({"SIDEVOICE_DATA_DIR":"/tmp/other","CODEX_HOME":"/tmp/other"}))
-    ));
-    assert!(!proof.owns(AgentId::Codex, "/tmp/other/sidevoice", &selected_args, None));
+    assert!(!own.owns(&own.command, &["connector".into()]));
+    assert!(!own.owns("/tmp/other/sidevoice", &own.args));
 
     let releases = fixture.root.join("js-copies");
     let node_cli = releases.join("current/dist/cli.mjs");
@@ -185,10 +156,8 @@ fn proof_ownership_is_exact_and_js_release_fixtures_stay_narrow() {
         releases.clone(),
     );
     assert!(node.owns(
-        AgentId::Codex,
         "/usr/local/bin/node",
         &[node_cli.to_string_lossy().into_owned(), "mcp".into()],
-        None
     ));
     let old_native = releases.join("releases/1.2.3/dist/sidevoice");
     let native = InstalledCommand::selected(
@@ -198,18 +167,8 @@ fn proof_ownership_is_exact_and_js_release_fixtures_stay_narrow() {
             .into_owned()],
         releases.clone(),
     );
-    assert!(native.owns(
-        AgentId::Claude,
-        &old_native.to_string_lossy(),
-        &["mcp".into()],
-        None
-    ));
-    assert!(!native.owns(
-        AgentId::Claude,
-        "/tmp/other/dist/sidevoice",
-        &["mcp".into()],
-        None
-    ));
+    assert!(native.owns(&old_native.to_string_lossy(), &["mcp".into()]));
+    assert!(!native.owns("/tmp/other/dist/sidevoice", &["mcp".into()]));
 }
 
 #[tokio::test]

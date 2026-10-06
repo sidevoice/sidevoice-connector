@@ -1,7 +1,8 @@
 use crate::agents::HostAgents;
 use crate::cursor_app::{AppNotice, CursorApps};
 use crate::link::{Incoming, Link};
-use crate::proof::{atomic_json, private_dir, private_file, verify_socket, Profile};
+use crate::profile::Profile;
+use crate::secure_fs::{atomic_json, private_dir, private_file, verify_socket};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -239,7 +240,7 @@ impl Daemon {
                 &daemon.profile.data.join("conversation-state.json"),
                 &compacted,
             ) {
-                eprintln!("[sidevoice rust proof] compact conversation state: {error}");
+                crate::logfile::log(&format!("compact conversation state: {error}"));
                 let mut guard = daemon
                     .conversation_guard
                     .lock()
@@ -332,7 +333,7 @@ impl Daemon {
         let bindings: Vec<_> = self.bindings.lock().await.values().cloned().collect();
         for binding in bindings {
             if let Err(error) = self.register_core(&binding).await {
-                eprintln!("[sidevoice rust proof] binding replay: {error}");
+                crate::logfile::log(&format!("binding replay: {error}"));
                 continue;
             }
             let working = *binding.working.lock().await;
@@ -403,7 +404,7 @@ impl Daemon {
             .map_err(|_| anyhow::anyhow!("conversation guard lock poisoned"))
             .and_then(|mut file| write_conversation_guard(&mut file, guard));
         if let Err(error) = result {
-            eprintln!("[sidevoice rust proof] emergency conversation guard: {error}");
+            crate::logfile::log(&format!("emergency conversation guard: {error}"));
             let _ = self.shutdown.send(true);
         }
     }
@@ -435,7 +436,7 @@ impl Daemon {
                     "resume_block_reason":self.resume_block_reason()});
             }
             Err(error) => {
-                eprintln!("[sidevoice rust proof] conversation state: {error}");
+                crate::logfile::log(&format!("conversation state: {error}"));
                 self.mark_state_write_failed(refused.is_some());
                 return;
             }
@@ -451,15 +452,13 @@ impl Daemon {
             if serde_json::to_vec(&state)
                 .map_or(true, |bytes| bytes.len() > CONVERSATION_STATE_MAX_BYTES)
             {
-                eprintln!(
-                    "[sidevoice rust proof] compact conversation state exceeds its size limit"
-                );
+                crate::logfile::log("compact conversation state exceeds its size limit");
                 return;
             }
         }
         if let Err(error) = atomic_json(&self.profile.data.join("conversation-state.json"), &state)
         {
-            eprintln!("[sidevoice rust proof] conversation state: {error}");
+            crate::logfile::log(&format!("conversation state: {error}"));
             self.mark_state_write_failed(refused.is_some());
         } else if let Err(error) = self
             .conversation_guard
@@ -467,7 +466,7 @@ impl Daemon {
             .map_err(|_| anyhow::anyhow!("conversation guard lock poisoned"))
             .and_then(|mut file| write_conversation_guard(&mut file, GUARD_CLEAR))
         {
-            eprintln!("[sidevoice rust proof] clear conversation guard: {error}");
+            crate::logfile::log(&format!("clear conversation guard: {error}"));
             self.mark_state_write_failed(refused.is_some());
         }
     }
@@ -584,7 +583,7 @@ impl Daemon {
         let mut reply = match result {
             Ok(v) => v,
             Err(error) => {
-                eprintln!("[sidevoice rust proof] speech retry retained: {error}");
+                crate::logfile::log(&format!("speech retry retained: {error}"));
                 return Ok(None);
             }
         };
@@ -614,7 +613,7 @@ impl Daemon {
                     {
                         Ok(value) => value,
                         Err(error) => {
-                            eprintln!("[sidevoice rust proof] speech retry retained: {error}");
+                            crate::logfile::log(&format!("speech retry retained: {error}"));
                             return Ok(None);
                         }
                     };
@@ -623,7 +622,13 @@ impl Daemon {
                 }
             } else {
                 if published.get("client_ref").is_none() {
-                    eprintln!("[sidevoice rust proof] copied speech {} has an unknown binding; retaining for explicit migration", published.get("event_id").and_then(Value::as_str).unwrap_or("?"));
+                    crate::logfile::log(&format!(
+                        "copied speech {} has an unknown binding; retaining for explicit migration",
+                        published
+                            .get("event_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                    ));
                 }
                 return Ok(None);
             }
@@ -691,7 +696,7 @@ impl Daemon {
                     .unwrap_or("");
                 if let Some(binding) = self.binding_for_id(id).await {
                     if let Err(error) = self.arm_conversation_guard(false) {
-                        eprintln!("[sidevoice rust proof] arm conversation guard: {error}");
+                        crate::logfile::log(&format!("arm conversation guard: {error}"));
                         self.mark_state_write_failed(false);
                         let _ = self.shutdown.send(true);
                     }
@@ -725,7 +730,7 @@ impl Daemon {
                     .map(str::to_owned);
                 if let Some(reason) = refusal {
                     if let Err(error) = self.arm_conversation_guard(true) {
-                        eprintln!("[sidevoice rust proof] arm revocation guard: {error}");
+                        crate::logfile::log(&format!("arm revocation guard: {error}"));
                         self.mark_state_write_failed(true);
                         let _ = self.shutdown.send(true);
                     }
@@ -756,20 +761,15 @@ impl Daemon {
                 self.host_agents.handle(method, params.clone()).await
             }
             "pair.request" => {
-                if !self.profile.is_installed() {
-                    json!({"error":{"key":"pair.proof-only","message":"Pairing is unavailable in the isolated Rust proof."}})
-                } else {
-                    let room = params.get("room").and_then(Value::as_str).unwrap_or("");
-                    let code = params.get("code").and_then(Value::as_str).unwrap_or("");
-                    if room.is_empty() || code.is_empty() {
-                        json!({"ok":false,"detail":"Hacen falta la dirección de la sala y el código."})
-                    } else {
-                        match crate::pairing::run_pair(&self.profile, room, code).await {
-                            Ok(result) => {
-                                json!({"ok":true,"origin":result["room"],"connector_id":result["connector_id"]})
-                            }
-                            Err(error) => json!({"ok":false,"detail":error.to_string()}),
-                        }
+                let room = params.get("room").and_then(Value::as_str).unwrap_or("");
+                let code = params.get("code").and_then(Value::as_str).unwrap_or("");
+                match crate::pairing::run_pair(&self.profile, room, code).await {
+                    Ok(result) => {
+                        json!({"ok":true,"origin":result["room"],"connector_id":result["connector_id"]})
+                    }
+                    Err(error) => {
+                        let keyed = crate::messages::keyed(&error);
+                        json!({"ok":false,"key":keyed.key,"detail":keyed.message()})
                     }
                 }
             }
@@ -1270,6 +1270,7 @@ impl Daemon {
                 let resume_block_reason = self.resume_block_reason();
                 Ok(
                     json!({"version":self.profile.connector_version(),"connected":self.link.connected().await,
+                    "core":self.link.core().await,
                     "room_reachable":room_reachable,"bindings":listed,
                     "closed_by_room":closed_by_room,"closed_reasons":closed,"refused":refused,
                     "resume_blocked":self.resume_blocked.load(Ordering::Acquire),
@@ -2102,25 +2103,18 @@ fn prune_binding_order(order: &mut HashMap<String, oneshot::Receiver<()>>) {
 }
 
 pub async fn run(profile: Profile, managed: bool) -> Result<()> {
-    if profile.is_installed() {
-        profile.validate_private()?;
-        if managed {
-            profile.validate_installed_service_environment()?;
-        }
-    } else {
-        profile.validate_private()?;
-        if managed {
-            #[cfg(not(target_os = "macos"))]
-            bail!("the private managed connector is supported only by macOS launchd");
-            #[cfg(target_os = "macos")]
-            profile.validate_service_environment("launchd")?;
-        }
+    // Refused, not repaired: a data directory others can write into is not one to serve from.
+    crate::secure_fs::ensure_private_dir(&profile.data)?;
+    crate::logfile::init(profile.data.join("connector.log"), managed);
+    profile.validate_existing_private()?;
+    if managed {
+        profile.validate_service_environment()?;
     }
     if profile.service_stopped()? {
-        eprintln!(
-            "{}",
-            crate::agents::message("service.node-stopped", &serde_json::Value::Null)
-        );
+        crate::logfile::log(&crate::messages::message(
+            "service.node-stopped",
+            &Value::Null,
+        ));
         return Ok(());
     }
     private_dir(&profile.data)?;
@@ -2197,7 +2191,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     loop {
         tokio::select! {
             Some(result) = replay_tasks.join_next(), if !replay_tasks.is_empty() => {
-                if let Err(error) = result { eprintln!("[sidevoice rust proof] outbox replay: {error}"); }
+                if let Err(error) = result { crate::logfile::log(&format!("outbox replay: {error}")); }
                 if replay_again {
                     replay_again = false;
                     let daemon = daemon.clone();
@@ -2205,7 +2199,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
                 }
             }
             Some(result) = client_tasks.join_next(), if !client_tasks.is_empty() => {
-                if let Err(error) = result { eprintln!("[sidevoice rust proof] IPC task: {error}"); }
+                if let Err(error) = result { crate::logfile::log(&format!("IPC task: {error}")); }
             }
             Some(()) = replay_rx.recv() => {
                 if replay_tasks.is_empty() {
@@ -2219,7 +2213,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
                 daemon.handle_app_notice(notice).await;
             }
             Some(result) = core_tasks.join_next(), if !core_tasks.is_empty() => {
-                if let Err(error) = result { eprintln!("[sidevoice rust proof] Core handler: {error}"); }
+                if let Err(error) = result { crate::logfile::log(&format!("Core handler: {error}")); }
                 prune_binding_order(&mut binding_order);
             }
             accepted = listener.accept() => {
@@ -2256,7 +2250,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
                     if let Some(tx) = item.reply {
                         let _ = tx.send(json!({"status":"failed","detail":"connector handler capacity reached"}));
                     } else {
-                        eprintln!("[sidevoice rust proof] Core notification capacity reached");
+                        crate::logfile::log("Core notification capacity reached");
                     }
                     continue;
                 }

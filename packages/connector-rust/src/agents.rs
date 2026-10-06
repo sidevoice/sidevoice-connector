@@ -1,15 +1,16 @@
-//! The isolated proof's R2 host-agent coordinator.
+//! The host-agent coordinator: which agents (Claude Code, Codex, Cursor) are on this computer, and registering
+//! Sidevoice with them or removing it, only ever touching an entry Sidevoice wrote.
 //!
 //! One gate owns a complete request. CLI children belong to its worker task so a vanished link reply can
 //! cancel the work without releasing the gate before the child has exited.
 
-use crate::proof::{atomic_json, private_dir, validate_user_directory, Profile};
+use crate::messages::message;
+use crate::profile::Profile;
+use crate::secure_fs::{atomic_json, validate_user_directory};
 use anyhow::{Context, Result};
-use fs2::FileExt;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -22,7 +23,7 @@ mod cursor;
 mod tests;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
@@ -143,11 +144,9 @@ impl AgentId {
 
 #[derive(Clone)]
 enum Ownership {
-    Proof {
+    /// This very binary, run by path: what a connector that is not an installed release registers.
+    Executable {
         executable: PathBuf,
-        root: PathBuf,
-        data: PathBuf,
-        codex: PathBuf,
     },
     Installed {
         release_root: PathBuf,
@@ -159,7 +158,7 @@ enum Ownership {
     },
 }
 
-/// Immutable command selected for one request. The proof constructor never reads production `current`.
+/// Immutable command selected for one request.
 #[derive(Clone)]
 struct InstalledCommand {
     command: String,
@@ -169,22 +168,13 @@ struct InstalledCommand {
 }
 
 impl InstalledCommand {
-    fn proof(profile: &Profile) -> Result<Self> {
+    fn executable() -> Result<Self> {
         let executable = std::env::current_exe()?.canonicalize()?;
         Ok(Self {
             command: executable.to_string_lossy().into_owned(),
-            args: vec![
-                "mcp".into(),
-                "--profile-root".into(),
-                profile.root.to_string_lossy().into_owned(),
-            ],
-            version: env!("CARGO_PKG_VERSION").into(),
-            ownership: Ownership::Proof {
-                executable,
-                root: profile.root.clone(),
-                data: profile.data.clone(),
-                codex: profile.codex.clone(),
-            },
+            args: vec!["mcp".into()],
+            version: crate::identity::VERSION.into(),
+            ownership: Ownership::Executable { executable },
         })
     }
 
@@ -229,42 +219,10 @@ impl InstalledCommand {
         }
     }
 
-    fn owns(
-        &self,
-        agent: AgentId,
-        command: &str,
-        args: &[String],
-        child_env: Option<&Value>,
-    ) -> bool {
+    fn owns(&self, command: &str, args: &[String]) -> bool {
         match &self.ownership {
-            Ownership::Proof {
-                executable,
-                root,
-                data,
-                codex,
-            } => {
-                let same_executable = canonical(command).as_deref() == Some(executable.as_path());
-                let selected = same_executable
-                    && args
-                        == [
-                            "mcp".to_owned(),
-                            "--profile-root".to_owned(),
-                            root.to_string_lossy().into_owned(),
-                        ];
-                if selected {
-                    return true;
-                }
-                agent == AgentId::Codex
-                    && same_executable
-                    && args == ["mcp"]
-                    && child_env
-                        .and_then(|env| env.get("SIDEVOICE_DATA_DIR"))
-                        .and_then(Value::as_str)
-                        == Some(data.to_string_lossy().as_ref())
-                    && child_env
-                        .and_then(|env| env.get("CODEX_HOME"))
-                        .and_then(Value::as_str)
-                        == Some(codex.to_string_lossy().as_ref())
+            Ownership::Executable { executable } => {
+                canonical(command).as_deref() == Some(executable.as_path()) && args == ["mcp"]
             }
             Ownership::Installed { release_root } => {
                 let Some(executable) = canonical(command) else {
@@ -370,7 +328,7 @@ impl HostAgents {
         let selected = if profile.is_installed() {
             InstalledCommand::installed(&profile)?
         } else {
-            InstalledCommand::proof(&profile)?
+            InstalledCommand::executable()?
         };
         Ok(Self::with_command(profile, selected))
     }
@@ -819,23 +777,13 @@ impl HostAgents {
         &self,
         cancel: &Cancellation,
         deadline: Instant,
-    ) -> std::result::Result<File, Failure> {
+    ) -> std::result::Result<crate::lock::Lock, Failure> {
         let path = self.profile.data.join("agents.lock");
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|_| Failure::Internal)?;
-        private_state_file(&path)?;
         loop {
             check_live(cancel, deadline)?;
-            match lock.try_lock_exclusive() {
-                Ok(()) => return Ok(lock),
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+            match crate::lock::try_lock(&path, "agents") {
+                Ok(Some(lock)) => return Ok(lock),
+                Ok(None) => {
                     tokio::select! {
                         _ = cancel.cancelled() => return Err(Failure::Cancelled),
                         _ = sleep_until(deadline) => return Err(Failure::Busy),
@@ -953,45 +901,6 @@ fn not_present(id: AgentId) -> Failure {
 
 fn agent_failure(key: &'static str, id: AgentId) -> Failure {
     Failure::keyed(key, json!({"id":id.as_str(),"agent":id.label()}))
-}
-
-pub(crate) fn message(key: &str, params: &Value) -> String {
-    static MESSAGES: OnceLock<HashMap<String, String>> = OnceLock::new();
-    let messages = MESSAGES.get_or_init(|| {
-        serde_json::from_str(include_str!("../../connector/messages/agent-errors.json"))
-            .expect("embedded agent message bundle must be valid JSON")
-    });
-    let Some(template) = messages.get(key) else {
-        return key.to_owned();
-    };
-    let mut rendered = String::new();
-    let mut remaining = template.as_str();
-    loop {
-        let Some(open) = remaining.find('{') else {
-            rendered.push_str(remaining);
-            break;
-        };
-        rendered.push_str(&remaining[..open]);
-        let tail = &remaining[open + 1..];
-        let Some(close) = tail.find('}') else {
-            rendered.push_str(&remaining[open..]);
-            break;
-        };
-        let name = &tail[..close];
-        if let Some(value) = params.get(name) {
-            rendered.push_str(
-                value
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| value.to_string())
-                    .as_str(),
-            );
-        } else {
-            rendered.push_str(&remaining[open..open + close + 2]);
-        }
-        remaining = &tail[close + 1..];
-    }
-    rendered
 }
 
 fn seen_entry(state: &Value, id: AgentId) -> Option<&Value> {
@@ -1352,13 +1261,9 @@ fn write_cursor_config(profile: &Profile, file: &Path, config: &Value) -> Result
         None => (file.to_path_buf(), 0o600),
     };
     let parent = target.parent().context("Cursor config parent")?;
-    if profile.is_installed() {
-        validate_user_directory(parent)?;
-    } else {
-        private_dir(parent)?;
-    }
+    validate_user_directory(parent)?;
     if !parent.canonicalize()?.starts_with(&root) {
-        anyhow::bail!("Cursor config escaped proof root");
+        anyhow::bail!("Cursor config escaped its directory");
     }
     let temporary = parent.join(format!(".mcp.json.{}.tmp", Uuid::new_v4()));
     let result = (|| -> Result<()> {
@@ -1383,26 +1288,6 @@ fn write_cursor_config(profile: &Profile, file: &Path, config: &Value) -> Result
         let _ = fs::remove_file(&temporary);
     }
     result
-}
-
-fn toml_to_json(value: &toml::Value) -> Option<Value> {
-    match value {
-        toml::Value::String(value) => Some(json!(value)),
-        toml::Value::Integer(value) => Some(json!(value)),
-        toml::Value::Float(value) => Some(json!(value)),
-        toml::Value::Boolean(value) => Some(json!(value)),
-        toml::Value::Datetime(value) => Some(json!(value.to_string())),
-        toml::Value::Array(values) => values
-            .iter()
-            .map(toml_to_json)
-            .collect::<Option<Vec<_>>>()
-            .map(Value::Array),
-        toml::Value::Table(values) => values
-            .iter()
-            .map(|(key, value)| toml_to_json(value).map(|value| (key.clone(), value)))
-            .collect::<Option<Map<_, _>>>()
-            .map(Value::Object),
-    }
 }
 
 fn iso_now() -> String {

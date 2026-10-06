@@ -67,7 +67,7 @@ impl HostAgents {
         if !user_scope {
             return Ok("foreign".into());
         }
-        if self.selected.owns(AgentId::Claude, &command, &args, None) {
+        if self.selected.owns(&command, &args) {
             Ok(
                 if command == self.selected.command && args == self.selected.args {
                     "connected"

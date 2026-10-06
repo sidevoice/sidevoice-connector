@@ -75,12 +75,7 @@ impl HostAgents {
         }
         let command = command.unwrap_or_default();
         let args = args.unwrap_or_default();
-        if !self.selected.owns(
-            AgentId::Codex,
-            command,
-            &args,
-            transport.and_then(|value| value.get("env")),
-        ) {
+        if !self.selected.owns(command, &args) {
             return Ok("foreign".into());
         }
         let enabled = entry.get("enabled").and_then(Value::as_bool) != Some(false);
@@ -153,11 +148,7 @@ impl HostAgents {
         else {
             return Ok("invalid".into());
         };
-        let env = entry.get("env").and_then(toml_to_json);
-        Ok(if self
-            .selected
-            .owns(AgentId::Codex, command, &args, env.as_ref())
-        {
+        Ok(if self.selected.owns(command, &args) {
             "ours"
         } else {
             "foreign"

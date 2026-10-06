@@ -48,24 +48,26 @@ impl Fixture {
         command
     }
 
-    /// `connector codex <action>`: its last line of output is its JSON answer.
+    /// `agents [<action> codex] --json`: one line of output, its JSON answer.
     fn connector(&self, action: &str, succeed: bool) -> Value {
-        let output = self
-            .command(Path::new(CONNECTOR))
-            .arg("--profile-root")
-            .arg(&self.profile.root)
-            .args(["codex", action])
-            .output()
-            .unwrap();
+        let mut command = self.command(Path::new(CONNECTOR));
+        command.arg("agents");
+        if action != "list" {
+            command.args([action, "codex"]);
+        }
+        let output = command.arg("--json").output().unwrap();
         let text = String::from_utf8_lossy(&output.stdout);
         assert_eq!(
             output.status.success(),
             succeed,
-            "codex {action}: {text} {}",
+            "agents {action}: {text} {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        serde_json::from_str(text.lines().last().unwrap_or("null"))
-            .unwrap_or_else(|_| panic!("codex {action}: no JSON answer: {text}"))
+        assert_eq!(text.lines().count(), 1, "agents {action}: {text}");
+        let answer: Value = serde_json::from_str(&text)
+            .unwrap_or_else(|_| panic!("agents {action}: no JSON answer: {text}"));
+        assert_eq!(answer["ok"], succeed, "{answer}");
+        answer
     }
 
     fn codex(&self, args: &[&str]) -> String {
@@ -79,7 +81,7 @@ impl Fixture {
     }
 
     fn registration(&self) -> Value {
-        let answer = self.connector("inspect", true);
+        let answer = self.connector("list", true);
         answer["agents"]
             .as_array()
             .and_then(|agents| agents.iter().find(|agent| agent["id"] == "codex"))
@@ -108,11 +110,7 @@ fn the_connector_registers_with_the_real_codex_cli_and_leaves_foreign_entries_al
         fs::canonicalize(CONNECTOR).unwrap(),
         "{entry}"
     );
-    assert_eq!(
-        transport["args"],
-        serde_json::json!(["mcp", "--profile-root", fixture.profile.root]),
-        "{entry}"
-    );
+    assert_eq!(transport["args"], serde_json::json!(["mcp"]), "{entry}");
     assert_eq!(fixture.registration(), "connected");
     fixture.codex(&["mcp", "remove", "sidevoice"]);
 

@@ -1,10 +1,12 @@
 //! Private-profile launchd jobs and status. Linux mutation remains deliberately disabled until its real
 //! user-manager path has been reviewed against an isolated runner.
 
-use crate::agents::message;
+use crate::core_ready::Ready;
+use crate::messages::message;
+use crate::profile::Profile;
 #[cfg(target_os = "macos")]
-use crate::proof::atomic_json;
-use crate::proof::{private_dir, private_file, Profile, Ready};
+use crate::secure_fs::atomic_json;
+use crate::secure_fs::{private_dir, private_file};
 use anyhow::Context;
 #[cfg(target_os = "macos")]
 use fs2::FileExt;
@@ -71,10 +73,6 @@ impl Failure {
         json!({"ok":false,"error":{"key":self.key,"params":self.params,
             "message":message(self.key,&self.params)}})
     }
-}
-
-pub fn proof_profile_required() -> Value {
-    Failure::keyed("service.proof-profile-required", json!({})).value()
 }
 
 impl Display for Failure {
@@ -146,8 +144,6 @@ impl ServiceSpec {
             connector_program.to_string_lossy().into_owned(),
             "connector".into(),
             "--service".into(),
-            "--profile-root".into(),
-            root.to_string_lossy().into_owned(),
         ];
         let core_environment = BTreeMap::from([
             ("HOME".into(), profile.home.to_string_lossy().into_owned()),
@@ -211,7 +207,9 @@ impl ServiceSpec {
     }
 
     fn validate_programs(&self, profile: &Profile) -> Result<()> {
-        profile.validate_private().map_err(Failure::plain)?;
+        profile
+            .validate_existing_private()
+            .map_err(Failure::plain)?;
         if profile.data.join("install.json").exists() {
             return Err(Failure::keyed("service.no-installation", json!({})));
         }
@@ -878,7 +876,7 @@ async fn connector_request(
     if !profile.socket.exists() {
         return Ok(None);
     }
-    crate::proof::verify_socket(&profile.socket)?;
+    crate::secure_fs::verify_socket(&profile.socket)?;
     let mut stream = match timeout(
         Duration::from_millis(800),
         UnixStream::connect(&profile.socket),
@@ -1215,8 +1213,7 @@ pub async fn ensure_connector(profile: &Profile) -> anyhow::Result<()> {
     }
     let mut command = Command::new(executable);
     command
-        .args(["connector", "--profile-root"])
-        .arg(&profile.root)
+        .arg("connector")
         .env_clear()
         .env(
             "PATH",
@@ -1420,7 +1417,7 @@ async fn observe(profile: &Profile, connector_self: bool) -> anyhow::Result<Obse
             reason: Some("manager-unavailable".into()),
             ..Job::default()
         },
-        Some("Linux service support is not enabled in the private Rust proof".to_owned()),
+        Some("Linux service support is not enabled in this build".to_owned()),
     );
     let mut definition_error = None;
     if let Err(error) = core_result {
@@ -1628,7 +1625,9 @@ pub async fn run(profile: Profile, action: Action) -> Value {
 
 #[cfg(target_os = "macos")]
 async fn mutate(profile: &Profile, action: Action) -> Result<Value> {
-    profile.validate_private().map_err(Failure::plain)?;
+    profile
+        .validate_existing_private()
+        .map_err(Failure::plain)?;
     let spec = ServiceSpec::for_private_fixture(profile)?;
     let lock = install_lock(profile).await?;
     let result = match action {
@@ -1928,7 +1927,7 @@ fn core_stopped(profile: &Profile, pids: &mut Vec<u32>) -> bool {
 
 #[cfg(target_os = "macos")]
 fn remove_stale_socket(path: &Path) -> io::Result<()> {
-    crate::proof::verify_socket(path)
+    crate::secure_fs::verify_socket(path)
         .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))?;
     fs::remove_file(path)?;
     if let Some(parent) = path.parent() {

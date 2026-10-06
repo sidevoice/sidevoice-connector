@@ -1,25 +1,23 @@
-use crate::proof::{private_file, Profile};
+use crate::messages::Keyed;
+use crate::profile::Profile;
+use crate::secure_fs::read_trusted;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::fs;
 use std::process::Stdio;
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
 fn room_origin(profile: &Profile) -> Option<String> {
-    if !profile.is_installed() {
-        return None;
-    }
     let file = profile.data.join("credentials.json");
-    private_file(&file).ok()?;
-    let saved: Value = serde_json::from_slice(&fs::read(file).ok()?).ok()?;
+    let bytes = read_trusted(&file, 65536).ok()??;
+    let saved: Value = serde_json::from_slice(&bytes).ok()?;
     saved
         .get("url")
         .and_then(Value::as_str)
         .and_then(normalize_origin)
 }
 
-fn normalize_origin(address: &str) -> Option<String> {
+pub fn normalize_origin(address: &str) -> Option<String> {
     let (scheme, remainder) = address.trim().split_once("://")?;
     let scheme = match scheme.to_ascii_lowercase().as_str() {
         "https" | "wss" => "https",
@@ -34,11 +32,8 @@ fn normalize_origin(address: &str) -> Option<String> {
 }
 
 pub async fn run_pair(profile: &Profile, room: &str, code: &str) -> Result<Value> {
-    if !profile.is_installed() {
-        bail!("pairing is unavailable in the isolated Rust proof");
-    }
     if room.is_empty() || code.is_empty() {
-        bail!("Hacen falta la dirección de la sala y el código.");
+        bail!(Keyed::new("pair.missing", json!({})));
     }
     let control = profile.control_executable()?;
     let output = timeout(
@@ -75,6 +70,7 @@ pub async fn run_pair(profile: &Profile, room: &str, code: &str) -> Result<Value
     bail!("{detail}");
 }
 
+/// The room this machine is paired with, as an origin (`https://host[:port]`), from its trusted credentials.
 pub fn previous_room(profile: &Profile) -> Option<String> {
     room_origin(profile)
 }

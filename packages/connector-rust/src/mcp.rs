@@ -1,5 +1,6 @@
 use crate::adapters::{self, Identity};
-use crate::proof::{verify_socket, Profile};
+use crate::profile::Profile;
+use crate::secure_fs::verify_socket;
 use anyhow::{bail, Context, Result};
 use rmcp::{
     model::*, service::RequestContext, transport::stdio, ErrorData as McpError, RoleServer,
@@ -256,6 +257,25 @@ struct Joined {
     experimental: Vec<String>,
 }
 
+/// Asked to join a named room: what to ask the user when this machine is not paired with it, or nothing when it is.
+/// The code exists only on the room's screen, so the agent asks the user and never fetches one itself.
+fn pairing_needed(room: &str, paired: Option<String>) -> Option<String> {
+    let Some(target) = crate::pairing::normalize_origin(room) else {
+        return Some(format!(
+            "\"{room}\" is not a room address; expected something like https://voice.example"
+        ));
+    };
+    match paired {
+        None => Some(format!(
+            "This machine is not paired with the room at {target}. Ask the user for the room's address (confirm {target}) and the one-time pairing code the room shows under \"Emparejar máquina\", then call voice_pair with both. Do not fetch a code yourself."
+        )),
+        Some(paired) if paired != target => Some(format!(
+            "This machine is paired with {paired}, not {target}. One room per machine: to switch, ask the user for the pairing code that {target} shows under \"Emparejar máquina\" and call voice_pair (it replaces the current pairing); to stay, call voice_connect without a room."
+        )),
+        Some(_) => None,
+    }
+}
+
 fn closed_note(reason: &str) -> &'static str {
     if reason == "conversation_history_limit" {
         "The connector reached its private conversation history limit and cannot safely restore this older conversation automatically. Its prior room state may be unavailable. Call voice_connect again if the user wants to rejoin."
@@ -327,8 +347,12 @@ impl Facade {
     ) -> Result<Value> {
         match name {
             "voice_connect" => {
-                if args.get("room").and_then(Value::as_str).is_some() {
-                    bail!("This isolated Rust proof is not paired with the requested room. Ask the user for the room's one-time code; pairing is not available in this proof.");
+                if let Some(room) = args.get("room").and_then(Value::as_str) {
+                    if let Some(refusal) =
+                        pairing_needed(room, crate::pairing::previous_room(&self.profile))
+                    {
+                        bail!("{refusal}");
+                    }
                 }
                 let mut identity = adapters::identify(&meta, Some(&client), &client_caps)?;
                 let explicit_title = args.get("title").and_then(Value::as_str).unwrap_or("");
@@ -1097,4 +1121,36 @@ pub async fn run(profile: Profile) -> Result<()> {
     let service = Facade::new(profile).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pairing_needed;
+
+    #[test]
+    fn a_named_room_joins_only_when_this_machine_is_paired_with_it() {
+        assert_eq!(
+            pairing_needed(
+                "https://Room.example/x",
+                Some("https://room.example".into())
+            ),
+            None
+        );
+        let unpaired = pairing_needed("https://room.example", None).unwrap();
+        assert!(
+            unpaired.contains("not paired with the room at https://room.example"),
+            "{unpaired}"
+        );
+        let other =
+            pairing_needed("https://other.example", Some("https://room.example".into())).unwrap();
+        assert!(
+            other.starts_with(
+                "This machine is paired with https://room.example, not https://other.example"
+            ),
+            "{other}"
+        );
+        assert!(pairing_needed("room", None)
+            .unwrap()
+            .contains("is not a room address"));
+    }
 }
