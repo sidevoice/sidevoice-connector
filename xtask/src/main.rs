@@ -26,8 +26,11 @@
 //! - `npm-publish TAG`: the npm packages of the GitHub release TAG's checked assets, published by trusted publishing:
 //!   the platform packages, then the launcher as a staged version a maintainer approves.
 //! - `fixtures`: `core` and `codex`, into their default directories: what `cargo test` runs against.
+//! - `bench [ARGS...]`: the connector's test bench (connector/README.md, "Test bench"): the pinned core (fetched when
+//!   missing), this build, and `sidevoice-bench ARGS` run on them.
 
 mod archive;
+mod bench;
 mod codex;
 mod core;
 mod dist;
@@ -98,7 +101,7 @@ pub(crate) const MANIFEST: &str = "sidevoice-connector-manifest.json";
 pub(crate) const KIND: &str = "sidevoice-connector-v1";
 
 const USAGE: &str =
-    "usage: cargo xtask dist | verify ARCHIVE | verify-floor ARCHIVE | manifest DIR [--tag vX.Y.Z] | publish DIR TAG | npm ARCHIVE... | npm-smoke | npm-publish TAG | fixtures | core [DIR] | codex [DIR]";
+    "usage: cargo xtask dist | verify ARCHIVE | verify-floor ARCHIVE | manifest DIR [--tag vX.Y.Z] | publish DIR TAG | npm ARCHIVE... | npm-smoke | npm-publish TAG | fixtures | core [DIR] | codex [DIR] | bench [ARGS...]";
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -122,6 +125,7 @@ fn main() {
         }
         ["npm-smoke"] => npm::smoke(),
         ["npm-publish", tag] => npm::publish(tag),
+        ["bench", args @ ..] => bench::bench(args),
         _ => Err(USAGE.into()),
     };
     if let Err(error) = result {

@@ -112,6 +112,8 @@ cargo xtask dist       # this machine's release archive, built and verified as a
                        # (Linux: needs zig and cargo-zigbuild, to link against glibc 2.28; RELEASING.md)
 cargo xtask npm target/dist/sidevoice-connector-<target>.tar.zst && cargo xtask npm-smoke
                        # its npm packages, installed into a temporary prefix and run (needs Node.js)
+cargo xtask bench      # the test bench: talk to a real Claude Code or Codex session through this build, no app
+                       # needed (connector/README.md, "Test bench")
 ```
 
 How a version is built, verified and published (GitHub Releases and npm): [`RELEASING.md`](RELEASING.md).
