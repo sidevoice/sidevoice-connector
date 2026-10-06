@@ -33,23 +33,6 @@ pub struct InstalledRelease {
     pub pair_id: String,
 }
 
-fn compiled_target() -> Option<&'static str> {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        return Some("macos-aarch64");
-    }
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    {
-        return Some("linux-x86_64");
-    }
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    {
-        return Some("linux-aarch64");
-    }
-    #[allow(unreachable_code)]
-    None
-}
-
 fn lower_hex(value: &str, length: usize) -> bool {
     value.len() == length
         && value
@@ -101,7 +84,8 @@ pub fn selected() -> Result<(PathBuf, InstalledRelease)> {
         bail!("selected release record is oversized");
     }
     let selected: InstalledRelease = serde_json::from_slice(&fs::read(&release_file)?)?;
-    let target = compiled_target().context("unsupported installed Rust Connector target")?;
+    let target =
+        crate::identity::target().context("unsupported installed Rust Connector target")?;
     let runtime_sha = selected
         .runtime_sha256
         .as_deref()

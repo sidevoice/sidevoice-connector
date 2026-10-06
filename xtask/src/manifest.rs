@@ -86,24 +86,14 @@ pub(crate) fn write_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::write_archive;
-    use crate::INVENTORY;
+    use crate::archive::{test_core_record, test_tree, write_archive};
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
     /// A minimal archive of `target` built from `sha` at `version`, as `dist` names it, in `dir`.
     fn built(dir: &Path, target: &str, sha: &str, version: &str) {
         let work = TempDir::new(&format!("xtask-manifest-stage-{target}-{version}")).unwrap();
-        let root = work.0.join(ROOT_NAME);
-        mkdir(&root.join("bin")).unwrap();
-        write(&root.join(ENTRYPOINT), target.as_bytes()).unwrap();
-        let files = vec![file_record(&root.join(ENTRYPOINT), ENTRYPOINT).unwrap()];
-        let mut inventory = json!({"schema": 1, "kind": KIND, "version": version, "target": target,
-                                   "source_sha": sha, "entrypoint": ENTRYPOINT, "files": files});
-        if target.starts_with("linux-") {
-            inventory["glibc"] = "2.28".into();
-        }
-        write(&root.join(INVENTORY), &canonical(&inventory)).unwrap();
+        test_tree(&work.0, target, sha, version, test_core_record);
         let archive = dir.join(format!("{ROOT_NAME}-{target}.tar.zst"));
         write_archive(&work.0, ROOT_NAME, &[ENTRYPOINT], 1, &archive).unwrap();
     }

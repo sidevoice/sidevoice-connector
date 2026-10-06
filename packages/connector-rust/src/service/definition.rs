@@ -24,20 +24,6 @@ use std::path::Path;
 /// systemd's start limit, the same for both jobs; launchd has none.
 pub const START_LIMIT: u64 = 5;
 
-/// Variables a dynamic loader reads: never passed to the core, whose libraries are its own.
-const LOADER_VARIABLES: &[&str] = &[
-    "LD_LIBRARY_PATH",
-    "LD_PRELOAD",
-    "LD_AUDIT",
-    "LD_DEBUG",
-    "DYLD_LIBRARY_PATH",
-    "DYLD_FALLBACK_LIBRARY_PATH",
-    "DYLD_FRAMEWORK_PATH",
-    "DYLD_INSERT_LIBRARIES",
-    "DYLD_VERSIONED_LIBRARY_PATH",
-    "DYLD_ROOT_PATH",
-];
-
 /// A value that goes into a definition: text with no control character. A newline in a path or a setting would
 /// start a directive of its own in a unit (an injected `ExecStartPre=`), and has no place in a plist either.
 fn safe<'a>(value: &'a str, what: &str) -> Result<&'a str> {
@@ -347,18 +333,7 @@ pub fn core_environment(
     layout: &Layout,
     base: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
-    let mut environment = base.clone();
-    for name in LOADER_VARIABLES {
-        environment.remove(*name);
-    }
-    environment.insert(
-        "RUSTVANI_CACHE_DIR".into(),
-        layout
-            .core_root()
-            .join("models")
-            .to_string_lossy()
-            .into_owned(),
-    );
+    let mut environment = crate::core_package::environment(base, &layout.core_root());
     environment.insert(
         "SIDEVOICE_CORE_DATA_DIR".into(),
         layout.core_data().to_string_lossy().into_owned(),

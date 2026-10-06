@@ -23,14 +23,16 @@ publish`):
 - `cargo xtask fixtures` fetches what the tests run against: the sidevoice-core release whose version is in
   `core.pin` (one line, `X.Y.Z`), its archive for this machine checked against that release's `SHA256SUMS`,
   `native-core-manifest.json` and `attestation.sigstore.json` (signed by the core's `release.yml` on `main`), into
-  `target/sidevoice-core`; and the pinned Codex CLI into `target/codex`. Without them the tests that
-  need them are skipped locally and fail in CI.
+  `target/sidevoice-core` (unpacked, with the checked archive beside it); and the pinned Codex CLI into
+  `target/codex`. Without them the tests that need them are skipped locally and fail in CI.
 - `cargo test --locked` runs the unit tests and the integration tests in `packages/connector-rust/tests/`: the
   connector against the real core, registration with the real Codex CLI, and (macOS) the login service under the
   real launchd.
-- `cargo xtask dist` builds this machine's release binary and packages it exactly as the release does, then verifies
-  the archive by unpacking it elsewhere and running the connector from there. A pull request already runs it on
-  every target. On Linux it needs [zig](https://ziglang.org) and
+- `cargo xtask dist` builds this machine's release binary and packages it exactly as the release does, with the
+  pinned core release's archive for this machine (fetched and checked as `fixtures` checks it), then verifies the
+  archive by unpacking it elsewhere and running the connector from there: its version and build identity, and
+  `stage-core`, which stages the core it carries into a release where the core passes its own self-test. A pull
+  request already runs it on every target. On Linux it needs [zig](https://ziglang.org) and
   [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) on the `PATH` (CI installs the versions pinned in
   `.github/actions/setup`): see [Linux: the glibc floor](#linux-the-glibc-floor).
 - `cargo xtask verify-floor <archive>` (Linux, needs Docker) verifies a Linux archive again, running the connector
@@ -52,15 +54,19 @@ Ubuntu 20.04, RHEL/AlmaLinux 8, Amazon Linux 2023 and every later release) and e
 
 Raising or lowering the floor is a change of `FLOOR` and `FLOOR_IMAGE` together, and of the requirements in the
 README. Only the connector binary is covered: the tests still run on the `ubuntu-24.04` runners because the
-sidevoice-core release they run against (`core.pin`) has its own floor.
+sidevoice-core release they run against (`core.pin`) has its own floor. For the same reason `verify-floor` does not
+stage or run the core the archive carries; `verify` does, on the build machine. Until a core release with the same
+floor is pinned, the package as a whole needs the core's floor.
 
 ## Assets
 
 - `sidevoice-connector-<version>-<target>.tar.zst` for `macos-aarch64`, `linux-x86_64` and `linux-aarch64` (on the
   nightly, `sidevoice-connector-nightly-<target>.tar.zst`, fixed names whose download URLs never change): the root
   `sidevoice-connector/` holds `bin/sidevoice-connector`, `LICENSE`, the licence notices of every crate linked into
-  the binary (`notices/`), and `connector.json`, the inventory: version, target, source commit, on Linux the glibc
-  floor, and every file with its size and digest.
+  the binary (`notices/`), `core/sidevoice-core-<core version>-<target>.tar.zst`, the pinned core release's archive
+  for the same target exactly as the core published it (its own licence notices are inside it), and
+  `connector.json`, the inventory: version, target, source commit, on Linux the glibc floor, every file with its
+  size and digest, and `core`: the core's version, archive, digest, size and source commit.
 - `sidevoice-connector-manifest.json`: every archive with its digest and size, bound to the version and the source
   commit.
 - `SHA256SUMS`.
@@ -76,7 +82,8 @@ gh attestation verify sidevoice-connector-0.7.0-linux-x86_64.tar.zst \
   --deny-self-hosted-runners
 ```
 
-The core is not inside: the connector is to install a pinned core release of its own (sidevoice/sidevoice-connector#66).
+The core is inside (sidevoice/sidevoice-connector#66, decision 2): nothing is downloaded at install. Installing
+stages it from the package into the release and runs its self-test there (`packages/connector-rust/src/core_package.rs`).
 
 The changelog is written from the squashed PR titles. To change it, edit `CHANGELOG.md` in the release PR right
 before merging it: any later merge into `main` regenerates the PR. After the release, fix the notes on the

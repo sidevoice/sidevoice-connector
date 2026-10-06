@@ -13,7 +13,7 @@ use crate::glibc;
 use crate::notices::stage_notices;
 use crate::util::*;
 use crate::verify::verify;
-use crate::{Result, ENTRYPOINT, INVENTORY, KIND, PACKAGE, ROOT_NAME};
+use crate::{core, Result, CORE_DIR, ENTRYPOINT, INVENTORY, KIND, PACKAGE, ROOT_NAME};
 
 /// Where `dist` leaves the archive.
 pub(crate) const DIST_DIR: &str = "target/dist";
@@ -76,6 +76,11 @@ pub(crate) fn dist() -> Result<()> {
     chmod(&binary, 0o755)?;
     write(&stage.join("LICENSE"), &read(&repo.join("LICENSE"))?)?;
     stage_notices(&stage.join("notices"), &triple)?;
+    // The core travels inside: the pinned release's archive for this target, checked against its attestation.
+    let pinned = core::fetch(target)?;
+    let core_archive = format!("{CORE_DIR}/{}", pinned.name);
+    mkdir(&stage.join(CORE_DIR))?;
+    write(&stage.join(&core_archive), &read(&pinned.archive())?)?;
 
     let mut files = Vec::new();
     for (name, is_dir) in walk(&stage)? {
@@ -85,7 +90,10 @@ pub(crate) fn dist() -> Result<()> {
     }
     let count = files.len();
     let mut inventory = json!({"schema": 1, "kind": KIND, "version": version, "target": target,
-                               "source_sha": source_sha, "entrypoint": ENTRYPOINT, "files": files});
+                               "source_sha": source_sha, "entrypoint": ENTRYPOINT, "files": files,
+                               "core": {"version": pinned.version, "archive": core_archive,
+                                        "sha256": pinned.sha256, "size": pinned.size,
+                                        "source_sha": pinned.source_sha}});
     if linux {
         inventory["glibc"] = glibc::FLOOR.into();
     }

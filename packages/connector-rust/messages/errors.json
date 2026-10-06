@@ -60,5 +60,8 @@
   "pair.unreachable": "The room at {origin} could not be reached: {detail}",
   "pair.refused": "The room at {origin} refused the pairing: {detail}",
   "pair.bad-answer": "The room at {origin} answered the pairing without a credential.",
-  "pair-device.failed": "No pairing code could be had from this machine's core: {detail}"
+  "pair-device.failed": "No pairing code could be had from this machine's core: {detail}",
+  "core.package-missing": "This Sidevoice package does not carry a core for this computer ({detail}). Install Sidevoice again.",
+  "core.package-mismatch": "The core in this Sidevoice package is not the one the package lists ({detail}); nothing was installed. Install Sidevoice again.",
+  "core.self-test": "The Sidevoice core failed its self-test on this computer ({detail}); it was not installed."
 }

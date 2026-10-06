@@ -1,4 +1,4 @@
-//! `cargo xtask verify ARCHIVE`: unpack it elsewhere and run the connector from there.
+//! `cargo xtask verify ARCHIVE`: unpack it elsewhere and run the connector from there, and the core it carries.
 //! `cargo xtask verify-floor ARCHIVE`: the same, running the connector on the oldest Linux it supports.
 
 use std::path::Path;
@@ -29,10 +29,13 @@ const CONTAINER_ROOT: &str = "/opt/sidevoice-connector";
 
 /// Unpacks the archive somewhere else (a path with a space), checks the binary loads only what every machine of
 /// its target has and, on Linux, needs no glibc newer than the floor its inventory records, and runs it from
-/// there: `--version` and `--version --json` must name the inventory's version, target and source commit.
+/// there: `--version` and `--version --json` must name the inventory's version, target and source commit, and
+/// `stage-core` must stage the core the inventory names into a release and pass the core's own self-test there.
 ///
 /// With `image` (a container image of this machine's architecture), the binary runs in that container instead,
-/// read-only, without network; the container's own glibc must be the inventory's floor.
+/// read-only, without network; the container's own glibc must be the inventory's floor. The core is not staged
+/// there: the floor is the connector binary's, and the pinned core release has its own (newer, until the core's
+/// floor change is released), so its checks stay with the plain `verify` on the build machine.
 pub(crate) fn verify(archive: &Path, image: Option<&str>) -> Result<()> {
     let work = TempDir::new_in(Path::new("/tmp"), "sidevoice connector relocated")?;
     let (root, inventory) = unpack_checked(archive, &work.0)?;
@@ -104,10 +107,11 @@ pub(crate) fn verify(archive: &Path, image: Option<&str>) -> Result<()> {
         let result = result.map_err(|error| format!("{binary_str} {}: {error}", args.join(" ")))?;
         if !result.status.success() {
             return Err(format!(
-                "{} {}: {}",
+                "{} {}: {}{}",
                 ENTRYPOINT,
                 args.join(" "),
-                String::from_utf8_lossy(&result.stderr)
+                String::from_utf8_lossy(&result.stderr),
+                String::from_utf8_lossy(&result.stdout)
             ));
         }
         String::from_utf8(result.stdout).map_err(|_| "output is not UTF-8".into())
@@ -136,12 +140,37 @@ pub(crate) fn verify(archive: &Path, image: Option<&str>) -> Result<()> {
             ));
         }
     }
+    // The core inside: staged into a release and self-tested by the connector itself, as an install does it. Not in
+    // the floor's container (read-only, and the core's own glibc floor is not the connector's yet).
+    let staged = match image {
+        Some(_) => None,
+        None => {
+            let release = work.0.join("release");
+            mkdir(&release)?;
+            chmod(&release, 0o700)?;
+            let staged = parse_json(
+                run(&["stage-core", path_str(&release)?, "--json"])?.as_bytes(),
+                "stage-core --json",
+            )?;
+            for field in ["version", "sha256", "size", "source_sha"] {
+                if staged["core"][field] != inventory["core"][field] {
+                    return Err(format!(
+                        "stage-core staged a core whose {field} is {}, the archive says {}",
+                        staged["core"][field], inventory["core"][field]
+                    ));
+                }
+            }
+            Some(staged)
+        }
+    };
     println!(
         "{}",
         json!({"target": target, "version": inventory["version"], "source_sha": inventory["source_sha"],
                "identity": identity, "libraries": libraries, "relocation": true,
                "glibc": {"floor": floor, "needed": needed}, "ran_in": image,
-               "files": inventory["files"].as_array().map(Vec::len)})
+               "files": inventory["files"].as_array().map(Vec::len),
+               "core": staged.as_ref().map(|staged| &staged["core"]),
+               "core_self_test": staged.as_ref().map(|staged| &staged["self_test"])})
     );
     Ok(())
 }
