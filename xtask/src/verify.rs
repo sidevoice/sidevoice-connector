@@ -1,4 +1,5 @@
 //! `cargo xtask verify ARCHIVE`: unpack it elsewhere and run the connector from there.
+//! `cargo xtask verify-floor ARCHIVE`: the same, running the connector on the oldest Linux it supports.
 
 use std::path::Path;
 use std::process::Command;
@@ -6,6 +7,7 @@ use std::process::Command;
 use serde_json::json;
 
 use crate::archive::unpack_checked;
+use crate::glibc;
 use crate::util::*;
 use crate::{Result, ENTRYPOINT, PACKAGE};
 
@@ -22,10 +24,16 @@ const LINUX_SYSTEM: [&str; 9] = [
     "ld-linux-aarch64.so.1",
 ];
 
+/// Where the unpacked archive is mounted in the container `verify-floor` runs.
+const CONTAINER_ROOT: &str = "/opt/sidevoice-connector";
+
 /// Unpacks the archive somewhere else (a path with a space), checks the binary loads only what every machine of
-/// its target has, and runs it from there: `--version` and `--version --json` must name the inventory's
-/// version, target and source commit.
-pub(crate) fn verify(archive: &Path) -> Result<()> {
+/// its target has and, on Linux, needs no glibc newer than the floor its inventory records, and runs it from
+/// there: `--version` and `--version --json` must name the inventory's version, target and source commit.
+///
+/// With `image` (a container image of this machine's architecture), the binary runs in that container instead,
+/// read-only, without network; the container's own glibc must be the inventory's floor.
+pub(crate) fn verify(archive: &Path, image: Option<&str>) -> Result<()> {
     let work = TempDir::new_in(Path::new("/tmp"), "sidevoice connector relocated")?;
     let (root, inventory) = unpack_checked(archive, &work.0)?;
     let binary = root.join(ENTRYPOINT);
@@ -49,14 +57,51 @@ pub(crate) fn verify(archive: &Path) -> Result<()> {
         ));
     }
 
+    let floor = inventory["glibc"].as_str();
+    let needed = match floor {
+        Some(floor) => {
+            let needed = glibc::needed(binary_str)?;
+            glibc::check(&needed, floor)?;
+            Some(needed)
+        }
+        None => None,
+    };
+
+    if let Some(image) = image {
+        let floor = floor.ok_or("the archive records no glibc floor to run it on")?;
+        let result = in_container(image, &root, &["ldd", "--version"])?
+            .output()
+            .map_err(|error| format!("docker: {error}"))?;
+        let listing = String::from_utf8_lossy(&result.stdout);
+        let present = listing
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().last())
+            .unwrap_or("");
+        if !result.status.success() || present != floor {
+            return Err(format!(
+                "{image} has glibc {present:?}, not the floor {floor}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            ));
+        }
+    }
+
     // A clean environment: nothing the build or the runner set may stand in for what the binary carries.
     let run = |args: &[&str]| -> Result<String> {
-        let result = Command::new(&binary)
-            .args(args)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .output()
-            .map_err(|error| format!("{binary_str} {}: {error}", args.join(" ")))?;
+        let result = match image {
+            Some(image) => {
+                let entrypoint = format!("{CONTAINER_ROOT}/{ENTRYPOINT}");
+                let mut full = vec![entrypoint.as_str()];
+                full.extend(args);
+                in_container(image, &root, &full)?.output()
+            }
+            None => Command::new(&binary)
+                .args(args)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .output(),
+        };
+        let result = result.map_err(|error| format!("{binary_str} {}: {error}", args.join(" ")))?;
         if !result.status.success() {
             return Err(format!(
                 "{} {}: {}",
@@ -95,9 +140,25 @@ pub(crate) fn verify(archive: &Path) -> Result<()> {
         "{}",
         json!({"target": target, "version": inventory["version"], "source_sha": inventory["source_sha"],
                "identity": identity, "libraries": libraries, "relocation": true,
+               "glibc": {"floor": floor, "needed": needed}, "ran_in": image,
                "files": inventory["files"].as_array().map(Vec::len)})
     );
     Ok(())
+}
+
+/// `args` run in a throwaway container of `image`, with the unpacked archive `root` mounted read-only at
+/// [`CONTAINER_ROOT`] and no network.
+fn in_container(image: &str, root: &Path, args: &[&str]) -> Result<Command> {
+    let mut command = Command::new("docker");
+    command
+        .args(["run", "--rm", "--network", "none", "--mount"])
+        .arg(format!(
+            "type=bind,source={},target={CONTAINER_ROOT},readonly",
+            path_str(root)?
+        ))
+        .arg(image)
+        .args(args);
+    Ok(command)
 }
 
 fn linked_libraries(binary: &str, target: &str) -> Result<Vec<String>> {

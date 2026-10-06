@@ -71,6 +71,10 @@ Beta. What works today: the install above on macOS and Linux, pairing devices wi
 your agents' conversations from the desktop app, interrupting a reply, and replies spoken while the agent keeps
 working. Reaching your machine from outside your network needs a relay, which is still being built.
 
+The connector's own binaries, published on [GitHub Releases](https://github.com/sidevoice/sidevoice-connector/releases),
+run on macOS on Apple silicon and on Linux x86_64 and arm64 with **glibc 2.28 or newer** (Debian 10, Ubuntu 20.04,
+RHEL 8 and their later releases, and most other distributions since 2019; not musl-based ones such as Alpine).
+
 ## Commands
 
 The package installs one command, `sidevoice`:
@@ -94,6 +98,7 @@ the installer until then, and is no longer part of CI.
 cargo xtask fixtures   # what the tests run against: the sidevoice-core release pinned in core.pin, the pinned Codex CLI
 cargo test --locked    # unit tests, and the connector against the real core, Codex and (macOS) launchd
 cargo xtask dist       # this machine's release archive, built and verified as a release builds it
+                       # (Linux: needs zig and cargo-zigbuild, to link against glibc 2.28; RELEASING.md)
 
 npm ci
 npm test               # the Node package: node --test, on the source

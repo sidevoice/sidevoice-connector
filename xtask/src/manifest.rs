@@ -98,8 +98,11 @@ mod tests {
         mkdir(&root.join("bin")).unwrap();
         write(&root.join(ENTRYPOINT), target.as_bytes()).unwrap();
         let files = vec![file_record(&root.join(ENTRYPOINT), ENTRYPOINT).unwrap()];
-        let inventory = json!({"schema": 1, "kind": KIND, "version": version, "target": target,
-                               "source_sha": sha, "entrypoint": ENTRYPOINT, "files": files});
+        let mut inventory = json!({"schema": 1, "kind": KIND, "version": version, "target": target,
+                                   "source_sha": sha, "entrypoint": ENTRYPOINT, "files": files});
+        if target.starts_with("linux-") {
+            inventory["glibc"] = "2.28".into();
+        }
         write(&root.join(INVENTORY), &canonical(&inventory)).unwrap();
         let archive = dir.join(format!("{ROOT_NAME}-{target}.tar.zst"));
         write_archive(&work.0, ROOT_NAME, &[ENTRYPOINT], 1, &archive).unwrap();

@@ -1,10 +1,15 @@
 //! `cargo xtask dist`: build the release binary for this host and package it as the release archive.
+//!
+//! On Linux the binary is linked against glibc [`glibc::FLOOR`] (`cargo zigbuild`, zig's glibc stubs), not against
+//! the build machine's, so it runs on every distribution from that release on; the inventory records the floor and
+//! `verify` checks the binary needs nothing newer.
 
 use std::process::Command;
 
 use serde_json::json;
 
 use crate::archive::write_archive;
+use crate::glibc;
 use crate::notices::stage_notices;
 use crate::util::*;
 use crate::verify::verify;
@@ -31,17 +36,35 @@ pub(crate) fn dist() -> Result<()> {
         .parse()
         .map_err(|_| "commit time")?;
     let version = connector_version()?;
+    let triple = host_triple()?;
+    let linux = target.starts_with("linux-");
+    // On Linux, cargo-zigbuild's `<triple>.<glibc>` target links against that glibc release; the binary lands in
+    // target/<triple>/release.
+    let (subcommand, build_target, built) = if linux {
+        let built = repo.join("target").join(&triple).join("release");
+        (
+            "zigbuild",
+            Some(format!("{triple}.{}", glibc::FLOOR)),
+            built,
+        )
+    } else {
+        ("build", None, repo.join("target/release"))
+    };
+    let mut build = Command::new(cargo());
+    build.args([subcommand, "--locked", "--release", "--package", PACKAGE]);
+    if let Some(build_target) = &build_target {
+        build.args(["--target", build_target]);
+    }
     // The build identity the binary reports (packages/connector-rust/build.rs).
-    let status = Command::new(cargo())
-        .args(["build", "--locked", "--release", "--package", PACKAGE])
+    let status = build
         .env("SIDEVOICE_CONNECTOR_BUILD_SHA", &source_sha)
         .env("SIDEVOICE_CONNECTOR_TARGET", target)
         .env("SIDEVOICE_CONNECTOR_VERSION", &version)
         .current_dir(&repo)
         .status()
-        .map_err(|error| format!("cargo build: {error}"))?;
+        .map_err(|error| format!("cargo {subcommand}: {error}"))?;
     if !status.success() {
-        return Err("cargo build failed".into());
+        return Err(format!("cargo {subcommand} failed"));
     }
 
     let work = TempDir::new("sidevoice-connector-dist")?;
@@ -49,10 +72,10 @@ pub(crate) fn dist() -> Result<()> {
     mkdir(&stage.join("bin"))?;
     mkdir(&stage.join("notices"))?;
     let binary = stage.join(ENTRYPOINT);
-    write(&binary, &read(&repo.join("target/release").join(PACKAGE))?)?;
+    write(&binary, &read(&built.join(PACKAGE))?)?;
     chmod(&binary, 0o755)?;
     write(&stage.join("LICENSE"), &read(&repo.join("LICENSE"))?)?;
-    stage_notices(&stage.join("notices"), &host_triple()?)?;
+    stage_notices(&stage.join("notices"), &triple)?;
 
     let mut files = Vec::new();
     for (name, is_dir) in walk(&stage)? {
@@ -61,8 +84,11 @@ pub(crate) fn dist() -> Result<()> {
         }
     }
     let count = files.len();
-    let inventory = json!({"schema": 1, "kind": KIND, "version": version, "target": target,
-                           "source_sha": source_sha, "entrypoint": ENTRYPOINT, "files": files});
+    let mut inventory = json!({"schema": 1, "kind": KIND, "version": version, "target": target,
+                               "source_sha": source_sha, "entrypoint": ENTRYPOINT, "files": files});
+    if linux {
+        inventory["glibc"] = glibc::FLOOR.into();
+    }
     write(&stage.join(INVENTORY), &canonical(&inventory))?;
 
     let archive = repo
@@ -75,5 +101,5 @@ pub(crate) fn dist() -> Result<()> {
         json!({"target": target, "version": version, "name": archive.file_name().map(|name| name.to_string_lossy()),
                "size": bytes.len(), "sha256": sha256(&bytes), "files": count})
     );
-    verify(&archive)
+    verify(&archive, None)
 }
