@@ -9,6 +9,25 @@ use serde_json::{json, Value};
 /// This build's version: the release version stamped at build time (`build.rs`).
 pub const VERSION: &str = env!("SIDEVOICE_CONNECTOR_VERSION");
 
+/// The release target this binary was compiled for (`linux-x86_64`, `linux-aarch64`, `macos-aarch64`), or `None`
+/// on a platform no release is made for.
+pub fn target() -> Option<&'static str> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        return Some("macos-aarch64");
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        return Some("linux-x86_64");
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        return Some("linux-aarch64");
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
 /// The host name, as the operating system reports it. `SIDEVOICE_HOST_ID` overrides it (tests, several profiles on
 /// one machine).
 pub fn host() -> String {

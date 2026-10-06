@@ -47,6 +47,21 @@ When it links to the core, the daemon says what this machine is: its host name, 
 `Linux x64`), the connector's version and the agents whose homes exist here. The core keeps the latest and the room
 lists the machine by it.
 
+## The core inside
+
+The connector's package carries the core: next to `bin/sidevoice-connector`, the pinned sidevoice-core release's
+archive for the same target (`core/sidevoice-core-<version>-<target>.tar.zst`), named with its version, digest, size
+and source commit in the package's inventory, `connector.json` (`cargo xtask dist` puts it there after checking it
+against the core release's attestation; RELEASING.md). Nothing is downloaded at install.
+
+Installing a release stages it (`src/core_package.rs`; run as the internal step `stage-core <release> [--json]`):
+the archive must have the inventory's size and digest; it is unpacked beside the release, below its one root, plain
+files and directories only, and must be exactly the core's own inventory (`native-core.json`: this target, this
+source commit, every file with its size and digest); then it is renamed into `<release>/core`. There the core runs
+its own self-test (`--self-test <core>/checks/detector-16k.wav <core>/models`), and a core that fails it is removed.
+The failures carry stable keys: `core.package-missing`, `core.package-mismatch`, `core.self-test`. The core never
+runs with a library-path variable (`LD_*`, `DYLD_*`, `ORT_DYLIB_PATH`) of ours: its libraries are its own.
+
 ## Installed release
 
 A release built by the JavaScript installer can carry this binary as its daemon and MCP server
@@ -61,8 +76,9 @@ installer (sidevoice/sidevoice-connector#66, decision 3).
 `core.pin` at the repository root (a conversation joins through MCP, input from a call is delivered, a reply is
 saved, the core restarts and the link comes back), against the real Codex CLI in a disposable profile, as a
 login service under the real launchd (macOS) and the real systemd user manager (Linux; on a CI runner the test
-enables lingering for the runner's user), and with no service manager at all; `pair` against a room on loopback. `cargo xtask fixtures` fetches the core and Codex; without them
-those tests are skipped locally and fail in CI.
+enables lingering for the runner's user), with no service manager at all; `pair` against a room on loopback; and the
+core staged from a package into a release, where it passes its self-test. `cargo xtask fixtures` fetches the core and
+Codex; without them those tests are skipped locally and fail in CI.
 
 Codex 0.157.0 does not give the active thread ID in MCP request metadata, so queued delivery into a Codex
 conversation needs `CODEX_THREAD_ID` in its environment. A queued message can be accepted before Codex reads it; the

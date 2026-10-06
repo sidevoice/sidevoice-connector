@@ -1030,11 +1030,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "tokio",
  "tokio-tungstenite",
  "toml",
  "ureq",
  "uuid",
+ "zstd",
 ]
 
 [[package]]

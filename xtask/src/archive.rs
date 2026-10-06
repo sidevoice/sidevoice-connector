@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::glibc;
 use crate::util::*;
-use crate::{Result, ENTRYPOINT, INVENTORY, KIND, ROOT_NAME, TARGETS};
+use crate::{Result, CORE_DIR, ENTRYPOINT, INVENTORY, KIND, ROOT_NAME, TARGETS};
 
 const MAX_COMPRESSED: u64 = 250_000_000;
 const MAX_TOTAL: u64 = 1_000_000_000;
@@ -168,6 +168,7 @@ pub(crate) fn unpack_checked(archive: &Path, destination: &Path) -> Result<(Path
         "source_sha",
         "entrypoint",
         "files",
+        "core",
     ]);
     // A Linux binary's glibc floor: the oldest C library it runs on (crate::glibc).
     if target.starts_with("linux-") {
@@ -227,7 +228,82 @@ pub(crate) fn unpack_checked(archive: &Path, destination: &Path) -> Result<(Path
             return Err(format!("inventory mismatch: {name}"));
         }
     }
+    check_core(&inventory, records)?;
     Ok((root, inventory))
+}
+
+/// The core the archive carries: the pinned core release's archive for the same target, at `core/<its name>`,
+/// listed among the files with the digest and size the `core` record names.
+fn check_core(inventory: &Value, records: &[Value]) -> Result<()> {
+    let core = &inventory["core"];
+    let fields: BTreeSet<&str> = core
+        .as_object()
+        .ok_or("the inventory names no core")?
+        .keys()
+        .map(String::as_str)
+        .collect();
+    if fields != BTreeSet::from(["version", "archive", "sha256", "size", "source_sha"]) {
+        return Err("wrong core fields".into());
+    }
+    let version = crate::core::parse_pin(core["version"].as_str().unwrap_or(""))?;
+    let target = inventory["target"].as_str().unwrap_or("");
+    let archive = format!("{CORE_DIR}/{}", crate::core::archive_name(&version, target));
+    let listed = records
+        .iter()
+        .find(|record| record["name"] == archive.as_str());
+    if core["archive"] != archive.as_str()
+        || !is_commit(core["source_sha"].as_str().unwrap_or(""))
+        || listed.is_none_or(|record| {
+            record["sha256"] != core["sha256"] || record["size"] != core["size"]
+        })
+    {
+        return Err(format!("the core record is not the archive's {archive}"));
+    }
+    Ok(())
+}
+
+/// A connector tree under `<work>/sidevoice-connector`, as `dist` stages one, for tests: a binary whose bytes are
+/// the target's name, a licence, and a core archive, with an inventory whose core record is `core(<the core
+/// archive's file record>)`.
+#[cfg(test)]
+pub(crate) fn test_tree(
+    work: &Path,
+    target: &str,
+    sha: &str,
+    version: &str,
+    core: impl Fn(&Value) -> Value,
+) -> PathBuf {
+    let root = work.join(ROOT_NAME);
+    let core_archive = format!("{CORE_DIR}/{}", crate::core::archive_name("0.2.0", target));
+    mkdir(&root.join("bin")).unwrap();
+    mkdir(&root.join(CORE_DIR)).unwrap();
+    write(&root.join(ENTRYPOINT), target.as_bytes()).unwrap();
+    write(&root.join("LICENSE"), b"licence").unwrap();
+    write(&root.join(&core_archive), b"the core").unwrap();
+    let mut files = vec![
+        file_record(&root.join(ENTRYPOINT), ENTRYPOINT).unwrap(),
+        file_record(&root.join("LICENSE"), "LICENSE").unwrap(),
+        file_record(&root.join(&core_archive), &core_archive).unwrap(),
+    ];
+    files.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    let record = files
+        .iter()
+        .find(|record| record["name"] == core_archive.as_str())
+        .unwrap();
+    let mut inventory = serde_json::json!({"schema": 1, "kind": KIND, "version": version, "target": target,
+        "source_sha": sha, "entrypoint": ENTRYPOINT, "core": core(record), "files": files});
+    if target.starts_with("linux-") {
+        inventory["glibc"] = "2.28".into();
+    }
+    write(&root.join(INVENTORY), &canonical(&inventory)).unwrap();
+    root
+}
+
+/// The core record [`test_tree`] writes when nothing is changed in it.
+#[cfg(test)]
+pub(crate) fn test_core_record(record: &Value) -> Value {
+    serde_json::json!({"version": "0.2.0", "archive": record["name"], "sha256": record["sha256"],
+        "size": record["size"], "source_sha": "89abcdef0123456789abcdef0123456789abcdef"})
 }
 
 #[cfg(test)]
@@ -235,22 +311,44 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn stage_with(work: &Path, core: impl Fn(&Value) -> Value) -> PathBuf {
+        test_tree(
+            work,
+            "linux-x86_64",
+            "0123456789abcdef0123456789abcdef01234567",
+            "1.2.3",
+            core,
+        )
+    }
+
+    fn core_record(record: &Value) -> Value {
+        test_core_record(record)
+    }
+
     fn stage(work: &Path) -> PathBuf {
-        let root = work.join(ROOT_NAME);
-        mkdir(&root.join("bin")).unwrap();
-        write(&root.join(ENTRYPOINT), b"#!/bin/sh\n").unwrap();
-        write(&root.join("LICENSE"), b"licence").unwrap();
-        let files = vec![
-            file_record(&root.join(ENTRYPOINT), ENTRYPOINT).unwrap(),
-            file_record(&root.join("LICENSE"), "LICENSE").unwrap(),
-        ];
-        let mut files = files;
-        files.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-        let inventory = json!({"schema": 1, "kind": KIND, "version": "1.2.3", "target": "linux-x86_64",
-            "glibc": "2.28", "source_sha": "0123456789abcdef0123456789abcdef01234567", "entrypoint": ENTRYPOINT,
-            "files": files});
-        write(&root.join(INVENTORY), &canonical(&inventory)).unwrap();
-        root
+        stage_with(work, core_record)
+    }
+
+    #[test]
+    fn the_core_record_must_be_the_carried_archive() {
+        for (label, change) in [
+            ("digest", ("sha256", json!("0".repeat(64)))),
+            ("size", ("size", json!(1))),
+            ("version", ("version", json!("0.3.0"))),
+            ("archive", ("archive", json!("core/other.tar.zst"))),
+        ] {
+            let work = TempDir::new("xtask-archive-core").unwrap();
+            stage_with(&work.0, |record| {
+                let mut core = core_record(record);
+                core[change.0] = change.1.clone();
+                core
+            });
+            let archive = work.0.join("a.tar.zst");
+            write_archive(&work.0, ROOT_NAME, &[ENTRYPOINT], 1, &archive).unwrap();
+            let out = TempDir::new("xtask-archive-core-out").unwrap();
+            let error = unpack_checked(&archive, &out.0).unwrap_err();
+            assert!(error.contains("core record"), "{label}: {error}");
+        }
     }
 
     #[test]

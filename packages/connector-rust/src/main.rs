@@ -1,5 +1,6 @@
 mod adapters;
 mod agents;
+mod core_package;
 mod core_ready;
 mod cursor_app;
 mod daemon;
@@ -103,6 +104,10 @@ enum Action {
     },
     /// Show a one-time code (and its QR) to pair a device, such as the Sidevoice app, with this machine.
     PairDevice,
+    /// The installer's step for the core: stage the core this package carries into RELEASE/core and run its
+    /// self-test there.
+    #[command(hide = true)]
+    StageCore { release: std::path::PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -220,6 +225,19 @@ async fn run(action: Action, installed: bool, json: bool) -> Result<ExitCode> {
             ExitCode::FAILURE
         });
     }
+    if let Action::StageCore { release } = &action {
+        let installed = core_package::install(&core_package::package_root()?, release)?;
+        if json {
+            println!("{}", installed.value());
+        } else {
+            println!(
+                "Installed the Sidevoice core {} in {}; its self-test passed.",
+                installed.core.version,
+                installed.path.display()
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let profile = Profile::from_env(installed)?;
     match action {
         Action::Mcp => mcp::run(profile).await.map(|()| ExitCode::SUCCESS),
@@ -261,6 +279,7 @@ async fn run(action: Action, installed: bool, json: bool) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Action::Service { .. } => unreachable!("service commands run before the profile"),
+        Action::StageCore { .. } => unreachable!("the core is staged before the profile"),
     }
 }
 

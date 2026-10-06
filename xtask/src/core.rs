@@ -53,31 +53,55 @@ pub(crate) fn archive_name(version: &str, target: &str) -> String {
     format!("sidevoice-core-{version}-{target}.tar.zst")
 }
 
-/// Downloads the pinned core release's archive for this host with `SHA256SUMS`, the manifest and the attestation;
-/// checks the archive is listed in both with the same digest and that the attestation binds the archive and the
-/// manifest to the core's release workflow on main; then unpacks it as `DIR/sidevoice-core-rust` and records what it
-/// is in `DIR/core.json`.
-pub(crate) fn core(dir: &Path) -> Result<()> {
-    let version = parse_pin(&String::from_utf8_lossy(&read(&repo().join(PIN))?))?;
-    let target = host_target()?;
+/// The pinned core release's archive for a target, downloaded and checked: listed in the release's `SHA256SUMS`
+/// and manifest with the same digest, and attested together with the manifest by the core's release workflow on
+/// main. The archive is `<download>/<name>` and lives as long as this value.
+pub(crate) struct PinnedCore {
+    pub(crate) version: String,
+    pub(crate) target: String,
+    /// The archive's published name, `sidevoice-core-<version>-<target>.tar.zst`.
+    pub(crate) name: String,
+    pub(crate) sha256: String,
+    pub(crate) size: u64,
+    pub(crate) source_sha: String,
+    download: TempDir,
+}
+
+impl PinnedCore {
+    pub(crate) fn archive(&self) -> std::path::PathBuf {
+        self.download.0.join(&self.name)
+    }
+}
+
+/// The version `core.pin` names.
+pub(crate) fn pinned_version() -> Result<String> {
+    parse_pin(&String::from_utf8_lossy(&read(&repo().join(PIN))?))
+}
+
+/// Downloads the pinned core release's archive for `target` with `SHA256SUMS`, the manifest and the attestation,
+/// and checks the archive is listed in both with the same digest and that the attestation binds the archive and
+/// the manifest to the core's release workflow on main.
+pub(crate) fn fetch(target: &str) -> Result<PinnedCore> {
+    let version = pinned_version()?;
     let name = archive_name(&version, target);
-    let download_dir = TempDir::new("sidevoice-core-download")?;
+    let downloaded = TempDir::new("sidevoice-core-download")?;
     for asset in [name.as_str(), "SHA256SUMS", MANIFEST, ATTESTATION] {
         write(
-            &download_dir.0.join(asset),
+            &downloaded.0.join(asset),
             &download(&asset_url(&version, asset))?,
         )?;
     }
-    let archive = download_dir.0.join(&name);
-    let manifest_path = download_dir.0.join(MANIFEST);
-    let sums = parse_sums(&read(&download_dir.0.join("SHA256SUMS"))?)?;
+    let archive = downloaded.0.join(&name);
+    let manifest_path = downloaded.0.join(MANIFEST);
+    let sums = parse_sums(&read(&downloaded.0.join("SHA256SUMS"))?)?;
     let listed = |file: &str| {
         sums.iter()
             .find(|(_, listed)| listed == file)
             .map(|(digest, _)| digest.clone())
             .ok_or_else(|| format!("{file} is not in the core's SHA256SUMS"))
     };
-    let digest = sha256(&read(&archive)?);
+    let bytes = read(&archive)?;
+    let digest = sha256(&bytes);
     let manifest_bytes = read(&manifest_path)?;
     if listed(MANIFEST)? != sha256(&manifest_bytes) {
         return Err(format!("{MANIFEST} is not the one SHA256SUMS lists"));
@@ -92,21 +116,41 @@ pub(crate) fn core(dir: &Path) -> Result<()> {
             "{name}: its digest {digest} is not the one SHA256SUMS and the manifest list"
         ));
     }
-    let attestation = download_dir.0.join(ATTESTATION);
+    let attestation = downloaded.0.join(ATTESTATION);
     for file in [&archive, &manifest_path] {
         verify_attestation(file, REPOSITORY, &attestation, &signer())?;
     }
+    let source_sha = manifest["source_sha"].as_str().unwrap_or("").to_string();
+    if !is_commit(&source_sha) {
+        return Err(format!("{MANIFEST} names no source commit"));
+    }
+    Ok(PinnedCore {
+        version,
+        target: target.to_string(),
+        name,
+        sha256: digest,
+        size: bytes.len() as u64,
+        source_sha,
+        download: downloaded,
+    })
+}
 
+/// Fetches the pinned core for this host ([`fetch`]) and unpacks it as `DIR/sidevoice-core-rust`, keeps the checked
+/// archive as `DIR/<name>`, and records what it is in `DIR/core.json`.
+pub(crate) fn core(dir: &Path) -> Result<()> {
+    let pinned = fetch(host_target()?)?;
     if dir.exists() {
         fs::remove_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
     }
     mkdir(dir)?;
-    let root = unpack(&archive, dir, ROOT)?;
+    let root = unpack(&pinned.archive(), dir, ROOT)?;
     if !root.join(ENTRYPOINT).is_file() {
-        return Err(format!("{name} has no {ENTRYPOINT}"));
+        return Err(format!("{} has no {ENTRYPOINT}", pinned.name));
     }
-    let record = json!({"version": version, "target": target, "archive": name, "sha256": digest,
-                        "source_sha": manifest["source_sha"], "entrypoint": root.join(ENTRYPOINT)});
+    write(&dir.join(&pinned.name), &read(&pinned.archive())?)?;
+    let record = json!({"version": pinned.version, "target": pinned.target, "archive": pinned.name,
+                        "sha256": pinned.sha256, "size": pinned.size, "source_sha": pinned.source_sha,
+                        "entrypoint": root.join(ENTRYPOINT)});
     write(&dir.join("core.json"), &canonical(&record))?;
     print!("{}", String::from_utf8_lossy(&canonical(&record)));
     Ok(())

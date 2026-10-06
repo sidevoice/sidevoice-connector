@@ -1,20 +1,22 @@
 //! Build tooling for the connector, run as `cargo xtask <command>` (alias in `.cargo/config.toml`).
 //!
 //! - `dist`: build the release binary for this host (Linux: against glibc `glibc::FLOOR`, with cargo-zigbuild)
-//!   and package it, with its licence notices, as the archive `target/dist/sidevoice-connector-<target>.tar.zst`;
-//!   then `verify` it.
-//! - `verify ARCHIVE`: unpack it somewhere else, check its inventory, what the binary links and (Linux) that it
-//!   needs no glibc newer than the floor the inventory records, and run it from there: it must report the version
-//!   and build identity the inventory names.
+//!   and package it, with its licence notices and the pinned core release's archive for this host (checked as
+//!   `core` checks it), as the archive `target/dist/sidevoice-connector-<target>.tar.zst`; then `verify` it.
+//! - `verify ARCHIVE`: unpack it somewhere else, check its inventory (the core inside included), what the binary
+//!   links and (Linux) that it needs no glibc newer than the floor the inventory records, and run it from there: it
+//!   must report the version and build identity the inventory names, and stage the core it carries into a release,
+//!   where the core passes its own self-test.
 //! - `verify-floor ARCHIVE` (Linux, needs Docker): `verify`, running the binary in a container of the oldest
-//!   distribution it supports, whose glibc is the floor (`glibc::FLOOR_IMAGE`).
+//!   distribution it supports, whose glibc is the floor (`glibc::FLOOR_IMAGE`). The core is not run there: the
+//!   pinned core release has a floor of its own.
 //! - `manifest DIR [--tag vX.Y.Z]`: check every target's archive in DIR, give each its published name and write
 //!   `sidevoice-connector-manifest.json` and `SHA256SUMS`; with a tag, the crate version must be that release.
 //! - `publish DIR TAG`: attach every file in DIR to the release TAG (for `nightly`, move the tag here first and drop
 //!   older assets), download them back, check them against `SHA256SUMS` and the attestation, and publish.
 //! - `core [DIR]`: download the sidevoice-core release pinned in `core.pin` for this host, check it against that
 //!   release's `SHA256SUMS`, manifest and attestation, and unpack it into DIR (default `target/sidevoice-core`),
-//!   where the connector's tests find the real core.
+//!   with the checked archive beside it: where the connector's tests find the real core.
 //! - `codex [DIR]`: install the pinned Codex CLI from npm into DIR (default `target/codex`), where the registration
 //!   test finds it.
 //! - `fixtures`: `core` and `codex`, into their default directories: what `cargo test` runs against.
@@ -41,6 +43,8 @@ pub(crate) const PACKAGE: &str = "sidevoice-connector";
 /// The archive's single root directory.
 pub(crate) const ROOT_NAME: &str = "sidevoice-connector";
 pub(crate) const ENTRYPOINT: &str = "bin/sidevoice-connector";
+/// Where the archive carries the pinned core release archive, as the core published it.
+pub(crate) const CORE_DIR: &str = "core";
 /// The inventory every archive carries at its root.
 pub(crate) const INVENTORY: &str = "connector.json";
 pub(crate) const MANIFEST: &str = "sidevoice-connector-manifest.json";
