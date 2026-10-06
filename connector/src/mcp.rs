@@ -27,6 +27,20 @@ const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the user's
 - Read receipts and working state need nothing from you: the room observes what the harness records.
 - Pairing a device is the user's act: voice_pair_device only when asked; show just its result."#;
 
+/// Overall budget for an IPC round trip, before the daemon's reply (or lack of one) gives up on
+/// its own. `pair_device` gets longer: the daemon can spend up to 15 s waiting for the core link
+/// plus 10 s generating the code, so the MCP-side limit must clear that with room to spare.
+const DEFAULT_IPC_LIMIT: Duration = Duration::from_secs(20);
+const PAIR_DEVICE_IPC_LIMIT: Duration = Duration::from_secs(30);
+
+fn ipc_limit(method: &str) -> Duration {
+    if method == "pair_device" {
+        PAIR_DEVICE_IPC_LIMIT
+    } else {
+        DEFAULT_IPC_LIMIT
+    }
+}
+
 struct Ipc {
     profile: Profile,
     joined: Arc<Mutex<HashMap<String, Joined>>>,
@@ -194,7 +208,7 @@ impl Ipc {
     }
 
     async fn call_ready(self: &Arc<Self>, method: &str, params: Value) -> Result<Value> {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + ipc_limit(method);
         let id = self.serial.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
@@ -1123,7 +1137,16 @@ pub async fn run(profile: Profile) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::pairing_needed;
+    use super::{ipc_limit, pairing_needed};
+    use std::time::Duration;
+
+    #[test]
+    fn pair_device_gets_30s_everything_else_keeps_20s() {
+        assert_eq!(ipc_limit("pair_device"), Duration::from_secs(30));
+        for method in ["register", "status", "publish", "unregister", "adopt"] {
+            assert_eq!(ipc_limit(method), Duration::from_secs(20), "{method}");
+        }
+    }
 
     #[test]
     fn a_named_room_joins_only_when_this_machine_is_paired_with_it() {
