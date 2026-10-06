@@ -60,7 +60,7 @@ files and directories only, and must be exactly the core's own inventory (`nativ
 source commit, every file with its size and digest); then it is renamed into `<release>/core`. There the core runs
 its own self-test (`--self-test <core>/checks/detector-16k.wav <core>/models`), and a core that fails it is removed.
 The failures carry stable keys: `core.package-missing`, `core.package-mismatch`, `core.self-test`. The core never
-runs with a dynamic-loader variable (`LD_*`, `DYLD_*`) of ours: its libraries are its own.
+runs with a library-path variable (`LD_*`, `DYLD_*`, `ORT_DYLIB_PATH`) of ours: its libraries are its own.
 
 ## Installed release
 

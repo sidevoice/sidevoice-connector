@@ -34,8 +34,10 @@ use std::time::{Duration, Instant};
 /// The package's inventory, at its root.
 pub const INVENTORY: &str = "connector.json";
 
-/// Variables a dynamic loader reads: never passed to the core, whose libraries are its own.
+/// Variables a dynamic loader (or the core's ONNX runtime, `ORT_DYLIB_PATH`) reads to load a library from
+/// elsewhere: never passed to the core, whose libraries are its own.
 pub const LOADER_VARIABLES: &[&str] = &[
+    "ORT_DYLIB_PATH",
     "LD_LIBRARY_PATH",
     "LD_PRELOAD",
     "LD_AUDIT",
@@ -807,6 +809,10 @@ mod tests {
         let base = BTreeMap::from([
             ("LD_PRELOAD".to_owned(), "/x.so".to_owned()),
             ("DYLD_INSERT_LIBRARIES".to_owned(), "/x.dylib".to_owned()),
+            (
+                "ORT_DYLIB_PATH".to_owned(),
+                "/x/libonnxruntime.so".to_owned(),
+            ),
             ("HOME".to_owned(), "/h".to_owned()),
         ]);
         let environment = environment(&base, Path::new("/r/core"));
