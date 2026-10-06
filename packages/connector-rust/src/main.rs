@@ -5,6 +5,7 @@ mod core_ready;
 mod cursor_app;
 mod daemon;
 mod identity;
+mod install;
 mod link;
 mod lock;
 mod logfile;
@@ -13,7 +14,6 @@ mod messages;
 mod pairing;
 mod process;
 mod profile;
-mod release;
 mod secure_fs;
 mod service;
 
@@ -69,15 +69,21 @@ struct Cli {
     /// Print one JSON object instead of text.
     #[arg(long, global = true)]
     json: bool,
-    /// Run as the installed release this binary is part of.
-    #[arg(long, global = true)]
-    installed: bool,
     #[command(subcommand)]
     command: Option<Action>,
 }
 
 #[derive(Subcommand)]
 enum Action {
+    /// Install this package's Sidevoice on this computer (or update to it), run it, and register it with the agents
+    /// found here.
+    Install {
+        /// Register with no agent (connect them later with `agents connect`).
+        #[arg(long)]
+        no_agents: bool,
+    },
+    /// Remove Sidevoice from this computer: its service, its agent registrations, its releases and its data.
+    Uninstall,
     /// Serve MCP over stdio for one agent conversation.
     Mcp,
     /// Run this machine's connector daemon; --service when a service manager runs it.
@@ -178,7 +184,7 @@ async fn main() -> ExitCode {
         let _ = Cli::command().print_help();
         return ExitCode::from(2);
     };
-    match run(action, cli.installed, cli.json).await {
+    match run(action, cli.json).await {
         Ok(code) => code,
         Err(error) => {
             // A refusal from the service layer keeps its own key; anything else is keyed here.
@@ -199,7 +205,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(action: Action, installed: bool, json: bool) -> Result<ExitCode> {
+async fn run(action: Action, json: bool) -> Result<ExitCode> {
     // The service commands act on the installation the environment names, whatever binary runs them.
     if let Action::Service { command } = &action {
         let action = match command {
@@ -238,8 +244,33 @@ async fn run(action: Action, installed: bool, json: bool) -> Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let profile = Profile::from_env(installed)?;
+    let profile = Profile::from_env()?;
     match action {
+        Action::Install { no_agents } => {
+            let package = install::Package::running()?;
+            if !json {
+                println!("Installing Sidevoice {}…", package.version);
+            }
+            let options = install::Options { agents: !no_agents };
+            let answer =
+                install::install(&profile, &package, options, &install::Runtime::Machine).await?;
+            if json {
+                println!("{answer}");
+            } else {
+                println!("{}", install::human_install(&answer));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Action::Uninstall => {
+            let options = install::Options { agents: true };
+            let answer = install::uninstall(&profile, options, &install::Runtime::Machine).await?;
+            if json {
+                println!("{answer}");
+            } else {
+                println!("{}", install::human_uninstall(&answer));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Action::Mcp => mcp::run(profile).await.map(|()| ExitCode::SUCCESS),
         Action::Connector { service } => {
             let managed = service

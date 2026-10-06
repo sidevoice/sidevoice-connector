@@ -2,13 +2,15 @@
 
 One binary, `sidevoice-connector`, that links this machine's agent conversations (Claude Code, Codex, Cursor) to the
 Sidevoice core: it serves MCP to each conversation and runs the machine's connector daemon, which holds the link to
-the core. It is migrating to stand alone (sidevoice/sidevoice-connector#68); until that is done, installing is
-still the JavaScript package's (`packages/connector`).
+the core. It is migrating to stand alone (sidevoice/sidevoice-connector#68): it installs itself (`install`, below);
+the JavaScript package (`packages/connector`) is still in the repository until that is done.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
+| `install [--no-agents] [--json]` | Installs this package's Sidevoice (or updates to it), starts it, and registers it with the agents found here (below). |
+| `uninstall [--json]` | Removes Sidevoice from this computer: its service jobs, its agent registrations, its releases and its data. |
 | `mcp` | MCP over stdio for one conversation; it reaches the daemon over `connector.sock`. |
 | `connector [--service]` | The daemon: one per data directory. `--service` (or `SIDEVOICE_SERVICE=launchd\|systemd`) when a service manager runs it. |
 | `agents [--json]` | The agents on this computer and whether they use Sidevoice. |
@@ -17,7 +19,6 @@ still the JavaScript package's (`packages/connector`).
 | `pair <room-url> <code> [--json]` | Pairs this machine with a room: redeems the one-time code the room shows at its `POST /api/connectors/pair` and writes `credentials.json` (0600). https only; plain http only to loopback or a host in `SIDEVOICE_TRUSTED_CLUSTER_HOSTS` (`.suffix` or exact host, comma-separated). The core follows the file; nothing restarts. |
 | `pair-device [--json]` | A one-time code from this machine's core (through the connector, started on demand) to pair a device such as the Sidevoice app: the code, its QR, its validity and where it works (`reach`: `room`, `direct` or `local-only`). `--json`: `{ok, code, expires_in, reach, payload}`. The MCP tool `voice_pair_device` says the same text. |
 | `--version [--json]` | The release version; with `--json`, also the target and the source commit. |
-| `--installed` | Run as the installed release this binary is part of (below). |
 
 The command line is English only and is not translated. With `--json` a command prints one JSON object on stdout; a
 failure is `{"ok":false,"error":{"key","params","message"}}` and exit status 1, the key stable and the message
@@ -62,13 +63,41 @@ its own self-test (`--self-test <core>/checks/detector-16k.wav <core>/models`), 
 The failures carry stable keys: `core.package-missing`, `core.package-mismatch`, `core.self-test`. The core never
 runs with a library-path variable (`LD_*`, `DYLD_*`, `ORT_DYLIB_PATH`) of ours: its libraries are its own.
 
-## Installed release
+## Installing
 
-A release built by the JavaScript installer can carry this binary as its daemon and MCP server
-(`<R>/releases/<id>/dist/sidevoice-rust`, run as `--installed mcp` and `--installed connector` through `<R>/current`).
-At startup it checks again that it is the current release's binary: the release record, the paths, both
-executables' digests, the target and the pair identity. That layout is being replaced by the connector's own
-installer (sidevoice/sidevoice-connector#66, decision 3).
+`install` (`src/install.rs`) runs from the package it is part of (an npm platform package or the release archive,
+laid out as above) and makes the installation every other part runs (sidevoice/sidevoice-connector#66, decisions 1
+and 3):
+
+- `R/releases/<version>/`: one directory per version, with a copy of the binary (`bin/sidevoice-connector`) and the
+  core staged and self-tested in it (above). Another build of a version already there (a nightly, a local build) is
+  `<version>+<the first 12 hex digits of its binary's digest>`.
+- `R/current`: a link to the selected release, switched by renaming a new link over it.
+- `D/install.json`: `command`, `[R/current/bin/sidevoice-connector]`, and `releases`, `R`. The service jobs, the
+  desktop app and every agent registration run that command, never the package's own path (npm's cache moves).
+
+Under the install lock, `install` refuses an installation made by the earlier JavaScript installer (its releases,
+its `verified` or `previous` link, its Python core, or an `install.json` naming another command) with the one
+command that removes it (`install.legacy`): there is no upgrade in place. Otherwise it stages the release unless it
+is there, switches `current`, writes `install.json`, clears a person's stop, and restarts: with a service manager both
+jobs are defined (`service install`'s definitions) and restarted; without one, what runs on demand is stopped and the
+connector is started from the new release, which starts its core. The pair must then answer within 60 s: the core's
+health, for a launch after the restart, and the connector's identity (this release's binary) and its `node.status`.
+When it does not, `current` goes back to the release it named before, that one is restarted and verified, the failed
+release is deleted, and the install fails with `install.rolled-back` (or `install.rollback-failed`); a first
+installation that does not answer stays, failing with `install.verify-failed` and the core's own failure. Releases
+other than the current one and the one before it are pruned: exactly one previous, no `verified` link, no `rollback`
+command. Then the agents found are registered with the installation's command (Claude Code through `claude mcp add`,
+Codex through its CLI, Cursor in its `mcp.json`, only the `sidevoice` entry and only one Sidevoice wrote; an agent
+that needs its configuration by hand is told how), unless `--no-agents`. Running `install` again is the recovery.
+
+`uninstall` unloads both jobs and stops what runs on demand (a refusal stops it there, with nothing deleted), removes
+the agents' registrations Sidevoice wrote, then `R` and everything in `D` but its lock files and the stop, so that a
+launcher on its way finds the stop and starts nothing. It refuses an earlier installer's installation as `install`
+does. The room keeps this machine's pairing until it is revoked
+there.
+
+With `--json` both print one JSON object and nothing else.
 
 ## Tests
 
@@ -77,7 +106,9 @@ installer (sidevoice/sidevoice-connector#66, decision 3).
 saved, the core restarts and the link comes back), against the real Codex CLI in a disposable profile, as a
 login service under the real launchd (macOS) and the real systemd user manager (Linux; on a CI runner the test
 enables lingering for the runner's user), with no service manager at all; `pair` against a room on loopback; and the
-core staged from a package into a release, where it passes its self-test. `cargo xtask fixtures` fetches the core and
+core staged from a package into a release, where it passes its self-test; and `install`, `install` again and
+`uninstall` from such a package with no service manager (upgrade, rollback and pruning are unit tests, with a
+stand-in for the services). `cargo xtask fixtures` fetches the core and
 Codex; without them those tests are skipped locally and fail in CI.
 
 Codex 0.157.0 does not give the active thread ID in MCP request metadata, so queued delivery into a Codex

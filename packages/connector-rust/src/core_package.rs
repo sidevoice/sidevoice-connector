@@ -132,9 +132,9 @@ pub fn package_root() -> Result<PathBuf> {
     Ok(bin.parent().context("the package's root")?.to_path_buf())
 }
 
-/// The core the package at `root` carries, from its inventory: it must be this build's package (version, target)
-/// and name a core archive inside it.
-pub fn packaged(root: &Path) -> Result<PackagedCore> {
+/// The core the package at `root` carries, from its inventory: it must be the package of connector `version` for
+/// this target, and name a core archive inside it.
+pub fn packaged_as(root: &Path, version: &str) -> Result<PackagedCore> {
     let path = root.join(INVENTORY);
     if !path.exists() {
         bail!(Keyed::new(
@@ -145,12 +145,10 @@ pub fn packaged(root: &Path) -> Result<PackagedCore> {
     let inventory: Value = serde_json::from_slice(&read_bounded(&path, MAX_INVENTORY)?)
         .map_err(|error| mismatch(format!("{INVENTORY}: {error}")))?;
     let target = crate::identity::target().context("unsupported target")?;
-    if inventory["version"] != crate::identity::VERSION || inventory["target"] != target {
+    if inventory["version"] != version || inventory["target"] != target {
         return Err(mismatch(format!(
-            "{INVENTORY} is version {} for {}; this connector is {} for {target}",
-            inventory["version"],
-            inventory["target"],
-            crate::identity::VERSION
+            "{INVENTORY} is version {} for {}; this connector is {version} for {target}",
+            inventory["version"], inventory["target"],
         )));
     }
     let core = &inventory["core"];
@@ -534,7 +532,12 @@ pub struct Installed {
 /// The installer's step for the core: stages the core the package at `package` carries into `<release>/core`
 /// and runs its self-test there. A core that fails its self-test is removed again.
 pub fn install(package: &Path, release: &Path) -> Result<Installed> {
-    let core = packaged(package)?;
+    install_as(package, release, crate::identity::VERSION)
+}
+
+/// [`install`], for a package of connector version `version`.
+pub fn install_as(package: &Path, release: &Path, version: &str) -> Result<Installed> {
+    let core = packaged_as(package, version)?;
     let path = stage(&core, release)?;
     match self_test(&path) {
         Ok(self_test) => Ok(Installed {
@@ -559,7 +562,7 @@ impl Installed {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
@@ -585,7 +588,7 @@ mod tests {
     const SOURCE: &str = "0123456789abcdef0123456789abcdef01234567";
 
     /// A core whose program is a script: it passes its self-test, or fails it the way the core does.
-    fn core_files(passes: bool) -> Vec<(&'static str, Vec<u8>)> {
+    pub(crate) fn core_files(passes: bool) -> Vec<(&'static str, Vec<u8>)> {
         let program = if passes {
             "#!/bin/sh\necho '{\"detectors\":{\"sample_rate\":16000,\"frames\":3,\"max_voice_confidence\":0.9,\
              \"smart_turn_probability\":0.8,\"smart_turn_complete\":true},\"opus_decoded_samples\":320}'\n"
@@ -602,7 +605,7 @@ mod tests {
         ]
     }
 
-    fn core_archive(files: &[(&str, Vec<u8>)], extra: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(crate) fn core_archive(files: &[(&str, Vec<u8>)], extra: &[(&str, &[u8])]) -> Vec<u8> {
         let mut records: Vec<Value> = files
             .iter()
             .map(|(name, bytes)| {
@@ -781,7 +784,7 @@ mod tests {
     #[test]
     fn a_package_without_a_core_or_for_another_build_is_refused() {
         let scratch = Scratch::new("missing");
-        let error = packaged(&scratch.0).unwrap_err();
+        let error = packaged_as(&scratch.0, crate::identity::VERSION).unwrap_err();
         assert_eq!(key(&error), "core.package-missing", "{error}");
         fs::write(
             scratch.0.join(INVENTORY),
@@ -789,7 +792,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            key(&packaged(&scratch.0).unwrap_err()),
+            key(&packaged_as(&scratch.0, crate::identity::VERSION).unwrap_err()),
             "core.package-mismatch"
         );
         fs::write(
@@ -799,7 +802,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            key(&packaged(&scratch.0).unwrap_err()),
+            key(&packaged_as(&scratch.0, crate::identity::VERSION).unwrap_err()),
             "core.package-missing"
         );
     }

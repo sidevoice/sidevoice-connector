@@ -7,6 +7,7 @@
 
 #![allow(dead_code)]
 
+pub mod package;
 pub mod service;
 
 use std::collections::BTreeMap;
