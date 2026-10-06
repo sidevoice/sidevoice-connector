@@ -2,8 +2,8 @@
 
 One binary, `sidevoice-connector`, that links this machine's agent conversations (Claude Code, Codex, Cursor) to the
 Sidevoice core: it serves MCP to each conversation and runs the machine's connector daemon, which holds the link to
-the core. It is migrating to stand alone (sidevoice/sidevoice-connector#68); until that is done, installing, the
-service commands of an installed release and pairing are still the JavaScript package's (`packages/connector`).
+the core. It is migrating to stand alone (sidevoice/sidevoice-connector#68); until that is done, installing and pairing are
+still the JavaScript package's (`packages/connector`).
 
 ## Commands
 
@@ -13,7 +13,7 @@ service commands of an installed release and pairing are still the JavaScript pa
 | `connector [--service]` | The daemon: one per data directory. `--service` (or `SIDEVOICE_SERVICE=launchd\|systemd`) when a service manager runs it. |
 | `agents [--json]` | The agents on this computer and whether they use Sidevoice. |
 | `agents connect\|disconnect\|dismiss <claude\|codex\|cursor> [--json]` | Registers Sidevoice with an agent, removes its registration, or dismisses the new-agent notice. Only an entry Sidevoice wrote is ever changed. |
-| `service <install\|start\|stop\|restart\|status\|uninstall> --json` | The login service (being rebuilt: launchd and systemd). |
+| `service <install\|start\|stop\|restart\|status\|uninstall> [--json]` | The login service: two jobs under launchd or the systemd user manager; with no manager, Sidevoice on demand (below). |
 | `--version [--json]` | The release version; with `--json`, also the target and the source commit. |
 | `--installed` | Run as the installed release this binary is part of (below). |
 
@@ -57,8 +57,9 @@ installer (sidevoice/sidevoice-connector#66, decision 3).
 
 `cargo test` runs the unit tests and, in `tests/`, this binary against the sidevoice-core release pinned in
 `core.pin` at the repository root (a conversation joins through MCP, input from a call is delivered, a reply is
-saved, the core restarts and the link comes back), against the real Codex CLI in a disposable profile, and, on
-macOS, as a login service under the real launchd. `cargo xtask fixtures` fetches the core and Codex; without them
+saved, the core restarts and the link comes back), against the real Codex CLI in a disposable profile, as a
+login service under the real launchd (macOS) and the real systemd user manager (Linux; on a CI runner the test
+enables lingering for the runner's user), and with no service manager at all. `cargo xtask fixtures` fetches the core and Codex; without them
 those tests are skipped locally and fail in CI.
 
 Codex 0.157.0 does not give the active thread ID in MCP request metadata, so queued delivery into a Codex
@@ -71,3 +72,21 @@ crash immediately afterwards can lose that speech text ([Core issue #43](https:/
 A speech row copied from the JavaScript connector has no conversation reference; if the core later remints its
 binding ID, it is retained and reported rather than assigned to another conversation
 ([Connector issue #41](https://github.com/sidevoice/sidevoice-connector/issues/41)).
+
+## Login service and Sidevoice on demand
+
+`service install|uninstall|start|stop|restart|status` (`src/service/`) runs two jobs of this user's service manager:
+the core (`dev.sidevoice.core` under launchd, `sidevoice-core.service` under the systemd user manager) and the
+connector daemon (`dev.sidevoice.connector`, `sidevoice-connector.service`). The core job runs
+`R/current/core/bin/sidevoice-core-rust` with `idle-exit 0`; the connector job runs `D/install.json`'s `command` +
+`connector`. Neither job starts or signals the other. A person's stop (`D/node-stopped.json`) is written before the
+manager is asked and holds until `service start` or the next login; every change holds `D/install.lock`. On Linux,
+`service install` says whether the user lingers and prints `loginctl enable-linger <user>`; it never runs it.
+
+`service status --json`, and a daemon's `node.status`, is derived on every read from the manager, the core's
+`core-failure.json` and its health: `absent`, `not-installed`, `stopped-by-person`, `starting`, `backoff`,
+`running`, `failed` or `service-failed`, the states the desktop app reads.
+
+With no manager (`SIDEVOICE_SERVICE_MANAGER=none`, a container, an `su` shell, Linux without a user bus) or no jobs
+installed, an MCP server starts the connector from the selected installation, and the connector starts the core,
+detached, and again whenever its link to it fails.

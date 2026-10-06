@@ -120,9 +120,12 @@ fn with_no_manager_a_conversation_starts_the_connector_and_the_connector_the_cor
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("stopped"), "{stderr}");
+    // With no service there is no job to be stopped: the status says so (Node's order), and nothing answers.
+    let after = service(&profile, &extra, "status");
     assert_eq!(
-        service(&profile, &extra, "status")["state"],
-        "stopped-by-person"
+        (after["state"].as_str(), after["reachable"].as_bool()),
+        (Some("not-installed"), Some(false)),
+        "{after}"
     );
 
     // `start` lifts the stop; with no manager nothing runs until a conversation needs it.
