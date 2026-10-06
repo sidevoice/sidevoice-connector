@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::glibc;
 use crate::util::*;
-use crate::{Result, CORE_DIR, ENTRYPOINT, INVENTORY, KIND, ROOT_NAME, TARGETS};
+use crate::{target_names, Result, CORE_DIR, ENTRYPOINT, INVENTORY, KIND, ROOT_NAME};
 
 const MAX_COMPRESSED: u64 = 250_000_000;
 const MAX_TOTAL: u64 = 1_000_000_000;
@@ -186,7 +186,7 @@ pub(crate) fn unpack_checked(archive: &Path, destination: &Path) -> Result<(Path
     {
         return Err("wrong kind or entrypoint".into());
     }
-    if !TARGETS.contains(&target)
+    if !target_names().any(|name| name == target)
         || !is_commit(inventory["source_sha"].as_str().unwrap_or(""))
         || inventory["version"].as_str().unwrap_or("").is_empty()
     {

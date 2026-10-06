@@ -9,7 +9,7 @@ use serde_json::json;
 
 use crate::archive::unpack_checked;
 use crate::util::*;
-use crate::{Result, ENTRYPOINT, KIND, MANIFEST, ROOT_NAME, TARGETS};
+use crate::{target_names, Result, ENTRYPOINT, KIND, MANIFEST, ROOT_NAME};
 
 /// The name an archive is published under: the version for a release, `nightly` for the nightly (fixed names, so
 /// its download URLs never change). The commit is in the manifest and in every archive's inventory.
@@ -52,7 +52,7 @@ pub(crate) fn write_manifest(
         .unwrap_or("nightly");
     let mut bundles = serde_json::Map::new();
     let mut sums = Vec::new();
-    for target in TARGETS {
+    for target in target_names() {
         let built = dir.join(format!("{ROOT_NAME}-{target}.tar.zst"));
         let name = published_name(label, target);
         if built.exists() {
@@ -113,13 +113,13 @@ mod tests {
     #[test]
     fn a_release_lists_every_target_under_its_version() {
         let dir = TempDir::new("xtask-manifest-release").unwrap();
-        for target in TARGETS {
+        for target in target_names() {
             built(&dir.0, target, SHA, "0.7.0");
         }
         let bytes = write_manifest(&dir.0, Some("v0.7.0"), SHA, "0.7.0", b"lock").unwrap();
         let manifest = parse_json(&bytes, "manifest").unwrap();
         assert_eq!(manifest["version"], "0.7.0");
-        for target in TARGETS {
+        for target in target_names() {
             let name = published_name("0.7.0", target);
             assert_eq!(manifest["bundles"][target]["name"], name.as_str());
             assert!(dir.0.join(&name).is_file());
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn an_archive_of_another_commit_is_refused() {
         let dir = TempDir::new("xtask-manifest-commit").unwrap();
-        for target in TARGETS {
+        for target in target_names() {
             built(&dir.0, target, SHA, "0.7.0");
         }
         let other = "1111111111111111111111111111111111111111";
