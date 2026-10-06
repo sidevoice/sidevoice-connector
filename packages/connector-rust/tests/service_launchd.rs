@@ -1,8 +1,8 @@
 //! The connector's login service under the real launchd, with the real core, in a private profile (its jobs carry
 //! profile-specific labels, never the installed ones): install → both jobs up and linked → the core killed: launchd
 //! starts it again and the connector links to it → a person's stop → start → uninstall: no job, definition or
-//! socket left, the installation still there (`not-installed`) and, once it is removed too, `absent`. Nothing is
-//! written outside the profile.
+//! socket left, the installation still there (`not-installed`) and, once it is removed too, `absent`. Every place it
+//! uses comes from the profile's environment.
 //!
 //! macOS only. It loads jobs into this user's launchd domain, so outside CI it runs only when asked
 //! (`SIDEVOICE_TEST_LAUNCHD=1`).
@@ -20,26 +20,14 @@ use support::*;
 
 struct Service<'a> {
     profile: &'a Profile,
-    /// HOME and the agents' directories for the control commands: an empty directory that must stay empty, so
-    /// the service provably takes nothing from the caller's environment.
-    sentinel: PathBuf,
     installed: bool,
 }
 
 impl Service<'_> {
     fn run(&self, action: &str) -> Value {
-        let sentinel = self.sentinel.to_string_lossy().into_owned();
         let output = self
             .profile
             .connector(&["service", action, "--json"])
-            .env("HOME", &sentinel)
-            .env("CODEX_HOME", &sentinel)
-            .env("CLAUDE_CONFIG_DIR", &sentinel)
-            .env("CURSOR_CONFIG_DIR", &sentinel)
-            .env("CURSOR_DATA_DIR", &sentinel)
-            .env("XDG_CONFIG_HOME", &sentinel)
-            .env("XDG_DATA_HOME", &sentinel)
-            .env("SIDEVOICE_DATA_DIR", &sentinel)
             .output()
             .expect("run the service command");
         let text = String::from_utf8_lossy(&output.stdout);
@@ -98,18 +86,21 @@ fn alive(pid: u64) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
-/// The release layout the private service runs: `releases/current/core/bin/sidevoice-core` (here a wrapper that
-/// gives the real core its models) and `releases/current/dist/sidevoice-connector`.
+/// The release layout the private service runs, under the profile's release root (`$XDG_DATA_HOME/sidevoice`):
+/// `releases/current/core/bin/sidevoice-core` (here a wrapper that gives the real core its models) and
+/// `releases/current/dist/sidevoice-connector`.
 fn stage_release(profile: &Profile, core: &Path) {
-    let release = profile.root.join("releases/r1");
+    let root = release_root(profile);
+    let release = root.join("releases/r1");
     for dir in [
+        "",
         "releases",
         "releases/r1",
         "releases/r1/core",
         "releases/r1/core/bin",
         "releases/r1/dist",
     ] {
-        private_dir(&profile.root.join(dir));
+        private_dir(&root.join(dir));
     }
     let env = profile.core_env(core);
     let wrapper = format!(
@@ -123,7 +114,11 @@ fn stage_release(profile: &Profile, core: &Path) {
     let connector = release.join("dist/sidevoice-connector");
     fs::copy(CONNECTOR, &connector).unwrap();
     fs::set_permissions(&connector, fs::Permissions::from_mode(0o700)).unwrap();
-    symlink("r1", profile.root.join("releases/current")).unwrap();
+    symlink("r1", root.join("releases/current")).unwrap();
+}
+
+fn release_root(profile: &Profile) -> PathBuf {
+    profile.root.join("xdg/data/sidevoice")
 }
 
 #[test]
@@ -135,11 +130,8 @@ fn the_login_service_runs_recovers_stops_and_leaves_nothing_behind() {
     }
     let profile = Profile::new("launchd");
     stage_release(&profile, &core);
-    let sentinel = profile.root.join("sentinel");
-    private_dir(&sentinel);
     let mut service = Service {
         profile: &profile,
-        sentinel: sentinel.clone(),
         installed: false,
     };
 
@@ -195,7 +187,7 @@ fn the_login_service_runs_recovers_stops_and_leaves_nothing_behind() {
     assert_eq!(unserviced["state"], "not-installed", "{unserviced}");
     assert_eq!(unserviced["installed"], true, "{unserviced}");
     // Without the installation either, nothing is left.
-    fs::remove_file(profile.root.join("releases/current")).unwrap();
+    fs::remove_file(release_root(&profile).join("releases/current")).unwrap();
     let absent = service.run("status");
     assert_eq!(absent["state"], "absent", "{absent}");
     assert_eq!(absent["installed"], false, "{absent}");
@@ -204,9 +196,4 @@ fn the_login_service_runs_recovers_stops_and_leaves_nothing_behind() {
         assert!(!launchd_has(label), "{label} survived uninstall");
     }
     assert!(!profile.connector_socket().exists());
-    assert_eq!(
-        fs::read_dir(&sentinel).unwrap().count(),
-        0,
-        "the service wrote into the caller's home"
-    );
 }

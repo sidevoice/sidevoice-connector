@@ -76,7 +76,8 @@ pub fn read_json(path: &Path) -> Option<Value> {
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
 }
 
-/// A disposable private profile (`--profile-root`), removed when dropped. Under `/tmp`, short and canonical: a
+/// A disposable private profile, removed when dropped: every place the connector reads comes from the environment
+/// [`Profile::env`] gives its processes, all inside it. Under `/tmp`, short and canonical: a
 /// Unix socket path has a 104-byte limit on macOS, and the connector compares canonical paths.
 pub struct Profile {
     pub root: PathBuf,
@@ -152,7 +153,7 @@ impl Profile {
 
     pub fn connector(&self, args: &[&str]) -> Command {
         let mut command = self.command(CONNECTOR);
-        command.arg("--profile-root").arg(&self.root).args(args);
+        command.args(args);
         command
     }
 
@@ -210,14 +211,16 @@ impl Profile {
         process
     }
 
-    /// The connector's record of the core it linked to (`proof.json`), once it names `launch_id`.
+    /// The core the connector says it is linked to (its `status` over the connector's socket), once that is the core
+    /// started as `launch_id`.
     pub fn wait_linked(&self, launch_id: &str) -> Value {
         until(
             &format!("the connector linked to core {launch_id}"),
             60,
             || {
-                read_json(&self.data().join("proof.json"))
-                    .filter(|proof| proof["core_launch_id"] == launch_id)
+                connector_ipc(&self.connector_socket(), "status")
+                    .map(|status| status["core"].clone())
+                    .filter(|core| core["launch_id"] == launch_id)
             },
         )
     }
@@ -279,6 +282,23 @@ impl Drop for Process {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// One request to the connector over its socket (JSON lines `{id, method, params}`): its result, or `None` when the
+/// connector is not there or refused.
+pub fn connector_ipc(socket: &Path, method: &str) -> Option<Value> {
+    let mut stream = UnixStream::connect(socket).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    writeln!(
+        stream,
+        "{}",
+        json!({"id": 1, "method": method, "params": {}})
+    )
+    .ok()?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).ok()?;
+    let answer: Value = serde_json::from_str(&line).ok()?;
+    (answer["ok"] == true).then(|| answer["result"].clone())
 }
 
 /// One HTTP/1.0 request over the core's Unix socket; returns the status and the JSON body.

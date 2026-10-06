@@ -27,7 +27,7 @@ impl HostAgents {
                     .collect::<Option<Vec<_>>>()
             })
             .unwrap_or_default();
-        if !self.selected.owns(AgentId::Cursor, command, &args, None) {
+        if !self.selected.owns(command, &args) {
             return Ok("foreign".into());
         }
         Ok(
@@ -74,7 +74,7 @@ impl HostAgents {
                         .collect::<Option<Vec<_>>>()
                 })
                 .unwrap_or_default();
-            if !self.selected.owns(AgentId::Cursor, command, &args, None) {
+            if !self.selected.owns(command, &args) {
                 return Err(agent_failure("agents.foreign", AgentId::Cursor));
             }
             if command == self.selected.command && args == self.selected.args {
@@ -126,7 +126,7 @@ impl HostAgents {
                     .collect::<Option<Vec<_>>>()
             })
             .unwrap_or_default();
-        if !self.selected.owns(AgentId::Cursor, command, &args, None) {
+        if !self.selected.owns(command, &args) {
             return Err(agent_failure("agents.foreign", AgentId::Cursor));
         }
         servers.remove("sidevoice");

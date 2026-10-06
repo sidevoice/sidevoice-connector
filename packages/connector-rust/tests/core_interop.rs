@@ -17,9 +17,41 @@ fn a_conversation_talks_to_the_real_core_through_the_connector() {
     let _connector = profile.start_connector();
     let linked = profile.wait_linked("interop-1");
     assert_eq!(linked["protocol"], 3, "{linked}");
-    assert_eq!(linked["core_pid"], first_core.pid(), "{linked}");
+    assert_eq!(linked["pid"], first_core.pid(), "{linked}");
 
     let call = Presentation::open(&profile.core_socket());
+
+    // The machine as the room will list it (asked as the device the call paired): what this machine actually is,
+    // not a placeholder.
+    let listed = core_json(
+        &profile.core_socket(),
+        "GET",
+        "/api/connectors",
+        None,
+        Some(&call.token),
+    );
+    let machine = listed["connectors"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["connected"] == true))
+        .unwrap_or_else(|| panic!("no connected connector: {listed}"))
+        .clone();
+    let host = machine["host"].as_str().unwrap_or("");
+    assert!(!host.is_empty() && host != "rust-proof", "{machine}");
+    let platform = machine["platform"].as_str().unwrap_or("");
+    assert!(
+        platform.starts_with("macOS ") || platform.starts_with("Linux "),
+        "{machine}"
+    );
+    assert!(
+        machine["version"].as_str().is_some_and(|v| !v.is_empty()),
+        "{machine}"
+    );
+    // The profile keeps homes for Claude Code, Codex and Cursor; nothing else is claimed.
+    assert_eq!(
+        machine["harnesses"],
+        json!(["claude", "codex", "cursor"]),
+        "{machine}"
+    );
     let receiver = http_receiver();
     let thread = "connector-interop-thread";
     let mut command = profile.connector(&["mcp"]);
@@ -139,7 +171,7 @@ fn the_connector_and_core_sockets_are_this_users_alone() {
         profile.core_data(),
         profile.connector_socket(),
         profile.core_socket(),
-        profile.data().join("proof.json"),
+        profile.data().join("connector.lock"),
     ] {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(

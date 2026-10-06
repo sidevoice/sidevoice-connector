@@ -1,18 +1,27 @@
 mod adapters;
 mod agents;
+mod core_ready;
 mod cursor_app;
 mod daemon;
+mod identity;
 mod link;
+mod lock;
+mod logfile;
 mod mcp;
+mod messages;
 mod pairing;
-mod proof;
+mod process;
+mod profile;
+mod release;
+mod secure_fs;
 mod service;
 
 use anyhow::{bail, Result};
-use clap::{Parser, Subcommand};
-use proof::Profile;
-use serde_json::json;
-use std::path::PathBuf;
+use clap::{CommandFactory, Parser, Subcommand};
+use messages::Keyed;
+use profile::Profile;
+use serde_json::{json, Value};
+use std::process::ExitCode;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 async fn bounded_line<R: AsyncBufRead + Unpin>(
@@ -44,43 +53,43 @@ async fn bounded_line<R: AsyncBufRead + Unpin>(
     }
 }
 
+/// The command line is English only and is not translated. With `--json`, a command prints one JSON object on
+/// stdout, and a failure is `{"ok":false,"error":{"key","params","message"}}` with exit status 1.
 #[derive(Parser)]
 #[command(
     name = "sidevoice-connector",
-    version,
-    about = "Isolated Rust connector proof"
+    about = "Sidevoice connector: links this machine's agent conversations to the Sidevoice core",
+    disable_version_flag = true
 )]
 struct Cli {
-    /// Reconstruct the complete isolated profile in a fresh process.
+    /// Print this build's version (with --json: version, target and source commit).
+    #[arg(short = 'V', long)]
+    version: bool,
+    /// Print one JSON object instead of text.
     #[arg(long, global = true)]
-    profile_root: Option<PathBuf>,
-    /// Use the currently selected production release and the user's normal profile paths.
+    json: bool,
+    /// Run as the installed release this binary is part of.
     #[arg(long, global = true)]
     installed: bool,
     #[command(subcommand)]
-    command: Action,
+    command: Option<Action>,
 }
 
 #[derive(Subcommand)]
 enum Action {
-    /// Report this target binary's build identity for the trusted SEA packager.
-    RuntimeIdentity {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Serve MCP over stdio for one supported conversation adapter.
+    /// Serve MCP over stdio for one agent conversation.
     Mcp,
-    /// Link the isolated Core to Codex sessions; --service is for its private launchd job.
+    /// Run this machine's connector daemon; --service when a service manager runs it.
     Connector {
         #[arg(long)]
         service: bool,
     },
-    /// Inspect or explicitly register only this isolated Codex profile.
-    Codex {
+    /// List the agents on this computer and whether they use Sidevoice, or change one's registration.
+    Agents {
         #[command(subcommand)]
-        command: CodexAction,
+        action: Option<AgentsAction>,
     },
-    /// Manage this proof profile's private launchd service.
+    /// Manage the Sidevoice login service.
     Service {
         #[command(subcommand)]
         command: ServiceAction,
@@ -88,126 +97,246 @@ enum Action {
 }
 
 #[derive(Subcommand)]
-enum ServiceAction {
-    Install {
-        #[arg(long)]
-        json: bool,
-    },
-    Start {
-        #[arg(long)]
-        json: bool,
-    },
-    Stop {
-        #[arg(long)]
-        json: bool,
-    },
-    Restart {
-        #[arg(long)]
-        json: bool,
-    },
-    Status {
-        #[arg(long)]
-        json: bool,
-    },
-    Uninstall {
-        #[arg(long)]
-        json: bool,
-    },
+enum AgentsAction {
+    /// Register Sidevoice with the agent.
+    Connect { id: String },
+    /// Remove Sidevoice's registration from the agent.
+    Disconnect { id: String },
+    /// Dismiss the new-agent notice for the agent.
+    Dismiss { id: String },
 }
 
 #[derive(Subcommand)]
-enum CodexAction {
-    Inspect,
-    Connect,
+enum ServiceAction {
+    Install,
+    Start,
+    Stop,
+    Restart,
+    Status,
+    Uninstall,
+}
+
+/// A command line that does not parse, asked for `--json`: said as the keyed failure, not as clap's text. Help and
+/// version requests, and any error without `--json`, are left to clap.
+fn usage_refusal(error: &clap::Error, args: impl Iterator<Item = String>) -> Option<Value> {
+    use clap::error::ErrorKind;
+    if matches!(
+        error.kind(),
+        ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    ) || !args.into_iter().any(|arg| arg == "--json")
+    {
+        return None;
+    }
+    let text = error.kind().as_str().unwrap_or("invalid command line");
+    Some(Keyed::new("connector.usage", json!({"detail":text})).value())
+}
+
+/// What `--version` says: the version alone, or with `--json` the build's identity.
+fn version(json: bool) -> String {
+    if json {
+        json!({"ok":true,"version":identity::VERSION,"target":env!("SIDEVOICE_CONNECTOR_TARGET"),
+            "source_sha":env!("SIDEVOICE_CONNECTOR_BUILD_SHA")})
+        .to_string()
+    } else {
+        format!("sidevoice-connector {}", identity::VERSION)
+    }
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    if let Action::RuntimeIdentity { json } = &cli.command {
-        let identity = json!({"kind":"rust-native-v1", "target":env!("SIDEVOICE_CONNECTOR_TARGET"),
-            "source_sha":env!("SIDEVOICE_CONNECTOR_BUILD_SHA"), "version":env!("SIDEVOICE_CONNECTOR_VERSION")});
-        if *json {
-            println!("{identity}");
-        } else {
-            println!(
-                "Rust Connector {} ({})",
-                identity["version"], identity["target"]
-            );
-        }
-        return Ok(());
-    }
-    let explicit_profile = cli.profile_root.is_some();
-    if explicit_profile && cli.installed {
-        bail!("proof and installed profiles cannot be combined");
-    }
-    let profile = match cli.profile_root {
-        Some(root) => Profile::from_root(&root)?,
-        None if cli.installed => Profile::from_installed_env()?,
-        None => Profile::from_env()?,
-    };
-    match cli.command {
-        Action::RuntimeIdentity { .. } => {
-            unreachable!("runtime identity returned before profile setup")
-        }
-        Action::Mcp => mcp::run(profile).await,
-        Action::Connector { service } => {
-            if service && (cli.installed || !explicit_profile) {
-                eprintln!(
-                    "{}",
-                    crate::agents::message(
-                        "service.proof-profile-required",
-                        &serde_json::Value::Null
-                    )
-                );
-                std::process::exit(1);
+async fn main() -> ExitCode {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            if let Some(refusal) = usage_refusal(&error, std::env::args()) {
+                println!("{refusal}");
+                return ExitCode::FAILURE;
             }
-            let managed = if profile.is_installed() {
-                matches!(
+            error.exit();
+        }
+    };
+    if cli.version {
+        println!("{}", version(cli.json));
+        return ExitCode::SUCCESS;
+    }
+    let Some(action) = cli.command else {
+        let _ = Cli::command().print_help();
+        return ExitCode::from(2);
+    };
+    match run(action, cli.installed, cli.json).await {
+        Ok(code) => code,
+        Err(error) => {
+            let keyed = messages::keyed(&error);
+            if cli.json {
+                println!("{}", keyed.value());
+            } else {
+                eprintln!("sidevoice: {}", keyed.message());
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(action: Action, installed: bool, json: bool) -> Result<ExitCode> {
+    let profile = Profile::from_env(installed)?;
+    match action {
+        Action::Mcp => mcp::run(profile).await.map(|()| ExitCode::SUCCESS),
+        Action::Connector { service } => {
+            let managed = service
+                || matches!(
                     std::env::var("SIDEVOICE_SERVICE").as_deref(),
                     Ok("launchd" | "systemd")
-                )
-            } else {
-                service
-            };
-            daemon::run(profile, managed).await
+                );
+            daemon::run(profile, managed)
+                .await
+                .map(|()| ExitCode::SUCCESS)
         }
-        Action::Codex { command } => {
-            let host_agents = agents::HostAgents::new(profile.clone())?;
-            let _connector_lock = profile.try_connector_lock()?;
-            let (method, params) = match command {
-                CodexAction::Inspect => ("agents.list", json!({"rescan":true,"watch":"codex"})),
-                CodexAction::Connect => ("agents.connect", json!({"id":"codex"})),
-            };
-            let answer = host_agents.handle(method, params).await;
-            let failed = answer.get("error").is_some();
-            println!("{answer}");
-            if failed {
-                std::process::exit(1);
-            }
-            Ok(())
-        }
+        Action::Agents { action } => agents_command(profile, action, json).await,
         Action::Service { command } => {
-            if !explicit_profile {
-                let answer = service::proof_profile_required();
-                println!("{answer}");
-                std::process::exit(1);
-            }
             let action = match command {
-                ServiceAction::Install { .. } => service::Action::Install,
-                ServiceAction::Start { .. } => service::Action::Start,
-                ServiceAction::Stop { .. } => service::Action::Stop,
-                ServiceAction::Restart { .. } => service::Action::Restart,
-                ServiceAction::Status { .. } => service::Action::Status,
-                ServiceAction::Uninstall { .. } => service::Action::Uninstall,
+                ServiceAction::Install => service::Action::Install,
+                ServiceAction::Start => service::Action::Start,
+                ServiceAction::Stop => service::Action::Stop,
+                ServiceAction::Restart => service::Action::Restart,
+                ServiceAction::Status => service::Action::Status,
+                ServiceAction::Uninstall => service::Action::Uninstall,
             };
             let answer = service::run(profile, action).await;
-            let failed = answer.get("ok") != Some(&serde_json::Value::Bool(true));
             println!("{answer}");
-            if failed {
-                std::process::exit(1);
-            }
-            Ok(())
+            Ok(if answer.get("ok") == Some(&Value::Bool(true)) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
         }
+    }
+}
+
+/// `agents [--json]`, `agents connect|disconnect|dismiss <id> [--json]`.
+async fn agents_command(
+    profile: Profile,
+    action: Option<AgentsAction>,
+    json: bool,
+) -> Result<ExitCode> {
+    let host_agents = agents::HostAgents::new(profile)?;
+    let (method, id, done) = match &action {
+        None => ("agents.list", None, ""),
+        Some(AgentsAction::Connect { id }) => (
+            "agents.connect",
+            Some(id),
+            "Connected {agent} to Sidevoice.",
+        ),
+        Some(AgentsAction::Disconnect { id }) => (
+            "agents.disconnect",
+            Some(id),
+            "Disconnected Sidevoice from {agent}.",
+        ),
+        Some(AgentsAction::Dismiss { id }) => (
+            "agents.dismiss",
+            Some(id),
+            "Dismissed the new-agent notice for {agent}.",
+        ),
+    };
+    let params = match id {
+        Some(id) => json!({"id":id}),
+        None => json!({"rescan":true}),
+    };
+    let mut answer = host_agents.handle(method, params).await;
+    if let Some(error) = answer.get("error") {
+        let key = error.get("key").and_then(Value::as_str).unwrap_or("");
+        let params = error.get("params").cloned().unwrap_or(json!({}));
+        if json {
+            println!("{}", json!({"ok":false,"error":error}));
+        } else {
+            eprintln!("sidevoice: {}", messages::message(key, &params));
+        }
+        return Ok(ExitCode::FAILURE);
+    }
+    if json {
+        answer["ok"] = json!(true);
+        println!("{answer}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let rows = answer
+        .get("agents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let label = |id: &str| {
+        rows.iter()
+            .find(|row| row["id"] == id)
+            .and_then(|row| row["label"].as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| messages::message(&format!("harness.{id}"), &json!({})))
+    };
+    match id {
+        Some(id) => println!("{}", done.replace("{agent}", &label(id))),
+        None if rows.is_empty() => println!("No supported agents were found on this computer."),
+        None => {
+            for row in &rows {
+                let state = match row["registration"].as_str() {
+                    Some("connected") => "connected to Sidevoice",
+                    Some("not-connected") => "not connected",
+                    Some("foreign") => "another Sidevoice registration is present",
+                    Some("invalid") => "its Sidevoice registration is unreadable",
+                    _ => "registration state unknown",
+                };
+                let version = row["version"].as_str().unwrap_or("version unknown");
+                println!(
+                    "{}: {state} ({version})",
+                    row["label"].as_str().unwrap_or("?")
+                );
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_is_the_release_version_and_its_json_names_the_build() {
+        assert_eq!(
+            version(false),
+            format!("sidevoice-connector {}", identity::VERSION)
+        );
+        let value: Value = serde_json::from_str(&version(true)).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["version"], identity::VERSION);
+        assert_eq!(value["target"], env!("SIDEVOICE_CONNECTOR_TARGET"));
+        assert_eq!(value["source_sha"], env!("SIDEVOICE_CONNECTOR_BUILD_SHA"));
+    }
+
+    #[test]
+    fn the_command_line_parses_and_names_no_proof_mode() {
+        Cli::command().debug_assert();
+        assert!(Cli::try_parse_from(["x", "--profile-root", "/tmp/p", "mcp"]).is_err());
+        assert!(Cli::try_parse_from(["x", "codex", "inspect"]).is_err());
+        assert!(Cli::try_parse_from(["x", "runtime-identity"]).is_err());
+        let cli = Cli::try_parse_from(["x", "agents", "connect", "codex", "--json"]).unwrap();
+        assert!(cli.json);
+        let cli = Cli::try_parse_from(["x", "--version", "--json"]).unwrap();
+        assert!(cli.version && cli.json);
+        let error = Cli::try_parse_from(["x", "agents", "frobnicate", "--json"])
+            .err()
+            .unwrap();
+        let args = || {
+            ["x", "agents", "frobnicate", "--json"]
+                .map(String::from)
+                .into_iter()
+        };
+        let refusal = usage_refusal(&error, args()).unwrap();
+        assert_eq!(refusal["ok"], false);
+        assert_eq!(refusal["error"]["key"], "connector.usage");
+        assert!(usage_refusal(
+            &error,
+            ["x", "agents", "frobnicate"].map(String::from).into_iter()
+        )
+        .is_none());
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.to_lowercase().contains("proof"), "{help}");
     }
 }

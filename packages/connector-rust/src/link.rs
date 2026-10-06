@@ -1,4 +1,6 @@
-use crate::proof::{verify_socket, Profile, Ready};
+use crate::core_ready::Ready;
+use crate::profile::Profile;
+use crate::secure_fs::verify_socket;
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -26,6 +28,8 @@ pub struct Link {
     pending: Mutex<HashMap<String, oneshot::Sender<Result<Value, String>>>>,
     serial: AtomicU64,
     generation: AtomicU64,
+    /// The core this link is connected to (`launch_id`, `pid`, `protocol`), for status and diagnostics.
+    core: RwLock<Option<Value>>,
 }
 
 impl Link {
@@ -35,6 +39,7 @@ impl Link {
             pending: Mutex::new(HashMap::new()),
             serial: AtomicU64::new(2),
             generation: AtomicU64::new(1),
+            core: RwLock::new(None),
         })
     }
 
@@ -94,8 +99,14 @@ impl Link {
         }
     }
 
+    /// The core this link is connected to, when it is.
+    pub async fn core(&self) -> Option<Value> {
+        self.core.read().await.clone()
+    }
+
     async fn reset(&self) {
         *self.tx.write().await = None;
+        *self.core.write().await = None;
         for (_, waiting) in self.pending.lock().await.drain() {
             let _ = waiting.send(Err("disconnected".into()));
         }
@@ -125,7 +136,7 @@ impl Link {
                 Ok(()) => backoff = 100,
                 Err(error) => {
                     let message = error.to_string();
-                    eprintln!("[sidevoice rust proof] Core link: {message}");
+                    crate::logfile::log(&format!("Core link: {message}"));
                     if let Some(first) = first.take() {
                         let _ = first.send(Err(message.clone()));
                     }
@@ -159,11 +170,11 @@ impl Link {
             client_async_with_config("ws://localhost/api/connectors/v3", stream, Some(config)),
         )
         .await??;
-        let hello = json!({"jsonrpc":"2.0","id":"c:1","method":"connector.hello","params":{
-            "protocol":3,"connector_id":ready.connector_id,"token":ready.token,
-            "host":std::env::var("SIDEVOICE_HOST_ID").unwrap_or_else(|_| "rust-proof".into()),
-            "platform":std::env::consts::OS,"version":env!("CARGO_PKG_VERSION"),"harnesses":["claude","codex","cursor","http"]
-        }});
+        let mut params = crate::identity::machine(profile);
+        params["protocol"] = json!(3);
+        params["connector_id"] = json!(ready.connector_id);
+        params["token"] = json!(ready.token);
+        let hello = json!({"jsonrpc":"2.0","id":"c:1","method":"connector.hello","params":params});
         ws.send(Message::Text(hello.to_string().into())).await?;
         let reply = timeout(Duration::from_secs(5), ws.next())
             .await?
@@ -174,13 +185,14 @@ impl Link {
         {
             bail!("Core v3 authentication refused");
         }
-        profile.write_evidence(&ready)?;
         if let Some(first) = first.take() {
             let _ = first.send(Ok(ready.clone()));
         }
         let (mut write, mut read) = ws.split();
         let (tx, mut rx) = mpsc::channel::<Message>(128);
         *self.tx.write().await = Some(tx.clone());
+        *self.core.write().await =
+            Some(json!({"launch_id":ready.launch_id,"pid":ready.pid,"protocol":3}));
         let mut tasks = JoinSet::new();
         tasks.spawn(async move {
             while let Some(message) = rx.recv().await {

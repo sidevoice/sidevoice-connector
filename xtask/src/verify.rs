@@ -23,7 +23,7 @@ const LINUX_SYSTEM: [&str; 9] = [
 ];
 
 /// Unpacks the archive somewhere else (a path with a space), checks the binary loads only what every machine of
-/// its target has, and runs it from there: `--version` and `runtime-identity --json` must name the inventory's
+/// its target has, and runs it from there: `--version` and `--version --json` must name the inventory's
 /// version, target and source commit.
 pub(crate) fn verify(archive: &Path) -> Result<()> {
     let work = TempDir::new_in(Path::new("/tmp"), "sidevoice connector relocated")?;
@@ -76,8 +76,8 @@ pub(crate) fn verify(archive: &Path) -> Result<()> {
         ));
     }
     let identity = parse_json(
-        run(&["runtime-identity", "--json"])?.as_bytes(),
-        "runtime-identity",
+        run(&["--version", "--json"])?.as_bytes(),
+        "--version --json",
     )?;
     for (field, wanted) in [
         ("version", &inventory["version"]),
@@ -86,7 +86,7 @@ pub(crate) fn verify(archive: &Path) -> Result<()> {
     ] {
         if identity[field] != *wanted {
             return Err(format!(
-                "runtime identity {field} is {}, the archive says {wanted}",
+                "--version --json says {field} is {}, the archive says {wanted}",
                 identity[field]
             ));
         }

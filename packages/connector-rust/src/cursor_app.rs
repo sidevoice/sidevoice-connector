@@ -1,4 +1,4 @@
-use crate::proof::{atomic_json, private_file};
+use crate::secure_fs::{atomic_json, private_file};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -18,8 +18,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn resource_html() -> String {
     include_str!("cursor-app.html")
-        .replace("__SIDEVOICE_EN__", include_str!("../messages/en.json"))
-        .replace("__SIDEVOICE_ES__", include_str!("../messages/es.json"))
+        .replace("__SIDEVOICE_EN__", include_str!("../messages/card/en.json"))
+        .replace("__SIDEVOICE_ES__", include_str!("../messages/card/es.json"))
 }
 
 #[derive(Debug)]
@@ -143,7 +143,7 @@ impl CursorApps {
                                 });
                             }
                             Err(error) => {
-                                eprintln!("[sidevoice rust proof] Cursor card listener: {error}");
+                                crate::logfile::log(&format!("Cursor card listener: {error}"));
                                 break;
                             }
                         }
