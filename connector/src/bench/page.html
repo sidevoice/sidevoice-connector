@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Sidevoice bench</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 0; display: grid; grid-template-columns: 320px 1fr 380px; height: 100vh; }
+  section { overflow: auto; padding: 12px; border-right: 1px solid #ddd; }
+  h2 { font-size: 15px; margin: 4px 0 10px; }
+  .binding { border: 1px solid #ccc; border-radius: 6px; padding: 8px; margin-bottom: 8px; cursor: pointer; }
+  .binding.selected { border-color: #2563eb; background: #eff6ff; }
+  .binding.closed { opacity: .5; }
+  .muted { color: #666; font-size: 12px; }
+  .message { margin: 6px 0; padding: 6px 8px; border-radius: 6px; max-width: 80%; white-space: pre-wrap; }
+  .user { background: #e0e7ff; margin-left: auto; }
+  .assistant { background: #f3f4f6; }
+  .receipt { font-size: 11px; color: #555; }
+  #messages { display: flex; flex-direction: column; min-height: 60vh; }
+  form { display: flex; gap: 6px; margin-top: 10px; }
+  textarea { flex: 1; height: 54px; font: inherit; }
+  pre { font-size: 11px; white-space: pre-wrap; word-break: break-all; margin: 0 0 6px; border-bottom: 1px solid #eee; }
+</style>
+</head>
+<body>
+<section>
+  <h2>Conversations</h2>
+  <div id="call" class="muted">Opening a call on the core…</div>
+  <div id="bindings"></div>
+</section>
+<section>
+  <h2 id="title">Select a conversation</h2>
+  <div id="working" class="muted"></div>
+  <div id="messages"></div>
+  <form id="say">
+    <textarea id="text" placeholder="What you would say (Enter sends, Shift+Enter is a new line)"></textarea>
+    <button>Send</button>
+  </form>
+  <div id="error" class="muted"></div>
+</section>
+<section>
+  <h2>Call events</h2>
+  <div id="events"></div>
+</section>
+<script>
+"use strict";
+let selected = null, since = 0;
+const working = {};
+const $ = (id) => document.getElementById(id);
+const text = (tag, className, value) => {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  node.textContent = value;
+  return node;
+};
+async function getJson(url, options) {
+  const response = await fetch(url, options);
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.error || response.status);
+  return body;
+}
+async function refresh() {
+  try {
+    const state = await getJson(`/api/state?since=${since}`);
+    $("call").textContent = state.call ? `Call open (session ${state.session})` : "Opening a call on the core…";
+    for (const { seq, event } of state.events) {
+      since = Math.max(since, seq);
+      if (event.type === "voice-conversation" && event.data && "working" in event.data) working[event.data.thread_id] = event.data.working;
+      $("events").prepend(text("pre", "", JSON.stringify(event)));
+    }
+    const list = $("bindings");
+    list.replaceChildren();
+    for (const binding of state.bindings || []) {
+      const card = document.createElement("div");
+      card.className = "binding" + (binding.thread === selected ? " selected" : "") + (binding.connected ? "" : " closed");
+      card.append(text("div", "", binding.title || binding.thread));
+      const engine = binding.engine ? ` · ${binding.engine.model || ""} ${binding.engine.effort || ""}` : "";
+      card.append(text("div", "muted", `${binding.harness} · ${binding.input_mode} · ${binding.connected ? "live" : "closed"}${engine}`));
+      card.append(text("div", "muted", `thread ${binding.thread}`));
+      card.onclick = () => { selected = binding.thread; $("title").textContent = binding.title || binding.thread; refresh(); };
+      list.append(card);
+    }
+    if (selected) {
+      $("working").textContent = selected in working ? (working[selected] ? "Working…" : "Idle") : "";
+      const history = await getJson(`/api/history?thread=${encodeURIComponent(selected)}`);
+      const messages = $("messages");
+      messages.replaceChildren();
+      for (const row of history.messages || []) {
+        const bubble = text("div", `message ${row.role === "user" ? "user" : "assistant"}`, row.text);
+        bubble.append(text("div", "receipt", row.status));
+        messages.append(bubble);
+      }
+    }
+  } catch (error) {
+    $("error").textContent = String(error);
+  }
+}
+$("say").onsubmit = async (event) => {
+  event.preventDefault();
+  const said = $("text").value.trim();
+  if (!selected || !said) return;
+  try {
+    await getJson("/api/say", { method: "POST", headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ thread: selected, text: said }) });
+    $("text").value = "";
+    $("error").textContent = "";
+  } catch (error) {
+    $("error").textContent = String(error);
+  }
+  refresh();
+};
+$("text").onkeydown = (event) => {
+  if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); $("say").requestSubmit(); }
+};
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
