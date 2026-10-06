@@ -117,6 +117,7 @@ impl Link {
         profile: Profile,
         incoming: mpsc::Sender<Incoming>,
         first: oneshot::Sender<Result<Ready, String>>,
+        supervisor: Arc<crate::service::launcher::CoreSupervisor>,
     ) {
         let mut first = Some(first);
         let mut backoff = 100u64;
@@ -140,6 +141,8 @@ impl Link {
                     if let Some(first) = first.take() {
                         let _ = first.send(Err(message.clone()));
                     }
+                    // A core this connector starts (no core job) is started again when none answers.
+                    supervisor.link_failed().await;
                     if message.contains("authentication refused")
                         || message.contains("Core v3 upgrade required")
                     {

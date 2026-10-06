@@ -7,6 +7,8 @@
 
 #![allow(dead_code)]
 
+pub mod service;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
