@@ -33,7 +33,7 @@ pub fn core_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/sidevoice-core/sidevoice-core-rust")
+                .join("../target/sidevoice-core/sidevoice-core-rust")
         });
     if dir.join("bin/sidevoice-core-rust").is_file() {
         return Some(dir.canonicalize().expect("core directory"));

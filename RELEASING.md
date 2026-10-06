@@ -1,13 +1,12 @@
 # Releasing
 
-One version for the connector, tagged `vX.Y.Z`. It lives in `packages/connector-rust/Cargo.toml` (the build tooling at
+One version for the connector, tagged `vX.Y.Z`. It lives in `connector/Cargo.toml` (the build tooling at
 the workspace root carries the same one, and `Cargo.lock` both); release-please moves them together
 (`release-please-config.json`). Never edit it by hand. The connector is distributed as GitHub Releases of this
 repository, one archive per target, and on npm as the package `sidevoice` with one package per platform built from
 those very archives ([npm](#npm-what-is-published-and-how-to-add-a-platform)).
 
-The old Node package (`packages/connector`, `@sidevoice/uplink` on npm, deprecated) is not built, tested or published
-here any more.
+The earlier Node package, `@sidevoice/uplink` on npm, is deprecated and no longer in this repository.
 
 ## What each act means
 
@@ -27,7 +26,7 @@ publish | npm | npm-smoke | npm-publish`):
   `native-core-manifest.json` and `attestation.sigstore.json` (signed by the core's `release.yml` on `main`), into
   `target/sidevoice-core` (unpacked, with the checked archive beside it); and the pinned Codex CLI into
   `target/codex`. Without them the tests that need them are skipped locally and fail in CI.
-- `cargo test --locked` runs the unit tests and the integration tests in `packages/connector-rust/tests/`: the
+- `cargo test --locked` runs the unit tests and the integration tests in `connector/tests/`: the
   connector against the real core, registration with the real Codex CLI, and (macOS) the login service under the
   real launchd.
 - `cargo xtask dist` builds this machine's release binary and packages it exactly as the release does, with the
@@ -90,7 +89,7 @@ gh attestation verify sidevoice-connector-0.7.0-linux-x86_64.tar.zst \
 ```
 
 The core is inside (sidevoice/sidevoice-connector#66, decision 2): nothing is downloaded at install. Installing
-stages it from the package into the release and runs its self-test there (`packages/connector-rust/src/core_package.rs`).
+stages it from the package into the release and runs its self-test there (`connector/src/core_package.rs`).
 
 The changelog is written from the squashed PR titles. To change it, edit `CHANGELOG.md` in the release PR right
 before merging it: any later merge into `main` regenerates the PR. After the release, fix the notes on the
@@ -165,7 +164,7 @@ Say Windows x64 or macOS x86_64:
 4. **Add its runner** to the matrices of `ci.yml` (`test`) and `release.yml` (`dist`), and to `lint` in `ci.yml` if
    it compiles code no other runner does.
 5. **What is specific to the platform**, each a change of its own:
-   - the connector's own target name (`packages/connector-rust/src/identity.rs`) and its service manager
+   - the connector's own target name (`connector/src/identity.rs`) and its service manager
      (`src/service/`: launchd and systemd today; Windows needs its own);
    - a pinned sidevoice-core release built for that target (`core.pin`, `xtask/src/core.rs`);
    - linking: on Linux the glibc floor (`xtask/src/glibc.rs`, cargo-zigbuild in `.github/actions/setup`); on

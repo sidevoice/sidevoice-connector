@@ -55,7 +55,7 @@ pub(crate) fn dist() -> Result<()> {
     if let Some(build_target) = &build_target {
         build.args(["--target", build_target]);
     }
-    // The build identity the binary reports (packages/connector-rust/build.rs).
+    // The build identity the binary reports (connector/build.rs).
     let status = build
         .env("SIDEVOICE_CONNECTOR_BUILD_SHA", &source_sha)
         .env("SIDEVOICE_CONNECTOR_TARGET", target)

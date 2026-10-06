@@ -64,7 +64,7 @@ your machine (`@sidevoice/sidevoice-<os>-<cpu>`, with the core inside); installi
 | Agent | Setup | What you say reaches the conversation |
 |---|---|---|
 | Claude Code | Registered by `install`. | Delivered into the running session. |
-| Codex | `install` prints the lines to add to `~/.codex/config.toml`; then restart Codex. | Queued into the thread with `codex queue`. |
+| Codex | Registered by `install` through the Codex CLI (without it, `install` prints what to add to `~/.codex/config.toml`); then restart Codex. | Queued into the thread with `codex queue`. |
 | Cursor (experimental) | Registered by `install` in `~/.cursor/mcp.json`; approve the new MCP server once. | Cursor offers no route of its own. The CLI receives it only in a chat started with `cursor-agent persist` (needs tmux); the editor, while the small Sidevoice card stays open in that chat. |
 
 Any other agent can receive through an HTTP endpoint of its own (`SIDEVOICE_DELIVERY_URL`).
@@ -81,37 +81,40 @@ RHEL 8 and their later releases, and most other distributions since 2019; not mu
 
 ## Commands
 
-The package installs one command, `sidevoice`:
+The package installs one command, `sidevoice` (the release archive's binary is `sidevoice-connector`; same
+commands). With `--json`, a command prints one JSON object on stdout, and a failure as a stable key with an
+English message.
 
 | Command | What it does |
 |---|---|
-| `install` | Installs this machine's core, starts it, checks it answers, then registers the voice tools. `--no-core` skips the core. |
-| `uninstall` | The reverse of `install`: unregisters the voice tools, stops the connector and removes what it installed. Agent configuration files it did not write are never edited; it prints what to remove. |
+| `install` | Installs this package's connector and the core it carries (or updates to them), starts both, checks they answer (or goes back to the previous version), then registers the voice tools with the agents it finds. `--no-agents` registers none. |
+| `uninstall` | The reverse of `install`: stops Sidevoice, removes its service jobs and the agent registrations it wrote, then what it installed and its data. Agent configuration it did not write is never edited. |
 | `pair-device` | Prints a one-time code (and its QR) that pairs a device with this machine. |
+| `pair <room-url> <code>` | Pairs this machine with a room, with the one-time code the room shows. |
+| `agents` | The agents on this machine and whether they use Sidevoice; `agents connect\|disconnect\|dismiss <claude\|codex\|cursor>` changes one. |
+| `service <install\|start\|stop\|restart\|status\|uninstall>` | Sidevoice at login: the core and the connector as two jobs of launchd or the systemd user manager. Without a service manager, Sidevoice runs on demand. |
 | `mcp` | The MCP server an agent starts, one per conversation. You do not run it yourself. |
 | `connector` | The per-machine process the MCP servers share; started on demand, gone when the last conversation leaves. |
+| `--version` | The version; with `--json`, also the target and the source commit. |
 
-[`packages/connector/README.md`](packages/connector/README.md) describes how the pieces talk to each other.
+[`connector/README.md`](connector/README.md) describes each command, where things are kept and how the pieces talk
+to each other.
 
 ## Develop
 
-The connector is becoming one Rust binary (`packages/connector-rust`); the Node package (`packages/connector`) is
-the installer until then, and is no longer part of CI.
+The connector is one Rust binary, the crate in [`connector/`](connector); the build tooling is `cargo xtask`
+([`xtask/`](xtask)). You need the Rust toolchain pinned in [`.github/actions/setup`](.github/actions/setup/action.yml).
 
 ```sh
 cargo xtask fixtures   # what the tests run against: the sidevoice-core release pinned in core.pin, the pinned Codex CLI
-cargo test --locked    # unit tests, and the connector against the real core, Codex and (macOS) launchd
+cargo test --locked    # unit tests, and the connector against the real core, Codex and the service managers
 cargo xtask dist       # this machine's release archive, built and verified as a release builds it
                        # (Linux: needs zig and cargo-zigbuild, to link against glibc 2.28; RELEASING.md)
-
-npm ci
-npm test               # the Node package: node --test, on the source
-npm run build          # its bundled dist/cli.mjs
+cargo xtask npm target/dist/sidevoice-connector-<target>.tar.zst && cargo xtask npm-smoke
+                       # its npm packages, installed into a temporary prefix and run (needs Node.js)
 ```
 
-The published package has no runtime dependencies: esbuild bundles everything into `dist/cli.mjs`.
-`SIDEVOICE_CORE_WHEEL=<wheel> npm run build` embeds the pinned core's wheel; installing it still lets uv download
-Python and the core's dependencies.
+How a version is built, verified and published (GitHub Releases and npm): [`RELEASING.md`](RELEASING.md).
 
 ## Contributing
 
@@ -127,4 +130,4 @@ which release notes are written ([`RELEASING.md`](RELEASING.md)).
 
 ## Third-party components
 
-The bundle redistributes its dependencies under their own licences: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+The package redistributes its dependencies and the core under their own licences: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
