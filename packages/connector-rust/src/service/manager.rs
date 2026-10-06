@@ -657,7 +657,7 @@ pub async fn linger() -> serde_json::Value {
         manage("loginctl", &["enable-linger", &user]).await;
     }
     json!({"enabled": enabled, "command": command,
-        "reason": super::text::message("service.linger-reason", &serde_json::Value::Null)})
+        "reason": crate::messages::message("service.linger-reason", &serde_json::Value::Null)})
 }
 
 fn user_name() -> Option<String> {

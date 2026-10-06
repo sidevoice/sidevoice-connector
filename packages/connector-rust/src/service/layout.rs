@@ -18,7 +18,6 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// The core's program inside a release, and the directory its models are in (`core/models`).
@@ -248,16 +247,8 @@ impl Layout {
 
     /// `D/install.json`, read only when it is this user's regular file and nobody else can change it.
     pub fn install_record(&self) -> Option<Value> {
-        let path = self.install_file();
-        let metadata = fs::symlink_metadata(&path).ok()?;
-        if !metadata.is_file()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o022 != 0
-            || metadata.len() > 64 * 1024
-        {
-            return None;
-        }
-        serde_json::from_slice(&fs::read(&path).ok()?).ok()
+        let bytes = crate::secure_fs::read_trusted(&self.install_file(), 64 * 1024).ok()??;
+        serde_json::from_slice(&bytes).ok()
     }
 
     /// The argv prefix that runs this installation's connector (`install.json`'s `command`): absolute paths for

@@ -186,6 +186,99 @@ pub fn signal_verified(pid: u32, signal: i32, expected: &Expected<'_>) -> bool {
     is_process(pid, expected) && unsafe { libc::kill(pid as i32, signal) } == 0
 }
 
+/// This user's live processes whose command line `matches` (never this one): a process still starting, found
+/// before it has written anything that names it.
+pub fn find(matches: impl Fn(&str) -> bool) -> Vec<u32> {
+    candidates()
+        .into_iter()
+        .filter(|pid| *pid != std::process::id())
+        .filter(|pid| match lookup(*pid) {
+            Lookup::Alive(found) => found.uid == crate::secure_fs::uid() && matches(&found.command),
+            _ => false,
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn candidates() -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn candidates() -> Vec<u32> {
+    let output = Command::new("/bin/ps")
+        .args(["-ax", "-o", "pid="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    output
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .filter_map(|pid| pid.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// How many seconds `pid` has been running, when that can be read.
+#[cfg(target_os = "linux")]
+pub fn age(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<&str> = stat
+        .get(stat.rfind(')')? + 1..)?
+        .split_whitespace()
+        .collect();
+    let started: f64 = fields.get(19)?.parse().ok()?;
+    let uptime: f64 = std::fs::read_to_string("/proc/uptime")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    (ticks > 0).then(|| (uptime - started / ticks as f64).max(0.0) as u64)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn age(pid: u32) -> Option<u64> {
+    let output = Command::new("/bin/ps")
+        .args(["-o", "etime=", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    parse_elapsed(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `ps`'s `etime`: `[[dd-]hh:]mm:ss`.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn parse_elapsed(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let (days, clock) = match value.split_once('-') {
+        Some((days, clock)) => (days.parse::<u64>().ok()?, clock),
+        None => (0, value),
+    };
+    let parts = clock
+        .split(':')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let seconds = match parts.as_slice() {
+        [minutes, seconds] => minutes * 60 + seconds,
+        [hours, minutes, seconds] => hours * 3600 + minutes * 60 + seconds,
+        _ => return None,
+    };
+    Some(days * 86_400 + seconds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +361,30 @@ mod tests {
         assert!(!is_process(pid, &exact));
         child.wait().unwrap();
         assert_eq!(lookup(pid), Lookup::Gone);
+    }
+
+    #[test]
+    fn elapsed_times_parse_in_every_ps_form() {
+        assert_eq!(parse_elapsed("00:07"), Some(7));
+        assert_eq!(parse_elapsed(" 01:02:03\n"), Some(3723));
+        assert_eq!(parse_elapsed("2-00:00:01"), Some(172_801));
+        assert_eq!(parse_elapsed("soon"), None);
+    }
+
+    #[test]
+    fn a_process_is_found_by_its_command_line_and_has_an_age() {
+        let mut child = sleeper();
+        let pid = child.id();
+        // Until the child has exec'd, it is still a copy of this test process.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !find(|command| command.contains("sleep 30")).contains(&pid) {
+            assert!(Instant::now() < deadline, "the child never ran sleep");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!find(|command| command.contains("not-this-program")).contains(&pid));
+        assert!(age(pid).is_some_and(|age| age < 60));
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]

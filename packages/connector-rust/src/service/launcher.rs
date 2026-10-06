@@ -19,15 +19,15 @@ use super::definition::core_arguments;
 use super::layout::Layout;
 use super::manager;
 use super::status::{self, read_ready, serving};
-use super::text::message;
 use super::{Failure, Result};
 use crate::core_ready::Ready;
+use crate::messages::message;
+use crate::process::{Expected, Lookup};
 use crate::secure_fs::verify_socket;
-use fs2::FileExt;
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -75,24 +75,11 @@ pub async fn ask_connector(
 /// Whether some process holds the connector's lock (one this process can take has no holder).
 pub fn connector_lock_held(layout: &Layout) -> bool {
     let path = layout.connector_lock();
-    let Ok(file) = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-    else {
-        return false;
-    };
-    match file.try_lock_exclusive() {
-        Ok(()) => {
-            let _ = FileExt::unlock(&file);
-            false
-        }
-        Err(_) => true,
-    }
+    fs::symlink_metadata(&path).is_ok() && matches!(crate::lock::try_lock(&path, "probe"), Ok(None))
 }
 
-/// A core of this data directory, by its command line (`--data-dir <D/core>`): a pid alone is not one of ours.
+/// A core of this data directory, by its command line (`--data-dir <D/core>` as a whole argument): a pid alone is
+/// not one of ours.
 fn is_our_core(layout: &Layout, command_line: &str) -> bool {
     let needle = format!("--data-dir {}", layout.core_data().display());
     command_line
@@ -101,8 +88,14 @@ fn is_our_core(layout: &Layout, command_line: &str) -> bool {
         .any(|rest| rest.is_empty() || rest.starts_with(' '))
 }
 
+/// Whether `pid` is, now, this user's core of this data directory.
 pub fn core_running(layout: &Layout, pid: u32) -> bool {
-    super::process::command_line(pid).is_some_and(|line| is_our_core(layout, &line))
+    match crate::process::lookup(pid) {
+        Lookup::Alive(found) => {
+            found.uid == crate::secure_fs::uid() && is_our_core(layout, &found.command)
+        }
+        _ => false,
+    }
 }
 
 /// Every core of this data directory still alive: the one its ready file names, and any still starting.
@@ -112,17 +105,21 @@ pub fn core_processes(layout: &Layout) -> Vec<u32> {
         .filter(|pid| core_running(layout, *pid))
         .into_iter()
         .collect();
-    pids.extend(super::process::find(|line| is_our_core(layout, line)));
+    pids.extend(crate::process::find(|command| is_our_core(layout, command)));
     pids.sort_unstable();
     pids.dedup();
     pids
 }
 
+/// `signal` to `pid` only while it is provably this data directory's core.
+fn signal_core(layout: &Layout, pid: u32, signal: i32) -> bool {
+    core_running(layout, pid) && unsafe { libc::kill(pid as i32, signal) } == 0
+}
+
 /// Ask a core of this data directory to leave and wait until it has: SIGTERM, a grace period, SIGKILL; each sent
 /// only while it is provably that core.
 pub async fn terminate_core(layout: &Layout, pid: u32, grace: Duration) {
-    let ours = |line: &str| is_our_core(layout, line);
-    if !super::process::signal_verified(pid, libc::SIGTERM, ours) {
+    if !signal_core(layout, pid, libc::SIGTERM) {
         return;
     }
     let deadline = Instant::now() + grace;
@@ -130,11 +127,11 @@ pub async fn terminate_core(layout: &Layout, pid: u32, grace: Duration) {
         sleep(Duration::from_millis(50)).await;
     }
     if core_running(layout, pid) {
-        eprintln!(
-            "[sidevoice] the core (pid {pid}) did not leave within {} s; killing it",
+        crate::logfile::log(&format!(
+            "the core (pid {pid}) did not leave within {} s; killing it",
             grace.as_secs()
-        );
-        super::process::signal_verified(pid, libc::SIGKILL, ours);
+        ));
+        signal_core(layout, pid, libc::SIGKILL);
         let deadline = Instant::now() + Duration::from_secs(5);
         while core_running(layout, pid) && Instant::now() < deadline {
             sleep(Duration::from_millis(50)).await;
@@ -150,7 +147,7 @@ fn failure_cause(
     exit: Option<&io::Result<std::process::ExitStatus>>,
     key: Option<&str>,
 ) -> Value {
-    let at = status::now();
+    let at = crate::logfile::timestamp();
     if key.is_none() {
         if let Some(report) = status::read_failure(layout, &at) {
             if report.get("launch_id").and_then(Value::as_str) == Some(launch_id) {
@@ -160,7 +157,7 @@ fn failure_cause(
     }
     let describe = |key: &str, step: &str, detail: Value| {
         json!({"key": key, "step": step, "detail": detail, "at": at,
-            "message": message(key, &json!({"detail": detail})), "log_tail": status::log_tail(layout, 10)})
+            "message": message(key, &status::detail_params(Some(&detail))), "log_tail": status::log_tail(layout, 10)})
     };
     if let Some(key) = key {
         return describe(key, "ready", Value::Null);
@@ -189,8 +186,8 @@ fn spawn_failure(layout: &Layout, program: &Path, error: &io::Error) -> Value {
         _ => "launch.exited",
     };
     let detail = json!(program.to_string_lossy());
-    json!({"key": key, "step": "spawn", "detail": detail, "at": status::now(),
-        "message": message(key, &json!({"detail": detail})), "log_tail": status::log_tail(layout, 10)})
+    json!({"key": key, "step": "spawn", "detail": detail, "at": crate::logfile::timestamp(),
+        "message": message(key, &status::detail_params(Some(&detail))), "log_tail": status::log_tail(layout, 10)})
 }
 
 /// A core failure as an error: its key, and the failure itself for whoever reports it.
@@ -204,14 +201,7 @@ fn core_failure(failure: Value) -> Failure {
 }
 
 fn private_data_dir(path: &Path) -> Result<()> {
-    if fs::symlink_metadata(path).is_err() {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)
-            .map_err(Failure::plain)?;
-    }
-    crate::secure_fs::private_dir(path).map_err(Failure::plain)
+    crate::secure_fs::ensure_private_dir(path).map_err(Failure::plain)
 }
 
 /// The core serving this data directory without a service manager: the one already serving, or one started here,
@@ -250,7 +240,9 @@ pub async fn ensure_core(layout: &Layout) -> Result<Ready> {
         Err(error) => return Err(core_failure(spawn_failure(layout, &program, &error))),
     };
     let pid = child.id();
-    eprintln!("[sidevoice] started the core (pid {pid:?}, launch {launch_id}); waiting for it to be ready");
+    crate::logfile::log(&format!(
+        "started the core (pid {pid:?}, launch {launch_id}); waiting for it to be ready"
+    ));
     let deadline = Instant::now() + READY_LIMIT;
     let mut failure = None;
     while Instant::now() < deadline {
@@ -271,7 +263,7 @@ pub async fn ensure_core(layout: &Layout) -> Result<Ready> {
     let failure =
         failure.unwrap_or_else(|| failure_cause(layout, &launch_id, None, Some("ready.timeout")));
     if failure.get("key").and_then(Value::as_str) == Some("bind.core-running") {
-        eprintln!("[sidevoice] another core holds this data directory: waiting for it instead");
+        crate::logfile::log("another core holds this data directory: waiting for it instead");
         let deadline = Instant::now() + READY_LIMIT;
         while Instant::now() < deadline {
             if let Some((ready, _)) = serving(layout, Duration::from_secs(2)).await {
@@ -316,6 +308,63 @@ async fn connector_identity(layout: &Layout) -> Option<(u32, PathBuf, bool)> {
     Some((pid, executable, managed))
 }
 
+/// An on-demand connector to stop: who its socket says it is, and who its lock's holder record says it is.
+struct OnDemand {
+    pid: u32,
+    start: Option<String>,
+    executable: Option<String>,
+}
+
+impl OnDemand {
+    fn expected(&self) -> Expected<'_> {
+        Expected {
+            start: self.start.as_deref(),
+            command_contains: self.executable.as_deref(),
+        }
+    }
+
+    fn up(&self) -> bool {
+        crate::process::is_process(self.pid, &self.expected())
+    }
+}
+
+/// The connector running outside a manager, if one is: never the manager's own (it says `managed`), and never a
+/// pid alone (its start time or its executable must be known to signal it).
+async fn on_demand_connector(layout: &Layout) -> Option<OnDemand> {
+    let identity = connector_identity(layout).await;
+    if matches!(identity, Some((_, _, true))) {
+        return None;
+    }
+    let holder =
+        crate::lock::holder(&layout.connector_lock()).filter(|_| connector_lock_held(layout));
+    let holder_pid = holder
+        .as_ref()
+        .and_then(|record| record.get("pid")?.as_u64())
+        .and_then(|pid| u32::try_from(pid).ok());
+    let holder_start = |pid: u32| {
+        holder
+            .as_ref()
+            .filter(|_| holder_pid == Some(pid))
+            .and_then(|record| record.get("start")?.as_str().map(str::to_owned))
+    };
+    let found = match identity {
+        Some((pid, executable, _)) => OnDemand {
+            pid,
+            start: holder_start(pid),
+            executable: Some(executable.to_string_lossy().into_owned()),
+        },
+        None => {
+            let pid = holder_pid?;
+            OnDemand {
+                pid,
+                start: Some(holder_start(pid)?),
+                executable: None,
+            }
+        }
+    };
+    (found.start.is_some() || found.executable.is_some()).then_some(found)
+}
+
 /// What `stop_on_demand` stopped by force, and what is still there.
 #[derive(Debug, Default)]
 pub struct Teardown {
@@ -323,40 +372,36 @@ pub struct Teardown {
     pub left: Vec<String>,
 }
 
-/// Stop what runs outside a manager: an on-demand connector (asked over its socket to leave, as its verified self;
-/// killed after the grace period only while it is still that program), and every core of this data directory.
-/// Waits until both are gone and their sockets silent.
+/// Stop what runs outside a manager: an on-demand connector (asked over its socket to leave, else signalled as the
+/// lock's recorded holder; killed after the grace period only while it is still that process), and every core of
+/// this data directory. Waits until both are gone and their sockets silent.
 pub async fn stop_on_demand(layout: &Layout) -> Teardown {
     let mut teardown = Teardown::default();
-    let connector = connector_identity(layout)
-        .await
-        .filter(|(_, _, managed)| !managed);
-    if let Some((pid, executable, _)) = &connector {
-        ask_connector(
-            layout,
-            "shutdown",
-            json!({"expected_pid": pid, "expected_executable": executable}),
-            Duration::from_millis(1500),
-        )
-        .await;
+    let connector = on_demand_connector(layout).await;
+    if let Some(found) = &connector {
+        let asked = match &found.executable {
+            Some(executable) => ask_connector(
+                layout,
+                "shutdown",
+                json!({"expected_pid": found.pid, "expected_executable": executable}),
+                Duration::from_millis(1500),
+            )
+            .await
+            .is_some(),
+            None => false,
+        };
+        if !asked {
+            crate::process::signal_verified(found.pid, libc::SIGTERM, &found.expected());
+        }
     }
-    let connector_up = |connector: &Option<(u32, PathBuf, bool)>| {
-        connector
-            .as_ref()
-            .is_some_and(|(pid, _, _)| super::process::alive(*pid))
-    };
+    let up = |connector: &Option<OnDemand>| connector.as_ref().is_some_and(OnDemand::up);
     let deadline = Instant::now() + STOP_GRACE;
-    while connector_up(&connector) && Instant::now() < deadline {
+    while up(&connector) && Instant::now() < deadline {
         sleep(Duration::from_millis(100)).await;
     }
-    if let Some((pid, executable, _)) = &connector {
-        let program = executable.to_string_lossy().into_owned();
-        if super::process::alive(*pid)
-            && super::process::signal_verified(*pid, libc::SIGKILL, |line| {
-                line.starts_with(program.as_str())
-            })
-        {
-            teardown.killed.push(*pid);
+    if let Some(found) = connector.as_ref().filter(|found| found.up()) {
+        if crate::process::signal_verified(found.pid, libc::SIGKILL, &found.expected()) {
+            teardown.killed.push(found.pid);
         }
     }
     for pid in core_processes(layout) {
@@ -366,7 +411,7 @@ pub async fn stop_on_demand(layout: &Layout) -> Teardown {
         }
     }
     for _ in 0..50 {
-        if !connector_up(&connector)
+        if !up(&connector)
             && ask_connector(layout, "status", json!({}), Duration::from_millis(300))
                 .await
                 .is_none()
@@ -375,19 +420,18 @@ pub async fn stop_on_demand(layout: &Layout) -> Teardown {
         }
         sleep(Duration::from_millis(100)).await;
     }
-    // A replacement may take the lock or the socket after the first owner exits: that is not a success.
+    if let Some(found) = connector.as_ref().filter(|found| found.up()) {
+        teardown.left.push(format!("connector pid {}", found.pid));
+    }
+    // A replacement may take the lock or the socket after the first owner exits: that is not a success, unless it
+    // is the manager's own connector (a job that was not unloaded), which is not this to stop.
     let answering = ask_connector(layout, "status", json!({}), Duration::from_millis(300))
         .await
         .is_some();
-    if let Some((pid, _, _)) = connector.as_ref().filter(|_| connector_up(&connector)) {
-        teardown.left.push(format!("connector pid {pid}"));
-    }
-    if answering || connector_lock_held(layout) {
-        if let Some((_, _, true)) = connector_identity(layout).await {
-            // The manager's own connector (a job that was not unloaded) is not ours to stop.
-        } else {
-            teardown.left.push("connector socket or lock".into());
-        }
+    if (answering || connector_lock_held(layout))
+        && !matches!(connector_identity(layout).await, Some((_, _, true)))
+    {
+        teardown.left.push("connector socket or lock".into());
     }
     teardown
 }
@@ -528,7 +572,7 @@ impl CoreSupervisor {
             return;
         }
         if let Err(error) = ensure_core(&self.layout).await {
-            eprintln!("[sidevoice] the local core is not available: {error}");
+            crate::logfile::log(&format!("the local core is not available: {error}"));
         }
     }
 }

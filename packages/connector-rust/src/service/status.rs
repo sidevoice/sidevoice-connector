@@ -4,17 +4,13 @@
 use super::definition;
 use super::layout::Layout;
 use super::manager::{self, Job, JobState};
-use super::text::message;
 use crate::core_ready::Ready;
-use crate::secure_fs::{private_file, verify_socket};
+use crate::messages::message;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 
 /// A core job running this long without being ready is not starting any more.
 const STARTING_SECONDS: u64 = 60;
@@ -89,7 +85,7 @@ pub fn derive(o: &Observation) -> Value {
     };
     let failed = |key: &str, step: &str, detail: Option<Value>| {
         let mut failure = json!({"key": key, "step": step, "at": o.at, "log_tail": o.log_tail,
-            "message": message(key, &json!({"detail": detail.clone().unwrap_or(Value::Null)}))});
+            "message": message(key, &detail_params(detail.as_ref()))});
         if let Some(detail) = detail {
             failure["detail"] = detail;
         }
@@ -140,6 +136,14 @@ pub fn derive(o: &Observation) -> Value {
     status
 }
 
+/// A failure's `detail` as its text says it: `?` when there is none.
+pub fn detail_params(detail: Option<&Value>) -> Value {
+    match detail {
+        Some(detail) if !detail.is_null() => json!({"detail": detail}),
+        _ => json!({"detail": "?"}),
+    }
+}
+
 /// Whether a status is final for whoever just started the core: running, or a failure that will not change by
 /// waiting. An exit the manager may follow with a start, a health probe unanswered a moment after a restart, a
 /// core still starting: not yet.
@@ -156,43 +160,15 @@ pub fn settled(status: &Value) -> bool {
 
 /// The core's ready file (`core.json`) when it is this user's private file naming this data directory's socket.
 pub fn read_ready(layout: &Layout) -> Option<Ready> {
-    let path = layout.core_ready();
-    private_file(&path).ok()?;
-    if fs::metadata(&path).ok()?.len() > 64 * 1024 {
-        return None;
-    }
-    let ready: Ready = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
-    (ready.pid > 0 && !ready.launch_id.is_empty() && ready.socket == layout.core_socket())
-        .then_some(ready)
+    crate::core_ready::read(&layout.core_ready(), &layout.core_socket()).ok()
 }
 
-/// `GET /api/local/health` on the core's socket: the body of a 200 within `limit`, or none.
+/// The core's health on `socket` within `limit`: the body of its 200, or none.
 pub async fn health(socket: &Path, limit: Duration) -> Option<Value> {
-    verify_socket(socket).ok()?;
-    let ask = async {
-        let mut stream = UnixStream::connect(socket).await.ok()?;
-        stream
-            .write_all(
-                b"GET /api/local/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-            )
-            .await
-            .ok()?;
-        let mut response = Vec::new();
-        stream
-            .take(64 * 1024)
-            .read_to_end(&mut response)
-            .await
-            .ok()?;
-        let response = String::from_utf8(response).ok()?;
-        if !response.starts_with("HTTP/1.1 200 ") && !response.starts_with("HTTP/1.0 200 ") {
-            return None;
-        }
-        let (_, body) = response.split_once("\r\n\r\n")?;
-        serde_json::from_str::<Value>(body)
-            .ok()
-            .filter(Value::is_object)
-    };
-    timeout(limit, ask).await.ok().flatten()
+    crate::core_ready::health(socket, limit)
+        .await
+        .ok()
+        .filter(Value::is_object)
 }
 
 /// The core serving now: its ready file, and its health answering for that same launch.
@@ -201,18 +177,6 @@ pub async fn serving(layout: &Layout, limit: Duration) -> Option<(Ready, Value)>
     let body = health(&ready.socket, limit).await?;
     (body.get("launch_id").and_then(Value::as_str) == Some(ready.launch_id.as_str()))
         .then_some((ready, body))
-}
-
-fn bounded_private(path: &Path, limit: u64) -> Option<Vec<u8>> {
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o022 != 0
-        || metadata.len() > limit
-    {
-        return None;
-    }
-    fs::read(path).ok()
 }
 
 /// The last lines of the core's log, for a failure a person reads.
@@ -242,8 +206,10 @@ pub fn log_tail(layout: &Layout, lines: usize) -> Vec<String> {
 /// The core's report of its last failed start (written before ready, deleted once it holds its lock), as a person
 /// reads it: its own key, step and message, with the log tail.
 pub fn read_failure(layout: &Layout, at: &str) -> Option<Value> {
-    let report: Value =
-        serde_json::from_slice(&bounded_private(&layout.core_failure(), 64 * 1024)?).ok()?;
+    let report: Value = serde_json::from_slice(
+        &crate::secure_fs::read_trusted(&layout.core_failure(), 64 * 1024).ok()??,
+    )
+    .ok()?;
     let text = |name: &str, limit: usize| {
         report.get(name).and_then(Value::as_str).map(|value| {
             value
@@ -258,12 +224,8 @@ pub fn read_failure(layout: &Layout, at: &str) -> Option<Value> {
         .get("detail")
         .cloned()
         .filter(|detail| !detail.is_null());
-    let message = text("message", 400).unwrap_or_else(|| {
-        message(
-            &key,
-            &json!({"detail": detail.clone().unwrap_or(Value::Null)}),
-        )
-    });
+    let message =
+        text("message", 400).unwrap_or_else(|| message(&key, &detail_params(detail.as_ref())));
     Some(
         json!({"key": key, "step": text("step", 40), "message": message, "detail": detail,
         "at": text("at", 40).unwrap_or_else(|| at.to_owned()), "launch_id": text("launch_id", 80),
@@ -307,13 +269,13 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
         .map(|ready| ready.socket.clone())
         .unwrap_or_else(|| layout.core_socket());
     let health = health(&socket, Duration::from_millis(1500)).await;
-    let at = now();
+    let at = crate::logfile::timestamp();
     let core_age = match core_job
         .as_ref()
         .filter(|job| job.running)
         .and_then(|job| job.pid)
     {
-        Some(pid) => super::process::age(pid),
+        Some(pid) => crate::process::age(pid),
         None => None,
     };
     let connector_running = match connector_running {
@@ -344,31 +306,6 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
 /// `service status --json`: derived, read-only, never starts anything.
 pub async fn status(layout: &Layout, connector_running: Option<bool>) -> Value {
     derive(&observe(layout, connector_running).await)
-}
-
-/// Now, as RFC 3339 UTC, with no date crate.
-pub fn now() -> String {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let days = (seconds / 86_400) as i64;
-    let clock = seconds % 86_400;
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        clock / 3600,
-        (clock % 3600) / 60,
-        clock % 60
-    )
 }
 
 #[cfg(test)]
@@ -563,13 +500,5 @@ mod tests {
         assert!(settled(
             &json!({"state": "failed", "failure": {"step": "bind"}})
         ));
-    }
-
-    #[test]
-    fn timestamps_are_rfc3339() {
-        let now = now();
-        assert_eq!(now.len(), 20, "{now}");
-        assert!(now.ends_with('Z') && now.as_bytes()[10] == b'T', "{now}");
-        assert!(now.as_str() > "2026-01-01");
     }
 }

@@ -2110,7 +2110,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     if managed {
         profile.validate_service_environment()?;
         // Started by its manager (at login, or by `service start`): a person's stop from before no longer holds.
-        if !crate::service::managed_start_clears_stop(&profile)? {
+        if !crate::service::managed_start_clears_stop(&profile).await? {
             return Ok(());
         }
     }

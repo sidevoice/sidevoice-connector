@@ -15,20 +15,17 @@ pub mod definition;
 pub mod launcher;
 pub mod layout;
 pub mod manager;
-pub mod process;
 pub mod status;
-pub mod text;
 
+use crate::lock::Lock;
 use crate::profile::Profile;
-use crate::secure_fs::{atomic_json, private_dir};
-use fs2::FileExt;
+use crate::secure_fs::{atomic_json, ensure_private_dir};
 use layout::Layout;
 use manager::{Job, Kind};
 use serde_json::{json, Value};
 use std::fmt::{Display, Formatter};
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
 use tokio::time::{sleep, Duration, Instant};
 
@@ -94,13 +91,13 @@ impl Failure {
             .and_then(Value::as_str)
         {
             Some(message) => message.to_owned(),
-            None => text::message(&self.key, &self.params),
+            None => crate::messages::message(&self.key, &self.params),
         }
     }
 
-    /// `{ok: false, error: {key, message}}`.
+    /// `{ok: false, error: {key, params, message}}`, as every `--json` failure.
     pub fn value(&self) -> Value {
-        json!({"ok": false, "error": {"key": self.key, "message": self.message()}})
+        json!({"ok": false, "error": {"key": self.key, "params": self.params, "message": self.message()}})
     }
 }
 
@@ -116,56 +113,30 @@ pub type Result<T> = std::result::Result<T, Failure>;
 
 /// `D`, created private when missing.
 fn data_dir(layout: &Layout) -> Result<()> {
-    if fs::symlink_metadata(&layout.data).is_err() {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&layout.data)
-            .map_err(Failure::plain)?;
-    }
-    private_dir(&layout.data).map_err(Failure::plain)
-}
-
-fn open_lock(layout: &Layout) -> Result<File> {
-    data_dir(layout)?;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(layout.install_lock())
-        .map_err(Failure::plain)
+    ensure_private_dir(&layout.data).map_err(Failure::plain)
 }
 
 /// The install lock, waited for up to 30 s.
-async fn install_lock(layout: &Layout) -> Result<File> {
-    let file = open_lock(layout)?;
-    let deadline = Instant::now() + LOCK_WAIT;
-    loop {
-        match file.try_lock_exclusive() {
-            Ok(()) => return Ok(file),
-            Err(error)
-                if error.kind() != io::ErrorKind::WouldBlock
-                    && error.raw_os_error() != Some(libc::EWOULDBLOCK) =>
-            {
-                return Err(Failure::plain(error))
-            }
-            Err(_) if Instant::now() >= deadline => {
-                return Err(Failure::keyed(
-                    "service.busy",
-                    json!({"detail": "another install or service command"}),
-                ))
-            }
-            Err(_) => sleep(Duration::from_millis(50)).await,
-        }
-    }
+async fn install_lock(layout: &Layout) -> Result<Lock> {
+    data_dir(layout)?;
+    crate::lock::wait_lock(&layout.install_lock(), "service", LOCK_WAIT)
+        .await
+        .map_err(Failure::plain)?
+        .ok_or_else(|| {
+            Failure::keyed(
+                "service.busy",
+                json!({"detail": "another install or service command"}),
+            )
+        })
 }
 
 fn write_stop(layout: &Layout) -> Result<()> {
     data_dir(layout)?;
-    atomic_json(&layout.stop_marker(), &json!({"at": status::now()})).map_err(Failure::plain)
+    atomic_json(
+        &layout.stop_marker(),
+        &json!({"at": crate::logfile::timestamp()}),
+    )
+    .map_err(Failure::plain)
 }
 
 fn clear_stop(layout: &Layout) -> Result<()> {
@@ -249,7 +220,10 @@ fn killed_note(result: &mut Value, down: &launcher::Teardown) {
             .map(u32::to_string)
             .collect::<Vec<_>>()
             .join(", ");
-        result["note"] = json!(text::message("service.killed", &json!({"pids": pids})));
+        result["note"] = json!(crate::messages::message(
+            "service.killed",
+            &json!({"pids": pids})
+        ));
     }
 }
 
@@ -378,13 +352,15 @@ pub fn human(answer: &Value) -> String {
             .pointer("/error/message")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .unwrap_or_else(|| text::message("service.failed", &Value::Null));
+            .unwrap_or_else(|| {
+                crate::messages::message("service.failed", &status::detail_params(None))
+            });
     }
     let state = answer
         .get("state")
         .and_then(Value::as_str)
         .unwrap_or("failed");
-    let mut out = text::message(
+    let mut out = crate::messages::message(
         &format!("service.state.{state}"),
         &json!({"service": answer["service"]}),
     );
@@ -393,7 +369,9 @@ pub fn human(answer: &Value) -> String {
             .get("message")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .unwrap_or_else(|| text::message(failure["key"].as_str().unwrap_or(""), &Value::Null));
+            .unwrap_or_else(|| {
+                crate::messages::message(failure["key"].as_str().unwrap_or(""), &Value::Null)
+            });
         out.push_str(&format!(" ({reason})"));
     }
     if let Some(note) = answer.get("note").and_then(Value::as_str) {
@@ -420,23 +398,17 @@ pub async fn node_status(profile: &Profile) -> Value {
 
 /// A connector started by its manager at login clears a person's stop, unless a service command (which holds the
 /// install lock) is under way: then the stop being written now is the one that holds. Whether it may serve.
-pub fn managed_start_clears_stop(profile: &Profile) -> anyhow::Result<bool> {
+pub async fn managed_start_clears_stop(profile: &Profile) -> anyhow::Result<bool> {
     let layout = Layout::from_profile(profile);
     if !status::stopped(&layout) {
         return Ok(true);
     }
-    let lock = open_lock(&layout)?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        if lock.try_lock_exclusive().is_ok() {
-            let cleared = clear_stop(&layout).map(|()| true);
-            let _ = FileExt::unlock(&lock);
-            return Ok(cleared?);
+    match crate::lock::wait_lock(&layout.install_lock(), "login", Duration::from_secs(2)).await? {
+        Some(_lock) => {
+            clear_stop(&layout)?;
+            Ok(true)
         }
-        if std::time::Instant::now() >= deadline {
-            return Ok(!status::stopped(&layout));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        None => Ok(!status::stopped(&layout)),
     }
 }
 
