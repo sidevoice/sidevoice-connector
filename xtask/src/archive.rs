@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::glibc;
 use crate::util::*;
 use crate::{Result, ENTRYPOINT, INVENTORY, KIND, ROOT_NAME, TARGETS};
 
@@ -158,7 +159,8 @@ pub(crate) fn unpack_checked(archive: &Path, destination: &Path) -> Result<(Path
         .keys()
         .map(String::as_str)
         .collect();
-    let expected = BTreeSet::from([
+    let target = inventory["target"].as_str().unwrap_or("");
+    let mut expected = BTreeSet::from([
         "schema",
         "kind",
         "version",
@@ -167,6 +169,13 @@ pub(crate) fn unpack_checked(archive: &Path, destination: &Path) -> Result<(Path
         "entrypoint",
         "files",
     ]);
+    // A Linux binary's glibc floor: the oldest C library it runs on (crate::glibc).
+    if target.starts_with("linux-") {
+        expected.insert("glibc");
+        if glibc::parse(inventory["glibc"].as_str().unwrap_or("")).is_none() {
+            return Err("wrong glibc floor".into());
+        }
+    }
     if fields != expected {
         return Err("wrong inventory fields".into());
     }
@@ -176,7 +185,6 @@ pub(crate) fn unpack_checked(archive: &Path, destination: &Path) -> Result<(Path
     {
         return Err("wrong kind or entrypoint".into());
     }
-    let target = inventory["target"].as_str().unwrap_or("");
     if !TARGETS.contains(&target)
         || !is_commit(inventory["source_sha"].as_str().unwrap_or(""))
         || inventory["version"].as_str().unwrap_or("").is_empty()
@@ -239,7 +247,8 @@ mod tests {
         let mut files = files;
         files.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
         let inventory = json!({"schema": 1, "kind": KIND, "version": "1.2.3", "target": "linux-x86_64",
-            "source_sha": "0123456789abcdef0123456789abcdef01234567", "entrypoint": ENTRYPOINT, "files": files});
+            "glibc": "2.28", "source_sha": "0123456789abcdef0123456789abcdef01234567", "entrypoint": ENTRYPOINT,
+            "files": files});
         write(&root.join(INVENTORY), &canonical(&inventory)).unwrap();
         root
     }
@@ -286,6 +295,28 @@ mod tests {
         let out = TempDir::new("xtask-archive-changed-out").unwrap();
         let error = unpack_checked(&archive, &out.0).unwrap_err();
         assert!(error.contains("inventory mismatch: LICENSE"), "{error}");
+    }
+
+    #[test]
+    fn a_linux_archive_must_record_its_glibc_floor() {
+        for floor in [None, Some("latest")] {
+            let work = TempDir::new("xtask-archive-floor").unwrap();
+            let root = stage(&work.0);
+            let mut inventory = parse_json(&read(&root.join(INVENTORY)).unwrap(), "").unwrap();
+            match floor {
+                Some(floor) => inventory["glibc"] = floor.into(),
+                None => drop(inventory.as_object_mut().unwrap().remove("glibc")),
+            }
+            write(&root.join(INVENTORY), &canonical(&inventory)).unwrap();
+            let archive = work.0.join("a.tar.zst");
+            write_archive(&work.0, ROOT_NAME, &[ENTRYPOINT], 1, &archive).unwrap();
+            let out = TempDir::new("xtask-archive-floor-out").unwrap();
+            let error = unpack_checked(&archive, &out.0).unwrap_err();
+            assert!(
+                error.contains("inventory fields") || error.contains("glibc floor"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

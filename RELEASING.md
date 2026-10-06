@@ -17,7 +17,8 @@ it leaves with the move to one Rust binary, and npm per-platform packages of the
 | Merge the release PR | a maintainer | **This is the release.** release-please tags `vX.Y.Z` and creates a draft GitHub Release whose notes are that version's changelog; `release` runs from the tag, attaches and verifies the assets, and publishes the Release. |
 
 The tests are part of the build: an asset is only produced on a target where the whole suite passed. Everything
-besides the GitHub steps is code in `xtask/` (`cargo xtask fixtures | dist | verify | manifest | publish`):
+besides the GitHub steps is code in `xtask/` (`cargo xtask fixtures | dist | verify | verify-floor | manifest |
+publish`):
 
 - `cargo xtask fixtures` fetches what the tests run against: the sidevoice-core release whose version is in
   `core.pin` (one line, `X.Y.Z`), its archive for this machine checked against that release's `SHA256SUMS`,
@@ -29,15 +30,37 @@ besides the GitHub steps is code in `xtask/` (`cargo xtask fixtures | dist | ver
   real launchd.
 - `cargo xtask dist` builds this machine's release binary and packages it exactly as the release does, then verifies
   the archive by unpacking it elsewhere and running the connector from there. A pull request already runs it on
-  every target.
+  every target. On Linux it needs [zig](https://ziglang.org) and
+  [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) on the `PATH` (CI installs the versions pinned in
+  `.github/actions/setup`): see [Linux: the glibc floor](#linux-the-glibc-floor).
+- `cargo xtask verify-floor <archive>` (Linux, needs Docker) verifies a Linux archive again, running the connector
+  in a container of the oldest distribution it supports. CI runs it after `dist` on both Linux targets.
+
+## Linux: the glibc floor
+
+A Linux binary only starts where the system's C library is at least as new as the newest glibc symbol it was linked
+against. Built plainly on the `ubuntu-24.04` runners, the connector would need glibc 2.39 and refuse to start on
+most systems still in use. So the floor is fixed in `xtask/src/glibc.rs` (`FLOOR`, today **glibc 2.28**: Debian 10,
+Ubuntu 20.04, RHEL/AlmaLinux 8, Amazon Linux 2023 and every later release) and enforced:
+
+- `dist` links the Linux binary with `cargo zigbuild --target <arch>-unknown-linux-gnu.2.28` (zig's glibc 2.28
+  stubs instead of the runner's library) and records the floor in the archive's inventory (`"glibc": "2.28"`).
+- `verify` reads the binary's GLIBC symbol versions (`readelf --version-info`) and fails if any is newer than the
+  floor the inventory records; its report gives the floor and the newest version the binary really needs.
+- `verify-floor` runs the connector in `almalinux:8` (pinned by digest in `glibc.rs`), checking first that the
+  container's glibc is exactly the floor.
+
+Raising or lowering the floor is a change of `FLOOR` and `FLOOR_IMAGE` together, and of the requirements in the
+README. Only the connector binary is covered: the tests still run on the `ubuntu-24.04` runners because the
+sidevoice-core release they run against (`core.pin`) has its own floor.
 
 ## Assets
 
 - `sidevoice-connector-<version>-<target>.tar.zst` for `macos-aarch64`, `linux-x86_64` and `linux-aarch64` (on the
   nightly, `sidevoice-connector-nightly-<target>.tar.zst`, fixed names whose download URLs never change): the root
   `sidevoice-connector/` holds `bin/sidevoice-connector`, `LICENSE`, the licence notices of every crate linked into
-  the binary (`notices/`), and `connector.json`, the inventory: version, target, source commit and every file with
-  its size and digest.
+  the binary (`notices/`), and `connector.json`, the inventory: version, target, source commit, on Linux the glibc
+  floor, and every file with its size and digest.
 - `sidevoice-connector-manifest.json`: every archive with its digest and size, bound to the version and the source
   commit.
 - `SHA256SUMS`.
