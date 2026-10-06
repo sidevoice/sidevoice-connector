@@ -53,23 +53,49 @@ pub async fn ask_connector(
     params: Value,
     limit: Duration,
 ) -> Option<Value> {
+    request_connector(layout, method, params, limit).await.ok()
+}
+
+/// One request to the connector on its socket: its `result`, or why there is none (its refusal, or no answer
+/// within `limit`).
+pub async fn request_connector(
+    layout: &Layout,
+    method: &str,
+    params: Value,
+    limit: Duration,
+) -> std::result::Result<Value, String> {
     let socket = layout.connector_socket();
-    verify_socket(&socket).ok()?;
+    verify_socket(&socket).map_err(|error| error.to_string())?;
     let ask = async {
-        let mut stream = UnixStream::connect(&socket).await.ok()?;
+        let mut stream = UnixStream::connect(&socket)
+            .await
+            .map_err(|error| error.to_string())?;
         let request = json!({"id": 1, "method": method, "params": params});
         stream
             .write_all(format!("{request}\n").as_bytes())
             .await
-            .ok()?;
+            .map_err(|error| error.to_string())?;
         let mut reader = BufReader::new(stream.take(64 * 1024));
         let mut line = String::new();
-        reader.read_line(&mut line).await.ok()?;
-        let reply: Value = serde_json::from_str(&line).ok()?;
-        (reply.get("ok") == Some(&json!(true)))
-            .then(|| reply.get("result").cloned().unwrap_or(Value::Null))
+        reader
+            .read_line(&mut line)
+            .await
+            .map_err(|error| error.to_string())?;
+        let reply: Value = serde_json::from_str(&line)
+            .map_err(|_| "the connector closed the request without an answer".to_owned())?;
+        if reply.get("ok") == Some(&json!(true)) {
+            Ok(reply.get("result").cloned().unwrap_or(Value::Null))
+        } else {
+            Err(reply
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("the connector refused the request")
+                .to_owned())
+        }
     };
-    timeout(limit, ask).await.ok().flatten()
+    timeout(limit, ask)
+        .await
+        .unwrap_or_else(|_| Err(format!("no answer within {} s", limit.as_secs())))
 }
 
 /// Whether some process holds the connector's lock (one this process can take has no holder).

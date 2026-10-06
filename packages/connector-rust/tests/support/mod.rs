@@ -500,6 +500,54 @@ pub fn http_receiver() -> HttpReceiver {
     HttpReceiver { url, bodies }
 }
 
+/// A room on loopback that answers every request with `status` and `answer`, and hands over what it was asked:
+/// `(method and path, JSON body)`.
+pub struct FakeRoom {
+    pub url: String,
+    pub requests: Receiver<(String, Value)>,
+}
+
+pub fn fake_room(status: u16, answer: Value) -> FakeRoom {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, requests) = channel();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            let _ = reader.read_line(&mut request_line);
+            let mut length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0; length];
+            let _ = reader.read_exact(&mut body);
+            let target = request_line
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let _ = tx.send((target, serde_json::from_slice(&body).unwrap_or(Value::Null)));
+            let text = answer.to_string();
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                    text.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    FakeRoom { url, requests }
+}
+
 /// A call (presentation) socket open on the core, as the app holds one: it pairs a local device, joins, and
 /// keeps reading until dropped. `session` is the voice session the core gave it.
 pub struct Presentation {

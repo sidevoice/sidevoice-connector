@@ -2,7 +2,7 @@
 
 One binary, `sidevoice-connector`, that links this machine's agent conversations (Claude Code, Codex, Cursor) to the
 Sidevoice core: it serves MCP to each conversation and runs the machine's connector daemon, which holds the link to
-the core. It is migrating to stand alone (sidevoice/sidevoice-connector#68); until that is done, installing and pairing are
+the core. It is migrating to stand alone (sidevoice/sidevoice-connector#68); until that is done, installing is
 still the JavaScript package's (`packages/connector`).
 
 ## Commands
@@ -14,6 +14,8 @@ still the JavaScript package's (`packages/connector`).
 | `agents [--json]` | The agents on this computer and whether they use Sidevoice. |
 | `agents connect\|disconnect\|dismiss <claude\|codex\|cursor> [--json]` | Registers Sidevoice with an agent, removes its registration, or dismisses the new-agent notice. Only an entry Sidevoice wrote is ever changed. |
 | `service <install\|start\|stop\|restart\|status\|uninstall> [--json]` | The login service: two jobs under launchd or the systemd user manager; with no manager, Sidevoice on demand (below). |
+| `pair <room-url> <code> [--json]` | Pairs this machine with a room: redeems the one-time code the room shows at its `POST /api/connectors/pair` and writes `credentials.json` (0600). https only; plain http only to loopback or a host in `SIDEVOICE_TRUSTED_CLUSTER_HOSTS` (`.suffix` or exact host, comma-separated). The core follows the file; nothing restarts. |
+| `pair-device [--json]` | A one-time code from this machine's core (through the connector, started on demand) to pair a device such as the Sidevoice app: the code, its QR, its validity and where it works (`reach`: `room`, `direct` or `local-only`). `--json`: `{ok, code, expires_in, reach, payload}`. The MCP tool `voice_pair_device` says the same text. |
 | `--version [--json]` | The release version; with `--json`, also the target and the source commit. |
 | `--installed` | Run as the installed release this binary is part of (below). |
 
@@ -59,7 +61,7 @@ installer (sidevoice/sidevoice-connector#66, decision 3).
 `core.pin` at the repository root (a conversation joins through MCP, input from a call is delivered, a reply is
 saved, the core restarts and the link comes back), against the real Codex CLI in a disposable profile, as a
 login service under the real launchd (macOS) and the real systemd user manager (Linux; on a CI runner the test
-enables lingering for the runner's user), and with no service manager at all. `cargo xtask fixtures` fetches the core and Codex; without them
+enables lingering for the runner's user), and with no service manager at all; `pair` against a room on loopback. `cargo xtask fixtures` fetches the core and Codex; without them
 those tests are skipped locally and fail in CI.
 
 Codex 0.157.0 does not give the active thread ID in MCP request metadata, so queued delivery into a Codex

@@ -791,7 +791,11 @@ impl Facade {
                     json!({"status":"left","conversation":chosen,"room_reachable":result.get("connected")}),
                 )
             }
-            "voice_pair_device" => self.ipc.call("pair_device", json!({})).await,
+            "voice_pair_device" => {
+                let answer =
+                    crate::pairing::device_answer(self.ipc.call("pair_device", json!({})).await?)?;
+                Ok(Value::String(crate::pairing::device_text(&answer)?))
+            }
             "voice_pair" => {
                 let room = args
                     .get("room")
@@ -808,17 +812,10 @@ impl Facade {
                         "voice_pair needs the room's address and the code the user read from it.",
                     )?;
                 let previous = crate::pairing::previous_room(&self.profile);
-                let result =
-                    crate::pairing::run_pair(&self.profile, room, &code.trim().to_uppercase())
-                        .await?;
-                let origin = result
-                    .get("room")
-                    .and_then(Value::as_str)
-                    .context("pairing result omitted the room")?;
-                let connector_id = result
-                    .get("connector_id")
-                    .and_then(Value::as_str)
-                    .context("pairing result omitted connector identity")?;
+                let redeemed =
+                    crate::pairing::pair(&self.profile, room, &code.trim().to_uppercase()).await?;
+                let origin = redeemed.origin.as_str();
+                let connector_id = redeemed.connector_id.as_str();
                 let active = !self.joined.lock().await.is_empty();
                 let mut paired = json!({"status":"paired","room":origin,"connector_id":connector_id,
                     "next":if active {"Conversations already joined stay joined; the room reaches them within seconds."}
@@ -1052,6 +1049,7 @@ impl ServerHandler for Facade {
             .invoke(&request.name, args, meta, client, client_caps)
             .await;
         let value = match result {
+            Ok(Value::String(text)) => CallToolResult::success(vec![ContentBlock::text(text)]),
             Ok(value) => CallToolResult::success(vec![ContentBlock::text(value.to_string())]),
             Err(error) => CallToolResult::error(vec![ContentBlock::text(error.to_string())]),
         };
