@@ -19,8 +19,17 @@ fn a_conversation_talks_to_the_real_core_through_the_connector() {
     assert_eq!(linked["protocol"], 3, "{linked}");
     assert_eq!(linked["pid"], first_core.pid(), "{linked}");
 
-    // The machine as the room will list it: what this machine actually is, not a placeholder.
-    let listed = core_json(&profile.core_socket(), "GET", "/api/connectors", None, None);
+    let call = Presentation::open(&profile.core_socket());
+
+    // The machine as the room will list it (asked as the device the call paired): what this machine actually is,
+    // not a placeholder.
+    let listed = core_json(
+        &profile.core_socket(),
+        "GET",
+        "/api/connectors",
+        None,
+        Some(&call.token),
+    );
     let machine = listed["connectors"]
         .as_array()
         .and_then(|rows| rows.iter().find(|row| row["connected"] == true))
@@ -43,8 +52,6 @@ fn a_conversation_talks_to_the_real_core_through_the_connector() {
         json!(["claude", "codex", "cursor"]),
         "{machine}"
     );
-
-    let call = Presentation::open(&profile.core_socket());
     let receiver = http_receiver();
     let thread = "connector-interop-thread";
     let mut command = profile.connector(&["mcp"]);

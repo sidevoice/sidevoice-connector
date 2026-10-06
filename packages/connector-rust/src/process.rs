@@ -233,8 +233,14 @@ mod tests {
     fn a_child_is_signalled_only_as_its_recorded_self_and_is_gone_once_dead() {
         let mut child = sleeper();
         let pid = child.id();
-        let Lookup::Alive(found) = lookup(pid) else {
-            panic!("the child is not alive");
+        // Until the child has exec'd, it is still a copy of this test process.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let found = loop {
+            match lookup(pid) {
+                Lookup::Alive(found) if found.command.contains("sleep") => break found,
+                _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+                other => panic!("the child never ran sleep: {other:?}"),
+            }
         };
         assert!(found.command.contains("sleep"), "{found:?}");
         let wrong_command = Expected {
