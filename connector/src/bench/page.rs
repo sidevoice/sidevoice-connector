@@ -6,6 +6,8 @@
 //! - `GET /api/history?thread=T`: what was said into conversation T, with its receipt, and the replies;
 //! - `POST /api/say` `{"thread", "text"}`: says the text into the conversation, as if spoken.
 //!
+//! The page names its API relative to itself, so a proxy may serve it under a prefix.
+//!
 //! A request must name the bench itself as its `Host`, or a name given with `--allow-host` (no other site can reach it
 //! through a name of its own), and a write must be JSON (no plain form from another page can make one).
 
@@ -184,5 +186,18 @@ mod tests {
             assert_eq!(decode(&encode(value)), value);
         }
         assert_eq!(decode("a+b%2"), "a b%2");
+    }
+
+    /// The page reaches its API relative to where it is served, so it works the same under a prefix (the
+    /// playground serves it at /connector/, through a proxy).
+    #[test]
+    fn the_page_names_its_api_relative_to_itself() {
+        assert!(
+            PAGE.contains("api/state") && PAGE.contains("api/history") && PAGE.contains("api/say")
+        );
+        assert!(
+            !PAGE.contains("\"/api/") && !PAGE.contains("`/api/"),
+            "an absolute /api/ URL"
+        );
     }
 }
