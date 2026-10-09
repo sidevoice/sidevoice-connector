@@ -202,8 +202,8 @@ pub fn envelope(event: &Value) -> Result<String> {
 }
 
 /// What the user did not hear, as core sends it (`unheard: {count, replies: [{text, truncated,
-/// cut}]}`, already bounded): the count, and the replies it shows as lines after a colon, oldest
-/// first. None when there is nothing.
+/// cut, heard_chars?}]}`, already bounded): the count, and the replies it shows as lines after a
+/// colon, oldest first. None when there is nothing.
 fn unheard(event: &Value) -> Option<(u64, String)> {
     let unheard = event.get("unheard")?;
     let count = unheard
@@ -235,10 +235,13 @@ fn unheard(event: &Value) -> Option<(u64, String)> {
         if reply.get("truncated").and_then(Value::as_bool) == Some(true) {
             text.push('…');
         }
-        let how = if reply.get("cut").and_then(Value::as_bool) == Some(true) {
-            "cut off while playing: only its start was heard"
-        } else {
-            "never played"
+        let cut = reply.get("cut").and_then(Value::as_bool) == Some(true);
+        let how = match reply.get("heard_chars").and_then(Value::as_u64) {
+            Some(heard) if cut => {
+                format!("cut off while playing: only its first {heard} characters were heard")
+            }
+            _ if cut => "cut off while playing: only its start was heard".to_owned(),
+            _ => "never played".to_owned(),
         };
         let quoted = serde_json::to_string(&text).unwrap_or_default();
         list.push_str(&format!("\n- {quoted} ({how})"));
@@ -306,6 +309,18 @@ mod tests {
         );
         // The header the read receipts look for comes first, once.
         assert_eq!(body.matches("{\"channel\":").count(), 1);
+    }
+
+    #[test]
+    fn a_cut_reply_says_how_far_it_was_heard_when_core_knows() {
+        let mut event = voice();
+        event["unheard"] = json!({"count":1,"replies":[
+            {"text":"The build is green.","truncated":false,"cut":true,"heard_chars":9}]});
+        let body = envelope(&event).unwrap();
+        assert!(
+            body.contains("\n- \"The build is green.\" (cut off while playing: only its first 9 characters were heard)"),
+            "{body}"
+        );
     }
 
     #[test]
