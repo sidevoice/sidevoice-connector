@@ -850,7 +850,9 @@ impl Daemon {
             .unwrap_or("");
         let revision = frame.get("revision").and_then(Value::as_i64).unwrap_or(0);
         let text = frame.get("text").and_then(Value::as_str).unwrap_or("");
-        if message_id.is_empty() || session_id.is_empty() || text.is_empty() {
+        // A note from the room carries no words of the user's.
+        let note = frame.get("channel").and_then(Value::as_str) == Some("note");
+        if message_id.is_empty() || session_id.is_empty() || (text.is_empty() && !note) {
             return json!({"status":"failed","detail":"invalid input"});
         }
         {
@@ -2038,7 +2040,7 @@ fn voice_header(text: &str) -> Option<Value> {
     let header: Value = serde_json::from_str(&tail[..=end]).ok()?;
     if !matches!(
         header.get("channel").and_then(Value::as_str),
-        Some("voice" | "room-control")
+        Some("voice" | "room-control" | "note")
     ) || header
         .get("session_id")
         .and_then(Value::as_str)
@@ -2324,7 +2326,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{prune_binding_order, Daemon};
+    use super::{prune_binding_order, voice_header, Daemon};
     use serde_json::json;
     use std::collections::HashMap;
     use tokio::sync::oneshot;
@@ -2364,5 +2366,16 @@ mod tests {
         ] {
             assert!(!Daemon::ack_allows_removal(&speech, &reply));
         }
+    }
+
+    #[test]
+    fn a_note_is_read_back_by_its_header_like_a_voice_message() {
+        let note =
+            crate::adapters::envelope(&json!({"channel":"note","session_id":"s","revision":2,
+            "message_id":"note:1","text":"","unheard":{"count":1,"replies":[]}}))
+            .unwrap();
+        let header = voice_header(&note).unwrap();
+        assert_eq!(header["message_id"], "note:1");
+        assert_eq!(header["channel"], "note");
     }
 }
