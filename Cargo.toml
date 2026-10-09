@@ -3,7 +3,7 @@
 # release's version (RELEASING.md): the root needs a package of its own for that, and the tooling is it.
 [package]
 name = "xtask"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 publish = false
 description = "Build tooling for the connector: release archives, their manifest, publishing, and what the tests run against."
