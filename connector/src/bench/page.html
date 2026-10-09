@@ -60,7 +60,7 @@ async function getJson(url, options) {
 }
 async function refresh() {
   try {
-    const state = await getJson(`/api/state?since=${since}`);
+    const state = await getJson(`api/state?since=${since}`);
     $("call").textContent = state.call ? `Call open (session ${state.session})` : "Opening a call on the core…";
     for (const { seq, event } of state.events) {
       since = Math.max(since, seq);
@@ -81,7 +81,7 @@ async function refresh() {
     }
     if (selected) {
       $("working").textContent = selected in working ? (working[selected] ? "Working…" : "Idle") : "";
-      const history = await getJson(`/api/history?thread=${encodeURIComponent(selected)}`);
+      const history = await getJson(`api/history?thread=${encodeURIComponent(selected)}`);
       const messages = $("messages");
       messages.replaceChildren();
       for (const row of history.messages || []) {
@@ -99,7 +99,7 @@ $("say").onsubmit = async (event) => {
   const said = $("text").value.trim();
   if (!selected || !said) return;
   try {
-    await getJson("/api/say", { method: "POST", headers: { "Content-Type": "application/json" },
+    await getJson("api/say", { method: "POST", headers: { "Content-Type": "application/json" },
                                 body: JSON.stringify({ thread: selected, text: said }) });
     $("text").value = "";
     $("error").textContent = "";

@@ -17,7 +17,8 @@ use tokio::time::{timeout, timeout_at, Duration, Instant};
 
 const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the user's voice room.
 - Call voice_connect only when the user asks to join the room or enable voice; never as a side effect.
-- Voice input is a user message: a JSON header ({"channel":"voice","session_id","revision","message_id"}), the user's literal words, then a [Sidevoice] line that is not the user's. The header is opaque reply metadata. A repeated message_id is a redelivery: do not act on it again.
+- Voice input is a user message: a JSON header ({"channel":"voice","session_id","revision","message_id"}), the user's literal words, then [Sidevoice] lines that are not the user's. The header is opaque reply metadata. A repeated message_id is a redelivery: do not act on it again.
+- The room never plays a reply late. When the user did not hear some of yours (they spoke over it, moved on, or were away), a [Sidevoice] line lists them with the next voice message, or a note (channel "note", no user words) comes when they return without speaking. Do not resend the backlog: say what still matters now, in one fresh message, and drop what the conversation has moved past.
 - Reply by voice with voice_say, using that message's session_id and revision for every publication. For substantive work: first a short acknowledgement (what you understood, what you will do next), then meaningful checkpoints, then the result. No filler, no narrating tool calls. Publish questions too, and wait.
 - Between steps, at each tool result, take in newly arrived user input before starting the next step: an addition, a refinement or a replacement, by its meaning. Drop obsolete work not yet started; keep what remains useful; say what you now understand. No artificial pauses.
 - "published" means the room stored it, not that the user heard it. If publishing fails, continue in writing.
