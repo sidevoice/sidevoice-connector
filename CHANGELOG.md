@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.7.0...v0.7.1) (2026-10-09)
+
+
+### Bug Fixes
+
+* **mcp:** answer current Claude Code's server/discover with valid lists (rmcp 3.5.1) ([#87](https://github.com/sidevoice/sidevoice-connector/issues/87)) ([134f993](https://github.com/sidevoice/sidevoice-connector/commit/134f993e6dfc87c62678c1fce7d67f672e78b204))
+
 ## [0.7.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.6.0...v0.7.0) (2026-10-06)
 
 
