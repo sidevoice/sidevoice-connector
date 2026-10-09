@@ -160,15 +160,10 @@ impl Profile {
         command
     }
 
-    /// The core's own environment beyond the profile: its models, no STUN, no browser keepalive (the test's
-    /// presentation socket does not answer one).
-    pub fn core_env(&self, core: &Path) -> BTreeMap<String, String> {
+    /// The core's own environment beyond the profile: no browser keepalive (the test's presentation socket does
+    /// not answer one).
+    pub fn core_env(&self) -> BTreeMap<String, String> {
         let mut env = self.env();
-        env.insert(
-            "RUSTVANI_CACHE_DIR".into(),
-            core.join("models").to_string_lossy().into_owned(),
-        );
-        env.insert("SIDEVOICE_STUN_URLS".into(), String::new());
         env.insert("VOICE_BROWSER_HEARTBEAT_SECONDS".into(), "0".into());
         env
     }
@@ -179,7 +174,7 @@ impl Profile {
         let log = fs::File::create(self.root.join(format!("core-{launch_id}.log"))).unwrap();
         let child = self
             .command(core.join("bin/sidevoice-core-rust"))
-            .envs(self.core_env(core))
+            .envs(self.core_env())
             .arg("--data-dir")
             .arg(self.core_data())
             .arg("--socket")

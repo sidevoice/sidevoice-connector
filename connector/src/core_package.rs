@@ -14,10 +14,11 @@
 //! (the release layout's `CORE_DIRECTORY`): its size and digest must be the inventory's, it is unpacked below one
 //! fixed root with only plain files and directories, and what it unpacks to must be exactly the core's own
 //! inventory (`native-core.json`: every file with its size and digest, for this target and this source commit).
-//! Then the core runs its own self-test (`--self-test <wav> <models>`) from where it was staged; a core that fails
-//! it is removed and the failure is keyed (`core.self-test`).
+//! The core is a `rust-native-v2` archive: its program in `bin/` and its licence notices in `notices/`, nothing
+//! else.
 //!
-//! The core never runs with a dynamic loader variable of ours ([`environment`]): its libraries are its own.
+//! The core never runs with a dynamic loader variable of ours ([`environment`]): it loads only the system's
+//! libraries.
 
 use crate::messages::Keyed;
 use anyhow::{bail, Context, Result};
@@ -28,16 +29,12 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 /// The package's inventory, at its root.
 pub const INVENTORY: &str = "connector.json";
 
-/// Variables a dynamic loader (or the core's ONNX runtime, `ORT_DYLIB_PATH`) reads to load a library from
-/// elsewhere: never passed to the core, whose libraries are its own.
+/// Variables a dynamic loader reads to load a library from elsewhere: never passed to the core.
 pub const LOADER_VARIABLES: &[&str] = &[
-    "ORT_DYLIB_PATH",
     "LD_LIBRARY_PATH",
     "LD_PRELOAD",
     "LD_AUDIT",
@@ -53,19 +50,10 @@ pub const LOADER_VARIABLES: &[&str] = &[
 /// The core archive's single root directory, and what is below it.
 const ARCHIVE_ROOT: &str = "sidevoice-core-rust";
 const CORE_INVENTORY: &str = "native-core.json";
-const CORE_KIND: &str = "rust-native-v1";
+const CORE_KIND: &str = "rust-native-v2";
 const ENTRYPOINT: &str = "bin/sidevoice-core-rust";
-const SELF_TEST_WAV: &str = "checks/detector-16k.wav";
-const MODELS: &str = "models";
-/// The top-level directories a core may have, and the files it must.
-const TOP_LEVEL: &[&str] = &["bin", "lib", "models", "checks", "notices"];
-const REQUIRED: &[&str] = &[
-    ENTRYPOINT,
-    SELF_TEST_WAV,
-    "models/silero.onnx",
-    "models/silero_vad_16k.bin",
-    "models/smart_turn_weights.bin.gz",
-];
+/// The top-level directories a core may have; its entrypoint is the one file it must.
+const TOP_LEVEL: &[&str] = &["bin", "notices"];
 
 const MAX_INVENTORY: u64 = 1_000_000;
 const MAX_CORE_INVENTORY: u64 = 4_000_000;
@@ -73,7 +61,6 @@ const MAX_ARCHIVE: u64 = 250_000_000;
 const MAX_UNPACKED: u64 = 1_000_000_000;
 const MAX_ENTRIES: usize = 5_000;
 const MAX_PATH: usize = 240;
-const SELF_TEST_LIMIT: Duration = Duration::from_secs(120);
 
 /// The core a package carries, as its inventory names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,16 +175,12 @@ pub fn packaged_as(root: &Path, version: &str) -> Result<PackagedCore> {
     })
 }
 
-/// The core's environment: `base` with no loader variable and its models named.
-pub fn environment(base: &BTreeMap<String, String>, core: &Path) -> BTreeMap<String, String> {
+/// The core's environment: `base` with no loader variable.
+pub fn environment(base: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut environment = base.clone();
     for name in LOADER_VARIABLES {
         environment.remove(*name);
     }
-    environment.insert(
-        "RUSTVANI_CACHE_DIR".into(),
-        core.join(MODELS).to_string_lossy().into_owned(),
-    );
     environment
 }
 
@@ -347,8 +330,8 @@ fn check_inventory(core: &PackagedCore, inventory: &[u8], written: &Files) -> Re
             return Err(mismatch(format!("{CORE_INVENTORY} lists {name} twice")));
         }
     }
-    if let Some(missing) = REQUIRED.iter().find(|name| !listed.contains_key(**name)) {
-        return Err(mismatch(format!("the core has no {missing}")));
+    if !listed.contains_key(ENTRYPOINT) {
+        return Err(mismatch(format!("the core has no {ENTRYPOINT}")));
     }
     if &listed != written {
         let differ: Vec<&String> = listed
@@ -413,124 +396,14 @@ pub fn stage(core: &PackagedCore, release: &Path) -> Result<PathBuf> {
     result.map(|()| destination)
 }
 
-fn self_test_failure(detail: impl std::fmt::Display) -> anyhow::Error {
-    let detail: String = detail
-        .to_string()
-        .chars()
-        .filter(|ch| !ch.is_control())
-        .take(240)
-        .collect();
-    Keyed::new("core.self-test", json!({"detail": detail})).into()
-}
-
-/// Whether a self-test report is a passing one: the detectors heard the voice in the check file and the turn end,
-/// at 16 kHz, and Opus decoded a 20 ms frame (the criteria of the core's own release check).
-fn report_passes(report: &Value) -> bool {
-    let detectors = &report["detectors"];
-    detectors["sample_rate"] == 16_000
-        && detectors["frames"]
-            .as_u64()
-            .is_some_and(|frames| frames > 0)
-        && detectors["max_voice_confidence"]
-            .as_f64()
-            .is_some_and(|confidence| confidence > 0.5)
-        && detectors["smart_turn_complete"] == true
-        && report["opus_decoded_samples"] == 320
-}
-
-/// Runs the staged core's own self-test (`--self-test <core>/checks/detector-16k.wav <core>/models`) and returns
-/// its report; a failure, a timeout or a report that does not pass is `core.self-test`.
-pub fn self_test(core: &Path) -> Result<Value> {
-    let program = core.join(ENTRYPOINT);
-    let current: BTreeMap<String, String> = std::env::vars().collect();
-    let mut command = Command::new(&program);
-    command
-        .arg("--self-test")
-        .arg(core.join(SELF_TEST_WAV))
-        .arg(core.join(MODELS))
-        .env_clear()
-        .envs(environment(&current, core))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // A program just written can be "busy" for a moment while another thread's fork still holds it open.
-    let mut attempts = 0;
-    let mut child = loop {
-        match command.spawn() {
-            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempts < 20 => {
-                attempts += 1;
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            spawned => {
-                break spawned.map_err(|error| {
-                    self_test_failure(format!("{}: {error}", program.display()))
-                })?
-            }
-        }
-    };
-    let mut stdout = child.stdout.take().context("stdout")?;
-    let mut stderr = child.stderr.take().context("stderr")?;
-    let out = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = (&mut stdout).take(1_000_000).read_to_end(&mut bytes);
-        bytes
-    });
-    let err = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = (&mut stderr).take(1_000_000).read_to_end(&mut bytes);
-        bytes
-    });
-    let deadline = Instant::now() + SELF_TEST_LIMIT;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(self_test_failure(format!(
-                "no answer after {} s",
-                SELF_TEST_LIMIT.as_secs()
-            )));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let stdout = String::from_utf8_lossy(&out.join().unwrap_or_default()).into_owned();
-    let stderr = String::from_utf8_lossy(&err.join().unwrap_or_default()).into_owned();
-    let last = |text: &str| text.trim().lines().last().unwrap_or("").to_owned();
-    if !status.success() {
-        // The core says why as one JSON line: `{"error_key", "detail"}`.
-        let said = serde_json::from_str::<Value>(&last(&stderr)).ok();
-        let detail = said
-            .as_ref()
-            .and_then(|said| {
-                let key = said["error_key"].as_str()?;
-                Some(match said["detail"].as_str() {
-                    Some(detail) => format!("{key}: {detail}"),
-                    None => key.to_owned(),
-                })
-            })
-            .unwrap_or_else(|| format!("{status}: {}", last(&stderr)));
-        return Err(self_test_failure(detail));
-    }
-    let report: Value = serde_json::from_str(&last(&stdout))
-        .map_err(|_| self_test_failure(format!("unreadable report {:?}", last(&stdout))))?;
-    if !report_passes(&report) {
-        return Err(self_test_failure(format!("report {report}")));
-    }
-    Ok(report)
-}
-
 /// What [`install`] staged.
 #[derive(Debug)]
 pub struct Installed {
     pub core: PackagedCore,
     pub path: PathBuf,
-    pub self_test: Value,
 }
 
-/// The installer's step for the core: stages the core the package at `package` carries into `<release>/core`
-/// and runs its self-test there. A core that fails its self-test is removed again.
+/// The installer's step for the core: stages the core the package at `package` carries into `<release>/core`.
 pub fn install(package: &Path, release: &Path) -> Result<Installed> {
     install_as(package, release, crate::identity::VERSION)
 }
@@ -539,17 +412,7 @@ pub fn install(package: &Path, release: &Path) -> Result<Installed> {
 pub fn install_as(package: &Path, release: &Path, version: &str) -> Result<Installed> {
     let core = packaged_as(package, version)?;
     let path = stage(&core, release)?;
-    match self_test(&path) {
-        Ok(self_test) => Ok(Installed {
-            core,
-            path,
-            self_test,
-        }),
-        Err(error) => {
-            let _ = fs::remove_dir_all(&path);
-            Err(error)
-        }
-    }
+    Ok(Installed { core, path })
 }
 
 impl Installed {
@@ -557,7 +420,7 @@ impl Installed {
     pub fn value(&self) -> Value {
         json!({"ok": true, "core": {"version": self.core.version, "target": self.core.target,
             "sha256": self.core.sha256, "size": self.core.size, "source_sha": self.core.source_sha,
-            "path": self.path}, "self_test": self.self_test})
+            "path": self.path}})
     }
 }
 
@@ -587,20 +450,10 @@ pub(crate) mod tests {
 
     const SOURCE: &str = "0123456789abcdef0123456789abcdef01234567";
 
-    /// A core whose program is a script: it passes its self-test, or fails it the way the core does.
-    pub(crate) fn core_files(passes: bool) -> Vec<(&'static str, Vec<u8>)> {
-        let program = if passes {
-            "#!/bin/sh\necho '{\"detectors\":{\"sample_rate\":16000,\"frames\":3,\"max_voice_confidence\":0.9,\
-             \"smart_turn_probability\":0.8,\"smart_turn_complete\":true},\"opus_decoded_samples\":320}'\n"
-        } else {
-            "#!/bin/sh\necho '{\"error_key\":\"rust_core_t0_detector_failed\",\"detail\":\"no model\"}' >&2\nexit 1\n"
-        };
+    /// A core: its program (a script) and a notice.
+    pub(crate) fn core_files() -> Vec<(&'static str, Vec<u8>)> {
         vec![
-            (ENTRYPOINT, program.as_bytes().to_vec()),
-            (SELF_TEST_WAV, b"RIFF".to_vec()),
-            ("models/silero.onnx", b"onnx".to_vec()),
-            ("models/silero_vad_16k.bin", b"vad".to_vec()),
-            ("models/smart_turn_weights.bin.gz", b"turn".to_vec()),
+            (ENTRYPOINT, b"#!/bin/sh\nexit 0\n".to_vec()),
             ("notices/LICENSE", b"licence".to_vec()),
         ]
     }
@@ -668,14 +521,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_packaged_core_is_staged_into_the_release_and_passes_its_self_test() {
+    fn the_packaged_core_is_staged_into_the_release() {
         let scratch = Scratch::new("stage");
-        let root = package(&scratch.0, &core_archive(&core_files(true), &[]), None);
+        let root = package(&scratch.0, &core_archive(&core_files(), &[]), None);
         let release = release(&scratch.0);
         let installed = install(&root, &release).unwrap();
         assert_eq!(installed.path, release.join("core"));
         assert_eq!(installed.core.version, "0.2.0");
-        assert_eq!(installed.self_test["opus_decoded_samples"], 320);
         let program = release.join(crate::service::layout::CORE_ENTRYPOINT);
         let mode = fs::metadata(&program).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700, "only the entrypoint is executable");
@@ -699,7 +551,7 @@ pub(crate) mod tests {
         let scratch = Scratch::new("digest");
         let root = package(
             &scratch.0,
-            &core_archive(&core_files(true), &[]),
+            &core_archive(&core_files(), &[]),
             Some("0".repeat(64)),
         );
         let release = release(&scratch.0);
@@ -711,15 +563,15 @@ pub(crate) mod tests {
     #[test]
     fn a_core_that_differs_from_its_own_inventory_is_refused() {
         let scratch = Scratch::new("inventory");
-        // Listed with one model, shipped with another.
+        // Listed with one notice, shipped with another.
         let archive = core_archive_mismatched(
-            &core_files(true),
-            &[("models/silero.onnx", b"another model".to_vec())],
+            &core_files(),
+            &[("notices/LICENSE", b"another notice".to_vec())],
         );
         let root = package(&scratch.0, &archive, None);
         let error = install(&root, &release(&scratch.0)).unwrap_err();
         assert_eq!(key(&error), "core.package-mismatch", "{error}");
-        assert!(error.to_string().contains("models/silero.onnx"), "{error}");
+        assert!(error.to_string().contains("notices/LICENSE"), "{error}");
     }
 
     /// An archive whose inventory lists `listed` while it holds `held` in place of the same names.
@@ -750,10 +602,7 @@ pub(crate) mod tests {
     #[test]
     fn a_path_outside_the_core_is_refused() {
         let scratch = Scratch::new("escape");
-        let archive = core_archive(
-            &core_files(true),
-            &[("sidevoice-core-rust/../escape", b"x")],
-        );
+        let archive = core_archive(&core_files(), &[("sidevoice-core-rust/../escape", b"x")]);
         let root = package(&scratch.0, &archive, None);
         let release = release(&scratch.0);
         let error = install(&root, &release).unwrap_err();
@@ -764,21 +613,6 @@ pub(crate) mod tests {
         assert!(member("sidevoice-core-rust/etc/x").is_none());
         assert!(member("sidevoice-core-rust//x").is_none());
         assert!(member("elsewhere/bin/x").is_none());
-    }
-
-    #[test]
-    fn a_failed_self_test_is_keyed_and_leaves_no_core() {
-        let scratch = Scratch::new("self-test");
-        let root = package(&scratch.0, &core_archive(&core_files(false), &[]), None);
-        let release = release(&scratch.0);
-        let error = install(&root, &release).unwrap_err();
-        let keyed = crate::messages::keyed(&error);
-        assert_eq!(keyed.key, "core.self-test", "{error}");
-        assert_eq!(
-            keyed.params["detail"],
-            "rust_core_t0_detector_failed: no model"
-        );
-        assert!(!release.join("core").exists(), "a failing core is removed");
     }
 
     #[test]
@@ -808,37 +642,59 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_core_runs_with_no_loader_variable_and_its_models_named() {
+    fn the_core_runs_with_no_loader_variable() {
         let base = BTreeMap::from([
             ("LD_PRELOAD".to_owned(), "/x.so".to_owned()),
             ("DYLD_INSERT_LIBRARIES".to_owned(), "/x.dylib".to_owned()),
-            (
-                "ORT_DYLIB_PATH".to_owned(),
-                "/x/libonnxruntime.so".to_owned(),
-            ),
             ("HOME".to_owned(), "/h".to_owned()),
         ]);
-        let environment = environment(&base, Path::new("/r/core"));
-        assert_eq!(
-            environment.keys().collect::<Vec<_>>(),
-            ["HOME", "RUSTVANI_CACHE_DIR"]
-        );
-        assert_eq!(environment["RUSTVANI_CACHE_DIR"], "/r/core/models");
+        assert_eq!(environment(&base).keys().collect::<Vec<_>>(), ["HOME"]);
     }
 
     #[test]
-    fn only_a_passing_report_passes() {
-        let report: Value = serde_json::from_str(
-            "{\"detectors\":{\"sample_rate\":16000,\"frames\":3,\"max_voice_confidence\":0.9,\
-             \"smart_turn_complete\":true},\"opus_decoded_samples\":320}",
-        )
-        .unwrap();
-        assert!(report_passes(&report));
-        let mut quiet = report.clone();
-        quiet["detectors"]["max_voice_confidence"] = json!(0.1);
-        assert!(!report_passes(&quiet));
-        let mut silent = report;
-        silent["opus_decoded_samples"] = json!(0);
-        assert!(!report_passes(&silent));
+    fn only_a_rust_native_v2_core_with_bin_and_notices_is_taken() {
+        let scratch = Scratch::new("kind");
+        // A core of the old layout: its kind and its voice pipeline's files are refused.
+        let old = core_archive_kind(&core_files(), "rust-native-v1");
+        let root = package(&scratch.0, &old, None);
+        let error = install(&root, &release(&scratch.0)).unwrap_err();
+        assert_eq!(key(&error), "core.package-mismatch", "{error}");
+        assert!(error.to_string().contains("rust-native-v2"), "{error}");
+        for directory in ["models", "checks", "lib"] {
+            assert!(
+                member(&format!("sidevoice-core-rust/{directory}/x")).is_none(),
+                "{directory}"
+            );
+        }
+        let mut files = core_files();
+        files.retain(|(name, _)| *name != ENTRYPOINT);
+        let scratch = Scratch::new("entrypoint");
+        let root = package(&scratch.0, &core_archive(&files, &[]), None);
+        let error = install(&root, &release(&scratch.0)).unwrap_err();
+        assert!(error.to_string().contains(ENTRYPOINT), "{error}");
+    }
+
+    /// An honest archive of `files` whose inventory names `kind`.
+    fn core_archive_kind(files: &[(&str, Vec<u8>)], kind: &str) -> Vec<u8> {
+        let honest = core_archive(files, &[]);
+        let decoded = zstd::decode_all(honest.as_slice()).unwrap();
+        let mut archive = tar::Archive::new(decoded.as_slice());
+        let mut builder = tar::Builder::new(Vec::new());
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let name = entry.path().unwrap().to_string_lossy().into_owned();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            if name == format!("{ARCHIVE_ROOT}/{CORE_INVENTORY}") {
+                let mut inventory: Value = serde_json::from_slice(&bytes).unwrap();
+                inventory["kind"] = json!(kind);
+                bytes = serde_json::to_vec(&inventory).unwrap();
+            }
+            let mut header = entry.header().clone();
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            builder.append(&header, bytes.as_slice()).unwrap();
+        }
+        zstd::encode_all(builder.into_inner().unwrap().as_slice(), 3).unwrap()
     }
 }

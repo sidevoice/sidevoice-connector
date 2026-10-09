@@ -30,7 +30,7 @@ const CONTAINER_ROOT: &str = "/opt/sidevoice-connector";
 /// Unpacks the archive somewhere else (a path with a space), checks the binary loads only what every machine of
 /// its target has and, on Linux, needs no glibc newer than the floor its inventory records, and runs it from
 /// there: `--version` and `--version --json` must name the inventory's version, target and source commit, and
-/// `stage-core` must stage the core the inventory names into a release and pass the core's own self-test there.
+/// `stage-core` must stage the core the inventory names into a release, checked against the core's own inventory.
 ///
 /// With `image` (a container image of this machine's architecture), the binary runs in that container instead,
 /// read-only, without network; the container's own glibc must be the inventory's floor. The core is not staged
@@ -140,7 +140,7 @@ pub(crate) fn verify(archive: &Path, image: Option<&str>) -> Result<()> {
             ));
         }
     }
-    // The core inside: staged into a release and self-tested by the connector itself, as an install does it. Not in
+    // The core inside: staged into a release by the connector itself, as an install does it. Not in
     // the floor's container (read-only, and the core's own glibc floor is not the connector's yet).
     let staged = match image {
         Some(_) => None,
@@ -169,8 +169,7 @@ pub(crate) fn verify(archive: &Path, image: Option<&str>) -> Result<()> {
                "identity": identity, "libraries": libraries, "relocation": true,
                "glibc": {"floor": floor, "needed": needed}, "ran_in": image,
                "files": inventory["files"].as_array().map(Vec::len),
-               "core": staged.as_ref().map(|staged| &staged["core"]),
-               "core_self_test": staged.as_ref().map(|staged| &staged["self_test"])})
+               "core": staged.as_ref().map(|staged| &staged["core"])})
     );
     Ok(())
 }

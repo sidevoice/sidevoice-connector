@@ -6,7 +6,7 @@
 //! - `verify ARCHIVE`: unpack it somewhere else, check its inventory (the core inside included), what the binary
 //!   links and (Linux) that it needs no glibc newer than the floor the inventory records, and run it from there: it
 //!   must report the version and build identity the inventory names, and stage the core it carries into a release,
-//!   where the core passes its own self-test.
+//!   checked against its own inventory.
 //! - `verify-floor ARCHIVE` (Linux, needs Docker): `verify`, running the binary in a container of the oldest
 //!   distribution it supports, whose glibc is the floor (`glibc::FLOOR_IMAGE`). The core is not run there: the
 //!   pinned core release has a floor of its own.

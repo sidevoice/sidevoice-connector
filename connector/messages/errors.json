@@ -63,7 +63,6 @@
   "pair-device.failed": "No pairing code could be had from this machine's core: {detail}",
   "core.package-missing": "This Sidevoice package does not carry a core for this computer ({detail}). Install Sidevoice again.",
   "core.package-mismatch": "The core in this Sidevoice package is not the one the package lists ({detail}); nothing was installed. Install Sidevoice again.",
-  "core.self-test": "The Sidevoice core failed its self-test on this computer ({detail}); it was not installed.",
   "install.failed": "Sidevoice could not be installed: {detail}",
   "install.legacy": "Sidevoice was installed on this computer by an earlier installer ({detail}), which this version does not upgrade or remove. Remove it first with:\n    {command}\nthen run this command again.",
   "install.verify-failed": "Sidevoice {version} is installed but did not start ({cause}). See `sidevoice service status`, or run the install again.",

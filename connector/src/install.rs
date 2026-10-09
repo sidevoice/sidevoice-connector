@@ -4,7 +4,7 @@
 //!
 //! | What | Where |
 //! |---|---|
-//! | `R/releases/<id>/` | one release per version: `bin/sidevoice-connector`, a copy of the installing binary, and `core/`, the core the package carries, staged and self-tested (`core_package.rs`) |
+//! | `R/releases/<id>/` | one release per version: `bin/sidevoice-connector`, a copy of the installing binary, and `core/`, the core the package carries, staged and checked against its inventory (`core_package.rs`) |
 //! | `R/current` | a link to the selected release, switched by renaming a new link over it |
 //! | `D/install.json` | `command`: `[R/current/bin/sidevoice-connector]`, what the service jobs, the desktop app and every agent registration run, never the package's own path (npm's cache is not stable); `releases`: `R` |
 //!
@@ -1055,8 +1055,8 @@ pub(crate) mod tests {
         }
 
         /// A package of connector `version`: a binary that says its version (`build` tells builds apart) and a
-        /// core that passes its self-test, or fails it.
-        fn package(&self, version: &str, build: &str, core_passes: bool) -> Package {
+        /// core.
+        fn package(&self, version: &str, build: &str) -> Package {
             let root = self.scratch.0.join(format!(
                 "package-{version}-{build}-{}",
                 uuid::Uuid::new_v4().simple()
@@ -1070,7 +1070,7 @@ pub(crate) mod tests {
             )
             .unwrap();
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
-            let archive = core_archive(&core_files(core_passes), &[]);
+            let archive = core_archive(&core_files(), &[]);
             let target = crate::identity::target().unwrap();
             let name = format!("core/sidevoice-core-0.2.0-{target}.tar.zst");
             fs::write(root.join(&name), &archive).unwrap();
@@ -1112,7 +1112,7 @@ pub(crate) mod tests {
 
         // First install: the release, `current`, and the stable command recorded.
         let answer = fixture
-            .install(&fixture.package("1.0.0", "a", true))
+            .install(&fixture.package("1.0.0", "a"))
             .await
             .unwrap();
         assert_eq!(answer["action"], "installed", "{answer}");
@@ -1146,7 +1146,7 @@ pub(crate) mod tests {
             .modified()
             .unwrap();
         let again = fixture
-            .install(&fixture.package("1.0.0", "a", true))
+            .install(&fixture.package("1.0.0", "a"))
             .await
             .unwrap();
         assert_eq!(again["action"], "reinstalled", "{again}");
@@ -1160,7 +1160,7 @@ pub(crate) mod tests {
 
         // Upgrades: the one before is kept, any older one pruned.
         let second = fixture
-            .install(&fixture.package("2.0.0", "a", true))
+            .install(&fixture.package("2.0.0", "a"))
             .await
             .unwrap();
         assert_eq!(
@@ -1169,7 +1169,7 @@ pub(crate) mod tests {
         );
         assert_eq!(fixture.releases(), ["1.0.0", "2.0.0"]);
         let third = fixture
-            .install(&fixture.package("3.0.0", "a", true))
+            .install(&fixture.package("3.0.0", "a"))
             .await
             .unwrap();
         assert_eq!(third["pruned"], json!(["1.0.0"]));
@@ -1179,7 +1179,7 @@ pub(crate) mod tests {
         // A release whose pair does not answer: back to the one before, restarted, and the failed one deleted.
         fixture.fake.lock().unwrap().failing.insert("4.0.0".into());
         let error = fixture
-            .install(&fixture.package("4.0.0", "a", true))
+            .install(&fixture.package("4.0.0", "a"))
             .await
             .unwrap_err();
         assert_eq!(key(&error), "install.rolled-back", "{error}");
@@ -1220,7 +1220,7 @@ pub(crate) mod tests {
 
         // And it installs again from nothing.
         fixture
-            .install(&fixture.package("3.0.0", "a", true))
+            .install(&fixture.package("3.0.0", "a"))
             .await
             .unwrap();
         assert_eq!(fixture.releases(), ["3.0.0"]);
@@ -1231,7 +1231,7 @@ pub(crate) mod tests {
         let fixture = Fixture::new("first-fails");
         fixture.fake.lock().unwrap().failing.insert("1.0.0".into());
         let error = fixture
-            .install(&fixture.package("1.0.0", "a", true))
+            .install(&fixture.package("1.0.0", "a"))
             .await
             .unwrap_err();
         assert_eq!(key(&error), "install.verify-failed", "{error}");
@@ -1240,30 +1240,13 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_core_that_fails_its_self_test_is_not_installed() {
-        let fixture = Fixture::new("self-test");
-        fixture
-            .install(&fixture.package("1.0.0", "a", true))
-            .await
-            .unwrap();
-        let error = fixture
-            .install(&fixture.package("2.0.0", "a", false))
-            .await
-            .unwrap_err();
-        assert_eq!(key(&error), "core.self-test", "{error}");
-        assert_eq!(fixture.releases(), ["1.0.0"], "nothing partial is left");
-        assert_eq!(current_release(&fixture.layout()).as_deref(), Some("1.0.0"));
-        assert_eq!(fixture.fake.lock().unwrap().restarts.len(), 1);
-    }
-
-    #[tokio::test]
     async fn another_build_of_a_version_is_a_release_of_its_own() {
         let fixture = Fixture::new("builds");
         fixture
-            .install(&fixture.package("1.0.0", "a", true))
+            .install(&fixture.package("1.0.0", "a"))
             .await
             .unwrap();
-        let other = fixture.package("1.0.0", "b", true);
+        let other = fixture.package("1.0.0", "b");
         let digest = digest_file(&other.binary).unwrap();
         let answer = fixture.install(&other).await.unwrap();
         let id = format!("1.0.0+{}", &digest[..12]);
@@ -1271,7 +1254,7 @@ pub(crate) mod tests {
         assert_eq!(answer["action"], "updated");
         assert_eq!(fixture.releases(), ["1.0.0".to_owned(), id]);
         assert!(fixture
-            .install(&fixture.package("bad/version", "a", true))
+            .install(&fixture.package("bad/version", "a"))
             .await
             .is_err());
     }
@@ -1290,7 +1273,7 @@ pub(crate) mod tests {
         crate::secure_fs::atomic_json(&layout.install_file(), &json!({"command": [program]}))
             .unwrap();
         let error = fixture
-            .install(&fixture.package("1.0.0", "a", true))
+            .install(&fixture.package("1.0.0", "a"))
             .await
             .unwrap_err();
         assert_eq!(key(&error), "install.legacy", "{error}");
@@ -1312,7 +1295,7 @@ pub(crate) mod tests {
         let fixture = Fixture::new("legacy-python");
         fs::create_dir_all(fixture.layout().data.join("core-runtime/build")).unwrap();
         let error = fixture
-            .install(&fixture.package("1.0.0", "a", true))
+            .install(&fixture.package("1.0.0", "a"))
             .await
             .unwrap_err();
         assert_eq!(
@@ -1337,7 +1320,7 @@ pub(crate) mod tests {
         fs::set_permissions(releases_dir(&layout), fs::Permissions::from_mode(0o700)).unwrap();
         std::os::unix::fs::symlink("releases/x", layout.releases.join(".current-x.tmp")).unwrap();
         fixture
-            .install(&fixture.package("1.0.0", "a", true))
+            .install(&fixture.package("1.0.0", "a"))
             .await
             .unwrap();
         assert_eq!(fixture.releases(), ["1.0.0"]);

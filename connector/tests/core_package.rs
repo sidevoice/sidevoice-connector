@@ -1,6 +1,6 @@
 //! The core inside the connector's package, with the real core: a package laid out as the release archive lays it
 //! out (`bin/sidevoice-connector`, `core/<the pinned core archive>`, `connector.json`) stages its core into a
-//! release with `stage-core`, and the core passes its own self-test there; a package whose core archive is not the
+//! release with `stage-core`, checked against the core's own inventory; a package whose core archive is not the
 //! one its inventory names is refused with a stable key and stages nothing.
 //!
 //! The core archive is the one `cargo xtask core` checked and kept in `target/sidevoice-core`. Without it the test
@@ -49,7 +49,7 @@ fn stage_core(package: &Path, release: &Path) -> (bool, Value) {
 }
 
 #[test]
-fn the_packaged_core_is_staged_into_a_release_and_passes_its_self_test() {
+fn the_packaged_core_is_staged_into_a_release() {
     let Some((archive, record)) = pinned_core() else {
         return;
     };
@@ -60,11 +60,11 @@ fn the_packaged_core_is_staged_into_a_release_and_passes_its_self_test() {
     assert!(ok, "{answer}");
     assert_eq!(answer["core"]["version"], record["version"], "{answer}");
     assert_eq!(answer["core"]["sha256"], record["sha256"], "{answer}");
-    assert_eq!(answer["self_test"]["opus_decoded_samples"], 320, "{answer}");
     let program = release.join("core/bin/sidevoice-core-rust");
     let mode = fs::metadata(&program).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o700, "{}", program.display());
-    assert!(release.join("core/models/silero.onnx").is_file());
+    assert!(release.join("core/notices").is_dir());
+    assert!(!release.join("core/models").exists());
 
     let (ok, again) = stage_core(&root, &release);
     assert!(!ok, "a release has one core: {again}");
