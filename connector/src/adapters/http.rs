@@ -45,6 +45,7 @@ pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
         "session_id":event.get("session_id").and_then(Value::as_str).unwrap_or(""),
         "revision":event.get("revision").and_then(Value::as_i64).unwrap_or(0),
         "channel":event.get("channel").and_then(Value::as_str).unwrap_or("voice"),
+        "unheard":event.get("unheard"),
     })
     .to_string();
     let mut child = tokio::process::Command::new("curl")

@@ -137,6 +137,12 @@ pub fn experimental(identity: &Identity, capabilities: &Value) -> Vec<String> {
     names
 }
 
+/// What the agent reads for a delivery: the JSON header, then
+/// - `voice`: the user's words and the `[Sidevoice]` lines (how to answer, and what the user did
+///   not hear, when core says);
+/// - `note`: the room's note that the user came back without saying anything, and what they did
+///   not hear; it has no words of the user's;
+/// - `room-control`: the text as it is.
 pub fn envelope(event: &Value) -> Result<String> {
     let channel = event
         .get("channel")
@@ -150,10 +156,9 @@ pub fn envelope(event: &Value) -> Result<String> {
         message_id: &'a str,
     }
     let header = Header {
-        channel: if channel == "room-control" {
-            "room-control"
-        } else {
-            "voice"
+        channel: match channel {
+            "room-control" | "note" => channel,
+            _ => "voice",
         },
         session_id: event
             .get("session_id")
@@ -168,19 +173,77 @@ pub fn envelope(event: &Value) -> Result<String> {
             .and_then(Value::as_str)
             .context("message_id required")?,
     };
+    let header_text = serde_json::to_string(&header)?;
+    let unheard = unheard(event);
+    if header.channel == "note" {
+        let (count, list) = unheard.unwrap_or_default();
+        return Ok(format!(
+            "{header_text}\n\n[Sidevoice] A note from the room, not the user: the user came back and has not said anything yet. They did not hear {count} of your replies{list}\nTell them by voice, briefly, where things stand: what still matters from those replies and what is pending on them, without repeating them as they were. Reply with voice_say (session_id \"{}\", revision {}).",
+            header.session_id, header.revision
+        ));
+    }
     let text = event
         .get("text")
         .and_then(Value::as_str)
         .context("text required")?;
-    let header_text = serde_json::to_string(&header)?;
     let mut body = format!("{}\n\n{}", header_text, text);
     if header.channel != "room-control" {
         body.push_str(&format!(
             "\n\n[Sidevoice] Voice from the room: acknowledge with voice_say (session_id \"{}\", revision {}) before any other tool, then work and reply by voice, as the sidevoice server's instructions say.",
             header.session_id, header.revision
         ));
+        if let Some((count, list)) = unheard {
+            body.push_str(&format!(
+                "\n[Sidevoice] The user did not hear {count} of your earlier replies{list}\nDo not repeat them as they were: answer what the user says now and fold in only what still matters."
+            ));
+        }
     }
     Ok(body)
+}
+
+/// What the user did not hear, as core sends it (`unheard: {count, replies: [{text, truncated,
+/// cut}]}`, already bounded): the count, and the replies it shows as lines after a colon, oldest
+/// first. None when there is nothing.
+fn unheard(event: &Value) -> Option<(u64, String)> {
+    let unheard = event.get("unheard")?;
+    let count = unheard
+        .get("count")
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)?;
+    let replies = unheard
+        .get("replies")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut list = String::new();
+    if !replies.is_empty() {
+        let shown = replies.len() as u64;
+        list.push_str(&if shown < count {
+            format!(" (the latest {shown}, oldest first):")
+        } else {
+            " (oldest first):".to_owned()
+        });
+    } else {
+        list.push('.');
+    }
+    for reply in replies {
+        let mut text = reply
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if reply.get("truncated").and_then(Value::as_bool) == Some(true) {
+            text.push('…');
+        }
+        let how = if reply.get("cut").and_then(Value::as_bool) == Some(true) {
+            "cut off while playing: only its start was heard"
+        } else {
+            "never played"
+        };
+        let quoted = serde_json::to_string(&text).unwrap_or_default();
+        list.push_str(&format!("\n- {quoted} ({how})"));
+    }
+    Some((count, list))
 }
 
 pub async fn deliver(
@@ -198,5 +261,79 @@ pub async fn deliver(
         _ => {
             Ok(json!({"status":"unsupported","detail":format!("{} has no delivery route", thread)}))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::envelope;
+    use serde_json::json;
+
+    const HEADER: &str = r#"{"channel":"voice","session_id":"s","revision":4,"message_id":"m"}"#;
+
+    fn voice() -> serde_json::Value {
+        json!({"channel":"voice","session_id":"s","revision":4,"message_id":"m","text":"And the tests?"})
+    }
+
+    #[test]
+    fn a_voice_message_without_unheard_replies_is_as_before() {
+        let body = envelope(&voice()).unwrap();
+        assert!(body.starts_with(&format!(
+            "{HEADER}\n\nAnd the tests?\n\n[Sidevoice] Voice from the room:"
+        )));
+        assert!(!body.contains("did not hear"));
+    }
+
+    #[test]
+    fn a_voice_message_lists_what_the_user_did_not_hear() {
+        let mut event = voice();
+        event["unheard"] = json!({"count":5,"replies":[
+            {"text":"The build is \"green\".","truncated":false,"cut":true},
+            {"text":"Second part","truncated":true,"cut":false}]});
+        let body = envelope(&event).unwrap();
+        let trailer = body
+            .split("\n\n[Sidevoice] Voice from the room:")
+            .nth(1)
+            .unwrap();
+        assert!(
+            trailer.ends_with(concat!(
+                "\n[Sidevoice] The user did not hear 5 of your earlier replies (the latest 2, oldest first):",
+                "\n- \"The build is \\\"green\\\".\" (cut off while playing: only its start was heard)",
+                "\n- \"Second part…\" (never played)",
+                "\nDo not repeat them as they were: answer what the user says now and fold in only what still matters."
+            )),
+            "{trailer}"
+        );
+        // The header the read receipts look for comes first, once.
+        assert_eq!(body.matches("{\"channel\":").count(), 1);
+    }
+
+    #[test]
+    fn a_note_has_no_user_words_and_says_how_to_answer() {
+        let event = json!({"channel":"note","session_id":"s","revision":7,"message_id":"note:1","text":"",
+            "unheard":{"count":1,"replies":[{"text":"Done.","truncated":false,"cut":false}]}});
+        let body = envelope(&event).unwrap();
+        assert_eq!(
+            body,
+            concat!(
+                r#"{"channel":"note","session_id":"s","revision":7,"message_id":"note:1"}"#,
+                "\n\n[Sidevoice] A note from the room, not the user: the user came back and has not said anything yet.",
+                " They did not hear 1 of your replies (oldest first):\n- \"Done.\" (never played)",
+                "\nTell them by voice, briefly, where things stand: what still matters from those replies and what is",
+                " pending on them, without repeating them as they were. Reply with voice_say (session_id \"s\", revision 7)."
+            )
+        );
+    }
+
+    #[test]
+    fn room_control_stays_as_it_is() {
+        let event = json!({"channel":"room-control","session_id":"s","revision":1,"message_id":"m","text":"x",
+            "unheard":{"count":1,"replies":[]}});
+        assert_eq!(
+            envelope(&event).unwrap(),
+            r#"{"channel":"room-control","session_id":"s","revision":1,"message_id":"m"}"#
+                .to_owned()
+                + "\n\nx"
+        );
     }
 }
