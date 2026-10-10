@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.8.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.7.1...v0.8.0) (2026-10-10)
+
+
+### ⚠ BREAKING CHANGES
+
+* **connector:** take the room-only core archive (rust-native-v2), no self-test ([#91](https://github.com/sidevoice/sidevoice-connector/issues/91))
+
+### Features
+
+* **connector:** take the room-only core archive (rust-native-v2), no self-test ([#91](https://github.com/sidevoice/sidevoice-connector/issues/91)) ([ff0644c](https://github.com/sidevoice/sidevoice-connector/commit/ff0644cb50e9c964e91c303bec7e619130c12fde))
+* **connector:** tell the agent what the user did not hear ([#90](https://github.com/sidevoice/sidevoice-connector/issues/90)) ([14f868d](https://github.com/sidevoice/sidevoice-connector/commit/14f868d5bbb2d23dda1a5b540adbdcafb16f0bd6))
+
+
+### Bug Fixes
+
+* agents reach and leave this installation, systemd enables for the next login, install repairs a damaged core ([#94](https://github.com/sidevoice/sidevoice-connector/issues/94)) ([1f33488](https://github.com/sidevoice/sidevoice-connector/commit/1f33488428ae8247c136959cfa147ec030dc8a59))
+* **bench:** the page names its API relative to itself ([#92](https://github.com/sidevoice/sidevoice-connector/issues/92)) ([0b925d4](https://github.com/sidevoice/sidevoice-connector/commit/0b925d48e1c72049e12049d488d61b03f9d85b33))
+
 ## [0.7.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.7.0...v0.7.1) (2026-10-09)
 
 
