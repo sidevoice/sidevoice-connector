@@ -67,15 +67,25 @@ impl HostAgents {
         if !user_scope {
             return Ok("foreign".into());
         }
+        // The block under `Environment:`, one `KEY=value` per line, indented below the field.
+        let env = detail
+            .lines()
+            .skip_while(|line| !line.trim().eq_ignore_ascii_case("Environment:"))
+            .skip(1)
+            .take_while(|line| line.starts_with("    ") && line.contains('='))
+            .filter_map(|line| line.trim().split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect::<BTreeMap<_, _>>();
         if self.selected.owns(&command, &args) {
-            Ok(
-                if command == self.selected.command && args == self.selected.args {
-                    "connected"
-                } else {
-                    "owned-old"
-                }
-                .into(),
-            )
+            Ok(if command == self.selected.command
+                && args == self.selected.args
+                && env == self.mcp_env()
+            {
+                "connected"
+            } else {
+                "owned-old"
+            }
+            .into())
         } else {
             Ok("foreign".into())
         }
@@ -88,10 +98,10 @@ impl HostAgents {
         deadline: Instant,
     ) -> std::result::Result<String, Failure> {
         let state = self.claude_entry_state(binary, cancel, deadline).await?;
-        Ok(if state == "absent" || state == "owned-old" {
-            "not-connected".into()
-        } else {
-            state
+        Ok(match state.as_str() {
+            "absent" => "not-connected".into(),
+            "owned-old" => "outdated".into(),
+            _ => state,
         })
     }
 
@@ -153,14 +163,29 @@ impl HostAgents {
                 .await?;
             }
         }
-        let mut args = vec!["mcp", "add", "--scope", "user", "sidevoice", "--"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        args.push(self.selected.command.clone());
-        args.extend(self.selected.args.clone());
+        let args = self.claude_add_args();
         self.run_cli_required(binary, &args, cancel, deadline, AgentId::Claude)
             .await
+    }
+
+    /// `mcp add` for this installation: its command, and the environment it runs with. `-e` takes every value up
+    /// to the next option, so the server's name comes before it.
+    pub(super) fn claude_add_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "mcp".to_owned(),
+            "add".into(),
+            "--scope".into(),
+            "user".into(),
+            "sidevoice".into(),
+        ];
+        for (key, value) in self.mcp_env() {
+            args.push("-e".into());
+            args.push(format!("{key}={value}"));
+        }
+        args.push("--".into());
+        args.push(self.selected.command.clone());
+        args.extend(self.selected.args.clone());
+        args
     }
 
     pub(super) async fn claude_disconnect(
@@ -176,7 +201,8 @@ impl HostAgents {
             .await?;
         match state.as_str() {
             "not-connected" => Ok(()),
-            "connected" => {
+            // Ours, current or not (an older release, another environment): removed.
+            "connected" | "outdated" => {
                 self.run_cli_required(
                     binary,
                     &["mcp", "remove", "--scope", "user", "sidevoice"],

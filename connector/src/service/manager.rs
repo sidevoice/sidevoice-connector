@@ -490,6 +490,38 @@ async fn boot_in(layout: &Layout, job: Job) -> std::result::Result<(), String> {
     Err(booted.trimmed())
 }
 
+/// What systemd does before `jobs` start, through `systemctl` (its arguments after `--user`): with `reload`, it reads
+/// the definitions again, and it enables each job for the next login, then checks that it is. A refusal of any of it is
+/// the start failing, even when the job would run now: it would not start at the next login, or would run the definition
+/// from before. The job a refusal is about, if it is about one, and what the manager said.
+async fn prepare_systemd<F, Fut>(
+    systemctl: F,
+    reload: bool,
+    jobs: &[Job],
+) -> std::result::Result<(), (Option<Job>, String)>
+where
+    F: Fn(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Output>,
+{
+    if reload {
+        let out = systemctl(vec!["daemon-reload".into()]).await;
+        if !out.ok {
+            return Err((None, format!("daemon-reload: {}", out.trimmed())));
+        }
+    }
+    for &job in jobs {
+        let out = systemctl(vec!["enable".into(), job.unit().into()]).await;
+        if !out.ok {
+            return Err((Some(job), format!("enable: {}", out.trimmed())));
+        }
+        let state = systemctl(vec!["is-enabled".into(), job.unit().into()]).await;
+        if !state.ok || state.trimmed() != "enabled" {
+            return Err((Some(job), format!("is-enabled: {}", state.trimmed())));
+        }
+    }
+    Ok(())
+}
+
 /// Each of `jobs` started from its definition as it is now: a changed definition is loaded again (launchd reads a
 /// plist only when it is bootstrapped; systemd reloads), and with `restart` a running job is restarted (launchd
 /// `kickstart -k`; systemd `reset-failed` + `restart`, which clears a start limit).
@@ -536,11 +568,22 @@ pub async fn start(
             }
         }
         Kind::Systemd => {
-            if !changed.is_empty() {
-                systemctl(&["daemon-reload"]).await;
+            let run = |args: Vec<String>| async move {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                systemctl(&args).await
+            };
+            if let Err((job, detail)) = prepare_systemd(run, !changed.is_empty(), jobs).await {
+                let detail = match job {
+                    Some(job) => format!("{}: {detail}", job.name(kind)),
+                    None => detail,
+                };
+                return Err(Failure::keyed(
+                    "service.not-enabled",
+                    json!({"detail": detail}),
+                ));
             }
             for &job in jobs {
-                systemctl(&["enable", job.unit()]).await;
+                // It clears an earlier start limit; a job that never failed has none, so its answer does not matter.
                 systemctl(&["reset-failed", job.unit()]).await;
                 let verb = if restart || changed.contains(&job) {
                     "restart"
@@ -672,6 +715,85 @@ fn user_name() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `systemctl` that answers each call from `script` (its arguments → whether it succeeds, and what it prints;
+    /// anything else succeeds silently), and logs every call.
+    fn scripted(
+        script: Vec<(String, bool, &'static str)>,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> impl Fn(Vec<String>) -> std::future::Ready<Output> {
+        move |args: Vec<String>| {
+            let call = args.join(" ");
+            log.lock().unwrap().push(call.clone());
+            let (ok, output) = script
+                .iter()
+                .find(|(line, _, _)| *line == call)
+                .map_or((true, ""), |(_, ok, output)| (*ok, *output));
+            std::future::ready(Output {
+                ok,
+                code: Some(i32::from(!ok)),
+                output: output.into(),
+            })
+        }
+    }
+
+    fn enabled() -> Vec<(String, bool, &'static str)> {
+        Job::ALL
+            .iter()
+            .map(|job| (format!("is-enabled {}", job.unit()), true, "enabled\n"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn systemd_reloads_enables_and_checks_each_job() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prepared = prepare_systemd(scripted(enabled(), log.clone()), true, &Job::ALL).await;
+        assert_eq!(prepared, Ok(()));
+        let calls = log.lock().unwrap().clone();
+        assert_eq!(calls[0], "daemon-reload");
+        for job in Job::ALL {
+            assert!(
+                calls.contains(&format!("enable {}", job.unit())),
+                "{calls:?}"
+            );
+            assert!(
+                calls.contains(&format!("is-enabled {}", job.unit())),
+                "{calls:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_reload_or_enable_fails_the_start_even_when_the_job_would_run() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut script = enabled();
+        script.push(("daemon-reload".into(), false, "Access denied"));
+        let reload = prepare_systemd(scripted(script, log.clone()), true, &Job::ALL).await;
+        assert_eq!(reload, Err((None, "daemon-reload: Access denied".into())));
+
+        let job = Job::ALL[0];
+        let mut script = enabled();
+        script.push((
+            format!("enable {}", job.unit()),
+            false,
+            "Failed to create symlink: Permission denied",
+        ));
+        let refused = prepare_systemd(scripted(script, log.clone()), false, &Job::ALL).await;
+        assert_eq!(
+            refused,
+            Err((
+                Some(job),
+                "enable: Failed to create symlink: Permission denied".into()
+            ))
+        );
+
+        // An enable the manager accepted while the job is still not enabled for the next login.
+        let mut script = enabled();
+        script.retain(|(line, _, _)| *line != format!("is-enabled {}", job.unit()));
+        script.push((format!("is-enabled {}", job.unit()), false, "disabled"));
+        let checked = prepare_systemd(scripted(script, log), false, &Job::ALL).await;
+        assert_eq!(checked, Err((Some(job), "is-enabled: disabled".into())));
+    }
 
     #[test]
     fn launchd_reports_read_as_job_states() {

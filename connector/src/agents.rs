@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -556,12 +557,13 @@ impl HostAgents {
             return self.response(&store);
         }
 
+        let owned = current.get("owned") == Some(&Value::Bool(true));
         match registration {
-            "not-connected" => return self.response(&state),
+            "not-connected" if !owned => return self.response(&state),
             "foreign" => return Err(agent_failure("agents.foreign", agent)),
             "invalid" => return Err(agent_failure("agents.invalid", agent)),
             "unknown" => return Err(agent_failure("agents.registration-unknown", agent)),
-            "connected" => {}
+            "connected" | "not-connected" => {}
             _ => return Err(agent_failure("agents.registration-unknown", agent)),
         }
         let binary = state
@@ -573,12 +575,16 @@ impl HostAgents {
         state = self
             .scan(state, Some(agent), false, cancel, deadline)
             .await?;
-        match seen_agent(&state, agent)
+        let after = seen_agent(&state, agent);
+        let still_owned = after.and_then(|row| row.get("owned")) == Some(&Value::Bool(true));
+        match after
             .and_then(|row| row.get("registration"))
             .and_then(Value::as_str)
         {
-            Some("not-connected") => {}
-            Some("connected") => return Err(agent_failure("agents.action-failed", agent)),
+            Some("not-connected") if !still_owned => {}
+            Some("connected" | "not-connected") => {
+                return Err(agent_failure("agents.action-failed", agent))
+            }
             Some("foreign") => return Err(agent_failure("agents.foreign", agent)),
             Some("invalid") => return Err(agent_failure("agents.invalid", agent)),
             _ => return Err(agent_failure("agents.registration-unknown", agent)),
@@ -617,6 +623,7 @@ impl HostAgents {
                 sidevoice: CustomServer {
                     command: &self.selected.command,
                     args: &self.selected.args,
+                    env: self.mcp_env(),
                 },
             },
         };
@@ -900,6 +907,7 @@ struct CustomServers<'a> {
 struct CustomServer<'a> {
     command: &'a str,
     args: &'a [String],
+    env: BTreeMap<String, String>,
 }
 
 fn parse_id(value: &str) -> std::result::Result<AgentId, Failure> {
@@ -966,6 +974,37 @@ fn normalized_state(mut value: Value) -> Value {
         value["login_path"] = Value::Null;
     }
     value
+}
+
+/// How an agent's CLI is run outside its registration (Codex's queue, for delivery): the executable the scan found
+/// (`SIDEVOICE_<AGENT>_BIN` when set to one), else its bare name; and the PATH of the person's login shell the scan
+/// captured, so a launcher that is a script (Node's) finds its interpreter where a service manager's PATH does not
+/// reach.
+pub struct AgentCommand {
+    pub program: String,
+    pub path: Option<String>,
+}
+
+pub fn agent_command(profile: &Profile, agent: &str) -> AgentCommand {
+    let id = AgentId::parse(agent);
+    let state = load_state_file(profile).unwrap_or_else(|_| empty_state());
+    let path = state
+        .get("login_path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned);
+    let program = id
+        .and_then(|id| std::env::var(id.override_name()).ok())
+        .filter(|path| executable(path))
+        .or_else(|| {
+            state
+                .pointer(&format!("/binaries/{agent}"))
+                .and_then(Value::as_str)
+                .filter(|path| executable(path))
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| agent.to_owned());
+    AgentCommand { program, path }
 }
 
 fn load_state_file(profile: &Profile) -> std::result::Result<Value, Failure> {
@@ -1344,6 +1383,18 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 }
 
 impl HostAgents {
+    /// What a registration hands the MCP server an agent starts: this installation's own places, so an agent opened
+    /// from any shell reaches this installation's connector. The agents' homes stay the agent's own.
+    pub(super) fn mcp_env(&self) -> BTreeMap<String, String> {
+        [
+            ("SIDEVOICE_DATA_DIR", &self.profile.data),
+            ("XDG_DATA_HOME", &self.profile.xdg_data),
+        ]
+        .into_iter()
+        .map(|(key, path)| (key.to_owned(), path.to_string_lossy().into_owned()))
+        .collect()
+    }
+
     async fn inspect(
         &self,
         id: AgentId,
@@ -1367,6 +1418,14 @@ impl HostAgents {
             AgentId::Cursor => self
                 .cursor_registration()
                 .unwrap_or_else(|_| "invalid".into()),
+        };
+        // An entry of ours that is not the current one (disabled, an older release, another environment) reads as not
+        // connected, and is still ours to remove: `owned`.
+        let owned = registration == "connected" || registration == "outdated";
+        let registration = if registration == "outdated" {
+            "not-connected".to_owned()
+        } else {
+            registration
         };
         let version = if input.include_version {
             match binary.as_deref() {
@@ -1424,6 +1483,7 @@ impl HostAgents {
             "label":id.label(),
             "version":version,
             "registration":registration,
+            "owned":owned,
             "connect":if binary.is_some() || id == AgentId::Cursor {"auto"} else {"manual"},
             "instructions":instructions,
             "evidence":evidence_json,
@@ -1443,12 +1503,7 @@ impl HostAgents {
         let selected = &self.selected;
         match id {
             AgentId::Claude => {
-                let mut args = vec!["mcp", "add", "--scope", "user", "sidevoice", "--"]
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
-                args.push(selected.command.clone());
-                args.extend(selected.args.clone());
+                let args = self.claude_add_args();
                 json!({
                     "command":shell_command(binary.unwrap_or("claude"), &args),
                     "file":Value::Null,
@@ -1462,12 +1517,7 @@ impl HostAgents {
                         .into_iter()
                         .map(str::to_owned)
                         .collect::<Vec<_>>();
-                    let mut add = vec!["mcp", "add", "sidevoice", "--"]
-                        .into_iter()
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>();
-                    add.push(selected.command.clone());
-                    add.extend(selected.args.clone());
+                    let add = self.codex_add_args();
                     let replace_message = message(
                         "agents.manual.codex.replace-existing",
                         &json!({
@@ -1482,11 +1532,17 @@ impl HostAgents {
                     });
                 }
                 let command = shell_command(&selected.command, &selected.args);
-                let snippet = format!(
-                    "[mcp_servers.sidevoice]\ncommand = {}\nargs = {}",
+                let mut snippet = format!(
+                    "[mcp_servers.sidevoice]\ncommand = {}\nargs = {}\n\n[mcp_servers.sidevoice.env]",
                     serde_json::to_string(&selected.command).unwrap_or_else(|_| "\"\"".into()),
                     serde_json::to_string(&selected.args).unwrap_or_else(|_| "[]".into())
                 );
+                for (key, value) in self.mcp_env() {
+                    snippet.push_str(&format!(
+                        "\n{key} = {}",
+                        serde_json::to_string(&value).unwrap_or_else(|_| "\"\"".into())
+                    ));
+                }
                 json!({
                     "command":command,
                     "file":self.profile.codex.join("config.toml").to_string_lossy(),
@@ -1499,6 +1555,7 @@ impl HostAgents {
                         sidevoice: CustomServer {
                             command: &selected.command,
                             args: &selected.args,
+                            env: self.mcp_env(),
                         },
                     },
                 };

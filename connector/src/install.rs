@@ -53,8 +53,6 @@ const KEPT: &[&str] = &[
     "agents.lock",
     "node-stopped.json",
 ];
-/// What removes an installation made by the JavaScript installer when its own command cannot be named.
-const LEGACY_REMOVAL: &str = "npx @sidevoice/uplink uninstall";
 
 /// The package being installed: its root (`bin/`, `connector.json`, `core/`), its binary and the version it is.
 #[derive(Clone, Debug)]
@@ -114,89 +112,6 @@ pub fn stable_command(layout: &Layout) -> PathBuf {
 
 fn releases_dir(layout: &Layout) -> PathBuf {
     layout.releases.join("releases")
-}
-
-/// A word as a POSIX shell reads it back.
-fn shell_word(word: &str) -> String {
-    if !word.is_empty()
-        && word
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || "/._-+=:@".contains(ch))
-    {
-        word.to_owned()
-    } else {
-        format!("'{}'", word.replace('\'', "'\\''"))
-    }
-}
-
-/// An installation made by an earlier installer (the JavaScript package's: its ESM, SEA and Rust-pair releases, or
-/// its Python core): what gives it away, and the one command that removes it.
-fn legacy(layout: &Layout) -> Option<(String, String)> {
-    let ours = vec![stable_command(layout).to_string_lossy().into_owned()];
-    let recorded = layout.install_record().and_then(|record| {
-        record
-            .get("command")?
-            .as_array()?
-            .iter()
-            .map(|word| word.as_str().map(str::to_owned))
-            .collect::<Option<Vec<String>>>()
-    });
-    let mut found = None;
-    if let Some(command) = recorded.as_ref().filter(|command| **command != ours) {
-        found = Some(format!(
-            "{} runs {}",
-            layout.install_file().display(),
-            command.join(" ")
-        ));
-    }
-    for link in ["verified", "previous"] {
-        let path = layout.releases.join(link);
-        if found.is_none() && fs::symlink_metadata(&path).is_ok() {
-            found = Some(path.display().to_string());
-        }
-    }
-    if found.is_none() {
-        for entry in fs::read_dir(releases_dir(layout)).into_iter().flatten() {
-            let Ok(entry) = entry else { continue };
-            for marker in ["release.json", "dist"] {
-                let path = entry.path().join(marker);
-                if found.is_none() && fs::symlink_metadata(&path).is_ok() {
-                    found = Some(path.display().to_string());
-                }
-            }
-        }
-    }
-    let runtime = layout.data.join("core-runtime");
-    if found.is_none() && fs::symlink_metadata(&runtime).is_ok() {
-        found = Some(runtime.display().to_string());
-    }
-    let found = found?;
-    // Its own CLI removes it, when the installation still names one that is there.
-    let removal = recorded
-        .filter(|command| {
-            command != &ours
-                && !command.is_empty()
-                && command
-                    .iter()
-                    .all(|word| Path::new(word).is_absolute() && Path::new(word).exists())
-        })
-        .map(|command| {
-            let mut words: Vec<String> = command.iter().map(|word| shell_word(word)).collect();
-            words.push("uninstall".into());
-            words.join(" ")
-        })
-        .unwrap_or_else(|| LEGACY_REMOVAL.to_owned());
-    Some((found, removal))
-}
-
-fn refuse_legacy(layout: &Layout) -> Result<()> {
-    match legacy(layout) {
-        Some((found, command)) => Err(keyed(
-            "install.legacy",
-            json!({"detail": found, "command": command}),
-        )),
-        None => Ok(()),
-    }
 }
 
 /// The release `R/current` names, by its directory name, when it is one of `R/releases`.
@@ -269,8 +184,21 @@ fn complete(release: &Path) -> bool {
             .is_file()
 }
 
+/// Whether the release's core is still the one `package` carries, file by file (`core_package::staged_intact`).
+fn core_intact(release: &Path, package: &Package) -> bool {
+    crate::core_package::packaged_as(&package.root, &package.version).is_ok_and(|core| {
+        crate::core_package::staged_intact(
+            &core,
+            &release.join(crate::service::layout::CORE_DIRECTORY),
+        )
+        .is_ok()
+    })
+}
+
 /// Which release this package is: `<version>`, unless another build holds that name; then
-/// `<version>+<digest prefix>`. Whether it still has to be staged.
+/// `<version>+<digest prefix>`. Whether it still has to be staged. A release of this build is reused only whole, its
+/// core as its inventory says; a damaged one that is selected stays until its replacement, staged under the next
+/// name, is in place.
 fn release_id(layout: &Layout, package: &Package, digest: &str) -> Result<(String, bool)> {
     if !valid_version(&package.version) {
         return Err(failed(format!(
@@ -279,19 +207,33 @@ fn release_id(layout: &Layout, package: &Package, digest: &str) -> Result<(Strin
         )));
     }
     let current = current_release(layout);
-    for id in [
+    let names = [
         package.version.clone(),
         format!("{}+{}", package.version, &digest[..12]),
-    ] {
+    ];
+    let same = |id: &str| {
+        digest_file(&releases_dir(layout).join(id).join(BINARY))
+            .ok()
+            .as_deref()
+            == Some(digest)
+    };
+    if let Some(whole) = names.iter().find(|id| {
+        let release = releases_dir(layout).join(id);
+        same(id) && complete(&release) && core_intact(&release, package)
+    }) {
+        return Ok((whole.clone(), false));
+    }
+    for id in names {
         let release = releases_dir(layout).join(&id);
         if fs::symlink_metadata(&release).is_err() {
             return Ok((id, true));
         }
-        let same = digest_file(&release.join(BINARY)).ok().as_deref() == Some(digest);
-        if same && complete(&release) {
-            return Ok((id, false));
+        let same = same(&id);
+        let selected = current.as_deref() == Some(id.as_str());
+        if same && selected {
+            continue;
         }
-        if same || current.as_deref() != Some(id.as_str()) {
+        if same || !selected {
             // Ours but incomplete, or another build that is not selected: staged again.
             fs::remove_dir_all(&release)?;
             return Ok((id, true));
@@ -604,7 +546,6 @@ pub async fn install(
 ) -> Result<Value> {
     let layout = Layout::from_profile(profile);
     let lock = crate::service::install_lock(&layout).await?;
-    refuse_legacy(&layout)?;
     ensure_private_dir(&layout.releases)?;
     remove_leftovers(&layout);
     let previous = current_release(&layout);
@@ -747,6 +688,18 @@ async fn register(profile: &Profile) -> Value {
     Value::Object(outcomes)
 }
 
+/// What uninstall does with an agent's row: `Some(true)` removes its entry, `Some(false)` leaves a foreign or unknown
+/// one as it is, `None` has nothing to do. An entry of ours that is not the current one (disabled, an older release)
+/// is removed too: once the release it names is deleted it would only be a broken server.
+fn removal(row: &Value) -> Option<bool> {
+    let owned = row["owned"] == Value::Bool(true);
+    match row["registration"].as_str() {
+        Some("not-connected") if !owned => None,
+        Some("connected" | "not-connected") => Some(true),
+        _ => Some(false),
+    }
+}
+
 /// Every registration of ours removed: per agent, `{outcome, message}`.
 async fn unregister(profile: &Profile) -> Value {
     let agents = match HostAgents::for_installer(profile.clone()) {
@@ -759,15 +712,17 @@ async fn unregister(profile: &Profile) -> Value {
     }
     let mut outcomes = serde_json::Map::new();
     for (id, label, row) in agent_rows(&listed) {
+        let Some(remove) = removal(&row) else {
+            continue;
+        };
         let (outcome, message) = match row["registration"].as_str() {
-            Some("connected") => {
+            _ if remove => {
                 let answer = agents.handle("agents.disconnect", json!({"id": id})).await;
                 match error_message(&answer) {
                     None => ("removed", format!("Removed Sidevoice from {label}.")),
                     Some((_, message)) => ("failed", message),
                 }
             }
-            Some("not-connected") => continue,
             Some("foreign") => (
                 "foreign",
                 format!("{label} has a Sidevoice entry that Sidevoice did not create; it was left unchanged."),
@@ -913,7 +868,6 @@ pub fn human_install(answer: &Value) -> String {
 pub async fn uninstall(profile: &Profile, options: Options, runtime: &Runtime) -> Result<Value> {
     let layout = Layout::from_profile(profile);
     let _lock = crate::service::install_lock(&layout).await?;
-    refuse_legacy(&layout)?;
     let service = runtime.unload(&layout).await?;
     let agents = if options.agents {
         unregister(profile).await
@@ -1260,58 +1214,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn an_installation_by_the_earlier_installer_is_refused_with_the_command_that_removes_it()
-    {
-        let fixture = Fixture::new("legacy");
-        let layout = fixture.layout();
-        // An R4 release: its CLI in `dist/`, named by install.json.
-        let legacy = layout.releases.join("releases/0.5.0/dist");
-        fs::create_dir_all(&legacy).unwrap();
-        fs::write(legacy.join("sidevoice"), "#!/bin/sh\n").unwrap();
-        std::os::unix::fs::symlink("releases/0.5.0", layout.current()).unwrap();
-        let program = layout.current().join("dist/sidevoice");
-        crate::secure_fs::atomic_json(&layout.install_file(), &json!({"command": [program]}))
-            .unwrap();
-        let error = fixture
-            .install(&fixture.package("1.0.0", "a"))
-            .await
-            .unwrap_err();
-        assert_eq!(key(&error), "install.legacy", "{error}");
-        let keyed = crate::messages::keyed(&error);
-        assert_eq!(
-            keyed.params["command"],
-            format!("{} uninstall", program.display())
-        );
-        assert!(error.to_string().contains("uninstall"), "{error}");
-        assert!(!releases_dir(&layout).join("1.0.0").exists());
-        assert!(fixture.fake.lock().unwrap().restarts.is_empty());
-        let refused = uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
-            .await
-            .unwrap_err();
-        assert_eq!(key(&refused), "install.legacy");
-        assert!(layout.releases.exists(), "nothing of it was removed");
-
-        // A Python core's environment, with nothing that names its CLI: the npm package's own uninstall.
-        let fixture = Fixture::new("legacy-python");
-        fs::create_dir_all(fixture.layout().data.join("core-runtime/build")).unwrap();
-        let error = fixture
-            .install(&fixture.package("1.0.0", "a"))
-            .await
-            .unwrap_err();
-        assert_eq!(
-            crate::messages::keyed(&error).params["command"],
-            LEGACY_REMOVAL
-        );
-    }
-
-    #[test]
-    fn shell_words_are_quoted_only_when_needed() {
-        assert_eq!(shell_word("/a/b-c_d.e"), "/a/b-c_d.e");
-        assert_eq!(shell_word("/a b/it's"), "'/a b/it'\\''s'");
-        assert_eq!(shell_word(""), "''");
-    }
-
-    #[tokio::test]
     async fn leftovers_of_a_dead_installer_are_removed() {
         let fixture = Fixture::new("leftovers");
         let layout = fixture.layout();
@@ -1325,5 +1227,51 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(fixture.releases(), ["1.0.0"]);
         assert!(fs::symlink_metadata(layout.releases.join(".current-x.tmp")).is_err());
+    }
+
+    #[test]
+    fn uninstall_removes_every_entry_of_ours_and_leaves_the_rest() {
+        let row =
+            |registration: &str, owned: bool| json!({"registration": registration, "owned": owned});
+        assert_eq!(removal(&row("connected", true)), Some(true));
+        assert_eq!(
+            removal(&row("not-connected", true)),
+            Some(true),
+            "disabled or an older release, still ours"
+        );
+        assert_eq!(removal(&row("not-connected", false)), None, "nothing there");
+        assert_eq!(removal(&row("foreign", false)), Some(false));
+        assert_eq!(removal(&row("unknown", false)), Some(false));
+    }
+
+    #[tokio::test]
+    async fn installing_again_repairs_a_release_whose_core_was_damaged() {
+        let fixture = Fixture::new("repair");
+        let layout = fixture.layout();
+        let package = fixture.package("1.0.0", "a");
+        fixture.install(&package).await.unwrap();
+        let first = current_release(&layout).unwrap();
+        let notice = releases_dir(&layout)
+            .join(&first)
+            .join(crate::service::layout::CORE_DIRECTORY)
+            .join("notices/LICENSE");
+        fs::write(&notice, b"damaged").unwrap();
+        assert!(!core_intact(&releases_dir(&layout).join(&first), &package));
+
+        // The same package again: staged anew beside the damaged release, which stayed selected until then.
+        fixture.install(&package).await.unwrap();
+        let repaired = current_release(&layout).unwrap();
+        assert_ne!(
+            repaired, first,
+            "a fresh release, not the damaged one reused"
+        );
+        assert!(core_intact(
+            &releases_dir(&layout).join(&repaired),
+            &package
+        ));
+
+        // And once more: the repaired release is reused as it is.
+        fixture.install(&package).await.unwrap();
+        assert_eq!(current_release(&layout).unwrap(), repaired);
     }
 }
