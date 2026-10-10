@@ -413,6 +413,47 @@ pub fn stage(core: &PackagedCore, release: &Path) -> Result<PathBuf> {
     result.map(|()| destination)
 }
 
+/// Whether the core staged at `staged` (`<release>/core`) is still the one `core` names: its saved inventory is that
+/// core's, and its files are exactly the inventory's, with their sizes and digests. A release whose core is not is
+/// staged again by the installer.
+pub fn staged_intact(core: &PackagedCore, staged: &Path) -> Result<()> {
+    let inventory = read_bounded(&staged.join(CORE_INVENTORY), MAX_CORE_INVENTORY)?;
+    let mut files = Files::new();
+    staged_files(staged, staged, &mut files)?;
+    check_inventory(core, &inventory, &files)
+}
+
+/// Every plain file below `dir` but the inventory, by its path below `root`, with its size and digest.
+fn staged_files(root: &Path, dir: &Path, files: &mut Files) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let relative = path.strip_prefix(root)?.to_string_lossy().into_owned();
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            staged_files(root, &path, files)?;
+            continue;
+        }
+        if !kind.is_file() {
+            return Err(mismatch(format!("{relative} is not a plain file")));
+        }
+        if relative == CORE_INVENTORY {
+            continue;
+        }
+        if files.len() >= MAX_ENTRIES {
+            return Err(mismatch("the staged core has too many files"));
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        let mut hasher = Sha256::new();
+        let length = std::io::copy(&mut file, &mut hasher)?;
+        files.insert(relative, (length, hex::encode(hasher.finalize())));
+    }
+    Ok(())
+}
+
 fn self_test_failure(detail: impl std::fmt::Display) -> anyhow::Error {
     let detail: String = detail
         .to_string()

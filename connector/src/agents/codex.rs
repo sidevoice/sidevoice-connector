@@ -79,14 +79,25 @@ impl HostAgents {
             return Ok("foreign".into());
         }
         let enabled = entry.get("enabled").and_then(Value::as_bool) != Some(false);
-        Ok(
-            if enabled && command == self.selected.command && args == self.selected.args {
-                "connected"
-            } else {
-                "not-connected"
-            }
-            .into(),
-        )
+        let env = transport
+            .and_then(|value| value.get("env"))
+            .and_then(Value::as_object)
+            .map(|env| {
+                env.iter()
+                    .map(|(key, value)| (key.clone(), value.as_str().unwrap_or("").to_owned()))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        Ok(if enabled
+            && command == self.selected.command
+            && args == self.selected.args
+            && env == self.mcp_env()
+        {
+            "connected"
+        } else {
+            "outdated"
+        }
+        .into())
     }
 
     fn codex_file_guard(&self) -> std::result::Result<String, Failure> {
@@ -204,14 +215,22 @@ impl HostAgents {
             )
             .await?;
         }
-        let mut args = vec!["mcp", "add", "sidevoice", "--"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        args.push(self.selected.command.clone());
-        args.extend(self.selected.args.clone());
+        let args = self.codex_add_args();
         self.run_cli_required(binary, &args, cancel, deadline, AgentId::Codex)
             .await
+    }
+
+    /// `mcp add` for this installation: its command, and the environment it runs with.
+    pub(super) fn codex_add_args(&self) -> Vec<String> {
+        let mut args = vec!["mcp".to_owned(), "add".into(), "sidevoice".into()];
+        for (key, value) in self.mcp_env() {
+            args.push("--env".into());
+            args.push(format!("{key}={value}"));
+        }
+        args.push("--".into());
+        args.push(self.selected.command.clone());
+        args.extend(self.selected.args.clone());
+        args
     }
 
     pub(super) async fn codex_disconnect(
@@ -227,7 +246,8 @@ impl HostAgents {
             .await?;
         match state.as_str() {
             "not-connected" => Ok(()),
-            "connected" => {
+            // Ours, current or not (disabled, an older release, another environment): removed.
+            "connected" | "outdated" => {
                 self.run_cli_required(
                     binary,
                     &["mcp", "remove", "sidevoice"],

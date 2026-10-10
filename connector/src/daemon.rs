@@ -131,45 +131,21 @@ impl Daemon {
         managed: bool,
         shutdown: watch::Sender<bool>,
     ) -> Result<Arc<Self>> {
-        let path = profile.data.join("outbox.json");
-        let outbox = if path.exists() {
-            private_file(&path)?;
-            let bytes = fs::read(&path)?;
-            if bytes.len() > 8 << 20 {
-                bail!("outbox too large");
-            }
-            serde_json::from_slice::<Vec<Value>>(&bytes).context("invalid existing outbox")?
-        } else {
-            Vec::new()
-        };
+        let outbox = read_outbox(&profile.data.join("outbox.json"))?;
         let host_agents = HostAgents::new(profile.clone())?;
         let guard_path = profile.data.join("conversation-state.guard");
         let (guard_state, conversation_guard) = prepare_conversation_guard(&guard_path)?;
-        let state_path = profile.data.join("conversation-state.json");
-        let state_bytes = if state_path.exists() {
-            private_file(&state_path)?;
-            let metadata = fs::metadata(&state_path)?;
-            if metadata.len() > 8 << 20 {
-                bail!("conversation state too large");
-            }
-            Some(fs::read(&state_path)?)
-        } else {
-            None
-        };
+        let state_bytes = read_conversation_state(&profile.data.join("conversation-state.json"))?;
         let state = state_bytes
             .as_deref()
             .map(serde_json::from_slice::<Value>)
             .transpose()
             .context("invalid conversation state")?
             .unwrap_or_else(|| json!({}));
-        let legacy_state_oversized = state_bytes
-            .as_ref()
-            .is_some_and(|bytes| bytes.len() > CONVERSATION_STATE_MAX_BYTES);
         let resume_blocked = state
             .get("resume_blocked")
             .and_then(Value::as_bool)
             .unwrap_or(false)
-            || legacy_state_oversized
             || guard_state != GUARD_CLEAR;
         let resume_block_reason = if guard_state != GUARD_CLEAR
             || state.get("resume_block_reason").and_then(Value::as_str)
@@ -220,49 +196,13 @@ impl Daemon {
             shutdown,
             rendezvous: Mutex::new(None),
             refusal: Mutex::new(refusal.clone()),
-            closed_by_room: Mutex::new(if resume_blocked {
-                if legacy_state_oversized {
-                    HashMap::new()
-                } else {
-                    closed_by_room
-                }
-            } else {
-                closed_by_room
-            }),
+            closed_by_room: Mutex::new(closed_by_room),
             latest_closed: Mutex::new(None),
             resume_blocked: AtomicBool::new(resume_blocked),
             resume_block_reason: AtomicU8::new(resume_block_reason),
             conversation_guard: std::sync::Mutex::new(conversation_guard),
             conversation_state_serial: Mutex::new(()),
         });
-        if legacy_state_oversized {
-            let compacted = json!({"refused":refusal.clone(),"closed_by_room":{},
-                "resume_blocked":true,"resume_block_reason":daemon.resume_block_reason()});
-            if let Err(error) = atomic_json(
-                &daemon.profile.data.join("conversation-state.json"),
-                &compacted,
-            ) {
-                crate::logfile::log(&format!("compact conversation state: {error}"));
-                let mut guard = daemon
-                    .conversation_guard
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("conversation guard lock poisoned"))?;
-                write_conversation_guard(
-                    &mut guard,
-                    if refusal.is_some() {
-                        GUARD_REVOKED
-                    } else {
-                        GUARD_BLOCK_RESUME
-                    },
-                )?;
-            } else if guard_state != GUARD_CLEAR {
-                let mut guard = daemon
-                    .conversation_guard
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("conversation guard lock poisoned"))?;
-                write_conversation_guard(&mut guard, GUARD_CLEAR)?;
-            }
-        }
         let announcer = daemon.clone();
         let mut stop = daemon.shutdown.subscribe();
         tokio::spawn(async move {
@@ -623,15 +563,6 @@ impl Daemon {
                     return Ok(None);
                 }
             } else {
-                if published.get("client_ref").is_none() {
-                    crate::logfile::log(&format!(
-                        "copied speech {} has an unknown binding; retaining for explicit migration",
-                        published
-                            .get("event_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("?")
-                    ));
-                }
                 return Ok(None);
             }
         }
@@ -921,13 +852,8 @@ impl Daemon {
                 }
             };
         }
-        match crate::adapters::deliver(
-            &binding.delivery,
-            &binding.thread,
-            &self.profile.codex,
-            frame,
-        )
-        .await
+        match crate::adapters::deliver(&binding.delivery, &binding.thread, &self.profile, frame)
+            .await
         {
             Ok(result) => result,
             Err(error) => {
@@ -2324,8 +2250,100 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     Ok(())
 }
 
+/// The speech waiting for the room, as this connector writes it: every row a speech of a conversation (its event,
+/// binding, conversation reference, utterance and text). A row of any other shape makes the outbox invalid.
+fn read_outbox(path: &Path) -> Result<Vec<Value>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    private_file(path)?;
+    let bytes = fs::read(path)?;
+    if bytes.len() > 8 << 20 {
+        bail!("outbox too large");
+    }
+    let rows = serde_json::from_slice::<Vec<Value>>(&bytes).context("invalid existing outbox")?;
+    if !rows.iter().all(|row| {
+        [
+            "event_id",
+            "binding_id",
+            "client_ref",
+            "utterance_id",
+            "text",
+        ]
+        .iter()
+        .all(|key| row.get(key).is_some_and(Value::is_string))
+    }) {
+        bail!("invalid existing outbox: a row is not a speech of a conversation");
+    }
+    Ok(rows)
+}
+
+/// The conversation state as this connector writes it: never above its size bound, which a larger file makes invalid.
+fn read_conversation_state(path: &Path) -> Result<Option<Vec<u8>>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    private_file(path)?;
+    if fs::metadata(path)?.len() > CONVERSATION_STATE_MAX_BYTES as u64 {
+        bail!("conversation state too large");
+    }
+    Ok(Some(fs::read(path)?))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_outbox_or_a_state_of_another_shape_is_invalid() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("sidevoice-daemon-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            path
+        };
+        let speech = serde_json::json!({"event_id":"e","binding_id":"b","client_ref":"c","session_id":"s",
+            "revision":1,"utterance_id":"u","text":"hola","language":null});
+        let outbox = write(
+            "outbox.json",
+            serde_json::to_vec(std::slice::from_ref(&speech))
+                .unwrap()
+                .as_slice(),
+        );
+        assert_eq!(super::read_outbox(&outbox).unwrap(), vec![speech.clone()]);
+        let mut copied = speech;
+        copied.as_object_mut().unwrap().remove("client_ref");
+        let outbox = write(
+            "outbox.json",
+            serde_json::to_vec(&[copied]).unwrap().as_slice(),
+        );
+        let error = super::read_outbox(&outbox).unwrap_err();
+        assert!(
+            error.to_string().contains("not a speech of a conversation"),
+            "{error}"
+        );
+        assert!(super::read_outbox(&dir.join("absent.json"))
+            .unwrap()
+            .is_empty());
+
+        let state = write(
+            "conversation-state.json",
+            br#"{"refused":null,"closed_by_room":{}}"#,
+        );
+        assert!(super::read_conversation_state(&state).unwrap().is_some());
+        let oversized = write(
+            "conversation-state.json",
+            &vec![b' '; super::CONVERSATION_STATE_MAX_BYTES + 1],
+        );
+        assert!(super::read_conversation_state(&oversized)
+            .unwrap_err()
+            .to_string()
+            .contains("too large"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::{prune_binding_order, voice_header, Daemon};
     use serde_json::json;
     use std::collections::HashMap;

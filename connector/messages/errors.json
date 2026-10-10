@@ -19,6 +19,7 @@
   "service.no-manager": "This computer has no service manager for your user (launchd, or systemd --user), so Sidevoice cannot start at login here; it starts on demand when a conversation needs it.",
   "service.unsafe-value": "A value for the service definition ({what}) contains a control character; nothing was written.",
   "service.definition-unsafe": "A Sidevoice service definition or its directory is unsafe ({detail}); nothing was changed.",
+  "service.not-enabled": "The service manager did not take the Sidevoice service for your next login ({detail}); it was not installed. Run `sidevoice service install` again once the manager can.",
   "service.not-loaded": "The Sidevoice service is installed but its service manager did not start it ({detail}). Start it with `sidevoice service start`, or install it again with `sidevoice service install`.",
   "service.start-limit": "The Sidevoice service failed too many times in a row and its service manager stopped trying ({detail}). Retry with `sidevoice service restart`.",
   "service.executable-missing": "The Sidevoice service points at a program that is not there any more ({detail}). Install Sidevoice again.",
@@ -65,7 +66,6 @@
   "core.package-mismatch": "The core in this Sidevoice package is not the one the package lists ({detail}); nothing was installed. Install Sidevoice again.",
   "core.self-test": "The Sidevoice core failed its self-test on this computer ({detail}); it was not installed.",
   "install.failed": "Sidevoice could not be installed: {detail}",
-  "install.legacy": "Sidevoice was installed on this computer by an earlier installer ({detail}), which this version does not upgrade or remove. Remove it first with:\n    {command}\nthen run this command again.",
   "install.verify-failed": "Sidevoice {version} is installed but did not start ({cause}). See `sidevoice service status`, or run the install again.",
   "install.rolled-back": "Sidevoice {version} did not start ({cause}), so this computer is back on {previous}, which is running. Nothing of {version} was kept.",
   "install.rollback-failed": "Sidevoice {version} did not start ({cause}), and {previous}, put back in its place, did not start either ({back}). See `sidevoice service status`."

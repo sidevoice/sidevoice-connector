@@ -30,14 +30,15 @@ impl HostAgents {
         if !self.selected.owns(command, &args) {
             return Ok("foreign".into());
         }
-        Ok(
-            if command == self.selected.command && args == self.selected.args {
-                "connected"
-            } else {
-                "not-connected"
-            }
-            .into(),
-        )
+        Ok(if command == self.selected.command
+            && args == self.selected.args
+            && cursor_env(&current) == self.mcp_env()
+        {
+            "connected"
+        } else {
+            "outdated"
+        }
+        .into())
     }
 
     pub(super) fn cursor_connect(&self) -> std::result::Result<(), Failure> {
@@ -77,7 +78,10 @@ impl HostAgents {
             if !self.selected.owns(command, &args) {
                 return Err(agent_failure("agents.foreign", AgentId::Cursor));
             }
-            if command == self.selected.command && args == self.selected.args {
+            if command == self.selected.command
+                && args == self.selected.args
+                && cursor_env(current) == self.mcp_env()
+            {
                 return Ok(());
             }
         }
@@ -89,6 +93,7 @@ impl HostAgents {
             .unwrap_or_default();
         entry.insert("command".into(), json!(self.selected.command));
         entry.insert("args".into(), json!(self.selected.args));
+        entry.insert("env".into(), json!(self.mcp_env()));
         servers.insert("sidevoice".into(), Value::Object(entry));
         config["mcpServers"] = Value::Object(servers);
         write_cursor_config(&self.profile, &file, &config)
@@ -133,4 +138,17 @@ impl HostAgents {
         write_cursor_config(&self.profile, &file, &config)
             .map_err(|_| agent_failure("agents.invalid", AgentId::Cursor))
     }
+}
+
+/// The environment a Cursor entry gives its server.
+fn cursor_env(entry: &Value) -> BTreeMap<String, String> {
+    entry
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|env| {
+            env.iter()
+                .map(|(key, value)| (key.clone(), value.as_str().unwrap_or("").to_owned()))
+                .collect()
+        })
+        .unwrap_or_default()
 }

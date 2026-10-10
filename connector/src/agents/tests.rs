@@ -7,6 +7,13 @@ struct Fixture {
     profile: Profile,
 }
 
+/// Agent tests take turns: an agent's CLI is found through process-wide variables (`SIDEVOICE_<AGENT>_BIN`) that some
+/// of them set, and every scan resolves every agent, so two at once would run each other's stand-ins.
+async fn agent_env() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    LOCK.lock().await
+}
+
 struct EnvGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
@@ -171,6 +178,7 @@ fn ownership_is_exact_and_js_release_fixtures_stay_narrow() {
 
 #[tokio::test]
 async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped_files() {
+    let _turn = agent_env().await;
     let fixture = Fixture::new();
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let old = fixture.root.join("selected/releases/1.2.3/dist/sidevoice");
@@ -311,6 +319,7 @@ async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped
 
 #[tokio::test]
 async fn disappeared_and_reappeared_config_gets_a_new_generation() {
+    let _turn = agent_env().await;
     let fixture = Fixture::new();
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     private_write(
@@ -355,6 +364,7 @@ async fn disappeared_and_reappeared_config_gets_a_new_generation() {
 
 #[tokio::test]
 async fn replacing_cursor_profile_with_symlink_refuses_connect_without_touching_target() {
+    let _turn = agent_env().await;
     let fixture = Fixture::new();
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let external = fixture.root.parent().unwrap().join(format!(
@@ -381,6 +391,7 @@ async fn replacing_cursor_profile_with_symlink_refuses_connect_without_touching_
 
 #[tokio::test]
 async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn() {
+    let _turn = agent_env().await;
     let fixture = Fixture::new();
     let executable = fixture.root.join("bin/codex");
     private_mkdir(executable.parent().unwrap());
@@ -435,6 +446,7 @@ async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn()
 
 #[tokio::test]
 async fn dangling_codex_config_symlink_is_invalid_not_absent() {
+    let _turn = agent_env().await;
     let fixture = Fixture::new();
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let missing = fixture.root.join("missing-config-target.toml");
@@ -446,6 +458,7 @@ async fn dangling_codex_config_symlink_is_invalid_not_absent() {
 
 #[tokio::test]
 async fn complete_request_gate_orders_scans_mutations_and_external_dismissals() {
+    let _turn = agent_env().await;
     let fixture = Fixture::new();
     let binary = fixture.root.join("bin/codex");
     private_mkdir(binary.parent().unwrap());
@@ -487,7 +500,15 @@ if [ "$1 $2 $3" = "mcp remove sidevoice" ]; then
 fi
 if [ "$1 $2 $3" = "mcp add sidevoice" ]; then
     shift 3
-    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+    env=""
+    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+        if [ "$1" = "--env" ]; then
+            shift
+            if [ -n "$env" ]; then env="$env, "; fi
+            env="$env$(quote "${1%%=*}"): $(quote "${1#*=}")"
+        fi
+        shift
+    done
     if [ "$#" -lt 2 ]; then
         echo 'unsupported fixture command' >&2
         exit 2
@@ -509,8 +530,8 @@ if [ "$1 $2 $3" = "mcp add sidevoice" ]; then
         printf '%s' "$$" > "$home/slow-add-started"
         sleep 0.8
     fi
-    printf '{"name": "sidevoice", "transport": {"type": "stdio", "command": %s, "args": [%s]}, "enabled": true}' \
-        "$(quote "$command")" "$args" > "$state_file"
+    printf '{"name": "sidevoice", "transport": {"type": "stdio", "command": %s, "args": [%s], "env": {%s}}, "enabled": true}' \
+        "$(quote "$command")" "$args" "$env" > "$state_file"
     printf '[mcp_servers.sidevoice]\ncommand = %s\nargs = [%s]\n' "$(quote "$command")" "$args" > "$config_file"
     exit 0
 fi
@@ -667,6 +688,7 @@ async fn wait_for_file(path: &Path) {
 
 #[tokio::test]
 async fn the_installed_command_is_registered_and_owns_every_release_of_it() {
+    let _turn = agent_env().await;
     let fixture = Fixture::new();
     let profile = &fixture.profile;
     let releases = profile.xdg_data.join("sidevoice");
@@ -723,4 +745,276 @@ async fn the_installed_command_is_registered_and_owns_every_release_of_it() {
     let config: Value =
         serde_json::from_slice(&fs::read(profile.cursor.join("mcp.json")).unwrap()).unwrap();
     assert!(config["mcpServers"].get("sidevoice").is_none(), "{config}");
+}
+
+// Delivery runs the Codex the scan found, with the login shell's PATH, not whatever `codex` the daemon's own PATH (a
+// service manager's) reaches; a launcher that is a script finds its interpreter there.
+#[tokio::test]
+async fn codex_delivery_runs_the_scanned_codex_with_the_login_path() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let bin = fixture.root.join("login-bin");
+    private_mkdir(&bin);
+    let marker = fixture.root.join("queued");
+    let codex = bin.join("codex");
+    private_write(
+        &codex,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$PATH\" \"$@\" > '{}'\n",
+            marker.display()
+        )
+        .as_bytes(),
+    );
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+    let login = format!("{}:/usr/bin:/bin", bin.display());
+    let mut state = empty_state();
+    state["binaries"]["codex"] = json!(codex);
+    state["login_path"] = json!(login);
+    write_json(&fixture.profile.data.join("agents.json"), &state);
+
+    let answer = crate::adapters::deliver(
+        &json!({"kind":"codex-queue","thread":"t-1"}),
+        "t-1",
+        &fixture.profile,
+        &json!({"channel":"voice","session_id":"s","revision":1,"message_id":"m","text":"hola"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(answer["status"], "accepted");
+    let seen = fs::read_to_string(&marker).unwrap();
+    let lines: Vec<&str> = seen.lines().collect();
+    assert_eq!(lines[0], login);
+    assert_eq!(lines[1..4], ["queue", "--thread", "t-1"]);
+}
+
+/// A Codex CLI that keeps one `sidevoice` entry in `$CODEX_HOME` as the real one shows it (`mcp get --json`, with
+/// `transport.env`), and logs every call.
+fn fake_codex(fixture: &Fixture) -> PathBuf {
+    let binary = fixture.root.join("bin/codex");
+    private_mkdir(binary.parent().unwrap());
+    private_write(
+        &binary,
+        br##"#!/bin/sh
+home="$CODEX_HOME"
+entry="$home/fake-entry.json"
+printf '%s\n' "$*" >> "$home/calls"
+quote() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
+case "$1 $2 $3" in
+"mcp get sidevoice")
+    if [ ! -e "$entry" ]; then echo 'No such server: sidevoice' >&2; exit 1; fi
+    cat "$entry"; exit 0 ;;
+"mcp remove sidevoice")
+    rm -f "$entry" "$home/config.toml"; exit 0 ;;
+"mcp add sidevoice")
+    shift 3
+    env=""
+    while [ "$1" != "--" ]; do
+        if [ "$1" = "--env" ]; then
+            shift
+            if [ -n "$env" ]; then env="$env, "; fi
+            env="$env$(quote "${1%%=*}"): $(quote "${1#*=}")"
+        fi
+        shift
+    done
+    shift
+    command="$1"; shift
+    printf '{"name":"sidevoice","enabled":true,"transport":{"type":"stdio","command":%s,"args":["%s"],"env":{%s}}}' \
+        "$(quote "$command")" "$*" "$env" > "$entry"
+    printf '[mcp_servers.sidevoice]\ncommand = %s\nargs = ["%s"]\n' "$(quote "$command")" "$*" > "$home/config.toml"
+    exit 0 ;;
+esac
+echo 'unsupported fixture command' >&2
+exit 2
+"##,
+    );
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    binary
+}
+
+/// An entry of ours in the fake Codex: `enabled`, with `env` as its environment.
+fn codex_entry(fixture: &Fixture, selected: &InstalledCommand, enabled: bool, env: Value) {
+    let codex = &fixture.profile.codex;
+    write_json(
+        &codex.join("fake-entry.json"),
+        &json!({"name":"sidevoice","enabled":enabled,"transport":{"type":"stdio",
+            "command":selected.command,"args":selected.args,"env":env}}),
+    );
+    private_write(
+        &codex.join("config.toml"),
+        format!(
+            "[mcp_servers.sidevoice]\ncommand = {}\nargs = {}\n",
+            serde_json::to_string(&selected.command).unwrap(),
+            serde_json::to_string(&selected.args).unwrap()
+        )
+        .as_bytes(),
+    );
+}
+
+fn installation_env(fixture: &Fixture) -> Value {
+    json!({"SIDEVOICE_DATA_DIR": fixture.profile.data, "XDG_DATA_HOME": fixture.profile.xdg_data})
+}
+
+#[tokio::test]
+async fn codex_registration_carries_the_installation_environment() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let binary = fake_codex(&fixture);
+    let _codex = EnvGuard::set("SIDEVOICE_CODEX_BIN", binary.as_os_str());
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+
+    let connected = host.handle("agents.connect", json!({"id":"codex"})).await;
+    assert_eq!(
+        row(&connected, "codex")["registration"],
+        "connected",
+        "{connected}"
+    );
+    let calls = fs::read_to_string(fixture.profile.codex.join("calls")).unwrap();
+    let add = calls
+        .lines()
+        .find(|line| line.starts_with("mcp add"))
+        .unwrap();
+    assert!(
+        add.contains(&format!(
+            "--env SIDEVOICE_DATA_DIR={}",
+            fixture.profile.data.display()
+        )),
+        "{add}"
+    );
+    assert!(
+        add.contains(&format!(
+            "--env XDG_DATA_HOME={}",
+            fixture.profile.xdg_data.display()
+        )),
+        "{add}"
+    );
+
+    // A registration of ours without this installation's environment (an agent opened from another shell would reach
+    // another data directory) is not current: connecting writes it again.
+    codex_entry(&fixture, &fixture.selected(), true, json!({}));
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_eq!(row(&listed, "codex")["registration"], "not-connected");
+    assert_eq!(row(&listed, "codex")["owned"], true);
+    let again = host.handle("agents.connect", json!({"id":"codex"})).await;
+    assert_eq!(row(&again, "codex")["registration"], "connected", "{again}");
+}
+
+#[tokio::test]
+async fn codex_disconnect_removes_a_disabled_or_outdated_entry_of_ours() {
+    let _turn = agent_env().await;
+    for (enabled, env) in [(false, None), (true, Some(json!({})))] {
+        let fixture = Fixture::new();
+        let binary = fake_codex(&fixture);
+        let _codex = EnvGuard::set("SIDEVOICE_CODEX_BIN", binary.as_os_str());
+        let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+        codex_entry(
+            &fixture,
+            &fixture.selected(),
+            enabled,
+            env.unwrap_or_else(|| installation_env(&fixture)),
+        );
+        let listed = host.handle("agents.list", json!({"rescan":true})).await;
+        assert_eq!(row(&listed, "codex")["registration"], "not-connected");
+        assert_eq!(row(&listed, "codex")["owned"], true);
+
+        let answer = host
+            .handle("agents.disconnect", json!({"id":"codex"}))
+            .await;
+        assert!(answer.get("error").is_none(), "{answer}");
+        assert!(
+            !fixture.profile.codex.join("fake-entry.json").exists(),
+            "the entry of ours stayed"
+        );
+        assert_eq!(row(&answer, "codex")["owned"], false);
+    }
+}
+
+/// A Claude Code CLI that keeps one user-scope `sidevoice` entry as the real one prints it (`mcp get`, with an
+/// `Environment:` block), and logs every call.
+fn fake_claude(fixture: &Fixture) -> PathBuf {
+    let binary = fixture.root.join("bin/claude");
+    private_mkdir(binary.parent().unwrap());
+    private_write(
+        &binary,
+        br##"#!/bin/sh
+home="$CLAUDE_CONFIG_DIR"
+entry="$home/fake-entry.txt"
+printf '%s\n' "$*" >> "$home/calls"
+case "$1 $2" in
+"mcp get")
+    if [ ! -e "$entry" ]; then echo 'No MCP server named "sidevoice" found.' >&2; exit 1; fi
+    cat "$entry"; exit 0 ;;
+"mcp remove")
+    rm -f "$entry"; exit 0 ;;
+"mcp add")
+    shift 5
+    env=""
+    while [ "$1" != "--" ]; do
+        if [ "$1" = "-e" ]; then shift; env="$env    $1
+"; fi
+        shift
+    done
+    shift
+    command="$1"; shift
+    printf 'sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: %s\n  Args: %s\n  Environment:\n%s\nTo remove this server, run: claude mcp remove sidevoice -s user\n' \
+        "$command" "$*" "$env" > "$entry"
+    exit 0 ;;
+esac
+echo 'unsupported fixture command' >&2
+exit 2
+"##,
+    );
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    binary
+}
+
+#[tokio::test]
+async fn claude_registration_carries_the_installation_environment_and_an_older_one_is_removed() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let binary = fake_claude(&fixture);
+    let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", binary.as_os_str());
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+
+    let connected = host.handle("agents.connect", json!({"id":"claude"})).await;
+    assert_eq!(
+        row(&connected, "claude")["registration"],
+        "connected",
+        "{connected}"
+    );
+    let calls = fs::read_to_string(fixture.profile.claude.join("calls")).unwrap();
+    let add = calls
+        .lines()
+        .find(|line| line.starts_with("mcp add"))
+        .unwrap();
+    assert!(
+        add.starts_with(&format!(
+            "mcp add --scope user sidevoice -e SIDEVOICE_DATA_DIR={} -e XDG_DATA_HOME={} --",
+            fixture.profile.data.display(),
+            fixture.profile.xdg_data.display()
+        )),
+        "{add}"
+    );
+
+    // The same command without the environment: ours, not current, and removed on disconnect.
+    let selected = fixture.selected();
+    private_write(
+        &fixture.profile.claude.join("fake-entry.txt"),
+        format!(
+            "sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: {}\n  Args: {}\n\nTo remove this server, run: claude mcp remove sidevoice -s user\n",
+            selected.command,
+            selected.args.join(" ")
+        )
+        .as_bytes(),
+    );
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_eq!(row(&listed, "claude")["registration"], "not-connected");
+    assert_eq!(row(&listed, "claude")["owned"], true);
+    let answer = host
+        .handle("agents.disconnect", json!({"id":"claude"}))
+        .await;
+    assert!(answer.get("error").is_none(), "{answer}");
+    assert!(
+        !fixture.profile.claude.join("fake-entry.txt").exists(),
+        "the entry of ours stayed"
+    );
 }

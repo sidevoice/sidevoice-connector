@@ -3,9 +3,9 @@ mod codex;
 pub mod cursor;
 mod http;
 
+use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::path::Path;
 
 #[derive(Clone, Debug)]
 pub struct Identity {
@@ -252,12 +252,12 @@ fn unheard(event: &Value) -> Option<(u64, String)> {
 pub async fn deliver(
     delivery: &Value,
     thread: &str,
-    codex_home: &Path,
+    profile: &Profile,
     event: &Value,
 ) -> Result<Value> {
     match delivery.get("kind").and_then(Value::as_str).unwrap_or("") {
         "claude-uds" => claude::deliver(delivery, event).await,
-        "codex-queue" => codex::deliver(delivery, event, codex_home).await,
+        "codex-queue" => codex::deliver(delivery, event, profile).await,
         "http" => http::deliver(delivery, event).await,
         "cursor-tmux" => cursor::deliver(delivery, event).await,
         "cursor-app" => bail!("Cursor editor card delivery is not prepared"),
