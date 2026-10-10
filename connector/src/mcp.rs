@@ -1048,10 +1048,7 @@ impl ServerHandler for Facade {
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, McpError> {
         let args = Value::Object(request.arguments.unwrap_or_default());
-        let meta = request
-            .meta
-            .and_then(|m| serde_json::to_value(m).ok())
-            .unwrap_or(json!({}));
+        let meta = call_meta(&context.meta, request.meta);
         let client = context
             .client_info()
             .and_then(|value| serde_json::to_value(value).ok())
@@ -1134,6 +1131,23 @@ pub async fn run(profile: Profile) -> Result<()> {
     let service = Facade::new(profile).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+/// A tool call's `_meta`, as the agent sent it. rmcp moves the request's `_meta` into its context before the handler
+/// runs (`context.meta`), so that is where an agent's per-call identity is: Codex's `x-codex-turn-metadata`, with
+/// the conversation's `thread_id`, on every call. What the params still carry is merged over it.
+fn call_meta(context: &impl serde::Serialize, params: Option<impl serde::Serialize>) -> Value {
+    let mut meta = serde_json::to_value(context)
+        .ok()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if let (Some(meta), Some(Value::Object(params))) = (
+        meta.as_object_mut(),
+        params.and_then(|params| serde_json::to_value(params).ok()),
+    ) {
+        meta.extend(params);
+    }
+    meta
 }
 
 #[cfg(test)]
