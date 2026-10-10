@@ -110,9 +110,11 @@ core staged from a package into a release; and `install`, `install` again and
 stand-in for the services). `cargo xtask fixtures` fetches the core and
 Codex; without them those tests are skipped locally and fail in CI.
 
-Codex 0.157.0 does not give the active thread ID in MCP request metadata, so queued delivery into a Codex
-conversation needs `CODEX_THREAD_ID` in its environment. A queued message can be accepted before Codex reads it; the
-connector sends `input.read` only after the same message appears in that thread's rollout.
+Codex (the CLI and the desktop app) names the conversation in each tool call's `_meta`: `x-codex-turn-metadata`,
+with its `thread_id`. rmcp hands a request's `_meta` to the handler's context, which is where the connector reads it;
+Codex never passes the thread to an MCP server through its environment. Older Codex releases sent no thread at all:
+those need `CODEX_THREAD_ID` in the registration's environment. A queued message can be accepted before Codex reads
+it; the connector sends `input.read` only after the same message appears in that thread's rollout.
 
 The local speech outbox is synced to disk. Core's `text_saved: true` acknowledges admission into its current-process
 journal, which the core keeps in memory; the connector removes an outbox item on that acknowledgement, so a core
@@ -159,7 +161,7 @@ its MCP server is the installation's command with the profile's variables:
 - **Codex**: `. P/bench/env.sh && codex login` once, then register the server once with the `codex mcp add sidevoice
   --env ... -- .../current/bin/sidevoice-connector mcp` line the bench prints (Codex passes an MCP server only the
   variables it is given), then `. P/bench/env.sh && codex`. If `voice_connect` says it cannot tell which conversation
-  this is, this Codex does not give its thread ID to MCP servers: note the thread ID (`/status`), quit, register again
+  this is, this Codex is too old to name its thread in each call: note the thread ID (`/status`), quit, register again
   with `--env CODEX_THREAD_ID=<id>` added, and `codex resume <id>`.
 
 Nothing outside the profile is touched: the operator's own `~/.claude`, `~/.codex` and Sidevoice installation are

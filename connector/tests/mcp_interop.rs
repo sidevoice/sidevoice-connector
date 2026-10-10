@@ -76,3 +76,42 @@ fn a_client_that_initializes_with_an_older_version_gets_the_tools() {
     assert!(names(&tools["tools"]).contains(&"voice_connect"), "{tools}");
     mcp.stop();
 }
+
+/// Codex, the CLI and the desktop app alike, runs the MCP server with a filtered environment that never holds the
+/// conversation, and says which conversation is calling in each tool call's `_meta` (`x-codex-turn-metadata`, with
+/// its `thread_id`): `voice_connect` joins that conversation. A call that names none is refused naming Codex and the
+/// agents Sidevoice joins, and tells the agent nothing to set.
+#[test]
+fn codex_names_its_conversation_in_each_calls_meta() {
+    let profile = Profile::new("codexmeta");
+    let _connector = profile.start_connector();
+    let mut mcp = Mcp::start(profile.connector(&["mcp"]));
+    mcp.initialize("codex-mcp-client");
+
+    let refused = mcp.request(
+        "tools/call",
+        json!({"name": "voice_connect", "arguments": {}}),
+    );
+    assert_eq!(refused["isError"], true, "{refused}");
+    let text = refused["content"][0]["text"].as_str().unwrap_or("");
+    for named in ["Codex", "Claude Code", "Cursor"] {
+        assert!(text.contains(named), "{named} in {text}");
+    }
+    assert!(
+        !text.contains("SIDEVOICE_"),
+        "no settings for people: {text}"
+    );
+
+    let thread = "019a0000-0000-7000-8000-000000000001";
+    let turn = json!({"session_id": thread, "thread_id": thread, "turn_id": "turn-1"}).to_string();
+    let joined = mcp.request(
+        "tools/call",
+        json!({"name": "voice_connect", "arguments": {},
+               "_meta": {"callId": "call-1", "x-codex-turn-metadata": turn}}),
+    );
+    assert_ne!(joined["isError"], true, "{joined}");
+    let answer: Value = serde_json::from_str(joined["content"][0]["text"].as_str().unwrap_or(""))
+        .unwrap_or_default();
+    assert_eq!(answer["conversation"], thread, "{answer}");
+    assert_eq!(answer["harness"], "codex", "{answer}");
+}

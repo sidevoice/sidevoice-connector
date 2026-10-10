@@ -83,7 +83,42 @@ pub fn identify(
     if let Some(identity) = http::identity()? {
         return Ok(identity);
     }
-    bail!("Cannot tell which conversation this is: not launched by Claude Code, Codex or the Cursor CLI, and no SIDEVOICE_THREAD/SIDEVOICE_DELIVERY_URL set")
+    bail!("{}", unidentified(client))
+}
+
+/// The agents whose conversations Sidevoice joins.
+pub const SUPPORTED: &str = "Claude Code, Codex (the CLI and the desktop app) and Cursor";
+
+/// Why a call could not be tied to a conversation, naming the agent that made it (from its MCP client info), and
+/// which agents Sidevoice joins.
+pub fn unidentified(client: Option<&Value>) -> String {
+    let name = client
+        .and_then(|client| client.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let version = client
+        .and_then(|client| client.get("version"))
+        .and_then(Value::as_str)
+        .filter(|version| !version.is_empty());
+    let agent = if name.contains("claude") {
+        Some("Claude Code")
+    } else if name.contains("codex") {
+        Some("Codex")
+    } else if client.is_some_and(cursor::is_cursor_client) {
+        Some("Cursor")
+    } else {
+        None
+    };
+    let detected = match (agent, version) {
+        (Some(agent), Some(version)) => {
+            format!("{agent} {version} did not say which of its conversations is calling")
+        }
+        (Some(agent), None) => format!("{agent} did not say which of its conversations is calling"),
+        (None, _) if !name.is_empty() => format!("{name} is not an agent Sidevoice joins"),
+        (None, _) => "the agent did not say who it is".to_owned(),
+    };
+    format!("Cannot tell which conversation this is: {detected}. Sidevoice joins conversations of {SUPPORTED}.")
 }
 
 pub fn inspect_inbound(identity: &Identity) -> Result<Option<Value>> {
@@ -270,6 +305,7 @@ pub async fn deliver(
 #[cfg(test)]
 mod tests {
     use super::envelope;
+    use super::unidentified;
     use serde_json::json;
 
     const HEADER: &str = r#"{"channel":"voice","session_id":"s","revision":4,"message_id":"m"}"#;
@@ -350,5 +386,27 @@ mod tests {
                 .to_owned()
                 + "\n\nx"
         );
+    }
+
+    #[test]
+    fn a_call_tied_to_no_conversation_names_the_agent_and_the_agents_sidevoice_joins() {
+        let said = |client: serde_json::Value| unidentified(Some(&client));
+        let codex = said(json!({"name": "codex-mcp-client", "version": "0.160.0"}));
+        assert!(
+            codex.contains("Codex 0.160.0 did not say which of its conversations is calling"),
+            "{codex}"
+        );
+        assert!(said(json!({"name": "claude-code"})).contains("Claude Code did not say"));
+        assert!(said(json!({"name": "cursor-vscode"})).contains("Cursor did not say"));
+        let other = said(json!({"name": "zed"}));
+        assert!(
+            other.contains("zed is not an agent Sidevoice joins"),
+            "{other}"
+        );
+        assert!(unidentified(None).contains("the agent did not say who it is"));
+        for text in [codex, other] {
+            assert!(text.ends_with("Sidevoice joins conversations of Claude Code, Codex (the CLI and the desktop app) and Cursor."), "{text}");
+            assert!(!text.contains("SIDEVOICE_"), "{text}");
+        }
     }
 }
