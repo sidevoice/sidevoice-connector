@@ -169,10 +169,6 @@ impl Layout {
         self.releases.join("current")
     }
 
-    pub fn core_root(&self) -> PathBuf {
-        self.current().join(CORE_DIRECTORY)
-    }
-
     pub fn core_program(&self) -> PathBuf {
         self.current().join(CORE_ENTRYPOINT)
     }

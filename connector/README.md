@@ -58,10 +58,10 @@ against the core release's attestation; RELEASING.md). Nothing is downloaded at 
 Installing a release stages it (`src/core_package.rs`; run as the internal step `stage-core <release> [--json]`):
 the archive must have the inventory's size and digest; it is unpacked beside the release, below its one root, plain
 files and directories only, and must be exactly the core's own inventory (`native-core.json`: this target, this
-source commit, every file with its size and digest); then it is renamed into `<release>/core`. There the core runs
-its own self-test (`--self-test <core>/checks/detector-16k.wav <core>/models`), and a core that fails it is removed.
-The failures carry stable keys: `core.package-missing`, `core.package-mismatch`, `core.self-test`. The core never
-runs with a library-path variable (`LD_*`, `DYLD_*`, `ORT_DYLIB_PATH`) of ours: its libraries are its own.
+source commit, every file with its size and digest); then it is renamed into `<release>/core`. The core is a
+`rust-native-v2` archive: its program in `bin/` and its notices in `notices/`, nothing else. The failures carry
+stable keys: `core.package-missing`, `core.package-mismatch`. The core never runs with a library-path variable
+(`LD_*`, `DYLD_*`) of ours: it loads only the system's libraries.
 
 ## Installing
 
@@ -70,7 +70,7 @@ laid out as above) and makes the installation every other part runs (sidevoice/s
 and 3):
 
 - `R/releases/<version>/`: one directory per version, with a copy of the binary (`bin/sidevoice-connector`) and the
-  core staged and self-tested in it (above). Another build of a version already there (a nightly, a local build) is
+  core staged in it (above). Another build of a version already there (a nightly, a local build) is
   `<version>+<the first 12 hex digits of its binary's digest>`.
 - `R/current`: a link to the selected release, switched by renaming a new link over it.
 - `D/install.json`: `command`, `[R/current/bin/sidevoice-connector]`, and `releases`, `R`. The service jobs, the
@@ -105,7 +105,7 @@ With `--json` both print one JSON object and nothing else.
 saved, the core restarts and the link comes back), against the real Codex CLI in a disposable profile, as a
 login service under the real launchd (macOS) and the real systemd user manager (Linux; on a CI runner the test
 enables lingering for the runner's user), with no service manager at all; `pair` against a room on loopback; and the
-core staged from a package into a release, where it passes its self-test; and `install`, `install` again and
+core staged from a package into a release; and `install`, `install` again and
 `uninstall` from such a package with no service manager (upgrade, rollback and pruning are unit tests, with a
 stand-in for the services). `cargo xtask fixtures` fetches the core and
 Codex; without them those tests are skipped locally and fail in CI.

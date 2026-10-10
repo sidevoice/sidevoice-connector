@@ -328,12 +328,12 @@ pub fn environment(layout: &Layout, kind: Kind) -> BTreeMap<String, String> {
     environment
 }
 
-/// The core's environment: the jobs', with no loader variable, its models named, and its data directory.
+/// The core's environment: the jobs', with no loader variable, and its data directory.
 pub fn core_environment(
     layout: &Layout,
     base: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
-    let mut environment = crate::core_package::environment(base, &layout.core_root());
+    let mut environment = crate::core_package::environment(base);
     environment.insert(
         "SIDEVOICE_CORE_DATA_DIR".into(),
         layout.core_data().to_string_lossy().into_owned(),
@@ -575,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn the_core_environment_drops_loader_variables_and_names_its_models() {
+    fn the_core_environment_drops_loader_variables_and_names_its_data() {
         let layout = Layout::from_vars(
             |name| (name == "HOME").then(|| "/home/u".into()),
             Vec::new(),
@@ -587,10 +587,6 @@ mod tests {
         ]);
         let core = core_environment(&layout, &base);
         assert!(!core.contains_key("LD_PRELOAD"));
-        assert_eq!(
-            core["RUSTVANI_CACHE_DIR"],
-            "/home/u/.local/share/sidevoice/current/core/models"
-        );
         assert_eq!(core["SIDEVOICE_CORE_DATA_DIR"], "/home/u/.sidevoice/core");
         let args = core_arguments(&layout, None, Some(0));
         assert_eq!(&args[args.len() - 2..], ["--idle-exit", "0"]);

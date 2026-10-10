@@ -32,7 +32,7 @@ publish | npm | npm-smoke | npm-publish`):
 - `cargo xtask dist` builds this machine's release binary and packages it exactly as the release does, with the
   pinned core release's archive for this machine (fetched and checked as `fixtures` checks it), then verifies the
   archive by unpacking it elsewhere and running the connector from there: its version and build identity, and
-  `stage-core`, which stages the core it carries into a release where the core passes its own self-test. A pull
+  `stage-core`, which stages the core it carries into a release, checked against the core's own inventory. A pull
   request already runs it on every target. On Linux it needs [zig](https://ziglang.org) and
   [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) on the `PATH` (CI installs the versions pinned in
   `.github/actions/setup`): see [Linux: the glibc floor](#linux-the-glibc-floor).
@@ -89,7 +89,7 @@ gh attestation verify sidevoice-connector-0.7.0-linux-x86_64.tar.zst \
 ```
 
 The core is inside (sidevoice/sidevoice-connector#66, decision 2): nothing is downloaded at install. Installing
-stages it from the package into the release and runs its self-test there (`connector/src/core_package.rs`).
+stages it from the package into the release, checked against its inventory (`connector/src/core_package.rs`).
 
 The changelog is written from the squashed PR titles. To change it, edit `CHANGELOG.md` in the release PR right
 before merging it: any later merge into `main` regenerates the PR. After the release, fix the notes on the

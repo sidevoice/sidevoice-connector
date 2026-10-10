@@ -110,8 +110,7 @@ enum Action {
     },
     /// Show a one-time code (and its QR) to pair a device, such as the Sidevoice app, with this machine.
     PairDevice,
-    /// The installer's step for the core: stage the core this package carries into RELEASE/core and run its
-    /// self-test there.
+    /// The installer's step for the core: stage the core this package carries into RELEASE/core.
     #[command(hide = true)]
     StageCore { release: std::path::PathBuf },
 }
@@ -237,7 +236,7 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
             println!("{}", installed.value());
         } else {
             println!(
-                "Installed the Sidevoice core {} in {}; its self-test passed.",
+                "Installed the Sidevoice core {} in {}.",
                 installed.core.version,
                 installed.path.display()
             );
