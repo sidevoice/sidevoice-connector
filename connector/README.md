@@ -76,10 +76,7 @@ and 3):
 - `D/install.json`: `command`, `[R/current/bin/sidevoice-connector]`, and `releases`, `R`. The service jobs, the
   desktop app and every agent registration run that command, never the package's own path (npm's cache moves).
 
-Under the install lock, `install` refuses an installation made by the earlier JavaScript installer (its releases,
-its `verified` or `previous` link, its Python core, or an `install.json` naming another command) with the one
-command that removes it (`install.legacy`): there is no upgrade in place. Otherwise it stages the release unless it
-is there, switches `current`, writes `install.json`, clears a person's stop, and restarts: with a service manager both
+Under the install lock, `install` stages the release unless it is there, whole (its core as its inventory says), switches `current`, writes `install.json`, clears a person's stop, and restarts: with a service manager both
 jobs are defined (`service install`'s definitions) and restarted; without one, what runs on demand is stopped and the
 connector is started from the new release, which starts its core. The pair must then answer within 60 s: the core's
 health, for a launch after the restart, and the connector's identity (this release's binary) and its `node.status`.
@@ -89,12 +86,14 @@ installation that does not answer stays, failing with `install.verify-failed` an
 other than the current one and the one before it are pruned: exactly one previous, no `verified` link, no `rollback`
 command. Then the agents found are registered with the installation's command (Claude Code through `claude mcp add`,
 Codex through its CLI, Cursor in its `mcp.json`, only the `sidevoice` entry and only one Sidevoice wrote; an agent
-that needs its configuration by hand is told how), unless `--no-agents`. Running `install` again is the recovery.
+that needs its configuration by hand is told how), unless `--no-agents`. Each registration carries the installation's
+`SIDEVOICE_DATA_DIR` and `XDG_DATA_HOME`, so an agent opened from any shell reaches this installation; one of ours
+without them, disabled, or naming another release is not current, and is written again. Running `install` again is the
+recovery: a release whose core no longer matches its inventory is staged again.
 
 `uninstall` unloads both jobs and stops what runs on demand (a refusal stops it there, with nothing deleted), removes
-the agents' registrations Sidevoice wrote, then `R` and everything in `D` but its lock files and the stop, so that a
-launcher on its way finds the stop and starts nothing. It refuses an earlier installer's installation as `install`
-does. The room keeps this machine's pairing until it is revoked
+the agents' registrations Sidevoice wrote (current or not), then `R` and everything in `D` but its lock files and the
+stop, so that a launcher on its way finds the stop and starts nothing. The room keeps this machine's pairing until it is revoked
 there.
 
 With `--json` both print one JSON object and nothing else.
@@ -180,7 +179,9 @@ the bench is delivered to it, and its reply and the input's receipt show on the 
 the core (`dev.sidevoice.core` under launchd, `sidevoice-core.service` under the systemd user manager) and the
 connector daemon (`dev.sidevoice.connector`, `sidevoice-connector.service`). The core job runs
 `R/current/core/bin/sidevoice-core-rust` with `idle-exit 0`; the connector job runs `D/install.json`'s `command` +
-`connector`. Neither job starts or signals the other. A person's stop (`D/node-stopped.json`) is written before the
+`connector`. Neither job starts or signals the other. Under systemd, each job must also be enabled for the next login
+(`enable`, checked with `is-enabled`) and a changed definition read again (`daemon-reload`): a refusal of either fails
+the command (`service.not-enabled`), even when the job would run now. A person's stop (`D/node-stopped.json`) is written before the
 manager is asked and holds until `service start` or the next login; every change holds `D/install.lock`. On Linux,
 `service install` says whether the user lingers and prints `loginctl enable-linger <user>`; it never runs it.
 

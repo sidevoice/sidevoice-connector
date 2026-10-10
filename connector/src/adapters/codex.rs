@@ -1,8 +1,8 @@
 use super::{envelope, Identity};
+use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::env;
-use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -54,7 +54,9 @@ pub fn identity(meta: &Value) -> Result<Option<Identity>> {
     Ok(Some(Identity::new("codex", thread, delivery)))
 }
 
-pub async fn deliver(delivery: &Value, event: &Value, codex_home: &Path) -> Result<Value> {
+/// Queues `event` on the thread with the Codex CLI the agent scan found, not whatever `codex` a service manager's
+/// PATH reaches (`agents::agent_command`).
+pub async fn deliver(delivery: &Value, event: &Value, profile: &Profile) -> Result<Value> {
     if delivery.get("kind").and_then(Value::as_str) != Some("codex-queue") {
         bail!("Unsupported Codex delivery route");
     }
@@ -62,11 +64,15 @@ pub async fn deliver(delivery: &Value, event: &Value, codex_home: &Path) -> Resu
         .get("thread")
         .and_then(Value::as_str)
         .context("Codex thread missing")?;
-    let binary = env::var("SIDEVOICE_CODEX_BIN").unwrap_or_else(|_| "codex".into());
+    let codex = crate::agents::agent_command(profile, "codex");
+    let mut command = tokio::process::Command::new(&codex.program);
+    if let Some(path) = &codex.path {
+        command.env("PATH", path);
+    }
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        tokio::process::Command::new(binary)
-            .env("CODEX_HOME", codex_home)
+        command
+            .env("CODEX_HOME", &profile.codex)
             .args(["queue", "--thread", thread, "--message"])
             .arg(envelope(event)?)
             .stdout(Stdio::null())
