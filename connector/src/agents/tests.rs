@@ -1091,10 +1091,12 @@ async fn each_agent_says_what_the_connector_does_itself_and_how_to_do_it_by_hand
         add.extend(["-e".to_owned(), pair.clone()]);
     }
     add.extend(ours());
-    let add = json!({"command":quoted(add)});
+    let file = fixture.profile.claude.join(".claude.json");
+    let file = file.to_string_lossy();
+    let add = json!({"command":quoted(add),"file":file});
     let remove = json!({"command":quoted(
         std::iter::once(cli).chain(["mcp", "remove", "--scope", "user", "sidevoice"].map(String::from)).collect()
-    )});
+    ),"file":file});
     assert_eq!(
         row(&listed, "claude")["manual"],
         json!({"connect":[add],"disconnect":[remove],"replace":[remove,add]})

@@ -228,9 +228,13 @@ impl Registration for Claude {
 
     fn manual(&self, host: &dyn AgentHost, binary: Option<&str>) -> Manual {
         let cli = binary.unwrap_or("claude");
+        // `claude mcp` writes `.claude.json` in the configuration directory the connector names to it: the file each
+        // step changes.
+        let file = host.profile().claude.join(".claude.json");
         let step = |args: &[String]| ManualStep {
             command: Some(shell_command(cli, args)),
-            ..ManualStep::default()
+            snippet: None,
+            file: Some(file.to_string_lossy().into_owned()),
         };
         Manual::by_cli(step(&add_args(host)), step(&strings(&REMOVE)))
     }
