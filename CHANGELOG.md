@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.8.0...v0.8.1) (2026-10-10)
+
+
+### Bug Fixes
+
+* **connector:** read each tool call's _meta where rmcp puts it, so Codex Desktop joins voice ([#97](https://github.com/sidevoice/sidevoice-connector/issues/97)) ([e90ca99](https://github.com/sidevoice/sidevoice-connector/commit/e90ca99d681bb93c3271e3921a553f004d38cafe))
+
 ## [0.8.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.7.1...v0.8.0) (2026-10-10)
 
 
