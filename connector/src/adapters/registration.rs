@@ -1,10 +1,11 @@
 //! Registering Sidevoice with an agent: the trait a harness implements, and what the host-agent coordinator lends
 //! it for one request.
 
+use crate::messages::message;
 use crate::profile::Profile;
 use futures_util::future::BoxFuture;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -85,9 +86,60 @@ pub trait Registration: Send + Sync {
         host: &'a dyn AgentHost,
         binary: Option<&'a str>,
     ) -> BoxFuture<'a, Result<(), AgentError>>;
-    /// How a person registers it by hand: `{command, file, snippet}`.
-    fn instructions(&self, host: &dyn AgentHost, registration: &str, binary: Option<&str>)
-        -> Value;
+    /// How a person does each operation by hand, as ordered steps.
+    fn manual(&self, host: &dyn AgentHost, binary: Option<&str>) -> Manual;
+}
+
+/// One step done by hand: a command to run, or a snippet for a file. `file` is the file the step changes, when
+/// known.
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManualStep {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+}
+
+/// How a person registers Sidevoice with an agent by hand (`connect`), removes it (`disconnect`), and replaces another
+/// "sidevoice" entry with it (`replace`), each as steps in order.
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Manual {
+    pub connect: Vec<ManualStep>,
+    pub disconnect: Vec<ManualStep>,
+    pub replace: Vec<ManualStep>,
+}
+
+impl Manual {
+    /// An agent whose CLI adds and removes the entry: replacing removes the other entry, then adds ours.
+    pub fn by_cli(add: ManualStep, remove: ManualStep) -> Self {
+        Self {
+            connect: vec![add.clone()],
+            disconnect: vec![remove.clone()],
+            replace: vec![remove, add],
+        }
+    }
+
+    /// An agent configured by a file: connecting adds `snippet` to `file`, disconnecting deletes the "sidevoice" entry
+    /// under `under`, and replacing deletes the other one there first.
+    pub fn by_file(file: &str, snippet: String, under: &str) -> Self {
+        let step = |snippet: String| ManualStep {
+            command: None,
+            snippet: Some(snippet),
+            file: Some(file.to_owned()),
+        };
+        let params = json!({"under": under});
+        let add = step(snippet);
+        Self {
+            connect: vec![add.clone()],
+            disconnect: vec![step(message("agents.manual.delete-entry", &params))],
+            replace: vec![
+                step(message("agents.manual.delete-other-entry", &params)),
+                add,
+            ],
+        }
+    }
 }
 
 /// Runs the agent's CLI and requires it to succeed.

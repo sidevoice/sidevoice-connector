@@ -2,12 +2,11 @@
 
 use super::Claude;
 use crate::adapters::registration::{
-    looks_absent, run_required, shell_command, strings, AgentError, AgentHost, CliError,
-    Registration,
+    looks_absent, run_required, shell_command, strings, AgentError, AgentHost, CliError, Manual,
+    ManualStep, Registration,
 };
 use crate::profile::Profile;
 use futures_util::future::BoxFuture;
-use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
@@ -227,13 +226,12 @@ impl Registration for Claude {
         Box::pin(self.disconnect_entry(host, binary))
     }
 
-    fn instructions(
-        &self,
-        host: &dyn AgentHost,
-        _registration: &str,
-        binary: Option<&str>,
-    ) -> Value {
-        let command = shell_command(binary.unwrap_or("claude"), &add_args(host));
-        json!({"command":command.clone(),"file":Value::Null,"snippet":command})
+    fn manual(&self, host: &dyn AgentHost, binary: Option<&str>) -> Manual {
+        let cli = binary.unwrap_or("claude");
+        let step = |args: &[String]| ManualStep {
+            command: Some(shell_command(cli, args)),
+            ..ManualStep::default()
+        };
+        Manual::by_cli(step(&add_args(host)), step(&strings(&REMOVE)))
     }
 }

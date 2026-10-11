@@ -1326,7 +1326,9 @@ impl HostAgents {
             }
         }
         let present = !evidence.is_empty();
-        let instructions = agent.instructions(&host, &registration, binary.as_deref());
+        let manual = agent.manual(&host, binary.as_deref());
+        // The connector acts itself where it reaches the agent: its CLI found, or a file it edits.
+        let able = binary.is_some() || agent.connects_without_binary();
         let evidence_json = serde_json::to_value(&evidence).map_err(|_| Failure::Internal)?;
         let signature = if present {
             let identity = format!(
@@ -1345,8 +1347,12 @@ impl HostAgents {
             "version":version,
             "registration":registration,
             "owned":owned,
-            "connect":if binary.is_some() || agent.connects_without_binary() {"auto"} else {"manual"},
-            "instructions":instructions,
+            "connect":if able {"auto"} else {"manual"},
+            "can":{"connect":able,"update":able,"disconnect":able},
+            "manual":manual,
+            // The older forms of `manual.connect` and `manual.disconnect`, which older clients read.
+            "instructions":manual.connect.first(),
+            "removal":manual.disconnect.first(),
             "evidence":evidence_json,
             "present":present,
             "dismissed":false,

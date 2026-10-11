@@ -129,13 +129,15 @@ fn agent_refusals_labels_and_manual_text_use_the_shared_english_bundle() {
     );
     assert_eq!(label("claude"), "Claude Code");
     assert_eq!(
+        message("agents.manual.delete-entry", &json!({"under":"mcpServers"})),
+        "Delete the \"sidevoice\" entry under \"mcpServers\"."
+    );
+    assert_eq!(
         message(
-            "agents.manual.codex.replace-existing",
-            &json!({"remove":"codex mcp remove sidevoice","add":"codex mcp add sidevoice"})
+            "agents.manual.delete-other-entry",
+            &json!({"under":"mcpServers"})
         ),
-        "# Replace the existing Sidevoice entry by running these Codex commands:\n\
-         codex mcp remove sidevoice\n\
-         codex mcp add sidevoice"
+        "Delete the other \"sidevoice\" entry under \"mcpServers\"."
     );
 }
 
@@ -1017,4 +1019,116 @@ async fn claude_registration_carries_the_installation_environment_and_an_older_o
         !fixture.profile.claude.join("fake-entry.txt").exists(),
         "the entry of ours stayed"
     );
+}
+
+#[tokio::test]
+async fn each_agent_says_what_the_connector_does_itself_and_how_to_do_it_by_hand() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let claude = fake_claude(&fixture);
+    let codex = fake_codex(&fixture);
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let selected = fixture.selected();
+    let env = [
+        format!("SIDEVOICE_DATA_DIR={}", fixture.profile.data.display()),
+        format!("XDG_DATA_HOME={}", fixture.profile.xdg_data.display()),
+    ];
+    let quoted = |words: Vec<String>| {
+        words
+            .iter()
+            .map(|word| format!("'{word}'"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let ours = || {
+        std::iter::once("--".to_owned())
+            .chain(std::iter::once(selected.command.clone()))
+            .chain(selected.args.iter().cloned())
+    };
+
+    // Not found: Claude Code and Codex are then connected by hand; Cursor's file is edited all the same.
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    for id in ["claude", "codex"] {
+        let agent = row(&listed, id);
+        let found = agent["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["kind"] == "binary");
+        if !found {
+            assert_eq!(agent["connect"], "manual", "{agent}");
+            assert_eq!(
+                agent["can"],
+                json!({"connect":false,"update":false,"disconnect":false})
+            );
+            assert_eq!(agent["manual"]["connect"].as_array().unwrap().len(), 1);
+        }
+    }
+    assert_eq!(
+        row(&listed, "cursor")["can"],
+        json!({"connect":true,"update":true,"disconnect":true})
+    );
+
+    let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", claude.as_os_str());
+    let _codex = EnvGuard::set("SIDEVOICE_CODEX_BIN", codex.as_os_str());
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    for id in ["claude", "codex", "cursor"] {
+        let agent = row(&listed, id);
+        assert_eq!(agent["connect"], "auto", "{agent}");
+        assert_eq!(
+            agent["can"],
+            json!({"connect":true,"update":true,"disconnect":true})
+        );
+        // The older fields are the first step of connecting and of disconnecting.
+        assert_eq!(agent["instructions"], agent["manual"]["connect"][0]);
+        assert_eq!(agent["removal"], agent["manual"]["disconnect"][0]);
+    }
+
+    let cli = claude.to_string_lossy().into_owned();
+    let mut add = vec![cli.clone()];
+    add.extend(["mcp", "add", "--scope", "user", "sidevoice"].map(String::from));
+    for pair in &env {
+        add.extend(["-e".to_owned(), pair.clone()]);
+    }
+    add.extend(ours());
+    let add = json!({"command":quoted(add)});
+    let remove = json!({"command":quoted(
+        std::iter::once(cli).chain(["mcp", "remove", "--scope", "user", "sidevoice"].map(String::from)).collect()
+    )});
+    assert_eq!(
+        row(&listed, "claude")["manual"],
+        json!({"connect":[add],"disconnect":[remove],"replace":[remove,add]})
+    );
+
+    let cli = codex.to_string_lossy().into_owned();
+    let file = fixture.profile.codex.join("config.toml");
+    let file = file.to_string_lossy();
+    let mut add = vec![cli.clone()];
+    add.extend(["mcp", "add", "sidevoice"].map(String::from));
+    for pair in &env {
+        add.extend(["--env".to_owned(), pair.clone()]);
+    }
+    add.extend(ours());
+    let add = json!({"command":quoted(add),"file":file});
+    let remove = json!({"command":quoted(
+        std::iter::once(cli).chain(["mcp", "remove", "sidevoice"].map(String::from)).collect()
+    ),"file":file});
+    assert_eq!(
+        row(&listed, "codex")["manual"],
+        json!({"connect":[add],"disconnect":[remove],"replace":[remove,add]})
+    );
+
+    let file = fixture.profile.cursor.join("mcp.json");
+    let file = file.to_string_lossy();
+    let snippet = mcp_servers_json(&selected.command, &selected.args, host.mcp_env()).unwrap();
+    let add = json!({"snippet":snippet,"file":file});
+    assert_eq!(
+        row(&listed, "cursor")["manual"],
+        json!({
+            "connect":[add],
+            "disconnect":[{"snippet":"Delete the \"sidevoice\" entry under \"mcpServers\".","file":file}],
+            "replace":[{"snippet":"Delete the other \"sidevoice\" entry under \"mcpServers\".","file":file},add],
+        })
+    );
+    host.shutdown().await;
 }

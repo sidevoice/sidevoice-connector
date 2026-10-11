@@ -2,14 +2,13 @@
 
 use super::Codex;
 use crate::adapters::registration::{
-    looks_absent, run_required, shell_command, strings, AgentError, AgentHost, CliError,
-    Registration,
+    looks_absent, run_required, shell_command, strings, AgentError, AgentHost, CliError, Manual,
+    ManualStep, Registration,
 };
-use crate::messages::message;
 use crate::profile::Profile;
 use anyhow::{Context, Result};
 use futures_util::future::BoxFuture;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
@@ -297,43 +296,15 @@ impl Registration for Codex {
         Box::pin(self.disconnect_entry(host, binary))
     }
 
-    fn instructions(
-        &self,
-        host: &dyn AgentHost,
-        registration: &str,
-        binary: Option<&str>,
-    ) -> Value {
-        if registration == "foreign" {
-            let cli = binary.unwrap_or("codex");
-            let replace_message = message(
-                "agents.manual.codex.replace-existing",
-                &json!({
-                    "remove":shell_command(cli, &strings(&REMOVE)),
-                    "add":shell_command(cli, &add_args(host)),
-                }),
-            );
-            return json!({
-                "command":replace_message,
-                "file":Value::Null,
-                "snippet":Value::Null,
-            });
-        }
-        let command = shell_command(host.command(), host.args());
-        let mut snippet = format!(
-            "[mcp_servers.sidevoice]\ncommand = {}\nargs = {}\n\n[mcp_servers.sidevoice.env]",
-            serde_json::to_string(host.command()).unwrap_or_else(|_| "\"\"".into()),
-            serde_json::to_string(host.args()).unwrap_or_else(|_| "[]".into())
-        );
-        for (key, value) in host.mcp_env() {
-            snippet.push_str(&format!(
-                "\n{key} = {}",
-                serde_json::to_string(&value).unwrap_or_else(|_| "\"\"".into())
-            ));
-        }
-        json!({
-            "command":command,
-            "file":host.profile().codex.join("config.toml").to_string_lossy(),
-            "snippet":snippet,
-        })
+    fn manual(&self, host: &dyn AgentHost, binary: Option<&str>) -> Manual {
+        let cli = binary.unwrap_or("codex");
+        // `codex mcp` writes `config.toml`: the file each step changes.
+        let file = host.profile().codex.join("config.toml");
+        let step = |args: &[String]| ManualStep {
+            command: Some(shell_command(cli, args)),
+            snippet: None,
+            file: Some(file.to_string_lossy().into_owned()),
+        };
+        Manual::by_cli(step(&add_args(host)), step(&strings(&REMOVE)))
     }
 }
