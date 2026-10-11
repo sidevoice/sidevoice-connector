@@ -97,6 +97,20 @@ pub fn assistant_model(entry: &Value) -> Option<&str> {
         .filter(|model| !model.is_empty())
 }
 
+/// The engine an assistant transcript entry records: its model and the effort of that turn,
+/// falling back to the launch settings for an effort the entry lacks and for thinking.
+pub fn assistant_engine(entry: &Value, launch: &Value) -> Option<Value> {
+    let model = assistant_model(entry)?;
+    let effort = entry
+        .get("effort")
+        .filter(|effort| effort.as_str().is_some_and(|effort| !effort.is_empty()))
+        .or_else(|| launch.get("effort"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let thinking = launch.get("thinking").cloned().unwrap_or(Value::Null);
+    Some(json!({"model":model,"effort":effort,"thinking":thinking}))
+}
+
 pub fn transcript_path(session_id: &str) -> Option<PathBuf> {
     let projects = config_dir().join("projects");
     for entry in fs::read_dir(projects).ok()?.flatten() {
@@ -242,5 +256,40 @@ pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
             json!({"status":"rejected","detail":"Claude Code inbox closed before confirming delivery"}),
         ),
         Ok(Err(error)) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assistant_engine_takes_the_turn_effort() {
+        let entry =
+            json!({"type":"assistant","effort":"high","message":{"model":"claude-opus-5-5"}});
+        let launch = json!({"effort":"low","thinking":"enabled"});
+        assert_eq!(
+            assistant_engine(&entry, &launch),
+            Some(json!({"model":"claude-opus-5-5","effort":"high","thinking":"enabled"}))
+        );
+    }
+
+    #[test]
+    fn assistant_engine_falls_back_to_the_launch_effort() {
+        let entry = json!({"type":"assistant","message":{"model":"claude-opus-5-5"}});
+        assert_eq!(
+            assistant_engine(&entry, &json!({"effort":"low"})),
+            Some(json!({"model":"claude-opus-5-5","effort":"low","thinking":null}))
+        );
+        assert_eq!(
+            assistant_engine(&entry, &json!({})),
+            Some(json!({"model":"claude-opus-5-5","effort":null,"thinking":null}))
+        );
+    }
+
+    #[test]
+    fn assistant_engine_ignores_other_entries() {
+        let entry = json!({"type":"user","effort":"high","message":{"model":"claude-opus-5-5"}});
+        assert_eq!(assistant_engine(&entry, &json!({})), None);
     }
 }
