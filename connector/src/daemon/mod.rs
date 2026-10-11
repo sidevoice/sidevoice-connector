@@ -1,112 +1,45 @@
+use crate::adapters::{Conversation, Registry, Room};
 use crate::agents::HostAgents;
-use crate::cursor_app::{AppNotice, CursorApps};
 use crate::link::{Incoming, Link};
 use crate::profile::Profile;
-use crate::secure_fs::{atomic_json, private_dir, private_file, verify_socket};
+use crate::secure_fs::atomic_json;
 use anyhow::{bail, Context, Result};
+use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot, watch, Mutex, Semaphore};
-use tokio::task::JoinSet;
+use tokio::net::UnixStream;
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::Duration;
 use tokio::time::Instant;
 
-struct Binding {
-    client_ref: String,
-    harness: String,
-    thread: String,
-    title: String,
-    delivery: Value,
-    engine: Mutex<Option<Value>>,
-    bridge_chat: Mutex<Option<String>>,
-    transcript_chat: Mutex<Option<String>>,
-    route: Option<String>,
-    capabilities: Value,
-    experimental: Value,
-    inbound: Value,
-    detachable: bool,
-    owner: AtomicU64,
-    id: Mutex<String>,
-    serial: Mutex<()>,
-    pending: Mutex<VecDeque<String>>,
-    turns: Mutex<HashMap<String, String>>,
-    input_context: Mutex<HashMap<String, (String, i64)>>,
-    read: Mutex<VecDeque<String>>,
-    working: Mutex<Option<bool>>,
-    stopped: AtomicBool,
-}
+mod files;
+mod run;
 
-const CONVERSATION_STATE_MAX_BYTES: usize = 1 << 20;
+use files::{
+    prepare_conversation_guard, read_conversation_state, read_outbox, write_conversation_guard,
+    CONVERSATION_STATE_MAX_BYTES, GUARD_BLOCK_RESUME, GUARD_CLEAR, GUARD_REVOKED,
+};
+pub use run::run;
+
 /// How long `pair_device` waits for the link to the core (the code itself has 10 s more).
 const PAIR_DEVICE_LINK_WAIT: Duration = Duration::from_secs(15);
-const CONVERSATION_GUARD_MAGIC: &[u8; 8] = b"SVGUARD1";
-const GUARD_CLEAR: u8 = 0;
-const GUARD_BLOCK_RESUME: u8 = 1;
-const GUARD_REVOKED: u8 = 2;
 const RESUME_REASON_NONE: u8 = 0;
 const RESUME_REASON_HISTORY: u8 = 1;
 const RESUME_REASON_STORAGE: u8 = 2;
 
-fn prepare_conversation_guard(path: &Path) -> Result<(u8, fs::File)> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => {
-            private_file(path)?;
-            let metadata = fs::metadata(path)?;
-            if metadata.len() != 16 || metadata.mode() & 0o200 == 0 {
-                bail!("invalid conversation state guard");
-            }
-            let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
-            let mut bytes = [0; 16];
-            file.read_exact(&mut bytes)?;
-            if &bytes[..8] != CONVERSATION_GUARD_MAGIC || bytes[9..].iter().any(|byte| *byte != 0) {
-                bail!("invalid conversation state guard");
-            }
-            if !matches!(bytes[8], GUARD_CLEAR | GUARD_BLOCK_RESUME | GUARD_REVOKED) {
-                bail!("invalid conversation state guard");
-            }
-            Ok((bytes[8], file))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)?;
-            let mut bytes = [0; 16];
-            bytes[..8].copy_from_slice(CONVERSATION_GUARD_MAGIC);
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            fs::File::open(path.parent().context("conversation guard parent")?)?.sync_all()?;
-            file.seek(SeekFrom::Start(0))?;
-            Ok((GUARD_CLEAR, file))
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn write_conversation_guard(file: &mut fs::File, state: u8) -> Result<()> {
-    file.seek(SeekFrom::Start(8))?;
-    file.write_all(&[state])?;
-    file.sync_all()?;
-    Ok(())
-}
-
 pub struct Daemon {
     profile: Profile,
     link: Arc<Link>,
-    bindings: Mutex<HashMap<String, Arc<Binding>>>,
+    bindings: Mutex<HashMap<String, Arc<Conversation>>>,
     outbox: Mutex<Vec<Value>>,
     replay_tx: mpsc::Sender<()>,
     host_agents: Arc<HostAgents>,
-    cursor_apps: Arc<CursorApps>,
+    registry: Arc<Registry>,
     owner_serial: AtomicU64,
     client_count: AtomicU64,
     activity_generation: AtomicU64,
@@ -127,7 +60,7 @@ impl Daemon {
         profile: Profile,
         link: Arc<Link>,
         replay_tx: mpsc::Sender<()>,
-        cursor_apps: Arc<CursorApps>,
+        registry: Registry,
         managed: bool,
         shutdown: watch::Sender<bool>,
     ) -> Result<Arc<Self>> {
@@ -188,7 +121,7 @@ impl Daemon {
             outbox: Mutex::new(outbox),
             replay_tx,
             host_agents,
-            cursor_apps,
+            registry: Arc::new(registry),
             owner_serial: AtomicU64::new(1),
             client_count: AtomicU64::new(0),
             activity_generation: AtomicU64::new(0),
@@ -217,10 +150,14 @@ impl Daemon {
                 }
             }
         });
+        let room: Arc<dyn Room> = daemon.clone();
+        for harness in daemon.registry.all() {
+            harness.attach(&daemon.profile, Arc::downgrade(&room))?;
+        }
         Ok(daemon)
     }
 
-    async fn register_core(&self, binding: &Arc<Binding>) -> Result<Value> {
+    async fn register_core(&self, binding: &Arc<Conversation>) -> Result<Value> {
         let mut current = binding.id.lock().await;
         let engine = binding.engine.lock().await.clone().unwrap_or(Value::Null);
         let mut frame = json!({"client_ref":binding.client_ref,"harness":binding.harness,"thread":binding.thread,"title":binding.title,"delivery":binding.delivery,
@@ -413,7 +350,7 @@ impl Daemon {
         }
     }
 
-    async fn send_working_event(&self, binding: &Binding, mut event: Value) {
+    async fn send_working_event(&self, binding: &Conversation, mut event: Value) {
         let current = binding.working.lock().await;
         if event.get("working").and_then(Value::as_bool) != *current {
             return;
@@ -426,19 +363,19 @@ impl Daemon {
         let _ = self.link.notify("input.working", event).await;
     }
 
-    async fn report_working_event(&self, binding: &Binding, event: Value) {
+    async fn report_working_event(&self, binding: &Conversation, event: Value) {
         if let Some(working) = event.get("working").and_then(Value::as_bool) {
             *binding.working.lock().await = Some(working);
             self.send_working_event(binding, event).await;
         }
     }
 
-    async fn report_working(&self, binding: &Binding, working: bool) {
+    async fn report_working(&self, binding: &Conversation, working: bool) {
         self.report_working_event(binding, json!({"working":working,"turn_id":Value::Null}))
             .await;
     }
 
-    async fn report_engine(&self, binding: &Binding, engine: Value) {
+    async fn report_engine(&self, binding: &Conversation, engine: Value) {
         if !engine
             .get("model")
             .and_then(Value::as_str)
@@ -590,7 +527,7 @@ impl Daemon {
         }
     }
 
-    async fn binding_for_id(&self, id: &str) -> Option<Arc<Binding>> {
+    async fn binding_for_id(&self, id: &str) -> Option<Arc<Conversation>> {
         let candidates: Vec<_> = self.bindings.lock().await.values().cloned().collect();
         for b in candidates {
             if *b.id.lock().await == id {
@@ -647,7 +584,7 @@ impl Daemon {
                             Some((binding.client_ref.clone(), reason));
                     }
                     self.persist_conversation_state().await;
-                    self.cursor_apps.close(&binding.thread).await;
+                    self.registry.get(&binding.harness).close(&binding).await;
                     drop(_state_transaction);
                 }
                 json!({})
@@ -681,7 +618,7 @@ impl Daemon {
                     }
                     self.persist_conversation_state().await;
                     for binding in bindings {
-                        self.cursor_apps.close(&binding.thread).await;
+                        self.registry.get(&binding.harness).close(&binding).await;
                     }
                     drop(_state_transaction);
                 } else if previous_refusal.is_some() {
@@ -714,52 +651,6 @@ impl Daemon {
 
     async fn node_status(&self) -> Value {
         crate::service::node_status(&self.profile).await
-    }
-
-    async fn handle_app_notice(&self, notice: AppNotice) {
-        let (thread, message_id, answered) = match notice {
-            AppNotice::Dispatched { thread, message_id } => (thread, message_id, None),
-            AppNotice::Answered {
-                thread,
-                message_id,
-                ok,
-            } => (thread, message_id, Some(ok)),
-        };
-        let binding = self.bindings.lock().await.get(&thread).cloned();
-        let Some(binding) = binding else {
-            return;
-        };
-        if answered.is_none() || answered == Some(false) {
-            return;
-        }
-        let context = binding.input_context.lock().await.get(&message_id).cloned();
-        let Some((session_id, revision)) = context else {
-            return;
-        };
-        let mut pending = binding.pending.lock().await;
-        if !pending.iter().any(|id| id == &message_id) {
-            return;
-        }
-        pending.retain(|id| id != &message_id);
-        drop(pending);
-        let mut read = binding.read.lock().await;
-        if read.iter().any(|id| id == &message_id) {
-            return;
-        }
-        read.push_back(message_id.clone());
-        if read.len() > 512 {
-            read.pop_front();
-        }
-        drop(read);
-        let binding_id = binding.id.lock().await.clone();
-        let _ = self
-            .link
-            .notify(
-                "input.read",
-                json!({"binding_id":binding_id,"message_id":message_id,
-            "session_id":session_id,"revision":revision,"turn_id":Value::Null}),
-            )
-            .await;
     }
 
     async fn deliver(&self, frame: &Value) -> Value {
@@ -809,50 +700,10 @@ impl Daemon {
             .lock()
             .await
             .insert(message_id.to_owned(), (session_id.to_owned(), revision));
-        if binding.delivery.get("kind").and_then(Value::as_str) == Some("cursor-app") {
-            let mut delivery = binding.delivery.clone();
-            let composer = binding.bridge_chat.lock().await.clone().or_else(|| {
-                delivery
-                    .get("composer")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            });
-            let composer = match composer {
-                Some(composer) => Some(composer),
-                None => crate::adapters::cursor::composer_holding(&delivery).await,
-            };
-            if let Some(composer) = composer {
-                delivery["composer"] = json!(composer);
-                *binding.bridge_chat.lock().await = Some(composer);
-                if let Some(result) =
-                    crate::adapters::cursor::deliver_editor(&delivery, frame).await
-                {
-                    return result;
-                }
-            }
-            return match self
-                .cursor_apps
-                .deliver(
-                    &binding.thread,
-                    message_id,
-                    crate::adapters::envelope(frame).unwrap_or_else(|_| text.to_owned()),
-                )
-                .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    binding.pending.lock().await.retain(|id| id != message_id);
-                    binding
-                        .turns
-                        .lock()
-                        .await
-                        .remove(&format!("{session_id}:{revision}"));
-                    binding.input_context.lock().await.remove(message_id);
-                    json!({"status":"failed","detail":error.to_string()})
-                }
-            };
-        }
-        match crate::adapters::deliver(&binding.delivery, &binding.thread, &self.profile, frame)
+        match self
+            .registry
+            .get(&binding.harness)
+            .deliver(&binding, frame, &self.profile)
             .await
         {
             Ok(result) => result,
@@ -897,39 +748,14 @@ impl Daemon {
                     .get("delivery")
                     .cloned()
                     .unwrap_or_else(|| json!({"kind":"none"}));
-                let kind = delivery.get("kind").and_then(Value::as_str).unwrap_or("");
-                let route_ok = match kind {
-                    "codex-queue" => {
-                        harness == "codex"
-                            && delivery.get("thread").and_then(Value::as_str)
-                                == Some(thread.as_str())
-                    }
-                    "claude-uds" => {
-                        harness == "claude"
-                            && delivery.get("socket").and_then(Value::as_str).is_some()
-                    }
-                    "cursor-tmux" => {
-                        harness == "cursor"
-                            && delivery.get("chat").and_then(Value::as_str) == Some(thread.as_str())
-                    }
-                    "cursor-app" => {
-                        harness == "cursor"
-                            && delivery.get("thread").and_then(Value::as_str)
-                                == Some(thread.as_str())
-                    }
-                    "http" => {
-                        delivery.get("thread").and_then(Value::as_str) == Some(thread.as_str())
-                    }
-                    "none" => harness == "cursor",
-                    _ => false,
-                };
-                if !route_ok {
+                let harness_adapter = self.registry.get(&harness).clone();
+                if !harness_adapter.accepts(&delivery, &thread) {
                     bail!("harness identity does not match its delivery route");
                 }
                 let capabilities = params
                     .get("capabilities")
                     .cloned()
-                    .unwrap_or_else(|| crate::adapters::advertised_capabilities(&harness));
+                    .unwrap_or_else(|| harness_adapter.capabilities());
                 let experimental = params
                     .get("experimental")
                     .cloned()
@@ -954,7 +780,7 @@ impl Daemon {
                     );
                 }
                 drop(_state_transaction);
-                let binding = Arc::new(Binding {
+                let binding = Arc::new(Conversation {
                     client_ref: client_ref.clone(),
                     harness,
                     thread: thread.clone(),
@@ -966,8 +792,6 @@ impl Daemon {
                             .filter(|value| !value.is_null())
                             .cloned(),
                     ),
-                    bridge_chat: Mutex::new(None),
-                    transcript_chat: Mutex::new(None),
                     route,
                     capabilities,
                     experimental,
@@ -982,6 +806,7 @@ impl Daemon {
                     read: Mutex::new(VecDeque::new()),
                     working: Mutex::new(None),
                     stopped: AtomicBool::new(false),
+                    state: harness_adapter.conversation_state(),
                 });
                 let _state_transaction = self.conversation_state_serial.lock().await;
                 self.check_registration_allowed(&client_ref, resume).await?;
@@ -994,15 +819,7 @@ impl Daemon {
                     return Ok(json!({"binding_id":binding_id,"thread":thread,
                         "connected":self.link.connected().await,"prepared":null}));
                 }
-                let prepared = if kind == "cursor-app" {
-                    let key = delivery
-                        .get("key")
-                        .and_then(Value::as_str)
-                        .context("Cursor card key missing")?;
-                    Some(json!({"port":self.cursor_apps.open(&thread, key).await?}))
-                } else {
-                    None
-                };
+                let prepared = harness_adapter.prepare(&binding).await?;
                 self.bindings
                     .lock()
                     .await
@@ -1097,7 +914,7 @@ impl Daemon {
                 let binding = self.find_owned(owner, &params).await?;
                 binding.stopped.store(true, Ordering::Relaxed);
                 self.bindings.lock().await.remove(&binding.client_ref);
-                self.cursor_apps.close(&binding.thread).await;
+                self.registry.get(&binding.harness).close(&binding).await;
                 drop(_state_transaction);
                 let _ = self
                     .link
@@ -1147,8 +964,7 @@ impl Daemon {
                     .cloned()
                     .context("unknown editor conversation")?;
                 if !binding.detachable
-                    || binding.harness != "cursor"
-                    || !client_ref.starts_with("cursor-editor-")
+                    || !self.registry.get(&binding.harness).adopts(Some(client_ref))
                 {
                     bail!("conversation cannot be adopted");
                 }
@@ -1174,12 +990,11 @@ impl Daemon {
                         "harness":binding.harness,"thread":binding.thread,"title":binding.title,"delivery":binding.delivery,
                         "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound,
                         "engine":engine,"working":working});
-                    if binding.delivery.get("kind").and_then(Value::as_str) == Some("cursor-app") {
-                        let mut state = self.cursor_apps.status(&binding.thread).await;
-                        state["bridge_chat_known"] =
-                            json!(binding.bridge_chat.lock().await.is_some());
-                        item["delivery_state"] = state;
-                        item["cursor_app_port"] = json!(self.cursor_apps.port().await);
+                    if let Some(fields) = self.registry.get(&binding.harness).status(&binding).await
+                    {
+                        for (key, value) in fields {
+                            item[key] = value;
+                        }
                     }
                     listed.push(item);
                 }
@@ -1215,7 +1030,7 @@ impl Daemon {
         }
     }
 
-    async fn find_owned(&self, owner: u64, params: &Value) -> Result<Arc<Binding>> {
+    async fn find_owned(&self, owner: u64, params: &Value) -> Result<Arc<Conversation>> {
         let candidates: Vec<_> = self.bindings.lock().await.values().cloned().collect();
         for b in candidates {
             let id = b.id.lock().await.clone();
@@ -1235,7 +1050,7 @@ impl Daemon {
         params: &Value,
         session_id: &str,
         revision: i64,
-    ) -> Result<(Arc<Binding>, bool)> {
+    ) -> Result<(Arc<Conversation>, bool)> {
         let allowed = params
             .get("client_refs")
             .and_then(Value::as_array)
@@ -1257,7 +1072,7 @@ impl Daemon {
                 || (adopt_orphans
                     && previous == 0
                     && binding.detachable
-                    && binding.harness == "cursor");
+                    && self.registry.get(&binding.harness).adopts(None));
             if !is_allowed || !binding.turns.lock().await.contains_key(&key) {
                 continue;
             }
@@ -1266,7 +1081,7 @@ impl Daemon {
             } else if previous == 0
                 && adopt_orphans
                 && binding.detachable
-                && binding.harness == "cursor"
+                && self.registry.get(&binding.harness).adopts(None)
             {
                 matches.push((binding, true));
             }
@@ -1289,337 +1104,20 @@ impl Daemon {
         bail!("AMBIGUOUS: several conversations received this voice message ({titles}); pass the session_id and revision from its header")
     }
 
-    fn watch_binding(self: Arc<Self>, binding: Arc<Binding>) {
-        match (
-            binding.harness.as_str(),
-            binding.delivery.get("kind").and_then(Value::as_str),
-        ) {
-            ("codex", Some("codex-queue")) => self.watch_rollout(binding),
-            ("codex", Some("http")) if binding.capabilities["working"] == "supported" => {
-                self.watch_rollout(binding)
-            }
-            (_, Some("claude-uds")) => {
-                self.clone().watch_transcript(binding.clone(), true);
-                self.watch_claude_working(binding);
-            }
-            (_, Some("cursor-tmux" | "none")) if binding.harness == "cursor" => {
-                self.watch_transcript(binding, false)
-            }
-            (_, Some("cursor-app")) => self.watch_editor_transcript(binding),
-            _ => {}
-        }
+    fn watch_binding(self: Arc<Self>, binding: Arc<Conversation>) {
+        let harness = self.registry.get(&binding.harness).clone();
+        harness.watch(binding, self);
     }
 
-    fn watch_claude_working(self: Arc<Self>, binding: Arc<Binding>) {
-        tokio::spawn(async move {
-            let mut last = None;
-            while !binding.stopped.load(Ordering::Relaxed) {
-                let current = crate::adapters::claude::working_state(&binding.thread);
-                if let Some(working) = current {
-                    if current != last {
-                        self.report_working(&binding, working).await;
-                        last = current;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(400)).await;
-            }
-        });
-    }
-
-    fn watch_transcript(self: Arc<Self>, binding: Arc<Binding>, claude: bool) {
-        self.watch_transcript_for(binding.clone(), claude, binding.thread.clone());
-    }
-
-    fn watch_editor_transcript(self: Arc<Self>, binding: Arc<Binding>) {
-        tokio::spawn(async move {
-            let lookup_at = std::env::var("SIDEVOICE_CURSOR_LOOKUP_AT")
-                .ok()
-                .map(|value| {
-                    value
-                        .split(',')
-                        .filter_map(|part| part.trim().parse::<u64>().ok())
-                        .map(Duration::from_millis)
-                        .collect::<Vec<_>>()
-                })
-                .filter(|times| !times.is_empty())
-                .unwrap_or_else(|| {
-                    [3_000, 15_000, 35_000, 70_000]
-                        .into_iter()
-                        .map(Duration::from_millis)
-                        .collect()
-                });
-            let started = tokio::time::Instant::now();
-            let mut lookup_index = 0;
-            let mut last_bridge_lookup: Option<tokio::time::Instant> = None;
-            loop {
-                if binding.stopped.load(Ordering::Relaxed) {
-                    return;
-                }
-                let known_chat = { binding.bridge_chat.lock().await.clone() };
-                if let Some(chat) = known_chat {
-                    let observed = binding.transcript_chat.lock().await.clone();
-                    if observed.as_deref() != Some(chat.as_str()) {
-                        *binding.transcript_chat.lock().await = Some(chat.clone());
-                        self.clone().watch_transcript_for(binding, false, chat);
-                    }
-                    return;
-                }
-
-                let expected = binding
-                    .input_context
-                    .lock()
-                    .await
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let others = self
-                    .bindings
-                    .lock()
-                    .await
-                    .values()
-                    .filter(|other| other.client_ref != binding.client_ref)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let mut excluded = std::collections::HashSet::new();
-                for other in others {
-                    if let Some(chat) = other.bridge_chat.lock().await.clone() {
-                        excluded.insert(chat);
-                    }
-                    if let Some(chat) = other.transcript_chat.lock().await.clone() {
-                        excluded.insert(chat);
-                    }
-                }
-                if let Some((chat, pending_message_match)) =
-                    crate::adapters::cursor::editor_transcript_chat(
-                        &binding.delivery,
-                        &expected,
-                        &excluded,
-                    )
-                {
-                    let observed = binding.transcript_chat.lock().await.clone();
-                    if observed.as_deref() != Some(chat.as_str())
-                        && (observed.is_none() || pending_message_match)
-                    {
-                        *binding.transcript_chat.lock().await = Some(chat.clone());
-                        self.clone()
-                            .watch_transcript_for(binding.clone(), false, chat.clone());
-                    }
-                    if pending_message_match {
-                        *binding.bridge_chat.lock().await = Some(chat);
-                        continue;
-                    }
-                }
-
-                let lookup_due = if lookup_index < lookup_at.len() {
-                    started.elapsed() >= lookup_at[lookup_index]
-                } else {
-                    last_bridge_lookup.is_some_and(|last| last.elapsed() >= Duration::from_secs(5))
-                };
-                if lookup_due {
-                    if lookup_index < lookup_at.len() {
-                        lookup_index += 1;
-                    }
-                    last_bridge_lookup = Some(tokio::time::Instant::now());
-                    if let Some(chat) =
-                        crate::adapters::cursor::composer_holding(&binding.delivery).await
-                    {
-                        *binding.bridge_chat.lock().await = Some(chat);
-                        continue;
-                    }
-                }
-                let scan_ms = std::env::var("SIDEVOICE_CURSOR_SCAN_MS")
-                    .ok()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or(2_000)
-                    .max(10);
-                tokio::time::sleep(Duration::from_millis(scan_ms)).await;
-            }
-        });
-    }
-
-    fn watch_transcript_for(self: Arc<Self>, binding: Arc<Binding>, claude: bool, chat: String) {
-        tokio::spawn(async move {
-            while !binding.stopped.load(Ordering::Relaxed) {
-                if !claude
-                    && binding.delivery.get("kind").and_then(Value::as_str) == Some("cursor-app")
-                    && binding.transcript_chat.lock().await.as_deref() != Some(chat.as_str())
-                {
-                    return;
-                }
-                let path = if claude {
-                    crate::adapters::claude::transcript_path(&chat)
-                } else {
-                    crate::adapters::cursor::transcript_path(&chat)
-                };
-                if let Some(path) = path {
-                    self.watch_transcript_file(binding, path, claude, chat)
-                        .await;
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(400)).await;
-            }
-        });
-    }
-
-    async fn watch_transcript_file(
+    /// That `message_id`, delivered to the conversation, was read: told to the room once, if it is still pending.
+    async fn report_read(
         &self,
-        binding: Arc<Binding>,
-        path: PathBuf,
-        claude: bool,
-        engine_chat: String,
+        binding: &Conversation,
+        message_id: &str,
+        session_id: Value,
+        revision: Value,
+        turn_id: Value,
     ) {
-        let mut file_id: Option<(u64, u64)> = None;
-        let mut offset = 0u64;
-        let mut partial = Vec::new();
-        let mut tail = Vec::new();
-        let mut working = None;
-        let mut catching_up = true;
-        let mut announced_initial = false;
-        let mut engine_checked = false;
-        let mut oversized = false;
-        loop {
-            if binding.stopped.load(Ordering::Relaxed) {
-                break;
-            }
-            if !claude
-                && binding.delivery.get("kind").and_then(Value::as_str) == Some("cursor-app")
-                && binding.transcript_chat.lock().await.as_deref() != Some(engine_chat.as_str())
-            {
-                break;
-            }
-            let editor = binding.delivery.get("kind").and_then(Value::as_str) == Some("cursor-app");
-            let authenticated = !editor
-                || binding.bridge_chat.lock().await.as_deref() == Some(engine_chat.as_str());
-            if authenticated && !claude && !engine_checked {
-                engine_checked = true;
-                if let Some(engine) = crate::adapters::cursor::engine(&engine_chat) {
-                    self.report_engine(&binding, engine).await;
-                }
-            }
-            let Ok(mut input) = fs::File::open(&path) else {
-                tokio::time::sleep(Duration::from_millis(400)).await;
-                continue;
-            };
-            let Ok(meta) = input.metadata() else {
-                continue;
-            };
-            let current = (meta.dev(), meta.ino());
-            if file_id != Some(current) || meta.len() < offset {
-                file_id = Some(current);
-                offset = 0;
-                partial.clear();
-                tail.clear();
-                working = None;
-                catching_up = true;
-                announced_initial = false;
-                oversized = false;
-            }
-            if !claude && !tail.is_empty() && offset >= tail.len() as u64 {
-                let mut current_tail = vec![0; tail.len()];
-                if input
-                    .seek(SeekFrom::Start(offset - tail.len() as u64))
-                    .is_ok()
-                    && input.read_exact(&mut current_tail).is_ok()
-                    && current_tail != tail
-                {
-                    offset = 0;
-                    partial.clear();
-                    tail.clear();
-                    working = None;
-                    catching_up = true;
-                    announced_initial = false;
-                }
-            }
-            if input.seek(SeekFrom::Start(offset)).is_ok() {
-                let mut bytes = [0u8; 65536];
-                let limit = bytes.len().min(meta.len().saturating_sub(offset) as usize);
-                if let Ok(count) = input.read(&mut bytes[..limit]) {
-                    offset += count as u64;
-                    if !claude && count > 0 {
-                        tail.extend_from_slice(&bytes[..count]);
-                        if tail.len() > 64 {
-                            tail.drain(..tail.len() - 64);
-                        }
-                    }
-                    for segment in bytes[..count].split_inclusive(|byte| *byte == b'\n') {
-                        if !oversized {
-                            if partial.len() + segment.len() > 1 << 20 {
-                                partial.clear();
-                                oversized = true;
-                            } else {
-                                partial.extend_from_slice(segment);
-                            }
-                        }
-                        if segment.last() == Some(&b'\n') {
-                            if !oversized {
-                                if let Ok(item) = serde_json::from_slice::<Value>(&partial) {
-                                    if claude {
-                                        if crate::adapters::claude::assistant_model(&item).is_some()
-                                        {
-                                            let launch = crate::adapters::claude::session_engine(
-                                                &binding.thread,
-                                            )
-                                            .unwrap_or_else(|| json!({}));
-                                            if let Some(engine) =
-                                                crate::adapters::claude::assistant_engine(
-                                                    &item, &launch,
-                                                )
-                                            {
-                                                self.report_engine(&binding, engine).await;
-                                            }
-                                        }
-                                    } else if authenticated
-                                        && transcript_user_text(&item, false).is_some()
-                                    {
-                                        if let Some(engine) =
-                                            crate::adapters::cursor::engine(&engine_chat)
-                                        {
-                                            self.report_engine(&binding, engine).await;
-                                        }
-                                    }
-                                    if !claude {
-                                        if item.get("type") == Some(&json!("turn_ended")) {
-                                            working = Some(false);
-                                            if !catching_up && authenticated {
-                                                self.report_working(&binding, false).await;
-                                            }
-                                        } else if item.get("role") == Some(&json!("user")) {
-                                            working = Some(true);
-                                            if !catching_up && authenticated {
-                                                self.report_working(&binding, true).await;
-                                            }
-                                        }
-                                    }
-                                    if let Some(text) = transcript_user_text(&item, claude) {
-                                        if let Some(header) = voice_header(&text) {
-                                            self.report_read(&binding, &header).await;
-                                        }
-                                    }
-                                }
-                            }
-                            partial.clear();
-                            oversized = false;
-                        }
-                    }
-                }
-            }
-            if catching_up && offset >= meta.len() {
-                catching_up = false;
-            }
-            if !catching_up && authenticated && !announced_initial {
-                if let Some(state) = working {
-                    self.report_working(&binding, state).await;
-                }
-                announced_initial = true;
-            }
-            tokio::time::sleep(Duration::from_millis(400)).await;
-        }
-    }
-
-    async fn report_read(&self, binding: &Binding, header: &Value) {
-        let Some(message_id) = header.get("message_id").and_then(Value::as_str) else {
-            return;
-        };
         let mut pending = binding.pending.lock().await;
         if !pending.iter().any(|id| id == message_id) {
             return;
@@ -1635,208 +1133,14 @@ impl Daemon {
             read.pop_front();
         }
         drop(read);
-        let session_id = header
-            .get("session_id")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let revision = header.get("revision").and_then(Value::as_i64).unwrap_or(0);
         let _ = self
             .link
             .notify(
                 "input.read",
                 json!({"binding_id":*binding.id.lock().await,"message_id":message_id,
-            "session_id":session_id,"revision":revision,"turn_id":Value::Null}),
+            "session_id":session_id,"revision":revision,"turn_id":turn_id}),
             )
             .await;
-    }
-
-    fn watch_rollout(self: Arc<Self>, binding: Arc<Binding>) {
-        tokio::spawn(async move {
-            let mut path: Option<PathBuf> = None;
-            let mut offset = 0u64;
-            let mut file_id: Option<(u64, u64)> = None;
-            let mut partial = Vec::new();
-            let mut oversized = false;
-            let mut turn: Option<String> = None;
-            let mut working = None;
-            let mut catching_up = true;
-            loop {
-                if binding.stopped.load(Ordering::Relaxed) {
-                    break;
-                }
-                if path.is_none() {
-                    path = rollout_path(&self.profile.codex, &binding.thread);
-                    if let Some(file) = &path {
-                        if let Ok(meta) = fs::metadata(file) {
-                            offset = 0;
-                            file_id = Some((meta.dev(), meta.ino()));
-                        }
-                    }
-                }
-                if let Some(file) = &path {
-                    if let Ok(mut input) = fs::File::open(file) {
-                        let Ok(meta) = input.metadata() else {
-                            continue;
-                        };
-                        let current = (meta.dev(), meta.ino());
-                        if file_id != Some(current) || meta.len() < offset {
-                            offset = 0;
-                            partial.clear();
-                            oversized = false;
-                            turn = None;
-                            working = None;
-                            catching_up = true;
-                        }
-                        file_id = Some(current);
-                        if input.seek(SeekFrom::Start(offset)).is_ok() {
-                            let mut bytes = [0u8; 65536];
-                            let limit = bytes.len().min(meta.len().saturating_sub(offset) as usize);
-                            if let Ok(n) = input.read(&mut bytes[..limit]) {
-                                offset += n as u64;
-                                for segment in bytes[..n].split_inclusive(|byte| *byte == b'\n') {
-                                    if !oversized {
-                                        if partial.len() + segment.len() > 1 << 20 {
-                                            partial.clear();
-                                            oversized = true;
-                                        } else {
-                                            partial.extend_from_slice(segment);
-                                        }
-                                    }
-                                    if segment.last() == Some(&b'\n') {
-                                        if !oversized {
-                                            if let Ok(item) =
-                                                serde_json::from_slice::<Value>(&partial)
-                                            {
-                                                self.observe_rollout(
-                                                    &binding,
-                                                    &item,
-                                                    &mut turn,
-                                                    &mut working,
-                                                    catching_up,
-                                                )
-                                                .await;
-                                            }
-                                        }
-                                        partial.clear();
-                                        oversized = false;
-                                    }
-                                }
-                            }
-                            if catching_up && offset >= meta.len() {
-                                catching_up = false;
-                                if let Some(state) = working {
-                                    self.report_working_event(&binding, json!({
-                                        "working":state,"turn_id":if state { turn.clone() } else { None }
-                                    })).await;
-                                }
-                            }
-                        }
-                    } else {
-                        path = None;
-                        file_id = None;
-                        partial.clear();
-                        oversized = false;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(400)).await;
-            }
-        });
-    }
-
-    async fn observe_rollout(
-        &self,
-        binding: &Binding,
-        item: &Value,
-        turn: &mut Option<String>,
-        working: &mut Option<bool>,
-        catching_up: bool,
-    ) {
-        let id = binding.id.lock().await.clone();
-        if let Some(engine) = crate::adapters::codex::rollout_engine(item) {
-            self.report_engine(binding, engine).await;
-        }
-        if item.get("type") == Some(&json!("event_msg")) {
-            let phase = item
-                .pointer("/payload/type")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let turn_id = item.pointer("/payload/turn_id").and_then(Value::as_str);
-            if phase == "task_started" {
-                if let Some(turn_id) = turn_id {
-                    *turn = Some(turn_id.to_owned());
-                    *working = Some(true);
-                    if !catching_up {
-                        self.report_working_event(
-                            binding,
-                            json!({"working":true,"turn_id":turn_id}),
-                        )
-                        .await;
-                    }
-                }
-            }
-            if phase == "task_complete" || phase == "turn_aborted" {
-                if let Some(turn_id) = turn_id {
-                    if turn.as_deref() == Some(turn_id) {
-                        *turn = None;
-                    }
-                    *working = Some(false);
-                    if !catching_up {
-                        self.report_working_event(
-                            binding,
-                            json!({"working":false,"turn_id":turn_id}),
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
-        if item.get("type") == Some(&json!("response_item"))
-            && item.pointer("/payload/type") == Some(&json!("message"))
-            && item.pointer("/payload/role") == Some(&json!("user"))
-        {
-            let text = item
-                .pointer("/payload/content")
-                .and_then(Value::as_array)
-                .map(|parts| {
-                    parts
-                        .iter()
-                        .filter(|part| {
-                            part.get("type").and_then(Value::as_str) == Some("input_text")
-                        })
-                        .filter_map(|p| p.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_default();
-            let Some(start) = text.find("{\"channel\":") else {
-                return;
-            };
-            let Some(end) = text[start..].find('}') else {
-                return;
-            };
-            let Ok(header) = serde_json::from_str::<Value>(&text[start..=start + end]) else {
-                return;
-            };
-            let Some(message_id) = header.get("message_id").and_then(Value::as_str) else {
-                return;
-            };
-            let mut pending = binding.pending.lock().await;
-            if !pending.iter().any(|id| id == message_id) {
-                return;
-            }
-            pending.retain(|id| id != message_id);
-            drop(pending);
-            let mut read = binding.read.lock().await;
-            if read.iter().any(|id| id == message_id) {
-                return;
-            }
-            read.push_back(message_id.to_owned());
-            if read.len() > 512 {
-                read.pop_front();
-            }
-            drop(read);
-            let _ = self.link.notify("input.read", json!({"binding_id":id,"message_id":message_id,"session_id":header["session_id"],"revision":header["revision"],"turn_id":turn})).await;
-        }
     }
 
     async fn serve_client(self: Arc<Self>, stream: UnixStream) -> Result<()> {
@@ -1915,429 +1219,39 @@ impl Daemon {
     }
 }
 
-fn transcript_user_text(item: &Value, claude: bool) -> Option<String> {
-    if claude
-        && item.get("type") == Some(&json!("attachment"))
-        && item.pointer("/attachment/type") == Some(&json!("queued_command"))
-    {
-        return item
-            .pointer("/attachment/prompt")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+impl Room for Daemon {
+    fn profile(&self) -> &Profile {
+        &self.profile
     }
-    let is_user = if claude {
-        item.get("type") == Some(&json!("user"))
-            && item.pointer("/message/role") == Some(&json!("user"))
-    } else {
-        item.get("role") == Some(&json!("user"))
-    };
-    if !is_user {
-        return None;
-    }
-    let content = item
-        .pointer("/message/content")
-        .or_else(|| item.get("content"))?;
-    if let Some(text) = content.as_str() {
-        return Some(text.to_owned());
-    }
-    let parts = content.as_array()?;
-    let texts = parts
-        .iter()
-        .filter_map(|part| {
-            (part.get("type").and_then(Value::as_str) == Some("text"))
-                .then(|| part.get("text").and_then(Value::as_str))
-                .flatten()
-        })
-        .collect::<Vec<_>>();
-    (!texts.is_empty()).then(|| texts.join("\n"))
-}
 
-fn voice_header(text: &str) -> Option<Value> {
-    let start = text.find("{\"channel\":")?;
-    let tail = &text[start..];
-    let end = tail.find('}')?;
-    let header: Value = serde_json::from_str(&tail[..=end]).ok()?;
-    if !matches!(
-        header.get("channel").and_then(Value::as_str),
-        Some("voice" | "room-control" | "note")
-    ) || header
-        .get("session_id")
-        .and_then(Value::as_str)
-        .is_none_or(str::is_empty)
-        || header
-            .get("message_id")
-            .and_then(Value::as_str)
-            .is_none_or(str::is_empty)
-        || header
-            .get("revision")
-            .and_then(Value::as_i64)
-            .is_none_or(|revision| revision < 0)
-    {
-        return None;
+    fn engine<'a>(&'a self, conversation: &'a Conversation, engine: Value) -> BoxFuture<'a, ()> {
+        Box::pin(self.report_engine(conversation, engine))
     }
-    Some(header)
-}
 
-fn rollout_path(home: &Path, thread: &str) -> Option<PathBuf> {
-    let root = home.join("sessions");
-    let mut years: Vec<_> = fs::read_dir(root)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .collect();
-    years.sort();
-    years.reverse();
-    for year in years {
-        let mut months: Vec<_> = fs::read_dir(year)
-            .ok()?
-            .flatten()
-            .map(|e| e.path())
-            .collect();
-        months.sort();
-        months.reverse();
-        for month in months {
-            let mut days: Vec<_> = fs::read_dir(month)
-                .ok()?
-                .flatten()
-                .map(|e| e.path())
-                .collect();
-            days.sort();
-            days.reverse();
-            for day in days {
-                if let Ok(files) = fs::read_dir(day) {
-                    for entry in files.flatten() {
-                        let path = entry.path();
-                        if path.file_name().is_some_and(|n| {
-                            n.to_string_lossy().ends_with(&format!("-{thread}.jsonl"))
-                        }) {
-                            return Some(path);
-                        }
-                    }
-                }
-            }
-        }
+    fn working<'a>(&'a self, conversation: &'a Conversation, event: Value) -> BoxFuture<'a, ()> {
+        Box::pin(self.report_working_event(conversation, event))
     }
-    None
-}
 
-fn prune_binding_order(order: &mut HashMap<String, oneshot::Receiver<()>>) {
-    order.retain(|_, tail| matches!(tail.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
-}
+    fn read<'a>(
+        &'a self,
+        conversation: &'a Conversation,
+        message_id: &'a str,
+        session_id: Value,
+        revision: Value,
+        turn_id: Value,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(self.report_read(conversation, message_id, session_id, revision, turn_id))
+    }
 
-pub async fn run(profile: Profile, managed: bool) -> Result<()> {
-    // Refused, not repaired: a data directory others can write into is not one to serve from.
-    crate::secure_fs::ensure_private_dir(&profile.data)?;
-    crate::logfile::init(profile.data.join("connector.log"), managed);
-    profile.validate_existing_private()?;
-    if managed {
-        profile.validate_service_environment()?;
-        // Started by its manager (at login, or by `service start`): a person's stop from before no longer holds.
-        if !crate::service::managed_start_clears_stop(&profile).await? {
-            return Ok(());
-        }
+    fn conversations(&self) -> BoxFuture<'_, Vec<Arc<Conversation>>> {
+        Box::pin(async { self.bindings.lock().await.values().cloned().collect() })
     }
-    if profile.service_stopped()? {
-        crate::logfile::log(&crate::messages::message(
-            "service.node-stopped",
-            &Value::Null,
-        ));
-        return Ok(());
-    }
-    private_dir(&profile.data)?;
-    let lock = profile.try_connector_lock()?;
-    if profile.service_stopped()? {
-        return Ok(());
-    }
-    if profile.socket.exists() {
-        verify_socket(&profile.socket)?;
-        fs::remove_file(&profile.socket)?;
-    }
-    let link = Link::new();
-    let (replay_tx, mut replay_rx) = mpsc::channel(1);
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-    let (app_tx, mut app_rx) = mpsc::unbounded_channel();
-    let cursor_apps = CursorApps::new(app_tx, profile.data.join("cursor-card-port.json"))?;
-    let daemon = Daemon::new(
-        profile.clone(),
-        link.clone(),
-        replay_tx,
-        cursor_apps,
-        managed,
-        shutdown_tx,
-    )?;
-    let (incoming_tx, mut incoming_rx) = mpsc::channel(128);
-    let clients = Arc::new(Semaphore::new(32));
-    let mut core_tasks = JoinSet::new();
-    let mut replay_tasks = JoinSet::new();
-    let mut client_tasks = JoinSet::new();
-    let mut replay_again = false;
-    let mut core_session = 0u64;
-    let mut binding_order = HashMap::<String, oneshot::Receiver<()>>::new();
-    // Accept MCP before Core is ready. The link task retries the private Core socket until the
-    // separately manager-owned Core job becomes healthy.
-    let listener = UnixListener::bind(&profile.socket)?;
-    fs::set_permissions(&profile.socket, fs::Permissions::from_mode(0o600))?;
-    let (ready_tx, ready_rx) = oneshot::channel();
-    let supervisor = Arc::new(crate::service::core_supervisor(&profile));
-    let link_task = tokio::spawn(link.run(profile.clone(), incoming_tx, ready_tx, supervisor));
-    drop(ready_rx);
-    let scanner = if managed {
-        let host_agents = daemon.host_agents.clone();
-        let scan_profile = profile.clone();
-        Some(tokio::spawn(async move {
-            loop {
-                if !scan_profile.service_stopped().unwrap_or(true) {
-                    let _ = host_agents
-                        .handle("agents.list", serde_json::json!({"rescan":true}))
-                        .await;
-                }
-                tokio::time::sleep(Duration::from_secs(6 * 60 * 60)).await;
-            }
-        }))
-    } else {
-        None
-    };
-    let mut idle_since = Instant::now();
-    let mut last_activity = daemon.activity_generation.load(Ordering::Relaxed);
-    let mut idle_check = tokio::time::interval_at(
-        Instant::now() + Duration::from_millis(200),
-        Duration::from_millis(200),
-    );
-    idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut link_exited = false;
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    loop {
-        tokio::select! {
-            Some(result) = replay_tasks.join_next(), if !replay_tasks.is_empty() => {
-                if let Err(error) = result { crate::logfile::log(&format!("outbox replay: {error}")); }
-                if replay_again {
-                    replay_again = false;
-                    let daemon = daemon.clone();
-                    replay_tasks.spawn(async move { daemon.flush_outbox().await; });
-                }
-            }
-            Some(result) = client_tasks.join_next(), if !client_tasks.is_empty() => {
-                if let Err(error) = result { crate::logfile::log(&format!("IPC task: {error}")); }
-            }
-            Some(()) = replay_rx.recv() => {
-                if replay_tasks.is_empty() {
-                    let daemon = daemon.clone();
-                    replay_tasks.spawn(async move { daemon.flush_outbox().await; });
-                } else {
-                    replay_again = true;
-                }
-            }
-            Some(notice) = app_rx.recv() => {
-                daemon.handle_app_notice(notice).await;
-            }
-            Some(result) = core_tasks.join_next(), if !core_tasks.is_empty() => {
-                if let Err(error) = result { crate::logfile::log(&format!("Core handler: {error}")); }
-                prune_binding_order(&mut binding_order);
-            }
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                if let Ok(permit) = clients.clone().try_acquire_owned() {
-                    let daemon = daemon.clone();
-                    client_tasks.spawn(async move { let _permit = permit; daemon.serve_client(stream).await });
-                }
-            }
-            item = incoming_rx.recv() => {
-                let Some(item) = item else { link_exited=true; break; };
-                if item.method == "connector.lost" {
-                    if item.session == core_session {
-                        core_tasks.abort_all();
-                        while core_tasks.join_next().await.is_some() {}
-                        replay_tasks.abort_all();
-                        while replay_tasks.join_next().await.is_some() {}
-                        replay_again = false;
-                        binding_order.clear();
-                        core_session = 0;
-                    }
-                    continue;
-                }
-                if item.session != core_session {
-                    core_tasks.abort_all();
-                    while core_tasks.join_next().await.is_some() {}
-                    replay_tasks.abort_all();
-                    while replay_tasks.join_next().await.is_some() {}
-                    replay_again = false;
-                    binding_order.clear();
-                    core_session = item.session;
-                }
-                if core_tasks.len() >= 64 {
-                    if let Some(tx) = item.reply {
-                        let _ = tx.send(json!({"status":"failed","detail":"connector handler capacity reached"}));
-                    } else {
-                        crate::logfile::log("Core notification capacity reached");
-                    }
-                    continue;
-                }
-                if item.method == "binding.close" {
-                    if let Some(id) = item.params.get("binding_id").and_then(Value::as_str) {
-                        binding_order.remove(id);
-                    }
-                }
-                let daemon = daemon.clone();
-                let (previous, completed) = if item.method == "input.deliver" {
-                    let id = item.params.get("binding_id")
-                        .and_then(Value::as_str).unwrap_or("").to_owned();
-                    let (tx, rx) = oneshot::channel();
-                    (binding_order.insert(id, rx), Some(tx))
-                } else {
-                    (None, None)
-                };
-                core_tasks.spawn(async move {
-                    if let Some(previous) = previous {
-                        let _ = previous.await;
-                    }
-                    daemon.incoming(item).await;
-                    if let Some(completed) = completed {
-                        let _ = completed.send(());
-                    }
-                });
-            }
-            _ = tokio::signal::ctrl_c() => { break; }
-            _ = terminate.recv() => { break; }
-            _ = shutdown_rx.changed() => { break; }
-            _ = idle_check.tick(), if !managed => {
-                let activity = daemon.activity_generation.load(Ordering::Relaxed);
-                if activity != last_activity {
-                    idle_since = Instant::now();
-                    last_activity = activity;
-                }
-                if daemon.is_idle().await {
-                    if idle_since.elapsed() >= Duration::from_secs(15) { break; }
-                } else {
-                    idle_since = Instant::now();
-                }
-            }
-        }
-    }
-    daemon.shutdown.send_replace(true);
-    if !client_tasks.is_empty() {
-        let drained = tokio::time::timeout(Duration::from_secs(2), async {
-            while client_tasks.join_next().await.is_some() {}
-        })
-        .await;
-        if drained.is_err() {
-            client_tasks.abort_all();
-            while client_tasks.join_next().await.is_some() {}
-        }
-    }
-    if let Some(scanner) = scanner {
-        scanner.abort();
-        let _ = scanner.await;
-    }
-    link_task.abort();
-    let _ = link_task.await;
-    replay_tasks.abort_all();
-    while replay_tasks.join_next().await.is_some() {}
-    core_tasks.abort_all();
-    while core_tasks.join_next().await.is_some() {}
-    daemon.host_agents.shutdown().await;
-    fs::remove_file(&profile.socket)?;
-    drop(lock);
-    if link_exited {
-        bail!("Core authentication was refused or its link task exited");
-    }
-    Ok(())
-}
-
-/// The speech waiting for the room, as this connector writes it: every row a speech of a conversation (its event,
-/// binding, conversation reference, utterance and text). A row of any other shape makes the outbox invalid.
-fn read_outbox(path: &Path) -> Result<Vec<Value>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    private_file(path)?;
-    let bytes = fs::read(path)?;
-    if bytes.len() > 8 << 20 {
-        bail!("outbox too large");
-    }
-    let rows = serde_json::from_slice::<Vec<Value>>(&bytes).context("invalid existing outbox")?;
-    if !rows.iter().all(|row| {
-        [
-            "event_id",
-            "binding_id",
-            "client_ref",
-            "utterance_id",
-            "text",
-        ]
-        .iter()
-        .all(|key| row.get(key).is_some_and(Value::is_string))
-    }) {
-        bail!("invalid existing outbox: a row is not a speech of a conversation");
-    }
-    Ok(rows)
-}
-
-/// The conversation state as this connector writes it: never above its size bound, which a larger file makes invalid.
-fn read_conversation_state(path: &Path) -> Result<Option<Vec<u8>>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    private_file(path)?;
-    if fs::metadata(path)?.len() > CONVERSATION_STATE_MAX_BYTES as u64 {
-        bail!("conversation state too large");
-    }
-    Ok(Some(fs::read(path)?))
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn an_outbox_or_a_state_of_another_shape_is_invalid() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir =
-            std::env::temp_dir().join(format!("sidevoice-daemon-state-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let write = |name: &str, bytes: &[u8]| {
-            let path = dir.join(name);
-            std::fs::write(&path, bytes).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-            path
-        };
-        let speech = serde_json::json!({"event_id":"e","binding_id":"b","client_ref":"c","session_id":"s",
-            "revision":1,"utterance_id":"u","text":"hola","language":null});
-        let outbox = write(
-            "outbox.json",
-            serde_json::to_vec(std::slice::from_ref(&speech))
-                .unwrap()
-                .as_slice(),
-        );
-        assert_eq!(super::read_outbox(&outbox).unwrap(), vec![speech.clone()]);
-        let mut copied = speech;
-        copied.as_object_mut().unwrap().remove("client_ref");
-        let outbox = write(
-            "outbox.json",
-            serde_json::to_vec(&[copied]).unwrap().as_slice(),
-        );
-        let error = super::read_outbox(&outbox).unwrap_err();
-        assert!(
-            error.to_string().contains("not a speech of a conversation"),
-            "{error}"
-        );
-        assert!(super::read_outbox(&dir.join("absent.json"))
-            .unwrap()
-            .is_empty());
-
-        let state = write(
-            "conversation-state.json",
-            br#"{"refused":null,"closed_by_room":{}}"#,
-        );
-        assert!(super::read_conversation_state(&state).unwrap().is_some());
-        let oversized = write(
-            "conversation-state.json",
-            &vec![b' '; super::CONVERSATION_STATE_MAX_BYTES + 1],
-        );
-        assert!(super::read_conversation_state(&oversized)
-            .unwrap_err()
-            .to_string()
-            .contains("too large"));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    use super::{prune_binding_order, voice_header, Daemon};
+    use super::run::prune_binding_order;
+    use super::Daemon;
     use serde_json::json;
     use std::collections::HashMap;
     use tokio::sync::oneshot;
@@ -2379,14 +1293,150 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_note_is_read_back_by_its_header_like_a_voice_message() {
-        let note =
-            crate::adapters::envelope(&json!({"channel":"note","session_id":"s","revision":2,
-            "message_id":"note:1","text":"","unheard":{"count":1,"replies":[]}}))
+    /// A harness the daemon has never heard of, registered by its id: the daemon checks its route, prepares,
+    /// delivers to, follows, lists and closes its conversation only through the trait.
+    #[tokio::test]
+    async fn a_harness_registered_by_id_is_driven_through_its_trait() {
+        use crate::adapters::{Conversation, Harness, Registry, Room};
+        use crate::profile::Profile;
+        use anyhow::Result;
+        use futures_util::future::BoxFuture;
+        use serde_json::{Map, Value};
+        use std::sync::{Arc, Mutex};
+
+        struct Fake {
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl Harness for Fake {
+            fn id(&self) -> &'static str {
+                "fake"
+            }
+
+            fn capabilities(&self) -> Value {
+                json!({"deliver":"supported","working":"unsupported"})
+            }
+
+            fn accepts(&self, delivery: &Value, thread: &str) -> bool {
+                delivery["kind"] == "fake-route" && delivery["thread"] == thread
+            }
+
+            fn prepare<'a>(&'a self, _: &'a Conversation) -> BoxFuture<'a, Result<Option<Value>>> {
+                Box::pin(async { Ok(Some(json!({"ready":true}))) })
+            }
+
+            fn deliver<'a>(
+                &'a self,
+                conversation: &'a Conversation,
+                frame: &'a Value,
+                _: &'a Profile,
+            ) -> BoxFuture<'a, Result<Value>> {
+                Box::pin(async move {
+                    self.calls
+                        .lock()
+                        .unwrap()
+                        .push(format!("deliver {} {}", conversation.thread, frame["text"]));
+                    Ok(json!({"status":"accepted"}))
+                })
+            }
+
+            fn close<'a>(&'a self, conversation: &'a Conversation) -> BoxFuture<'a, ()> {
+                Box::pin(async move {
+                    self.calls
+                        .lock()
+                        .unwrap()
+                        .push(format!("close {}", conversation.thread));
+                })
+            }
+
+            fn status<'a>(
+                &'a self,
+                _: &'a Conversation,
+            ) -> BoxFuture<'a, Option<Map<String, Value>>> {
+                Box::pin(async { json!({"fake_state":"open"}).as_object().cloned() })
+            }
+
+            fn watch(&self, conversation: Arc<Conversation>, room: Arc<dyn Room>) {
+                tokio::spawn(async move {
+                    room.engine(
+                        &conversation,
+                        json!({"model":"fake-1","effort":"low","thinking":null}),
+                    )
+                    .await;
+                });
+            }
+        }
+
+        let scratch = crate::secure_fs::tests::Scratch::new("fake-harness");
+        let profile = Profile::for_test(&scratch.0);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let registry = Registry::new(vec![Arc::new(Fake {
+            calls: calls.clone(),
+        })]);
+        let (replay_tx, _replay_rx) = tokio::sync::mpsc::channel(1);
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let daemon = Daemon::new(
+            profile,
+            crate::link::Link::new(),
+            replay_tx,
+            registry,
+            false,
+            shutdown,
+        )
+        .unwrap();
+
+        let refused = daemon
+            .command(
+                1,
+                "register",
+                json!({"client_ref":"other","thread":"t-2","harness":"fake",
+                "delivery":{"kind":"other-route","thread":"t-2"}}),
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "a route the harness does not take is refused"
+        );
+
+        let joined = daemon
+            .command(
+                1,
+                "register",
+                json!({"client_ref":"fake-1","thread":"t-1","title":"Fake","harness":"fake",
+                "delivery":{"kind":"fake-route","thread":"t-1"}}),
+            )
+            .await
             .unwrap();
-        let header = voice_header(&note).unwrap();
-        assert_eq!(header["message_id"], "note:1");
-        assert_eq!(header["channel"], "note");
+        assert_eq!(joined["prepared"], json!({"ready":true}));
+
+        let delivered = daemon
+            .deliver(
+                &json!({"binding_id":joined["binding_id"],"message_id":"m-1","session_id":"s",
+                "revision":1,"text":"hola"}),
+            )
+            .await;
+        assert_eq!(delivered["status"], "accepted");
+
+        let mut listed = Value::Null;
+        for _ in 0..100 {
+            listed = daemon.command(1, "status", json!({})).await.unwrap()["bindings"][0].clone();
+            if !listed["engine"].is_null() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(listed["harness"], "fake");
+        assert_eq!(listed["fake_state"], "open");
+        assert_eq!(listed["engine"]["model"], "fake-1");
+        assert_eq!(listed["capabilities"]["working"], "unsupported");
+
+        daemon
+            .command(1, "unregister", json!({"client_ref":"fake-1"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["deliver t-1 \"hola\"", "close t-1"]
+        );
     }
 }

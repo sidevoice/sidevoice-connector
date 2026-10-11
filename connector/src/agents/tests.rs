@@ -1,6 +1,7 @@
 use super::*;
 use fs2::FileExt;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::fs::OpenOptions;
+use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 
 struct Fixture {
     root: PathBuf,
@@ -126,7 +127,7 @@ fn agent_refusals_labels_and_manual_text_use_the_shared_english_bundle() {
         message("agents.invalid", &json!({"agent":"Codex"})),
         "Codex has an unreadable or malformed Sidevoice registration; it was left unchanged."
     );
-    assert_eq!(AgentId::Claude.label(), "Claude Code");
+    assert_eq!(label("claude"), "Claude Code");
     assert_eq!(
         message(
             "agents.manual.codex.replace-existing",
@@ -772,11 +773,10 @@ async fn codex_delivery_runs_the_scanned_codex_with_the_login_path() {
     state["login_path"] = json!(login);
     write_json(&fixture.profile.data.join("agents.json"), &state);
 
-    let answer = crate::adapters::deliver(
+    let answer = crate::adapters::codex::deliver(
         &json!({"kind":"codex-queue","thread":"t-1"}),
-        "t-1",
-        &fixture.profile,
         &json!({"channel":"voice","session_id":"s","revision":1,"message_id":"m","text":"hola"}),
+        &fixture.profile,
     )
     .await
     .unwrap();

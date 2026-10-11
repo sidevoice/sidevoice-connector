@@ -1,3 +1,9 @@
+mod harness;
+mod registration;
+mod rollout;
+
+pub use harness::Codex;
+
 use super::{envelope, Identity};
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};

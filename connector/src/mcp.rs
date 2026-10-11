@@ -1112,7 +1112,7 @@ impl ServerHandler for Facade {
             return Err(McpError::invalid_params("unknown resource", None));
         }
         self.card_reads.fetch_add(1, Ordering::Relaxed);
-        let html = crate::cursor_app::resource_html();
+        let html = crate::adapters::cursor::app::resource_html();
         let meta: MetaObject = serde_json::from_value(
             json!({"ui":{"csp":{"connectDomains":["http://127.0.0.1:*"]},"prefersBorder":true}}),
         )

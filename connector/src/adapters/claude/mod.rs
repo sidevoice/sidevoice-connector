@@ -1,3 +1,8 @@
+mod harness;
+mod registration;
+
+pub use harness::Claude;
+
 use super::{envelope, Identity};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -8,6 +13,10 @@ use std::process::Command;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+
+pub fn capabilities() -> Value {
+    json!({"deliver":"supported","inspectInbound":"supported","working":"supported","endOfTurn":"supported","sessionIdentity":"supported"})
+}
 
 fn config_dir() -> PathBuf {
     env::var_os("CLAUDE_CONFIG_DIR")

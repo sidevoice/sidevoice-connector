@@ -1,9 +1,15 @@
 pub mod claude;
 pub mod codex;
+mod conversation;
 pub mod cursor;
+mod harness;
 mod http;
+pub mod registration;
+mod transcript;
 
-use crate::profile::Profile;
+pub use conversation::{Conversation, Room};
+pub use harness::{Harness, Registry};
+
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
@@ -26,14 +32,7 @@ pub struct Identity {
 
 impl Identity {
     fn new(harness: &str, thread: String, delivery: Value) -> Self {
-        let capabilities = match harness {
-            "claude" => {
-                json!({"deliver":"supported","inspectInbound":"supported","working":"supported","endOfTurn":"supported","sessionIdentity":"supported"})
-            }
-            "codex" => codex::capabilities(),
-            "cursor" => cursor::capabilities(),
-            _ => http::capabilities(),
-        };
+        let capabilities = advertised_capabilities(harness);
         Self {
             harness: harness.to_owned(),
             thread,
@@ -53,14 +52,7 @@ impl Identity {
 }
 
 pub fn advertised_capabilities(harness: &str) -> Value {
-    match harness {
-        "claude" => {
-            json!({"deliver":"supported","inspectInbound":"supported","working":"supported","endOfTurn":"supported","sessionIdentity":"supported"})
-        }
-        "codex" => codex::capabilities(),
-        "cursor" => cursor::capabilities(),
-        _ => http::capabilities(),
-    }
+    Registry::standard().get(harness).capabilities()
 }
 
 pub fn identify(
@@ -282,24 +274,6 @@ fn unheard(event: &Value) -> Option<(u64, String)> {
         list.push_str(&format!("\n- {quoted} ({how})"));
     }
     Some((count, list))
-}
-
-pub async fn deliver(
-    delivery: &Value,
-    thread: &str,
-    profile: &Profile,
-    event: &Value,
-) -> Result<Value> {
-    match delivery.get("kind").and_then(Value::as_str).unwrap_or("") {
-        "claude-uds" => claude::deliver(delivery, event).await,
-        "codex-queue" => codex::deliver(delivery, event, profile).await,
-        "http" => http::deliver(delivery, event).await,
-        "cursor-tmux" => cursor::deliver(delivery, event).await,
-        "cursor-app" => bail!("Cursor editor card delivery is not prepared"),
-        _ => {
-            Ok(json!({"status":"unsupported","detail":format!("{} has no delivery route", thread)}))
-        }
-    }
 }
 
 #[cfg(test)]

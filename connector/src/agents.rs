@@ -1,28 +1,29 @@
-//! The host-agent coordinator: which agents (Claude Code, Codex, Cursor) are on this computer, and registering
+//! The host-agent coordinator: which agents (each harness with a `Registration`) are on this computer, and registering
 //! Sidevoice with them or removing it, only ever touching an entry Sidevoice wrote.
 //!
 //! One gate owns a complete request. CLI children belong to its worker task so a vanished link reply can
 //! cancel the work without releasing the gate before the child has exited.
 
+use crate::adapters::registration::{
+    mcp_servers_json, shell_command, AgentError, AgentHost, CliError, CliOutput, Registration,
+};
+use crate::adapters::Registry;
 use crate::messages::message;
 use crate::profile::Profile;
-use crate::secure_fs::{atomic_json, validate_user_directory};
-use anyhow::{Context, Result};
+use crate::secure_fs::atomic_json;
+use anyhow::Result;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{ErrorKind, Read};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-mod claude;
-mod codex;
-mod cursor;
 #[cfg(test)]
 mod tests;
-use std::process::{ExitStatus, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
@@ -33,7 +34,6 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, sleep_until, timeout, Instant};
 use uuid::Uuid;
 
-const AGENT_IDS: [&str; 3] = ["claude", "codex", "cursor"];
 const REQUEST_LIMIT: StdDuration = StdDuration::from_secs(18);
 const CHILD_LIMIT: StdDuration = StdDuration::from_millis(2500);
 const OUTPUT_LIMIT: usize = 64 * 1024;
@@ -89,58 +89,17 @@ struct ActiveOperation {
     task: JoinHandle<()>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AgentId {
-    Claude,
-    Codex,
-    Cursor,
+/// An agent, by the id of its harness.
+type AgentId = &'static str;
+
+/// The variable naming an agent's CLI explicitly: `SIDEVOICE_<ID>_BIN`.
+fn override_name(id: AgentId) -> String {
+    format!("SIDEVOICE_{}_BIN", id.to_ascii_uppercase())
 }
 
-impl AgentId {
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "claude" => Some(Self::Claude),
-            "codex" => Some(Self::Codex),
-            "cursor" => Some(Self::Cursor),
-            _ => None,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Cursor => "cursor",
-        }
-    }
-
-    fn label(self) -> String {
-        message(&format!("harness.{}", self.as_str()), &Value::Null)
-    }
-
-    fn config_root(self, profile: &Profile) -> &Path {
-        match self {
-            Self::Claude => &profile.claude,
-            Self::Codex => &profile.codex,
-            Self::Cursor => &profile.cursor,
-        }
-    }
-
-    fn override_name(self) -> &'static str {
-        match self {
-            Self::Claude => "SIDEVOICE_CLAUDE_BIN",
-            Self::Codex => "SIDEVOICE_CODEX_BIN",
-            Self::Cursor => "SIDEVOICE_CURSOR_BIN",
-        }
-    }
-
-    fn binary_names(self) -> &'static [&'static str] {
-        match self {
-            Self::Claude => &["claude"],
-            Self::Codex => &["codex"],
-            Self::Cursor => &["cursor-agent", "cursor"],
-        }
-    }
+/// How the agent list names an agent.
+fn label(id: AgentId) -> String {
+    message(&format!("harness.{id}"), &Value::Null)
 }
 
 #[derive(Clone)]
@@ -279,6 +238,7 @@ impl InstalledCommand {
 pub struct HostAgents {
     profile: Profile,
     selected: InstalledCommand,
+    registry: Arc<Registry>,
     gate: Arc<Mutex<()>>,
     operations: Arc<Mutex<Vec<ActiveOperation>>>,
     stopping: Arc<AtomicBool>,
@@ -306,12 +266,6 @@ enum CommandFailure {
     Deadline,
     Start,
     Io,
-}
-
-struct CommandOutput {
-    status: ExitStatus,
-    stdout: String,
-    stderr: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -347,6 +301,7 @@ impl HostAgents {
         Arc::new(Self {
             selected,
             profile,
+            registry: Arc::new(Registry::standard()),
             gate: Arc::new(Mutex::new(())),
             operations: Arc::new(Mutex::new(Vec::new())),
             stopping: Arc::new(AtomicBool::new(false)),
@@ -456,7 +411,7 @@ impl HostAgents {
     ) -> std::result::Result<Value, Failure> {
         if method == "agents.list" {
             let watch = match params.get("watch").and_then(Value::as_str) {
-                Some(value) => Some(parse_id(value)?),
+                Some(value) => Some(parse_id(&self.registry, value)?),
                 None => None,
             };
             let rescan = params.get("rescan") == Some(&Value::Bool(true));
@@ -478,7 +433,7 @@ impl HostAgents {
             ));
         }
         let id = params.get("id").and_then(Value::as_str).unwrap_or("");
-        let agent = parse_id(id)?;
+        let agent = parse_id(&self.registry, id)?;
         let state = self.load_state(cancel, deadline).await?;
         let mut state = self
             .scan(state, Some(agent), true, cancel, deadline)
@@ -497,7 +452,7 @@ impl HostAgents {
                             == Some("not-connected")
                         {
                             if let Some(generation) = fresh.get("generation") {
-                                latest["dismissed"][agent.as_str()] = generation.clone();
+                                latest["dismissed"][agent] = generation.clone();
                             }
                         }
                     }
@@ -519,7 +474,7 @@ impl HostAgents {
                 return Err(agent_failure("agents.manual-required", agent));
             }
             let binary = state
-                .pointer(&format!("/binaries/{}", agent.as_str()))
+                .pointer(&format!("/binaries/{agent}"))
                 .and_then(Value::as_str)
                 .map(str::to_owned);
             self.connect(agent, binary.as_deref(), cancel, deadline)
@@ -549,7 +504,7 @@ impl HostAgents {
                         if let Some(dismissed) =
                             latest.get_mut("dismissed").and_then(Value::as_object_mut)
                         {
-                            dismissed.remove(agent.as_str());
+                            dismissed.remove(agent);
                         }
                     }
                 })
@@ -567,7 +522,7 @@ impl HostAgents {
             _ => return Err(agent_failure("agents.registration-unknown", agent)),
         }
         let binary = state
-            .pointer(&format!("/binaries/{}", agent.as_str()))
+            .pointer(&format!("/binaries/{agent}"))
             .and_then(Value::as_str)
             .map(str::to_owned);
         self.disconnect(agent, binary.as_deref(), cancel, deadline)
@@ -594,7 +549,7 @@ impl HostAgents {
 
     fn response(&self, state: &Value) -> std::result::Result<Value, Failure> {
         let mut rows = Vec::new();
-        for id in AGENT_IDS {
+        for (id, _) in self.registry.agents() {
             if let Some(seen) = state.pointer(&format!("/seen/{id}")) {
                 if seen.get("present") == Some(&Value::Bool(true)) {
                     if let Some(mut row) = seen.get("agent").cloned() {
@@ -618,16 +573,8 @@ impl HostAgents {
                 }
             }
         }
-        let custom = CustomConfig {
-            mcp_servers: CustomServers {
-                sidevoice: CustomServer {
-                    command: &self.selected.command,
-                    args: &self.selected.args,
-                    env: self.mcp_env(),
-                },
-            },
-        };
-        let snippet = serde_json::to_string_pretty(&custom).map_err(|_| Failure::Internal)?;
+        let snippet = mcp_servers_json(&self.selected.command, &self.selected.args, self.mcp_env())
+            .map_err(|_| Failure::Internal)?;
         Ok(json!({
             "agents": rows,
             "scanned_at": state.get("scanned_at").cloned().unwrap_or(Value::Null),
@@ -660,11 +607,14 @@ impl HostAgents {
                 login_path = Some(captured);
             }
         }
-        let ids: Vec<_> = watch.map_or_else(|| AGENT_IDS.to_vec(), |id| vec![id.as_str()]);
+        let ids: Vec<_> = watch.map_or_else(
+            || self.registry.agents().map(|(id, _)| id).collect(),
+            |id| vec![id],
+        );
         let mut observations = Vec::new();
         for name in ids {
             check_live(cancel, deadline)?;
-            let agent = AgentId::parse(name).ok_or(Failure::Internal)?;
+            let agent = name;
             let previous_version = base
                 .pointer(&format!("/seen/{name}/agent/version"))
                 .and_then(Value::as_str)
@@ -706,20 +656,20 @@ impl HostAgents {
             }
             for (id, observation) in observations {
                 if !path_unchanged
-                    || latest.pointer(&format!("/binaries/{}", id.as_str()))
-                        != base.pointer(&format!("/binaries/{}", id.as_str()))
+                    || latest.pointer(&format!("/binaries/{}", id))
+                        != base.pointer(&format!("/binaries/{}", id))
                 {
                     continue;
                 }
                 if let Some(binary) = &observation.binary {
-                    latest["binaries"][id.as_str()] = json!(binary);
+                    latest["binaries"][id] = json!(binary);
                 } else if let Some(binaries) =
                     latest.get_mut("binaries").and_then(Value::as_object_mut)
                 {
-                    binaries.remove(id.as_str());
+                    binaries.remove(id);
                 }
                 let signature = observation.signature;
-                let previous = latest.pointer(&format!("/seen/{}", id.as_str())).cloned();
+                let previous = latest.pointer(&format!("/seen/{}", id)).cloned();
                 let same = previous.as_ref().is_some_and(|seen| {
                     seen.get("present") == Some(&Value::Bool(true))
                         && seen.get("signature").and_then(Value::as_str) == signature.as_deref()
@@ -750,7 +700,7 @@ impl HostAgents {
                         .cloned()
                         .unwrap_or(Value::Null)
                 };
-                latest["seen"][id.as_str()] = json!({
+                latest["seen"][id] = json!({
                     "present":observation.present,
                     "signature":signature,
                     "generation":generation,
@@ -821,6 +771,29 @@ impl HostAgents {
         }
     }
 
+    /// The registration of `id`, which a scan or a request only names when one exists.
+    fn registration(&self, id: AgentId) -> std::result::Result<&dyn Registration, Failure> {
+        self.registry
+            .agent(id)
+            .map(|(_, registration)| registration)
+            .ok_or(Failure::Internal)
+    }
+
+    /// What a registration of `id` borrows for one request.
+    fn host<'a>(
+        &'a self,
+        registration: &dyn Registration,
+        cancel: &'a Cancellation,
+        deadline: Instant,
+    ) -> RequestHost<'a> {
+        RequestHost {
+            agents: self,
+            root: registration.config_root(&self.profile).to_path_buf(),
+            cancel,
+            deadline,
+        }
+    }
+
     async fn connect(
         &self,
         id: AgentId,
@@ -829,14 +802,12 @@ impl HostAgents {
         deadline: Instant,
     ) -> std::result::Result<(), Failure> {
         check_live(cancel, deadline)?;
-        match id {
-            AgentId::Claude => self.claude_connect(binary, cancel, deadline).await,
-            AgentId::Codex => self.codex_connect(binary, cancel, deadline).await,
-            AgentId::Cursor => {
-                check_live(cancel, deadline)?;
-                self.cursor_connect()
-            }
-        }
+        let registration = self.registration(id)?;
+        let host = self.host(registration, cancel, deadline);
+        registration
+            .connect(&host, binary)
+            .await
+            .map_err(|error| failure(error, id))
     }
 
     async fn disconnect(
@@ -847,71 +818,87 @@ impl HostAgents {
         deadline: Instant,
     ) -> std::result::Result<(), Failure> {
         check_live(cancel, deadline)?;
-        match id {
-            AgentId::Claude => self.claude_disconnect(binary, cancel, deadline).await,
-            AgentId::Codex => self.codex_disconnect(binary, cancel, deadline).await,
-            AgentId::Cursor => {
-                check_live(cancel, deadline)?;
-                self.cursor_disconnect()
-            }
-        }
-    }
-
-    async fn run_cli_required(
-        &self,
-        binary: &str,
-        args: &[impl AsRef<str>],
-        cancel: &Cancellation,
-        deadline: Instant,
-        agent: AgentId,
-    ) -> std::result::Result<(), Failure> {
-        let args = args
-            .iter()
-            .map(|value| value.as_ref().to_owned())
-            .collect::<Vec<_>>();
-        let output = match run_command(
-            &self.profile,
-            Some(agent.config_root(&self.profile)),
-            binary,
-            &args,
-            cancel,
-            deadline,
-        )
-        .await
-        {
-            Ok(output) => output,
-            Err(CommandFailure::Cancelled) => return Err(Failure::Cancelled),
-            Err(_) => return Err(agent_failure("agents.action-failed", agent)),
-        };
-        check_live(cancel, deadline)?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(agent_failure("agents.action-failed", agent))
-        }
+        let registration = self.registration(id)?;
+        let host = self.host(registration, cancel, deadline);
+        registration
+            .disconnect(&host, binary)
+            .await
+            .map_err(|error| failure(error, id))
     }
 }
 
-#[derive(Serialize)]
-struct CustomConfig<'a> {
-    #[serde(rename = "mcpServers")]
-    mcp_servers: CustomServers<'a>,
+/// The coordinator as one request on one agent lends it to that agent's registration.
+struct RequestHost<'a> {
+    agents: &'a HostAgents,
+    root: PathBuf,
+    cancel: &'a Cancellation,
+    deadline: Instant,
 }
 
-#[derive(Serialize)]
-struct CustomServers<'a> {
-    sidevoice: CustomServer<'a>,
+impl AgentHost for RequestHost<'_> {
+    fn profile(&self) -> &Profile {
+        &self.agents.profile
+    }
+
+    fn command(&self) -> &str {
+        &self.agents.selected.command
+    }
+
+    fn args(&self) -> &[String] {
+        &self.agents.selected.args
+    }
+
+    fn owns(&self, command: &str, args: &[String]) -> bool {
+        self.agents.selected.owns(command, args)
+    }
+
+    fn mcp_env(&self) -> BTreeMap<String, String> {
+        self.agents.mcp_env()
+    }
+
+    fn run<'a>(
+        &'a self,
+        binary: &'a str,
+        args: Vec<String>,
+    ) -> futures_util::future::BoxFuture<'a, std::result::Result<CliOutput, CliError>> {
+        Box::pin(async move {
+            run_command(
+                &self.agents.profile,
+                Some(&self.root),
+                binary,
+                &args,
+                self.cancel,
+                self.deadline,
+            )
+            .await
+            .map_err(|error| match error {
+                CommandFailure::Cancelled => CliError::Cancelled,
+                CommandFailure::Deadline | CommandFailure::Start | CommandFailure::Io => {
+                    CliError::Failed
+                }
+            })
+        })
+    }
+
+    fn live(&self) -> std::result::Result<(), AgentError> {
+        check_live(self.cancel, self.deadline).map_err(|error| match error {
+            Failure::Busy => AgentError::Busy,
+            _ => AgentError::Cancelled,
+        })
+    }
 }
 
-#[derive(Serialize)]
-struct CustomServer<'a> {
-    command: &'a str,
-    args: &'a [String],
-    env: BTreeMap<String, String>,
+/// A registration's failure, about agent `id`.
+fn failure(error: AgentError, id: AgentId) -> Failure {
+    match error {
+        AgentError::Cancelled => Failure::Cancelled,
+        AgentError::Busy => Failure::Busy,
+        AgentError::Key(key) => agent_failure(key, id),
+    }
 }
 
-fn parse_id(value: &str) -> std::result::Result<AgentId, Failure> {
-    AgentId::parse(value).ok_or_else(|| {
+fn parse_id(registry: &Registry, value: &str) -> std::result::Result<AgentId, Failure> {
+    registry.agent(value).map(|(id, _)| id).ok_or_else(|| {
         Failure::keyed(
             "agents.unknown",
             json!({"id":value.chars().take(120).collect::<String>()}),
@@ -920,18 +907,15 @@ fn parse_id(value: &str) -> std::result::Result<AgentId, Failure> {
 }
 
 fn not_present(id: AgentId) -> Failure {
-    Failure::keyed(
-        "agents.not-present",
-        json!({"id":id.as_str(),"agent":id.label()}),
-    )
+    Failure::keyed("agents.not-present", json!({"id":id,"agent":label(id)}))
 }
 
 fn agent_failure(key: &'static str, id: AgentId) -> Failure {
-    Failure::keyed(key, json!({"id":id.as_str(),"agent":id.label()}))
+    Failure::keyed(key, json!({"id":id,"agent":label(id)}))
 }
 
 fn seen_entry(state: &Value, id: AgentId) -> Option<&Value> {
-    state.pointer(&format!("/seen/{}", id.as_str()))
+    state.pointer(&format!("/seen/{}", id))
 }
 
 fn seen_agent(state: &Value, id: AgentId) -> Option<&Value> {
@@ -986,7 +970,7 @@ pub struct AgentCommand {
 }
 
 pub fn agent_command(profile: &Profile, agent: &str) -> AgentCommand {
-    let id = AgentId::parse(agent);
+    let id = Registry::standard().agent(agent).map(|(id, _)| id);
     let state = load_state_file(profile).unwrap_or_else(|_| empty_state());
     let path = state
         .get("login_path")
@@ -994,7 +978,7 @@ pub fn agent_command(profile: &Profile, agent: &str) -> AgentCommand {
         .filter(|path| !path.is_empty())
         .map(str::to_owned);
     let program = id
-        .and_then(|id| std::env::var(id.override_name()).ok())
+        .and_then(|id| std::env::var(override_name(id)).ok())
         .filter(|path| executable(path))
         .or_else(|| {
             state
@@ -1052,29 +1036,6 @@ fn check_live(cancel: &Cancellation, deadline: Instant) -> std::result::Result<(
 fn error_value(key: &str, params: Value) -> Value {
     let message = message(key, &params);
     json!({"error":{"key":key,"params":params,"message":message}})
-}
-
-fn shell_command(command: &str, args: &[String]) -> String {
-    std::iter::once(command)
-        .chain(args.iter().map(String::as_str))
-        .map(|value| format!("'{}'", value.replace('\'', "'\\''")))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn looks_absent(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    [
-        "no such server",
-        "no such mcp server",
-        "no mcp server",
-        "no such mcp entry",
-        "not found",
-        "does not exist",
-        "no entry",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
 }
 
 fn canonical(value: &str) -> Option<PathBuf> {
@@ -1201,7 +1162,7 @@ async fn run_command(
     args: &[String],
     cancel: &Cancellation,
     deadline: Instant,
-) -> std::result::Result<CommandOutput, CommandFailure> {
+) -> std::result::Result<CliOutput, CommandFailure> {
     if cancel.is_cancelled() {
         return Err(CommandFailure::Cancelled);
     }
@@ -1257,95 +1218,11 @@ async fn run_command(
     let stderr = collect_pipe(&mut stderr_task)
         .await
         .ok_or(CommandFailure::Io)?;
-    Ok(CommandOutput {
+    Ok(CliOutput {
         status,
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
     })
-}
-
-fn read_profile_file(path: &Path, root: &Path, limit: u64) -> Result<String> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o022 != 0
-        || metadata.len() > limit
-        || !path.canonicalize()?.starts_with(root)
-    {
-        anyhow::bail!("unsafe profile file");
-    }
-    fs::read_to_string(path).context("read profile file")
-}
-
-fn read_cursor_config(file: &Path, root: &Path) -> Result<Option<(Value, u32, PathBuf)>> {
-    let link_metadata = match fs::symlink_metadata(file) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let target = if link_metadata.file_type().is_symlink() {
-        file.canonicalize()?
-    } else {
-        file.to_path_buf()
-    };
-    let metadata = fs::symlink_metadata(&target)?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o022 != 0
-        || metadata.len() > (1 << 20)
-        || !target.canonicalize()?.starts_with(root)
-    {
-        anyhow::bail!("unsafe Cursor profile file");
-    }
-    let text = fs::read_to_string(&target)?;
-    let config: Value = serde_json::from_str(&text)?;
-    if !config.is_object() {
-        anyhow::bail!("Cursor configuration is not an object");
-    }
-    Ok(Some((
-        config,
-        metadata.permissions().mode() & 0o777,
-        target,
-    )))
-}
-
-fn write_cursor_config(profile: &Profile, file: &Path, config: &Value) -> Result<()> {
-    profile.validate_for_agent(&profile.cursor)?;
-    let root = profile.agent_root(&profile.cursor)?;
-    let (target, mode) = match read_cursor_config(file, &root)? {
-        Some((_, mode, target)) => (target, mode),
-        None => (file.to_path_buf(), 0o600),
-    };
-    let parent = target.parent().context("Cursor config parent")?;
-    validate_user_directory(parent)?;
-    if !parent.canonicalize()?.starts_with(&root) {
-        anyhow::bail!("Cursor config escaped its directory");
-    }
-    let temporary = parent.join(format!(".mcp.json.{}.tmp", Uuid::new_v4()));
-    let result = (|| -> Result<()> {
-        profile.validate_for_agent(&profile.cursor)?;
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temporary)?;
-        serde_json::to_writer_pretty(&mut output, config)?;
-        use std::io::Write;
-        output.write_all(b"\n")?;
-        output.sync_all()?;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
-        profile.validate_for_agent(&profile.cursor)?;
-        fs::rename(&temporary, &target)?;
-        File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
 }
 
 fn iso_now() -> String {
@@ -1405,20 +1282,13 @@ impl HostAgents {
         self.profile
             .validate_existing_private()
             .map_err(|_| agent_failure("agents.invalid", id))?;
-        let binary = self.resolve_binary(id, input.state, input.login_path);
-        let registration = match id {
-            AgentId::Claude => {
-                self.claude_registration(binary.as_deref(), cancel, deadline)
-                    .await?
-            }
-            AgentId::Codex => {
-                self.codex_registration(binary.as_deref(), cancel, deadline)
-                    .await?
-            }
-            AgentId::Cursor => self
-                .cursor_registration()
-                .unwrap_or_else(|_| "invalid".into()),
-        };
+        let agent = self.registration(id)?;
+        let host = self.host(agent, cancel, deadline);
+        let binary = self.resolve_binary(id, agent, input.state, input.login_path);
+        let registration = agent
+            .state(&host, binary.as_deref())
+            .await
+            .map_err(|error| failure(error, id))?;
         // An entry of ours that is not the current one (disabled, an older release, another environment) reads as not
         // connected, and is still ours to remove: `owned`.
         let owned = registration == "connected" || registration == "outdated";
@@ -1429,18 +1299,14 @@ impl HostAgents {
         };
         let version = if input.include_version {
             match binary.as_deref() {
-                Some(binary) => self.binary_version(id, binary, cancel, deadline).await?,
+                Some(binary) => self.binary_version(agent, binary, cancel, deadline).await?,
                 None => None,
             }
         } else {
             input.old_version.map(str::to_owned)
         };
         let mut evidence = Vec::new();
-        let config = match id {
-            AgentId::Claude => &self.profile.claude,
-            AgentId::Codex => &self.profile.codex,
-            AgentId::Cursor => &self.profile.cursor,
-        };
+        let config = agent.config_root(&self.profile);
         if config.exists() {
             evidence.push(Evidence {
                 kind: "config-dir",
@@ -1453,24 +1319,19 @@ impl HostAgents {
                 path: binary.clone(),
             });
         }
-        if id == AgentId::Cursor
-            && Path::new("/Applications/Cursor.app").exists()
-            && !evidence
-                .iter()
-                .any(|item| item.path == "/Applications/Cursor.app")
-        {
-            evidence.push(Evidence {
-                kind: "app",
-                path: "/Applications/Cursor.app".into(),
-            });
+        for (kind, path) in agent.evidence() {
+            let path = path.to_string_lossy().into_owned();
+            if !evidence.iter().any(|item| item.path == path) {
+                evidence.push(Evidence { kind, path });
+            }
         }
         let present = !evidence.is_empty();
-        let instructions = self.instructions(id, &registration, binary.as_deref());
+        let instructions = agent.instructions(&host, &registration, binary.as_deref());
         let evidence_json = serde_json::to_value(&evidence).map_err(|_| Failure::Internal)?;
         let signature = if present {
             let identity = format!(
                 "{{\"id\":{},\"version\":{},\"evidence\":{}}}",
-                serde_json::to_string(id.as_str()).map_err(|_| Failure::Internal)?,
+                serde_json::to_string(id).map_err(|_| Failure::Internal)?,
                 serde_json::to_string(&version).map_err(|_| Failure::Internal)?,
                 serde_json::to_string(&evidence).map_err(|_| Failure::Internal)?
             );
@@ -1479,12 +1340,12 @@ impl HostAgents {
             None
         };
         let row = json!({
-            "id":id.as_str(),
-            "label":id.label(),
+            "id":id,
+            "label":label(id),
             "version":version,
             "registration":registration,
             "owned":owned,
-            "connect":if binary.is_some() || id == AgentId::Cursor {"auto"} else {"manual"},
+            "connect":if binary.is_some() || agent.connects_without_binary() {"auto"} else {"manual"},
             "instructions":instructions,
             "evidence":evidence_json,
             "present":present,
@@ -1499,131 +1360,32 @@ impl HostAgents {
         })
     }
 
-    fn instructions(&self, id: AgentId, registration: &str, binary: Option<&str>) -> Value {
-        let selected = &self.selected;
-        match id {
-            AgentId::Claude => {
-                let args = self.claude_add_args();
-                json!({
-                    "command":shell_command(binary.unwrap_or("claude"), &args),
-                    "file":Value::Null,
-                    "snippet":shell_command(binary.unwrap_or("claude"), &args),
-                })
-            }
-            AgentId::Codex => {
-                if registration == "foreign" {
-                    let cli = binary.unwrap_or("codex");
-                    let remove = vec!["mcp", "remove", "sidevoice"]
-                        .into_iter()
-                        .map(str::to_owned)
-                        .collect::<Vec<_>>();
-                    let add = self.codex_add_args();
-                    let replace_message = message(
-                        "agents.manual.codex.replace-existing",
-                        &json!({
-                            "remove":shell_command(cli, &remove),
-                            "add":shell_command(cli, &add),
-                        }),
-                    );
-                    return json!({
-                        "command":replace_message,
-                        "file":Value::Null,
-                        "snippet":Value::Null,
-                    });
-                }
-                let command = shell_command(&selected.command, &selected.args);
-                let mut snippet = format!(
-                    "[mcp_servers.sidevoice]\ncommand = {}\nargs = {}\n\n[mcp_servers.sidevoice.env]",
-                    serde_json::to_string(&selected.command).unwrap_or_else(|_| "\"\"".into()),
-                    serde_json::to_string(&selected.args).unwrap_or_else(|_| "[]".into())
-                );
-                for (key, value) in self.mcp_env() {
-                    snippet.push_str(&format!(
-                        "\n{key} = {}",
-                        serde_json::to_string(&value).unwrap_or_else(|_| "\"\"".into())
-                    ));
-                }
-                json!({
-                    "command":command,
-                    "file":self.profile.codex.join("config.toml").to_string_lossy(),
-                    "snippet":snippet,
-                })
-            }
-            AgentId::Cursor => {
-                let config = CustomConfig {
-                    mcp_servers: CustomServers {
-                        sidevoice: CustomServer {
-                            command: &selected.command,
-                            args: &selected.args,
-                            env: self.mcp_env(),
-                        },
-                    },
-                };
-                json!({
-                    "command":shell_command(&selected.command,&selected.args),
-                    "file":self.profile.cursor.join("mcp.json").to_string_lossy(),
-                    "snippet":serde_json::to_string_pretty(&config).unwrap_or_default(),
-                })
-            }
-        }
-    }
-
     fn resolve_binary(
         &self,
         id: AgentId,
+        agent: &dyn Registration,
         state: &Value,
         login_path: Option<&str>,
     ) -> Option<String> {
-        let override_path = std::env::var(id.override_name()).ok();
+        let override_path = std::env::var(override_name(id)).ok();
         if let Some(path) = override_path.as_deref().filter(|path| executable(path)) {
             return Some(path.to_owned());
         }
         if let Some(path) = state
-            .pointer(&format!("/binaries/{}", id.as_str()))
+            .pointer(&format!("/binaries/{id}"))
             .and_then(Value::as_str)
             .filter(|path| executable(path))
         {
             return Some(path.to_owned());
         }
-        if let Some(path) = find_in_path(id.binary_names(), login_path) {
+        if let Some(path) = find_in_path(agent.binary_names(), login_path) {
             return Some(path);
         }
-        self.known_paths(id)
+        agent
+            .known_paths(&self.profile.home)
             .into_iter()
-            .find(|path| executable(path))
-    }
-
-    fn known_paths(&self, id: AgentId) -> Vec<String> {
-        let local = self.profile.home.join("AppData/Local");
-        let bin = self.profile.home.join(".local/bin");
-        let mut paths = match id {
-            AgentId::Claude => vec![
-                self.profile.home.join(".claude/local/claude"),
-                bin.join("claude"),
-                PathBuf::from("/usr/local/bin/claude"),
-                PathBuf::from("/opt/homebrew/bin/claude"),
-            ],
-            AgentId::Codex => vec![
-                bin.join("codex"),
-                PathBuf::from("/usr/local/bin/codex"),
-                PathBuf::from("/opt/homebrew/bin/codex"),
-                local.join("Programs/Codex/codex.exe"),
-            ],
-            AgentId::Cursor => vec![
-                bin.join("cursor-agent"),
-                bin.join("cursor"),
-                PathBuf::from("/usr/local/bin/cursor-agent"),
-                PathBuf::from("/opt/homebrew/bin/cursor-agent"),
-                PathBuf::from("/usr/local/bin/cursor"),
-                PathBuf::from("/opt/homebrew/bin/cursor"),
-                PathBuf::from("/Applications/Cursor.app/Contents/Resources/app/bin/cursor"),
-                local.join("Programs/cursor/resources/app/bin/cursor.cmd"),
-            ],
-        };
-        paths
-            .drain(..)
             .map(|path| path.to_string_lossy().into_owned())
-            .collect()
+            .find(|path| executable(path))
     }
 
     async fn capture_login_path(
@@ -1660,14 +1422,14 @@ impl HostAgents {
 
     async fn binary_version(
         &self,
-        id: AgentId,
+        agent: &dyn Registration,
         binary: &str,
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<Option<String>, Failure> {
         match run_command(
             &self.profile,
-            Some(id.config_root(&self.profile)),
+            Some(agent.config_root(&self.profile)),
             binary,
             &["--version".into()],
             cancel,

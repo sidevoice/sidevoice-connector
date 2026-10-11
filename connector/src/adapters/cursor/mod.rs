@@ -1,3 +1,9 @@
+pub mod app;
+mod harness;
+mod registration;
+
+pub use harness::Cursor;
+
 use super::{envelope, Identity};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};

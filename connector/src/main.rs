@@ -2,7 +2,6 @@ mod adapters;
 mod agents;
 mod core_package;
 mod core_ready;
-mod cursor_app;
 mod daemon;
 mod identity;
 mod install;
