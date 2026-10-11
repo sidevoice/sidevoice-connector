@@ -99,15 +99,19 @@ recovery: a release whose core no longer matches its inventory is staged again.
 
 An agent whose registration is `connected` also says whether that registration works: its row in `agents` (and the
 connector's `agents.list`) carries `health`, `{"state","error","checked_at"}`. The connector starts the entry as the
-agent would (its command, arguments and environment, read back from the agent's configuration, over the profile's
-homes and the login PATH the scan captured), with `SIDEVOICE_HEALTH_CHECK=1`, which keeps `mcp` from reaching or
-starting the daemon. It sends `initialize`, `notifications/initialized` and `tools/list`, calls no tool, and stops the
-server and its process group, within 5 s. `state` is `working`, or `not-starting` with `error` saying why in a few
-English words (`command not found`, `permission denied`, `could not start`, `exited with status N`, `killed by
-signal N`, `closed its output`, `timed out`, `protocol mismatch`); `checked_at` is when (ISO 8601, UTC). An agent that
-is not connected has `health: null`. The check runs on every scan (`agents.list` with `rescan` or `watch`), after a
-connect, and on demand (`agents.check`, `{"id"}`, or `agents check <id>`); a listing from the cache, and a request
-with too little time left, keep the last one found (in `agents.json`).
+agent would: its command, arguments, environment and (Codex's `cwd`) working directory, read back from the agent's
+configuration over the profile's homes and the login PATH the scan captured. Claude Code's entry is read from
+`.claude.json` in its configuration directory, never with `claude mcp get`, which starts the server it names; nothing
+is started before the entry is known to be ours. The server gets `SIDEVOICE_HEALTH_CHECK=1`, which keeps `mcp` from
+reaching or starting the daemon. The connector sends `initialize`, `notifications/initialized` and `tools/list`
+(their results must be what the protocol defines: `protocolVersion`, `capabilities`, `serverInfo` with its name and
+version; tools with their names), calls no tool, and stops the server and its process group, within 5 s. `state` is
+`working`, or `not-starting` with `error` saying why in a few English words (`command not found`, `permission
+denied`, `could not start`, `working directory not found`, `exited with status N`, `killed by signal N`, `closed its
+output`, `timed out`, `protocol mismatch`); `checked_at` is when (ISO 8601, UTC). An agent that is not connected has
+`health: null`. The check runs on every scan (`agents.list` with `rescan` or `watch`), after a connect, and on demand
+(`agents.check`, `{"id"}`, or `agents check <id>`); a listing from the cache, and a request with too little time
+left, keep the last one found (in `agents.json`).
 
 `uninstall` unloads both jobs and stops what runs on demand (a refusal stops it there, with nothing deleted), removes
 the agents' registrations Sidevoice wrote (current or not), then `R` and everything in `D` but its lock files and the

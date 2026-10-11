@@ -1,9 +1,9 @@
-//! Sidevoice's entry in Claude Code (`claude mcp`, user scope).
+//! Sidevoice's entry in Claude Code: written with `claude mcp`, user scope; read back from `.claude.json`.
 
 use super::Claude;
 use crate::adapters::registration::{
-    looks_absent, run_required, shell_command, strings, AgentError, AgentHost, CliError, Entry,
-    Launch, Registration,
+    read_profile_file, run_required, shell_command, strings, AgentError, AgentHost, Entry, Launch,
+    Registration,
 };
 use crate::profile::Profile;
 use futures_util::future::BoxFuture;
@@ -14,80 +14,99 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 const REMOVE: [&str; 5] = ["mcp", "remove", "--scope", "user", "sidevoice"];
+/// The largest `.claude.json` read: it also holds Claude Code's per-project state.
+const SETTINGS_LIMIT: u64 = 64 << 20;
 
 impl Claude {
+    /// The `sidevoice` entry of Claude Code's user scope, read from its configuration file and never through `claude
+    /// mcp get`, which starts the server it names: a foreign command must not run, and ours would start the daemon.
     async fn entry_state(
         &self,
         host: &dyn AgentHost,
         binary: Option<&str>,
     ) -> Result<Entry, AgentError> {
-        match fs::symlink_metadata(&host.profile().claude) {
+        let profile = host.profile();
+        match fs::symlink_metadata(&profile.claude) {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Entry::bare("absent")),
             Err(_) => return Ok(Entry::bare("invalid")),
             Ok(_) => {}
         }
-        let Some(binary) = binary else {
-            return Ok(Entry::bare("unknown"));
-        };
-        let output = match host
-            .run(binary, strings(&["mcp", "get", "sidevoice"]))
-            .await
-        {
-            Ok(output) => output,
-            Err(CliError::Cancelled) => return Err(AgentError::Cancelled),
-            Err(_) => return Ok(Entry::bare("unknown")),
-        };
-        if !output.status.success() {
-            let detail = format!("{}\n{}", output.stdout, output.stderr);
-            if (output.status.code() == Some(1) && detail.trim().is_empty())
-                || looks_absent(&detail)
-            {
-                return Ok(Entry::bare("absent"));
-            }
+        // Registering goes through its CLI: without one, what the file says cannot be acted on.
+        if binary.is_none() {
             return Ok(Entry::bare("unknown"));
         }
-        let detail = format!("{}\n{}", output.stdout, output.stderr);
-        let field = |name: &str| -> Option<String> {
-            detail.lines().find_map(|line| {
-                let (key, value) = line.trim().split_once(':')?;
-                key.eq_ignore_ascii_case(name)
-                    .then(|| value.trim().to_owned())
-            })
+        let file = settings_file(profile);
+        match fs::symlink_metadata(&file) {
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Entry::bare("absent")),
+            Err(_) => return Ok(Entry::bare("invalid")),
+            Ok(_) => {}
+        }
+        let Ok(root) = profile.agent_root(&profile.claude) else {
+            return Ok(Entry::bare("invalid"));
         };
-        let Some(command) = field("Command").filter(|value| !value.is_empty()) else {
-            return Ok(Entry::bare(if looks_absent(&detail) {
+        let Ok(text) = read_profile_file(&file, &root, SETTINGS_LIMIT) else {
+            return Ok(Entry::bare("invalid"));
+        };
+        let Ok(config) = serde_json::from_str::<Value>(&text) else {
+            return Ok(Entry::bare("invalid"));
+        };
+        let Some(config) = config.as_object() else {
+            return Ok(Entry::bare("invalid"));
+        };
+        let Some(servers) = config.get("mcpServers") else {
+            return Ok(Entry::bare("absent"));
+        };
+        let Some(entry) = servers
+            .as_object()
+            .and_then(|servers| servers.get("sidevoice"))
+        else {
+            return Ok(Entry::bare(if servers.is_object() {
                 "absent"
             } else {
-                "unknown"
+                "invalid"
             }));
         };
-        let args = field("Args")
-            .map(|value| {
-                value
-                    .split_whitespace()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
+        // Another transport (`http`, `sse`) or no command: not an entry Sidevoice writes.
+        let stdio = entry
+            .get("type")
+            .and_then(Value::as_str)
+            .is_none_or(|kind| kind == "stdio");
+        let Some(command) = entry
+            .get("command")
+            .and_then(Value::as_str)
+            .filter(|command| stdio && !command.is_empty())
+            .map(str::to_owned)
+        else {
+            return Ok(Entry::bare("foreign"));
+        };
+        let Some(args) = strings_of(entry.get("args")) else {
+            return Ok(Entry::bare("invalid"));
+        };
+        let env = entry
+            .get("env")
+            .and_then(Value::as_object)
+            .map(|env| {
+                env.iter()
+                    .map(|(key, value)| (key.clone(), value.as_str().unwrap_or("").to_owned()))
+                    .collect::<BTreeMap<_, _>>()
             })
             .unwrap_or_default();
-        let user_scope =
-            field("Scope").is_some_and(|value| value.to_ascii_lowercase().contains("user"));
-        // The block under `Environment:`, one `KEY=value` per line, indented below the field.
-        let env = detail
-            .lines()
-            .skip_while(|line| !line.trim().eq_ignore_ascii_case("Environment:"))
-            .skip(1)
-            .take_while(|line| line.starts_with("    ") && line.contains('='))
-            .filter_map(|line| line.trim().split_once('='))
-            .map(|(key, value)| (key.to_owned(), value.to_owned()))
-            .collect::<BTreeMap<_, _>>();
-        let state = if !user_scope || !host.owns(&command, &args) {
+        let state = if !host.owns(&command, &args) {
             "foreign"
         } else if command == host.command() && args == host.args() && env == host.mcp_env() {
             "connected"
         } else {
             "owned-old"
         };
-        Ok(Entry::with(state, Launch { command, args, env }))
+        Ok(Entry::with(
+            state,
+            Launch {
+                command,
+                args,
+                env,
+                cwd: None,
+            },
+        ))
     }
 
     async fn registration_state(
@@ -231,5 +250,23 @@ impl Registration for Claude {
     ) -> Value {
         let command = shell_command(binary.unwrap_or("claude"), &add_args(host));
         json!({"command":command.clone(),"file":Value::Null,"snippet":command})
+    }
+}
+
+/// The file Claude Code keeps its user-scope MCP servers in: `.claude.json` in its configuration directory, which the
+/// connector names to its CLI (`CLAUDE_CONFIG_DIR`).
+fn settings_file(profile: &Profile) -> PathBuf {
+    profile.claude.join(".claude.json")
+}
+
+/// The strings of a JSON array; none at all is no arguments, anything but strings is not an entry.
+fn strings_of(value: Option<&Value>) -> Option<Vec<String>> {
+    match value {
+        None => Some(Vec::new()),
+        Some(value) => value
+            .as_array()?
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned))
+            .collect(),
     }
 }

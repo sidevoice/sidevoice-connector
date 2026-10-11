@@ -3,7 +3,7 @@
 //! after, with every process it started.
 
 use super::registration::Launch;
-use rmcp::model::ProtocolVersion;
+use rmcp::model::{InitializeResult, ListToolsResult, ProtocolVersion};
 use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::future::Future;
@@ -51,6 +51,13 @@ pub async fn check(
 ) -> Result<Health, Cancelled> {
     let deadline = Instant::now() + limit;
     let mut command = Command::new(&launch.command);
+    if let Some(directory) = &launch.cwd {
+        // Told apart from a missing command, which is what spawning in a missing directory would say.
+        if !directory.is_dir() {
+            return Ok(Health::NotStarting("working directory not found".into()));
+        }
+        command.current_dir(directory);
+    }
     command
         .args(&launch.args)
         .envs(environment.iter().map(|(key, value)| (key, value)))
@@ -104,11 +111,13 @@ async fn handshake(mut stdin: ChildStdin, stdout: ChildStdout) -> Result<(), Sto
         }}),
     )
     .await?;
-    let initialized = answer(&mut reader, 1).await?;
-    let agreed = initialized.get("protocolVersion").and_then(Value::as_str);
+    // The result as the protocol defines it (`protocolVersion`, `capabilities`, `serverInfo` with its name and
+    // version), in a version that has this handshake.
+    let initialized: InitializeResult =
+        serde_json::from_value(answer(&mut reader, 1).await?).map_err(|_| Stop::Mismatch)?;
     if !ProtocolVersion::KNOWN_VERSIONS
         .iter()
-        .any(|version| Some(version.as_str()) == agreed && version.has_initialize())
+        .any(|version| *version == initialized.protocol_version && version.has_initialize())
     {
         return Err(Stop::Mismatch);
     }
@@ -122,12 +131,10 @@ async fn handshake(mut stdin: ChildStdin, stdout: ChildStdout) -> Result<(), Sto
         json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
     )
     .await?;
-    let listed = answer(&mut reader, 2).await?;
-    if listed.get("tools").is_some_and(Value::is_array) {
-        Ok(())
-    } else {
-        Err(Stop::Mismatch)
-    }
+    // Every tool as the protocol defines it: an object with its name and input schema.
+    serde_json::from_value::<ListToolsResult>(answer(&mut reader, 2).await?)
+        .map(|_| ())
+        .map_err(|_| Stop::Mismatch)
 }
 
 async fn send(stdin: &mut ChildStdin, message: Value) -> Result<(), Stop> {
@@ -252,6 +259,7 @@ mod tests {
             command: path.to_string_lossy().into_owned(),
             args: vec!["mcp".into()],
             env: BTreeMap::new(),
+            cwd: None,
         }
     }
 
@@ -376,6 +384,96 @@ sleep 30"#,
         assert_eq!(
             run(&refused, &[], Duration::from_secs(5)).await,
             Health::NotStarting("protocol mismatch".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn results_the_protocol_does_not_define_are_a_protocol_mismatch() {
+        let scratch = Scratch::new();
+        let initialize = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}}"#;
+        let tools = r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#;
+        for (name, initialize, tools) in [
+            // Only the version: no capabilities, no serverInfo.
+            (
+                "bare",
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}"#,
+                tools,
+            ),
+            // serverInfo without its version.
+            (
+                "nameless",
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"fake"}}}"#,
+                tools,
+            ),
+            (
+                "null-tool",
+                initialize,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[null]}}"#,
+            ),
+            (
+                "unnamed-tool",
+                initialize,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"inputSchema":{"type":"object"}}]}}"#,
+            ),
+            (
+                "no-tools",
+                initialize,
+                r#"{"jsonrpc":"2.0","id":2,"result":{}}"#,
+            ),
+        ] {
+            let launch = scratch.script(
+                name,
+                &format!(
+                    "read -r line\nprintf '%s\\n' '{initialize}'\nread -r line\nread -r line\nprintf '%s\\n' '{tools}'\nsleep 30"
+                ),
+            );
+            assert_eq!(
+                run(&launch, &[], Duration::from_secs(5)).await,
+                Health::NotStarting("protocol mismatch".into()),
+                "{name}"
+            );
+        }
+        // The same answers, well formed, work.
+        let launch = scratch.script(
+            "valid",
+            &format!(
+                "read -r line\nprintf '%s\\n' '{initialize}'\nread -r line\nread -r line\nprintf '%s\\n' '{tools}'\nsleep 30"
+            ),
+        );
+        assert_eq!(
+            run(&launch, &[], Duration::from_secs(5)).await,
+            Health::Working
+        );
+    }
+
+    #[tokio::test]
+    async fn the_server_starts_in_the_working_directory_its_entry_names() {
+        let scratch = Scratch::new();
+        let log = scratch.0.join("log");
+        let mut launch = scratch.script(
+            "server",
+            &fake_server("2025-11-25").replace(
+                "read -r initialize\n",
+                "read -r initialize\npwd > \"$LOG.cwd\"\n",
+            ),
+        );
+        let environment = vec![("LOG".to_owned(), log.into_os_string())];
+        let directory = scratch.0.join("work");
+        std::fs::create_dir(&directory).unwrap();
+        launch.cwd = Some(directory.clone());
+        assert_eq!(
+            run(&launch, &environment, Duration::from_secs(5)).await,
+            Health::Working
+        );
+        let started_in = std::fs::read_to_string(scratch.0.join("log.cwd")).unwrap();
+        assert_eq!(
+            Path::new(started_in.trim()).canonicalize().unwrap(),
+            directory.canonicalize().unwrap()
+        );
+        launch.cwd = Some(scratch.0.join("missing"));
+        assert_eq!(
+            run(&launch, &environment, Duration::from_secs(5)).await,
+            Health::NotStarting("working directory not found".into())
         );
     }
 

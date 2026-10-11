@@ -65,6 +65,8 @@ fn registration_state(host: &dyn AgentHost) -> Result<Entry> {
             command: command.to_owned(),
             args,
             env,
+            // Cursor's stdio entries name no working directory.
+            cwd: None,
         },
     ))
 }

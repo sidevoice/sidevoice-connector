@@ -2,18 +2,17 @@
 
 use super::Codex;
 use crate::adapters::registration::{
-    looks_absent, run_required, shell_command, strings, AgentError, AgentHost, CliError, Entry,
-    Launch, Registration,
+    looks_absent, read_profile_file, run_required, shell_command, strings, AgentError, AgentHost,
+    CliError, Entry, Launch, Registration,
 };
 use crate::messages::message;
 use crate::profile::Profile;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 const REMOVE: [&str; 3] = ["mcp", "remove", "sidevoice"];
@@ -109,6 +108,11 @@ impl Codex {
                 command: command.to_owned(),
                 args,
                 env,
+                // Codex starts the server in it.
+                cwd: transport
+                    .and_then(|value| value.get("cwd"))
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from),
             },
         ))
     }
@@ -242,20 +246,6 @@ fn file_guard(host: &dyn AgentHost) -> String {
         "foreign"
     }
     .into()
-}
-
-fn read_profile_file(path: &Path, root: &Path, limit: u64) -> Result<String> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o022 != 0
-        || metadata.len() > limit
-        || !path.canonicalize()?.starts_with(root)
-    {
-        anyhow::bail!("unsafe profile file");
-    }
-    fs::read_to_string(path).context("read profile file")
 }
 
 /// `mcp add` for this installation: its command, and the environment it runs with.

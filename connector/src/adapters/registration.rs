@@ -31,12 +31,14 @@ pub enum CliError {
     Failed,
 }
 
-/// How the agent starts the server its entry names: the command, its arguments and the environment the entry gives it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// How the agent starts the server its entry names: the command, its arguments, the environment the entry gives it and
+/// the working directory it names, if any.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Launch {
     pub command: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    pub cwd: Option<PathBuf>,
 }
 
 /// What the agent's configuration says of Sidevoice's entry: the registration's state and, when the entry could be
@@ -201,4 +203,22 @@ pub fn mcp_servers_json(
             sidevoice: CustomServer { command, args, env },
         },
     })
+}
+
+/// A file in an agent's home, read only when it is the person's own (a regular file, not a link, writable by nobody
+/// else), at most `limit` bytes, and inside `root`.
+pub fn read_profile_file(path: &Path, root: &Path, limit: u64) -> anyhow::Result<String> {
+    use anyhow::Context;
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+        || metadata.len() > limit
+        || !path.canonicalize()?.starts_with(root)
+    {
+        anyhow::bail!("unsafe profile file");
+    }
+    std::fs::read_to_string(path).context("read profile file")
 }
