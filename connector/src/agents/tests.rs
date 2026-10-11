@@ -463,18 +463,36 @@ async fn dangling_codex_config_symlink_is_invalid_not_absent() {
 async fn unparsable_settings_are_listed_invalid_with_their_file_and_left_alone() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
-    let binary = fake_codex(&fixture);
-    let _codex = EnvGuard::set("SIDEVOICE_CODEX_BIN", binary.as_os_str());
+    let codex = fake_codex(&fixture);
+    let claude = fake_claude(&fixture);
+    let _codex = EnvGuard::set("SIDEVOICE_CODEX_BIN", codex.as_os_str());
+    let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", claude.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
-    let codex_file = fixture.profile.codex.join("config.toml");
-    let cursor_file = fixture.profile.cursor.join("mcp.json");
-    private_write(&codex_file, b"[mcp_servers.sidevoice\ncommand = ");
-    private_write(&cursor_file, b"{\"mcpServers\": {\"sidevoice\": ");
+    let files = [
+        (
+            "claude",
+            fixture.profile.claude.join(".claude.json"),
+            &b"{\"mcpServers\": {"[..],
+        ),
+        (
+            "codex",
+            fixture.profile.codex.join("config.toml"),
+            &b"[mcp_servers.sidevoice\ncommand = "[..],
+        ),
+        (
+            "cursor",
+            fixture.profile.cursor.join("mcp.json"),
+            &b"{\"mcpServers\": {\"sidevoice\": "[..],
+        ),
+    ];
+    for (_, file, bytes) in &files {
+        private_write(file, bytes);
+    }
 
     // A whole scan still answers: each agent says its settings cannot be read, and where they are.
     let listed = host.handle("agents.list", json!({"rescan":true})).await;
     assert!(listed.get("error").is_none(), "{listed}");
-    for (id, file) in [("codex", &codex_file), ("cursor", &cursor_file)] {
+    for (id, file, _) in &files {
         let agent = row(&listed, id);
         assert_eq!(agent["registration"], "invalid", "{agent}");
         assert_eq!(agent["owned"], false);
@@ -485,7 +503,7 @@ async fn unparsable_settings_are_listed_invalid_with_their_file_and_left_alone()
         );
     }
 
-    for id in ["codex", "cursor"] {
+    for (id, _, _) in &files {
         for action in ["agents.connect", "agents.disconnect"] {
             let answer = host.handle(action, json!({"id":id})).await;
             assert_eq!(
@@ -495,20 +513,16 @@ async fn unparsable_settings_are_listed_invalid_with_their_file_and_left_alone()
             );
         }
     }
-    assert_eq!(
-        fs::read(&codex_file).unwrap(),
-        b"[mcp_servers.sidevoice\ncommand = "
-    );
-    assert_eq!(
-        fs::read(&cursor_file).unwrap(),
-        b"{\"mcpServers\": {\"sidevoice\": "
-    );
-    assert!(
-        !fs::read_to_string(fixture.profile.codex.join("calls"))
-            .unwrap_or_default()
-            .contains("mcp add"),
-        "Codex's CLI was asked to write over unreadable settings"
-    );
+    for (id, file, bytes) in &files {
+        assert_eq!(&fs::read(file).unwrap(), bytes, "{id}");
+    }
+    for home in [&fixture.profile.claude, &fixture.profile.codex] {
+        let calls = fs::read_to_string(home.join("calls")).unwrap_or_default();
+        assert!(
+            !calls.contains("mcp add") && !calls.contains("mcp remove"),
+            "an agent's CLI was asked to write over unreadable settings: {calls}"
+        );
+    }
     host.shutdown().await;
 }
 
@@ -1001,6 +1015,7 @@ case "$1 $2" in
 "mcp remove")
     rm -f "$entry"; exit 0 ;;
 "mcp add")
+    if [ -e "$home/fail-add" ]; then echo 'add failed' >&2; exit 1; fi
     shift 5
     env=""
     while [ "$1" != "--" ]; do
@@ -1072,4 +1087,76 @@ async fn claude_registration_carries_the_installation_environment_and_an_older_o
         !fixture.profile.claude.join("fake-entry.txt").exists(),
         "the entry of ours stayed"
     );
+}
+
+/// An entry of ours in the fake Claude Code that names this installation's command without its environment.
+fn claude_outdated_entry(fixture: &Fixture) {
+    let selected = fixture.selected();
+    private_write(
+        &fixture.profile.claude.join("fake-entry.txt"),
+        format!(
+            "sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: {}\n  Args: {}\n\nTo remove this server, run: claude mcp remove sidevoice -s user\n",
+            selected.command,
+            selected.args.join(" ")
+        )
+        .as_bytes(),
+    );
+}
+
+#[tokio::test]
+async fn connect_rewrites_an_outdated_entry_and_a_failed_rewrite_is_not_success() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let binary = fake_claude(&fixture);
+    let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", binary.as_os_str());
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let calls = fixture.profile.claude.join("calls");
+    let entry = fixture.profile.claude.join("fake-entry.txt");
+
+    claude_outdated_entry(&fixture);
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_eq!(row(&listed, "claude")["registration"], "outdated");
+    let _ = fs::remove_file(&calls);
+    let connected = host.handle("agents.connect", json!({"id":"claude"})).await;
+    assert!(connected.get("error").is_none(), "{connected}");
+    assert_eq!(row(&connected, "claude")["registration"], "connected");
+    assert_eq!(row(&connected, "claude")["owned"], true);
+    // The old entry is removed, then this installation's is added, with its environment.
+    let mutations: Vec<String> = fs::read_to_string(&calls)
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with("mcp remove") || line.starts_with("mcp add"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(mutations.len(), 2, "{mutations:?}");
+    assert_eq!(mutations[0], "mcp remove --scope user sidevoice");
+    assert!(
+        mutations[1].starts_with(&format!(
+            "mcp add --scope user sidevoice -e SIDEVOICE_DATA_DIR={} -e XDG_DATA_HOME={} --",
+            fixture.profile.data.display(),
+            fixture.profile.xdg_data.display()
+        )),
+        "{mutations:?}"
+    );
+    let written = fs::read_to_string(&entry).unwrap();
+    assert!(
+        written.contains(&format!(
+            "SIDEVOICE_DATA_DIR={}",
+            fixture.profile.data.display()
+        )),
+        "{written}"
+    );
+
+    // The removal succeeds but the add fails: a failure, never reported as connected.
+    claude_outdated_entry(&fixture);
+    private_write(&fixture.profile.claude.join("fail-add"), b"1");
+    let failed = host.handle("agents.connect", json!({"id":"claude"})).await;
+    assert_eq!(
+        failed.pointer("/error/key"),
+        Some(&json!("agents.action-failed")),
+        "{failed}"
+    );
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_ne!(row(&listed, "claude")["registration"], "connected");
+    host.shutdown().await;
 }

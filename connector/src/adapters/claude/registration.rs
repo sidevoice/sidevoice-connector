@@ -26,6 +26,10 @@ impl Claude {
             Err(_) => return Ok("invalid".into()),
             Ok(_) => {}
         }
+        // Settings Claude Code cannot parse are left alone: its CLI is not even asked.
+        if settings_unparsable(&settings_file(host.profile())) {
+            return Ok("invalid".into());
+        }
         let Some(binary) = binary else {
             return Ok("unknown".into());
         };
@@ -171,6 +175,26 @@ impl Claude {
     }
 }
 
+/// The file Claude Code keeps its user-scope MCP servers in: `.claude.json` in its configuration directory, which the
+/// connector always names to it (`CLAUDE_CONFIG_DIR`).
+fn settings_file(profile: &Profile) -> PathBuf {
+    profile.claude.join(".claude.json")
+}
+
+/// Whether `file` is there and is not JSON. One too large to read here is not judged: the CLI says.
+fn settings_unparsable(file: &Path) -> bool {
+    const LIMIT: u64 = 64 << 20;
+    match fs::metadata(file) {
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(_) => true,
+        Ok(metadata) if metadata.len() > LIMIT => false,
+        Ok(_) => match fs::read(file) {
+            Ok(bytes) => serde_json::from_slice::<Value>(&bytes).is_err(),
+            Err(_) => true,
+        },
+    }
+}
+
 /// `mcp add` for this installation: its command, and the environment it runs with. `-e` takes every value up
 /// to the next option, so the server's name comes before it.
 fn add_args(host: &dyn AgentHost) -> Vec<String> {
@@ -234,6 +258,10 @@ impl Registration for Claude {
         binary: Option<&str>,
     ) -> Value {
         let command = shell_command(binary.unwrap_or("claude"), &add_args(host));
-        json!({"command":command.clone(),"file":Value::Null,"snippet":command})
+        json!({
+            "command":command.clone(),
+            "file":settings_file(host.profile()).to_string_lossy(),
+            "snippet":command,
+        })
     }
 }
