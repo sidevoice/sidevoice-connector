@@ -189,7 +189,7 @@ manager: the core (`dev.sidevoice.core` under launchd, `sidevoice-core.service` 
 connector daemon (`dev.sidevoice.connector`, `sidevoice-connector.service`). The core job runs
 `R/current/core/bin/sidevoice-core-rust` with `idle-exit 0`; the connector job runs `D/install.json`'s `command` +
 `connector`. Neither job starts or signals the other. Under systemd, each job must also be enabled for the next login
-(`enable`, checked with `is-enabled`; not when the person turned that off, below) and a changed definition read again (`daemon-reload`): a refusal of either fails
+(`enable`, checked with `is-enabled`; only as below once the person has a choice) and a changed definition read again (`daemon-reload`): a refusal of either fails
 the command (`service.not-enabled`), even when the job would run now. A person's stop (`D/node-stopped.json`) is written before the
 manager is asked and holds until `service start` or the next login; every change holds `D/install.lock`. On Linux,
 `service install` says whether the user lingers and prints `loginctl enable-linger <user>`; it never runs it.
@@ -197,19 +197,26 @@ manager is asked and holds until `service start` or the next login; every change
 `service status --json`, and a daemon's `node.status`, is derived on every read from the manager, the core's
 `core-failure.json` and its health: `absent`, `not-installed`, `stopped-by-person`, `starting`, `backoff`,
 `running`, `failed` or `service-failed`, the states the desktop app reads. It also says `start_at_login`: `true`
-when the manager starts both jobs at the next login, `false` when it does not start one of them, and `null` when no
-job is defined or the manager cannot tell (never guessed).
+when the manager starts both jobs at the next login, `false` when it does not start one of them, and `null` when the
+manager cannot tell for either, or the service is not whole (no job, or one of the two definitions missing): never
+guessed.
 
 `service login on|off` sets whether both jobs start at the next login, and nothing else: launchd `launchctl
 enable|disable gui/<uid>/<label>` (no `bootout`, no `bootstrap`), systemd `systemctl --user enable|disable <unit>`
 (never `--now`). A running Sidevoice keeps running when it is turned off, a stopped one stays stopped when it is turned
 on, and a person's stop is left as it is. Each change is read back from the manager (`launchctl print-disabled`,
-`systemctl --user is-enabled`); a refusal, or a change the manager does not confirm, is `service.login-failed`; with no
-job defined it is `service.login-no-service`, and with no manager `service.no-manager`. `--json` answers
-`{"ok":true,"start_at_login":true|false|null,"service":"launchd|systemd|none"}`, as does `service login status`. The
-choice lives in the manager only: `service install` (or `install`) with no job defined turns it on, over any override
-launchd kept from an earlier installation; `service start`, `restart`, `install` over defined jobs and an update leave
-it as the person set it (under launchd a job turned off is enabled just for its `bootstrap` and disabled again).
+`systemctl --user is-enabled`); a refusal, or a change the manager does not confirm, is `service.login-failed`. With
+no job defined it is `service.login-no-service`, with one of the two missing `service.login-incomplete` (nothing is
+changed; `service install` repairs it), and with no manager `service.no-manager`. `--json` answers as `service
+start|stop|status` do, from the status read afterwards: `{"ok":true,"state":"<state>","service":"launchd|systemd|none",
+"start_at_login":true|false|null}` (and `failure` when the state has one); `service login status` answers the same.
+
+The choice lives in the manager only. `service install` (or `install`) with no job defined turns it on, over any
+override launchd kept from an earlier installation. `service start`, `restart`, `install` over defined jobs and an
+update enable the jobs again only when those defined all start at login now; off, or not known (an unreadable
+override, systemd's `enabled-runtime`), it is left as it is, never turned on. launchd refuses to bootstrap a job
+disabled for login: one turned off is enabled just for its `bootstrap` and disabled again, and when whether it is off
+cannot be read, the start is refused (`service.login-unknown`) rather than risk turning it on for good.
 
 With no manager (`SIDEVOICE_SERVICE_MANAGER=none`, a container, an `su` shell, Linux without a user bus) or no jobs
 installed, an MCP server starts the connector from the selected installation, and the connector starts the core,

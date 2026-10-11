@@ -233,7 +233,15 @@ fn the_login_service_runs_recovers_stops_and_leaves_nothing_behind() {
     assert_eq!(retried["start_at_login"], true, "{retried}");
     assert_eq!(ok(&profile, &extra, "login status")["start_at_login"], true);
     let off = ok(&profile, &extra, "login off");
-    assert_eq!(off["start_at_login"], false, "{off}");
+    assert_eq!(
+        (
+            off["state"].as_str(),
+            off["service"].as_str(),
+            off["start_at_login"].as_bool()
+        ),
+        (Some("running"), Some(kind), Some(false)),
+        "login off answers as the other service verbs, and stops nothing: {off}"
+    );
     for job in JOBS {
         assert!(
             !manager_starts_at_login(&extra, job),
@@ -300,7 +308,11 @@ fn the_login_service_runs_recovers_stops_and_leaves_nothing_behind() {
     // On starts nothing: a stopped Sidevoice stays stopped.
     ok(&profile, &extra, "stop");
     let on = ok(&profile, &extra, "login on");
-    assert_eq!(on["start_at_login"], true, "{on}");
+    assert_eq!(
+        (on["state"].as_str(), on["start_at_login"].as_bool()),
+        (Some("stopped-by-person"), Some(true)),
+        "login on starts nothing: {on}"
+    );
     for job in JOBS {
         assert!(
             manager_starts_at_login(&extra, job),
@@ -346,7 +358,15 @@ fn the_login_service_runs_recovers_stops_and_leaves_nothing_behind() {
     );
     // With no job there is nothing to start at login: not known, and not settable.
     assert!(unserviced["start_at_login"].is_null(), "{unserviced}");
-    assert!(ok(&profile, &extra, "login status")["start_at_login"].is_null());
+    let unknown = ok(&profile, &extra, "login status");
+    assert_eq!(
+        (
+            unknown["state"].as_str(),
+            unknown["start_at_login"].is_null()
+        ),
+        (Some("not-installed"), true),
+        "{unknown}"
+    );
     let refused = service(&profile, &extra, "login on");
     assert_eq!(
         refused["error"]["key"], "service.login-no-service",
