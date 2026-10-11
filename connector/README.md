@@ -48,6 +48,12 @@ When it links to the core, the daemon says what this machine is: its host name, 
 `Linux x64`), the connector's version and the agents whose homes exist here. The core keeps the latest and the room
 lists the machine by it.
 
+Each conversation also reports its engine, `{"model","effort","thinking"}`, on joining and again (`input.engine`)
+whenever it changes; the room shows it as the participant's `engine`. A value nobody recorded is `null`, never
+guessed, and nothing is reported without a model. Claude Code: the model and effort of each assistant entry in the
+transcript, with the launch flags (`--effort`, `--thinking`) for what the entry lacks. Codex: `model` and `effort`
+of the rollout's `turn_context`. Cursor: the chat's last used model, no effort.
+
 ## The core inside
 
 The connector's package carries the core: next to `bin/sidevoice-connector`, the pinned sidevoice-core release's

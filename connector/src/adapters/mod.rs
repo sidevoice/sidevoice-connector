@@ -1,5 +1,5 @@
 pub mod claude;
-mod codex;
+pub mod codex;
 pub mod cursor;
 mod http;
 
