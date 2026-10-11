@@ -1,6 +1,10 @@
-//! `sidevoice service install | uninstall | start | stop | restart | status [--json]`: Sidevoice at login, as two
-//! jobs of this user's service manager (launchd on macOS, systemd's user manager on Linux), and nothing of ours
-//! supervising either; and, where there is no manager, Sidevoice on demand (`launcher`).
+//! `sidevoice service install | uninstall | start | stop | restart | status | login on|off|status [--json]`: Sidevoice
+//! at login, as two jobs of this user's service manager (launchd on macOS, systemd's user manager on Linux), and
+//! nothing of ours supervising either; and, where there is no manager, Sidevoice on demand (`launcher`).
+//!
+//! Whether the jobs start at the next login is the person's (`service login`) and is kept by the manager alone,
+//! never stored: a new service starts at login; `start`, `restart`, `install` over defined jobs and an update leave
+//! it as it is; and turning it on or off neither starts nor stops anything.
 //!
 //! A stop is a person's: `D/node-stopped.json` is written before the manager is asked, and while it is there the
 //! launcher starts nothing; `service start` clears it, and so does the connector job starting at the next login.
@@ -42,6 +46,8 @@ pub enum Action {
     Restart,
     Status,
     Uninstall,
+    /// `service login on|off|status`: `Some(on)` sets it, `None` reads it.
+    Login(Option<bool>),
 }
 
 /// A refusal: a stable key, its parameters, and (for a core that failed) the failure as the core described it.
@@ -190,10 +196,12 @@ pub async fn install(layout: &Layout) -> Result<Value> {
 
 /// Both definitions written for the selected installation and both jobs started; with `restart`, restarted even
 /// when their definitions did not change, so that both run what `current` names now. When no job was defined,
-/// anything running on demand is stopped first. The caller holds the install lock.
+/// anything running on demand is stopped first, and both start at login; otherwise that stays as it was. The caller
+/// holds the install lock.
 pub async fn define_and_start(layout: &Layout, kind: Kind, restart: bool) -> Result<()> {
     let texts = definition::texts(layout, kind)?;
     let had = manager::installed(layout).await;
+    let login = keeps_login(had.as_ref()).await;
     let mut changed = Vec::new();
     for job in Job::ALL {
         let file = manager::definition_path(layout, kind, job)
@@ -206,7 +214,16 @@ pub async fn define_and_start(layout: &Layout, kind: Kind, restart: bool) -> Res
     if had.is_none() {
         stop_on_demand_or_fail(layout).await?;
     }
-    manager::start(layout, kind, &changed, restart, &Job::ALL).await
+    manager::start(layout, kind, &changed, restart, login, &Job::ALL).await
+}
+
+/// Whether a start enables the jobs for the next login: yes, unless they are defined and their manager says the
+/// person turned that off. A manager that cannot tell is asked to enable them, as before there was a choice.
+async fn keeps_login(installed: Option<&manager::Installed>) -> bool {
+    match installed {
+        Some(found) => manager::start_at_login(found).await != Some(false),
+        None => true,
+    }
 }
 
 /// What runs outside a manager stopped (`launcher::stop_on_demand`), or the refusal naming what is still running.
@@ -244,7 +261,8 @@ pub async fn start(layout: &Layout) -> Result<Value> {
         let _lock = install_lock(layout).await?;
         clear_stop(layout)?;
         if let Some(found) = &installed {
-            manager::start(layout, found.kind, &[], false, &Job::ALL).await?;
+            let login = keeps_login(Some(found)).await;
+            manager::start(layout, found.kind, &[], false, login, &Job::ALL).await?;
         }
     }
     let now = settle(layout, SETTLE).await;
@@ -287,7 +305,8 @@ pub async fn restart(layout: &Layout) -> Result<Value> {
         let _lock = install_lock(layout).await?;
         match &installed {
             Some(found) if found.core.is_some() => {
-                manager::start(layout, found.kind, &[], true, &[Job::Core]).await?;
+                let login = keeps_login(Some(found)).await;
+                manager::start(layout, found.kind, &[], true, login, &[Job::Core]).await?;
             }
             _ => {
                 for pid in launcher::core_processes(layout) {
@@ -342,6 +361,46 @@ pub async fn uninstall_held(layout: &Layout, keep_stopped: bool) -> Result<Value
     Ok(result)
 }
 
+/// `service login on|off`: whether both jobs start at the next login, and only that (`manager::set_start_at_login`):
+/// a running service keeps running, a stopped one stays stopped, a person's stop is left as it is. `service login
+/// status` (`on` none) reads it. Answered with `start_at_login` as the manager says it afterwards: `null` when it
+/// cannot tell, or there is no job to start.
+pub async fn login(layout: &Layout, on: Option<bool>) -> Result<Value> {
+    let Some(on) = on else {
+        let installed = manager::installed(layout).await;
+        let now = match &installed {
+            Some(found) => manager::start_at_login(found).await,
+            None => None,
+        };
+        let kind = match &installed {
+            Some(found) => found.kind,
+            None => manager::kind().await,
+        };
+        return Ok(json!({"ok": true, "start_at_login": now, "service": kind.as_str()}));
+    };
+    let _lock = install_lock(layout).await?;
+    let Some(found) = manager::installed(layout).await else {
+        return Err(Failure::keyed(
+            if manager::kind().await == Kind::None {
+                "service.no-manager"
+            } else {
+                "service.login-no-service"
+            },
+            json!({}),
+        ));
+    };
+    if let Err(detail) = manager::set_start_at_login(&found, on).await {
+        return Err(Failure::keyed(
+            "service.login-failed",
+            json!({"detail": detail}),
+        ));
+    }
+    Ok(
+        json!({"ok": true, "start_at_login": manager::start_at_login(&found).await,
+        "service": found.kind.as_str()}),
+    )
+}
+
 /// One service command against the installation this environment names: its JSON answer.
 pub async fn run(action: Action) -> Value {
     let layout = match Layout::from_env() {
@@ -355,6 +414,7 @@ pub async fn run(action: Action) -> Value {
         Action::Stop => stop(&layout).await,
         Action::Restart => restart(&layout).await,
         Action::Uninstall => uninstall(&layout, false).await,
+        Action::Login(on) => login(&layout, on).await,
     };
     result.unwrap_or_else(|failure| failure.value())
 }
@@ -369,6 +429,16 @@ pub fn human(answer: &Value) -> String {
             .unwrap_or_else(|| {
                 crate::messages::message("service.failed", &status::detail_params(None))
             });
+    }
+    if answer.get("state").is_none() {
+        if let Some(login) = answer.get("start_at_login") {
+            let key = match login.as_bool() {
+                Some(true) => "service.login.on",
+                Some(false) => "service.login.off",
+                None => "service.login.unknown",
+            };
+            return crate::messages::message(key, &Value::Null);
+        }
     }
     let state = answer
         .get("state")

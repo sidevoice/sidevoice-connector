@@ -133,6 +133,18 @@ enum ServiceAction {
     Restart,
     Status,
     Uninstall,
+    /// Whether Sidevoice starts at the next login; changing it neither starts nor stops it now.
+    Login {
+        #[arg(value_enum)]
+        setting: LoginSetting,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum LoginSetting {
+    On,
+    Off,
+    Status,
 }
 
 /// A command line that does not parse, asked for `--json`: said as the keyed failure, not as clap's text. Help and
@@ -214,6 +226,11 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
             ServiceAction::Restart => service::Action::Restart,
             ServiceAction::Status => service::Action::Status,
             ServiceAction::Uninstall => service::Action::Uninstall,
+            ServiceAction::Login { setting } => service::Action::Login(match setting {
+                LoginSetting::On => Some(true),
+                LoginSetting::Off => Some(false),
+                LoginSetting::Status => None,
+            }),
         };
         let answer = service::run(action).await;
         let ok = answer.get("ok") == Some(&Value::Bool(true));

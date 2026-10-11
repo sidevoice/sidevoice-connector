@@ -16,6 +16,7 @@ this binary from the platform package (RELEASING.md); the command is then `sidev
 | `agents [--json]` | The agents on this computer and whether they use Sidevoice. |
 | `agents connect\|disconnect\|dismiss <claude\|codex\|cursor> [--json]` | Registers Sidevoice with an agent, removes its registration, or dismisses the new-agent notice. Only an entry Sidevoice wrote is ever changed. |
 | `service <install\|start\|stop\|restart\|status\|uninstall> [--json]` | The login service: two jobs under launchd or the systemd user manager; with no manager, Sidevoice on demand (below). |
+| `service login <on\|off\|status> [--json]` | Whether the login service starts at the next login, and only that: turning it off stops nothing, turning it on starts nothing (below). |
 | `pair <room-url> <code> [--json]` | Pairs this machine with a room: redeems the one-time code the room shows at its `POST /api/connectors/pair` and writes `credentials.json` (0600). https only; plain http only to loopback or a host in `SIDEVOICE_TRUSTED_CLUSTER_HOSTS` (`.suffix` or exact host, comma-separated). The core follows the file; nothing restarts. |
 | `pair-device [--json]` | A one-time code from this machine's core (through the connector, started on demand) to pair a device such as the Sidevoice app: the code, its QR, its validity and where it works (`reach`: `room`, `direct` or `local-only`). `--json`: `{ok, code, expires_in, reach, payload}`. The MCP tool `voice_pair_device` says the same text. |
 | `--version [--json]` | The release version; with `--json`, also the target and the source commit. |
@@ -183,19 +184,32 @@ the bench is delivered to it, and its reply and the input's receipt show on the 
 
 ## Login service and Sidevoice on demand
 
-`service install|uninstall|start|stop|restart|status` (`src/service/`) runs two jobs of this user's service manager:
-the core (`dev.sidevoice.core` under launchd, `sidevoice-core.service` under the systemd user manager) and the
+`service install|uninstall|start|stop|restart|status|login` (`src/service/`) runs two jobs of this user's service
+manager: the core (`dev.sidevoice.core` under launchd, `sidevoice-core.service` under the systemd user manager) and the
 connector daemon (`dev.sidevoice.connector`, `sidevoice-connector.service`). The core job runs
 `R/current/core/bin/sidevoice-core-rust` with `idle-exit 0`; the connector job runs `D/install.json`'s `command` +
 `connector`. Neither job starts or signals the other. Under systemd, each job must also be enabled for the next login
-(`enable`, checked with `is-enabled`) and a changed definition read again (`daemon-reload`): a refusal of either fails
+(`enable`, checked with `is-enabled`; not when the person turned that off, below) and a changed definition read again (`daemon-reload`): a refusal of either fails
 the command (`service.not-enabled`), even when the job would run now. A person's stop (`D/node-stopped.json`) is written before the
 manager is asked and holds until `service start` or the next login; every change holds `D/install.lock`. On Linux,
 `service install` says whether the user lingers and prints `loginctl enable-linger <user>`; it never runs it.
 
 `service status --json`, and a daemon's `node.status`, is derived on every read from the manager, the core's
 `core-failure.json` and its health: `absent`, `not-installed`, `stopped-by-person`, `starting`, `backoff`,
-`running`, `failed` or `service-failed`, the states the desktop app reads.
+`running`, `failed` or `service-failed`, the states the desktop app reads. It also says `start_at_login`: `true`
+when the manager starts both jobs at the next login, `false` when it does not start one of them, and `null` when no
+job is defined or the manager cannot tell (never guessed).
+
+`service login on|off` sets whether both jobs start at the next login, and nothing else: launchd `launchctl
+enable|disable gui/<uid>/<label>` (no `bootout`, no `bootstrap`), systemd `systemctl --user enable|disable <unit>`
+(never `--now`). A running Sidevoice keeps running when it is turned off, a stopped one stays stopped when it is turned
+on, and a person's stop is left as it is. Each change is read back from the manager (`launchctl print-disabled`,
+`systemctl --user is-enabled`); a refusal, or a change the manager does not confirm, is `service.login-failed`; with no
+job defined it is `service.login-no-service`, and with no manager `service.no-manager`. `--json` answers
+`{"ok":true,"start_at_login":true|false|null,"service":"launchd|systemd|none"}`, as does `service login status`. The
+choice lives in the manager only: `service install` (or `install`) with no job defined turns it on, over any override
+launchd kept from an earlier installation; `service start`, `restart`, `install` over defined jobs and an update leave
+it as the person set it (under launchd a job turned off is enabled just for its `bootstrap` and disabled again).
 
 With no manager (`SIDEVOICE_SERVICE_MANAGER=none`, a container, an `su` shell, Linux without a user bus) or no jobs
 installed, an MCP server starts the connector from the selected installation, and the connector starts the core,
