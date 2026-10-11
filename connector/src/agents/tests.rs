@@ -222,9 +222,11 @@ async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped
     let listed = host
         .handle("agents.list", json!({"rescan":true,"watch":"cursor"}))
         .await;
-    assert_eq!(row(&listed, "cursor")["registration"], "not-connected");
+    // The entry names an older release of ours: told apart, still ours, and not a new agent to offer.
+    assert_eq!(row(&listed, "cursor")["registration"], "outdated");
+    assert_eq!(row(&listed, "cursor")["owned"], true);
     assert_eq!(row(&listed, "cursor")["dismissed"], false);
-    assert_eq!(row(&listed, "cursor")["actionable"], true);
+    assert_eq!(row(&listed, "cursor")["actionable"], false);
     let mut store: Value =
         serde_json::from_slice(&fs::read(fixture.profile.data.join("agents.json")).unwrap())
             .unwrap();
@@ -454,6 +456,59 @@ async fn dangling_codex_config_symlink_is_invalid_not_absent() {
     symlink(missing, fixture.profile.codex.join("config.toml")).unwrap();
     let answer = host.handle("agents.connect", json!({"id":"codex"})).await;
     assert_eq!(answer.pointer("/error/key"), Some(&json!("agents.invalid")));
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn unparsable_settings_are_listed_invalid_with_their_file_and_left_alone() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let binary = fake_codex(&fixture);
+    let _codex = EnvGuard::set("SIDEVOICE_CODEX_BIN", binary.as_os_str());
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let codex_file = fixture.profile.codex.join("config.toml");
+    let cursor_file = fixture.profile.cursor.join("mcp.json");
+    private_write(&codex_file, b"[mcp_servers.sidevoice\ncommand = ");
+    private_write(&cursor_file, b"{\"mcpServers\": {\"sidevoice\": ");
+
+    // A whole scan still answers: each agent says its settings cannot be read, and where they are.
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert!(listed.get("error").is_none(), "{listed}");
+    for (id, file) in [("codex", &codex_file), ("cursor", &cursor_file)] {
+        let agent = row(&listed, id);
+        assert_eq!(agent["registration"], "invalid", "{agent}");
+        assert_eq!(agent["owned"], false);
+        assert_eq!(agent["actionable"], false);
+        assert_eq!(
+            agent.pointer("/instructions/file"),
+            Some(&json!(file.to_string_lossy()))
+        );
+    }
+
+    for id in ["codex", "cursor"] {
+        for action in ["agents.connect", "agents.disconnect"] {
+            let answer = host.handle(action, json!({"id":id})).await;
+            assert_eq!(
+                answer.pointer("/error/key"),
+                Some(&json!("agents.invalid")),
+                "{action} {id}: {answer}"
+            );
+        }
+    }
+    assert_eq!(
+        fs::read(&codex_file).unwrap(),
+        b"[mcp_servers.sidevoice\ncommand = "
+    );
+    assert_eq!(
+        fs::read(&cursor_file).unwrap(),
+        b"{\"mcpServers\": {\"sidevoice\": "
+    );
+    assert!(
+        !fs::read_to_string(fixture.profile.codex.join("calls"))
+            .unwrap_or_default()
+            .contains("mcp add"),
+        "Codex's CLI was asked to write over unreadable settings"
+    );
     host.shutdown().await;
 }
 
@@ -892,7 +947,7 @@ async fn codex_registration_carries_the_installation_environment() {
     // another data directory) is not current: connecting writes it again.
     codex_entry(&fixture, &fixture.selected(), true, json!({}));
     let listed = host.handle("agents.list", json!({"rescan":true})).await;
-    assert_eq!(row(&listed, "codex")["registration"], "not-connected");
+    assert_eq!(row(&listed, "codex")["registration"], "outdated");
     assert_eq!(row(&listed, "codex")["owned"], true);
     let again = host.handle("agents.connect", json!({"id":"codex"})).await;
     assert_eq!(row(&again, "codex")["registration"], "connected", "{again}");
@@ -913,7 +968,7 @@ async fn codex_disconnect_removes_a_disabled_or_outdated_entry_of_ours() {
             env.unwrap_or_else(|| installation_env(&fixture)),
         );
         let listed = host.handle("agents.list", json!({"rescan":true})).await;
-        assert_eq!(row(&listed, "codex")["registration"], "not-connected");
+        assert_eq!(row(&listed, "codex")["registration"], "outdated");
         assert_eq!(row(&listed, "codex")["owned"], true);
 
         let answer = host
@@ -1007,7 +1062,7 @@ async fn claude_registration_carries_the_installation_environment_and_an_older_o
         .as_bytes(),
     );
     let listed = host.handle("agents.list", json!({"rescan":true})).await;
-    assert_eq!(row(&listed, "claude")["registration"], "not-connected");
+    assert_eq!(row(&listed, "claude")["registration"], "outdated");
     assert_eq!(row(&listed, "claude")["owned"], true);
     let answer = host
         .handle("agents.disconnect", json!({"id":"claude"}))

@@ -467,7 +467,8 @@ impl HostAgents {
                 "foreign" => return Err(agent_failure("agents.foreign", agent)),
                 "invalid" => return Err(agent_failure("agents.invalid", agent)),
                 "unknown" => return Err(agent_failure("agents.registration-unknown", agent)),
-                "not-connected" => {}
+                // An entry an older Sidevoice wrote is written again.
+                "not-connected" | "outdated" => {}
                 _ => return Err(agent_failure("agents.registration-unknown", agent)),
             }
             if current.get("connect").and_then(Value::as_str) != Some("auto") {
@@ -487,7 +488,7 @@ impl HostAgents {
                 .and_then(Value::as_str)
             {
                 Some("connected") => {}
-                Some("not-connected") => {
+                Some("not-connected" | "outdated") => {
                     return Err(agent_failure("agents.registration-not-confirmed", agent))
                 }
                 Some("foreign") => return Err(agent_failure("agents.foreign", agent)),
@@ -512,13 +513,13 @@ impl HostAgents {
             return self.response(&store);
         }
 
-        let owned = current.get("owned") == Some(&Value::Bool(true));
         match registration {
-            "not-connected" if !owned => return self.response(&state),
+            "not-connected" => return self.response(&state),
             "foreign" => return Err(agent_failure("agents.foreign", agent)),
             "invalid" => return Err(agent_failure("agents.invalid", agent)),
             "unknown" => return Err(agent_failure("agents.registration-unknown", agent)),
-            "connected" | "not-connected" => {}
+            // Ours, current or not: removed.
+            "connected" | "outdated" => {}
             _ => return Err(agent_failure("agents.registration-unknown", agent)),
         }
         let binary = state
@@ -530,14 +531,12 @@ impl HostAgents {
         state = self
             .scan(state, Some(agent), false, cancel, deadline)
             .await?;
-        let after = seen_agent(&state, agent);
-        let still_owned = after.and_then(|row| row.get("owned")) == Some(&Value::Bool(true));
-        match after
+        match seen_agent(&state, agent)
             .and_then(|row| row.get("registration"))
             .and_then(Value::as_str)
         {
-            Some("not-connected") if !still_owned => {}
-            Some("connected" | "not-connected") => {
+            Some("not-connected") => {}
+            Some("connected" | "outdated") => {
                 return Err(agent_failure("agents.action-failed", agent))
             }
             Some("foreign") => return Err(agent_failure("agents.foreign", agent)),
@@ -1289,14 +1288,9 @@ impl HostAgents {
             .state(&host, binary.as_deref())
             .await
             .map_err(|error| failure(error, id))?;
-        // An entry of ours that is not the current one (disabled, an older release, another environment) reads as not
-        // connected, and is still ours to remove: `owned`.
+        // `outdated`: an entry of ours that is not the current one (disabled, an older release, another environment).
+        // Connect writes it again; like a current one, it is ours to remove: `owned`.
         let owned = registration == "connected" || registration == "outdated";
-        let registration = if registration == "outdated" {
-            "not-connected".to_owned()
-        } else {
-            registration
-        };
         let version = if input.include_version {
             match binary.as_deref() {
                 Some(binary) => self.binary_version(agent, binary, cancel, deadline).await?,

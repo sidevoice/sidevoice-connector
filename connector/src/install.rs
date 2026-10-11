@@ -656,7 +656,8 @@ async fn register(profile: &Profile) -> Value {
             .to_owned();
         let (outcome, message) = match row["registration"].as_str() {
             Some("connected") => ("registered", format!("{label} already uses Sidevoice.")),
-            Some("not-connected") if row["connect"] == "auto" => {
+            // An entry an older Sidevoice wrote is written again.
+            Some("not-connected" | "outdated") if row["connect"] == "auto" => {
                 let answer = agents.handle("agents.connect", json!({"id": id})).await;
                 match error_message(&answer) {
                     None => ("registered", format!("Registered Sidevoice with {label}.")),
@@ -667,6 +668,12 @@ async fn register(profile: &Profile) -> Value {
                 "manual",
                 format!(
                     "{label}: Sidevoice is not registered there; to register it:\n    {manual}"
+                ),
+            ),
+            Some("outdated") => (
+                "manual",
+                format!(
+                    "{label}: an older Sidevoice registered it; to register this one:\n    {manual}"
                 ),
             ),
             Some(other) => {
@@ -689,13 +696,12 @@ async fn register(profile: &Profile) -> Value {
 }
 
 /// What uninstall does with an agent's row: `Some(true)` removes its entry, `Some(false)` leaves a foreign or unknown
-/// one as it is, `None` has nothing to do. An entry of ours that is not the current one (disabled, an older release)
-/// is removed too: once the release it names is deleted it would only be a broken server.
+/// one as it is, `None` has nothing to do. An entry of ours that is not the current one (`outdated`: disabled, an
+/// older release) is removed too: once the release it names is deleted it would only be a broken server.
 fn removal(row: &Value) -> Option<bool> {
-    let owned = row["owned"] == Value::Bool(true);
     match row["registration"].as_str() {
-        Some("not-connected") if !owned => None,
-        Some("connected" | "not-connected") => Some(true),
+        Some("not-connected") => None,
+        Some("connected" | "outdated") => Some(true),
         _ => Some(false),
     }
 }
@@ -1235,12 +1241,13 @@ pub(crate) mod tests {
             |registration: &str, owned: bool| json!({"registration": registration, "owned": owned});
         assert_eq!(removal(&row("connected", true)), Some(true));
         assert_eq!(
-            removal(&row("not-connected", true)),
+            removal(&row("outdated", true)),
             Some(true),
             "disabled or an older release, still ours"
         );
         assert_eq!(removal(&row("not-connected", false)), None, "nothing there");
         assert_eq!(removal(&row("foreign", false)), Some(false));
+        assert_eq!(removal(&row("invalid", false)), Some(false));
         assert_eq!(removal(&row("unknown", false)), Some(false));
     }
 

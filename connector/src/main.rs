@@ -377,6 +377,7 @@ async fn agents_command(
                 let state = match row["registration"].as_str() {
                     Some("connected") => "connected to Sidevoice",
                     Some("not-connected") => "not connected",
+                    Some("outdated") => "registered by an older Sidevoice; connect updates it",
                     Some("foreign") => "another Sidevoice registration is present",
                     Some("invalid") => "its Sidevoice registration is unreadable",
                     _ => "registration state unknown",

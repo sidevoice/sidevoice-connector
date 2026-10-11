@@ -94,8 +94,9 @@ command. Then the agents found are registered with the installation's command (C
 Codex through its CLI, Cursor in its `mcp.json`, only the `sidevoice` entry and only one Sidevoice wrote; an agent
 that needs its configuration by hand is told how), unless `--no-agents`. Each registration carries the installation's
 `SIDEVOICE_DATA_DIR` and `XDG_DATA_HOME`, so an agent opened from any shell reaches this installation; one of ours
-without them, disabled, or naming another release is not current, and is written again. Running `install` again is the
-recovery: a release whose core no longer matches its inventory is staged again.
+without them, disabled, or naming another release is not current (`outdated`), and is written again. An agent whose
+MCP settings cannot be read is `invalid` and left alone. Running `install` again is the recovery: a release whose core
+no longer matches its inventory is staged again.
 
 `uninstall` unloads both jobs and stops what runs on demand (a refusal stops it there, with nothing deleted), removes
 the agents' registrations Sidevoice wrote (current or not), then `R` and everything in `D` but its lock files and the
