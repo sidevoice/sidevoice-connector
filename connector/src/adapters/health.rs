@@ -61,9 +61,18 @@ pub async fn check(
         .kill_on_drop(true)
         // Its own process group, so a wrapper (a shell, Node's launcher) leaves nothing behind.
         .process_group(0);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => return Ok(Health::NotStarting(spawn_error(&error))),
+    let mut attempt = 0;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            // The executable is open for writing somewhere (being replaced, or just written and a sibling process
+            // forked before it was closed): a moment later it runs.
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempt < 5 => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => return Ok(Health::NotStarting(spawn_error(&error))),
+        }
     };
     let group = child.id();
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
