@@ -1126,8 +1126,14 @@ impl ServerHandler for Facade {
     }
 }
 
+/// Set by the agents' health check (`agents.rs`): the server is started only for the handshake and the tool list,
+/// neither of which reaches the daemon, so it must not start one (or fail because a person stopped it).
+pub const HEALTH_CHECK: &str = "SIDEVOICE_HEALTH_CHECK";
+
 pub async fn run(profile: Profile) -> Result<()> {
-    crate::service::ensure_connector(&profile).await?;
+    if std::env::var_os(HEALTH_CHECK).is_none() {
+        crate::service::ensure_connector(&profile).await?;
+    }
     let service = Facade::new(profile).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())

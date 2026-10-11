@@ -3,6 +3,7 @@ pub mod codex;
 mod conversation;
 pub mod cursor;
 mod harness;
+pub mod health;
 mod http;
 pub mod registration;
 mod transcript;

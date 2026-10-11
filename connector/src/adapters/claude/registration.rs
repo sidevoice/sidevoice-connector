@@ -2,8 +2,8 @@
 
 use super::Claude;
 use crate::adapters::registration::{
-    looks_absent, run_required, shell_command, strings, AgentError, AgentHost, CliError,
-    Registration,
+    looks_absent, run_required, shell_command, strings, AgentError, AgentHost, CliError, Entry,
+    Launch, Registration,
 };
 use crate::profile::Profile;
 use futures_util::future::BoxFuture;
@@ -20,14 +20,14 @@ impl Claude {
         &self,
         host: &dyn AgentHost,
         binary: Option<&str>,
-    ) -> Result<String, AgentError> {
+    ) -> Result<Entry, AgentError> {
         match fs::symlink_metadata(&host.profile().claude) {
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok("absent".into()),
-            Err(_) => return Ok("invalid".into()),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Entry::bare("absent")),
+            Err(_) => return Ok(Entry::bare("invalid")),
             Ok(_) => {}
         }
         let Some(binary) = binary else {
-            return Ok("unknown".into());
+            return Ok(Entry::bare("unknown"));
         };
         let output = match host
             .run(binary, strings(&["mcp", "get", "sidevoice"]))
@@ -35,16 +35,16 @@ impl Claude {
         {
             Ok(output) => output,
             Err(CliError::Cancelled) => return Err(AgentError::Cancelled),
-            Err(_) => return Ok("unknown".into()),
+            Err(_) => return Ok(Entry::bare("unknown")),
         };
         if !output.status.success() {
             let detail = format!("{}\n{}", output.stdout, output.stderr);
             if (output.status.code() == Some(1) && detail.trim().is_empty())
                 || looks_absent(&detail)
             {
-                return Ok("absent".into());
+                return Ok(Entry::bare("absent"));
             }
-            return Ok("unknown".into());
+            return Ok(Entry::bare("unknown"));
         }
         let detail = format!("{}\n{}", output.stdout, output.stderr);
         let field = |name: &str| -> Option<String> {
@@ -55,12 +55,11 @@ impl Claude {
             })
         };
         let Some(command) = field("Command").filter(|value| !value.is_empty()) else {
-            return Ok(if looks_absent(&detail) {
+            return Ok(Entry::bare(if looks_absent(&detail) {
                 "absent"
             } else {
                 "unknown"
-            }
-            .into());
+            }));
         };
         let args = field("Args")
             .map(|value| {
@@ -72,9 +71,6 @@ impl Claude {
             .unwrap_or_default();
         let user_scope =
             field("Scope").is_some_and(|value| value.to_ascii_lowercase().contains("user"));
-        if !user_scope {
-            return Ok("foreign".into());
-        }
         // The block under `Environment:`, one `KEY=value` per line, indented below the field.
         let env = detail
             .lines()
@@ -84,31 +80,28 @@ impl Claude {
             .filter_map(|line| line.trim().split_once('='))
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect::<BTreeMap<_, _>>();
-        if host.owns(&command, &args) {
-            Ok(
-                if command == host.command() && args == host.args() && env == host.mcp_env() {
-                    "connected"
-                } else {
-                    "owned-old"
-                }
-                .into(),
-            )
+        let state = if !user_scope || !host.owns(&command, &args) {
+            "foreign"
+        } else if command == host.command() && args == host.args() && env == host.mcp_env() {
+            "connected"
         } else {
-            Ok("foreign".into())
-        }
+            "owned-old"
+        };
+        Ok(Entry::with(state, Launch { command, args, env }))
     }
 
     async fn registration_state(
         &self,
         host: &dyn AgentHost,
         binary: Option<&str>,
-    ) -> Result<String, AgentError> {
-        let state = self.entry_state(host, binary).await?;
-        Ok(match state.as_str() {
-            "absent" => "not-connected".into(),
-            "owned-old" => "outdated".into(),
-            _ => state,
-        })
+    ) -> Result<Entry, AgentError> {
+        let mut entry = self.entry_state(host, binary).await?;
+        match entry.registration.as_str() {
+            "absent" => entry.registration = "not-connected".into(),
+            "owned-old" => entry.registration = "outdated".into(),
+            _ => {}
+        }
+        Ok(entry)
     }
 
     async fn connect_entry(
@@ -117,7 +110,7 @@ impl Claude {
         binary: Option<&str>,
     ) -> Result<(), AgentError> {
         let binary = binary.ok_or(AgentError::Key("agents.manual-required"))?;
-        let state = self.entry_state(host, Some(binary)).await?;
+        let state = self.entry_state(host, Some(binary)).await?.registration;
         if state == "connected" {
             return Ok(());
         }
@@ -133,7 +126,7 @@ impl Claude {
         host.live()?;
         if state == "absent" || state == "owned-old" {
             // A second probe just before mutation closes the gap with an external CLI writer.
-            let again = self.entry_state(host, Some(binary)).await?;
+            let again = self.entry_state(host, Some(binary)).await?.registration;
             if again == "foreign" {
                 return Err(AgentError::Key("agents.foreign"));
             }
@@ -159,7 +152,10 @@ impl Claude {
         binary: Option<&str>,
     ) -> Result<(), AgentError> {
         let binary = binary.ok_or(AgentError::Key("agents.registration-unknown"))?;
-        let state = self.registration_state(host, Some(binary)).await?;
+        let state = self
+            .registration_state(host, Some(binary))
+            .await?
+            .registration;
         match state.as_str() {
             "not-connected" => Ok(()),
             // Ours, current or not (an older release, another environment): removed.
@@ -207,7 +203,7 @@ impl Registration for Claude {
         &'a self,
         host: &'a dyn AgentHost,
         binary: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<String, AgentError>> {
+    ) -> BoxFuture<'a, Result<Entry, AgentError>> {
         Box::pin(self.registration_state(host, binary))
     }
 

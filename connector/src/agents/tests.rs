@@ -1018,3 +1018,86 @@ async fn claude_registration_carries_the_installation_environment_and_an_older_o
         "the entry of ours stayed"
     );
 }
+
+/// A stand-in for this installation's `mcp` server at the selected command: it answers the handshake and logs, to
+/// the data directory its entry names, the health-check marker and its arguments.
+fn fake_server(fixture: &Fixture) {
+    let server = fixture.root.join("selected/current/dist/sidevoice");
+    private_mkdir(server.parent().unwrap());
+    private_write(
+        &server,
+        br##"#!/bin/sh
+read -r initialize
+printf '%s\n' "$SIDEVOICE_HEALTH_CHECK $*" >> "$SIDEVOICE_DATA_DIR/health-calls"
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}'
+read -r initialized
+read -r list
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}'
+sleep 30
+"##,
+    );
+    fs::set_permissions(&server, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[tokio::test]
+async fn a_connected_agent_is_checked_on_connect_scan_and_demand_and_its_health_is_kept() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let binary = fake_claude(&fixture);
+    let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", binary.as_os_str());
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    fake_server(&fixture);
+    let calls = fixture.profile.data.join("health-calls");
+
+    // Not connected: no health.
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_eq!(row(&listed, "claude")["registration"], "not-connected");
+    assert_eq!(row(&listed, "claude")["health"], Value::Null);
+    assert!(!calls.exists());
+
+    // Connecting checks it, starting the entry as Claude Code would: its command, its arguments and its environment,
+    // with the marker that keeps our server from starting the daemon.
+    let connected = host.handle("agents.connect", json!({"id":"claude"})).await;
+    let health = &row(&connected, "claude")["health"];
+    assert_eq!(health["state"], "working", "{connected}");
+    assert_eq!(health["error"], Value::Null);
+    let checked_at = health["checked_at"].as_str().unwrap().to_owned();
+    assert_eq!(fs::read_to_string(&calls).unwrap(), "1 mcp\n");
+
+    // A listing from the cache keeps it; a rescan checks again.
+    let cached = host.handle("agents.list", json!({})).await;
+    assert_eq!(row(&cached, "claude")["health"]["checked_at"], checked_at);
+    let rescanned = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_eq!(row(&rescanned, "claude")["health"]["state"], "working");
+    assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 2);
+
+    // On demand: a server that no longer starts says why, and the store keeps it.
+    fs::remove_file(fixture.root.join("selected/current/dist/sidevoice")).unwrap();
+    let checked = host.handle("agents.check", json!({"id":"claude"})).await;
+    assert_eq!(
+        row(&checked, "claude")["health"],
+        json!({"state":"not-starting","error":"command not found",
+            "checked_at":row(&checked, "claude")["health"]["checked_at"]}),
+        "{checked}"
+    );
+    assert_eq!(row(&checked, "claude")["registration"], "connected");
+    let store: Value =
+        serde_json::from_slice(&fs::read(fixture.profile.data.join("agents.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        store.pointer("/seen/claude/agent/health/state"),
+        Some(&json!("not-starting"))
+    );
+
+    // An unknown agent is refused like any other request; a disconnected one has no health again.
+    let unknown = host.handle("agents.check", json!({"id":"nope"})).await;
+    assert_eq!(
+        unknown.pointer("/error/key"),
+        Some(&json!("agents.unknown"))
+    );
+    let disconnected = host
+        .handle("agents.disconnect", json!({"id":"claude"}))
+        .await;
+    assert_eq!(row(&disconnected, "claude")["health"], Value::Null);
+    host.shutdown().await;
+}

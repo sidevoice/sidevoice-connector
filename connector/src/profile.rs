@@ -108,7 +108,7 @@ impl Profile {
         command
     }
 
-    fn variables(&self) -> [(&'static str, &Path); 8] {
+    pub(crate) fn variables(&self) -> [(&'static str, &Path); 8] {
         [
             ("HOME", &self.home),
             ("CLAUDE_CONFIG_DIR", &self.claude),

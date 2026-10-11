@@ -31,6 +31,39 @@ pub enum CliError {
     Failed,
 }
 
+/// How the agent starts the server its entry names: the command, its arguments and the environment the entry gives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Launch {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+}
+
+/// What the agent's configuration says of Sidevoice's entry: the registration's state and, when the entry could be
+/// read, how the agent starts it.
+#[derive(Clone, Debug)]
+pub struct Entry {
+    pub registration: String,
+    pub launch: Option<Launch>,
+}
+
+impl Entry {
+    /// A state with no entry to start.
+    pub fn bare(registration: &str) -> Self {
+        Self {
+            registration: registration.to_owned(),
+            launch: None,
+        }
+    }
+
+    pub fn with(registration: &str, launch: Launch) -> Self {
+        Self {
+            registration: registration.to_owned(),
+            launch: Some(launch),
+        }
+    }
+}
+
 /// What the coordinator lends a registration for one request on one agent.
 pub trait AgentHost: Send + Sync {
     fn profile(&self) -> &Profile;
@@ -69,12 +102,12 @@ pub trait Registration: Send + Sync {
         false
     }
     /// The registration's state: `connected`, `outdated` (ours, not current), `not-connected`, `foreign`, `invalid`
-    /// or `unknown`.
+    /// or `unknown`; with the entry's launch, as the agent would run it, whenever its configuration names one.
     fn state<'a>(
         &'a self,
         host: &'a dyn AgentHost,
         binary: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<String, AgentError>>;
+    ) -> BoxFuture<'a, Result<Entry, AgentError>>;
     fn connect<'a>(
         &'a self,
         host: &'a dyn AgentHost,
