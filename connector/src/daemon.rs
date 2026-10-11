@@ -1554,16 +1554,19 @@ impl Daemon {
                             if !oversized {
                                 if let Ok(item) = serde_json::from_slice::<Value>(&partial) {
                                     if claude {
-                                        if let Some(model) =
-                                            crate::adapters::claude::assistant_model(&item)
+                                        if crate::adapters::claude::assistant_model(&item).is_some()
                                         {
                                             let launch = crate::adapters::claude::session_engine(
                                                 &binding.thread,
                                             )
                                             .unwrap_or_else(|| json!({}));
-                                            self.report_engine(&binding, json!({"model":model,
-                                                "effort":launch.get("effort").cloned().unwrap_or(Value::Null),
-                                                "thinking":launch.get("thinking").cloned().unwrap_or(Value::Null)})).await;
+                                            if let Some(engine) =
+                                                crate::adapters::claude::assistant_engine(
+                                                    &item, &launch,
+                                                )
+                                            {
+                                                self.report_engine(&binding, engine).await;
+                                            }
                                         }
                                     } else if authenticated
                                         && transcript_user_text(&item, false).is_some()
@@ -1749,18 +1752,8 @@ impl Daemon {
         catching_up: bool,
     ) {
         let id = binding.id.lock().await.clone();
-        if matches!(
-            item.get("type").and_then(Value::as_str),
-            Some("turn_context" | "session_meta")
-        ) {
-            if let Some(model) = item.pointer("/payload/model").and_then(Value::as_str) {
-                let effort = std::env::var("CODEX_REASONING_EFFORT").ok();
-                self.report_engine(
-                    binding,
-                    json!({"model":model,"effort":effort,"thinking":Value::Null}),
-                )
-                .await;
-            }
+        if let Some(engine) = crate::adapters::codex::rollout_engine(item) {
+            self.report_engine(binding, engine).await;
         }
         if item.get("type") == Some(&json!("event_msg")) {
             let phase = item

@@ -10,6 +10,23 @@ pub fn capabilities() -> Value {
     json!({"deliver":"supported","inspectInbound":"unsupported","working":"supported","endOfTurn":"supported","sessionIdentity":"supported"})
 }
 
+/// The engine a rollout's turn context or session header records: its model and reasoning effort.
+pub fn rollout_engine(item: &Value) -> Option<Value> {
+    if !matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("turn_context" | "session_meta")
+    ) {
+        return None;
+    }
+    let text = |pointer| {
+        item.pointer(pointer)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let model = text("/payload/model")?;
+    Some(json!({"model":model,"effort":text("/payload/effort"),"thinking":Value::Null}))
+}
+
 pub fn identity(meta: &Value) -> Result<Option<Identity>> {
     let turn = meta.get("x-codex-turn-metadata").and_then(|value| {
         if let Some(text) = value.as_str() {
@@ -86,5 +103,36 @@ pub async fn deliver(delivery: &Value, event: &Value, profile: &Profile) -> Resu
             Ok(json!({"status":"accepted","detail":"codex queue confirmed the thread"}))
         }
         _ => bail!("Codex queue failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollout_engine_reads_model_and_effort() {
+        let item = json!({"type":"turn_context","payload":{"model":"gpt-6-luna","effort":"xhigh"}});
+        assert_eq!(
+            rollout_engine(&item),
+            Some(json!({"model":"gpt-6-luna","effort":"xhigh","thinking":null}))
+        );
+    }
+
+    #[test]
+    fn rollout_engine_leaves_an_unknown_effort_null() {
+        let item = json!({"type":"session_meta","payload":{"model":"gpt-6-luna"}});
+        assert_eq!(
+            rollout_engine(&item),
+            Some(json!({"model":"gpt-6-luna","effort":null,"thinking":null}))
+        );
+    }
+
+    #[test]
+    fn rollout_engine_needs_a_model_and_a_context_item() {
+        let effort_only = json!({"type":"turn_context","payload":{"effort":"high"}});
+        assert_eq!(rollout_engine(&effort_only), None);
+        let event = json!({"type":"event_msg","payload":{"model":"gpt-6-luna"}});
+        assert_eq!(rollout_engine(&event), None);
     }
 }
