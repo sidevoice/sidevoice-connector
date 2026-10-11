@@ -86,8 +86,8 @@ pub trait Registration: Send + Sync {
         host: &'a dyn AgentHost,
         binary: Option<&'a str>,
     ) -> BoxFuture<'a, Result<(), AgentError>>;
-    /// How a person does each operation by hand, as ordered steps.
-    fn manual(&self, host: &dyn AgentHost, binary: Option<&str>) -> Manual;
+    /// How a person does each operation by hand, as ordered steps, for the registration `state` reported.
+    fn manual(&self, host: &dyn AgentHost, registration: &str, binary: Option<&str>) -> Manual;
 }
 
 /// One step done by hand: a command to run, or a snippet for a file. `file` is the file the step changes, when
@@ -112,12 +112,23 @@ pub struct Manual {
 }
 
 impl Manual {
-    /// An agent whose CLI adds and removes the entry: replacing removes the other entry, then adds ours.
-    pub fn by_cli(add: ManualStep, remove: ManualStep) -> Self {
+    /// An agent whose CLI adds and removes the entry. Connecting adds ours, after removing ours first when it is
+    /// `outdated` (the CLI refuses to add over it); replacing removes the other entry (`remove_other`), then adds ours.
+    pub fn by_cli(
+        registration: &str,
+        add: ManualStep,
+        remove: ManualStep,
+        remove_other: ManualStep,
+    ) -> Self {
+        let connect = if registration == "outdated" {
+            vec![remove.clone(), add.clone()]
+        } else {
+            vec![add.clone()]
+        };
         Self {
-            connect: vec![add.clone()],
-            disconnect: vec![remove.clone()],
-            replace: vec![remove, add],
+            connect,
+            disconnect: vec![remove],
+            replace: vec![remove_other, add],
         }
     }
 
@@ -182,13 +193,28 @@ pub fn looks_absent(text: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// `value` quoted for a POSIX shell.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// `command args`, each quoted for a POSIX shell.
 pub fn shell_command(command: &str, args: &[String]) -> String {
     std::iter::once(command)
         .chain(args.iter().map(String::as_str))
-        .map(|value| format!("'{}'", value.replace('\'', "'\\''")))
+        .map(shell_quote)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// `command args` for a POSIX shell, run with the agent's home in `variable`, as the connector runs its CLI: a step
+/// done by hand then changes the same profile as the connector would.
+pub fn shell_command_in(variable: &str, home: &Path, command: &str, args: &[String]) -> String {
+    format!(
+        "{variable}={} {}",
+        shell_quote(&home.to_string_lossy()),
+        shell_command(command, args)
+    )
 }
 
 #[derive(Serialize)]

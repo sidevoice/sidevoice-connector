@@ -289,7 +289,7 @@ impl Registration for Cursor {
         })
     }
 
-    fn manual(&self, host: &dyn AgentHost, _binary: Option<&str>) -> Manual {
+    fn manual(&self, host: &dyn AgentHost, _registration: &str, _binary: Option<&str>) -> Manual {
         Manual::by_file(
             &host.profile().cursor.join("mcp.json").to_string_lossy(),
             mcp_servers_json(host.command(), host.args(), host.mcp_env()).unwrap_or_default(),

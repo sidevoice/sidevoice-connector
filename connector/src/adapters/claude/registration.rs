@@ -2,7 +2,7 @@
 
 use super::Claude;
 use crate::adapters::registration::{
-    looks_absent, run_required, shell_command, strings, AgentError, AgentHost, CliError, Manual,
+    looks_absent, run_required, shell_command_in, strings, AgentError, AgentHost, CliError, Manual,
     ManualStep, Registration,
 };
 use crate::profile::Profile;
@@ -226,16 +226,23 @@ impl Registration for Claude {
         Box::pin(self.disconnect_entry(host, binary))
     }
 
-    fn manual(&self, host: &dyn AgentHost, binary: Option<&str>) -> Manual {
+    fn manual(&self, host: &dyn AgentHost, registration: &str, binary: Option<&str>) -> Manual {
         let cli = binary.unwrap_or("claude");
-        // `claude mcp` writes `.claude.json` in the configuration directory the connector names to it: the file each
-        // step changes.
-        let file = host.profile().claude.join(".claude.json");
+        let home = &host.profile().claude;
+        // `claude mcp` writes `.claude.json` in `CLAUDE_CONFIG_DIR`: the file each step changes.
+        let file = home.join(".claude.json");
         let step = |args: &[String]| ManualStep {
-            command: Some(shell_command(cli, args)),
+            command: Some(shell_command_in("CLAUDE_CONFIG_DIR", home, cli, args)),
             snippet: None,
             file: Some(file.to_string_lossy().into_owned()),
         };
-        Manual::by_cli(step(&add_args(host)), step(&strings(&REMOVE)))
+        // Ours is always in the user scope. Another entry may be in any scope, a project's or a local one relative to
+        // the directory the person runs it in: without `--scope`, Claude Code removes it from the scope it is in.
+        Manual::by_cli(
+            registration,
+            step(&add_args(host)),
+            step(&strings(&REMOVE)),
+            step(&strings(&["mcp", "remove", "sidevoice"])),
+        )
     }
 }

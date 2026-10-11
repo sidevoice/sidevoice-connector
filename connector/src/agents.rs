@@ -1289,6 +1289,8 @@ impl HostAgents {
             .state(&host, binary.as_deref())
             .await
             .map_err(|error| failure(error, id))?;
+        // The manual steps follow the state itself: an `outdated` entry is removed before ours is added.
+        let manual = agent.manual(&host, &registration, binary.as_deref());
         // An entry of ours that is not the current one (disabled, an older release, another environment) reads as not
         // connected, and is still ours to remove: `owned`.
         let owned = registration == "connected" || registration == "outdated";
@@ -1326,7 +1328,6 @@ impl HostAgents {
             }
         }
         let present = !evidence.is_empty();
-        let manual = agent.manual(&host, binary.as_deref());
         // The connector acts itself where it reaches the agent: its CLI found, or a file it edits.
         let able = binary.is_some() || agent.connects_without_binary();
         let evidence_json = serde_json::to_value(&evidence).map_err(|_| Failure::Internal)?;

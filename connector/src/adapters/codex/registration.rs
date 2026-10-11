@@ -2,7 +2,7 @@
 
 use super::Codex;
 use crate::adapters::registration::{
-    looks_absent, run_required, shell_command, strings, AgentError, AgentHost, CliError, Manual,
+    looks_absent, run_required, shell_command_in, strings, AgentError, AgentHost, CliError, Manual,
     ManualStep, Registration,
 };
 use crate::profile::Profile;
@@ -296,15 +296,17 @@ impl Registration for Codex {
         Box::pin(self.disconnect_entry(host, binary))
     }
 
-    fn manual(&self, host: &dyn AgentHost, binary: Option<&str>) -> Manual {
+    fn manual(&self, host: &dyn AgentHost, registration: &str, binary: Option<&str>) -> Manual {
         let cli = binary.unwrap_or("codex");
-        // `codex mcp` writes `config.toml`: the file each step changes.
-        let file = host.profile().codex.join("config.toml");
+        let home = &host.profile().codex;
+        // `codex mcp` writes `config.toml` in `CODEX_HOME`: the file each step changes.
+        let file = home.join("config.toml");
         let step = |args: &[String]| ManualStep {
-            command: Some(shell_command(cli, args)),
+            command: Some(shell_command_in("CODEX_HOME", home, cli, args)),
             snippet: None,
             file: Some(file.to_string_lossy().into_owned()),
         };
-        Manual::by_cli(step(&add_args(host)), step(&strings(&REMOVE)))
+        let remove = step(&strings(&REMOVE));
+        Manual::by_cli(registration, step(&add_args(host)), remove.clone(), remove)
     }
 }

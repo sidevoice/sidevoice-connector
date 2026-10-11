@@ -948,6 +948,7 @@ case "$1 $2" in
 "mcp remove")
     rm -f "$entry"; exit 0 ;;
 "mcp add")
+    if [ -e "$entry" ]; then echo 'MCP server sidevoice already exists in user config' >&2; exit 1; fi
     shift 5
     env=""
     while [ "$1" != "--" ]; do
@@ -1084,37 +1085,45 @@ async fn each_agent_says_what_the_connector_does_itself_and_how_to_do_it_by_hand
         assert_eq!(agent["removal"], agent["manual"]["disconnect"][0]);
     }
 
-    let cli = claude.to_string_lossy().into_owned();
-    let mut add = vec![cli.clone()];
-    add.extend(["mcp", "add", "--scope", "user", "sidevoice"].map(String::from));
+    // Each command names the agent's home, as the connector runs its CLI.
+    let claude_home = fixture.profile.claude.display().to_string();
+    let codex_home = fixture.profile.codex.display().to_string();
+    let words = |cli: &Path, words: &[&str]| {
+        std::iter::once(cli.to_string_lossy().into_owned())
+            .chain(words.iter().map(|word| (*word).to_owned()))
+            .collect::<Vec<_>>()
+    };
+
+    let mut add = words(&claude, &["mcp", "add", "--scope", "user", "sidevoice"]);
     for pair in &env {
         add.extend(["-e".to_owned(), pair.clone()]);
     }
     add.extend(ours());
     let file = fixture.profile.claude.join(".claude.json");
     let file = file.to_string_lossy();
-    let add = json!({"command":quoted(add),"file":file});
-    let remove = json!({"command":quoted(
-        std::iter::once(cli).chain(["mcp", "remove", "--scope", "user", "sidevoice"].map(String::from)).collect()
-    ),"file":file});
+    let step = |words: Vec<String>| json!({"command":format!("CLAUDE_CONFIG_DIR='{claude_home}' {}", quoted(words)),"file":file});
+    let add = step(add);
+    let remove = step(words(
+        &claude,
+        &["mcp", "remove", "--scope", "user", "sidevoice"],
+    ));
+    // Another entry may be in any scope: removed from the one it is in.
+    let remove_other = step(words(&claude, &["mcp", "remove", "sidevoice"]));
     assert_eq!(
         row(&listed, "claude")["manual"],
-        json!({"connect":[add],"disconnect":[remove],"replace":[remove,add]})
+        json!({"connect":[add],"disconnect":[remove],"replace":[remove_other,add]})
     );
 
-    let cli = codex.to_string_lossy().into_owned();
     let file = fixture.profile.codex.join("config.toml");
     let file = file.to_string_lossy();
-    let mut add = vec![cli.clone()];
-    add.extend(["mcp", "add", "sidevoice"].map(String::from));
+    let mut add = words(&codex, &["mcp", "add", "sidevoice"]);
     for pair in &env {
         add.extend(["--env".to_owned(), pair.clone()]);
     }
     add.extend(ours());
-    let add = json!({"command":quoted(add),"file":file});
-    let remove = json!({"command":quoted(
-        std::iter::once(cli).chain(["mcp", "remove", "sidevoice"].map(String::from)).collect()
-    ),"file":file});
+    let step = |words: Vec<String>| json!({"command":format!("CODEX_HOME='{codex_home}' {}", quoted(words)),"file":file});
+    let add = step(add);
+    let remove = step(words(&codex, &["mcp", "remove", "sidevoice"]));
     assert_eq!(
         row(&listed, "codex")["manual"],
         json!({"connect":[add],"disconnect":[remove],"replace":[remove,add]})
@@ -1132,5 +1141,57 @@ async fn each_agent_says_what_the_connector_does_itself_and_how_to_do_it_by_hand
             "replace":[{"snippet":"Delete the other \"sidevoice\" entry under \"mcpServers\".","file":file},add],
         })
     );
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_manual_steps_run_by_hand_update_an_older_entry_in_the_agents_own_home() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let claude = fake_claude(&fixture);
+    let codex = fake_codex(&fixture);
+    let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", claude.as_os_str());
+    let _codex = EnvGuard::set("SIDEVOICE_CODEX_BIN", codex.as_os_str());
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let selected = fixture.selected();
+    // Older entries of ours: this installation's command without its environment.
+    private_write(
+        &fixture.profile.claude.join("fake-entry.txt"),
+        format!(
+            "sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: {}\n  Args: {}\n\nTo remove this server, run: claude mcp remove sidevoice -s user\n",
+            selected.command,
+            selected.args.join(" ")
+        )
+        .as_bytes(),
+    );
+    codex_entry(&fixture, &selected, true, json!({}));
+
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    for id in ["claude", "codex"] {
+        let agent = row(&listed, id);
+        assert_eq!(agent["owned"], true, "{agent}");
+        let steps = agent["manual"]["connect"].as_array().unwrap();
+        assert_eq!(steps.len(), 2, "an older entry is removed first: {agent}");
+        // Run by hand from a shell that names no agent home: the steps name it themselves.
+        for step in steps {
+            let command = step["command"].as_str().unwrap();
+            let status = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(command)
+                .env_remove("CLAUDE_CONFIG_DIR")
+                .env_remove("CODEX_HOME")
+                .env("HOME", fixture.root.join("elsewhere"))
+                .status()
+                .unwrap();
+            assert!(status.success(), "{command}");
+        }
+    }
+
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    for id in ["claude", "codex"] {
+        let agent = row(&listed, id);
+        assert_eq!(agent["registration"], "connected", "{agent}");
+        assert_eq!(agent["manual"]["connect"].as_array().unwrap().len(), 1);
+    }
     host.shutdown().await;
 }
