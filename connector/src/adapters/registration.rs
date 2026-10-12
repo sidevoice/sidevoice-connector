@@ -111,38 +111,43 @@ pub struct ManualStep {
     pub file: Option<String>,
 }
 
-/// How a person registers Sidevoice with an agent by hand (`connect`), removes it (`disconnect`), and replaces another
-/// "sidevoice" entry with it (`replace`), each as steps in order.
+/// How a person registers Sidevoice with an agent by hand (`connect`), updates an entry an older Sidevoice wrote
+/// (`update`: removes ours, then adds the current one), removes it (`disconnect`), and replaces another "sidevoice"
+/// entry with it (`replace`), each as steps in order.
 #[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Manual {
     pub connect: Vec<ManualStep>,
+    pub update: Vec<ManualStep>,
     pub disconnect: Vec<ManualStep>,
     pub replace: Vec<ManualStep>,
 }
 
 impl Manual {
     /// An agent whose CLI adds and removes the entry. Connecting adds ours, after removing ours first when it is
-    /// `outdated` (the CLI refuses to add over it); replacing removes the other entry (`remove_other`), then adds ours.
+    /// `outdated` (the CLI refuses to add over it); updating removes ours, then adds it; replacing removes the other
+    /// entry (`remove_other`), then adds ours.
     pub fn by_cli(
         registration: &str,
         add: ManualStep,
         remove: ManualStep,
         remove_other: ManualStep,
     ) -> Self {
+        let update = vec![remove.clone(), add.clone()];
         let connect = if registration == "outdated" {
-            vec![remove.clone(), add.clone()]
+            update.clone()
         } else {
             vec![add.clone()]
         };
         Self {
             connect,
+            update,
             disconnect: vec![remove],
             replace: vec![remove_other, add],
         }
     }
 
     /// An agent configured by a file: connecting adds `snippet` to `file`, disconnecting deletes the "sidevoice" entry
-    /// under `under`, and replacing deletes the other one there first.
+    /// under `under`, updating deletes it and adds `snippet` again, and replacing deletes the other one there first.
     pub fn by_file(file: &str, snippet: String, under: &str) -> Self {
         let step = |snippet: String| ManualStep {
             command: None,
@@ -151,9 +156,11 @@ impl Manual {
         };
         let params = json!({"under": under});
         let add = step(snippet);
+        let delete = step(message("agents.manual.delete-entry", &params));
         Self {
             connect: vec![add.clone()],
-            disconnect: vec![step(message("agents.manual.delete-entry", &params))],
+            update: vec![delete.clone(), add.clone()],
+            disconnect: vec![delete],
             replace: vec![
                 step(message("agents.manual.delete-other-entry", &params)),
                 add,

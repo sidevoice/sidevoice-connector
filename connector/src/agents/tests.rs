@@ -1227,7 +1227,7 @@ async fn each_agent_says_what_the_connector_does_itself_and_how_to_do_it_by_hand
     let remove_other = step(words(&claude, &["mcp", "remove", "sidevoice"]));
     assert_eq!(
         row(&listed, "claude")["manual"],
-        json!({"connect":[add],"disconnect":[remove],"replace":[remove_other,add]})
+        json!({"connect":[add],"update":[remove,add],"disconnect":[remove],"replace":[remove_other,add]})
     );
 
     let file = fixture.profile.agent_home("CODEX_HOME").join("config.toml");
@@ -1242,7 +1242,7 @@ async fn each_agent_says_what_the_connector_does_itself_and_how_to_do_it_by_hand
     let remove = step(words(&codex, &["mcp", "remove", "sidevoice"]));
     assert_eq!(
         row(&listed, "codex")["manual"],
-        json!({"connect":[add],"disconnect":[remove],"replace":[remove,add]})
+        json!({"connect":[add],"update":[remove,add],"disconnect":[remove],"replace":[remove,add]})
     );
 
     let file = fixture
@@ -1256,6 +1256,7 @@ async fn each_agent_says_what_the_connector_does_itself_and_how_to_do_it_by_hand
         row(&listed, "cursor")["manual"],
         json!({
             "connect":[add],
+            "update":[{"snippet":"Delete the \"sidevoice\" entry under \"mcpServers\".","file":file},add],
             "disconnect":[{"snippet":"Delete the \"sidevoice\" entry under \"mcpServers\".","file":file}],
             "replace":[{"snippet":"Delete the other \"sidevoice\" entry under \"mcpServers\".","file":file},add],
         })
@@ -1273,44 +1274,52 @@ async fn the_manual_steps_run_by_hand_update_an_older_entry_in_the_agents_own_ho
     let _codex = EnvGuard::set("SIDEVOICE_CODEX_BIN", codex.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let selected = fixture.selected();
-    // Older entries of ours: this installation's command without its environment.
-    private_write(
-        &fixture.profile.agent_home("CLAUDE_CONFIG_DIR").join("fake-entry.txt"),
-        format!(
-            "sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: {}\n  Args: {}\n\nTo remove this server, run: claude mcp remove sidevoice -s user\n",
-            selected.command,
-            selected.args.join(" ")
-        )
-        .as_bytes(),
-    );
-    codex_entry(&fixture, &selected, true, json!({}));
+    // `connect` (on an outdated entry) and `update` both rewrite an older entry: each runs from one.
+    for kind in ["connect", "update"] {
+        // Older entries of ours: this installation's command without its environment.
+        private_write(
+            &fixture.profile.agent_home("CLAUDE_CONFIG_DIR").join("fake-entry.txt"),
+            format!(
+                "sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: {}\n  Args: {}\n\nTo remove this server, run: claude mcp remove sidevoice -s user\n",
+                selected.command,
+                selected.args.join(" ")
+            )
+            .as_bytes(),
+        );
+        codex_entry(&fixture, &selected, true, json!({}));
 
-    let listed = host.handle("agents.list", json!({"rescan":true})).await;
-    for id in ["claude", "codex"] {
-        let agent = row(&listed, id);
-        assert_eq!(agent["owned"], true, "{agent}");
-        let steps = agent["manual"]["connect"].as_array().unwrap();
-        assert_eq!(steps.len(), 2, "an older entry is removed first: {agent}");
-        // Run by hand from a shell that names no agent home: the steps name it themselves.
-        for step in steps {
-            let command = step["command"].as_str().unwrap();
-            let status = std::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(command)
-                .env_remove("CLAUDE_CONFIG_DIR")
-                .env_remove("CODEX_HOME")
-                .env("HOME", fixture.root.join("elsewhere"))
-                .status()
-                .unwrap();
-            assert!(status.success(), "{command}");
+        let listed = host.handle("agents.list", json!({"rescan":true})).await;
+        for id in ["claude", "codex"] {
+            let agent = row(&listed, id);
+            assert_eq!(agent["owned"], true, "{agent}");
+            let steps = agent["manual"][kind].as_array().unwrap();
+            assert_eq!(
+                steps.len(),
+                2,
+                "an older entry is removed first: {kind} {agent}"
+            );
+            // Run by hand from a shell that names no agent home: the steps name it themselves.
+            for step in steps {
+                let command = step["command"].as_str().unwrap();
+                let status = std::process::Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(command)
+                    .env_remove("CLAUDE_CONFIG_DIR")
+                    .env_remove("CODEX_HOME")
+                    .env("HOME", fixture.root.join("elsewhere"))
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "{kind}: {command}");
+            }
         }
-    }
 
-    let listed = host.handle("agents.list", json!({"rescan":true})).await;
-    for id in ["claude", "codex"] {
-        let agent = row(&listed, id);
-        assert_eq!(agent["registration"], "connected", "{agent}");
-        assert_eq!(agent["manual"]["connect"].as_array().unwrap().len(), 1);
+        let listed = host.handle("agents.list", json!({"rescan":true})).await;
+        for id in ["claude", "codex"] {
+            let agent = row(&listed, id);
+            assert_eq!(agent["registration"], "connected", "{kind}: {agent}");
+            assert_eq!(agent["manual"]["connect"].as_array().unwrap().len(), 1);
+            assert_eq!(agent["manual"]["update"].as_array().unwrap().len(), 2);
+        }
     }
     host.shutdown().await;
 }
@@ -1353,7 +1362,7 @@ async fn steps_name_an_agents_home_only_when_the_person_sets_it() {
         let agent = row(&listed, id);
         assert_eq!(agent["owned"], true, "{agent}");
         let manual = &agent["manual"];
-        for operation in ["connect", "disconnect", "replace"] {
+        for operation in ["connect", "update", "disconnect", "replace"] {
             for step in manual[operation].as_array().unwrap() {
                 assert_eq!(step["file"], json!(file.to_string_lossy()), "{step}");
                 let command = step["command"].as_str().unwrap();
