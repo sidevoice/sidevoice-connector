@@ -15,6 +15,7 @@ pub const HOME: crate::profile::AgentHome = crate::profile::AgentHome {
 };
 
 use super::{envelope, Identity};
+use crate::profile::Profile;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::env;
@@ -33,6 +34,41 @@ fn config_dir() -> PathBuf {
     env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".claude"))
+}
+
+/// The file Claude Code keeps its user configuration in, user-scope MCP servers included, resolved as its CLI resolves
+/// it: `$CLAUDE_CONFIG_DIR/.claude.json` when the person's environment sets the variable, else `~/.claude.json`.
+pub(crate) fn user_config(profile: &Profile) -> PathBuf {
+    if profile.agent_home_set(HOME.var) {
+        profile.agent_home(HOME.var).join(".claude.json")
+    } else {
+        profile.home.join(".claude.json")
+    }
+}
+
+/// The largest `.claude.json` read: it also holds Claude Code's per-project state.
+const USER_CONFIG_LIMIT: u64 = 64 << 20;
+
+/// Claude Code's user configuration cannot be parsed or cannot be read safely: it is left alone, whatever else is
+/// there.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Unreadable;
+
+/// Reads [`user_config`] with the guarded reader, before anything else is judged: a regular file of the person's,
+/// writable by nobody else, and JSON. A link is followed wherever it leads (dotfiles managers link it), and the file
+/// it leads to is judged; one that leads nowhere is unreadable. `None` when there is no such file.
+pub(crate) fn read_user_config(profile: &Profile) -> Result<Option<serde_json::Value>, Unreadable> {
+    let file = user_config(profile);
+    match fs::symlink_metadata(&file) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(Unreadable),
+        Ok(_) => {}
+    }
+    let text =
+        super::registration::read_profile_file(&file, USER_CONFIG_LIMIT).map_err(|_| Unreadable)?;
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|_| Unreadable)
 }
 
 pub fn identity() -> Result<Option<Identity>> {
