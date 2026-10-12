@@ -206,11 +206,7 @@ fn file_guard(host: &dyn AgentHost) -> String {
         Err(_) => return "invalid".into(),
         Ok(_) => {}
     }
-    let root = match profile.agent_root(profile.agent_home(super::HOME.var)) {
-        Ok(root) => root,
-        Err(_) => return "invalid".into(),
-    };
-    let text = match read_profile_file(&file, Some(&root), 1 << 20) {
+    let text = match read_profile_file(&file, 1 << 20) {
         Ok(text) => text,
         Err(_) => return "invalid".into(),
     };

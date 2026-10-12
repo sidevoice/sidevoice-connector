@@ -486,6 +486,83 @@ async fn dangling_codex_config_symlink_is_invalid_not_absent() {
     host.shutdown().await;
 }
 
+/// Dotfiles managers link `config.toml` from their own directory: the link is followed, and the file it leads to is
+/// judged as `config.toml` itself would be. Ours reads `connected`, another `foreign`; one that cannot be parsed,
+/// one others may write, and a FIFO are `invalid` (the FIFO without waiting on it), and are left as they are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_codex_config_is_judged_where_the_link_leads() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let binary = fake_codex(&fixture);
+    let _codex = EnvGuard::set("SIDEVOICE_CODEX_BIN", binary.as_os_str());
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let selected = fixture.selected();
+    codex_entry(&fixture, &selected, true, installation_env(&fixture));
+    let config = fixture.profile.agent_home("CODEX_HOME").join("config.toml");
+    let dotfiles = fixture.root.join("dotfiles");
+    private_mkdir(&dotfiles);
+    let target = dotfiles.join("config.toml");
+    fs::rename(&config, &target).unwrap();
+    symlink(&target, &config).unwrap();
+    // A scan that must answer, never wait on what the link leads to.
+    let list = |host: std::sync::Arc<HostAgents>| async move {
+        let scan =
+            tokio::spawn(async move { host.handle("agents.list", json!({"rescan":true})).await });
+        tokio::time::timeout(StdDuration::from_secs(20), scan)
+            .await
+            .expect("the scan waited on the linked file")
+            .unwrap()
+    };
+
+    let listed = list(host.clone()).await;
+    assert_eq!(
+        row(&listed, "codex")["registration"],
+        "connected",
+        "{listed}"
+    );
+
+    private_write(
+        &target,
+        b"[mcp_servers.sidevoice]\ncommand = \"/elsewhere/server\"\nargs = []\n",
+    );
+    let listed = list(host.clone()).await;
+    assert_eq!(row(&listed, "codex")["registration"], "foreign", "{listed}");
+
+    let malformed = b"[mcp_servers.sidevoice\ncommand = ";
+    private_write(&target, malformed);
+    let listed = list(host.clone()).await;
+    assert_eq!(row(&listed, "codex")["registration"], "invalid", "{listed}");
+    for action in ["agents.connect", "agents.disconnect"] {
+        let answer = host.handle(action, json!({"id":"codex"})).await;
+        assert_eq!(
+            answer.pointer("/error/key"),
+            Some(&json!("agents.invalid")),
+            "{action}: {answer}"
+        );
+    }
+    assert_eq!(fs::read(&target).unwrap(), malformed);
+
+    fs::write(&target, b"").unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o620)).unwrap();
+    let listed = list(host.clone()).await;
+    assert_eq!(
+        row(&listed, "codex")["registration"],
+        "invalid",
+        "group-writable: {listed}"
+    );
+
+    fs::remove_file(&target).unwrap();
+    let fifo = std::ffi::CString::new(target.to_string_lossy().into_owned()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let listed = list(host.clone()).await;
+    assert_eq!(
+        row(&listed, "codex")["registration"],
+        "invalid",
+        "FIFO: {listed}"
+    );
+    host.shutdown().await;
+}
+
 #[tokio::test]
 async fn complete_request_gate_orders_scans_mutations_and_external_dismissals() {
     let _turn = agent_env().await;
