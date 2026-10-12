@@ -37,7 +37,9 @@ Every place comes from the environment, so a disposable profile is just a set of
 - the release root `R`: `$XDG_DATA_HOME/sidevoice`, else `~/.local/share/sidevoice`;
 - the agents' homes: `$CLAUDE_CONFIG_DIR` (`~/.claude`), `$CODEX_HOME` (`~/.codex`), `$CURSOR_CONFIG_DIR`
   (`~/.cursor`), `$CURSOR_DATA_DIR`. Each is checked to be the person's and writable by nobody else before it is
-  read or written.
+  read or written. `CLAUDE_CONFIG_DIR` reaches Claude Code (its CLI, the service jobs) only when the person's
+  environment sets it: Claude Code keeps its user configuration, MCP servers included, in `~/.claude.json` without
+  it and in `$CLAUDE_CONFIG_DIR/.claude.json` with it, so naming the default would make it read another file.
 
 Records are written whole (a private temporary file renamed into place). Locks are kernel `flock(2)` locks on
 permanent lock files, released when their holder dies, with the holder's pid and start time written inside for
