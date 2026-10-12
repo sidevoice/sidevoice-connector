@@ -9,7 +9,7 @@ pub mod registration;
 mod transcript;
 
 pub use conversation::{Conversation, Room};
-pub use harness::{Harness, Registry, View};
+pub use harness::{Harness, Registry};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -26,7 +26,8 @@ pub struct Identity {
     pub inbound: Option<Value>,
     pub editor: bool,
     pub detachable: bool,
-    pub view_key: Option<String>,
+    /// A string unique to this join that the harness may find in its own record of the call.
+    pub chat_marker: Option<String>,
     pub deliver_note: Option<String>,
     pub watch_note: Option<String>,
 }
@@ -45,7 +46,7 @@ impl Identity {
             inbound: None,
             editor: false,
             detachable: false,
-            view_key: None,
+            chat_marker: None,
             deliver_note: None,
             watch_note: None,
         }
@@ -154,7 +155,7 @@ pub fn experimental(identity: &Identity, capabilities: &Value) -> Vec<String> {
     if identity.harness == "cursor"
         && matches!(
             identity.delivery["kind"].as_str(),
-            Some("cursor-tmux" | "cursor-app")
+            Some("cursor-tmux" | "cursor-bridge")
         )
     {
         names.push("deliver".into());

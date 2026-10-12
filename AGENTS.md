@@ -12,9 +12,6 @@ Rules for any coding agent (and person) working in this repository.
   `{"ok":false,"error":{"key","params","message"}}`. The client translates by key; the message is never parsed.
   The keys and their English texts live in `connector/messages/errors.json`; adding a keyed failure means adding
   its key there.
-- **UI keeps per-language bundles.** Text shown in an interface we draw (the Cursor card) goes through a key looked
-  up in per-language message bundles (`connector/messages/card/`), with English as the fallback when a key is
-  missing; other languages may lag. Language default: the device's language when we support it, otherwise English.
 - What reaches the agent (MCP instructions, tool results, the `[Sidevoice]` trailer) is English; it is not UI.
 
 ## Before changing things

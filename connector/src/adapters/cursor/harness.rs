@@ -1,31 +1,29 @@
-//! Cursor as a harness: the CLI's chats (tmux, transcript) and the editor's chats (the Sidevoice card, its Desktop
-//! Bridge, the transcript found by what was delivered to it).
+//! Cursor as a harness: the CLI's chats (tmux, transcript) and the editor's chats, reached through Cursor's Desktop
+//! Bridge once it knows which chat a conversation is, their transcript found the same way.
 
-use super::app::{AppNotice, CursorApps};
 use super::{composer_holding, deliver_editor, editor_transcript_chat, engine, transcript_path};
 use crate::adapters::conversation::{Conversation, Room};
-use crate::adapters::envelope;
-use crate::adapters::harness::{no_route, Harness, View};
+use crate::adapters::harness::{no_route, Harness};
 use crate::adapters::registration::Registration;
 use crate::adapters::transcript::{self, Observed, TranscriptReader};
 use crate::adapters::Identity;
 use crate::profile::Profile;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use futures_util::future::BoxFuture;
 use serde_json::{json, Map, Value};
 use std::any::Any;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
-use tokio::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use tokio::time::Duration;
 
-/// Cursor, with the card bridge its editor chats are reached through once the room exists (`attach`).
+/// What an editor chat's delivery and status say until the Desktop Bridge knows which chat it is.
+const WAITING: &str = "waiting for Cursor to register this chat";
+
+/// Cursor.
 #[derive(Default)]
-pub struct Cursor {
-    apps: OnceLock<Arc<CursorApps>>,
-}
+pub struct Cursor;
 
 /// Which Cursor chat a conversation is: the one the Desktop Bridge holds (`bridge`, which authenticates it), and the
 /// one whose transcript is followed.
@@ -60,12 +58,6 @@ fn set_followed(conversation: &Conversation, chat: String) {
     }
 }
 
-impl Cursor {
-    fn apps(&self) -> Result<&Arc<CursorApps>> {
-        self.apps.get().context("Cursor card bridge is not running")
-    }
-}
-
 impl Harness for Cursor {
     fn id(&self) -> &'static str {
         "cursor"
@@ -86,7 +78,7 @@ impl Harness for Cursor {
     fn accepts(&self, delivery: &Value, thread: &str) -> bool {
         match delivery.get("kind").and_then(Value::as_str) {
             Some("cursor-tmux") => delivery.get("chat").and_then(Value::as_str) == Some(thread),
-            Some("cursor-app") => delivery.get("thread").and_then(Value::as_str) == Some(thread),
+            Some("cursor-bridge") => delivery.get("thread").and_then(Value::as_str) == Some(thread),
             Some("none") => true,
             _ => crate::adapters::http::accepts(delivery, thread),
         }
@@ -94,39 +86,6 @@ impl Harness for Cursor {
 
     fn conversation_state(&self) -> Box<dyn Any + Send + Sync> {
         Box::new(Chats::default())
-    }
-
-    fn attach(&self, profile: &Profile, room: Weak<dyn Room>) -> Result<()> {
-        let (notices, mut received) = mpsc::unbounded_channel();
-        let apps = CursorApps::new(notices, profile.data.join("cursor-card-port.json"))?;
-        let _ = self.apps.set(apps);
-        tokio::spawn(async move {
-            while let Some(notice) = received.recv().await {
-                let Some(room) = room.upgrade() else {
-                    return;
-                };
-                answered(&*room, notice).await;
-            }
-        });
-        Ok(())
-    }
-
-    fn prepare<'a>(
-        &'a self,
-        conversation: &'a Conversation,
-    ) -> BoxFuture<'a, Result<Option<Value>>> {
-        Box::pin(async move {
-            if conversation.route_kind() != Some("cursor-app") {
-                return Ok(None);
-            }
-            let key = conversation
-                .delivery
-                .get("key")
-                .and_then(Value::as_str)
-                .context("Cursor card key missing")?;
-            let port = self.apps()?.open(&conversation.thread, key).await?;
-            Ok(Some(json!({"port":port})))
-        })
     }
 
     fn deliver<'a>(
@@ -137,18 +96,10 @@ impl Harness for Cursor {
     ) -> BoxFuture<'a, Result<Value>> {
         Box::pin(async move {
             match conversation.route_kind() {
-                Some("cursor-app") => self.deliver_to_editor(conversation, frame).await,
+                Some("cursor-bridge") => Ok(deliver_to_editor(conversation, frame).await),
                 Some("cursor-tmux") => super::deliver(&conversation.delivery, frame).await,
                 Some("http") => crate::adapters::http::deliver(&conversation.delivery, frame).await,
                 _ => Ok(no_route(&conversation.thread)),
-            }
-        })
-    }
-
-    fn close<'a>(&'a self, conversation: &'a Conversation) -> BoxFuture<'a, ()> {
-        Box::pin(async move {
-            if let Some(apps) = self.apps.get() {
-                apps.close(&conversation.thread).await;
             }
         })
     }
@@ -158,15 +109,14 @@ impl Harness for Cursor {
         conversation: &'a Conversation,
     ) -> BoxFuture<'a, Option<Map<String, Value>>> {
         Box::pin(async move {
-            if conversation.route_kind() != Some("cursor-app") {
+            if conversation.route_kind() != Some("cursor-bridge") {
                 return None;
             }
-            let apps = self.apps.get()?;
-            let mut state = apps.status(&conversation.thread).await;
-            state["bridge_chat_known"] = json!(bridge(conversation).is_some());
             let mut fields = Map::new();
-            fields.insert("delivery_state".into(), state);
-            fields.insert("cursor_app_port".into(), json!(apps.port().await));
+            fields.insert(
+                "delivery_state".into(),
+                bridge_state(bridge(conversation).is_some()),
+            );
             Some(fields)
         })
     }
@@ -183,8 +133,8 @@ impl Harness for Cursor {
         client::recognises(client)
     }
 
-    fn view(&self, client_caps: &Value) -> Option<View> {
-        client::view(client_caps)
+    fn hosts_several_chats(&self, client_caps: &Value) -> bool {
+        super::is_editor(client_caps)
     }
 
     fn refine_identity<'a>(
@@ -199,22 +149,12 @@ impl Harness for Cursor {
         client::experimental_note(capability, identity)
     }
 
-    fn joined_fields(
-        &self,
-        identity: &Identity,
-        registered: &Value,
-        views: bool,
-    ) -> Map<String, Value> {
-        Cursor::card_fields(identity, registered, views)
+    fn joined_fields(&self, identity: &Identity, _registered: &Value) -> Map<String, Value> {
+        client::joined_fields(identity)
     }
 
-    fn status_fields(
-        &self,
-        identity: &Identity,
-        listed: Option<&Value>,
-        view_reads: u64,
-    ) -> Map<String, Value> {
-        client::status_fields(identity, listed, view_reads)
+    fn status_fields(&self, identity: &Identity, listed: Option<&Value>) -> Map<String, Value> {
+        client::status_fields(identity, listed)
     }
 
     fn adopted_identity(&self, name: &str, adopted: &Value) -> Option<(Identity, String)> {
@@ -227,86 +167,36 @@ impl Harness for Cursor {
                 let chat = conversation.thread.clone();
                 transcript::follow(conversation, room, Reader::new(chat, false));
             }
-            Some("cursor-app") => watch_editor(conversation, room),
+            Some("cursor-bridge") => watch_editor(conversation, room),
             _ => {}
         }
     }
 }
 
-impl Cursor {
-    /// An editor chat: by its own id through the Desktop Bridge when it is known, else through the card.
-    async fn deliver_to_editor(&self, conversation: &Conversation, frame: &Value) -> Result<Value> {
-        let mut delivery = conversation.delivery.clone();
-        let composer = bridge(conversation).or_else(|| {
-            delivery
-                .get("composer")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        });
-        let composer = match composer {
-            Some(composer) => Some(composer),
-            None => composer_holding(&delivery).await,
-        };
-        if let Some(composer) = composer {
-            delivery["composer"] = json!(composer);
-            set_bridge(conversation, composer);
-            if let Some(result) = deliver_editor(&delivery, frame).await {
-                return Ok(result);
-            }
-        }
-        let message_id = frame
-            .get("message_id")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let text = frame.get("text").and_then(Value::as_str).unwrap_or("");
-        self.apps()?
-            .deliver(
-                &conversation.thread,
-                message_id,
-                envelope(frame).unwrap_or_else(|_| text.to_owned()),
-            )
-            .await
-    }
+/// Where an editor chat's route stands: whether the Desktop Bridge knows which chat it is.
+fn bridge_state(chat_known: bool) -> Value {
+    json!({"bridge_chat_known":chat_known,
+        "state":if chat_known {"registered"} else {WAITING}})
 }
 
-/// The card's answer that it submitted a message: the message was read.
-async fn answered(room: &dyn Room, notice: AppNotice) {
-    let (thread, message_id, answered) = match notice {
-        AppNotice::Dispatched { thread, message_id } => (thread, message_id, None),
-        AppNotice::Answered {
-            thread,
-            message_id,
-            ok,
-        } => (thread, message_id, Some(ok)),
+/// An editor chat, only by its own id through the Desktop Bridge. Until the bridge knows which chat it is, the
+/// message is not sent and the answer says so.
+async fn deliver_to_editor(conversation: &Conversation, frame: &Value) -> Value {
+    let mut delivery = conversation.delivery.clone();
+    let composer = match bridge(conversation) {
+        Some(composer) => Some(composer),
+        None => composer_holding(&delivery).await,
     };
-    let conversation = room
-        .conversations()
-        .await
-        .into_iter()
-        .find(|conversation| conversation.client_ref == thread);
-    let Some(conversation) = conversation else {
-        return;
+    let Some(composer) = composer else {
+        return json!({"status":"failed","reason":"chat_unregistered",
+            "detail":format!("Cursor's Desktop Bridge: {WAITING}. Voice reaches this chat once Cursor has recorded its join call (up to ~30 s after it).")});
     };
-    if answered.is_none() || answered == Some(false) {
-        return;
-    }
-    let context = conversation
-        .input_context
-        .lock()
-        .await
-        .get(&message_id)
-        .cloned();
-    let Some((session_id, revision)) = context else {
-        return;
-    };
-    room.read(
-        &conversation,
-        &message_id,
-        json!(session_id),
-        json!(revision),
-        Value::Null,
-    )
-    .await;
+    delivery["composer"] = json!(composer);
+    set_bridge(conversation, composer);
+    deliver_editor(&delivery, frame).await.unwrap_or_else(|| {
+        json!({"status":"failed","reason":"bridge_unavailable",
+            "detail":"Cursor's Desktop Bridge did not take the message: it may not be running."})
+    })
 }
 
 /// Finds which Cursor chat an editor conversation is (by the Desktop Bridge, or by a delivered message showing up
@@ -476,46 +366,6 @@ impl TranscriptReader for Reader {
     }
 }
 
-const VIEW_URI: &str = "ui://sidevoice/voice-link";
-
-/// The card a Cursor editor chat draws under its join call (an MCP App), through which voice reaches it.
-fn card() -> View {
-    View {
-        uri: VIEW_URI,
-        name: "Sidevoice voice link",
-        mime: "text/html;profile=mcp-app",
-        html: super::app::resource_html,
-        meta: || json!({"ui":{"csp":{"connectDomains":["http://127.0.0.1:*"]},"prefersBorder":true}}),
-    }
-}
-
-impl Cursor {
-    /// What Cursor's client is told about the card when a conversation joins.
-    fn card_fields(identity: &Identity, registered: &Value, views: bool) -> Map<String, Value> {
-        let mut fields = Map::new();
-        let prepared = registered.pointer("/prepared/port").is_some();
-        if identity.editor {
-            fields.insert("view".into(), json!(format!("Voice reaches this chat through the small Sidevoice card drawn under this call: it must stay open in this chat. Other chats of this window can join too, each with its own card. Remember this chat's conversation id ({}): voice_status and voice_disconnect need it when several chats are joined.", identity.thread)));
-            fields.insert("speak_first".into(), json!(format!("To speak before the user has said anything by voice, call voice_say with conversation \"{}\" and no session_id. To answer a voice message, use its session_id and revision as usual.", identity.thread)));
-        }
-        let bridge = identity.route.as_deref() == Some("cursor-editor-bridge");
-        fields.insert("card".into(), json!({"requested":identity.editor && prepared,
-            "bridge":bridge,
-            "note":if bridge {"Cursor's Desktop Bridge is on: once Cursor has recorded this call (up to ~30 s), voice reaches this chat by its own id, on screen or not. Until then, and whenever the bridge cannot, it comes through the card under this call."}
-                else if identity.editor && prepared {"A Sidevoice card should appear under this call within seconds. If none does, Cursor did not draw it: tell the user, and that ~/.sidevoice/mcp.log says whether Cursor read the card (a \"resources/read\" line) — without the card, what they say in the room does not reach this chat."}
-                else if identity.editor {"The connector could not open the card's loopback bridge, so no card will work: tell the user to look at ~/.sidevoice/connector.log."}
-                else if !views {"This Cursor did not declare MCP Apps support in initialize, so it draws no card: what the user says in the room cannot reach this chat. ~/.sidevoice/mcp.log shows what it declared."}
-                else {"Cursor CLI: no card; voice reaches the chat only under cursor-agent persist."}}));
-        if identity.delivery["kind"] == "cursor-app" && prepared {
-            fields.insert(
-                "view_link".into(),
-                json!({"conversation":identity.thread,"port":registered["prepared"]["port"],"key":identity.view_key}),
-            );
-        }
-        fields
-    }
-}
-
 /// The hooks Cursor's MCP client is served by.
 pub(super) mod client {
     use super::*;
@@ -524,46 +374,41 @@ pub(super) mod client {
         super::super::is_cursor_client(client)
     }
 
-    pub fn view(client_caps: &Value) -> Option<View> {
-        super::super::draws_views(client_caps).then(card)
-    }
-
     pub fn experimental_note(capability: &str, identity: &Identity) -> Option<&'static str> {
         match (capability, identity.delivery["kind"].as_str()) {
             ("deliver", Some("cursor-tmux")) => Some("Voice from the room reaches this conversation by an experimental route: it is pasted into this chat's terminal through tmux and sent with Enter. If the user is typing at the same moment, the two texts mix. Tell the user once."),
-            ("deliver", Some("cursor-app")) => Some("Voice from the room reaches this chat by an experimental route: the small Sidevoice card under this call submits it as if the user had typed it; it must stay open in this chat. If the user is typing at the same moment, the two may mix. Tell the user once."),
-            ("sessionIdentity", _) => Some("This conversation is identified by the Sidevoice card drawn in it, not by an id Cursor gives: each chat of this window that joins gets a card and a conversation of its own. Asking this same chat to join again gives it a second one; leave the old one with voice_disconnect and its conversation id."),
+            ("deliver", Some("cursor-bridge")) => Some("Voice from the room reaches this chat by an experimental route: Cursor's Desktop Bridge submits it to this chat as if the user had typed it, once Cursor has recorded this join call (up to ~30 s). If the user is typing at the same moment, the two may mix. Tell the user once."),
+            ("sessionIdentity", _) => Some("This conversation is identified by Sidevoice, not by an id Cursor gives: each chat of this window that joins gets a conversation of its own. Asking this same chat to join again gives it a second one; leave the old one with voice_disconnect and its conversation id."),
             _ => None,
         }
     }
 
-    pub fn status_fields(
-        identity: &Identity,
-        listed: Option<&Value>,
-        reads: u64,
-    ) -> Map<String, Value> {
+    /// What Cursor's editor client is told when one of its chats joins: how voice reaches it, and the marker the
+    /// Desktop Bridge finds this chat by in Cursor's own record of the call.
+    pub fn joined_fields(identity: &Identity) -> Map<String, Value> {
         let mut fields = Map::new();
         if !identity.editor {
             return fields;
         }
-        let state = listed
-            .and_then(|item| item.get("delivery_state"))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        fields.insert("card".into(), json!({"html_read_by_cursor":reads,"card_connected":state.get("card_connected"),
-            "card_last_seen_ms_ago":state.get("card_last_seen_ms_ago"),"bridge_chat_known":state.get("bridge_chat_known"),
-            "note":if state.get("card_connected") == Some(&json!(true)) {"The card in this chat is connected."}
-                else if reads > 0 {"Cursor read the card but it has not connected to this machine's connector: it may not be on screen, or it failed to load."}
-                else {"Cursor never read the card, so it drew none: tell the user; ~/.sidevoice/mcp.log has what Cursor declared."}}));
-        if let Some(port) = listed
-            .and_then(|item| item.get("cursor_app_port"))
-            .and_then(Value::as_u64)
-        {
-            fields.insert(
-                "view_link".into(),
-                json!({"conversation":identity.thread,"port":port,"key":identity.view_key}),
-            );
+        fields.insert("view".into(), json!(format!("Voice reaches this chat through Cursor's Desktop Bridge, once Cursor has recorded this call (up to ~30 s): until then it says \"{WAITING}\" and nothing is sent. Other chats of this window can join too. Remember this chat's conversation id ({}): voice_status and voice_disconnect need it when several chats are joined.", identity.thread)));
+        fields.insert("speak_first".into(), json!(format!("To speak before the user has said anything by voice, call voice_say with conversation \"{}\" and no session_id. To answer a voice message, use its session_id and revision as usual.", identity.thread)));
+        if let Some(marker) = &identity.chat_marker {
+            fields.insert("chat_marker".into(), json!(marker));
         }
+        fields
+    }
+
+    /// Where an editor chat's route stands, for its client.
+    pub fn status_fields(identity: &Identity, listed: Option<&Value>) -> Map<String, Value> {
+        let mut fields = Map::new();
+        if !identity.editor {
+            return fields;
+        }
+        let known = listed
+            .and_then(|item| item.pointer("/delivery_state/bridge_chat_known"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        fields.insert("bridge".into(), bridge_state(known));
         fields
     }
 
@@ -571,7 +416,7 @@ pub(super) mod client {
         let delivery = result
             .get("delivery")
             .cloned()
-            .unwrap_or_else(|| json!({"kind":"cursor-app","thread":name}));
+            .unwrap_or_else(|| json!({"kind":"cursor-bridge","thread":name}));
         let identity = Identity {
             harness: result
                 .get("harness")
@@ -606,8 +451,8 @@ pub(super) mod client {
                 .cloned(),
             editor: true,
             detachable: true,
-            view_key: result
-                .pointer("/delivery/key")
+            chat_marker: result
+                .pointer("/delivery/marker")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             deliver_note: None,
@@ -619,5 +464,85 @@ pub(super) mod client {
             .unwrap_or("Cursor conversation")
             .to_owned();
         (identity, title)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use tokio::sync::Mutex as AsyncMutex;
+
+    /// An editor chat as Cursor's client declares itself at `initialize`: MCP Apps support.
+    fn editor_caps() -> Value {
+        json!({"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app"]}}})
+    }
+
+    fn conversation(identity: &Identity) -> Conversation {
+        Conversation {
+            client_ref: identity.thread.clone(),
+            harness: identity.harness.clone(),
+            thread: identity.thread.clone(),
+            title: "chat".into(),
+            delivery: identity.delivery.clone(),
+            engine: AsyncMutex::new(None),
+            route: identity.route.clone(),
+            capabilities: identity.capabilities.clone(),
+            experimental: json!([]),
+            inbound: Value::Null,
+            detachable: true,
+            owner: AtomicU64::new(1),
+            id: AsyncMutex::new("local-1".into()),
+            serial: AsyncMutex::new(()),
+            pending: AsyncMutex::new(VecDeque::new()),
+            turns: AsyncMutex::new(HashMap::new()),
+            input_context: AsyncMutex::new(HashMap::new()),
+            read: AsyncMutex::new(VecDeque::new()),
+            working: AsyncMutex::new(None),
+            stopped: AtomicBool::new(false),
+            state: Cursor.conversation_state(),
+        }
+    }
+
+    /// An editor chat joins on the Desktop Bridge route, with a marker of its own the bridge finds it by, which its
+    /// join answer carries; no card is drawn or offered.
+    #[test]
+    fn an_editor_chat_joins_on_the_bridge_route_with_its_marker() {
+        let identity =
+            super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
+        assert_eq!(identity.delivery["kind"], "cursor-bridge");
+        assert_eq!(identity.route.as_deref(), Some("cursor-editor-bridge"));
+        let marker = identity.chat_marker.clone().unwrap();
+        assert_eq!(identity.delivery["marker"], marker.as_str());
+        assert!(Cursor.accepts(&identity.delivery, &identity.thread));
+        let fields = client::joined_fields(&identity);
+        assert_eq!(fields["chat_marker"], marker.as_str());
+        assert!(fields["view"].as_str().unwrap().contains(WAITING));
+        assert!(!fields.contains_key("card") && !fields.contains_key("view_link"));
+    }
+
+    /// Until the Desktop Bridge knows which chat it is, nothing is sent and both the delivery and the status say so.
+    #[tokio::test]
+    async fn an_unregistered_editor_chat_is_waiting_not_reached_another_way() {
+        let identity =
+            super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
+        let conversation = conversation(&identity);
+        let frame =
+            json!({"channel":"voice","session_id":"s","revision":1,"message_id":"m","text":"hola"});
+        let answer = deliver_to_editor(&conversation, &frame).await;
+        assert_eq!(answer["status"], "failed", "{answer}");
+        assert_eq!(answer["reason"], "chat_unregistered", "{answer}");
+        assert!(answer["detail"].as_str().unwrap().contains(WAITING));
+
+        let listed = Cursor.status(&conversation).await.unwrap();
+        assert_eq!(listed["delivery_state"]["state"], WAITING);
+        let item = json!({"delivery_state": listed["delivery_state"]});
+        let fields = client::status_fields(&identity, Some(&item));
+        assert_eq!(fields["bridge"]["bridge_chat_known"], false);
+
+        set_bridge(&conversation, "chat-1".into());
+        let listed = Cursor.status(&conversation).await.unwrap();
+        assert_eq!(listed["delivery_state"]["state"], "registered");
     }
 }

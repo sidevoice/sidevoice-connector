@@ -1,4 +1,4 @@
-use crate::adapters::{self, Identity, Registry, View};
+use crate::adapters::{self, Identity, Registry};
 use crate::profile::Profile;
 use crate::secure_fs::verify_socket;
 use anyhow::{bail, Context, Result};
@@ -8,7 +8,7 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -260,9 +260,9 @@ struct Facade {
     ipc: Arc<Ipc>,
     joined: Arc<Mutex<HashMap<String, Joined>>>,
     registry: Arc<Registry>,
-    /// The view this client draws under a call, when it draws one (from `initialize`).
-    view: Arc<std::sync::Mutex<Option<View>>>,
-    view_reads: Arc<AtomicU64>,
+    /// Whether this client serves several of its chats at once (from `initialize`): a call that names no
+    /// conversation may then be any of them.
+    several_chats: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -306,16 +306,8 @@ fn closed_note(reason: &str) -> &'static str {
 }
 
 impl Facade {
-    /// The view this client draws, if it draws one.
-    fn view(&self) -> Option<View> {
-        *self
-            .view
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn views(&self) -> bool {
-        self.view().is_some()
+    fn several_chats(&self) -> bool {
+        self.several_chats.load(Ordering::Relaxed)
     }
 
     fn new(profile: Profile) -> Self {
@@ -325,8 +317,7 @@ impl Facade {
             profile,
             joined,
             registry: Arc::new(Registry::standard()),
-            view: Arc::new(std::sync::Mutex::new(None)),
-            view_reads: Arc::new(AtomicU64::new(0)),
+            several_chats: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -506,9 +497,7 @@ impl Facade {
                         .collect::<Vec<_>>());
                 }
                 if let Some(client_harness) = self.registry.client(&client) {
-                    for (key, value) in
-                        client_harness.joined_fields(&identity, &result, self.views())
-                    {
+                    for (key, value) in client_harness.joined_fields(&identity, &result) {
                         response[key] = value;
                     }
                 }
@@ -576,7 +565,7 @@ impl Facade {
                         "room_reachable":status.get("connected"),"connector":status,
                         "note":closed_note(status.pointer("/resume_block_reason").and_then(Value::as_str).unwrap_or("conversation_history_limit"))}));
                 }
-                if named.is_none() && self.views() && !self.joined.lock().await.is_empty() {
+                if named.is_none() && self.several_chats() && !self.joined.lock().await.is_empty() {
                     let conversations = self.joined.lock().await.values().map(|binding| json!({"title":binding.title,"harness":binding.identity.harness})).collect::<Vec<_>>();
                     return Ok(
                         json!({"joined":Value::Null,"conversation":Value::Null,"room_reachable":status.get("connected"),"connector":status,
@@ -608,9 +597,8 @@ impl Facade {
                         "room_reachable":status.get("connected"),"connector":status,"capabilities":binding.capabilities,
                         "experimental":binding.experimental,"inbound":binding.identity.inbound});
                     if let Some(client_harness) = self.registry.client(&client) {
-                        let reads = self.view_reads.load(Ordering::Relaxed);
                         for (key, value) in
-                            client_harness.status_fields(&binding.identity, daemon_binding, reads)
+                            client_harness.status_fields(&binding.identity, daemon_binding)
                         {
                             response[key] = value;
                         }
@@ -686,7 +674,7 @@ impl Facade {
                     .and_then(Value::as_str)
                     .context("text required")?;
                 let supplied_session = args.get("session_id").and_then(Value::as_str);
-                let editor_views = self.views();
+                let editor_views = self.several_chats();
                 let is_typed =
                     supplied_session.is_some_and(|session| session.starts_with("typed:"));
                 if editor_views && is_typed && named.is_none() {
@@ -720,7 +708,7 @@ impl Facade {
                         .cloned()
                         .context("not connected")?;
                     if named.is_some() && !joined.identity.editor {
-                        bail!("conversation is only for a chat of an editor window that draws Sidevoice's view: answer with the session_id and revision of the voice message.");
+                        bail!("conversation is only for a chat of an editor window: answer with the session_id and revision of the voice message.");
                     }
                     publish["binding_id"] = json!(joined.binding_id);
                     publish["client_ref"] = json!(chosen);
@@ -772,7 +760,7 @@ impl Facade {
                 if let Some(name) = named {
                     self.adopt_by_id(name, &client).await;
                 }
-                if self.views() && named.is_none() {
+                if self.several_chats() && named.is_none() {
                     bail!("Several chats of this window may be joined; pass the conversation id voice_connect returned in this chat.");
                 }
                 let chosen = self.pick(named).await?.context("not connected")?;
@@ -859,7 +847,7 @@ impl Facade {
         let Some(harness) = self.registry.client(client).cloned() else {
             return;
         };
-        if !self.views() || !harness.adopts(Some(name)) {
+        if !self.several_chats() || !harness.adopts(Some(name)) {
             return;
         }
         if self.joined.lock().await.contains_key(name) {
@@ -894,7 +882,7 @@ impl Facade {
     }
 }
 
-fn tools(view: Option<View>) -> Vec<Tool> {
+fn tools() -> Vec<Tool> {
     let spec = [
         ("voice_connect", "Connect this conversation to the voice room. Only on an explicit request to join or enable voice. Fails, saying what to ask the user, when a room is named that this machine is not paired with; with no room paired it joins this machine only (local_only).", json!({"title":{"type":"string","description":"Short label for this conversation in the room"},"room":{"type":"string","description":"The room's address (https://…) when the user names one; omitted, the room this machine is paired with"}}), vec![]),
         ("voice_pair", "Pair this machine with a room using the one-time code the user read from the room's interface (\"Emparejar máquina\"). Only with a code the user gave you; one room per machine, a new pairing replaces the previous one.", json!({"room":{"type":"string","description":"The room's address (https://…)"},"code":{"type":"string","description":"The one-time pairing code shown by the room"}}), vec!["room","code"]),
@@ -905,11 +893,7 @@ fn tools(view: Option<View>) -> Vec<Tool> {
     ];
     spec.into_iter().map(|(name, description, properties, required)| {
         let schema = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
-        let mut tool = Tool::new(name, description, schema.as_object().unwrap().clone());
-        if let Some(view) = view.filter(|_| name == "voice_connect") {
-            tool.meta = Some(serde_json::from_value(json!({"ui":{"resourceUri":view.uri},"ui/resourceUri":view.uri})).unwrap());
-        }
-        tool
+        Tool::new(name, description, schema.as_object().unwrap().clone())
     }).collect()
 }
 
@@ -928,19 +912,11 @@ fn prompt_text(args: Option<&serde_json::Map<String, Value>>) -> String {
     format!("Join the voice room for this conversation and keep it reachable.\n\n1. Call voice_status. If it reports joined and room_reachable (or local_only), say so in one line and stop.\n2. Call voice_connect with the title {title}. If the user named a room, pass its address as room.\n   If it returns local_only, the machine has no room: relay that note in one line and continue.\n   If it fails saying this machine is not paired with the room (or is paired with a different one), ask the user for the room's address and the one-time code the room shows them under \"Emparejar máquina\"; call voice_pair with both, then voice_connect again. Never try to get a code from the room yourself.\n3. Tell the user in one line whether the room can reach this conversation. If inbound.ok is false, relay inbound.reason and offer inbound.remedy in your own words, including what safeguard it removes; change nothing yourself.\n\nNothing else is registered: the room learns that a message was read and whether this conversation is working from what the harness itself records about it. How to behave once joined is in this server's instructions.")
 }
 
-/// A view as an MCP resource listing names it.
-fn view_resource(view: &View) -> Value {
-    json!({"uri":view.uri,"name":view.name,"mimeType":view.mime})
-}
-
 impl ServerHandler for Facade {
     fn get_info(&self) -> ServerConfig {
         let mut capabilities = ServerCapabilities::default();
         capabilities.tools = Some(Default::default());
         capabilities.prompts = Some(Default::default());
-        if self.views() {
-            capabilities.resources = Some(Default::default());
-        }
         ServerConfig::new(capabilities)
             .with_server_info(Implementation::new(
                 "sidevoice",
@@ -956,14 +932,11 @@ impl ServerHandler for Facade {
     ) -> std::result::Result<InitializeResult, McpError> {
         let client = serde_json::to_value(&request.client_info).unwrap_or_else(|_| json!({}));
         let client_caps = serde_json::to_value(&request.capabilities).unwrap_or_else(|_| json!({}));
-        let view = self
+        let several = self
             .registry
             .client(&client)
-            .and_then(|harness| harness.view(&client_caps));
-        *self
-            .view
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = view;
+            .is_some_and(|harness| harness.hosts_several_chats(&client_caps));
+        self.several_chats.store(several, Ordering::Relaxed);
         context.peer.set_peer_info(request.clone());
         self.negotiate_initialize(&request)
     }
@@ -973,13 +946,11 @@ impl ServerHandler for Facade {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, McpError> {
-        Ok(ListToolsResult::with_all_items(tools(self.view())))
+        Ok(ListToolsResult::with_all_items(tools()))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        tools(self.view())
-            .into_iter()
-            .find(|tool| tool.name == name)
+        tools().into_iter().find(|tool| tool.name == name)
     }
 
     async fn call_tool(
@@ -1028,39 +999,6 @@ impl ServerHandler for Facade {
         }
         let message = prompt_text(request.arguments.as_ref());
         Ok(GetPromptResult::new(vec![PromptMessage::new_text(Role::User, message)]).into())
-    }
-
-    async fn list_resources(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> std::result::Result<ListResourcesResult, McpError> {
-        let resources = self
-            .view()
-            .map(|view| serde_json::from_value(view_resource(&view)).unwrap())
-            .into_iter()
-            .collect::<Vec<_>>();
-        Ok(ListResourcesResult::with_all_items(resources))
-    }
-
-    async fn read_resource(
-        &self,
-        request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> std::result::Result<ReadResourceResponse, McpError> {
-        let Some(view) = self.view().filter(|view| request.uri == view.uri) else {
-            return Err(McpError::invalid_params("unknown resource", None));
-        };
-        self.view_reads.fetch_add(1, Ordering::Relaxed);
-        let html = (view.html)();
-        let meta: MetaObject = serde_json::from_value((view.meta)())
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        Ok(
-            ReadResourceResult::new(vec![ResourceContents::text(html, view.uri)
-                .with_mime_type(view.mime)
-                .with_meta(meta)])
-            .into(),
-        )
     }
 }
 
