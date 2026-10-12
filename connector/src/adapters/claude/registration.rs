@@ -27,7 +27,7 @@ impl Claude {
             Ok(_) => {}
         }
         // Settings Claude Code cannot parse are left alone: its CLI is not even asked.
-        if settings_unparsable(&settings_file(host.profile())) {
+        if settings_unparsable(&super::user_config(host.profile())) {
             return Ok("invalid".into());
         }
         let Some(binary) = binary else {
@@ -175,12 +175,6 @@ impl Claude {
     }
 }
 
-/// The file Claude Code keeps its user-scope MCP servers in: `.claude.json` in its configuration directory, which the
-/// connector always names to it (`CLAUDE_CONFIG_DIR`).
-fn settings_file(profile: &Profile) -> PathBuf {
-    profile.claude.join(".claude.json")
-}
-
 /// Whether `file` is there and is not JSON. One too large to read here is not judged: the CLI says.
 fn settings_unparsable(file: &Path) -> bool {
     const LIMIT: u64 = 64 << 20;
@@ -260,7 +254,7 @@ impl Registration for Claude {
         let command = shell_command(binary.unwrap_or("claude"), &add_args(host));
         json!({
             "command":command.clone(),
-            "file":settings_file(host.profile()).to_string_lossy(),
+            "file":super::user_config(host.profile()).to_string_lossy(),
             "snippet":command,
         })
     }

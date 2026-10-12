@@ -527,6 +527,60 @@ async fn unparsable_settings_are_listed_invalid_with_their_file_and_left_alone()
     host.shutdown().await;
 }
 
+/// Claude Code reads its user configuration from `~/.claude.json` unless the person's environment sets
+/// `CLAUDE_CONFIG_DIR`, and from `$CLAUDE_CONFIG_DIR/.claude.json` when it does: that file is the one judged and named.
+#[tokio::test]
+async fn claude_settings_are_judged_where_claude_code_reads_them() {
+    let _turn = agent_env().await;
+    let mut fixture = Fixture::new();
+    fixture.profile.claude = fixture.profile.home.join(".claude");
+    private_mkdir(&fixture.profile.claude);
+    let claude = fake_claude(&fixture);
+    let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", claude.as_os_str());
+    let in_home = fixture.profile.home.join(".claude.json");
+    let in_config_dir = fixture.profile.claude.join(".claude.json");
+    let file = |listed: &Value| row(listed, "claude").pointer("/instructions/file").cloned();
+
+    // Unset: `~/.claude.json`. A broken file inside `~/.claude` is not Claude Code's and is not read.
+    fixture.profile.claude_config_dir_set = false;
+    private_write(&in_config_dir, b"{\"mcpServers\": {");
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_eq!(
+        row(&listed, "claude")["registration"],
+        "not-connected",
+        "{listed}"
+    );
+    assert_eq!(file(&listed), Some(json!(in_home.to_string_lossy())));
+    private_write(&in_home, b"{\"mcpServers\": {");
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_eq!(
+        row(&listed, "claude")["registration"],
+        "invalid",
+        "{listed}"
+    );
+    host.shutdown().await;
+
+    // Set: `$CLAUDE_CONFIG_DIR/.claude.json`, whatever `~/.claude.json` holds.
+    fixture.profile.claude_config_dir_set = true;
+    write_json(&in_config_dir, &json!({}));
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_eq!(
+        row(&listed, "claude")["registration"],
+        "not-connected",
+        "{listed}"
+    );
+    assert_eq!(file(&listed), Some(json!(in_config_dir.to_string_lossy())));
+    private_write(&in_config_dir, b"{\"mcpServers\": {");
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_eq!(
+        row(&listed, "claude")["registration"],
+        "invalid",
+        "{listed}"
+    );
+    host.shutdown().await;
+}
 #[tokio::test]
 async fn complete_request_gate_orders_scans_mutations_and_external_dismissals() {
     let _turn = agent_env().await;
@@ -1006,7 +1060,7 @@ fn fake_claude(fixture: &Fixture) -> PathBuf {
     private_write(
         &binary,
         br##"#!/bin/sh
-home="$CLAUDE_CONFIG_DIR"
+home="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 entry="$home/fake-entry.txt"
 printf '%s\n' "$*" >> "$home/calls"
 case "$1 $2" in
