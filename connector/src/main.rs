@@ -2,7 +2,6 @@ mod adapters;
 mod agents;
 mod core_package;
 mod core_ready;
-mod cursor_app;
 mod daemon;
 mod identity;
 mod install;
@@ -113,6 +112,9 @@ enum Action {
     /// The installer's step for the core: stage the core this package carries into RELEASE/core.
     #[command(hide = true)]
     StageCore { release: std::path::PathBuf },
+    /// The test bench's question about the agents: a JSON request on stdin, the JSON answer on stdout.
+    #[command(hide = true)]
+    BenchAgents,
 }
 
 #[derive(Subcommand)]
@@ -177,6 +179,7 @@ fn version(json: bool) -> String {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    logfile::private_ids(adapters::Registry::standard().private_id_prefixes());
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
@@ -232,7 +235,9 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
                 LoginSetting::Status => None,
             }),
         };
-        let answer = service::run(action).await;
+        let homes = adapters::Registry::standard().homes();
+        let agent_vars: Vec<&'static str> = homes.iter().map(|home| home.var).collect();
+        let answer = service::run(action, &agent_vars).await;
         let ok = answer.get("ok") == Some(&Value::Bool(true));
         if json {
             println!("{answer}");
@@ -247,6 +252,13 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
             ExitCode::FAILURE
         });
     }
+    if let Action::BenchAgents = &action {
+        let mut request = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut request)?;
+        let request: Value = serde_json::from_str(&request)?;
+        println!("{}", adapters::registration::bench_agents(&request));
+        return Ok(ExitCode::SUCCESS);
+    }
     if let Action::StageCore { release } = &action {
         let installed = core_package::install(&core_package::package_root()?, release)?;
         if json {
@@ -260,7 +272,7 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let profile = Profile::from_env()?;
+    let profile = Profile::from_env(&adapters::Registry::standard().homes())?;
     match action {
         Action::Install { no_agents } => {
             let package = install::Package::running()?;
@@ -327,6 +339,7 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
         }
         Action::Service { .. } => unreachable!("service commands run before the profile"),
         Action::StageCore { .. } => unreachable!("the core is staged before the profile"),
+        Action::BenchAgents => unreachable!("the bench is answered before the profile"),
     }
 }
 
@@ -431,9 +444,9 @@ mod tests {
     fn the_command_line_parses_and_names_no_proof_mode() {
         Cli::command().debug_assert();
         assert!(Cli::try_parse_from(["x", "--profile-root", "/tmp/p", "mcp"]).is_err());
-        assert!(Cli::try_parse_from(["x", "codex", "inspect"]).is_err());
+        assert!(Cli::try_parse_from(["x", "some-agent", "inspect"]).is_err());
         assert!(Cli::try_parse_from(["x", "runtime-identity"]).is_err());
-        let cli = Cli::try_parse_from(["x", "agents", "connect", "codex", "--json"]).unwrap();
+        let cli = Cli::try_parse_from(["x", "agents", "connect", "some-agent", "--json"]).unwrap();
         assert!(cli.json);
         let cli = Cli::try_parse_from(["x", "--version", "--json"]).unwrap();
         assert!(cli.version && cli.json);

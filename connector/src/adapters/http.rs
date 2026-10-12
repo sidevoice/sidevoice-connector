@@ -1,5 +1,9 @@
+use super::conversation::Conversation;
+use super::harness::{no_route, Harness};
 use super::Identity;
+use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
+use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
 use std::env;
 use std::process::Stdio;
@@ -93,4 +97,41 @@ pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
         bail!("Harness delivery failed ({status})");
     }
     Ok(json!({"status":"accepted","detail":format!("receiver answered {status}")}))
+}
+
+/// Whether `delivery` is the HTTP route of conversation `thread`.
+pub fn accepts(delivery: &Value, thread: &str) -> bool {
+    delivery.get("kind").and_then(Value::as_str) == Some("http")
+        && delivery.get("thread").and_then(Value::as_str) == Some(thread)
+}
+
+/// Any agent whose conversations take voice by HTTP (`SIDEVOICE_DELIVERY_URL`): the harness of an id no other claims.
+pub struct Http;
+
+impl Harness for Http {
+    fn id(&self) -> &'static str {
+        "http"
+    }
+
+    fn capabilities(&self) -> Value {
+        capabilities()
+    }
+
+    fn accepts(&self, delivery: &Value, thread: &str) -> bool {
+        accepts(delivery, thread)
+    }
+
+    fn deliver<'a>(
+        &'a self,
+        conversation: &'a Conversation,
+        frame: &'a Value,
+        _profile: &'a Profile,
+    ) -> BoxFuture<'a, Result<Value>> {
+        Box::pin(async move {
+            match conversation.route_kind() {
+                Some("http") => deliver(&conversation.delivery, frame).await,
+                _ => Ok(no_route(&conversation.thread)),
+            }
+        })
+    }
 }

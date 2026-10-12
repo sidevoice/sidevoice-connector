@@ -591,6 +591,7 @@ mod tests {
         let layout = Layout::from_vars(
             |name| (name == "HOME").then(|| "/home/u".into()),
             Vec::new(),
+            &[],
         )
         .unwrap();
         let base = BTreeMap::from([
@@ -609,23 +610,16 @@ mod tests {
     }
 
     /// An agent home the installing environment leaves unset is unset in the job too, whatever the user's manager
-    /// carries: Claude Code then reads `~/.claude.json`, as it does for the person.
+    /// carries: the agent then uses its own default there, as it does for the person.
     #[test]
     fn a_unit_does_not_inherit_an_agent_home_its_profile_leaves_unset() {
         let unset = Layout::from_vars(
             |name| (name == "HOME").then(|| "/home/u".into()),
             Vec::new(),
+            &["ALPHA_HOME", "BETA_HOME"],
         )
         .unwrap();
-        assert_eq!(
-            unset.agent_dirs_unset(),
-            [
-                "CLAUDE_CONFIG_DIR",
-                "CODEX_HOME",
-                "CURSOR_CONFIG_DIR",
-                "CURSOR_DATA_DIR"
-            ]
-        );
+        assert_eq!(unset.agent_dirs_unset(), ["ALPHA_HOME", "BETA_HOME"]);
         let env = environment(&unset, Kind::Systemd);
         let unit = unit_text(
             "x",
@@ -636,21 +630,20 @@ mod tests {
             2,
         )
         .unwrap();
-        assert!(unit.contains(
-            "\nUnsetEnvironment=CLAUDE_CONFIG_DIR CODEX_HOME CURSOR_CONFIG_DIR CURSOR_DATA_DIR\n"
-        ));
-        assert!(!unit.contains("Environment=\"CLAUDE_CONFIG_DIR="));
+        assert!(unit.contains("\nUnsetEnvironment=ALPHA_HOME BETA_HOME\n"));
+        assert!(!unit.contains("Environment=\"ALPHA_HOME="));
 
         let named = Layout::from_vars(
             |name| match name {
                 "HOME" => Some("/home/u".into()),
-                "CLAUDE_CONFIG_DIR" => Some("/home/u/.claude".into()),
+                "ALPHA_HOME" => Some("/home/u/.alpha".into()),
                 _ => None,
             },
             Vec::new(),
+            &["ALPHA_HOME", "BETA_HOME"],
         )
         .unwrap();
-        assert!(!named.agent_dirs_unset().contains(&"CLAUDE_CONFIG_DIR"));
+        assert!(!named.agent_dirs_unset().contains(&"ALPHA_HOME"));
         let env = environment(&named, Kind::Systemd);
         let unit = unit_text(
             "x",
@@ -662,10 +655,10 @@ mod tests {
         )
         .unwrap();
         assert!(
-            unit.contains("Environment=\"CLAUDE_CONFIG_DIR=/home/u/.claude\""),
+            unit.contains("Environment=\"ALPHA_HOME=/home/u/.alpha\""),
             "{unit}"
         );
-        assert!(unit.contains("UnsetEnvironment=CODEX_HOME CURSOR_CONFIG_DIR CURSOR_DATA_DIR\n"));
+        assert!(unit.contains("UnsetEnvironment=BETA_HOME\n"));
     }
 
     #[test]

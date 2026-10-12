@@ -737,38 +737,6 @@ async fn unregister(profile: &Profile) -> Value {
     Value::Object(outcomes)
 }
 
-/// What Cursor can and cannot do with a room, said at install so that nobody expects more.
-const CURSOR_NOTES: &str = "Cursor: ask a chat to join the voice room; it speaks its replies there. The first time, \
-Cursor asks to approve the new MCP server (cursor-agent: or run  cursor-agent mcp enable sidevoice ). What you say in \
-the room reaches Cursor only by experimental routes, because Cursor offers none of its own:\n  - Cursor CLI: only a \
-chat started with  cursor-agent persist  (needs tmux); the room types into its terminal.\n  - Cursor editor: a small \
-Sidevoice card appears under the join call; while it stays open in that chat, the room sends to it. Several chats of \
-a window can join, each with its own card.\nIf you type while the room sends, the two mix.";
-
-/// Claude Code holds what other local processes send to a session that bypasses permission prompts.
-fn inbound_warning(profile: &Profile) -> Option<String> {
-    let settings = profile.claude.join("settings.json");
-    let parsed: Value = serde_json::from_slice(&fs::read(&settings).ok()?).ok()?;
-    if parsed
-        .get("crossSessionInbound")
-        .is_some_and(|value| !value.is_null())
-        || parsed
-            .pointer("/permissions/defaultMode")
-            .and_then(Value::as_str)
-            != Some("bypassPermissions")
-    {
-        return None;
-    }
-    Some(format!(
-        "This machine runs Claude Code sessions in bypassPermissions, and those hold what the room sends instead of \
-         delivering it: voice looks sent and never arrives. Either start a session with\n  --settings \
-         '{{\"crossSessionInbound\":\"accept\"}}'\nor add \"crossSessionInbound\": \"accept\" to {}. That second one \
-         lets any local process post into every Claude session on this machine, which is the safeguard it removes: \
-         your call, not ours.",
-        settings.display()
-    ))
-}
-
 /// What is left for the person after an install.
 fn advice(profile: &Profile, answer: &Value) -> Vec<String> {
     let mut next = Vec::new();
@@ -791,19 +759,10 @@ fn advice(profile: &Profile, answer: &Value) -> Vec<String> {
         );
     }
     let agents = answer["agents"].as_object();
-    let has = |id: &str| agents.is_some_and(|agents| agents.contains_key(id));
-    if has("claude") {
-        next.push(
-            "In a conversation, ask to join the voice room. Sessions already open need a restart before they see \
-             the server."
-                .to_owned(),
-        );
-        if let Some(warning) = inbound_warning(profile) {
-            next.push(warning);
+    for (id, registration) in crate::adapters::Registry::standard().agents() {
+        if agents.is_some_and(|agents| agents.contains_key(id)) {
+            next.extend(registration.after_install(profile));
         }
-    }
-    if has("cursor") {
-        next.push(CURSOR_NOTES.to_owned());
     }
     next
 }
@@ -992,7 +951,10 @@ pub(crate) mod tests {
     impl Fixture {
         fn new(label: &str) -> Self {
             let scratch = Scratch::new(label);
-            let profile = Profile::for_test(&scratch.0.join("profile"));
+            let profile = Profile::for_test(
+                &scratch.0.join("profile"),
+                &crate::adapters::Registry::standard().homes(),
+            );
             Self {
                 scratch,
                 profile,

@@ -7,10 +7,10 @@
 //!   `node-stopped.json` (a person's stop), `credentials.json` (the room pairing), `outbox.json`, `core/core.json`
 //!   and `core/local.sock`.
 //! - `R`, the release root: `$XDG_DATA_HOME/sidevoice` (else `~/.local/share/sidevoice`), as `service/layout.rs` names it.
-//! - The agents' homes: `$CLAUDE_CONFIG_DIR` (`~/.claude`), `$CODEX_HOME` (`~/.codex`), `$CURSOR_CONFIG_DIR`
-//!   (`~/.cursor`) and `$CURSOR_DATA_DIR` (`<cursor>/data`). `CLAUDE_CONFIG_DIR` is passed on only when the person's
-//!   environment sets it: with it, Claude Code keeps its user configuration in `$CLAUDE_CONFIG_DIR/.claude.json`;
-//!   without it, in `~/.claude.json` (its data stays in `~/.claude` either way).
+//! - The agents' homes, each named by a variable its harness declares ([`AgentHome`]): the variable's value, else
+//!   its default below `HOME` (or below another home of the same agent). A home that is not always passed on reaches
+//!   a child only when the person's environment sets it, so the agent uses its own default there as it does for
+//!   the person.
 //!
 //! Every path is absolute. The directories are checked again at each operation boundary, not trusted from startup:
 //! they are passed to agents' command lines and written into.
@@ -22,18 +22,44 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Where an agent's home is when its variable is unset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HomeDefault {
+    /// Below `HOME`.
+    Home(&'static str),
+    /// Below another home (named by its variable), declared before it.
+    Under(&'static str, &'static str),
+}
+
+/// A directory an agent keeps, named by an environment variable: what a harness declares of its homes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgentHome {
+    pub var: &'static str,
+    pub default: HomeDefault,
+    /// Passed to a child even when the environment leaves the variable unset (the agent reads that very default).
+    pub always_passed: bool,
+    /// Its configuration is what Sidevoice's registration reads and writes (`validate_for_agent`).
+    pub config: bool,
+    /// Checked through its parent rather than itself.
+    pub check_parent: bool,
+}
+
+/// An agent's home as this profile resolves it.
+#[derive(Clone, Debug)]
+pub struct ResolvedHome {
+    pub spec: AgentHome,
+    pub path: PathBuf,
+    /// Whether the environment sets its variable.
+    pub set: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Profile {
     pub home: PathBuf,
-    /// Claude Code's data directory: `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
-    pub claude: PathBuf,
-    /// Whether the environment sets `CLAUDE_CONFIG_DIR`; only then is it passed on to Claude Code.
-    pub claude_config_dir_set: bool,
     /// `D`, the data directory.
     pub data: PathBuf,
-    pub codex: PathBuf,
-    pub cursor: PathBuf,
-    pub cursor_data: PathBuf,
+    /// The agents' homes, as their harnesses declare them.
+    pub agent_homes: Vec<ResolvedHome>,
     pub xdg_config: PathBuf,
     pub xdg_data: PathBuf,
     pub socket: PathBuf,
@@ -42,31 +68,22 @@ pub struct Profile {
 }
 
 impl Profile {
-    /// This user's profile from the environment.
-    pub fn from_env() -> Result<Self> {
-        Self::from_vars(|key| std::env::var_os(key))
+    /// This user's profile from the environment, with the agents' homes `homes` declares.
+    pub fn from_env(homes: &[AgentHome]) -> Result<Self> {
+        Self::from_vars(|key| std::env::var_os(key), homes)
     }
 
-    fn from_vars(var: impl Fn(&str) -> Option<OsString>) -> Result<Self> {
+    pub fn from_vars(var: impl Fn(&str) -> Option<OsString>, homes: &[AgentHome]) -> Result<Self> {
         let home = PathBuf::from(var("HOME").context("HOME is not set")?);
         if !home.is_absolute() {
             bail!("HOME must be absolute");
         }
         let or = |key: &str, fallback: PathBuf| var(key).map(PathBuf::from).unwrap_or(fallback);
         let data = or("SIDEVOICE_DATA_DIR", home.join(".sidevoice"));
-        let claude_config_dir_set = var("CLAUDE_CONFIG_DIR").is_some();
-        let claude = or("CLAUDE_CONFIG_DIR", home.join(".claude"));
-        let codex = or("CODEX_HOME", home.join(".codex"));
-        let cursor = or("CURSOR_CONFIG_DIR", home.join(".cursor"));
-        let cursor_data = or("CURSOR_DATA_DIR", cursor.join("data"));
         let xdg_config = or("XDG_CONFIG_HOME", home.join(".config"));
         let xdg_data = or("XDG_DATA_HOME", home.join(".local/share"));
         for (name, path) in [
             ("SIDEVOICE_DATA_DIR", &data),
-            ("CLAUDE_CONFIG_DIR", &claude),
-            ("CODEX_HOME", &codex),
-            ("CURSOR_CONFIG_DIR", &cursor),
-            ("CURSOR_DATA_DIR", &cursor_data),
             ("XDG_CONFIG_HOME", &xdg_config),
             ("XDG_DATA_HOME", &xdg_data),
         ] {
@@ -74,18 +91,36 @@ impl Profile {
                 bail!("{name} must be absolute");
             }
         }
+        let mut agent_homes: Vec<ResolvedHome> = Vec::new();
+        for spec in homes {
+            let set = var(spec.var).is_some();
+            let fallback = match spec.default {
+                HomeDefault::Home(relative) => home.join(relative),
+                HomeDefault::Under(parent, relative) => agent_homes
+                    .iter()
+                    .find(|resolved| resolved.spec.var == parent)
+                    .with_context(|| format!("{} is declared before {parent}", spec.var))?
+                    .path
+                    .join(relative),
+            };
+            let path = or(spec.var, fallback);
+            if !path.is_absolute() {
+                bail!("{} must be absolute", spec.var);
+            }
+            agent_homes.push(ResolvedHome {
+                spec: *spec,
+                path,
+                set,
+            });
+        }
         let core = data.join("core");
         let profile = Self {
             home,
-            claude,
-            claude_config_dir_set,
             socket: data.join("connector.sock"),
             core_socket: core.join("local.sock"),
             core_ready: core.join("core.json"),
             data,
-            codex,
-            cursor,
-            cursor_data,
+            agent_homes,
             xdg_config,
             xdg_data,
         };
@@ -93,9 +128,18 @@ impl Profile {
         Ok(profile)
     }
 
+    /// The home named by `var`, as this profile resolves it. A harness asks only for homes it declares.
+    pub fn agent_home(&self, var: &str) -> &Path {
+        self.agent_homes
+            .iter()
+            .find(|resolved| resolved.spec.var == var)
+            .map(|resolved| resolved.path.as_path())
+            .unwrap_or_else(|| panic!("{var} is not a declared agent home"))
+    }
+
     /// The version this connector reports: the build's.
     pub fn connector_version(&self) -> &str {
-        crate::identity::VERSION
+        env!("SIDEVOICE_CONNECTOR_VERSION")
     }
 
     /// What identifies the running build to a client that checks it (`identity`).
@@ -104,13 +148,16 @@ impl Profile {
             "runtime_target":env!("SIDEVOICE_CONNECTOR_TARGET")})
     }
 
-    /// Passes this profile on to a child, whatever the child's own environment was cleared to.
+    /// Passes this profile on to a child, whatever the child's own environment was cleared to. A home that is
+    /// passed on only when set is removed from the child's environment when it is not.
     pub fn command_env<'a>(
         &self,
         command: &'a mut tokio::process::Command,
     ) -> &'a mut tokio::process::Command {
-        if !self.claude_config_dir_set {
-            command.env_remove("CLAUDE_CONFIG_DIR");
+        for resolved in &self.agent_homes {
+            if !resolved.spec.always_passed && !resolved.set {
+                command.env_remove(resolved.spec.var);
+            }
         }
         for (key, value) in self.variables() {
             command.env(key, value);
@@ -118,22 +165,21 @@ impl Profile {
         command
     }
 
-    /// The variables a child is given: every directory, except `CLAUDE_CONFIG_DIR` when the environment leaves it
-    /// unset (Claude Code then uses its own default, as it does for the person).
+    /// The variables a child is given: every directory, except an agent's home its harness passes on only when the
+    /// environment sets it, and it does not (the agent then uses its own default, as it does for the person).
     pub fn variables(&self) -> Vec<(&'static str, &Path)> {
-        let mut variables = vec![
-            ("HOME", self.home.as_path()),
-            ("CLAUDE_CONFIG_DIR", self.claude.as_path()),
-            ("CODEX_HOME", &self.codex),
-            ("CURSOR_CONFIG_DIR", &self.cursor),
-            ("CURSOR_DATA_DIR", &self.cursor_data),
-            ("XDG_CONFIG_HOME", &self.xdg_config),
-            ("XDG_DATA_HOME", &self.xdg_data),
-            ("SIDEVOICE_DATA_DIR", &self.data),
-        ];
-        if !self.claude_config_dir_set {
-            variables.retain(|(key, _)| *key != "CLAUDE_CONFIG_DIR");
-        }
+        let mut variables = vec![("HOME", self.home.as_path())];
+        variables.extend(
+            self.agent_homes
+                .iter()
+                .filter(|resolved| resolved.spec.always_passed || resolved.set)
+                .map(|resolved| (resolved.spec.var, resolved.path.as_path())),
+        );
+        variables.extend([
+            ("XDG_CONFIG_HOME", self.xdg_config.as_path()),
+            ("XDG_DATA_HOME", self.xdg_data.as_path()),
+            ("SIDEVOICE_DATA_DIR", self.data.as_path()),
+        ]);
         variables
     }
 
@@ -186,16 +232,23 @@ impl Profile {
                 Err(error) => return Err(error.into()),
             }
         }
-        for path in [
-            &self.home,
-            &self.claude,
-            &self.codex,
-            self.cursor.parent().context("Cursor config parent")?,
-            &self.cursor_data,
+        let mut paths = vec![self.home.as_path()];
+        for resolved in &self.agent_homes {
+            paths.push(if resolved.spec.check_parent {
+                resolved
+                    .path
+                    .parent()
+                    .with_context(|| format!("{} parent", resolved.spec.var))?
+            } else {
+                resolved.path.as_path()
+            });
+        }
+        paths.extend([
             self.xdg_config.parent().context("XDG config parent")?,
             &self.xdg_config,
             &self.xdg_data,
-        ] {
+        ]);
+        for path in paths {
             match fs::symlink_metadata(path) {
                 Ok(_) => {
                     validate_user_directory(path)?;
@@ -207,13 +260,14 @@ impl Profile {
         Ok(())
     }
 
-    /// Before an agent's configuration is read or changed: it is one of the three this profile names, and a
+    /// Before an agent's configuration is read or changed: it is a configuration home this profile names, and a
     /// directory of the person's.
     pub fn validate_for_agent(&self, config_root: &Path) -> Result<()> {
         self.validate_existing_private()?;
-        if config_root != self.claude.as_path()
-            && config_root != self.codex.as_path()
-            && config_root != self.cursor.as_path()
+        if !self
+            .agent_homes
+            .iter()
+            .any(|resolved| resolved.spec.config && resolved.path == config_root)
         {
             bail!("unknown agent configuration directory");
         }
@@ -240,18 +294,20 @@ impl Profile {
 
     /// A profile entirely inside `root`, with every directory made private: what unit tests run in.
     #[cfg(test)]
-    pub fn for_test(root: &Path) -> Self {
+    pub fn for_test(root: &Path, homes: &[AgentHome]) -> Self {
         use std::os::unix::fs::DirBuilderExt;
-        for child in [
-            "home",
-            "claude",
-            "codex",
-            "cursor/config",
-            "cursor/data",
-            "xdg/config",
-            "xdg/data",
-            "sidevoice/core",
-        ] {
+        let mut children = vec![
+            "home".to_owned(),
+            "xdg/config".into(),
+            "xdg/data".into(),
+            "sidevoice/core".into(),
+        ];
+        children.extend(
+            homes
+                .iter()
+                .map(|home| format!("agents/{}", home.var.to_ascii_lowercase())),
+        );
+        for child in &children {
             fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
@@ -260,22 +316,27 @@ impl Profile {
         }
         let root = root.canonicalize().unwrap();
         let path = |child: &str| -> OsString { root.join(child).into_os_string() };
-        let variables = [
-            ("HOME", path("home")),
-            ("CLAUDE_CONFIG_DIR", path("claude")),
-            ("CODEX_HOME", path("codex")),
-            ("CURSOR_CONFIG_DIR", path("cursor/config")),
-            ("CURSOR_DATA_DIR", path("cursor/data")),
-            ("XDG_CONFIG_HOME", path("xdg/config")),
-            ("XDG_DATA_HOME", path("xdg/data")),
-            ("SIDEVOICE_DATA_DIR", path("sidevoice")),
+        let mut variables = vec![
+            ("HOME".to_owned(), path("home")),
+            ("XDG_CONFIG_HOME".into(), path("xdg/config")),
+            ("XDG_DATA_HOME".into(), path("xdg/data")),
+            ("SIDEVOICE_DATA_DIR".into(), path("sidevoice")),
         ];
-        Self::from_vars(|key| {
-            variables
-                .iter()
-                .find(|(name, _)| *name == key)
-                .map(|(_, value)| value.clone())
-        })
+        variables.extend(homes.iter().map(|home| {
+            (
+                home.var.to_owned(),
+                path(&format!("agents/{}", home.var.to_ascii_lowercase())),
+            )
+        }));
+        Self::from_vars(
+            |key| {
+                variables
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.clone())
+            },
+            homes,
+        )
         .unwrap()
     }
 }
@@ -299,11 +360,36 @@ mod tests {
         }
     }
 
+    /// Two agents' homes as a harness would declare them: one passed on always, one only when set, one below it.
+    const HOMES: [AgentHome; 3] = [
+        AgentHome {
+            var: "ALPHA_HOME",
+            default: HomeDefault::Home(".alpha"),
+            always_passed: true,
+            config: true,
+            check_parent: false,
+        },
+        AgentHome {
+            var: "BETA_HOME",
+            default: HomeDefault::Home(".beta"),
+            always_passed: false,
+            config: true,
+            check_parent: true,
+        },
+        AgentHome {
+            var: "BETA_DATA",
+            default: HomeDefault::Under("BETA_HOME", "data"),
+            always_passed: true,
+            config: false,
+            check_parent: false,
+        },
+    ];
+
     #[test]
     fn the_layout_derives_from_home_unless_each_place_is_named() {
         let scratch = Scratch::new("layout");
         let home = scratch.0.to_string_lossy().into_owned();
-        let profile = Profile::from_vars(vars(&[("HOME", &home)])).unwrap();
+        let profile = Profile::from_vars(vars(&[("HOME", &home)]), &HOMES).unwrap();
         assert_eq!(profile.data, scratch.0.join(".sidevoice"));
         assert_eq!(profile.socket, scratch.0.join(".sidevoice/connector.sock"));
         assert_eq!(
@@ -314,92 +400,115 @@ mod tests {
             profile.core_ready,
             scratch.0.join(".sidevoice/core/core.json")
         );
-        assert_eq!(profile.claude, scratch.0.join(".claude"));
-        assert_eq!(profile.codex, scratch.0.join(".codex"));
-        assert_eq!(profile.cursor, scratch.0.join(".cursor"));
-        assert_eq!(profile.cursor_data, scratch.0.join(".cursor/data"));
+        assert_eq!(profile.agent_home("ALPHA_HOME"), scratch.0.join(".alpha"));
+        assert_eq!(profile.agent_home("BETA_HOME"), scratch.0.join(".beta"));
+        assert_eq!(
+            profile.agent_home("BETA_DATA"),
+            scratch.0.join(".beta/data")
+        );
         assert_eq!(profile.connector_version(), crate::identity::VERSION);
 
         let data = scratch.0.join("elsewhere");
-        let named = Profile::from_vars(vars(&[
-            ("HOME", &home),
-            ("SIDEVOICE_DATA_DIR", data.to_str().unwrap()),
-            ("XDG_DATA_HOME", "/xdg-data"),
-        ]))
+        let beta = scratch.0.join("beta");
+        let named = Profile::from_vars(
+            vars(&[
+                ("HOME", &home),
+                ("SIDEVOICE_DATA_DIR", data.to_str().unwrap()),
+                ("XDG_DATA_HOME", "/xdg-data"),
+                ("BETA_HOME", beta.to_str().unwrap()),
+            ]),
+            &HOMES,
+        )
         .unwrap();
         assert_eq!(named.data, data);
+        assert_eq!(named.agent_home("BETA_DATA"), beta.join("data"));
     }
 
-    /// Claude Code keeps its user configuration in `~/.claude.json` unless `CLAUDE_CONFIG_DIR` is set: a child is
-    /// given the variable only when the person's environment sets it, and never a stray one otherwise.
+    /// A home its harness passes on only when set reaches a child only when the environment sets it, and a stray
+    /// inherited value is removed; one passed always reaches it either way.
     #[test]
-    fn claude_config_dir_is_passed_on_only_when_the_environment_sets_it() {
-        let scratch = Scratch::new("claude-config");
+    fn a_home_passed_only_when_set_reaches_a_child_only_then() {
+        let scratch = Scratch::new("passed-when-set");
         let home = scratch.0.to_string_lossy().into_owned();
-        let passed = |profile: &Profile| {
+        let passed = |profile: &Profile, key: &str| {
             let mut command = tokio::process::Command::new("true");
             profile.command_env(&mut command);
             command
                 .as_std()
                 .get_envs()
-                .find(|(key, _)| *key == "CLAUDE_CONFIG_DIR")
+                .find(|(name, _)| *name == key)
                 .map(|(_, value)| value.map(|value| value.to_owned()))
         };
 
-        let unset = Profile::from_vars(vars(&[("HOME", &home)])).unwrap();
+        let unset = Profile::from_vars(vars(&[("HOME", &home)]), &HOMES).unwrap();
+        assert!(!unset.variables().iter().any(|(key, _)| *key == "BETA_HOME"));
         assert_eq!(
-            unset.claude,
-            scratch.0.join(".claude"),
-            "its data stays in ~/.claude"
+            passed(&unset, "BETA_HOME"),
+            Some(None),
+            "an inherited value is removed"
         );
-        assert!(!unset
-            .variables()
-            .iter()
-            .any(|(key, _)| *key == "CLAUDE_CONFIG_DIR"));
-        assert_eq!(passed(&unset), Some(None), "an inherited value is removed");
+        assert_eq!(
+            passed(&unset, "ALPHA_HOME"),
+            Some(Some(scratch.0.join(".alpha").into_os_string()))
+        );
         let layout = crate::service::layout::Layout::from_profile(&unset);
-        assert!(!layout.agent_dirs.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(!layout.agent_dirs.contains_key("BETA_HOME"));
+        assert!(layout.agent_dirs_unset().contains(&"BETA_HOME"));
 
-        let named = scratch.0.join("claude-home");
+        let named = scratch.0.join("beta-home");
         fs::create_dir(&named).unwrap();
         fs::set_permissions(&named, fs::Permissions::from_mode(0o700)).unwrap();
-        let set = Profile::from_vars(vars(&[
-            ("HOME", &home),
-            ("CLAUDE_CONFIG_DIR", named.to_str().unwrap()),
-        ]))
+        let set = Profile::from_vars(
+            vars(&[("HOME", &home), ("BETA_HOME", named.to_str().unwrap())]),
+            &HOMES,
+        )
         .unwrap();
-        assert_eq!(set.claude, named);
-        assert_eq!(passed(&set), Some(Some(named.clone().into_os_string())));
+        assert_eq!(
+            passed(&set, "BETA_HOME"),
+            Some(Some(named.clone().into_os_string()))
+        );
         let layout = crate::service::layout::Layout::from_profile(&set);
-        assert_eq!(layout.agent_dirs.get("CLAUDE_CONFIG_DIR"), Some(&named));
+        assert_eq!(layout.agent_dirs.get("BETA_HOME"), Some(&named));
     }
 
     #[test]
     fn relative_or_missing_places_are_refused() {
-        assert!(Profile::from_vars(vars(&[])).is_err());
-        assert!(Profile::from_vars(vars(&[("HOME", "relative")])).is_err());
+        assert!(Profile::from_vars(vars(&[]), &HOMES).is_err());
+        assert!(Profile::from_vars(vars(&[("HOME", "relative")]), &HOMES).is_err());
+        assert!(Profile::from_vars(
+            vars(&[("HOME", "/tmp"), ("SIDEVOICE_DATA_DIR", "data")]),
+            &HOMES
+        )
+        .is_err());
         assert!(
-            Profile::from_vars(vars(&[("HOME", "/tmp"), ("SIDEVOICE_DATA_DIR", "data")])).is_err()
+            Profile::from_vars(vars(&[("HOME", "/tmp"), ("ALPHA_HOME", "alpha")]), &HOMES).is_err()
         );
     }
 
     #[test]
     fn a_data_directory_others_can_enter_or_a_replaced_agent_home_is_refused() {
         let scratch = Scratch::new("trust");
-        let profile = Profile::for_test(&scratch.0);
+        let profile = Profile::for_test(&scratch.0, &HOMES);
+        let config = profile
+            .agent_homes
+            .iter()
+            .filter(|home| home.spec.config)
+            .map(|home| home.path.clone())
+            .collect::<Vec<_>>();
+        let (first, second) = (&config[0], &config[1]);
         profile.validate_existing_private().unwrap();
         fs::set_permissions(&profile.data, fs::Permissions::from_mode(0o750)).unwrap();
         assert!(profile.validate_existing_private().is_err());
         fs::set_permissions(&profile.data, fs::Permissions::from_mode(0o700)).unwrap();
 
-        fs::set_permissions(&profile.codex, fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(profile.validate_for_agent(&profile.codex).is_err());
-        fs::set_permissions(&profile.codex, fs::Permissions::from_mode(0o700)).unwrap();
-        profile.validate_for_agent(&profile.codex).unwrap();
+        fs::set_permissions(second, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(profile.validate_for_agent(second).is_err());
+        fs::set_permissions(second, fs::Permissions::from_mode(0o700)).unwrap();
+        profile.validate_for_agent(second).unwrap();
         assert!(profile.validate_for_agent(&profile.home).is_err());
 
-        fs::remove_dir(&profile.claude).unwrap();
-        std::os::unix::fs::symlink(&profile.codex, &profile.claude).unwrap();
+        fs::remove_dir(first).unwrap();
+        std::os::unix::fs::symlink(second, first).unwrap();
         assert!(profile.validate_existing_private().is_err());
     }
 
@@ -407,7 +516,7 @@ mod tests {
     fn missing_directories_are_not_unsafe_and_one_connector_holds_the_data_directory() {
         let scratch = Scratch::new("fresh");
         let home = scratch.0.to_string_lossy().into_owned();
-        let profile = Profile::from_vars(vars(&[("HOME", &home)])).unwrap();
+        let profile = Profile::from_vars(vars(&[("HOME", &home)]), &HOMES).unwrap();
         assert!(!profile.data.exists());
         crate::secure_fs::ensure_private_dir(&profile.data).unwrap();
         let held = profile.try_connector_lock().unwrap();
@@ -419,7 +528,7 @@ mod tests {
     #[test]
     fn a_person_stop_marker_is_honoured_and_must_be_private() {
         let scratch = Scratch::new("stop");
-        let profile = Profile::for_test(&scratch.0);
+        let profile = Profile::for_test(&scratch.0, &HOMES);
         assert!(!profile.service_stopped().unwrap());
         let marker = profile.data.join("node-stopped.json");
         crate::secure_fs::atomic_json(&marker, &json!({"at":"now"})).unwrap();

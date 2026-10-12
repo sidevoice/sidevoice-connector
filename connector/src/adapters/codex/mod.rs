@@ -1,3 +1,18 @@
+mod harness;
+mod registration;
+mod rollout;
+
+pub use harness::Codex;
+
+/// Codex's home (`config.toml`, sessions).
+pub const HOME: crate::profile::AgentHome = crate::profile::AgentHome {
+    var: "CODEX_HOME",
+    default: crate::profile::HomeDefault::Home(".codex"),
+    always_passed: true,
+    config: true,
+    check_parent: false,
+};
+
 use super::{envelope, Identity};
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
@@ -89,7 +104,7 @@ pub async fn deliver(delivery: &Value, event: &Value, profile: &Profile) -> Resu
     let result = tokio::time::timeout(
         Duration::from_secs(30),
         command
-            .env("CODEX_HOME", &profile.codex)
+            .env(HOME.var, profile.agent_home(HOME.var))
             .args(["queue", "--thread", thread, "--message"])
             .arg(envelope(event)?)
             .stdout(Stdio::null())

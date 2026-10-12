@@ -394,8 +394,8 @@ pub async fn login(layout: &Layout, on: Option<bool>) -> Result<Value> {
 }
 
 /// One service command against the installation this environment names: its JSON answer.
-pub async fn run(action: Action) -> Value {
-    let layout = match Layout::from_env() {
+pub async fn run(action: Action, agent_vars: &[&'static str]) -> Value {
+    let layout = match Layout::from_env(agent_vars) {
         Ok(layout) => layout,
         Err(error) => return Failure::plain(error).value(),
     };

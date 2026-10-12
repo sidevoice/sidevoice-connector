@@ -17,9 +17,15 @@ const DELIVERY_TIMEOUT: Duration = Duration::from_secs(20);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn resource_html() -> String {
-    include_str!("cursor-app.html")
-        .replace("__SIDEVOICE_EN__", include_str!("../messages/card/en.json"))
-        .replace("__SIDEVOICE_ES__", include_str!("../messages/card/es.json"))
+    include_str!("app.html")
+        .replace(
+            "__SIDEVOICE_EN__",
+            include_str!("../../../messages/card/en.json"),
+        )
+        .replace(
+            "__SIDEVOICE_ES__",
+            include_str!("../../../messages/card/es.json"),
+        )
 }
 
 #[derive(Debug)]

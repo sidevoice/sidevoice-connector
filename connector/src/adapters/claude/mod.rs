@@ -1,3 +1,19 @@
+mod harness;
+mod registration;
+
+pub use harness::Claude;
+
+/// Claude Code's home: its data (projects, sessions) and, when the variable is set, its user configuration. Passed
+/// on only when the person's environment sets it: Claude Code keeps its user configuration, MCP servers included,
+/// in `~/.claude.json` without it and in `$CLAUDE_CONFIG_DIR/.claude.json` with it.
+pub const HOME: crate::profile::AgentHome = crate::profile::AgentHome {
+    var: "CLAUDE_CONFIG_DIR",
+    default: crate::profile::HomeDefault::Home(".claude"),
+    always_passed: false,
+    config: true,
+    check_parent: false,
+};
+
 use super::{envelope, Identity};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -8,6 +24,10 @@ use std::process::Command;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+
+pub fn capabilities() -> Value {
+    json!({"deliver":"supported","inspectInbound":"supported","working":"supported","endOfTurn":"supported","sessionIdentity":"supported"})
+}
 
 fn config_dir() -> PathBuf {
     env::var_os("CLAUDE_CONFIG_DIR")
@@ -262,6 +282,42 @@ pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Claude Code keeps its user configuration in `~/.claude.json` unless `CLAUDE_CONFIG_DIR` is set (in
+    /// `$CLAUDE_CONFIG_DIR/.claude.json` then): its home reaches a child only when the person's environment sets it.
+    #[test]
+    fn claude_config_dir_is_passed_on_only_when_the_environment_sets_it() {
+        use crate::profile::Profile;
+        let scratch = crate::secure_fs::tests::Scratch::new("claude-home");
+        let home = scratch.0.to_string_lossy().into_owned();
+        let homes = crate::adapters::Registry::standard().homes();
+        let unset =
+            Profile::from_vars(|key| (key == "HOME").then(|| home.clone().into()), &homes).unwrap();
+        assert_eq!(
+            unset.agent_home(HOME.var),
+            scratch.0.join(".claude"),
+            "its data stays in ~/.claude"
+        );
+        assert!(!unset
+            .variables()
+            .iter()
+            .any(|(key, _)| *key == "CLAUDE_CONFIG_DIR"));
+
+        let named = scratch.0.join("elsewhere");
+        let set = Profile::from_vars(
+            |key| match key {
+                "HOME" => Some(home.clone().into()),
+                "CLAUDE_CONFIG_DIR" => Some(named.clone().into_os_string()),
+                _ => None,
+            },
+            &homes,
+        )
+        .unwrap();
+        assert!(set
+            .variables()
+            .iter()
+            .any(|(key, path)| *key == "CLAUDE_CONFIG_DIR" && *path == named));
+    }
 
     #[test]
     fn assistant_engine_takes_the_turn_effort() {
