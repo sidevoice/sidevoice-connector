@@ -125,6 +125,8 @@ enum AgentsAction {
     Disconnect { id: String },
     /// Dismiss the new-agent notice for the agent.
     Dismiss { id: String },
+    /// Check that the agent's Sidevoice entry starts and answers MCP.
+    Check { id: String },
 }
 
 #[derive(Subcommand)]
@@ -343,7 +345,7 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
     }
 }
 
-/// `agents [--json]`, `agents connect|disconnect|dismiss <id> [--json]`.
+/// `agents [--json]`, `agents connect|disconnect|dismiss|check <id> [--json]`.|disconnect|dismiss <id> [--json]`.
 async fn agents_command(
     profile: Profile,
     action: Option<AgentsAction>,
@@ -367,6 +369,7 @@ async fn agents_command(
             Some(id),
             "Dismissed the new-agent notice for {agent}.",
         ),
+        Some(AgentsAction::Check { id }) => ("agents.check", Some(id), ""),
     };
     let params = match id {
         Some(id) => json!({"id":id}),
@@ -400,7 +403,23 @@ async fn agents_command(
             .map(str::to_owned)
             .unwrap_or_else(|| messages::message(&format!("harness.{id}"), &json!({})))
     };
+    // What a check found, for a connected agent: `, working` or `, not starting: <why>`.
+    let health = |row: &Value| match row["health"]["state"].as_str() {
+        Some("working") => ", working".to_owned(),
+        Some(_) => format!(
+            ", not starting: {}",
+            row["health"]["error"].as_str().unwrap_or("unknown")
+        ),
+        None => String::new(),
+    };
     match id {
+        Some(id) if matches!(action, Some(AgentsAction::Check { .. })) => {
+            let found = rows.iter().find(|row| row["id"] == id.as_str());
+            match found.filter(|row| row["registration"] == "connected") {
+                Some(row) => println!("{}: connected{}", label(id), health(row)),
+                None => println!("{}: not connected, nothing to check", label(id)),
+            }
+        }
         Some(id) => println!("{}", done.replace("{agent}", &label(id))),
         None if rows.is_empty() => println!("No supported agents were found on this computer."),
         None => {
@@ -415,8 +434,9 @@ async fn agents_command(
                 };
                 let version = row["version"].as_str().unwrap_or("version unknown");
                 println!(
-                    "{}: {state} ({version})",
-                    row["label"].as_str().unwrap_or("?")
+                    "{}: {state}{} ({version})",
+                    row["label"].as_str().unwrap_or("?"),
+                    health(row)
                 );
             }
         }

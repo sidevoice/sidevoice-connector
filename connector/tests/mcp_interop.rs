@@ -115,3 +115,29 @@ fn codex_names_its_conversation_in_each_calls_meta() {
     assert_eq!(answer["conversation"], thread, "{answer}");
     assert_eq!(answer["harness"], "codex", "{answer}");
 }
+
+/// The agents' health check starts the server as an agent would, with `SIDEVOICE_HEALTH_CHECK` set, and asks only
+/// for the handshake and the tool list: the server answers both without a daemon, and starts none.
+#[test]
+fn a_health_check_gets_the_tools_and_starts_no_daemon() {
+    let profile = Profile::new("health");
+    let mut command = profile.connector(&["mcp"]);
+    command.env("SIDEVOICE_HEALTH_CHECK", "1");
+    let mut mcp = Mcp::start(command);
+    let initialized = mcp.request(
+        "initialize",
+        json!({"protocolVersion": OLDER, "capabilities": {},
+               "clientInfo": {"name": "sidevoice-health", "version": "test"}}),
+    );
+    assert_eq!(initialized["protocolVersion"], OLDER, "{initialized}");
+    mcp.notify("notifications/initialized", json!({}));
+    let tools = mcp.request("tools/list", json!({}));
+    assert!(names(&tools["tools"]).contains(&"voice_connect"), "{tools}");
+    mcp.stop();
+    for file in ["connector.sock", "connector.lock"] {
+        assert!(
+            !profile.data().join(file).exists(),
+            "{file}: a health check started the daemon"
+        );
+    }
+}

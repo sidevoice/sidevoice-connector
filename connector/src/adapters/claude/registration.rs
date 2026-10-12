@@ -1,9 +1,10 @@
-//! Sidevoice's entry in Claude Code (`claude mcp`, user scope).
+//! Sidevoice's entry in Claude Code: written with `claude mcp`, user scope; read back from its user configuration
+//! (`adapters::claude::user_config`).
 
 use super::Claude;
 use crate::adapters::registration::{
-    looks_absent, run_required, shell_command_in, strings, AgentError, AgentHost, BenchSetup,
-    CliError, Manual, ManualStep, Registration,
+    run_required, shell_command_in, strings, AgentError, AgentHost, BenchSetup, Entry, Launch,
+    Manual, ManualStep, Registration,
 };
 use crate::profile::Profile;
 use futures_util::future::BoxFuture;
@@ -16,103 +17,101 @@ use std::path::{Path, PathBuf};
 const REMOVE: [&str; 5] = ["mcp", "remove", "--scope", "user", "sidevoice"];
 
 impl Claude {
+    /// The `sidevoice` entry of Claude Code's user scope, read from its configuration file and never through `claude
+    /// mcp get`, which starts the server it names: a foreign command must not run, and ours would start the daemon.
     async fn entry_state(
         &self,
         host: &dyn AgentHost,
         binary: Option<&str>,
-    ) -> Result<String, AgentError> {
-        // Settings Claude Code cannot parse are left alone, whatever else is there: its CLI is not even asked.
-        if super::read_user_config(host.profile()).is_err() {
-            return Ok("invalid".into());
-        }
-        match fs::symlink_metadata(host.profile().agent_home(super::HOME.var)) {
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok("absent".into()),
-            Err(_) => return Ok("invalid".into()),
+    ) -> Result<Entry, AgentError> {
+        let profile = host.profile();
+        // Settings Claude Code cannot parse are left alone, whatever else is there: nothing else is judged.
+        let Ok(config) = super::read_user_config(profile) else {
+            return Ok(Entry::bare("invalid"));
+        };
+        match fs::symlink_metadata(profile.agent_home(super::HOME.var)) {
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Entry::bare("absent")),
+            Err(_) => return Ok(Entry::bare("invalid")),
             Ok(_) => {}
         }
-        let Some(binary) = binary else {
-            return Ok("unknown".into());
-        };
-        let output = match host
-            .run(binary, strings(&["mcp", "get", "sidevoice"]))
-            .await
-        {
-            Ok(output) => output,
-            Err(CliError::Cancelled) => return Err(AgentError::Cancelled),
-            Err(_) => return Ok("unknown".into()),
-        };
-        if !output.status.success() {
-            let detail = format!("{}\n{}", output.stdout, output.stderr);
-            if (output.status.code() == Some(1) && detail.trim().is_empty())
-                || looks_absent(&detail)
-            {
-                return Ok("absent".into());
-            }
-            return Ok("unknown".into());
+        // Registering goes through its CLI: without one, what the file says cannot be acted on.
+        if binary.is_none() {
+            return Ok(Entry::bare("unknown"));
         }
-        let detail = format!("{}\n{}", output.stdout, output.stderr);
-        let field = |name: &str| -> Option<String> {
-            detail.lines().find_map(|line| {
-                let (key, value) = line.trim().split_once(':')?;
-                key.eq_ignore_ascii_case(name)
-                    .then(|| value.trim().to_owned())
-            })
+        let Some(config) = config else {
+            return Ok(Entry::bare("absent"));
         };
-        let Some(command) = field("Command").filter(|value| !value.is_empty()) else {
-            return Ok(if looks_absent(&detail) {
+        let Some(config) = config.as_object() else {
+            return Ok(Entry::bare("invalid"));
+        };
+        let Some(servers) = config.get("mcpServers") else {
+            return Ok(Entry::bare("absent"));
+        };
+        let Some(entry) = servers
+            .as_object()
+            .and_then(|servers| servers.get("sidevoice"))
+        else {
+            return Ok(Entry::bare(if servers.is_object() {
                 "absent"
             } else {
-                "unknown"
-            }
-            .into());
+                "invalid"
+            }));
         };
-        let args = field("Args")
-            .map(|value| {
-                value
-                    .split_whitespace()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
+        // Another transport (`http`, `sse`) or no command: not an entry Sidevoice writes.
+        let stdio = entry
+            .get("type")
+            .and_then(Value::as_str)
+            .is_none_or(|kind| kind == "stdio");
+        let Some(command) = entry
+            .get("command")
+            .and_then(Value::as_str)
+            .filter(|command| stdio && !command.is_empty())
+            .map(str::to_owned)
+        else {
+            return Ok(Entry::bare("foreign"));
+        };
+        let Some(args) = strings_of(entry.get("args")) else {
+            return Ok(Entry::bare("invalid"));
+        };
+        let env = entry
+            .get("env")
+            .and_then(Value::as_object)
+            .map(|env| {
+                env.iter()
+                    .map(|(key, value)| (key.clone(), value.as_str().unwrap_or("").to_owned()))
+                    .collect::<BTreeMap<_, _>>()
             })
             .unwrap_or_default();
-        let user_scope =
-            field("Scope").is_some_and(|value| value.to_ascii_lowercase().contains("user"));
-        if !user_scope {
-            return Ok("foreign".into());
-        }
-        // The block under `Environment:`, one `KEY=value` per line, indented below the field.
-        let env = detail
-            .lines()
-            .skip_while(|line| !line.trim().eq_ignore_ascii_case("Environment:"))
-            .skip(1)
-            .take_while(|line| line.starts_with("    ") && line.contains('='))
-            .filter_map(|line| line.trim().split_once('='))
-            .map(|(key, value)| (key.to_owned(), value.to_owned()))
-            .collect::<BTreeMap<_, _>>();
-        if host.owns(&command, &args) {
-            Ok(
-                if command == host.command() && args == host.args() && env == host.mcp_env() {
-                    "connected"
-                } else {
-                    "owned-old"
-                }
-                .into(),
-            )
+        let state = if !host.owns(&command, &args) {
+            "foreign"
+        } else if command == host.command() && args == host.args() && env == host.mcp_env() {
+            "connected"
         } else {
-            Ok("foreign".into())
-        }
+            "owned-old"
+        };
+        Ok(Entry::with(
+            state,
+            Launch {
+                command,
+                args,
+                env,
+                cwd: None,
+            },
+        ))
     }
 
     async fn registration_state(
         &self,
         host: &dyn AgentHost,
         binary: Option<&str>,
-    ) -> Result<String, AgentError> {
-        let state = self.entry_state(host, binary).await?;
-        Ok(match state.as_str() {
-            "absent" => "not-connected".into(),
-            "owned-old" => "outdated".into(),
-            _ => state,
-        })
+    ) -> Result<Entry, AgentError> {
+        let mut entry = self.entry_state(host, binary).await?;
+        match entry.registration.as_str() {
+            "absent" => entry.registration = "not-connected".into(),
+            "owned-old" => entry.registration = "outdated".into(),
+            _ => {}
+        }
+        Ok(entry)
     }
 
     async fn connect_entry(
@@ -121,7 +120,7 @@ impl Claude {
         binary: Option<&str>,
     ) -> Result<(), AgentError> {
         let binary = binary.ok_or(AgentError::Key("agents.manual-required"))?;
-        let state = self.entry_state(host, Some(binary)).await?;
+        let state = self.entry_state(host, Some(binary)).await?.registration;
         if state == "connected" {
             return Ok(());
         }
@@ -137,7 +136,7 @@ impl Claude {
         host.live()?;
         if state == "absent" || state == "owned-old" {
             // A second probe just before mutation closes the gap with an external CLI writer.
-            let again = self.entry_state(host, Some(binary)).await?;
+            let again = self.entry_state(host, Some(binary)).await?.registration;
             if again == "foreign" {
                 return Err(AgentError::Key("agents.foreign"));
             }
@@ -163,7 +162,10 @@ impl Claude {
         binary: Option<&str>,
     ) -> Result<(), AgentError> {
         let binary = binary.ok_or(AgentError::Key("agents.registration-unknown"))?;
-        let state = self.registration_state(host, Some(binary)).await?;
+        let state = self
+            .registration_state(host, Some(binary))
+            .await?
+            .registration;
         match state.as_str() {
             "not-connected" => Ok(()),
             // Ours, current or not (an older release, another environment): removed.
@@ -226,7 +228,7 @@ impl Registration for Claude {
         &'a self,
         host: &'a dyn AgentHost,
         binary: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<String, AgentError>> {
+    ) -> BoxFuture<'a, Result<Entry, AgentError>> {
         Box::pin(self.registration_state(host, binary))
     }
 
@@ -265,6 +267,18 @@ impl Registration for Claude {
             step(&strings(&REMOVE)),
             step(&strings(&["mcp", "remove", "sidevoice"])),
         )
+    }
+}
+
+/// The strings of a JSON array; none at all is no arguments, anything but strings is not an entry.
+fn strings_of(value: Option<&Value>) -> Option<Vec<String>> {
+    match value {
+        None => Some(Vec::new()),
+        Some(value) => value
+            .as_array()?
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned))
+            .collect(),
     }
 }
 
@@ -474,7 +488,23 @@ mod tests {
         assert_eq!(state(&Host(profile), None).await, "invalid");
     }
 
+    /// Through a dotfiles link, the entry is read as from the file: this installation's is `connected`, and one an
+    /// older Sidevoice wrote (another environment) is `owned-old`.
+    #[tokio::test]
+    async fn entries_are_read_through_a_link() {
+        let scratch = Scratch::new("claude-linked-entry");
+        let (profile, file) = profile(&scratch, false, true);
+        let target = linked(&scratch, &file, "claude.json");
+        let host = Host(profile);
+        for (env, expected) in [(json!({}), "connected"), (json!({"OLD": "1"}), "owned-old")] {
+            let config = json!({"mcpServers": {"sidevoice": {"type": "stdio",
+                "command": "/nowhere/sidevoice", "args": [], "env": env}}});
+            write(&target, config.to_string().as_bytes(), 0o600);
+            assert_eq!(state(&host, Some("/nowhere/claude")).await, expected);
+        }
+    }
+
     async fn state(host: &Host, binary: Option<&str>) -> String {
-        Claude.entry_state(host, binary).await.unwrap()
+        Claude.entry_state(host, binary).await.unwrap().registration
     }
 }

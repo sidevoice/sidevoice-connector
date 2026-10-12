@@ -4,8 +4,9 @@
 //! One gate owns a complete request. CLI children belong to its worker task so a vanished link reply can
 //! cancel the work without releasing the gate before the child has exited.
 
+use crate::adapters::health::{self, Health};
 use crate::adapters::registration::{
-    mcp_servers_json, shell_command, AgentError, AgentHost, CliError, CliOutput, Manual,
+    mcp_servers_json, shell_command, AgentError, AgentHost, CliError, CliOutput, Launch, Manual,
     Registration,
 };
 use crate::adapters::Registry;
@@ -17,6 +18,7 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::MetadataExt;
@@ -39,6 +41,12 @@ const REQUEST_LIMIT: StdDuration = StdDuration::from_secs(18);
 const CHILD_LIMIT: StdDuration = StdDuration::from_millis(2500);
 const OUTPUT_LIMIT: usize = 64 * 1024;
 const STATE_LIMIT: u64 = 4 * 1024 * 1024;
+/// The longest a health check of one agent takes.
+const HEALTH_LIMIT: StdDuration = StdDuration::from_secs(5);
+/// What a request keeps after its health checks, to save what it found.
+const HEALTH_MARGIN: StdDuration = StdDuration::from_secs(1);
+/// Less than this left and a scan keeps the last health it found rather than check.
+const HEALTH_MINIMUM: StdDuration = StdDuration::from_millis(500);
 
 #[derive(Clone)]
 struct Cancellation {
@@ -56,7 +64,8 @@ impl Cancellation {
 
     fn cancel(&self) {
         if !self.cancelled.swap(true, Ordering::SeqCst) {
-            self.notify.notify_one();
+            // Every waiter: a scan checks several agents at once, each waiting on the same request.
+            self.notify.notify_waiters();
         }
     }
 
@@ -277,6 +286,8 @@ struct Evidence<'a> {
 
 struct Observation {
     row: Value,
+    /// How the agent starts Sidevoice's entry, when its configuration names one.
+    launch: Option<Launch>,
     binary: Option<String>,
     present: bool,
     signature: Option<String>,
@@ -421,13 +432,15 @@ impl HostAgents {
                 .get("scanned_at")
                 .is_some_and(|value| !value.is_null());
             if rescan || watch.is_some() || !has_cache {
-                state = self.scan(state, watch, true, cancel, deadline).await?;
+                state = self
+                    .scan(state, watch, true, true, cancel, deadline)
+                    .await?;
             }
             return self.response(&state);
         }
 
         let action = method.strip_prefix("agents.").unwrap_or("");
-        if !matches!(action, "connect" | "disconnect" | "dismiss") {
+        if !matches!(action, "connect" | "disconnect" | "dismiss" | "check") {
             return Err(Failure::keyed(
                 "agents.unknown-request",
                 json!({"route":method.chars().take(120).collect::<String>()}),
@@ -437,9 +450,19 @@ impl HostAgents {
         let agent = parse_id(&self.registry, id)?;
         let state = self.load_state(cancel, deadline).await?;
         let mut state = self
-            .scan(state, Some(agent), true, cancel, deadline)
+            .scan(
+                state,
+                Some(agent),
+                true,
+                action == "check",
+                cancel,
+                deadline,
+            )
             .await?;
         let current = seen_agent(&state, agent).ok_or_else(|| not_present(agent))?;
+        if action == "check" {
+            return self.response(&state);
+        }
         let registration = current
             .get("registration")
             .and_then(Value::as_str)
@@ -482,7 +505,7 @@ impl HostAgents {
             self.connect(agent, binary.as_deref(), cancel, deadline)
                 .await?;
             state = self
-                .scan(state, Some(agent), false, cancel, deadline)
+                .scan(state, Some(agent), false, true, cancel, deadline)
                 .await?;
             match seen_agent(&state, agent)
                 .and_then(|row| row.get("registration"))
@@ -530,7 +553,7 @@ impl HostAgents {
         self.disconnect(agent, binary.as_deref(), cancel, deadline)
             .await?;
         state = self
-            .scan(state, Some(agent), false, cancel, deadline)
+            .scan(state, Some(agent), false, false, cancel, deadline)
             .await?;
         match seen_agent(&state, agent)
             .and_then(|row| row.get("registration"))
@@ -591,6 +614,7 @@ impl HostAgents {
         state: Value,
         watch: Option<AgentId>,
         include_version: bool,
+        check: bool,
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<Value, Failure> {
@@ -635,8 +659,85 @@ impl HostAgents {
                 .await?,
             ));
         }
+        self.health(
+            &base,
+            &mut observations,
+            login_path.as_deref(),
+            check,
+            cancel,
+            deadline,
+        )
+        .await?;
         self.merge_scan(base, observations, login_path, cancel, deadline)
             .await
+    }
+
+    /// Each connected agent's `health`: checked now, all at once, when `check` and the request has the time; else the
+    /// last one found. An agent that is not connected has none.
+    async fn health(
+        &self,
+        base: &Value,
+        observations: &mut [(AgentId, Observation)],
+        login_path: Option<&str>,
+        check: bool,
+        cancel: &Cancellation,
+        deadline: Instant,
+    ) -> std::result::Result<(), Failure> {
+        let limit = deadline
+            .saturating_duration_since(Instant::now())
+            .saturating_sub(HEALTH_MARGIN)
+            .min(HEALTH_LIMIT);
+        let check = check && limit >= HEALTH_MINIMUM;
+        let environment = self.health_environment(login_path);
+        let environment = &environment;
+        let checks = observations.iter().map(|(id, observation)| {
+            let launch = observation
+                .launch
+                .as_ref()
+                .filter(|_| observation.row["registration"] == "connected");
+            let previous = base
+                .pointer(&format!("/seen/{id}/agent/health"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            async move {
+                let Some(launch) = launch else {
+                    return Ok(Value::Null);
+                };
+                if !check {
+                    return Ok(previous);
+                }
+                let found = health::check(launch, environment, limit, cancel.cancelled())
+                    .await
+                    .map_err(|_| Failure::Cancelled)?;
+                let (state, error) = match found {
+                    Health::Working => ("working", None),
+                    Health::NotStarting(error) => ("not-starting", Some(error)),
+                };
+                Ok(json!({"state":state,"error":error,"checked_at":iso_now()}))
+            }
+        });
+        let found = futures_util::future::join_all(checks).await;
+        for ((_, observation), health) in observations.iter_mut().zip(found) {
+            observation.row["health"] = health?;
+        }
+        Ok(())
+    }
+
+    /// What a health check starts a server with before its entry's own environment: what the agent would have had
+    /// from this profile (its homes, `HOME`), the person's login PATH as the scan captured it, and the marker that
+    /// keeps Sidevoice's own server from starting the daemon.
+    fn health_environment(&self, login_path: Option<&str>) -> Vec<(String, OsString)> {
+        let mut environment = self
+            .profile
+            .variables()
+            .iter()
+            .map(|(key, path)| ((*key).to_owned(), path.as_os_str().to_owned()))
+            .collect::<Vec<_>>();
+        if let Some(path) = login_path {
+            environment.push(("PATH".into(), path.into()));
+        }
+        environment.push((crate::mcp::HEALTH_CHECK.into(), "1".into()));
+        environment
     }
 
     async fn merge_scan(
@@ -1285,10 +1386,11 @@ impl HostAgents {
         let agent = self.registration(id)?;
         let host = self.host(agent, cancel, deadline);
         let binary = self.resolve_binary(id, agent, input.state, input.login_path);
-        let registration = agent
+        let entry = agent
             .state(&host, binary.as_deref())
             .await
             .map_err(|error| failure(error, id))?;
+        let registration = entry.registration;
         // The manual steps follow the state itself: an `outdated` entry is removed before ours is added.
         let manual = agent.manual(&host, &registration, binary.as_deref());
         // `outdated`: an entry of ours that is not the current one (disabled, an older release, another environment).
@@ -1354,9 +1456,11 @@ impl HostAgents {
             "present":present,
             "dismissed":false,
             "actionable":false,
+            "health":Value::Null,
         });
         Ok(Observation {
             row,
+            launch: entry.launch,
             binary,
             present,
             signature,

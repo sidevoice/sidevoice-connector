@@ -627,9 +627,8 @@ impl Daemon {
                 }
                 json!({})
             }
-            "agents.list" | "agents.connect" | "agents.disconnect" | "agents.dismiss" => {
-                self.host_agents.handle(method, params.clone()).await
-            }
+            "agents.list" | "agents.connect" | "agents.disconnect" | "agents.dismiss"
+            | "agents.check" => self.host_agents.handle(method, params.clone()).await,
             "pair.request" => {
                 let room = params.get("room").and_then(Value::as_str).unwrap_or("");
                 let code = params.get("code").and_then(Value::as_str).unwrap_or("");

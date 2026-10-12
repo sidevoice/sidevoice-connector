@@ -162,7 +162,8 @@ mod tests {
         let mut pipe = [0i32; 2];
         unsafe {
             assert_eq!(libc::pipe(pipe.as_mut_ptr()), 0);
-            let fd = libc::open(c_path.as_ptr(), libc::O_RDWR);
+            // Close-on-exec: a process another test spawns meanwhile must not inherit it and keep the lock held.
+            let fd = libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
             assert!(fd >= 0);
             let pid = libc::fork();
             assert!(pid >= 0);

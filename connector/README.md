@@ -14,7 +14,7 @@ this binary from the platform package (RELEASING.md); the command is then `sidev
 | `mcp` | MCP over stdio for one conversation; it reaches the daemon over `connector.sock`. |
 | `connector [--service]` | The daemon: one per data directory. `--service` (or `SIDEVOICE_SERVICE=launchd\|systemd`) when a service manager runs it. |
 | `agents [--json]` | The agents on this computer and whether they use Sidevoice. |
-| `agents connect\|disconnect\|dismiss <claude\|codex\|cursor> [--json]` | Registers Sidevoice with an agent, removes its registration, or dismisses the new-agent notice. Only an entry Sidevoice wrote is ever changed. |
+| `agents connect\|disconnect\|dismiss\|check <claude\|codex\|cursor> [--json]` | Registers Sidevoice with an agent, removes its registration, dismisses the new-agent notice, or checks that its registration works (below). Only an entry Sidevoice wrote is ever changed. |
 | `service <install\|start\|stop\|restart\|status\|uninstall> [--json]` | The login service: two jobs under launchd or the systemd user manager; with no manager, Sidevoice on demand (below). |
 | `service login <on\|off\|status> [--json]` | Whether the login service starts at the next login, and only that: turning it off stops nothing, turning it on starts nothing (below). |
 | `pair <room-url> <code> [--json]` | Pairs this machine with a room: redeems the one-time code the room shows at its `POST /api/connectors/pair` and writes `credentials.json` (0600). https only; plain http only to loopback or a host in `SIDEVOICE_TRUSTED_CLUSTER_HOSTS` (`.suffix` or exact host, comma-separated). The core follows the file; nothing restarts. |
@@ -100,6 +100,23 @@ that needs its configuration by hand is told how), unless `--no-agents`. Each re
 without them, disabled, or naming another release is not current (`outdated`), and is written again. An agent whose
 MCP settings cannot be read is `invalid` and left alone. Running `install` again is the recovery: a release whose core
 no longer matches its inventory is staged again.
+
+An agent whose registration is `connected` also says whether that registration works: its row in `agents` (and the
+connector's `agents.list`) carries `health`, `{"state","error","checked_at"}`. The connector starts the entry as the
+agent would: its command, arguments, environment and (Codex's `cwd`) working directory, read back from the agent's
+configuration over the profile's homes and the login PATH the scan captured. Claude Code's entry is read from
+the file its CLI reads (`$CLAUDE_CONFIG_DIR/.claude.json` when the person's environment sets the variable, else
+`~/.claude.json`), never with `claude mcp get`, which starts the server it names; nothing
+is started before the entry is known to be ours. The server gets `SIDEVOICE_HEALTH_CHECK=1`, which keeps `mcp` from
+reaching or starting the daemon. The connector sends `initialize`, `notifications/initialized` and `tools/list`
+(their results must be what the protocol defines: `protocolVersion`, `capabilities`, `serverInfo` with its name and
+version; tools with their names), calls no tool, and stops the server and its process group, within 5 s. `state` is
+`working`, or `not-starting` with `error` saying why in a few English words (`command not found`, `permission
+denied`, `could not start`, `working directory not found`, `exited with status N`, `killed by signal N`, `closed its
+output`, `timed out`, `protocol mismatch`); `checked_at` is when (ISO 8601, UTC). An agent that is not connected has
+`health: null`. The check runs on every scan (`agents.list` with `rescan` or `watch`), after a connect, and on demand
+(`agents.check`, `{"id"}`, or `agents check <id>`); a listing from the cache, and a request with too little time
+left, keep the last one found (in `agents.json`).
 
 `uninstall` unloads both jobs and stops what runs on demand (a refusal stops it there, with nothing deleted), removes
 the agents' registrations Sidevoice wrote (current or not), then `R` and everything in `D` but its lock files and the

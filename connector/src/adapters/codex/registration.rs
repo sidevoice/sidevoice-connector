@@ -2,17 +2,16 @@
 
 use super::Codex;
 use crate::adapters::registration::{
-    looks_absent, run_required, shell_command, shell_command_in, strings, AgentError, AgentHost,
-    BenchSetup, CliError, Manual, ManualStep, Registration,
+    looks_absent, read_profile_file, run_required, shell_command, shell_command_in, strings,
+    AgentError, AgentHost, BenchSetup, CliError, Entry, Launch, Manual, ManualStep, Registration,
 };
 use crate::profile::Profile;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use futures_util::future::BoxFuture;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 const REMOVE: [&str; 3] = ["mcp", "remove", "sidevoice"];
@@ -22,20 +21,20 @@ impl Codex {
         &self,
         host: &dyn AgentHost,
         binary: Option<&str>,
-    ) -> Result<String, AgentError> {
+    ) -> Result<Entry, AgentError> {
         let profile = host.profile();
         let guard = file_guard(host);
         if guard == "foreign" || guard == "invalid" {
-            return Ok(guard);
+            return Ok(Entry::bare(&guard));
         }
         if matches!(
             fs::symlink_metadata(profile.agent_home(super::HOME.var)),
             Err(ref error) if error.kind() == ErrorKind::NotFound
         ) {
-            return Ok("not-connected".into());
+            return Ok(Entry::bare("not-connected"));
         }
         let Some(binary) = binary else {
-            return Ok("unknown".into());
+            return Ok(Entry::bare("unknown"));
         };
         let output = match host
             .run(binary, strings(&["mcp", "get", "sidevoice", "--json"]))
@@ -43,18 +42,18 @@ impl Codex {
         {
             Ok(output) => output,
             Err(CliError::Cancelled) => return Err(AgentError::Cancelled),
-            Err(_) => return Ok("unknown".into()),
+            Err(_) => return Ok(Entry::bare("unknown")),
         };
         if !output.status.success() {
             let detail = format!("{}\n{}", output.stderr, output.stdout);
             if guard == "not-connected" && looks_absent(&detail) {
-                return Ok("not-connected".into());
+                return Ok(Entry::bare("not-connected"));
             }
-            return Ok("unknown".into());
+            return Ok(Entry::bare("unknown"));
         }
         let entry: Value = match serde_json::from_str(output.stdout.trim()) {
             Ok(value) => value,
-            Err(_) => return Ok("unknown".into()),
+            Err(_) => return Ok(Entry::bare("unknown")),
         };
         let transport = entry.get("transport");
         let command = transport
@@ -77,13 +76,10 @@ impl Codex {
             || command.is_none()
             || args.is_none()
         {
-            return Ok("invalid".into());
+            return Ok(Entry::bare("invalid"));
         }
         let command = command.unwrap_or_default();
         let args = args.unwrap_or_default();
-        if !host.owns(command, &args) {
-            return Ok("foreign".into());
-        }
         let enabled = entry.get("enabled").and_then(Value::as_bool) != Some(false);
         let env = transport
             .and_then(|value| value.get("env"))
@@ -94,15 +90,30 @@ impl Codex {
                     .collect::<BTreeMap<_, _>>()
             })
             .unwrap_or_default();
-        Ok(
-            if enabled && command == host.command() && args == host.args() && env == host.mcp_env()
-            {
-                "connected"
-            } else {
-                "outdated"
-            }
-            .into(),
-        )
+        let state = if !host.owns(command, &args) {
+            "foreign"
+        } else if enabled
+            && command == host.command()
+            && args == host.args()
+            && env == host.mcp_env()
+        {
+            "connected"
+        } else {
+            "outdated"
+        };
+        Ok(Entry::with(
+            state,
+            Launch {
+                command: command.to_owned(),
+                args,
+                env,
+                // Codex starts the server in it.
+                cwd: transport
+                    .and_then(|value| value.get("cwd"))
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from),
+            },
+        ))
     }
 
     async fn connect_entry(
@@ -111,7 +122,10 @@ impl Codex {
         binary: Option<&str>,
     ) -> Result<(), AgentError> {
         let binary = binary.ok_or(AgentError::Key("agents.manual-required"))?;
-        let state = self.registration_state(host, Some(binary)).await?;
+        let state = self
+            .registration_state(host, Some(binary))
+            .await?
+            .registration;
         if state == "connected" {
             return Ok(());
         }
@@ -124,7 +138,10 @@ impl Codex {
         if state == "unknown" {
             return Err(AgentError::Key("agents.registration-unknown"));
         }
-        let again = self.registration_state(host, Some(binary)).await?;
+        let again = self
+            .registration_state(host, Some(binary))
+            .await?
+            .registration;
         if again == "foreign" {
             return Err(AgentError::Key("agents.foreign"));
         }
@@ -149,7 +166,10 @@ impl Codex {
         binary: Option<&str>,
     ) -> Result<(), AgentError> {
         let binary = binary.ok_or(AgentError::Key("agents.registration-unknown"))?;
-        let state = self.registration_state(host, Some(binary)).await?;
+        let state = self
+            .registration_state(host, Some(binary))
+            .await?
+            .registration;
         match state.as_str() {
             "not-connected" => Ok(()),
             // Ours, current or not (disabled, an older release, another environment): removed.
@@ -185,11 +205,7 @@ fn file_guard(host: &dyn AgentHost) -> String {
         Err(_) => return "invalid".into(),
         Ok(_) => {}
     }
-    let root = match profile.agent_root(profile.agent_home(super::HOME.var)) {
-        Ok(root) => root,
-        Err(_) => return "invalid".into(),
-    };
-    let text = match read_profile_file(&file, &root, 1 << 20) {
+    let text = match read_profile_file(&file, 1 << 20) {
         Ok(text) => text,
         Err(_) => return "invalid".into(),
     };
@@ -228,20 +244,6 @@ fn file_guard(host: &dyn AgentHost) -> String {
         "foreign"
     }
     .into()
-}
-
-fn read_profile_file(path: &Path, root: &Path, limit: u64) -> Result<String> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o022 != 0
-        || metadata.len() > limit
-        || !path.canonicalize()?.starts_with(root)
-    {
-        anyhow::bail!("unsafe profile file");
-    }
-    fs::read_to_string(path).context("read profile file")
 }
 
 /// `mcp add` for this installation: its command, and the environment it runs with.
@@ -294,7 +296,7 @@ impl Registration for Codex {
         &'a self,
         host: &'a dyn AgentHost,
         binary: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<String, AgentError>> {
+    ) -> BoxFuture<'a, Result<Entry, AgentError>> {
         Box::pin(self.registration_state(host, binary))
     }
 

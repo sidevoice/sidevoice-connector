@@ -2,7 +2,7 @@
 
 use super::Cursor;
 use crate::adapters::registration::{
-    mcp_servers_json, AgentError, AgentHost, Manual, Registration,
+    mcp_servers_json, AgentError, AgentHost, Entry, Launch, Manual, Registration,
 };
 use crate::profile::Profile;
 use crate::secure_fs::validate_user_directory;
@@ -34,13 +34,13 @@ fn entry_command(entry: &Value) -> (&str, Vec<String>) {
     (command, args)
 }
 
-fn registration_state(host: &dyn AgentHost) -> Result<String> {
+fn registration_state(host: &dyn AgentHost) -> Result<Entry> {
     let profile = host.profile();
     profile.validate_existing_private()?;
     let file = super::config_home(profile).join("mcp.json");
     let root = profile.agent_root(super::config_home(profile))?;
     let Some((mut config, _mode, _target)) = read_cursor_config(&file, &root)? else {
-        return Ok("not-connected".into());
+        return Ok(Entry::bare("not-connected"));
     };
     let current = config
         .get_mut("mcpServers")
@@ -48,23 +48,27 @@ fn registration_state(host: &dyn AgentHost) -> Result<String> {
         .and_then(|servers| servers.get("sidevoice"))
         .cloned();
     let Some(current) = current else {
-        return Ok("not-connected".into());
+        return Ok(Entry::bare("not-connected"));
     };
     let (command, args) = entry_command(&current);
-    if !host.owns(command, &args) {
-        return Ok("foreign".into());
-    }
-    Ok(
-        if command == host.command()
-            && args == host.args()
-            && cursor_env(&current) == host.mcp_env()
-        {
-            "connected"
-        } else {
-            "outdated"
-        }
-        .into(),
-    )
+    let env = cursor_env(&current);
+    let state = if !host.owns(command, &args) {
+        "foreign"
+    } else if command == host.command() && args == host.args() && env == host.mcp_env() {
+        "connected"
+    } else {
+        "outdated"
+    };
+    Ok(Entry::with(
+        state,
+        Launch {
+            command: command.to_owned(),
+            args,
+            env,
+            // Cursor's stdio entries name no working directory.
+            cwd: None,
+        },
+    ))
 }
 
 fn connect_entry(host: &dyn AgentHost) -> Result<(), AgentError> {
@@ -275,8 +279,10 @@ impl Registration for Cursor {
         &'a self,
         host: &'a dyn AgentHost,
         _binary: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<String, AgentError>> {
-        Box::pin(async move { Ok(registration_state(host).unwrap_or_else(|_| "invalid".into())) })
+    ) -> BoxFuture<'a, Result<Entry, AgentError>> {
+        Box::pin(
+            async move { Ok(registration_state(host).unwrap_or_else(|_| Entry::bare("invalid"))) },
+        )
     }
 
     fn connect<'a>(
