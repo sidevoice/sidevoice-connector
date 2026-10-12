@@ -226,10 +226,11 @@ pub fn mcp_servers_json(
     })
 }
 
-/// A file in an agent's home, read only when it is the person's own (a regular file, not a link, writable by nobody
-/// else), at most `limit` bytes, and inside `root`. Anything else, a FIFO or a device included, is refused without
-/// waiting on it.
-pub fn read_profile_file(path: &Path, root: &Path, limit: u64) -> anyhow::Result<String> {
+/// A file in an agent's home, read only when it is the person's own (a regular file, writable by nobody else) and at
+/// most `limit` bytes. With `root`, it must be the file itself, not a link, inside `root`. Without, a link is followed
+/// wherever it leads (a dotfiles manager's, say), and the file it leads to is judged. A FIFO or a device is refused
+/// without waiting on it.
+pub fn read_profile_file(path: &Path, root: Option<&Path>, limit: u64) -> anyhow::Result<String> {
     use anyhow::Context;
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -239,17 +240,23 @@ pub fn read_profile_file(path: &Path, root: &Path, limit: u64) -> anyhow::Result
             && metadata.mode() & 0o022 == 0
             && metadata.len() <= limit
     };
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink()
-        || !regular(&metadata)
-        || !path.canonicalize()?.starts_with(root)
-    {
+    let mut flags = libc::O_NONBLOCK | libc::O_NOCTTY;
+    if let Some(root) = root {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink()
+            || !regular(&metadata)
+            || !path.canonicalize()?.starts_with(root)
+        {
+            anyhow::bail!("unsafe profile file");
+        }
+        flags |= libc::O_NOFOLLOW;
+    } else if !regular(&std::fs::metadata(path)?) {
         anyhow::bail!("unsafe profile file");
     }
     // Opened without waiting (a FIFO put there since would wait for a writer), then judged again as opened.
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_NOCTTY)
+        .custom_flags(flags)
         .open(path)
         .context("open profile file")?;
     if !regular(&file.metadata()?) {

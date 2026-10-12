@@ -315,8 +315,8 @@ mod tests {
         fn args(&self) -> &[String] {
             &[]
         }
-        fn owns(&self, _command: &str, _args: &[String]) -> bool {
-            false
+        fn owns(&self, command: &str, args: &[String]) -> bool {
+            command == self.command() && args.is_empty()
         }
         fn mcp_env(&self) -> BTreeMap<String, String> {
             BTreeMap::new()
@@ -400,6 +400,96 @@ mod tests {
             "the read waited on the FIFO, or did not refuse it"
         );
         assert_eq!(state(&Host(profile), None).await, "invalid");
+    }
+
+    /// Links `file` to `name` in a dotfiles directory (outside Claude's and the home's), and returns where it leads.
+    fn linked(scratch: &Scratch, file: &Path, name: &str) -> PathBuf {
+        let dotfiles = scratch.0.join("dotfiles");
+        fs::create_dir_all(&dotfiles).unwrap();
+        let target = dotfiles.join(name);
+        std::os::unix::fs::symlink(&target, file).unwrap();
+        target
+    }
+
+    fn write(path: &Path, bytes: &[u8], mode: u32) {
+        fs::write(path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Dotfiles managers link `~/.claude.json` from their own directory: the link is followed, and what it leads to
+    /// is read, or judged unparsable, as the file itself would be.
+    #[tokio::test]
+    async fn a_linked_user_configuration_is_read_where_the_link_leads() {
+        let scratch = Scratch::new("claude-linked");
+        let (profile, file) = profile(&scratch, false, true);
+        let target = linked(&scratch, &file, "claude.json");
+        write(&target, b"{\"mcpServers\": {}}", 0o600);
+        assert_eq!(
+            super::super::read_user_config(&profile),
+            Ok(Some(json!({"mcpServers": {}})))
+        );
+        write(&target, b"{\"mcpServers\": {", 0o600);
+        assert_eq!(state(&Host(profile), None).await, "invalid");
+        assert_eq!(fs::read(&target).unwrap(), b"{\"mcpServers\": {");
+    }
+
+    /// A link to a FIFO is refused at once, never waited on.
+    #[tokio::test]
+    async fn a_link_to_a_fifo_is_refused_without_waiting() {
+        let scratch = Scratch::new("claude-linked-fifo");
+        let (profile, file) = profile(&scratch, false, true);
+        let target = linked(&scratch, &file, "fifo");
+        let path = std::ffi::CString::new(target.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let (sent, received) = std::sync::mpsc::channel();
+        let reader = profile.clone();
+        std::thread::spawn(move || {
+            let _ = sent.send(super::super::read_user_config(&reader).is_err());
+        });
+        assert_eq!(
+            received.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(true),
+            "the read waited on the FIFO, or did not refuse it"
+        );
+        assert_eq!(state(&Host(profile), None).await, "invalid");
+    }
+
+    /// What a link leads to is judged as the file itself: one others may write is refused (one another user owns is
+    /// refused by the same check of the opened file, which a test cannot make without root), and a link that leads
+    /// nowhere is unreadable, so the CLI is not run over it.
+    #[tokio::test]
+    async fn a_link_to_a_file_others_may_write_or_to_nothing_is_refused() {
+        let scratch = Scratch::new("claude-linked-mode");
+        let (profile, file) = profile(&scratch, false, true);
+        let target = linked(&scratch, &file, "claude.json");
+        write(&target, b"{}", 0o622);
+        assert_eq!(
+            super::super::read_user_config(&profile),
+            Err(super::super::Unreadable)
+        );
+        assert_eq!(state(&Host(profile.clone()), None).await, "invalid");
+        fs::remove_file(&target).unwrap();
+        assert_eq!(
+            super::super::read_user_config(&profile),
+            Err(super::super::Unreadable)
+        );
+        assert_eq!(state(&Host(profile), None).await, "invalid");
+    }
+
+    /// Through a dotfiles link, the entry is read as from the file: this installation's is `connected`, and one an
+    /// older Sidevoice wrote (another environment) is `owned-old`.
+    #[tokio::test]
+    async fn entries_are_read_through_a_link() {
+        let scratch = Scratch::new("claude-linked-entry");
+        let (profile, file) = profile(&scratch, false, true);
+        let target = linked(&scratch, &file, "claude.json");
+        let host = Host(profile);
+        for (env, expected) in [(json!({}), "connected"), (json!({"OLD": "1"}), "owned-old")] {
+            let config = json!({"mcpServers": {"sidevoice": {"type": "stdio",
+                "command": "/nowhere/sidevoice", "args": [], "env": env}}});
+            write(&target, config.to_string().as_bytes(), 0o600);
+            assert_eq!(state(&host, Some("/nowhere/claude")).await, expected);
+        }
     }
 
     async fn state(host: &Host, binary: Option<&str>) -> String {
