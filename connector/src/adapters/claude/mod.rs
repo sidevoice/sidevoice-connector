@@ -64,8 +64,8 @@ pub(crate) fn read_user_config(profile: &Profile) -> Result<Option<serde_json::V
         Err(_) => return Err(Unreadable),
         Ok(_) => {}
     }
-    let text = super::registration::read_profile_file(&file, None, USER_CONFIG_LIMIT)
-        .map_err(|_| Unreadable)?;
+    let text =
+        super::registration::read_profile_file(&file, USER_CONFIG_LIMIT).map_err(|_| Unreadable)?;
     serde_json::from_str(&text)
         .map(Some)
         .map_err(|_| Unreadable)
