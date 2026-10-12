@@ -35,6 +35,8 @@ pub struct Observation {
     pub program: Option<&'static str>,
     pub log_tail: Vec<String>,
     pub connector_running: bool,
+    /// Whether the jobs start at the next login, as their manager says; none when it cannot tell or no job is defined.
+    pub start_at_login: Option<bool>,
     /// When this was observed (RFC 3339), for the failures derived from it.
     pub at: String,
 }
@@ -62,6 +64,7 @@ pub fn derive(o: &Observation) -> Value {
         "calls": body.and_then(|body| body.get("calls")).filter(|calls| calls.is_number()).cloned(),
         "failure": null, "attempts": null, "limit": null, "since": null, "window_started": null,
         "next_retry_at": null, "reachable": body.is_some(), "connector": {"running": o.connector_running},
+        "start_at_login": o.start_at_login,
     });
     let job = o.core_job.as_ref();
     let service_failure = if o.defined_core {
@@ -278,6 +281,10 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
         Some(pid) => crate::process::age(pid),
         None => None,
     };
+    let start_at_login = match &installed {
+        Some(found) => manager::start_at_login(found).await,
+        None => None,
+    };
     let connector_running = match connector_running {
         Some(running) => running,
         None => super::launcher::ask_connector(layout, "status", json!({}), Duration::from_secs(1))
@@ -299,6 +306,7 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
         program,
         log_tail: log_tail(layout, 10),
         connector_running,
+        start_at_login,
         at,
     }
 }
@@ -362,8 +370,22 @@ mod tests {
             "since",
             "window_started",
             "next_retry_at",
+            "start_at_login",
         ] {
             assert!(status[key].is_null(), "{key}: {status}");
+        }
+    }
+
+    #[test]
+    fn start_at_login_is_reported_as_the_manager_says_whatever_runs_now() {
+        for login in [Some(true), Some(false)] {
+            let o = Observation {
+                start_at_login: login,
+                ..running()
+            };
+            let status = derive(&o);
+            assert_eq!(status["start_at_login"], json!(login));
+            assert_eq!(status["state"], "running", "{status}");
         }
     }
 
