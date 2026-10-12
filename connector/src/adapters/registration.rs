@@ -307,7 +307,7 @@ pub fn bench_agents(request: &Value) -> Value {
                     path.split(':')
                         .filter(|dir| !dir.is_empty())
                         .map(|dir| Path::new(dir).join(name))
-                        .find(|candidate| candidate.is_file())
+                        .find(|candidate| executable(candidate))
                 })?;
                 Some((
                     format!("SIDEVOICE_{}_BIN", id.to_ascii_uppercase()),
@@ -346,4 +346,37 @@ pub fn bench_agents(request: &Value) -> Value {
         .filter_map(|(_, registration)| registration.bench_steps(&bench))
         .collect();
     serde_json::json!({"steps": steps})
+}
+
+/// A file anyone may run.
+fn executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The bench's CLI lookup passes over a file of an agent's CLI name that cannot be run, as a shell would.
+    #[test]
+    fn a_cli_that_cannot_be_run_is_passed_over() {
+        let scratch = crate::secure_fs::tests::Scratch::new("bench-cli");
+        let (first, second) = (scratch.0.join("first"), scratch.0.join("second"));
+        let name = super::super::Registry::standard()
+            .agents()
+            .next()
+            .map(|(_, registration)| registration.binary_names()[0])
+            .unwrap();
+        for (dir, mode) in [(&first, 0o644), (&second, 0o755)] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(name), "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+        assert!(!executable(&first.join(name)));
+        assert!(executable(&second.join(name)));
+    }
 }
