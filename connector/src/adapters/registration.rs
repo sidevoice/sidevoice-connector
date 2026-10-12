@@ -123,6 +123,29 @@ pub struct Manual {
 }
 
 impl Manual {
+    /// `steps` as the one step the older fields (`instructions`, `removal`) hold: commands joined with `&&`, each run
+    /// once the one before succeeded, else the last step that gives a snippet (the one that adds), with its file.
+    pub fn as_one(steps: &[ManualStep]) -> Option<ManualStep> {
+        if !steps.is_empty() && steps.iter().all(|step| step.command.is_some()) {
+            let command = steps
+                .iter()
+                .filter_map(|step| step.command.as_deref())
+                .collect::<Vec<_>>()
+                .join(" && ");
+            return Some(ManualStep {
+                command: Some(command),
+                snippet: None,
+                file: steps.last().and_then(|step| step.file.clone()),
+            });
+        }
+        steps
+            .iter()
+            .rev()
+            .find(|step| step.snippet.is_some())
+            .or(steps.last())
+            .cloned()
+    }
+
     /// An agent whose CLI adds and removes the entry. Connecting adds ours, after removing ours first when it is
     /// `outdated` (the CLI refuses to add over it); updating removes ours, then adds it; replacing removes the other
     /// entry (`remove_other`), then adds ours.
@@ -385,5 +408,31 @@ mod tests {
         }
         assert!(!executable(&first.join(name)));
         assert!(executable(&second.join(name)));
+    }
+
+    /// The older single-step fields: commands run in order, each once the one before succeeded; file steps keep the
+    /// snippet that adds.
+    #[test]
+    fn a_sequence_as_one_step_does_the_whole_operation() {
+        let command = |text: &str| ManualStep {
+            command: Some(text.into()),
+            snippet: None,
+            file: Some("/f".into()),
+        };
+        assert_eq!(
+            Manual::as_one(&[command("remove"), command("add")]),
+            Some(ManualStep {
+                command: Some("remove && add".into()),
+                snippet: None,
+                file: Some("/f".into()),
+            })
+        );
+        let file = Manual::by_file("/mcp.json", "{\"add\":1}".into(), "mcpServers");
+        assert_eq!(Manual::as_one(&file.update), file.connect.first().cloned());
+        assert_eq!(
+            Manual::as_one(&file.disconnect),
+            file.disconnect.first().cloned()
+        );
+        assert_eq!(Manual::as_one(&[]), None);
     }
 }

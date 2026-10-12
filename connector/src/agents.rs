@@ -5,7 +5,8 @@
 //! cancel the work without releasing the gate before the child has exited.
 
 use crate::adapters::registration::{
-    mcp_servers_json, shell_command, AgentError, AgentHost, CliError, CliOutput, Registration,
+    mcp_servers_json, shell_command, AgentError, AgentHost, CliError, CliOutput, Manual,
+    Registration,
 };
 use crate::adapters::Registry;
 use crate::messages::message;
@@ -1351,9 +1352,10 @@ impl HostAgents {
             "connect":if able {"auto"} else {"manual"},
             "can":{"connect":able,"update":able,"disconnect":able},
             "manual":manual,
-            // The older forms of `manual.connect` and `manual.disconnect`, which older clients read.
-            "instructions":manual.connect.first(),
-            "removal":manual.disconnect.first(),
+            // The older forms of `manual.connect` and `manual.disconnect`, which older clients read: each sequence as one
+            // step, so running it does the whole operation.
+            "instructions":Manual::as_one(&manual.connect),
+            "removal":Manual::as_one(&manual.disconnect),
             "evidence":evidence_json,
             "present":present,
             "dismissed":false,

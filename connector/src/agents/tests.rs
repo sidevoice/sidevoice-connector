@@ -1184,7 +1184,7 @@ async fn each_agent_says_what_the_connector_does_itself_and_how_to_do_it_by_hand
             agent["can"],
             json!({"connect":true,"update":true,"disconnect":true})
         );
-        // The older fields are the first step of connecting and of disconnecting.
+        // The older fields hold connecting and disconnecting as one step each: here, their only step.
         assert_eq!(agent["instructions"], agent["manual"]["connect"][0]);
         assert_eq!(agent["removal"], agent["manual"]["disconnect"][0]);
     }
@@ -1274,8 +1274,9 @@ async fn the_manual_steps_run_by_hand_update_an_older_entry_in_the_agents_own_ho
     let _codex = EnvGuard::set("SIDEVOICE_CODEX_BIN", codex.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let selected = fixture.selected();
-    // `connect` (on an outdated entry) and `update` both rewrite an older entry: each runs from one.
-    for kind in ["connect", "update"] {
+    // `connect` (on an outdated entry), `update`, and the older `instructions` (connecting as one step) each rewrite
+    // an older entry: each runs from one.
+    for kind in ["connect", "update", "instructions"] {
         // Older entries of ours: this installation's command without its environment.
         private_write(
             &fixture.profile.agent_home("CLAUDE_CONFIG_DIR").join("fake-entry.txt"),
@@ -1292,12 +1293,19 @@ async fn the_manual_steps_run_by_hand_update_an_older_entry_in_the_agents_own_ho
         for id in ["claude", "codex"] {
             let agent = row(&listed, id);
             assert_eq!(agent["owned"], true, "{agent}");
-            let steps = agent["manual"][kind].as_array().unwrap();
-            assert_eq!(
-                steps.len(),
-                2,
-                "an older entry is removed first: {kind} {agent}"
-            );
+            let steps = if kind == "instructions" {
+                let command = agent["instructions"]["command"].as_str().unwrap();
+                assert!(command.contains(" && "), "removes, then adds: {agent}");
+                vec![agent["instructions"].clone()]
+            } else {
+                let steps = agent["manual"][kind].as_array().unwrap().clone();
+                assert_eq!(
+                    steps.len(),
+                    2,
+                    "an older entry is removed first: {kind} {agent}"
+                );
+                steps
+            };
             // Run by hand from a shell that names no agent home: the steps name it themselves.
             for step in steps {
                 let command = step["command"].as_str().unwrap();
