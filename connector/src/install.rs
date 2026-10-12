@@ -649,11 +649,15 @@ async fn register(profile: &Profile) -> Value {
     }
     let mut outcomes = serde_json::Map::new();
     for (id, label, row) in agent_rows(&listed) {
-        let manual = row
-            .pointer("/instructions/command")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
+        // Another "sidevoice" entry is replaced by hand; anything else is connected by hand.
+        let manual = manual_text(
+            &row,
+            if row["registration"] == "foreign" {
+                "replace"
+            } else {
+                "connect"
+            },
+        );
         let (outcome, message) = match row["registration"].as_str() {
             Some("connected") => ("registered", format!("{label} already uses Sidevoice.")),
             // An entry an older Sidevoice wrote is written again.
@@ -666,9 +670,7 @@ async fn register(profile: &Profile) -> Value {
             }
             Some("not-connected") => (
                 "manual",
-                format!(
-                    "{label}: Sidevoice is not registered there; to register it:\n    {manual}"
-                ),
+                format!("{label}: Sidevoice is not registered there; to register it:{manual}"),
             ),
             Some("outdated") => (
                 "manual",
@@ -683,9 +685,7 @@ async fn register(profile: &Profile) -> Value {
                     _ => "agents.registration-unknown",
                 };
                 let mut text = crate::messages::message(key, &json!({"agent": label}));
-                if !manual.is_empty() {
-                    text.push_str(&format!("\n    {manual}"));
-                }
+                text.push_str(&manual);
                 (if other == "unknown" { "unknown" } else { other }, text)
             }
             None => continue,
@@ -693,6 +693,29 @@ async fn register(profile: &Profile) -> Value {
         outcomes.insert(id, json!({"outcome": outcome, "message": message}));
     }
     Value::Object(outcomes)
+}
+
+/// The steps of an agent row's `manual.<kind>`, each line on its own indented line: a command, or a snippet and the
+/// file it goes in.
+fn manual_text(row: &Value, kind: &str) -> String {
+    let steps = row
+        .pointer(&format!("/manual/{kind}"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|step| {
+            if let Some(command) = step["command"].as_str() {
+                return Some(command.to_owned());
+            }
+            let snippet = step["snippet"].as_str()?;
+            Some(match step["file"].as_str() {
+                Some(file) => format!("In {file}:\n{snippet}"),
+                None => snippet.to_owned(),
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    steps.lines().map(|line| format!("\n    {line}")).collect()
 }
 
 /// What uninstall does with an agent's row: `Some(true)` removes its entry, `Some(false)` leaves a foreign or unknown

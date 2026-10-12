@@ -5,7 +5,8 @@
 //! cancel the work without releasing the gate before the child has exited.
 
 use crate::adapters::registration::{
-    mcp_servers_json, shell_command, AgentError, AgentHost, CliError, CliOutput, Registration,
+    mcp_servers_json, shell_command, AgentError, AgentHost, CliError, CliOutput, Manual,
+    Registration,
 };
 use crate::adapters::Registry;
 use crate::messages::message;
@@ -1288,6 +1289,8 @@ impl HostAgents {
             .state(&host, binary.as_deref())
             .await
             .map_err(|error| failure(error, id))?;
+        // The manual steps follow the state itself: an `outdated` entry is removed before ours is added.
+        let manual = agent.manual(&host, &registration, binary.as_deref());
         // `outdated`: an entry of ours that is not the current one (disabled, an older release, another environment).
         // Connect writes it again; like a current one, it is ours to remove: `owned`.
         let owned = registration == "connected" || registration == "outdated";
@@ -1320,7 +1323,8 @@ impl HostAgents {
             }
         }
         let present = !evidence.is_empty();
-        let instructions = agent.instructions(&host, &registration, binary.as_deref());
+        // The connector acts itself where it reaches the agent: its CLI found, or a file it edits.
+        let able = binary.is_some() || agent.connects_without_binary();
         let evidence_json = serde_json::to_value(&evidence).map_err(|_| Failure::Internal)?;
         let signature = if present {
             let identity = format!(
@@ -1339,8 +1343,13 @@ impl HostAgents {
             "version":version,
             "registration":registration,
             "owned":owned,
-            "connect":if binary.is_some() || agent.connects_without_binary() {"auto"} else {"manual"},
-            "instructions":instructions,
+            "connect":if able {"auto"} else {"manual"},
+            "can":{"connect":able,"update":able,"disconnect":able},
+            "manual":manual,
+            // The older forms of `manual.connect` and `manual.disconnect`, which older clients read: each sequence as one
+            // step, so running it does the whole operation.
+            "instructions":Manual::as_one(&manual.connect),
+            "removal":Manual::as_one(&manual.disconnect),
             "evidence":evidence_json,
             "present":present,
             "dismissed":false,

@@ -147,13 +147,15 @@ fn agent_refusals_labels_and_manual_text_use_the_shared_english_bundle() {
     );
     assert_eq!(label("claude"), "Claude Code");
     assert_eq!(
+        message("agents.manual.delete-entry", &json!({"under":"mcpServers"})),
+        "Delete the \"sidevoice\" entry under \"mcpServers\"."
+    );
+    assert_eq!(
         message(
-            "agents.manual.codex.replace-existing",
-            &json!({"remove":"codex mcp remove sidevoice","add":"codex mcp add sidevoice"})
+            "agents.manual.delete-other-entry",
+            &json!({"under":"mcpServers"})
         ),
-        "# Replace the existing Sidevoice entry by running these Codex commands:\n\
-         codex mcp remove sidevoice\n\
-         codex mcp add sidevoice"
+        "Delete the other \"sidevoice\" entry under \"mcpServers\"."
     );
 }
 
@@ -1066,7 +1068,7 @@ fn fake_codex(fixture: &Fixture) -> PathBuf {
     private_write(
         &binary,
         br##"#!/bin/sh
-home="$CODEX_HOME"
+home="${CODEX_HOME:-$HOME/.codex}"
 entry="$home/fake-entry.json"
 printf '%s\n' "$*" >> "$home/calls"
 quote() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
@@ -1221,6 +1223,7 @@ case "$1 $2" in
 "mcp remove")
     rm -f "$entry"; exit 0 ;;
 "mcp add")
+    if [ -e "$entry" ]; then echo 'MCP server sidevoice already exists in user config' >&2; exit 1; fi
     if [ -e "$home/fail-add" ]; then echo 'add failed' >&2; exit 1; fi
     shift 5
     env=""
@@ -1303,6 +1306,281 @@ async fn claude_registration_carries_the_installation_environment_and_an_older_o
             .exists(),
         "the entry of ours stayed"
     );
+}
+
+#[tokio::test]
+async fn each_agent_says_what_the_connector_does_itself_and_how_to_do_it_by_hand() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let claude = fake_claude(&fixture);
+    let codex = fake_codex(&fixture);
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let selected = fixture.selected();
+    let env = [
+        format!("SIDEVOICE_DATA_DIR={}", fixture.profile.data.display()),
+        format!("XDG_DATA_HOME={}", fixture.profile.xdg_data.display()),
+    ];
+    let quoted = |words: Vec<String>| {
+        words
+            .iter()
+            .map(|word| format!("'{word}'"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let ours = || {
+        std::iter::once("--".to_owned())
+            .chain(std::iter::once(selected.command.clone()))
+            .chain(selected.args.iter().cloned())
+    };
+
+    // Not found: Claude Code and Codex are then connected by hand; Cursor's file is edited all the same.
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    for id in ["claude", "codex"] {
+        let agent = row(&listed, id);
+        let found = agent["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["kind"] == "binary");
+        if !found {
+            assert_eq!(agent["connect"], "manual", "{agent}");
+            assert_eq!(
+                agent["can"],
+                json!({"connect":false,"update":false,"disconnect":false})
+            );
+            assert_eq!(agent["manual"]["connect"].as_array().unwrap().len(), 1);
+        }
+    }
+    assert_eq!(
+        row(&listed, "cursor")["can"],
+        json!({"connect":true,"update":true,"disconnect":true})
+    );
+
+    let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", claude.as_os_str());
+    let _codex = EnvGuard::set("SIDEVOICE_CODEX_BIN", codex.as_os_str());
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    for id in ["claude", "codex", "cursor"] {
+        let agent = row(&listed, id);
+        assert_eq!(agent["connect"], "auto", "{agent}");
+        assert_eq!(
+            agent["can"],
+            json!({"connect":true,"update":true,"disconnect":true})
+        );
+        // The older fields hold connecting and disconnecting as one step each: here, their only step.
+        assert_eq!(agent["instructions"], agent["manual"]["connect"][0]);
+        assert_eq!(agent["removal"], agent["manual"]["disconnect"][0]);
+    }
+
+    // Each command names the agent's home, as the connector runs its CLI (the fixture's environment sets
+    // `CLAUDE_CONFIG_DIR` and `CODEX_HOME`; without them, see `steps_name_an_agents_home_only_when_the_person_sets_it`).
+    let claude_home = fixture
+        .profile
+        .agent_home("CLAUDE_CONFIG_DIR")
+        .display()
+        .to_string();
+    let codex_home = fixture
+        .profile
+        .agent_home("CODEX_HOME")
+        .display()
+        .to_string();
+    let words = |cli: &Path, words: &[&str]| {
+        std::iter::once(cli.to_string_lossy().into_owned())
+            .chain(words.iter().map(|word| (*word).to_owned()))
+            .collect::<Vec<_>>()
+    };
+
+    let mut add = words(&claude, &["mcp", "add", "--scope", "user", "sidevoice"]);
+    for pair in &env {
+        add.extend(["-e".to_owned(), pair.clone()]);
+    }
+    add.extend(ours());
+    let file = fixture
+        .profile
+        .agent_home("CLAUDE_CONFIG_DIR")
+        .join(".claude.json");
+    let file = file.to_string_lossy();
+    let step = |words: Vec<String>| json!({"command":format!("CLAUDE_CONFIG_DIR='{claude_home}' {}", quoted(words)),"file":file});
+    let add = step(add);
+    let remove = step(words(
+        &claude,
+        &["mcp", "remove", "--scope", "user", "sidevoice"],
+    ));
+    // Another entry may be in any scope: removed from the one it is in.
+    let remove_other = step(words(&claude, &["mcp", "remove", "sidevoice"]));
+    assert_eq!(
+        row(&listed, "claude")["manual"],
+        json!({"connect":[add],"update":[remove,add],"disconnect":[remove],"replace":[remove_other,add]})
+    );
+
+    let file = fixture.profile.agent_home("CODEX_HOME").join("config.toml");
+    let file = file.to_string_lossy();
+    let mut add = words(&codex, &["mcp", "add", "sidevoice"]);
+    for pair in &env {
+        add.extend(["--env".to_owned(), pair.clone()]);
+    }
+    add.extend(ours());
+    let step = |words: Vec<String>| json!({"command":format!("CODEX_HOME='{codex_home}' {}", quoted(words)),"file":file});
+    let add = step(add);
+    let remove = step(words(&codex, &["mcp", "remove", "sidevoice"]));
+    assert_eq!(
+        row(&listed, "codex")["manual"],
+        json!({"connect":[add],"update":[remove,add],"disconnect":[remove],"replace":[remove,add]})
+    );
+
+    let file = fixture
+        .profile
+        .agent_home("CURSOR_CONFIG_DIR")
+        .join("mcp.json");
+    let file = file.to_string_lossy();
+    let snippet = mcp_servers_json(&selected.command, &selected.args, host.mcp_env()).unwrap();
+    let add = json!({"snippet":snippet,"file":file});
+    assert_eq!(
+        row(&listed, "cursor")["manual"],
+        json!({
+            "connect":[add],
+            "update":[{"snippet":"Delete the \"sidevoice\" entry under \"mcpServers\".","file":file},add],
+            "disconnect":[{"snippet":"Delete the \"sidevoice\" entry under \"mcpServers\".","file":file}],
+            "replace":[{"snippet":"Delete the other \"sidevoice\" entry under \"mcpServers\".","file":file},add],
+        })
+    );
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_manual_steps_run_by_hand_update_an_older_entry_in_the_agents_own_home() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let claude = fake_claude(&fixture);
+    let codex = fake_codex(&fixture);
+    let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", claude.as_os_str());
+    let _codex = EnvGuard::set("SIDEVOICE_CODEX_BIN", codex.as_os_str());
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let selected = fixture.selected();
+    // `connect` (on an outdated entry), `update`, and the older `instructions` (connecting as one step) each rewrite
+    // an older entry: each runs from one.
+    for kind in ["connect", "update", "instructions"] {
+        // Older entries of ours: this installation's command without its environment.
+        private_write(
+            &fixture.profile.agent_home("CLAUDE_CONFIG_DIR").join("fake-entry.txt"),
+            format!(
+                "sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: {}\n  Args: {}\n\nTo remove this server, run: claude mcp remove sidevoice -s user\n",
+                selected.command,
+                selected.args.join(" ")
+            )
+            .as_bytes(),
+        );
+        codex_entry(&fixture, &selected, true, json!({}));
+
+        let listed = host.handle("agents.list", json!({"rescan":true})).await;
+        for id in ["claude", "codex"] {
+            let agent = row(&listed, id);
+            assert_eq!(agent["owned"], true, "{agent}");
+            let steps = if kind == "instructions" {
+                let command = agent["instructions"]["command"].as_str().unwrap();
+                assert!(command.contains(" && "), "removes, then adds: {agent}");
+                vec![agent["instructions"].clone()]
+            } else {
+                let steps = agent["manual"][kind].as_array().unwrap().clone();
+                assert_eq!(
+                    steps.len(),
+                    2,
+                    "an older entry is removed first: {kind} {agent}"
+                );
+                steps
+            };
+            // Run by hand from a shell that names no agent home: the steps name it themselves.
+            for step in steps {
+                let command = step["command"].as_str().unwrap();
+                let status = std::process::Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(command)
+                    .env_remove("CLAUDE_CONFIG_DIR")
+                    .env_remove("CODEX_HOME")
+                    .env("HOME", fixture.root.join("elsewhere"))
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "{kind}: {command}");
+            }
+        }
+
+        let listed = host.handle("agents.list", json!({"rescan":true})).await;
+        for id in ["claude", "codex"] {
+            let agent = row(&listed, id);
+            assert_eq!(agent["registration"], "connected", "{kind}: {agent}");
+            assert_eq!(agent["manual"]["connect"].as_array().unwrap().len(), 1);
+            assert_eq!(agent["manual"]["update"].as_array().unwrap().len(), 2);
+        }
+    }
+    host.shutdown().await;
+}
+
+/// Without an agent's home variable in the person's environment, its steps name none and change the file in the
+/// agent's default home (`~/.claude.json` for Claude Code, `~/.codex/config.toml` for Codex): run by hand from the
+/// person's shell, they change what the connector reads.
+#[tokio::test]
+async fn steps_name_an_agents_home_only_when_the_person_sets_it() {
+    let _turn = agent_env().await;
+    let mut fixture = Fixture::new();
+    let home = fixture.profile.home.clone();
+    for (var, default) in [("CLAUDE_CONFIG_DIR", ".claude"), ("CODEX_HOME", ".codex")] {
+        set_agent_home(&mut fixture.profile, var, &home.join(default), false);
+        private_mkdir(&home.join(default));
+    }
+    let claude = fake_claude(&fixture);
+    let codex = fake_codex(&fixture);
+    let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", claude.as_os_str());
+    let _codex = EnvGuard::set("SIDEVOICE_CODEX_BIN", codex.as_os_str());
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let selected = fixture.selected();
+    // Older entries of ours: this installation's command without its environment.
+    private_write(
+        &home.join(".claude/fake-entry.txt"),
+        format!(
+            "sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: {}\n  Args: {}\n\nTo remove this server, run: claude mcp remove sidevoice -s user\n",
+            selected.command,
+            selected.args.join(" ")
+        )
+        .as_bytes(),
+    );
+    codex_entry(&fixture, &selected, true, json!({}));
+
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    for (id, cli, file) in [
+        ("claude", &claude, home.join(".claude.json")),
+        ("codex", &codex, home.join(".codex/config.toml")),
+    ] {
+        let agent = row(&listed, id);
+        assert_eq!(agent["owned"], true, "{agent}");
+        let manual = &agent["manual"];
+        for operation in ["connect", "update", "disconnect", "replace"] {
+            for step in manual[operation].as_array().unwrap() {
+                assert_eq!(step["file"], json!(file.to_string_lossy()), "{step}");
+                let command = step["command"].as_str().unwrap();
+                assert!(
+                    command.starts_with(&format!("'{}' ", cli.display())),
+                    "{command}"
+                );
+            }
+        }
+        // The person's shell: their HOME, no agent home named.
+        for step in manual["connect"].as_array().unwrap() {
+            let command = step["command"].as_str().unwrap();
+            let status = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(command)
+                .env_remove("CLAUDE_CONFIG_DIR")
+                .env_remove("CODEX_HOME")
+                .env("HOME", &home)
+                .status()
+                .unwrap();
+            assert!(status.success(), "{command}");
+        }
+    }
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    for id in ["claude", "codex"] {
+        assert_eq!(row(&listed, id)["registration"], "connected", "{listed}");
+    }
+    host.shutdown().await;
 }
 
 /// An entry of ours in the fake Claude Code that names this installation's command without its environment.
