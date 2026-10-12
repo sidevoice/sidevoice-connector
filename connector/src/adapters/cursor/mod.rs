@@ -670,6 +670,22 @@ fn bridge_instances() -> Vec<BridgeInstance> {
     found
 }
 
+/// Whether a Desktop Bridge of Cursor's is running for this user.
+pub fn bridge_running() -> bool {
+    !bridge_instances().is_empty()
+}
+
+/// Whether `sqlite3` can be run: finding which chat holds a join reads Cursor's own records with it.
+pub fn sqlite3_found() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    env::var_os("PATH").is_some_and(|path| {
+        env::split_paths(&path).any(|dir| {
+            fs::metadata(dir.join("sqlite3"))
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+    })
+}
+
 fn process_alive(pid: u64) -> bool {
     unsafe {
         libc::kill(pid as i32, 0) == 0
@@ -922,6 +938,12 @@ pub async fn deliver_editor(delivery: &Value, event: &Value) -> Option<Value> {
                 }
                 if matches!(outcome, "not-found" | "unknown-thread") {
                     continue;
+                }
+                // Refused outright (the request was not taken): nothing reached the chat.
+                if (400..500).contains(&response.status) {
+                    return Some(
+                        json!({"status":"failed","detail":format!("Cursor Desktop Bridge refused the message ({}): {}", response.status, response.body.get("reason").or_else(|| response.body.get("message")).or_else(|| response.body.get("error")).and_then(Value::as_str).unwrap_or(outcome))}),
+                    );
                 }
                 return Some(
                     json!({"status":"unknown","detail":format!("Cursor Desktop Bridge did not confirm delivery: {}", response.body.get("reason").or_else(|| response.body.get("message")).or_else(|| response.body.get("error")).and_then(Value::as_str).unwrap_or(outcome))}),

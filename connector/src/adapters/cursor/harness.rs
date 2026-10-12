@@ -1,7 +1,10 @@
 //! Cursor as a harness: the CLI's chats (tmux, transcript) and the editor's chats, reached through Cursor's Desktop
 //! Bridge once it knows which chat a conversation is, their transcript found the same way.
 
-use super::{composer_holding, deliver_editor, editor_transcript_chat, engine, transcript_path};
+use super::{
+    bridge_running, composer_holding, deliver_editor, editor_transcript_chat, engine,
+    sqlite3_found, transcript_path,
+};
 use crate::adapters::conversation::{Conversation, Room};
 use crate::adapters::harness::{no_route, Harness};
 use crate::adapters::registration::Registration;
@@ -20,6 +23,11 @@ use tokio::time::Duration;
 
 /// What an editor chat's delivery and status say until the Desktop Bridge knows which chat it is.
 const WAITING: &str = "waiting for Cursor to register this chat";
+/// What they say when Cursor's Desktop Bridge is not running at all.
+const NO_BRIDGE: &str = "Cursor's Desktop Bridge is not running";
+/// What they say when the chat cannot be looked up: Cursor's records are read with `sqlite3`.
+const NO_SQLITE: &str =
+    "sqlite3 is not installed, and Sidevoice needs it to find which Cursor chat this is";
 
 /// Cursor.
 #[derive(Default)]
@@ -115,7 +123,7 @@ impl Harness for Cursor {
             let mut fields = Map::new();
             fields.insert(
                 "delivery_state".into(),
-                bridge_state(bridge(conversation).is_some()),
+                bridge_state(route_state(bridge(conversation).is_some())),
             );
             Some(fields)
         })
@@ -173,10 +181,26 @@ impl Harness for Cursor {
     }
 }
 
-/// Where an editor chat's route stands: whether the Desktop Bridge knows which chat it is.
-fn bridge_state(chat_known: bool) -> Value {
-    json!({"bridge_chat_known":chat_known,
-        "state":if chat_known {"registered"} else {WAITING}})
+/// Where an editor chat's route stands: registered when the Desktop Bridge knows which chat it is, else why not
+/// yet.
+fn route_state(chat_known: bool) -> &'static str {
+    state_of(chat_known, bridge_running(), sqlite3_found())
+}
+
+fn state_of(chat_known: bool, bridge_running: bool, sqlite3: bool) -> &'static str {
+    if chat_known {
+        "registered"
+    } else if !bridge_running {
+        NO_BRIDGE
+    } else if !sqlite3 {
+        NO_SQLITE
+    } else {
+        WAITING
+    }
+}
+
+fn bridge_state(state: &str) -> Value {
+    json!({"bridge_chat_known":state == "registered","state":state})
 }
 
 /// An editor chat, only by its own id through the Desktop Bridge. Until the bridge knows which chat it is, the
@@ -188,14 +212,15 @@ async fn deliver_to_editor(conversation: &Conversation, frame: &Value) -> Value 
         None => composer_holding(&delivery).await,
     };
     let Some(composer) = composer else {
-        return json!({"status":"failed","reason":"chat_unregistered",
-            "detail":format!("Cursor's Desktop Bridge: {WAITING}. Voice reaches this chat once Cursor has recorded its join call (up to ~30 s after it).")});
+        let state = route_state(false);
+        return json!({"status":"failed",
+            "detail":format!("Not sent, {state}: voice reaches this Cursor chat only through its Desktop Bridge, once Cursor has recorded the chat's join call (up to ~30 s after it).")});
     };
     delivery["composer"] = json!(composer);
     set_bridge(conversation, composer);
     deliver_editor(&delivery, frame).await.unwrap_or_else(|| {
-        json!({"status":"failed","reason":"bridge_unavailable",
-            "detail":"Cursor's Desktop Bridge did not take the message: it may not be running."})
+        json!({"status":"failed",
+            "detail":"Not sent: Cursor's Desktop Bridge did not take the message (it may not be running)."})
     })
 }
 
@@ -390,7 +415,7 @@ pub(super) mod client {
         if !identity.editor {
             return fields;
         }
-        fields.insert("view".into(), json!(format!("Voice reaches this chat through Cursor's Desktop Bridge, once Cursor has recorded this call (up to ~30 s): until then it says \"{WAITING}\" and nothing is sent. Other chats of this window can join too. Remember this chat's conversation id ({}): voice_status and voice_disconnect need it when several chats are joined.", identity.thread)));
+        fields.insert("voice_in".into(), json!(format!("Voice reaches this chat through Cursor's Desktop Bridge, once Cursor has recorded this call (up to ~30 s): until then it says \"{WAITING}\" and nothing is sent. Other chats of this window can join too. Remember this chat's conversation id ({}): voice_status and voice_disconnect need it when several chats are joined.", identity.thread)));
         fields.insert("speak_first".into(), json!(format!("To speak before the user has said anything by voice, call voice_say with conversation \"{}\" and no session_id. To answer a voice message, use its session_id and revision as usual.", identity.thread)));
         if let Some(marker) = &identity.chat_marker {
             fields.insert("chat_marker".into(), json!(marker));
@@ -408,7 +433,14 @@ pub(super) mod client {
             .and_then(|item| item.pointer("/delivery_state/bridge_chat_known"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        fields.insert("bridge".into(), bridge_state(known));
+        let state = listed
+            .and_then(|item| item.pointer("/delivery_state/state"))
+            .and_then(Value::as_str)
+            .unwrap_or(if known { "registered" } else { WAITING });
+        fields.insert(
+            "bridge".into(),
+            json!({"bridge_chat_known":known,"state":state}),
+        );
         fields
     }
 
@@ -505,6 +537,16 @@ mod tests {
         }
     }
 
+    /// Why an editor chat is not reached yet, in the order a person fixes it: the bridge, then sqlite3, then Cursor
+    /// recording the join.
+    #[test]
+    fn an_unregistered_chat_says_what_it_waits_for() {
+        assert_eq!(state_of(true, false, false), "registered");
+        assert_eq!(state_of(false, false, true), NO_BRIDGE);
+        assert_eq!(state_of(false, true, false), NO_SQLITE);
+        assert_eq!(state_of(false, true, true), WAITING);
+    }
+
     /// An editor chat joins on the Desktop Bridge route, with a marker of its own the bridge finds it by, which its
     /// join answer carries; no card is drawn or offered.
     #[test]
@@ -518,7 +560,7 @@ mod tests {
         assert!(Cursor.accepts(&identity.delivery, &identity.thread));
         let fields = client::joined_fields(&identity);
         assert_eq!(fields["chat_marker"], marker.as_str());
-        assert!(fields["view"].as_str().unwrap().contains(WAITING));
+        assert!(fields["voice_in"].as_str().unwrap().contains(WAITING));
         assert!(!fields.contains_key("card") && !fields.contains_key("view_link"));
     }
 
@@ -532,11 +574,20 @@ mod tests {
             json!({"channel":"voice","session_id":"s","revision":1,"message_id":"m","text":"hola"});
         let answer = deliver_to_editor(&conversation, &frame).await;
         assert_eq!(answer["status"], "failed", "{answer}");
-        assert_eq!(answer["reason"], "chat_unregistered", "{answer}");
-        assert!(answer["detail"].as_str().unwrap().contains(WAITING));
+        // Only the fields the room takes in a delivery answer: a failure it keeps, with why in the detail.
+        assert_eq!(
+            answer.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["detail", "status"],
+            "{answer}"
+        );
+        let state = route_state(false);
+        assert!(
+            answer["detail"].as_str().unwrap().contains(state),
+            "{answer}"
+        );
 
         let listed = Cursor.status(&conversation).await.unwrap();
-        assert_eq!(listed["delivery_state"]["state"], WAITING);
+        assert_eq!(listed["delivery_state"]["state"], state);
         let item = json!({"delivery_state": listed["delivery_state"]});
         let fields = client::status_fields(&identity, Some(&item));
         assert_eq!(fields["bridge"]["bridge_chat_known"], false);
