@@ -57,6 +57,7 @@ impl Fixture {
         let profile = Profile {
             home: root.join("home"),
             claude: root.join("claude"),
+            claude_config_dir_set: true,
             codex: root.join("codex"),
             cursor: root.join("cursor/config"),
             cursor_data: root.join("cursor/data"),

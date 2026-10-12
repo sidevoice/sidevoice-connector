@@ -8,7 +8,9 @@
 //!   and `core/local.sock`.
 //! - `R`, the release root: `$XDG_DATA_HOME/sidevoice` (else `~/.local/share/sidevoice`), as `service/layout.rs` names it.
 //! - The agents' homes: `$CLAUDE_CONFIG_DIR` (`~/.claude`), `$CODEX_HOME` (`~/.codex`), `$CURSOR_CONFIG_DIR`
-//!   (`~/.cursor`) and `$CURSOR_DATA_DIR` (`<cursor>/data`).
+//!   (`~/.cursor`) and `$CURSOR_DATA_DIR` (`<cursor>/data`). `CLAUDE_CONFIG_DIR` is passed on only when the person's
+//!   environment sets it: with it, Claude Code keeps its user configuration in `$CLAUDE_CONFIG_DIR/.claude.json`;
+//!   without it, in `~/.claude.json` (its data stays in `~/.claude` either way).
 //!
 //! Every path is absolute. The directories are checked again at each operation boundary, not trusted from startup:
 //! they are passed to agents' command lines and written into.
@@ -23,7 +25,10 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug)]
 pub struct Profile {
     pub home: PathBuf,
+    /// Claude Code's data directory: `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
     pub claude: PathBuf,
+    /// Whether the environment sets `CLAUDE_CONFIG_DIR`; only then is it passed on to Claude Code.
+    pub claude_config_dir_set: bool,
     /// `D`, the data directory.
     pub data: PathBuf,
     pub codex: PathBuf,
@@ -49,6 +54,7 @@ impl Profile {
         }
         let or = |key: &str, fallback: PathBuf| var(key).map(PathBuf::from).unwrap_or(fallback);
         let data = or("SIDEVOICE_DATA_DIR", home.join(".sidevoice"));
+        let claude_config_dir_set = var("CLAUDE_CONFIG_DIR").is_some();
         let claude = or("CLAUDE_CONFIG_DIR", home.join(".claude"));
         let codex = or("CODEX_HOME", home.join(".codex"));
         let cursor = or("CURSOR_CONFIG_DIR", home.join(".cursor"));
@@ -72,6 +78,7 @@ impl Profile {
         let profile = Self {
             home,
             claude,
+            claude_config_dir_set,
             socket: data.join("connector.sock"),
             core_socket: core.join("local.sock"),
             core_ready: core.join("core.json"),
@@ -102,23 +109,32 @@ impl Profile {
         &self,
         command: &'a mut tokio::process::Command,
     ) -> &'a mut tokio::process::Command {
+        if !self.claude_config_dir_set {
+            command.env_remove("CLAUDE_CONFIG_DIR");
+        }
         for (key, value) in self.variables() {
             command.env(key, value);
         }
         command
     }
 
-    pub(crate) fn variables(&self) -> [(&'static str, &Path); 8] {
-        [
-            ("HOME", &self.home),
-            ("CLAUDE_CONFIG_DIR", &self.claude),
+    /// The variables a child is given: every directory, except `CLAUDE_CONFIG_DIR` when the environment leaves it
+    /// unset (Claude Code then uses its own default, as it does for the person).
+    pub fn variables(&self) -> Vec<(&'static str, &Path)> {
+        let mut variables = vec![
+            ("HOME", self.home.as_path()),
+            ("CLAUDE_CONFIG_DIR", self.claude.as_path()),
             ("CODEX_HOME", &self.codex),
             ("CURSOR_CONFIG_DIR", &self.cursor),
             ("CURSOR_DATA_DIR", &self.cursor_data),
             ("XDG_CONFIG_HOME", &self.xdg_config),
             ("XDG_DATA_HOME", &self.xdg_data),
             ("SIDEVOICE_DATA_DIR", &self.data),
-        ]
+        ];
+        if !self.claude_config_dir_set {
+            variables.retain(|(key, _)| *key != "CLAUDE_CONFIG_DIR");
+        }
+        variables
     }
 
     /// A process its service manager started must have been given this very profile: the paths a service job
@@ -312,6 +328,50 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(named.data, data);
+    }
+
+    /// Claude Code keeps its user configuration in `~/.claude.json` unless `CLAUDE_CONFIG_DIR` is set: a child is
+    /// given the variable only when the person's environment sets it, and never a stray one otherwise.
+    #[test]
+    fn claude_config_dir_is_passed_on_only_when_the_environment_sets_it() {
+        let scratch = Scratch::new("claude-config");
+        let home = scratch.0.to_string_lossy().into_owned();
+        let passed = |profile: &Profile| {
+            let mut command = tokio::process::Command::new("true");
+            profile.command_env(&mut command);
+            command
+                .as_std()
+                .get_envs()
+                .find(|(key, _)| *key == "CLAUDE_CONFIG_DIR")
+                .map(|(_, value)| value.map(|value| value.to_owned()))
+        };
+
+        let unset = Profile::from_vars(vars(&[("HOME", &home)])).unwrap();
+        assert_eq!(
+            unset.claude,
+            scratch.0.join(".claude"),
+            "its data stays in ~/.claude"
+        );
+        assert!(!unset
+            .variables()
+            .iter()
+            .any(|(key, _)| *key == "CLAUDE_CONFIG_DIR"));
+        assert_eq!(passed(&unset), Some(None), "an inherited value is removed");
+        let layout = crate::service::layout::Layout::from_profile(&unset);
+        assert!(!layout.agent_dirs.contains_key("CLAUDE_CONFIG_DIR"));
+
+        let named = scratch.0.join("claude-home");
+        fs::create_dir(&named).unwrap();
+        fs::set_permissions(&named, fs::Permissions::from_mode(0o700)).unwrap();
+        let set = Profile::from_vars(vars(&[
+            ("HOME", &home),
+            ("CLAUDE_CONFIG_DIR", named.to_str().unwrap()),
+        ]))
+        .unwrap();
+        assert_eq!(set.claude, named);
+        assert_eq!(passed(&set), Some(Some(named.clone().into_os_string())));
+        let layout = crate::service::layout::Layout::from_profile(&set);
+        assert_eq!(layout.agent_dirs.get("CLAUDE_CONFIG_DIR"), Some(&named));
     }
 
     #[test]
