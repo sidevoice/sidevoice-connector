@@ -139,7 +139,7 @@ impl Profile {
 
     /// The version this connector reports: the build's.
     pub fn connector_version(&self) -> &str {
-        crate::identity::VERSION
+        env!("SIDEVOICE_CONNECTOR_VERSION")
     }
 
     /// What identifies the running build to a client that checks it (`identity`).
@@ -294,9 +294,8 @@ impl Profile {
 
     /// A profile entirely inside `root`, with every directory made private: what unit tests run in.
     #[cfg(test)]
-    pub fn for_test(root: &Path) -> Self {
+    pub fn for_test(root: &Path, homes: &[AgentHome]) -> Self {
         use std::os::unix::fs::DirBuilderExt;
-        let homes = crate::adapters::Registry::standard().homes();
         let mut children = vec![
             "home".to_owned(),
             "xdg/config".into(),
@@ -336,7 +335,7 @@ impl Profile {
                     .find(|(name, _)| name == key)
                     .map(|(_, value)| value.clone())
             },
-            &homes,
+            homes,
         )
         .unwrap()
     }
@@ -489,7 +488,7 @@ mod tests {
     #[test]
     fn a_data_directory_others_can_enter_or_a_replaced_agent_home_is_refused() {
         let scratch = Scratch::new("trust");
-        let profile = Profile::for_test(&scratch.0);
+        let profile = Profile::for_test(&scratch.0, &HOMES);
         let config = profile
             .agent_homes
             .iter()
@@ -529,7 +528,7 @@ mod tests {
     #[test]
     fn a_person_stop_marker_is_honoured_and_must_be_private() {
         let scratch = Scratch::new("stop");
-        let profile = Profile::for_test(&scratch.0);
+        let profile = Profile::for_test(&scratch.0, &HOMES);
         assert!(!profile.service_stopped().unwrap());
         let marker = profile.data.join("node-stopped.json");
         crate::secure_fs::atomic_json(&marker, &json!({"at":"now"})).unwrap();

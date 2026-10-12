@@ -1368,7 +1368,7 @@ mod tests {
         }
 
         let scratch = crate::secure_fs::tests::Scratch::new("fake-harness");
-        let profile = Profile::for_test(&scratch.0);
+        let profile = Profile::for_test(&scratch.0, &crate::adapters::Registry::standard().homes());
         let calls = Arc::new(Mutex::new(Vec::new()));
         let registry = Registry::new(vec![Arc::new(Fake {
             calls: calls.clone(),

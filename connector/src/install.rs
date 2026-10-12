@@ -951,7 +951,10 @@ pub(crate) mod tests {
     impl Fixture {
         fn new(label: &str) -> Self {
             let scratch = Scratch::new(label);
-            let profile = Profile::for_test(&scratch.0.join("profile"));
+            let profile = Profile::for_test(
+                &scratch.0.join("profile"),
+                &crate::adapters::Registry::standard().homes(),
+            );
             Self {
                 scratch,
                 profile,
