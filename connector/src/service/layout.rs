@@ -157,6 +157,16 @@ impl Layout {
             .expect("a validated profile names absolute paths")
     }
 
+    /// The agents' directories the installing environment leaves unset: a job must not inherit them from its manager
+    /// either, so the agents use their own defaults there too.
+    pub fn agent_dirs_unset(&self) -> Vec<&'static str> {
+        AGENT_DIRECTORIES
+            .iter()
+            .copied()
+            .filter(|name| !self.agent_dirs.contains_key(*name))
+            .collect()
+    }
+
     pub fn current(&self) -> PathBuf {
         self.releases.join("current")
     }
