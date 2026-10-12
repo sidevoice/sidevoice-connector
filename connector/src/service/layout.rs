@@ -45,14 +45,6 @@ const NOT_SETTINGS: &[&str] = &[
     "SIDEVOICE_DATA_DIR",
 ];
 
-/// The agents' configuration directories a definition passes on when the installing environment names them.
-const AGENT_DIRECTORIES: &[&str] = &[
-    "CLAUDE_CONFIG_DIR",
-    "CODEX_HOME",
-    "CURSOR_CONFIG_DIR",
-    "CURSOR_DATA_DIR",
-];
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub home: PathBuf,
@@ -62,8 +54,10 @@ pub struct Layout {
     pub releases: PathBuf,
     pub config_home: PathBuf,
     pub data_home: PathBuf,
-    /// `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `CURSOR_CONFIG_DIR`, `CURSOR_DATA_DIR`: only those that are set.
+    /// The agents' homes the installing environment names (only those that are set), by variable.
     pub agent_dirs: BTreeMap<String, PathBuf>,
+    /// Every agent home's variable the harnesses declare: a job is given those named, and none of the others.
+    pub agent_vars: Vec<&'static str>,
     /// The `SIDEVOICE_*` settings this installation is made with.
     pub settings: BTreeMap<String, String>,
 }
@@ -84,15 +78,20 @@ fn absolute(
 }
 
 impl Layout {
-    /// From this process's environment.
-    pub fn from_env() -> anyhow::Result<Self> {
-        Self::from_vars(|name| std::env::var_os(name), std::env::vars_os())
+    /// From this process's environment, with the agents' homes named by `agent_vars`.
+    pub fn from_env(agent_vars: &[&'static str]) -> anyhow::Result<Self> {
+        Self::from_vars(
+            |name| std::env::var_os(name),
+            std::env::vars_os(),
+            agent_vars,
+        )
     }
 
     /// From named variables (`var`) and all of them (`vars`, for the `SIDEVOICE_*` settings).
     pub fn from_vars(
         var: impl Fn(&str) -> Option<OsString>,
         vars: impl IntoIterator<Item = (OsString, OsString)>,
+        agent_vars: &[&'static str],
     ) -> anyhow::Result<Self> {
         let home = absolute("HOME", var("HOME"), PathBuf::new)?;
         let data = absolute("SIDEVOICE_DATA_DIR", var("SIDEVOICE_DATA_DIR"), || {
@@ -105,7 +104,7 @@ impl Layout {
             home.join(".config")
         })?;
         let mut agent_dirs = BTreeMap::new();
-        for name in AGENT_DIRECTORIES {
+        for name in agent_vars {
             if let Some(value) = var(name).filter(|value| !value.is_empty()) {
                 agent_dirs.insert(
                     (*name).to_owned(),
@@ -127,6 +126,7 @@ impl Layout {
             config_home,
             data_home,
             agent_dirs,
+            agent_vars: agent_vars.to_vec(),
             settings,
         };
         if let Some(recorded) = layout
@@ -153,14 +153,23 @@ impl Layout {
             .into_iter()
             .map(|(name, path)| (name.to_owned(), path.as_os_str().to_owned()))
             .collect();
-        Self::from_vars(|name| vars.get(name).cloned(), std::env::vars_os())
-            .expect("a validated profile names absolute paths")
+        let agent_vars: Vec<&'static str> = profile
+            .agent_homes
+            .iter()
+            .map(|resolved| resolved.spec.var)
+            .collect();
+        Self::from_vars(
+            |name| vars.get(name).cloned(),
+            std::env::vars_os(),
+            &agent_vars,
+        )
+        .expect("a validated profile names absolute paths")
     }
 
     /// The agents' directories the installing environment leaves unset: a job must not inherit them from its manager
     /// either, so the agents use their own defaults there too.
     pub fn agent_dirs_unset(&self) -> Vec<&'static str> {
-        AGENT_DIRECTORIES
+        self.agent_vars
             .iter()
             .copied()
             .filter(|name| !self.agent_dirs.contains_key(*name))
@@ -277,6 +286,7 @@ mod tests {
             |name| map.get(name).cloned(),
             map.iter()
                 .map(|(name, value)| (OsString::from(name), value.clone())),
+            &["ALPHA_HOME"],
         )
     }
 
@@ -297,7 +307,7 @@ mod tests {
             ("HOME", "/home/u"),
             ("SIDEVOICE_DATA_DIR", "/d"),
             ("XDG_DATA_HOME", "/x"),
-            ("CODEX_HOME", "/c"),
+            ("ALPHA_HOME", "/c"),
             ("SIDEVOICE_CORE_PORT", "0"),
             ("SIDEVOICE_CONNECTOR_TOKEN", "secret"),
             ("SIDEVOICE_SERVICE", "launchd"),
@@ -305,7 +315,7 @@ mod tests {
         .unwrap();
         assert_eq!(named.core_socket(), Path::new("/d/core/local.sock"));
         assert_eq!(named.releases, Path::new("/x/sidevoice"));
-        assert_eq!(named.agent_dirs["CODEX_HOME"], Path::new("/c"));
+        assert_eq!(named.agent_dirs["ALPHA_HOME"], Path::new("/c"));
         assert_eq!(named.core_port(), "0");
         assert_eq!(
             named.settings.keys().collect::<Vec<_>>(),

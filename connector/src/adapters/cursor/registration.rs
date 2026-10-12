@@ -37,8 +37,8 @@ fn entry_command(entry: &Value) -> (&str, Vec<String>) {
 fn registration_state(host: &dyn AgentHost) -> Result<String> {
     let profile = host.profile();
     profile.validate_existing_private()?;
-    let file = profile.cursor.join("mcp.json");
-    let root = profile.agent_root(&profile.cursor)?;
+    let file = super::config_home(profile).join("mcp.json");
+    let root = profile.agent_root(super::config_home(profile))?;
     let Some((mut config, _mode, _target)) = read_cursor_config(&file, &root)? else {
         return Ok("not-connected".into());
     };
@@ -70,11 +70,11 @@ fn registration_state(host: &dyn AgentHost) -> Result<String> {
 fn connect_entry(host: &dyn AgentHost) -> Result<(), AgentError> {
     let profile = host.profile();
     profile
-        .validate_for_agent(&profile.cursor)
+        .validate_for_agent(super::config_home(profile))
         .map_err(|_| AgentError::Key("agents.invalid"))?;
-    let file = profile.cursor.join("mcp.json");
+    let file = super::config_home(profile).join("mcp.json");
     let root = profile
-        .agent_root(&profile.cursor)
+        .agent_root(super::config_home(profile))
         .map_err(|_| AgentError::Key("agents.invalid"))?;
     let mut config = match read_cursor_config(&file, &root) {
         Ok(Some((config, _, _))) => config,
@@ -116,11 +116,11 @@ fn connect_entry(host: &dyn AgentHost) -> Result<(), AgentError> {
 fn disconnect_entry(host: &dyn AgentHost) -> Result<(), AgentError> {
     let profile = host.profile();
     profile
-        .validate_for_agent(&profile.cursor)
+        .validate_for_agent(super::config_home(profile))
         .map_err(|_| AgentError::Key("agents.invalid"))?;
-    let file = profile.cursor.join("mcp.json");
+    let file = super::config_home(profile).join("mcp.json");
     let root = profile
-        .agent_root(&profile.cursor)
+        .agent_root(super::config_home(profile))
         .map_err(|_| AgentError::Key("agents.invalid"))?;
     let Some((mut config, _, _)) =
         read_cursor_config(&file, &root).map_err(|_| AgentError::Key("agents.invalid"))?
@@ -188,8 +188,8 @@ fn read_cursor_config(file: &Path, root: &Path) -> Result<Option<(Value, u32, Pa
 }
 
 fn write_cursor_config(profile: &Profile, file: &Path, config: &Value) -> Result<()> {
-    profile.validate_for_agent(&profile.cursor)?;
-    let root = profile.agent_root(&profile.cursor)?;
+    profile.validate_for_agent(super::config_home(profile))?;
+    let root = profile.agent_root(super::config_home(profile))?;
     let (target, mode) = match read_cursor_config(file, &root)? {
         Some((_, mode, target)) => (target, mode),
         None => (file.to_path_buf(), 0o600),
@@ -201,7 +201,7 @@ fn write_cursor_config(profile: &Profile, file: &Path, config: &Value) -> Result
     }
     let temporary = parent.join(format!(".mcp.json.{}.tmp", Uuid::new_v4()));
     let result = (|| -> Result<()> {
-        profile.validate_for_agent(&profile.cursor)?;
+        profile.validate_for_agent(super::config_home(profile))?;
         let mut output = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -213,7 +213,7 @@ fn write_cursor_config(profile: &Profile, file: &Path, config: &Value) -> Result
         output.write_all(b"\n")?;
         output.sync_all()?;
         fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
-        profile.validate_for_agent(&profile.cursor)?;
+        profile.validate_for_agent(super::config_home(profile))?;
         fs::rename(&temporary, &target)?;
         File::open(parent)?.sync_all()?;
         Ok(())
@@ -224,9 +224,21 @@ fn write_cursor_config(profile: &Profile, file: &Path, config: &Value) -> Result
     result
 }
 
+/// What Cursor can and cannot do with a room, said at install so that nobody expects more.
+const INSTALL_NOTES: &str = "Cursor: ask a chat to join the voice room; it speaks its replies there. The first time, \
+Cursor asks to approve the new MCP server (cursor-agent: or run  cursor-agent mcp enable sidevoice ). What you say in \
+the room reaches Cursor only by experimental routes, because Cursor offers none of its own:\n  - Cursor CLI: only a \
+chat started with  cursor-agent persist  (needs tmux); the room types into its terminal.\n  - Cursor editor: a small \
+Sidevoice card appears under the join call; while it stays open in that chat, the room sends to it. Several chats of \
+a window can join, each with its own card.\nIf you type while the room sends, the two mix.";
+
 impl Registration for Cursor {
+    fn after_install(&self, _profile: &Profile) -> Vec<String> {
+        vec![INSTALL_NOTES.to_owned()]
+    }
+
     fn config_root<'a>(&self, profile: &'a Profile) -> &'a Path {
-        &profile.cursor
+        super::config_home(profile)
     }
 
     fn binary_names(&self) -> &'static [&'static str] {
@@ -297,7 +309,7 @@ impl Registration for Cursor {
     ) -> Value {
         json!({
             "command":shell_command(host.command(), host.args()),
-            "file":host.profile().cursor.join("mcp.json").to_string_lossy(),
+            "file":super::config_home(host.profile()).join("mcp.json").to_string_lossy(),
             "snippet":mcp_servers_json(host.command(), host.args(), host.mcp_env()).unwrap_or_default(),
         })
     }

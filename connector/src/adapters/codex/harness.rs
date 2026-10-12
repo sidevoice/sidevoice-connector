@@ -20,6 +20,10 @@ impl Harness for Codex {
         super::capabilities()
     }
 
+    fn homes(&self) -> &'static [crate::profile::AgentHome] {
+        std::slice::from_ref(&super::HOME)
+    }
+
     fn registration(&self) -> Option<&dyn Registration> {
         Some(self)
     }

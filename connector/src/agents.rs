@@ -960,7 +960,7 @@ fn normalized_state(mut value: Value) -> Value {
     value
 }
 
-/// How an agent's CLI is run outside its registration (Codex's queue, for delivery): the executable the scan found
+/// How an agent's CLI is run outside its registration (an adapter's delivery through it): the executable the scan found
 /// (`SIDEVOICE_<AGENT>_BIN` when set to one), else its bare name; and the PATH of the person's login shell the scan
 /// captured, so a launcher that is a script (Node's) finds its interpreter where a service manager's PATH does not
 /// reach.

@@ -28,7 +28,7 @@ pub fn follow(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
                 break;
             }
             if path.is_none() {
-                path = rollout_path(&room.profile().codex, &binding.thread);
+                path = rollout_path(room.profile().agent_home(super::HOME.var), &binding.thread);
                 if let Some(file) = &path {
                     if let Ok(meta) = fs::metadata(file) {
                         offset = 0;

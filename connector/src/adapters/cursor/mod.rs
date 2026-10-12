@@ -4,6 +4,29 @@ mod registration;
 
 pub use harness::Cursor;
 
+/// Cursor's configuration home (`mcp.json`), checked through its parent, and its data below it.
+pub const HOMES: [crate::profile::AgentHome; 2] = [
+    crate::profile::AgentHome {
+        var: "CURSOR_CONFIG_DIR",
+        default: crate::profile::HomeDefault::Home(".cursor"),
+        always_passed: true,
+        config: true,
+        check_parent: true,
+    },
+    crate::profile::AgentHome {
+        var: "CURSOR_DATA_DIR",
+        default: crate::profile::HomeDefault::Under("CURSOR_CONFIG_DIR", "data"),
+        always_passed: true,
+        config: false,
+        check_parent: false,
+    },
+];
+
+/// Cursor's configuration home, as the profile resolves it.
+pub fn config_home(profile: &crate::profile::Profile) -> &std::path::Path {
+    profile.agent_home(HOMES[0].var)
+}
+
 use super::{envelope, Identity};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};

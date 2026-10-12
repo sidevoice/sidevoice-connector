@@ -162,7 +162,7 @@ Pointing an agent at it (the paths are printed by the bench; `P` is the profile)
 `bench/env.sh` sourced, so that its own home (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) is the one the connector reads, and
 its MCP server is the installation's command with the profile's variables:
 
-- **Claude Code**: `. P/bench/env.sh && claude --mcp-config P/bench/claude-mcp.json --strict-mcp-config`. The
+- **Claude Code**: `. P/bench/env.sh && claude --mcp-config P/bench/mcp.json --strict-mcp-config`. The
   profile's Claude home starts empty: log in once there (`/login`), and accept the folder's trust prompt.
   `--strict-mcp-config` keeps any other Sidevoice registration out of the session. Then ask it to join the voice
   call. If `voice_connect` reports `inbound.ok: false`, Claude Code will not take messages from another session in
