@@ -435,19 +435,11 @@ pub fn core_supervisor(profile: &Profile) -> launcher::CoreSupervisor {
 pub async fn ensure_connector(profile: &Profile) -> anyhow::Result<()> {
     let layout = Layout::from_profile(profile);
     let fallback = vec![std::env::current_exe()?.to_string_lossy().into_owned()];
-    let environment: Vec<(String, PathBuf)> = [
-        ("HOME", &profile.home),
-        ("CLAUDE_CONFIG_DIR", &profile.claude),
-        ("CODEX_HOME", &profile.codex),
-        ("CURSOR_CONFIG_DIR", &profile.cursor),
-        ("CURSOR_DATA_DIR", &profile.cursor_data),
-        ("XDG_CONFIG_HOME", &profile.xdg_config),
-        ("XDG_DATA_HOME", &profile.xdg_data),
-        ("SIDEVOICE_DATA_DIR", &profile.data),
-    ]
-    .into_iter()
-    .map(|(name, path)| (name.to_owned(), path.clone()))
-    .collect();
+    let environment: Vec<(String, PathBuf)> = profile
+        .variables()
+        .into_iter()
+        .map(|(name, path)| (name.to_owned(), path.to_path_buf()))
+        .collect();
     launcher::ensure_connector(&layout, fallback, environment, || verify_connector(profile))
         .await
         .map_err(anyhow::Error::new)

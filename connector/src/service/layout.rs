@@ -148,19 +148,11 @@ impl Layout {
 
     /// The paths a running connector's profile names, with this process's `SIDEVOICE_*` settings.
     pub fn from_profile(profile: &crate::profile::Profile) -> Self {
-        let mut vars: BTreeMap<String, OsString> = BTreeMap::new();
-        for (name, path) in [
-            ("HOME", &profile.home),
-            ("SIDEVOICE_DATA_DIR", &profile.data),
-            ("XDG_DATA_HOME", &profile.xdg_data),
-            ("XDG_CONFIG_HOME", &profile.xdg_config),
-            ("CLAUDE_CONFIG_DIR", &profile.claude),
-            ("CODEX_HOME", &profile.codex),
-            ("CURSOR_CONFIG_DIR", &profile.cursor),
-            ("CURSOR_DATA_DIR", &profile.cursor_data),
-        ] {
-            vars.insert(name.into(), path.clone().into_os_string());
-        }
+        let vars: BTreeMap<String, OsString> = profile
+            .variables()
+            .into_iter()
+            .map(|(name, path)| (name.to_owned(), path.as_os_str().to_owned()))
+            .collect();
         Self::from_vars(|name| vars.get(name).cloned(), std::env::vars_os())
             .expect("a validated profile names absolute paths")
     }
