@@ -628,6 +628,45 @@ async fn claude_settings_are_judged_where_claude_code_reads_them() {
     );
     host.shutdown().await;
 }
+
+/// Without its data directory (`~/.claude`, the variable unset), Claude Code's unparsable `~/.claude.json` is still
+/// `invalid`: Connect and Disconnect refuse, its CLI is never asked, and the file is left as it was.
+#[tokio::test]
+async fn unparsable_claude_settings_are_left_alone_without_its_data_directory() {
+    let _turn = agent_env().await;
+    let mut fixture = Fixture::new();
+    let claude_home = fixture.profile.home.join(".claude");
+    set_agent_home(
+        &mut fixture.profile,
+        "CLAUDE_CONFIG_DIR",
+        &claude_home,
+        false,
+    );
+    let claude = fake_claude(&fixture);
+    let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", claude.as_os_str());
+    let file = fixture.profile.home.join(".claude.json");
+    let bytes = b"{\"mcpServers\": {";
+    private_write(&file, bytes);
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_eq!(
+        row(&listed, "claude")["registration"],
+        "invalid",
+        "{listed}"
+    );
+    for action in ["agents.connect", "agents.disconnect"] {
+        let answer = host.handle(action, json!({"id":"claude"})).await;
+        assert_eq!(
+            answer.pointer("/error/key"),
+            Some(&json!("agents.invalid")),
+            "{action}: {answer}"
+        );
+    }
+    assert_eq!(fs::read(&file).unwrap(), bytes);
+    assert!(!claude_home.exists(), "Claude Code's CLI was run");
+    host.shutdown().await;
+}
 #[tokio::test]
 async fn complete_request_gate_orders_scans_mutations_and_external_dismissals() {
     let _turn = agent_env().await;

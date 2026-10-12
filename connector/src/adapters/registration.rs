@@ -191,6 +191,42 @@ pub fn mcp_servers_json(
     })
 }
 
+/// A file in an agent's home, read only when it is the person's own (a regular file, not a link, writable by nobody
+/// else), at most `limit` bytes, and inside `root`. Anything else, a FIFO or a device included, is refused without
+/// waiting on it.
+pub fn read_profile_file(path: &Path, root: &Path, limit: u64) -> anyhow::Result<String> {
+    use anyhow::Context;
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let regular = |metadata: &std::fs::Metadata| {
+        metadata.is_file()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o022 == 0
+            && metadata.len() <= limit
+    };
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !regular(&metadata)
+        || !path.canonicalize()?.starts_with(root)
+    {
+        anyhow::bail!("unsafe profile file");
+    }
+    // Opened without waiting (a FIFO put there since would wait for a writer), then judged again as opened.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_NOCTTY)
+        .open(path)
+        .context("open profile file")?;
+    if !regular(&file.metadata()?) {
+        anyhow::bail!("unsafe profile file");
+    }
+    let mut text = String::new();
+    file.take(limit)
+        .read_to_string(&mut text)
+        .context("read profile file")?;
+    Ok(text)
+}
+
 /// What the test bench asks the connector about the agents (`bench-agents`, a separate binary that cannot read the
 /// registry itself):
 /// - `{"root": R}`: each declared agent home, below `R/agents/`, and each agent's CLI as this `PATH` finds it
