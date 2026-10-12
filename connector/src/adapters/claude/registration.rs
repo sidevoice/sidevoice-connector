@@ -3,12 +3,12 @@
 
 use super::Claude;
 use crate::adapters::registration::{
-    run_required, shell_command, strings, AgentError, AgentHost, BenchSetup, Entry, Launch,
-    Registration,
+    run_required, shell_command_in, strings, AgentError, AgentHost, BenchSetup, Entry, Launch,
+    Manual, ManualStep, Registration,
 };
 use crate::profile::Profile;
 use futures_util::future::BoxFuture;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
@@ -248,14 +248,25 @@ impl Registration for Claude {
         Box::pin(self.disconnect_entry(host, binary))
     }
 
-    fn instructions(
-        &self,
-        host: &dyn AgentHost,
-        _registration: &str,
-        binary: Option<&str>,
-    ) -> Value {
-        let command = shell_command(binary.unwrap_or("claude"), &add_args(host));
-        json!({"command":command.clone(),"file":Value::Null,"snippet":command})
+    fn manual(&self, host: &dyn AgentHost, registration: &str, binary: Option<&str>) -> Manual {
+        let cli = binary.unwrap_or("claude");
+        let profile = host.profile();
+        // `claude mcp` writes Claude Code's user configuration: the file each step changes. A step names
+        // `CLAUDE_CONFIG_DIR` only when the person's environment sets it, as the connector runs the CLI.
+        let file = super::user_config(profile);
+        let step = |args: &[String]| ManualStep {
+            command: Some(shell_command_in(profile, super::HOME.var, cli, args)),
+            snippet: None,
+            file: Some(file.to_string_lossy().into_owned()),
+        };
+        // Ours is always in the user scope. Another entry may be in any scope, a project's or a local one relative to
+        // the directory the person runs it in: without `--scope`, Claude Code removes it from the scope it is in.
+        Manual::by_cli(
+            registration,
+            step(&add_args(host)),
+            step(&strings(&REMOVE)),
+            step(&strings(&["mcp", "remove", "sidevoice"])),
+        )
     }
 }
 
@@ -300,6 +311,7 @@ mod tests {
     use super::*;
     use crate::adapters::registration::{CliError, CliOutput};
     use crate::secure_fs::tests::Scratch;
+    use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
 
     /// A host with no CLI to run: a state judged here never needs one.

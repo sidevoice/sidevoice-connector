@@ -6,7 +6,7 @@
 
 use crate::adapters::health::{self, Health};
 use crate::adapters::registration::{
-    mcp_servers_json, shell_command, AgentError, AgentHost, CliError, CliOutput, Launch,
+    mcp_servers_json, shell_command, AgentError, AgentHost, CliError, CliOutput, Launch, Manual,
     Registration,
 };
 use crate::adapters::Registry;
@@ -491,7 +491,8 @@ impl HostAgents {
                 "foreign" => return Err(agent_failure("agents.foreign", agent)),
                 "invalid" => return Err(agent_failure("agents.invalid", agent)),
                 "unknown" => return Err(agent_failure("agents.registration-unknown", agent)),
-                "not-connected" => {}
+                // An entry an older Sidevoice wrote is written again.
+                "not-connected" | "outdated" => {}
                 _ => return Err(agent_failure("agents.registration-unknown", agent)),
             }
             if current.get("connect").and_then(Value::as_str) != Some("auto") {
@@ -511,7 +512,7 @@ impl HostAgents {
                 .and_then(Value::as_str)
             {
                 Some("connected") => {}
-                Some("not-connected") => {
+                Some("not-connected" | "outdated") => {
                     return Err(agent_failure("agents.registration-not-confirmed", agent))
                 }
                 Some("foreign") => return Err(agent_failure("agents.foreign", agent)),
@@ -536,13 +537,13 @@ impl HostAgents {
             return self.response(&store);
         }
 
-        let owned = current.get("owned") == Some(&Value::Bool(true));
         match registration {
-            "not-connected" if !owned => return self.response(&state),
+            "not-connected" => return self.response(&state),
             "foreign" => return Err(agent_failure("agents.foreign", agent)),
             "invalid" => return Err(agent_failure("agents.invalid", agent)),
             "unknown" => return Err(agent_failure("agents.registration-unknown", agent)),
-            "connected" | "not-connected" => {}
+            // Ours, current or not: removed.
+            "connected" | "outdated" => {}
             _ => return Err(agent_failure("agents.registration-unknown", agent)),
         }
         let binary = state
@@ -554,14 +555,12 @@ impl HostAgents {
         state = self
             .scan(state, Some(agent), false, false, cancel, deadline)
             .await?;
-        let after = seen_agent(&state, agent);
-        let still_owned = after.and_then(|row| row.get("owned")) == Some(&Value::Bool(true));
-        match after
+        match seen_agent(&state, agent)
             .and_then(|row| row.get("registration"))
             .and_then(Value::as_str)
         {
-            Some("not-connected") if !still_owned => {}
-            Some("connected" | "not-connected") => {
+            Some("not-connected") => {}
+            Some("connected" | "outdated") => {
                 return Err(agent_failure("agents.action-failed", agent))
             }
             Some("foreign") => return Err(agent_failure("agents.foreign", agent)),
@@ -1392,14 +1391,11 @@ impl HostAgents {
             .await
             .map_err(|error| failure(error, id))?;
         let registration = entry.registration;
-        // An entry of ours that is not the current one (disabled, an older release, another environment) reads as not
-        // connected, and is still ours to remove: `owned`.
+        // The manual steps follow the state itself: an `outdated` entry is removed before ours is added.
+        let manual = agent.manual(&host, &registration, binary.as_deref());
+        // `outdated`: an entry of ours that is not the current one (disabled, an older release, another environment).
+        // Connect writes it again; like a current one, it is ours to remove: `owned`.
         let owned = registration == "connected" || registration == "outdated";
-        let registration = if registration == "outdated" {
-            "not-connected".to_owned()
-        } else {
-            registration
-        };
         let version = if input.include_version {
             match binary.as_deref() {
                 Some(binary) => self.binary_version(agent, binary, cancel, deadline).await?,
@@ -1429,7 +1425,8 @@ impl HostAgents {
             }
         }
         let present = !evidence.is_empty();
-        let instructions = agent.instructions(&host, &registration, binary.as_deref());
+        // The connector acts itself where it reaches the agent: its CLI found, or a file it edits.
+        let able = binary.is_some() || agent.connects_without_binary();
         let evidence_json = serde_json::to_value(&evidence).map_err(|_| Failure::Internal)?;
         let signature = if present {
             let identity = format!(
@@ -1448,8 +1445,13 @@ impl HostAgents {
             "version":version,
             "registration":registration,
             "owned":owned,
-            "connect":if binary.is_some() || agent.connects_without_binary() {"auto"} else {"manual"},
-            "instructions":instructions,
+            "connect":if able {"auto"} else {"manual"},
+            "can":{"connect":able,"update":able,"disconnect":able},
+            "manual":manual,
+            // The older forms of `manual.connect` and `manual.disconnect`, which older clients read: each sequence as one
+            // step, so running it does the whole operation.
+            "instructions":Manual::as_one(&manual.connect),
+            "removal":Manual::as_one(&manual.disconnect),
             "evidence":evidence_json,
             "present":present,
             "dismissed":false,

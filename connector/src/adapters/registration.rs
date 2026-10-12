@@ -1,10 +1,11 @@
 //! Registering Sidevoice with an agent: the trait a harness implements, and what the host-agent coordinator lends
 //! it for one request.
 
+use crate::messages::message;
 use crate::profile::Profile;
 use futures_util::future::BoxFuture;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -129,9 +130,101 @@ pub trait Registration: Send + Sync {
         host: &'a dyn AgentHost,
         binary: Option<&'a str>,
     ) -> BoxFuture<'a, Result<(), AgentError>>;
-    /// How a person registers it by hand: `{command, file, snippet}`.
-    fn instructions(&self, host: &dyn AgentHost, registration: &str, binary: Option<&str>)
-        -> Value;
+    /// How a person does each operation by hand, as ordered steps, for the registration `state` reported.
+    fn manual(&self, host: &dyn AgentHost, registration: &str, binary: Option<&str>) -> Manual;
+}
+
+/// One step done by hand: a command to run, or a snippet for a file. `file` is the file the step changes, when
+/// known.
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManualStep {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+}
+
+/// How a person registers Sidevoice with an agent by hand (`connect`), updates an entry an older Sidevoice wrote
+/// (`update`: removes ours, then adds the current one), removes it (`disconnect`), and replaces another "sidevoice"
+/// entry with it (`replace`), each as steps in order.
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Manual {
+    pub connect: Vec<ManualStep>,
+    pub update: Vec<ManualStep>,
+    pub disconnect: Vec<ManualStep>,
+    pub replace: Vec<ManualStep>,
+}
+
+impl Manual {
+    /// `steps` as the one step the older fields (`instructions`, `removal`) hold: commands joined with `&&`, each run
+    /// once the one before succeeded, else the last step that gives a snippet (the one that adds), with its file.
+    pub fn as_one(steps: &[ManualStep]) -> Option<ManualStep> {
+        if !steps.is_empty() && steps.iter().all(|step| step.command.is_some()) {
+            let command = steps
+                .iter()
+                .filter_map(|step| step.command.as_deref())
+                .collect::<Vec<_>>()
+                .join(" && ");
+            return Some(ManualStep {
+                command: Some(command),
+                snippet: None,
+                file: steps.last().and_then(|step| step.file.clone()),
+            });
+        }
+        steps
+            .iter()
+            .rev()
+            .find(|step| step.snippet.is_some())
+            .or(steps.last())
+            .cloned()
+    }
+
+    /// An agent whose CLI adds and removes the entry. Connecting adds ours, after removing ours first when it is
+    /// `outdated` (the CLI refuses to add over it); updating removes ours, then adds it; replacing removes the other
+    /// entry (`remove_other`), then adds ours.
+    pub fn by_cli(
+        registration: &str,
+        add: ManualStep,
+        remove: ManualStep,
+        remove_other: ManualStep,
+    ) -> Self {
+        let update = vec![remove.clone(), add.clone()];
+        let connect = if registration == "outdated" {
+            update.clone()
+        } else {
+            vec![add.clone()]
+        };
+        Self {
+            connect,
+            update,
+            disconnect: vec![remove],
+            replace: vec![remove_other, add],
+        }
+    }
+
+    /// An agent configured by a file: connecting adds `snippet` to `file`, disconnecting deletes the "sidevoice" entry
+    /// under `under`, updating deletes it and adds `snippet` again, and replacing deletes the other one there first.
+    pub fn by_file(file: &str, snippet: String, under: &str) -> Self {
+        let step = |snippet: String| ManualStep {
+            command: None,
+            snippet: Some(snippet),
+            file: Some(file.to_owned()),
+        };
+        let params = json!({"under": under});
+        let add = step(snippet);
+        let delete = step(message("agents.manual.delete-entry", &params));
+        Self {
+            connect: vec![add.clone()],
+            update: vec![delete.clone(), add.clone()],
+            disconnect: vec![delete],
+            replace: vec![
+                step(message("agents.manual.delete-other-entry", &params)),
+                add,
+            ],
+        }
+    }
 }
 
 /// The test bench's profile, as an agent is pointed at it: what [`Registration::bench_steps`] writes its steps with.
@@ -186,13 +279,37 @@ pub fn looks_absent(text: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// `value` quoted for a POSIX shell.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// `command args`, each quoted for a POSIX shell.
 pub fn shell_command(command: &str, args: &[String]) -> String {
     std::iter::once(command)
         .chain(args.iter().map(String::as_str))
-        .map(|value| format!("'{}'", value.replace('\'', "'\\''")))
+        .map(shell_quote)
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// `command args` for a POSIX shell, run with the agent's home `variable` as the connector runs its CLI: named when the
+/// person's environment sets it, else left to the agent's own default, as in the person's shell. A step done by hand
+/// then changes the same configuration as the connector would.
+pub fn shell_command_in(
+    profile: &Profile,
+    variable: &str,
+    command: &str,
+    args: &[String],
+) -> String {
+    if !profile.agent_home_set(variable) {
+        return shell_command(command, args);
+    }
+    format!(
+        "{variable}={} {}",
+        shell_quote(&profile.agent_home(variable).to_string_lossy()),
+        shell_command(command, args)
+    )
 }
 
 #[derive(Serialize)]
@@ -358,5 +475,31 @@ mod tests {
         }
         assert!(!executable(&first.join(name)));
         assert!(executable(&second.join(name)));
+    }
+
+    /// The older single-step fields: commands run in order, each once the one before succeeded; file steps keep the
+    /// snippet that adds.
+    #[test]
+    fn a_sequence_as_one_step_does_the_whole_operation() {
+        let command = |text: &str| ManualStep {
+            command: Some(text.into()),
+            snippet: None,
+            file: Some("/f".into()),
+        };
+        assert_eq!(
+            Manual::as_one(&[command("remove"), command("add")]),
+            Some(ManualStep {
+                command: Some("remove && add".into()),
+                snippet: None,
+                file: Some("/f".into()),
+            })
+        );
+        let file = Manual::by_file("/mcp.json", "{\"add\":1}".into(), "mcpServers");
+        assert_eq!(Manual::as_one(&file.update), file.connect.first().cloned());
+        assert_eq!(
+            Manual::as_one(&file.disconnect),
+            file.disconnect.first().cloned()
+        );
+        assert_eq!(Manual::as_one(&[]), None);
     }
 }

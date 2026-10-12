@@ -2,7 +2,7 @@
 
 use super::Cursor;
 use crate::adapters::registration::{
-    mcp_servers_json, shell_command, AgentError, AgentHost, Entry, Launch, Registration,
+    mcp_servers_json, AgentError, AgentHost, Entry, Launch, Manual, Registration,
 };
 use crate::profile::Profile;
 use crate::secure_fs::validate_user_directory;
@@ -307,16 +307,13 @@ impl Registration for Cursor {
         })
     }
 
-    fn instructions(
-        &self,
-        host: &dyn AgentHost,
-        _registration: &str,
-        _binary: Option<&str>,
-    ) -> Value {
-        json!({
-            "command":shell_command(host.command(), host.args()),
-            "file":super::config_home(host.profile()).join("mcp.json").to_string_lossy(),
-            "snippet":mcp_servers_json(host.command(), host.args(), host.mcp_env()).unwrap_or_default(),
-        })
+    fn manual(&self, host: &dyn AgentHost, _registration: &str, _binary: Option<&str>) -> Manual {
+        Manual::by_file(
+            &super::config_home(host.profile())
+                .join("mcp.json")
+                .to_string_lossy(),
+            mcp_servers_json(host.command(), host.args(), host.mcp_env()).unwrap_or_default(),
+            "mcpServers",
+        )
     }
 }
