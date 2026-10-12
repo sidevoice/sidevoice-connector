@@ -288,7 +288,7 @@ fn inbound_warning(profile: &Profile) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::registration::CliOutput;
+    use crate::adapters::registration::{CliError, CliOutput};
     use crate::secure_fs::tests::Scratch;
     use std::os::unix::fs::PermissionsExt;
 
