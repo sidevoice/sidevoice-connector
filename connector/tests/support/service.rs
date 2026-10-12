@@ -52,9 +52,12 @@ pub fn command(profile: &Profile, extra: &BTreeMap<String, String>, args: &[&str
     command
 }
 
-/// `service <verb> --json`: its one JSON line.
+/// `service <verb> --json` (`verb` may be words, `login off`): its one JSON line.
 pub fn service(profile: &Profile, extra: &BTreeMap<String, String>, verb: &str) -> Value {
-    let output = command(profile, extra, &["service", verb, "--json"])
+    let mut args = vec!["service"];
+    args.extend(verb.split_whitespace());
+    args.push("--json");
+    let output = command(profile, extra, &args)
         .stdin(Stdio::null())
         .output()
         .expect("run the service command");
