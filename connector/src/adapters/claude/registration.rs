@@ -2,8 +2,8 @@
 
 use super::Claude;
 use crate::adapters::registration::{
-    looks_absent, run_required, shell_command_in, strings, AgentError, AgentHost, CliError, Manual,
-    ManualStep, Registration,
+    looks_absent, run_required, shell_command, shell_command_in, strings, AgentError, AgentHost,
+    CliError, Manual, ManualStep, Registration,
 };
 use crate::profile::Profile;
 use futures_util::future::BoxFuture;
@@ -228,11 +228,16 @@ impl Registration for Claude {
 
     fn manual(&self, host: &dyn AgentHost, registration: &str, binary: Option<&str>) -> Manual {
         let cli = binary.unwrap_or("claude");
-        let home = &host.profile().claude;
-        // `claude mcp` writes `.claude.json` in `CLAUDE_CONFIG_DIR`: the file each step changes.
-        let file = home.join(".claude.json");
+        let profile = host.profile();
+        // `claude mcp` writes Claude Code's user configuration: the file each step changes. A step names
+        // `CLAUDE_CONFIG_DIR` only when the person's environment sets it, as the connector runs the CLI.
+        let file = super::user_config(profile);
         let step = |args: &[String]| ManualStep {
-            command: Some(shell_command_in("CLAUDE_CONFIG_DIR", home, cli, args)),
+            command: Some(if profile.claude_config_dir_set {
+                shell_command_in("CLAUDE_CONFIG_DIR", &profile.claude, cli, args)
+            } else {
+                shell_command(cli, args)
+            }),
             snippet: None,
             file: Some(file.to_string_lossy().into_owned()),
         };

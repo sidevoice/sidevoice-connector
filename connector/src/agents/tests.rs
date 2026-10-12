@@ -939,7 +939,7 @@ fn fake_claude(fixture: &Fixture) -> PathBuf {
     private_write(
         &binary,
         br##"#!/bin/sh
-home="$CLAUDE_CONFIG_DIR"
+home="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 entry="$home/fake-entry.txt"
 printf '%s\n' "$*" >> "$home/calls"
 case "$1 $2" in
@@ -1086,7 +1086,8 @@ async fn each_agent_says_what_the_connector_does_itself_and_how_to_do_it_by_hand
         assert_eq!(agent["removal"], agent["manual"]["disconnect"][0]);
     }
 
-    // Each command names the agent's home, as the connector runs its CLI.
+    // Each command names the agent's home, as the connector runs its CLI (the fixture's environment sets
+    // `CLAUDE_CONFIG_DIR`; without it, see `claude_steps_name_its_config_dir_only_when_the_person_sets_it`).
     let claude_home = fixture.profile.claude.display().to_string();
     let codex_home = fixture.profile.codex.display().to_string();
     let words = |cli: &Path, words: &[&str]| {
@@ -1194,5 +1195,64 @@ async fn the_manual_steps_run_by_hand_update_an_older_entry_in_the_agents_own_ho
         assert_eq!(agent["registration"], "connected", "{agent}");
         assert_eq!(agent["manual"]["connect"].as_array().unwrap().len(), 1);
     }
+    host.shutdown().await;
+}
+
+/// Without `CLAUDE_CONFIG_DIR` in the person's environment, Claude Code's steps name no variable and change
+/// `~/.claude.json`: run by hand from the person's shell, they change what the connector reads.
+#[tokio::test]
+async fn claude_steps_name_its_config_dir_only_when_the_person_sets_it() {
+    let _turn = agent_env().await;
+    let mut fixture = Fixture::new();
+    fixture.profile.claude = fixture.profile.home.join(".claude");
+    fixture.profile.claude_config_dir_set = false;
+    private_mkdir(&fixture.profile.claude);
+    let claude = fake_claude(&fixture);
+    let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", claude.as_os_str());
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let selected = fixture.selected();
+    private_write(
+        &fixture.profile.claude.join("fake-entry.txt"),
+        format!(
+            "sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: {}\n  Args: {}\n\nTo remove this server, run: claude mcp remove sidevoice -s user\n",
+            selected.command,
+            selected.args.join(" ")
+        )
+        .as_bytes(),
+    );
+
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    let agent = row(&listed, "claude");
+    assert_eq!(agent["owned"], true, "{agent}");
+    let file = fixture.profile.home.join(".claude.json");
+    let manual = &agent["manual"];
+    for operation in ["connect", "disconnect", "replace"] {
+        for step in manual[operation].as_array().unwrap() {
+            assert_eq!(step["file"], json!(file.to_string_lossy()), "{step}");
+            let command = step["command"].as_str().unwrap();
+            assert!(
+                command.starts_with(&format!("'{}' ", claude.display())),
+                "{command}"
+            );
+        }
+    }
+    // The person's shell: their HOME, no CLAUDE_CONFIG_DIR.
+    for step in manual["connect"].as_array().unwrap() {
+        let command = step["command"].as_str().unwrap();
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env("HOME", &fixture.profile.home)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{command}");
+    }
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_eq!(
+        row(&listed, "claude")["registration"],
+        "connected",
+        "{listed}"
+    );
     host.shutdown().await;
 }
