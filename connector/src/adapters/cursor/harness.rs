@@ -5,9 +5,10 @@ use super::app::{AppNotice, CursorApps};
 use super::{composer_holding, deliver_editor, editor_transcript_chat, engine, transcript_path};
 use crate::adapters::conversation::{Conversation, Room};
 use crate::adapters::envelope;
-use crate::adapters::harness::{no_route, Harness};
+use crate::adapters::harness::{no_route, Harness, View};
 use crate::adapters::registration::Registration;
 use crate::adapters::transcript::{self, Observed, TranscriptReader};
+use crate::adapters::Identity;
 use crate::profile::Profile;
 use anyhow::{Context, Result};
 use futures_util::future::BoxFuture;
@@ -72,6 +73,10 @@ impl Harness for Cursor {
 
     fn capabilities(&self) -> Value {
         super::capabilities()
+    }
+
+    fn homes(&self) -> &'static [crate::profile::AgentHome] {
+        &super::HOMES
     }
 
     fn registration(&self) -> Option<&dyn Registration> {
@@ -168,6 +173,52 @@ impl Harness for Cursor {
 
     fn adopts(&self, client_ref: Option<&str>) -> bool {
         client_ref.is_none_or(|client_ref| client_ref.starts_with("cursor-editor-"))
+    }
+
+    fn private_id_prefixes(&self) -> &'static [&'static str] {
+        &["cursor-editor-"]
+    }
+
+    fn recognises_client(&self, client: &Value) -> bool {
+        client::recognises(client)
+    }
+
+    fn view(&self, client_caps: &Value) -> Option<View> {
+        client::view(client_caps)
+    }
+
+    fn refine_identity<'a>(
+        &'a self,
+        identity: &'a mut Identity,
+        title: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(super::refine_identity(identity, title))
+    }
+
+    fn experimental_note(&self, capability: &str, identity: &Identity) -> Option<&'static str> {
+        client::experimental_note(capability, identity)
+    }
+
+    fn joined_fields(
+        &self,
+        identity: &Identity,
+        registered: &Value,
+        views: bool,
+    ) -> Map<String, Value> {
+        Cursor::card_fields(identity, registered, views)
+    }
+
+    fn status_fields(
+        &self,
+        identity: &Identity,
+        listed: Option<&Value>,
+        view_reads: u64,
+    ) -> Map<String, Value> {
+        client::status_fields(identity, listed, view_reads)
+    }
+
+    fn adopted_identity(&self, name: &str, adopted: &Value) -> Option<(Identity, String)> {
+        Some(client::adopted_identity(name, adopted))
     }
 
     fn watch(&self, conversation: Arc<Conversation>, room: Arc<dyn Room>) {
@@ -422,5 +473,151 @@ impl TranscriptReader for Reader {
             observed.push(Observed::Read(header));
         }
         observed
+    }
+}
+
+const VIEW_URI: &str = "ui://sidevoice/voice-link";
+
+/// The card a Cursor editor chat draws under its join call (an MCP App), through which voice reaches it.
+fn card() -> View {
+    View {
+        uri: VIEW_URI,
+        name: "Sidevoice voice link",
+        mime: "text/html;profile=mcp-app",
+        html: super::app::resource_html,
+        meta: || json!({"ui":{"csp":{"connectDomains":["http://127.0.0.1:*"]},"prefersBorder":true}}),
+    }
+}
+
+impl Cursor {
+    /// What Cursor's client is told about the card when a conversation joins.
+    fn card_fields(identity: &Identity, registered: &Value, views: bool) -> Map<String, Value> {
+        let mut fields = Map::new();
+        let prepared = registered.pointer("/prepared/port").is_some();
+        if identity.editor {
+            fields.insert("view".into(), json!(format!("Voice reaches this chat through the small Sidevoice card drawn under this call: it must stay open in this chat. Other chats of this window can join too, each with its own card. Remember this chat's conversation id ({}): voice_status and voice_disconnect need it when several chats are joined.", identity.thread)));
+            fields.insert("speak_first".into(), json!(format!("To speak before the user has said anything by voice, call voice_say with conversation \"{}\" and no session_id. To answer a voice message, use its session_id and revision as usual.", identity.thread)));
+        }
+        let bridge = identity.route.as_deref() == Some("cursor-editor-bridge");
+        fields.insert("card".into(), json!({"requested":identity.editor && prepared,
+            "bridge":bridge,
+            "note":if bridge {"Cursor's Desktop Bridge is on: once Cursor has recorded this call (up to ~30 s), voice reaches this chat by its own id, on screen or not. Until then, and whenever the bridge cannot, it comes through the card under this call."}
+                else if identity.editor && prepared {"A Sidevoice card should appear under this call within seconds. If none does, Cursor did not draw it: tell the user, and that ~/.sidevoice/mcp.log says whether Cursor read the card (a \"resources/read\" line) — without the card, what they say in the room does not reach this chat."}
+                else if identity.editor {"The connector could not open the card's loopback bridge, so no card will work: tell the user to look at ~/.sidevoice/connector.log."}
+                else if !views {"This Cursor did not declare MCP Apps support in initialize, so it draws no card: what the user says in the room cannot reach this chat. ~/.sidevoice/mcp.log shows what it declared."}
+                else {"Cursor CLI: no card; voice reaches the chat only under cursor-agent persist."}}));
+        if identity.delivery["kind"] == "cursor-app" && prepared {
+            fields.insert(
+                "view_link".into(),
+                json!({"conversation":identity.thread,"port":registered["prepared"]["port"],"key":identity.view_key}),
+            );
+        }
+        fields
+    }
+}
+
+/// The hooks Cursor's MCP client is served by.
+pub(super) mod client {
+    use super::*;
+
+    pub fn recognises(client: &Value) -> bool {
+        super::super::is_cursor_client(client)
+    }
+
+    pub fn view(client_caps: &Value) -> Option<View> {
+        super::super::draws_views(client_caps).then(card)
+    }
+
+    pub fn experimental_note(capability: &str, identity: &Identity) -> Option<&'static str> {
+        match (capability, identity.delivery["kind"].as_str()) {
+            ("deliver", Some("cursor-tmux")) => Some("Voice from the room reaches this conversation by an experimental route: it is pasted into this chat's terminal through tmux and sent with Enter. If the user is typing at the same moment, the two texts mix. Tell the user once."),
+            ("deliver", Some("cursor-app")) => Some("Voice from the room reaches this chat by an experimental route: the small Sidevoice card under this call submits it as if the user had typed it; it must stay open in this chat. If the user is typing at the same moment, the two may mix. Tell the user once."),
+            ("sessionIdentity", _) => Some("This conversation is identified by the Sidevoice card drawn in it, not by an id Cursor gives: each chat of this window that joins gets a card and a conversation of its own. Asking this same chat to join again gives it a second one; leave the old one with voice_disconnect and its conversation id."),
+            _ => None,
+        }
+    }
+
+    pub fn status_fields(
+        identity: &Identity,
+        listed: Option<&Value>,
+        reads: u64,
+    ) -> Map<String, Value> {
+        let mut fields = Map::new();
+        if !identity.editor {
+            return fields;
+        }
+        let state = listed
+            .and_then(|item| item.get("delivery_state"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        fields.insert("card".into(), json!({"html_read_by_cursor":reads,"card_connected":state.get("card_connected"),
+            "card_last_seen_ms_ago":state.get("card_last_seen_ms_ago"),"bridge_chat_known":state.get("bridge_chat_known"),
+            "note":if state.get("card_connected") == Some(&json!(true)) {"The card in this chat is connected."}
+                else if reads > 0 {"Cursor read the card but it has not connected to this machine's connector: it may not be on screen, or it failed to load."}
+                else {"Cursor never read the card, so it drew none: tell the user; ~/.sidevoice/mcp.log has what Cursor declared."}}));
+        if let Some(port) = listed
+            .and_then(|item| item.get("cursor_app_port"))
+            .and_then(Value::as_u64)
+        {
+            fields.insert(
+                "view_link".into(),
+                json!({"conversation":identity.thread,"port":port,"key":identity.view_key}),
+            );
+        }
+        fields
+    }
+
+    pub fn adopted_identity(name: &str, result: &Value) -> (Identity, String) {
+        let delivery = result
+            .get("delivery")
+            .cloned()
+            .unwrap_or_else(|| json!({"kind":"cursor-app","thread":name}));
+        let identity = Identity {
+            harness: result
+                .get("harness")
+                .and_then(Value::as_str)
+                .unwrap_or("cursor")
+                .to_owned(),
+            thread: name.to_owned(),
+            delivery,
+            capability_overrides: json!({}),
+            route: result
+                .get("route")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            capabilities: result
+                .get("capabilities")
+                .cloned()
+                .unwrap_or_else(super::super::capabilities),
+            experimental: result
+                .get("experimental")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            inbound: result
+                .get("inbound")
+                .filter(|value| !value.is_null())
+                .cloned(),
+            editor: true,
+            detachable: true,
+            view_key: result
+                .pointer("/delivery/key")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            deliver_note: None,
+            watch_note: None,
+        };
+        let title = result
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("Cursor conversation")
+            .to_owned();
+        (identity, title)
     }
 }

@@ -99,6 +99,15 @@ pub trait Registration: Send + Sync {
     fn evidence(&self) -> Vec<(&'static str, PathBuf)> {
         Vec::new()
     }
+    /// How to start this agent against the test bench's profile, when it can be: printed when the bench starts.
+    fn bench_steps(&self, _setup: &BenchSetup) -> Option<String> {
+        None
+    }
+
+    /// What is left for the person after an install that registered Sidevoice with this agent.
+    fn after_install(&self, _profile: &Profile) -> Vec<String> {
+        Vec::new()
+    }
     /// Whether Sidevoice registers with it without its CLI.
     fn connects_without_binary(&self) -> bool {
         false
@@ -123,6 +132,18 @@ pub trait Registration: Send + Sync {
     /// How a person registers it by hand: `{command, file, snippet}`.
     fn instructions(&self, host: &dyn AgentHost, registration: &str, binary: Option<&str>)
         -> Value;
+}
+
+/// The test bench's profile, as an agent is pointed at it: what [`Registration::bench_steps`] writes its steps with.
+pub struct BenchSetup<'a> {
+    /// The script to source before starting the agent.
+    pub env_script: &'a str,
+    /// An `mcpServers` configuration file naming the installation.
+    pub mcp_config: &'a str,
+    /// The installation's MCP server command, quoted for a shell.
+    pub server: &'a str,
+    /// The environment the server runs with.
+    pub env: &'a BTreeMap<String, String>,
 }
 
 /// Runs the agent's CLI and requires it to succeed.
@@ -221,4 +242,107 @@ pub fn read_profile_file(path: &Path, root: &Path, limit: u64) -> anyhow::Result
         anyhow::bail!("unsafe profile file");
     }
     std::fs::read_to_string(path).context("read profile file")
+}
+
+/// What the test bench asks the connector about the agents (`bench-agents`, a separate binary that cannot read the
+/// registry itself):
+/// - `{"root": R}`: each declared agent home, below `R/agents/`, and each agent's CLI as this `PATH` finds it
+///   (`SIDEVOICE_<ID>_BIN`), as `{"homes": {VAR: path}, "binaries": {VAR: path}}`;
+/// - `{"setup": {env_script, mcp_config, server, env}}`: how to start each agent against the bench, `{"steps": […]}`.
+pub fn bench_agents(request: &Value) -> Value {
+    let registry = super::Registry::standard();
+    if let Some(root) = request.get("root").and_then(Value::as_str) {
+        let homes: serde_json::Map<String, Value> = registry
+            .homes()
+            .iter()
+            .map(|home| {
+                let dir = Path::new(root)
+                    .join("agents")
+                    .join(home.var.to_ascii_lowercase());
+                (
+                    home.var.to_owned(),
+                    Value::from(dir.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let binaries: serde_json::Map<String, Value> = registry
+            .agents()
+            .filter_map(|(id, registration)| {
+                let found = registration.binary_names().iter().find_map(|name| {
+                    path.split(':')
+                        .filter(|dir| !dir.is_empty())
+                        .map(|dir| Path::new(dir).join(name))
+                        .find(|candidate| executable(candidate))
+                })?;
+                Some((
+                    format!("SIDEVOICE_{}_BIN", id.to_ascii_uppercase()),
+                    Value::from(found.to_string_lossy().into_owned()),
+                ))
+            })
+            .collect();
+        return serde_json::json!({"homes": homes, "binaries": binaries});
+    }
+    let setup = request.get("setup").cloned().unwrap_or_default();
+    let text = |key: &str| {
+        setup
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    };
+    let env: BTreeMap<String, String> = setup
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|env| {
+            env.iter()
+                .map(|(name, value)| (name.clone(), value.as_str().unwrap_or("").to_owned()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let (env_script, mcp_config, server) = (text("env_script"), text("mcp_config"), text("server"));
+    let bench = BenchSetup {
+        env_script: &env_script,
+        mcp_config: &mcp_config,
+        server: &server,
+        env: &env,
+    };
+    let steps: Vec<String> = registry
+        .agents()
+        .filter_map(|(_, registration)| registration.bench_steps(&bench))
+        .collect();
+    serde_json::json!({"steps": steps})
+}
+
+/// A file anyone may run.
+fn executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The bench's CLI lookup passes over a file of an agent's CLI name that cannot be run, as a shell would.
+    #[test]
+    fn a_cli_that_cannot_be_run_is_passed_over() {
+        let scratch = crate::secure_fs::tests::Scratch::new("bench-cli");
+        let (first, second) = (scratch.0.join("first"), scratch.0.join("second"));
+        let name = super::super::Registry::standard()
+            .agents()
+            .next()
+            .map(|(_, registration)| registration.binary_names()[0])
+            .unwrap();
+        for (dir, mode) in [(&first, 0o644), (&second, 0o755)] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join(name), "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+        assert!(!executable(&first.join(name)));
+        assert!(executable(&second.join(name)));
+    }
 }

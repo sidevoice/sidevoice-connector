@@ -3,8 +3,8 @@
 
 use super::Claude;
 use crate::adapters::registration::{
-    read_profile_file, run_required, shell_command, strings, AgentError, AgentHost, Entry, Launch,
-    Registration,
+    read_profile_file, run_required, shell_command, strings, AgentError, AgentHost, BenchSetup,
+    Entry, Launch, Registration,
 };
 use crate::profile::Profile;
 use futures_util::future::BoxFuture;
@@ -27,7 +27,7 @@ impl Claude {
         binary: Option<&str>,
     ) -> Result<Entry, AgentError> {
         let profile = host.profile();
-        match fs::symlink_metadata(&profile.claude) {
+        match fs::symlink_metadata(profile.agent_home(super::HOME.var)) {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Entry::bare("absent")),
             Err(_) => return Ok(Entry::bare("invalid")),
             Ok(_) => {}
@@ -44,8 +44,8 @@ impl Claude {
         }
         // The file stays inside the directory Claude Code reads it from: its configuration directory when the
         // person's environment names one, else their home.
-        let root = if profile.claude_config_dir_set {
-            profile.agent_root(&profile.claude)
+        let root = if profile.agent_home_set(super::HOME.var) {
+            profile.agent_root(profile.agent_home(super::HOME.var))
         } else {
             profile
                 .validate_existing_private()
@@ -211,8 +211,23 @@ fn add_args(host: &dyn AgentHost) -> Vec<String> {
 }
 
 impl Registration for Claude {
+    fn bench_steps(&self, setup: &BenchSetup) -> Option<String> {
+        Some(format!(
+            "Claude Code (log in once inside the profile with /login):\n  . {} && claude --mcp-config {} --strict-mcp-config",
+            setup.env_script, setup.mcp_config
+        ))
+    }
+
+    fn after_install(&self, profile: &Profile) -> Vec<String> {
+        let mut notes = vec!["In a conversation, ask to join the voice room. Sessions already open need a restart before they \
+             see the server."
+            .to_owned()];
+        notes.extend(inbound_warning(profile));
+        notes
+    }
+
     fn config_root<'a>(&self, profile: &'a Profile) -> &'a Path {
-        &profile.claude
+        profile.agent_home(super::HOME.var)
     }
 
     fn binary_names(&self) -> &'static [&'static str] {
@@ -273,4 +288,28 @@ fn strings_of(value: Option<&Value>) -> Option<Vec<String>> {
             .map(|item| item.as_str().map(str::to_owned))
             .collect(),
     }
+}
+
+/// Claude Code holds what other local processes send to a session that bypasses permission prompts.
+fn inbound_warning(profile: &Profile) -> Option<String> {
+    let settings = profile.agent_home(super::HOME.var).join("settings.json");
+    let parsed: Value = serde_json::from_slice(&fs::read(&settings).ok()?).ok()?;
+    if parsed
+        .get("crossSessionInbound")
+        .is_some_and(|value| !value.is_null())
+        || parsed
+            .pointer("/permissions/defaultMode")
+            .and_then(Value::as_str)
+            != Some("bypassPermissions")
+    {
+        return None;
+    }
+    Some(format!(
+        "This machine runs Claude Code sessions in bypassPermissions, and those hold what the room sends instead of \
+         delivering it: voice looks sent and never arrives. Either start a session with\n  --settings \
+         '{{\"crossSessionInbound\":\"accept\"}}'\nor add \"crossSessionInbound\": \"accept\" to {}. That second one \
+         lets any local process post into every Claude session on this machine, which is the safeguard it removes: \
+         your call, not ours.",
+        settings.display()
+    ))
 }

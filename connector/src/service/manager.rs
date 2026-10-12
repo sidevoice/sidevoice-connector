@@ -1,5 +1,5 @@
 //! This user's service manager: which one there is, what it says about each job, and the commands that load,
-//! start, restart and unload them. Every call has an absolute deadline (30 s: launchd holds a `kickstart` of a job
+//! start, restart and unload them, and that say whether they start at the next login. Every call has an absolute deadline (30 s: launchd holds a `kickstart` of a job
 //! started less than its ThrottleInterval ago until that interval has passed, and systemd's `stop` waits
 //! TimeoutStopSec), and a manager that cannot be asked is never taken to mean a job is absent.
 
@@ -197,6 +197,17 @@ async fn systemctl(args: &[&str]) -> Output {
     let mut all = vec!["--user"];
     all.extend_from_slice(args);
     manage("systemctl", &all).await
+}
+
+/// [`launchctl`] and [`systemctl`] with owned arguments: the runners the generic steps below take, which tests fake.
+async fn launchd_run(args: Vec<String>) -> Output {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    launchctl(&args).await
+}
+
+async fn systemd_run(args: Vec<String>) -> Output {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    systemctl(&args).await
 }
 
 fn domain() -> String {
@@ -471,7 +482,44 @@ async fn boot_out(job: Job) -> std::result::Result<(), String> {
     }
 }
 
-async fn boot_in(layout: &Layout, job: Job) -> std::result::Result<(), String> {
+/// How a job is bootstrapped, from whether this start enables it for login and, if not, whether it starts at login
+/// now. launchd refuses to bootstrap a job disabled for login, so one the person turned off is enabled for the
+/// bootstrap and disabled again right after: it runs now and still not at the next login. When that cannot be read,
+/// enabling it could leave it on for good: refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Boot {
+    Plain,
+    Reenabled,
+    Refused,
+}
+
+pub fn boot_plan(login: bool, now: Option<bool>) -> Boot {
+    match (login, now) {
+        (true, _) | (false, Some(true)) => Boot::Plain,
+        (false, Some(false)) => Boot::Reenabled,
+        (false, None) => Boot::Refused,
+    }
+}
+
+/// The job loaded from its plist; with `reenable` ([`Boot::Reenabled`]), enabled for the bootstrap and disabled again.
+async fn boot_in(layout: &Layout, job: Job, reenable: bool) -> std::result::Result<(), String> {
+    if reenable {
+        let enabled = launchctl(&["enable", &target(job)]).await;
+        if !enabled.ok {
+            return Err(format!("enable: {}", enabled.trimmed()));
+        }
+    }
+    let booted = bootstrap(layout, job).await;
+    if reenable {
+        let disabled = launchctl(&["disable", &target(job)]).await;
+        if !disabled.ok {
+            return Err(format!("disable: {}", disabled.trimmed()));
+        }
+    }
+    booted
+}
+
+async fn bootstrap(layout: &Layout, job: Job) -> std::result::Result<(), String> {
     let file = definition_path(layout, Kind::Launchd, job)
         .await
         .expect("launchd definitions have a path");
@@ -491,12 +539,14 @@ async fn boot_in(layout: &Layout, job: Job) -> std::result::Result<(), String> {
 }
 
 /// What systemd does before `jobs` start, through `systemctl` (its arguments after `--user`): with `reload`, it reads
-/// the definitions again, and it enables each job for the next login, then checks that it is. A refusal of any of it is
-/// the start failing, even when the job would run now: it would not start at the next login, or would run the definition
-/// from before. The job a refusal is about, if it is about one, and what the manager said.
+/// the definitions again, and with `login` it enables each job for the next login, then checks that it is (without,
+/// a job the person turned off for login stays off). A refusal of any of it is the start failing, even when the job
+/// would run now: it would not start at the next login, or would run the definition from before. The job a refusal
+/// is about, if it is about one, and what the manager said.
 async fn prepare_systemd<F, Fut>(
     systemctl: F,
     reload: bool,
+    login: bool,
     jobs: &[Job],
 ) -> std::result::Result<(), (Option<Job>, String)>
 where
@@ -508,6 +558,9 @@ where
         if !out.ok {
             return Err((None, format!("daemon-reload: {}", out.trimmed())));
         }
+    }
+    if !login {
+        return Ok(());
     }
     for &job in jobs {
         let out = systemctl(vec!["enable".into(), job.unit().into()]).await;
@@ -524,12 +577,14 @@ where
 
 /// Each of `jobs` started from its definition as it is now: a changed definition is loaded again (launchd reads a
 /// plist only when it is bootstrapped; systemd reloads), and with `restart` a running job is restarted (launchd
-/// `kickstart -k`; systemd `reset-failed` + `restart`, which clears a start limit).
+/// `kickstart -k`; systemd `reset-failed` + `restart`, which clears a start limit). With `login`, each is also enabled
+/// for the next login; without, whether it starts at login is left as it is ([`set_start_at_login`]).
 pub async fn start(
     layout: &Layout,
     kind: Kind,
     changed: &[Job],
     restart: bool,
+    login: bool,
     jobs: &[Job],
 ) -> Result<()> {
     if jobs.contains(&Job::Core) && (restart || changed.contains(&Job::Core)) {
@@ -545,12 +600,34 @@ pub async fn start(
     match kind {
         Kind::Launchd => {
             for &job in jobs {
+                if login {
+                    // An override left by an earlier installation would keep the job from loading at the next login.
+                    let enabled = launchctl(&["enable", &target(job)]).await;
+                    if !enabled.ok {
+                        return Err(Failure::keyed(
+                            "service.not-enabled",
+                            json!({"detail": format!("{}: enable: {}", job.label(), enabled.trimmed())}),
+                        ));
+                    }
+                }
                 let loaded = matches!(presence(kind, job).await, Presence::Loaded { .. });
                 if changed.contains(&job) && loaded {
                     boot_out(job).await.map_err(|detail| fail(job, detail))?;
                 }
                 if !matches!(presence(kind, job).await, Presence::Loaded { .. }) {
-                    boot_in(layout, job)
+                    let now = if login {
+                        Some(true)
+                    } else {
+                        job_login(&launchd_run, kind, job).await
+                    };
+                    let plan = boot_plan(login, now);
+                    if plan == Boot::Refused {
+                        return Err(Failure::keyed(
+                            "service.login-unknown",
+                            json!({"detail": job.label()}),
+                        ));
+                    }
+                    boot_in(layout, job, plan == Boot::Reenabled)
                         .await
                         .map_err(|detail| fail(job, detail))?;
                     continue;
@@ -568,11 +645,9 @@ pub async fn start(
             }
         }
         Kind::Systemd => {
-            let run = |args: Vec<String>| async move {
-                let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                systemctl(&args).await
-            };
-            if let Err((job, detail)) = prepare_systemd(run, !changed.is_empty(), jobs).await {
+            if let Err((job, detail)) =
+                prepare_systemd(systemd_run, !changed.is_empty(), login, jobs).await
+            {
                 let detail = match job {
                     Some(job) => format!("{}: {detail}", job.name(kind)),
                     None => detail,
@@ -663,6 +738,209 @@ pub async fn unload(installed: &Installed, disable: bool) -> Option<String> {
     None
 }
 
+/// Whether a job starts at the next login, read from `launchctl print-disabled <domain>`: its label overridden
+/// `disabled` (`true` on older macOS) does not, `enabled` (`false`) does, and a label with no override loads with its
+/// plist. `None`: the output is not that list.
+pub fn parse_launchd_login(printed: &str, label: &str) -> Option<bool> {
+    if !printed.contains("disabled services") {
+        return None;
+    }
+    let quoted = format!("\"{label}\"");
+    let value = printed.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(&quoted)?
+            .trim_start()
+            .strip_prefix("=>")
+            .map(str::trim)
+    });
+    match value {
+        None | Some("enabled" | "false") => Some(true),
+        Some("disabled" | "true") => Some(false),
+        Some(_) => None,
+    }
+}
+
+/// Whether a unit starts at the next login, from `systemctl --user is-enabled`: `enabled` or `disabled`; anything
+/// else (`masked`, `static`, `enabled-runtime`, no answer) is `None`.
+pub fn parse_systemd_login(shown: &str) -> Option<bool> {
+    match shown.lines().next().map(str::trim) {
+        Some("enabled") => Some(true),
+        Some("disabled") => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether one job starts at the next login, as its manager (`run`, its arguments) answers now.
+async fn job_login<F, Fut>(run: &F, kind: Kind, job: Job) -> Option<bool>
+where
+    F: Fn(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Output>,
+{
+    match kind {
+        Kind::Launchd => {
+            let printed = run(vec!["print-disabled".into(), domain()]).await;
+            printed
+                .ok
+                .then(|| parse_launchd_login(&printed.output, job.label()))
+                .flatten()
+        }
+        Kind::Systemd => {
+            // `is-enabled` exits non-zero for `disabled`: its answer is the text.
+            let shown = run(vec!["is-enabled".into(), job.unit().into()]).await;
+            parse_systemd_login(&shown.output)
+        }
+        Kind::None => None,
+    }
+}
+
+/// Sidevoice's start at login from its jobs' answers: off when any job is off (Sidevoice would not come up whole), on
+/// when every job is on, and otherwise (a job its manager cannot tell about, or no job) not known.
+pub fn combine_login(jobs: impl IntoIterator<Item = Option<bool>>) -> Option<bool> {
+    let jobs: Vec<Option<bool>> = jobs.into_iter().collect();
+    if jobs.contains(&Some(false)) {
+        Some(false)
+    } else if jobs.is_empty() || jobs.contains(&None) {
+        None
+    } else {
+        Some(true)
+    }
+}
+
+async fn login_with<F, Fut>(run: &F, kind: Kind, jobs: &[Job]) -> Option<bool>
+where
+    F: Fn(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Output>,
+{
+    let mut each = Vec::new();
+    for &job in jobs {
+        each.push(job_login(run, kind, job).await);
+    }
+    combine_login(each)
+}
+
+/// The jobs whose definitions are here.
+fn defined(installed: &Installed) -> Vec<Job> {
+    Job::ALL
+        .into_iter()
+        .filter(|&job| installed.file(job).is_some())
+        .collect()
+}
+
+/// The jobs whose definitions are missing: an incomplete service, which `service install` repairs.
+pub fn missing(installed: &Installed) -> Vec<Job> {
+    Job::ALL
+        .into_iter()
+        .filter(|&job| installed.file(job).is_none())
+        .collect()
+}
+
+pub fn names(jobs: &[Job], kind: Kind) -> String {
+    jobs.iter()
+        .map(|job| job.name(kind))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Sidevoice's start at login, through `run`: `None` for an incomplete service (with a job missing, whether
+/// Sidevoice comes up at login is not that of either job), else [`combine_login`] over both.
+async fn login_of<F, Fut>(run: &F, installed: &Installed) -> Option<bool>
+where
+    F: Fn(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Output>,
+{
+    if !missing(installed).is_empty() {
+        return None;
+    }
+    login_with(run, installed.kind, &Job::ALL).await
+}
+
+/// Whether both jobs start at the next login, as their manager says now; `None` when it cannot tell, or a job is not
+/// defined.
+pub async fn start_at_login(installed: &Installed) -> Option<bool> {
+    match installed.kind {
+        Kind::Launchd => login_of(&launchd_run, installed).await,
+        Kind::Systemd => login_of(&systemd_run, installed).await,
+        Kind::None => None,
+    }
+}
+
+/// Whether a start enables its jobs for the next login: on a new service (no job was defined), and otherwise only
+/// when the jobs that were defined all start at login now. Off, or not known (launchd's override unreadable, systemd
+/// `enabled-runtime`, …): left as it is, never turned on.
+pub fn enable_on_start(new: bool, defined_now: Option<bool>) -> bool {
+    new || defined_now == Some(true)
+}
+
+async fn login_to_keep<F, Fut>(run: &F, installed: Option<&Installed>) -> bool
+where
+    F: Fn(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Output>,
+{
+    match installed {
+        None => enable_on_start(true, None),
+        Some(found) => enable_on_start(false, login_with(run, found.kind, &defined(found)).await),
+    }
+}
+
+/// [`enable_on_start`] for the jobs defined here (`None`: none was).
+pub async fn keeps_login(installed: Option<&Installed>) -> bool {
+    match installed.map(|found| found.kind) {
+        Some(Kind::Launchd) => login_to_keep(&launchd_run, installed).await,
+        Some(Kind::Systemd) => login_to_keep(&systemd_run, installed).await,
+        Some(Kind::None) => false,
+        None => true,
+    }
+}
+
+/// Each of `jobs` set to start at the next login (`on`) or not, through its manager (`run`): launchd `enable` /
+/// `disable` of its label, which only says whether it loads at login; systemd `enable` / `disable` of its unit, never
+/// with `--now`. Nothing is loaded, started, stopped or unloaded: a running job keeps running, a stopped one stays
+/// stopped. Each change is read back. The first job refused or not confirmed, and what the manager said.
+async fn set_login<F, Fut>(
+    run: F,
+    kind: Kind,
+    jobs: &[Job],
+    on: bool,
+) -> std::result::Result<(), (Job, String)>
+where
+    F: Fn(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Output>,
+{
+    let verb = if on { "enable" } else { "disable" };
+    for &job in jobs {
+        let name = match kind {
+            Kind::Launchd => target(job),
+            _ => job.unit().into(),
+        };
+        let out = run(vec![verb.into(), name]).await;
+        if !out.ok {
+            return Err((job, format!("{verb}: {}", out.trimmed())));
+        }
+        let now = job_login(&run, kind, job).await;
+        if now != Some(on) {
+            let now = now.map_or("unknown", |now| if now { "on" } else { "off" });
+            return Err((job, format!("{verb}: not confirmed (now {now})")));
+        }
+    }
+    Ok(())
+}
+
+/// The jobs defined here set to start at the next login or not, and nothing else ([`set_login`]); a refusal, said
+/// with its job's name.
+pub async fn set_start_at_login(
+    installed: &Installed,
+    on: bool,
+) -> std::result::Result<(), String> {
+    let jobs = defined(installed);
+    let kind = installed.kind;
+    let set = match kind {
+        Kind::Launchd => set_login(launchd_run, kind, &jobs, on).await,
+        Kind::Systemd => set_login(systemd_run, kind, &jobs, on).await,
+        Kind::None => Ok(()),
+    };
+    set.map_err(|(job, detail)| format!("{}: {detail}", job.name(kind)))
+}
+
 /// After the definitions are deleted: systemd forgets the units.
 pub async fn forget(kind: Kind) -> Result<()> {
     if kind != Kind::Systemd {
@@ -747,7 +1025,8 @@ mod tests {
     #[tokio::test]
     async fn systemd_reloads_enables_and_checks_each_job() {
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let prepared = prepare_systemd(scripted(enabled(), log.clone()), true, &Job::ALL).await;
+        let prepared =
+            prepare_systemd(scripted(enabled(), log.clone()), true, true, &Job::ALL).await;
         assert_eq!(prepared, Ok(()));
         let calls = log.lock().unwrap().clone();
         assert_eq!(calls[0], "daemon-reload");
@@ -764,11 +1043,317 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_start_that_keeps_login_off_enables_nothing() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prepared = prepare_systemd(scripted(vec![], log.clone()), true, false, &Job::ALL).await;
+        assert_eq!(prepared, Ok(()));
+        assert_eq!(*log.lock().unwrap(), vec!["daemon-reload".to_owned()]);
+    }
+
+    const PRINT_DISABLED_OFF: &str = "disabled services = {\n\t\"com.apple.Siri.agent\" => enabled\n\t\"dev.sidevoice.core\" => disabled\n\t\"dev.sidevoice.connector\" => disabled\n}\n";
+    const PRINT_DISABLED_ON: &str = "disabled services = {\n\t\"dev.sidevoice.core\" => enabled\n\t\"dev.sidevoice.connector\" => enabled\n}\n";
+
+    #[tokio::test]
+    async fn login_off_and_on_only_disable_and_enable_each_unit_under_systemd() {
+        let off = Job::ALL
+            .iter()
+            .map(|job| (format!("is-enabled {}", job.unit()), false, "disabled\n"))
+            .collect();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let set = set_login(scripted(off, log.clone()), Kind::Systemd, &Job::ALL, false).await;
+        assert_eq!(set, Ok(()));
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![
+                "disable sidevoice-core.service",
+                "is-enabled sidevoice-core.service",
+                "disable sidevoice-connector.service",
+                "is-enabled sidevoice-connector.service",
+            ],
+            "no --now, no stop: the running service is left running"
+        );
+
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let set = set_login(
+            scripted(enabled(), log.clone()),
+            Kind::Systemd,
+            &Job::ALL,
+            true,
+        )
+        .await;
+        assert_eq!(set, Ok(()));
+        let calls = log.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                "enable sidevoice-core.service",
+                "is-enabled sidevoice-core.service",
+                "enable sidevoice-connector.service",
+                "is-enabled sidevoice-connector.service",
+            ],
+            "no --now, no start: a stopped service stays stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_off_and_on_only_disable_and_enable_each_label_under_launchd() {
+        let domain = domain();
+        let printed = |output| vec![(format!("print-disabled {domain}"), true, output)];
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let set = set_login(
+            scripted(printed(PRINT_DISABLED_OFF), log.clone()),
+            Kind::Launchd,
+            &Job::ALL,
+            false,
+        )
+        .await;
+        assert_eq!(set, Ok(()));
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![
+                format!("disable {domain}/dev.sidevoice.core"),
+                format!("print-disabled {domain}"),
+                format!("disable {domain}/dev.sidevoice.connector"),
+                format!("print-disabled {domain}"),
+            ],
+            "no bootout: the loaded jobs stay loaded and running"
+        );
+
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let set = set_login(
+            scripted(printed(PRINT_DISABLED_ON), log.clone()),
+            Kind::Launchd,
+            &[Job::Core],
+            true,
+        )
+        .await;
+        assert_eq!(set, Ok(()));
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![
+                format!("enable {domain}/dev.sidevoice.core"),
+                format!("print-disabled {domain}"),
+            ],
+            "no bootstrap or kickstart"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_login_change_refused_or_not_read_back_is_a_refusal() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let refused = vec![(
+            "disable sidevoice-core.service".to_owned(),
+            false,
+            "Access denied",
+        )];
+        let set = set_login(
+            scripted(refused, log.clone()),
+            Kind::Systemd,
+            &Job::ALL,
+            false,
+        )
+        .await;
+        assert_eq!(set, Err((Job::Core, "disable: Access denied".into())));
+
+        // The manager accepted it and still says the unit starts at login.
+        let set = set_login(
+            scripted(enabled(), log.clone()),
+            Kind::Systemd,
+            &Job::ALL,
+            false,
+        )
+        .await;
+        assert_eq!(
+            set,
+            Err((Job::Core, "disable: not confirmed (now on)".into()))
+        );
+
+        // A manager that cannot be read back is not taken to have done it.
+        let set = set_login(scripted(vec![], log), Kind::Launchd, &Job::ALL, true).await;
+        assert_eq!(
+            set,
+            Err((Job::Core, "enable: not confirmed (now unknown)".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn start_at_login_is_read_from_each_job_never_guessed() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let both = login_with(&scripted(enabled(), log.clone()), Kind::Systemd, &Job::ALL).await;
+        assert_eq!(both, Some(true));
+
+        let mut one_off = enabled();
+        one_off.retain(|(line, _, _)| *line != "is-enabled sidevoice-connector.service");
+        one_off.push((
+            "is-enabled sidevoice-connector.service".into(),
+            false,
+            "disabled\n",
+        ));
+        let mixed = login_with(&scripted(one_off, log.clone()), Kind::Systemd, &Job::ALL).await;
+        assert_eq!(mixed, Some(false), "Sidevoice would not come up whole");
+
+        let masked = vec![(
+            "is-enabled sidevoice-core.service".to_owned(),
+            false,
+            "masked\n",
+        )];
+        let unknown = login_with(&scripted(masked, log.clone()), Kind::Systemd, &[Job::Core]).await;
+        assert_eq!(unknown, None);
+
+        let failed = vec![(format!("print-disabled {}", domain()), false, "")];
+        let unknown = login_with(&scripted(failed, log), Kind::Launchd, &Job::ALL).await;
+        assert_eq!(unknown, None, "launchctl could not be asked");
+    }
+
+    fn service(kind: Kind, core: bool, connector: bool) -> Installed {
+        Installed {
+            kind,
+            core: core.then(|| PathBuf::from("/defs/core")),
+            connector: connector.then(|| PathBuf::from("/defs/connector")),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_start_turns_login_on_only_for_a_new_service_or_one_that_has_it_on() {
+        // install, upgrade (`define_and_start`), start and restart all decide through this.
+        assert!(enable_on_start(true, None), "a new service starts at login");
+        assert!(enable_on_start(false, Some(true)));
+        assert!(
+            !enable_on_start(false, Some(false)),
+            "the person's off holds"
+        );
+        assert!(
+            !enable_on_start(false, None),
+            "not known is never turned on"
+        );
+
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let both = service(Kind::Systemd, true, true);
+        assert!(login_to_keep(&scripted(enabled(), log.clone()), Some(&both)).await);
+        assert!(login_to_keep(&scripted(vec![], log.clone()), None).await);
+
+        // Enabled for this boot only, or a manager that does not answer: left as it is.
+        let runtime = Job::ALL
+            .iter()
+            .map(|job| {
+                (
+                    format!("is-enabled {}", job.unit()),
+                    true,
+                    "enabled-runtime\n",
+                )
+            })
+            .collect();
+        assert!(!login_to_keep(&scripted(runtime, log.clone()), Some(&both)).await);
+        let silent = Job::ALL
+            .iter()
+            .map(|job| (format!("is-enabled {}", job.unit()), false, ""))
+            .collect();
+        assert!(!login_to_keep(&scripted(silent, log.clone()), Some(&both)).await);
+        let unreadable = vec![(format!("print-disabled {}", domain()), false, "")];
+        let launchd = service(Kind::Launchd, true, true);
+        assert!(!login_to_keep(&scripted(unreadable, log.clone()), Some(&launchd)).await);
+
+        // And a start that leaves it as it is enables nothing.
+        log.lock().unwrap().clear();
+        let prepared =
+            prepare_systemd(scripted(vec![], log.clone()), false, false, &Job::ALL).await;
+        assert_eq!(prepared, Ok(()));
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn launchd_bootstraps_a_job_off_for_login_reenabled_and_refuses_when_it_cannot_tell() {
+        assert_eq!(boot_plan(true, None), Boot::Plain);
+        assert_eq!(boot_plan(false, Some(true)), Boot::Plain);
+        assert_eq!(boot_plan(false, Some(false)), Boot::Reenabled);
+        assert_eq!(boot_plan(false, None), Boot::Refused);
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_service_never_reports_start_at_login() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        for (core, connector, expected) in [
+            (true, true, Some(true)),
+            (true, false, None),
+            (false, true, None),
+            (false, false, None),
+        ] {
+            let installed = service(Kind::Systemd, core, connector);
+            let login = login_of(&scripted(enabled(), log.clone()), &installed).await;
+            assert_eq!(login, expected, "core {core}, connector {connector}");
+        }
+        assert_eq!(missing(&service(Kind::Systemd, true, true)), vec![]);
+        let none = missing(&service(Kind::Systemd, false, false));
+        assert_eq!(
+            names(&none, Kind::Systemd),
+            "sidevoice-core.service, sidevoice-connector.service"
+        );
+        assert_eq!(
+            names(
+                &missing(&service(Kind::Launchd, true, false)),
+                Kind::Launchd
+            ),
+            "dev.sidevoice.connector"
+        );
+        assert_eq!(
+            names(
+                &missing(&service(Kind::Launchd, false, true)),
+                Kind::Launchd
+            ),
+            "dev.sidevoice.core"
+        );
+    }
+
+    #[test]
+    fn login_answers_read_as_on_off_or_unknown() {
+        assert_eq!(
+            parse_launchd_login(PRINT_DISABLED_OFF, "dev.sidevoice.core"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_launchd_login(PRINT_DISABLED_ON, "dev.sidevoice.core"),
+            Some(true)
+        );
+        let older = "disabled services = {\n\t\"dev.sidevoice.core\" => true\n\t\"dev.sidevoice.connector\" => false\n}\n";
+        assert_eq!(
+            parse_launchd_login(older, "dev.sidevoice.core"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_launchd_login(older, "dev.sidevoice.connector"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_launchd_login("disabled services = {\n}\n", "dev.sidevoice.core"),
+            Some(true),
+            "no override: it loads with its plist"
+        );
+        assert_eq!(parse_launchd_login("", "dev.sidevoice.core"), None);
+        assert_eq!(
+            parse_launchd_login(
+                "disabled services = {\n\t\"dev.sidevoice.core\" => ???\n}",
+                "dev.sidevoice.core"
+            ),
+            None
+        );
+
+        assert_eq!(parse_systemd_login("enabled\n"), Some(true));
+        assert_eq!(parse_systemd_login("disabled\n"), Some(false));
+        for other in ["masked\n", "static\n", "enabled-runtime\n", ""] {
+            assert_eq!(parse_systemd_login(other), None, "{other:?}");
+        }
+
+        assert_eq!(combine_login([]), None, "no job");
+        assert_eq!(combine_login([Some(true), None]), None);
+        assert_eq!(combine_login([None, Some(false)]), Some(false));
+    }
+
+    #[tokio::test]
     async fn a_refused_reload_or_enable_fails_the_start_even_when_the_job_would_run() {
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut script = enabled();
         script.push(("daemon-reload".into(), false, "Access denied"));
-        let reload = prepare_systemd(scripted(script, log.clone()), true, &Job::ALL).await;
+        let reload = prepare_systemd(scripted(script, log.clone()), true, true, &Job::ALL).await;
         assert_eq!(reload, Err((None, "daemon-reload: Access denied".into())));
 
         let job = Job::ALL[0];
@@ -778,7 +1363,7 @@ mod tests {
             false,
             "Failed to create symlink: Permission denied",
         ));
-        let refused = prepare_systemd(scripted(script, log.clone()), false, &Job::ALL).await;
+        let refused = prepare_systemd(scripted(script, log.clone()), false, true, &Job::ALL).await;
         assert_eq!(
             refused,
             Err((
@@ -791,7 +1376,7 @@ mod tests {
         let mut script = enabled();
         script.retain(|(line, _, _)| *line != format!("is-enabled {}", job.unit()));
         script.push((format!("is-enabled {}", job.unit()), false, "disabled"));
-        let checked = prepare_systemd(scripted(script, log), false, &Job::ALL).await;
+        let checked = prepare_systemd(scripted(script, log), false, true, &Job::ALL).await;
         assert_eq!(checked, Err((Some(job), "is-enabled: disabled".into())));
     }
 

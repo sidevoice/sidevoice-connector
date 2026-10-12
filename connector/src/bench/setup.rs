@@ -15,19 +15,42 @@ use serde_json::{json, Value};
 #[derive(Clone)]
 pub struct Profile {
     pub root: PathBuf,
+    /// The agents' homes below the root and their CLIs as this shell finds them, by variable: what the connector
+    /// says its harnesses declare (`bench-agents`).
+    pub agents: BTreeMap<String, String>,
 }
 
-const DIRECTORIES: &[&str] = &[
-    "home",
-    "sidevoice",
-    "claude",
-    "codex",
-    "cursor/config",
-    "cursor/data",
-    "xdg/config",
-    "xdg/data",
-    "bench",
-];
+const DIRECTORIES: &[&str] = &["home", "sidevoice", "xdg/config", "xdg/data", "bench"];
+
+/// Asks this build's connector about the agents its harnesses declare (`bench-agents`).
+fn bench_agents(request: Value) -> Result<Value> {
+    use std::io::Write;
+    let mut child = Command::new(connector_binary()?)
+        .arg("bench-agents")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .context("connector stdin")?
+        .write_all(request.to_string().as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!("the connector did not say which agents it has");
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+/// A JSON object of strings, as a map.
+fn strings(value: &Value) -> BTreeMap<String, String> {
+    value
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, value)| Some((name.clone(), value.as_str()?.to_owned())))
+        .collect()
+}
 
 impl Profile {
     /// The profile at `root`, its directories created private (0700) when missing. A directory with anything in it
@@ -47,8 +70,12 @@ impl Profile {
                 root.display()
             );
         }
-        for directory in std::iter::once("").chain(DIRECTORIES.iter().copied()) {
-            let path = root.join(directory);
+        let answer = bench_agents(json!({"root": root}))?;
+        let homes = strings(&answer["homes"]);
+        let directories = std::iter::once(root.clone())
+            .chain(DIRECTORIES.iter().map(|directory| root.join(directory)))
+            .chain(homes.values().map(PathBuf::from));
+        for path in directories {
             fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
@@ -56,7 +83,9 @@ impl Profile {
                 .with_context(|| path.display().to_string())?;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
         }
-        Ok(Self { root })
+        let mut agents = homes;
+        agents.extend(strings(&answer["binaries"]));
+        Ok(Self { root, agents })
     }
 
     fn path(&self, child: &str) -> String {
@@ -78,23 +107,15 @@ impl Profile {
         let mut env = BTreeMap::from([
             ("HOME".into(), self.path("home")),
             ("SIDEVOICE_DATA_DIR".into(), self.path("sidevoice")),
-            ("CLAUDE_CONFIG_DIR".into(), self.path("claude")),
-            ("CODEX_HOME".into(), self.path("codex")),
-            ("CURSOR_CONFIG_DIR".into(), self.path("cursor/config")),
-            ("CURSOR_DATA_DIR".into(), self.path("cursor/data")),
             ("XDG_CONFIG_HOME".into(), self.path("xdg/config")),
             ("XDG_DATA_HOME".into(), self.path("xdg/data")),
             ("SIDEVOICE_SERVICE_MANAGER".into(), "none".into()),
             ("SIDEVOICE_CORE_PORT".into(), "0".into()),
             ("SIDEVOICE_STUN_URLS".into(), String::new()),
         ]);
-        // Codex delivery runs `codex queue`; a connector started on demand has a fixed PATH that may not hold it.
-        if let Some(codex) = on_path("codex") {
-            env.insert(
-                "SIDEVOICE_CODEX_BIN".into(),
-                codex.to_string_lossy().into_owned(),
-            );
-        }
+        // Every agent home the harnesses declare, the bench's own; and an agent's CLI the connector runs (delivery,
+        // registration) as this shell finds it: a connector started on demand has a fixed PATH that may not hold it.
+        env.extend(self.agents.clone());
         env
     }
 
@@ -107,7 +128,7 @@ impl Profile {
     }
 
     /// A command of this profile: nothing inherited but `PATH`, so an agent session the bench is run
-    /// from (its `CLAUDE_CODE_*`, `CODEX_*`, `SIDEVOICE_*`) cannot leak in.
+    /// from (its own variables, `SIDEVOICE_*` among them) cannot leak in.
     pub fn command(&self, program: impl AsRef<Path>) -> Command {
         let mut command = Command::new(program.as_ref());
         command.env_clear().envs(self.mcp_env());
@@ -173,7 +194,8 @@ impl Profile {
             .ok_or_else(|| anyhow!("install.json names no command"))
     }
 
-    /// `bench/env.sh` (what an agent runs with) and `bench/claude-mcp.json` (Claude Code's MCP configuration).
+    /// `bench/env.sh` (what an agent runs with) and `bench/mcp.json` (an `mcpServers` configuration naming this
+    /// installation).
     pub fn write_agent_files(&self, command: &[String]) -> Result<()> {
         let mut script = String::from(
             "# The Sidevoice bench's profile, for an agent started from this shell.\n",
@@ -187,7 +209,7 @@ impl Profile {
         let config = json!({"mcpServers": {"sidevoice": {
             "command": command[0], "args": args, "env": self.mcp_env()}}});
         fs::write(
-            self.root.join("bench/claude-mcp.json"),
+            self.root.join("bench/mcp.json"),
             serde_json::to_string_pretty(&config)?,
         )?;
         Ok(())
@@ -201,22 +223,23 @@ impl Profile {
             .map(|part| shell_quote(part))
             .collect::<Vec<_>>();
         program.push("mcp".into());
-        let codex_env: String = self
-            .mcp_env()
-            .iter()
-            .map(|(name, value)| format!(" --env {}", shell_quote(&format!("{name}={value}"))))
-            .collect();
-        format!(
-            "\nThe bench: http://127.0.0.1:{port}/  (profile {root})\n\n\
-             Claude Code (log in once inside the profile with /login):\n  \
-             . {root}/bench/env.sh && claude --mcp-config {root}/bench/claude-mcp.json --strict-mcp-config\n\n\
-             Codex (log in once inside the profile, register once, then start it):\n  \
-             . {root}/bench/env.sh && codex login\n  \
-             . {root}/bench/env.sh && codex mcp add sidevoice{codex_env} -- {}\n  \
-             . {root}/bench/env.sh && codex\n\n\
-             Then ask the agent to join the voice call, and type to it on the page.\n",
-            program.join(" ")
+        let env_script = format!("{root}/bench/env.sh");
+        let mcp_config = format!("{root}/bench/mcp.json");
+        let server = program.join(" ");
+        let env = self.mcp_env();
+        let steps = bench_agents(
+            json!({"setup": {"env_script": env_script, "mcp_config": mcp_config,
+            "server": server, "env": env}}),
         )
+        .map(|answer| answer["steps"].as_array().cloned().unwrap_or_default())
+        .unwrap_or_default();
+        let mut text = format!("\nThe bench: http://127.0.0.1:{port}/  (profile {root})\n\n");
+        for steps in steps.iter().filter_map(Value::as_str) {
+            text.push_str(steps);
+            text.push_str("\n\n");
+        }
+        text.push_str("Then ask the agent to join the voice call, and type to it on the page.\n");
+        text
     }
 
     /// Stops this profile's connector and core and removes the installation (`uninstall`), when there is one.
@@ -265,12 +288,6 @@ fn run_json(command: &mut Command) -> Result<Value> {
     })
 }
 
-fn on_path(program: &str) -> Option<PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|directory| directory.join(program))
-        .find(|candidate| candidate.is_file())
-}
-
 fn shell_quote(value: &str) -> String {
     if !value.is_empty()
         && value
@@ -298,6 +315,10 @@ mod tests {
     fn the_agent_keeps_its_own_xdg_directories() {
         let profile = Profile {
             root: PathBuf::from("/p"),
+            agents: BTreeMap::from([(
+                "SOME_AGENT_HOME".to_owned(),
+                "/p/agents/some_agent_home".to_owned(),
+            )]),
         };
         let mcp = profile.mcp_env();
         assert_eq!(mcp["SIDEVOICE_DATA_DIR"], "/p/sidevoice");
@@ -305,6 +326,6 @@ mod tests {
         assert_eq!(mcp["SIDEVOICE_SERVICE_MANAGER"], "none");
         let agent = profile.agent_env();
         assert!(agent.keys().all(|name| !name.starts_with("XDG_")));
-        assert_eq!(agent["CODEX_HOME"], "/p/codex");
+        assert_eq!(agent["SOME_AGENT_HOME"], "/p/agents/some_agent_home");
     }
 }
