@@ -169,11 +169,12 @@ pub fn plist_text(
 
 /// A user unit: restarted `restart` (`on-failure`: the core; `always`: the connector) `restart_sec` later, at most
 /// [`START_LIMIT`] starts in 10 minutes (then `start-limit-hit`, which `service restart` clears); started with the
-/// user's manager. Output goes to the journal.
+/// user's manager. Output goes to the journal. `unset` names variables the job must not inherit from the manager.
 pub fn unit_text(
     description: &str,
     program: &[String],
     environment: &BTreeMap<String, String>,
+    unset: &[&str],
     restart: &str,
     restart_sec: u32,
 ) -> Result<String> {
@@ -192,6 +193,15 @@ pub fn unit_text(
         })
         .collect::<Result<Vec<_>>>()?
         .join("\n");
+    let variables = if unset.is_empty() {
+        variables
+    } else {
+        let names = unset
+            .iter()
+            .map(|name| safe(name, "UnsetEnvironment"))
+            .collect::<Result<Vec<_>>>()?;
+        format!("{variables}\nUnsetEnvironment={}", names.join(" "))
+    };
     Ok(format!(
         "[Unit]
 Description={description}
@@ -377,6 +387,7 @@ pub fn texts(layout: &Layout, kind: Kind) -> Result<BTreeMap<Job, String>> {
                     "Sidevoice core (this machine's conversations and voice)",
                     &programs.core,
                     &core_environment,
+                    &layout.agent_dirs_unset(),
                     "on-failure",
                     10,
                 )?,
@@ -387,6 +398,7 @@ pub fn texts(layout: &Layout, kind: Kind) -> Result<BTreeMap<Job, String>> {
                     "Sidevoice connector (the harnesses' link to the core)",
                     &programs.connector,
                     &environment,
+                    &layout.agent_dirs_unset(),
                     "always",
                     2,
                 )?,
@@ -537,7 +549,7 @@ mod tests {
     fn units_quote_every_word_and_read_back_their_program() {
         let program = words(&["/r/cur rent/bin", "100%", "$HOME", "a\"b\\c"]);
         let env = BTreeMap::from([("PRICE".to_owned(), "$5 at 50% \"off\"".to_owned())]);
-        let unit = unit_text("Sidevoice core", &program, &env, "on-failure", 10).unwrap();
+        let unit = unit_text("Sidevoice core", &program, &env, &[], "on-failure", 10).unwrap();
         assert!(
             unit.contains(r#"ExecStart="/r/cur rent/bin" "100%%" "$$HOME" "a\"b\\c""#),
             "{unit}"
@@ -557,7 +569,7 @@ mod tests {
         let env = BTreeMap::new();
         let injected = words(&["/bin/true\nExecStartPre=/bin/evil"]);
         assert_eq!(
-            unit_text("x", &injected, &env, "always", 2)
+            unit_text("x", &injected, &env, &[], "always", 2)
                 .unwrap_err()
                 .key,
             "service.unsafe-value"
@@ -569,9 +581,9 @@ mod tests {
             "service.unsafe-value"
         );
         let bad = BTreeMap::from([("A=B".to_owned(), "x".to_owned())]);
-        assert!(unit_text("x", &words(&["/bin/true"]), &bad, "always", 2).is_err());
+        assert!(unit_text("x", &words(&["/bin/true"]), &bad, &[], "always", 2).is_err());
         let digit = BTreeMap::from([("1A".to_owned(), "x".to_owned())]);
-        assert!(unit_text("x", &words(&["/bin/true"]), &digit, "always", 2).is_err());
+        assert!(unit_text("x", &words(&["/bin/true"]), &digit, &[], "always", 2).is_err());
     }
 
     #[test]
@@ -579,6 +591,7 @@ mod tests {
         let layout = Layout::from_vars(
             |name| (name == "HOME").then(|| "/home/u".into()),
             Vec::new(),
+            &[],
         )
         .unwrap();
         let base = BTreeMap::from([
@@ -594,6 +607,58 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["--ready-file", "/home/u/.sidevoice/core/core.json"]));
         assert!(!args.contains(&"--launch-id".to_owned()));
+    }
+
+    /// An agent home the installing environment leaves unset is unset in the job too, whatever the user's manager
+    /// carries: the agent then uses its own default there, as it does for the person.
+    #[test]
+    fn a_unit_does_not_inherit_an_agent_home_its_profile_leaves_unset() {
+        let unset = Layout::from_vars(
+            |name| (name == "HOME").then(|| "/home/u".into()),
+            Vec::new(),
+            &["ALPHA_HOME", "BETA_HOME"],
+        )
+        .unwrap();
+        assert_eq!(unset.agent_dirs_unset(), ["ALPHA_HOME", "BETA_HOME"]);
+        let env = environment(&unset, Kind::Systemd);
+        let unit = unit_text(
+            "x",
+            &words(&["/bin/true"]),
+            &env,
+            &unset.agent_dirs_unset(),
+            "always",
+            2,
+        )
+        .unwrap();
+        assert!(unit.contains("\nUnsetEnvironment=ALPHA_HOME BETA_HOME\n"));
+        assert!(!unit.contains("Environment=\"ALPHA_HOME="));
+
+        let named = Layout::from_vars(
+            |name| match name {
+                "HOME" => Some("/home/u".into()),
+                "ALPHA_HOME" => Some("/home/u/.alpha".into()),
+                _ => None,
+            },
+            Vec::new(),
+            &["ALPHA_HOME", "BETA_HOME"],
+        )
+        .unwrap();
+        assert!(!named.agent_dirs_unset().contains(&"ALPHA_HOME"));
+        let env = environment(&named, Kind::Systemd);
+        let unit = unit_text(
+            "x",
+            &words(&["/bin/true"]),
+            &env,
+            &named.agent_dirs_unset(),
+            "always",
+            2,
+        )
+        .unwrap();
+        assert!(
+            unit.contains("Environment=\"ALPHA_HOME=/home/u/.alpha\""),
+            "{unit}"
+        );
+        assert!(unit.contains("UnsetEnvironment=BETA_HOME\n"));
     }
 
     #[test]

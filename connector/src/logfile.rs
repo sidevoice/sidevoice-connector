@@ -82,22 +82,37 @@ pub fn append_line(file: &Path, line: &str) {
     }
 }
 
-/// A Cursor editor conversation's id is what lets a chat speak as it: the log names it by a hash.
+/// Conversation-id prefixes whose ids let a chat speak as it, set once at start from the harnesses.
+static PRIVATE_IDS: OnceLock<Vec<&'static str>> = OnceLock::new();
+
+/// Which conversation ids the log names only by a hash: those after one of `prefixes` (a harness declares them).
+pub fn private_ids(prefixes: Vec<&'static str>) {
+    let _ = PRIVATE_IDS.set(prefixes);
+}
+
+/// A line with every private conversation id ([`private_ids`]) named by a hash.
 pub fn redact(line: &str) -> String {
-    const PREFIX: &str = "cursor-editor-";
+    PRIVATE_IDS
+        .get()
+        .into_iter()
+        .flatten()
+        .fold(line.to_owned(), |line, prefix| redact_after(&line, prefix))
+}
+
+fn redact_after(line: &str, prefix: &str) -> String {
     const ID: usize = 36;
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
-    while let Some(at) = rest.find(PREFIX) {
-        out.push_str(&rest[..at + PREFIX.len()]);
-        let tail = &rest[at + PREFIX.len()..];
+    while let Some(at) = rest.find(prefix) {
+        out.push_str(&rest[..at + prefix.len()]);
+        let tail = &rest[at + prefix.len()..];
         let candidate = tail.get(..ID).filter(|id| {
             id.bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase() || byte == b'-')
         });
         match candidate {
             Some(id) => {
-                let digest = hex::encode(Sha256::digest(format!("{PREFIX}{id}").as_bytes()));
+                let digest = hex::encode(Sha256::digest(format!("{prefix}{id}").as_bytes()));
                 out.push_str("h:");
                 out.push_str(&digest[..10]);
                 rest = &tail[ID..];
@@ -202,15 +217,15 @@ mod tests {
     }
 
     #[test]
-    fn editor_conversation_ids_are_logged_by_hash() {
-        let id = "cursor-editor-0123abcd-0123-4567-89ab-0123456789ab";
-        let line = redact(&format!("joined {id} and cursor-editor-short"));
+    fn private_conversation_ids_are_logged_by_hash() {
+        let id = "chat-x-0123abcd-0123-4567-89ab-0123456789ab";
+        let line = redact_after(&format!("joined {id} and chat-x-short"), "chat-x-");
         assert!(!line.contains("0123abcd"), "{line}");
-        assert!(line.starts_with("joined cursor-editor-h:"), "{line}");
-        assert!(line.ends_with(" and cursor-editor-short"), "{line}");
+        assert!(line.starts_with("joined chat-x-h:"), "{line}");
+        assert!(line.ends_with(" and chat-x-short"), "{line}");
         assert_eq!(
             line,
-            redact(&format!("joined {id} and cursor-editor-short"))
+            redact_after(&format!("joined {id} and chat-x-short"), "chat-x-")
         );
     }
 

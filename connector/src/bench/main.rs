@@ -1,5 +1,5 @@
 //! `sidevoice-bench`: the connector on this machine without the desktop app or a room, to talk to real agent
-//! sessions (Claude Code, Codex) by typing. A developer tool: it is not shipped in the release archive.
+//! sessions by typing. A developer tool: it is not shipped in the release archive.
 //!
 //! It makes a private profile (every directory the connector reads, under one root), installs this build there with
 //! the pinned core as a person's machine without a service manager has it (`install --no-agents`, Sidevoice on

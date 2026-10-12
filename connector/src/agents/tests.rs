@@ -53,21 +53,27 @@ impl Fixture {
             private_mkdir(&root.join(name));
         }
         private_mkdir(&root.join("sidevoice/core"));
-        let data = root.join("sidevoice");
-        let profile = Profile {
-            home: root.join("home"),
-            claude: root.join("claude"),
-            claude_config_dir_set: true,
-            codex: root.join("codex"),
-            cursor: root.join("cursor/config"),
-            cursor_data: root.join("cursor/data"),
-            xdg_config: root.join("xdg/config"),
-            xdg_data: root.join("xdg/data"),
-            socket: data.join("connector.sock"),
-            core_socket: data.join("core/local.sock"),
-            core_ready: data.join("core/core.json"),
-            data,
-        };
+        let path = |child: &str| root.join(child).into_os_string();
+        let variables = [
+            ("HOME", path("home")),
+            ("CLAUDE_CONFIG_DIR", path("claude")),
+            ("CODEX_HOME", path("codex")),
+            ("CURSOR_CONFIG_DIR", path("cursor/config")),
+            ("CURSOR_DATA_DIR", path("cursor/data")),
+            ("XDG_CONFIG_HOME", path("xdg/config")),
+            ("XDG_DATA_HOME", path("xdg/data")),
+            ("SIDEVOICE_DATA_DIR", path("sidevoice")),
+        ];
+        let profile = Profile::from_vars(
+            |key| {
+                variables
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| value.clone())
+            },
+            &crate::adapters::Registry::standard().homes(),
+        )
+        .unwrap();
         Self { root, profile }
     }
 
@@ -185,7 +191,10 @@ async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let old = fixture.root.join("selected/releases/1.2.3/dist/sidevoice");
     let current = fixture.root.join("selected/current/dist/sidevoice");
-    let config_path = fixture.profile.cursor.join("mcp.json");
+    let config_path = fixture
+        .profile
+        .agent_home("CURSOR_CONFIG_DIR")
+        .join("mcp.json");
     write_json(
         &config_path,
         &json!({
@@ -198,7 +207,11 @@ async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped
     );
     let evidence = vec![Evidence {
         kind: "config-dir",
-        path: fixture.profile.cursor.to_string_lossy().into_owned(),
+        path: fixture
+            .profile
+            .agent_home("CURSOR_CONFIG_DIR")
+            .to_string_lossy()
+            .into_owned(),
     }];
     let signature = identity_signature("cursor", None, &evidence);
     write_json(
@@ -341,7 +354,7 @@ async fn disappeared_and_reappeared_config_gets_a_new_generation() {
         .as_str()
         .unwrap()
         .to_owned();
-    fs::remove_dir_all(&fixture.profile.cursor).unwrap();
+    fs::remove_dir_all(fixture.profile.agent_home("CURSOR_CONFIG_DIR")).unwrap();
     let absent = host
         .handle("agents.list", json!({"watch":"cursor","rescan":true}))
         .await;
@@ -354,7 +367,7 @@ async fn disappeared_and_reappeared_config_gets_a_new_generation() {
         serde_json::from_slice(&fs::read(fixture.profile.data.join("agents.json")).unwrap())
             .unwrap();
     assert_eq!(state["seen"]["cursor"]["present"], false);
-    private_mkdir(&fixture.profile.cursor);
+    private_mkdir(fixture.profile.agent_home("CURSOR_CONFIG_DIR"));
     let returned = host
         .handle("agents.list", json!({"watch":"cursor","rescan":true}))
         .await;
@@ -383,8 +396,8 @@ async fn replacing_cursor_profile_with_symlink_refuses_connect_without_touching_
         br#"{"mcpServers":{"other":{"command":"keep-me"}}}"#,
     );
     let before = fs::read(&config).unwrap();
-    fs::remove_dir_all(&fixture.profile.cursor).unwrap();
-    symlink(&external, &fixture.profile.cursor).unwrap();
+    fs::remove_dir_all(fixture.profile.agent_home("CURSOR_CONFIG_DIR")).unwrap();
+    symlink(&external, fixture.profile.agent_home("CURSOR_CONFIG_DIR")).unwrap();
 
     let answer = host.handle("agents.connect", json!({"id":"cursor"})).await;
     assert_eq!(answer.pointer("/error/key"), Some(&json!("agents.invalid")));
@@ -418,8 +431,8 @@ async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn()
     let config = external.join("config.toml");
     private_write(&config, b"[mcp_servers.other]\ncommand = 'keep-me'\n");
     let before = fs::read(&config).unwrap();
-    fs::remove_dir_all(&fixture.profile.codex).unwrap();
-    symlink(&external, &fixture.profile.codex).unwrap();
+    fs::remove_dir_all(fixture.profile.agent_home("CODEX_HOME")).unwrap();
+    symlink(&external, fixture.profile.agent_home("CODEX_HOME")).unwrap();
 
     let answer = host.handle("agents.connect", json!({"id":"codex"})).await;
     assert_eq!(answer.pointer("/error/key"), Some(&json!("agents.invalid")));
@@ -432,7 +445,7 @@ async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn()
     // The spawn boundary also rejects replacement after binary resolution by an earlier request.
     let direct = run_command(
         &fixture.profile,
-        Some(&fixture.profile.codex),
+        Some(fixture.profile.agent_home("CODEX_HOME")),
         executable.to_str().unwrap(),
         &["mcp".into(), "get".into(), "sidevoice".into()],
         &Cancellation::new(),
@@ -454,7 +467,11 @@ async fn dangling_codex_config_symlink_is_invalid_not_absent() {
     let fixture = Fixture::new();
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let missing = fixture.root.join("missing-config-target.toml");
-    symlink(missing, fixture.profile.codex.join("config.toml")).unwrap();
+    symlink(
+        missing,
+        fixture.profile.agent_home("CODEX_HOME").join("config.toml"),
+    )
+    .unwrap();
     let answer = host.handle("agents.connect", json!({"id":"codex"})).await;
     assert_eq!(answer.pointer("/error/key"), Some(&json!("agents.invalid")));
     host.shutdown().await;
@@ -671,8 +688,17 @@ exit 2
     write_json(&fixture.profile.data.join("agents.json"), &initial);
     let host = HostAgents::new(fixture.profile.clone()).unwrap();
 
-    let started = fixture.profile.codex.join("slow-get-started");
-    private_write(&fixture.profile.codex.join("slow-next-get"), b"1");
+    let started = fixture
+        .profile
+        .agent_home("CODEX_HOME")
+        .join("slow-get-started");
+    private_write(
+        &fixture
+            .profile
+            .agent_home("CODEX_HOME")
+            .join("slow-next-get"),
+        b"1",
+    );
     let listing_host = host.clone();
     let listing = tokio::spawn(async move {
         listing_host
@@ -695,11 +721,20 @@ exit 2
 
     // A cross-process JS writer can dismiss while the CLI is being inspected. The short file lock
     // and reload-before-merge must preserve that newer generation dismissal.
-    let slow_scan = fixture.profile.codex.join("slow-get-started");
+    let slow_scan = fixture
+        .profile
+        .agent_home("CODEX_HOME")
+        .join("slow-get-started");
     let state_path = fixture.profile.data.join("agents.json");
     let mut state: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
     let generation = state["seen"]["codex"]["generation"].clone();
-    private_write(&fixture.profile.codex.join("slow-next-get"), b"1");
+    private_write(
+        &fixture
+            .profile
+            .agent_home("CODEX_HOME")
+            .join("slow-next-get"),
+        b"1",
+    );
     let scanning_host = host.clone();
     let scanning = tokio::spawn(async move {
         scanning_host
@@ -727,8 +762,17 @@ exit 2
         .handle("agents.disconnect", json!({"id":"codex"}))
         .await;
     assert_eq!(row(&disconnected, "codex")["registration"], "not-connected");
-    private_write(&fixture.profile.codex.join("slow-next-add"), b"1");
-    let add_started = fixture.profile.codex.join("slow-add-started");
+    private_write(
+        &fixture
+            .profile
+            .agent_home("CODEX_HOME")
+            .join("slow-next-add"),
+        b"1",
+    );
+    let add_started = fixture
+        .profile
+        .agent_home("CODEX_HOME")
+        .join("slow-add-started");
     let connect_host = host.clone();
     let connect = tokio::spawn(async move {
         connect_host
@@ -750,7 +794,10 @@ exit 2
     assert_eq!(row(&final_state, "codex")["registration"], "not-connected");
 
     private_write(
-        &fixture.profile.codex.join("leave-unregistered-after-add"),
+        &fixture
+            .profile
+            .agent_home("CODEX_HOME")
+            .join("leave-unregistered-after-add"),
         b"1",
     );
     let unconfirmed_connect = host.handle("agents.connect", json!({"id":"codex"})).await;
@@ -758,11 +805,21 @@ exit 2
         unconfirmed_connect.pointer("/error/key"),
         Some(&json!("agents.registration-not-confirmed"))
     );
-    assert!(!fixture.profile.codex.join("fake-entry.json").exists());
+    assert!(!fixture
+        .profile
+        .agent_home("CODEX_HOME")
+        .join("fake-entry.json")
+        .exists());
 
     let restored = host.handle("agents.connect", json!({"id":"codex"})).await;
     assert_eq!(row(&restored, "codex")["registration"], "connected");
-    private_write(&fixture.profile.codex.join("timeout-after-remove"), b"1");
+    private_write(
+        &fixture
+            .profile
+            .agent_home("CODEX_HOME")
+            .join("timeout-after-remove"),
+        b"1",
+    );
     let uncertain_disconnect = host
         .handle("agents.disconnect", json!({"id":"codex"}))
         .await;
@@ -770,13 +827,26 @@ exit 2
         uncertain_disconnect.pointer("/error/key"),
         Some(&json!("agents.registration-unknown"))
     );
-    assert!(!fixture.profile.codex.join("fake-entry.json").exists());
+    assert!(!fixture
+        .profile
+        .agent_home("CODEX_HOME")
+        .join("fake-entry.json")
+        .exists());
 
     // Dropping the link-side waiter cancels the owned operation. The delayed add is killed before
     // it can write, and a subsequent request re-inspects the actual entry before connecting.
     fs::remove_file(&add_started).unwrap();
-    private_write(&fixture.profile.codex.join("slow-next-add"), b"1");
-    let pid_file = fixture.profile.codex.join("slow-add-started");
+    private_write(
+        &fixture
+            .profile
+            .agent_home("CODEX_HOME")
+            .join("slow-next-add"),
+        b"1",
+    );
+    let pid_file = fixture
+        .profile
+        .agent_home("CODEX_HOME")
+        .join("slow-add-started");
     let abandoned_host = host.clone();
     let abandoned = tokio::spawn(async move {
         abandoned_host
@@ -793,7 +863,11 @@ exit 2
         -1,
         "cancelled CLI process was reaped"
     );
-    assert!(!fixture.profile.codex.join("fake-entry.json").exists());
+    assert!(!fixture
+        .profile
+        .agent_home("CODEX_HOME")
+        .join("fake-entry.json")
+        .exists());
     let recovered = host.handle("agents.connect", json!({"id":"codex"})).await;
     assert_eq!(row(&recovered, "codex")["registration"], "connected");
 
@@ -859,16 +933,20 @@ async fn the_installed_command_is_registered_and_owns_every_release_of_it() {
         .handle("agents.connect", json!({"id":"cursor"}))
         .await;
     assert!(connected.get("error").is_none(), "{connected}");
-    let config: Value =
-        serde_json::from_slice(&fs::read(profile.cursor.join("mcp.json")).unwrap()).unwrap();
+    let config: Value = serde_json::from_slice(
+        &fs::read(profile.agent_home("CURSOR_CONFIG_DIR").join("mcp.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(config["mcpServers"]["sidevoice"]["command"], json!(stable));
     assert_eq!(config["mcpServers"]["sidevoice"]["args"], json!(["mcp"]));
     let removed = installer
         .handle("agents.disconnect", json!({"id":"cursor"}))
         .await;
     assert!(removed.get("error").is_none(), "{removed}");
-    let config: Value =
-        serde_json::from_slice(&fs::read(profile.cursor.join("mcp.json")).unwrap()).unwrap();
+    let config: Value = serde_json::from_slice(
+        &fs::read(profile.agent_home("CURSOR_CONFIG_DIR").join("mcp.json")).unwrap(),
+    )
+    .unwrap();
     assert!(config["mcpServers"].get("sidevoice").is_none(), "{config}");
 }
 
@@ -957,7 +1035,7 @@ exit 2
 
 /// An entry of ours in the fake Codex: `enabled`, with `env` as its environment.
 fn codex_entry(fixture: &Fixture, selected: &InstalledCommand, enabled: bool, env: Value) {
-    let codex = &fixture.profile.codex;
+    let codex = &fixture.profile.agent_home("CODEX_HOME");
     write_json(
         &codex.join("fake-entry.json"),
         &json!({"name":"sidevoice","enabled":enabled,"transport":{"type":"stdio",
@@ -992,7 +1070,7 @@ async fn codex_registration_carries_the_installation_environment() {
         "connected",
         "{connected}"
     );
-    let calls = fs::read_to_string(fixture.profile.codex.join("calls")).unwrap();
+    let calls = fs::read_to_string(fixture.profile.agent_home("CODEX_HOME").join("calls")).unwrap();
     let add = calls
         .lines()
         .find(|line| line.starts_with("mcp add"))
@@ -1045,7 +1123,11 @@ async fn codex_disconnect_removes_a_disabled_or_outdated_entry_of_ours() {
             .await;
         assert!(answer.get("error").is_none(), "{answer}");
         assert!(
-            !fixture.profile.codex.join("fake-entry.json").exists(),
+            !fixture
+                .profile
+                .agent_home("CODEX_HOME")
+                .join("fake-entry.json")
+                .exists(),
             "the entry of ours stayed"
         );
         assert_eq!(row(&answer, "codex")["owned"], false);
@@ -1106,7 +1188,13 @@ async fn claude_registration_carries_the_installation_environment_and_an_older_o
         "connected",
         "{connected}"
     );
-    let calls = fs::read_to_string(fixture.profile.claude.join("calls")).unwrap();
+    let calls = fs::read_to_string(
+        fixture
+            .profile
+            .agent_home("CLAUDE_CONFIG_DIR")
+            .join("calls"),
+    )
+    .unwrap();
     let add = calls
         .lines()
         .find(|line| line.starts_with("mcp add"))
@@ -1123,7 +1211,7 @@ async fn claude_registration_carries_the_installation_environment_and_an_older_o
     // The same command without the environment: ours, not current, and removed on disconnect.
     let selected = fixture.selected();
     private_write(
-        &fixture.profile.claude.join("fake-entry.txt"),
+        &fixture.profile.agent_home("CLAUDE_CONFIG_DIR").join("fake-entry.txt"),
         format!(
             "sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: {}\n  Args: {}\n\nTo remove this server, run: claude mcp remove sidevoice -s user\n",
             selected.command,
@@ -1139,7 +1227,11 @@ async fn claude_registration_carries_the_installation_environment_and_an_older_o
         .await;
     assert!(answer.get("error").is_none(), "{answer}");
     assert!(
-        !fixture.profile.claude.join("fake-entry.txt").exists(),
+        !fixture
+            .profile
+            .agent_home("CLAUDE_CONFIG_DIR")
+            .join("fake-entry.txt")
+            .exists(),
         "the entry of ours stayed"
     );
 }

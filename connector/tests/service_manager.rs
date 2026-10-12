@@ -1,8 +1,9 @@
 //! The login service under this user's real service manager (launchd on macOS, the systemd user manager on Linux),
 //! with the real core and an installation staged in a private profile: install → both jobs up, the core
 //! reachable and the connector linked → the core killed: the manager starts it again and the connector links to
-//! it → a person's stop holds → start → restart (a new core) → uninstall: no job, definition or socket left, the
-//! installation still there (`not-installed`) and, once it is removed too, `absent`.
+//! it → a person's stop holds → start → restart (a new core) → start at login off: everything keeps running, and stays
+//! off through a crash, a stop, a start and a restart → on while stopped: nothing starts → uninstall: no job,
+//! definition or socket left, the installation still there (`not-installed`) and, once it is removed too, `absent`.
 //!
 //! The jobs carry the real names (`dev.sidevoice.core`, `sidevoice-core.service`, …), so outside CI it runs only
 //! when asked (`SIDEVOICE_TEST_SERVICE=1`) and never over jobs this user already has. On a Linux runner with no
@@ -41,6 +42,32 @@ fn manager_has(extra: &BTreeMap<String, String>, job: (&str, &str)) -> bool {
                 let text = String::from_utf8_lossy(&output.stdout);
                 output.status.success() && !text.contains("not-found")
             })
+    }
+}
+
+/// Whether the manager starts the job at the next login, asked directly: launchd's override for its label, systemd's
+/// `is-enabled`.
+fn manager_starts_at_login(extra: &BTreeMap<String, String>, job: (&str, &str)) -> bool {
+    if cfg!(target_os = "macos") {
+        let uid = unsafe { libc::getuid() };
+        let output = Command::new("/bin/launchctl")
+            .args(["print-disabled", &format!("gui/{uid}")])
+            .output()
+            .expect("launchctl print-disabled");
+        let text = String::from_utf8_lossy(&output.stdout);
+        let quoted = format!("\"{}\"", job.0);
+        !text.lines().any(|line| {
+            line.trim()
+                .strip_prefix(&quoted)
+                .is_some_and(|rest| matches!(rest.trim(), "=> disabled" | "=> true"))
+        })
+    } else {
+        let output = Command::new("systemctl")
+            .args(["--user", "is-enabled", job.1])
+            .envs(extra)
+            .output()
+            .expect("systemctl is-enabled");
+        String::from_utf8_lossy(&output.stdout).trim() == "enabled"
     }
 }
 
@@ -197,8 +224,116 @@ fn the_login_service_runs_recovers_stops_and_leaves_nothing_behind() {
     // The person's retry: a new core.
     let retried = ok(&profile, &extra, "restart");
     assert!(retried["state"].is_string(), "{retried}");
-    wait_state(&profile, &extra, "a new core after restart", |status| {
+    let retried = wait_state(&profile, &extra, "a new core after restart", |status| {
         status["state"] == "running" && status["core"]["launch_id"] != started["core"]["launch_id"]
+    });
+
+    // Start at login is the person's, and only that. Off: both jobs stay loaded and running, and the manager still
+    // brings a crashed core back.
+    assert_eq!(retried["start_at_login"], true, "{retried}");
+    assert_eq!(ok(&profile, &extra, "login status")["start_at_login"], true);
+    let off = ok(&profile, &extra, "login off");
+    assert_eq!(
+        (
+            off["state"].as_str(),
+            off["service"].as_str(),
+            off["start_at_login"].as_bool()
+        ),
+        (Some("running"), Some(kind), Some(false)),
+        "login off answers as the other service verbs, and stops nothing: {off}"
+    );
+    for job in JOBS {
+        assert!(
+            !manager_starts_at_login(&extra, job),
+            "{job:?} still starts at login"
+        );
+        assert!(manager_has(&extra, job), "login off unloaded {job:?}");
+    }
+    let unchanged = service(&profile, &extra, "status");
+    assert_eq!(
+        (
+            unchanged["state"].as_str(),
+            unchanged["start_at_login"].as_bool(),
+            unchanged["core"]["pid"].as_u64()
+        ),
+        (
+            Some("running"),
+            Some(false),
+            retried["core"]["pid"].as_u64()
+        ),
+        "{unchanged}"
+    );
+    assert!(alive(retried["core"]["pid"].as_u64().unwrap()));
+    unsafe {
+        libc::kill(
+            retried["core"]["pid"].as_u64().unwrap() as i32,
+            libc::SIGKILL,
+        );
+    }
+    wait_state(
+        &profile,
+        &extra,
+        "the manager restarted the core with login off",
+        |status| {
+            status["state"] == "running"
+                && status["core"]["launch_id"] != retried["core"]["launch_id"]
+        },
+    );
+
+    // A stop and a start (launchd loads jobs disabled for login) and a restart leave it off.
+    ok(&profile, &extra, "stop");
+    ok(&profile, &extra, "start");
+    let started = wait_state(
+        &profile,
+        &extra,
+        "running after start with login off",
+        |status| status["state"] == "running" && status["connector"]["running"] == true,
+    );
+    assert_eq!(started["start_at_login"], false, "{started}");
+    ok(&profile, &extra, "restart");
+    wait_state(
+        &profile,
+        &extra,
+        "a new core after restart with login off",
+        |status| {
+            status["state"] == "running"
+                && status["core"]["launch_id"] != started["core"]["launch_id"]
+        },
+    );
+    assert_eq!(
+        ok(&profile, &extra, "login status")["start_at_login"],
+        false
+    );
+
+    // On starts nothing: a stopped Sidevoice stays stopped.
+    ok(&profile, &extra, "stop");
+    let on = ok(&profile, &extra, "login on");
+    assert_eq!(
+        (on["state"].as_str(), on["start_at_login"].as_bool()),
+        (Some("stopped-by-person"), Some(true)),
+        "login on starts nothing: {on}"
+    );
+    for job in JOBS {
+        assert!(
+            manager_starts_at_login(&extra, job),
+            "{job:?} does not start at login"
+        );
+    }
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let still = service(&profile, &extra, "status");
+    assert_eq!(
+        (
+            still["state"].as_str(),
+            still["reachable"].as_bool(),
+            still["start_at_login"].as_bool()
+        ),
+        (Some("stopped-by-person"), Some(false), Some(true)),
+        "{still}"
+    );
+    assert!(!profile.connector_socket().exists());
+    ok(&profile, &extra, "start");
+    wait_state(&profile, &extra, "running again with login on", |status| {
+        status["state"] == "running" && status["start_at_login"] == true
     });
 
     let removed = ok(&profile, &extra, "uninstall");
@@ -220,6 +355,22 @@ fn the_login_service_runs_recovers_stops_and_leaves_nothing_behind() {
         ),
         (Some("not-installed"), Some(true)),
         "{unserviced}"
+    );
+    // With no job there is nothing to start at login: not known, and not settable.
+    assert!(unserviced["start_at_login"].is_null(), "{unserviced}");
+    let unknown = ok(&profile, &extra, "login status");
+    assert_eq!(
+        (
+            unknown["state"].as_str(),
+            unknown["start_at_login"].is_null()
+        ),
+        (Some("not-installed"), true),
+        "{unknown}"
+    );
+    let refused = service(&profile, &extra, "login on");
+    assert_eq!(
+        refused["error"]["key"], "service.login-no-service",
+        "{refused}"
     );
     // Without the installation either, nothing is left.
     std::fs::remove_file(&current).unwrap();

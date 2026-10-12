@@ -109,8 +109,8 @@ mod tests {
     #[test]
     fn texts_are_filled_from_params_and_unknown_keys_say_themselves() {
         assert_eq!(
-            message("agents.not-present", &json!({"agent":"Codex"})),
-            "Codex is not detected on this computer."
+            message("agents.not-present", &json!({"agent":"Some Agent"})),
+            "Some Agent is not detected on this computer."
         );
         assert_eq!(
             message("agents.not-present", &json!({})),

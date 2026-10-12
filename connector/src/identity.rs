@@ -76,18 +76,13 @@ fn platform_of(os: &str, arch: &str) -> String {
     format!("{os} {arch}")
 }
 
-/// Which harnesses live on this machine, by the home each of them keeps. Nothing is run to find out.
+/// Which harnesses live on this machine, by the configuration home each keeps. Nothing is run to find out.
 pub fn harnesses(profile: &Profile) -> Vec<&'static str> {
-    [
-        ("claude", &profile.claude),
-        ("codex", &profile.codex),
-        // Cursor, the CLI or the editor: both keep ~/.cursor, and both read the MCP servers in it.
-        ("cursor", &profile.cursor),
-    ]
-    .into_iter()
-    .filter(|(_, home)| home.exists())
-    .map(|(name, _)| name)
-    .collect()
+    crate::adapters::Registry::standard()
+        .agents()
+        .filter(|(_, registration)| registration.config_root(profile).exists())
+        .map(|(id, _)| id)
+        .collect()
 }
 
 /// This machine, as the room will list it.
@@ -112,9 +107,14 @@ mod tests {
     fn the_machine_names_its_real_host_version_and_the_harnesses_it_has() {
         let scratch = Scratch::new("identity");
         let profile = Profile::for_test(&scratch.0);
-        std::fs::remove_dir(&profile.cursor).unwrap();
+        let registry = crate::adapters::Registry::standard();
+        let mut agents: Vec<_> = registry.agents().collect();
+        let (gone, registration) = agents.pop().unwrap();
+        std::fs::remove_dir(registration.config_root(&profile)).unwrap();
         let machine = machine(&profile);
-        assert_eq!(machine["harnesses"], json!(["claude", "codex"]));
+        let present: Vec<_> = agents.iter().map(|(id, _)| *id).collect();
+        assert_eq!(machine["harnesses"], json!(present));
+        assert!(!present.contains(&gone));
         assert_eq!(machine["version"], VERSION);
         assert_eq!(machine["platform"], platform());
         let host = machine["host"].as_str().unwrap();
