@@ -46,6 +46,31 @@ pub(crate) fn user_config(profile: &Profile) -> PathBuf {
     }
 }
 
+/// The largest `.claude.json` read: it also holds Claude Code's per-project state.
+const USER_CONFIG_LIMIT: u64 = 64 << 20;
+
+/// Claude Code's user configuration cannot be parsed or cannot be read safely: it is left alone, whatever else is
+/// there.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Unreadable;
+
+/// Reads [`user_config`] with the guarded reader, before anything else is judged: a regular file of the person's,
+/// writable by nobody else, and JSON. A link is followed wherever it leads (dotfiles managers link it), and the file
+/// it leads to is judged; one that leads nowhere is unreadable. `None` when there is no such file.
+pub(crate) fn read_user_config(profile: &Profile) -> Result<Option<serde_json::Value>, Unreadable> {
+    let file = user_config(profile);
+    match fs::symlink_metadata(&file) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(Unreadable),
+        Ok(_) => {}
+    }
+    let text =
+        super::registration::read_profile_file(&file, USER_CONFIG_LIMIT).map_err(|_| Unreadable)?;
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|_| Unreadable)
+}
+
 pub fn identity() -> Result<Option<Identity>> {
     let Some(thread) = env::var("CLAUDE_CODE_SESSION_ID")
         .ok()

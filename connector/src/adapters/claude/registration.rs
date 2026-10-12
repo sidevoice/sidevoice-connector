@@ -21,6 +21,10 @@ impl Claude {
         host: &dyn AgentHost,
         binary: Option<&str>,
     ) -> Result<String, AgentError> {
+        // Settings Claude Code cannot parse are left alone, whatever else is there: its CLI is not even asked.
+        if super::read_user_config(host.profile()).is_err() {
+            return Ok("invalid".into());
+        }
         match fs::symlink_metadata(host.profile().agent_home(super::HOME.var)) {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok("absent".into()),
             Err(_) => return Ok("invalid".into()),
@@ -286,4 +290,191 @@ fn inbound_warning(profile: &Profile) -> Option<String> {
          your call, not ours.",
         settings.display()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapters::registration::{CliError, CliOutput};
+    use crate::secure_fs::tests::Scratch;
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A host with no CLI to run: a state judged here never needs one.
+    struct Host(Profile);
+
+    impl AgentHost for Host {
+        fn profile(&self) -> &Profile {
+            &self.0
+        }
+        fn command(&self) -> &str {
+            "/nowhere/sidevoice"
+        }
+        fn args(&self) -> &[String] {
+            &[]
+        }
+        fn owns(&self, command: &str, args: &[String]) -> bool {
+            command == self.command() && args.is_empty()
+        }
+        fn mcp_env(&self) -> BTreeMap<String, String> {
+            BTreeMap::new()
+        }
+        fn run<'a>(
+            &'a self,
+            _binary: &'a str,
+            _args: Vec<String>,
+        ) -> BoxFuture<'a, Result<CliOutput, CliError>> {
+            panic!("the CLI was asked")
+        }
+        fn live(&self) -> Result<(), AgentError> {
+            Ok(())
+        }
+    }
+
+    /// A profile whose Claude home is `home/.claude` (left to the default) or its own directory (`set`), created
+    /// only when `exists`; and the user configuration file Claude Code reads there.
+    fn profile(scratch: &Scratch, set: bool, exists: bool) -> (Profile, PathBuf) {
+        let mut profile =
+            Profile::for_test(&scratch.0, &crate::adapters::Registry::standard().homes());
+        let home = profile
+            .agent_homes
+            .iter_mut()
+            .find(|home| home.spec.var == super::super::HOME.var)
+            .unwrap();
+        let _ = fs::remove_dir(&home.path);
+        if !set {
+            home.path = profile.home.join(".claude");
+        }
+        home.set = set;
+        if exists {
+            fs::create_dir_all(&home.path).unwrap();
+            fs::set_permissions(&home.path, fs::Permissions::from_mode(0o700)).unwrap();
+        } else if set {
+            // Its parent stays, so the file can be there without the home.
+            fs::create_dir_all(home.path.parent().unwrap()).unwrap();
+        }
+        let file = super::super::user_config(&profile);
+        (profile, file)
+    }
+
+    /// Settings Claude Code cannot parse are `invalid` before anything else is judged: whether or not the person's
+    /// environment names its home, whether or not its data directory is there, and with no CLI found.
+    #[tokio::test]
+    async fn unparsable_settings_are_invalid_before_the_home_and_the_cli() {
+        for set in [false, true] {
+            for exists in [false, true] {
+                if set && !exists {
+                    continue; // The file lives in the home then: no home, no file.
+                }
+                let scratch = Scratch::new("claude-unparsable");
+                let (profile, file) = profile(&scratch, set, exists);
+                fs::write(&file, b"{\"mcpServers\": {").unwrap();
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+                assert_eq!(
+                    state(&Host(profile), None).await,
+                    "invalid",
+                    "set {set}, home there {exists}"
+                );
+                assert_eq!(fs::read(&file).unwrap(), b"{\"mcpServers\": {");
+            }
+        }
+    }
+
+    /// A FIFO where the user configuration belongs is refused at once, never waited on.
+    #[tokio::test]
+    async fn a_fifo_for_the_user_configuration_is_refused_without_waiting() {
+        let scratch = Scratch::new("claude-fifo");
+        let (profile, file) = profile(&scratch, true, true);
+        let path = std::ffi::CString::new(file.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let (sent, received) = std::sync::mpsc::channel();
+        let reader = profile.clone();
+        std::thread::spawn(move || {
+            let _ = sent.send(super::super::read_user_config(&reader).is_err());
+        });
+        assert_eq!(
+            received.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(true),
+            "the read waited on the FIFO, or did not refuse it"
+        );
+        assert_eq!(state(&Host(profile), None).await, "invalid");
+    }
+
+    /// Links `file` to `name` in a dotfiles directory (outside Claude's and the home's), and returns where it leads.
+    fn linked(scratch: &Scratch, file: &Path, name: &str) -> PathBuf {
+        let dotfiles = scratch.0.join("dotfiles");
+        fs::create_dir_all(&dotfiles).unwrap();
+        let target = dotfiles.join(name);
+        std::os::unix::fs::symlink(&target, file).unwrap();
+        target
+    }
+
+    fn write(path: &Path, bytes: &[u8], mode: u32) {
+        fs::write(path, bytes).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Dotfiles managers link `~/.claude.json` from their own directory: the link is followed, and what it leads to
+    /// is read, or judged unparsable, as the file itself would be.
+    #[tokio::test]
+    async fn a_linked_user_configuration_is_read_where_the_link_leads() {
+        let scratch = Scratch::new("claude-linked");
+        let (profile, file) = profile(&scratch, false, true);
+        let target = linked(&scratch, &file, "claude.json");
+        write(&target, b"{\"mcpServers\": {}}", 0o600);
+        assert_eq!(
+            super::super::read_user_config(&profile),
+            Ok(Some(json!({"mcpServers": {}})))
+        );
+        write(&target, b"{\"mcpServers\": {", 0o600);
+        assert_eq!(state(&Host(profile), None).await, "invalid");
+        assert_eq!(fs::read(&target).unwrap(), b"{\"mcpServers\": {");
+    }
+
+    /// A link to a FIFO is refused at once, never waited on.
+    #[tokio::test]
+    async fn a_link_to_a_fifo_is_refused_without_waiting() {
+        let scratch = Scratch::new("claude-linked-fifo");
+        let (profile, file) = profile(&scratch, false, true);
+        let target = linked(&scratch, &file, "fifo");
+        let path = std::ffi::CString::new(target.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let (sent, received) = std::sync::mpsc::channel();
+        let reader = profile.clone();
+        std::thread::spawn(move || {
+            let _ = sent.send(super::super::read_user_config(&reader).is_err());
+        });
+        assert_eq!(
+            received.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(true),
+            "the read waited on the FIFO, or did not refuse it"
+        );
+        assert_eq!(state(&Host(profile), None).await, "invalid");
+    }
+
+    /// What a link leads to is judged as the file itself: one others may write is refused (one another user owns is
+    /// refused by the same check of the opened file, which a test cannot make without root), and a link that leads
+    /// nowhere is unreadable, so the CLI is not run over it.
+    #[tokio::test]
+    async fn a_link_to_a_file_others_may_write_or_to_nothing_is_refused() {
+        let scratch = Scratch::new("claude-linked-mode");
+        let (profile, file) = profile(&scratch, false, true);
+        let target = linked(&scratch, &file, "claude.json");
+        write(&target, b"{}", 0o622);
+        assert_eq!(
+            super::super::read_user_config(&profile),
+            Err(super::super::Unreadable)
+        );
+        assert_eq!(state(&Host(profile.clone()), None).await, "invalid");
+        fs::remove_file(&target).unwrap();
+        assert_eq!(
+            super::super::read_user_config(&profile),
+            Err(super::super::Unreadable)
+        );
+        assert_eq!(state(&Host(profile), None).await, "invalid");
+    }
+
+    async fn state(host: &Host, binary: Option<&str>) -> String {
+        Claude.entry_state(host, binary).await.unwrap()
+    }
 }
