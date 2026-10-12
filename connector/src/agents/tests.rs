@@ -109,6 +109,17 @@ fn write_json(path: &Path, value: &Value) {
     private_write(path, &serde_json::to_vec_pretty(value).unwrap());
 }
 
+/// Points the agent home `var` at `path`, as if the person's environment set it (`set`) or left it to its default.
+fn set_agent_home(profile: &mut Profile, var: &str, path: &Path, set: bool) {
+    let home = profile
+        .agent_homes
+        .iter_mut()
+        .find(|home| home.spec.var == var)
+        .unwrap();
+    home.path = path.to_owned();
+    home.set = set;
+}
+
 fn row<'a>(answer: &'a Value, id: &str) -> &'a Value {
     answer["agents"]
         .as_array()
@@ -489,17 +500,23 @@ async fn unparsable_settings_are_listed_invalid_with_their_file_and_left_alone()
     let files = [
         (
             "claude",
-            fixture.profile.claude.join(".claude.json"),
+            fixture
+                .profile
+                .agent_home("CLAUDE_CONFIG_DIR")
+                .join(".claude.json"),
             &b"{\"mcpServers\": {"[..],
         ),
         (
             "codex",
-            fixture.profile.codex.join("config.toml"),
+            fixture.profile.agent_home("CODEX_HOME").join("config.toml"),
             &b"[mcp_servers.sidevoice\ncommand = "[..],
         ),
         (
             "cursor",
-            fixture.profile.cursor.join("mcp.json"),
+            fixture
+                .profile
+                .agent_home("CURSOR_CONFIG_DIR")
+                .join("mcp.json"),
             &b"{\"mcpServers\": {\"sidevoice\": "[..],
         ),
     ];
@@ -534,7 +551,10 @@ async fn unparsable_settings_are_listed_invalid_with_their_file_and_left_alone()
     for (id, file, bytes) in &files {
         assert_eq!(&fs::read(file).unwrap(), bytes, "{id}");
     }
-    for home in [&fixture.profile.claude, &fixture.profile.codex] {
+    for home in [
+        fixture.profile.agent_home("CLAUDE_CONFIG_DIR"),
+        fixture.profile.agent_home("CODEX_HOME"),
+    ] {
         let calls = fs::read_to_string(home.join("calls")).unwrap_or_default();
         assert!(
             !calls.contains("mcp add") && !calls.contains("mcp remove"),
@@ -550,16 +570,21 @@ async fn unparsable_settings_are_listed_invalid_with_their_file_and_left_alone()
 async fn claude_settings_are_judged_where_claude_code_reads_them() {
     let _turn = agent_env().await;
     let mut fixture = Fixture::new();
-    fixture.profile.claude = fixture.profile.home.join(".claude");
-    private_mkdir(&fixture.profile.claude);
+    let claude_home = fixture.profile.home.join(".claude");
+    set_agent_home(
+        &mut fixture.profile,
+        "CLAUDE_CONFIG_DIR",
+        &claude_home,
+        false,
+    );
+    private_mkdir(&claude_home);
     let claude = fake_claude(&fixture);
     let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", claude.as_os_str());
     let in_home = fixture.profile.home.join(".claude.json");
-    let in_config_dir = fixture.profile.claude.join(".claude.json");
+    let in_config_dir = claude_home.join(".claude.json");
     let file = |listed: &Value| row(listed, "claude").pointer("/instructions/file").cloned();
 
     // Unset: `~/.claude.json`. A broken file inside `~/.claude` is not Claude Code's and is not read.
-    fixture.profile.claude_config_dir_set = false;
     private_write(&in_config_dir, b"{\"mcpServers\": {");
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let listed = host.handle("agents.list", json!({"rescan":true})).await;
@@ -579,7 +604,12 @@ async fn claude_settings_are_judged_where_claude_code_reads_them() {
     host.shutdown().await;
 
     // Set: `$CLAUDE_CONFIG_DIR/.claude.json`, whatever `~/.claude.json` holds.
-    fixture.profile.claude_config_dir_set = true;
+    set_agent_home(
+        &mut fixture.profile,
+        "CLAUDE_CONFIG_DIR",
+        &claude_home,
+        true,
+    );
     write_json(&in_config_dir, &json!({}));
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let listed = host.handle("agents.list", json!({"rescan":true})).await;
@@ -1240,7 +1270,7 @@ async fn claude_registration_carries_the_installation_environment_and_an_older_o
 fn claude_outdated_entry(fixture: &Fixture) {
     let selected = fixture.selected();
     private_write(
-        &fixture.profile.claude.join("fake-entry.txt"),
+        &fixture.profile.agent_home("CLAUDE_CONFIG_DIR").join("fake-entry.txt"),
         format!(
             "sidevoice:\n  Scope: User config (available in all your projects)\n  Type: stdio\n  Command: {}\n  Args: {}\n\nTo remove this server, run: claude mcp remove sidevoice -s user\n",
             selected.command,
@@ -1257,8 +1287,14 @@ async fn connect_rewrites_an_outdated_entry_and_a_failed_rewrite_is_not_success(
     let binary = fake_claude(&fixture);
     let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", binary.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
-    let calls = fixture.profile.claude.join("calls");
-    let entry = fixture.profile.claude.join("fake-entry.txt");
+    let calls = fixture
+        .profile
+        .agent_home("CLAUDE_CONFIG_DIR")
+        .join("calls");
+    let entry = fixture
+        .profile
+        .agent_home("CLAUDE_CONFIG_DIR")
+        .join("fake-entry.txt");
 
     claude_outdated_entry(&fixture);
     let listed = host.handle("agents.list", json!({"rescan":true})).await;
@@ -1296,7 +1332,13 @@ async fn connect_rewrites_an_outdated_entry_and_a_failed_rewrite_is_not_success(
 
     // The removal succeeds but the add fails: a failure, never reported as connected.
     claude_outdated_entry(&fixture);
-    private_write(&fixture.profile.claude.join("fail-add"), b"1");
+    private_write(
+        &fixture
+            .profile
+            .agent_home("CLAUDE_CONFIG_DIR")
+            .join("fail-add"),
+        b"1",
+    );
     let failed = host.handle("agents.connect", json!({"id":"claude"})).await;
     assert_eq!(
         failed.pointer("/error/key"),

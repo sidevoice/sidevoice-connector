@@ -137,6 +137,15 @@ impl Profile {
             .unwrap_or_else(|| panic!("{var} is not a declared agent home"))
     }
 
+    /// Whether the person's environment sets the home named by `var`. A harness asks only for homes it declares.
+    pub fn agent_home_set(&self, var: &str) -> bool {
+        self.agent_homes
+            .iter()
+            .find(|resolved| resolved.spec.var == var)
+            .map(|resolved| resolved.set)
+            .unwrap_or_else(|| panic!("{var} is not a declared agent home"))
+    }
+
     /// The version this connector reports: the build's.
     pub fn connector_version(&self) -> &str {
         crate::identity::VERSION

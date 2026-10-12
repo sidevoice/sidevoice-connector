@@ -39,8 +39,8 @@ fn config_dir() -> PathBuf {
 /// The file Claude Code keeps its user configuration in, user-scope MCP servers included, resolved as its CLI resolves
 /// it: `$CLAUDE_CONFIG_DIR/.claude.json` when the person's environment sets the variable, else `~/.claude.json`.
 pub(crate) fn user_config(profile: &Profile) -> PathBuf {
-    if profile.claude_config_dir_set {
-        profile.claude.join(".claude.json")
+    if profile.agent_home_set(HOME.var) {
+        profile.agent_home(HOME.var).join(".claude.json")
     } else {
         profile.home.join(".claude.json")
     }
