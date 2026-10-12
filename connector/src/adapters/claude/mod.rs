@@ -55,8 +55,8 @@ const USER_CONFIG_LIMIT: u64 = 64 << 20;
 pub(crate) struct Unreadable;
 
 /// Reads [`user_config`] with the guarded reader, before anything else is judged: a regular file of the person's,
-/// inside the directory Claude Code reads it from (its configuration directory when the person's environment names
-/// one, else their home), and JSON. `None` when there is no such file.
+/// writable by nobody else, and JSON. A link is followed wherever it leads (dotfiles managers link it), and the file
+/// it leads to is judged; one that leads nowhere is unreadable. `None` when there is no such file.
 pub(crate) fn read_user_config(profile: &Profile) -> Result<Option<serde_json::Value>, Unreadable> {
     let file = user_config(profile);
     match fs::symlink_metadata(&file) {
@@ -64,15 +64,7 @@ pub(crate) fn read_user_config(profile: &Profile) -> Result<Option<serde_json::V
         Err(_) => return Err(Unreadable),
         Ok(_) => {}
     }
-    let root = if profile.agent_home_set(HOME.var) {
-        profile.agent_root(profile.agent_home(HOME.var))
-    } else {
-        profile
-            .validate_existing_private()
-            .and_then(|()| Ok(profile.home.canonicalize()?))
-    };
-    let root = root.map_err(|_| Unreadable)?;
-    let text = super::registration::read_profile_file(&file, &root, USER_CONFIG_LIMIT)
+    let text = super::registration::read_profile_file(&file, None, USER_CONFIG_LIMIT)
         .map_err(|_| Unreadable)?;
     serde_json::from_str(&text)
         .map(Some)
