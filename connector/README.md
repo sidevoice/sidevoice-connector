@@ -103,7 +103,8 @@ An agent whose registration is `connected` also says whether that registration w
 connector's `agents.list`) carries `health`, `{"state","error","checked_at"}`. The connector starts the entry as the
 agent would: its command, arguments, environment and (Codex's `cwd`) working directory, read back from the agent's
 configuration over the profile's homes and the login PATH the scan captured. Claude Code's entry is read from
-`.claude.json` in its configuration directory, never with `claude mcp get`, which starts the server it names; nothing
+the file its CLI reads (`$CLAUDE_CONFIG_DIR/.claude.json` when the person's environment sets the variable, else
+`~/.claude.json`), never with `claude mcp get`, which starts the server it names; nothing
 is started before the entry is known to be ours. The server gets `SIDEVOICE_HEALTH_CHECK=1`, which keeps `mcp` from
 reaching or starting the daemon. The connector sends `initialize`, `notifications/initialized` and `tools/list`
 (their results must be what the protocol defines: `protocolVersion`, `capabilities`, `serverInfo` with its name and

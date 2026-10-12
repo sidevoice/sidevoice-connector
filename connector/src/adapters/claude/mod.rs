@@ -4,6 +4,7 @@ mod registration;
 pub use harness::Claude;
 
 use super::{envelope, Identity};
+use crate::profile::Profile;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::env;
@@ -22,6 +23,16 @@ fn config_dir() -> PathBuf {
     env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".claude"))
+}
+
+/// The file Claude Code keeps its user configuration in, user-scope MCP servers included, resolved as its CLI resolves
+/// it: `$CLAUDE_CONFIG_DIR/.claude.json` when the person's environment sets the variable, else `~/.claude.json`.
+pub(crate) fn user_config(profile: &Profile) -> PathBuf {
+    if profile.claude_config_dir_set {
+        profile.claude.join(".claude.json")
+    } else {
+        profile.home.join(".claude.json")
+    }
 }
 
 pub fn identity() -> Result<Option<Identity>> {

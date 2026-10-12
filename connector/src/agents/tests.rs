@@ -929,17 +929,18 @@ async fn codex_disconnect_removes_a_disabled_or_outdated_entry_of_ours() {
     }
 }
 
-/// A Claude Code CLI that keeps its user-scope MCP servers in `$CLAUDE_CONFIG_DIR/.claude.json` as the real one does,
-/// and logs every call. Like the real one, `mcp get` starts the server the entry names (its command is kept beside
-/// the file) to report whether it connects.
+/// A Claude Code CLI that keeps its user-scope MCP servers where the real one does: `$CLAUDE_CONFIG_DIR/.claude.json`
+/// when the variable is set, else `~/.claude.json`. It logs every call to its data directory (`$CLAUDE_CONFIG_DIR`,
+/// else `~/.claude`). Like the real one, `mcp get` starts the server the entry names (its command is kept in the data
+/// directory) to report whether it connects.
 fn fake_claude(fixture: &Fixture) -> PathBuf {
     let binary = fixture.root.join("bin/claude");
     private_mkdir(binary.parent().unwrap());
     private_write(
         &binary,
         br##"#!/bin/sh
-home="$CLAUDE_CONFIG_DIR"
-settings="$home/.claude.json"
+home="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+settings="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
 printf '%s\n' "$*" >> "$home/calls"
 quote() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
 case "$1 $2" in
@@ -1068,6 +1069,54 @@ async fn a_foreign_claude_entry_is_never_started() {
     assert!(!ran.exists(), "the foreign command ran");
     let calls = fs::read_to_string(fixture.profile.claude.join("calls")).unwrap_or_default();
     assert!(!calls.contains("mcp get"), "{calls}");
+    host.shutdown().await;
+}
+
+/// Claude Code reads its user-scope MCP servers from `~/.claude.json` unless the person's environment sets
+/// `CLAUDE_CONFIG_DIR`, and from `$CLAUDE_CONFIG_DIR/.claude.json` when it does: the entry is read from that file.
+#[tokio::test]
+async fn the_claude_entry_is_read_where_claude_code_reads_it() {
+    let _turn = agent_env().await;
+    let mut fixture = Fixture::new();
+    fixture.profile.claude = fixture.profile.home.join(".claude");
+    private_mkdir(&fixture.profile.claude);
+    let binary = fake_claude(&fixture);
+    let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", binary.as_os_str());
+    let in_home = fixture.profile.home.join(".claude.json");
+    let in_config_dir = fixture.profile.claude.join(".claude.json");
+    let foreign =
+        json!({"mcpServers":{"sidevoice":{"type":"stdio","command":"/elsewhere/server"}}});
+
+    // Unset: connecting writes `~/.claude.json`, and that is the file read back; another one in `~/.claude` is not
+    // Claude Code's.
+    fixture.profile.claude_config_dir_set = false;
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let connected = host.handle("agents.connect", json!({"id":"claude"})).await;
+    assert_eq!(
+        row(&connected, "claude")["registration"],
+        "connected",
+        "{connected}"
+    );
+    let saved: Value = serde_json::from_slice(&fs::read(&in_home).unwrap()).unwrap();
+    assert!(saved.pointer("/mcpServers/sidevoice").is_some(), "{saved}");
+    write_json(&in_config_dir, &foreign);
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_eq!(
+        row(&listed, "claude")["registration"],
+        "connected",
+        "{listed}"
+    );
+    host.shutdown().await;
+
+    // Set: `$CLAUDE_CONFIG_DIR/.claude.json`, whatever `~/.claude.json` holds.
+    fixture.profile.claude_config_dir_set = true;
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_eq!(
+        row(&listed, "claude")["registration"],
+        "foreign",
+        "{listed}"
+    );
     host.shutdown().await;
 }
 

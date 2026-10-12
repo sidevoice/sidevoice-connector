@@ -1,4 +1,5 @@
-//! Sidevoice's entry in Claude Code: written with `claude mcp`, user scope; read back from `.claude.json`.
+//! Sidevoice's entry in Claude Code: written with `claude mcp`, user scope; read back from its user configuration
+//! (`adapters::claude::user_config`).
 
 use super::Claude;
 use crate::adapters::registration::{
@@ -35,13 +36,22 @@ impl Claude {
         if binary.is_none() {
             return Ok(Entry::bare("unknown"));
         }
-        let file = settings_file(profile);
+        let file = super::user_config(profile);
         match fs::symlink_metadata(&file) {
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Entry::bare("absent")),
             Err(_) => return Ok(Entry::bare("invalid")),
             Ok(_) => {}
         }
-        let Ok(root) = profile.agent_root(&profile.claude) else {
+        // The file stays inside the directory Claude Code reads it from: its configuration directory when the
+        // person's environment names one, else their home.
+        let root = if profile.claude_config_dir_set {
+            profile.agent_root(&profile.claude)
+        } else {
+            profile
+                .validate_existing_private()
+                .and_then(|()| Ok(profile.home.canonicalize()?))
+        };
+        let Ok(root) = root else {
             return Ok(Entry::bare("invalid"));
         };
         let Ok(text) = read_profile_file(&file, &root, SETTINGS_LIMIT) else {
@@ -251,12 +261,6 @@ impl Registration for Claude {
         let command = shell_command(binary.unwrap_or("claude"), &add_args(host));
         json!({"command":command.clone(),"file":Value::Null,"snippet":command})
     }
-}
-
-/// The file Claude Code keeps its user-scope MCP servers in: `.claude.json` in its configuration directory, which the
-/// connector names to its CLI (`CLAUDE_CONFIG_DIR`).
-fn settings_file(profile: &Profile) -> PathBuf {
-    profile.claude.join(".claude.json")
 }
 
 /// The strings of a JSON array; none at all is no arguments, anything but strings is not an entry.
