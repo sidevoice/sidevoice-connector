@@ -609,8 +609,12 @@ mod tests {
 
     #[test]
     fn a_core_is_ours_only_with_this_data_directory_as_a_whole_argument() {
-        let layout =
-            Layout::from_vars(|name| (name == "HOME").then(|| "/h".into()), Vec::new()).unwrap();
+        let layout = Layout::from_vars(
+            |name| (name == "HOME").then(|| "/h".into()),
+            Vec::new(),
+            &[],
+        )
+        .unwrap();
         assert!(is_our_core(
             &layout,
             "/r/core --data-dir /h/.sidevoice/core --socket /x"
@@ -631,6 +635,7 @@ mod tests {
         let layout = Layout::from_vars(
             |name| (name == "HOME").then(|| "/nonexistent-home".into()),
             Vec::new(),
+            &[],
         )
         .unwrap();
         assert_eq!(

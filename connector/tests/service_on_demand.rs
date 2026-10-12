@@ -38,6 +38,10 @@ fn with_no_manager_a_conversation_starts_the_connector_and_the_connector_the_cor
     assert_eq!(idle["reachable"], false, "{idle}");
     let refused = service(&profile, &extra, "install");
     assert_eq!(refused["error"]["key"], "service.no-manager", "{refused}");
+    // Nothing starts at login with no manager: not known, and not settable.
+    assert!(idle["start_at_login"].is_null(), "{idle}");
+    let refused = service(&profile, &extra, "login off");
+    assert_eq!(refused["error"]["key"], "service.no-manager", "{refused}");
 
     // A conversation's MCP server is what gets Sidevoice started; joining keeps its connector busy.
     let receiver = http_receiver();

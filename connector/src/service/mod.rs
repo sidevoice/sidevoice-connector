@@ -1,6 +1,10 @@
-//! `sidevoice service install | uninstall | start | stop | restart | status [--json]`: Sidevoice at login, as two
-//! jobs of this user's service manager (launchd on macOS, systemd's user manager on Linux), and nothing of ours
-//! supervising either; and, where there is no manager, Sidevoice on demand (`launcher`).
+//! `sidevoice service install | uninstall | start | stop | restart | status | login on|off|status [--json]`: Sidevoice
+//! at login, as two jobs of this user's service manager (launchd on macOS, systemd's user manager on Linux), and
+//! nothing of ours supervising either; and, where there is no manager, Sidevoice on demand (`launcher`).
+//!
+//! Whether the jobs start at the next login is the person's (`service login`) and is kept by the manager alone,
+//! never stored: a new service starts at login; `start`, `restart`, `install` over defined jobs and an update leave
+//! it as it is; and turning it on or off neither starts nor stops anything.
 //!
 //! A stop is a person's: `D/node-stopped.json` is written before the manager is asked, and while it is there the
 //! launcher starts nothing; `service start` clears it, and so does the connector job starting at the next login.
@@ -42,6 +46,8 @@ pub enum Action {
     Restart,
     Status,
     Uninstall,
+    /// `service login on|off|status`: `Some(on)` sets it, `None` reads it.
+    Login(Option<bool>),
 }
 
 /// A refusal: a stable key, its parameters, and (for a core that failed) the failure as the core described it.
@@ -190,10 +196,12 @@ pub async fn install(layout: &Layout) -> Result<Value> {
 
 /// Both definitions written for the selected installation and both jobs started; with `restart`, restarted even
 /// when their definitions did not change, so that both run what `current` names now. When no job was defined,
-/// anything running on demand is stopped first. The caller holds the install lock.
+/// anything running on demand is stopped first, and both start at login; otherwise that stays as it was. The caller
+/// holds the install lock.
 pub async fn define_and_start(layout: &Layout, kind: Kind, restart: bool) -> Result<()> {
     let texts = definition::texts(layout, kind)?;
     let had = manager::installed(layout).await;
+    let login = manager::keeps_login(had.as_ref()).await;
     let mut changed = Vec::new();
     for job in Job::ALL {
         let file = manager::definition_path(layout, kind, job)
@@ -206,7 +214,7 @@ pub async fn define_and_start(layout: &Layout, kind: Kind, restart: bool) -> Res
     if had.is_none() {
         stop_on_demand_or_fail(layout).await?;
     }
-    manager::start(layout, kind, &changed, restart, &Job::ALL).await
+    manager::start(layout, kind, &changed, restart, login, &Job::ALL).await
 }
 
 /// What runs outside a manager stopped (`launcher::stop_on_demand`), or the refusal naming what is still running.
@@ -244,7 +252,8 @@ pub async fn start(layout: &Layout) -> Result<Value> {
         let _lock = install_lock(layout).await?;
         clear_stop(layout)?;
         if let Some(found) = &installed {
-            manager::start(layout, found.kind, &[], false, &Job::ALL).await?;
+            let login = manager::keeps_login(Some(found)).await;
+            manager::start(layout, found.kind, &[], false, login, &Job::ALL).await?;
         }
     }
     let now = settle(layout, SETTLE).await;
@@ -287,7 +296,8 @@ pub async fn restart(layout: &Layout) -> Result<Value> {
         let _lock = install_lock(layout).await?;
         match &installed {
             Some(found) if found.core.is_some() => {
-                manager::start(layout, found.kind, &[], true, &[Job::Core]).await?;
+                let login = manager::keeps_login(Some(found)).await;
+                manager::start(layout, found.kind, &[], true, login, &[Job::Core]).await?;
             }
             _ => {
                 for pid in launcher::core_processes(layout) {
@@ -342,9 +352,50 @@ pub async fn uninstall_held(layout: &Layout, keep_stopped: bool) -> Result<Value
     Ok(result)
 }
 
+/// `service login on|off`: whether both jobs start at the next login, and only that (`manager::set_start_at_login`):
+/// a running service keeps running, a stopped one stays stopped, a person's stop is left as it is. `service login
+/// status` (`on` none) reads it. Answered as `start`, `stop` and `status` are, `{ok, state, service}` from the status
+/// read afterwards, with its `start_at_login`: `null` when the manager cannot tell or the service is not whole.
+pub async fn login(layout: &Layout, on: Option<bool>) -> Result<Value> {
+    if let Some(on) = on {
+        let _lock = install_lock(layout).await?;
+        let Some(found) = manager::installed(layout).await else {
+            return Err(Failure::keyed(
+                if manager::kind().await == Kind::None {
+                    "service.no-manager"
+                } else {
+                    "service.login-no-service"
+                },
+                json!({}),
+            ));
+        };
+        // Half a service cannot be said to start at login or not: nothing is changed until it is whole again.
+        let missing = manager::missing(&found);
+        if !missing.is_empty() {
+            return Err(Failure::keyed(
+                "service.login-incomplete",
+                json!({"missing": manager::names(&missing, found.kind)}),
+            ));
+        }
+        if let Err(detail) = manager::set_start_at_login(&found, on).await {
+            return Err(Failure::keyed(
+                "service.login-failed",
+                json!({"detail": detail}),
+            ));
+        }
+    }
+    let now = status::status(layout, None).await;
+    let mut result = json!({"ok": true, "state": now["state"], "service": now["service"],
+        "start_at_login": now["start_at_login"]});
+    if let Some(failure) = now.get("failure").filter(|failure| !failure.is_null()) {
+        result["failure"] = failure.clone();
+    }
+    Ok(result)
+}
+
 /// One service command against the installation this environment names: its JSON answer.
-pub async fn run(action: Action) -> Value {
-    let layout = match Layout::from_env() {
+pub async fn run(action: Action, agent_vars: &[&'static str]) -> Value {
+    let layout = match Layout::from_env(agent_vars) {
         Ok(layout) => layout,
         Err(error) => return Failure::plain(error).value(),
     };
@@ -355,6 +406,7 @@ pub async fn run(action: Action) -> Value {
         Action::Stop => stop(&layout).await,
         Action::Restart => restart(&layout).await,
         Action::Uninstall => uninstall(&layout, false).await,
+        Action::Login(on) => login(&layout, on).await,
     };
     result.unwrap_or_else(|failure| failure.value())
 }
@@ -387,6 +439,15 @@ pub fn human(answer: &Value) -> String {
                 crate::messages::message(failure["key"].as_str().unwrap_or(""), &Value::Null)
             });
         out.push_str(&format!(" ({reason})"));
+    }
+    if let Some(login) = answer.get("start_at_login") {
+        let key = match login.as_bool() {
+            Some(true) => "service.login.on",
+            Some(false) => "service.login.off",
+            None => "service.login.unknown",
+        };
+        out.push('\n');
+        out.push_str(&crate::messages::message(key, &Value::Null));
     }
     if let Some(note) = answer.get("note").and_then(Value::as_str) {
         out.push('\n');
@@ -451,4 +512,33 @@ async fn verify_connector(profile: &Profile) -> bool {
     launcher::ask_connector(&layout, "identity", json!({}), Duration::from_secs(1))
         .await
         .is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_login_answer_reads_as_its_state_and_whether_it_starts_at_login() {
+        let off =
+            json!({"ok": true, "state": "running", "service": "launchd", "start_at_login": false});
+        assert_eq!(
+            human(&off),
+            "Sidevoice is running (launchd).\nSidevoice does not start at login."
+        );
+        let unknown = json!({"ok": true, "state": "not-installed", "service": "systemd", "start_at_login": null});
+        assert!(
+            human(&unknown).ends_with("\nWhether Sidevoice starts at login is not known: it has no login service here, or the service manager cannot tell."),
+            "{}",
+            human(&unknown)
+        );
+        let refused = Failure::keyed(
+            "service.login-incomplete",
+            json!({"missing": "dev.sidevoice.connector"}),
+        );
+        assert_eq!(
+            human(&refused.value()),
+            "The Sidevoice login service is incomplete (dev.sidevoice.connector is missing), so whether it starts at login was not changed. Repair it with `sidevoice service install`, then try again."
+        );
+    }
 }

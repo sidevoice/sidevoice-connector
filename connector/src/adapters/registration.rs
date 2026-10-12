@@ -5,7 +5,7 @@ use crate::messages::message;
 use crate::profile::Profile;
 use futures_util::future::BoxFuture;
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -63,6 +63,15 @@ pub trait Registration: Send + Sync {
     fn known_paths(&self, home: &Path) -> Vec<PathBuf>;
     /// Evidence, beyond its home and its CLI, that the agent is on this computer: `(kind, path)`.
     fn evidence(&self) -> Vec<(&'static str, PathBuf)> {
+        Vec::new()
+    }
+    /// How to start this agent against the test bench's profile, when it can be: printed when the bench starts.
+    fn bench_steps(&self, _setup: &BenchSetup) -> Option<String> {
+        None
+    }
+
+    /// What is left for the person after an install that registered Sidevoice with this agent.
+    fn after_install(&self, _profile: &Profile) -> Vec<String> {
         Vec::new()
     }
     /// Whether Sidevoice registers with it without its CLI.
@@ -153,6 +162,18 @@ impl Manual {
     }
 }
 
+/// The test bench's profile, as an agent is pointed at it: what [`Registration::bench_steps`] writes its steps with.
+pub struct BenchSetup<'a> {
+    /// The script to source before starting the agent.
+    pub env_script: &'a str,
+    /// An `mcpServers` configuration file naming the installation.
+    pub mcp_config: &'a str,
+    /// The installation's MCP server command, quoted for a shell.
+    pub server: &'a str,
+    /// The environment the server runs with.
+    pub env: &'a BTreeMap<String, String>,
+}
+
 /// Runs the agent's CLI and requires it to succeed.
 pub async fn run_required(
     host: &dyn AgentHost,
@@ -207,12 +228,21 @@ pub fn shell_command(command: &str, args: &[String]) -> String {
         .join(" ")
 }
 
-/// `command args` for a POSIX shell, run with the agent's home in `variable`, as the connector runs its CLI: a step
-/// done by hand then changes the same profile as the connector would.
-pub fn shell_command_in(variable: &str, home: &Path, command: &str, args: &[String]) -> String {
+/// `command args` for a POSIX shell, run with the agent's home `variable` as the connector runs its CLI: named when the
+/// person's environment sets it, else left to the agent's own default, as in the person's shell. A step done by hand
+/// then changes the same configuration as the connector would.
+pub fn shell_command_in(
+    profile: &Profile,
+    variable: &str,
+    command: &str,
+    args: &[String],
+) -> String {
+    if !profile.agent_home_set(variable) {
+        return shell_command(command, args);
+    }
     format!(
         "{variable}={} {}",
-        shell_quote(&home.to_string_lossy()),
+        shell_quote(&profile.agent_home(variable).to_string_lossy()),
         shell_command(command, args)
     )
 }
@@ -246,4 +276,74 @@ pub fn mcp_servers_json(
             sidevoice: CustomServer { command, args, env },
         },
     })
+}
+
+/// What the test bench asks the connector about the agents (`bench-agents`, a separate binary that cannot read the
+/// registry itself):
+/// - `{"root": R}`: each declared agent home, below `R/agents/`, and each agent's CLI as this `PATH` finds it
+///   (`SIDEVOICE_<ID>_BIN`), as `{"homes": {VAR: path}, "binaries": {VAR: path}}`;
+/// - `{"setup": {env_script, mcp_config, server, env}}`: how to start each agent against the bench, `{"steps": […]}`.
+pub fn bench_agents(request: &Value) -> Value {
+    let registry = super::Registry::standard();
+    if let Some(root) = request.get("root").and_then(Value::as_str) {
+        let homes: serde_json::Map<String, Value> = registry
+            .homes()
+            .iter()
+            .map(|home| {
+                let dir = Path::new(root)
+                    .join("agents")
+                    .join(home.var.to_ascii_lowercase());
+                (
+                    home.var.to_owned(),
+                    Value::from(dir.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let binaries: serde_json::Map<String, Value> = registry
+            .agents()
+            .filter_map(|(id, registration)| {
+                let found = registration.binary_names().iter().find_map(|name| {
+                    path.split(':')
+                        .filter(|dir| !dir.is_empty())
+                        .map(|dir| Path::new(dir).join(name))
+                        .find(|candidate| candidate.is_file())
+                })?;
+                Some((
+                    format!("SIDEVOICE_{}_BIN", id.to_ascii_uppercase()),
+                    Value::from(found.to_string_lossy().into_owned()),
+                ))
+            })
+            .collect();
+        return serde_json::json!({"homes": homes, "binaries": binaries});
+    }
+    let setup = request.get("setup").cloned().unwrap_or_default();
+    let text = |key: &str| {
+        setup
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned()
+    };
+    let env: BTreeMap<String, String> = setup
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|env| {
+            env.iter()
+                .map(|(name, value)| (name.clone(), value.as_str().unwrap_or("").to_owned()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let (env_script, mcp_config, server) = (text("env_script"), text("mcp_config"), text("server"));
+    let bench = BenchSetup {
+        env_script: &env_script,
+        mcp_config: &mcp_config,
+        server: &server,
+        env: &env,
+    };
+    let steps: Vec<String> = registry
+        .agents()
+        .filter_map(|(_, registration)| registration.bench_steps(&bench))
+        .collect();
+    serde_json::json!({"steps": steps})
 }

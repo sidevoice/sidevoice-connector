@@ -2,8 +2,8 @@
 
 use super::Codex;
 use crate::adapters::registration::{
-    looks_absent, run_required, shell_command_in, strings, AgentError, AgentHost, CliError, Manual,
-    ManualStep, Registration,
+    looks_absent, run_required, shell_command, shell_command_in, strings, AgentError, AgentHost,
+    BenchSetup, CliError, Manual, ManualStep, Registration,
 };
 use crate::profile::Profile;
 use anyhow::{Context, Result};
@@ -29,7 +29,7 @@ impl Codex {
             return Ok(guard);
         }
         if matches!(
-            fs::symlink_metadata(&profile.codex),
+            fs::symlink_metadata(profile.agent_home(super::HOME.var)),
             Err(ref error) if error.kind() == ErrorKind::NotFound
         ) {
             return Ok("not-connected".into());
@@ -168,21 +168,24 @@ fn file_guard(host: &dyn AgentHost) -> String {
     if profile.validate_existing_private().is_err() {
         return "invalid".into();
     }
-    match fs::symlink_metadata(&profile.codex) {
+    match fs::symlink_metadata(profile.agent_home(super::HOME.var)) {
         Err(error) if error.kind() == ErrorKind::NotFound => return "not-connected".into(),
         Err(_) => return "invalid".into(),
         Ok(_) => {}
     }
-    if profile.validate_for_agent(&profile.codex).is_err() {
+    if profile
+        .validate_for_agent(profile.agent_home(super::HOME.var))
+        .is_err()
+    {
         return "invalid".into();
     }
-    let file = profile.codex.join("config.toml");
+    let file = profile.agent_home(super::HOME.var).join("config.toml");
     match fs::symlink_metadata(&file) {
         Err(error) if error.kind() == ErrorKind::NotFound => return "not-connected".into(),
         Err(_) => return "invalid".into(),
         Ok(_) => {}
     }
-    let root = match profile.agent_root(&profile.codex) {
+    let root = match profile.agent_root(profile.agent_home(super::HOME.var)) {
         Ok(root) => root,
         Err(_) => return "invalid".into(),
     };
@@ -255,8 +258,23 @@ fn add_args(host: &dyn AgentHost) -> Vec<String> {
 }
 
 impl Registration for Codex {
+    fn bench_steps(&self, setup: &BenchSetup) -> Option<String> {
+        let env: String = setup
+            .env
+            .iter()
+            .map(|(name, value)| {
+                format!(" --env {}", shell_command(&format!("{name}={value}"), &[]))
+            })
+            .collect();
+        let script = setup.env_script;
+        Some(format!(
+            "Codex (log in once inside the profile, register once, then start it):\n  . {script} && codex login\n  . {script} && codex mcp add sidevoice{env} -- {}\n  . {script} && codex",
+            setup.server
+        ))
+    }
+
     fn config_root<'a>(&self, profile: &'a Profile) -> &'a Path {
-        &profile.codex
+        profile.agent_home(super::HOME.var)
     }
 
     fn binary_names(&self) -> &'static [&'static str] {
@@ -298,11 +316,12 @@ impl Registration for Codex {
 
     fn manual(&self, host: &dyn AgentHost, registration: &str, binary: Option<&str>) -> Manual {
         let cli = binary.unwrap_or("codex");
-        let home = &host.profile().codex;
-        // `codex mcp` writes `config.toml` in `CODEX_HOME`: the file each step changes.
-        let file = home.join("config.toml");
+        let profile = host.profile();
+        // `codex mcp` writes `config.toml` in Codex's home: the file each step changes. A step names `CODEX_HOME` only
+        // when the person's environment sets it; without it, Codex's default is the same home.
+        let file = profile.agent_home(super::HOME.var).join("config.toml");
         let step = |args: &[String]| ManualStep {
-            command: Some(shell_command_in("CODEX_HOME", home, cli, args)),
+            command: Some(shell_command_in(profile, super::HOME.var, cli, args)),
             snippet: None,
             file: Some(file.to_string_lossy().into_owned()),
         };
