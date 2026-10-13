@@ -6,7 +6,7 @@ use super::{
     sqlite3_found, transcript_path,
 };
 use crate::adapters::conversation::{Conversation, Room};
-use crate::adapters::harness::{no_route, Harness};
+use crate::adapters::harness::{no_route, Harness, Route};
 use crate::adapters::registration::Registration;
 use crate::adapters::transcript::{self, Observed, TranscriptReader};
 use crate::adapters::Identity;
@@ -83,11 +83,15 @@ impl Harness for Cursor {
         Some(self)
     }
 
-    fn accepts(&self, delivery: &Value, thread: &str) -> bool {
+    fn accepts(&self, delivery: &Value, thread: &str) -> Route {
         match delivery.get("kind").and_then(Value::as_str) {
-            Some("cursor-tmux") => delivery.get("chat").and_then(Value::as_str) == Some(thread),
-            Some("cursor-bridge") => delivery.get("thread").and_then(Value::as_str) == Some(thread),
-            Some("none") => true,
+            Some("cursor-tmux") => {
+                Route::known(delivery.get("chat").and_then(Value::as_str) == Some(thread))
+            }
+            Some("cursor-bridge") => {
+                Route::known(delivery.get("thread").and_then(Value::as_str) == Some(thread))
+            }
+            Some("none") => Route::Accepted,
             _ => crate::adapters::http::accepts(delivery, thread),
         }
     }
@@ -557,7 +561,10 @@ mod tests {
         assert_eq!(identity.route.as_deref(), Some("cursor-editor-bridge"));
         let marker = identity.chat_marker.clone().unwrap();
         assert_eq!(identity.delivery["marker"], marker.as_str());
-        assert!(Cursor.accepts(&identity.delivery, &identity.thread));
+        assert_eq!(
+            Cursor.accepts(&identity.delivery, &identity.thread),
+            Route::Accepted
+        );
         let fields = client::joined_fields(&identity);
         assert_eq!(fields["chat_marker"], marker.as_str());
         assert!(fields["voice_in"].as_str().unwrap().contains(WAITING));

@@ -12,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::time::{timeout, Duration};
 
+/// `core.json` as the core writes it. A core of another version may add fields: they are ignored, never refused.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Ready {
     pub pid: u32,
@@ -19,7 +20,8 @@ pub struct Ready {
     pub socket: PathBuf,
     pub connector_id: String,
     pub token: String,
-    pub connector_protocols: Option<Vec<u8>>,
+    /// The link protocols this core speaks; a number this connector does not know is only not one it speaks.
+    pub connector_protocols: Option<Vec<u64>>,
 }
 
 /// The ready file at `path`, when it is this user's private file naming a launch on `socket`.
@@ -101,5 +103,29 @@ impl Profile {
         let ready = self.read_ready()?;
         let health = self.health_ready(&ready).await?;
         Ok((ready, health))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read, require_v3};
+    use crate::secure_fs::tests::Scratch;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A newer core's ready file: fields this connector does not know, at the top and nested, and a protocol
+    /// number it has never heard of. It is read for what it knows, and v3 is still found among the protocols.
+    #[test]
+    fn a_ready_file_with_fields_and_protocols_this_connector_does_not_know_is_read() {
+        let scratch = Scratch::new("ready");
+        let socket = scratch.0.join("local.sock");
+        let path = scratch.0.join("core.json");
+        let ready = serde_json::json!({"pid":42,"launch_id":"launch-1","socket":socket,"connector_id":"c-1",
+            "token":"t","connector_protocols":[3, 4, 1000],"future_field":{"nested":[1, 2]},"listen":"x"});
+        std::fs::write(&path, serde_json::to_vec(&ready).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let read = read(&path, &socket).unwrap();
+        assert_eq!((read.pid, read.launch_id.as_str()), (42, "launch-1"));
+        assert_eq!(read.connector_protocols, Some(vec![3, 4, 1000]));
+        require_v3(&read).unwrap();
     }
 }

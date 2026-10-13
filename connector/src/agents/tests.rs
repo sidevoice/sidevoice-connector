@@ -1979,3 +1979,47 @@ async fn connect_rewrites_an_outdated_entry_and_a_failed_rewrite_is_not_success(
     assert_ne!(row(&listed, "claude")["registration"], "connected");
     host.shutdown().await;
 }
+
+/// `agents.*` from a newer core carry fields this connector does not know, at the top and nested
+/// (sidevoice/sidevoice-core#112): each request is answered for what it knows.
+#[tokio::test]
+async fn agents_requests_with_unknown_fields_are_answered_for_what_they_know() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let binary = fake_claude(&fixture);
+    let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", binary.as_os_str());
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    fake_server(&fixture);
+
+    let listed = host
+        .handle(
+            "agents.list",
+            json!({"rescan":true,"future_field":1,"future_filter":{"nested":["x"]}}),
+        )
+        .await;
+    assert_eq!(
+        row(&listed, "claude")["registration"],
+        "not-connected",
+        "{listed}"
+    );
+    let connected = host
+        .handle(
+            "agents.connect",
+            json!({"id":"claude","future_field":{"nested":{"deeper":true}}}),
+        )
+        .await;
+    assert_eq!(
+        row(&connected, "claude")["registration"],
+        "connected",
+        "{connected}"
+    );
+    let checked = host
+        .handle("agents.check", json!({"id":"claude","future_field":[1, 2]}))
+        .await;
+    assert_eq!(
+        row(&checked, "claude")["health"]["state"],
+        "working",
+        "{checked}"
+    );
+    host.shutdown().await;
+}

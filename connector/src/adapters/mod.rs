@@ -9,7 +9,7 @@ pub mod registration;
 mod transcript;
 
 pub use conversation::{Conversation, Room};
-pub use harness::{Harness, Registry};
+pub use harness::{Harness, Registry, Route};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
