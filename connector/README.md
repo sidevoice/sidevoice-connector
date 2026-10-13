@@ -35,6 +35,7 @@ Every place comes from the environment, so a disposable profile is just a set of
   `node-stopped.json` (a person's stop), `credentials.json` (the room pairing), the speech outbox, and `core/`
   (the core's own: `core.json`, `local.sock`);
 - the release root `R`: `$XDG_DATA_HOME/sidevoice`, else `~/.local/share/sidevoice`;
+- the core's port: `$SIDEVOICE_CORE_PORT`, else 10829;
 - the agents' homes: `$CLAUDE_CONFIG_DIR` (`~/.claude`), `$CODEX_HOME` (`~/.codex`), `$CURSOR_CONFIG_DIR`
   (`~/.cursor`), `$CURSOR_DATA_DIR`. Each is checked to be the person's and writable by nobody else before it is
   read or written. `CLAUDE_CONFIG_DIR` reaches Claude Code (its CLI, the service jobs) only when the person's
