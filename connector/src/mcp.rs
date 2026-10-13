@@ -3,8 +3,7 @@ use crate::profile::Profile;
 use crate::secure_fs::verify_socket;
 use anyhow::{bail, Context, Result};
 use rmcp::{
-    model::*, service::RequestContext, transport::stdio, ErrorData as McpError, RoleServer,
-    ServerHandler, ServiceExt,
+    model::*, service::RequestContext, ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -882,7 +881,7 @@ fn tools() -> Vec<Tool> {
     let spec = [
         ("voice_connect", "Connect this conversation to the voice room. Only on an explicit request to join or enable voice. Fails, saying what to ask the user, when a room is named that this machine is not paired with; with no room paired it joins this machine only (local_only).", json!({"title":{"type":"string","description":"Short label for this conversation in the room"},"room":{"type":"string","description":"The room's address (https://…) when the user names one; omitted, the room this machine is paired with"}}), vec![]),
         ("voice_pair", "Pair this machine with a room using the one-time code the user read from the room's interface (\"Emparejar máquina\"). Only with a code the user gave you; one room per machine, a new pairing replaces the previous one.", json!({"room":{"type":"string","description":"The room's address (https://…)"},"code":{"type":"string","description":"The one-time pairing code shown by the room"}}), vec!["room","code"]),
-        ("voice_say", "Publish a concise spoken version of your reply to the room, with the session_id and revision from the voice message header. To speak before any voice message arrived, pass instead the conversation id voice_connect returned in this chat.", json!({"text":{"type":"string"},"session_id":{"type":"string"},"revision":{"type":"integer","minimum":0},"conversation":{"type":"string","description":"The conversation id voice_connect returned in this chat: to speak with no voice message to answer"},"utterance_id":{"type":"string"},"language":{"type":"string","enum":["es","en","fr","it","pt","hi"]}}), vec!["text"]),
+        ("voice_say", "Publish a concise spoken version of your reply to the room, with the session_id and revision from the voice message header. To speak before any voice message arrived, pass instead the conversation id voice_connect returned in this chat.", json!({"text":{"type":"string"},"session_id":{"type":"string"},"revision":{"type":"integer","minimum":0},"conversation":{"type":"string","description":"The conversation id voice_connect returned in this chat: to speak with no voice message to answer"},"utterance_id":{"type":"string"},"language":{"type":"string","description":"The language of the reply, as a code: es, en, fr, it, pt or hi are the ones known now; the room decides what it speaks"}}), vec!["text"]),
         ("voice_disconnect", "Leave the voice room. The conversation and its work continue in writing.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
         ("voice_pair_device", "Show a one-time code to pair a device (the desktop app or a browser) with this machine: the code, a QR of it and how long it is valid. Only when the user asks to pair a device, never on your own initiative; show the user the result as it is.", json!({}), vec![]),
         ("voice_status", "Whether the room can currently reach this conversation.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
@@ -1010,9 +1009,84 @@ pub async fn run(profile: Profile) -> Result<()> {
     if std::env::var_os(HEALTH_CHECK).is_none() {
         crate::service::ensure_connector(&profile).await?;
     }
-    let service = Facade::new(profile).serve(stdio()).await?;
+    // rmcp reads the client's identity into closed types (an icon's `theme` is `light` or `dark` only), and a value
+    // it does not know fails the whole `initialize`, or drops a call's client info. Each message passes through
+    // `tolerant_message` first, which keeps of the client info only what Sidevoice reads.
+    let (to_rmcp, from_agent) = tokio::io::duplex(1 << 20);
+    tokio::spawn(forward_tolerantly(tokio::io::stdin(), from_agent));
+    let service = Facade::new(profile)
+        .serve((to_rmcp, tokio::io::stdout()))
+        .await?;
     service.waiting().await?;
     Ok(())
+}
+
+/// The agent's messages, one JSON-RPC message per line, each through `tolerant_message`, until the agent closes them.
+async fn forward_tolerantly(
+    agent: impl tokio::io::AsyncRead + Unpin,
+    mut rmcp: impl tokio::io::AsyncWrite + Unpin,
+) {
+    use tokio::io::AsyncBufReadExt;
+    let mut reader = BufReader::new(agent);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if !matches!(reader.read_until(b'\n', &mut line).await, Ok(1..)) {
+            break;
+        }
+        if rmcp.write_all(&tolerant_message(&line)).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// One line from the agent as rmcp is to read it: a client info (`initialize`'s `clientInfo`, a call's
+/// `_meta["io.modelcontextprotocol/clientInfo"]`) is kept to the text fields Sidevoice reads, its name and version
+/// among them, so that nothing a newer client adds to it (an icon theme rmcp does not know) refuses the message.
+/// Anything that is not a JSON object passes as it came.
+fn tolerant_message(line: &[u8]) -> Vec<u8> {
+    let Ok(mut message) = serde_json::from_slice::<Value>(line) else {
+        return line.to_vec();
+    };
+    let Some(params) = message.get_mut("params") else {
+        return line.to_vec();
+    };
+    let mut changed = false;
+    for pointer in ["/clientInfo", "/_meta/io.modelcontextprotocol~1clientInfo"] {
+        if let Some(info) = params.pointer_mut(pointer) {
+            let kept = client_info(info);
+            if *info != kept {
+                *info = kept;
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return line.to_vec();
+    }
+    let mut out = message.to_string().into_bytes();
+    out.push(b'\n');
+    out
+}
+
+/// A client's identity, as the protocol defines it (`Implementation`), kept to its text fields; one without a name
+/// or a version is left for rmcp to judge.
+fn client_info(raw: &Value) -> Value {
+    if !["name", "version"]
+        .iter()
+        .all(|key| raw.get(key).is_some_and(Value::is_string))
+    {
+        return raw.clone();
+    }
+    let kept = ["name", "title", "version", "description", "websiteUrl"]
+        .iter()
+        .filter_map(|key| {
+            raw.get(key)
+                .filter(|value| value.is_string())
+                .map(|value| (key.to_string(), value.clone()))
+        })
+        .collect();
+    Value::Object(kept)
 }
 
 /// A tool call's `_meta`, as the agent sent it. rmcp moves the request's `_meta` into its context before the handler
@@ -1035,12 +1109,41 @@ fn call_meta(context: &impl serde::Serialize, params: Option<impl serde::Seriali
 #[cfg(test)]
 mod tests {
     use super::{closed_note, ipc_limit, pairing_needed, tools};
+    use rmcp::model::InitializeRequestParams;
+    use serde_json::{json, Value};
     use std::time::Duration;
 
-    /// No tool refuses an argument it does not know, in the server or in a client that checks calls against the
-    /// schema.
+    /// Whether a client that checks a call against `schema` (the keywords these schemas use: `required`, each
+    /// property's `type` and `enum`, `additionalProperties: false`) lets `arguments` through.
+    fn schema_lets_through(schema: &serde_json::Map<String, Value>, arguments: &Value) -> bool {
+        let arguments = arguments.as_object().unwrap();
+        let properties = schema["properties"].as_object().unwrap();
+        let required = schema["required"].as_array().unwrap();
+        required
+            .iter()
+            .all(|name| arguments.contains_key(name.as_str().unwrap()))
+            && arguments
+                .iter()
+                .all(|(name, value)| match properties.get(name) {
+                    None => schema.get("additionalProperties") != Some(&json!(false)),
+                    Some(property) => {
+                        let typed = match property["type"].as_str() {
+                            Some("string") => value.is_string(),
+                            Some("integer") => value.is_i64(),
+                            _ => true,
+                        };
+                        typed
+                            && property["enum"]
+                                .as_array()
+                                .is_none_or(|values| values.contains(value))
+                    }
+                })
+    }
+
+    /// No tool refuses an argument it does not know, or a value a closed list would not name, in the server or in a
+    /// client that checks calls against the schema: a reply in a language the room learns later goes through.
     #[test]
-    fn no_tool_schema_refuses_an_argument_it_does_not_know() {
+    fn no_tool_schema_refuses_an_argument_or_a_value_it_does_not_know() {
         for tool in tools() {
             assert_eq!(
                 tool.input_schema.get("additionalProperties"),
@@ -1048,9 +1151,78 @@ mod tests {
                 "{}",
                 tool.name
             );
+            for (name, property) in tool.input_schema["properties"].as_object().unwrap() {
+                assert_eq!(property.get("enum"), None, "{}.{name}", tool.name);
+            }
         }
+        let say = tools()
+            .into_iter()
+            .find(|tool| tool.name == "voice_say")
+            .unwrap();
+        for arguments in [
+            json!({"text":"hola","session_id":"s","revision":1,"language":"es"}),
+            json!({"text":"hello","session_id":"s","revision":1,"language":"tlh","future":{"nested":1}}),
+        ] {
+            assert!(
+                schema_lets_through(&say.input_schema, &arguments),
+                "{arguments}"
+            );
+        }
+        assert!(!schema_lets_through(
+            &say.input_schema,
+            &json!({"session_id":"s"})
+        ));
     }
 
+    /// rmcp reads a client info into closed types: an icon theme it does not know refuses the whole `initialize`
+    /// and drops a call's client info. Each line is kept to the client info's text fields before rmcp reads it;
+    /// anything else passes as it came.
+    #[test]
+    fn a_client_info_rmcp_would_refuse_is_kept_to_what_sidevoice_reads() {
+        let client = json!({"name":"an-agent","version":"0.99.0","title":"An agent",
+            "icons":[{"src":"https://example.invalid/i.png","theme":"high-contrast"}],"future":{"nested":true}});
+        let initialize =
+            json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":client});
+        assert!(serde_json::from_value::<InitializeRequestParams>(initialize.clone()).is_err());
+        let line =
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":initialize}).to_string();
+        let read: Value =
+            serde_json::from_slice(&super::tolerant_message(line.as_bytes())).unwrap();
+        assert_eq!(
+            read["params"]["clientInfo"],
+            json!({"name":"an-agent","version":"0.99.0","title":"An agent"})
+        );
+        let params: InitializeRequestParams =
+            serde_json::from_value(read["params"].clone()).unwrap();
+        assert_eq!(
+            (
+                params.client_info.name.as_str(),
+                params.client_info.version.as_str()
+            ),
+            ("an-agent", "0.99.0")
+        );
+
+        let call =
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"voice_status",
+            "_meta":{"io.modelcontextprotocol/clientInfo":client,"x-other":1}}})
+            .to_string();
+        let read: Value =
+            serde_json::from_slice(&super::tolerant_message(call.as_bytes())).unwrap();
+        assert_eq!(
+            read["params"]["_meta"],
+            json!({"io.modelcontextprotocol/clientInfo":{"name":"an-agent","version":"0.99.0","title":"An agent"},
+                "x-other":1})
+        );
+
+        for untouched in [
+            b"not json\n".to_vec(),
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n".to_vec(),
+            format!("{}\n", json!({"jsonrpc":"2.0","id":3,"method":"initialize","params":{"clientInfo":{"name":"x"}}}))
+                .into_bytes(),
+        ] {
+            assert_eq!(super::tolerant_message(&untouched), untouched);
+        }
+    }
     /// A reason the room closes a conversation for that this connector does not know reads as the room's close.
     #[test]
     fn an_unknown_close_reason_reads_as_closed_from_the_room() {

@@ -188,10 +188,67 @@ fn a_tool_call_with_arguments_this_server_does_not_know_is_answered_for_what_it_
     assert_eq!(status["joined"], true, "{status}");
     assert_eq!(status["conversation"], thread, "{status}");
 
+    // A language the schema does not list (it lists none as a closed set) is passed on, not refused.
+    let said = mcp.request(
+        "tools/call",
+        json!({"name": "voice_say", "_meta": meta,
+               "arguments": {"text": "Hello", "session_id": format!("typed:{thread}"), "revision": 0,
+                             "language": "tlh", "future_argument": {"nested": 1}}}),
+    );
+    assert_ne!(said["isError"], true, "{said}");
+    let said: Value =
+        serde_json::from_str(said["content"][0]["text"].as_str().unwrap_or("")).unwrap_or_default();
+    assert_eq!(said["status"], "queued", "{said}");
+
     let left = mcp.request(
         "tools/call",
         json!({"name": "voice_disconnect", "_meta": meta, "arguments": {"future_argument": 1}}),
     );
     assert_ne!(left["isError"], true, "{left}");
+    mcp.stop();
+}
+
+/// A client info carrying what rmcp does not know (an icon `theme` beyond `light` and `dark`, fields of an icon of
+/// its own): rmcp alone would refuse the whole `initialize` and drop it from a call's `_meta`. The client is still
+/// named by its name and version, both when it initializes and when it says who it is on each call.
+#[test]
+fn a_client_info_with_an_icon_theme_rmcp_does_not_know_still_names_the_client() {
+    let profile = Profile::new("icontheme");
+    let _connector = profile.start_connector();
+    let client = json!({"name": "codex-mcp-client", "version": "0.99.0", "title": "Codex",
+        "icons": [{"src": "https://example.invalid/icon.png", "theme": "high-contrast", "future": 1}],
+        "future_field": {"nested": true}});
+    let refusal = |answer: &Value| {
+        assert_eq!(answer["isError"], true, "{answer}");
+        answer["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned()
+    };
+
+    // `initialize`, then a call that names no conversation: refused naming Codex and its version.
+    let mut mcp = Mcp::start(profile.connector(&["mcp"]));
+    let initialized = mcp.request(
+        "initialize",
+        json!({"protocolVersion": OLDER, "capabilities": {}, "clientInfo": client}),
+    );
+    assert_eq!(initialized["protocolVersion"], OLDER, "{initialized}");
+    mcp.notify("notifications/initialized", json!({}));
+    let text = refusal(&mcp.request(
+        "tools/call",
+        json!({"name": "voice_connect", "arguments": {}}),
+    ));
+    assert!(text.contains("Codex 0.99.0 did not say"), "{text}");
+    mcp.stop();
+
+    // A 2026-07-28 client says who it is in each call's `_meta`.
+    let mut mcp = Mcp::start(profile.connector(&["mcp"]));
+    let mut call_meta = meta();
+    call_meta["io.modelcontextprotocol/clientInfo"] = client;
+    let text = refusal(&mcp.request(
+        "tools/call",
+        json!({"name": "voice_connect", "arguments": {}, "_meta": call_meta}),
+    ));
+    assert!(text.contains("Codex 0.99.0 did not say"), "{text}");
     mcp.stop();
 }
