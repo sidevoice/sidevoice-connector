@@ -25,7 +25,7 @@ pub const CORE_ENTRYPOINT: &str = "core/bin/sidevoice-core-rust";
 pub const CORE_DIRECTORY: &str = "core";
 
 /// The core's port when `SIDEVOICE_CORE_PORT` does not name one.
-pub const DEFAULT_CORE_PORT: &str = "8768";
+pub const DEFAULT_CORE_PORT: &str = "10829";
 
 /// Settings that are never written into a service definition: credentials of a core somebody else runs, test hooks,
 /// what only says where to install from, and what a definition sets itself.
@@ -301,7 +301,7 @@ mod tests {
             Path::new("/home/u/.local/share/sidevoice/current/core/bin/sidevoice-core-rust")
         );
         assert!(plain.agent_dirs.is_empty());
-        assert_eq!(plain.core_port(), "8768");
+        assert_eq!(plain.core_port(), "10829");
 
         let named = layout(&[
             ("HOME", "/home/u"),
