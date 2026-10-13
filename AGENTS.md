@@ -38,9 +38,15 @@ MCP tools, the files another version may have written) follows these rules:
   `additionalProperties: false` in a tool schema; an unknown field is ignored, and a whole message is never refused
   for one. An unknown enum value gets a defined default (`#[serde(other)]`, a default variant, a `_ =>` arm that does
   something sensible), written down where it is read: an unknown `channel` is delivered as `voice`, an unknown close
-  reason reads as closed from the room, a speech answer that is neither saved nor a refusal it knows keeps the speech
-  in the outbox, an unknown method or command gets a defined refusal (`connector.unknown-method`, `unknown IPC
-  method`). A `null` optional field reads as an absent one.
+  reason reads as closed from the room, a delivery route kind a harness does not know joins the conversation with no
+  route in (deliver unsupported; its speech still goes out), a speech answer that is neither saved nor a refusal it
+  knows keeps the speech in the outbox, an unknown method or command gets a defined refusal
+  (`connector.unknown-method`, `unknown IPC method`). A `null` optional field reads as an absent one.
+- **Tool schemas name no closed lists.** An argument whose values may grow (a language) is a string whose description
+  lists the values known now; a client that checks calls against the schema must not refuse the next one.
+- **A library's closed types are not ours to impose.** Where a dependency reads a peer's message into a closed enum
+  (rmcp's client info: an icon `theme` of `light` or `dark` only), the message is normalised to what Sidevoice reads
+  before the library sees it (`mcp.rs`, `tolerant_message`).
 - **What stays strict:** the fields a message cannot be acted on without, and the checks that protect someone (the
   JSON-RPC envelope, IDs this side never sent, the link's protocol version, an agent registration this connector
   did not write, file ownership and permissions). An unknown value there is refused, never guessed.
@@ -48,4 +54,4 @@ MCP tools, the files another version may have written) follows these rules:
   side can say "update this machine" instead of failing.
 - **Contract tests** send each boundary's messages with extra fields, top level and nested, and unknown enum values,
   and assert they are accepted and behave per their known part (`src/daemon/contract_tests.rs`, `src/link.rs`,
-  `tests/mcp_interop.rs`). A new message or field gets its case there.
+  `tests/mcp_interop.rs`, `tests/ipc_interop.rs`). A new message or field gets its case there.
