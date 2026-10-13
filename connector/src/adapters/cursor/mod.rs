@@ -1,4 +1,3 @@
-pub mod app;
 mod harness;
 mod registration;
 
@@ -41,7 +40,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-const EDITOR_NOTE: &str = "This Cursor did not declare MCP Apps support (the io.modelcontextprotocol/ui extension) when it started this server, so it would draw no Sidevoice card, and a chat of the editor has no other way to receive the room; nor is this a Cursor CLI chat (cursor-agent), whose open chat Sidevoice can see. ~/.sidevoice/mcp.log shows what it declared.";
+const EDITOR_NOTE: &str = "Sidevoice cannot tell which Cursor chat this is: this Cursor did not declare MCP Apps support (the io.modelcontextprotocol/ui extension) when it started this server, which is how the editor is told apart, nor is this a Cursor CLI chat (cursor-agent), whose open chat Sidevoice can see. ~/.sidevoice/mcp.log shows what it declared.";
 const NOT_PERSISTED: &str = "This chat is not running under cursor-agent persist, so nothing can put a message into it. To let the room talk to a Cursor CLI chat (experimental), start it with  cursor-agent persist  (it needs tmux).";
 
 pub fn capabilities() -> Value {
@@ -61,7 +60,9 @@ pub fn is_cursor_client(client: &Value) -> bool {
         })
 }
 
-pub fn draws_views(capabilities: &Value) -> bool {
+/// Whether the client is Cursor's editor: it declares MCP Apps support (HTML views) when it starts a server, and its
+/// CLI does not. Nothing is drawn; it only tells an editor chat from a CLI one.
+pub fn is_editor(capabilities: &Value) -> bool {
     let Some(ui) = capabilities.pointer("/extensions/io.modelcontextprotocol~1ui") else {
         return false;
     };
@@ -77,31 +78,28 @@ pub fn draws_views(capabilities: &Value) -> bool {
 }
 
 pub fn identity(_client: &Value, capabilities: &Value) -> Result<Identity> {
-    if draws_views(capabilities) {
+    if is_editor(capabilities) {
         let thread = format!("cursor-editor-{}", uuid::Uuid::new_v4());
-        let key = format!(
+        // Unique to this join: the join call's answer carries it, so the Desktop Bridge finds this chat by it in
+        // Cursor's own record of the call.
+        let marker = format!(
             "{}{}",
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        let bridge = bridge_instances();
-        let route = if bridge.is_empty() {
-            "cursor-editor-view"
-        } else {
-            "cursor-editor-bridge"
-        };
-        let delivery = json!({"kind":"cursor-app","thread":thread,"key":key,"route":route,"joined_at":unix_ms()});
+        let route = "cursor-editor-bridge";
+        let delivery = json!({"kind":"cursor-bridge","thread":thread,"marker":marker,"route":route,"joined_at":unix_ms()});
         let mut identity = Identity::new("cursor", thread.clone(), delivery);
         identity.route = Some(route.into());
         identity.editor = true;
         identity.detachable = true;
-        identity.view_key = Some(key);
+        identity.chat_marker = Some(marker);
         identity.experimental.extend([
             "sessionIdentity".into(),
             "working".into(),
             "endOfTurn".into(),
         ]);
-        identity.watch_note = Some("The room learns that this chat took a voice message, and when it is working, from Cursor itself: from its answer to the card, and from this chat's transcript once the first voice message it takes shows which one is its own.".into());
+        identity.watch_note = Some("The room learns that this chat took a voice message, and when it is working, from Cursor itself: from this chat's transcript, once the Desktop Bridge knows which chat it is.".into());
         return Ok(identity);
     }
     let Some(found) = find_chat() else {
@@ -603,22 +601,15 @@ fn persist_session(chat: &str) -> Result<Option<(String, String, bool, bool)>> {
 }
 
 pub async fn refine_identity(identity: &mut Identity, title: &str) {
-    if identity.delivery.get("kind").and_then(Value::as_str) != Some("cursor-app") {
+    if identity.delivery.get("kind").and_then(Value::as_str) != Some("cursor-bridge") {
         return;
     }
     if !title.is_empty() {
         identity.delivery["title"] = json!(title);
     }
     let instances = bridge_instances();
-    if !instances.is_empty() {
-        identity.route = Some("cursor-editor-bridge".into());
-        identity.delivery["route"] = json!("cursor-editor-bridge");
-        if let Some(candidate) = calling_thread(&instances).await {
-            identity.delivery["candidate"] = json!(candidate);
-        }
-    } else {
-        identity.route = Some("cursor-editor-view".into());
-        identity.delivery["route"] = json!("cursor-editor-view");
+    if let Some(candidate) = calling_thread(&instances).await {
+        identity.delivery["candidate"] = json!(candidate);
     }
 }
 
@@ -677,6 +668,22 @@ fn bridge_instances() -> Vec<BridgeInstance> {
         .collect::<Vec<_>>();
     found.sort_by_key(|instance| std::cmp::Reverse(instance.created_at));
     found
+}
+
+/// Whether a Desktop Bridge of Cursor's is running for this user.
+pub fn bridge_running() -> bool {
+    !bridge_instances().is_empty()
+}
+
+/// Whether `sqlite3` can be run: finding which chat holds a join reads Cursor's own records with it.
+pub fn sqlite3_found() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    env::var_os("PATH").is_some_and(|path| {
+        env::split_paths(&path).any(|dir| {
+            fs::metadata(dir.join("sqlite3"))
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
+    })
 }
 
 fn process_alive(pid: u64) -> bool {
@@ -820,7 +827,7 @@ async fn calling_thread(instances: &[BridgeInstance]) -> Option<String> {
 }
 
 pub async fn composer_holding(delivery: &Value) -> Option<String> {
-    let marker = delivery.get("key").and_then(Value::as_str)?;
+    let marker = delivery.get("marker").and_then(Value::as_str)?;
     if marker.len() != 64 || !marker.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
@@ -931,6 +938,12 @@ pub async fn deliver_editor(delivery: &Value, event: &Value) -> Option<Value> {
                 }
                 if matches!(outcome, "not-found" | "unknown-thread") {
                     continue;
+                }
+                // Refused outright (the request was not taken): nothing reached the chat.
+                if (400..500).contains(&response.status) {
+                    return Some(
+                        json!({"status":"failed","detail":format!("Cursor Desktop Bridge refused the message ({}): {}", response.status, response.body.get("reason").or_else(|| response.body.get("message")).or_else(|| response.body.get("error")).and_then(Value::as_str).unwrap_or(outcome))}),
+                    );
                 }
                 return Some(
                     json!({"status":"unknown","detail":format!("Cursor Desktop Bridge did not confirm delivery: {}", response.body.get("reason").or_else(|| response.body.get("message")).or_else(|| response.body.get("error")).and_then(Value::as_str).unwrap_or(outcome))}),

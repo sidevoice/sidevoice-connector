@@ -232,9 +232,9 @@ fn write_cursor_config(profile: &Profile, file: &Path, config: &Value) -> Result
 const INSTALL_NOTES: &str = "Cursor: ask a chat to join the voice room; it speaks its replies there. The first time, \
 Cursor asks to approve the new MCP server (cursor-agent: or run  cursor-agent mcp enable sidevoice ). What you say in \
 the room reaches Cursor only by experimental routes, because Cursor offers none of its own:\n  - Cursor CLI: only a \
-chat started with  cursor-agent persist  (needs tmux); the room types into its terminal.\n  - Cursor editor: a small \
-Sidevoice card appears under the join call; while it stays open in that chat, the room sends to it. Several chats of \
-a window can join, each with its own card.\nIf you type while the room sends, the two mix.";
+chat started with  cursor-agent persist  (needs tmux); the room types into its terminal.\n  - Cursor editor: through \
+Cursor's Desktop Bridge, once Cursor has recorded the chat's join call (up to ~30 s); until then nothing is sent. \
+Several chats of a window can join.\nIf you type while the room sends, the two mix.";
 
 impl Registration for Cursor {
     fn after_install(&self, _profile: &Profile) -> Vec<String> {

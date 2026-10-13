@@ -86,10 +86,10 @@ pub trait Harness: Send + Sync {
         false
     }
 
-    /// The MCP App view this harness's client draws under a call, when its capabilities (`client_caps`) say it draws
-    /// views at all.
-    fn view(&self, _client_caps: &Value) -> Option<View> {
-        None
+    /// Whether this harness's client (with capabilities `client_caps`) serves several of its chats at once, so a call
+    /// that names no conversation may be any of them.
+    fn hosts_several_chats(&self, _client_caps: &Value) -> bool {
+        false
     }
 
     /// Refines a conversation's identity as it joins, with the title the agent gave.
@@ -107,24 +107,14 @@ pub trait Harness: Send + Sync {
     }
 
     /// Fields a join answer to this harness's client carries, from the conversation's identity and the connector's
-    /// `registered` answer; `views` says whether the client draws views.
-    fn joined_fields(
-        &self,
-        _identity: &Identity,
-        _registered: &Value,
-        _views: bool,
-    ) -> Map<String, Value> {
+    /// `registered` answer.
+    fn joined_fields(&self, _identity: &Identity, _registered: &Value) -> Map<String, Value> {
         Map::new()
     }
 
-    /// Fields a status answer to this harness's client carries for a joined conversation: from its identity, the
-    /// connector's `listed` binding and how many times the client read the view.
-    fn status_fields(
-        &self,
-        _identity: &Identity,
-        _listed: Option<&Value>,
-        _view_reads: u64,
-    ) -> Map<String, Value> {
+    /// Fields a status answer to this harness's client carries for a joined conversation: from its identity and the
+    /// connector's `listed` binding.
+    fn status_fields(&self, _identity: &Identity, _listed: Option<&Value>) -> Map<String, Value> {
         Map::new()
     }
 
@@ -137,17 +127,6 @@ pub trait Harness: Send + Sync {
     /// Follows what the harness records about the conversation (transcript, rollout, session state), reporting it
     /// to the room until the conversation stops.
     fn watch(&self, _conversation: Arc<Conversation>, _room: Arc<dyn Room>) {}
-}
-
-/// An MCP App view a client draws under a call (a card): its resource.
-#[derive(Clone, Copy)]
-pub struct View {
-    pub uri: &'static str,
-    pub name: &'static str,
-    pub mime: &'static str,
-    pub html: fn() -> String,
-    /// The resource's `_meta`.
-    pub meta: fn() -> Value,
 }
 
 /// Unsupported delivery, as a delivery result.
@@ -174,7 +153,7 @@ impl Registry {
         Self::new(vec![
             Arc::new(super::claude::Claude),
             Arc::new(super::codex::Codex),
-            Arc::new(super::cursor::Cursor::default()),
+            Arc::new(super::cursor::Cursor),
         ])
     }
 
