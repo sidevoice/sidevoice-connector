@@ -86,11 +86,10 @@ pub async fn request_connector(
         if reply.get("ok") == Some(&json!(true)) {
             Ok(reply.get("result").cloned().unwrap_or(Value::Null))
         } else {
-            Err(reply
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("the connector refused the request")
-                .to_owned())
+            Err(crate::ipc_failure(
+                &reply,
+                "the connector refused the request",
+            ))
         }
     };
     timeout(limit, ask)

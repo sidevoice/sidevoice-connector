@@ -99,6 +99,48 @@ impl Link {
         }
     }
 
+    /// A frame without a method: the answer to one of this connector's requests, its fields this connector does not
+    /// know ignored. An answer whose ID is `null` (JSON-RPC's answer to a request the core could not read) names no
+    /// request and is only logged; any other ID this connector could never have sent ends the link.
+    async fn settle(&self, frame: &Value) -> Result<()> {
+        let Some(id) = frame.get("id").filter(|id| !id.is_null()) else {
+            crate::logfile::log(&format!(
+                "Core answer without an ID ignored: {}",
+                frame.get("error").unwrap_or(&Value::Null)
+            ));
+            return Ok(());
+        };
+        let Some(id) = id.as_str().filter(|id| id.starts_with("c:")) else {
+            bail!("Core response ID invalid");
+        };
+        if let Some(waiting) = self.pending.lock().await.remove(id) {
+            let result = match frame.get("result") {
+                Some(result) => Ok(result.clone()),
+                None => Err(frame
+                    .get("error")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "missing result".into())),
+            };
+            let _ = waiting.send(result);
+        } // A response to a timed-out request is harmless.
+        Ok(())
+    }
+
+    /// A link whose frames go to the returned receiver and whose answers come through `settle`: the core's side of
+    /// the link, for tests that play it.
+    #[cfg(test)]
+    pub async fn attached(&self) -> mpsc::Receiver<Message> {
+        let (tx, rx) = mpsc::channel(128);
+        *self.tx.write().await = Some(tx);
+        rx
+    }
+
+    /// An answer from the core's side of an `attached` link, read as the link reads it.
+    #[cfg(test)]
+    pub async fn answer(&self, frame: Value) -> Result<()> {
+        self.settle(&frame).await
+    }
+
     /// The core this link is connected to, when it is.
     pub async fn core(&self) -> Option<Value> {
         self.core.read().await.clone()
@@ -258,14 +300,9 @@ impl Link {
                                         false
                                     });
                                 }
-                            } else if let Some(id) = value.get("id").and_then(Value::as_str) {
-                                if !id.starts_with("c:") { bail!("Core response ID prefix invalid"); }
-                                if let Some(waiting) = self.pending.lock().await.remove(id) {
-                                    let result = if let Some(result) = value.get("result") { Ok(result.clone()) }
-                                        else { Err(value.get("error").map(Value::to_string).unwrap_or_else(|| "missing result".into())) };
-                                    let _ = waiting.send(result);
-                                } // A response to a timed-out request is harmless.
-                            } else { bail!("Core frame has no method or ID"); }
+                            } else {
+                                self.settle(&value).await?;
+                            }
                         }
                         Message::Close(frame) => {
                             if let Some(frame) = frame {
@@ -282,5 +319,50 @@ impl Link {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Link;
+    use serde_json::{json, Value};
+    use tokio::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    /// The core answers with fields this connector does not know, at the top of the frame and inside its result: the
+    /// request gets its result whole. JSON-RPC's answer to a request the core could not read (`"id": null`) names no
+    /// request: it is ignored and the link stays. An ID this connector never sent still ends the link.
+    #[tokio::test]
+    async fn an_answer_with_unknown_fields_is_taken_and_one_without_an_id_is_ignored() {
+        let link = Link::new();
+        let mut core = link.attached().await;
+        let asking = {
+            let link = link.clone();
+            tokio::spawn(async move {
+                link.request("speech.publish", json!({}), Duration::from_secs(5))
+                    .await
+            })
+        };
+        let Some(Message::Text(sent)) = core.recv().await else {
+            panic!("nothing sent")
+        };
+        let sent: Value = serde_json::from_str(sent.as_str()).unwrap();
+        link.answer(
+            json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}),
+        )
+        .await
+        .unwrap();
+        link.answer(json!({"jsonrpc":"2.0","id":sent["id"],"trace":{"span":"x"},
+            "result":{"text_saved":true,"future":{"nested":[1]}}}))
+            .await
+            .unwrap();
+        assert_eq!(
+            asking.await.unwrap().unwrap(),
+            json!({"text_saved":true,"future":{"nested":[1]}})
+        );
+        assert!(link
+            .answer(json!({"jsonrpc":"2.0","id":7,"result":{}}))
+            .await
+            .is_err());
     }
 }

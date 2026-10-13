@@ -53,6 +53,27 @@ async fn bounded_line<R: AsyncBufRead + Unpin>(
     }
 }
 
+/// What a refused answer over `connector.sock` (`{"ok":false,"error":…}`) says: the daemon's English text, which is
+/// a string today; a daemon of another version may say it keyed (`{"key","params","message"}`), whose message (else
+/// its key) is read. Anything else is `fallback`.
+fn ipc_failure(answer: &Value, fallback: &str) -> String {
+    let error = answer.get("error");
+    error
+        .and_then(Value::as_str)
+        .or_else(|| {
+            error
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            error
+                .and_then(|error| error.get("key"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
 /// The command line is English only and is not translated. With `--json`, a command prints one JSON object on
 /// stdout, and a failure is `{"ok":false,"error":{"key","params","message"}}` with exit status 1.
 #[derive(Parser)]
@@ -447,6 +468,25 @@ async fn agents_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal over `connector.sock` is read whether the daemon says it as text (today) or keyed (another version).
+    #[test]
+    fn an_ipc_refusal_is_read_as_text_or_keyed() {
+        let fallback = "IPC error";
+        assert_eq!(
+            ipc_failure(&json!({"ok":false,"error":"CLOSED_BY_ROOM:x:t"}), fallback),
+            "CLOSED_BY_ROOM:x:t"
+        );
+        let keyed = json!({"ok":false,"error":{"key":"ipc.future","params":{},"message":"Refused.","future":1}});
+        assert_eq!(ipc_failure(&keyed, fallback), "Refused.");
+        assert_eq!(
+            ipc_failure(&json!({"ok":false,"error":{"key":"ipc.future"}}), fallback),
+            "ipc.future"
+        );
+        for shapeless in [json!({"ok":false}), json!({"ok":false,"error":{"code":3}})] {
+            assert_eq!(ipc_failure(&shapeless, fallback), fallback);
+        }
+    }
 
     #[test]
     fn version_is_the_release_version_and_its_json_names_the_build() {

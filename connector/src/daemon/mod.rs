@@ -17,6 +17,8 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::Duration;
 use tokio::time::Instant;
 
+#[cfg(test)]
+mod contract_tests;
 mod files;
 mod run;
 
@@ -170,7 +172,8 @@ impl Daemon {
             .link
             .request("binding.register", frame, Duration::from_secs(10))
             .await?;
-        if let Some(error) = reply.get("error") {
+        // An answer may carry fields this connector does not know, `"error": null` among them: only an error is one.
+        if let Some(error) = reply.get("error").filter(|error| !error.is_null()) {
             bail!("Core binding refusal: {error}");
         }
         let id = reply

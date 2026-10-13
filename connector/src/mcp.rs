@@ -118,11 +118,7 @@ impl Ipc {
                     let result = if reply.get("ok") == Some(&json!(true)) {
                         Ok(reply.get("result").cloned().unwrap_or(Value::Null))
                     } else {
-                        Err(reply
-                            .get("error")
-                            .and_then(Value::as_str)
-                            .unwrap_or("IPC error")
-                            .to_owned())
+                        Err(crate::ipc_failure(&reply, "IPC error"))
                     };
                     let _ = waiting.send(result);
                 }
@@ -891,10 +887,14 @@ fn tools() -> Vec<Tool> {
         ("voice_pair_device", "Show a one-time code to pair a device (the desktop app or a browser) with this machine: the code, a QR of it and how long it is valid. Only when the user asks to pair a device, never on your own initiative; show the user the result as it is.", json!({}), vec![]),
         ("voice_status", "Whether the room can currently reach this conversation.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
     ];
-    spec.into_iter().map(|(name, description, properties, required)| {
-        let schema = json!({"type":"object","properties":properties,"required":required,"additionalProperties":false});
-        Tool::new(name, description, schema.as_object().unwrap().clone())
-    }).collect()
+    // No `additionalProperties: false`: an argument this server does not know (an agent's own, or one a newer server
+    // added) is ignored, never refused, by the server or by a client that checks calls against the schema.
+    spec.into_iter()
+        .map(|(name, description, properties, required)| {
+            let schema = json!({"type":"object","properties":properties,"required":required});
+            Tool::new(name, description, schema.as_object().unwrap().clone())
+        })
+        .collect()
 }
 
 fn prompt_text(args: Option<&serde_json::Map<String, Value>>) -> String {
@@ -1034,8 +1034,31 @@ fn call_meta(context: &impl serde::Serialize, params: Option<impl serde::Seriali
 
 #[cfg(test)]
 mod tests {
-    use super::{ipc_limit, pairing_needed};
+    use super::{closed_note, ipc_limit, pairing_needed, tools};
     use std::time::Duration;
+
+    /// No tool refuses an argument it does not know, in the server or in a client that checks calls against the
+    /// schema.
+    #[test]
+    fn no_tool_schema_refuses_an_argument_it_does_not_know() {
+        for tool in tools() {
+            assert_eq!(
+                tool.input_schema.get("additionalProperties"),
+                None,
+                "{}",
+                tool.name
+            );
+        }
+    }
+
+    /// A reason the room closes a conversation for that this connector does not know reads as the room's close.
+    #[test]
+    fn an_unknown_close_reason_reads_as_closed_from_the_room() {
+        assert_eq!(
+            closed_note("a_reason_from_the_future"),
+            closed_note("closed_from_room")
+        );
+    }
 
     #[test]
     fn pair_device_gets_30s_everything_else_keeps_20s() {

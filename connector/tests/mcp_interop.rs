@@ -141,3 +141,57 @@ fn a_health_check_gets_the_tools_and_starts_no_daemon() {
         );
     }
 }
+
+/// An agent newer than this server may send arguments and `_meta` keys it does not know (sidevoice/sidevoice-core#112):
+/// no tool schema refuses them, and each call is answered for what it knows.
+#[test]
+fn a_tool_call_with_arguments_this_server_does_not_know_is_answered_for_what_it_knows() {
+    let profile = Profile::new("extraargs");
+    let _connector = profile.start_connector();
+    let mut mcp = Mcp::start(profile.connector(&["mcp"]));
+    mcp.initialize("codex-mcp-client");
+
+    let tools = mcp.request("tools/list", json!({}));
+    for tool in tools["tools"].as_array().unwrap() {
+        assert_eq!(
+            tool["inputSchema"].get("additionalProperties"),
+            None,
+            "{tool}"
+        );
+    }
+
+    let thread = "019a0000-0000-7000-8000-000000000002";
+    let turn = json!({"session_id": thread, "thread_id": thread, "turn_id": "turn-1",
+                      "future_turn_field": {"nested": true}})
+    .to_string();
+    let meta =
+        json!({"callId": "call-1", "x-codex-turn-metadata": turn, "future-meta-key": [1, 2]});
+    let joined = mcp.request(
+        "tools/call",
+        json!({"name": "voice_connect", "_meta": meta,
+               "arguments": {"title": "Extra arguments", "future_argument": true,
+                             "future_object": {"nested": {"deeper": 1}}}}),
+    );
+    assert_ne!(joined["isError"], true, "{joined}");
+    let answer: Value = serde_json::from_str(joined["content"][0]["text"].as_str().unwrap_or(""))
+        .unwrap_or_default();
+    assert_eq!(answer["conversation"], thread, "{answer}");
+
+    let status = mcp.request(
+        "tools/call",
+        json!({"name": "voice_status", "_meta": meta,
+               "arguments": {"future_argument": "x", "verbose": {"nested": true}}}),
+    );
+    assert_ne!(status["isError"], true, "{status}");
+    let status: Value = serde_json::from_str(status["content"][0]["text"].as_str().unwrap_or(""))
+        .unwrap_or_default();
+    assert_eq!(status["joined"], true, "{status}");
+    assert_eq!(status["conversation"], thread, "{status}");
+
+    let left = mcp.request(
+        "tools/call",
+        json!({"name": "voice_disconnect", "_meta": meta, "arguments": {"future_argument": 1}}),
+    );
+    assert_ne!(left["isError"], true, "{left}");
+    mcp.stop();
+}
