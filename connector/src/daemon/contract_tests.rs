@@ -3,7 +3,7 @@
 //! ignored, an unknown value gets its defined default, and nothing is refused for them.
 
 use super::Daemon;
-use crate::adapters::{Conversation, Harness, Registry};
+use crate::adapters::{Conversation, Harness, Registry, Route};
 use crate::link::Link;
 use crate::profile::Profile;
 use crate::secure_fs::tests::Scratch;
@@ -27,8 +27,11 @@ impl Harness for Recorder {
         json!({"deliver":"supported"})
     }
 
-    fn accepts(&self, delivery: &Value, thread: &str) -> bool {
-        delivery["kind"] == "recorder" && delivery["thread"] == thread
+    fn accepts(&self, delivery: &Value, thread: &str) -> Route {
+        match delivery["kind"].as_str() {
+            Some("recorder") => Route::known(delivery["thread"] == thread),
+            _ => Route::Unknown,
+        }
     }
 
     fn deliver<'a>(

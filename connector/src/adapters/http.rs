@@ -1,5 +1,5 @@
 use super::conversation::Conversation;
-use super::harness::{no_route, Harness};
+use super::harness::{no_route, Harness, Route};
 use super::Identity;
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
@@ -100,9 +100,14 @@ pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
 }
 
 /// Whether `delivery` is the HTTP route of conversation `thread`.
-pub fn accepts(delivery: &Value, thread: &str) -> bool {
-    delivery.get("kind").and_then(Value::as_str) == Some("http")
-        && delivery.get("thread").and_then(Value::as_str) == Some(thread)
+/// The HTTP route, which every harness knows: `Unknown` for any other kind.
+pub fn accepts(delivery: &Value, thread: &str) -> Route {
+    match delivery.get("kind").and_then(Value::as_str) {
+        Some("http") => {
+            Route::known(delivery.get("thread").and_then(Value::as_str) == Some(thread))
+        }
+        _ => Route::Unknown,
+    }
 }
 
 /// Any agent whose conversations take voice by HTTP (`SIDEVOICE_DELIVERY_URL`): the harness of an id no other claims.
@@ -117,7 +122,7 @@ impl Harness for Http {
         capabilities()
     }
 
-    fn accepts(&self, delivery: &Value, thread: &str) -> bool {
+    fn accepts(&self, delivery: &Value, thread: &str) -> Route {
         accepts(delivery, thread)
     }
 

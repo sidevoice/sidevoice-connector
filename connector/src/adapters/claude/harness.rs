@@ -2,7 +2,7 @@
 
 use super::{assistant_engine, assistant_model, session_engine, transcript_path, working_state};
 use crate::adapters::conversation::{report_working, Conversation, Room};
-use crate::adapters::harness::{no_route, Harness};
+use crate::adapters::harness::{no_route, Harness, Route};
 use crate::adapters::registration::Registration;
 use crate::adapters::transcript::{self, Observed, TranscriptReader};
 use crate::profile::Profile;
@@ -33,9 +33,11 @@ impl Harness for Claude {
         Some(self)
     }
 
-    fn accepts(&self, delivery: &Value, thread: &str) -> bool {
+    fn accepts(&self, delivery: &Value, thread: &str) -> Route {
         match delivery.get("kind").and_then(Value::as_str) {
-            Some("claude-uds") => delivery.get("socket").and_then(Value::as_str).is_some(),
+            Some("claude-uds") => {
+                Route::known(delivery.get("socket").and_then(Value::as_str).is_some())
+            }
             _ => crate::adapters::http::accepts(delivery, thread),
         }
     }

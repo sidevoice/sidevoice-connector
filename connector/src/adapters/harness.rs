@@ -10,6 +10,28 @@ use serde_json::{json, Map, Value};
 use std::any::Any;
 use std::sync::{Arc, Weak};
 
+/// What a harness makes of the delivery route a façade names for a conversation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Route {
+    /// A route this harness knows, and it reaches that conversation.
+    Accepted,
+    /// A route this harness knows, naming somewhere that is not that conversation: the registration is refused.
+    Refused,
+    /// A kind this harness does not know (a newer façade's): the conversation joins with no route in.
+    Unknown,
+}
+
+impl Route {
+    /// `Accepted` when `matches`, else `Refused`: for a kind the harness knows.
+    pub fn known(matches: bool) -> Self {
+        if matches {
+            Self::Accepted
+        } else {
+            Self::Refused
+        }
+    }
+}
+
 /// One harness: how its conversations are reached and followed, and how Sidevoice is registered with it.
 pub trait Harness: Send + Sync {
     /// The id conversations and the agent list name it by (`claude`, `codex`, …).
@@ -28,8 +50,9 @@ pub trait Harness: Send + Sync {
         None
     }
 
-    /// Whether voice reaches its conversation `thread` by `delivery`.
-    fn accepts(&self, delivery: &Value, thread: &str) -> bool;
+    /// Whether voice reaches its conversation `thread` by `delivery`, for a route kind this harness knows; a kind it
+    /// does not know is `Route::Unknown`, never refused.
+    fn accepts(&self, delivery: &Value, thread: &str) -> Route;
 
     /// The harness's own state for one conversation, kept in `Conversation::state`.
     fn conversation_state(&self) -> Box<dyn Any + Send + Sync> {

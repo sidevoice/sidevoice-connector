@@ -1,4 +1,4 @@
-use crate::adapters::{Conversation, Registry, Room};
+use crate::adapters::{Conversation, Registry, Room, Route};
 use crate::agents::HostAgents;
 use crate::link::{Incoming, Link};
 use crate::profile::Profile;
@@ -33,6 +33,11 @@ const PAIR_DEVICE_LINK_WAIT: Duration = Duration::from_secs(15);
 const RESUME_REASON_NONE: u8 = 0;
 const RESUME_REASON_HISTORY: u8 = 1;
 const RESUME_REASON_STORAGE: u8 = 2;
+
+/// An optional field of a message, `null` read as absent: a sender of another version may write either.
+fn present<'a>(params: &'a Value, key: &str) -> Option<&'a Value> {
+    params.get(key).filter(|value| !value.is_null())
+}
 
 pub struct Daemon {
     profile: Profile,
@@ -746,27 +751,41 @@ impl Daemon {
                     .and_then(Value::as_str)
                     .context("harness required")?
                     .to_owned();
-                let delivery = params
-                    .get("delivery")
+                let harness_adapter = self.registry.get(&harness).clone();
+                let mut delivery = present(&params, "delivery")
                     .cloned()
                     .unwrap_or_else(|| json!({"kind":"none"}));
-                let harness_adapter = self.registry.get(&harness).clone();
-                if !harness_adapter.accepts(&delivery, &thread) {
-                    bail!("harness identity does not match its delivery route");
-                }
-                let capabilities = params
-                    .get("capabilities")
+                let mut capabilities = present(&params, "capabilities")
                     .cloned()
                     .unwrap_or_else(|| harness_adapter.capabilities());
-                let experimental = params
-                    .get("experimental")
+                let mut experimental = present(&params, "experimental")
                     .cloned()
                     .unwrap_or_else(|| json!([]));
-                let inbound = params.get("inbound").cloned().unwrap_or(Value::Null);
-                let route = params
+                let mut route = params
                     .get("route")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                match harness_adapter.accepts(&delivery, &thread) {
+                    Route::Accepted => {}
+                    Route::Refused => bail!("harness identity does not match its delivery route"),
+                    // A route kind a newer façade knows and this daemon does not: the conversation joins with no
+                    // route in (the room cannot deliver to it), and its speech still goes out.
+                    Route::Unknown => {
+                        crate::logfile::log(&format!(
+                            "conversation {client_ref} joins with no route in: {harness} has no route {}",
+                            delivery.get("kind").unwrap_or(&Value::Null)
+                        ));
+                        delivery = json!({"kind":"none"});
+                        route = None;
+                        if let Some(capabilities) = capabilities.as_object_mut() {
+                            capabilities.insert("deliver".into(), json!("unsupported"));
+                        }
+                        if let Some(names) = experimental.as_array_mut() {
+                            names.retain(|name| name != "deliver");
+                        }
+                    }
+                }
+                let inbound = params.get("inbound").cloned().unwrap_or(Value::Null);
                 let detachable = params.get("detachable") == Some(&json!(true));
                 let _state_transaction = self.conversation_state_serial.lock().await;
                 self.check_registration_allowed(&client_ref, resume).await?;
@@ -878,7 +897,7 @@ impl Daemon {
                     .get("revision")
                     .and_then(Value::as_i64)
                     .context("revision required")?;
-                let routed = params.get("client_refs").is_some()
+                let routed = present(&params, "client_refs").is_some()
                     || params.get("adopt_orphans") == Some(&json!(true));
                 let (binding, adopted) = if routed {
                     self.find_for_turn(owner, &params, session_id, revision)
@@ -1319,8 +1338,13 @@ mod tests {
                 json!({"deliver":"supported","working":"unsupported"})
             }
 
-            fn accepts(&self, delivery: &Value, thread: &str) -> bool {
-                delivery["kind"] == "fake-route" && delivery["thread"] == thread
+            fn accepts(&self, delivery: &Value, thread: &str) -> crate::adapters::Route {
+                match delivery["kind"].as_str() {
+                    Some("fake-route") => {
+                        crate::adapters::Route::known(delivery["thread"] == thread)
+                    }
+                    _ => crate::adapters::Route::Unknown,
+                }
             }
 
             fn prepare<'a>(&'a self, _: &'a Conversation) -> BoxFuture<'a, Result<Option<Value>>> {
@@ -1392,7 +1416,7 @@ mod tests {
                 1,
                 "register",
                 json!({"client_ref":"other","thread":"t-2","harness":"fake",
-                "delivery":{"kind":"other-route","thread":"t-2"}}),
+                "delivery":{"kind":"fake-route","thread":"elsewhere"}}),
             )
             .await;
         assert!(

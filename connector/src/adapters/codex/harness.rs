@@ -1,7 +1,7 @@
 //! Codex as a harness: voice through its queue, the rollout followed.
 
 use crate::adapters::conversation::{Conversation, Room};
-use crate::adapters::harness::{no_route, Harness};
+use crate::adapters::harness::{no_route, Harness, Route};
 use crate::adapters::registration::Registration;
 use crate::profile::Profile;
 use anyhow::Result;
@@ -28,9 +28,11 @@ impl Harness for Codex {
         Some(self)
     }
 
-    fn accepts(&self, delivery: &Value, thread: &str) -> bool {
+    fn accepts(&self, delivery: &Value, thread: &str) -> Route {
         match delivery.get("kind").and_then(Value::as_str) {
-            Some("codex-queue") => delivery.get("thread").and_then(Value::as_str) == Some(thread),
+            Some("codex-queue") => {
+                Route::known(delivery.get("thread").and_then(Value::as_str) == Some(thread))
+            }
             _ => crate::adapters::http::accepts(delivery, thread),
         }
     }
