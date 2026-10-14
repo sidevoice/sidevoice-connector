@@ -21,6 +21,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use messages::Keyed;
 use profile::Profile;
 use serde_json::{json, Value};
+use std::io::IsTerminal;
 use std::process::ExitCode;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
@@ -95,12 +96,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Install this package's Sidevoice on this computer (or update to it), run it, and register it with the agents
-    /// found here.
+    /// Install this package's Sidevoice on this computer (or update to it) and run it. It connects no agent by itself:
+    /// it lists the agents found here and how to connect each one, and at a terminal offers to connect them.
     Install {
-        /// Register with no agent (connect them later with `agents connect`).
+        /// Leave the agents alone: none listed or offered, and no entry an older Sidevoice wrote updated.
         #[arg(long)]
         no_agents: bool,
+        /// Do not offer to connect the agents found (never offered with --json, without a terminal, or under CI).
+        #[arg(long)]
+        no_prompt: bool,
     },
     /// Remove Sidevoice from this computer: its service, its agent registrations, its releases and its data.
     Uninstall,
@@ -297,14 +301,30 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
     }
     let profile = Profile::from_env(&adapters::Registry::standard().homes())?;
     match action {
-        Action::Install { no_agents } => {
+        Action::Install {
+            no_agents,
+            no_prompt,
+        } => {
             let package = install::Package::running()?;
             if !json {
                 println!("Installing Sidevoice {}…", package.version);
             }
             let options = install::Options { agents: !no_agents };
-            let answer =
+            let mut answer =
                 install::install(&profile, &package, options, &install::Runtime::Machine).await?;
+            let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+            let ci = std::env::var_os("CI");
+            if install::may_offer(json, no_prompt, terminal, ci.as_deref()) {
+                let offered = install::offerable(&answer);
+                if !offered.is_empty() {
+                    let chosen = install::ask(
+                        &offered,
+                        &mut std::io::stdin().lock(),
+                        &mut std::io::stdout(),
+                    )?;
+                    install::connect_chosen(&profile, &mut answer, &chosen).await;
+                }
+            }
             if json {
                 println!("{answer}");
             } else {
@@ -509,6 +529,14 @@ mod tests {
         assert!(Cli::try_parse_from(["x", "runtime-identity"]).is_err());
         let cli = Cli::try_parse_from(["x", "agents", "connect", "some-agent", "--json"]).unwrap();
         assert!(cli.json);
+        let cli = Cli::try_parse_from(["x", "install", "--no-prompt", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Action::Install {
+                no_agents: false,
+                no_prompt: true
+            })
+        ));
         let cli = Cli::try_parse_from(["x", "--version", "--json"]).unwrap();
         assert!(cli.version && cli.json);
         let error = Cli::try_parse_from(["x", "agents", "frobnicate", "--json"])
