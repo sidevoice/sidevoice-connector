@@ -44,6 +44,7 @@ pub struct Daemon {
     link: Arc<Link>,
     bindings: Mutex<HashMap<String, Arc<Conversation>>>,
     outbox: Mutex<Vec<Value>>,
+    publication_serial: Mutex<()>,
     replay_tx: mpsc::Sender<()>,
     host_agents: Arc<HostAgents>,
     registry: Arc<Registry>,
@@ -126,6 +127,7 @@ impl Daemon {
             link,
             bindings: Mutex::new(HashMap::new()),
             outbox: Mutex::new(outbox),
+            publication_serial: Mutex::new(()),
             replay_tx,
             host_agents,
             registry: Arc::new(registry),
@@ -169,7 +171,8 @@ impl Daemon {
         let engine = binding.engine.lock().await.clone().unwrap_or(Value::Null);
         let mut frame = json!({"client_ref":binding.client_ref,"harness":binding.harness,"thread":binding.thread,"title":binding.title,"delivery":binding.delivery,
             "inbound":binding.inbound,"capabilities":binding.capabilities,
-            "experimental":binding.experimental,"route":binding.route,"engine":engine,"focus":false});
+            "experimental":binding.experimental,"route":binding.route,"engine":engine,"focus":false,
+            "input_mode":*binding.input_mode.lock().await});
         if !current.starts_with("local-") {
             frame["binding_id"] = json!(*current);
         }
@@ -213,10 +216,18 @@ impl Daemon {
             }
         }
         *current = id.to_owned();
+        *binding.initial_reply_context.lock().await = reply
+            .get("initial_reply_context")
+            .cloned()
+            .unwrap_or(Value::Null);
         Ok(reply)
     }
 
     async fn on_welcome(self: &Arc<Self>) {
+        if let Err(error) = self.retire_held_audio().await {
+            crate::logfile::log(&format!("speech outbox retained: {error}"));
+            return;
+        }
         let bindings: Vec<_> = self.bindings.lock().await.values().cloned().collect();
         for binding in bindings {
             if let Err(error) = self.register_core(&binding).await {
@@ -447,12 +458,46 @@ impl Daemon {
         ids_match
             && (reply.get("text_saved") == Some(&json!(true))
                 || (reply.get("status") == Some(&json!("rejected"))
-                    && reply.get("terminal") == Some(&json!(true))
-                    && reply.get("reason_code") == Some(&json!("application_refusal"))))
+                    && reply.get("terminal") == Some(&json!(true))))
+    }
+
+    async fn make_history_only(&self, event_id: &Value) -> Result<()> {
+        let mut outbox = self.outbox.lock().await;
+        let before = outbox.clone();
+        if let Some(item) = outbox
+            .iter_mut()
+            .find(|item| item.get("event_id") == Some(event_id))
+        {
+            item["history_only"] = json!(true);
+            if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+                *outbox = before;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    async fn retire_held_audio(&self) -> Result<()> {
+        let _publication = self.publication_serial.lock().await;
+        let mut outbox = self.outbox.lock().await;
+        if outbox.iter().all(|item| item["history_only"] == true) {
+            return Ok(());
+        }
+        let before = outbox.clone();
+        for item in outbox.iter_mut() {
+            item["history_only"] = json!(true);
+        }
+        if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+            *outbox = before;
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn publish_one(&self, speech: &Value) -> Result<Option<Value>> {
+        let _publication = self.publication_serial.lock().await;
         if !self.link.connected().await {
+            self.make_history_only(&speech["event_id"]).await?;
             return Ok(None);
         }
         let mut published = self
@@ -471,6 +516,7 @@ impl Daemon {
             Ok(v) => v,
             Err(error) => {
                 crate::logfile::log(&format!("speech retry retained: {error}"));
+                self.make_history_only(&speech["event_id"]).await?;
                 return Ok(None);
             }
         };
@@ -501,6 +547,7 @@ impl Daemon {
                         Ok(value) => value,
                         Err(error) => {
                             crate::logfile::log(&format!("speech retry retained: {error}"));
+                            self.make_history_only(&speech["event_id"]).await?;
                             return Ok(None);
                         }
                     };
@@ -531,7 +578,9 @@ impl Daemon {
     async fn flush_outbox(&self) {
         let items = self.outbox.lock().await.clone();
         for speech in items {
-            let _ = self.publish_one(&speech).await;
+            if self.publish_one(&speech).await.ok().flatten().is_none() {
+                break;
+            }
         }
     }
 
@@ -668,6 +717,9 @@ impl Daemon {
         let Some(binding) = self.binding_for_id(id).await else {
             return json!({"status":"unknown_binding"});
         };
+        if *binding.input_mode.lock().await == "pull" {
+            return json!({"status":"failed","detail":"binding uses pull delivery"});
+        }
         let _serial = binding.serial.lock().await;
         let message_id = frame
             .get("message_id")
@@ -695,7 +747,10 @@ impl Daemon {
         }
         {
             let mut turns = binding.turns.lock().await;
-            turns.insert(format!("{session_id}:{revision}"), message_id.to_owned());
+            turns.insert(
+                format!("{session_id}:{revision}"),
+                (message_id.to_owned(), frame["epoch"].as_u64().unwrap_or(0)),
+            );
             if turns.len() > 512 {
                 if let Some(oldest) = turns.keys().next().cloned() {
                     turns.remove(&oldest);
@@ -752,6 +807,13 @@ impl Daemon {
                     .context("harness required")?
                     .to_owned();
                 let harness_adapter = self.registry.get(&harness).clone();
+                let input_mode = params
+                    .get("input_mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("push");
+                if !matches!(input_mode, "push" | "pull") {
+                    bail!("input_mode must be push or pull");
+                }
                 let mut delivery = present(&params, "delivery")
                     .cloned()
                     .unwrap_or_else(|| json!({"kind":"none"}));
@@ -794,10 +856,13 @@ impl Daemon {
                     if existing.owner.load(Ordering::Relaxed) != owner {
                         bail!("binding belongs to another façade");
                     }
+                    *existing.input_mode.lock().await = input_mode.to_owned();
+                    let registered = self.register_core(&existing).await?;
                     let binding_id = existing.id.lock().await.clone();
                     drop(_state_transaction);
                     return Ok(
-                        json!({"binding_id":binding_id,"thread":thread,"connected":self.link.connected().await,"prepared":null}),
+                        json!({"binding_id":binding_id,"thread":thread,"connected":self.link.connected().await,"prepared":null,
+                            "epoch":registered.get("epoch"),"initial_reply_context":registered.get("initial_reply_context")}),
                     );
                 }
                 drop(_state_transaction);
@@ -807,6 +872,8 @@ impl Daemon {
                     thread: thread.clone(),
                     title,
                     delivery: delivery.clone(),
+                    input_mode: Mutex::new(input_mode.to_owned()),
+                    initial_reply_context: Mutex::new(Value::Null),
                     engine: Mutex::new(
                         params
                             .get("engine")
@@ -865,7 +932,9 @@ impl Daemon {
                     self.request_replay();
                 }
                 Ok(
-                    json!({"binding_id":id,"thread":thread,"connected":result.is_ok(),"pending":result.is_err(),"prepared":prepared}),
+                    json!({"binding_id":id,"thread":thread,"connected":result.is_ok(),"pending":result.is_err(),"prepared":prepared,
+                        "epoch":result.as_ref().ok().and_then(|v| v.get("epoch")),
+                        "initial_reply_context":result.as_ref().ok().and_then(|v| v.get("initial_reply_context"))}),
                 )
             }
             "publish" => {
@@ -897,6 +966,10 @@ impl Daemon {
                     .get("revision")
                     .and_then(Value::as_i64)
                     .context("revision required")?;
+                let epoch = params
+                    .get("epoch")
+                    .and_then(Value::as_u64)
+                    .context("epoch required")?;
                 let routed = present(&params, "client_refs").is_some()
                     || params.get("adopt_orphans") == Some(&json!(true));
                 let (binding, adopted) = if routed {
@@ -914,12 +987,24 @@ impl Daemon {
                 }
                 let id = binding.id.lock().await;
                 let speech = json!({"event_id":params.get("event_id").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                    "binding_id":*id,"client_ref":binding.client_ref,"session_id":session_id,"revision":revision,
+                    "binding_id":*id,"client_ref":binding.client_ref,"session_id":session_id,"revision":revision,"epoch":epoch,
                     "utterance_id":params.get("utterance_id").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     "text":text,"language":params.get("language")});
                 self.queue(speech.clone()).await?;
                 drop(id);
-                let answer = self.publish_one(&speech).await?;
+                let first = self
+                    .outbox
+                    .lock()
+                    .await
+                    .first()
+                    .and_then(|item| item.get("event_id"))
+                    .cloned();
+                let answer = if first == speech.get("event_id").cloned() {
+                    self.publish_one(&speech).await?
+                } else {
+                    self.request_replay();
+                    None
+                };
                 let mut result = answer.unwrap_or_else(
                     || json!({"status":"queued","utterance_id":speech["utterance_id"]}),
                 );
@@ -927,6 +1012,84 @@ impl Daemon {
                     result["adopted"] = json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,
                         "harness":binding.harness,"title":binding.title,"delivery":binding.delivery,"route":binding.route,
                         "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound});
+                }
+                Ok(result)
+            }
+            "get_messages" => {
+                let binding = self.find_owned(owner, &params).await?;
+                let _serial = binding.serial.lock().await;
+                if *binding.input_mode.lock().await != "pull" {
+                    bail!("get_messages requires a pull binding");
+                }
+                let operation = params
+                    .get("operation")
+                    .and_then(Value::as_str)
+                    .unwrap_or("get");
+                if !matches!(operation, "get" | "check") {
+                    bail!("invalid pull operation");
+                }
+                let binding_id = binding.id.lock().await.clone();
+                let mut request = json!({"binding_id":binding_id,"operation":operation});
+                if let Some(after) = params.get("after") {
+                    request["after"] = after.clone();
+                }
+                if let Some(ack_ids) = params.get("ack_ids") {
+                    request["ack_ids"] = ack_ids.clone();
+                }
+                let mut result = self
+                    .link
+                    .request("input.pull", request, Duration::from_secs(10))
+                    .await?;
+                if let Some(messages) = result.get_mut("messages").and_then(Value::as_array_mut) {
+                    // Validate and render the entire page before exposing any of its claims to MCP.
+                    let rendered: Result<Vec<_>> = messages
+                        .iter()
+                        .map(|message| {
+                            Ok((
+                                message["session_id"]
+                                    .as_str()
+                                    .context("pull session_id missing")?
+                                    .to_owned(),
+                                message["revision"]
+                                    .as_i64()
+                                    .context("pull revision missing")?,
+                                message["epoch"].as_u64().context("pull epoch missing")?,
+                                message["message_id"]
+                                    .as_str()
+                                    .context("pull message_id missing")?
+                                    .to_owned(),
+                                crate::adapters::envelope(message)?,
+                            ))
+                        })
+                        .collect();
+                    let rendered = match rendered {
+                        Ok(rendered) => rendered,
+                        Err(error) => {
+                            // A malformed page cannot be delivered or acknowledged. End this claim and
+                            // re-register the same binding so core returns the rows to its queue.
+                            let _ = self
+                                .link
+                                .notify("binding.unregister", json!({"binding_id":binding_id}))
+                                .await;
+                            let _ = self.register_core(&binding).await;
+                            return Err(error);
+                        }
+                    };
+                    for (message, (session, revision, epoch, id, envelope)) in
+                        messages.iter_mut().zip(rendered)
+                    {
+                        binding
+                            .turns
+                            .lock()
+                            .await
+                            .insert(format!("{session}:{revision}"), (id.clone(), epoch));
+                        binding
+                            .input_context
+                            .lock()
+                            .await
+                            .insert(id, (session, revision));
+                        message["envelope"] = json!(envelope);
+                    }
                 }
                 Ok(result)
             }
@@ -998,7 +1161,8 @@ impl Daemon {
                     json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,"thread":binding.thread,
                     "harness":binding.harness,"title":binding.title,"delivery":binding.delivery,"route":binding.route,
                     "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound,"detachable":binding.detachable,
-                    "engine":binding.engine.lock().await.clone()}),
+                    "engine":binding.engine.lock().await.clone(),"input_mode":*binding.input_mode.lock().await,
+                    "initial_reply_context":*binding.initial_reply_context.lock().await}),
                 )
             }
             "status" => {
@@ -1094,7 +1258,16 @@ impl Daemon {
                     && previous == 0
                     && binding.detachable
                     && self.registry.get(&binding.harness).adopts(None));
-            if !is_allowed || !binding.turns.lock().await.contains_key(&key) {
+            if !is_allowed
+                || binding
+                    .turns
+                    .lock()
+                    .await
+                    .get(&key)
+                    .is_none_or(|(_, epoch)| {
+                        Some(*epoch) != params.get("epoch").and_then(Value::as_u64)
+                    })
+            {
                 continue;
             }
             if previous == owner {
@@ -1308,7 +1481,7 @@ mod tests {
             json!({}),
             json!({"event_id":"e","utterance_id":"u","status":"unknown_binding"}),
             json!({"event_id":"e","utterance_id":"wrong","text_saved":true}),
-            json!({"event_id":"e","utterance_id":"u","status":"rejected","terminal":true}),
+            json!({"event_id":"e","utterance_id":"u","status":"rejected"}),
         ] {
             assert!(!Daemon::ack_allows_removal(&speech, &reply));
         }

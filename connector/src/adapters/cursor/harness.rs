@@ -522,6 +522,8 @@ mod tests {
             thread: identity.thread.clone(),
             title: "chat".into(),
             delivery: identity.delivery.clone(),
+            input_mode: AsyncMutex::new("push".into()),
+            initial_reply_context: AsyncMutex::new(Value::Null),
             engine: AsyncMutex::new(None),
             route: identity.route.clone(),
             capabilities: identity.capabilities.clone(),

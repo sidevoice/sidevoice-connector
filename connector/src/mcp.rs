@@ -14,18 +14,15 @@ use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{timeout, timeout_at, Duration, Instant};
 
-const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the user's voice room.
-- Call voice_connect only when the user asks to join the room or enable voice; never as a side effect.
-- Voice input is a user message: a JSON header ({"channel":"voice","session_id","revision","message_id"}), the user's literal words, then [Sidevoice] lines that are not the user's. The header is opaque reply metadata. A repeated message_id is a redelivery: do not act on it again.
-- The room never plays a reply late. When the user did not hear some of yours (they spoke over it, moved on, or were away), a [Sidevoice] line lists them with the next voice message, or a note (channel "note", no user words) comes when they return without speaking. Do not resend the backlog: say what still matters now, in one fresh message, and drop what the conversation has moved past.
-- Reply by voice with voice_say, using that message's session_id and revision for every publication. For substantive work: first a short acknowledgement (what you understood, what you will do next), then meaningful checkpoints, then the result. No filler, no narrating tool calls. Publish questions too, and wait.
-- Between steps, at each tool result, take in newly arrived user input before starting the next step: an addition, a refinement or a replacement, by its meaning. Drop obsolete work not yet started; keep what remains useful; say what you now understand. No artificial pauses.
-- "published" means the room stored it, not that the user heard it. If publishing fails, continue in writing.
-- If the user closes this conversation's voice from the room, voice_say fails saying so: continue in writing, do not retry, and call voice_connect again only if asked.
-- Pairing is the user's act. If voice_connect says this machine is not paired with the room, ask the user for the room's address and the one-time code the room shows under "Emparejar máquina", then call voice_pair and voice_connect again. Never try to obtain a code from the room yourself.
-- If voice_connect returns inbound.ok false, voice will look sent and never arrive: tell the user inbound.reason, offer inbound.remedy in your own words including the safeguard the machine-wide option removes, and change no settings unasked.
-- Read receipts and working state need nothing from you: the room observes what the harness records.
-- Pairing a device is the user's act: voice_pair_device only when asked; show just its result."#;
+const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the person's voice room.
+- Call voice_connect only when the person asks to join or enable voice. Select input_mode pull when this harness will call get_messages; otherwise the core injects input. One binding uses one mode.
+- Each voice or note message carries a stable message_id, conversation epoch, session_id and revision. A repeated ID is redelivery, not new input. A note contains Sidevoice facts and no words from the person. The full notice and unheard evidence, including corrections and related message IDs, matter in both modes.
+- In pull mode, call get_messages at useful hooks. Acknowledge IDs with ack_ids only after processing them. Pull may learn later than injection. After is a journal cursor, not an acknowledgement.
+- Reply with voice_say using the message's session_id, revision and epoch. For speech before any message, use voice_connect's initial_reply_context. Typing does not advance the epoch. Several replies in one epoch play in publication order.
+- If voice_say says the person is speaking, the call was refused and nothing was queued: wait for their message. If that turn ends without words, a Sidevoice note may ask you to resend what still matters. A published reply is not proof it was heard.
+- When a notice says a reply was interrupted, not played, skipped, later heard, or that the person returned, use its full evidence and instruction. Do not automatically resend an unheard backlog; say what still matters in the current context.
+- For substantive work, first a short acknowledgement, then meaningful checkpoints, then the result. No filler or tool narration. Take in new input at tool results before starting the next step.
+- Pairing a machine or device is the person's act. Ask for their room address and one-time code only when needed; never fetch a code yourself. If inbound.ok is false, explain its reason and remedy without changing settings unasked."#;
 
 /// Overall budget for an IPC round trip, before the daemon's reply (or lack of one) gives up on
 /// its own. `pair_device` gets longer: the daemon can spend up to 15 s waiting for the core link
@@ -195,6 +192,9 @@ impl Ipc {
             {
                 if let Some(joined) = self.joined.lock().await.get_mut(&client_ref) {
                     joined.binding_id = binding_id.to_owned();
+                    if let Some(context) = result.get("initial_reply_context") {
+                        joined.initial_reply_context = context.clone();
+                    }
                 }
             }
         }
@@ -263,6 +263,8 @@ struct Facade {
 #[derive(Clone)]
 struct Joined {
     binding_id: String,
+    input_mode: String,
+    initial_reply_context: Value,
     title: String,
     identity: Identity,
     capabilities: Value,
@@ -363,6 +365,13 @@ impl Facade {
     ) -> Result<Value> {
         match name {
             "voice_connect" => {
+                let input_mode = args
+                    .get("input_mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("push");
+                if !matches!(input_mode, "push" | "pull") {
+                    bail!("input_mode must be push or pull");
+                }
                 if let Some(room) = args.get("room").and_then(Value::as_str) {
                     if let Some(refusal) =
                         pairing_needed(room, crate::pairing::previous_room(&self.profile))
@@ -442,7 +451,8 @@ impl Facade {
                 let mut params = json!({
                     "client_ref":identity.thread,"harness":identity.harness,"thread":identity.thread,"title":title,
                     "delivery":identity.delivery,"route":identity.route,"inbound":identity.inbound,
-                    "capabilities":capabilities,"experimental":experimental,"detachable":identity.detachable
+                    "capabilities":capabilities,"experimental":experimental,"detachable":identity.detachable,
+                    "input_mode":input_mode
                 });
                 if let Some(engine) = adapters::engine(&identity) {
                     params["engine"] = engine;
@@ -456,6 +466,11 @@ impl Facade {
                     identity.thread.clone(),
                     Joined {
                         binding_id: binding_id.to_owned(),
+                        input_mode: input_mode.to_owned(),
+                        initial_reply_context: result
+                            .get("initial_reply_context")
+                            .cloned()
+                            .unwrap_or(Value::Null),
                         title: title.clone(),
                         identity: identity.clone(),
                         capabilities: capabilities.clone(),
@@ -471,15 +486,16 @@ impl Facade {
                 let mut response = json!({
                     "status":if result.get("pending") == Some(&json!(true)) {"joining"} else {"joined"},
                     "harness":identity.harness,"conversation":identity.thread,"binding_id":binding_id,
-                    "delivery":if pushed {"push"} else {"none"},"room_reachable":result.get("connected"),
+                    "delivery":if input_mode == "pull" {"pull"} else if pushed {"push"} else {"none"},"room_reachable":result.get("connected"),
+                    "epoch":result.get("epoch"),"initial_reply_context":result.get("initial_reply_context"),
                     "capabilities":capabilities,"inbound":identity.inbound,
                     "local_only":"This machine is not paired with any room, so this conversation is reachable only from devices paired with this machine itself (the Sidevoice app on this computer, at this machine's own address). Tell the user in one line. Pairing the app is voice_pair_device, only if they ask; reaching it from elsewhere needs a room's address and code (voice_pair).",
                     "version":self.profile.connector_version(),"connector_version":connector.get("version")
                 });
-                if !pushed {
-                    response["voice_in"] = json!({"supported":false,"speak_with":{"session_id":format!("typed:{}", identity.thread),"revision":0},
+                if !pushed && input_mode != "pull" {
+                    response["voice_in"] = json!({"supported":false,"speak_with":result.get("initial_reply_context"),
                         "reason":format!("What the user says in the room cannot reach this conversation: {} The user types here as usual.", identity.deliver_note.as_deref().unwrap_or("this harness offers no way to put a message into it.")),
-                        "how":format!("Reply by voice to what the user types, as the server's instructions say for voice messages, calling voice_say with session_id \"typed:{}\" and revision 0. Tell the user once that the room hears this conversation but cannot talk to it.", identity.thread)});
+                        "how":"Use initial_reply_context to speak first. Tell the user once that the room hears this conversation but cannot talk to it."});
                 }
                 if let Some(note) = &identity.watch_note {
                     response["watch_note"] = json!(note);
@@ -608,6 +624,35 @@ impl Facade {
                     )
                 }
             }
+            "get_messages" => {
+                let named = args
+                    .get("conversation")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty());
+                if let Some(name) = named {
+                    self.adopt_by_id(name, &client).await;
+                }
+                let chosen = self.pick(named).await?.context("not connected")?;
+                let joined = self
+                    .joined
+                    .lock()
+                    .await
+                    .get(&chosen)
+                    .cloned()
+                    .context("not connected")?;
+                if joined.input_mode != "pull" {
+                    bail!("This conversation uses injection; reconnect with input_mode pull to use get_messages.");
+                }
+                let mut request = json!({"binding_id":joined.binding_id,"client_ref":chosen,
+                    "operation":args.get("operation").and_then(Value::as_str).unwrap_or("get")});
+                if let Some(after) = args.get("after") {
+                    request["after"] = after.clone();
+                }
+                if let Some(ids) = args.get("ack_ids") {
+                    request["ack_ids"] = ids.clone();
+                }
+                self.ipc.call("get_messages", request).await
+            }
             "voice_say" => {
                 let named = args
                     .get("conversation")
@@ -669,25 +714,44 @@ impl Facade {
                     .and_then(Value::as_str)
                     .context("text required")?;
                 let supplied_session = args.get("session_id").and_then(Value::as_str);
-                let editor_views = self.several_chats();
-                let is_typed =
-                    supplied_session.is_some_and(|session| session.starts_with("typed:"));
-                if editor_views && is_typed && named.is_none() {
-                    bail!("To speak before the first voice message in a chat of this window, pass the conversation id voice_connect returned in that chat.");
-                }
-                let direct_typed = named.is_some() && (supplied_session.is_none() || is_typed);
-                let turn_route = editor_views && !direct_typed;
-                let (session_id, revision) = if direct_typed {
-                    (format!("typed:{}", named.unwrap()), 0)
-                } else if let (Some(s), Some(r)) = (
-                    args.get("session_id").and_then(Value::as_str),
-                    args.get("revision").and_then(Value::as_i64),
-                ) {
-                    (s.to_owned(), r)
+                let named_binding = if let Some(name) = named {
+                    self.joined.lock().await.get(name).cloned()
                 } else {
-                    bail!("voice_say needs the session_id and revision of the voice message you answer, or the conversation id from voice_connect to speak first")
+                    None
                 };
-                let mut publish = json!({"session_id":session_id,"revision":revision,"text":text,
+                let initial = named_binding
+                    .as_ref()
+                    .map(|joined| &joined.initial_reply_context);
+                let (session_id, revision, epoch) = if let (
+                    Some(session),
+                    Some(revision),
+                    Some(epoch),
+                ) = (
+                    supplied_session,
+                    args.get("revision").and_then(Value::as_i64),
+                    args.get("epoch").and_then(Value::as_u64),
+                ) {
+                    (session.to_owned(), revision, epoch)
+                } else if supplied_session.is_none()
+                    && args.get("revision").is_none()
+                    && args.get("epoch").is_none()
+                {
+                    let context = initial.context("voice_say needs the message's session_id, revision and epoch, or a conversation with initial_reply_context")?;
+                    (
+                        context["session_id"]
+                            .as_str()
+                            .context("initial session_id missing")?
+                            .to_owned(),
+                        context["revision"]
+                            .as_i64()
+                            .context("initial revision missing")?,
+                        context["epoch"].as_u64().context("initial epoch missing")?,
+                    )
+                } else {
+                    bail!("voice_say needs the message's session_id, revision and epoch together");
+                };
+                let turn_route = self.several_chats() && named.is_none();
+                let mut publish = json!({"session_id":session_id,"revision":revision,"epoch":epoch,"text":text,
                     "utterance_id":args.get("utterance_id"),"language":args.get("language")});
                 if turn_route {
                     publish["client_refs"] =
@@ -862,12 +926,18 @@ impl Facade {
         let registration = json!({"client_ref":name,"harness":identity.harness,"thread":identity.thread,
             "title":title,"delivery":identity.delivery,"route":identity.route,"inbound":identity.inbound,
             "capabilities":capabilities,"experimental":experimental,"detachable":true,
-            "engine":result.get("engine").cloned().unwrap_or(Value::Null)});
+            "engine":result.get("engine").cloned().unwrap_or(Value::Null),
+            "input_mode":result.get("input_mode").cloned().unwrap_or(json!("push"))});
         self.ipc.remember_registration(registration).await;
         self.joined.lock().await.insert(
             name.to_owned(),
             Joined {
                 binding_id: binding_id.to_owned(),
+                input_mode: result["input_mode"].as_str().unwrap_or("push").to_owned(),
+                initial_reply_context: result
+                    .get("initial_reply_context")
+                    .cloned()
+                    .unwrap_or(Value::Null),
                 title,
                 identity,
                 capabilities,
@@ -879,9 +949,10 @@ impl Facade {
 
 fn tools() -> Vec<Tool> {
     let spec = [
-        ("voice_connect", "Connect this conversation to the voice room. Only on an explicit request to join or enable voice. Fails, saying what to ask the user, when a room is named that this machine is not paired with; with no room paired it joins this machine only (local_only).", json!({"title":{"type":"string","description":"Short label for this conversation in the room"},"room":{"type":"string","description":"The room's address (https://…) when the user names one; omitted, the room this machine is paired with"}}), vec![]),
+        ("voice_connect", "Connect this conversation to the voice room. Only on an explicit request to join or enable voice. Choose input_mode pull to read the ordinary queue with get_messages; otherwise input is injected. Pull learns messages only when called. The reply includes the core's initial_reply_context for speaking first.", json!({"title":{"type":"string","description":"Short label for this conversation in the room"},"room":{"type":"string","description":"The room's address (https://…) when the user names one; omitted, the room this machine is paired with"},"input_mode":{"type":"string","description":"push (injection, default) or pull (get_messages)"}}), vec![]),
         ("voice_pair", "Pair this machine with a room using the one-time code the user read from the room's interface (\"Emparejar máquina\"). Only with a code the user gave you; one room per machine, a new pairing replaces the previous one.", json!({"room":{"type":"string","description":"The room's address (https://…)"},"code":{"type":"string","description":"The one-time pairing code shown by the room"}}), vec!["room","code"]),
-        ("voice_say", "Publish a concise spoken version of your reply to the room, with the session_id and revision from the voice message header. To speak before any voice message arrived, pass instead the conversation id voice_connect returned in this chat.", json!({"text":{"type":"string"},"session_id":{"type":"string"},"revision":{"type":"integer","minimum":0},"conversation":{"type":"string","description":"The conversation id voice_connect returned in this chat: to speak with no voice message to answer"},"utterance_id":{"type":"string"},"language":{"type":"string","description":"The language of the reply, as a code: es, en, fr, it, pt or hi are the ones known now; the room decides what it speaks"}}), vec!["text"]),
+        ("voice_say", "Publish a spoken reply with the session_id, revision and epoch from the message header. To speak first, pass conversation and use the initial_reply_context from voice_connect. A current open user turn is refused immediately: wait for its message. A saved reply is not proof it was heard.", json!({"text":{"type":"string"},"session_id":{"type":"string"},"revision":{"type":"integer","minimum":0},"epoch":{"type":"integer","minimum":0},"conversation":{"type":"string","description":"The conversation id voice_connect returned in this chat: to speak first"},"utterance_id":{"type":"string"},"language":{"type":"string","description":"The language of the reply, as a code: es, en, fr, it, pt or hi are the ones known now; the room decides what it speaks"}}), vec!["text"]),
+        ("get_messages", "Read this conversation's ordered ordinary input queue in pull mode. Messages include stable IDs, full notice evidence, an envelope, and a cursor. Pass ack_ids only after consuming them. Without an acknowledgement, a claimed message is returned again; after is a journal cursor, not an acknowledgement. Pull may learn of speech later than injection.", json!({"conversation":{"type":"string","description":"Conversation id when several chats are joined"},"operation":{"type":"string","description":"get (default) or check"},"after":{"type":"integer","minimum":0},"ack_ids":{"type":"array","items":{"type":"string"}}}), vec![]),
         ("voice_disconnect", "Leave the voice room. The conversation and its work continue in writing.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
         ("voice_pair_device", "Show a one-time code to pair a device (the desktop app or a browser) with this machine: the code, a QR of it and how long it is valid. Only when the user asks to pair a device, never on your own initiative; show the user the result as it is.", json!({}), vec![]),
         ("voice_status", "Whether the room can currently reach this conversation.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
