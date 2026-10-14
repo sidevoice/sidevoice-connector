@@ -268,6 +268,11 @@ mod tests {
     fn t16_notice_matrix_has_identical_inject_and_pull_meaning() {
         // The eleven scenarios are the producer matrix in core's flow.rs. The transport extras
         // differ; every agent-visible fact and instruction is rendered by this one formatter.
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/conversation-flow.json"))
+                .unwrap();
+        let original = fixture["text"].as_str().unwrap();
+        let cut_extent = fixture["playback"][1]["history"]["heard_chars"].clone();
         for scenario in [
             "cut_words",
             "cut_empty_early",
@@ -294,13 +299,13 @@ mod tests {
             };
             let mut push = event(kind, channel, words);
             push["message_id"] = json!(format!("m-{scenario}"));
-            let long = "é🐙".to_owned() + &"z".repeat(300);
+            let long = original.to_owned() + &"z".repeat(300);
             let evidence = |n: usize| {
                 json!({"utterance_id":format!("u{n}"),
                 "history_id":format!("h{n}"),"session_id":"s","revision":3,"epoch":1,
                 "text":long.clone(),"fate":if scenario.starts_with("cut") {"interrupted"} else {"unplayed"},
                 "reason":if scenario == "stale" {"newer_turn"} else {"user_interrupted"},
-                "cut":scenario.starts_with("cut"),"heard_chars":if scenario.starts_with("cut") {json!(2)} else {Value::Null}})
+                "cut":scenario.starts_with("cut"),"heard_chars":if scenario.starts_with("cut") {cut_extent.clone()} else {Value::Null}})
             };
             if scenario == "skip" {
                 push["notice"]["skipped"] =
