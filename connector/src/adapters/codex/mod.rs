@@ -18,14 +18,21 @@ use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::env;
+use std::fs;
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
+
+/// Codex's model catalogue in its home: the models the account can use, each with its default reasoning level.
+const MODEL_CATALOGUE: &str = "models_cache.json";
 
 pub fn capabilities() -> Value {
     json!({"deliver":"supported","inspectInbound":"unsupported","working":"supported","endOfTurn":"supported","sessionIdentity":"supported"})
 }
 
-/// The engine a rollout's turn context or session header records: its model and reasoning effort.
+/// The engine a rollout's turn context or session header records: its model and reasoning effort. A turn context
+/// records the effort chosen for the session (`model_reasoning_effort`, a profile, `-c`, the app's picker), and none
+/// when nothing chose one: Codex then runs the model at its default level, [`default_effort`].
 pub fn rollout_engine(item: &Value) -> Option<Value> {
     if !matches!(
         item.get("type").and_then(Value::as_str),
@@ -40,6 +47,26 @@ pub fn rollout_engine(item: &Value) -> Option<Value> {
     };
     let model = text("/payload/model")?;
     Some(json!({"model":model,"effort":text("/payload/effort"),"thinking":Value::Null}))
+}
+
+/// The reasoning effort Codex runs `model` at when nothing chose one: the model's `default_reasoning_level` in
+/// Codex's own model catalogue, in its `home`. Codex sends that level with every request whose turn names no effort.
+/// None when the catalogue is missing or unreadable, or does not give the model a level.
+pub fn default_effort(home: &Path, model: &str) -> Option<String> {
+    let catalogue = fs::read(home.join(MODEL_CATALOGUE)).ok()?;
+    catalogue_default_effort(&serde_json::from_slice(&catalogue).ok()?, model)
+}
+
+fn catalogue_default_effort(catalogue: &Value, model: &str) -> Option<String> {
+    catalogue
+        .get("models")?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("slug").and_then(Value::as_str) == Some(model))?
+        .get("default_reasoning_level")?
+        .as_str()
+        .filter(|level| !level.is_empty())
+        .map(str::to_owned)
 }
 
 pub fn identity(meta: &Value) -> Result<Option<Identity>> {
@@ -149,5 +176,59 @@ mod tests {
         assert_eq!(rollout_engine(&effort_only), None);
         let event = json!({"type":"event_msg","payload":{"model":"gpt-6-luna"}});
         assert_eq!(rollout_engine(&event), None);
+    }
+
+    /// A catalogue as Codex 0.157 caches it, trimmed to what is read, plus fields it does not know.
+    fn catalogue() -> Value {
+        json!({"client_version":"0.157.0","etag":"e","future":{"nested":1},"models":[
+            {"slug":"gpt-6-astra","default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"low"}]},
+            {"slug":"gpt-6-luna","default_reasoning_level":"high","priority":3,"future":true},
+            {"slug":"gpt-plain","default_reasoning_level":null},
+            {"slug":"gpt-blank","default_reasoning_level":""}]})
+    }
+
+    #[test]
+    fn the_default_effort_is_the_models_level_in_the_catalogue() {
+        assert_eq!(
+            catalogue_default_effort(&catalogue(), "gpt-6-luna"),
+            Some("high".to_owned())
+        );
+        assert_eq!(
+            catalogue_default_effort(&catalogue(), "gpt-6-astra"),
+            Some("medium".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_model_the_catalogue_gives_no_level_has_no_default_effort() {
+        for model in ["gpt-unknown", "gpt-plain", "gpt-blank"] {
+            assert_eq!(
+                catalogue_default_effort(&catalogue(), model),
+                None,
+                "{model}"
+            );
+        }
+        assert_eq!(
+            catalogue_default_effort(&json!({"models":{}}), "gpt-6-luna"),
+            None
+        );
+        assert_eq!(catalogue_default_effort(&json!([]), "gpt-6-luna"), None);
+    }
+
+    #[test]
+    fn the_default_effort_is_read_from_the_catalogue_in_codex_home() {
+        let home =
+            std::env::temp_dir().join(format!("sv-codex-catalogue-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&home).unwrap();
+        assert_eq!(default_effort(&home, "gpt-6-luna"), None, "no catalogue");
+        fs::write(home.join(MODEL_CATALOGUE), "{not json").unwrap();
+        assert_eq!(
+            default_effort(&home, "gpt-6-luna"),
+            None,
+            "unreadable catalogue"
+        );
+        fs::write(home.join(MODEL_CATALOGUE), catalogue().to_string()).unwrap();
+        assert_eq!(default_effort(&home, "gpt-6-luna"), Some("high".to_owned()));
+        fs::remove_dir_all(&home).unwrap();
     }
 }
