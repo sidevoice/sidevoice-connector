@@ -208,7 +208,12 @@ pub fn envelope(event: &Value) -> Result<String> {
         body.push_str(text);
     }
     if channel != "room-control" {
-        body.push_str(&format!("\n\n[Sidevoice] Reply with voice_say (session_id {}, revision {revision}, epoch {epoch}). Treat this message ID as stable: a redelivery is not new input.", serde_json::to_string(session_id)?));
+        let verb = if channel == "note" {
+            "If a reply is appropriate, use voice_say"
+        } else {
+            "Reply with voice_say"
+        };
+        body.push_str(&format!("\n\n[Sidevoice] {verb} (session_id {}, revision {revision}, epoch {epoch}). Treat this message ID as stable: a redelivery is not new input.", serde_json::to_string(session_id)?));
     }
     if let Some(notice) = event.get("notice").filter(|v| !v.is_null()) {
         body.push_str("\n[Sidevoice] Notice: ");
@@ -250,7 +255,7 @@ pub fn envelope(event: &Value) -> Result<String> {
 mod tests {
     use super::envelope;
     use super::unidentified;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     fn event(kind: &str, channel: &str, text: &str) -> serde_json::Value {
         json!({"channel":channel,"session_id":"s","revision":4,"epoch":2,
@@ -261,42 +266,111 @@ mod tests {
 
     #[test]
     fn t16_notice_matrix_has_identical_inject_and_pull_meaning() {
-        // Both transports hand the same core content to this one formatter. Pull adds only cursor/time.
-        for (kind, channel, words) in [
-            ("reply_interrupted", "voice", "Wait"),
-            ("reply_not_played", "voice", "Next"),
-            ("reply_not_played", "note", ""),
-            ("turn_empty", "note", ""),
-            ("user_returned", "note", ""),
-            ("reply_skipped", "note", ""),
-            ("reply_heard", "note", ""),
+        // The eleven scenarios are the producer matrix in core's flow.rs. The transport extras
+        // differ; every agent-visible fact and instruction is rendered by this one formatter.
+        for scenario in [
+            "cut_words",
+            "cut_empty_early",
+            "cut_empty_late",
+            "unplayed_words",
+            "unplayed_empty_early",
+            "unplayed_empty_late",
+            "refused_empty",
+            "return",
+            "skip",
+            "stale",
+            "full_evidence",
         ] {
+            let (kind, channel, words) = match scenario {
+                "cut_words" => ("reply_interrupted", "voice", "Wait"),
+                "cut_empty_early" | "cut_empty_late" => ("reply_interrupted", "note", ""),
+                "unplayed_words" => ("reply_not_played", "voice", "Next"),
+                "unplayed_empty_early" | "unplayed_empty_late" => ("reply_not_played", "note", ""),
+                "refused_empty" => ("turn_empty", "note", ""),
+                "return" => ("user_returned", "note", ""),
+                "skip" => ("reply_skipped", "note", ""),
+                "stale" | "full_evidence" => ("reply_not_played", "note", ""),
+                _ => unreachable!(),
+            };
             let mut push = event(kind, channel, words);
-            push["unheard"] = json!({"count":1,"replies":[{"utterance_id":"u",
-                "history_id":"h","session_id":"s","revision":3,"epoch":1,
-                "text":"é🐙".to_owned() + &"z".repeat(300),"fate":"interrupted",
-                "reason":"newer_turn","cut":true,"heard_chars":2}]});
-            push["notice"]["corrects_message_id"] = json!("m-previous");
-            push["notice"]["heard"] = json!([{"utterance_id":"u","history_id":"h",
-                "fate":"heard","heard_chars":302}]);
+            push["message_id"] = json!(format!("m-{scenario}"));
+            let long = "é🐙".to_owned() + &"z".repeat(300);
+            let evidence = |n: usize| {
+                json!({"utterance_id":format!("u{n}"),
+                "history_id":format!("h{n}"),"session_id":"s","revision":3,"epoch":1,
+                "text":long.clone(),"fate":if scenario.starts_with("cut") {"interrupted"} else {"unplayed"},
+                "reason":if scenario == "stale" {"newer_turn"} else {"user_interrupted"},
+                "cut":scenario.starts_with("cut"),"heard_chars":if scenario.starts_with("cut") {json!(2)} else {Value::Null}})
+            };
+            if scenario == "skip" {
+                push["notice"]["skipped"] =
+                    json!([{"utterance_id":"u0","history_id":"h0","fate":"skipped"}]);
+            } else if scenario != "refused_empty" {
+                let count = if scenario == "full_evidence" { 8 } else { 1 };
+                push["unheard"] = json!({"count":count,
+                    "replies":(0..count).map(evidence).collect::<Vec<_>>()});
+            }
             let mut pull = push.clone();
             pull["cursor"] = json!(25);
             pull["arrival_time"] = json!(1792000000);
             let injected = envelope(&push).unwrap();
-            assert_eq!(injected, envelope(&pull).unwrap(), "{kind}");
-            assert!(injected.contains("m-previous") && injected.contains("m-original"));
-            assert!(
-                injected.contains(&"z".repeat(300)),
-                "full text was clipped: {kind}"
-            );
-            assert!(
-                injected.contains("heard prefix \"é🐙\""),
-                "scalar split: {injected}"
-            );
+            assert_eq!(injected, envelope(&pull).unwrap(), "{scenario}");
+            assert!(injected.contains(&format!("m-{scenario}")));
+            assert!(injected.contains("m-original"), "related ID: {scenario}");
+            if scenario != "refused_empty" && scenario != "skip" {
+                assert!(
+                    injected.contains(&"z".repeat(300)),
+                    "full text clipped: {scenario}"
+                );
+            }
+            if scenario.starts_with("cut") {
+                assert!(
+                    injected.contains("heard prefix \"é🐙\""),
+                    "scalar split: {scenario}"
+                );
+            }
             if channel == "note" {
-                assert!(injected.contains("person sent no words"));
+                assert!(injected.contains("person sent no words"), "{scenario}");
             }
         }
+    }
+
+    #[test]
+    fn t14_later_hearing_correction_retains_its_link_and_instruction() {
+        let mut correction = event("reply_heard", "note", "");
+        correction["unheard"] = Value::Null;
+        correction["notice"]["corrects_message_id"] = json!("m-earlier");
+        correction["notice"]["heard"] = json!([{"utterance_id":"u","history_id":"h",
+            "fate":"heard","heard_chars":304}]);
+        correction["notice"]["instruction"] =
+            json!("Do not resend solely because of the earlier notice.");
+        let body = envelope(&correction).unwrap();
+        assert!(body.contains("m-earlier"));
+        assert!(body.contains("Do not resend solely"));
+        assert!(body.contains("If a reply is appropriate"));
+        assert!(!body.contains("Complete unheard evidence"));
+    }
+
+    #[test]
+    fn t04b_t05_nine_reply_evidence_keeps_both_batches_in_publication_order() {
+        let mut delivered = Vec::new();
+        for batch in [0..8, 8..9] {
+            let mut note = event("reply_not_played", "note", "");
+            note["message_id"] = json!(format!("batch-{}", batch.start));
+            note["unheard"] = json!({"count":9,"replies":batch.map(|n| json!({
+                "utterance_id":format!("u{n}"),"history_id":format!("h{n}"),
+                "text":format!("reply {n}"),"heard_chars":null,"fate":"unplayed"
+            })).collect::<Vec<_>>()});
+            delivered.push(envelope(&note).unwrap());
+        }
+        let first = &delivered[0];
+        let second = &delivered[1];
+        for n in 0..8 {
+            assert!(first.contains(&format!("reply {n}")));
+        }
+        assert!(second.contains("reply 8"));
+        assert!(first.contains("batch-0") && second.contains("batch-8"));
+        assert!(first.contains("m-original") && second.contains("m-original"));
     }
 
     #[test]

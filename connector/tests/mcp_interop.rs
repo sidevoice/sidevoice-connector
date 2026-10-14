@@ -192,7 +192,7 @@ fn a_tool_call_with_arguments_this_server_does_not_know_is_answered_for_what_it_
     let said = mcp.request(
         "tools/call",
         json!({"name": "voice_say", "_meta": meta,
-               "arguments": {"text": "Hello", "session_id": answer["initial_reply_context"]["session_id"], "revision": 0, "epoch": answer["initial_reply_context"]["epoch"],
+               "arguments": {"text": "Hello", "session_id": "test-session", "revision": 0, "epoch": 0,
                              "language": "tlh", "future_argument": {"nested": 1}}}),
     );
     assert_ne!(said["isError"], true, "{said}");

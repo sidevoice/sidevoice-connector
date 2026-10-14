@@ -986,10 +986,11 @@ impl Daemon {
                     bail!("text length invalid");
                 }
                 let id = binding.id.lock().await;
+                let history_only = !self.link.connected().await;
                 let speech = json!({"event_id":params.get("event_id").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     "binding_id":*id,"client_ref":binding.client_ref,"session_id":session_id,"revision":revision,"epoch":epoch,
                     "utterance_id":params.get("utterance_id").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                    "text":text,"language":params.get("language")});
+                    "text":text,"language":params.get("language"),"history_only":history_only});
                 self.queue(speech.clone()).await?;
                 drop(id);
                 let first = self
@@ -1040,9 +1041,13 @@ impl Daemon {
                     .link
                     .request("input.pull", request, Duration::from_secs(10))
                     .await?;
-                if let Some(messages) = result.get_mut("messages").and_then(Value::as_array_mut) {
+                let rendered = (|| -> Result<Vec<_>> {
+                    let messages = result
+                        .get("messages")
+                        .and_then(Value::as_array)
+                        .context("pull messages missing")?;
                     // Validate and render the entire page before exposing any of its claims to MCP.
-                    let rendered: Result<Vec<_>> = messages
+                    messages
                         .iter()
                         .map(|message| {
                             Ok((
@@ -1061,35 +1066,39 @@ impl Daemon {
                                 crate::adapters::envelope(message)?,
                             ))
                         })
-                        .collect();
-                    let rendered = match rendered {
-                        Ok(rendered) => rendered,
-                        Err(error) => {
-                            // A malformed page cannot be delivered or acknowledged. End this claim and
-                            // re-register the same binding so core returns the rows to its queue.
-                            let _ = self
-                                .link
-                                .notify("binding.unregister", json!({"binding_id":binding_id}))
-                                .await;
-                            let _ = self.register_core(&binding).await;
-                            return Err(error);
-                        }
-                    };
-                    for (message, (session, revision, epoch, id, envelope)) in
-                        messages.iter_mut().zip(rendered)
-                    {
-                        binding
-                            .turns
-                            .lock()
-                            .await
-                            .insert(format!("{session}:{revision}"), (id.clone(), epoch));
-                        binding
-                            .input_context
-                            .lock()
-                            .await
-                            .insert(id, (session, revision));
-                        message["envelope"] = json!(envelope);
+                        .collect()
+                })();
+                let rendered = match rendered {
+                    Ok(rendered) => rendered,
+                    Err(error) => {
+                        // A malformed page cannot be delivered or acknowledged. End this claim and
+                        // re-register the same binding so core returns the rows to its queue.
+                        let _ = self
+                            .link
+                            .notify("binding.unregister", json!({"binding_id":binding_id}))
+                            .await;
+                        let _ = self.register_core(&binding).await;
+                        return Err(error);
                     }
+                };
+                for (message, (session, revision, epoch, id, envelope)) in result
+                    .get_mut("messages")
+                    .and_then(Value::as_array_mut)
+                    .expect("validated pull page")
+                    .iter_mut()
+                    .zip(rendered)
+                {
+                    binding
+                        .turns
+                        .lock()
+                        .await
+                        .insert(format!("{session}:{revision}"), (id.clone(), epoch));
+                    binding
+                        .input_context
+                        .lock()
+                        .await
+                        .insert(id, (session, revision));
+                    message["envelope"] = json!(envelope);
                 }
                 Ok(result)
             }

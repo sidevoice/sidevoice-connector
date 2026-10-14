@@ -258,6 +258,29 @@ async fn ipc_commands_with_unknown_fields_are_read_for_what_they_know() {
         .await
         .unwrap();
     assert_eq!(said["status"], "queued", "{said}");
+    let second = daemon
+        .command(
+            7,
+            "publish",
+            json!({"client_ref":"t-2","session_id":"s","revision":1,"epoch":0,
+                "text":"queued second"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second["status"], "queued", "{second}");
+    let outbox = daemon.outbox.lock().await.clone();
+    assert_eq!(outbox.len(), 2);
+    assert_eq!(outbox[0]["text"], "queued");
+    assert_eq!(outbox[1]["text"], "queued second");
+    assert!(outbox.iter().all(|item| item["history_only"] == true));
+    let persisted: Value =
+        serde_json::from_slice(&std::fs::read(scratch.0.join("sidevoice/outbox.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        persisted,
+        json!(outbox),
+        "publication order must survive restart"
+    );
 
     // A detachable conversation another façade adopts, asked with fields of its own.
     let left = daemon
