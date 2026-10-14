@@ -1,6 +1,6 @@
 //! Following a Codex thread's rollout: its engine, its turns (working) and the messages it read.
 
-use super::rollout_engine;
+use super::{default_effort, rollout_engine};
 use crate::adapters::conversation::{Conversation, Room};
 use serde_json::{json, Value};
 use std::fs;
@@ -23,6 +23,7 @@ pub fn follow(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
         let mut turn: Option<String> = None;
         let mut working = None;
         let mut catching_up = true;
+        let mut defaults = DefaultEffort::new(room.profile().agent_home(super::HOME.var));
         loop {
             if binding.stopped.load(Ordering::Relaxed) {
                 break;
@@ -75,6 +76,7 @@ pub fn follow(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
                                                 &item,
                                                 &mut turn,
                                                 &mut working,
+                                                &mut defaults,
                                                 catching_up,
                                             )
                                             .await;
@@ -110,16 +112,46 @@ pub fn follow(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
     });
 }
 
+/// The default reasoning level of the model a rollout last named, read from Codex's catalogue once per model: a
+/// rollout being caught up names the same model in every turn.
+struct DefaultEffort {
+    home: PathBuf,
+    last: Option<(String, Option<String>)>,
+}
+
+impl DefaultEffort {
+    fn new(home: &Path) -> Self {
+        Self {
+            home: home.to_owned(),
+            last: None,
+        }
+    }
+
+    /// `engine` as Codex runs it: the effort it records, or else the model's default level.
+    fn complete(&mut self, mut engine: Value) -> Value {
+        if !engine["effort"].is_null() {
+            return engine;
+        }
+        let model = engine["model"].as_str().unwrap_or_default();
+        if self.last.as_ref().is_none_or(|(last, _)| last != model) {
+            self.last = Some((model.to_owned(), default_effort(&self.home, model)));
+        }
+        engine["effort"] = json!(self.last.as_ref().and_then(|(_, effort)| effort.clone()));
+        engine
+    }
+}
+
 async fn observe(
     room: &dyn Room,
     binding: &Conversation,
     item: &Value,
     turn: &mut Option<String>,
     working: &mut Option<bool>,
+    defaults: &mut DefaultEffort,
     catching_up: bool,
 ) {
     if let Some(engine) = rollout_engine(item) {
-        room.engine(binding, engine).await;
+        room.engine(binding, defaults.complete(engine)).await;
     }
     if item.get("type") == Some(&json!("event_msg")) {
         let phase = item
@@ -230,4 +262,77 @@ fn rollout_path(home: &Path, thread: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn home_with(catalogue: &Value) -> PathBuf {
+        let home = std::env::temp_dir().join(format!("sv-codex-rollout-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("models_cache.json"), catalogue.to_string()).unwrap();
+        home
+    }
+
+    fn levels(luna: &str) -> Value {
+        json!({"models":[{"slug":"gpt-6-luna","default_reasoning_level":luna},
+            {"slug":"gpt-6-astra","default_reasoning_level":"medium"}]})
+    }
+
+    #[test]
+    fn a_turn_that_names_no_effort_runs_at_the_models_default() {
+        let home = home_with(&levels("medium"));
+        let mut defaults = DefaultEffort::new(&home);
+        // A turn context as Codex 0.157 writes it when nothing chose an effort: no `effort`, none in the mode.
+        let item = json!({"type":"turn_context","payload":{"model":"gpt-6-luna","summary":"none",
+            "collaboration_mode":{"mode":"default","settings":{"model":"gpt-6-luna","reasoning_effort":null}}}});
+        assert_eq!(
+            defaults.complete(rollout_engine(&item).unwrap()),
+            json!({"model":"gpt-6-luna","effort":"medium","thinking":null})
+        );
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn the_effort_a_turn_records_is_kept() {
+        let home = home_with(&levels("medium"));
+        let mut defaults = DefaultEffort::new(&home);
+        let item = json!({"type":"turn_context","payload":{"model":"gpt-6-luna","effort":"xhigh"}});
+        assert_eq!(
+            defaults.complete(rollout_engine(&item).unwrap()),
+            json!({"model":"gpt-6-luna","effort":"xhigh","thinking":null})
+        );
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn a_model_without_a_default_keeps_no_effort() {
+        let home = std::env::temp_dir().join(format!("sv-codex-rollout-{}", uuid::Uuid::new_v4()));
+        let mut defaults = DefaultEffort::new(&home);
+        let engine = json!({"model":"gpt-6-luna","effort":null,"thinking":null});
+        assert_eq!(defaults.complete(engine.clone()), engine);
+    }
+
+    #[test]
+    fn the_catalogue_is_read_once_per_model() {
+        let home = home_with(&levels("medium"));
+        let mut defaults = DefaultEffort::new(&home);
+        let luna = json!({"model":"gpt-6-luna","effort":null,"thinking":null});
+        assert_eq!(defaults.complete(luna.clone())["effort"], "medium");
+        fs::write(home.join("models_cache.json"), levels("low").to_string()).unwrap();
+        assert_eq!(
+            defaults.complete(luna.clone())["effort"],
+            "medium",
+            "same model, not read again"
+        );
+        let astra = json!({"model":"gpt-6-astra","effort":null,"thinking":null});
+        assert_eq!(defaults.complete(astra)["effort"], "medium");
+        assert_eq!(
+            defaults.complete(luna)["effort"],
+            "low",
+            "another model in between reads it again"
+        );
+        fs::remove_dir_all(&home).unwrap();
+    }
 }
