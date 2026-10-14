@@ -321,3 +321,25 @@ async fn ipc_commands_with_unknown_fields_are_read_for_what_they_know() {
         .unwrap_err();
     assert_eq!(unknown.to_string(), "unknown IPC method");
 }
+
+#[tokio::test]
+async fn a_detached_pull_binding_reconnects_under_its_original_client_ref() {
+    let scratch = Scratch::new("pull-reconnect");
+    let link = Link::new();
+    let core = link.attached().await;
+    play_core(link.clone(), core);
+    let (daemon, _) = daemon(&scratch, link);
+    let mut params = registration("pull-thread");
+    params["input_mode"] = json!("pull");
+    let first = daemon.command(7, "register", params.clone()).await.unwrap();
+    let binding = daemon.bindings.lock().await["pull-thread"].clone();
+    binding.owner.store(0, std::sync::atomic::Ordering::Relaxed);
+    let second = daemon.command(8, "register", params).await.unwrap();
+    assert_eq!(second["binding_id"], first["binding_id"]);
+    assert_eq!(
+        second["initial_reply_context"],
+        first["initial_reply_context"]
+    );
+    assert_eq!(binding.owner.load(std::sync::atomic::Ordering::Relaxed), 8);
+    assert_eq!(*binding.input_mode.lock().await, "pull");
+}

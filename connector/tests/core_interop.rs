@@ -296,6 +296,21 @@ fn t16_pull_claim_ack_redelivery_and_mode_handover_use_the_real_core() {
         .contains("Pull words"));
     let again = mcp.tool("get_messages", json!({}));
     assert_eq!(again["messages"][0]["message_id"], id, "{again}");
+    mcp.stop();
+    let mut reconnected_command = profile.connector(&["mcp"]);
+    reconnected_command
+        .env("SIDEVOICE_THREAD", thread)
+        .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+    let mut mcp = Mcp::start(reconnected_command);
+    mcp.initialize("turns-pull-reconnected");
+    let rejoined = mcp.tool("voice_connect", json!({"input_mode":"pull"}));
+    assert_eq!(rejoined["delivery"], "pull", "{rejoined}");
+    let recovered = mcp.tool("get_messages", json!({}));
+    assert_eq!(recovered["messages"][0]["message_id"], id, "{recovered}");
+    assert_eq!(
+        recovered["messages"][0]["envelope"],
+        first["messages"][0]["envelope"]
+    );
     let ack = mcp.tool("get_messages", json!({"ack_ids":[id]}));
     assert_eq!(ack["acknowledged"], 1, "{ack}");
     assert_eq!(ack["count"], 0, "{ack}");

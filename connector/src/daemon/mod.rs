@@ -853,7 +853,10 @@ impl Daemon {
                 self.check_registration_allowed(&client_ref, resume).await?;
                 let existing = { self.bindings.lock().await.get(&client_ref).cloned() };
                 if let Some(existing) = existing {
-                    if existing.owner.load(Ordering::Relaxed) != owner {
+                    let previous_owner = existing.owner.load(Ordering::Relaxed);
+                    if previous_owner == 0 && existing.detachable {
+                        existing.owner.store(owner, Ordering::Relaxed);
+                    } else if previous_owner != owner {
                         bail!("binding belongs to another façade");
                     }
                     *existing.input_mode.lock().await = input_mode.to_owned();
@@ -899,13 +902,19 @@ impl Daemon {
                 let _state_transaction = self.conversation_state_serial.lock().await;
                 self.check_registration_allowed(&client_ref, resume).await?;
                 if let Some(existing) = self.bindings.lock().await.get(&client_ref).cloned() {
-                    if existing.owner.load(Ordering::Relaxed) != owner {
+                    let previous_owner = existing.owner.load(Ordering::Relaxed);
+                    if previous_owner == 0 && existing.detachable {
+                        existing.owner.store(owner, Ordering::Relaxed);
+                    } else if previous_owner != owner {
                         bail!("binding belongs to another façade");
                     }
+                    *existing.input_mode.lock().await = input_mode.to_owned();
+                    let registered = self.register_core(&existing).await?;
                     let binding_id = existing.id.lock().await.clone();
                     drop(_state_transaction);
                     return Ok(json!({"binding_id":binding_id,"thread":thread,
-                        "connected":self.link.connected().await,"prepared":null}));
+                        "connected":self.link.connected().await,"prepared":null,
+                        "epoch":registered.get("epoch"),"initial_reply_context":registered.get("initial_reply_context")}));
                 }
                 let prepared = harness_adapter.prepare(&binding).await?;
                 self.bindings
