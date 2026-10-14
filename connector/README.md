@@ -9,7 +9,7 @@ this binary from the platform package (RELEASING.md); the command is then `sidev
 
 | Command | What it does |
 | --- | --- |
-| `install [--no-agents] [--json]` | Installs this package's Sidevoice (or updates to it), starts it, and registers it with the agents found here (below). |
+| `install [--no-agents] [--no-prompt] [--json]` | Installs this package's Sidevoice (or updates to it) and starts it. It connects no agent by itself: it lists the agents found here, and at a terminal offers to connect them (below). `--no-agents` leaves the agents alone; `--no-prompt` does not ask. |
 | `uninstall [--json]` | Removes Sidevoice from this computer: its service jobs, its agent registrations, its releases and its data. |
 | `mcp` | MCP over stdio for one conversation; it reaches the daemon over `connector.sock`. |
 | `connector [--service]` | The daemon: one per data directory. `--service` (or `SIDEVOICE_SERVICE=launchd\|systemd`) when a service manager runs it. |
@@ -94,13 +94,26 @@ When it does not, `current` goes back to the release it named before, that one i
 release is deleted, and the install fails with `install.rolled-back` (or `install.rollback-failed`); a first
 installation that does not answer stays, failing with `install.verify-failed` and the core's own failure. Releases
 other than the current one and the one before it are pruned: exactly one previous, no `verified` link, no `rollback`
-command. Then the agents found are registered with the installation's command (Claude Code through `claude mcp add`,
-Codex through its CLI, Cursor in its `mcp.json`, only the `sidevoice` entry and only one Sidevoice wrote; an agent
-that needs its configuration by hand is told how), unless `--no-agents`. Each registration carries the installation's
-`SIDEVOICE_DATA_DIR` and `XDG_DATA_HOME`, so an agent opened from any shell reaches this installation; one of ours
-without them, disabled, or naming another release is not current (`outdated`), and is written again. An agent whose
-MCP settings cannot be read is `invalid` and left alone. Running `install` again is the recovery: a release whose core
-no longer matches its inventory is staged again.
+command. Running `install` again is the recovery: a release whose core no longer matches its inventory is staged
+again.
+
+Installing connects no agent. An agent gets Sidevoice only when the person connects it: Connect in the app (which
+calls `agents.connect`), `agents connect <id>`, or their answer to the offer below. Unless `--no-agents`, `install`
+lists the agents found (a rescan) and its answer's `agents` has one entry per agent, `{outcome, message}`:
+`registered` when it uses Sidevoice, `not-connected` when it does not and the connector can connect it (with
+`command`, `sidevoice agents connect <id>`), `manual` when that needs a step by hand (the message gives it), or
+`failed`, `foreign`, `invalid`, `unknown`. The one entry `install` writes is one Sidevoice wrote that is not current
+(`outdated`: disabled, naming another release, or without the installation's environment): it is written again with
+the installation's command (Claude Code through `claude mcp add`, Codex through its CLI, Cursor in its `mcp.json`,
+only the `sidevoice` entry). That is not a new consent: the person connected that agent already, and the entry would
+stop working once the release it names is pruned. Each registration carries the installation's `SIDEVOICE_DATA_DIR`
+and `XDG_DATA_HOME`, so an agent opened from any shell reaches this installation. An agent whose MCP settings cannot
+be read is `invalid` and left alone.
+
+At a terminal (standard input and output both, no `--json`, no `--no-prompt`, `CI` unset), `install` then offers to
+connect the agents it found that the connector can connect itself: all, some (by number) or none, the default
+(Enter, or the end of input); those chosen are connected as `agents connect` connects them. The install lock is
+released before it asks. With `--json` (the desktop app reads it) or without a terminal nothing is asked.
 
 An agent whose registration is `connected` also says whether that registration works: its row in `agents` (and the
 connector's `agents.list`) carries `health`, `{"state","error","checked_at"}`. The connector starts the entry as the

@@ -19,8 +19,22 @@
 //! release's binary, and its `node.status`. When it does not, `current` goes back to the release it named before,
 //! that is restarted and verified, and the failed release is deleted; a first installation that does not answer is
 //! left in place, said with the core's own failure. Releases other than the current one and the one before it are
-//! pruned (exactly one previous), and the agents found are registered with the installation's command. Running it
-//! again is the recovery.
+//! pruned (exactly one previous). Running it again is the recovery.
+//!
+//! The agents (unless `--no-agents`): installing connects none. An agent gets Sidevoice only when the person connects
+//! it: Connect in the Sidevoice app (`agents.connect`), `sidevoice agents connect <id>`, or their answer to the offer
+//! below. `install` lists the agents found (a rescan) and reports each one in its answer: one that uses Sidevoice as
+//! it is; one without Sidevoice as found, with the command that connects it (`command`) when the connector can do it
+//! itself, else the steps by hand. The one entry it writes is an entry an older Sidevoice wrote (`outdated`: disabled,
+//! naming an older release, or without this installation's environment), written again with the installation's
+//! command: the person already chose to connect that agent, and the entry would stop working once the release it
+//! names is pruned, so keeping it working across an update is not a new consent.
+//!
+//! At a terminal (standard input and output both terminals, no `--json`, no `--no-prompt`, not under CI), the command
+//! line then offers to connect the agents found without Sidevoice that the connector can connect itself: all, some,
+//! or none, none being the default (Enter, or the end of input). Those chosen are connected as `agents connect`
+//! connects them. The offer comes after the install lock is released, so a person thinking does not hold up another
+//! install. With `--json` (the desktop app reads it) or without a terminal nothing is asked and no agent is connected.
 //!
 //! `uninstall`, under the install lock: both jobs unloaded and what runs on demand stopped (a refusal stops
 //! everything here, with nothing deleted), the agents' registrations removed, then `R` and everything in `D` but
@@ -533,7 +547,8 @@ async fn start_and_verify(
 /// What `install` and `uninstall` were asked.
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
-    /// Register with (or, uninstalling, remove from) the agents on this computer.
+    /// Installing: list the agents on this computer and write again the entries an older Sidevoice wrote (never
+    /// connecting a new one); uninstalling: remove Sidevoice's entries from them.
     pub agents: bool,
 }
 
@@ -587,7 +602,7 @@ pub async fn install(
         .collect();
     let pruned = prune(&layout, &keep);
     let agents = if options.agents {
-        register(profile).await
+        refresh(profile).await
     } else {
         json!({})
     };
@@ -636,9 +651,23 @@ fn error_message(answer: &Value) -> Option<(String, String)> {
     ))
 }
 
-/// Every agent found registered with the installation's command, never touching an entry Sidevoice did not write:
-/// per agent, `{outcome, message}`.
-async fn register(profile: &Profile) -> Value {
+/// The command a person runs to connect Sidevoice with one agent.
+pub fn connect_command(id: &str) -> String {
+    format!("sidevoice agents connect {id}")
+}
+
+/// How the answer names an agent.
+fn agent_label(id: &str) -> String {
+    crate::messages::message(&format!("harness.{id}"), &json!({}))
+}
+
+/// The agents found, as installing leaves them: no agent connected, and only an entry an older Sidevoice wrote
+/// (`outdated`) written again with the installation's command (the module's documentation says why); never an entry
+/// Sidevoice did not write. Per agent, `{outcome, message}`, and `command` for one the connector connects when the
+/// person asks: `outcome` is `registered` (it uses Sidevoice: as it was, or its entry written again),
+/// `not-connected` (found without Sidevoice), `manual` (its configuration needs a step by hand), `failed`, `foreign`,
+/// `invalid` or `unknown`.
+async fn refresh(profile: &Profile) -> Value {
     let agents = match HostAgents::for_installer(profile.clone()) {
         Ok(agents) => agents,
         Err(error) => return json!({"error": error.to_string()}),
@@ -658,25 +687,39 @@ async fn register(profile: &Profile) -> Value {
                 "connect"
             },
         );
+        let auto = row["connect"] == "auto";
         let (outcome, message) = match row["registration"].as_str() {
             Some("connected") => ("registered", format!("{label} already uses Sidevoice.")),
-            // An entry an older Sidevoice wrote is written again.
-            Some("not-connected" | "outdated") if row["connect"] == "auto" => {
+            // The person connected it with an older Sidevoice: kept working with this one.
+            Some("outdated") if auto => {
                 let answer = agents.handle("agents.connect", json!({"id": id})).await;
                 match error_message(&answer) {
-                    None => ("registered", format!("Registered Sidevoice with {label}.")),
+                    None => (
+                        "registered",
+                        format!("{label}'s Sidevoice entry, written by an older Sidevoice, now runs this one."),
+                    ),
                     Some((_, message)) => ("failed", message),
                 }
             }
-            Some("not-connected") => (
-                "manual",
-                format!("{label}: Sidevoice is not registered there; to register it:{manual}"),
-            ),
             Some("outdated") => (
                 "manual",
-                format!(
-                    "{label}: an older Sidevoice registered it; to register this one:\n    {manual}"
-                ),
+                format!("{label}: an older Sidevoice registered it; to register this one:{manual}"),
+            ),
+            // Found, and left as it is: the person connects it.
+            Some("not-connected") if auto => {
+                let command = connect_command(&id);
+                let message = format!(
+                    "{label} does not use Sidevoice; to connect it, use the Sidevoice app or run `{command}`."
+                );
+                outcomes.insert(
+                    id,
+                    json!({"outcome": "not-connected", "message": message, "command": command}),
+                );
+                continue;
+            }
+            Some("not-connected") => (
+                "manual",
+                format!("{label} does not use Sidevoice; to connect it:{manual}"),
             ),
             Some(other) => {
                 let key = match other {
@@ -787,13 +830,123 @@ fn advice(profile: &Profile, answer: &Value) -> Vec<String> {
                 .to_owned(),
         );
     }
-    let agents = answer["agents"].as_object();
+    // What to do next with an agent that uses Sidevoice; one without it has its own line in the answer.
     for (id, registration) in crate::adapters::Registry::standard().agents() {
-        if agents.is_some_and(|agents| agents.contains_key(id)) {
+        if answer["agents"][id]["outcome"] == "registered" {
             next.extend(registration.after_install(profile));
         }
     }
     next
+}
+
+/// Whether `install` offers, after installing, to connect the agents it found: only to a person at a terminal
+/// (`terminal`: its standard input and output both are), never with `--json` (a program reads the answer: the desktop
+/// app), `--no-prompt`, or under CI (`CI` set to anything but nothing, `0` or `false`).
+pub fn may_offer(
+    json: bool,
+    no_prompt: bool,
+    terminal: bool,
+    ci: Option<&std::ffi::OsStr>,
+) -> bool {
+    let ci = ci.is_some_and(|value| !matches!(value.to_str(), Some("" | "0" | "false")));
+    !json && !no_prompt && terminal && !ci
+}
+
+/// The agents `install` found without Sidevoice that the connector connects itself, as `(id, label)`: what it offers.
+pub fn offerable(answer: &Value) -> Vec<(String, String)> {
+    answer["agents"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(_, agent)| agent["outcome"] == "not-connected" && agent["command"].is_string())
+        .map(|(id, _)| (id.clone(), agent_label(id)))
+        .collect()
+}
+
+/// The person's choice among `offered`, asked on `output` and read from `input`: Enter, `none` (`n`, `no`) or the
+/// end of input chooses none; `all` (`a`) all of them; numbers or ids, separated by spaces or commas, those. An
+/// answer not understood is asked again.
+pub fn ask(
+    offered: &[(String, String)],
+    input: &mut impl io::BufRead,
+    output: &mut impl io::Write,
+) -> io::Result<Vec<String>> {
+    writeln!(
+        output,
+        "\nSidevoice is not connected to these agents found here:"
+    )?;
+    for (number, (_, label)) in offered.iter().enumerate() {
+        writeln!(output, "  {}. {label}", number + 1)?;
+    }
+    loop {
+        write!(
+            output,
+            "Connect it to all of them, some (their numbers, such as 1 2), or none? [none] "
+        )?;
+        output.flush()?;
+        let mut line = String::new();
+        if input.read_line(&mut line)? == 0 {
+            writeln!(output)?;
+            return Ok(Vec::new());
+        }
+        match choice(offered, &line) {
+            Some(chosen) => return Ok(chosen),
+            None => writeln!(
+                output,
+                "Answer all, none (or just Enter), or numbers from 1 to {}.",
+                offered.len()
+            )?,
+        }
+    }
+}
+
+/// One answer to [`ask`]: the ids chosen, or `None` when it is not understood.
+fn choice(offered: &[(String, String)], answer: &str) -> Option<Vec<String>> {
+    let answer = answer.trim().to_lowercase();
+    match answer.as_str() {
+        "" | "n" | "no" | "none" => return Some(Vec::new()),
+        "a" | "all" => return Some(offered.iter().map(|(id, _)| id.clone()).collect()),
+        _ => {}
+    }
+    let mut chosen: Vec<String> = Vec::new();
+    for word in answer
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|word| !word.is_empty())
+    {
+        let (id, _) = match word.parse::<usize>() {
+            Ok(number) => offered.get(number.checked_sub(1)?)?,
+            Err(_) => offered.iter().find(|(id, _)| id == word)?,
+        };
+        if !chosen.contains(id) {
+            chosen.push(id.clone());
+        }
+    }
+    Some(chosen)
+}
+
+/// The agents the person chose after an install connected, as `agents connect` connects them, and said in `answer`:
+/// each one's outcome (`registered` or `failed`), and the advice again.
+pub async fn connect_chosen(profile: &Profile, answer: &mut Value, chosen: &[String]) {
+    if chosen.is_empty() {
+        return;
+    }
+    let agents = HostAgents::for_installer(profile.clone());
+    for id in chosen {
+        let label = agent_label(id);
+        let outcome = match &agents {
+            Ok(agents) => {
+                let connected = agents.handle("agents.connect", json!({"id": id})).await;
+                match error_message(&connected) {
+                    None => json!({"outcome": "registered",
+                        "message": format!("Connected {label} to Sidevoice.")}),
+                    Some((_, message)) => json!({"outcome": "failed", "message": message}),
+                }
+            }
+            Err(error) => json!({"outcome": "failed", "message": error.to_string()}),
+        };
+        answer["agents"][id.as_str()] = outcome;
+    }
+    answer["advice"] = json!(advice(profile, answer));
 }
 
 /// `install` as a person reads it.
@@ -976,6 +1129,7 @@ pub(crate) mod tests {
     }
 
     const NO_AGENTS: Options = Options { agents: false };
+    const AGENTS: Options = Options { agents: true };
 
     impl Fixture {
         fn new(label: &str) -> Self {
@@ -1234,6 +1388,170 @@ pub(crate) mod tests {
         assert_eq!(removal(&row("foreign", false)), Some(false));
         assert_eq!(removal(&row("invalid", false)), Some(false));
         assert_eq!(removal(&row("unknown", false)), Some(false));
+    }
+
+    /// An agent of the registry the connector connects by itself, without its CLI: found in any profile of the tests
+    /// (its configuration directory is there), whatever is installed on the machine that runs them.
+    fn agent_without_cli() -> &'static str {
+        crate::adapters::Registry::standard()
+            .agents()
+            .find(|(_, registration)| registration.connects_without_binary())
+            .map(|(id, _)| id)
+            .expect("an agent the connector connects without its CLI")
+    }
+
+    /// The agent's registration as a scan finds it, judged against the installation.
+    async fn registration(profile: &Profile, id: &str) -> Value {
+        let agents = HostAgents::for_installer(profile.clone()).unwrap();
+        let listed = agents.handle("agents.list", json!({"rescan": true})).await;
+        agent_rows(&listed)
+            .into_iter()
+            .find(|(found, _, _)| found == id)
+            .map(|(_, _, row)| row["registration"].clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether `answer`'s advice includes what to do next with the agent `id` once it uses Sidevoice.
+    fn advised(profile: &Profile, answer: &Value, id: &str) -> bool {
+        let registry = crate::adapters::Registry::standard();
+        let (_, agent) = registry.agents().find(|(found, _)| *found == id).unwrap();
+        let notes = agent.after_install(profile);
+        assert!(!notes.is_empty(), "{id} has advice after an install");
+        let advice = answer["advice"].to_string();
+        notes
+            .iter()
+            .all(|note| advice.contains(&json!(note).to_string()))
+    }
+
+    #[tokio::test]
+    async fn installing_connects_no_agent_and_keeps_an_entry_an_older_sidevoice_wrote_working() {
+        // Every scan resolves every agent: in turn with the agents' tests, which point them at stand-ins.
+        let _turn = crate::agents::tests::agent_env().await;
+        let fixture = Fixture::new("agents");
+        let profile = &fixture.profile;
+        let id = agent_without_cli();
+        let label = agent_label(id);
+        let with_agents = |version: &'static str| {
+            let package = fixture.package(version, "a");
+            let runtime = fixture.runtime();
+            async move { install(profile, &package, AGENTS, &runtime).await.unwrap() }
+        };
+
+        // Before any installation, the person connected the agent with a Sidevoice run by its own path: an entry of
+        // Sidevoice's that is not the installation's command. Installing writes it again with that command: the
+        // person chose that agent already.
+        let by_path = HostAgents::new(profile.clone()).unwrap();
+        let connected = by_path.handle("agents.connect", json!({"id": id})).await;
+        assert!(connected.get("error").is_none(), "{connected}");
+        let first = with_agents("1.0.0").await;
+        assert_eq!(first["agents"][id]["outcome"], "registered", "{first}");
+        assert_eq!(registration(profile, id).await, "connected");
+        assert!(advised(profile, &first, id), "{first}");
+
+        // Its current entry is left as it is.
+        let second = with_agents("2.0.0").await;
+        assert_eq!(second["agents"][id]["outcome"], "registered", "{second}");
+        assert_eq!(registration(profile, id).await, "connected");
+
+        // Without Sidevoice (the person removed it), installing leaves it so and says how to connect it. No agent
+        // found is connected.
+        let installer = HostAgents::for_installer(profile.clone()).unwrap();
+        let removed = installer
+            .handle("agents.disconnect", json!({"id": id}))
+            .await;
+        assert!(removed.get("error").is_none(), "{removed}");
+        let mut third = with_agents("2.0.0").await;
+        let agent = &third["agents"][id];
+        assert_eq!(agent["outcome"], "not-connected", "{third}");
+        let command = format!("sidevoice agents connect {id}");
+        assert_eq!(agent["command"], command.as_str());
+        for (found, agent) in third["agents"].as_object().unwrap() {
+            assert_ne!(agent["outcome"], "registered", "{found}: {third}");
+        }
+        assert_eq!(registration(profile, id).await, "not-connected");
+        let said = human_install(&third);
+        assert!(
+            said.contains(&format!(
+                "{label} does not use Sidevoice; to connect it, use the Sidevoice app or run `{command}`."
+            )),
+            "{said}"
+        );
+        assert!(!advised(profile, &third, id), "{third}");
+        assert!(offerable(&third).contains(&(id.to_owned(), label.clone())));
+
+        // At a terminal the person chooses it: connected as `agents connect` connects it.
+        let mut asked = Vec::new();
+        let chosen = ask(
+            &offerable(&third),
+            &mut format!("{id}\n").as_bytes(),
+            &mut asked,
+        )
+        .unwrap();
+        assert_eq!(chosen, [id]);
+        connect_chosen(profile, &mut third, &chosen).await;
+        assert_eq!(third["agents"][id]["outcome"], "registered", "{third}");
+        assert_eq!(registration(profile, id).await, "connected");
+        assert!(advised(profile, &third, id), "{third}");
+    }
+
+    #[test]
+    fn the_offer_is_made_only_to_a_person_at_a_terminal() {
+        let ci = |value: &str| Some(std::ffi::OsString::from(value));
+        assert!(may_offer(false, false, true, None));
+        for unset in ["", "0", "false"] {
+            assert!(
+                may_offer(false, false, true, ci(unset).as_deref()),
+                "CI={unset:?}"
+            );
+        }
+        assert!(
+            !may_offer(true, false, true, None),
+            "--json: a program reads the answer"
+        );
+        assert!(!may_offer(false, true, true, None), "--no-prompt");
+        assert!(!may_offer(false, false, false, None), "no terminal");
+        for set in ["true", "1"] {
+            assert!(
+                !may_offer(false, false, true, ci(set).as_deref()),
+                "CI={set:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_offer_chooses_none_unless_told_all_or_which() {
+        let offered = [("first", "First Agent"), ("second", "Second Agent")]
+            .map(|(id, label)| (id.to_owned(), label.to_owned()));
+        let answer = |input: &str| {
+            let mut said = Vec::new();
+            let chosen = ask(&offered, &mut input.as_bytes(), &mut said).unwrap();
+            (chosen, String::from_utf8(said).unwrap())
+        };
+        let (chosen, said) = answer("\n");
+        assert!(chosen.is_empty(), "Enter is none");
+        assert!(
+            said.contains("1. First Agent")
+                && said.contains("2. Second Agent")
+                && said.contains("[none]"),
+            "{said}"
+        );
+        for none in ["", "none\n", "N\n", " no \n"] {
+            assert!(answer(none).0.is_empty(), "{none:?}");
+        }
+        for all in ["all\n", "A\n"] {
+            assert_eq!(answer(all).0, ["first", "second"], "{all:?}");
+        }
+        assert_eq!(answer("2\n").0, ["second"]);
+        assert_eq!(answer("2, 1 2\n").0, ["second", "first"]);
+        assert_eq!(answer("second\n").0, ["second"]);
+        // An answer not understood chooses nothing and is asked again.
+        let (chosen, said) = answer("3\nyes\n1\n");
+        assert_eq!(chosen, ["first"]);
+        assert_eq!(said.matches("[none]").count(), 3, "{said}");
+        assert!(
+            answer("0\n").0.is_empty(),
+            "not understood, then the end of input"
+        );
     }
 
     #[tokio::test]

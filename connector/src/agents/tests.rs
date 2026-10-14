@@ -10,7 +10,7 @@ struct Fixture {
 
 /// Agent tests take turns: an agent's CLI is found through process-wide variables (`SIDEVOICE_<AGENT>_BIN`) that some
 /// of them set, and every scan resolves every agent, so two at once would run each other's stand-ins.
-async fn agent_env() -> tokio::sync::MutexGuard<'static, ()> {
+pub(crate) async fn agent_env() -> tokio::sync::MutexGuard<'static, ()> {
     static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     LOCK.lock().await
 }

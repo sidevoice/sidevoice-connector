@@ -1,8 +1,9 @@
 //! `install` and `uninstall` from a package laid out as the release archive lays it out (this build and the real
 //! pinned core), in a private profile with no service manager (`SIDEVOICE_SERVICE_MANAGER=none`): the release is
-//! staged and selected, the connector started from it starts its core and both answer, the agents found are
-//! registered with the installation's command; installing again recovers the same release; uninstalling stops both,
-//! removes the registration, the releases and the data, and leaves the locks and the stop.
+//! staged and selected, the connector started from it starts its core and both answer, the agents found are listed
+//! and none is connected; one connected with `agents connect` runs the installation's command; installing again
+//! recovers the same release and keeps that registration; uninstalling stops both, removes the registration, the
+//! releases and the data, and leaves the locks and the stop.
 //!
 //! Upgrades, rollback and pruning are the unit tests' (`src/install.rs`): this binary is one version.
 
@@ -73,7 +74,7 @@ impl Drop for Teardown<'_> {
 }
 
 #[test]
-fn install_runs_the_pair_registers_the_agents_and_uninstall_leaves_only_the_locks() {
+fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks() {
     let Some((archive, record)) = pinned_core() else {
         return;
     };
@@ -123,12 +124,23 @@ fn install_runs_the_pair_registers_the_agents_and_uninstall_leaves_only_the_lock
     });
     mcp.stop();
 
-    // Cursor (its configuration directory is there) runs the installation's command.
+    // Cursor (its configuration directory is there) is found and left without Sidevoice, with the command that
+    // connects it; connected with it, it runs the installation's command.
     assert_eq!(
-        installed["agents"]["cursor"]["outcome"], "registered",
+        installed["agents"]["cursor"]["outcome"], "not-connected",
+        "{installed}"
+    );
+    assert_eq!(
+        installed["agents"]["cursor"]["command"], "sidevoice agents connect cursor",
         "{installed}"
     );
     let cursor = profile.root.join("cursor/config/mcp.json");
+    assert!(
+        read_json(&cursor).is_none_or(|config| config["mcpServers"].get("sidevoice").is_none()),
+        "installing connected Cursor"
+    );
+    let (ok, connected) = run(&profile, &stable, &["agents", "connect", "cursor"]);
+    assert!(ok, "{connected}");
     let config = read_json(&cursor).unwrap();
     assert_eq!(
         config["mcpServers"]["sidevoice"]["command"],

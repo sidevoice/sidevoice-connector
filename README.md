@@ -48,8 +48,11 @@ your machine (`@sidevoice/sidevoice-<os>-<cpu>`, with the core inside); installi
    npx sidevoice install
    ```
 
-   It installs and starts this machine's core, registers the voice tools with the agents it finds, and tells you
-   what, if anything, needs a manual step (see [Supported agents](#supported-agents)).
+   It installs and starts this machine's core and lists the agents it finds. It connects none of them by itself:
+   run in a terminal, it offers to connect them (none unless you choose); otherwise connect each one you want from
+   the desktop app, or with `npx sidevoice agents connect <claude|codex|cursor>`. It tells you what, if anything,
+   needs a manual step (see [Supported agents](#supported-agents)). An agent you connected with an older Sidevoice
+   stays connected.
 
    A release candidate, when there is one: `npx sidevoice@next install`.
 
@@ -63,9 +66,9 @@ your machine (`@sidevoice/sidevoice-<os>-<cpu>`, with the core inside); installi
 
 | Agent | Setup | What you say reaches the conversation |
 |---|---|---|
-| Claude Code | Registered by `install`. | Delivered into the running session. |
-| Codex | Registered by `install` through the Codex CLI (without it, `install` prints what to add to `~/.codex/config.toml`); then restart Codex. | Queued into the thread with `codex queue`. |
-| Cursor (experimental) | Registered by `install` in `~/.cursor/mcp.json`; approve the new MCP server once. | Cursor offers no route of its own. The CLI receives it only in a chat started with `cursor-agent persist` (needs tmux); the editor, only through Cursor's Desktop Bridge (it must be on, and `sqlite3` installed), once Cursor has recorded the chat's join call; until then nothing is sent. |
+| Claude Code | Connected when you choose it. | Delivered into the running session. |
+| Codex | Connected when you choose it, through the Codex CLI (without it, Sidevoice prints what to add to `~/.codex/config.toml`); then restart Codex. | Queued into the thread with `codex queue`. |
+| Cursor (experimental) | Connected when you choose it, in `~/.cursor/mcp.json`; approve the new MCP server once. | Cursor offers no route of its own. The CLI receives it only in a chat started with `cursor-agent persist` (needs tmux); the editor, only through Cursor's Desktop Bridge (it must be on, and `sqlite3` installed), once Cursor has recorded the chat's join call; until then nothing is sent. |
 
 Any other agent can receive through an HTTP endpoint of its own (`SIDEVOICE_DELIVERY_URL`).
 
@@ -87,7 +90,7 @@ English message.
 
 | Command | What it does |
 |---|---|
-| `install` | Installs this package's connector and the core it carries (or updates to them), starts both, checks they answer (or goes back to the previous version), then registers the voice tools with the agents it finds. `--no-agents` registers none. |
+| `install` | Installs this package's connector and the core it carries (or updates to them), starts both, checks they answer (or goes back to the previous version), then lists the agents it finds and how to connect each one. It connects none by itself; in a terminal it offers to (`--no-prompt` does not ask). An agent connected by an older Sidevoice is kept working. `--no-agents` leaves the agents alone. |
 | `uninstall` | The reverse of `install`: stops Sidevoice, removes its service jobs and the agent registrations it wrote, then what it installed and its data. Agent configuration it did not write is never edited. |
 | `pair-device` | Prints a one-time code (and its QR) that pairs a device with this machine. |
 | `pair <room-url> <code>` | Pairs this machine with a room, with the one-time code the room shows. |
