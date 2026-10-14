@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.9.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.8.1...v0.9.0) (2026-10-14)
+
+
+### Features
+
+* **connector:** check that a connected agent's MCP entry starts and answers ([#108](https://github.com/sidevoice/sidevoice-connector/issues/108)) ([6dcef8d](https://github.com/sidevoice/sidevoice-connector/commit/6dcef8d34656b6a806580409d3d548184284d10e))
+* **connector:** Cursor's editor chats are reached only through its Desktop Bridge ([#115](https://github.com/sidevoice/sidevoice-connector/issues/115)) ([3a3d54b](https://github.com/sidevoice/sidevoice-connector/commit/3a3d54b17fad1bb427ea13139e4c36c4cd9be869))
+* **connector:** report outdated agent entries and act on them ([#105](https://github.com/sidevoice/sidevoice-connector/issues/105)) ([e251b5d](https://github.com/sidevoice/sidevoice-connector/commit/e251b5d159520cce914f2242f1d1b241e8e052bb))
+* **connector:** say per agent what the connector can do and the manual steps ([#107](https://github.com/sidevoice/sidevoice-connector/issues/107)) ([b45f7a3](https://github.com/sidevoice/sidevoice-connector/commit/b45f7a36552fad9bf801389038541f7e283b2385))
+* **connector:** service login on|off|status, start at login without starting or stopping ([#106](https://github.com/sidevoice/sidevoice-connector/issues/106)) ([237ce13](https://github.com/sidevoice/sidevoice-connector/commit/237ce13899a3c6cd60ba63ab8c5ba05e8724d7e9))
+* **connector:** the core's default port is 10829 ([#119](https://github.com/sidevoice/sidevoice-connector/issues/119)) ([6a56cdb](https://github.com/sidevoice/sidevoice-connector/commit/6a56cdb6f2e39610f9dcaf08029a57478ccdf4d9))
+
+
+### Bug Fixes
+
+* **connector:** a Codex conversation reports its effort, the model's default when none was chosen ([#123](https://github.com/sidevoice/sidevoice-connector/issues/123)) ([e28f24d](https://github.com/sidevoice/sidevoice-connector/commit/e28f24dc4983dad6aac294dafa56b022399cb7d2))
+* **connector:** every wire reader ignores unknown fields and enum values ([#117](https://github.com/sidevoice/sidevoice-connector/issues/117)) ([5ee9348](https://github.com/sidevoice/sidevoice-connector/commit/5ee93480e28fbf2bf92751afc00e135ad6acaeb7))
+* **connector:** pass CLAUDE_CONFIG_DIR to Claude Code only when the person's environment sets it ([#110](https://github.com/sidevoice/sidevoice-connector/issues/110)) ([da54743](https://github.com/sidevoice/sidevoice-connector/commit/da5474303093aa3f7d13fed1ddfe2e1fcf1991a7))
+* **connector:** report each conversation's reasoning effort from its transcript ([#99](https://github.com/sidevoice/sidevoice-connector/issues/99)) ([a554912](https://github.com/sidevoice/sidevoice-connector/commit/a5549120962c63e78f3315be283a9d98a66cf32e))
+* **install:** installing registers Sidevoice with no agent; the person connects each one ([#121](https://github.com/sidevoice/sidevoice-connector/issues/121)) ([101a826](https://github.com/sidevoice/sidevoice-connector/commit/101a82691cd8e508cfff4153648bededb7b47912))
+
 ## [0.8.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.8.0...v0.8.1) (2026-10-10)
 
 
