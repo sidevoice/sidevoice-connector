@@ -1125,7 +1125,7 @@ async fn codex_delivery_runs_the_scanned_codex_with_the_login_path() {
 
     let answer = crate::adapters::codex::deliver(
         &json!({"kind":"codex-queue","thread":"t-1"}),
-        &json!({"channel":"voice","session_id":"s","revision":1,"message_id":"m","text":"hola"}),
+        &json!({"channel":"voice","session_id":"s","revision":1,"epoch":1,"message_id":"m","text":"hola"}),
         &fixture.profile,
     )
     .await

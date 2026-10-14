@@ -1174,7 +1174,8 @@ impl Daemon {
                     let mut item = json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,
                         "harness":binding.harness,"thread":binding.thread,"title":binding.title,"delivery":binding.delivery,
                         "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound,
-                        "engine":engine,"working":working});
+                        "engine":engine,"working":working,"input_mode":*binding.input_mode.lock().await,
+                        "initial_reply_context":*binding.initial_reply_context.lock().await});
                     if let Some(fields) = self.registry.get(&binding.harness).status(&binding).await
                     {
                         for (key, value) in fields {

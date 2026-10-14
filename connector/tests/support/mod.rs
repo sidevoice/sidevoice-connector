@@ -549,6 +549,8 @@ pub fn fake_room(status: u16, answer: Value) -> FakeRoom {
 pub struct Presentation {
     pub token: String,
     pub session: String,
+    send: tokio::sync::mpsc::UnboundedSender<Value>,
+    frames: Receiver<Value>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -566,6 +568,8 @@ impl Presentation {
             .expect("device token")
             .to_string();
         let (session_tx, session_rx) = channel();
+        let (frame_tx, frames) = channel();
+        let (send, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let socket = socket.to_path_buf();
         let protocol_token = token.clone();
@@ -597,6 +601,9 @@ impl Presentation {
                 loop {
                     tokio::select! {
                         _ = &mut stopped => break,
+                        Some(outgoing) = send_rx.recv() => {
+                            if ws.send(Message::Text(outgoing.to_string().into())).await.is_err() { break; }
+                        }
                         frame = ws.next() => {
                             let Some(Ok(frame)) = frame else { break };
                             if let Message::Text(text) = frame {
@@ -604,6 +611,7 @@ impl Presentation {
                                 if value["type"] == "voice-session" {
                                     let _ = session_tx.send(value["data"]["session_id"].as_str().unwrap_or("").to_string());
                                 }
+                                let _ = frame_tx.send(value);
                             }
                         }
                     }
@@ -617,8 +625,37 @@ impl Presentation {
         Self {
             token,
             session,
+            send,
+            frames,
             stop: Some(stop),
             thread: Some(thread),
+        }
+    }
+
+    pub fn report_turn(&self, phase: &str, turn_id: &str, text: Option<&str>) {
+        let mut data = json!({"session_id":self.session,"client_msg_id":uuid::Uuid::new_v4().to_string(),
+            "phase":phase,"turn_id":turn_id});
+        if let Some(text) = text {
+            data["text"] = json!(text);
+        }
+        self.send
+            .send(json!({"type":"voice-user-turn","data":data}))
+            .unwrap();
+    }
+
+    pub fn turn_started(&self, turn_id: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let frame = self
+                .frames
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|_| panic!("no turn start for {turn_id}"));
+            if frame["type"] == "voice-user-turn"
+                && frame["data"]["phase"] == "started"
+                && frame["data"]["turn_id"] == turn_id
+            {
+                return frame["data"].clone();
+            }
         }
     }
 }

@@ -156,7 +156,7 @@ fn what_is_typed_on_the_bench_reaches_a_conversation_and_its_reply_shows() {
     // The conversation answers; the bench shows the reply and the input's receipt.
     let said = mcp.tool(
         "voice_say",
-        json!({"session_id": delivered["session_id"], "revision": delivered["revision"],
+        json!({"session_id": delivered["session_id"], "revision": delivered["revision"], "epoch": delivered["epoch"],
                "text": "A reply for the bench"}),
     );
     assert_eq!(said["text_saved"], true, "{said}");

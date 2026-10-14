@@ -84,12 +84,18 @@ fn play_core(link: Arc<Link>, mut frames: tokio::sync::mpsc::Receiver<Message>) 
             let result = match frame["method"].as_str() {
                 Some("binding.register") => {
                     json!({"binding_id":format!("core-{}", params["client_ref"].as_str().unwrap()),
-                    "error":null,"status":"registered_somewhere_new","future":{"nested":{"x":1}}})
+                    "error":null,"epoch":0,"initial_reply_context":{"thread_id":params["thread"],"session_id":format!("binding:core-{}", params["client_ref"].as_str().unwrap()),"revision":0,"epoch":0},"status":"registered_somewhere_new","future":{"nested":{"x":1}}})
                 }
                 Some("speech.publish") => {
-                    json!({"event_id":params["event_id"],"utterance_id":params["utterance_id"],
-                    "text_saved":true,"status":"a_status_from_the_future","reason":"new_reason",
-                    "future":{"nested":[1, 2]}})
+                    if params["text"] == "during turn" {
+                        json!({"event_id":params["event_id"],"utterance_id":params["utterance_id"],
+                            "status":"rejected","terminal":true,"reason":"user_speaking",
+                            "instruction":"The person is speaking; wait for their message."})
+                    } else {
+                        json!({"event_id":params["event_id"],"utterance_id":params["utterance_id"],
+                        "text_saved":true,"status":"a_status_from_the_future","reason":"new_reason",
+                        "future":{"nested":[1, 2]}})
+                    }
                 }
                 _ => json!({}),
             };
@@ -131,7 +137,7 @@ async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_
 
     // input.deliver with extra keys, nested ones in `unheard`, and a channel this connector does not know: delivered,
     // and the agent reads it as voice, the default.
-    let frame = json!({"binding_id":"core-t-1","message_id":"m-1","session_id":"s","revision":3,
+    let frame = json!({"binding_id":"core-t-1","message_id":"m-1","session_id":"s","revision":3,"epoch":1,
         "text":"hello","channel":"a_channel_from_the_future","future_field":{"nested":true},
         "unheard":{"count":1,"replies":[{"text":"earlier","cut":false,"future_reply_field":1}],"future":"x"}});
     let delivered = daemon.handle_incoming("input.deliver", &frame).await;
@@ -144,17 +150,17 @@ async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_
     let header: Value = serde_json::from_str(envelope.lines().next().unwrap()).unwrap();
     assert_eq!(
         header,
-        json!({"channel":"voice","session_id":"s","revision":3,"message_id":"m-1"})
+        json!({"channel":"voice","session_id":"s","revision":3,"epoch":1,"message_id":"m-1"})
     );
-    assert!(envelope.contains("\n\nhello\n\n[Sidevoice] Voice from the room"));
-    assert!(envelope.contains("did not hear 1 of your earlier replies"));
+    assert!(envelope.contains("\n\nhello\n\n[Sidevoice] Reply with voice_say"));
+    assert!(envelope.contains("Complete unheard evidence"));
 
     // speech.publish answered with a status and fields this connector does not know: saved is saved.
     let said = daemon
         .command(
             1,
             "publish",
-            json!({"client_ref":"t-1","session_id":"s","revision":3,"text":"reply",
+            json!({"client_ref":"t-1","session_id":"s","revision":3,"epoch":1,"text":"reply",
                 "future_publish_field":{"nested":1}}),
         )
         .await
@@ -164,6 +170,21 @@ async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_
     assert!(
         daemon.outbox.lock().await.is_empty(),
         "the saved speech left the outbox"
+    );
+    let refused = daemon
+        .command(
+            1,
+            "publish",
+            json!({"client_ref":"t-1","session_id":"s",
+        "revision":3,"epoch":1,"text":"during turn"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused}");
+    assert_eq!(refused["reason"], "user_speaking", "{refused}");
+    assert!(
+        daemon.outbox.lock().await.is_empty(),
+        "a terminal refusal cannot retry as speech"
     );
 
     // node.rendezvous with fields of its own and no refusal: nothing is refused.
@@ -231,7 +252,7 @@ async fn ipc_commands_with_unknown_fields_are_read_for_what_they_know() {
         .command(
             7,
             "publish",
-            json!({"client_ref":"t-2","session_id":"s","revision":1,"text":"queued",
+            json!({"client_ref":"t-2","session_id":"s","revision":1,"epoch":0,"text":"queued",
                 "language":"a_language_from_the_future","future":{"nested":[1]}}),
         )
         .await

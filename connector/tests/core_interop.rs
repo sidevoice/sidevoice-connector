@@ -78,6 +78,7 @@ fn a_conversation_talks_to_the_real_core_through_the_connector() {
     assert_eq!(
         tools,
         [
+            "get_messages",
             "voice_connect",
             "voice_disconnect",
             "voice_pair",
@@ -139,7 +140,7 @@ fn a_conversation_talks_to_the_real_core_through_the_connector() {
     assert_eq!(status["binding_id"], binding, "{status}");
     let said = mcp.tool(
         "voice_say",
-        json!({"session_id": delivered["session_id"], "revision": delivered["revision"],
+        json!({"session_id": delivered["session_id"], "revision": delivered["revision"], "epoch": delivered["epoch"],
                "text": "A reply from the conversation"}),
     );
     assert_eq!(said["text_saved"], true, "{said}");
@@ -238,6 +239,165 @@ fn pair_device_gives_the_cores_code_with_its_qr() {
             && said.contains("\n\nSV1.")
             && said.contains('█'),
         "{result}"
+    );
+    mcp.stop();
+}
+
+#[test]
+fn t16_pull_claim_ack_redelivery_and_mode_handover_use_the_real_core() {
+    let Some(core) = core_dir() else { return };
+    let profile = Profile::new("turns-pull");
+    let _core = profile.start_core(&core, "turns-pull-core");
+    let _connector = profile.start_connector();
+    profile.wait_linked("turns-pull-core");
+    let call = Presentation::open(&profile.core_socket());
+    let receiver = http_receiver();
+    let thread = "turns-pull-thread";
+    let mut command = profile.connector(&["mcp"]);
+    command
+        .env("SIDEVOICE_THREAD", thread)
+        .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+    let mut mcp = Mcp::start(command);
+    mcp.initialize("turns-pull-client");
+    let joined = mcp.tool("voice_connect", json!({"input_mode":"pull"}));
+    assert_eq!(joined["delivery"], "pull", "{joined}");
+    assert_eq!(joined["initial_reply_context"]["epoch"], 0, "{joined}");
+    let selected = core_json(
+        &profile.core_socket(),
+        "POST",
+        "/api/presentation/select",
+        Some(&json!({"session_id":call.session,"thread_id":thread})),
+        Some(&call.token),
+    );
+    let id = uuid::Uuid::new_v4().to_string();
+    let posted = core_json(
+        &profile.core_socket(),
+        "POST",
+        "/api/presentation/text",
+        Some(
+            &json!({"text":"Pull words","session_id":call.session,"thread_id":thread,
+            "binding_id":selected["binding"]["binding_id"],"message_id":id}),
+        ),
+        Some(&call.token),
+    );
+    assert_eq!(posted["accepted"], true, "{posted}");
+    assert!(receiver
+        .bodies
+        .recv_timeout(Duration::from_millis(250))
+        .is_err());
+    let check = mcp.tool("get_messages", json!({"operation":"check"}));
+    assert_eq!(check["count"], 1, "{check}");
+    let first = mcp.tool("get_messages", json!({}));
+    assert_eq!(first["messages"][0]["message_id"], id, "{first}");
+    assert_eq!(first["messages"][0]["epoch"], 0, "{first}");
+    assert!(first["messages"][0]["envelope"]
+        .as_str()
+        .unwrap()
+        .contains("Pull words"));
+    let again = mcp.tool("get_messages", json!({}));
+    assert_eq!(again["messages"][0]["message_id"], id, "{again}");
+    let ack = mcp.tool("get_messages", json!({"ack_ids":[id]}));
+    assert_eq!(ack["acknowledged"], 1, "{ack}");
+    assert_eq!(ack["count"], 0, "{ack}");
+    let push = mcp.tool("voice_connect", json!({"input_mode":"push"}));
+    assert_eq!(push["delivery"], "push", "{push}");
+    let id2 = uuid::Uuid::new_v4().to_string();
+    let posted = core_json(
+        &profile.core_socket(),
+        "POST",
+        "/api/presentation/text",
+        Some(
+            &json!({"text":"Push words","session_id":call.session,"thread_id":thread,
+            "binding_id":selected["binding"]["binding_id"],"message_id":id2}),
+        ),
+        Some(&call.token),
+    );
+    assert_eq!(posted["accepted"], true, "{posted}");
+    let pushed = receiver
+        .bodies
+        .recv_timeout(Duration::from_secs(15))
+        .unwrap();
+    assert_eq!(pushed["message_id"], id2, "{pushed}");
+    assert_eq!(pushed["epoch"], 0, "{pushed}");
+    assert!(pushed["envelope"].as_str().unwrap().contains("Push words"));
+    mcp.stop();
+}
+
+#[test]
+fn t02c_t02d_open_turn_refusal_is_terminal_and_empty_notice_is_pullable() {
+    let Some(core) = core_dir() else { return };
+    let profile = Profile::new("turns-refusal");
+    let _core = profile.start_core(&core, "turns-refusal-core");
+    let _connector = profile.start_connector();
+    profile.wait_linked("turns-refusal-core");
+    let call = Presentation::open(&profile.core_socket());
+    let receiver = http_receiver();
+    let thread = "turns-refusal-thread";
+    let mut command = profile.connector(&["mcp"]);
+    command
+        .env("SIDEVOICE_THREAD", thread)
+        .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+    let mut mcp = Mcp::start(command);
+    mcp.initialize("turns-refusal-client");
+    let joined = mcp.tool("voice_connect", json!({"input_mode":"pull"}));
+    assert_eq!(joined["delivery"], "pull", "{joined}");
+    core_json(
+        &profile.core_socket(),
+        "POST",
+        "/api/presentation/select",
+        Some(&json!({"session_id":call.session,"thread_id":thread})),
+        Some(&call.token),
+    );
+    call.report_turn("started", "open", None);
+    let started = call.turn_started("open");
+    assert_eq!(started["epoch"], 1, "{started}");
+    let args = json!({"text":"Reply during the turn","session_id":call.session,
+        "revision":started["revision"],"epoch":started["epoch"],
+        "event_id":"refused-event","utterance_id":"refused-utterance"});
+    let refused = mcp.tool("voice_say", args.clone());
+    assert_eq!(refused["status"], "rejected", "{refused}");
+    assert_eq!(refused["reason"], "user_speaking", "{refused}");
+    assert!(refused["instruction"]
+        .as_str()
+        .unwrap()
+        .contains("Wait for their message"));
+    let outbox: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(profile.data().join("outbox.json")).unwrap())
+            .unwrap();
+    assert_eq!(outbox, json!([]), "refusal left queued audio: {outbox}");
+    call.report_turn("finished", "open", Some(""));
+    let note = until("empty-turn note in the pull queue", 15, || {
+        let page = mcp.tool("get_messages", json!({}));
+        page["messages"].as_array().and_then(|messages| {
+            messages
+                .iter()
+                .find(|message| message["notice"]["kind"] == "turn_empty")
+                .cloned()
+        })
+    });
+    assert_eq!(note["channel"], "note", "{note}");
+    assert_eq!(note["text"], "", "{note}");
+    assert!(note["envelope"]
+        .as_str()
+        .unwrap()
+        .contains("person sent no words"));
+    let after = mcp.tool("voice_say", args);
+    assert_eq!(after["status"], "rejected", "{after}");
+    assert_eq!(after["reason"], "user_speaking", "{after}");
+    let history = core_json(
+        &profile.core_socket(),
+        "GET",
+        &format!("/api/presentation/history?thread_id={thread}"),
+        None,
+        Some(&call.token),
+    );
+    assert!(
+        history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["role"] != "assistant"),
+        "refused speech created a reply bubble: {history}"
     );
     mcp.stop();
 }

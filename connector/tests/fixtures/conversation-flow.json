@@ -1,0 +1,55 @@
+{
+  "text": "é🐙ab",
+  "playback": [
+    {
+      "voice": {"status": "heard"},
+      "core": {"status": "heard"},
+      "history": {"status": "playback_finished", "audio_reason": null, "heard_chars": 4, "globally_heard": true}
+    },
+    {
+      "voice": {"status": "heard-up-to", "heard_chars": 2, "reason": {"reason": "barge-in"}},
+      "core": {"status": "interrupted", "reason": "user_interrupted", "heard_chars": 2},
+      "history": {"status": "interrupted", "audio_reason": "user_interrupted", "heard_chars": 2, "globally_heard": false}
+    },
+    {
+      "voice": {"status": "not-played", "reason": {"reason": "barge-in"}},
+      "core": {"status": "unplayed", "reason": "newer_turn"},
+      "history": {"status": "interrupted", "audio_reason": "newer_turn", "heard_chars": null, "globally_heard": false}
+    },
+    {
+      "voice": {"type": "agent-interrupted", "utterance_id": "local-handle", "heard_until": 0, "played": true},
+      "core": {"status": "interrupted", "reason": "user_interrupted", "heard_chars": 0},
+      "history": {"status": "interrupted", "audio_reason": "user_interrupted", "heard_chars": 0, "globally_heard": false}
+    },
+    {
+      "voice": {"type": "agent-interrupted", "utterance_id": "local-handle", "heard_until": 0, "played": false},
+      "core": {"status": "unplayed", "reason": "newer_turn"},
+      "history": {"status": "interrupted", "audio_reason": "newer_turn", "heard_chars": null, "globally_heard": false}
+    },
+    {
+      "voice": {"status": "heard-up-to", "heard_chars": 1, "reason": {"reason": "cancelled"}, "local_action": "skip"},
+      "core": {"status": "interrupted", "reason": "user_skipped", "heard_chars": 1},
+      "history": {"status": "skipped", "audio_reason": "user_skipped", "heard_chars": 4, "globally_heard": true}
+    },
+    {
+      "voice": {"status": "not-played", "reason": {"reason": "cancelled"}, "local_action": "skip"},
+      "core": {"status": "unplayed", "reason": "user_skipped"},
+      "history": {"status": "skipped", "audio_reason": "user_skipped", "heard_chars": 4, "globally_heard": true}
+    },
+    {
+      "voice": {"status": "heard-up-to", "heard_chars": 2, "reason": {"reason": "stopped"}, "local_action": "voice_off"},
+      "core": {"status": "interrupted", "reason": "voice_off", "heard_chars": 2},
+      "history": {"status": "interrupted", "audio_reason": "voice_off", "heard_chars": 2, "globally_heard": false}
+    },
+    {
+      "voice": {"status": "heard-up-to", "heard_chars": 2, "reason": {"reason": "failed", "code": "speech-failed"}},
+      "core": {"status": "failed", "heard_chars": 2},
+      "history": {"status": "failed", "audio_reason": "playback_failed", "heard_chars": 2, "globally_heard": false}
+    }
+  ],
+  "turns": [
+    {"voice": {"phase": "cancelled", "turn_id": "earlier", "merged": true}, "core": {"type": "voice-user-turn", "data": {"session_id": "SESSION", "client_msg_id": "C1", "phase": "cancelled", "turn_id": "earlier", "merged": true}}, "meaning": "transfer empty obligation to continuing turn"},
+    {"voice": {"phase": "finished", "turn_id": "later", "text": "Merged words", "merged": true}, "core": {"type": "voice-user-turn", "data": {"session_id": "SESSION", "client_msg_id": "C2", "phase": "finished", "turn_id": "later", "text": "Merged words", "merged": true}}, "meaning": "transcript already includes earlier turn"},
+    {"voice": {"phase": "finished", "turn_id": "offline", "text": "Offline words", "merged": false}, "core": {"type": "voice-user-turn", "data": {"session_id": "SESSION", "client_msg_id": "C3", "phase": "finished", "turn_id": "offline", "text": "Offline words", "offline": true, "thread_id": "t", "binding_id": "FOCUS_BINDING", "started_at": 1792000000000}}, "meaning": "accept once at captured focus and assign one epoch"}
+  ]
+}
