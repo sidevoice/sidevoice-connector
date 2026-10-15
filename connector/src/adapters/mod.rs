@@ -14,6 +14,61 @@ pub use harness::{Harness, Registry, Route};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
+pub(crate) const PULL_POSITION_FIELD: &str = "cursor";
+const PULL_PAGE_TARGET_BYTES: usize = 1 << 20;
+
+/// Render a core page before exposing its claims. Include complete evidence in the measured IPC
+/// response and return an ordered prefix when a whole page expands beyond the usual page budget.
+pub(crate) fn prepare_pull_page(result: &mut Value, after: u64) -> Result<()> {
+    let messages = result
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .context("pull messages missing")?;
+    for message in messages.iter_mut() {
+        message["session_id"]
+            .as_str()
+            .context("pull session_id missing")?;
+        message["revision"]
+            .as_i64()
+            .context("pull revision missing")?;
+        message["epoch"].as_u64().context("pull epoch missing")?;
+        message["message_id"]
+            .as_str()
+            .context("pull message_id missing")?;
+        message[PULL_POSITION_FIELD]
+            .as_u64()
+            .context("pull cursor missing")?;
+        message["envelope"] = json!(envelope(message)?);
+    }
+    let all = std::mem::take(messages);
+    let total = all.len();
+    let core_more = result["more"] == true;
+    for message in all {
+        result["messages"].as_array_mut().unwrap().push(message);
+        let exposed = result["messages"].as_array().unwrap().len();
+        result[PULL_POSITION_FIELD] = result["messages"][exposed - 1][PULL_POSITION_FIELD].clone();
+        result["more"] = json!(core_more || exposed < total);
+        let bytes =
+            serde_json::to_vec(&json!({"id":u64::MAX,"ok":true,"result":result}))?.len() + 1;
+        if bytes > crate::IPC_FRAME_LIMIT || (exposed > 1 && bytes > PULL_PAGE_TARGET_BYTES) {
+            result["messages"].as_array_mut().unwrap().pop();
+            break;
+        }
+    }
+    let exposed = result["messages"].as_array().unwrap();
+    if total > 0 && exposed.is_empty() {
+        bail!("one complete pull message exceeds the IPC frame limit");
+    }
+    let position = exposed.last().map_or_else(
+        || json!(after),
+        |message| message[PULL_POSITION_FIELD].clone(),
+    );
+    let more = core_more || exposed.len() < total;
+    result[PULL_POSITION_FIELD] = position;
+    result["more"] = json!(more);
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct Identity {
     pub harness: String,

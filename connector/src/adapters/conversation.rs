@@ -30,6 +30,7 @@ pub struct Conversation {
     pub pending: Mutex<VecDeque<String>>,
     pub turns: Mutex<HashMap<String, (String, u64)>>,
     pub input_context: Mutex<HashMap<String, (String, i64)>>,
+    pub recent_inputs: Mutex<VecDeque<(String, String)>>,
     pub read: Mutex<VecDeque<String>>,
     pub working: Mutex<Option<bool>>,
     pub stopped: AtomicBool,
@@ -37,6 +38,42 @@ pub struct Conversation {
 }
 
 impl Conversation {
+    /// Keep recent reply routing without retaining a long-lived pull binding's entire journal.
+    pub async fn remember_input(&self, id: &str, session: &str, revision: i64, epoch: u64) {
+        let key = format!("{session}:{revision}");
+        let mut recent = self.recent_inputs.lock().await;
+        recent.retain(|(seen, _)| seen != id);
+        recent.push_back((id.to_owned(), key.clone()));
+        let mut turns = self.turns.lock().await;
+        let mut context = self.input_context.lock().await;
+        turns.insert(key, (id.to_owned(), epoch));
+        context.insert(id.to_owned(), (session.to_owned(), revision));
+        while recent.len() > 512 {
+            if let Some((old_id, old_key)) = recent.pop_front() {
+                context.remove(&old_id);
+                if turns
+                    .get(&old_key)
+                    .is_some_and(|(current, _)| current == &old_id)
+                {
+                    turns.remove(&old_key);
+                }
+            }
+        }
+    }
+
+    pub async fn forget_input(&self, id: &str, session: &str, revision: i64) {
+        let key = format!("{session}:{revision}");
+        self.recent_inputs
+            .lock()
+            .await
+            .retain(|(seen, _)| seen != id);
+        let mut turns = self.turns.lock().await;
+        if turns.get(&key).is_some_and(|(current, _)| current == id) {
+            turns.remove(&key);
+        }
+        self.input_context.lock().await.remove(id);
+    }
+
     /// The kind of route voice reaches it by (`delivery.kind`).
     pub fn route_kind(&self) -> Option<&str> {
         self.delivery.get("kind").and_then(Value::as_str)

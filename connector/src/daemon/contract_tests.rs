@@ -3,6 +3,7 @@
 //! ignored, an unknown value gets its defined default, and nothing is refused for them.
 
 use super::Daemon;
+use crate::adapters::{prepare_pull_page, PULL_POSITION_FIELD};
 use crate::adapters::{Conversation, Harness, Registry, Route};
 use crate::link::Link;
 use crate::profile::Profile;
@@ -97,6 +98,24 @@ fn play_core(link: Arc<Link>, mut frames: tokio::sync::mpsc::Receiver<Message>) 
                         "future":{"nested":[1, 2]}})
                     }
                 }
+                Some("input.pull") => {
+                    let after = params["after"].as_u64().unwrap_or(0);
+                    let next = after + 1;
+                    let messages = if params["operation"] == "get" && next <= 620 {
+                        let mut message = json!({"message_id":format!("pull-{next}"),"session_id":"s",
+                            "revision":next,"epoch":next,"channel":"voice","text":"words",
+                            "arrival_time":1792000000});
+                        message[PULL_POSITION_FIELD] = json!(next);
+                        vec![message]
+                    } else {
+                        Vec::new()
+                    };
+                    let count = messages.len();
+                    let mut page = json!({"messages":messages,"count":count,"more":false,
+                        "acknowledged":params["ack_ids"].as_array().map_or(0,Vec::len)});
+                    page[PULL_POSITION_FIELD] = json!(if count == 0 { after } else { next });
+                    page
+                }
                 _ => json!({}),
             };
             link.answer(
@@ -106,6 +125,50 @@ fn play_core(link: Arc<Link>, mut frames: tokio::sync::mpsc::Receiver<Message>) 
             .unwrap();
         }
     });
+}
+
+#[test]
+fn t16_complete_pull_pages_fit_ipc_and_keep_the_next_position() {
+    let source: Vec<Value> = (1..=32)
+        .map(|n| {
+            let mut message = json!({"message_id":format!("m-{n}"),"session_id":"s","revision":n,
+                "epoch":0,"channel":"voice","text":"\"".repeat(12_000),
+                "arrival_time":1792000000});
+            message[PULL_POSITION_FIELD] = json!(n);
+            message
+        })
+        .collect();
+    let raw = json!({"messages":source.clone(),"count":32,"more":false});
+    assert!(serde_json::to_vec(&raw).unwrap().len() < 1 << 20);
+    let mut delivered = Vec::new();
+    let mut position = 0;
+    while delivered.len() < 32 {
+        let mut page = json!({"messages":source.iter().filter(|m| m[PULL_POSITION_FIELD].as_u64().unwrap() > position).cloned().collect::<Vec<_>>(),
+            "count":32-delivered.len(),"more":false});
+        prepare_pull_page(&mut page, position).unwrap();
+        let messages = page["messages"].as_array().unwrap();
+        assert!(!messages.is_empty());
+        assert!(
+            serde_json::to_vec(&json!({"id":u64::MAX,"ok":true,"result":page.clone()}))
+                .unwrap()
+                .len()
+                + 1
+                <= crate::IPC_FRAME_LIMIT
+        );
+        for message in messages {
+            assert!(message["envelope"]
+                .as_str()
+                .unwrap()
+                .contains(&"\"".repeat(12_000)));
+            delivered.push(message["message_id"].as_str().unwrap().to_owned());
+        }
+        position = page[PULL_POSITION_FIELD].as_u64().unwrap();
+        assert_eq!(page["more"], delivered.len() < 32);
+    }
+    assert_eq!(
+        delivered,
+        (1..=32).map(|n| format!("m-{n}")).collect::<Vec<_>>()
+    );
 }
 
 /// The core link: the frames a newer core sends this daemon (`connector.welcome`, `input.deliver`,
@@ -342,4 +405,53 @@ async fn a_detached_pull_binding_reconnects_under_its_original_client_ref() {
     );
     assert_eq!(binding.owner.load(std::sync::atomic::Ordering::Relaxed), 8);
     assert_eq!(*binding.input_mode.lock().await, "pull");
+}
+
+#[tokio::test]
+async fn acknowledged_pull_pages_keep_recent_routing_bounded_across_rejoin() {
+    let scratch = Scratch::new("pull-context-bound");
+    let link = Link::new();
+    let core = link.attached().await;
+    play_core(link.clone(), core);
+    let (daemon, _) = daemon(&scratch, link);
+    let mut params = registration("pull-bound");
+    params["input_mode"] = json!("pull");
+    daemon.command(7, "register", params.clone()).await.unwrap();
+    let binding = daemon.bindings.lock().await["pull-bound"].clone();
+    for after in 0..620 {
+        let ack_ids = if after == 0 {
+            vec![]
+        } else {
+            vec![format!("pull-{after}")]
+        };
+        let page = daemon
+            .command(
+                7,
+                "get_messages",
+                json!({"client_ref":"pull-bound","after":after,"ack_ids":ack_ids}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page["messages"][0]["message_id"],
+            format!("pull-{}", after + 1)
+        );
+    }
+    daemon
+        .command(
+            7,
+            "get_messages",
+            json!({"client_ref":"pull-bound","after":620,
+        "ack_ids":["pull-620"]}),
+        )
+        .await
+        .unwrap();
+    assert!(binding.input_context.lock().await.is_empty());
+    assert_eq!(binding.recent_inputs.lock().await.len(), 512);
+    assert_eq!(binding.turns.lock().await.len(), 512);
+    assert!(!binding.turns.lock().await.contains_key("s:1"));
+    binding.owner.store(0, std::sync::atomic::Ordering::Relaxed);
+    daemon.command(8, "register", params).await.unwrap();
+    assert!(binding.input_context.lock().await.is_empty());
+    assert_eq!(binding.recent_inputs.lock().await.len(), 512);
 }

@@ -100,7 +100,7 @@ impl Ipc {
         tokio::spawn(async move {
             let mut reader = BufReader::new(read);
             loop {
-                let line = match crate::bounded_line(&mut reader, 1 << 20).await {
+                let line = match crate::bounded_line(&mut reader, crate::IPC_FRAME_LIMIT).await {
                     Ok(Some(v)) => v,
                     _ => break,
                 };

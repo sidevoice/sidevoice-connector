@@ -494,3 +494,64 @@ fn t07_retry_identifiers_are_a_pair_and_one_pair_creates_one_reply() {
     );
     mcp.stop();
 }
+
+#[test]
+fn t16_large_valid_pull_page_arrives_in_complete_cursor_order() {
+    let Some(core) = core_dir() else { return };
+    let profile = Profile::new("pull-large-page");
+    let _core = profile.start_core(&core, "pull-large-core");
+    let _connector = profile.start_connector();
+    profile.wait_linked("pull-large-core");
+    let call = Presentation::open(&profile.core_socket());
+    let thread = "pull-large-thread";
+    let mut command = profile.connector(&["mcp"]);
+    command.env("SIDEVOICE_THREAD", thread);
+    let mut mcp = Mcp::start(command);
+    mcp.initialize("pull-large-client");
+    mcp.tool("voice_connect", json!({"input_mode":"pull"}));
+    let selected = core_json(
+        &profile.core_socket(),
+        "POST",
+        "/api/presentation/select",
+        Some(&json!({"session_id":call.session,"thread_id":thread})),
+        Some(&call.token),
+    );
+    let words = "\"".repeat(12_000);
+    let mut ids = Vec::new();
+    for _ in 0..32 {
+        let id = uuid::Uuid::new_v4().to_string();
+        let posted = core_json(
+            &profile.core_socket(),
+            "POST",
+            "/api/presentation/text",
+            Some(
+                &json!({"text":words,"session_id":call.session,"thread_id":thread,
+                "binding_id":selected["binding"]["binding_id"],"message_id":id}),
+            ),
+            Some(&call.token),
+        );
+        assert_eq!(posted["accepted"], true, "{posted}");
+        ids.push(id);
+    }
+    let check = mcp.tool("get_messages", json!({"operation":"check"}));
+    assert_eq!(check["count"], 32, "{check}");
+    let mut cursor = 0;
+    let mut received = Vec::new();
+    while received.len() < ids.len() {
+        let page = mcp.tool("get_messages", json!({"after":cursor}));
+        let messages = page["messages"].as_array().unwrap();
+        assert!(!messages.is_empty(), "{page}");
+        for message in messages {
+            assert_eq!(message["text"], words);
+            assert!(message["envelope"].as_str().unwrap().contains(&words));
+            received.push(message["message_id"].as_str().unwrap().to_owned());
+        }
+        cursor = page["cursor"].as_u64().unwrap();
+        assert_eq!(page["more"], received.len() < ids.len(), "{page}");
+    }
+    assert_eq!(received, ids);
+    let ack = mcp.tool("get_messages", json!({"ack_ids":ids,"after":cursor}));
+    assert_eq!(ack["acknowledged"], 32, "{ack}");
+    assert_eq!(ack["count"], 0, "{ack}");
+    mcp.stop();
+}

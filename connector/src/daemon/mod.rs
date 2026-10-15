@@ -745,23 +745,14 @@ impl Daemon {
                 pending.pop_front();
             }
         }
-        {
-            let mut turns = binding.turns.lock().await;
-            turns.insert(
-                format!("{session_id}:{revision}"),
-                (message_id.to_owned(), frame["epoch"].as_u64().unwrap_or(0)),
-            );
-            if turns.len() > 512 {
-                if let Some(oldest) = turns.keys().next().cloned() {
-                    turns.remove(&oldest);
-                }
-            }
-        }
         binding
-            .input_context
-            .lock()
-            .await
-            .insert(message_id.to_owned(), (session_id.to_owned(), revision));
+            .remember_input(
+                message_id,
+                session_id,
+                revision,
+                frame["epoch"].as_u64().unwrap_or(0),
+            )
+            .await;
         match self
             .registry
             .get(&binding.harness)
@@ -771,12 +762,7 @@ impl Daemon {
             Ok(result) => result,
             Err(error) => {
                 binding.pending.lock().await.retain(|id| id != message_id);
-                binding
-                    .turns
-                    .lock()
-                    .await
-                    .remove(&format!("{session_id}:{revision}"));
-                binding.input_context.lock().await.remove(message_id);
+                binding.forget_input(message_id, session_id, revision).await;
                 json!({"status":"failed","detail":error.to_string()})
             }
         }
@@ -894,6 +880,7 @@ impl Daemon {
                     pending: Mutex::new(VecDeque::new()),
                     turns: Mutex::new(HashMap::new()),
                     input_context: Mutex::new(HashMap::new()),
+                    recent_inputs: Mutex::new(VecDeque::new()),
                     read: Mutex::new(VecDeque::new()),
                     working: Mutex::new(None),
                     stopped: AtomicBool::new(false),
@@ -1058,64 +1045,30 @@ impl Daemon {
                     .link
                     .request("input.pull", request, Duration::from_secs(10))
                     .await?;
-                let rendered = (|| -> Result<Vec<_>> {
-                    let messages = result
-                        .get("messages")
-                        .and_then(Value::as_array)
-                        .context("pull messages missing")?;
-                    // Validate and render the entire page before exposing any of its claims to MCP.
-                    messages
-                        .iter()
-                        .map(|message| {
-                            Ok((
-                                message["session_id"]
-                                    .as_str()
-                                    .context("pull session_id missing")?
-                                    .to_owned(),
-                                message["revision"]
-                                    .as_i64()
-                                    .context("pull revision missing")?,
-                                message["epoch"].as_u64().context("pull epoch missing")?,
-                                message["message_id"]
-                                    .as_str()
-                                    .context("pull message_id missing")?
-                                    .to_owned(),
-                                crate::adapters::envelope(message)?,
-                            ))
-                        })
-                        .collect()
-                })();
-                let rendered = match rendered {
-                    Ok(rendered) => rendered,
-                    Err(error) => {
-                        // A malformed page cannot be delivered or acknowledged. End this claim and
-                        // re-register the same binding so core returns the rows to its queue.
-                        let _ = self
-                            .link
-                            .notify("binding.unregister", json!({"binding_id":binding_id}))
-                            .await;
-                        let _ = self.register_core(&binding).await;
-                        return Err(error);
+                if let Err(error) = crate::adapters::prepare_pull_page(
+                    &mut result,
+                    params.get("after").and_then(Value::as_u64).unwrap_or(0),
+                ) {
+                    // A malformed or unrepresentable page cannot be delivered or acknowledged.
+                    let _ = self
+                        .link
+                        .notify("binding.unregister", json!({"binding_id":binding_id}))
+                        .await;
+                    let _ = self.register_core(&binding).await;
+                    return Err(error);
+                }
+                if let Some(ids) = params.get("ack_ids").and_then(Value::as_array) {
+                    let mut context = binding.input_context.lock().await;
+                    for id in ids.iter().filter_map(Value::as_str) {
+                        context.remove(id);
                     }
-                };
-                for (message, (session, revision, epoch, id, envelope)) in result
-                    .get_mut("messages")
-                    .and_then(Value::as_array_mut)
-                    .expect("validated pull page")
-                    .iter_mut()
-                    .zip(rendered)
-                {
-                    binding
-                        .turns
-                        .lock()
-                        .await
-                        .insert(format!("{session}:{revision}"), (id.clone(), epoch));
-                    binding
-                        .input_context
-                        .lock()
-                        .await
-                        .insert(id, (session, revision));
-                    message["envelope"] = json!(envelope);
+                }
+                for message in result["messages"].as_array().expect("validated pull page") {
+                    let session = message["session_id"].as_str().unwrap();
+                    let revision = message["revision"].as_i64().unwrap();
+                    let epoch = message["epoch"].as_u64().unwrap();
+                    let id = message["message_id"].as_str().unwrap();
+                    binding.remember_input(id, session, revision, epoch).await;
                 }
                 Ok(result)
             }
@@ -1374,7 +1327,7 @@ impl Daemon {
             loop {
                 let line = tokio::select! {
                     _ = shutdown.changed() => break,
-                    line = crate::bounded_line(&mut reader, 1 << 20) => line?,
+                    line = crate::bounded_line(&mut reader, crate::IPC_FRAME_LIMIT) => line?,
                 };
                 let Some(line) = line else {
                     break;

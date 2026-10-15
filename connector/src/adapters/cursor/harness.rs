@@ -536,6 +536,7 @@ mod tests {
             pending: AsyncMutex::new(VecDeque::new()),
             turns: AsyncMutex::new(HashMap::new()),
             input_context: AsyncMutex::new(HashMap::new()),
+            recent_inputs: AsyncMutex::new(VecDeque::new()),
             read: AsyncMutex::new(VecDeque::new()),
             working: AsyncMutex::new(None),
             stopped: AtomicBool::new(false),
