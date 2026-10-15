@@ -285,10 +285,9 @@ mod tests {
             ("array", "$.modelConfig.parameters[0].value"),
         ] {
             let sql = format!("SELECT DISTINCT j.fullkey,j.type FROM cursorDiskKV AS c, json_tree(CAST(c.value AS TEXT)) AS j WHERE c.key='composerData:{chat}' AND json_valid(CAST(c.value AS TEXT)) AND (j.fullkey='$.modelConfig' OR j.fullkey LIKE '$.modelConfig.%' OR j.fullkey LIKE '$.modelConfig[%') LIMIT 120;");
-            let inventory = state_db::query(&database_path, &sql)
-                .await
-                .unwrap()
-                .to_string();
+            let inventory =
+                serde_json::to_string(&state_db::query(&database_path, &sql).await.unwrap())
+                    .unwrap();
             assert!(inventory.contains(expected), "{inventory}");
             if chat == "array" {
                 assert!(inventory.contains("$.modelConfig.parameters[0].id"));
