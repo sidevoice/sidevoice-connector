@@ -533,6 +533,7 @@ mod tests {
             owner: AtomicU64::new(1),
             id: AsyncMutex::new("local-1".into()),
             serial: AsyncMutex::new(()),
+            publication: AsyncMutex::new(()),
             pending: AsyncMutex::new(VecDeque::new()),
             turns: AsyncMutex::new(HashMap::new()),
             input_context: AsyncMutex::new(HashMap::new()),

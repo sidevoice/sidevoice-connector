@@ -27,6 +27,7 @@ pub struct Conversation {
     pub owner: AtomicU64,
     pub id: Mutex<String>,
     pub serial: Mutex<()>,
+    pub publication: Mutex<()>,
     pub pending: Mutex<VecDeque<String>>,
     pub turns: Mutex<HashMap<String, (String, u64)>>,
     pub input_context: Mutex<HashMap<String, (String, i64)>>,

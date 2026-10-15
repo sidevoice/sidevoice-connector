@@ -44,7 +44,6 @@ pub struct Daemon {
     link: Arc<Link>,
     bindings: Mutex<HashMap<String, Arc<Conversation>>>,
     outbox: Mutex<Vec<Value>>,
-    publication_serial: Mutex<()>,
     replay_tx: mpsc::Sender<()>,
     host_agents: Arc<HostAgents>,
     registry: Arc<Registry>,
@@ -127,7 +126,6 @@ impl Daemon {
             link,
             bindings: Mutex::new(HashMap::new()),
             outbox: Mutex::new(outbox),
-            publication_serial: Mutex::new(()),
             replay_tx,
             host_agents,
             registry: Arc::new(registry),
@@ -200,6 +198,9 @@ impl Daemon {
             let old = outbox.clone();
             let mut changed = false;
             for item in outbox.iter_mut() {
+                if item["attempted"] == true {
+                    continue;
+                }
                 if item.get("binding_id").and_then(Value::as_str) == Some(current.as_str())
                     || item.get("client_ref").and_then(Value::as_str)
                         == Some(binding.client_ref.as_str())
@@ -468,6 +469,9 @@ impl Daemon {
             .iter_mut()
             .find(|item| item.get("event_id") == Some(event_id))
         {
+            if item["attempted"] == true || item["history_only"] == true {
+                return Ok(());
+            }
             item["history_only"] = json!(true);
             if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
                 *outbox = before;
@@ -477,15 +481,51 @@ impl Daemon {
         Ok(())
     }
 
-    async fn retire_held_audio(&self) -> Result<()> {
-        let _publication = self.publication_serial.lock().await;
+    async fn clear_attempted(&self, event_id: &Value) -> Result<()> {
         let mut outbox = self.outbox.lock().await;
-        if outbox.iter().all(|item| item["history_only"] == true) {
+        let before = outbox.clone();
+        if let Some(item) = outbox
+            .iter_mut()
+            .find(|item| item.get("event_id") == Some(event_id))
+        {
+            item.as_object_mut().unwrap().remove("attempted");
+            if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+                *outbox = before;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    async fn rebind_known_unknown(&self, event_id: &Value, binding_id: &str) -> Result<Value> {
+        let mut outbox = self.outbox.lock().await;
+        let before = outbox.clone();
+        let item = outbox
+            .iter_mut()
+            .find(|item| item.get("event_id") == Some(event_id))
+            .context("speech disappeared during binding repair")?;
+        item["binding_id"] = json!(binding_id);
+        let published = item.clone();
+        if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+            *outbox = before;
+            return Err(error);
+        }
+        Ok(published)
+    }
+
+    async fn retire_held_audio(&self) -> Result<()> {
+        let mut outbox = self.outbox.lock().await;
+        if outbox
+            .iter()
+            .all(|item| item["history_only"] == true || item["attempted"] == true)
+        {
             return Ok(());
         }
         let before = outbox.clone();
         for item in outbox.iter_mut() {
-            item["history_only"] = json!(true);
+            if item["attempted"] != true {
+                item["history_only"] = json!(true);
+            }
         }
         if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
             *outbox = before;
@@ -495,19 +535,34 @@ impl Daemon {
     }
 
     async fn publish_one(&self, speech: &Value) -> Result<Option<Value>> {
-        let _publication = self.publication_serial.lock().await;
         if !self.link.connected().await {
             self.make_history_only(&speech["event_id"]).await?;
             return Ok(None);
         }
-        let mut published = self
-            .outbox
-            .lock()
-            .await
-            .iter()
-            .find(|item| item.get("event_id") == speech.get("event_id"))
-            .cloned()
-            .unwrap_or_else(|| speech.clone());
+        // Persist the attempt before transport can take the frame. A lost answer leaves an
+        // uncertain admission; its immutable fingerprint must never be rewritten or replayed
+        // with late-audio risk.
+        let mut published = {
+            let mut outbox = self.outbox.lock().await;
+            let before = outbox.clone();
+            let Some(item) = outbox
+                .iter_mut()
+                .find(|item| item.get("event_id") == speech.get("event_id"))
+            else {
+                return Ok(None);
+            };
+            if item["attempted"] == true {
+                return Ok(None);
+            }
+            item["attempted"] = json!(true);
+            let published = item.clone();
+            if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+                *outbox = before;
+                return Err(error);
+            }
+            published
+        };
+        published.as_object_mut().unwrap().remove("attempted");
         let result = self
             .link
             .request("speech.publish", published.clone(), Duration::from_secs(15))
@@ -516,7 +571,6 @@ impl Daemon {
             Ok(v) => v,
             Err(error) => {
                 crate::logfile::log(&format!("speech retry retained: {error}"));
-                self.make_history_only(&speech["event_id"]).await?;
                 return Ok(None);
             }
         };
@@ -532,13 +586,9 @@ impl Daemon {
             {
                 if self.register_core(&binding).await.is_ok() {
                     published = self
-                        .outbox
-                        .lock()
-                        .await
-                        .iter()
-                        .find(|item| item.get("event_id") == speech.get("event_id"))
-                        .cloned()
-                        .context("speech disappeared during binding repair")?;
+                        .rebind_known_unknown(&speech["event_id"], &binding.id.lock().await)
+                        .await?;
+                    published.as_object_mut().unwrap().remove("attempted");
                     reply = match self
                         .link
                         .request("speech.publish", published.clone(), Duration::from_secs(15))
@@ -547,14 +597,15 @@ impl Daemon {
                         Ok(value) => value,
                         Err(error) => {
                             crate::logfile::log(&format!("speech retry retained: {error}"));
-                            self.make_history_only(&speech["event_id"]).await?;
                             return Ok(None);
                         }
                     };
                 } else {
+                    self.clear_attempted(&speech["event_id"]).await?;
                     return Ok(None);
                 }
             } else {
+                self.clear_attempted(&speech["event_id"]).await?;
                 return Ok(None);
             }
         }
@@ -577,9 +628,20 @@ impl Daemon {
 
     async fn flush_outbox(&self) {
         let items = self.outbox.lock().await.clone();
+        let mut blocked = std::collections::HashSet::new();
         for speech in items {
+            let Some(client_ref) = speech.get("client_ref").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(binding) = self.bindings.lock().await.get(client_ref).cloned() else {
+                continue;
+            };
+            let _publication = binding.publication.lock().await;
+            if blocked.contains(client_ref) {
+                let _ = self.make_history_only(&speech["event_id"]).await;
+            }
             if self.publish_one(&speech).await.ok().flatten().is_none() {
-                break;
+                blocked.insert(client_ref.to_owned());
             }
         }
     }
@@ -877,6 +939,7 @@ impl Daemon {
                     owner: AtomicU64::new(owner),
                     id: Mutex::new(format!("local-{}", uuid::Uuid::new_v4())),
                     serial: Mutex::new(()),
+                    publication: Mutex::new(()),
                     pending: Mutex::new(VecDeque::new()),
                     turns: Mutex::new(HashMap::new()),
                     input_context: Mutex::new(HashMap::new()),
@@ -989,6 +1052,7 @@ impl Daemon {
                 {
                     bail!("publish requires nonempty event_id and utterance_id together");
                 }
+                let _publication = binding.publication.lock().await;
                 let id = binding.id.lock().await;
                 let history_only = !self.link.connected().await;
                 let speech = json!({"event_id":event_id.map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
@@ -997,22 +1061,31 @@ impl Daemon {
                     "text":text,"language":params.get("language"),"history_only":history_only});
                 self.queue(speech.clone()).await?;
                 drop(id);
-                let first = self
-                    .outbox
-                    .lock()
-                    .await
-                    .first()
-                    .and_then(|item| item.get("event_id"))
-                    .cloned();
-                let answer = if first == speech.get("event_id").cloned() {
-                    self.publish_one(&speech).await?
+                let earlier_same_conversation = self.outbox.lock().await.iter().any(|item| {
+                    item["client_ref"] == speech["client_ref"]
+                        && item["event_id"] != speech["event_id"]
+                });
+                if earlier_same_conversation {
+                    self.make_history_only(&speech["event_id"]).await?;
+                }
+                let answer = self.publish_one(&speech).await?;
+                let mut result = if let Some(answer) = answer {
+                    answer
                 } else {
-                    self.request_replay();
-                    None
+                    let attempted = self
+                        .outbox
+                        .lock()
+                        .await
+                        .iter()
+                        .find(|item| item["event_id"] == speech["event_id"])
+                        .is_some_and(|item| item["attempted"] == true);
+                    if attempted {
+                        json!({"status":"admission_unknown","event_id":speech["event_id"],
+                            "utterance_id":speech["utterance_id"],"instruction":"Core admission is uncertain; wait for the next message before replying again."})
+                    } else {
+                        json!({"status":"queued","event_id":speech["event_id"],"utterance_id":speech["utterance_id"]})
+                    }
                 };
-                let mut result = answer.unwrap_or_else(
-                    || json!({"status":"queued","utterance_id":speech["utterance_id"]}),
-                );
                 if adopted {
                     result["adopted"] = json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,
                         "harness":binding.harness,"title":binding.title,"delivery":binding.delivery,"route":binding.route,

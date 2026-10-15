@@ -284,6 +284,79 @@ async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_
     );
 }
 
+#[tokio::test]
+async fn unresolved_other_conversation_does_not_hide_live_refusal() {
+    let scratch = Scratch::new("outbox-other-conversation");
+    let link = Link::new();
+    let core = link.attached().await;
+    play_core(link.clone(), core);
+    let (daemon, _) = daemon(&scratch, link);
+    daemon
+        .command(1, "register", registration("a"))
+        .await
+        .unwrap();
+    daemon
+        .command(2, "register", registration("b"))
+        .await
+        .unwrap();
+    daemon
+        .queue(
+            json!({"client_ref":"a","binding_id":"core-a","event_id":"event-a",
+        "utterance_id":"utterance-a","session_id":"s","revision":1,"epoch":0,
+        "text":"unresolved","history_only":false,"attempted":true}),
+        )
+        .await
+        .unwrap();
+    let refused = daemon
+        .command(
+            2,
+            "publish",
+            json!({"client_ref":"b","session_id":"s",
+        "revision":1,"epoch":0,"text":"during turn"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused["status"], "rejected", "{refused}");
+    assert_eq!(refused["reason"], "user_speaking", "{refused}");
+    assert!(refused["instruction"].as_str().unwrap().contains("wait"));
+    let outbox = daemon.outbox.lock().await;
+    assert_eq!(outbox.len(), 1, "{outbox:?}");
+    assert_eq!(outbox[0]["event_id"], "event-a");
+}
+
+#[tokio::test]
+async fn uncertain_publication_keeps_its_fingerprint_and_unsent_work_is_suppressed() {
+    let scratch = Scratch::new("outbox-immutable");
+    let link = Link::new();
+    let core = link.attached().await;
+    play_core(link.clone(), core);
+    let (daemon, _) = daemon(&scratch, link);
+    daemon
+        .command(1, "register", registration("a"))
+        .await
+        .unwrap();
+    let base = json!({"client_ref":"a","binding_id":"core-a","session_id":"s",
+        "revision":1,"epoch":0,"text":"reply","history_only":false});
+    let mut attempted = base.clone();
+    attempted["event_id"] = json!("event-a");
+    attempted["utterance_id"] = json!("utterance-a");
+    attempted["attempted"] = json!(true);
+    daemon.queue(attempted).await.unwrap();
+    let mut unsent = base;
+    unsent["event_id"] = json!("event-b");
+    unsent["utterance_id"] = json!("utterance-b");
+    daemon.queue(unsent).await.unwrap();
+    daemon.retire_held_audio().await.unwrap();
+    let outbox = daemon.outbox.lock().await.clone();
+    assert_eq!(outbox[0]["history_only"], false);
+    assert_eq!(outbox[0]["attempted"], true);
+    assert_eq!(outbox[1]["history_only"], true);
+    daemon.flush_outbox().await;
+    let outbox = daemon.outbox.lock().await.clone();
+    assert_eq!(outbox.len(), 1, "{outbox:?}");
+    assert_eq!(outbox[0]["event_id"], "event-a");
+}
+
 /// The façade↔daemon IPC: every command a newer `sidevoice mcp` sends, with fields this daemon does not know at the
 /// top and nested, is answered for what it knows. A command it has never heard of gets a defined refusal.
 #[tokio::test]
