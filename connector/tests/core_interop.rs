@@ -521,6 +521,104 @@ fn t07_retry_identifiers_are_a_pair_and_one_pair_creates_one_reply() {
 }
 
 #[test]
+fn t07_recovered_attempt_allows_a_new_context_to_play_with_real_core() {
+    let Some(core) = core_dir() else { return };
+    for admitted in [true, false] {
+        let label = if admitted {
+            "recover-saved"
+        } else {
+            "recover-missing"
+        };
+        let profile = Profile::new(label);
+        let _core = profile.start_core(&core, label);
+        let mut connector = profile.start_connector();
+        profile.wait_linked(label);
+        let call = Presentation::open(&profile.core_socket());
+        let receiver = http_receiver();
+        let thread = format!("{label}-thread");
+        let mut command = profile.connector(&["mcp"]);
+        command
+            .env("SIDEVOICE_THREAD", &thread)
+            .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+        let mut mcp = Mcp::start(command);
+        mcp.initialize("recover-first");
+        let joined = mcp.tool("voice_connect", json!({}));
+        core_json(
+            &profile.core_socket(),
+            "POST",
+            "/api/presentation/select",
+            Some(&json!({"session_id":call.session,"thread_id":thread})),
+            Some(&call.token),
+        );
+        let context = joined["initial_reply_context"].clone();
+        let original = json!({"event_id":"recover-a-event","utterance_id":"recover-a-utterance",
+            "binding_id":joined["binding_id"],"client_ref":thread,
+            "session_id":context["session_id"],"revision":context["revision"],
+            "epoch":context["epoch"],"text":"First answer","language":null,
+            "history_only":false,"attempted":true});
+        if admitted {
+            let saved = mcp.tool(
+                "voice_say",
+                json!({"conversation":thread,"text":"First answer",
+                "event_id":"recover-a-event","utterance_id":"recover-a-utterance"}),
+            );
+            assert_eq!(saved["text_saved"], true, "{saved}");
+        }
+        mcp.stop();
+        connector.stop();
+        let outbox = profile.data().join("outbox.json");
+        std::fs::write(&outbox, serde_json::to_vec(&json!([original])).unwrap()).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&outbox, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let _connector = profile.start_connector();
+        profile.wait_linked(label);
+        let mut command = profile.connector(&["mcp"]);
+        command
+            .env("SIDEVOICE_THREAD", &thread)
+            .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+        let mut mcp = Mcp::start(command);
+        mcp.initialize("recover-second");
+        mcp.tool("voice_connect", json!({}));
+        let recovered = mcp.tool(
+            "voice_say",
+            json!({"conversation":thread,"text":"First answer",
+            "session_id":context["session_id"],"revision":context["revision"],
+            "epoch":context["epoch"],"event_id":"recover-a-event",
+            "utterance_id":"recover-a-utterance"}),
+        );
+        assert_eq!(recovered["text_saved"], true, "{recovered}");
+        assert_eq!(recovered["status"], "published", "{recovered}");
+        if admitted {
+            assert_eq!(recovered["audio"], "queued", "{recovered}");
+        } else {
+            assert_eq!(recovered["audio"], "text_only", "{recovered}");
+            assert_eq!(recovered["reason"], "connector_disconnected", "{recovered}");
+        }
+        assert_eq!(read_json(&outbox), Some(json!([])));
+        call.report_turn("started", "recover-next-turn", None);
+        call.turn_started("recover-next-turn");
+        call.report_turn("finished", "recover-next-turn", Some("A new question"));
+        let words = until("new words after recovered admission", 15, || {
+            receiver
+                .bodies
+                .recv_timeout(Duration::from_millis(100))
+                .ok()
+                .filter(|message| message["text"] == "A new question")
+        });
+        let next = mcp.tool(
+            "voice_say",
+            json!({"conversation":thread,"text":"Fresh answer",
+            "session_id":words["session_id"],"revision":words["revision"],
+            "epoch":words["epoch"],"event_id":"recover-b-event",
+            "utterance_id":"recover-b-utterance"}),
+        );
+        assert_eq!(next["status"], "published", "{next}");
+        assert_eq!(next["audio"], "queued", "{next}");
+        mcp.stop();
+    }
+}
+
+#[test]
 fn t16_large_valid_pull_page_arrives_in_complete_cursor_order() {
     let Some(core) = core_dir() else { return };
     let profile = Profile::new("pull-large-page");
@@ -1180,6 +1278,7 @@ fn t14_real_two_device_corrections_keep_the_original_notice_frozen() {
     let Some(core) = core_dir() else { return };
     for mode in ["push", "pull"] {
         for (fate, status, reason) in [
+            ("partial", "interrupted", Some("user_interrupted")),
             ("heard", "heard", None),
             ("skipped", "interrupted", Some("user_skipped")),
         ] {
@@ -1280,7 +1379,8 @@ fn t14_real_two_device_corrections_keep_the_original_notice_frozen() {
                 "{correction}"
             );
             assert_eq!(
-                correction["notice"]["heard"][0]["heard_chars"], 16,
+                correction["notice"]["heard"][0]["heard_chars"],
+                if fate == "partial" { 3 } else { 16 },
                 "{correction}"
             );
             assert!(correction["envelope"]
