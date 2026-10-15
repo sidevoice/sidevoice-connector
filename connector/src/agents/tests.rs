@@ -130,7 +130,7 @@ fn row<'a>(answer: &'a Value, id: &str) -> &'a Value {
 }
 
 #[tokio::test]
-async fn cursor_agent_row_exposes_bridge_steps_without_home_paths_or_secrets() {
+async fn cursor_agent_row_exposes_only_bridge_fact_without_home_paths_or_secrets() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
     let bin = fixture.root.join("bin");
@@ -150,9 +150,7 @@ async fn cursor_agent_row_exposes_bridge_steps_without_home_paths_or_secrets() {
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let missing = host.handle("agents.list", json!({"watch":"cursor"})).await;
     let bridge = &row(&missing, "cursor")["cursor_bridge"];
-    assert_eq!(bridge["reason"], "bridge_missing");
-    assert_eq!(bridge["cursor_version"], "3.22.12");
-    assert_eq!(bridge["steps"][1]["state"], "unknown");
+    assert_eq!(bridge, &json!({"state":"unsupported","chat_known":null}));
     let cached = host.handle("agents.list", json!({})).await;
     assert_eq!(row(&cached, "cursor")["cursor_bridge"], *bridge);
 
@@ -170,56 +168,10 @@ async fn cursor_agent_row_exposes_bridge_steps_without_home_paths_or_secrets() {
     );
     let rescanned = host.handle("agents.list", json!({"watch":"cursor"})).await;
     let bridge = &row(&rescanned, "cursor")["cursor_bridge"];
-    assert_eq!(bridge["reason"], "sidevoice_not_registered");
-    assert_eq!(bridge["steps"][1]["state"], "done");
-    assert_eq!(bridge["steps"][2]["state"], "done");
+    assert_eq!(bridge, &json!({"state":"unsupported","chat_known":null}));
     let serialized = bridge.to_string();
     assert!(!serialized.contains(&fixture.root.to_string_lossy().to_string()));
     assert!(!serialized.contains("secret-token"));
-}
-
-#[tokio::test]
-async fn cursor_bridge_sqlite_status_matches_delivery_without_login_capture() {
-    let _turn = agent_env().await;
-    let fixture = Fixture::new();
-    let process_bin = fixture.root.join("process-bin");
-    let login_bin = fixture.root.join("login-bin");
-    private_mkdir(&process_bin);
-    private_mkdir(&login_bin);
-    let cursor = login_bin.join("cursor");
-    private_write(&cursor, b"#!/bin/sh\necho 'Cursor 3.22.12'\n");
-    fs::set_permissions(&cursor, fs::Permissions::from_mode(0o700)).unwrap();
-    let sqlite = process_bin.join("sqlite3");
-    private_write(&sqlite, b"#!/bin/sh\nexit 0\n");
-    fs::set_permissions(&sqlite, fs::Permissions::from_mode(0o700)).unwrap();
-    let _path = EnvGuard::set("PATH", process_bin.as_os_str());
-    let _shell = EnvGuard::set("SHELL", std::ffi::OsStr::new(""));
-    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
-    let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
-    assert!(crate::adapters::cursor::sqlite3_found());
-    assert_eq!(
-        row(&answer, "cursor")["cursor_bridge"]["steps"][3]["state"],
-        "done"
-    );
-    assert_eq!(
-        crate::adapters::cursor::sqlite3_executable_on(Some(process_bin.as_os_str())),
-        Some(sqlite)
-    );
-    assert_eq!(
-        crate::adapters::cursor::sqlite3_executable_on(Some(login_bin.as_os_str())),
-        None
-    );
-
-    fs::remove_file(process_bin.join("sqlite3")).unwrap();
-    let login_sqlite = login_bin.join("sqlite3");
-    private_write(&login_sqlite, b"#!/bin/sh\nexit 0\n");
-    fs::set_permissions(&login_sqlite, fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(!crate::adapters::cursor::sqlite3_found());
-    let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
-    assert_eq!(
-        row(&answer, "cursor")["cursor_bridge"]["steps"][3]["state"],
-        "needs_action"
-    );
 }
 
 #[tokio::test]
@@ -242,61 +194,14 @@ async fn cursor_bridge_distinguishes_cli_only_from_editor_with_unreadable_versio
     let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
     let bridge = &row(&answer, "cursor")["cursor_bridge"];
     assert_eq!(bridge["state"], "unsupported");
-    assert_eq!(bridge["reason"], "editor_unavailable");
+    assert_eq!(bridge["chat_known"], Value::Null);
 
     let editor = bin.join("cursor");
     private_write(&editor, b"#!/bin/sh\necho 'unparseable'\n");
     fs::set_permissions(&editor, fs::Permissions::from_mode(0o700)).unwrap();
     let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
     let bridge = &row(&answer, "cursor")["cursor_bridge"];
-    assert_ne!(bridge["state"], "unsupported");
-    assert_eq!(bridge["reason"], "bridge_missing");
-    assert_eq!(bridge["cursor_version"], Value::Null);
-}
-
-#[tokio::test]
-async fn cursor_version_command_is_shared_only_for_same_binary() {
-    let _turn = agent_env().await;
-    let fixture = Fixture::new();
-    let bin = fixture.root.join("bin");
-    private_mkdir(&bin);
-    let _path = EnvGuard::set("PATH", bin.as_os_str());
-    let count = fixture.root.join("cursor-count");
-    let editor = bin.join("cursor");
-    private_write(
-        &editor,
-        format!(
-            "#!/bin/sh\necho x >> {}\necho 'Cursor 3.22.12'\n",
-            count.display()
-        )
-        .as_bytes(),
-    );
-    fs::set_permissions(&editor, fs::Permissions::from_mode(0o700)).unwrap();
-    write_json(
-        &fixture.profile.data.join("agents.json"),
-        &json!({
-            "version":1,"scanned_at":null,"login_path":bin,"binaries":{},"seen":{},"dismissed":{}
-        }),
-    );
-    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
-    let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
-    assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 1);
-    assert_eq!(
-        row(&answer, "cursor")["cursor_bridge"]["cursor_version"],
-        "3.22.12"
-    );
-
-    let cli = bin.join("cursor-agent");
-    private_write(&cli, b"#!/bin/sh\necho 'cursor-agent 1.2.3'\n");
-    fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
-    let _registration_binary = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cli.as_os_str());
-    let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
-    assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 2);
-    assert_eq!(row(&answer, "cursor")["version"], "cursor-agent 1.2.3");
-    assert_eq!(
-        row(&answer, "cursor")["cursor_bridge"]["cursor_version"],
-        "3.22.12"
-    );
+    assert_eq!(bridge, &json!({"state":"unsupported","chat_known":null}));
 }
 
 fn identity_signature(id: &str, version: Option<&str>, evidence: &[Evidence<'_>]) -> String {

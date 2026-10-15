@@ -241,27 +241,16 @@ impl Registration for Cursor {
         Some("cursor")
     }
 
-    fn cached_setup_version(&self, row: Option<&Value>) -> Option<String> {
-        row.and_then(|row| row.pointer("/cursor_bridge/cursor_version"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-    }
-
     fn setup_status(
         &self,
         profile: &Profile,
-        version: Option<&str>,
+        _version: Option<&str>,
         setup_binary_available: bool,
-        registration: &str,
+        _registration: &str,
     ) -> Option<(&'static str, Value)> {
         Some((
             "cursor_bridge",
-            super::bridge_setup::status(
-                profile,
-                version,
-                setup_binary_available || Path::new(APP).exists(),
-                registration,
-            ),
+            super::bridge_setup::status(profile, setup_binary_available || Path::new(APP).exists()),
         ))
     }
 

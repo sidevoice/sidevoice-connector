@@ -8,7 +8,6 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-const MIN_CURSOR: [u32; 3] = [3, 22, 12];
 const MAX_DESCRIPTOR: u64 = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,104 +95,29 @@ fn inventory(dir: &Path) -> BridgeFiles {
     }
 }
 
-fn parsed_version(raw: &str) -> Option<[u32; 3]> {
-    raw.split(|c: char| c.is_whitespace() || c == 'v')
-        .find_map(|part| {
-            let part = part.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
-            let mut pieces = part.split('.');
-            Some([
-                pieces.next()?.parse().ok()?,
-                pieces.next()?.parse().ok()?,
-                pieces.next()?.parse().ok()?,
-            ])
-        })
-}
-
-pub fn status(
-    profile: &Profile,
-    cursor_version: Option<&str>,
-    editor_available: bool,
-    registration: &str,
-) -> Value {
-    assess(
-        cursor_version,
-        editor_available,
-        inventory(&bridge_dir(profile)),
-        super::sqlite3_found(),
-        registration,
-    )
+pub fn status(profile: &Profile, editor_available: bool) -> Value {
+    // Agent discovery has no particular editor chat. Its chat_known value is therefore unknown.
+    // The per-chat voice status remains the source of a known/unknown chat binding.
+    let bridge = inventory(&bridge_dir(profile));
+    assess(cfg!(target_os = "macos"), editor_available, bridge, None)
 }
 
 fn assess(
-    cursor_version: Option<&str>,
+    macos: bool,
     editor_available: bool,
     bridge: BridgeFiles,
-    sqlite3: bool,
-    registration: &str,
+    chat_known: Option<bool>,
 ) -> Value {
-    let version = cursor_version.and_then(parsed_version);
-    let version_state = match version {
-        Some(found) if found >= MIN_CURSOR => "done",
-        Some(_) => "needs_action",
-        None => "unknown",
-    };
-    let bridge_state = if bridge == BridgeFiles::Live {
-        "done"
+    let state = if !macos || !editor_available {
+        "unsupported"
+    } else if bridge == BridgeFiles::Live {
+        "running"
     } else {
-        "needs_action"
+        "not_running"
     };
-    let setting_state = if bridge == BridgeFiles::Live {
-        "done"
-    } else {
-        "unknown"
-    };
-    let registration_state = match registration {
-        "connected" => "done",
-        "not-connected" | "outdated" => "needs_action",
-        _ => "unknown",
-    };
-    let reason = if !editor_available {
-        Some("editor_unavailable")
-    } else if version_state == "needs_action" {
-        Some("cursor_version_too_old")
-    } else if bridge == BridgeFiles::Missing {
-        Some("bridge_missing")
-    } else if bridge == BridgeFiles::Stale {
-        Some("bridge_stale")
-    } else if !sqlite3 {
-        Some("sqlite3_missing")
-    } else if registration_state == "needs_action" {
-        Some("sidevoice_not_registered")
-    } else if version_state == "unknown" {
-        Some("cursor_version_unknown")
-    } else if registration_state == "unknown" {
-        Some("registration_unknown")
-    } else {
-        None
-    };
-    let state = match reason {
-        None => "ready",
-        Some("editor_unavailable") => "unsupported",
-        Some("cursor_version_unknown" | "registration_unknown") => "unknown",
-        Some(_) => "needs_attention",
-    };
-    let normalized_version =
-        version.map(|[major, minor, patch]| format!("{major}.{minor}.{patch}"));
     json!({
-        "state":state,
-        "reason":reason,
-        "cursor_version":normalized_version,
-        "minimum_cursor_version":"3.22.12",
-        "minimum_connector_version":"0.9.0",
-        "steps":[
-            {"id":"cursor_version","state":version_state},
-            {"id":"enable_desktop_bridge","state":setting_state},
-            {"id":"bridge_running","state":bridge_state},
-            {"id":"sqlite3","state":if sqlite3 {"done"} else {"needs_action"}},
-            {"id":"register_sidevoice","state":registration_state},
-            {"id":"join_editor_chat","state":"unknown"},
-            {"id":"wait_for_chat_registration","state":"unknown"}
-        ]
+        "state": state,
+        "chat_known": if state == "running" { chat_known } else { None },
     })
 }
 
@@ -235,85 +159,67 @@ mod tests {
     }
 
     #[test]
-    fn states_are_keyed_and_conservative() {
-        assert_eq!(
-            assess(
-                Some("Cursor 3.22.12"),
+    fn states_and_chat_knowledge_have_only_the_two_contract_fields() {
+        for (macos, editor, bridge, known, expected) in [
+            (
+                true,
                 true,
                 BridgeFiles::Live,
+                Some(true),
+                json!({"state":"running","chat_known":true}),
+            ),
+            (
                 true,
-                "connected"
-            )["state"],
-            "ready"
-        );
-        assert_eq!(
-            assess(Some("3.22.11"), true, BridgeFiles::Live, true, "connected")["reason"],
-            "cursor_version_too_old"
-        );
-        assert_eq!(
-            assess(
-                Some("3.22.12"),
-                true,
-                BridgeFiles::Missing,
-                true,
-                "connected"
-            )["reason"],
-            "bridge_missing"
-        );
-        assert_eq!(
-            assess(Some("3.22.12"), true, BridgeFiles::Stale, true, "connected")["reason"],
-            "bridge_stale"
-        );
-        assert_eq!(
-            assess(Some("3.22.12"), true, BridgeFiles::Live, false, "connected")["reason"],
-            "sqlite3_missing"
-        );
-        assert_eq!(
-            assess(None, true, BridgeFiles::Live, true, "connected")["state"],
-            "unknown"
-        );
-        assert_eq!(
-            assess(
-                Some("3.22.12"),
                 true,
                 BridgeFiles::Live,
+                Some(false),
+                json!({"state":"running","chat_known":false}),
+            ),
+            (
                 true,
-                "not-connected"
-            )["reason"],
-            "sidevoice_not_registered"
-        );
-        assert_eq!(
-            assess(
-                Some("3.22.12"),
+                true,
+                BridgeFiles::Live,
+                None,
+                json!({"state":"running","chat_known":null}),
+            ),
+            (
+                true,
                 true,
                 BridgeFiles::Missing,
+                None,
+                json!({"state":"not_running","chat_known":null}),
+            ),
+            (
                 true,
-                "connected"
-            )["steps"][1]["state"],
-            "unknown"
-        );
-        assert_eq!(
-            assess(None, false, BridgeFiles::Missing, true, "connected")["state"],
-            "unsupported"
-        );
-        assert_eq!(
-            assess(None, false, BridgeFiles::Missing, true, "connected")["reason"],
-            "editor_unavailable"
-        );
+                true,
+                BridgeFiles::Stale,
+                Some(true),
+                json!({"state":"not_running","chat_known":null}),
+            ),
+            (
+                false,
+                true,
+                BridgeFiles::Live,
+                Some(true),
+                json!({"state":"unsupported","chat_known":null}),
+            ),
+            (
+                true,
+                false,
+                BridgeFiles::Live,
+                Some(true),
+                json!({"state":"unsupported","chat_known":null}),
+            ),
+        ] {
+            assert_eq!(assess(macos, editor, bridge, known), expected);
+        }
     }
 
     #[test]
-    fn disabled_setting_without_bridge_files_is_reported_as_unverified() {
-        // A disabled beta setting and a closed Cursor both leave no descriptor. The connector
-        // cannot read that setting, so it reports the step as unknown instead of claiming it is off.
-        let status = assess(
-            Some("3.22.12"),
-            true,
-            BridgeFiles::Missing,
-            true,
-            "connected",
+    fn disabled_setting_without_bridge_files_is_not_running() {
+        assert_eq!(
+            assess(true, true, BridgeFiles::Missing, None)["state"],
+            "not_running"
         );
-        assert_eq!(status["reason"], "bridge_missing");
-        assert_eq!(status["steps"][1]["state"], "unknown");
     }
 }
