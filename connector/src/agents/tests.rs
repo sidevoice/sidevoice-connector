@@ -1892,6 +1892,10 @@ async fn each_agent_says_what_the_connector_does_itself_and_how_to_do_it_by_hand
     let fixture = Fixture::new();
     let claude = fake_claude(&fixture);
     let codex = fake_codex(&fixture);
+    let cursor = fixture.root.join("cursor-bin");
+    private_write(&cursor, b"#!/bin/sh\nexit 0\n");
+    fs::set_permissions(&cursor, fs::Permissions::from_mode(0o700)).unwrap();
+    let _cursor_bin = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cursor.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let selected = fixture.selected();
     let env = [
