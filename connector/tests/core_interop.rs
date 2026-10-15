@@ -1538,3 +1538,98 @@ fn t02a_late_receipt_follows_real_words_with_related_message_id_in_both_modes() 
         mcp.stop();
     }
 }
+
+#[test]
+fn t07_t16_detachable_pull_claim_reaches_the_next_real_ipc_owner() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::path::Path;
+
+    struct Ipc {
+        reader: BufReader<UnixStream>,
+        serial: u64,
+    }
+    impl Ipc {
+        fn open(path: &Path) -> Self {
+            let stream = UnixStream::connect(path).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .unwrap();
+            Self {
+                reader: BufReader::new(stream),
+                serial: 0,
+            }
+        }
+        fn call(&mut self, method: &str, params: Value) -> Value {
+            self.serial += 1;
+            writeln!(
+                self.reader.get_mut(),
+                "{}",
+                json!({"id":self.serial,"method":method,"params":params})
+            )
+            .unwrap();
+            self.reader.get_mut().flush().unwrap();
+            let mut line = String::new();
+            self.reader.read_line(&mut line).unwrap();
+            let answer: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(answer["ok"], true, "{answer}");
+            answer["result"].clone()
+        }
+    }
+
+    let Some(core) = core_dir() else { return };
+    let profile = Profile::new("detachable-claim");
+    let _core = profile.start_core(&core, "detachable-core");
+    let _connector = profile.start_connector();
+    profile.wait_linked("detachable-core");
+    let call = Presentation::open(&profile.core_socket());
+    let thread = "detachable-thread";
+    let receiver = http_receiver();
+    let registration = json!({"client_ref":"detachable-ref","thread":thread,
+        "title":"Detached pull","harness":"http","delivery":{"kind":"http","url":receiver.url,"thread":thread},
+        "detachable":true,"input_mode":"pull"});
+    let mut first = Ipc::open(&profile.connector_socket());
+    let joined = first.call("register", registration.clone());
+    assert!(joined["binding_id"].is_string(), "{joined}");
+    let selected = core_json(
+        &profile.core_socket(),
+        "POST",
+        "/api/presentation/select",
+        Some(&json!({"session_id":call.session,"thread_id":thread})),
+        Some(&call.token),
+    );
+    let binding_id = selected["binding"]["binding_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let id = uuid::Uuid::new_v4().to_string();
+    let posted = core_json(
+        &profile.core_socket(),
+        "POST",
+        "/api/presentation/text",
+        Some(
+            &json!({"text":"Claim survives owner exit","session_id":call.session,
+            "thread_id":thread,"binding_id":binding_id,"message_id":id}),
+        ),
+        Some(&call.token),
+    );
+    assert_eq!(posted["accepted"], true, "{posted}");
+    let first_page = first.call("get_messages", json!({"client_ref":"detachable-ref"}));
+    assert_eq!(first_page["messages"][0]["message_id"], id, "{first_page}");
+    drop(first);
+    let mut next = Ipc::open(&profile.connector_socket());
+    let reclaimed = next.call("register", registration);
+    assert!(reclaimed["binding_id"].is_string(), "{reclaimed}");
+    let again = next.call("get_messages", json!({"client_ref":"detachable-ref"}));
+    assert_eq!(again["messages"][0]["message_id"], id, "{again}");
+    assert_eq!(
+        again["messages"][0]["envelope"],
+        first_page["messages"][0]["envelope"]
+    );
+    let acknowledged = next.call(
+        "get_messages",
+        json!({"client_ref":"detachable-ref","ack_ids":[id]}),
+    );
+    assert_eq!(acknowledged["acknowledged"], 1, "{acknowledged}");
+    assert_eq!(acknowledged["count"], 0, "{acknowledged}");
+}
