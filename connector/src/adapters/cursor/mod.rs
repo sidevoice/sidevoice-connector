@@ -605,14 +605,22 @@ fn persist_session(chat: &str) -> Result<Option<(String, String, bool, bool)>> {
 }
 
 pub async fn refine_identity(identity: &mut Identity, title: &str) {
+    let instances = bridge_instances();
+    refine_identity_with_instances(identity, title, &instances).await;
+}
+
+async fn refine_identity_with_instances(
+    identity: &mut Identity,
+    title: &str,
+    instances: &[BridgeInstance],
+) {
     if identity.delivery.get("kind").and_then(Value::as_str) != Some("cursor-bridge") {
         return;
     }
     if !title.is_empty() {
         identity.delivery["title"] = json!(title);
     }
-    let instances = bridge_instances();
-    if let Some(candidate) = calling_thread(&instances).await {
+    if let Some(candidate) = calling_thread(instances).await {
         identity.thread = candidate.thread();
         identity.delivery["thread"] = json!(identity.thread);
         identity.delivery["candidate"] = json!(candidate.composer);
@@ -907,20 +915,27 @@ async fn calling_thread(instances: &[BridgeInstance]) -> Option<BridgeChat> {
 }
 
 pub async fn composer_holding_identity(delivery: &Value) -> Option<BridgeChat> {
+    let instances = bridge_instances();
+    composer_holding_identity_with_instances(delivery, &instances).await
+}
+
+async fn composer_holding_identity_with_instances(
+    delivery: &Value,
+    instances: &[BridgeInstance],
+) -> Option<BridgeChat> {
     let marker = delivery.get("marker").and_then(Value::as_str)?;
     if marker.len() != 64 || !marker.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     let candidate = delivery.get("candidate").and_then(Value::as_str);
-    let instances = bridge_instances();
     if let Some(candidate) = candidate {
         if safe_chat_id(candidate) {
-            if let Some(chat) = query_bridge_chat(&instances, marker, Some(candidate)).await {
+            if let Some(chat) = query_bridge_chat(instances, marker, Some(candidate)).await {
                 return Some(chat);
             }
         }
     }
-    query_bridge_chat(&instances, marker, None).await
+    query_bridge_chat(instances, marker, None).await
 }
 
 fn safe_chat_id(value: &str) -> bool {

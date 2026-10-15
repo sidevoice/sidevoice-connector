@@ -86,7 +86,19 @@ async fn same_bridge_composer_reuses_a_namespaced_thread_after_reconnect() {
     let first = fixture.instance("profile-a", "first.sock");
     let response = json!({"threads":[{"id":"composer-1","source":"local","status":"running"}]});
     let reply = serve_once(&first, response.clone());
-    let chat = calling_thread(&[first.clone()]).await.unwrap();
+    let mut join = identity(
+        &json!({"name":"cursor-vscode"}),
+        &json!({"extensions":{"io.modelcontextprotocol/ui":{}}}),
+    )
+    .unwrap();
+    refine_identity_with_instances(&mut join, "Example", std::slice::from_ref(&first)).await;
+    let chat = BridgeChat {
+        composer: "composer-1".into(),
+        profile_id: profile_id(&first.user_data).unwrap(),
+    };
+    assert_eq!(join.thread, chat.thread());
+    assert_eq!(join.delivery["identity_state"], "candidate");
+    assert_eq!(join.delivery["candidate"], "composer-1");
     assert_eq!(reply.await.unwrap()["type"], "listThreads");
     assert_eq!(
         chat.thread(),
@@ -148,7 +160,13 @@ async fn ambiguous_or_unsafe_running_bridge_chat_keeps_identity_pending() {
             {"id":"composer-2","source":"local","status":"running"}
         ]}),
     );
-    assert!(calling_thread(&[instance]).await.is_none());
+    let mut identity = identity(
+        &json!({"name":"cursor-vscode"}),
+        &json!({"extensions":{"io.modelcontextprotocol/ui":{}}}),
+    )
+    .unwrap();
+    refine_identity_with_instances(&mut identity, "", &[instance]).await;
+    assert!(identity.thread.starts_with("cursor-editor-pending-"));
     reply.await.unwrap();
     let unsafe_instance = fixture.instance("profile-a", "unsafe.sock");
     let reply = serve_once(
@@ -157,12 +175,6 @@ async fn ambiguous_or_unsafe_running_bridge_chat_keeps_identity_pending() {
     );
     assert!(calling_thread(&[unsafe_instance]).await.is_none());
     reply.await.unwrap();
-    let identity = identity(
-        &json!({"name":"cursor-vscode"}),
-        &json!({"extensions":{"io.modelcontextprotocol/ui":{}}}),
-    )
-    .unwrap();
-    assert!(identity.thread.starts_with("cursor-editor-pending-"));
 }
 
 #[tokio::test]
@@ -217,13 +229,15 @@ async fn late_marker_in_sqlite_corrects_an_earlier_running_candidate() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert!(
-        query_bridge_chat(&[instance.clone()], &marker, Some("wrong-chat"))
+        query_bridge_chat(std::slice::from_ref(&instance), &marker, Some("wrong-chat"))
             .await
             .is_none()
     );
-    let corrected = query_bridge_chat(&[instance.clone()], &marker, None)
-        .await
-        .unwrap();
+    let delivery = json!({"marker":marker,"candidate":"wrong-chat"});
+    let corrected =
+        composer_holding_identity_with_instances(&delivery, std::slice::from_ref(&instance))
+            .await
+            .unwrap();
     assert_eq!(corrected.composer, "actual-chat");
     assert_eq!(
         corrected.thread(),
