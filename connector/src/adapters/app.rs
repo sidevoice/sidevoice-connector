@@ -91,6 +91,7 @@ pub fn linux_entry(identity: Identity, roots: &[PathBuf], path: Option<&str>) ->
 fn desktop_valid(contents: &str, path: Option<&str>) -> bool {
     let mut in_entry = false;
     let mut kind = None;
+    let mut name = None;
     let mut hidden = false;
     let mut exec = None;
     let mut dbus = false;
@@ -109,6 +110,7 @@ fn desktop_valid(contents: &str, path: Option<&str>) -> bool {
         if let Some((key, value)) = line.split_once('=') {
             match key {
                 "Type" => kind = Some(value),
+                "Name" => name = Some(value),
                 "Hidden" => hidden = value == "true",
                 "Exec" => exec = Some(value),
                 "DBusActivatable" => dbus = value == "true",
@@ -118,6 +120,7 @@ fn desktop_valid(contents: &str, path: Option<&str>) -> bool {
         }
     }
     kind == Some("Application")
+        && name.is_some_and(|value| !value.trim().is_empty())
         && !hidden
         && (exec.is_some_and(|value| !value.trim().is_empty()) || dbus)
         && try_exec.is_none_or(|value| {
@@ -216,6 +219,15 @@ mod tests {
             None
         );
         std::fs::write(&user_file, "[Desktop Entry]\nType=Link\nExec=cursor\n").unwrap();
+        assert_eq!(
+            linux_entry(CURSOR, &[user.clone(), system.clone()], None),
+            None
+        );
+        std::fs::write(
+            &user_file,
+            "[Desktop Entry]\nType=Application\nExec=cursor\n",
+        )
+        .unwrap();
         assert_eq!(
             linux_entry(CURSOR, &[user.clone(), system.clone()], None),
             None
