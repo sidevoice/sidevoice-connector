@@ -362,4 +362,37 @@ mod tests {
     async fn oversized_editor_sqlite_output_is_bounded_and_reaped() {
         bounded_child("printf '%040000d' 0; exec sleep 5").await;
     }
+
+    #[test]
+    fn model_inventory_lists_effort_structure_without_values() {
+        let scratch = Scratch::new("cursor-model-inventory");
+        let database_path = scratch.0.join("state.vscdb");
+        database(&database_path, "CREATE TABLE cursorDiskKV(key TEXT, value TEXT); INSERT INTO cursorDiskKV VALUES ('composerData:object', '{\"modelConfig\":{\"modelName\":\"secret-model\",\"effort\":\"topsecret-effort\",\"privateMessage\":\"chat text\"}}'); INSERT INTO cursorDiskKV VALUES ('composerData:array', '{\"modelConfig\":{\"modelName\":\"secret-model\",\"parameters\":[{\"id\":\"effort\",\"value\":\"topsecret-effort\"}],\"token\":\"fixture-secret\"}}');");
+        for (chat, expected) in [
+            ("object", "$.modelConfig.effort"),
+            ("array", "$.modelConfig.parameters[0].value"),
+        ] {
+            let sql = format!("SELECT DISTINCT j.fullkey,j.type FROM cursorDiskKV AS c, json_tree(CAST(c.value AS TEXT)) AS j WHERE c.key='composerData:{chat}' AND json_valid(CAST(c.value AS TEXT)) AND (j.fullkey='$.modelConfig' OR j.fullkey LIKE '$.modelConfig.%' OR j.fullkey LIKE '$.modelConfig[%') LIMIT 120;");
+            let output = Command::new("sqlite3")
+                .args(["-readonly", "-json"])
+                .arg(&database_path)
+                .arg(sql)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let inventory = String::from_utf8(output.stdout).unwrap();
+            assert!(inventory.contains(expected), "{inventory}");
+            if chat == "array" {
+                assert!(inventory.contains("$.modelConfig.parameters[0].id"));
+            }
+            for private in [
+                "secret-model",
+                "topsecret-effort",
+                "chat text",
+                "fixture-secret",
+            ] {
+                assert!(!inventory.contains(private));
+            }
+        }
+    }
 }
