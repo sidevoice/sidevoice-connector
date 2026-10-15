@@ -46,7 +46,17 @@ fn chats(conversation: &Conversation) -> Option<&Chats> {
 }
 
 fn bridge(conversation: &Conversation) -> Option<String> {
-    chats(conversation).and_then(|chats| chats.bridge.lock().ok()?.clone())
+    chats(conversation)
+        .and_then(|chats| chats.bridge.lock().ok()?.clone())
+        .or_else(|| {
+            (conversation.delivery["identity_state"] == "verified")
+                .then(|| {
+                    conversation.delivery["composer"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .flatten()
+        })
 }
 
 fn set_bridge(conversation: &Conversation, chat: String) {
@@ -407,7 +417,7 @@ pub(super) mod client {
         match (capability, identity.delivery["kind"].as_str()) {
             ("deliver", Some("cursor-tmux")) => Some("Voice from the room reaches this conversation by an experimental route: it is pasted into this chat's terminal through tmux and sent with Enter. If the user is typing at the same moment, the two texts mix. Tell the user once."),
             ("deliver", Some("cursor-bridge")) => Some("Voice from the room reaches this chat by an experimental route: Cursor's Desktop Bridge submits it to this chat as if the user had typed it, once Cursor has recorded this join call (up to ~30 s). If the user is typing at the same moment, the two may mix. Tell the user once."),
-            ("sessionIdentity", _) => Some("This conversation is identified by Sidevoice, not by an id Cursor gives: each chat of this window that joins gets a conversation of its own. Asking this same chat to join again gives it a second one; leave the old one with voice_disconnect and its conversation id."),
+            ("sessionIdentity", Some("cursor-bridge")) => Some("This conversation is keyed to Cursor's editor chat once its Desktop Bridge identifies it. Until then, a provisional id may be replaced; voice_status with the returned id reports the current conversation."),
             _ => None,
         }
     }

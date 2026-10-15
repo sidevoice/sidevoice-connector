@@ -669,6 +669,9 @@ impl Daemon {
             return json!({"status":"unknown_binding"});
         };
         let _serial = binding.serial.lock().await;
+        if binding.stopped.load(Ordering::Relaxed) {
+            return json!({"status":"unknown_binding"});
+        }
         let message_id = frame
             .get("message_id")
             .and_then(Value::as_str)
@@ -791,8 +794,14 @@ impl Daemon {
                 self.check_registration_allowed(&client_ref, resume).await?;
                 let existing = { self.bindings.lock().await.get(&client_ref).cloned() };
                 if let Some(existing) = existing {
-                    if existing.owner.load(Ordering::Relaxed) != owner {
+                    let previous = existing.owner.load(Ordering::Relaxed);
+                    if previous != owner
+                        && !(previous == 0 && existing.detachable && existing.thread == thread)
+                    {
                         bail!("binding belongs to another façade");
+                    }
+                    if previous == 0 {
+                        existing.owner.store(owner, Ordering::Relaxed);
                     }
                     let binding_id = existing.id.lock().await.clone();
                     drop(_state_transaction);
@@ -832,8 +841,14 @@ impl Daemon {
                 let _state_transaction = self.conversation_state_serial.lock().await;
                 self.check_registration_allowed(&client_ref, resume).await?;
                 if let Some(existing) = self.bindings.lock().await.get(&client_ref).cloned() {
-                    if existing.owner.load(Ordering::Relaxed) != owner {
+                    let previous = existing.owner.load(Ordering::Relaxed);
+                    if previous != owner
+                        && !(previous == 0 && existing.detachable && existing.thread == thread)
+                    {
                         bail!("binding belongs to another façade");
+                    }
+                    if previous == 0 {
+                        existing.owner.store(owner, Ordering::Relaxed);
                     }
                     let binding_id = existing.id.lock().await.clone();
                     drop(_state_transaction);
@@ -933,6 +948,13 @@ impl Daemon {
             "unregister" => {
                 let _state_transaction = self.conversation_state_serial.lock().await;
                 let binding = self.find_owned(owner, &params).await?;
+                let _serial = binding.serial.lock().await;
+                if params.get("only_if_idle") == Some(&json!(true))
+                    && (!binding.pending.lock().await.is_empty()
+                        || *binding.working.lock().await == Some(true))
+                {
+                    bail!("conversation is still processing an input");
+                }
                 binding.stopped.store(true, Ordering::Relaxed);
                 self.bindings.lock().await.remove(&binding.client_ref);
                 self.registry.get(&binding.harness).close(&binding).await;

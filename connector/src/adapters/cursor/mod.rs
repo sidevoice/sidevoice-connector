@@ -29,7 +29,8 @@ pub fn config_home(profile: &crate::profile::Profile) -> &std::path::Path {
 use super::{envelope, Identity};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -79,7 +80,7 @@ pub fn is_editor(capabilities: &Value) -> bool {
 
 pub fn identity(_client: &Value, capabilities: &Value) -> Result<Identity> {
     if is_editor(capabilities) {
-        let thread = format!("cursor-editor-{}", uuid::Uuid::new_v4());
+        let thread = format!("cursor-editor-pending-{}", uuid::Uuid::new_v4());
         // Unique to this join: the join call's answer carries it, so the Desktop Bridge finds this chat by it in
         // Cursor's own record of the call.
         let marker = format!(
@@ -88,7 +89,7 @@ pub fn identity(_client: &Value, capabilities: &Value) -> Result<Identity> {
             uuid::Uuid::new_v4().simple()
         );
         let route = "cursor-editor-bridge";
-        let delivery = json!({"kind":"cursor-bridge","thread":thread,"marker":marker,"route":route,"joined_at":unix_ms()});
+        let delivery = json!({"kind":"cursor-bridge","thread":thread,"marker":marker,"route":route,"joined_at":unix_ms(),"identity_state":"pending"});
         let mut identity = Identity::new("cursor", thread.clone(), delivery);
         identity.route = Some(route.into());
         identity.editor = true;
@@ -609,8 +610,54 @@ pub async fn refine_identity(identity: &mut Identity, title: &str) {
     }
     let instances = bridge_instances();
     if let Some(candidate) = calling_thread(&instances).await {
-        identity.delivery["candidate"] = json!(candidate);
+        identity.thread = candidate.thread();
+        identity.delivery["thread"] = json!(identity.thread);
+        identity.delivery["candidate"] = json!(candidate.composer);
+        identity.delivery["profile_id"] = json!(candidate.profile_id);
+        identity.delivery["identity_state"] = json!("candidate");
     }
+}
+
+/// The profile namespace is a digest of Cursor's canonical user-data directory, not a path or bridge secret.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BridgeChat {
+    pub composer: String,
+    pub profile_id: String,
+}
+
+impl BridgeChat {
+    pub fn thread(&self) -> String {
+        format!("cursor-editor-{}-{}", self.profile_id, self.composer)
+    }
+}
+
+/// Keep a bounded private record of verified bridge identities for restart diagnostics. The key itself is
+/// deterministic, so loss of this file never changes a chat's thread.
+pub fn remember_chat(data_dir: &Path, chat: &BridgeChat) -> Result<()> {
+    let path = data_dir.join("cursor-editor-threads.json");
+    let mut known = crate::secure_fs::read_trusted(&path, 24 * 1024)?
+        .map(|bytes| serde_json::from_slice::<BTreeMap<String, String>>(&bytes))
+        .transpose()?
+        .unwrap_or_default();
+    let key = format!("{}:{}", chat.profile_id, chat.composer);
+    let thread = chat.thread();
+    if known.get(&key).is_some_and(|saved| saved != &thread) {
+        bail!("Cursor chat identity record conflicts with its deterministic thread");
+    }
+    known.insert(key, thread);
+    while known.len() > 128 {
+        let first = known.keys().next().cloned().unwrap();
+        known.remove(&first);
+    }
+    crate::secure_fs::atomic_json(&path, &known)
+}
+
+fn profile_id(user_data: &Path) -> Option<String> {
+    let canonical = user_data.canonicalize().ok()?;
+    if !canonical.is_dir() {
+        return None;
+    }
+    Some(hex::encode(Sha256::digest(canonical.as_os_str().as_encoded_bytes()))[..16].to_owned())
 }
 
 #[derive(Clone)]
@@ -800,9 +847,12 @@ fn decode_chunks(mut input: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-async fn calling_thread(instances: &[BridgeInstance]) -> Option<String> {
-    let mut running = Vec::new();
+async fn calling_thread(instances: &[BridgeInstance]) -> Option<BridgeChat> {
+    let mut running = HashSet::new();
     for instance in instances {
+        let Some(profile_id) = profile_id(&instance.user_data) else {
+            continue;
+        };
         let Ok(reply) = bridge_request(instance, &json!({"type":"listThreads"})).await else {
             continue;
         };
@@ -810,23 +860,35 @@ async fn calling_thread(instances: &[BridgeInstance]) -> Option<String> {
             continue;
         }
         if let Some(threads) = reply.body.get("threads").and_then(Value::as_array) {
-            running.extend(
-                threads
-                    .iter()
-                    .filter(|thread| {
-                        thread.get("status") == Some(&json!("running"))
-                            && thread.get("source") == Some(&json!("local"))
-                    })
-                    .filter_map(|thread| {
-                        thread.get("id").and_then(Value::as_str).map(str::to_owned)
-                    }),
-            );
+            for thread in threads.iter().filter(|thread| {
+                thread.get("status") == Some(&json!("running"))
+                    && thread.get("source") == Some(&json!("local"))
+            }) {
+                if let Some(composer) = thread
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| safe_chat_id(id))
+                {
+                    running.insert(BridgeChat {
+                        composer: composer.to_owned(),
+                        profile_id: profile_id.clone(),
+                    });
+                }
+            }
         }
     }
-    (running.len() == 1).then(|| running.remove(0))
+    (running.len() == 1)
+        .then(|| running.into_iter().next())
+        .flatten()
 }
 
 pub async fn composer_holding(delivery: &Value) -> Option<String> {
+    composer_holding_identity(delivery)
+        .await
+        .map(|chat| chat.composer)
+}
+
+pub async fn composer_holding_identity(delivery: &Value) -> Option<BridgeChat> {
     let marker = delivery.get("marker").and_then(Value::as_str)?;
     if marker.len() != 64 || !marker.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
@@ -855,11 +917,15 @@ async fn query_bridge_chat(
     instances: &[BridgeInstance],
     marker: &str,
     candidate: Option<&str>,
-) -> Option<String> {
+) -> Option<BridgeChat> {
+    let mut matches = HashSet::new();
     for instance in instances {
         if instance.user_data.as_os_str().is_empty() {
             continue;
         }
+        let Some(profile_id) = profile_id(&instance.user_data) else {
+            continue;
+        };
         let database = instance.user_data.join("User/globalStorage/state.vscdb");
         if !database.is_file() {
             continue;
@@ -893,11 +959,16 @@ async fn query_bridge_chat(
                 .and_then(Value::as_str)
                 .filter(|chat| safe_chat_id(chat))
             {
-                return Some(chat.to_owned());
+                matches.insert(BridgeChat {
+                    composer: chat.to_owned(),
+                    profile_id,
+                });
             }
         }
     }
-    None
+    (matches.len() == 1)
+        .then(|| matches.into_iter().next())
+        .flatten()
 }
 
 pub async fn deliver_editor(delivery: &Value, event: &Value) -> Option<Value> {
