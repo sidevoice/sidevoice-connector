@@ -19,7 +19,7 @@ use super::{private_dir, until, Profile, CONNECTOR};
 
 /// `R`.
 pub fn releases(profile: &Profile) -> PathBuf {
-    profile.root.join("xdg/data/sidevoice")
+    profile.root.join("home/.local/share/sidevoice")
 }
 
 /// Stage the release and the installation record; returns `R/current`.
