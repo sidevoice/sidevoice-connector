@@ -1012,6 +1012,8 @@ pub async fn uninstall(profile: &Profile, options: Options, runtime: &Runtime) -
     let layout = Layout::from_profile(profile);
     safe_remove::validate_scope(&layout).map_err(failed)?;
     let _lock = crate::service::install_lock(&layout).await?;
+    let guard = safe_remove::Guard::new(&layout).map_err(failed)?;
+    let had_releases = guard.preflight().map_err(failed)?;
     let service = runtime.unload(&layout).await?;
     let agents = if options.agents {
         unregister(profile).await
@@ -1019,35 +1021,15 @@ pub async fn uninstall(profile: &Profile, options: Options, runtime: &Runtime) -
         json!({})
     };
     let paired = crate::pairing::previous_room(profile);
-    let had_releases = fs::symlink_metadata(&layout.releases).is_ok();
-    match fs::remove_dir_all(&layout.releases) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(failed(error)),
-        _ => {}
-    }
-    let mut removed = Vec::new();
-    if layout.data.is_dir() {
-        let _agents_lock = crate::lock::wait_lock(
-            &layout.data.join("agents.lock"),
-            "uninstall",
-            Duration::from_secs(30),
-        )
-        .await?
-        .ok_or_else(|| failed("another agents request holds agents.lock"))?;
-        for entry in fs::read_dir(&layout.data)?.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if KEPT.contains(&name.as_str()) {
-                continue;
-            }
-            let path = entry.path();
-            let gone = if entry.file_type()?.is_dir() {
-                fs::remove_dir_all(&path)
-            } else {
-                fs::remove_file(&path)
-            };
-            gone.map_err(|error| failed(format!("{}: {error}", path.display())))?;
-            removed.push(name);
-        }
-    }
+    guard.remove_releases().map_err(failed)?;
+    let _agents_lock = crate::lock::wait_lock(
+        &layout.data.join("agents.lock"),
+        "uninstall",
+        Duration::from_secs(30),
+    )
+    .await?
+    .ok_or_else(|| failed("another agents request holds agents.lock"))?;
+    let removed = guard.remove_data_contents().map_err(failed)?;
     let mut advice = Vec::new();
     if let Some(room) = &paired {
         advice.push(format!(
