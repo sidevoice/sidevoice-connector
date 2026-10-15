@@ -237,23 +237,6 @@ Cursor's Desktop Bridge, once Cursor has recorded the chat's join call (up to ~3
 Several chats of a window can join.\nIf you type while the room sends, the two mix.";
 
 impl Registration for Cursor {
-    fn setup_version_binary(&self) -> Option<&'static str> {
-        Some("cursor")
-    }
-
-    fn setup_status(
-        &self,
-        profile: &Profile,
-        _version: Option<&str>,
-        setup_binary_available: bool,
-        _registration: &str,
-    ) -> Option<(&'static str, Value)> {
-        Some((
-            "cursor_bridge",
-            super::bridge_setup::status(profile, setup_binary_available || Path::new(APP).exists()),
-        ))
-    }
-
     fn after_install(&self, _profile: &Profile) -> Vec<String> {
         vec![INSTALL_NOTES.to_owned()]
     }

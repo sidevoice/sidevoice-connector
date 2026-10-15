@@ -1404,32 +1404,6 @@ impl HostAgents {
         } else {
             input.old_version.map(str::to_owned)
         };
-        // An adapter can ask for the version of a different binary than its MCP registration uses.
-        let setup_binary = agent.setup_version_binary().and_then(|name| {
-            find_in_path(&[name], input.login_path)
-                .or_else(|| find_in_path(&[name], std::env::var("PATH").ok().as_deref()))
-                .or_else(|| {
-                    agent
-                        .known_paths(&self.profile.home)
-                        .into_iter()
-                        .filter(|path| path.file_name().is_some_and(|file| file == name))
-                        .map(|path| path.to_string_lossy().into_owned())
-                        .find(|path| executable(path))
-                })
-        });
-        let setup_version = if agent.setup_version_binary().is_some() {
-            if input.include_version {
-                match setup_binary.as_deref() {
-                    Some(setup) if binary.as_deref() == Some(setup) => version.clone(),
-                    Some(setup) => self.binary_version(agent, setup, cancel, deadline).await?,
-                    None => None,
-                }
-            } else {
-                agent.cached_setup_version(input.state.pointer(&format!("/seen/{id}/agent")))
-            }
-        } else {
-            None
-        };
         let mut evidence = Vec::new();
         let config = agent.config_root(&self.profile);
         if config.exists() {
@@ -1484,13 +1458,14 @@ impl HostAgents {
             "actionable":false,
             "health":Value::Null,
         });
-        if let Some((field, value)) = agent.setup_status(
-            &self.profile,
-            setup_version.as_deref(),
-            setup_binary.is_some(),
-            &registration,
-        ) {
-            row[field] = value;
+        if id == "cursor" {
+            let editor_available = binary.as_deref().is_some_and(|path| {
+                Path::new(path)
+                    .file_name()
+                    .is_some_and(|name| name == "cursor")
+            }) || evidence.iter().any(|item| item.kind == "app");
+            row["cursor_bridge"] =
+                crate::adapters::cursor::bridge_setup::status(&self.profile, editor_available);
         }
         Ok(Observation {
             row,
