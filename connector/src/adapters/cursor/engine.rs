@@ -255,4 +255,29 @@ mod tests {
         );
         assert_eq!(editor_engine_in("chat-c", &[instance]), None);
     }
+
+    #[test]
+    fn malformed_editor_metadata_does_not_claim_an_engine() {
+        let scratch = Scratch::new("cursor-editor-bad-engine");
+        let user_data = scratch.0.join("Cursor");
+        let storage = user_data.join("User/globalStorage");
+        fs::create_dir_all(&storage).unwrap();
+        let db = storage.join("state.vscdb");
+        database(&db, "CREATE TABLE cursorDiskKV(key TEXT, value TEXT); INSERT INTO cursorDiskKV VALUES ('composerData:chat-a', 'not-json'); INSERT INTO cursorDiskKV VALUES ('composerData:chat-b', '{\"modelConfig\":{\"modelName\":\"default\"}}');");
+        let instance = BridgeInstance {
+            socket: PathBuf::new(),
+            token: String::new(),
+            user_data,
+            created_at: 0,
+        };
+        assert_eq!(
+            editor_engine_in("chat-a", std::slice::from_ref(&instance)),
+            None
+        );
+        assert_eq!(
+            editor_engine_in("chat-b", std::slice::from_ref(&instance)),
+            None
+        );
+        assert_eq!(editor_engine_in("../chat-b", &[instance]), None);
+    }
 }
