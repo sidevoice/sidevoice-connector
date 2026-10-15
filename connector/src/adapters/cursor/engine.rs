@@ -227,7 +227,7 @@ mod tests {
             engine_in_roots("chat-a", std::slice::from_ref(&root)).unwrap(),
             json!({"model":"claude-opus","effort":"high","thinking":null})
         );
-        assert_eq!(engine_in_roots("chat-b", &[root.clone()]), None);
+        assert_eq!(engine_in_roots("chat-b", std::slice::from_ref(&root)), None);
         assert_eq!(engine_in_roots("../chat-a", &[root]), None);
     }
 
