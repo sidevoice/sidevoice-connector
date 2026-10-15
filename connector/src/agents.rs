@@ -5,6 +5,7 @@
 //! cancel the work without releasing the gate before the child has exited.
 
 use crate::adapters::health::{self, Health};
+use crate::adapters::markers::{self, Roots};
 use crate::adapters::registration::{
     mcp_servers_json, shell_command, AgentError, AgentHost, CliError, CliOutput, Launch, Manual,
     Registration,
@@ -102,7 +103,8 @@ struct ActiveOperation {
 /// An agent, by the id of its harness.
 type AgentId = &'static str;
 
-/// The variable naming an agent's CLI explicitly: `SIDEVOICE_<ID>_BIN`.
+/// Unit-test-only binary fixture. Production CLI detection uses the captured login PATH.
+#[cfg(test)]
 fn override_name(id: AgentId) -> String {
     format!("SIDEVOICE_{}_BIN", id.to_ascii_uppercase())
 }
@@ -281,7 +283,6 @@ enum CommandFailure {
 #[derive(Serialize, Clone)]
 struct Evidence<'a> {
     kind: &'a str,
-    path: String,
 }
 
 struct Observation {
@@ -291,13 +292,6 @@ struct Observation {
     binary: Option<String>,
     present: bool,
     signature: Option<String>,
-}
-
-struct InspectionInput<'a> {
-    state: &'a Value,
-    login_path: Option<&'a str>,
-    include_version: bool,
-    old_version: Option<&'a str>,
 }
 
 impl HostAgents {
@@ -432,9 +426,7 @@ impl HostAgents {
                 .get("scanned_at")
                 .is_some_and(|value| !value.is_null());
             if rescan || watch.is_some() || !has_cache {
-                state = self
-                    .scan(state, watch, true, true, cancel, deadline)
-                    .await?;
+                state = self.scan(state, watch, true, cancel, deadline).await?;
             }
             return self.response(&state);
         }
@@ -450,14 +442,7 @@ impl HostAgents {
         let agent = parse_id(&self.registry, id)?;
         let state = self.load_state(cancel, deadline).await?;
         let mut state = self
-            .scan(
-                state,
-                Some(agent),
-                true,
-                action == "check",
-                cancel,
-                deadline,
-            )
+            .scan(state, Some(agent), action == "check", cancel, deadline)
             .await?;
         let current = seen_agent(&state, agent).ok_or_else(|| not_present(agent))?;
         if action == "check" {
@@ -505,7 +490,7 @@ impl HostAgents {
             self.connect(agent, binary.as_deref(), cancel, deadline)
                 .await?;
             state = self
-                .scan(state, Some(agent), false, true, cancel, deadline)
+                .scan(state, Some(agent), true, cancel, deadline)
                 .await?;
             match seen_agent(&state, agent)
                 .and_then(|row| row.get("registration"))
@@ -553,7 +538,7 @@ impl HostAgents {
         self.disconnect(agent, binary.as_deref(), cancel, deadline)
             .await?;
         state = self
-            .scan(state, Some(agent), false, false, cancel, deadline)
+            .scan(state, Some(agent), false, cancel, deadline)
             .await?;
         match seen_agent(&state, agent)
             .and_then(|row| row.get("registration"))
@@ -574,7 +559,9 @@ impl HostAgents {
         let mut rows = Vec::new();
         for (id, _) in self.registry.agents() {
             if let Some(seen) = state.pointer(&format!("/seen/{id}")) {
-                if seen.get("present") == Some(&Value::Bool(true)) {
+                if state.get("login_path").and_then(Value::as_str).is_some()
+                    && seen.get("present") == Some(&Value::Bool(true))
+                {
                     if let Some(mut row) = seen.get("agent").cloned() {
                         let dismissed = seen
                             .get("generation")
@@ -613,7 +600,6 @@ impl HostAgents {
         &self,
         state: Value,
         watch: Option<AgentId>,
-        include_version: bool,
         check: bool,
         cancel: &Cancellation,
         deadline: Instant,
@@ -622,16 +608,18 @@ impl HostAgents {
             return Err(Failure::Cancelled);
         }
         let base = state.clone();
-        let mut login_path = state
-            .get("login_path")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if watch.is_none() || login_path.is_none() {
-            if let Some(captured) = self.capture_login_path(cancel, deadline).await? {
-                login_path = Some(captured);
-            }
+        let login_path = self.capture_login_path(cancel, deadline).await?;
+        if login_path.is_none() {
+            return self
+                .merge_scan(base, Vec::new(), None, cancel, deadline)
+                .await;
         }
-        let ids: Vec<_> = watch.map_or_else(
+        let ids: Vec<_> = (if base.get("login_path") != Some(&json!(login_path)) {
+            None
+        } else {
+            watch
+        })
+        .map_or_else(
             || self.registry.agents().map(|(id, _)| id).collect(),
             |id| vec![id],
         );
@@ -639,24 +627,10 @@ impl HostAgents {
         for name in ids {
             check_live(cancel, deadline)?;
             let agent = name;
-            let previous_version = base
-                .pointer(&format!("/seen/{name}/agent/version"))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
             observations.push((
                 agent,
-                self.inspect(
-                    agent,
-                    InspectionInput {
-                        state: &base,
-                        login_path: login_path.as_deref(),
-                        include_version,
-                        old_version: previous_version.as_deref(),
-                    },
-                    cancel,
-                    deadline,
-                )
-                .await?,
+                self.inspect(agent, login_path.as_deref(), cancel, deadline)
+                    .await?,
             ));
         }
         self.health(
@@ -749,11 +723,20 @@ impl HostAgents {
         deadline: Instant,
     ) -> std::result::Result<Value, Failure> {
         self.update_state(cancel, deadline, true, move |latest| {
+            if captured_path.is_none() {
+                latest["login_path"] = Value::Null;
+                latest["binaries"] = json!({});
+                if let Some(seen) = latest.get_mut("seen").and_then(Value::as_object_mut) {
+                    for entry in seen.values_mut() {
+                        entry["present"] = json!(false);
+                    }
+                }
+                latest["scanned_at"] = json!(iso_now());
+                return;
+            }
             let path_unchanged = latest.get("login_path") == base.get("login_path");
             if path_unchanged {
-                if let Some(path) = captured_path {
-                    latest["login_path"] = json!(path);
-                }
+                latest["login_path"] = json!(captured_path);
             }
             for (id, observation) in observations {
                 if !path_unchanged
@@ -1061,12 +1044,11 @@ fn normalized_state(mut value: Value) -> Value {
     value
 }
 
-/// How an agent's CLI is run outside its registration (an adapter's delivery through it): the executable the scan found
-/// (`SIDEVOICE_<AGENT>_BIN` when set to one), else its bare name; and the PATH of the person's login shell the scan
-/// captured, so a launcher that is a script (Node's) finds its interpreter where a service manager's PATH does not
-/// reach.
+/// How an adapter runs a CLI outside registration: only the executable found on the captured
+/// login PATH, and that PATH so a script launcher finds its interpreter. A missing program stays
+/// missing; the service manager's unrelated PATH is never used as a fallback.
 pub struct AgentCommand {
-    pub program: String,
+    pub program: Option<String>,
     pub path: Option<String>,
 }
 
@@ -1078,17 +1060,10 @@ pub fn agent_command(profile: &Profile, agent: &str) -> AgentCommand {
         .and_then(Value::as_str)
         .filter(|path| !path.is_empty())
         .map(str::to_owned);
+    let registry = Registry::standard();
     let program = id
-        .and_then(|id| std::env::var(override_name(id)).ok())
-        .filter(|path| executable(path))
-        .or_else(|| {
-            state
-                .pointer(&format!("/binaries/{agent}"))
-                .and_then(Value::as_str)
-                .filter(|path| executable(path))
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| agent.to_owned());
+        .and_then(|id| registry.agent(id).map(|(_, registration)| registration))
+        .and_then(|registration| find_in_path(registration.binary_names(), path.as_deref()));
     AgentCommand { program, path }
 }
 
@@ -1180,7 +1155,8 @@ fn js_release_program(program: &str, root: &Path) -> bool {
     }
 }
 
-fn executable(value: &str) -> bool {
+#[cfg(test)]
+pub(crate) fn executable(value: &str) -> bool {
     let path = Path::new(value);
     if !path.is_absolute() {
         return false;
@@ -1188,28 +1164,46 @@ fn executable(value: &str) -> bool {
     fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && (metadata.mode() & 0o111 != 0))
 }
 
-fn find_in_path(names: &[&str], path: Option<&str>) -> Option<String> {
-    for directory in path?.split(':').filter(|value| !value.is_empty()) {
-        for name in names {
-            let candidate = Path::new(directory).join(name);
-            let value = candidate.to_string_lossy().into_owned();
-            if executable(&value) {
-                return Some(value);
-            }
-        }
-    }
-    None
+pub(crate) fn find_in_path(names: &[&str], path: Option<&str>) -> Option<String> {
+    let path = path?;
+    names.iter().find_map(|name| {
+        which::which_in(*name, Some(path), Path::new("/"))
+            .ok()
+            .map(|found| found.to_string_lossy().into_owned())
+    })
 }
 
-async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> std::io::Result<Vec<u8>> {
+fn parse_login_path(output: &str) -> Option<String> {
+    const START: &str = "\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}";
+    const END: &str = "\u{1e}SIDEVOICE_PATH_END\u{1e}";
+    let (_, framed) = output.split_once(START)?;
+    let (value, tail) = framed.split_once(END)?;
+    if tail.contains(START) || tail.contains(END) || value.is_empty() || value.len() > 32_768 {
+        return None;
+    }
+    (value.split(':').all(|part| Path::new(part).is_absolute())
+        && !value.chars().any(char::is_control))
+    .then(|| value.to_owned())
+}
+
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    limit: usize,
+) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
     let mut buffer = [0u8; 8192];
+    let mut truncated = false;
     loop {
         let count = reader.read(&mut buffer).await?;
         if count == 0 {
-            return Ok(output);
+            return if truncated {
+                Err(std::io::Error::other("command output truncated"))
+            } else {
+                Ok(output)
+            };
         }
-        let keep = OUTPUT_LIMIT.saturating_sub(output.len()).min(count);
+        let keep = limit.saturating_sub(output.len()).min(count);
+        truncated |= keep < count;
         output.extend_from_slice(&buffer[..keep]);
     }
 }
@@ -1264,6 +1258,27 @@ async fn run_command(
     cancel: &Cancellation,
     deadline: Instant,
 ) -> std::result::Result<CliOutput, CommandFailure> {
+    run_command_with_limit(
+        profile,
+        agent_config,
+        binary,
+        args,
+        cancel,
+        deadline,
+        OUTPUT_LIMIT,
+    )
+    .await
+}
+
+async fn run_command_with_limit(
+    profile: &Profile,
+    agent_config: Option<&Path>,
+    binary: &str,
+    args: &[String],
+    cancel: &Cancellation,
+    deadline: Instant,
+    output_limit: usize,
+) -> std::result::Result<CliOutput, CommandFailure> {
     if cancel.is_cancelled() {
         return Err(CommandFailure::Cancelled);
     }
@@ -1284,8 +1299,8 @@ async fn run_command(
     let process_group = child.id().ok_or(CommandFailure::Io)?;
     let stdout = child.stdout.take().ok_or(CommandFailure::Io)?;
     let stderr = child.stderr.take().ok_or(CommandFailure::Io)?;
-    let mut stdout_task = tokio::spawn(read_capped(stdout));
-    let mut stderr_task = tokio::spawn(read_capped(stderr));
+    let mut stdout_task = tokio::spawn(read_capped(stdout, output_limit));
+    let mut stderr_task = tokio::spawn(read_capped(stderr, OUTPUT_LIMIT));
     let child_deadline = (Instant::now() + CHILD_LIMIT).min(deadline);
     let status = tokio::select! {
         _ = cancel.cancelled() => {
@@ -1376,7 +1391,7 @@ impl HostAgents {
     async fn inspect(
         &self,
         id: AgentId,
-        input: InspectionInput<'_>,
+        login_path: Option<&str>,
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<Observation, Failure> {
@@ -1385,7 +1400,7 @@ impl HostAgents {
             .map_err(|_| agent_failure("agents.invalid", id))?;
         let agent = self.registration(id)?;
         let host = self.host(agent, cancel, deadline);
-        let binary = self.resolve_binary(id, agent, input.state, input.login_path);
+        let binary = self.resolve_binary(id, agent, login_path);
         let entry = agent
             .state(&host, binary.as_deref())
             .await
@@ -1396,47 +1411,31 @@ impl HostAgents {
         // `outdated`: an entry of ours that is not the current one (disabled, an older release, another environment).
         // Connect writes it again; like a current one, it is ours to remove: `owned`.
         let owned = registration == "connected" || registration == "outdated";
-        let version = if input.include_version {
-            match binary.as_deref() {
-                Some(binary) => self.binary_version(agent, binary, cancel, deadline).await?,
-                None => None,
-            }
-        } else {
-            input.old_version.map(str::to_owned)
-        };
+        // Discovery never executes a candidate binary. An apparent CLI can itself launch a GUI.
+        let version: Option<String> = None;
         let mut evidence = Vec::new();
-        let config = agent.config_root(&self.profile);
-        if config.exists() {
-            evidence.push(Evidence {
-                kind: "config-dir",
-                path: config.to_string_lossy().into_owned(),
-            });
+        if binary.is_some() {
+            evidence.push(Evidence { kind: "cli" });
         }
-        if let Some(binary) = &binary {
-            evidence.push(Evidence {
-                kind: "binary",
-                path: binary.clone(),
-            });
+        for kind in markers::matching_kinds(
+            agent.install_markers(),
+            std::env::consts::OS,
+            &Roots::process(&self.profile.home),
+        ) {
+            evidence.push(Evidence { kind });
         }
-        for (kind, path) in agent.evidence() {
-            let path = path.to_string_lossy().into_owned();
-            if !evidence.iter().any(|item| item.path == path) {
-                evidence.push(Evidence { kind, path });
-            }
-        }
-        // Installed, not merely remembered: a signal of the program itself (its CLI on the login PATH or in its standard
-        // places, or its app), never its configuration directory alone, which other tools and an uninstall leave
-        // behind. The directory stays in the evidence, a detail of the agent found, never the reason it is.
-        let present = evidence.iter().any(|item| item.kind != "config-dir");
+        // Configuration directories are not install markers: they can survive an uninstall.
+        let present = !evidence.is_empty();
         // The connector acts itself where it reaches the agent: its CLI found, or a file it edits.
         let able = binary.is_some() || agent.connects_without_binary();
         let evidence_json = serde_json::to_value(&evidence).map_err(|_| Failure::Internal)?;
         let signature = if present {
             let identity = format!(
-                "{{\"id\":{},\"version\":{},\"evidence\":{}}}",
+                "{{\"id\":{},\"version\":{},\"evidence\":{},\"binary\":{}}}",
                 serde_json::to_string(id).map_err(|_| Failure::Internal)?,
                 serde_json::to_string(&version).map_err(|_| Failure::Internal)?,
-                serde_json::to_string(&evidence).map_err(|_| Failure::Internal)?
+                serde_json::to_string(&evidence).map_err(|_| Failure::Internal)?,
+                serde_json::to_string(&binary).map_err(|_| Failure::Internal)?
             );
             Some(hex::encode(Sha256::digest(identity.as_bytes())))
         } else {
@@ -1474,28 +1473,17 @@ impl HostAgents {
         &self,
         id: AgentId,
         agent: &dyn Registration,
-        state: &Value,
         login_path: Option<&str>,
     ) -> Option<String> {
-        let override_path = std::env::var(override_name(id)).ok();
-        if let Some(path) = override_path.as_deref().filter(|path| executable(path)) {
-            return Some(path.to_owned());
-        }
-        if let Some(path) = state
-            .pointer(&format!("/binaries/{id}"))
-            .and_then(Value::as_str)
+        #[cfg(test)]
+        if let Some(path) = std::env::var(override_name(id))
+            .ok()
             .filter(|path| executable(path))
         {
-            return Some(path.to_owned());
-        }
-        if let Some(path) = find_in_path(agent.binary_names(), login_path) {
             return Some(path);
         }
-        agent
-            .known_paths(&self.profile.home)
-            .into_iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .find(|path| executable(path))
+        let _ = id;
+        find_in_path(agent.binary_names(), login_path)
     }
 
     async fn capture_login_path(
@@ -1509,50 +1497,25 @@ impl HostAgents {
         else {
             return Ok(None);
         };
+        let command = if Path::new(&shell)
+            .file_name()
+            .is_some_and(|name| name == "fish")
+        {
+            "printf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' (string join : $PATH)"
+        } else {
+            "printf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' \"$PATH\""
+        };
         let output = run_command(
             &self.profile,
             None,
             &shell,
-            &["-lc".into(), "printf %s \"$PATH\"".into()],
+            &["-lc".into(), command.into()],
             cancel,
             deadline,
         )
         .await;
         match output {
-            Ok(output) if output.status.success() => {
-                let value = output.stdout.trim();
-                Ok((!value.is_empty()).then(|| value.to_owned()))
-            }
-            Ok(_) | Err(CommandFailure::Start | CommandFailure::Deadline | CommandFailure::Io) => {
-                Ok(None)
-            }
-            Err(CommandFailure::Cancelled) => Err(Failure::Cancelled),
-        }
-    }
-
-    async fn binary_version(
-        &self,
-        agent: &dyn Registration,
-        binary: &str,
-        cancel: &Cancellation,
-        deadline: Instant,
-    ) -> std::result::Result<Option<String>, Failure> {
-        match run_command(
-            &self.profile,
-            Some(agent.config_root(&self.profile)),
-            binary,
-            &["--version".into()],
-            cancel,
-            deadline,
-        )
-        .await
-        {
-            Ok(output) if output.status.success() => Ok(output
-                .stdout
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .map(|line| line.chars().take(200).collect())),
+            Ok(output) if output.status.success() => Ok(parse_login_path(&output.stdout)),
             Ok(_) | Err(CommandFailure::Start | CommandFailure::Deadline | CommandFailure::Io) => {
                 Ok(None)
             }

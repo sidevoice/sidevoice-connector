@@ -72,6 +72,7 @@ async fn run(args: Args) -> Result<()> {
     eprintln!("Installed {}.", installed["version"]);
     let command = profile.installed_command()?;
     profile.write_agent_files(&command)?;
+    profile.discover_agents(&command)?;
     let call = Arc::new(call::Call::new(profile.clone(), command.clone()));
     tokio::spawn(call.clone().keep_open());
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", args.port)).await?;

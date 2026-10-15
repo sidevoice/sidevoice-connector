@@ -94,11 +94,9 @@ pub trait Registration: Send + Sync {
     fn config_root<'a>(&self, profile: &'a Profile) -> &'a Path;
     /// Its CLI's names, as found on PATH.
     fn binary_names(&self) -> &'static [&'static str];
-    /// Where its CLI is installed when PATH does not reach it.
-    fn known_paths(&self, home: &Path) -> Vec<PathBuf>;
-    /// Evidence, beyond its home and its CLI, that the agent is on this computer: `(kind, path)`.
-    fn evidence(&self) -> Vec<(&'static str, PathBuf)> {
-        Vec::new()
+    /// Fixed, passive filesystem markers for this agent. CLI names above use the captured login PATH.
+    fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
+        &[]
     }
     /// How to start this agent against the test bench's profile, when it can be: printed when the bench starts.
     fn bench_steps(&self, _setup: &BenchSetup) -> Option<String> {
