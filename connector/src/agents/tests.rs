@@ -83,6 +83,7 @@ async fn failed_watched_capture_hides_all_agents_and_recovery_reconciles_all() {
     host.shutdown().await;
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn public_app_evidence_redacts_a_user_desktop_entry() {
     let _turn = agent_env().await;

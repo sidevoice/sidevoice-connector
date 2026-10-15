@@ -21,7 +21,15 @@ pub struct Profile {
 }
 
 fn capture_person_login_path() -> Result<String> {
-    let shell = std::env::var("SHELL").context("SHELL is required for bench discovery")?;
+    let shell = match std::env::var("SHELL") {
+        Ok(shell) => shell,
+        Err(std::env::VarError::NotPresent) => {
+            // Noninteractive test runners have no login shell; their process PATH is already the
+            // environment in which the bench found its agents. Capture it before private HOME.
+            return checked_bench_path(std::env::var("PATH")?);
+        }
+        Err(error) => return Err(error.into()),
+    };
     if !Path::new(&shell).is_absolute() {
         bail!("SHELL must be absolute");
     }
@@ -44,13 +52,17 @@ fn capture_person_login_path() -> Result<String> {
     let (path, _) = framed
         .split_once("\u{1e}SIDEVOICE_PATH_END\u{1e}")
         .context("login shell truncated PATH frame")?;
+    checked_bench_path(path.to_owned())
+}
+
+fn checked_bench_path(path: String) -> Result<String> {
     if path.is_empty()
         || path.len() > 32768
         || !path.split(':').all(|part| Path::new(part).is_absolute())
     {
         bail!("login shell supplied an invalid bench PATH");
     }
-    Ok(path.to_owned())
+    Ok(path)
 }
 
 const DIRECTORIES: &[&str] = &["home", "sidevoice", "xdg/config", "xdg/data", "bench"];

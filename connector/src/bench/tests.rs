@@ -51,3 +51,15 @@ fn bench_login_shell_exposes_captured_cli_path_without_binary_override() {
     assert!(bin.join("codex").is_file());
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn bench_captures_process_path_when_runner_has_no_login_shell() {
+    let old = std::env::var_os("SHELL");
+    std::env::remove_var("SHELL");
+    let captured = capture_person_login_path();
+    if let Some(old) = old {
+        std::env::set_var("SHELL", old);
+    }
+    assert_eq!(captured.unwrap(), std::env::var("PATH").unwrap());
+    assert!(checked_bench_path("relative:/usr/bin".into()).is_err());
+}
