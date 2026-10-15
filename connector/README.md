@@ -5,6 +5,11 @@ Sidevoice core: it installs itself and the core it carries (`install`, below), s
 runs the machine's connector daemon, which holds the link to the core. On npm it is `sidevoice`, whose launcher runs
 this binary from the platform package (RELEASING.md); the command is then `sidevoice`.
 
+The connector reports `input.working` as soon as its harness observes a busy transition. Claude Code uses its
+session status, Codex uses rollout turn events, and Cursor uses the joined chat's transcript. For an editor chat,
+Cursor's Desktop Bridge must first identify that chat; delivery identifying it wakes transcript monitoring at once.
+The room exposes this as a boolean fact, and the web waits three seconds before showing Working.
+
 ## Commands
 
 | Command | What it does |

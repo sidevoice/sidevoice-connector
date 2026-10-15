@@ -19,6 +19,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 use tokio::time::Duration;
 
 /// What an editor chat's delivery and status say until the Desktop Bridge knows which chat it is.
@@ -39,6 +40,7 @@ pub struct Cursor;
 struct Chats {
     bridge: Mutex<Option<String>>,
     transcript: Mutex<Option<String>>,
+    bridge_changed: Notify,
 }
 
 fn chats(conversation: &Conversation) -> Option<&Chats> {
@@ -50,8 +52,11 @@ fn bridge(conversation: &Conversation) -> Option<String> {
 }
 
 fn set_bridge(conversation: &Conversation, chat: String) {
-    if let Some(mut bridge) = chats(conversation).and_then(|chats| chats.bridge.lock().ok()) {
-        *bridge = Some(chat);
+    if let Some(chats) = chats(conversation) {
+        if let Ok(mut bridge) = chats.bridge.lock() {
+            *bridge = Some(chat);
+            chats.bridge_changed.notify_one();
+        }
     }
 }
 
@@ -256,6 +261,12 @@ fn watch_editor(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
             if binding.stopped.load(Ordering::Relaxed) {
                 return;
             }
+            // Register for the wakeup before checking the bridge. notify_one keeps a permit
+            // if delivery identifies the chat between this check and the wait below.
+            let changed = chats(binding)
+                .expect("Cursor conversation state")
+                .bridge_changed
+                .notified();
             if let Some(chat) = bridge(binding) {
                 if followed(binding).as_deref() != Some(chat.as_str()) {
                     set_followed(binding, chat.clone());
@@ -323,7 +334,10 @@ fn watch_editor(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(2_000)
                 .max(10);
-            tokio::time::sleep(Duration::from_millis(scan_ms)).await;
+            tokio::select! {
+                _ = changed => {},
+                _ = tokio::time::sleep(Duration::from_millis(scan_ms)) => {},
+            }
         }
     });
 }
@@ -539,6 +553,45 @@ mod tests {
             stopped: AtomicBool::new(false),
             state: Cursor.conversation_state(),
         }
+    }
+
+    /// A delivery can identify the editor chat while the periodic transcript scan sleeps.
+    /// Its retained wakeup must let the watcher attach without waiting for that scan.
+    #[tokio::test]
+    async fn bridge_identification_wakes_working_monitor() {
+        let identity =
+            super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
+        let conversation = conversation(&identity);
+        let changed = chats(&conversation).unwrap().bridge_changed.notified();
+        set_bridge(&conversation, "chat-1".into());
+        tokio::time::timeout(Duration::from_millis(100), changed)
+            .await
+            .expect("delivery must wake the monitor without a scan interval");
+        assert_eq!(bridge(&conversation).as_deref(), Some("chat-1"));
+    }
+
+    #[test]
+    fn transcript_fixture_reports_busy_until_turn_ends() {
+        let mut reader = Reader::new("chat-1".into(), true);
+        let fixture = [
+            r#"{"role":"user","message":{"content":"hello"}}"#,
+            r#"{"role":"assistant","message":{"content":"working"}}"#,
+            r#"{"type":"turn_ended"}"#,
+        ];
+        let events = fixture
+            .iter()
+            .map(|line| {
+                reader
+                    .item(&serde_json::from_str::<Value>(line).unwrap(), false)
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        Observed::Working(value) => Some(value),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(events, vec![vec![true], vec![], vec![false]]);
     }
 
     /// Why an editor chat is not reached yet, in the order a person fixes it: the bridge, then sqlite3, then Cursor
