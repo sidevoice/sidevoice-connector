@@ -56,6 +56,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::time::{sleep, timeout, Duration, Instant};
 
+mod safe_remove;
+
 /// The connector's program inside a package and inside a release.
 pub const BINARY: &str = "bin/sidevoice-connector";
 /// How long the pair has to answer after a restart.
@@ -1008,6 +1010,7 @@ pub fn human_install(answer: &Value) -> String {
 /// `uninstall`: see the module's documentation. The answer is `uninstall --json`'s.
 pub async fn uninstall(profile: &Profile, options: Options, runtime: &Runtime) -> Result<Value> {
     let layout = Layout::from_profile(profile);
+    safe_remove::validate_scope(&layout).map_err(failed)?;
     let _lock = crate::service::install_lock(&layout).await?;
     let service = runtime.unload(&layout).await?;
     let agents = if options.agents {
