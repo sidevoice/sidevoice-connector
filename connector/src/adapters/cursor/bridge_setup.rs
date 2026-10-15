@@ -18,10 +18,12 @@ enum BridgeFiles {
 }
 
 fn bridge_dir(profile: &Profile) -> PathBuf {
-    env::var_os("CURSOR_DESKTOP_BRIDGE_DIR")
+    env::var("CURSOR_DESKTOP_BRIDGE_DIR")
+        .ok()
+        .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| super::config_home(profile).join("desktop-bridge"))
+        .unwrap_or_else(|| profile.home.join(".cursor/desktop-bridge"))
 }
 
 fn inventory(dir: &Path) -> BridgeFiles {
@@ -36,9 +38,6 @@ fn inventory(dir: &Path) -> BridgeFiles {
         }
         json_seen = true;
         // A descriptor's token is checked for presence only. The socket path is used locally only.
-        let Ok(file) = File::open(&path) else {
-            continue;
-        };
         let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
@@ -48,6 +47,9 @@ fn inventory(dir: &Path) -> BridgeFiles {
         {
             continue;
         }
+        let Ok(file) = File::open(&path) else {
+            continue;
+        };
         let mut bytes = Vec::new();
         if file
             .take(MAX_DESCRIPTOR + 1)
@@ -279,5 +281,14 @@ mod tests {
             assess(Some("3.22.12"), BridgeFiles::Missing, true, "connected")["steps"][1]["state"],
             "unknown"
         );
+    }
+
+    #[test]
+    fn disabled_setting_without_bridge_files_is_reported_as_unverified() {
+        // A disabled beta setting and a closed Cursor both leave no descriptor. The connector
+        // cannot read that setting, so it reports the step as unknown instead of claiming it is off.
+        let status = assess(Some("3.22.12"), BridgeFiles::Missing, true, "connected");
+        assert_eq!(status["reason"], "bridge_missing");
+        assert_eq!(status["steps"][1]["state"], "unknown");
     }
 }

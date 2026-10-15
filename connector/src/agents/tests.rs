@@ -156,10 +156,8 @@ async fn cursor_agent_row_exposes_bridge_steps_without_home_paths_or_secrets() {
     let cached = host.handle("agents.list", json!({})).await;
     assert_eq!(row(&cached, "cursor")["cursor_bridge"], *bridge);
 
-    let dir = fixture
-        .profile
-        .agent_home("CURSOR_CONFIG_DIR")
-        .join("desktop-bridge");
+    let dir = fixture.profile.home.join(".cursor/desktop-bridge");
+    private_mkdir(&fixture.profile.home.join(".cursor"));
     private_mkdir(&dir);
     let socket = fixture.root.join("bridge.sock");
     private_write(&socket, b"");
