@@ -66,6 +66,7 @@ fn cli_detection_uses_only_fresh_login_path_not_overrides_fixed_paths_or_cache()
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn cursor_desktop_registration_needs_a_scan_path_and_hidden_entries_are_not_detected() {
     let profile = Profile::new("desktopdetect");
     let entry = profile.root.join("xdg/data/applications/cursor.desktop");
