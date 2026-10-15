@@ -1,13 +1,17 @@
 //! The model selection of one Cursor chat. Only chat-local records may identify its engine.
 
-use super::{bridge_instances, safe_chat_id, BridgeInstance};
+use super::{safe_chat_id, BridgeInstance};
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::process::Stdio;
+use tokio::io::AsyncReadExt;
+use tokio::time::{timeout, Duration};
 
 const MAX_RESULT: usize = 32 * 1024;
+const QUERY_DEADLINE: Duration = Duration::from_millis(500);
 
 fn text(value: Option<&Value>) -> Option<&str> {
     value
@@ -81,6 +85,43 @@ fn query(database: &Path, sql: &str) -> Option<Vec<Value>> {
     serde_json::from_slice(&output.stdout).ok()
 }
 
+/// The editor query must not block the transcript runtime or buffer unlimited SQLite output.
+async fn query_editor_with(binary: &Path, database: &Path, sql: &str) -> Option<Vec<Value>> {
+    let mut child = tokio::process::Command::new(binary)
+        .args(["-readonly", "-json"])
+        .arg(database)
+        .arg(sql)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let mut bytes = Vec::new();
+    let result = timeout(QUERY_DEADLINE, async {
+        stdout
+            .take((MAX_RESULT + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await
+            .ok()?;
+        child.wait().await.ok()
+    })
+    .await;
+    let Some(status) = result.ok().flatten() else {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return None;
+    };
+    if !status.success() || bytes.len() > MAX_RESULT {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+async fn query_editor(database: &Path, sql: &str) -> Option<Vec<Value>> {
+    query_editor_with(Path::new("sqlite3"), database, sql).await
+}
+
 /// The Cursor CLI session's last model is in its own store.db metadata. It may itself contain
 /// an `effort=` override. A global CLI model selection does not establish this chat's effort.
 pub fn engine(chat_id: &str) -> Option<Value> {
@@ -138,11 +179,7 @@ fn engine_in_roots(chat_id: &str, roots: &[PathBuf]) -> Option<Value> {
 
 /// Cursor's editor keeps each composer's selection in its Desktop Bridge user-data database.
 /// Query only the named composer's model configuration; message bodies never leave SQLite.
-pub fn editor_engine(chat_id: &str) -> Option<Value> {
-    editor_engine_in(chat_id, &bridge_instances())
-}
-
-fn editor_engine_in(chat_id: &str, instances: &[BridgeInstance]) -> Option<Value> {
+pub(super) async fn editor_engine_in(chat_id: &str, instances: &[BridgeInstance]) -> Option<Value> {
     if !safe_chat_id(chat_id) {
         return None;
     }
@@ -152,7 +189,7 @@ fn editor_engine_in(chat_id: &str, instances: &[BridgeInstance]) -> Option<Value
         if !database.is_file() {
             continue;
         }
-        let Some(rows) = query(&database, &sql) else {
+        let Some(rows) = query_editor(&database, &sql).await else {
             continue;
         };
         let Some(config) = rows
@@ -180,6 +217,8 @@ fn editor_engine_in(chat_id: &str, instances: &[BridgeInstance]) -> Option<Value
 mod tests {
     use super::*;
     use crate::secure_fs::tests::Scratch;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
 
     fn database(path: &Path, sql: &str) {
         assert!(Command::new("sqlite3")
@@ -236,8 +275,8 @@ mod tests {
         assert_eq!(engine_in_roots("../chat-a", &[root]), None);
     }
 
-    #[test]
-    fn editor_model_and_effort_are_scoped_to_the_composer() {
+    #[tokio::test]
+    async fn editor_model_and_effort_are_scoped_to_the_composer() {
         let scratch = Scratch::new("cursor-editor-engine");
         let user_data = scratch.0.join("Cursor");
         let storage = user_data.join("User/globalStorage");
@@ -251,18 +290,22 @@ mod tests {
             created_at: 0,
         };
         assert_eq!(
-            editor_engine_in("chat-a", std::slice::from_ref(&instance)).unwrap(),
+            editor_engine_in("chat-a", std::slice::from_ref(&instance))
+                .await
+                .unwrap(),
             json!({"model":"gpt-5","effort":"high","thinking":null})
         );
         assert_eq!(
-            editor_engine_in("chat-b", std::slice::from_ref(&instance)).unwrap()["effort"],
+            editor_engine_in("chat-b", std::slice::from_ref(&instance))
+                .await
+                .unwrap()["effort"],
             "medium"
         );
-        assert_eq!(editor_engine_in("chat-c", &[instance]), None);
+        assert_eq!(editor_engine_in("chat-c", &[instance]).await, None);
     }
 
-    #[test]
-    fn malformed_editor_metadata_does_not_claim_an_engine() {
+    #[tokio::test]
+    async fn malformed_editor_metadata_does_not_claim_an_engine() {
         let scratch = Scratch::new("cursor-editor-bad-engine");
         let user_data = scratch.0.join("Cursor");
         let storage = user_data.join("User/globalStorage");
@@ -276,13 +319,47 @@ mod tests {
             created_at: 0,
         };
         assert_eq!(
-            editor_engine_in("chat-a", std::slice::from_ref(&instance)),
+            editor_engine_in("chat-a", std::slice::from_ref(&instance)).await,
             None
         );
         assert_eq!(
-            editor_engine_in("chat-b", std::slice::from_ref(&instance)),
+            editor_engine_in("chat-b", std::slice::from_ref(&instance)).await,
             None
         );
-        assert_eq!(editor_engine_in("../chat-b", &[instance]), None);
+        assert_eq!(editor_engine_in("../chat-b", &[instance]).await, None);
+    }
+
+    async fn bounded_child(script_body: &str) {
+        let scratch = Scratch::new("cursor-sqlite-child");
+        let script = scratch.0.join("sqlite3-fixture");
+        let pid_file = scratch.0.join("pid");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\n{script_body}\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            query_editor_with(&script, Path::new("unused"), "SELECT 1").await,
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let pid: i32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        // The query waits for the killed child before returning.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
+
+    #[tokio::test]
+    async fn slow_editor_sqlite_child_is_deadlined_and_reaped() {
+        bounded_child("exec sleep 5").await;
+    }
+
+    #[tokio::test]
+    async fn oversized_editor_sqlite_output_is_bounded_and_reaped() {
+        bounded_child("printf '%040000d' 0; exec sleep 5").await;
     }
 }

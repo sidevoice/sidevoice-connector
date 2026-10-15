@@ -2,7 +2,7 @@ mod engine;
 mod harness;
 mod registration;
 
-pub use engine::{editor_engine, engine};
+pub use engine::engine;
 pub use harness::Cursor;
 
 /// Cursor's configuration home (`mcp.json`), checked through its parent, and its data below it.
