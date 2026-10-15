@@ -481,6 +481,88 @@ async fn lost_admission_recovers_original_and_does_not_bar_new_audio() {
     }
 }
 
+#[tokio::test]
+async fn recovery_re_registers_an_unknown_binding_without_changing_original_fields() {
+    let scratch = Scratch::new("recover-unknown-binding");
+    let link = Link::new();
+    let mut frames = link.attached().await;
+    let answering_link = link.clone();
+    tokio::spawn(async move {
+        let mut registrations = 0;
+        let mut recoveries = 0;
+        while let Some(Message::Text(text)) = frames.recv().await {
+            let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+            if frame["method"] == "binding.register" {
+                registrations += 1;
+                let id = if registrations == 1 {
+                    "core-a"
+                } else {
+                    "core-a-new"
+                };
+                answering_link
+                    .answer(json!({"jsonrpc":"2.0","id":frame["id"],
+                    "result":{"binding_id":id,"initial_reply_context":{}}}))
+                    .await
+                    .unwrap();
+            } else if frame["method"] == "speech.recover" {
+                recoveries += 1;
+                let params = &frame["params"];
+                assert_eq!(params["binding_id"], "core-a");
+                assert_eq!(params["history_only"], false);
+                assert_eq!(
+                    params["recovery_binding_id"],
+                    if recoveries == 1 {
+                        "core-a"
+                    } else {
+                        "core-a-new"
+                    }
+                );
+                let result = if recoveries == 1 {
+                    json!({"status":"unknown_binding","event_id":params["event_id"],
+                        "utterance_id":params["utterance_id"]})
+                } else {
+                    json!({"status":"text_only","reason":"connector_disconnected","text_saved":true,
+                        "event_id":params["event_id"],"utterance_id":params["utterance_id"]})
+                };
+                answering_link
+                    .answer(json!({"jsonrpc":"2.0","id":frame["id"],"result":result}))
+                    .await
+                    .unwrap();
+            } else if frame["method"] == "speech.publish" {
+                panic!("uncertain first admission was blindly retried");
+            }
+        }
+    });
+    let (daemon, _) = daemon(&scratch, link);
+    daemon
+        .command(1, "register", registration("a"))
+        .await
+        .unwrap();
+    daemon
+        .queue(
+            json!({"client_ref":"a","binding_id":"core-a","event_id":"event-a",
+        "utterance_id":"utterance-a","session_id":"s","revision":1,"epoch":0,
+        "text":"reply","language":null,"history_only":false,"attempted":true}),
+        )
+        .await
+        .unwrap();
+    let result = daemon
+        .command(
+            1,
+            "publish",
+            json!({"client_ref":"a","session_id":"s",
+        "revision":1,"epoch":0,"text":"reply","event_id":"event-a",
+        "utterance_id":"utterance-a"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["status"], "text_only", "{result}");
+    assert_eq!(result["reason"], "connector_disconnected", "{result}");
+    let retained = daemon.outbox.lock().await.clone();
+    assert_eq!(retained[0]["binding_id"], "core-a");
+    assert_eq!(retained[0]["resolved"], result);
+}
+
 /// The façade↔daemon IPC: every command a newer `sidevoice mcp` sends, with fields this daemon does not know at the
 /// top and nested, is answered for what it knows. A command it has never heard of gets a defined refusal.
 #[tokio::test]
