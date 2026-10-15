@@ -247,6 +247,23 @@ impl Profile {
             .ok_or_else(|| anyhow!("install.json names no command"))
     }
 
+    /// Populate discovery state before the bench can accept a conversation and its first delivery.
+    pub fn discover_agents(&self, command: &[String]) -> Result<()> {
+        let answer = run_json(
+            self.command(&command[0])
+                .args(&command[1..])
+                .args(["agents", "--json"]),
+        )?;
+        if answer["ok"] != true {
+            bail!("bench agent discovery failed: {}", answer["error"]);
+        }
+        let state: Value = serde_json::from_slice(&fs::read(self.data().join("agents.json"))?)?;
+        if state["login_path"].as_str() != Some(self.login_path.as_str()) {
+            bail!("bench agent discovery did not capture its login PATH");
+        }
+        Ok(())
+    }
+
     /// `bench/env.sh` (what an agent runs with) and `bench/mcp.json` (an `mcpServers` configuration naming this
     /// installation).
     pub fn write_agent_files(&self, command: &[String]) -> Result<()> {
