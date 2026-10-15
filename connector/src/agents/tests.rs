@@ -42,10 +42,16 @@ async fn command_output_limit_reports_truncation_instead_of_parsing_prefix() {
 async fn failed_watched_capture_hides_all_agents_and_recovery_reconciles_all() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
-    let claude = fake_claude(&fixture);
-    let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", claude.as_os_str());
+    let _no_cursor_override = EnvGuard::set("SIDEVOICE_CURSOR_BIN", std::ffi::OsStr::new(""));
+    let bin = fixture.root.join("login-bin");
+    private_mkdir(&bin);
+    for name in ["claude", "cursor-agent"] {
+        let program = bin.join(name);
+        private_write(&program, b"#!/bin/sh\nexit 0\n");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let shell = fixture.root.join("login-shell");
-    private_write(&shell, b"#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' /usr/bin\n");
+    private_write(&shell, format!("#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' '{}'\n", bin.display()).as_bytes());
     fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
     let _shell = EnvGuard::set("SHELL", shell.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
@@ -56,7 +62,7 @@ async fn failed_watched_capture_hides_all_agents_and_recovery_reconciles_all() {
         )
         .await
         .unwrap(),
-        Some("/usr/bin".into())
+        Some(bin.to_string_lossy().into_owned())
     );
     let first = host.handle("agents.list", json!({"rescan":true})).await;
     assert!(listed_ids(&first).contains(&"claude".into()), "{first}");
@@ -68,7 +74,7 @@ async fn failed_watched_capture_hides_all_agents_and_recovery_reconciles_all() {
     assert!(listed_ids(&cached).is_empty(), "{cached}");
     private_write(
         &shell,
-        b"#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' /bin\n",
+        format!("#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' '{}'\n", bin.display()).as_bytes(),
     );
     fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
     let recovered = host.handle("agents.list", json!({"watch":"cursor"})).await;
@@ -85,35 +91,15 @@ async fn failed_watched_capture_hides_all_agents_and_recovery_reconciles_all() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn public_app_evidence_redacts_a_user_desktop_entry() {
+async fn public_marker_evidence_names_kind_without_home_path() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
-    let mut profile = fixture.profile.clone();
-    profile.xdg_data = profile.home.join(".local/share");
-    private_mkdir(&profile.xdg_data);
-    let applications = profile.xdg_data.join("applications");
-    private_mkdir(&applications);
-    private_write(
-        &applications.join("cursor.desktop"),
-        b"[Desktop Entry]\nType=Application\nName=Cursor\nExec=cursor\n",
-    );
-    let shell = fixture.root.join("login-shell");
-    private_write(&shell, b"#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' /usr/bin\n");
-    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
-    let _shell = EnvGuard::set("SHELL", shell.as_os_str());
-    let host = HostAgents::with_selected(profile.clone(), fixture.selected());
+    let _no_cli = EnvGuard::set("SIDEVOICE_CURSOR_BIN", std::ffi::OsStr::new(""));
+    private_mkdir(&fixture.profile.home.join(".local/share/cursor"));
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let listed = host.handle("agents.list", json!({"rescan":true})).await;
-    let app = row(&listed, "cursor")["evidence"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|value| value["kind"] == "app")
-        .unwrap();
-    assert_eq!(app["path"], "~/.local/share/applications/cursor.desktop");
-    assert!(!app["path"]
-        .as_str()
-        .unwrap()
-        .contains(&profile.home.to_string_lossy().to_string()));
+    assert_eq!(row(&listed, "cursor")["evidence"], json!([{"kind":"install_dir"}]));
+    assert!(!row(&listed, "cursor")["evidence"].to_string().contains(&fixture.profile.home.to_string_lossy().to_string()));
     host.shutdown().await;
 }
 
@@ -273,12 +259,13 @@ fn row<'a>(answer: &'a Value, id: &str) -> &'a Value {
         .unwrap()
 }
 
-fn identity_signature(id: &str, version: Option<&str>, evidence: &[Evidence<'_>]) -> String {
+fn identity_signature(id: &str, version: Option<&str>, evidence: &[Evidence<'_>], binary: Option<&str>) -> String {
     let identity = format!(
-        "{{\"id\":{},\"version\":{},\"evidence\":{}}}",
+        "{{\"id\":{},\"version\":{},\"evidence\":{},\"binary\":{}}}",
         serde_json::to_string(id).unwrap(),
         serde_json::to_string(&version).unwrap(),
         serde_json::to_string(evidence).unwrap(),
+        serde_json::to_string(&binary).unwrap(),
     );
     hex::encode(Sha256::digest(identity.as_bytes()))
 }
@@ -363,21 +350,9 @@ async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped
             }
         }),
     );
-    let evidence = vec![
-        Evidence {
-            kind: "config-dir",
-            path: fixture
-                .profile
-                .agent_home("CURSOR_CONFIG_DIR")
-                .to_string_lossy()
-                .into_owned(),
-        },
-        Evidence {
-            kind: "binary",
-            path: fixture.cursor().to_string_lossy().into_owned(),
-        },
-    ];
-    let signature = identity_signature("cursor", None, &evidence);
+    let evidence = vec![Evidence { kind: "cli" }];
+    let cursor = fixture.cursor().to_string_lossy().into_owned();
+    let signature = identity_signature("cursor", None, &evidence, Some(&cursor));
     write_json(
         &fixture.profile.data.join("agents.json"),
         &json!({
@@ -498,15 +473,6 @@ async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped
     host.shutdown().await;
 }
 
-/// A desktop registration in the host environment can still make an agent present.
-fn installed_on_this_machine(fixture: &Fixture, id: &str) -> bool {
-    let registry = crate::adapters::Registry::standard();
-    let (_, agent) = registry.agents().find(|(found, _)| *found == id).unwrap();
-    agent.app_identity().is_some_and(|identity| {
-        app::linux_entry(identity, &app::linux_roots(&fixture.profile.xdg_data), None).is_some()
-    })
-}
-
 fn listed_ids(answer: &Value) -> Vec<String> {
     answer["agents"]
         .as_array()
@@ -554,12 +520,10 @@ async fn an_agent_is_listed_when_its_program_is_installed_not_for_its_home_alone
         let missing = host.handle("agents.list", json!({"rescan":true})).await;
         fs::rename(&away, program).unwrap();
         assert!(missing.get("error").is_none(), "{missing}");
-        if !installed_on_this_machine(&fixture, id) {
-            assert!(
-                !listed_ids(&missing).contains(&id.to_owned()),
-                "{id} is listed for its home alone: {missing}"
-            );
-        }
+        assert!(
+            !listed_ids(&missing).contains(&id.to_owned()),
+            "{id} is listed for its home alone: {missing}"
+        );
         // Its program: installed, and said why.
         std::env::set_var(&variable, program);
         let found = host.handle("agents.list", json!({"rescan":true})).await;
@@ -569,7 +533,7 @@ async fn an_agent_is_listed_when_its_program_is_installed_not_for_its_home_alone
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|item| item["kind"] == "binary"),
+                .any(|item| item["kind"] == "cli"),
             "{found}"
         );
         std::env::remove_var(&variable);
@@ -582,9 +546,7 @@ async fn an_agent_is_listed_when_its_program_is_installed_not_for_its_home_alone
     std::env::set_var(override_name("cursor"), &cursor);
     let listed = host.handle("agents.list", json!({"rescan":true})).await;
     for id in ["claude", "codex"] {
-        if !installed_on_this_machine(&fixture, id) {
-            assert!(!listed_ids(&listed).contains(&id.to_owned()), "{listed}");
-        }
+        assert!(!listed_ids(&listed).contains(&id.to_owned()), "{listed}");
     }
     assert!(
         listed_ids(&listed).contains(&"cursor".to_owned()),

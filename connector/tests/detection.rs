@@ -70,45 +70,36 @@ fn cli_detection_uses_only_fresh_login_path_not_overrides_fixed_paths_or_cache()
 
 #[test]
 #[cfg(target_os = "linux")]
-fn cursor_desktop_registration_needs_a_scan_path_and_hidden_entries_are_not_detected() {
-    let profile = Profile::new("desktopdetect");
-    let entry = profile.root.join("xdg/data/applications/cursor.desktop");
-    fs::create_dir_all(entry.parent().unwrap()).unwrap();
-    fs::write(
-        &entry,
-        "[Desktop Entry]\nType=Application\nName=Cursor\nExec=cursor %F\n",
-    )
-    .unwrap();
+fn cursor_install_directory_is_passive_and_needs_a_captured_path() {
+    let profile = Profile::new("markerdetect");
+    let install_dir = profile.root.join("home/.local/share/cursor");
+    fs::create_dir_all(&install_dir).unwrap();
     let no_shell = listed(&profile, None, None);
-    assert!(
-        !has(&no_shell, "cursor"),
-        "failed PATH capture must leave the list empty: {no_shell}"
-    );
+    assert!(!has(&no_shell, "cursor"), "failed PATH capture listed a marker: {no_shell}");
     let shell = profile.root.join("login-shell");
     program(&shell, "#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' /usr/bin\n");
     let found = listed(&profile, Some(&shell), None);
-    assert!(
-        has(&found, "cursor"),
-        "OS registration was ignored: {found}"
-    );
-    assert!(found["agents"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["id"] == "cursor")
-        .unwrap()["evidence"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|evidence| evidence["kind"] == "app"));
-    fs::write(
-        &entry,
-        "[Desktop Entry]\nType=Application\nName=Cursor\nExec=cursor\nHidden=true\n",
-    )
-    .unwrap();
-    let hidden = listed(&profile, Some(&shell), None);
-    assert!(
-        !has(&hidden, "cursor"),
-        "hidden app was guessed present: {hidden}"
-    );
+    let cursor = found["agents"].as_array().unwrap().iter().find(|row| row["id"] == "cursor").unwrap();
+    assert_eq!(cursor["evidence"], serde_json::json!([{"kind":"install_dir"}]));
+    assert!(!cursor["evidence"].to_string().contains(&profile.root.join("home").to_string_lossy().to_string()));
+    fs::remove_dir_all(&install_dir).unwrap();
+    let removed = listed(&profile, Some(&shell), None);
+    assert!(!has(&removed, "cursor"), "removed install marker stayed listed: {removed}");
+}
+
+#[test]
+fn startup_output_is_not_mistaken_for_the_login_path() {
+    let profile = Profile::new("noisypath");
+    let bin = profile.root.join("found");
+    program(&bin.join("claude"), "#!/bin/sh\nexit 0\n");
+    let shell = profile.root.join("login-shell");
+    program(&shell, &format!(
+        "#!/bin/sh\necho 'Welcome to your shell'\necho 'startup stderr' >&2\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' '{}'\n",
+        bin.display()
+    ));
+    let found = listed(&profile, Some(&shell), None);
+    assert!(has(&found, "claude"), "framed first PATH component was lost: {found}");
+    fs::write(&shell, "#!/bin/sh\necho 'Welcome to your shell'\n").unwrap();
+    let refused = listed(&profile, Some(&shell), None);
+    assert!(!has(&refused, "claude"), "banner-only output passed as PATH: {refused}");
 }

@@ -247,13 +247,16 @@ impl Registration for Cursor {
         &["cursor-agent", "cursor"]
     }
 
-    fn app_identity(&self) -> Option<crate::adapters::app::Identity> {
-        Some(crate::adapters::app::Identity {
-            mac_bundle: "com.todesktop.230313mzl4w4u92",
-            windows_name: "Cursor",
-            windows_publisher: "Anysphere",
-            linux_desktop: "cursor.desktop",
-        })
+    fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
+        use crate::adapters::markers::{Marker, Root};
+        &[
+            Marker { os: "macos", kind: "app_bundle", root: Root::Absolute, path: "/Applications/Cursor.app" },
+            Marker { os: "macos", kind: "app_bundle", root: Root::Home, path: "Applications/Cursor.app" },
+            Marker { os: "windows", kind: "install_dir", root: Root::LocalAppData, path: "Programs/cursor" },
+            Marker { os: "windows", kind: "install_dir", root: Root::ProgramFiles, path: "cursor" },
+            Marker { os: "linux", kind: "install_dir", root: Root::Absolute, path: "/usr/share/cursor" },
+            Marker { os: "linux", kind: "install_dir", root: Root::Home, path: ".local/share/cursor" },
+        ]
     }
 
     fn connects_without_binary(&self) -> bool {

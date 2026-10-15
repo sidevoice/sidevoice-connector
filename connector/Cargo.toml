@@ -33,4 +33,5 @@ tokio-tungstenite = "0.30"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
+which = "=8.0.6"
 zstd = "0.13"

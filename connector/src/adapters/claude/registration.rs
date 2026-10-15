@@ -217,6 +217,15 @@ impl Registration for Claude {
         &["claude"]
     }
 
+    fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
+        use crate::adapters::markers::{Marker, Root};
+        &[
+            Marker { os: "macos", kind: "install_file", root: Root::Home, path: ".local/bin/claude" },
+            Marker { os: "linux", kind: "install_file", root: Root::Home, path: ".local/bin/claude" },
+            Marker { os: "windows", kind: "install_file", root: Root::Home, path: ".local/bin/claude.exe" },
+        ]
+    }
+
     fn state<'a>(
         &'a self,
         host: &'a dyn AgentHost,

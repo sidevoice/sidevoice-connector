@@ -94,9 +94,9 @@ pub trait Registration: Send + Sync {
     fn config_root<'a>(&self, profile: &'a Profile) -> &'a Path;
     /// Its CLI's names, as found on PATH.
     fn binary_names(&self) -> &'static [&'static str];
-    /// OS registration identity for a desktop app, when this adapter has one.
-    fn app_identity(&self) -> Option<crate::adapters::app::Identity> {
-        None
+    /// Fixed, passive filesystem markers for this agent. CLI names above use the captured login PATH.
+    fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
+        &[]
     }
     /// How to start this agent against the test bench's profile, when it can be: printed when the bench starts.
     fn bench_steps(&self, _setup: &BenchSetup) -> Option<String> {

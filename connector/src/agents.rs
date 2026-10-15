@@ -4,7 +4,7 @@
 //! One gate owns a complete request. CLI children belong to its worker task so a vanished link reply can
 //! cancel the work without releasing the gate before the child has exited.
 
-use crate::adapters::app;
+use crate::adapters::markers::{self, Roots};
 use crate::adapters::health::{self, Health};
 use crate::adapters::registration::{
     mcp_servers_json, shell_command, AgentError, AgentHost, CliError, CliOutput, Launch, Manual,
@@ -283,7 +283,6 @@ enum CommandFailure {
 #[derive(Serialize, Clone)]
 struct Evidence<'a> {
     kind: &'a str,
-    path: String,
 }
 
 struct Observation {
@@ -579,20 +578,6 @@ impl HostAgents {
                     && seen.get("present") == Some(&Value::Bool(true))
                 {
                     if let Some(mut row) = seen.get("agent").cloned() {
-                        if let Some(evidence) =
-                            row.get_mut("evidence").and_then(Value::as_array_mut)
-                        {
-                            for item in evidence {
-                                if let Some(path) = item.get("path").and_then(Value::as_str) {
-                                    if let Ok(relative) =
-                                        Path::new(path).strip_prefix(&self.profile.home)
-                                    {
-                                        item["path"] =
-                                            json!(Path::new("~").join(relative).to_string_lossy());
-                                    }
-                                }
-                            }
-                        }
                         let dismissed = seen
                             .get("generation")
                             .and_then(Value::as_str)
@@ -1208,16 +1193,12 @@ pub(crate) fn executable(value: &str) -> bool {
 }
 
 pub(crate) fn find_in_path(names: &[&str], path: Option<&str>) -> Option<String> {
-    for directory in path?.split(':').filter(|value| !value.is_empty()) {
-        for name in names {
-            let candidate = Path::new(directory).join(name);
-            let value = candidate.to_string_lossy().into_owned();
-            if executable(&value) {
-                return Some(value);
-            }
-        }
-    }
-    None
+    let path = path?;
+    names.iter().find_map(|name| {
+        which::which_in(*name, Some(path), Path::new("/"))
+            .ok()
+            .map(|found| found.to_string_lossy().into_owned())
+    })
 }
 
 fn parse_login_path(output: &str) -> Option<String> {
@@ -1467,42 +1448,28 @@ impl HostAgents {
             input.old_version.map(str::to_owned)
         };
         let mut evidence = Vec::new();
-        let config = agent.config_root(&self.profile);
-        if config.exists() {
-            evidence.push(Evidence {
-                kind: "config-dir",
-                path: config.to_string_lossy().into_owned(),
-            });
+        if binary.is_some() {
+            evidence.push(Evidence { kind: "cli" });
         }
-        if let Some(binary) = &binary {
-            evidence.push(Evidence {
-                kind: "binary",
-                path: binary.clone(),
-            });
+        for kind in markers::matching_kinds(
+            agent.install_markers(),
+            std::env::consts::OS,
+            &Roots::process(&self.profile.home),
+        ) {
+            evidence.push(Evidence { kind });
         }
-        if let Some(path) = self
-            .app_path(agent, input.login_path, cancel, deadline)
-            .await
-        {
-            let kind = "app";
-            let path = path.to_string_lossy().into_owned();
-            if !evidence.iter().any(|item| item.path == path) {
-                evidence.push(Evidence { kind, path });
-            }
-        }
-        // Installed, not merely remembered: its CLI on the login PATH or an OS-registered app. The configuration
-        // directory alone is not installation evidence; other tools and an uninstall leave it
-        // behind. The directory stays in the evidence, a detail of the agent found, never the reason it is.
-        let present = evidence.iter().any(|item| item.kind != "config-dir");
+        // Configuration directories are not install markers: they can survive an uninstall.
+        let present = !evidence.is_empty();
         // The connector acts itself where it reaches the agent: its CLI found, or a file it edits.
         let able = binary.is_some() || agent.connects_without_binary();
         let evidence_json = serde_json::to_value(&evidence).map_err(|_| Failure::Internal)?;
         let signature = if present {
             let identity = format!(
-                "{{\"id\":{},\"version\":{},\"evidence\":{}}}",
+                "{{\"id\":{},\"version\":{},\"evidence\":{},\"binary\":{}}}",
                 serde_json::to_string(id).map_err(|_| Failure::Internal)?,
                 serde_json::to_string(&version).map_err(|_| Failure::Internal)?,
-                serde_json::to_string(&evidence).map_err(|_| Failure::Internal)?
+                serde_json::to_string(&evidence).map_err(|_| Failure::Internal)?,
+                serde_json::to_string(&binary).map_err(|_| Failure::Internal)?
             );
             Some(hex::encode(Sha256::digest(identity.as_bytes())))
         } else {
@@ -1551,108 +1518,6 @@ impl HostAgents {
         }
         let _ = id;
         find_in_path(agent.binary_names(), login_path)
-    }
-
-    async fn app_path(
-        &self,
-        agent: &dyn Registration,
-        login_path: Option<&str>,
-        cancel: &Cancellation,
-        deadline: Instant,
-    ) -> Option<PathBuf> {
-        // A failed login PATH capture leaves the whole discovery list empty.
-        let login_path = login_path?;
-        let _ = login_path;
-        let identity = agent.app_identity()?;
-        #[cfg(target_os = "linux")]
-        {
-            let _ = (cancel, deadline);
-            app::linux_entry(
-                identity,
-                &app::linux_roots(&self.profile.xdg_data),
-                Some(login_path),
-            )
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let result = run_command(
-                &self.profile,
-                None,
-                "/usr/bin/osascript",
-                &app::mac_query(identity),
-                cancel,
-                deadline,
-            )
-            .await
-            .ok()?;
-            result
-                .status
-                .success()
-                .then(|| app::mac_result(&result.stdout))
-                .flatten()
-        }
-        #[cfg(target_os = "windows")]
-        {
-            for root in ["HKCU", "HKLM"] {
-                for view in ["32", "64"] {
-                    let key = format!(
-                        r"{}\Software\Microsoft\Windows\CurrentVersion\Uninstall",
-                        root
-                    );
-                    let args = [
-                        "query".into(),
-                        key,
-                        "/s".into(),
-                        "/f".into(),
-                        identity.windows_name.into(),
-                        "/d".into(),
-                        format!("/reg:{view}"),
-                    ];
-                    let Ok(result) = run_command_with_limit(
-                        &self.profile,
-                        None,
-                        "reg.exe",
-                        &args,
-                        cancel,
-                        deadline,
-                        4 * 1024 * 1024,
-                    )
-                    .await
-                    else {
-                        continue;
-                    };
-                    if result.status.success() {
-                        for key in app::windows_candidate_keys(&result.stdout, identity)
-                            .into_iter()
-                            .take(64)
-                        {
-                            let args = ["query".into(), key, format!("/reg:{view}")];
-                            let Ok(entry) = run_command(
-                                &self.profile,
-                                None,
-                                "reg.exe",
-                                &args,
-                                cancel,
-                                deadline,
-                            )
-                            .await
-                            else {
-                                continue;
-                            };
-                            if entry.status.success() {
-                                if let Some(path) = app::windows_results(&entry.stdout, identity)
-                                    .into_iter()
-                                    .find(|path| app::windows_installed_path(path, identity))
-                                {
-                                    return Some(path);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            None
-        }
     }
 
     async fn capture_login_path(

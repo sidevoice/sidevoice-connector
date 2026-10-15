@@ -283,6 +283,11 @@ impl Registration for Codex {
         &["codex"]
     }
 
+    // npm and Homebrew select their own installation prefix; neither is a stable Codex marker.
+    fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
+        &[]
+    }
+
     fn state<'a>(
         &'a self,
         host: &'a dyn AgentHost,
