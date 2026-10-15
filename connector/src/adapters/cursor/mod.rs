@@ -237,7 +237,11 @@ fn find_chat() -> Option<Chat> {
 }
 
 pub fn transcript_path(chat_id: &str) -> Option<PathBuf> {
-    for root in transcript_roots() {
+    transcript_path_in(chat_id, &transcript_roots())
+}
+
+fn transcript_path_in(chat_id: &str, roots: &[PathBuf]) -> Option<PathBuf> {
+    for root in roots {
         let Ok(projects) = fs::read_dir(root.join("projects")) else {
             continue;
         };
@@ -253,6 +257,31 @@ pub fn transcript_path(chat_id: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod pinned_transcript_tests {
+    use super::*;
+
+    #[test]
+    fn joined_chat_transcript_does_not_switch_to_newer_unrelated_chat() {
+        let root = std::env::temp_dir().join(format!("sv-cursor-pin-{}", uuid::Uuid::new_v4()));
+        let joined = root.join("projects/project/agent-transcripts/joined/joined.jsonl");
+        let other = root.join("projects/project/agent-transcripts/other/other.jsonl");
+        fs::create_dir_all(joined.parent().unwrap()).unwrap();
+        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        fs::write(&joined, b"{\"role\":\"user\"}\n").unwrap();
+        assert_eq!(
+            transcript_path_in("joined", std::slice::from_ref(&root)),
+            Some(joined.clone())
+        );
+        fs::write(&other, b"{\"role\":\"user\"}\n").unwrap();
+        assert_eq!(
+            transcript_path_in("joined", std::slice::from_ref(&root)),
+            Some(joined)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 pub fn engine(chat_id: &str) -> Option<Value> {

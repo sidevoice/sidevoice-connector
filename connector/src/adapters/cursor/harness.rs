@@ -676,4 +676,162 @@ mod tests {
         let listed = Cursor.status(&conversation).await.unwrap();
         assert_eq!(listed["delivery_state"]["state"], "registered");
     }
+    /// Records Working from the real Cursor and Codex followers with populated histories.
+    /// The initial catch-up delay remains after Cursor bridge discovery is woken.
+    struct HistoryRoom {
+        profile: Profile,
+        events: AsyncMutex<Vec<Value>>,
+    }
+    impl Room for HistoryRoom {
+        fn profile(&self) -> &Profile {
+            &self.profile
+        }
+        fn engine<'a>(&'a self, _: &'a Conversation, _: Value) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+        fn working<'a>(&'a self, _: &'a Conversation, event: Value) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.events.lock().await.push(event);
+            })
+        }
+        fn read<'a>(
+            &'a self,
+            _: &'a Conversation,
+            _: &'a str,
+            _: Value,
+            _: Value,
+            _: Value,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+        fn conversations(&self) -> BoxFuture<'_, Vec<Arc<Conversation>>> {
+            Box::pin(async { vec![] })
+        }
+    }
+    async fn wait_for_caught_up_working(room: &HistoryRoom) {
+        tokio::time::timeout(Duration::from_secs(6), async {
+            while room.events.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn populated_cursor_and_codex_history_delays_initial_working() {
+        use std::{fs, io::Write};
+        let root = std::env::temp_dir().join(format!("sv-history-watch-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let previous_data = std::env::var_os("CURSOR_DATA_DIR");
+        std::env::set_var("CURSOR_DATA_DIR", &root);
+        for large in [false, true] {
+            let chat = if large {
+                "history-large-chat"
+            } else {
+                "history-small-chat"
+            };
+            let path = root.join(format!(
+                "projects/project/agent-transcripts/{chat}/{chat}.jsonl"
+            ));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let history = format!(
+                "{}\n",
+                json!({"role":"assistant","message":{"content":"x".repeat(1024)}})
+            );
+            let mut content = if large {
+                history.repeat(500)
+            } else {
+                String::new()
+            };
+            content.push_str("{\"role\":\"user\",\"message\":{\"content\":\"hello\"}}\n");
+            fs::write(&path, &content).unwrap();
+            let identity =
+                super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
+            let binding = Arc::new(conversation(&identity));
+            let room = Arc::new(HistoryRoom {
+                profile: Profile::for_test(&root.join(chat), &[]),
+                events: AsyncMutex::new(vec![]),
+            });
+            watch_editor(binding.clone(), room.clone());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let start = tokio::time::Instant::now();
+            set_bridge(&binding, chat.to_owned());
+            wait_for_caught_up_working(&room).await;
+            let elapsed = start.elapsed();
+            println!(
+                "History Cursor large={large} bytes={} first_working_ms={}",
+                content.len(),
+                elapsed.as_millis()
+            );
+            assert_eq!(
+                room.events.lock().await.as_slice(),
+                &[json!({"working":true,"turn_id":null})]
+            );
+            if large {
+                assert!(elapsed >= Duration::from_secs(2));
+            } else {
+                assert!(elapsed < Duration::from_secs(2));
+            }
+            for _ in 0..10 {
+                set_bridge(&binding, chat.to_owned());
+            }
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(file, "{{\"type\":\"turn_ended\"}}").unwrap();
+            tokio::time::sleep(Duration::from_millis(850)).await;
+            assert_eq!(
+                room.events.lock().await.as_slice(),
+                &[
+                    json!({"working":true,"turn_id":null}),
+                    json!({"working":false,"turn_id":null})
+                ]
+            );
+            binding.stopped.store(true, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(450)).await;
+        }
+        let profile = Profile::for_test(&root.join("codex"), &[crate::adapters::codex::HOME]);
+        let path = profile
+            .agent_home("CODEX_HOME")
+            .join("sessions/2026/10/15/rollout-history-codex.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let history = format!(
+            "{}\n",
+            json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"x".repeat(1024)}]}})
+        );
+        let mut content = history.repeat(500);
+        content.push_str(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}\n",
+        );
+        fs::write(&path, &content).unwrap();
+        let identity =
+            super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
+        let mut binding = conversation(&identity);
+        binding.thread = "history-codex".into();
+        binding.delivery = json!({"kind":"codex-queue"});
+        let binding = Arc::new(binding);
+        let room = Arc::new(HistoryRoom {
+            profile,
+            events: AsyncMutex::new(vec![]),
+        });
+        let start = tokio::time::Instant::now();
+        crate::adapters::codex::Codex.watch(binding.clone(), room.clone());
+        wait_for_caught_up_working(&room).await;
+        println!(
+            "History Codex bytes={} first_working_ms={}",
+            content.len(),
+            start.elapsed().as_millis()
+        );
+        assert!(start.elapsed() >= Duration::from_secs(2));
+        assert_eq!(
+            room.events.lock().await.as_slice(),
+            &[json!({"working":true,"turn_id":"t1"})]
+        );
+        binding.stopped.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        if let Some(value) = previous_data {
+            std::env::set_var("CURSOR_DATA_DIR", value);
+        } else {
+            std::env::remove_var("CURSOR_DATA_DIR");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 }
