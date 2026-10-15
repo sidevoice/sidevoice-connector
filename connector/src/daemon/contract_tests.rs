@@ -457,7 +457,9 @@ async fn lost_admission_recovers_original_and_does_not_bar_new_audio() {
             },
             "{recovered}"
         );
-        assert!(daemon.outbox.lock().await.is_empty());
+        let retained = daemon.outbox.lock().await.clone();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0]["resolved"], recovered);
         let next = daemon
             .command(
                 1,

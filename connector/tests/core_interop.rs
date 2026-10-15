@@ -594,7 +594,9 @@ fn t07_recovered_attempt_allows_a_new_context_to_play_with_real_core() {
             assert_eq!(recovered["audio"], "text_only", "{recovered}");
             assert_eq!(recovered["reason"], "connector_disconnected", "{recovered}");
         }
-        assert_eq!(read_json(&outbox), Some(json!([])));
+        let retained = read_json(&outbox).unwrap();
+        assert_eq!(retained[0]["event_id"], "recover-a-event");
+        assert_eq!(retained[0]["resolved"]["text_saved"], true);
         call.report_turn("started", "recover-next-turn", None);
         call.turn_started("recover-next-turn");
         call.report_turn("finished", "recover-next-turn", Some("A new question"));

@@ -440,13 +440,27 @@ impl Daemon {
 
     async fn queue(&self, speech: Value) -> Result<()> {
         let mut outbox = self.outbox.lock().await;
+        let before = outbox.clone();
         outbox.push(speech);
-        if serde_json::to_vec(&*outbox)?.len() > 8 << 20 {
-            outbox.pop();
-            bail!("outbox full");
+        while outbox
+            .iter()
+            .filter(|item| item.get("resolved").is_some())
+            .count()
+            > 2048
+            || serde_json::to_vec(&*outbox)?.len() > 8 << 20
+        {
+            if let Some(index) = outbox
+                .iter()
+                .position(|item| item.get("resolved").is_some())
+            {
+                outbox.remove(index);
+            } else {
+                *outbox = before;
+                bail!("outbox full");
+            }
         }
         if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
-            outbox.pop();
+            *outbox = before;
             return Err(error);
         }
         Ok(())
@@ -551,6 +565,9 @@ impl Daemon {
             else {
                 return Ok(None);
             };
+            if let Some(reply) = item.get("resolved") {
+                return Ok(Some(reply.clone()));
+            }
             if item["attempted"] == true {
                 let original = item.clone();
                 drop(outbox);
@@ -666,7 +683,12 @@ impl Daemon {
             }
             let mut outbox = self.outbox.lock().await;
             let before = outbox.clone();
-            outbox.retain(|item| item.get("event_id") != speech.get("event_id"));
+            if let Some(item) = outbox
+                .iter_mut()
+                .find(|item| item.get("event_id") == speech.get("event_id"))
+            {
+                item["resolved"] = reply.clone();
+            }
             if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
                 *outbox = before;
                 return Err(error);
@@ -680,6 +702,9 @@ impl Daemon {
         let items = self.outbox.lock().await.clone();
         let mut blocked = std::collections::HashSet::new();
         for speech in items {
+            if speech.get("resolved").is_some() {
+                continue;
+            }
             let Some(client_ref) = speech.get("client_ref").and_then(Value::as_str) else {
                 continue;
             };
@@ -1159,7 +1184,9 @@ impl Daemon {
                     .lock()
                     .await
                     .iter()
-                    .filter(|item| item["client_ref"] == speech["client_ref"])
+                    .filter(|item| {
+                        item["client_ref"] == speech["client_ref"] && item.get("resolved").is_none()
+                    })
                     .cloned()
                     .collect::<Vec<_>>();
                 let mut unresolved = false;
