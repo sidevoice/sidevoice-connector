@@ -210,7 +210,7 @@ async fn cursor_bridge_sqlite_status_matches_delivery_without_login_capture() {
         None
     );
 
-    fs::remove_file(&process_bin.join("sqlite3")).unwrap();
+    fs::remove_file(process_bin.join("sqlite3")).unwrap();
     let login_sqlite = login_bin.join("sqlite3");
     private_write(&login_sqlite, b"#!/bin/sh\nexit 0\n");
     fs::set_permissions(&login_sqlite, fs::Permissions::from_mode(0o700)).unwrap();
