@@ -196,7 +196,8 @@ fn usage_refusal(error: &clap::Error, args: impl Iterator<Item = String>) -> Opt
 /// What `--version` says: the version alone, or with `--json` the build's identity.
 fn version(json: bool) -> String {
     if json {
-        json!({"ok":true,"version":identity::VERSION,"target":env!("SIDEVOICE_CONNECTOR_TARGET"),
+        json!({"ok":true,"version":identity::VERSION,"safe_uninstall":identity::SAFE_UNINSTALL,
+            "target":env!("SIDEVOICE_CONNECTOR_TARGET"),
             "source_sha":env!("SIDEVOICE_CONNECTOR_BUILD_SHA")})
         .to_string()
     } else {
@@ -517,6 +518,7 @@ mod tests {
         let value: Value = serde_json::from_str(&version(true)).unwrap();
         assert_eq!(value["ok"], true);
         assert_eq!(value["version"], identity::VERSION);
+        assert_eq!(value["safe_uninstall"], 1);
         assert_eq!(value["target"], env!("SIDEVOICE_CONNECTOR_TARGET"));
         assert_eq!(value["source_sha"], env!("SIDEVOICE_CONNECTOR_BUILD_SHA"));
     }
