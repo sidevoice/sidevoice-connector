@@ -1,17 +1,12 @@
 //! The model selection of one Cursor chat. Only chat-local records may identify its engine.
 
-use super::{safe_chat_id, BridgeInstance};
+use super::{safe_chat_id, state_db, BridgeInstance};
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::process::Stdio;
-use tokio::io::AsyncReadExt;
-use tokio::time::{timeout, Duration};
-
-const MAX_RESULT: usize = 32 * 1024;
-const QUERY_DEADLINE: Duration = Duration::from_secs(2);
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 
 fn text(value: Option<&Value>) -> Option<&str> {
     value
@@ -72,61 +67,9 @@ fn selected_engine(model: &str, configuration: Option<&Value>) -> Option<Value> 
     Some(json!({"model":model,"effort":effort,"thinking":Value::Null}))
 }
 
-fn query(database: &Path, sql: &str) -> Option<Vec<Value>> {
-    let output = Command::new("sqlite3")
-        .args(["-readonly", "-json"])
-        .arg(database)
-        .arg(sql)
-        .output()
-        .ok()?;
-    if !output.status.success() || output.stdout.len() > MAX_RESULT {
-        return None;
-    }
-    serde_json::from_slice(&output.stdout).ok()
-}
-
-/// The editor query must not block the transcript runtime or buffer unlimited SQLite output.
-async fn query_editor_with(binary: &Path, database: &Path, sql: &str) -> Option<Vec<Value>> {
-    let mut child = tokio::process::Command::new(binary)
-        .args(["-readonly", "-json"])
-        .arg(database)
-        .arg(sql)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .ok()?;
-    let stdout = child.stdout.take()?;
-    let mut bytes = Vec::new();
-    let read = timeout(
-        QUERY_DEADLINE,
-        stdout.take((MAX_RESULT + 1) as u64).read_to_end(&mut bytes),
-    )
-    .await;
-    if !matches!(read, Ok(Ok(_))) || bytes.len() > MAX_RESULT {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        return None;
-    }
-    let status = timeout(QUERY_DEADLINE, child.wait()).await;
-    let Ok(Ok(status)) = status else {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        return None;
-    };
-    if !status.success() {
-        return None;
-    }
-    serde_json::from_slice(&bytes).ok()
-}
-
-async fn query_editor(database: &Path, sql: &str) -> Option<Vec<Value>> {
-    query_editor_with(Path::new("sqlite3"), database, sql).await
-}
-
 /// The Cursor CLI session's last model is in its own store.db metadata. It may itself contain
 /// an `effort=` override. A global CLI model selection does not establish this chat's effort.
-pub fn engine(chat_id: &str) -> Option<Value> {
+pub async fn engine(chat_id: &str) -> Option<Value> {
     let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     let mut roots = Vec::new();
     if let Some(path) = env::var_os("CURSOR_CONFIG_DIR") {
@@ -136,10 +79,10 @@ pub fn engine(chat_id: &str) -> Option<Value> {
         roots.push(PathBuf::from(path).join("cursor"));
     }
     roots.extend([home.join(".config/cursor"), home.join(".cursor")]);
-    engine_in_roots(chat_id, &roots)
+    engine_in_roots(chat_id, &roots).await
 }
 
-fn engine_in_roots(chat_id: &str, roots: &[PathBuf]) -> Option<Value> {
+async fn engine_in_roots(chat_id: &str, roots: &[PathBuf]) -> Option<Value> {
     if !safe_chat_id(chat_id) {
         return None;
     }
@@ -152,7 +95,10 @@ fn engine_in_roots(chat_id: &str, roots: &[PathBuf]) -> Option<Value> {
             if !database.is_file() {
                 continue;
             }
-            let Some(rows) = query(&database, "SELECT value FROM meta WHERE key = '0' LIMIT 1;")
+            let Some(rows) =
+                state_db::query(&database, "SELECT value FROM meta WHERE key = '0' LIMIT 1;")
+                    .await
+                    .ok()
             else {
                 continue;
             };
@@ -191,7 +137,7 @@ pub(super) async fn editor_engine_in(chat_id: &str, instances: &[BridgeInstance]
         if !database.is_file() {
             continue;
         }
-        let Some(rows) = query_editor(&database, &sql).await else {
+        let Some(rows) = state_db::query(&database, &sql).await.ok() else {
             continue;
         };
         let Some(config) = rows
@@ -219,16 +165,9 @@ pub(super) async fn editor_engine_in(chat_id: &str, instances: &[BridgeInstance]
 mod tests {
     use super::*;
     use crate::secure_fs::tests::Scratch;
-    use std::os::unix::fs::PermissionsExt;
-    use std::time::Instant;
 
     fn database(path: &Path, sql: &str) {
-        assert!(Command::new("sqlite3")
-            .arg(path)
-            .arg(sql)
-            .status()
-            .unwrap()
-            .success());
+        state_db::fixture(path, sql);
     }
 
     #[test]
@@ -261,8 +200,8 @@ mod tests {
         assert_eq!(selected_engine("default", None), None);
     }
 
-    #[test]
-    fn cli_model_comes_from_its_own_store_and_never_another_chat() {
+    #[tokio::test]
+    async fn cli_model_comes_from_its_own_store_and_never_another_chat() {
         let scratch = Scratch::new("cursor-cli-engine");
         let root = scratch.0.join("cursor");
         let chat = root.join("chats/workspace/chat-a");
@@ -270,11 +209,16 @@ mod tests {
         let db = chat.join("store.db");
         database(&db, "CREATE TABLE meta(key TEXT, value TEXT); INSERT INTO meta VALUES ('0', '{\"lastUsedModel\":\"claude-opus[effort=high]\"}');");
         assert_eq!(
-            engine_in_roots("chat-a", std::slice::from_ref(&root)).unwrap(),
+            engine_in_roots("chat-a", std::slice::from_ref(&root))
+                .await
+                .unwrap(),
             json!({"model":"claude-opus","effort":"high","thinking":null})
         );
-        assert_eq!(engine_in_roots("chat-b", std::slice::from_ref(&root)), None);
-        assert_eq!(engine_in_roots("../chat-a", &[root]), None);
+        assert_eq!(
+            engine_in_roots("chat-b", std::slice::from_ref(&root)).await,
+            None
+        );
+        assert_eq!(engine_in_roots("../chat-a", &[root]).await, None);
     }
 
     #[tokio::test]
@@ -331,42 +275,8 @@ mod tests {
         assert_eq!(editor_engine_in("../chat-b", &[instance]).await, None);
     }
 
-    async fn bounded_child(script_body: &str) {
-        let scratch = Scratch::new("cursor-sqlite-child");
-        let script = scratch.0.join("sqlite3-fixture");
-        let pid_file = scratch.0.join("pid");
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\n{script_body}\n",
-                pid_file.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-        let started = Instant::now();
-        assert_eq!(
-            query_editor_with(&script, Path::new("unused"), "SELECT 1").await,
-            None
-        );
-        assert!(started.elapsed() < Duration::from_secs(3));
-        let pid: i32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
-        // The query waits for the killed child before returning.
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-    }
-
     #[tokio::test]
-    async fn slow_editor_sqlite_child_is_deadlined_and_reaped() {
-        bounded_child("exec sleep 5").await;
-    }
-
-    #[tokio::test]
-    async fn oversized_editor_sqlite_output_is_bounded_and_reaped() {
-        bounded_child("printf '%040000d' 0; exec sleep 5").await;
-    }
-
-    #[test]
-    fn model_inventory_lists_effort_structure_without_values() {
+    async fn model_inventory_lists_effort_structure_without_values() {
         let scratch = Scratch::new("cursor-model-inventory");
         let database_path = scratch.0.join("state.vscdb");
         database(&database_path, "CREATE TABLE cursorDiskKV(key TEXT, value TEXT); INSERT INTO cursorDiskKV VALUES ('composerData:object', '{\"modelConfig\":{\"modelName\":\"secret-model\",\"effort\":\"topsecret-effort\",\"privateMessage\":\"chat text\"}}'); INSERT INTO cursorDiskKV VALUES ('composerData:array', '{\"modelConfig\":{\"modelName\":\"secret-model\",\"parameters\":[{\"id\":\"effort\",\"value\":\"topsecret-effort\"}],\"token\":\"fixture-secret\"}}');");
@@ -375,14 +285,10 @@ mod tests {
             ("array", "$.modelConfig.parameters[0].value"),
         ] {
             let sql = format!("SELECT DISTINCT j.fullkey,j.type FROM cursorDiskKV AS c, json_tree(CAST(c.value AS TEXT)) AS j WHERE c.key='composerData:{chat}' AND json_valid(CAST(c.value AS TEXT)) AND (j.fullkey='$.modelConfig' OR j.fullkey LIKE '$.modelConfig.%' OR j.fullkey LIKE '$.modelConfig[%') LIMIT 120;");
-            let output = Command::new("sqlite3")
-                .args(["-readonly", "-json"])
-                .arg(&database_path)
-                .arg(sql)
-                .output()
-                .unwrap();
-            assert!(output.status.success());
-            let inventory = String::from_utf8(output.stdout).unwrap();
+            let inventory = state_db::query(&database_path, &sql)
+                .await
+                .unwrap()
+                .to_string();
             assert!(inventory.contains(expected), "{inventory}");
             if chat == "array" {
                 assert!(inventory.contains("$.modelConfig.parameters[0].id"));

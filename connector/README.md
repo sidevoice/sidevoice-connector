@@ -150,6 +150,13 @@ output`, `timed out`, `protocol mismatch`); `checked_at` is when (ISO 8601, UTC)
 (`agents.check`, `{"id"}`, or `agents check <id>`); a listing from the cache, and a request with too little time
 left, keep the last one found (in `agents.json`).
 
+Cursor's chat lookup and model metadata use a bundled SQLite library through bounded, read-only
+queries on blocking workers. No system `sqlite3` command is required. Read-only mode preserves
+visibility of Cursor's live WAL; immutable mode is avoided because it can miss a newly recorded
+join. The connector does not issue writes to Cursor's databases. A query has a two-second deadline,
+interrupts on timeout, and caps returned data at 64 KiB. SQLite errors in diagnostics are fixed
+codes and contain no query values, chat text, or local paths.
+
 For a Cursor editor chat, a room receipt of `delivered` means Cursor's Desktop Bridge answered `submitted` or
 `queued`; it does not prove the editor displayed or read the message. A later transcript observation supplies the
 `read` receipt. When investigating a missing message, `connector.log` records `cursor_bridge` lines with fixed
