@@ -1404,6 +1404,35 @@ impl HostAgents {
         } else {
             input.old_version.map(str::to_owned)
         };
+        // The existing row version may describe cursor-agent. Only the editor executable can
+        // establish the Desktop Bridge's minimum Cursor version.
+        let cursor_version = if id == "cursor" {
+            let cursor_binary = find_in_path(&["cursor"], input.login_path).or_else(|| {
+                agent
+                    .known_paths(&self.profile.home)
+                    .into_iter()
+                    .filter(|path| path.file_name().is_some_and(|name| name == "cursor"))
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .find(|path| executable(path))
+            });
+            if input.include_version {
+                match cursor_binary {
+                    Some(binary) => {
+                        self.binary_version(agent, &binary, cancel, deadline)
+                            .await?
+                    }
+                    None => None,
+                }
+            } else {
+                input
+                    .state
+                    .pointer("/seen/cursor/agent/cursor_bridge/cursor_version")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }
+        } else {
+            None
+        };
         let mut evidence = Vec::new();
         let config = agent.config_root(&self.profile);
         if config.exists() {
@@ -1439,7 +1468,7 @@ impl HostAgents {
         } else {
             None
         };
-        let row = json!({
+        let mut row = json!({
             "id":id,
             "label":label(id),
             "version":version,
@@ -1458,6 +1487,14 @@ impl HostAgents {
             "actionable":false,
             "health":Value::Null,
         });
+        if id == "cursor" {
+            row["cursor_bridge"] = crate::adapters::cursor::bridge_setup::status(
+                &self.profile,
+                cursor_version.as_deref(),
+                input.login_path,
+                &registration,
+            );
+        }
         Ok(Observation {
             row,
             launch: entry.launch,

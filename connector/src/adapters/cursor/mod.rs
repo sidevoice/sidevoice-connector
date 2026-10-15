@@ -1,3 +1,4 @@
+pub mod bridge_setup;
 mod harness;
 mod registration;
 
