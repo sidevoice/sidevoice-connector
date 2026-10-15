@@ -6,7 +6,7 @@ use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 fn clean_absolute(path: &Path) -> bool {
     path.is_absolute()
@@ -209,6 +209,7 @@ fn entries(fd: RawFd) -> Result<Vec<OsString>, &'static str> {
 }
 
 pub(super) struct Guard {
+    home_path: PathBuf,
     home: OwnedFd,
     expected: Mount,
 }
@@ -218,7 +219,11 @@ impl Guard {
         validate_scope(layout)?;
         let home = absolute_dir(&layout.home)?;
         let expected = mount(home.as_raw_fd())?;
-        Ok(Self { home, expected })
+        Ok(Self {
+            home_path: layout.home.clone(),
+            home,
+            expected,
+        })
     }
 
     fn check_mount(&self, fd: RawFd) -> Result<(), &'static str> {
@@ -245,6 +250,13 @@ impl Guard {
     }
 
     fn verify_dir(&self, path: &Path, held: RawFd) -> Result<(), &'static str> {
+        let named_home = absolute_dir(&self.home_path)?;
+        if !same(
+            &stat_fd(named_home.as_raw_fd())?,
+            &stat_fd(self.home.as_raw_fd())?,
+        ) {
+            return Err("uninstall home replaced during removal");
+        }
         let current = self
             .open_relative(path)?
             .ok_or("uninstall path disappeared")?;
@@ -440,7 +452,6 @@ impl Guard {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn layout(home: &Path) -> Layout {
@@ -557,5 +568,23 @@ mod tests {
             .is_err());
         assert_eq!(fs::read_to_string(outside.join("keep")).unwrap(), "outside");
         assert_eq!(fs::read_to_string(moved.join("inside")).unwrap(), "inside");
+    }
+
+    #[test]
+    fn home_replaced_after_opening_is_refused() {
+        let scratch = crate::secure_fs::tests::Scratch::new("uninstall-home-race");
+        let home = scratch.0.join("home");
+        let moved = scratch.0.join("moved-home");
+        let layout = layout(&home);
+        fs::create_dir_all(&layout.data).unwrap();
+        fs::write(layout.data.join("keep"), "untouched").unwrap();
+        let guard = Guard::new(&layout).unwrap();
+        fs::rename(&home, &moved).unwrap();
+        symlink(&moved, &home).unwrap();
+        assert!(guard.remove_data_contents().is_err());
+        assert_eq!(
+            fs::read_to_string(moved.join(".sidevoice/keep")).unwrap(),
+            "untouched"
+        );
     }
 }
