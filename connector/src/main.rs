@@ -25,6 +25,10 @@ use std::io::IsTerminal;
 use std::process::ExitCode;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
+/// A core frame is capped at 1 MiB. Rendering complete pull evidence can expand it before the
+/// daemon returns it to MCP, so this IPC hop has a larger bound and paginates below that bound.
+const IPC_FRAME_LIMIT: usize = 16 << 20;
+
 async fn bounded_line<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     limit: usize,

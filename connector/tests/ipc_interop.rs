@@ -75,7 +75,7 @@ fn an_unknown_route_kind_joins_with_no_route_in_and_a_known_one_is_still_checked
 
     let said = ipc.ask(
         "publish",
-        json!({"client_ref":"t-1","session_id":"typed:t-1","revision":0,"text":"Still speaking"}),
+        json!({"client_ref":"t-1","session_id":"binding:t-1","revision":0,"epoch":0,"text":"Still speaking"}),
     );
     assert_eq!(said["ok"], true, "{said}");
     assert_eq!(said["result"]["status"], "queued", "{said}");
@@ -125,7 +125,7 @@ fn a_null_optional_field_reads_as_absent() {
     );
     assert_eq!(listed["experimental"], json!([]), "{listed}");
 
-    let absent = json!({"client_ref":"t-1","session_id":"typed:t-1","revision":0,"text":"absent"});
+    let absent = json!({"client_ref":"t-1","session_id":"binding:t-1","revision":0,"epoch":0,"text":"absent"});
     let mut null = absent.clone();
     null["client_refs"] = Value::Null;
     null["adopt_orphans"] = Value::Null;

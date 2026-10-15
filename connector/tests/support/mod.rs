@@ -423,6 +423,14 @@ impl Mcp {
         }
     }
 
+    /// Send a request whose response the caller deliberately never consumes.
+    pub fn request_without_response(&mut self, method: &str, params: Value) {
+        self.serial += 1;
+        let frame = json!({"jsonrpc":"2.0","id":self.serial,"method":method,"params":params});
+        writeln!(self.stdin, "{frame}").unwrap();
+        self.stdin.flush().unwrap();
+    }
+
     /// `initialize` and `notifications/initialized`; returns the initialize result.
     pub fn initialize(&mut self, client: &str) -> Value {
         let result = self.request(
@@ -455,6 +463,10 @@ pub struct HttpReceiver {
 }
 
 pub fn http_receiver() -> HttpReceiver {
+    http_receiver_with_status(200)
+}
+
+pub fn http_receiver_with_status(status: u16) -> HttpReceiver {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/input", listener.local_addr().unwrap());
     let (tx, bodies) = channel();
@@ -489,8 +501,9 @@ pub fn http_receiver() -> HttpReceiver {
                     let _ = tx.send(value);
                 }
             }
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let response =
+                format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(response.as_bytes());
         }
     });
     HttpReceiver { url, bodies }
@@ -549,6 +562,9 @@ pub fn fake_room(status: u16, answer: Value) -> FakeRoom {
 pub struct Presentation {
     pub token: String,
     pub session: String,
+    socket: PathBuf,
+    send: tokio::sync::mpsc::UnboundedSender<Value>,
+    frames: Receiver<Value>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -565,9 +581,16 @@ impl Presentation {
             .as_str()
             .expect("device token")
             .to_string();
+        Self::open_with_token(socket, token)
+    }
+
+    pub fn open_with_token(socket: &Path, token: String) -> Self {
         let (session_tx, session_rx) = channel();
+        let (frame_tx, frames) = channel();
+        let (send, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let socket = socket.to_path_buf();
+        let held_socket = socket.clone();
         let protocol_token = token.clone();
         let thread = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -597,6 +620,9 @@ impl Presentation {
                 loop {
                     tokio::select! {
                         _ = &mut stopped => break,
+                        Some(outgoing) = send_rx.recv() => {
+                            if ws.send(Message::Text(outgoing.to_string().into())).await.is_err() { break; }
+                        }
                         frame = ws.next() => {
                             let Some(Ok(frame)) = frame else { break };
                             if let Message::Text(text) = frame {
@@ -604,6 +630,7 @@ impl Presentation {
                                 if value["type"] == "voice-session" {
                                     let _ = session_tx.send(value["data"]["session_id"].as_str().unwrap_or("").to_string());
                                 }
+                                let _ = frame_tx.send(value);
                             }
                         }
                     }
@@ -617,8 +644,136 @@ impl Presentation {
         Self {
             token,
             session,
+            socket: held_socket,
+            send,
+            frames,
             stop: Some(stop),
             thread: Some(thread),
+        }
+    }
+
+    pub fn open_second(profile: &Profile) -> Self {
+        let output = profile
+            .connector(&["pair-device", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let code: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let secret = code["payload"]["secret"].as_str().expect("pairing secret");
+        let paired = core_json(
+            &profile.core_socket(),
+            "POST",
+            "/api/device/pair",
+            Some(&json!({"secret":secret,"name":"second test device"})),
+            None,
+        );
+        Self::open_with_token(
+            &profile.core_socket(),
+            paired["token"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    pub fn report_turn(&self, phase: &str, turn_id: &str, text: Option<&str>) {
+        let mut data = json!({"session_id":self.session,"client_msg_id":uuid::Uuid::new_v4().to_string(),
+            "phase":phase,"turn_id":turn_id});
+        if phase == "started" {
+            let state = core_json(
+                &self.socket,
+                "GET",
+                &format!("/api/presentation?session_id={}", self.session),
+                None,
+                Some(&self.token),
+            );
+            data["thread_id"] = json!(state["binding"]["thread_id"].as_str().unwrap_or(""));
+            data["binding_id"] = json!(state["binding"]["binding_id"].as_str().unwrap_or(""));
+        }
+        if let Some(text) = text {
+            data["text"] = json!(text);
+        }
+        self.send
+            .send(json!({"type":"voice-user-turn","data":data}))
+            .unwrap();
+    }
+
+    pub fn report_playback(
+        &self,
+        utterance_id: &str,
+        status: &str,
+        reason: Option<&str>,
+        heard_chars: Option<u64>,
+    ) {
+        self.send.send(json!({"type":"voice-playback","data":{
+            "session_id":self.session,"client_msg_id":uuid::Uuid::new_v4().to_string(),
+            "utterance_id":utterance_id,"status":status,"reason":reason,"heard_chars":heard_chars
+        }})).unwrap();
+    }
+
+    pub fn report_hearing(
+        &self,
+        history_id: &str,
+        utterance_id: &str,
+        outcome: &str,
+        heard_chars: Option<u64>,
+    ) {
+        let client_msg_id = uuid::Uuid::new_v4().to_string();
+        let mut data = json!({"session_id":self.session,"client_msg_id":client_msg_id,
+            "history_id":history_id,"utterance_id":utterance_id,"outcome":outcome});
+        if let Some(heard_chars) = heard_chars {
+            data["heard_chars"] = json!(heard_chars);
+        }
+        self.send
+            .send(json!({"type":"reply-hearing","data":data}))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let frame = self
+                .frames
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|_| panic!("no reply-hearing acknowledgement for {client_msg_id}"));
+            if frame["type"] == "voice-ack" && frame["data"]["client_msg_id"] == client_msg_id {
+                return;
+            }
+            if frame["type"] == "error" && frame["data"]["client_msg_id"] == client_msg_id {
+                panic!("reply-hearing refused: {frame}");
+            }
+        }
+    }
+
+    pub fn report_speech(&self, on: bool, reason: Option<&str>) {
+        self.send
+            .send(json!({"type":"voice-speech","data":{
+                "session_id":self.session,"client_msg_id":uuid::Uuid::new_v4().to_string(),
+                "on":on,"reason":reason
+            }}))
+            .unwrap();
+    }
+
+    pub fn next_frame(&self, kind: &str, seconds: u64) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        loop {
+            let frame = self
+                .frames
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|_| panic!("no {kind} frame"));
+            if frame["type"] == kind {
+                return frame;
+            }
+        }
+    }
+
+    pub fn turn_started(&self, turn_id: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let frame = self
+                .frames
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|_| panic!("no turn start for {turn_id}"));
+            if frame["type"] == "voice-user-turn"
+                && frame["data"]["phase"] == "started"
+                && frame["data"]["turn_id"] == turn_id
+            {
+                return frame["data"].clone();
+            }
         }
     }
 }
