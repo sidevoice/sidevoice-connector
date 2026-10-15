@@ -294,12 +294,6 @@ struct Observation {
     signature: Option<String>,
 }
 
-struct InspectionInput<'a> {
-    login_path: Option<&'a str>,
-    include_version: bool,
-    old_version: Option<&'a str>,
-}
-
 impl HostAgents {
     pub fn new(profile: Profile) -> Result<Arc<Self>> {
         let selected = match InstalledCommand::installed(&profile) {
@@ -433,7 +427,7 @@ impl HostAgents {
                 .is_some_and(|value| !value.is_null());
             if rescan || watch.is_some() || !has_cache {
                 state = self
-                    .scan(state, watch, true, true, cancel, deadline)
+                    .scan(state, watch, true, cancel, deadline)
                     .await?;
             }
             return self.response(&state);
@@ -450,14 +444,7 @@ impl HostAgents {
         let agent = parse_id(&self.registry, id)?;
         let state = self.load_state(cancel, deadline).await?;
         let mut state = self
-            .scan(
-                state,
-                Some(agent),
-                true,
-                action == "check",
-                cancel,
-                deadline,
-            )
+            .scan(state, Some(agent), action == "check", cancel, deadline)
             .await?;
         let current = seen_agent(&state, agent).ok_or_else(|| not_present(agent))?;
         if action == "check" {
@@ -505,7 +492,7 @@ impl HostAgents {
             self.connect(agent, binary.as_deref(), cancel, deadline)
                 .await?;
             state = self
-                .scan(state, Some(agent), false, true, cancel, deadline)
+                .scan(state, Some(agent), true, cancel, deadline)
                 .await?;
             match seen_agent(&state, agent)
                 .and_then(|row| row.get("registration"))
@@ -553,7 +540,7 @@ impl HostAgents {
         self.disconnect(agent, binary.as_deref(), cancel, deadline)
             .await?;
         state = self
-            .scan(state, Some(agent), false, false, cancel, deadline)
+            .scan(state, Some(agent), false, cancel, deadline)
             .await?;
         match seen_agent(&state, agent)
             .and_then(|row| row.get("registration"))
@@ -615,7 +602,6 @@ impl HostAgents {
         &self,
         state: Value,
         watch: Option<AgentId>,
-        include_version: bool,
         check: bool,
         cancel: &Cancellation,
         deadline: Instant,
@@ -643,19 +629,11 @@ impl HostAgents {
         for name in ids {
             check_live(cancel, deadline)?;
             let agent = name;
-            let previous_version = base
-                .pointer(&format!("/seen/{name}/agent/version"))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
             observations.push((
                 agent,
                 self.inspect(
                     agent,
-                    InspectionInput {
-                        login_path: login_path.as_deref(),
-                        include_version,
-                        old_version: previous_version.as_deref(),
-                    },
+                    login_path.as_deref(),
                     cancel,
                     deadline,
                 )
@@ -1184,6 +1162,7 @@ fn js_release_program(program: &str, root: &Path) -> bool {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn executable(value: &str) -> bool {
     let path = Path::new(value);
     if !path.is_absolute() {
@@ -1419,7 +1398,7 @@ impl HostAgents {
     async fn inspect(
         &self,
         id: AgentId,
-        input: InspectionInput<'_>,
+        login_path: Option<&str>,
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<Observation, Failure> {
@@ -1428,7 +1407,7 @@ impl HostAgents {
             .map_err(|_| agent_failure("agents.invalid", id))?;
         let agent = self.registration(id)?;
         let host = self.host(agent, cancel, deadline);
-        let binary = self.resolve_binary(id, agent, input.login_path);
+        let binary = self.resolve_binary(id, agent, login_path);
         let entry = agent
             .state(&host, binary.as_deref())
             .await
@@ -1439,14 +1418,8 @@ impl HostAgents {
         // `outdated`: an entry of ours that is not the current one (disabled, an older release, another environment).
         // Connect writes it again; like a current one, it is ours to remove: `owned`.
         let owned = registration == "connected" || registration == "outdated";
-        let version = if input.include_version {
-            match binary.as_deref() {
-                Some(binary) => self.binary_version(agent, binary, cancel, deadline).await?,
-                None => None,
-            }
-        } else {
-            input.old_version.map(str::to_owned)
-        };
+        // Discovery never executes a candidate binary. An apparent CLI can itself launch a GUI.
+        let version: Option<String> = None;
         let mut evidence = Vec::new();
         if binary.is_some() {
             evidence.push(Evidence { kind: "cli" });
@@ -1550,36 +1523,6 @@ impl HostAgents {
         .await;
         match output {
             Ok(output) if output.status.success() => Ok(parse_login_path(&output.stdout)),
-            Ok(_) | Err(CommandFailure::Start | CommandFailure::Deadline | CommandFailure::Io) => {
-                Ok(None)
-            }
-            Err(CommandFailure::Cancelled) => Err(Failure::Cancelled),
-        }
-    }
-
-    async fn binary_version(
-        &self,
-        agent: &dyn Registration,
-        binary: &str,
-        cancel: &Cancellation,
-        deadline: Instant,
-    ) -> std::result::Result<Option<String>, Failure> {
-        match run_command(
-            &self.profile,
-            Some(agent.config_root(&self.profile)),
-            binary,
-            &["--version".into()],
-            cancel,
-            deadline,
-        )
-        .await
-        {
-            Ok(output) if output.status.success() => Ok(output
-                .stdout
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .map(|line| line.chars().take(200).collect())),
             Ok(_) | Err(CommandFailure::Start | CommandFailure::Deadline | CommandFailure::Io) => {
                 Ok(None)
             }

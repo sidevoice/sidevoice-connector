@@ -44,7 +44,8 @@ fn has(answer: &Value, id: &str) -> bool {
 fn cli_detection_uses_only_fresh_login_path_not_overrides_fixed_paths_or_cache() {
     let profile = Profile::new("detect");
     let bin = profile.root.join("found/claude");
-    program(&bin, "#!/bin/sh\nexit 0\n");
+    let launched = profile.root.join("cli-launched");
+    program(&bin, &format!("#!/bin/sh\ntouch '{}'\n", launched.display()));
     let fixed = profile.root.join("home/.local/bin/claude");
     program(&fixed, "#!/bin/sh\nexit 0\n");
     let shell = profile.root.join("login-shell");
@@ -60,6 +61,7 @@ fn cli_detection_uses_only_fresh_login_path_not_overrides_fixed_paths_or_cache()
     assert!(!has(&missing, "claude"), "override was used: {missing}");
     let found = listed(&profile, Some(&shell), None);
     assert!(has(&found, "claude"), "login PATH was ignored: {found}");
+    assert!(!launched.exists(), "discovery launched the candidate CLI");
     fs::write(&shell, "#!/bin/sh\nexit 1\n").unwrap();
     let failed = listed(&profile, Some(&shell), Some(&bin));
     assert!(

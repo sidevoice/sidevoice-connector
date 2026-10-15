@@ -137,6 +137,7 @@ no agents if capture fails. A configuration directory alone is never installatio
 are intentionally narrow. A Cursor app installed elsewhere without a `cursor` or `cursor-agent` command on the
 captured PATH is not detected; the person can use Other to connect by hand. Public `evidence` reports only matched
 marker kinds (`cli`, `install_file`, `app_bundle`, `install_dir`), never the resolved paths or home directory.
+Discovery does not run agent commands (including `--version`), so a newly scanned agent's `version` is `null`.
 
 Codex queue delivery uses the CLI from that captured PATH and fails if none was found; it never runs a different
 `codex` from the connector service's PATH.
