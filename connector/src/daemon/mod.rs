@@ -552,7 +552,9 @@ impl Daemon {
                 return Ok(None);
             };
             if item["attempted"] == true {
-                return Ok(None);
+                let original = item.clone();
+                drop(outbox);
+                return self.recover_one(&original).await;
             }
             item["attempted"] = json!(true);
             let published = item.clone();
@@ -624,6 +626,54 @@ impl Daemon {
         } else {
             Ok(None)
         }
+    }
+
+    async fn recover_one(&self, speech: &Value) -> Result<Option<Value>> {
+        let client_ref = speech
+            .get("client_ref")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let Some(binding) = self.bindings.lock().await.get(client_ref).cloned() else {
+            return Ok(None);
+        };
+        let mut original = speech.clone();
+        original.as_object_mut().unwrap().remove("attempted");
+        for retry in 0..2 {
+            if !self.link.connected().await {
+                return Ok(None);
+            }
+            let mut request = original.clone();
+            request["recovery_binding_id"] = json!(*binding.id.lock().await);
+            let reply = match self
+                .link
+                .request("speech.recover", request, Duration::from_secs(15))
+                .await
+            {
+                Ok(reply) => reply,
+                Err(error) => {
+                    crate::logfile::log(&format!("speech recovery retained: {error}"));
+                    return Ok(None);
+                }
+            };
+            if reply.get("status") == Some(&json!("unknown_binding")) {
+                if retry == 0 && self.register_core(&binding).await.is_ok() {
+                    continue;
+                }
+                return Ok(None);
+            }
+            if !Self::ack_allows_removal(&original, &reply) {
+                return Ok(None);
+            }
+            let mut outbox = self.outbox.lock().await;
+            let before = outbox.clone();
+            outbox.retain(|item| item.get("event_id") != speech.get("event_id"));
+            if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+                *outbox = before;
+                return Err(error);
+            }
+            return Ok(Some(reply));
+        }
+        Ok(None)
     }
 
     async fn flush_outbox(&self) {
@@ -1101,13 +1151,26 @@ impl Daemon {
                     }
                     return Ok(result);
                 }
-                self.queue(speech.clone()).await?;
                 drop(id);
-                let earlier_same_conversation = self.outbox.lock().await.iter().any(|item| {
-                    item["client_ref"] == speech["client_ref"]
-                        && item["event_id"] != speech["event_id"]
-                });
-                if earlier_same_conversation {
+                // Settle older attempts before deciding whether this new answer can play.
+                // An uncertain first admission is recovered, never published again.
+                let earlier = self
+                    .outbox
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|item| item["client_ref"] == speech["client_ref"])
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut unresolved = false;
+                for item in earlier {
+                    if self.publish_one(&item).await?.is_none() {
+                        unresolved = true;
+                        break;
+                    }
+                }
+                self.queue(speech.clone()).await?;
+                if unresolved {
                     self.make_history_only(&speech["event_id"]).await?;
                 }
                 let answer = self.publish_one(&speech).await?;

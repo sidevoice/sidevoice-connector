@@ -383,8 +383,8 @@ async fn paired_retry_ids_share_one_pending_publication_and_reject_conflicting_r
 }
 
 #[tokio::test]
-async fn lost_saved_or_refused_admission_ack_never_rewrites_or_replays_a_live_publication() {
-    for outcome in ["saved", "refused"] {
+async fn lost_admission_recovers_original_and_does_not_bar_new_audio() {
+    for outcome in ["saved", "refused", "missing"] {
         let scratch = Scratch::new(&format!("lost-admission-{outcome}"));
         let link = Link::new();
         let mut frames = link.attached().await;
@@ -397,8 +397,34 @@ async fn lost_saved_or_refused_admission_ack_never_rewrites_or_replays_a_live_pu
                     answering_link.answer(json!({"jsonrpc":"2.0","id":frame["id"],
                         "result":{"binding_id":"core-a","initial_reply_context":{"session_id":"s","revision":1,"epoch":0}}})).await.unwrap();
                 } else if frame["method"] == "speech.publish" {
-                    // The fake core stores its outcome but loses the response on the wire.
                     published_tx.send(frame["params"].clone()).unwrap();
+                    if frame["params"]["event_id"] == "next-event" {
+                        answering_link
+                            .answer(json!({"jsonrpc":"2.0","id":frame["id"],
+                            "result":{"event_id":"next-event","utterance_id":"next-utterance",
+                                "status":"published","text_saved":true}}))
+                            .await
+                            .unwrap();
+                    }
+                } else if frame["method"] == "speech.recover" {
+                    let params = &frame["params"];
+                    assert_eq!(params["recovery_binding_id"], "core-a");
+                    assert_eq!(params["history_only"], false);
+                    assert!(params.get("attempted").is_none());
+                    let result = if outcome == "refused" {
+                        json!({"event_id":params["event_id"],"utterance_id":params["utterance_id"],
+                            "status":"rejected","terminal":true,"reason":"user_speaking"})
+                    } else {
+                        json!({"event_id":params["event_id"],"utterance_id":params["utterance_id"],
+                            "status":if outcome == "missing" { "text_only" } else { "published" },
+                            "reason":if outcome == "missing" { "connector_disconnected" } else { "" },
+                            "text_saved":true})
+                    };
+                    answering_link
+                        .answer(json!({"jsonrpc":"2.0","id":frame["id"],
+                        "result":result}))
+                        .await
+                        .unwrap();
                 }
             }
         });
@@ -407,16 +433,10 @@ async fn lost_saved_or_refused_admission_ack_never_rewrites_or_replays_a_live_pu
             .command(1, "register", registration("a"))
             .await
             .unwrap();
-        let answer = daemon
-            .command(
-                1,
-                "publish",
-                json!({"client_ref":"a","session_id":"s",
+        let args = json!({"client_ref":"a","session_id":"s",
             "revision":1,"epoch":0,"text":format!("{outcome} reply"),
-            "event_id":format!("{outcome}-event"),"utterance_id":format!("{outcome}-utterance")}),
-            )
-            .await
-            .unwrap();
+            "event_id":format!("{outcome}-event"),"utterance_id":format!("{outcome}-utterance")});
+        let answer = daemon.command(1, "publish", args.clone()).await.unwrap();
         assert_eq!(answer["status"], "admission_unknown", "{answer}");
         let sent = published_rx.try_recv().unwrap();
         assert_eq!(sent["history_only"], false, "{sent}");
@@ -425,16 +445,37 @@ async fn lost_saved_or_refused_admission_ack_never_rewrites_or_replays_a_live_pu
             "local state leaked to core: {sent}"
         );
         daemon.retire_held_audio().await.unwrap();
-        daemon.flush_outbox().await;
+        let recovered = daemon.command(1, "publish", args).await.unwrap();
+        assert_eq!(
+            recovered["status"],
+            if outcome == "refused" {
+                "rejected"
+            } else if outcome == "missing" {
+                "text_only"
+            } else {
+                "published"
+            },
+            "{recovered}"
+        );
+        assert!(daemon.outbox.lock().await.is_empty());
+        let next = daemon
+            .command(
+                1,
+                "publish",
+                json!({"client_ref":"a","session_id":"s",
+            "revision":1,"epoch":1,"text":"fresh answer","event_id":"next-event",
+            "utterance_id":"next-utterance"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(next["status"], "published", "{next}");
+        let sent_next = published_rx.try_recv().unwrap();
+        assert_eq!(sent_next["event_id"], "next-event");
+        assert_eq!(sent_next["history_only"], false);
         assert!(
             published_rx.try_recv().is_err(),
-            "uncertain admission replayed as audio"
+            "uncertain first admission was replayed"
         );
-        let retained = daemon.outbox.lock().await.clone();
-        assert_eq!(retained.len(), 1, "{retained:?}");
-        assert_eq!(retained[0]["history_only"], false);
-        assert_eq!(retained[0]["attempted"], true);
-        assert_eq!(retained[0]["event_id"], sent["event_id"]);
     }
 }
 
