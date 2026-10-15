@@ -29,7 +29,8 @@ fn model_selector(raw: &str) -> (&str, Option<&str>) {
     }
     let effort = parameters.split(',').find_map(|parameter| {
         let (id, value) = parameter.trim().split_once('=')?;
-        (id.trim() == "effort").then_some(value.trim())
+        let value = value.trim();
+        (id.trim() == "effort" && !value.is_empty() && value.len() <= 64).then_some(value)
     });
     (model, effort)
 }
@@ -210,6 +211,10 @@ mod tests {
         );
         assert_eq!(
             selected_engine("claude-opus", None).unwrap()["effort"],
+            Value::Null
+        );
+        assert_eq!(
+            selected_engine("claude-opus[effort=]", None).unwrap()["effort"],
             Value::Null
         );
         assert_eq!(selected_engine("default", None), None);
