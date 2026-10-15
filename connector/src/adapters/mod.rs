@@ -5,6 +5,7 @@ pub mod cursor;
 mod harness;
 pub mod health;
 mod http;
+pub(crate) mod markers;
 pub mod registration;
 mod transcript;
 

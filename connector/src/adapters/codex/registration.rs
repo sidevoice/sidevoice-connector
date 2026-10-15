@@ -283,13 +283,9 @@ impl Registration for Codex {
         &["codex"]
     }
 
-    fn known_paths(&self, home: &Path) -> Vec<PathBuf> {
-        vec![
-            home.join(".local/bin/codex"),
-            PathBuf::from("/usr/local/bin/codex"),
-            PathBuf::from("/opt/homebrew/bin/codex"),
-            home.join("AppData/Local/Programs/Codex/codex.exe"),
-        ]
+    // npm and Homebrew select their own installation prefix; neither is a stable Codex marker.
+    fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
+        &[]
     }
 
     fn state<'a>(

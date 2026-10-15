@@ -12,7 +12,9 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 const REMOVE: [&str; 5] = ["mcp", "remove", "--scope", "user", "sidevoice"];
 
@@ -215,12 +217,27 @@ impl Registration for Claude {
         &["claude"]
     }
 
-    fn known_paths(&self, home: &Path) -> Vec<PathBuf> {
-        vec![
-            home.join(".claude/local/claude"),
-            home.join(".local/bin/claude"),
-            PathBuf::from("/usr/local/bin/claude"),
-            PathBuf::from("/opt/homebrew/bin/claude"),
+    fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
+        use crate::adapters::markers::{Marker, Root};
+        &[
+            Marker {
+                os: "macos",
+                kind: "install_file",
+                root: Root::Home,
+                path: ".local/bin/claude",
+            },
+            Marker {
+                os: "linux",
+                kind: "install_file",
+                root: Root::Home,
+                path: ".local/bin/claude",
+            },
+            Marker {
+                os: "windows",
+                kind: "install_file",
+                root: Root::Home,
+                path: ".local/bin/claude.exe",
+            },
         ]
     }
 

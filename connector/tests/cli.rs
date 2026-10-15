@@ -51,7 +51,7 @@ fn agents_lists_in_english_or_as_json_and_failures_carry_a_stable_key() {
         .iter()
         .filter_map(|row| row["id"].as_str())
         .collect();
-    // An agent is listed for its program (its CLI or its app), never for its home alone, which every agent has in this
+    // An agent is listed for its CLI or passive install marker, never for its home alone, which every agent has in this
     // profile: what is listed is what this machine has installed.
     assert!(
         ids.iter()
@@ -61,9 +61,16 @@ fn agents_lists_in_english_or_as_json_and_failures_carry_a_stable_key() {
     for row in value["agents"].as_array().unwrap() {
         let evidence = row["evidence"].to_string();
         assert!(
-            evidence.contains("\"binary\"") || evidence.contains("\"app\""),
+            ["cli", "app_bundle", "install_dir", "install_file"]
+                .iter()
+                .any(|kind| evidence.contains(&format!("\"{kind}\""))),
             "{row}"
         );
+        assert!(row["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item.get("path").is_none()));
     }
 
     let text = profile.connector(&["agents"]).output().unwrap();
