@@ -165,6 +165,19 @@ Codex never passes the thread to an MCP server through its environment. Older Co
 those need `CODEX_THREAD_ID` in the registration's environment. A queued message can be accepted before Codex reads
 it; the connector sends `input.read` only after the same message appears in that thread's rollout.
 
+For a Cursor editor chat, the Desktop Bridge's composer ID gives the conversation its stable thread:
+`cursor-editor-<profile-hash16>-<composer-id>`. The profile prefix is derived from the bridge's canonical
+user-data directory and prevents two Cursor profiles with the same composer ID from sharing a conversation; the
+path itself is never sent to the room. When the bridge has one unambiguous running local chat, `voice_connect`
+uses that key immediately. Otherwise it returns a `cursor-editor-pending-<UUID>` conversation and
+`identity_state: pending`. Once Cursor records the join marker, the connector verifies the composer in its SQLite
+record, registers the stable thread, and retires the provisional or mistaken candidate binding when it is idle.
+The earlier thread's history remains under its earlier ID. `voice_status`, `voice_say`, and `voice_disconnect`
+accept the earlier ID as an alias within the same MCP session after promotion. A repeated join from the same
+editor chat reuses the stable thread and its room conversation, including after Cursor reconnects; a different
+chat or Cursor profile gets another thread. Only the verified bridge profile may receive delivery for that thread.
+The connector keeps a small private map of verified profile/composer keys for recovery diagnostics.
+
 The local speech outbox is synced to disk. Core's `text_saved: true` acknowledges admission into its current-process
 journal, which the core keeps in memory; the connector removes an outbox item on that acknowledgement, so a core
 crash immediately afterwards can lose that speech text ([Core issue #43](https://github.com/sidevoice/sidevoice-core/issues/43)).

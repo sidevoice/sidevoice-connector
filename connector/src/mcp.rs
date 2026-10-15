@@ -345,16 +345,16 @@ impl Facade {
             .unwrap_or_else(|| name.to_owned())
     }
 
-    /// The join marker becomes visible only after this tool reply enters Cursor's records. Keep the original
+    /// The join marker becomes visible only after this tool reply enters the editor's records. Keep the original
     /// binding until the verified stable binding is registered, then retire it.
-    fn resolve_cursor_join(
+    fn resolve_editor_join(
         &self,
         identity: Identity,
         title: String,
         capabilities: Value,
         experimental: Vec<String>,
     ) {
-        if !identity.editor || identity.delivery["kind"] != "cursor-bridge" {
+        if !adapters::resolves_editor_identity(&identity) {
             return;
         }
         let this = self.clone();
@@ -371,13 +371,11 @@ impl Facade {
                 if !still_joined {
                     return;
                 }
-                let Some(chat) =
-                    adapters::cursor::composer_holding_identity(&identity.delivery).await
-                else {
+                let Some(chat) = adapters::verified_editor_chat(&identity.delivery).await else {
                     continue;
                 };
-                if adapters::cursor::remember_chat(&this.profile.data, &chat).is_err() {
-                    crate::logfile::log("cursor identity map could not be saved");
+                if adapters::remember_editor_chat(&this.profile.data, &chat).is_err() {
+                    crate::logfile::log("editor identity map could not be saved");
                 }
                 let stable = chat.thread();
                 let mut verified = identity.clone();
@@ -587,7 +585,7 @@ impl Facade {
                 if identity.editor {
                     response["identity_state"] = identity.delivery["identity_state"].clone();
                     if identity.delivery["identity_state"] == "pending" {
-                        response["identity_note"] = json!("Cursor has not identified this chat yet. This conversation id is provisional; Sidevoice will replace it with the chat's stable id after Cursor records this join. The prior thread's history remains separate.");
+                        response["identity_note"] = json!(adapters::pending_editor_identity_note());
                     }
                 }
                 if !pushed {
@@ -610,7 +608,7 @@ impl Facade {
                         response[key] = value;
                     }
                 }
-                self.resolve_cursor_join(identity, title, capabilities, experimental);
+                self.resolve_editor_join(identity, title, capabilities, experimental);
                 Ok(response)
             }
             "voice_status" => {

@@ -53,6 +53,22 @@ impl Identity {
     }
 }
 
+pub fn resolves_editor_identity(identity: &Identity) -> bool {
+    identity.editor && identity.delivery["kind"] == "cursor-bridge"
+}
+
+pub async fn verified_editor_chat(delivery: &Value) -> Option<cursor::BridgeChat> {
+    cursor::composer_holding_identity(delivery).await
+}
+
+pub fn remember_editor_chat(data: &std::path::Path, chat: &cursor::BridgeChat) -> Result<()> {
+    cursor::remember_chat(data, chat)
+}
+
+pub fn pending_editor_identity_note() -> &'static str {
+    "Cursor has not identified this chat yet. This conversation id is provisional; Sidevoice will replace it with the chat's stable id after Cursor records this join. The prior thread's history remains separate."
+}
+
 pub fn advertised_capabilities(harness: &str) -> Value {
     Registry::standard().get(harness).capabilities()
 }
