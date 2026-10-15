@@ -6,11 +6,9 @@ struct Fixture(PathBuf);
 
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "sidevoice-cursor-identity-{}",
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir_all(&root).unwrap();
+        // macOS temp paths are long; keep Unix socket names below SUN_LEN.
+        let root = PathBuf::from("/tmp").join(format!("sci-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         Self(root)
     }
