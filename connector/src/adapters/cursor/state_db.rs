@@ -1,4 +1,8 @@
 //! Bounded, read-only access to Cursor's live SQLite state without a system sqlite3 executable.
+//! A live WAL read may create `-wal`/`-shm` sidecars and briefly hold a reader lock, including
+//! when Cursor is closed. It never changes database records. The response deadline and
+//! `sqlite3_interrupt` stop interruptible work; a stalled filesystem call can retain its worker
+//! and connection until that call returns.
 
 use rusqlite::{types::ValueRef, Connection, InterruptHandle, OpenFlags};
 use serde_json::{Map, Value};
@@ -150,5 +154,34 @@ mod tests {
             query(&database, "SELECT printf('%0100000d', 0) AS value").await,
             Err(DbError::TooLarge)
         );
+    }
+
+    #[tokio::test]
+    async fn live_wal_reads_include_recent_commits_and_may_create_sidecars() {
+        let scratch = Scratch::new("cursor-state-db-live-wal");
+        let database = scratch.0.join("state.vscdb");
+        fixture(
+            &database,
+            "PRAGMA journal_mode=WAL; CREATE TABLE cursorDiskKV(key TEXT, value TEXT); INSERT INTO cursorDiskKV VALUES ('one', 'first');",
+        );
+        let sql = "SELECT value FROM cursorDiskKV ORDER BY key";
+        assert_eq!(
+            query(&database, sql).await.unwrap(),
+            vec![serde_json::json!({"value":"first"})]
+        );
+        let writer = Connection::open(&database).unwrap();
+        writer
+            .execute_batch("INSERT INTO cursorDiskKV VALUES ('two', 'second');")
+            .unwrap();
+        assert_eq!(
+            query(&database, sql).await.unwrap(),
+            vec![
+                serde_json::json!({"value":"first"}),
+                serde_json::json!({"value":"second"})
+            ]
+        );
+        // Sidecars are an accepted effect of an ordinary read-only live-WAL open.
+        assert!(database.with_extension("vscdb-wal").exists());
+        assert!(database.with_extension("vscdb-shm").exists());
     }
 }
