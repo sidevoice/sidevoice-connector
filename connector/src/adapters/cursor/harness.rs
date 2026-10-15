@@ -199,7 +199,10 @@ impl Harness for Cursor {
                 watch_engine(conversation.clone(), room.clone(), false);
                 transcript::follow(conversation, room, Reader::new(chat, false));
             }
-            Some("cursor-bridge") => watch_editor(conversation, room),
+            Some("cursor-bridge") => {
+                watch_engine(conversation.clone(), room.clone(), true);
+                watch_editor(conversation, room);
+            }
             _ => {}
         }
     }
