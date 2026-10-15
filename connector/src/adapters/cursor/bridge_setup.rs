@@ -3,7 +3,6 @@
 use crate::adapters::registration::ReadinessCheck;
 use crate::profile::Profile;
 use serde::Deserialize;
-use serde_json::json;
 use std::env;
 use std::fs::{self, File};
 use std::io::Read;
@@ -117,6 +116,7 @@ fn evaluate(macos: bool, editor_available: bool, bridge: BridgeFiles) -> Readine
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::os::unix::fs::symlink;
 
     #[test]

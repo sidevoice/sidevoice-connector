@@ -87,8 +87,7 @@ pub trait AgentHost: Send + Sync {
     fn live(&self) -> Result<(), AgentError>;
 }
 
-/// Registering Sidevoice with an agent, reading that registration back and removing it, touching only an entry
-/// Sidevoice wrote.
+/// One agent-owned readiness check and its stable reason code when it is not OK.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadinessCheck {
     Ok,
@@ -125,8 +124,7 @@ pub fn aggregate_readiness(checks: &[ReadinessCheck]) -> Option<Value> {
     Some(json!({"state":state,"reasons":reasons}))
 }
 
-/// The variable naming an agent's CLI explicitly: `SIDEVOICE_<ID>_BIN`.
-
+/// Registering Sidevoice with an agent, reading its state, and removing only an entry Sidevoice wrote.
 pub trait Registration: Send + Sync {
     /// The agent's home.
     fn config_root<'a>(&self, profile: &'a Profile) -> &'a Path;

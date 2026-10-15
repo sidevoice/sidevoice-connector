@@ -163,6 +163,7 @@ async fn cursor_agent_row_exposes_only_readiness_codes_without_home_paths_or_sec
     let cursor = bin.join("cursor");
     private_write(&cursor, b"#!/bin/sh\necho 'Cursor 3.22.12'\n");
     fs::set_permissions(&cursor, fs::Permissions::from_mode(0o700)).unwrap();
+    let _cursor_bin = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cursor.as_os_str());
     write_json(
         &fixture.profile.data.join("agents.json"),
         &json!({
@@ -233,6 +234,7 @@ async fn cursor_readiness_distinguishes_cli_only_from_editor() {
     let editor = bin.join("cursor");
     private_write(&editor, b"#!/bin/sh\necho 'unparseable'\n");
     fs::set_permissions(&editor, fs::Permissions::from_mode(0o700)).unwrap();
+    let _editor_bin = EnvGuard::set("SIDEVOICE_CURSOR_BIN", editor.as_os_str());
     let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
     let bridge = &row(&answer, "cursor")["readiness"];
     let expected = if cfg!(target_os = "macos") {
