@@ -829,7 +829,12 @@ mod tests {
                         && line.contains(&format!("stage=lookup result={expected}"))
                 })
                 .expect("delivery lookup cause was not logged");
-            for secret in [marker, "private-token", "private words", user_data.to_str().unwrap()] {
+            for secret in [
+                marker,
+                "private-token",
+                "private words",
+                user_data.to_str().unwrap(),
+            ] {
                 assert!(!diagnostic.contains(secret), "private data in {diagnostic}");
             }
         }

@@ -783,7 +783,10 @@ fn log_bridge(
 ) {
     let line = bridge_diagnostic(stage, result, id, instance, http_status);
     #[cfg(test)]
-    bridge_lines().lock().expect("bridge test sink").push(line.clone());
+    bridge_lines()
+        .lock()
+        .expect("bridge test sink")
+        .push(line.clone());
     crate::logfile::log(&line);
 }
 

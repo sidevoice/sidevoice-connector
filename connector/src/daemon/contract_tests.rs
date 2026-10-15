@@ -293,8 +293,7 @@ async fn refused_target_registration_stays_pending_until_core_accepts_it() {
             let Some(id) = frame.get("id").cloned() else {
                 continue;
             };
-            let result = if frame["method"] == "binding.register"
-                && refusal.load(Ordering::Relaxed)
+            let result = if frame["method"] == "binding.register" && refusal.load(Ordering::Relaxed)
             {
                 json!({"error":"room.input_backlog_full"})
             } else {
@@ -322,7 +321,10 @@ async fn refused_target_registration_stays_pending_until_core_accepts_it() {
         .command(7, "register", registration("stable"))
         .await
         .unwrap();
-    assert_eq!(retry["pending"], true, "a refused target cannot retire its source: {retry}");
+    assert_eq!(
+        retry["pending"], true,
+        "a refused target cannot retire its source: {retry}"
+    );
     assert_eq!(retry["connected"], false);
     assert_eq!(retry["binding_id"], first["binding_id"]);
     assert!(daemon.bindings.lock().await.contains_key("original"));
