@@ -1390,8 +1390,8 @@ pub(crate) mod tests {
         assert_eq!(removal(&row("unknown", false)), Some(false));
     }
 
-    /// An agent of the registry the connector connects by itself, without its CLI: found in any profile of the tests
-    /// (its configuration directory is there), whatever is installed on the machine that runs them.
+    /// An agent of the registry the connector connects by itself, without its CLI: connected in any profile of the tests
+    /// (its configuration directory is there) once a stand-in of its program says it is installed.
     fn agent_without_cli() -> &'static str {
         crate::adapters::Registry::standard()
             .agents()
@@ -1430,6 +1430,13 @@ pub(crate) mod tests {
         let fixture = Fixture::new("agents");
         let profile = &fixture.profile;
         let id = agent_without_cli();
+        let program = fixture.scratch.0.join("agent-program");
+        fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let _installed = crate::agents::tests::EnvGuard::set(
+            &format!("SIDEVOICE_{}_BIN", id.to_ascii_uppercase()),
+            program.as_os_str(),
+        );
         let label = agent_label(id);
         let with_agents = |version: &'static str| {
             let package = fixture.package(version, "a");
