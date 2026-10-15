@@ -1455,6 +1455,7 @@ fn t16_failed_injection_and_pull_expose_identical_real_notice_fields() {
         Some("user_interrupted"),
         Some(1),
     );
+    other.next_frame("voice-ack", 15);
     call.report_turn("started", "parity-turn", None);
     call.turn_started("parity-turn");
     call.report_turn("finished", "parity-turn", Some("New words"));
