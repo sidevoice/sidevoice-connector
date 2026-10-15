@@ -1660,8 +1660,10 @@ fn t16_failed_injection_and_pull_expose_identical_real_notice_fields() {
                 .cloned()
         })
     });
+    // Push adds thread_id and pull adds cursor/arrival_time. Every shared agent fact must
+    // exist on both routes and match exactly, including the issued epoch and hearing evidence.
+    assert_eq!(injected["thread_id"], thread, "{injected}");
     for field in [
-        "thread_id",
         "message_id",
         "session_id",
         "revision",
@@ -1672,14 +1674,14 @@ fn t16_failed_injection_and_pull_expose_identical_real_notice_fields() {
         "unheard",
         "envelope",
     ] {
-        if let (Some(injected_field), Some(pulled_field)) = (injected.get(field), pulled.get(field))
-        {
-            assert_eq!(
-                injected_field, pulled_field,
-                "{field}: injected={injected}, pulled={pulled}"
-            );
-        }
+        assert!(injected.get(field).is_some(), "push {field}: {injected}");
+        assert!(pulled.get(field).is_some(), "pull {field}: {pulled}");
+        assert_eq!(
+            injected[field], pulled[field],
+            "{field}: injected={injected}, pulled={pulled}"
+        );
     }
+    assert_eq!(injected["epoch"], 1, "{injected}");
     assert_eq!(pulled["unheard"]["replies"][0]["text"], "Full parity reply");
     assert_eq!(pulled["unheard"]["replies"][0]["fate"], "partial");
     assert_eq!(pulled["unheard"]["replies"][0]["heard_chars"], 4);
