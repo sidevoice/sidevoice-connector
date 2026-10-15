@@ -15,9 +15,42 @@ use serde_json::{json, Value};
 #[derive(Clone)]
 pub struct Profile {
     pub root: PathBuf,
-    /// The agents' homes below the root and their CLIs as this shell finds them, by variable: what the connector
-    /// says its harnesses declare (`bench-agents`).
+    /// The agents' homes below the root, as declared by `bench-agents`.
     pub agents: BTreeMap<String, String>,
+    login_path: String,
+}
+
+fn capture_person_login_path() -> Result<String> {
+    let shell = std::env::var("SHELL").context("SHELL is required for bench discovery")?;
+    if !Path::new(&shell).is_absolute() {
+        bail!("SHELL must be absolute");
+    }
+    let command = if Path::new(&shell)
+        .file_name()
+        .is_some_and(|name| name == "fish")
+    {
+        "printf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' (string join : $PATH)"
+    } else {
+        "printf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' \"$PATH\""
+    };
+    let output = Command::new(shell).args(["-lc", command]).output()?;
+    if !output.status.success() {
+        bail!("login shell failed while capturing bench PATH");
+    }
+    let stdout = String::from_utf8(output.stdout)?;
+    let (_, framed) = stdout
+        .split_once("\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}")
+        .context("login shell omitted PATH frame")?;
+    let (path, _) = framed
+        .split_once("\u{1e}SIDEVOICE_PATH_END\u{1e}")
+        .context("login shell truncated PATH frame")?;
+    if path.is_empty()
+        || path.len() > 32768
+        || !path.split(':').all(|part| Path::new(part).is_absolute())
+    {
+        bail!("login shell supplied an invalid bench PATH");
+    }
+    Ok(path.to_owned())
 }
 
 const DIRECTORIES: &[&str] = &["home", "sidevoice", "xdg/config", "xdg/data", "bench"];
@@ -56,6 +89,7 @@ impl Profile {
     /// The profile at `root`, its directories created private (0700) when missing. A directory with anything in it
     /// that is not a bench profile is refused.
     pub fn new(root: &Path) -> Result<Self> {
+        let login_path = capture_person_login_path()?;
         let root = if root.is_absolute() {
             root.to_path_buf()
         } else {
@@ -83,9 +117,12 @@ impl Profile {
                 .with_context(|| path.display().to_string())?;
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
         }
-        let mut agents = homes;
-        agents.extend(strings(&answer["binaries"]));
-        Ok(Self { root, agents })
+        write_bench_login_shell(&root, &login_path)?;
+        Ok(Self {
+            root,
+            agents: homes,
+            login_path,
+        })
     }
 
     fn path(&self, child: &str) -> String {
@@ -112,9 +149,9 @@ impl Profile {
             ("SIDEVOICE_SERVICE_MANAGER".into(), "none".into()),
             ("SIDEVOICE_CORE_PORT".into(), "0".into()),
             ("SIDEVOICE_STUN_URLS".into(), String::new()),
+            ("SHELL".into(), self.path("bench/login-shell")),
         ]);
-        // Every agent home the harnesses declare, the bench's own; and an agent's CLI the connector runs (delivery,
-        // registration) as this shell finds it: a connector started on demand has a fixed PATH that may not hold it.
+        // Every agent home the harnesses declare, the bench's own.
         env.extend(self.agents.clone());
         env
     }
@@ -132,9 +169,7 @@ impl Profile {
     pub fn command(&self, program: impl AsRef<Path>) -> Command {
         let mut command = Command::new(program.as_ref());
         command.env_clear().envs(self.mcp_env());
-        if let Some(path) = std::env::var_os("PATH") {
-            command.env("PATH", path);
-        }
+        command.env("PATH", &self.login_path);
         command
     }
 
@@ -263,6 +298,19 @@ impl Profile {
     }
 }
 
+fn write_bench_login_shell(root: &Path, login_path: &str) -> Result<()> {
+    let shell = root.join("bench/login-shell");
+    fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' {}\n",
+            shell_quote(login_path)
+        ),
+    )?;
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
 /// The connector binary of this build: beside the bench's own.
 fn connector_binary() -> Result<PathBuf> {
     let binary = std::env::current_exe()?.with_file_name("sidevoice-connector");
@@ -300,32 +348,5 @@ fn shell_quote(value: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn values_are_quoted_for_the_shell_only_when_needed() {
-        assert_eq!(shell_quote("/tmp/a-b_c.d"), "/tmp/a-b_c.d");
-        assert_eq!(shell_quote(""), "''");
-        assert_eq!(shell_quote("a b"), "'a b'");
-        assert_eq!(shell_quote("it's"), r"'it'\''s'");
-    }
-
-    #[test]
-    fn the_agent_keeps_its_own_xdg_directories() {
-        let profile = Profile {
-            root: PathBuf::from("/p"),
-            agents: BTreeMap::from([(
-                "SOME_AGENT_HOME".to_owned(),
-                "/p/agents/some_agent_home".to_owned(),
-            )]),
-        };
-        let mcp = profile.mcp_env();
-        assert_eq!(mcp["SIDEVOICE_DATA_DIR"], "/p/sidevoice");
-        assert_eq!(mcp["XDG_DATA_HOME"], "/p/xdg/data");
-        assert_eq!(mcp["SIDEVOICE_SERVICE_MANAGER"], "none");
-        let agent = profile.agent_env();
-        assert!(agent.keys().all(|name| !name.starts_with("XDG_")));
-        assert_eq!(agent["SOME_AGENT_HOME"], "/p/agents/some_agent_home");
-    }
-}
+#[path = "tests.rs"]
+mod tests;
