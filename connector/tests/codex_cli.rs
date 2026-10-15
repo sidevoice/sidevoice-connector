@@ -5,6 +5,7 @@
 mod support;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -41,10 +42,16 @@ struct Fixture {
 impl Fixture {
     fn command(&self, program: &Path) -> Command {
         let mut command = self.profile.command(program);
-        // The CLI is a Node script: it needs the caller's PATH to find `node`.
+        // Detection uses the login shell's PATH; the CLI is a Node script and also needs node.
+        let login_path = format!(
+            "{}:{}",
+            self.codex.parent().unwrap().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
         command
             .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("SIDEVOICE_CODEX_BIN", &self.codex);
+            .env("SHELL", self.profile.root.join("login-shell"))
+            .env("SIDEVOICE_TEST_LOGIN_PATH", login_path);
         command
     }
 
@@ -93,10 +100,15 @@ impl Fixture {
 #[test]
 fn the_connector_registers_with_the_real_codex_cli_and_leaves_foreign_entries_alone() {
     let Some(codex) = codex_cli() else { return };
-    let fixture = Fixture {
-        profile: Profile::new("codex"),
-        codex,
-    };
+    let profile = Profile::new("codex");
+    let shell = profile.root.join("login-shell");
+    fs::write(
+        &shell,
+        "#!/bin/sh\nprintf %s \"$SIDEVOICE_TEST_LOGIN_PATH\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    let fixture = Fixture { profile, codex };
     let config = fixture.profile.root.join("codex/config.toml");
 
     assert_eq!(fixture.registration(), "not-connected");
