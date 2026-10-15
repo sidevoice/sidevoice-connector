@@ -1424,7 +1424,12 @@ impl HostAgents {
                 evidence.push(Evidence { kind, path });
             }
         }
-        let present = !evidence.is_empty();
+        // Installed, not merely remembered: an agent driven through its CLI is on this computer when that CLI is (or
+        // its own evidence, an app); its configuration directory alone is not, as other tools and an uninstall leave
+        // one behind. Only an agent the connector reaches through a file it edits counts its directory.
+        let present = evidence
+            .iter()
+            .any(|item| item.kind != "config-dir" || agent.connects_without_binary());
         // The connector acts itself where it reaches the agent: its CLI found, or a file it edits.
         let able = binary.is_some() || agent.connects_without_binary();
         let evidence_json = serde_json::to_value(&evidence).map_err(|_| Failure::Internal)?;

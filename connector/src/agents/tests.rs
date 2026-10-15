@@ -347,6 +347,56 @@ async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped
     host.shutdown().await;
 }
 
+/// A machine with only Cursor installed lists Cursor, and the way to connect any other agent by hand: Claude Code's
+/// and Codex's homes, even with a Sidevoice entry an uninstall left in them, are not those agents installed.
+#[tokio::test]
+async fn an_agent_is_listed_when_installed_not_for_its_home_alone() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    // No login PATH to search and no override: only the agents' known places say where a CLI is.
+    let _shell = EnvGuard::set("SHELL", std::ffi::OsStr::new(""));
+    let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", std::ffi::OsStr::new(""));
+    let _codex = EnvGuard::set("SIDEVOICE_CODEX_BIN", std::ffi::OsStr::new(""));
+    write_json(
+        &fixture
+            .profile
+            .agent_home("CLAUDE_CONFIG_DIR")
+            .join(".claude.json"),
+        &json!({"mcpServers":{"sidevoice":{"command":"sidevoice","args":["mcp"]}}}),
+    );
+    private_write(
+        &fixture.profile.agent_home("CODEX_HOME").join("config.toml"),
+        b"[mcp_servers.sidevoice]\ncommand = \"sidevoice\"\nargs = [\"mcp\"]\n",
+    );
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert!(listed.get("error").is_none(), "{listed}");
+    let registry = crate::adapters::Registry::standard();
+    for id in ["claude", "codex"] {
+        let (_, agent) = registry.agents().find(|(found, _)| *found == id).unwrap();
+        let installed_here = agent
+            .known_paths(&fixture.profile.home)
+            .iter()
+            .any(|path| executable(&path.to_string_lossy()));
+        if !installed_here {
+            assert!(
+                listed["agents"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row["id"] != id),
+                "{id} is listed for its home alone: {listed}"
+            );
+        }
+    }
+    assert_eq!(row(&listed, "cursor")["present"], true);
+    // Other: any agent, connected by hand.
+    assert!(listed["custom"]["command"].is_string(), "{listed}");
+    assert!(listed["custom"]["snippet"].is_string(), "{listed}");
+    host.shutdown().await;
+}
+
 #[tokio::test]
 async fn disappeared_and_reappeared_config_gets_a_new_generation() {
     let _turn = agent_env().await;
@@ -478,6 +528,8 @@ async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn()
 async fn dangling_codex_config_symlink_is_invalid_not_absent() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
+    let codex = fake_codex(&fixture);
+    let _codex = EnvGuard::set("SIDEVOICE_CODEX_BIN", codex.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let missing = fixture.root.join("missing-config-target.toml");
     symlink(
@@ -1649,24 +1701,9 @@ async fn each_agent_says_what_the_connector_does_itself_and_how_to_do_it_by_hand
             .chain(selected.args.iter().cloned())
     };
 
-    // Not found: Claude Code and Codex are then connected by hand; Cursor's file is edited all the same.
+    // Not found: Claude Code and Codex are not listed (an_agent_is_listed_when_installed_not_for_its_home_alone);
+    // Cursor's file is edited all the same.
     let listed = host.handle("agents.list", json!({"rescan":true})).await;
-    for id in ["claude", "codex"] {
-        let agent = row(&listed, id);
-        let found = agent["evidence"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["kind"] == "binary");
-        if !found {
-            assert_eq!(agent["connect"], "manual", "{agent}");
-            assert_eq!(
-                agent["can"],
-                json!({"connect":false,"update":false,"disconnect":false})
-            );
-            assert_eq!(agent["manual"]["connect"].as_array().unwrap().len(), 1);
-        }
-    }
     assert_eq!(
         row(&listed, "cursor")["can"],
         json!({"connect":true,"update":true,"disconnect":true})

@@ -51,12 +51,19 @@ fn agents_lists_in_english_or_as_json_and_failures_carry_a_stable_key() {
         .iter()
         .filter_map(|row| row["id"].as_str())
         .collect();
-    assert_eq!(ids, ["claude", "codex", "cursor"], "{value}");
+    // Cursor is found by its home, which the connector edits; Claude Code and Codex only by their CLIs, listed when
+    // this machine has them.
+    assert!(ids.contains(&"cursor"), "{value}");
+    for row in value["agents"].as_array().unwrap() {
+        if row["id"] != "cursor" {
+            assert!(row["evidence"].to_string().contains("\"binary\""), "{row}");
+        }
+    }
 
     let text = profile.connector(&["agents"]).output().unwrap();
     assert!(text.status.success());
     let text = String::from_utf8_lossy(&text.stdout);
-    assert!(text.contains("Claude Code: "), "{text}");
+    assert!(text.contains("Cursor: "), "{text}");
 
     let refused = profile
         .connector(&["agents", "connect", "nobody", "--json"])
