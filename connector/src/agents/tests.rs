@@ -7,33 +7,44 @@ use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 struct Fixture {
     root: PathBuf,
     profile: Profile,
+    /// Cursor installed: its CLI, which `SIDEVOICE_CURSOR_BIN` names while the fixture lives.
+    _cursor: EnvGuard,
 }
 
 /// Agent tests take turns: an agent's CLI is found through process-wide variables (`SIDEVOICE_<AGENT>_BIN`) that some
 /// of them set, and every scan resolves every agent, so two at once would run each other's stand-ins.
+static AGENT_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub(crate) async fn agent_env() -> tokio::sync::MutexGuard<'static, ()> {
-    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    LOCK.lock().await
+    AGENT_ENV.lock().await
 }
 
-struct EnvGuard {
-    key: &'static str,
+/// The same turn, for a test with no runtime: every fixture installs a Cursor CLI stand-in through those variables.
+fn agent_env_blocking() -> tokio::sync::MutexGuard<'static, ()> {
+    AGENT_ENV.blocking_lock()
+}
+
+pub(crate) struct EnvGuard {
+    key: String,
     previous: Option<std::ffi::OsString>,
 }
 
 impl EnvGuard {
-    fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+    pub(crate) fn set(key: &str, value: &std::ffi::OsStr) -> Self {
         let previous = std::env::var_os(key);
         std::env::set_var(key, value);
-        Self { key, previous }
+        Self {
+            key: key.to_owned(),
+            previous,
+        }
     }
 }
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         match self.previous.take() {
-            Some(value) => std::env::set_var(self.key, value),
-            None => std::env::remove_var(self.key),
+            Some(value) => std::env::set_var(&self.key, value),
+            None => std::env::remove_var(&self.key),
         }
     }
 }
@@ -75,7 +86,20 @@ impl Fixture {
             &crate::adapters::Registry::standard().homes(),
         )
         .unwrap();
-        Self { root, profile }
+        let cursor = root.join("cursor-bin/cursor-agent");
+        private_mkdir(cursor.parent().unwrap());
+        private_write(&cursor, b"#!/bin/sh\nexit 0\n");
+        fs::set_permissions(&cursor, fs::Permissions::from_mode(0o700)).unwrap();
+        let _cursor = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cursor.as_os_str());
+        Self {
+            root,
+            profile,
+            _cursor,
+        }
+    }
+
+    fn cursor(&self) -> PathBuf {
+        self.root.join("cursor-bin/cursor-agent")
     }
 
     fn selected(&self) -> InstalledCommand {
@@ -284,6 +308,7 @@ fn agent_refusals_labels_and_manual_text_use_the_shared_english_bundle() {
 
 #[test]
 fn ownership_is_exact_and_js_release_fixtures_stay_narrow() {
+    let _turn = agent_env_blocking();
     let fixture = Fixture::new();
     let own = InstalledCommand::executable().unwrap();
     assert_eq!(own.args, ["mcp"]);
@@ -341,14 +366,20 @@ async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped
             }
         }),
     );
-    let evidence = vec![Evidence {
-        kind: "config-dir",
-        path: fixture
-            .profile
-            .agent_home("CURSOR_CONFIG_DIR")
-            .to_string_lossy()
-            .into_owned(),
-    }];
+    let evidence = vec![
+        Evidence {
+            kind: "config-dir",
+            path: fixture
+                .profile
+                .agent_home("CURSOR_CONFIG_DIR")
+                .to_string_lossy()
+                .into_owned(),
+        },
+        Evidence {
+            kind: "binary",
+            path: fixture.cursor().to_string_lossy().into_owned(),
+        },
+    ];
     let signature = identity_signature("cursor", None, &evidence);
     write_json(
         &fixture.profile.data.join("agents.json"),
@@ -470,8 +501,109 @@ async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped
     host.shutdown().await;
 }
 
+/// Whether `id` is installed where the scan looks with no login PATH and no override: its CLI's standard places or its
+/// app. A test machine with one there cannot show that agent missing.
+fn installed_on_this_machine(fixture: &Fixture, id: &str) -> bool {
+    let registry = crate::adapters::Registry::standard();
+    let (_, agent) = registry.agents().find(|(found, _)| *found == id).unwrap();
+    agent
+        .known_paths(&fixture.profile.home)
+        .iter()
+        .any(|path| executable(&path.to_string_lossy()))
+        || !agent.evidence().is_empty()
+}
+
+fn listed_ids(answer: &Value) -> Vec<String> {
+    answer["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|agent| agent["id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Per agent: its home, even with a Sidevoice entry an uninstall left in it, is not the agent installed; its program
+/// is. A machine with only Cursor installed lists Cursor, and the way to connect any other agent by hand.
 #[tokio::test]
-async fn disappeared_and_reappeared_config_gets_a_new_generation() {
+async fn an_agent_is_listed_when_its_program_is_installed_not_for_its_home_alone() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    // No login PATH to search: only an override, the CLI's standard places or the app say an agent is installed.
+    let _shell = EnvGuard::set("SHELL", std::ffi::OsStr::new(""));
+    write_json(
+        &fixture
+            .profile
+            .agent_home("CLAUDE_CONFIG_DIR")
+            .join(".claude.json"),
+        &json!({"mcpServers":{"sidevoice":{"command":"sidevoice","args":["mcp"]}}}),
+    );
+    private_write(
+        &fixture.profile.agent_home("CODEX_HOME").join("config.toml"),
+        b"[mcp_servers.sidevoice]\ncommand = \"sidevoice\"\nargs = [\"mcp\"]\n",
+    );
+    write_json(
+        &fixture
+            .profile
+            .agent_home("CURSOR_CONFIG_DIR")
+            .join("mcp.json"),
+        &json!({"mcpServers":{"sidevoice":{"command":"sidevoice","args":["mcp"]}}}),
+    );
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let claude = fake_claude(&fixture);
+    let codex = fake_codex(&fixture);
+    let cursor = fixture.cursor();
+    for (id, program) in [("claude", &claude), ("codex", &codex), ("cursor", &cursor)] {
+        let variable = override_name(id);
+        // Its home and a leftover entry, no program: not installed.
+        let away = fixture.root.join(format!("{id}-uninstalled"));
+        fs::rename(program, &away).unwrap();
+        std::env::set_var(&variable, "");
+        let missing = host.handle("agents.list", json!({"rescan":true})).await;
+        fs::rename(&away, program).unwrap();
+        assert!(missing.get("error").is_none(), "{missing}");
+        if !installed_on_this_machine(&fixture, id) {
+            assert!(
+                !listed_ids(&missing).contains(&id.to_owned()),
+                "{id} is listed for its home alone: {missing}"
+            );
+        }
+        // Its program: installed, and said why.
+        std::env::set_var(&variable, program);
+        let found = host.handle("agents.list", json!({"rescan":true})).await;
+        assert_eq!(row(&found, id)["present"], true, "{found}");
+        assert!(
+            row(&found, id)["evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["kind"] == "binary"),
+            "{found}"
+        );
+        std::env::remove_var(&variable);
+    }
+
+    // Only Cursor installed (Claude Code and Codex uninstalled, their homes left): Cursor, and Other (`custom`) to
+    // connect any agent by hand.
+    fs::remove_file(&claude).unwrap();
+    fs::remove_file(&codex).unwrap();
+    std::env::set_var(override_name("cursor"), &cursor);
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    for id in ["claude", "codex"] {
+        if !installed_on_this_machine(&fixture, id) {
+            assert!(!listed_ids(&listed).contains(&id.to_owned()), "{listed}");
+        }
+    }
+    assert!(
+        listed_ids(&listed).contains(&"cursor".to_owned()),
+        "{listed}"
+    );
+    assert!(listed["custom"]["command"].is_string(), "{listed}");
+    assert!(listed["custom"]["snippet"].is_string(), "{listed}");
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn uninstalled_and_reinstalled_agent_gets_a_new_generation() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
@@ -490,7 +622,9 @@ async fn disappeared_and_reappeared_config_gets_a_new_generation() {
         .as_str()
         .unwrap()
         .to_owned();
-    fs::remove_dir_all(fixture.profile.agent_home("CURSOR_CONFIG_DIR")).unwrap();
+    // Uninstalled: its program gone, its home left behind.
+    let program = fs::read(fixture.cursor()).unwrap();
+    fs::remove_file(fixture.cursor()).unwrap();
     let absent = host
         .handle("agents.list", json!({"watch":"cursor","rescan":true}))
         .await;
@@ -503,7 +637,8 @@ async fn disappeared_and_reappeared_config_gets_a_new_generation() {
         serde_json::from_slice(&fs::read(fixture.profile.data.join("agents.json")).unwrap())
             .unwrap();
     assert_eq!(state["seen"]["cursor"]["present"], false);
-    private_mkdir(fixture.profile.agent_home("CURSOR_CONFIG_DIR"));
+    private_write(&fixture.cursor(), &program);
+    fs::set_permissions(fixture.cursor(), fs::Permissions::from_mode(0o700)).unwrap();
     let returned = host
         .handle("agents.list", json!({"watch":"cursor","rescan":true}))
         .await;
@@ -601,6 +736,8 @@ async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn()
 async fn dangling_codex_config_symlink_is_invalid_not_absent() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
+    let codex = fake_codex(&fixture);
+    let _codex = EnvGuard::set("SIDEVOICE_CODEX_BIN", codex.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let missing = fixture.root.join("missing-config-target.toml");
     symlink(
@@ -1772,24 +1909,9 @@ async fn each_agent_says_what_the_connector_does_itself_and_how_to_do_it_by_hand
             .chain(selected.args.iter().cloned())
     };
 
-    // Not found: Claude Code and Codex are then connected by hand; Cursor's file is edited all the same.
+    // Not found: Claude Code and Codex are not listed (an_agent_is_listed_when_installed_not_for_its_home_alone);
+    // Cursor's file is edited all the same.
     let listed = host.handle("agents.list", json!({"rescan":true})).await;
-    for id in ["claude", "codex"] {
-        let agent = row(&listed, id);
-        let found = agent["evidence"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|item| item["kind"] == "binary");
-        if !found {
-            assert_eq!(agent["connect"], "manual", "{agent}");
-            assert_eq!(
-                agent["can"],
-                json!({"connect":false,"update":false,"disconnect":false})
-            );
-            assert_eq!(agent["manual"]["connect"].as_array().unwrap().len(), 1);
-        }
-    }
     assert_eq!(
         row(&listed, "cursor")["can"],
         json!({"connect":true,"update":true,"disconnect":true})
