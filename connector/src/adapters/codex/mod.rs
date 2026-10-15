@@ -124,7 +124,10 @@ pub async fn deliver(delivery: &Value, event: &Value, profile: &Profile) -> Resu
         .and_then(Value::as_str)
         .context("Codex thread missing")?;
     let codex = crate::agents::agent_command(profile, "codex");
-    let mut command = tokio::process::Command::new(&codex.program);
+    let program = codex
+        .program
+        .context("Codex not on the captured login PATH")?;
+    let mut command = tokio::process::Command::new(program);
     if let Some(path) = &codex.path {
         command.env("PATH", path);
     }

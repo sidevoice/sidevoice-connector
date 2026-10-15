@@ -1,13 +1,120 @@
 use super::*;
+use crate::adapters::registration::{aggregate_readiness, ReadinessCheck};
 use fs2::FileExt;
 use std::fs::OpenOptions;
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
+
+#[test]
+fn login_path_frame_ignores_banners_and_rejects_empty_or_incomplete_output() {
+    let framed = "\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}/tmp/bin:/usr/bin\u{1e}SIDEVOICE_PATH_END\u{1e}";
+    assert_eq!(
+        parse_login_path(&format!("Welcome!\n{framed}\n")),
+        Some("/tmp/bin:/usr/bin".into())
+    );
+    assert_eq!(parse_login_path("Welcome!\n"), None);
+    assert_eq!(
+        parse_login_path("\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}\u{1e}SIDEVOICE_PATH_END\u{1e}"),
+        None
+    );
+    assert_eq!(
+        parse_login_path("\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}/usr/bin"),
+        None
+    );
+    assert_eq!(
+        parse_login_path("\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}relative\u{1e}SIDEVOICE_PATH_END\u{1e}"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn command_output_limit_reports_truncation_instead_of_parsing_prefix() {
+    let payload = vec![b'x'; 90_000];
+    assert!(read_capped(&payload[..], 65_536).await.is_err());
+    assert_eq!(
+        read_capped(&payload[..], 4 * 1024 * 1024)
+            .await
+            .unwrap()
+            .len(),
+        payload.len()
+    );
+}
+
+#[tokio::test]
+async fn failed_watched_capture_hides_all_agents_and_recovery_reconciles_all() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let _no_cursor_override = EnvGuard::set("SIDEVOICE_CURSOR_BIN", std::ffi::OsStr::new(""));
+    let bin = fixture.root.join("login-bin");
+    private_mkdir(&bin);
+    for name in ["claude", "cursor-agent"] {
+        let program = bin.join(name);
+        private_write(&program, b"#!/bin/sh\nexit 0\n");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let shell = fixture.root.join("login-shell");
+    private_write(&shell, format!("#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' '{}'\n", bin.display()).as_bytes());
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    let _shell = EnvGuard::set("SHELL", shell.as_os_str());
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    assert_eq!(
+        host.capture_login_path(
+            &Cancellation::new(),
+            Instant::now() + StdDuration::from_secs(5)
+        )
+        .await
+        .unwrap(),
+        Some(bin.to_string_lossy().into_owned())
+    );
+    let first = host.handle("agents.list", json!({"rescan":true})).await;
+    assert!(listed_ids(&first).contains(&"claude".into()), "{first}");
+    assert!(listed_ids(&first).contains(&"cursor".into()), "{first}");
+    private_write(&shell, b"#!/bin/sh\nexit 1\n");
+    let failed = host.handle("agents.list", json!({"watch":"cursor"})).await;
+    assert!(listed_ids(&failed).is_empty(), "{failed}");
+    let cached = host.handle("agents.list", json!({})).await;
+    assert!(listed_ids(&cached).is_empty(), "{cached}");
+    private_write(
+        &shell,
+        format!("#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' '{}'\n", bin.display()).as_bytes(),
+    );
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    let recovered = host.handle("agents.list", json!({"watch":"cursor"})).await;
+    assert!(
+        listed_ids(&recovered).contains(&"claude".into()),
+        "{recovered}"
+    );
+    assert!(
+        listed_ids(&recovered).contains(&"cursor".into()),
+        "{recovered}"
+    );
+    host.shutdown().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn public_marker_evidence_names_kind_without_home_path() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let _no_cli = EnvGuard::set("SIDEVOICE_CURSOR_BIN", std::ffi::OsStr::new(""));
+    private_mkdir(&fixture.profile.home.join(".local/share/cursor"));
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_eq!(
+        row(&listed, "cursor")["evidence"],
+        json!([{"kind":"install_dir"}])
+    );
+    assert!(!row(&listed, "cursor")["evidence"]
+        .to_string()
+        .contains(&fixture.profile.home.to_string_lossy().to_string()));
+    host.shutdown().await;
+}
 
 struct Fixture {
     root: PathBuf,
     profile: Profile,
     /// Cursor installed: its CLI, which `SIDEVOICE_CURSOR_BIN` names while the fixture lives.
     _cursor: EnvGuard,
+    _shell: EnvGuard,
 }
 
 /// Agent tests take turns: an agent's CLI is found through process-wide variables (`SIDEVOICE_<AGENT>_BIN`) that some
@@ -90,10 +197,15 @@ impl Fixture {
         private_write(&cursor, b"#!/bin/sh\nexit 0\n");
         fs::set_permissions(&cursor, fs::Permissions::from_mode(0o700)).unwrap();
         let _cursor = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cursor.as_os_str());
+        let shell = root.join("fixture-login-shell");
+        private_write(&shell, b"#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' /usr/bin\n");
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+        let _shell = EnvGuard::set("SHELL", shell.as_os_str());
         Self {
             root,
             profile,
             _cursor,
+            _shell,
         }
     }
 
@@ -153,12 +265,212 @@ fn row<'a>(answer: &'a Value, id: &str) -> &'a Value {
         .unwrap()
 }
 
-fn identity_signature(id: &str, version: Option<&str>, evidence: &[Evidence<'_>]) -> String {
+const BRIDGE_MESSAGE: &str = "Voice in the Cursor editor needs Cursor's Desktop Bridge: in Cursor, open Settings › Beta, enable “Allow CLI to access desktop agents”, then restart Cursor.";
+const UNSUPPORTED_MESSAGE: &str = "Cursor editor voice is not supported on this computer.";
+
+#[tokio::test]
+async fn cursor_agent_row_exposes_readiness_codes_and_fallbacks_without_private_data() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let bin = fixture.root.join("bin");
+    private_mkdir(&bin);
+    let cursor = bin.join("cursor");
+    private_write(&cursor, b"#!/bin/sh\necho 'Cursor 3.22.12'\n");
+    fs::set_permissions(&cursor, fs::Permissions::from_mode(0o700)).unwrap();
+    let _cursor_bin = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cursor.as_os_str());
+    write_json(
+        &fixture.profile.data.join("agents.json"),
+        &json!({
+            "version":1,"scanned_at":null,"login_path":bin,"binaries":{},"seen":{},"dismissed":{}
+        }),
+    );
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let missing = host.handle("agents.list", json!({"watch":"cursor"})).await;
+    let bridge = &row(&missing, "cursor")["readiness"];
+    let expected = if cfg!(target_os = "macos") {
+        json!({"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]})
+    } else {
+        json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
+    };
+    assert_eq!(bridge, &expected);
+    let cached = host.handle("agents.list", json!({})).await;
+    assert_eq!(row(&cached, "cursor")["readiness"], *bridge);
+
+    let dir = fixture.profile.home.join(".cursor/desktop-bridge");
+    private_mkdir(&fixture.profile.home.join(".cursor"));
+    private_mkdir(&dir);
+    let socket = fixture.root.join("bridge.sock");
+    private_write(&socket, b"");
+    write_json(
+        &dir.join("one.json"),
+        &json!({
+            "protocolVersion":1,"pid":std::process::id(),"socketPath":socket,
+            "token":"secret-token","userDataDir":fixture.root.join("private-cursor-data")
+        }),
+    );
+    let rescanned = if cfg!(target_os = "macos") {
+        tokio::time::timeout(StdDuration::from_secs(4), async {
+            loop {
+                let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
+                if row(&answer, "cursor")["readiness"]["state"] == "ready" {
+                    break answer;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    } else {
+        host.handle("agents.list", json!({"watch":"cursor"})).await
+    };
+    let bridge = &row(&rescanned, "cursor")["readiness"];
+    let expected = if cfg!(target_os = "macos") {
+        json!({"state":"ready","reasons":[]})
+    } else {
+        json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
+    };
+    assert_eq!(bridge, &expected);
+    let serialized = bridge.to_string();
+    assert!(!serialized.contains(&fixture.root.to_string_lossy().to_string()));
+    assert!(!serialized.contains("secret-token"));
+}
+
+#[tokio::test]
+async fn cursor_readiness_distinguishes_cli_only_from_editor() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let bin = fixture.root.join("bin");
+    private_mkdir(&bin);
+    let _path = EnvGuard::set("PATH", bin.as_os_str());
+    let cli = bin.join("cursor-agent");
+    private_write(&cli, b"#!/bin/sh\necho 'cursor-agent 1.0.0'\n");
+    fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+    write_json(
+        &fixture.profile.data.join("agents.json"),
+        &json!({
+            "version":1,"scanned_at":null,"login_path":bin,"binaries":{},"seen":{},"dismissed":{}
+        }),
+    );
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let answer = if cfg!(target_os = "macos") {
+        tokio::time::timeout(StdDuration::from_secs(4), async {
+            loop {
+                let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
+                if row(&answer, "cursor")["readiness"]["state"] == "unsupported" {
+                    break answer;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    } else {
+        host.handle("agents.list", json!({"watch":"cursor"})).await
+    };
+    let bridge = &row(&answer, "cursor")["readiness"];
+    assert_eq!(
+        bridge,
+        &json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
+    );
+
+    let app = fixture.profile.home.join("Applications/Cursor.app");
+    private_mkdir(&fixture.profile.home.join("Applications"));
+    private_mkdir(&app);
+    let answer = if cfg!(target_os = "macos") {
+        tokio::time::timeout(StdDuration::from_secs(4), async {
+            loop {
+                let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
+                if row(&answer, "cursor")["readiness"]["state"] == "needs_attention" {
+                    break answer;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    } else {
+        host.handle("agents.list", json!({"watch":"cursor"})).await
+    };
+    let bridge = &row(&answer, "cursor")["readiness"];
+    let expected = if cfg!(target_os = "macos") {
+        json!({"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]})
+    } else {
+        json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
+    };
+    assert_eq!(bridge, &expected);
+}
+
+#[test]
+fn readiness_aggregation_prioritizes_unsupported_then_attention_then_ready() {
+    use ReadinessCheck::{NeedsAttention, Ok, Unsupported};
+    for (checks, expected) in [
+        (vec![], None),
+        (vec![Ok], Some(json!({"state":"ready","reasons":[]}))),
+        (
+            vec![
+                Ok,
+                NeedsAttention("cursor.bridge_not_running", BRIDGE_MESSAGE),
+            ],
+            Some(
+                json!({"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]}),
+            ),
+        ),
+        (
+            vec![
+                NeedsAttention("cursor.bridge_not_running", BRIDGE_MESSAGE),
+                Unsupported("cursor.unsupported", UNSUPPORTED_MESSAGE),
+            ],
+            Some(
+                json!({"state":"unsupported","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE},{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]}),
+            ),
+        ),
+    ] {
+        assert_eq!(aggregate_readiness(&checks), expected);
+    }
+}
+
+#[test]
+fn readiness_row_helper_attaches_only_nonempty_check_sets() {
+    assert_eq!(
+        with_readiness(
+            json!({"id":"cursor"}),
+            vec![ReadinessCheck::NeedsAttention(
+                "cursor.bridge_not_running",
+                BRIDGE_MESSAGE
+            )]
+        ),
+        json!({"id":"cursor","readiness":{"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]}})
+    );
+    assert_eq!(
+        with_readiness(json!({"id":"claude"}), vec![]),
+        json!({"id":"claude"})
+    );
+}
+
+#[tokio::test]
+async fn profile_only_readiness_hook_defaults_empty_for_other_agents() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let claude = crate::adapters::claude::Claude.readiness_checks(&fixture.profile);
+    let codex = crate::adapters::codex::Codex.readiness_checks(&fixture.profile);
+    assert_eq!(aggregate_readiness(&claude), None);
+    assert_eq!(aggregate_readiness(&codex), None);
+    let cursor: &dyn Registration = &crate::adapters::cursor::Cursor;
+    assert_eq!(cursor.readiness_checks(&fixture.profile).len(), 1);
+}
+
+fn identity_signature(
+    id: &str,
+    version: Option<&str>,
+    evidence: &[Evidence<'_>],
+    binary: Option<&str>,
+) -> String {
     let identity = format!(
-        "{{\"id\":{},\"version\":{},\"evidence\":{}}}",
+        "{{\"id\":{},\"version\":{},\"evidence\":{},\"binary\":{}}}",
         serde_json::to_string(id).unwrap(),
         serde_json::to_string(&version).unwrap(),
         serde_json::to_string(evidence).unwrap(),
+        serde_json::to_string(&binary).unwrap(),
     );
     hex::encode(Sha256::digest(identity.as_bytes()))
 }
@@ -243,21 +555,9 @@ async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped
             }
         }),
     );
-    let evidence = vec![
-        Evidence {
-            kind: "config-dir",
-            path: fixture
-                .profile
-                .agent_home("CURSOR_CONFIG_DIR")
-                .to_string_lossy()
-                .into_owned(),
-        },
-        Evidence {
-            kind: "binary",
-            path: fixture.cursor().to_string_lossy().into_owned(),
-        },
-    ];
-    let signature = identity_signature("cursor", None, &evidence);
+    let evidence = vec![Evidence { kind: "cli" }];
+    let cursor = fixture.cursor().to_string_lossy().into_owned();
+    let signature = identity_signature("cursor", None, &evidence, Some(&cursor));
     write_json(
         &fixture.profile.data.join("agents.json"),
         &json!({
@@ -378,18 +678,6 @@ async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped
     host.shutdown().await;
 }
 
-/// Whether `id` is installed where the scan looks with no login PATH and no override: its CLI's standard places or its
-/// app. A test machine with one there cannot show that agent missing.
-fn installed_on_this_machine(fixture: &Fixture, id: &str) -> bool {
-    let registry = crate::adapters::Registry::standard();
-    let (_, agent) = registry.agents().find(|(found, _)| *found == id).unwrap();
-    agent
-        .known_paths(&fixture.profile.home)
-        .iter()
-        .any(|path| executable(&path.to_string_lossy()))
-        || !agent.evidence().is_empty()
-}
-
 fn listed_ids(answer: &Value) -> Vec<String> {
     answer["agents"]
         .as_array()
@@ -405,8 +693,7 @@ fn listed_ids(answer: &Value) -> Vec<String> {
 async fn an_agent_is_listed_when_its_program_is_installed_not_for_its_home_alone() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
-    // No login PATH to search: only an override, the CLI's standard places or the app say an agent is installed.
-    let _shell = EnvGuard::set("SHELL", std::ffi::OsStr::new(""));
+    // The fixture login PATH contains no fixture programs; test-only overrides supply each program.
     write_json(
         &fixture
             .profile
@@ -438,12 +725,10 @@ async fn an_agent_is_listed_when_its_program_is_installed_not_for_its_home_alone
         let missing = host.handle("agents.list", json!({"rescan":true})).await;
         fs::rename(&away, program).unwrap();
         assert!(missing.get("error").is_none(), "{missing}");
-        if !installed_on_this_machine(&fixture, id) {
-            assert!(
-                !listed_ids(&missing).contains(&id.to_owned()),
-                "{id} is listed for its home alone: {missing}"
-            );
-        }
+        assert!(
+            !listed_ids(&missing).contains(&id.to_owned()),
+            "{id} is listed for its home alone: {missing}"
+        );
         // Its program: installed, and said why.
         std::env::set_var(&variable, program);
         let found = host.handle("agents.list", json!({"rescan":true})).await;
@@ -453,7 +738,7 @@ async fn an_agent_is_listed_when_its_program_is_installed_not_for_its_home_alone
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|item| item["kind"] == "binary"),
+                .any(|item| item["kind"] == "cli"),
             "{found}"
         );
         std::env::remove_var(&variable);
@@ -466,9 +751,7 @@ async fn an_agent_is_listed_when_its_program_is_installed_not_for_its_home_alone
     std::env::set_var(override_name("cursor"), &cursor);
     let listed = host.handle("agents.list", json!({"rescan":true})).await;
     for id in ["claude", "codex"] {
-        if !installed_on_this_machine(&fixture, id) {
-            assert!(!listed_ids(&listed).contains(&id.to_owned()), "{listed}");
-        }
+        assert!(!listed_ids(&listed).contains(&id.to_owned()), "{listed}");
     }
     assert!(
         listed_ids(&listed).contains(&"cursor".to_owned()),
@@ -566,6 +849,7 @@ async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn()
         format!("#!/bin/sh\nprintf started > '{}'\n", marker.display()).as_bytes(),
     );
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let _binary = EnvGuard::set("SIDEVOICE_CODEX_BIN", executable.as_os_str());
     let mut state = empty_state();
     state["binaries"]["codex"] = json!(executable);
     write_json(&fixture.profile.data.join("agents.json"), &state);
@@ -583,7 +867,10 @@ async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn()
     symlink(&external, fixture.profile.agent_home("CODEX_HOME")).unwrap();
 
     let answer = host.handle("agents.connect", json!({"id":"codex"})).await;
-    assert_eq!(answer.pointer("/error/key"), Some(&json!("agents.invalid")));
+    assert_eq!(
+        answer.pointer("/error/key"),
+        Some(&json!("agents.not-present"))
+    );
     assert!(
         !marker.exists(),
         "Codex CLI ran with a replaced private profile"
@@ -1238,6 +1525,29 @@ async fn the_installed_command_is_registered_and_owns_every_release_of_it() {
 // Delivery runs the Codex the scan found, with the login shell's PATH, not whatever `codex` the daemon's own PATH (a
 // service manager's) reaches; a launcher that is a script finds its interpreter there.
 #[tokio::test]
+async fn codex_delivery_does_not_use_a_cached_binary_without_login_path() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let codex = fake_codex(&fixture);
+    let mut state = empty_state();
+    state["binaries"]["codex"] = json!(codex);
+    write_json(&fixture.profile.data.join("agents.json"), &state);
+    assert!(agent_command(&fixture.profile, "codex").program.is_none());
+    let result = crate::adapters::codex::deliver(
+        &json!({"kind":"codex-queue","thread":"t-1"}),
+        &json!({"channel":"voice","session_id":"s","revision":1,"message_id":"m","text":"hello"}),
+        &fixture.profile,
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(!fixture
+        .profile
+        .agent_home("CODEX_HOME")
+        .join("calls")
+        .exists());
+}
+
+#[tokio::test]
 async fn codex_delivery_runs_the_scanned_codex_with_the_login_path() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
@@ -1255,10 +1565,21 @@ async fn codex_delivery_runs_the_scanned_codex_with_the_login_path() {
     );
     fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
     let login = format!("{}:/usr/bin:/bin", bin.display());
-    let mut state = empty_state();
-    state["binaries"]["codex"] = json!(codex);
-    state["login_path"] = json!(login);
-    write_json(&fixture.profile.data.join("agents.json"), &state);
+    let shell = fixture.root.join("bench-login-shell");
+    private_write(&shell, format!("#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' '{login}'\n").as_bytes());
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    let _shell = EnvGuard::set("SHELL", shell.as_os_str());
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let discovered = host.handle("agents.list", json!({"rescan":true})).await;
+    assert!(
+        listed_ids(&discovered).contains(&"codex".into()),
+        "{discovered}"
+    );
+    let state: Value =
+        serde_json::from_slice(&fs::read(fixture.profile.data.join("agents.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["binaries"]["codex"], json!(codex));
+    host.shutdown().await;
 
     let answer = crate::adapters::codex::deliver(
         &json!({"kind":"codex-queue","thread":"t-1"}),

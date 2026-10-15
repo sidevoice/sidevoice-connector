@@ -87,17 +87,64 @@ pub trait AgentHost: Send + Sync {
     fn live(&self) -> Result<(), AgentError>;
 }
 
-/// Registering Sidevoice with an agent, reading that registration back and removing it, touching only an entry
-/// Sidevoice wrote.
+/// One agent-owned readiness check, with a stable code and English fallback when it is not OK.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadinessCheck {
+    Ok,
+    NeedsAttention(&'static str, &'static str),
+    Unsupported(&'static str, &'static str),
+}
+
+pub fn aggregate_readiness(checks: &[ReadinessCheck]) -> Option<Value> {
+    if checks.is_empty() {
+        return None;
+    }
+    let state = if checks
+        .iter()
+        .any(|check| matches!(check, ReadinessCheck::Unsupported(_, _)))
+    {
+        "unsupported"
+    } else if checks
+        .iter()
+        .any(|check| matches!(check, ReadinessCheck::NeedsAttention(_, _)))
+    {
+        "needs_attention"
+    } else {
+        "ready"
+    };
+    let reasons = checks
+        .iter()
+        .filter_map(|check| match check {
+            ReadinessCheck::Ok => None,
+            ReadinessCheck::NeedsAttention(code, message)
+            | ReadinessCheck::Unsupported(code, message) => {
+                Some(json!({"code":code,"message":message}))
+            }
+        })
+        .collect::<Vec<_>>();
+    Some(json!({"state":state,"reasons":reasons}))
+}
+
+/// Attach only nonempty agent checks; an absent field means ready.
+pub fn with_readiness(mut row: Value, checks: Vec<ReadinessCheck>) -> Value {
+    if let Some(value) = aggregate_readiness(&checks) {
+        row["readiness"] = value;
+    }
+    row
+}
+
+/// Registering Sidevoice with an agent, reading its state, and removing only an entry Sidevoice wrote.
 pub trait Registration: Send + Sync {
     /// The agent's home.
     fn config_root<'a>(&self, profile: &'a Profile) -> &'a Path;
     /// Its CLI's names, as found on PATH.
     fn binary_names(&self) -> &'static [&'static str];
-    /// Where its CLI is installed when PATH does not reach it.
-    fn known_paths(&self, home: &Path) -> Vec<PathBuf>;
-    /// Evidence, beyond its home and its CLI, that the agent is on this computer: `(kind, path)`.
-    fn evidence(&self) -> Vec<(&'static str, PathBuf)> {
+    /// Fixed, passive filesystem markers for this agent. CLI names above use the captured login PATH.
+    fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
+        &[]
+    }
+    /// Checks specific to this agent; an empty list needs no readiness field.
+    fn readiness_checks(&self, _profile: &Profile) -> Vec<ReadinessCheck> {
         Vec::new()
     }
     /// How to start this agent against the test bench's profile, when it can be: printed when the bench starts.
