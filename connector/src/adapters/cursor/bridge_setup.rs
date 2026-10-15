@@ -109,32 +109,24 @@ fn parsed_version(raw: &str) -> Option<[u32; 3]> {
         })
 }
 
-fn sqlite3_available(path: Option<&str>) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.is_some_and(|path| {
-        env::split_paths(path).any(|dir| {
-            fs::metadata(dir.join("sqlite3"))
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        })
-    })
-}
-
 pub fn status(
     profile: &Profile,
     cursor_version: Option<&str>,
-    login_path: Option<&str>,
+    editor_available: bool,
     registration: &str,
 ) -> Value {
     assess(
         cursor_version,
+        editor_available,
         inventory(&bridge_dir(profile)),
-        sqlite3_available(login_path),
+        super::sqlite3_found(),
         registration,
     )
 }
 
 fn assess(
     cursor_version: Option<&str>,
+    editor_available: bool,
     bridge: BridgeFiles,
     sqlite3: bool,
     registration: &str,
@@ -160,7 +152,9 @@ fn assess(
         "not-connected" | "outdated" => "needs_action",
         _ => "unknown",
     };
-    let reason = if version_state == "needs_action" {
+    let reason = if !editor_available {
+        Some("editor_unavailable")
+    } else if version_state == "needs_action" {
         Some("cursor_version_too_old")
     } else if bridge == BridgeFiles::Missing {
         Some("bridge_missing")
@@ -179,6 +173,7 @@ fn assess(
     };
     let state = match reason {
         None => "ready",
+        Some("editor_unavailable") => "unsupported",
         Some("cursor_version_unknown" | "registration_unknown") => "unknown",
         Some(_) => "needs_attention",
     };
@@ -205,7 +200,7 @@ fn assess(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn temporary_bridge_descriptors_cover_missing_empty_live_and_stale() {
@@ -240,55 +235,71 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_check_uses_only_the_supplied_path() {
-        let root = env::temp_dir().join(format!(
-            "sidevoice-sqlite-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir(&root).unwrap();
-        let path = root.to_str().unwrap();
-        assert!(!sqlite3_available(Some(path)));
-        let stub = root.join("sqlite3");
-        fs::write(&stub, b"#!/bin/sh\nexit 0\n").unwrap();
-        fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(sqlite3_available(Some(path)));
-        fs::remove_dir_all(root).unwrap();
-    }
-
     #[test]
     fn states_are_keyed_and_conservative() {
         assert_eq!(
-            assess(Some("Cursor 3.22.12"), BridgeFiles::Live, true, "connected")["state"],
+            assess(
+                Some("Cursor 3.22.12"),
+                true,
+                BridgeFiles::Live,
+                true,
+                "connected"
+            )["state"],
             "ready"
         );
         assert_eq!(
-            assess(Some("3.22.11"), BridgeFiles::Live, true, "connected")["reason"],
+            assess(Some("3.22.11"), true, BridgeFiles::Live, true, "connected")["reason"],
             "cursor_version_too_old"
         );
         assert_eq!(
-            assess(Some("3.22.12"), BridgeFiles::Missing, true, "connected")["reason"],
+            assess(
+                Some("3.22.12"),
+                true,
+                BridgeFiles::Missing,
+                true,
+                "connected"
+            )["reason"],
             "bridge_missing"
         );
         assert_eq!(
-            assess(Some("3.22.12"), BridgeFiles::Stale, true, "connected")["reason"],
+            assess(Some("3.22.12"), true, BridgeFiles::Stale, true, "connected")["reason"],
             "bridge_stale"
         );
         assert_eq!(
-            assess(Some("3.22.12"), BridgeFiles::Live, false, "connected")["reason"],
+            assess(Some("3.22.12"), true, BridgeFiles::Live, false, "connected")["reason"],
             "sqlite3_missing"
         );
         assert_eq!(
-            assess(None, BridgeFiles::Live, true, "connected")["state"],
+            assess(None, true, BridgeFiles::Live, true, "connected")["state"],
             "unknown"
         );
         assert_eq!(
-            assess(Some("3.22.12"), BridgeFiles::Live, true, "not-connected")["reason"],
+            assess(
+                Some("3.22.12"),
+                true,
+                BridgeFiles::Live,
+                true,
+                "not-connected"
+            )["reason"],
             "sidevoice_not_registered"
         );
         assert_eq!(
-            assess(Some("3.22.12"), BridgeFiles::Missing, true, "connected")["steps"][1]["state"],
+            assess(
+                Some("3.22.12"),
+                true,
+                BridgeFiles::Missing,
+                true,
+                "connected"
+            )["steps"][1]["state"],
             "unknown"
+        );
+        assert_eq!(
+            assess(None, false, BridgeFiles::Missing, true, "connected")["state"],
+            "unsupported"
+        );
+        assert_eq!(
+            assess(None, false, BridgeFiles::Missing, true, "connected")["reason"],
+            "editor_unavailable"
         );
     }
 
@@ -296,7 +307,13 @@ mod tests {
     fn disabled_setting_without_bridge_files_is_reported_as_unverified() {
         // A disabled beta setting and a closed Cursor both leave no descriptor. The connector
         // cannot read that setting, so it reports the step as unknown instead of claiming it is off.
-        let status = assess(Some("3.22.12"), BridgeFiles::Missing, true, "connected");
+        let status = assess(
+            Some("3.22.12"),
+            true,
+            BridgeFiles::Missing,
+            true,
+            "connected",
+        );
         assert_eq!(status["reason"], "bridge_missing");
         assert_eq!(status["steps"][1]["state"], "unknown");
     }

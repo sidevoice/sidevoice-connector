@@ -251,12 +251,17 @@ impl Registration for Cursor {
         &self,
         profile: &Profile,
         version: Option<&str>,
-        login_path: Option<&str>,
+        setup_binary_available: bool,
         registration: &str,
     ) -> Option<(&'static str, Value)> {
         Some((
             "cursor_bridge",
-            super::bridge_setup::status(profile, version, login_path, registration),
+            super::bridge_setup::status(
+                profile,
+                version,
+                setup_binary_available || Path::new(APP).exists(),
+                registration,
+            ),
         ))
     }
 

@@ -678,11 +678,21 @@ pub fn bridge_running() -> bool {
 
 /// Whether `sqlite3` can be run: finding which chat holds a join reads Cursor's own records with it.
 pub fn sqlite3_found() -> bool {
+    sqlite3_executable().is_some()
+}
+
+fn sqlite3_executable() -> Option<PathBuf> {
+    sqlite3_executable_on(env::var_os("PATH").as_deref())
+}
+
+pub(crate) fn sqlite3_executable_on(path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
-    env::var_os("PATH").is_some_and(|path| {
-        env::split_paths(&path).any(|dir| {
-            fs::metadata(dir.join("sqlite3"))
+    path.and_then(|path| {
+        env::split_paths(path).find_map(|dir| {
+            let candidate = dir.join("sqlite3");
+            fs::metadata(&candidate)
                 .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+                .then_some(candidate)
         })
     })
 }
@@ -870,7 +880,8 @@ async fn query_bridge_chat(
             None => ("bubbleId:".into(), "bubbleId;".into()),
         };
         let sql = format!("SELECT DISTINCT substr(key, 10, instr(substr(key, 10), ':') - 1) AS chat FROM cursorDiskKV WHERE key >= '{from}' AND key < '{to}' AND instr(CAST(value AS TEXT), '{marker}') > 0 LIMIT 2;");
-        let mut command = tokio::process::Command::new("sqlite3");
+        let sqlite3 = sqlite3_executable()?;
+        let mut command = tokio::process::Command::new(sqlite3);
         command
             .args(["-readonly", "-json"])
             .arg(&database)

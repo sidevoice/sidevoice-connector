@@ -113,7 +113,7 @@ pub trait Registration: Send + Sync {
         &self,
         _profile: &Profile,
         _version: Option<&str>,
-        _login_path: Option<&str>,
+        _setup_binary_available: bool,
         _registration: &str,
     ) -> Option<(&'static str, Value)> {
         None

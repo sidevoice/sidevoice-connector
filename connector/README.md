@@ -157,13 +157,15 @@ token, or socket path. Example:
 }
 ```
 
-`state` is `ready`, `needs_attention`, or `unknown`. `reason` is null when ready, otherwise one of
+`state` is `ready`, `needs_attention`, `unknown`, or `unsupported`. `reason` is null when ready, otherwise one of
 `cursor_version_too_old`, `bridge_missing`, `bridge_stale`, `sqlite3_missing`, `sidevoice_not_registered`,
-`cursor_version_unknown`, or `registration_unknown`. Step states are `done`, `needs_action`, or `unknown`.
+`cursor_version_unknown`, `registration_unknown`, or `editor_unavailable` (the `unsupported` state when the
+Cursor editor is absent, including a CLI-only installation). Step states are `done`, `needs_action`, or `unknown`.
 `cursor_version` is the parsed version from the editor's `cursor --version`, or null when unavailable. The minimum
 Cursor version is 3.22.12; the minimum connector version is 0.9.0. A live bridge requires a usable protocol-1
 descriptor under `~/.cursor/desktop-bridge/*.json`, with a live process and an existing socket. `sqlite3` must be
-executable on the captured login PATH. Missing and empty directories both give `bridge_missing`; unusable descriptors
+executable on the connector process PATH, which is also used for delivery. A missing login PATH capture does not
+change this check. Missing and empty directories both give `bridge_missing`; unusable descriptors
 give `bridge_stale`. `agents.list` with `rescan` or `watch`, and `agents check cursor`, refresh the checks; a cached
 list returns the last result.
 

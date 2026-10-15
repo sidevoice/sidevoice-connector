@@ -1405,21 +1405,23 @@ impl HostAgents {
             input.old_version.map(str::to_owned)
         };
         // An adapter can ask for the version of a different binary than its MCP registration uses.
-        let setup_version = if let Some(name) = agent.setup_version_binary() {
-            let setup_binary = find_in_path(&[name], input.login_path).or_else(|| {
-                agent
-                    .known_paths(&self.profile.home)
-                    .into_iter()
-                    .filter(|path| path.file_name().is_some_and(|file| file == name))
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .find(|path| executable(path))
-            });
+        let setup_binary = agent.setup_version_binary().and_then(|name| {
+            find_in_path(&[name], input.login_path)
+                .or_else(|| find_in_path(&[name], std::env::var("PATH").ok().as_deref()))
+                .or_else(|| {
+                    agent
+                        .known_paths(&self.profile.home)
+                        .into_iter()
+                        .filter(|path| path.file_name().is_some_and(|file| file == name))
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .find(|path| executable(path))
+                })
+        });
+        let setup_version = if agent.setup_version_binary().is_some() {
             if input.include_version {
-                match setup_binary {
-                    Some(binary) => {
-                        self.binary_version(agent, &binary, cancel, deadline)
-                            .await?
-                    }
+                match setup_binary.as_deref() {
+                    Some(setup) if binary.as_deref() == Some(setup) => version.clone(),
+                    Some(setup) => self.binary_version(agent, setup, cancel, deadline).await?,
                     None => None,
                 }
             } else {
@@ -1485,7 +1487,7 @@ impl HostAgents {
         if let Some((field, value)) = agent.setup_status(
             &self.profile,
             setup_version.as_deref(),
-            input.login_path,
+            setup_binary.is_some(),
             &registration,
         ) {
             row[field] = value;
