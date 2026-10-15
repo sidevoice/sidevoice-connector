@@ -19,7 +19,9 @@ fn codex_cli() -> Option<PathBuf> {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/codex/node_modules/.bin/codex")
         });
     if path.is_file() {
-        return Some(path.canonicalize().unwrap());
+        // Keep npm's `.bin/codex` entry: canonicalizing it can turn the path into
+        // `.../bin/codex.js`, whose directory has no executable named `codex`.
+        return Some(path);
     }
     if std::env::var_os("CI").is_some() {
         panic!(
