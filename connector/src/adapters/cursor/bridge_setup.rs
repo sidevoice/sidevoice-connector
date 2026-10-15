@@ -13,6 +13,14 @@ use std::time::{Duration, Instant};
 const MAX_DESCRIPTOR: u64 = 16 * 1024;
 const MAX_ENTRIES: usize = 256;
 const FRESHNESS: Duration = Duration::from_secs(2);
+const BRIDGE_NOT_RUNNING: ReadinessCheck = ReadinessCheck::NeedsAttention(
+    "cursor.bridge_not_running",
+    "Voice in the Cursor editor needs Cursor's Desktop Bridge: in Cursor, open Settings › Beta, enable “Allow CLI to access desktop agents”, then restart Cursor.",
+);
+const CURSOR_UNSUPPORTED: ReadinessCheck = ReadinessCheck::Unsupported(
+    "cursor.unsupported",
+    "Cursor editor voice is not supported on this computer.",
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BridgeFiles {
@@ -157,7 +165,7 @@ fn inventory(dir: &Path) -> BridgeFiles {
 
 pub fn check(profile: &Profile) -> ReadinessCheck {
     if !cfg!(target_os = "macos") {
-        return ReadinessCheck::Unsupported("cursor.unsupported");
+        return CURSOR_UNSUPPORTED;
     }
     let dir = bridge_dir(profile);
     let home_app = profile.home.join("Applications/Cursor.app");
@@ -181,21 +189,21 @@ fn check_with(
     scan: impl FnOnce() -> BridgeEvidence + Send + 'static,
 ) -> ReadinessCheck {
     if !macos {
-        return ReadinessCheck::Unsupported("cursor.unsupported");
+        return CURSOR_UNSUPPORTED;
     }
     evaluate(true, cache.snapshot_or_refresh(path, scan))
 }
 
 fn evaluate(macos: bool, evidence: Option<BridgeEvidence>) -> ReadinessCheck {
     if !macos {
-        ReadinessCheck::Unsupported("cursor.unsupported")
+        CURSOR_UNSUPPORTED
     } else if evidence.is_some_and(|evidence| evidence.files == BridgeFiles::Live) {
         ReadinessCheck::Ok
     } else if evidence.is_none_or(|evidence| evidence.editor_app) {
         // An unscanned bridge stays provisional until the background refresh completes.
-        ReadinessCheck::NeedsAttention("cursor.bridge_not_running")
+        BRIDGE_NOT_RUNNING
     } else {
-        ReadinessCheck::Unsupported("cursor.unsupported")
+        CURSOR_UNSUPPORTED
     }
 }
 
@@ -204,6 +212,31 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn cursor_fallback_messages_are_plain_and_private() {
+        for (check, expected_code) in [
+            (BRIDGE_NOT_RUNNING, "cursor.bridge_not_running"),
+            (CURSOR_UNSUPPORTED, "cursor.unsupported"),
+        ] {
+            let (code, message) = match check {
+                ReadinessCheck::NeedsAttention(code, message)
+                | ReadinessCheck::Unsupported(code, message) => (code, message),
+                ReadinessCheck::Ok => panic!("non-OK reason expected"),
+            };
+            assert_eq!(code, expected_code);
+            assert!(message.ends_with('.'));
+            assert!(!message.chars().any(|c| matches!(c, '/' | '\\' | '~')));
+            assert!(!message.chars().any(|c| c.is_ascii_digit()));
+            let lower = message.to_ascii_lowercase();
+            for private_word in ["home", "token", "secret", "password", "bearer"] {
+                assert!(!lower.contains(private_word));
+            }
+            assert!(!message
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|word| word.len() >= 40));
+        }
+    }
 
     #[test]
     fn temporary_bridge_descriptors_cover_missing_empty_live_and_stale() {
@@ -253,13 +286,10 @@ mod tests {
                         editor_app: true
                     })
                 ),
-                ReadinessCheck::NeedsAttention("cursor.bridge_not_running")
+                BRIDGE_NOT_RUNNING
             );
         }
-        assert_eq!(
-            evaluate(false, live),
-            ReadinessCheck::Unsupported("cursor.unsupported")
-        );
+        assert_eq!(evaluate(false, live), CURSOR_UNSUPPORTED);
         assert_eq!(
             evaluate(
                 true,
@@ -268,12 +298,9 @@ mod tests {
                     editor_app: false
                 })
             ),
-            ReadinessCheck::Unsupported("cursor.unsupported")
+            CURSOR_UNSUPPORTED
         );
-        assert_eq!(
-            evaluate(true, None),
-            ReadinessCheck::NeedsAttention("cursor.bridge_not_running")
-        );
+        assert_eq!(evaluate(true, None), BRIDGE_NOT_RUNNING);
     }
 
     #[tokio::test]
@@ -303,7 +330,7 @@ mod tests {
                 &probe_app,
                 &probe_system
             )),
-            ReadinessCheck::NeedsAttention("cursor.bridge_not_running")
+            BRIDGE_NOT_RUNNING
         );
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -321,10 +348,7 @@ mod tests {
         fs::remove_file(&socket).unwrap();
         let stopped = probe(&bridge, &home_app, &system_app);
         assert_eq!(stopped.files, BridgeFiles::Stale);
-        assert_eq!(
-            evaluate(true, Some(stopped)),
-            ReadinessCheck::NeedsAttention("cursor.bridge_not_running")
-        );
+        assert_eq!(evaluate(true, Some(stopped)), BRIDGE_NOT_RUNNING);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -336,7 +360,7 @@ mod tests {
         let path = PathBuf::from("/unused-fixture-key");
         assert_eq!(
             check_with(false, path.clone(), &cache, || panic!("non-Mac scanned")),
-            ReadinessCheck::Unsupported("cursor.unsupported")
+            CURSOR_UNSUPPORTED
         );
         assert!(cache.0.lock().unwrap().path.is_none());
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -353,10 +377,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(
-            pending,
-            ReadinessCheck::NeedsAttention("cursor.bridge_not_running")
-        );
+        assert_eq!(pending, BRIDGE_NOT_RUNNING);
         started_rx.await.unwrap();
         assert_eq!(
             check_with(true, path.clone(), &cache, || panic!("duplicate refresh")),

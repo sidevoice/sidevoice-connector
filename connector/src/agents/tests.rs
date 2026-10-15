@@ -265,8 +265,11 @@ fn row<'a>(answer: &'a Value, id: &str) -> &'a Value {
         .unwrap()
 }
 
+const BRIDGE_MESSAGE: &str = "Voice in the Cursor editor needs Cursor's Desktop Bridge: in Cursor, open Settings › Beta, enable “Allow CLI to access desktop agents”, then restart Cursor.";
+const UNSUPPORTED_MESSAGE: &str = "Cursor editor voice is not supported on this computer.";
+
 #[tokio::test]
-async fn cursor_agent_row_exposes_only_readiness_codes_without_home_paths_or_secrets() {
+async fn cursor_agent_row_exposes_readiness_codes_and_fallbacks_without_private_data() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
     let bin = fixture.root.join("bin");
@@ -285,9 +288,9 @@ async fn cursor_agent_row_exposes_only_readiness_codes_without_home_paths_or_sec
     let missing = host.handle("agents.list", json!({"watch":"cursor"})).await;
     let bridge = &row(&missing, "cursor")["readiness"];
     let expected = if cfg!(target_os = "macos") {
-        json!({"state":"needs_attention","reasons":["cursor.bridge_not_running"]})
+        json!({"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]})
     } else {
-        json!({"state":"unsupported","reasons":["cursor.unsupported"]})
+        json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
     };
     assert_eq!(bridge, &expected);
     let cached = host.handle("agents.list", json!({})).await;
@@ -324,7 +327,7 @@ async fn cursor_agent_row_exposes_only_readiness_codes_without_home_paths_or_sec
     let expected = if cfg!(target_os = "macos") {
         json!({"state":"ready","reasons":[]})
     } else {
-        json!({"state":"unsupported","reasons":["cursor.unsupported"]})
+        json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
     };
     assert_eq!(bridge, &expected);
     let serialized = bridge.to_string();
@@ -367,7 +370,7 @@ async fn cursor_readiness_distinguishes_cli_only_from_editor() {
     let bridge = &row(&answer, "cursor")["readiness"];
     assert_eq!(
         bridge,
-        &json!({"state":"unsupported","reasons":["cursor.unsupported"]})
+        &json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
     );
 
     let app = fixture.profile.home.join("Applications/Cursor.app");
@@ -390,9 +393,9 @@ async fn cursor_readiness_distinguishes_cli_only_from_editor() {
     };
     let bridge = &row(&answer, "cursor")["readiness"];
     let expected = if cfg!(target_os = "macos") {
-        json!({"state":"needs_attention","reasons":["cursor.bridge_not_running"]})
+        json!({"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]})
     } else {
-        json!({"state":"unsupported","reasons":["cursor.unsupported"]})
+        json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
     };
     assert_eq!(bridge, &expected);
 }
@@ -404,16 +407,21 @@ fn readiness_aggregation_prioritizes_unsupported_then_attention_then_ready() {
         (vec![], None),
         (vec![Ok], Some(json!({"state":"ready","reasons":[]}))),
         (
-            vec![Ok, NeedsAttention("cursor.bridge_not_running")],
-            Some(json!({"state":"needs_attention","reasons":["cursor.bridge_not_running"]})),
+            vec![
+                Ok,
+                NeedsAttention("cursor.bridge_not_running", BRIDGE_MESSAGE),
+            ],
+            Some(
+                json!({"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]}),
+            ),
         ),
         (
             vec![
-                NeedsAttention("cursor.bridge_not_running"),
-                Unsupported("cursor.unsupported"),
+                NeedsAttention("cursor.bridge_not_running", BRIDGE_MESSAGE),
+                Unsupported("cursor.unsupported", UNSUPPORTED_MESSAGE),
             ],
             Some(
-                json!({"state":"unsupported","reasons":["cursor.bridge_not_running","cursor.unsupported"]}),
+                json!({"state":"unsupported","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE},{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]}),
             ),
         ),
     ] {
@@ -426,9 +434,12 @@ fn readiness_row_helper_attaches_only_nonempty_check_sets() {
     assert_eq!(
         with_readiness(
             json!({"id":"cursor"}),
-            vec![ReadinessCheck::NeedsAttention("cursor.bridge_not_running")]
+            vec![ReadinessCheck::NeedsAttention(
+                "cursor.bridge_not_running",
+                BRIDGE_MESSAGE
+            )]
         ),
-        json!({"id":"cursor","readiness":{"state":"needs_attention","reasons":["cursor.bridge_not_running"]}})
+        json!({"id":"cursor","readiness":{"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]}})
     );
     assert_eq!(
         with_readiness(json!({"id":"claude"}), vec![]),

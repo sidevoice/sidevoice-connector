@@ -87,12 +87,12 @@ pub trait AgentHost: Send + Sync {
     fn live(&self) -> Result<(), AgentError>;
 }
 
-/// One agent-owned readiness check and its stable reason code when it is not OK.
+/// One agent-owned readiness check, with a stable code and English fallback when it is not OK.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadinessCheck {
     Ok,
-    NeedsAttention(&'static str),
-    Unsupported(&'static str),
+    NeedsAttention(&'static str, &'static str),
+    Unsupported(&'static str, &'static str),
 }
 
 pub fn aggregate_readiness(checks: &[ReadinessCheck]) -> Option<Value> {
@@ -101,12 +101,12 @@ pub fn aggregate_readiness(checks: &[ReadinessCheck]) -> Option<Value> {
     }
     let state = if checks
         .iter()
-        .any(|check| matches!(check, ReadinessCheck::Unsupported(_)))
+        .any(|check| matches!(check, ReadinessCheck::Unsupported(_, _)))
     {
         "unsupported"
     } else if checks
         .iter()
-        .any(|check| matches!(check, ReadinessCheck::NeedsAttention(_)))
+        .any(|check| matches!(check, ReadinessCheck::NeedsAttention(_, _)))
     {
         "needs_attention"
     } else {
@@ -116,8 +116,9 @@ pub fn aggregate_readiness(checks: &[ReadinessCheck]) -> Option<Value> {
         .iter()
         .filter_map(|check| match check {
             ReadinessCheck::Ok => None,
-            ReadinessCheck::NeedsAttention(reason) | ReadinessCheck::Unsupported(reason) => {
-                Some(*reason)
+            ReadinessCheck::NeedsAttention(code, message)
+            | ReadinessCheck::Unsupported(code, message) => {
+                Some(json!({"code":code,"message":message}))
             }
         })
         .collect::<Vec<_>>();

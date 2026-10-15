@@ -164,16 +164,19 @@ left, keep the last one found (in `agents.json`).
 Every row in `agents.list` / `agents --json` may carry an optional `readiness` object:
 
 ```json
-{"readiness":{"state":"needs_attention","reasons":["cursor.bridge_not_running"]}}
+{"readiness":{"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":"Voice in the Cursor editor needs Cursor's Desktop Bridge: in Cursor, open Settings › Beta, enable “Allow CLI to access desktop agents”, then restart Cursor."}]}}
 ```
 
-`state` is `ready`, `needs_attention`, or `unsupported`. `reasons` is an array of stable codes
-in the `<agent>.<code>` namespace, without display text, versions, paths, or secrets. An absent
+`state` is `ready`, `needs_attention`, or `unsupported`. `reasons` is an ordered array of
+`{"code","message"}` objects. `code` is stable in the `<agent>.<code>` namespace;
+`message` is a plain English fallback instruction supplied by that agent's check, with no paths,
+tokens, versions, or home directories. Consumers use `code` for logic and localization: the web
+shows its `agents.readiness.<code>` translation when present, else `message`. An absent
 `readiness` field means ready: adapters with no checks omit it. Every check contributes either
 OK, needs attention with a reason, or unsupported with a reason. The aggregate is `unsupported`
 if any check is unsupported; otherwise `needs_attention` if any check needs attention; otherwise
-`ready`. All non-OK reason codes are retained in check order. A ready object has `reasons: []`.
-The web owns localized copy for each reason code.
+`ready`. All non-OK reason objects are retained in check order. A ready object has `reasons: []`.
+For `cursor.unsupported`, the fallback is “Cursor editor voice is not supported on this computer.”
 
 Cursor currently has one check: a usable Desktop Bridge descriptor with a live process and socket
 is ready even when the selected CLI is `cursor-agent`. A detected Cursor editor in either
