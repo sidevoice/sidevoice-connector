@@ -38,8 +38,14 @@ impl Roots {
         match marker.root {
             Root::Absolute => Some(PathBuf::from(marker.path)),
             Root::Home => Some(self.home.join(marker.path)),
-            Root::LocalAppData => self.local_app_data.as_ref().map(|root| root.join(marker.path)),
-            Root::ProgramFiles => self.program_files.as_ref().map(|root| root.join(marker.path)),
+            Root::LocalAppData => self
+                .local_app_data
+                .as_ref()
+                .map(|root| root.join(marker.path)),
+            Root::ProgramFiles => self
+                .program_files
+                .as_ref()
+                .map(|root| root.join(marker.path)),
         }
     }
 }
@@ -71,7 +77,11 @@ mod tests {
         fs::create_dir_all(home.join("Applications")).unwrap();
         let marker_file = home.join("Applications/Cursor.app");
         let launched = root.join("launched");
-        fs::write(&marker_file, format!("#!/bin/sh\ntouch '{}'\n", launched.display())).unwrap();
+        fs::write(
+            &marker_file,
+            format!("#!/bin/sh\ntouch '{}'\n", launched.display()),
+        )
+        .unwrap();
         fs::set_permissions(&marker_file, fs::Permissions::from_mode(0o700)).unwrap();
         let markers = [Marker {
             os: "macos",
@@ -80,7 +90,10 @@ mod tests {
             path: "Applications/Cursor.app",
         }];
         let roots = Roots::process(&home);
-        assert_eq!(matching_kinds(&markers, "macos", &roots), vec!["app_bundle"]);
+        assert_eq!(
+            matching_kinds(&markers, "macos", &roots),
+            vec!["app_bundle"]
+        );
         assert!(!launched.exists(), "path discovery launched the app");
         assert!(matching_kinds(&markers, "linux", &roots).is_empty());
         fs::remove_dir_all(root).unwrap();
@@ -94,11 +107,28 @@ mod tests {
         fs::create_dir_all(local.join("Programs/cursor")).unwrap();
         fs::create_dir_all(&program).unwrap();
         let markers = [
-            Marker { os: "windows", kind: "install_dir", root: Root::LocalAppData, path: "Programs/cursor" },
-            Marker { os: "windows", kind: "install_dir", root: Root::ProgramFiles, path: "cursor" },
+            Marker {
+                os: "windows",
+                kind: "install_dir",
+                root: Root::LocalAppData,
+                path: "Programs/cursor",
+            },
+            Marker {
+                os: "windows",
+                kind: "install_dir",
+                root: Root::ProgramFiles,
+                path: "cursor",
+            },
         ];
-        let roots = Roots { home: root.clone(), local_app_data: Some(local), program_files: Some(program) };
-        assert_eq!(matching_kinds(&markers, "windows", &roots), vec!["install_dir"]);
+        let roots = Roots {
+            home: root.clone(),
+            local_app_data: Some(local),
+            program_files: Some(program),
+        };
+        assert_eq!(
+            matching_kinds(&markers, "windows", &roots),
+            vec!["install_dir"]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

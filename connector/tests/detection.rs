@@ -75,16 +75,32 @@ fn cursor_install_directory_is_passive_and_needs_a_captured_path() {
     let install_dir = profile.root.join("home/.local/share/cursor");
     fs::create_dir_all(&install_dir).unwrap();
     let no_shell = listed(&profile, None, None);
-    assert!(!has(&no_shell, "cursor"), "failed PATH capture listed a marker: {no_shell}");
+    assert!(
+        !has(&no_shell, "cursor"),
+        "failed PATH capture listed a marker: {no_shell}"
+    );
     let shell = profile.root.join("login-shell");
     program(&shell, "#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' /usr/bin\n");
     let found = listed(&profile, Some(&shell), None);
-    let cursor = found["agents"].as_array().unwrap().iter().find(|row| row["id"] == "cursor").unwrap();
-    assert_eq!(cursor["evidence"], serde_json::json!([{"kind":"install_dir"}]));
-    assert!(!cursor["evidence"].to_string().contains(&profile.root.join("home").to_string_lossy().to_string()));
+    let cursor = found["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "cursor")
+        .unwrap();
+    assert_eq!(
+        cursor["evidence"],
+        serde_json::json!([{"kind":"install_dir"}])
+    );
+    assert!(!cursor["evidence"]
+        .to_string()
+        .contains(&profile.root.join("home").to_string_lossy().to_string()));
     fs::remove_dir_all(&install_dir).unwrap();
     let removed = listed(&profile, Some(&shell), None);
-    assert!(!has(&removed, "cursor"), "removed install marker stayed listed: {removed}");
+    assert!(
+        !has(&removed, "cursor"),
+        "removed install marker stayed listed: {removed}"
+    );
 }
 
 #[test]
@@ -98,8 +114,14 @@ fn startup_output_is_not_mistaken_for_the_login_path() {
         bin.display()
     ));
     let found = listed(&profile, Some(&shell), None);
-    assert!(has(&found, "claude"), "framed first PATH component was lost: {found}");
+    assert!(
+        has(&found, "claude"),
+        "framed first PATH component was lost: {found}"
+    );
     fs::write(&shell, "#!/bin/sh\necho 'Welcome to your shell'\n").unwrap();
     let refused = listed(&profile, Some(&shell), None);
-    assert!(!has(&refused, "claude"), "banner-only output passed as PATH: {refused}");
+    assert!(
+        !has(&refused, "claude"),
+        "banner-only output passed as PATH: {refused}"
+    );
 }

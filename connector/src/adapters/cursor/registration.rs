@@ -250,12 +250,42 @@ impl Registration for Cursor {
     fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
         use crate::adapters::markers::{Marker, Root};
         &[
-            Marker { os: "macos", kind: "app_bundle", root: Root::Absolute, path: "/Applications/Cursor.app" },
-            Marker { os: "macos", kind: "app_bundle", root: Root::Home, path: "Applications/Cursor.app" },
-            Marker { os: "windows", kind: "install_dir", root: Root::LocalAppData, path: "Programs/cursor" },
-            Marker { os: "windows", kind: "install_dir", root: Root::ProgramFiles, path: "cursor" },
-            Marker { os: "linux", kind: "install_dir", root: Root::Absolute, path: "/usr/share/cursor" },
-            Marker { os: "linux", kind: "install_dir", root: Root::Home, path: ".local/share/cursor" },
+            Marker {
+                os: "macos",
+                kind: "app_bundle",
+                root: Root::Absolute,
+                path: "/Applications/Cursor.app",
+            },
+            Marker {
+                os: "macos",
+                kind: "app_bundle",
+                root: Root::Home,
+                path: "Applications/Cursor.app",
+            },
+            Marker {
+                os: "windows",
+                kind: "install_dir",
+                root: Root::LocalAppData,
+                path: "Programs/cursor",
+            },
+            Marker {
+                os: "windows",
+                kind: "install_dir",
+                root: Root::ProgramFiles,
+                path: "cursor",
+            },
+            Marker {
+                os: "linux",
+                kind: "install_dir",
+                root: Root::Absolute,
+                path: "/usr/share/cursor",
+            },
+            Marker {
+                os: "linux",
+                kind: "install_dir",
+                root: Root::Home,
+                path: ".local/share/cursor",
+            },
         ]
     }
 

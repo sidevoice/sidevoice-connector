@@ -66,7 +66,11 @@ fn agents_lists_in_english_or_as_json_and_failures_carry_a_stable_key() {
                 .any(|kind| evidence.contains(&format!("\"{kind}\""))),
             "{row}"
         );
-        assert!(row["evidence"].as_array().unwrap().iter().all(|item| item.get("path").is_none()));
+        assert!(row["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item.get("path").is_none()));
     }
 
     let text = profile.connector(&["agents"]).output().unwrap();

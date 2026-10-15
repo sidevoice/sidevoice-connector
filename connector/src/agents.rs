@@ -4,8 +4,8 @@
 //! One gate owns a complete request. CLI children belong to its worker task so a vanished link reply can
 //! cancel the work without releasing the gate before the child has exited.
 
-use crate::adapters::markers::{self, Roots};
 use crate::adapters::health::{self, Health};
+use crate::adapters::markers::{self, Roots};
 use crate::adapters::registration::{
     mcp_servers_json, shell_command, AgentError, AgentHost, CliError, CliOutput, Launch, Manual,
     Registration,

@@ -98,8 +98,13 @@ async fn public_marker_evidence_names_kind_without_home_path() {
     private_mkdir(&fixture.profile.home.join(".local/share/cursor"));
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let listed = host.handle("agents.list", json!({"rescan":true})).await;
-    assert_eq!(row(&listed, "cursor")["evidence"], json!([{"kind":"install_dir"}]));
-    assert!(!row(&listed, "cursor")["evidence"].to_string().contains(&fixture.profile.home.to_string_lossy().to_string()));
+    assert_eq!(
+        row(&listed, "cursor")["evidence"],
+        json!([{"kind":"install_dir"}])
+    );
+    assert!(!row(&listed, "cursor")["evidence"]
+        .to_string()
+        .contains(&fixture.profile.home.to_string_lossy().to_string()));
     host.shutdown().await;
 }
 
@@ -259,7 +264,12 @@ fn row<'a>(answer: &'a Value, id: &str) -> &'a Value {
         .unwrap()
 }
 
-fn identity_signature(id: &str, version: Option<&str>, evidence: &[Evidence<'_>], binary: Option<&str>) -> String {
+fn identity_signature(
+    id: &str,
+    version: Option<&str>,
+    evidence: &[Evidence<'_>],
+    binary: Option<&str>,
+) -> String {
     let identity = format!(
         "{{\"id\":{},\"version\":{},\"evidence\":{},\"binary\":{}}}",
         serde_json::to_string(id).unwrap(),
