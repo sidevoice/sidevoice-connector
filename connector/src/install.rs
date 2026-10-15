@@ -1119,10 +1119,33 @@ pub(crate) mod tests {
     impl Fixture {
         fn new(label: &str) -> Self {
             let scratch = Scratch::new(label);
-            let profile = Profile::for_test(
-                &scratch.0.join("profile"),
-                &crate::adapters::Registry::standard().homes(),
-            );
+            let homes = crate::adapters::Registry::standard().homes();
+            let original = Profile::for_test(&scratch.0.join("profile"), &homes);
+            let variables = original.variables();
+            let profile = Profile::from_vars(
+                |name| {
+                    if name == "SIDEVOICE_DATA_DIR" || name == "XDG_DATA_HOME" {
+                        None
+                    } else {
+                        variables
+                            .iter()
+                            .find(|(key, _)| *key == name)
+                            .map(|(_, value)| value.as_os_str().to_owned())
+                    }
+                },
+                &homes,
+            )
+            .unwrap();
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(profile.data.join("core"))
+                .unwrap();
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&profile.xdg_data)
+                .unwrap();
             Self {
                 scratch,
                 profile,

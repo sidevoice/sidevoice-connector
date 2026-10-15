@@ -137,6 +137,13 @@ the agents' registrations Sidevoice wrote (current or not), then `R` and everyth
 stop, so that a launcher on its way finds the stop and starts nothing. The room keeps this machine's pairing until it is revoked
 there.
 
+Before unloading, uninstall checks that `D` is exactly `HOME/.sidevoice` and `R` is exactly
+`HOME/.local/share/sidevoice`. A custom data or release path must be dealt with manually; uninstall refuses it.
+It checks the trees for mount boundaries, then removes entries through directory handles without following links.
+A failed check or a path changed during removal makes `uninstall --json` return its normal `ok: false` error and a
+nonzero exit. Symlinks inside an owned tree are removed as links; their targets are left alone. Running uninstall
+again after a successful removal is safe.
+
 With `--json` both print one JSON object and nothing else.
 
 ## Tests

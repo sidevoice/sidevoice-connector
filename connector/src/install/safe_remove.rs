@@ -6,7 +6,7 @@ use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 fn clean_absolute(path: &Path) -> bool {
     path.is_absolute()
@@ -433,6 +433,7 @@ impl Guard {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn layout(home: &Path) -> Layout {
