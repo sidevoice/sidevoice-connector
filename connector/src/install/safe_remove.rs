@@ -421,6 +421,19 @@ impl Guard {
         Ok(releases)
     }
 
+    #[cfg(test)]
+    pub(super) fn preflight_with_simulated_data_mount(&self) -> Result<bool, &'static str> {
+        let probe = |fd, path: &Path| {
+            let mut observed = mount(fd)?;
+            if path == Path::new(".sidevoice") {
+                observed.device ^= 1;
+            }
+            Ok(observed)
+        };
+        self.tree(Path::new(".sidevoice"), false, super::KEPT, false, &probe)?;
+        Ok(false)
+    }
+
     pub(super) fn remove_releases(&self) -> Result<(), &'static str> {
         self.tree(
             Path::new(".local/share/sidevoice"),

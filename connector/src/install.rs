@@ -1009,11 +1009,21 @@ pub fn human_install(answer: &Value) -> String {
 
 /// `uninstall`: see the module's documentation. The answer is `uninstall --json`'s.
 pub async fn uninstall(profile: &Profile, options: Options, runtime: &Runtime) -> Result<Value> {
+    uninstall_with_preflight(profile, options, runtime, |guard| guard.preflight()).await
+}
+
+async fn uninstall_with_preflight(
+    profile: &Profile,
+    options: Options,
+    runtime: &Runtime,
+    preflight: impl Fn(&safe_remove::Guard) -> std::result::Result<bool, &'static str>,
+) -> Result<Value> {
     let layout = Layout::from_profile(profile);
     safe_remove::validate_scope(&layout).map_err(failed)?;
-    let _lock = crate::service::install_lock(&layout).await?;
     let guard = safe_remove::Guard::new(&layout).map_err(failed)?;
-    let had_releases = guard.preflight().map_err(failed)?;
+    let had_releases = preflight(&guard).map_err(failed)?;
+    let _lock = crate::service::install_lock(&layout).await?;
+    guard.preflight().map_err(failed)?;
     let service = runtime.unload(&layout).await?;
     let agents = if options.agents {
         unregister(profile).await
@@ -1039,7 +1049,8 @@ pub async fn uninstall(profile: &Profile, options: Options, runtime: &Runtime) -
     advice
         .push("Conversations already open keep their Sidevoice server until they end.".to_owned());
     Ok(
-        json!({"ok": true, "state": "absent", "service": service.get("service").cloned().unwrap_or(Value::Null),
+        json!({"ok": true, "state": "absent", "safe_uninstall": crate::identity::SAFE_UNINSTALL,
+        "service": service.get("service").cloned().unwrap_or(Value::Null),
         "note": service.get("note").cloned().unwrap_or(Value::Null), "agents": agents,
         "releases": had_releases.then(|| layout.releases.clone()), "data": layout.data, "removed": removed,
         "advice": advice}),
@@ -1591,5 +1602,24 @@ pub(crate) mod tests {
         // And once more: the repaired release is reused as it is.
         fixture.install(&package).await.unwrap();
         assert_eq!(current_release(&layout).unwrap(), repaired);
+    }
+
+    #[tokio::test]
+    async fn mounted_data_refuses_before_install_lock_is_rewritten() {
+        let fixture = Fixture::new("mounted-uninstall-data");
+        let lock = fixture.layout().install_lock();
+        fs::write(&lock, b"sentinel lock contents").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+        let error =
+            uninstall_with_preflight(&fixture.profile, NO_AGENTS, &fixture.runtime(), |guard| {
+                guard.preflight_with_simulated_data_mount()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("mount or device boundary"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&lock).unwrap(), b"sentinel lock contents");
     }
 }

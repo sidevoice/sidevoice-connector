@@ -144,6 +144,10 @@ A failed check or a path changed during removal makes `uninstall --json` return 
 nonzero exit. Symlinks inside an owned tree are removed as links; their targets are left alone. Running uninstall
 again after a successful removal is safe.
 
+`--version --json` includes top-level `"safe_uninstall": 1` when this guarded uninstall contract is present.
+The successful `uninstall --json` object echoes the same marker. A caller must check the version marker before
+starting a destructive reset; the post-uninstall echo alone is too late to protect an older installed binary.
+
 With `--json` both print one JSON object and nothing else.
 
 ## Tests
