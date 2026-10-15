@@ -1,5 +1,5 @@
 use super::*;
-use crate::adapters::registration::ReadinessCheck;
+use crate::adapters::registration::{aggregate_readiness, ReadinessCheck};
 use fs2::FileExt;
 use std::fs::OpenOptions;
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
@@ -194,7 +194,21 @@ async fn cursor_agent_row_exposes_only_readiness_codes_without_home_paths_or_sec
             "token":"secret-token","userDataDir":fixture.root.join("private-cursor-data")
         }),
     );
-    let rescanned = host.handle("agents.list", json!({"watch":"cursor"})).await;
+    let rescanned = if cfg!(target_os = "macos") {
+        tokio::time::timeout(StdDuration::from_secs(4), async {
+            loop {
+                let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
+                if row(&answer, "cursor")["readiness"]["state"] == "ready" {
+                    break answer;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    } else {
+        host.handle("agents.list", json!({"watch":"cursor"})).await
+    };
     let bridge = &row(&rescanned, "cursor")["readiness"];
     let expected = if cfg!(target_os = "macos") {
         json!({"state":"ready","reasons":[]})
@@ -224,18 +238,45 @@ async fn cursor_readiness_distinguishes_cli_only_from_editor() {
         }),
     );
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
-    let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
+    let answer = if cfg!(target_os = "macos") {
+        tokio::time::timeout(StdDuration::from_secs(4), async {
+            loop {
+                let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
+                if row(&answer, "cursor")["readiness"]["state"] == "unsupported" {
+                    break answer;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    } else {
+        host.handle("agents.list", json!({"watch":"cursor"})).await
+    };
     let bridge = &row(&answer, "cursor")["readiness"];
     assert_eq!(
         bridge,
         &json!({"state":"unsupported","reasons":["cursor.unsupported"]})
     );
 
-    let editor = bin.join("cursor");
-    private_write(&editor, b"#!/bin/sh\necho 'unparseable'\n");
-    fs::set_permissions(&editor, fs::Permissions::from_mode(0o700)).unwrap();
-    let _editor_bin = EnvGuard::set("SIDEVOICE_CURSOR_BIN", editor.as_os_str());
-    let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
+    let app = fixture.profile.home.join("Applications/Cursor.app");
+    private_mkdir(&fixture.profile.home.join("Applications"));
+    private_mkdir(&app);
+    let answer = if cfg!(target_os = "macos") {
+        tokio::time::timeout(StdDuration::from_secs(4), async {
+            loop {
+                let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
+                if row(&answer, "cursor")["readiness"]["state"] == "needs_attention" {
+                    break answer;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    } else {
+        host.handle("agents.list", json!({"watch":"cursor"})).await
+    };
     let bridge = &row(&answer, "cursor")["readiness"];
     let expected = if cfg!(target_os = "macos") {
         json!({"state":"needs_attention","reasons":["cursor.bridge_not_running"]})
@@ -269,14 +310,31 @@ fn readiness_aggregation_prioritizes_unsupported_then_attention_then_ready() {
     }
 }
 
+#[test]
+fn readiness_row_helper_attaches_only_nonempty_check_sets() {
+    assert_eq!(
+        with_readiness(
+            json!({"id":"cursor"}),
+            vec![ReadinessCheck::NeedsAttention("cursor.bridge_not_running")]
+        ),
+        json!({"id":"cursor","readiness":{"state":"needs_attention","reasons":["cursor.bridge_not_running"]}})
+    );
+    assert_eq!(
+        with_readiness(json!({"id":"claude"}), vec![]),
+        json!({"id":"claude"})
+    );
+}
+
 #[tokio::test]
-async fn other_agents_have_no_readiness_when_their_hook_is_empty() {
+async fn profile_only_readiness_hook_defaults_empty_for_other_agents() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
-    let claude = crate::adapters::claude::Claude.readiness_checks(&fixture.profile, None);
-    let codex = crate::adapters::codex::Codex.readiness_checks(&fixture.profile, None);
+    let claude = crate::adapters::claude::Claude.readiness_checks(&fixture.profile);
+    let codex = crate::adapters::codex::Codex.readiness_checks(&fixture.profile);
     assert_eq!(aggregate_readiness(&claude), None);
     assert_eq!(aggregate_readiness(&codex), None);
+    let cursor: &dyn Registration = &crate::adapters::cursor::Cursor;
+    assert_eq!(cursor.readiness_checks(&fixture.profile).len(), 1);
 }
 
 fn identity_signature(id: &str, version: Option<&str>, evidence: &[Evidence<'_>]) -> String {

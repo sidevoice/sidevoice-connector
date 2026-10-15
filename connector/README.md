@@ -162,9 +162,12 @@ if any check is unsupported; otherwise `needs_attention` if any check needs atte
 The web owns localized copy for each reason code.
 
 Cursor currently has one check: a usable Desktop Bridge descriptor with a live process and socket
-is ready; a missing, empty, stale, or unusable bridge on macOS needs attention with
-`cursor.bridge_not_running`; non-macOS or no detected Cursor editor is unsupported with
-`cursor.unsupported`. Readiness is machine-wide and says nothing about a particular chat.
+is ready even when the selected CLI is `cursor-agent`. A detected Cursor editor in either
+`/Applications` or the user's `Applications` directory with a missing, empty, stale, or unusable
+bridge needs attention with `cursor.bridge_not_running`; non-macOS or no editor or live bridge is
+unsupported with `cursor.unsupported`. A first macOS scan reports provisional needs attention
+until its background refresh finishes. Refreshed status uses a snapshot up to two seconds old;
+filesystem discovery runs off the request worker. Readiness is machine-wide and says nothing about a particular chat.
 Per-chat `voice_status.bridge.bridge_chat_known` remains the source for whether that chat is known.
 The setting is in Cursor Settings → Beta → “Allow CLI to access desktop agents”. `agents.list`
 with `rescan` or `watch`, and `agents check cursor`, refresh readiness; a cached list returns the

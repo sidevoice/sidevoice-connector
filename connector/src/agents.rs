@@ -6,8 +6,8 @@
 
 use crate::adapters::health::{self, Health};
 use crate::adapters::registration::{
-    aggregate_readiness, mcp_servers_json, shell_command, AgentError, AgentHost, CliError,
-    CliOutput, Launch, Manual, Registration,
+    mcp_servers_json, shell_command, with_readiness, AgentError, AgentHost, CliError, CliOutput,
+    Launch, Manual, Registration,
 };
 use crate::adapters::Registry;
 use crate::messages::message;
@@ -102,6 +102,7 @@ struct ActiveOperation {
 /// An agent, by the id of its harness.
 type AgentId = &'static str;
 
+/// The variable naming an agent's CLI explicitly: `SIDEVOICE_<ID>_BIN`.
 fn override_name(id: AgentId) -> String {
     format!("SIDEVOICE_{}_BIN", id.to_ascii_uppercase())
 }
@@ -1441,7 +1442,7 @@ impl HostAgents {
         } else {
             None
         };
-        let mut row = json!({
+        let row = json!({
             "id":id,
             "label":label(id),
             "version":version,
@@ -1460,13 +1461,8 @@ impl HostAgents {
             "actionable":false,
             "health":Value::Null,
         });
-        if let Some(value) =
-            aggregate_readiness(&agent.readiness_checks(&self.profile, binary.as_deref()))
-        {
-            row["readiness"] = value;
-        }
         Ok(Observation {
-            row,
+            row: with_readiness(row, agent.readiness_checks(&self.profile)),
             launch: entry.launch,
             binary,
             present,

@@ -124,6 +124,14 @@ pub fn aggregate_readiness(checks: &[ReadinessCheck]) -> Option<Value> {
     Some(json!({"state":state,"reasons":reasons}))
 }
 
+/// Attach only nonempty agent checks; an absent field means ready.
+pub fn with_readiness(mut row: Value, checks: Vec<ReadinessCheck>) -> Value {
+    if let Some(value) = aggregate_readiness(&checks) {
+        row["readiness"] = value;
+    }
+    row
+}
+
 /// Registering Sidevoice with an agent, reading its state, and removing only an entry Sidevoice wrote.
 pub trait Registration: Send + Sync {
     /// The agent's home.
@@ -136,8 +144,8 @@ pub trait Registration: Send + Sync {
     fn evidence(&self) -> Vec<(&'static str, PathBuf)> {
         Vec::new()
     }
-    /// Checks specific to this agent, using the binary already resolved by discovery.
-    fn readiness_checks(&self, _profile: &Profile, _binary: Option<&str>) -> Vec<ReadinessCheck> {
+    /// Checks specific to this agent; an empty list needs no readiness field.
+    fn readiness_checks(&self, _profile: &Profile) -> Vec<ReadinessCheck> {
         Vec::new()
     }
     /// How to start this agent against the test bench's profile, when it can be: printed when the bench starts.

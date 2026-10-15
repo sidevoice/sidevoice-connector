@@ -7,14 +7,74 @@ use std::env;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 const MAX_DESCRIPTOR: u64 = 16 * 1024;
+const MAX_ENTRIES: usize = 256;
+const FRESHNESS: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BridgeFiles {
     Missing,
     Stale,
     Live,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BridgeEvidence {
+    files: BridgeFiles,
+    editor_app: bool,
+}
+
+#[derive(Default)]
+struct CacheState {
+    path: Option<PathBuf>,
+    snapshot: Option<(Instant, BridgeEvidence)>,
+    refreshing: bool,
+}
+
+#[derive(Clone, Default)]
+struct InventoryCache(Arc<Mutex<CacheState>>);
+
+static CACHE: LazyLock<InventoryCache> = LazyLock::new(InventoryCache::default);
+
+impl InventoryCache {
+    /// Return the latest short-lived snapshot immediately. At most one blocking refresh for this
+    /// profile runs at a time; a slow filesystem never holds the agent request's gate.
+    fn snapshot_or_refresh(
+        &self,
+        path: PathBuf,
+        scan: impl FnOnce() -> BridgeEvidence + Send + 'static,
+    ) -> Option<BridgeEvidence> {
+        let Ok(mut state) = self.0.lock() else {
+            return None;
+        };
+        if state.path.as_ref() != Some(&path) {
+            *state = CacheState {
+                path: Some(path.clone()),
+                ..CacheState::default()
+            };
+        }
+        let snapshot = state.snapshot.map(|(_, evidence)| evidence);
+        let stale = state
+            .snapshot
+            .is_none_or(|(at, _)| at.elapsed() >= FRESHNESS);
+        if stale && !state.refreshing {
+            state.refreshing = true;
+            let cache = self.clone();
+            tokio::task::spawn_blocking(move || {
+                let evidence = scan();
+                if let Ok(mut state) = cache.0.lock() {
+                    if state.path.as_ref() == Some(&path) {
+                        state.snapshot = Some((Instant::now(), evidence));
+                        state.refreshing = false;
+                    }
+                }
+            });
+        }
+        snapshot
+    }
 }
 
 /// Parse only fields needed to decide whether a bridge instance is usable. All other JSON fields
@@ -42,7 +102,7 @@ fn inventory(dir: &Path) -> BridgeFiles {
         return BridgeFiles::Missing;
     };
     let mut json_seen = false;
-    for entry in entries.flatten() {
+    for entry in entries.take(MAX_ENTRIES).flatten() {
         let path = entry.path();
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
@@ -95,21 +155,47 @@ fn inventory(dir: &Path) -> BridgeFiles {
     }
 }
 
-pub fn check(profile: &Profile, editor_available: bool) -> ReadinessCheck {
-    evaluate(
-        cfg!(target_os = "macos"),
-        editor_available,
-        inventory(&bridge_dir(profile)),
-    )
+pub fn check(profile: &Profile) -> ReadinessCheck {
+    if !cfg!(target_os = "macos") {
+        return ReadinessCheck::Unsupported("cursor.unsupported");
+    }
+    let dir = bridge_dir(profile);
+    let home_app = profile.home.join("Applications/Cursor.app");
+    check_with(true, dir.clone(), &CACHE, move || {
+        probe(&dir, &home_app, Path::new("/Applications/Cursor.app"))
+    })
 }
 
-fn evaluate(macos: bool, editor_available: bool, bridge: BridgeFiles) -> ReadinessCheck {
-    if !macos || !editor_available {
+fn probe(dir: &Path, home_app: &Path, system_app: &Path) -> BridgeEvidence {
+    let files = inventory(dir);
+    BridgeEvidence {
+        files,
+        editor_app: files == BridgeFiles::Live || home_app.is_dir() || system_app.is_dir(),
+    }
+}
+
+fn check_with(
+    macos: bool,
+    path: PathBuf,
+    cache: &InventoryCache,
+    scan: impl FnOnce() -> BridgeEvidence + Send + 'static,
+) -> ReadinessCheck {
+    if !macos {
+        return ReadinessCheck::Unsupported("cursor.unsupported");
+    }
+    evaluate(true, cache.snapshot_or_refresh(path, scan))
+}
+
+fn evaluate(macos: bool, evidence: Option<BridgeEvidence>) -> ReadinessCheck {
+    if !macos {
         ReadinessCheck::Unsupported("cursor.unsupported")
-    } else if bridge == BridgeFiles::Live {
+    } else if evidence.is_some_and(|evidence| evidence.files == BridgeFiles::Live) {
         ReadinessCheck::Ok
-    } else {
+    } else if evidence.is_none_or(|evidence| evidence.editor_app) {
+        // An unscanned bridge stays provisional until the background refresh completes.
         ReadinessCheck::NeedsAttention("cursor.bridge_not_running")
+    } else {
+        ReadinessCheck::Unsupported("cursor.unsupported")
     }
 }
 
@@ -153,20 +239,167 @@ mod tests {
 
     #[test]
     fn running_not_running_and_unsupported_are_distinct() {
-        assert_eq!(evaluate(true, true, BridgeFiles::Live), ReadinessCheck::Ok);
+        let live = Some(BridgeEvidence {
+            files: BridgeFiles::Live,
+            editor_app: false,
+        });
+        assert_eq!(evaluate(true, live), ReadinessCheck::Ok);
         for bridge in [BridgeFiles::Missing, BridgeFiles::Stale] {
             assert_eq!(
-                evaluate(true, true, bridge),
+                evaluate(
+                    true,
+                    Some(BridgeEvidence {
+                        files: bridge,
+                        editor_app: true
+                    })
+                ),
                 ReadinessCheck::NeedsAttention("cursor.bridge_not_running")
             );
         }
         assert_eq!(
-            evaluate(false, true, BridgeFiles::Live),
+            evaluate(false, live),
             ReadinessCheck::Unsupported("cursor.unsupported")
         );
         assert_eq!(
-            evaluate(true, false, BridgeFiles::Live),
+            evaluate(
+                true,
+                Some(BridgeEvidence {
+                    files: BridgeFiles::Missing,
+                    editor_app: false
+                })
+            ),
             ReadinessCheck::Unsupported("cursor.unsupported")
         );
+        assert_eq!(
+            evaluate(true, None),
+            ReadinessCheck::NeedsAttention("cursor.bridge_not_running")
+        );
+    }
+
+    #[tokio::test]
+    async fn user_local_app_and_live_bridge_override_selected_cli_only_evidence() {
+        let root = env::temp_dir().join(format!(
+            "sidevoice-cursor-user-app-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home_app = root.join("Applications/Cursor.app");
+        let bridge = root.join(".cursor/desktop-bridge");
+        fs::create_dir_all(&home_app).unwrap();
+        fs::create_dir_all(&bridge).unwrap();
+        let _selected_cli = root.join("bin/cursor-agent");
+        let socket = root.join("bridge.sock");
+        fs::write(&socket, b"").unwrap();
+        fs::write(bridge.join("one.json"), serde_json::to_vec(&json!({
+            "protocolVersion":1,"pid":std::process::id(),"socketPath":socket,"token":"fixture-secret"
+        })).unwrap()).unwrap();
+        let system_app = root.join("no-system-app");
+        let cache = InventoryCache::default();
+        let probe_bridge = bridge.clone();
+        let probe_app = home_app.clone();
+        let probe_system = system_app.clone();
+        assert_eq!(
+            check_with(true, bridge.clone(), &cache, move || probe(
+                &probe_bridge,
+                &probe_app,
+                &probe_system
+            )),
+            ReadinessCheck::NeedsAttention("cursor.bridge_not_running")
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if check_with(true, bridge.clone(), &cache, || {
+                    panic!("fresh cache rescanned")
+                }) == ReadinessCheck::Ok
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        fs::remove_file(&socket).unwrap();
+        let stopped = probe(&bridge, &home_app, &system_app);
+        assert_eq!(stopped.files, BridgeFiles::Stale);
+        assert_eq!(
+            evaluate(true, Some(stopped)),
+            ReadinessCheck::NeedsAttention("cursor.bridge_not_running")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_refresh_never_blocks_runtime_deadline_or_cancellation_and_non_mac_does_not_scan()
+    {
+        use std::sync::mpsc;
+        let cache = InventoryCache::default();
+        let path = PathBuf::from("/unused-fixture-key");
+        assert_eq!(
+            check_with(false, path.clone(), &cache, || panic!("non-Mac scanned")),
+            ReadinessCheck::Unsupported("cursor.unsupported")
+        );
+        assert!(cache.0.lock().unwrap().path.is_none());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let pending = tokio::time::timeout(Duration::from_millis(50), async {
+            check_with(true, path.clone(), &cache, move || {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                BridgeEvidence {
+                    files: BridgeFiles::Live,
+                    editor_app: false,
+                }
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            pending,
+            ReadinessCheck::NeedsAttention("cursor.bridge_not_running")
+        );
+        started_rx.await.unwrap();
+        assert_eq!(
+            check_with(true, path.clone(), &cache, || panic!("duplicate refresh")),
+            pending
+        );
+        let heartbeat = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            1
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(50), heartbeat)
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), std::future::pending::<()>())
+                .await
+                .is_err()
+        );
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(async move {
+            tokio::select! { _ = cancel_rx => true, _ = tokio::time::sleep(Duration::from_secs(1)) => false }
+        });
+        cancel_tx.send(()).unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(50), request)
+            .await
+            .unwrap()
+            .unwrap());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if check_with(true, path.clone(), &cache, || {
+                    panic!("fresh cache rescanned")
+                }) == ReadinessCheck::Ok
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }
