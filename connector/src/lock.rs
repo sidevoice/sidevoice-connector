@@ -26,7 +26,15 @@ pub struct Lock {
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        let _ = self.file.set_len(0);
+        // Another process may have linked the inode after acquisition. Never clear a
+        // holder record through a name that could also name an unrelated file.
+        if self
+            .file
+            .metadata()
+            .is_ok_and(|metadata| metadata.nlink() == 1)
+        {
+            let _ = self.file.set_len(0);
+        }
         let _ = FileExt::unlock(&self.file);
     }
 }
@@ -49,7 +57,8 @@ fn open(path: &Path) -> Result<File> {
         .open(path)
         .with_context(|| format!("open lock {}", path.display()))?;
     let m = file.metadata()?;
-    if !m.is_file() || m.uid() != crate::secure_fs::uid() || m.mode() & 0o077 != 0 {
+    if !m.is_file() || m.uid() != crate::secure_fs::uid() || m.mode() & 0o077 != 0 || m.nlink() != 1
+    {
         bail!("unsafe lock file {}", path.display());
     }
     Ok(file)
@@ -62,6 +71,9 @@ pub fn try_lock(path: &Path, kind: &str) -> Result<Option<Lock>> {
         Ok(()) => {}
         Err(error) if contended(&error) => return Ok(None),
         Err(error) => return Err(error).context(format!("lock {}", path.display())),
+    }
+    if file.metadata()?.nlink() != 1 {
+        bail!("unsafe lock file {}", path.display());
     }
     let record = json!({"pid":std::process::id(),
         "start":crate::process::self_identity().map(|identity| identity.start),
@@ -202,5 +214,17 @@ mod tests {
         std::fs::write(&open, b"").unwrap();
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(try_lock(&open, "connector").is_err());
+    }
+
+    #[test]
+    fn a_hard_linked_lock_refuses_without_changing_the_outside_file() {
+        let scratch = Scratch::new("hard-link-lock");
+        let outside = scratch.0.join("outside");
+        std::fs::write(&outside, b"sentinel content").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let lock = scratch.0.join("install.lock");
+        std::fs::hard_link(&outside, &lock).unwrap();
+        assert!(try_lock(&lock, "uninstall").is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel content");
     }
 }
