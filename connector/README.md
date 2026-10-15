@@ -140,6 +140,16 @@ output`, `timed out`, `protocol mismatch`); `checked_at` is when (ISO 8601, UTC)
 (`agents.check`, `{"id"}`, or `agents check <id>`); a listing from the cache, and a request with too little time
 left, keep the last one found (in `agents.json`).
 
+For a Cursor editor chat, a room receipt of `delivered` means Cursor's Desktop Bridge answered `submitted` or
+`queued`; it does not prove the editor displayed or read the message. A later transcript observation supplies the
+`read` receipt. When investigating a missing message, `connector.log` records `cursor_bridge` lines with fixed
+`stage` and `result` codes: `lookup` distinguishes no bridge instance, missing database, SQLite failure, no marker,
+ambiguous chats, and a found chat; `send` records the bridge instance ordinal, HTTP status, and whether it queued,
+submitted, refused, or left the reply uncertain. Instance ordinals follow descriptor creation order (newest first)
+for that scan. `id_hash` is the first 12 hex characters of SHA-256 of the marker or chat ID; the log contains no
+bridge token, message text, bridge response body, socket path, database path, or home path. A request whose write
+may have reached the bridge remains `unknown` and is not retried blindly.
+
 `uninstall` unloads both jobs and stops what runs on demand (a refusal stops it there, with nothing deleted), removes
 the agents' registrations Sidevoice wrote (current or not), then the owned data and releases. It keeps lock files and
 the stop, so that a launcher on its way finds the stop and starts nothing. The room keeps this machine's pairing until
