@@ -283,15 +283,6 @@ impl Registration for Codex {
         &["codex"]
     }
 
-    fn known_paths(&self, home: &Path) -> Vec<PathBuf> {
-        vec![
-            home.join(".local/bin/codex"),
-            PathBuf::from("/usr/local/bin/codex"),
-            PathBuf::from("/opt/homebrew/bin/codex"),
-            home.join("AppData/Local/Programs/Codex/codex.exe"),
-        ]
-    }
-
     fn state<'a>(
         &'a self,
         host: &'a dyn AgentHost,

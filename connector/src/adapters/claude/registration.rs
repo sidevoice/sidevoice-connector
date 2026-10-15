@@ -12,7 +12,9 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 
 const REMOVE: [&str; 5] = ["mcp", "remove", "--scope", "user", "sidevoice"];
 
@@ -213,15 +215,6 @@ impl Registration for Claude {
 
     fn binary_names(&self) -> &'static [&'static str] {
         &["claude"]
-    }
-
-    fn known_paths(&self, home: &Path) -> Vec<PathBuf> {
-        vec![
-            home.join(".claude/local/claude"),
-            home.join(".local/bin/claude"),
-            PathBuf::from("/usr/local/bin/claude"),
-            PathBuf::from("/opt/homebrew/bin/claude"),
-        ]
     }
 
     fn state<'a>(

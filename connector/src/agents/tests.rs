@@ -378,16 +378,13 @@ async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped
     host.shutdown().await;
 }
 
-/// Whether `id` is installed where the scan looks with no login PATH and no override: its CLI's standard places or its
-/// app. A test machine with one there cannot show that agent missing.
+/// A desktop registration in the host environment can still make an agent present.
 fn installed_on_this_machine(fixture: &Fixture, id: &str) -> bool {
     let registry = crate::adapters::Registry::standard();
     let (_, agent) = registry.agents().find(|(found, _)| *found == id).unwrap();
-    agent
-        .known_paths(&fixture.profile.home)
-        .iter()
-        .any(|path| executable(&path.to_string_lossy()))
-        || !agent.evidence().is_empty()
+    agent.app_identity().is_some_and(|identity| {
+        app::linux_entry(identity, &app::linux_roots(&fixture.profile.xdg_data), None).is_some()
+    })
 }
 
 fn listed_ids(answer: &Value) -> Vec<String> {
@@ -405,7 +402,7 @@ fn listed_ids(answer: &Value) -> Vec<String> {
 async fn an_agent_is_listed_when_its_program_is_installed_not_for_its_home_alone() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
-    // No login PATH to search: only an override, the CLI's standard places or the app say an agent is installed.
+    // No login PATH to search: only the unit-test fixture or an OS app registration says installed.
     let _shell = EnvGuard::set("SHELL", std::ffi::OsStr::new(""));
     write_json(
         &fixture

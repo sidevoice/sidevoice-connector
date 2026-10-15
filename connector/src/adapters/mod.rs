@@ -1,3 +1,4 @@
+pub(crate) mod app;
 pub mod claude;
 pub mod codex;
 mod conversation;

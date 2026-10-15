@@ -116,12 +116,14 @@ connect the agents it found that the connector can connect itself: all, some (by
 released before it asks. With `--json` (the desktop app reads it) or without a terminal nothing is asked.
 
 An agent is found (listed by `agents`, `agents.list` and the install offer, with `present: true`) only when its
-program is installed, each adapter saying how: Claude Code's `claude` and Codex's `codex` on the login PATH, in
-`SIDEVOICE_<AGENT>_BIN`, or in their standard install places; Cursor's `cursor-agent` or `cursor` the same way, or its
-app (`/Applications/Cursor.app`, `/usr/share/cursor`, `/opt/Cursor`). Its configuration directory, which other tools
-and an uninstall leave behind, never counts by itself. The row's `evidence` says why: `binary` and `app` are the
-program found; `config-dir` is a detail. An agent not found is not listed; any agent is connected by hand with the
-listing's `custom`.
+CLI is executable on the person's captured login-shell PATH, or its desktop app is registered with the OS. Claude
+Code's `claude`, Codex's `codex`, and Cursor's `cursor-agent` or `cursor` are looked up only on that PATH, in process.
+The connector captures the PATH by running `$SHELL -lc 'printf %s "$PATH"'` for each scan. If that fails, no CLI is
+detected. Cursor's desktop app is found by LaunchServices bundle ID on macOS, the uninstall registry on Windows, or
+its XDG `cursor.desktop` entry on Linux. A failed OS lookup does not count as installed. Its configuration directory,
+which other tools and an uninstall leave behind, never counts by itself. The row's `evidence` says why: `binary` and
+`app` are the program found; `config-dir` is a detail. An agent not found is not listed; any agent is connected by
+hand with the listing's `custom`.
 
 An agent whose registration is `connected` also says whether that registration works: its row in `agents` (and the
 connector's `agents.list`) carries `health`, `{"state","error","checked_at"}`. The connector starts the entry as the

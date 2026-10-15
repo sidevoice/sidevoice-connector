@@ -4,6 +4,7 @@
 //! One gate owns a complete request. CLI children belong to its worker task so a vanished link reply can
 //! cancel the work without releasing the gate before the child has exited.
 
+use crate::adapters::app;
 use crate::adapters::health::{self, Health};
 use crate::adapters::registration::{
     mcp_servers_json, shell_command, AgentError, AgentHost, CliError, CliOutput, Launch, Manual,
@@ -102,7 +103,8 @@ struct ActiveOperation {
 /// An agent, by the id of its harness.
 type AgentId = &'static str;
 
-/// The variable naming an agent's CLI explicitly: `SIDEVOICE_<ID>_BIN`.
+/// Unit-test-only binary fixture. Production CLI detection uses the captured login PATH.
+#[cfg(test)]
 fn override_name(id: AgentId) -> String {
     format!("SIDEVOICE_{}_BIN", id.to_ascii_uppercase())
 }
@@ -294,7 +296,6 @@ struct Observation {
 }
 
 struct InspectionInput<'a> {
-    state: &'a Value,
     login_path: Option<&'a str>,
     include_version: bool,
     old_version: Option<&'a str>,
@@ -622,15 +623,7 @@ impl HostAgents {
             return Err(Failure::Cancelled);
         }
         let base = state.clone();
-        let mut login_path = state
-            .get("login_path")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if watch.is_none() || login_path.is_none() {
-            if let Some(captured) = self.capture_login_path(cancel, deadline).await? {
-                login_path = Some(captured);
-            }
-        }
+        let login_path = self.capture_login_path(cancel, deadline).await?;
         let ids: Vec<_> = watch.map_or_else(
             || self.registry.agents().map(|(id, _)| id).collect(),
             |id| vec![id],
@@ -648,7 +641,6 @@ impl HostAgents {
                 self.inspect(
                     agent,
                     InspectionInput {
-                        state: &base,
                         login_path: login_path.as_deref(),
                         include_version,
                         old_version: previous_version.as_deref(),
@@ -751,9 +743,7 @@ impl HostAgents {
         self.update_state(cancel, deadline, true, move |latest| {
             let path_unchanged = latest.get("login_path") == base.get("login_path");
             if path_unchanged {
-                if let Some(path) = captured_path {
-                    latest["login_path"] = json!(path);
-                }
+                latest["login_path"] = json!(captured_path);
             }
             for (id, observation) in observations {
                 if !path_unchanged
@@ -1062,7 +1052,7 @@ fn normalized_state(mut value: Value) -> Value {
 }
 
 /// How an agent's CLI is run outside its registration (an adapter's delivery through it): the executable the scan found
-/// (`SIDEVOICE_<AGENT>_BIN` when set to one), else its bare name; and the PATH of the person's login shell the scan
+/// (from the captured login PATH), else its bare name; and the PATH of the person's login shell the scan
 /// captured, so a launcher that is a script (Node's) finds its interpreter where a service manager's PATH does not
 /// reach.
 pub struct AgentCommand {
@@ -1078,16 +1068,10 @@ pub fn agent_command(profile: &Profile, agent: &str) -> AgentCommand {
         .and_then(Value::as_str)
         .filter(|path| !path.is_empty())
         .map(str::to_owned);
+    let registry = Registry::standard();
     let program = id
-        .and_then(|id| std::env::var(override_name(id)).ok())
-        .filter(|path| executable(path))
-        .or_else(|| {
-            state
-                .pointer(&format!("/binaries/{agent}"))
-                .and_then(Value::as_str)
-                .filter(|path| executable(path))
-                .map(str::to_owned)
-        })
+        .and_then(|id| registry.agent(id).map(|(_, registration)| registration))
+        .and_then(|registration| find_in_path(registration.binary_names(), path.as_deref()))
         .unwrap_or_else(|| agent.to_owned());
     AgentCommand { program, path }
 }
@@ -1180,7 +1164,7 @@ fn js_release_program(program: &str, root: &Path) -> bool {
     }
 }
 
-fn executable(value: &str) -> bool {
+pub(crate) fn executable(value: &str) -> bool {
     let path = Path::new(value);
     if !path.is_absolute() {
         return false;
@@ -1188,7 +1172,7 @@ fn executable(value: &str) -> bool {
     fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && (metadata.mode() & 0o111 != 0))
 }
 
-fn find_in_path(names: &[&str], path: Option<&str>) -> Option<String> {
+pub(crate) fn find_in_path(names: &[&str], path: Option<&str>) -> Option<String> {
     for directory in path?.split(':').filter(|value| !value.is_empty()) {
         for name in names {
             let candidate = Path::new(directory).join(name);
@@ -1385,7 +1369,7 @@ impl HostAgents {
             .map_err(|_| agent_failure("agents.invalid", id))?;
         let agent = self.registration(id)?;
         let host = self.host(agent, cancel, deadline);
-        let binary = self.resolve_binary(id, agent, input.state, input.login_path);
+        let binary = self.resolve_binary(id, agent, input.login_path);
         let entry = agent
             .state(&host, binary.as_deref())
             .await
@@ -1418,14 +1402,18 @@ impl HostAgents {
                 path: binary.clone(),
             });
         }
-        for (kind, path) in agent.evidence() {
+        if let Some(path) = self
+            .app_path(agent, input.login_path, cancel, deadline)
+            .await
+        {
+            let kind = "app";
             let path = path.to_string_lossy().into_owned();
             if !evidence.iter().any(|item| item.path == path) {
                 evidence.push(Evidence { kind, path });
             }
         }
-        // Installed, not merely remembered: a signal of the program itself (its CLI on the login PATH or in its standard
-        // places, or its app), never its configuration directory alone, which other tools and an uninstall leave
+        // Installed, not merely remembered: its CLI on the login PATH or an OS-registered app. The configuration
+        // directory alone is not installation evidence; other tools and an uninstall leave it
         // behind. The directory stays in the evidence, a detail of the agent found, never the reason it is.
         let present = evidence.iter().any(|item| item.kind != "config-dir");
         // The connector acts itself where it reaches the agent: its CLI found, or a file it edits.
@@ -1474,28 +1462,80 @@ impl HostAgents {
         &self,
         id: AgentId,
         agent: &dyn Registration,
-        state: &Value,
         login_path: Option<&str>,
     ) -> Option<String> {
-        let override_path = std::env::var(override_name(id)).ok();
-        if let Some(path) = override_path.as_deref().filter(|path| executable(path)) {
-            return Some(path.to_owned());
-        }
-        if let Some(path) = state
-            .pointer(&format!("/binaries/{id}"))
-            .and_then(Value::as_str)
+        #[cfg(test)]
+        if let Some(path) = std::env::var(override_name(id))
+            .ok()
             .filter(|path| executable(path))
         {
-            return Some(path.to_owned());
-        }
-        if let Some(path) = find_in_path(agent.binary_names(), login_path) {
             return Some(path);
         }
-        agent
-            .known_paths(&self.profile.home)
-            .into_iter()
-            .map(|path| path.to_string_lossy().into_owned())
-            .find(|path| executable(path))
+        let _ = id;
+        find_in_path(agent.binary_names(), login_path)
+    }
+
+    async fn app_path(
+        &self,
+        agent: &dyn Registration,
+        login_path: Option<&str>,
+        cancel: &Cancellation,
+        deadline: Instant,
+    ) -> Option<PathBuf> {
+        let identity = agent.app_identity()?;
+        #[cfg(target_os = "linux")]
+        {
+            let _ = (cancel, deadline);
+            return app::linux_entry(
+                identity,
+                &app::linux_roots(&self.profile.xdg_data),
+                login_path,
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let result = run_command(
+                &self.profile,
+                None,
+                "/usr/bin/osascript",
+                &app::mac_query(identity),
+                cancel,
+                deadline,
+            )
+            .await
+            .ok()?;
+            return result
+                .status
+                .success()
+                .then(|| app::mac_result(&result.stdout))
+                .flatten();
+        }
+        #[cfg(target_os = "windows")]
+        {
+            for root in ["HKCU", "HKLM"] {
+                for view in ["32", "64"] {
+                    let key = format!(
+                        r"{}\Software\Microsoft\Windows\CurrentVersion\Uninstall",
+                        root
+                    );
+                    let args = ["query".into(), key, "/s".into(), format!("/reg:{view}")];
+                    let Ok(result) =
+                        run_command(&self.profile, None, "reg.exe", &args, cancel, deadline).await
+                    else {
+                        continue;
+                    };
+                    if result.status.success() {
+                        if let Some(path) = app::windows_results(&result.stdout, identity)
+                            .into_iter()
+                            .find(|path| path.is_dir())
+                        {
+                            return Some(path);
+                        }
+                    }
+                }
+            }
+            None
+        }
     }
 
     async fn capture_login_path(
