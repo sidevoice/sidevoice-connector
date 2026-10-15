@@ -562,6 +562,7 @@ pub fn fake_room(status: u16, answer: Value) -> FakeRoom {
 pub struct Presentation {
     pub token: String,
     pub session: String,
+    socket: PathBuf,
     send: tokio::sync::mpsc::UnboundedSender<Value>,
     frames: Receiver<Value>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -589,6 +590,7 @@ impl Presentation {
         let (send, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let socket = socket.to_path_buf();
+        let held_socket = socket.clone();
         let protocol_token = token.clone();
         let thread = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -642,6 +644,7 @@ impl Presentation {
         Self {
             token,
             session,
+            socket: held_socket,
             send,
             frames,
             stop: Some(stop),
@@ -673,6 +676,17 @@ impl Presentation {
     pub fn report_turn(&self, phase: &str, turn_id: &str, text: Option<&str>) {
         let mut data = json!({"session_id":self.session,"client_msg_id":uuid::Uuid::new_v4().to_string(),
             "phase":phase,"turn_id":turn_id});
+        if phase == "started" {
+            let state = core_json(
+                &self.socket,
+                "GET",
+                &format!("/api/presentation?session_id={}", self.session),
+                None,
+                Some(&self.token),
+            );
+            data["thread_id"] = json!(state["binding"]["thread_id"].as_str().unwrap_or(""));
+            data["binding_id"] = json!(state["binding"]["binding_id"].as_str().unwrap_or(""));
+        }
         if let Some(text) = text {
             data["text"] = json!(text);
         }
@@ -692,6 +706,37 @@ impl Presentation {
             "session_id":self.session,"client_msg_id":uuid::Uuid::new_v4().to_string(),
             "utterance_id":utterance_id,"status":status,"reason":reason,"heard_chars":heard_chars
         }})).unwrap();
+    }
+
+    pub fn report_hearing(
+        &self,
+        history_id: &str,
+        utterance_id: &str,
+        outcome: &str,
+        heard_chars: Option<u64>,
+    ) {
+        let client_msg_id = uuid::Uuid::new_v4().to_string();
+        let mut data = json!({"session_id":self.session,"client_msg_id":client_msg_id,
+            "history_id":history_id,"utterance_id":utterance_id,"outcome":outcome});
+        if let Some(heard_chars) = heard_chars {
+            data["heard_chars"] = json!(heard_chars);
+        }
+        self.send
+            .send(json!({"type":"reply-hearing","data":data}))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let frame = self
+                .frames
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|_| panic!("no reply-hearing acknowledgement for {client_msg_id}"));
+            if frame["type"] == "voice-ack" && frame["data"]["client_msg_id"] == client_msg_id {
+                return;
+            }
+            if frame["type"] == "error" && frame["data"]["client_msg_id"] == client_msg_id {
+                panic!("reply-hearing refused: {frame}");
+            }
+        }
     }
 
     pub fn report_speech(&self, on: bool, reason: Option<&str>) {

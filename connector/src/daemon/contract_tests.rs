@@ -201,7 +201,7 @@ async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_
     // and the agent reads it as voice, the default.
     let frame = json!({"binding_id":"core-t-1","message_id":"m-1","session_id":"s","revision":3,"epoch":1,
         "text":"hello","channel":"a_channel_from_the_future","future_field":{"nested":true},
-        "unheard":{"count":1,"replies":[{"text":"earlier","cut":false,"future_reply_field":1}],"future":"x"}});
+        "unheard":{"count":1,"replies":[{"text":"earlier","future_reply_field":1}],"future":"x"}});
     let delivered = daemon.handle_incoming("input.deliver", &frame).await;
     assert_eq!(delivered["status"], "accepted", "{delivered}");
     assert_eq!(

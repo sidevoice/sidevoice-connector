@@ -804,9 +804,7 @@ impl Facade {
                     self.adopt_by_id(adopted, &client).await;
                 }
                 if result.get("text_saved") == Some(&json!(true)) {
-                    Ok(
-                        json!({"status":"published","text_saved":true,"audio":result.get("status")}),
-                    )
+                    Ok(json!({"status":"published","text_saved":true,"audio":result.get("status")}))
                 } else {
                     if adopted.is_some() {
                         let mut response = result;
@@ -1187,7 +1185,7 @@ fn call_meta(context: &impl serde::Serialize, params: Option<impl serde::Seriali
 
 #[cfg(test)]
 mod tests {
-    use super::{closed_note, ipc_limit, pairing_needed, tools};
+    use super::{closed_note, ipc_limit, pairing_needed, tools, INSTRUCTIONS};
     use rmcp::model::InitializeRequestParams;
     use serde_json::{json, Value};
     use std::time::Duration;
@@ -1316,6 +1314,22 @@ mod tests {
         assert_eq!(ipc_limit("pair_device"), Duration::from_secs(30));
         for method in ["register", "status", "publish", "unregister", "adopt"] {
             assert_eq!(ipc_limit(method), Duration::from_secs(20), "{method}");
+        }
+    }
+
+    #[test]
+    fn agent_hearing_instructions_name_only_semantic_outcomes() {
+        assert!(INSTRUCTIONS.contains("heard, partially heard"));
+        assert!(INSTRUCTIONS.contains("not heard"));
+        assert!(INSTRUCTIONS.contains("confirmed prefix"));
+        for cause in [
+            "skipped",
+            "interrupted",
+            "not played",
+            "muted",
+            "disconnected",
+        ] {
+            assert!(!INSTRUCTIONS.contains(cause), "{cause}");
         }
     }
 
