@@ -61,7 +61,12 @@ Each conversation also reports its engine, `{"model","effort","thinking"}`, on j
 whenever it changes; the room shows it as the participant's `engine`. A value nobody recorded is `null`, never
 guessed, and nothing is reported without a model. Claude Code: the model and effort of each assistant entry in the
 transcript, with the launch flags (`--effort`, `--thinking`) for what the entry lacks. Codex: `model` and `effort`
-of the rollout's `turn_context`. Cursor: the chat's last used model, no effort.
+of the rollout's `turn_context`. Cursor CLI: the chat's `lastUsedModel` in its own `store.db`, including an explicit
+`[effort=...]` model parameter when present. Cursor editor: the identified chat's `composerData:<chat-id>` model
+configuration in the Desktop Bridge user-data database. Its `effort` is the chat's `effort` or `effort` model
+parameter, then a model-specific default recorded with that configuration. A global Cursor picker is never used
+for another chat; if the chat records no effort or model-specific default, `effort` stays null. `thinking` stays
+null. These are raw model and effort IDs for the room to render, not English display text.
 
 ## The core inside
 
