@@ -7,8 +7,8 @@
 use crate::adapters::health::{self, Health};
 use crate::adapters::markers::{self, Roots};
 use crate::adapters::registration::{
-    mcp_servers_json, shell_command, AgentError, AgentHost, CliError, CliOutput, Launch, Manual,
-    Registration,
+    mcp_servers_json, shell_command, with_readiness, AgentError, AgentHost, CliError, CliOutput,
+    Launch, Manual, Registration,
 };
 use crate::adapters::Registry;
 use crate::messages::message;
@@ -1461,7 +1461,7 @@ impl HostAgents {
             "health":Value::Null,
         });
         Ok(Observation {
-            row,
+            row: with_readiness(row, agent.readiness_checks(&self.profile)),
             launch: entry.launch,
             binary,
             present,

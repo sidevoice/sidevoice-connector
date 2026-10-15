@@ -159,6 +159,37 @@ output`, `timed out`, `protocol mismatch`); `checked_at` is when (ISO 8601, UTC)
 (`agents.check`, `{"id"}`, or `agents check <id>`); a listing from the cache, and a request with too little time
 left, keep the last one found (in `agents.json`).
 
+### Agent readiness
+
+Every row in `agents.list` / `agents --json` may carry an optional `readiness` object:
+
+```json
+{"readiness":{"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":"Voice in the Cursor editor needs Cursor's Desktop Bridge: in Cursor, open Settings › Beta, enable “Allow CLI to access desktop agents”, then restart Cursor."}]}}
+```
+
+`state` is `ready`, `needs_attention`, or `unsupported`. `reasons` is an ordered array of
+`{"code","message"}` objects. `code` is stable in the `<agent>.<code>` namespace;
+`message` is a plain English fallback instruction supplied by that agent's check, with no paths,
+tokens, versions, or home directories. Consumers use `code` for logic and localization: the web
+shows its `agents.readiness.<code>` translation when present, else `message`. An absent
+`readiness` field means ready: adapters with no checks omit it. Every check contributes either
+OK, needs attention with a reason, or unsupported with a reason. The aggregate is `unsupported`
+if any check is unsupported; otherwise `needs_attention` if any check needs attention; otherwise
+`ready`. All non-OK reason objects are retained in check order. A ready object has `reasons: []`.
+For `cursor.unsupported`, the fallback is “Cursor editor voice is not supported on this computer.”
+
+Cursor currently has one check: a usable Desktop Bridge descriptor with a live process and socket
+is ready even when the selected CLI is `cursor-agent`. A detected Cursor editor in either
+`/Applications` or the user's `Applications` directory with a missing, empty, stale, or unusable
+bridge needs attention with `cursor.bridge_not_running`; non-macOS or no editor or live bridge is
+unsupported with `cursor.unsupported`. A first macOS scan reports provisional needs attention
+until its background refresh finishes. Refreshed status uses a snapshot up to two seconds old;
+filesystem discovery runs off the request worker. Readiness is machine-wide and says nothing about a particular chat.
+Per-chat `voice_status.bridge.bridge_chat_known` remains the source for whether that chat is known.
+The setting is in Cursor Settings → Beta → “Allow CLI to access desktop agents”. `agents.list`
+with `rescan` or `watch`, and `agents check cursor`, refresh readiness; a cached list returns the
+last result.
+
 Cursor's chat lookup and model metadata use a bundled SQLite library through bounded, read-only
 queries on blocking workers. No system `sqlite3` command is required. Read-only mode preserves
 visibility of Cursor's live WAL; immutable mode is avoided because it can miss a newly recorded

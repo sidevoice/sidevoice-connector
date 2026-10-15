@@ -1,4 +1,5 @@
 use super::*;
+use crate::adapters::registration::{aggregate_readiness, ReadinessCheck};
 use fs2::FileExt;
 use std::fs::OpenOptions;
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
@@ -262,6 +263,200 @@ fn row<'a>(answer: &'a Value, id: &str) -> &'a Value {
         .iter()
         .find(|agent| agent["id"] == id)
         .unwrap()
+}
+
+const BRIDGE_MESSAGE: &str = "Voice in the Cursor editor needs Cursor's Desktop Bridge: in Cursor, open Settings › Beta, enable “Allow CLI to access desktop agents”, then restart Cursor.";
+const UNSUPPORTED_MESSAGE: &str = "Cursor editor voice is not supported on this computer.";
+
+#[tokio::test]
+async fn cursor_agent_row_exposes_readiness_codes_and_fallbacks_without_private_data() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let bin = fixture.root.join("bin");
+    private_mkdir(&bin);
+    let cursor = bin.join("cursor");
+    private_write(&cursor, b"#!/bin/sh\necho 'Cursor 3.22.12'\n");
+    fs::set_permissions(&cursor, fs::Permissions::from_mode(0o700)).unwrap();
+    let _cursor_bin = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cursor.as_os_str());
+    write_json(
+        &fixture.profile.data.join("agents.json"),
+        &json!({
+            "version":1,"scanned_at":null,"login_path":bin,"binaries":{},"seen":{},"dismissed":{}
+        }),
+    );
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let missing = host.handle("agents.list", json!({"watch":"cursor"})).await;
+    let bridge = &row(&missing, "cursor")["readiness"];
+    let expected = if cfg!(target_os = "macos") {
+        json!({"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]})
+    } else {
+        json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
+    };
+    assert_eq!(bridge, &expected);
+    let cached = host.handle("agents.list", json!({})).await;
+    assert_eq!(row(&cached, "cursor")["readiness"], *bridge);
+
+    let dir = fixture.profile.home.join(".cursor/desktop-bridge");
+    private_mkdir(&fixture.profile.home.join(".cursor"));
+    private_mkdir(&dir);
+    let socket = fixture.root.join("bridge.sock");
+    private_write(&socket, b"");
+    write_json(
+        &dir.join("one.json"),
+        &json!({
+            "protocolVersion":1,"pid":std::process::id(),"socketPath":socket,
+            "token":"secret-token","userDataDir":fixture.root.join("private-cursor-data")
+        }),
+    );
+    let rescanned = if cfg!(target_os = "macos") {
+        tokio::time::timeout(StdDuration::from_secs(4), async {
+            loop {
+                let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
+                if row(&answer, "cursor")["readiness"]["state"] == "ready" {
+                    break answer;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    } else {
+        host.handle("agents.list", json!({"watch":"cursor"})).await
+    };
+    let bridge = &row(&rescanned, "cursor")["readiness"];
+    let expected = if cfg!(target_os = "macos") {
+        json!({"state":"ready","reasons":[]})
+    } else {
+        json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
+    };
+    assert_eq!(bridge, &expected);
+    let serialized = bridge.to_string();
+    assert!(!serialized.contains(&fixture.root.to_string_lossy().to_string()));
+    assert!(!serialized.contains("secret-token"));
+}
+
+#[tokio::test]
+async fn cursor_readiness_distinguishes_cli_only_from_editor() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let bin = fixture.root.join("bin");
+    private_mkdir(&bin);
+    let _path = EnvGuard::set("PATH", bin.as_os_str());
+    let cli = bin.join("cursor-agent");
+    private_write(&cli, b"#!/bin/sh\necho 'cursor-agent 1.0.0'\n");
+    fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+    write_json(
+        &fixture.profile.data.join("agents.json"),
+        &json!({
+            "version":1,"scanned_at":null,"login_path":bin,"binaries":{},"seen":{},"dismissed":{}
+        }),
+    );
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let answer = if cfg!(target_os = "macos") {
+        tokio::time::timeout(StdDuration::from_secs(4), async {
+            loop {
+                let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
+                if row(&answer, "cursor")["readiness"]["state"] == "unsupported" {
+                    break answer;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    } else {
+        host.handle("agents.list", json!({"watch":"cursor"})).await
+    };
+    let bridge = &row(&answer, "cursor")["readiness"];
+    assert_eq!(
+        bridge,
+        &json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
+    );
+
+    let app = fixture.profile.home.join("Applications/Cursor.app");
+    private_mkdir(&fixture.profile.home.join("Applications"));
+    private_mkdir(&app);
+    let answer = if cfg!(target_os = "macos") {
+        tokio::time::timeout(StdDuration::from_secs(4), async {
+            loop {
+                let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
+                if row(&answer, "cursor")["readiness"]["state"] == "needs_attention" {
+                    break answer;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    } else {
+        host.handle("agents.list", json!({"watch":"cursor"})).await
+    };
+    let bridge = &row(&answer, "cursor")["readiness"];
+    let expected = if cfg!(target_os = "macos") {
+        json!({"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]})
+    } else {
+        json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
+    };
+    assert_eq!(bridge, &expected);
+}
+
+#[test]
+fn readiness_aggregation_prioritizes_unsupported_then_attention_then_ready() {
+    use ReadinessCheck::{NeedsAttention, Ok, Unsupported};
+    for (checks, expected) in [
+        (vec![], None),
+        (vec![Ok], Some(json!({"state":"ready","reasons":[]}))),
+        (
+            vec![
+                Ok,
+                NeedsAttention("cursor.bridge_not_running", BRIDGE_MESSAGE),
+            ],
+            Some(
+                json!({"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]}),
+            ),
+        ),
+        (
+            vec![
+                NeedsAttention("cursor.bridge_not_running", BRIDGE_MESSAGE),
+                Unsupported("cursor.unsupported", UNSUPPORTED_MESSAGE),
+            ],
+            Some(
+                json!({"state":"unsupported","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE},{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]}),
+            ),
+        ),
+    ] {
+        assert_eq!(aggregate_readiness(&checks), expected);
+    }
+}
+
+#[test]
+fn readiness_row_helper_attaches_only_nonempty_check_sets() {
+    assert_eq!(
+        with_readiness(
+            json!({"id":"cursor"}),
+            vec![ReadinessCheck::NeedsAttention(
+                "cursor.bridge_not_running",
+                BRIDGE_MESSAGE
+            )]
+        ),
+        json!({"id":"cursor","readiness":{"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]}})
+    );
+    assert_eq!(
+        with_readiness(json!({"id":"claude"}), vec![]),
+        json!({"id":"claude"})
+    );
+}
+
+#[tokio::test]
+async fn profile_only_readiness_hook_defaults_empty_for_other_agents() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let claude = crate::adapters::claude::Claude.readiness_checks(&fixture.profile);
+    let codex = crate::adapters::codex::Codex.readiness_checks(&fixture.profile);
+    assert_eq!(aggregate_readiness(&claude), None);
+    assert_eq!(aggregate_readiness(&codex), None);
+    let cursor: &dyn Registration = &crate::adapters::cursor::Cursor;
+    assert_eq!(cursor.readiness_checks(&fixture.profile).len(), 1);
 }
 
 fn identity_signature(
