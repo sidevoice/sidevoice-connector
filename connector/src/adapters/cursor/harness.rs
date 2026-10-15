@@ -2,8 +2,9 @@
 //! Bridge once it knows which chat a conversation is, their transcript found the same way.
 
 use super::{
-    bridge_running, composer_holding, composer_holding_for_delivery, deliver_editor,
-    editor_transcript_chat, engine, log_bridge, log_correlation, transcript_path,
+    bridge_instances, bridge_running, composer_holding_identity, composer_holding_identity_in,
+    deliver_editor, editor_transcript_chat, engine, log_bridge, log_correlation, transcript_path,
+    BridgeChat, BridgeInstance,
 };
 use crate::adapters::conversation::{Conversation, Room};
 use crate::adapters::harness::{no_route, Harness, Route};
@@ -35,6 +36,7 @@ pub struct Cursor;
 #[derive(Default)]
 struct Chats {
     bridge: Mutex<Option<String>>,
+    verified: Mutex<Option<BridgeChat>>,
     transcript: Mutex<Option<String>>,
     bridge_changed: Notify,
 }
@@ -44,7 +46,17 @@ fn chats(conversation: &Conversation) -> Option<&Chats> {
 }
 
 fn bridge(conversation: &Conversation) -> Option<String> {
-    chats(conversation).and_then(|chats| chats.bridge.lock().ok()?.clone())
+    chats(conversation)
+        .and_then(|chats| chats.bridge.lock().ok()?.clone())
+        .or_else(|| {
+            (conversation.delivery["identity_state"] == "verified")
+                .then(|| {
+                    conversation.delivery["composer"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .flatten()
+        })
 }
 
 fn set_bridge(conversation: &Conversation, chat: String) {
@@ -70,6 +82,29 @@ async fn wait_for_bridge_or_scan(conversation: &Conversation, scan_ms: u64) {
         _ = changed => {},
         _ = tokio::time::sleep(Duration::from_millis(scan_ms)) => {},
     }
+}
+
+fn verified_bridge(conversation: &Conversation) -> Option<BridgeChat> {
+    chats(conversation)
+        .and_then(|chats| chats.verified.lock().ok()?.clone())
+        .or_else(|| {
+            BridgeChat::from_verified_delivery(&conversation.delivery, &conversation.thread)
+        })
+}
+
+fn set_verified_bridge(conversation: &Conversation, chat: BridgeChat) {
+    if let Some(mut verified) = chats(conversation).and_then(|chats| chats.verified.lock().ok()) {
+        *verified = Some(chat.clone());
+    }
+    set_bridge(conversation, chat.composer);
+}
+
+fn verify_editor_binding(conversation: &Conversation, delivery: &Value) -> bool {
+    let Some(chat) = BridgeChat::from_verified_delivery(delivery, &conversation.thread) else {
+        return false;
+    };
+    set_verified_bridge(conversation, chat);
+    true
 }
 
 fn followed(conversation: &Conversation) -> Option<String> {
@@ -98,6 +133,10 @@ impl Harness for Cursor {
 
     fn registration(&self) -> Option<&dyn Registration> {
         Some(self)
+    }
+
+    fn refresh_registration(&self, conversation: &Conversation, delivery: &Value) {
+        verify_editor_binding(conversation, delivery);
     }
 
     fn accepts(&self, delivery: &Value, thread: &str) -> Route {
@@ -144,7 +183,7 @@ impl Harness for Cursor {
             let mut fields = Map::new();
             fields.insert(
                 "delivery_state".into(),
-                bridge_state(route_state(bridge(conversation).is_some())),
+                bridge_state(route_state(verified_bridge(conversation).is_some())),
             );
             Some(fields)
         })
@@ -255,15 +294,21 @@ fn bridge_state(state: &str) -> Value {
 /// An editor chat, only by its own id through the Desktop Bridge. Until the bridge knows which chat it is, the
 /// message is not sent and the answer says so.
 async fn deliver_to_editor(conversation: &Conversation, frame: &Value) -> Value {
+    let instances = bridge_instances();
+    deliver_to_editor_with_instances(conversation, frame, &instances).await
+}
+
+async fn deliver_to_editor_with_instances(
+    conversation: &Conversation,
+    frame: &Value,
+    instances: &[BridgeInstance],
+) -> Value {
     let mut delivery = conversation.delivery.clone();
-    let composer = match bridge(conversation) {
-        Some(composer) => {
-            log_bridge("lookup", "cached_chat", Some(&composer), None, None);
-            Some(composer)
-        }
-        None => composer_holding_for_delivery(&delivery).await,
+    let chat = match verified_bridge(conversation) {
+        Some(chat) => Some(chat),
+        None => composer_holding_identity_in(&delivery, instances, true).await,
     };
-    let Some(composer) = composer else {
+    let Some(chat) = chat else {
         log_bridge(
             "delivery",
             "chat_unresolved",
@@ -275,8 +320,11 @@ async fn deliver_to_editor(conversation: &Conversation, frame: &Value) -> Value 
         return json!({"status":"failed",
             "detail":format!("Not sent, {state}: voice reaches this Cursor chat only through its Desktop Bridge, once Cursor has recorded the chat's join call (up to ~30 s after it).")});
     };
-    delivery["composer"] = json!(composer);
-    set_bridge(conversation, composer);
+    delivery["composer"] = json!(chat.composer);
+    delivery["profile_id"] = json!(chat.profile_id);
+    delivery["thread"] = json!(chat.thread());
+    delivery["identity_state"] = json!("verified");
+    set_verified_bridge(conversation, chat);
     deliver_editor(&delivery, frame).await.unwrap_or_else(|| {
         json!({"status":"failed",
             "detail":"Not sent: Cursor's Desktop Bridge did not take the message (it may not be running)."})
@@ -375,8 +423,8 @@ fn watch_editor(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
                     lookup_index += 1;
                 }
                 last_bridge_lookup = Some(tokio::time::Instant::now());
-                if let Some(chat) = composer_holding(&binding.delivery).await {
-                    set_bridge(binding, chat);
+                if let Some(chat) = composer_holding_identity(&binding.delivery).await {
+                    set_verified_bridge(binding, chat);
                     continue;
                 }
             }
@@ -448,7 +496,7 @@ pub(super) mod client {
         match (capability, identity.delivery["kind"].as_str()) {
             ("deliver", Some("cursor-tmux")) => Some("Voice from the room reaches this conversation by an experimental route: it is pasted into this chat's terminal through tmux and sent with Enter. If the user is typing at the same moment, the two texts mix. Tell the user once."),
             ("deliver", Some("cursor-bridge")) => Some("Voice from the room reaches this chat by an experimental route: Cursor's Desktop Bridge submits it to this chat as if the user had typed it, once Cursor has recorded this join call (up to ~30 s). If the user is typing at the same moment, the two may mix. Tell the user once."),
-            ("sessionIdentity", _) => Some("This conversation is identified by Sidevoice, not by an id Cursor gives: each chat of this window that joins gets a conversation of its own. Asking this same chat to join again gives it a second one; leave the old one with voice_disconnect and its conversation id."),
+            ("sessionIdentity", Some("cursor-bridge")) => Some("This conversation is keyed to Cursor's editor chat once its Desktop Bridge identifies it. Until then, a provisional id may be replaced; voice_status with the returned id reports the current conversation."),
             _ => None,
         }
     }
@@ -547,6 +595,7 @@ pub(super) mod client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secure_fs::tests::Scratch;
     use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use tokio::sync::Mutex as AsyncMutex;
@@ -662,6 +711,36 @@ mod tests {
         assert!(!fields.contains_key("card") && !fields.contains_key("view_link"));
     }
 
+    #[tokio::test]
+    async fn same_thread_registration_adds_verified_bridge_identity_without_replacing_binding() {
+        let mut identity =
+            super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
+        let chat = BridgeChat {
+            composer: "chat-1".into(),
+            profile_id: "0123456789abcdef".into(),
+        };
+        identity.thread = chat.thread();
+        identity.delivery["thread"] = json!(identity.thread);
+        identity.delivery["identity_state"] = json!("candidate");
+        let conversation = conversation(&identity);
+        let mut wrong = identity.delivery.clone();
+        wrong["identity_state"] = json!("verified");
+        wrong["composer"] = json!("other-chat");
+        wrong["profile_id"] = json!(chat.profile_id);
+        Cursor.refresh_registration(&conversation, &wrong);
+        assert!(verified_bridge(&conversation).is_none());
+        let mut verified = identity.delivery.clone();
+        verified["identity_state"] = json!("verified");
+        verified["composer"] = json!(chat.composer);
+        verified["profile_id"] = json!(chat.profile_id);
+        Cursor.refresh_registration(&conversation, &verified);
+        assert_eq!(verified_bridge(&conversation), Some(chat));
+        assert_eq!(
+            Cursor.status(&conversation).await.unwrap()["delivery_state"]["bridge_chat_known"],
+            true
+        );
+    }
+
     /// Until the Desktop Bridge knows which chat it is, nothing is sent and both the delivery and the status say so.
     #[tokio::test]
     async fn an_unregistered_editor_chat_is_waiting_not_reached_another_way() {
@@ -692,7 +771,73 @@ mod tests {
 
         set_bridge(&conversation, "chat-1".into());
         let listed = Cursor.status(&conversation).await.unwrap();
+        assert_eq!(listed["delivery_state"]["state"], state);
+        set_verified_bridge(
+            &conversation,
+            BridgeChat {
+                composer: "chat-1".into(),
+                profile_id: "0123456789abcdef".into(),
+            },
+        );
+        let listed = Cursor.status(&conversation).await.unwrap();
         assert_eq!(listed["delivery_state"]["state"], "registered");
+    }
+
+    #[tokio::test]
+    async fn failed_editor_delivery_records_the_lookup_cause_without_private_data() {
+        for (case, expected) in [
+            ("missing", "database_missing"),
+            ("absent", "marker_absent"),
+            ("failed", "sqlite_failed"),
+        ] {
+            let scratch = Scratch::new(case);
+            let user_data = scratch.0.join("Cursor");
+            let storage = user_data.join("User/globalStorage");
+            std::fs::create_dir_all(&storage).unwrap();
+            let database = storage.join("state.vscdb");
+            if case == "absent" {
+                super::super::state_db::fixture(
+                    &database,
+                    "CREATE TABLE cursorDiskKV(key TEXT, value TEXT);",
+                );
+            } else if case == "failed" {
+                super::super::state_db::fixture(&database, "CREATE TABLE unrelated(value TEXT);");
+            }
+            let identity =
+                super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
+            let marker = identity.chat_marker.as_deref().unwrap();
+            let conversation = conversation(&identity);
+            let instance = BridgeInstance {
+                socket: scratch.0.join("unused.sock"),
+                token: "private-token".into(),
+                user_data: user_data.clone(),
+                created_at: 1,
+            };
+            let answer = deliver_to_editor_with_instances(
+                &conversation,
+                &json!({"text":"private words"}),
+                &[instance],
+            )
+            .await;
+            assert_eq!(answer["status"], "failed");
+            let hash = super::super::short_hash(marker);
+            let lines = super::super::bridge_lines().lock().unwrap();
+            let diagnostic = lines
+                .iter()
+                .find(|line| {
+                    line.contains(&format!("id_hash={hash}"))
+                        && line.contains(&format!("stage=lookup result={expected}"))
+                })
+                .expect("delivery lookup cause was not logged");
+            for secret in [
+                marker,
+                "private-token",
+                "private words",
+                user_data.to_str().unwrap(),
+            ] {
+                assert!(!diagnostic.contains(secret), "private data in {diagnostic}");
+            }
+        }
     }
     /// Records Working from the real Cursor and Codex followers with populated histories.
     /// The initial catch-up delay remains after Cursor bridge discovery is woken.

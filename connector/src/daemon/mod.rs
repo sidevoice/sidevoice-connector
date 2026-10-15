@@ -216,6 +216,21 @@ impl Daemon {
         Ok(reply)
     }
 
+    async fn existing_registration(&self, binding: &Arc<Conversation>, thread: &str) -> Value {
+        let local = binding.id.lock().await.starts_with("local-");
+        let connected = if local {
+            self.register_core(binding).await.is_ok()
+        } else {
+            self.link.connected().await
+        };
+        let binding_id = binding.id.lock().await.clone();
+        if connected {
+            self.request_replay();
+        }
+        json!({"binding_id":binding_id,"thread":thread,"connected":connected,
+            "pending":!connected,"prepared":null})
+    }
+
     async fn on_welcome(self: &Arc<Self>) {
         let bindings: Vec<_> = self.bindings.lock().await.values().cloned().collect();
         for binding in bindings {
@@ -669,6 +684,9 @@ impl Daemon {
             return json!({"status":"unknown_binding"});
         };
         let _serial = binding.serial.lock().await;
+        if binding.stopped.load(Ordering::Relaxed) {
+            return json!({"status":"unknown_binding"});
+        }
         let message_id = frame
             .get("message_id")
             .and_then(Value::as_str)
@@ -791,14 +809,18 @@ impl Daemon {
                 self.check_registration_allowed(&client_ref, resume).await?;
                 let existing = { self.bindings.lock().await.get(&client_ref).cloned() };
                 if let Some(existing) = existing {
-                    if existing.owner.load(Ordering::Relaxed) != owner {
+                    let previous = existing.owner.load(Ordering::Relaxed);
+                    if previous != owner
+                        && !(previous == 0 && existing.detachable && existing.thread == thread)
+                    {
                         bail!("binding belongs to another façade");
                     }
-                    let binding_id = existing.id.lock().await.clone();
+                    if previous == 0 {
+                        existing.owner.store(owner, Ordering::Relaxed);
+                    }
+                    harness_adapter.refresh_registration(&existing, &delivery);
                     drop(_state_transaction);
-                    return Ok(
-                        json!({"binding_id":binding_id,"thread":thread,"connected":self.link.connected().await,"prepared":null}),
-                    );
+                    return Ok(self.existing_registration(&existing, &thread).await);
                 }
                 drop(_state_transaction);
                 let binding = Arc::new(Conversation {
@@ -832,13 +854,18 @@ impl Daemon {
                 let _state_transaction = self.conversation_state_serial.lock().await;
                 self.check_registration_allowed(&client_ref, resume).await?;
                 if let Some(existing) = self.bindings.lock().await.get(&client_ref).cloned() {
-                    if existing.owner.load(Ordering::Relaxed) != owner {
+                    let previous = existing.owner.load(Ordering::Relaxed);
+                    if previous != owner
+                        && !(previous == 0 && existing.detachable && existing.thread == thread)
+                    {
                         bail!("binding belongs to another façade");
                     }
-                    let binding_id = existing.id.lock().await.clone();
+                    if previous == 0 {
+                        existing.owner.store(owner, Ordering::Relaxed);
+                    }
+                    harness_adapter.refresh_registration(&existing, &delivery);
                     drop(_state_transaction);
-                    return Ok(json!({"binding_id":binding_id,"thread":thread,
-                        "connected":self.link.connected().await,"prepared":null}));
+                    return Ok(self.existing_registration(&existing, &thread).await);
                 }
                 let prepared = harness_adapter.prepare(&binding).await?;
                 self.bindings
@@ -933,6 +960,13 @@ impl Daemon {
             "unregister" => {
                 let _state_transaction = self.conversation_state_serial.lock().await;
                 let binding = self.find_owned(owner, &params).await?;
+                let _serial = binding.serial.lock().await;
+                if params.get("only_if_idle") == Some(&json!(true))
+                    && (!binding.pending.lock().await.is_empty()
+                        || *binding.working.lock().await == Some(true))
+                {
+                    bail!("conversation is still processing an input");
+                }
                 binding.stopped.store(true, Ordering::Relaxed);
                 self.bindings.lock().await.remove(&binding.client_ref);
                 self.registry.get(&binding.harness).close(&binding).await;
@@ -1323,6 +1357,7 @@ mod tests {
         use anyhow::Result;
         use futures_util::future::BoxFuture;
         use serde_json::{Map, Value};
+        use std::sync::atomic::Ordering;
         use std::sync::{Arc, Mutex};
 
         struct Fake {
@@ -1429,7 +1464,7 @@ mod tests {
                 1,
                 "register",
                 json!({"client_ref":"fake-1","thread":"t-1","title":"Fake","harness":"fake",
-                "delivery":{"kind":"fake-route","thread":"t-1"}}),
+                "delivery":{"kind":"fake-route","thread":"t-1"},"detachable":true}),
             )
             .await
             .unwrap();
@@ -1456,8 +1491,22 @@ mod tests {
         assert_eq!(listed["engine"]["model"], "fake-1");
         assert_eq!(listed["capabilities"]["working"], "unsupported");
 
+        let binding = daemon.bindings.lock().await.get("fake-1").cloned().unwrap();
+        binding.owner.store(0, Ordering::Relaxed);
+        let resumed = daemon
+            .command(
+                2,
+                "register",
+                json!({"client_ref":"fake-1","thread":"t-1","harness":"fake",
+                "delivery":{"kind":"fake-route","thread":"t-1"},"detachable":true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed["binding_id"], joined["binding_id"]);
+        assert_eq!(binding.owner.load(Ordering::Relaxed), 2);
+
         daemon
-            .command(1, "unregister", json!({"client_ref":"fake-1"}))
+            .command(2, "unregister", json!({"client_ref":"fake-1"}))
             .await
             .unwrap();
         assert_eq!(

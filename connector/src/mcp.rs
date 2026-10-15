@@ -254,6 +254,7 @@ struct Facade {
     profile: Profile,
     ipc: Arc<Ipc>,
     joined: Arc<Mutex<HashMap<String, Joined>>>,
+    aliases: Arc<Mutex<HashMap<String, String>>>,
     registry: Arc<Registry>,
     /// Whether this client serves several of its chats at once (from `initialize`): a call that names no
     /// conversation may then be any of them.
@@ -311,6 +312,7 @@ impl Facade {
             ipc: Ipc::new(profile.clone(), joined.clone()),
             profile,
             joined,
+            aliases: Arc::new(Mutex::new(HashMap::new())),
             registry: Arc::new(Registry::standard()),
             several_chats: Arc::new(AtomicBool::new(false)),
         }
@@ -332,6 +334,110 @@ impl Facade {
                 binding.binding_id = binding_id.to_owned();
             }
         }
+    }
+
+    async fn canonical_name(&self, name: &str) -> String {
+        self.aliases
+            .lock()
+            .await
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_owned())
+    }
+
+    /// The join marker becomes visible only after this tool reply enters the editor's records. Keep the original
+    /// binding until the verified stable binding is registered, then retire it.
+    fn resolve_editor_join(
+        &self,
+        identity: Identity,
+        title: String,
+        capabilities: Value,
+        experimental: Vec<String>,
+    ) {
+        if !adapters::resolves_editor_identity(&identity) {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            let original = identity.thread.clone();
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let still_joined = this
+                    .joined
+                    .lock()
+                    .await
+                    .get(&original)
+                    .is_some_and(|joined| joined.identity.chat_marker == identity.chat_marker);
+                if !still_joined {
+                    return;
+                }
+                let Some(chat) = adapters::verified_editor_chat(&identity.delivery).await else {
+                    continue;
+                };
+                if adapters::remember_editor_chat(&this.profile.data, &chat).is_err() {
+                    crate::logfile::log("editor identity map could not be saved");
+                }
+                let stable = chat.thread();
+                let mut verified = identity.clone();
+                verified.thread = stable.clone();
+                verified.delivery["thread"] = json!(stable);
+                verified.delivery["composer"] = json!(chat.composer);
+                verified.delivery["profile_id"] = json!(chat.profile_id);
+                verified.delivery["identity_state"] = json!("verified");
+                let params = json!({"client_ref":verified.thread,"harness":verified.harness,"thread":verified.thread,
+                    "title":title,"delivery":verified.delivery,"route":verified.route,"inbound":verified.inbound,
+                    "capabilities":capabilities,"experimental":experimental,"detachable":verified.detachable});
+                let Ok(registered) = this.ipc.call("register", params).await else {
+                    continue;
+                };
+                if registered["pending"] == true || registered["connected"] != true {
+                    continue;
+                }
+                let Some(binding_id) = registered.get("binding_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if stable == original {
+                    if let Some(joined) = this.joined.lock().await.get_mut(&original) {
+                        if joined.identity.chat_marker == identity.chat_marker {
+                            joined.identity = verified;
+                        }
+                    }
+                    return;
+                }
+                let old_id = this
+                    .joined
+                    .lock()
+                    .await
+                    .get(&original)
+                    .map(|joined| joined.binding_id.clone());
+                let Some(old_id) = old_id else { return };
+                if this
+                    .ipc
+                    .call(
+                        "unregister",
+                        json!({"binding_id":old_id,"client_ref":original,"only_if_idle":true}),
+                    )
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                let mut joined = this.joined.lock().await;
+                joined.remove(&original);
+                joined.insert(
+                    stable.clone(),
+                    Joined {
+                        binding_id: binding_id.to_owned(),
+                        title: title.clone(),
+                        identity: verified,
+                        capabilities,
+                        experimental,
+                    },
+                );
+                this.aliases.lock().await.insert(original, stable);
+                return;
+            }
+        });
     }
 
     async fn has_active_binding(&self, status: &Value, named: Option<&str>) -> bool {
@@ -476,6 +582,12 @@ impl Facade {
                     "local_only":"This machine is not paired with any room, so this conversation is reachable only from devices paired with this machine itself (the Sidevoice app on this computer, at this machine's own address). Tell the user in one line. Pairing the app is voice_pair_device, only if they ask; reaching it from elsewhere needs a room's address and code (voice_pair).",
                     "version":self.profile.connector_version(),"connector_version":connector.get("version")
                 });
+                if identity.editor {
+                    response["identity_state"] = identity.delivery["identity_state"].clone();
+                    if identity.delivery["identity_state"] == "pending" {
+                        response["identity_note"] = json!(adapters::pending_editor_identity_note());
+                    }
+                }
                 if !pushed {
                     response["voice_in"] = json!({"supported":false,"speak_with":{"session_id":format!("typed:{}", identity.thread),"revision":0},
                         "reason":format!("What the user says in the room cannot reach this conversation: {} The user types here as usual.", identity.deliver_note.as_deref().unwrap_or("this harness offers no way to put a message into it.")),
@@ -496,6 +608,7 @@ impl Facade {
                         response[key] = value;
                     }
                 }
+                self.resolve_editor_join(identity, title, capabilities, experimental);
                 Ok(response)
             }
             "voice_status" => {
@@ -503,6 +616,11 @@ impl Facade {
                     .get("conversation")
                     .and_then(Value::as_str)
                     .filter(|name| !name.is_empty());
+                let canonical = match named {
+                    Some(name) => Some(self.canonical_name(name).await),
+                    None => None,
+                };
+                let named = canonical.as_deref();
                 if let Some(name) = named {
                     self.adopt_by_id(name, &client).await;
                 }
@@ -613,6 +731,11 @@ impl Facade {
                     .get("conversation")
                     .and_then(Value::as_str)
                     .filter(|name| !name.is_empty());
+                let canonical = match named {
+                    Some(name) => Some(self.canonical_name(name).await),
+                    None => None,
+                };
+                let named = canonical.as_deref();
                 if let Some(name) = named {
                     self.adopt_by_id(name, &client).await;
                 }
@@ -752,6 +875,11 @@ impl Facade {
                     .get("conversation")
                     .and_then(Value::as_str)
                     .filter(|name| !name.is_empty());
+                let canonical = match named {
+                    Some(name) => Some(self.canonical_name(name).await),
+                    None => None,
+                };
+                let named = canonical.as_deref();
                 if let Some(name) = named {
                     self.adopt_by_id(name, &client).await;
                 }
