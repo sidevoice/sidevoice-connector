@@ -203,16 +203,8 @@ async fn editor_delivery_is_confined_to_the_verified_bridge_profile() {
     );
 }
 
-#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn late_marker_in_sqlite_corrects_an_earlier_running_candidate() {
-    if std::process::Command::new("sqlite3")
-        .arg("-version")
-        .output()
-        .is_err()
-    {
-        return;
-    }
     let fixture = Fixture::new();
     let instance = fixture.instance("profile-a", "unused.sock");
     let storage = instance.user_data.join("User/globalStorage");
@@ -220,17 +212,15 @@ async fn late_marker_in_sqlite_corrects_an_earlier_running_candidate() {
     let db = storage.join("state.vscdb");
     let marker = "a".repeat(64);
     let sql = format!("CREATE TABLE cursorDiskKV(key TEXT, value BLOB); INSERT INTO cursorDiskKV VALUES ('bubbleId:actual-chat:1','{marker}');");
-    let result = Command::new("sqlite3").arg(&db).arg(sql).output().unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    assert!(
-        query_bridge_chat(std::slice::from_ref(&instance), &marker, Some("wrong-chat"))
-            .await
-            .is_none()
-    );
+    state_db::fixture(&db, &sql);
+    assert!(query_bridge_chat(
+        std::slice::from_ref(&instance),
+        &marker,
+        Some("wrong-chat"),
+        false
+    )
+    .await
+    .is_none());
     let delivery = json!({"marker":marker,"candidate":"wrong-chat"});
     let corrected =
         composer_holding_identity_with_instances(&delivery, std::slice::from_ref(&instance))
