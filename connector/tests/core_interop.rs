@@ -1410,6 +1410,7 @@ fn t16_failed_injection_and_pull_expose_identical_real_notice_fields() {
     let _connector = profile.start_connector();
     profile.wait_linked("notice-parity-core");
     let call = Presentation::open(&profile.core_socket());
+    let other = Presentation::open_second(&profile);
     let receiver = http_receiver_with_status(503);
     let thread = "notice-parity-thread";
     let mut command = profile.connector(&["mcp"]);
@@ -1425,6 +1426,13 @@ fn t16_failed_injection_and_pull_expose_identical_real_notice_fields() {
         "/api/presentation/select",
         Some(&json!({"session_id":call.session,"thread_id":thread})),
         Some(&call.token),
+    );
+    core_json(
+        &profile.core_socket(),
+        "POST",
+        "/api/presentation/select",
+        Some(&json!({"session_id":other.session,"thread_id":thread})),
+        Some(&other.token),
     );
     let said = mcp.tool(
         "voice_say",
@@ -1481,8 +1489,46 @@ fn t16_failed_injection_and_pull_expose_identical_real_notice_fields() {
         }
     }
     assert_eq!(pulled["unheard"]["replies"][0]["text"], "Full parity reply");
-    let acknowledged = mcp.tool("get_messages", json!({"ack_ids":[pulled["message_id"]]}));
-    assert_eq!(acknowledged["acknowledged"], 1, "{acknowledged}");
+    mcp.stop();
+    let mut command = profile.connector(&["mcp"]);
+    command
+        .env("SIDEVOICE_THREAD", thread)
+        .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+    let mut mcp = Mcp::start(command);
+    mcp.initialize("notice-parity-after-claim-release");
+    mcp.tool("voice_connect", json!({"input_mode":"pull"}));
+    other.report_playback(
+        "parity-utterance",
+        "interrupted",
+        Some("user_interrupted"),
+        Some(6),
+    );
+    let (original, correction) = until("frozen notice and late partial correction", 15, || {
+        let page = mcp.tool("get_messages", json!({}));
+        let messages = page["messages"].as_array()?;
+        let original = messages
+            .iter()
+            .find(|item| item["message_id"] == pulled["message_id"])?
+            .clone();
+        let correction = messages
+            .iter()
+            .find(|item| item["notice"]["kind"] == "reply_heard")?
+            .clone();
+        Some((original, correction))
+    });
+    assert_eq!(original["envelope"], pulled["envelope"]);
+    assert_eq!(original["notice"], pulled["notice"]);
+    assert_eq!(
+        correction["notice"]["corrects_message_id"],
+        pulled["message_id"]
+    );
+    assert_eq!(correction["notice"]["heard"][0]["fate"], "partial");
+    assert_eq!(correction["notice"]["heard"][0]["heard_chars"], 6);
+    let acknowledged = mcp.tool(
+        "get_messages",
+        json!({"ack_ids":[pulled["message_id"], correction["message_id"]]}),
+    );
+    assert_eq!(acknowledged["acknowledged"], 2, "{acknowledged}");
     mcp.stop();
 }
 
