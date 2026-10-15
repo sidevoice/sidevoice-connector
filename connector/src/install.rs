@@ -49,6 +49,7 @@ use crate::service::manager::Kind;
 use crate::service::{launcher, status};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -1010,14 +1011,15 @@ pub fn human_install(answer: &Value) -> String {
 
 /// `uninstall`: see the module's documentation. The answer is `uninstall --json`'s.
 pub async fn uninstall(profile: &Profile, options: Options, runtime: &Runtime) -> Result<Value> {
-    uninstall_with_preflight(profile, options, runtime, |guard| guard.preflight()).await
+    uninstall_with_hooks(profile, options, runtime, |guard| guard.preflight(), |_| {}).await
 }
 
-async fn uninstall_with_preflight(
+async fn uninstall_with_hooks(
     profile: &Profile,
     options: Options,
     runtime: &Runtime,
     preflight: impl Fn(&safe_remove::Guard) -> std::result::Result<bool, &'static str>,
+    before_claim: impl Fn(&OsStr),
 ) -> Result<Value> {
     let layout = Layout::from_profile(profile);
     safe_remove::validate_scope(&layout).map_err(failed)?;
@@ -1045,7 +1047,9 @@ async fn uninstall_with_preflight(
     .await?
     .ok_or_else(|| failed("another agents request holds agents.lock"))?;
     guard.stage_recovery(&layout).map_err(failed)?;
-    let removed = guard.remove_data_contents().map_err(failed)?;
+    let removed = guard
+        .remove_data_contents_with_hook(&before_claim)
+        .map_err(failed)?;
     guard.remove_releases().map_err(failed)?;
     guard.finish_claim().map_err(failed)?;
     guard.finish_recovery().map_err(failed)?;
@@ -1116,6 +1120,7 @@ pub(crate) mod tests {
     use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
@@ -1619,12 +1624,15 @@ pub(crate) mod tests {
         let lock = fixture.layout().install_lock();
         fs::write(&lock, b"sentinel lock contents").unwrap();
         fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
-        let error =
-            uninstall_with_preflight(&fixture.profile, NO_AGENTS, &fixture.runtime(), |guard| {
-                guard.preflight_with_simulated_data_mount()
-            })
-            .await
-            .unwrap_err();
+        let error = uninstall_with_hooks(
+            &fixture.profile,
+            NO_AGENTS,
+            &fixture.runtime(),
+            |guard| guard.preflight_with_simulated_data_mount(),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
         assert!(
             error.to_string().contains("mount or device boundary"),
             "{error}"
@@ -1643,5 +1651,53 @@ pub(crate) mod tests {
             .await
             .is_err());
         assert_eq!(fs::read(&outside).unwrap(), b"outside contents");
+    }
+
+    #[tokio::test]
+    async fn failed_claim_keeps_recovery_cli_and_retry_clears_residual_owned_data() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new("uninstall-retry");
+        let package = fixture.package("1.0.0", "a");
+        fixture.install(&package).await.unwrap();
+        let layout = fixture.layout();
+        let victim = layout.data.join("victim");
+        let moved = fixture.scratch.0.join("outside-victim");
+        fs::create_dir(&victim).unwrap();
+        fs::write(victim.join("keep"), b"outside contents").unwrap();
+        let swapped = AtomicBool::new(false);
+        let hook = |name: &OsStr| {
+            if name == OsStr::new("victim") && !swapped.swap(true, Ordering::SeqCst) {
+                fs::rename(&victim, &moved).unwrap();
+                symlink(&moved, &victim).unwrap();
+            }
+        };
+        assert!(uninstall_with_hooks(
+            &fixture.profile,
+            NO_AGENTS,
+            &fixture.runtime(),
+            |guard| guard.preflight(),
+            hook,
+        )
+        .await
+        .is_err());
+        assert!(
+            layout.releases.exists(),
+            "the installed release is still a retry route"
+        );
+        let record = layout.install_record().unwrap();
+        let recovery = PathBuf::from(record["command"][0].as_str().unwrap());
+        assert!(
+            recovery.is_file(),
+            "the desktop can run the recorded recovery CLI"
+        );
+        assert_eq!(fs::read(moved.join("keep")).unwrap(), b"outside contents");
+
+        let answer = uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
+            .await
+            .unwrap();
+        assert_eq!(answer["state"], "absent");
+        assert!(!layout.releases.exists());
+        assert!(!layout.install_file().exists());
+        assert_eq!(fs::read(moved.join("keep")).unwrap(), b"outside contents");
     }
 }

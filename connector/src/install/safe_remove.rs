@@ -437,7 +437,7 @@ impl Guard {
         source_name: &OsStr,
         claim: RawFd,
         claimed_name: &str,
-        before_rename: &impl Fn(),
+        before_rename: &impl Fn(&OsStr),
     ) -> Result<(), &'static str> {
         self.verify_dir(source_path, source)?;
         self.verify_dir(Path::new(CLAIM_REL), claim)?;
@@ -460,7 +460,7 @@ impl Guard {
         // The rename is the ownership claim. A replacement at the old name is
         // moved as a link/inode, never followed. Validate that it was the same
         // inode before traversing anything in the private claim directory.
-        before_rename();
+        before_rename(OsStr::from_bytes(source_name.to_bytes()));
         if unsafe { libc::renameat(source, source_name.as_ptr(), claim, dest_name.as_ptr()) } != 0 {
             return Err("cannot claim uninstall entry");
         }
@@ -660,7 +660,7 @@ impl Guard {
                     OsStr::new("sidevoice"),
                     claim.as_raw_fd(),
                     &claimed_name,
-                    &|| {},
+                    &|_| {},
                 )?;
             }
         }
@@ -697,12 +697,12 @@ impl Guard {
     }
 
     pub(super) fn remove_data_contents(&self) -> Result<Vec<String>, &'static str> {
-        self.remove_data_contents_with_hook(&|| {})
+        self.remove_data_contents_with_hook(&|_| {})
     }
 
-    fn remove_data_contents_with_hook(
+    pub(super) fn remove_data_contents_with_hook(
         &self,
-        before_rename: &impl Fn(),
+        before_rename: &impl Fn(&OsStr),
     ) -> Result<Vec<String>, &'static str> {
         let Some((root, claim)) = self.claim_area()? else {
             return Ok(Vec::new());
@@ -956,7 +956,7 @@ mod tests {
         fs::write(victim.join("keep"), "outside sentinel").unwrap();
         let guard = Guard::new(&layout).unwrap();
         let swapped = AtomicBool::new(false);
-        let hook = || {
+        let hook = |_: &OsStr| {
             if !swapped.swap(true, Ordering::SeqCst) {
                 fs::rename(&victim, &moved).unwrap();
                 symlink(&moved, &victim).unwrap();
