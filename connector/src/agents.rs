@@ -1404,19 +1404,18 @@ impl HostAgents {
         } else {
             input.old_version.map(str::to_owned)
         };
-        // The existing row version may describe cursor-agent. Only the editor executable can
-        // establish the Desktop Bridge's minimum Cursor version.
-        let cursor_version = if id == "cursor" {
-            let cursor_binary = find_in_path(&["cursor"], input.login_path).or_else(|| {
+        // An adapter can ask for the version of a different binary than its MCP registration uses.
+        let setup_version = if let Some(name) = agent.setup_version_binary() {
+            let setup_binary = find_in_path(&[name], input.login_path).or_else(|| {
                 agent
                     .known_paths(&self.profile.home)
                     .into_iter()
-                    .filter(|path| path.file_name().is_some_and(|name| name == "cursor"))
+                    .filter(|path| path.file_name().is_some_and(|file| file == name))
                     .map(|path| path.to_string_lossy().into_owned())
                     .find(|path| executable(path))
             });
             if input.include_version {
-                match cursor_binary {
+                match setup_binary {
                     Some(binary) => {
                         self.binary_version(agent, &binary, cancel, deadline)
                             .await?
@@ -1424,11 +1423,7 @@ impl HostAgents {
                     None => None,
                 }
             } else {
-                input
-                    .state
-                    .pointer("/seen/cursor/agent/cursor_bridge/cursor_version")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
+                agent.cached_setup_version(input.state.pointer(&format!("/seen/{id}/agent")))
             }
         } else {
             None
@@ -1487,13 +1482,13 @@ impl HostAgents {
             "actionable":false,
             "health":Value::Null,
         });
-        if id == "cursor" {
-            row["cursor_bridge"] = crate::adapters::cursor::bridge_setup::status(
-                &self.profile,
-                cursor_version.as_deref(),
-                input.login_path,
-                &registration,
-            );
+        if let Some((field, value)) = agent.setup_status(
+            &self.profile,
+            setup_version.as_deref(),
+            input.login_path,
+            &registration,
+        ) {
+            row[field] = value;
         }
         Ok(Observation {
             row,

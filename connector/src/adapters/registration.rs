@@ -100,6 +100,24 @@ pub trait Registration: Send + Sync {
     fn evidence(&self) -> Vec<(&'static str, PathBuf)> {
         Vec::new()
     }
+    /// An editor binary whose version is needed for this adapter's optional setup status.
+    fn setup_version_binary(&self) -> Option<&'static str> {
+        None
+    }
+    /// Reuse the last setup version when a scan does not ask binaries for their versions.
+    fn cached_setup_version(&self, _row: Option<&Value>) -> Option<String> {
+        None
+    }
+    /// Optional adapter-owned status field on an agent row.
+    fn setup_status(
+        &self,
+        _profile: &Profile,
+        _version: Option<&str>,
+        _login_path: Option<&str>,
+        _registration: &str,
+    ) -> Option<(&'static str, Value)> {
+        None
+    }
     /// How to start this agent against the test bench's profile, when it can be: printed when the bench starts.
     fn bench_steps(&self, _setup: &BenchSetup) -> Option<String> {
         None
