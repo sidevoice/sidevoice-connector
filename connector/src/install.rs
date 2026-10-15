@@ -1694,7 +1694,10 @@ pub(crate) mod tests {
             .arg("--list")
             .output()
             .unwrap();
-        assert!(recovery_probe.status.success(), "the staged binary must execute");
+        assert!(
+            recovery_probe.status.success(),
+            "the staged binary must execute"
+        );
         assert_eq!(fs::read(moved.join("keep")).unwrap(), b"outside contents");
 
         let answer = uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
