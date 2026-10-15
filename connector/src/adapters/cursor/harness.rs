@@ -2,8 +2,8 @@
 //! Bridge once it knows which chat a conversation is, their transcript found the same way.
 
 use super::{
-    bridge_running, composer_holding, deliver_editor, editor_transcript_chat, engine,
-    sqlite3_found, transcript_path,
+    bridge_running, composer_holding, deliver_editor, editor_engine, editor_transcript_chat,
+    engine, sqlite3_found, transcript_path,
 };
 use crate::adapters::conversation::{Conversation, Room};
 use crate::adapters::harness::{no_route, Harness, Route};
@@ -345,6 +345,14 @@ impl Reader {
             engine_checked: false,
         }
     }
+
+    fn chat_engine(&self) -> Option<Value> {
+        if self.editor {
+            editor_engine(&self.chat).or_else(|| engine(&self.chat))
+        } else {
+            engine(&self.chat)
+        }
+    }
 }
 
 impl TranscriptReader for Reader {
@@ -369,7 +377,7 @@ impl TranscriptReader for Reader {
             return Vec::new();
         }
         self.engine_checked = true;
-        engine(&self.chat)
+        self.chat_engine()
             .map(Observed::Engine)
             .into_iter()
             .collect()
@@ -379,7 +387,7 @@ impl TranscriptReader for Reader {
         let mut observed = Vec::new();
         let text = transcript::user_text(item, false);
         if authenticated && text.is_some() {
-            if let Some(engine) = engine(&self.chat) {
+            if let Some(engine) = self.chat_engine() {
                 observed.push(Observed::Engine(engine));
             }
         }

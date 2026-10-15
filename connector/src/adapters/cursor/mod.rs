@@ -1,6 +1,8 @@
+mod engine;
 mod harness;
 mod registration;
 
+pub use engine::{editor_engine, engine};
 pub use harness::Cursor;
 
 /// Cursor's configuration home (`mcp.json`), checked through its parent, and its data below it.
@@ -35,7 +37,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -249,64 +251,6 @@ pub fn transcript_path(chat_id: &str) -> Option<PathBuf> {
                 .join(format!("{chat_id}.jsonl"));
             if path.exists() {
                 return Some(path);
-            }
-        }
-    }
-    None
-}
-
-pub fn engine(chat_id: &str) -> Option<Value> {
-    let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    let mut roots = Vec::new();
-    if let Some(path) = env::var_os("CURSOR_CONFIG_DIR") {
-        roots.push(PathBuf::from(path));
-    }
-    if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
-        roots.push(PathBuf::from(path).join("cursor"));
-    }
-    roots.extend([home.join(".config/cursor"), home.join(".cursor")]);
-    for root in roots {
-        let chats = root.join("chats");
-        let Ok(workspaces) = fs::read_dir(chats) else {
-            continue;
-        };
-        for workspace in workspaces.flatten() {
-            let database = workspace.path().join(chat_id).join("store.db");
-            if !database.is_file() {
-                continue;
-            }
-            let Ok(output) = Command::new("sqlite3")
-                .args(["-readonly", "-json"])
-                .arg(&database)
-                .arg("SELECT value FROM meta WHERE key = '0';")
-                .output()
-            else {
-                continue;
-            };
-            if !output.status.success() {
-                continue;
-            }
-            let Ok(rows) = serde_json::from_slice::<Vec<Value>>(&output.stdout) else {
-                continue;
-            };
-            let Some(value) = rows
-                .first()
-                .and_then(|row| row.get("value"))
-                .and_then(Value::as_str)
-            else {
-                continue;
-            };
-            let Some(metadata) = serde_json::from_str::<Value>(value).ok().or_else(|| {
-                let decoded = hex::decode(value).ok()?;
-                serde_json::from_slice::<Value>(&decoded).ok()
-            }) else {
-                continue;
-            };
-            let Some(model) = metadata.get("lastUsedModel").and_then(Value::as_str) else {
-                continue;
-            };
-            if !model.is_empty() {
-                return Some(json!({"model":model,"effort":Value::Null,"thinking":Value::Null}));
             }
         }
     }
