@@ -1039,13 +1039,10 @@ async fn uninstall_with_hooks(
         json!({})
     };
     let paired = crate::pairing::previous_room(profile);
-    let _agents_lock = crate::lock::wait_lock(
-        &layout.data.join("agents.lock"),
-        "uninstall",
-        Duration::from_secs(30),
-    )
-    .await?
-    .ok_or_else(|| failed("another agents request holds agents.lock"))?;
+    let _agents_lock =
+        crate::lock::wait_uninstall_agents_lock_at(data.as_raw_fd(), Duration::from_secs(30))
+            .await?
+            .ok_or_else(|| failed("another agents request holds agents.lock"))?;
     guard.stage_recovery(&layout).map_err(failed)?;
     let removed = guard
         .remove_data_contents_with_hook(&before_claim)
@@ -1647,6 +1644,19 @@ pub(crate) mod tests {
         fs::write(&outside, b"outside contents").unwrap();
         fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
         fs::hard_link(&outside, fixture.layout().install_lock()).unwrap();
+        assert!(uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
+            .await
+            .is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside contents");
+    }
+
+    #[tokio::test]
+    async fn uninstall_refuses_hard_linked_agents_lock_without_touching_sentinel() {
+        let fixture = Fixture::new("hard-linked-uninstall-agents-lock");
+        let outside = fixture.scratch.0.join("outside-agents-sentinel");
+        fs::write(&outside, b"outside contents").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&outside, fixture.layout().data.join("agents.lock")).unwrap();
         assert!(uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
             .await
             .is_err());

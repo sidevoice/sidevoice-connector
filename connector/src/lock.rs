@@ -12,6 +12,7 @@
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use serde_json::{json, Value};
+use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::{FromRawFd, RawFd};
@@ -75,11 +76,11 @@ fn open(path: &Path) -> Result<File> {
 /// Uninstall pins the checked data directory and takes its install lock without
 /// mutating the lock inode, so a link added after validation cannot be cleared
 /// through this action.
-fn open_at(parent: RawFd) -> Result<File> {
+fn open_at(parent: RawFd, entry: &CStr) -> Result<File> {
     let fd = unsafe {
         libc::openat(
             parent,
-            c"install.lock".as_ptr(),
+            entry.as_ptr(),
             libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0o600,
         )
@@ -88,7 +89,7 @@ fn open_at(parent: RawFd) -> Result<File> {
         return Err(std::io::Error::last_os_error()).context("open uninstall lock");
     }
     let file = unsafe { File::from_raw_fd(fd) };
-    validate_inode(&file, "install.lock")?;
+    validate_inode(&file, &entry.to_string_lossy())?;
     Ok(file)
 }
 
@@ -117,14 +118,14 @@ pub fn try_lock(path: &Path, kind: &str) -> Result<Option<Lock>> {
     }))
 }
 
-pub fn try_uninstall_lock_at(parent: RawFd) -> Result<Option<Lock>> {
-    let file = open_at(parent)?;
+fn try_uninstall_named_lock_at(parent: RawFd, entry: &CStr) -> Result<Option<Lock>> {
+    let file = open_at(parent, entry)?;
     match file.try_lock_exclusive() {
         Ok(()) => {}
         Err(error) if contended(&error) => return Ok(None),
-        Err(error) => return Err(error).context("lock install.lock"),
+        Err(error) => return Err(error).context(format!("lock {}", entry.to_string_lossy())),
     }
-    validate_inode(&file, "install.lock")?;
+    validate_inode(&file, &entry.to_string_lossy())?;
     Ok(Some(Lock {
         file,
         clear_record: false,
@@ -132,9 +133,21 @@ pub fn try_uninstall_lock_at(parent: RawFd) -> Result<Option<Lock>> {
 }
 
 pub async fn wait_uninstall_lock_at(parent: RawFd, limit: Duration) -> Result<Option<Lock>> {
+    wait_uninstall_named_lock_at(parent, c"install.lock", limit).await
+}
+
+pub async fn wait_uninstall_agents_lock_at(parent: RawFd, limit: Duration) -> Result<Option<Lock>> {
+    wait_uninstall_named_lock_at(parent, c"agents.lock", limit).await
+}
+
+async fn wait_uninstall_named_lock_at(
+    parent: RawFd,
+    entry: &CStr,
+    limit: Duration,
+) -> Result<Option<Lock>> {
     let deadline = tokio::time::Instant::now() + limit;
     loop {
-        if let Some(lock) = try_uninstall_lock_at(parent)? {
+        if let Some(lock) = try_uninstall_named_lock_at(parent, entry)? {
             return Ok(Some(lock));
         }
         if tokio::time::Instant::now() >= deadline {
