@@ -767,17 +767,20 @@ impl HostAgents {
         deadline: Instant,
     ) -> std::result::Result<Value, Failure> {
         self.update_state(cancel, deadline, true, move |latest| {
-            let path_unchanged = latest.get("login_path") == base.get("login_path");
-            if path_unchanged {
-                latest["login_path"] = json!(captured_path);
-            }
-            if path_unchanged && captured_path.is_none() {
+            if captured_path.is_none() {
+                latest["login_path"] = Value::Null;
                 latest["binaries"] = json!({});
                 if let Some(seen) = latest.get_mut("seen").and_then(Value::as_object_mut) {
                     for entry in seen.values_mut() {
                         entry["present"] = json!(false);
                     }
                 }
+                latest["scanned_at"] = json!(iso_now());
+                return;
+            }
+            let path_unchanged = latest.get("login_path") == base.get("login_path");
+            if path_unchanged {
+                latest["login_path"] = json!(captured_path);
             }
             for (id, observation) in observations {
                 if !path_unchanged
@@ -1601,7 +1604,7 @@ impl HostAgents {
                         key,
                         "/s".into(),
                         "/f".into(),
-                        "Cursor".into(),
+                        identity.windows_name.into(),
                         "/d".into(),
                         format!("/reg:{view}"),
                     ];
@@ -1619,7 +1622,7 @@ impl HostAgents {
                         continue;
                     };
                     if result.status.success() {
-                        for key in app::windows_candidate_keys(&result.stdout)
+                        for key in app::windows_candidate_keys(&result.stdout, identity)
                             .into_iter()
                             .take(64)
                         {
@@ -1639,7 +1642,7 @@ impl HostAgents {
                             if entry.status.success() {
                                 if let Some(path) = app::windows_results(&entry.stdout, identity)
                                     .into_iter()
-                                    .find(|path| path.join("Cursor.exe").is_file())
+                                    .find(|path| app::windows_installed_path(path, identity))
                                 {
                                     return Some(path);
                                 }

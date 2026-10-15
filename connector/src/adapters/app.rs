@@ -90,15 +90,37 @@ pub fn windows_results(output: &str, identity: Identity) -> Vec<PathBuf> {
 }
 
 #[cfg(any(target_os = "windows", test))]
-pub fn windows_candidate_keys(output: &str) -> Vec<String> {
+pub fn windows_candidate_keys(output: &str, identity: Identity) -> Vec<String> {
     let mut keys = Vec::new();
+    let mut current = None;
     for line in output.lines() {
-        let key = line.trim();
-        if key.starts_with("HKEY_") && !keys.iter().any(|known| known == key) {
-            keys.push(key.to_owned());
+        let trimmed = line.trim();
+        if trimmed.starts_with("HKEY_") {
+            current = Some(trimmed);
+        } else if let Some(value) = trimmed.strip_prefix("DisplayName") {
+            let value = value.trim();
+            let value = value
+                .strip_prefix("REG_SZ")
+                .or_else(|| value.strip_prefix("REG_EXPAND_SZ"));
+            if let (Some(key), Some(value)) = (current, value) {
+                let value = value.trim();
+                if (value.eq_ignore_ascii_case(identity.windows_name)
+                    || (identity.windows_name == "Cursor"
+                        && value.eq_ignore_ascii_case("Cursor (User)")))
+                    && !keys.iter().any(|known| known == key)
+                {
+                    keys.push(key.to_owned());
+                }
+            }
         }
     }
     keys
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub fn windows_installed_path(path: &Path, identity: Identity) -> bool {
+    path.join(format!("{}.exe", identity.windows_name))
+        .is_file()
 }
 
 /// XDG's first desktop file of this ID wins, including a `Hidden=true` tombstone.
@@ -235,6 +257,12 @@ mod tests {
                 PathBuf::from("C:\\Program Files\\Cursor")
             ]
         );
+        let root = std::env::temp_dir().join(format!("sidevoice-win-app-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(!windows_installed_path(&root, CURSOR));
+        std::fs::write(root.join("Cursor.exe"), b"fixture").unwrap();
+        assert!(windows_installed_path(&root, CURSOR));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -247,7 +275,8 @@ mod tests {
         }
         inventory.push_str("HKEY_CURRENT_USER\\Uninstall\\CursorUser\n    DisplayName    REG_SZ    Cursor (User)\n");
         assert!(inventory.len() > 65536);
-        assert!(windows_candidate_keys(&inventory)
+        assert_eq!(windows_candidate_keys(&inventory, CURSOR).len(), 1);
+        assert!(windows_candidate_keys(&inventory, CURSOR)
             .last()
             .unwrap()
             .ends_with("CursorUser"));

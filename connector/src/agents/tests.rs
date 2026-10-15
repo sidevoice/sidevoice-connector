@@ -49,7 +49,15 @@ async fn failed_watched_capture_hides_all_agents_and_recovery_reconciles_all() {
     fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
     let _shell = EnvGuard::set("SHELL", shell.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
-    assert_eq!(host.capture_login_path(&Cancellation::new(), Instant::now() + StdDuration::from_secs(5)).await.unwrap(), Some("/usr/bin".into()));
+    assert_eq!(
+        host.capture_login_path(
+            &Cancellation::new(),
+            Instant::now() + StdDuration::from_secs(5)
+        )
+        .await
+        .unwrap(),
+        Some("/usr/bin".into())
+    );
     let first = host.handle("agents.list", json!({"rescan":true})).await;
     assert!(listed_ids(&first).contains(&"claude".into()), "{first}");
     assert!(listed_ids(&first).contains(&"cursor".into()), "{first}");
@@ -113,6 +121,7 @@ struct Fixture {
     profile: Profile,
     /// Cursor installed: its CLI, which `SIDEVOICE_CURSOR_BIN` names while the fixture lives.
     _cursor: EnvGuard,
+    _shell: EnvGuard,
 }
 
 /// Agent tests take turns: an agent's CLI is found through process-wide variables (`SIDEVOICE_<AGENT>_BIN`) that some
@@ -195,10 +204,15 @@ impl Fixture {
         private_write(&cursor, b"#!/bin/sh\nexit 0\n");
         fs::set_permissions(&cursor, fs::Permissions::from_mode(0o700)).unwrap();
         let _cursor = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cursor.as_os_str());
+        let shell = root.join("fixture-login-shell");
+        private_write(&shell, b"#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' /usr/bin\n");
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+        let _shell = EnvGuard::set("SHELL", shell.as_os_str());
         Self {
             root,
             profile,
             _cursor,
+            _shell,
         }
     }
 
@@ -507,8 +521,7 @@ fn listed_ids(answer: &Value) -> Vec<String> {
 async fn an_agent_is_listed_when_its_program_is_installed_not_for_its_home_alone() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
-    // No login PATH to search: only the unit-test fixture or an OS app registration says installed.
-    let _shell = EnvGuard::set("SHELL", std::ffi::OsStr::new(""));
+    // The fixture login PATH contains no fixture programs; test-only overrides supply each program.
     write_json(
         &fixture
             .profile
@@ -668,6 +681,7 @@ async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn()
         format!("#!/bin/sh\nprintf started > '{}'\n", marker.display()).as_bytes(),
     );
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let _binary = EnvGuard::set("SIDEVOICE_CODEX_BIN", executable.as_os_str());
     let mut state = empty_state();
     state["binaries"]["codex"] = json!(executable);
     write_json(&fixture.profile.data.join("agents.json"), &state);
@@ -685,7 +699,10 @@ async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn()
     symlink(&external, fixture.profile.agent_home("CODEX_HOME")).unwrap();
 
     let answer = host.handle("agents.connect", json!({"id":"codex"})).await;
-    assert_eq!(answer.pointer("/error/key"), Some(&json!("agents.invalid")));
+    assert_eq!(
+        answer.pointer("/error/key"),
+        Some(&json!("agents.not-present"))
+    );
     assert!(
         !marker.exists(),
         "Codex CLI ran with a replaced private profile"
@@ -1380,10 +1397,21 @@ async fn codex_delivery_runs_the_scanned_codex_with_the_login_path() {
     );
     fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
     let login = format!("{}:/usr/bin:/bin", bin.display());
-    let mut state = empty_state();
-    state["binaries"]["codex"] = json!(codex);
-    state["login_path"] = json!(login);
-    write_json(&fixture.profile.data.join("agents.json"), &state);
+    let shell = fixture.root.join("bench-login-shell");
+    private_write(&shell, format!("#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' '{login}'\n").as_bytes());
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    let _shell = EnvGuard::set("SHELL", shell.as_os_str());
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let discovered = host.handle("agents.list", json!({"rescan":true})).await;
+    assert!(
+        listed_ids(&discovered).contains(&"codex".into()),
+        "{discovered}"
+    );
+    let state: Value =
+        serde_json::from_slice(&fs::read(fixture.profile.data.join("agents.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["binaries"]["codex"], json!(codex));
+    host.shutdown().await;
 
     let answer = crate::adapters::codex::deliver(
         &json!({"kind":"codex-queue","thread":"t-1"}),
