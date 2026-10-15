@@ -1458,14 +1458,8 @@ impl HostAgents {
             "actionable":false,
             "health":Value::Null,
         });
-        if id == "cursor" {
-            let editor_available = binary.as_deref().is_some_and(|path| {
-                Path::new(path)
-                    .file_name()
-                    .is_some_and(|name| name == "cursor")
-            }) || evidence.iter().any(|item| item.kind == "app");
-            row["cursor_bridge"] =
-                crate::adapters::cursor::bridge_setup::status(&self.profile, editor_available);
+        if let Some((field, value)) = agent.extra_status(&self.profile, binary.as_deref()) {
+            row[field] = value;
         }
         Ok(Observation {
             row,

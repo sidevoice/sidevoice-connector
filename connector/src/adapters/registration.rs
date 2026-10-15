@@ -100,6 +100,14 @@ pub trait Registration: Send + Sync {
     fn evidence(&self) -> Vec<(&'static str, PathBuf)> {
         Vec::new()
     }
+    /// An optional fact attached to this agent's row using its already resolved binary.
+    fn extra_status(
+        &self,
+        _profile: &Profile,
+        _binary: Option<&str>,
+    ) -> Option<(&'static str, Value)> {
+        None
+    }
     /// How to start this agent against the test bench's profile, when it can be: printed when the bench starts.
     fn bench_steps(&self, _setup: &BenchSetup) -> Option<String> {
         None
