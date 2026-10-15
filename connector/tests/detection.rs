@@ -64,3 +64,47 @@ fn cli_detection_uses_only_fresh_login_path_not_overrides_fixed_paths_or_cache()
         "stale cache or fallback was used: {failed}"
     );
 }
+
+#[test]
+fn cursor_desktop_registration_needs_a_scan_path_and_hidden_entries_are_not_detected() {
+    let profile = Profile::new("desktopdetect");
+    let entry = profile.root.join("xdg/data/applications/cursor.desktop");
+    fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    fs::write(
+        &entry,
+        "[Desktop Entry]\nType=Application\nName=Cursor\nExec=cursor %F\n",
+    )
+    .unwrap();
+    let no_shell = listed(&profile, None, None);
+    assert!(
+        !has(&no_shell, "cursor"),
+        "failed PATH capture must leave the list empty: {no_shell}"
+    );
+    let shell = profile.root.join("login-shell");
+    program(&shell, "#!/bin/sh\nprintf %s /usr/bin\n");
+    let found = listed(&profile, Some(&shell), None);
+    assert!(
+        has(&found, "cursor"),
+        "OS registration was ignored: {found}"
+    );
+    assert!(found["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == "cursor")
+        .unwrap()["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|evidence| evidence["kind"] == "app"));
+    fs::write(
+        &entry,
+        "[Desktop Entry]\nType=Application\nName=Cursor\nExec=cursor\nHidden=true\n",
+    )
+    .unwrap();
+    let hidden = listed(&profile, Some(&shell), None);
+    assert!(
+        !has(&hidden, "cursor"),
+        "hidden app was guessed present: {hidden}"
+    );
+}

@@ -1482,6 +1482,9 @@ impl HostAgents {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> Option<PathBuf> {
+        // A failed login PATH capture leaves the whole discovery list empty.
+        let login_path = login_path?;
+        let _ = login_path;
         let identity = agent.app_identity()?;
         #[cfg(target_os = "linux")]
         {
@@ -1489,7 +1492,7 @@ impl HostAgents {
             return app::linux_entry(
                 identity,
                 &app::linux_roots(&self.profile.xdg_data),
-                login_path,
+                Some(login_path),
             );
         }
         #[cfg(target_os = "macos")]

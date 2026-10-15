@@ -167,6 +167,15 @@ mod tests {
         );
         assert_eq!(mac_result("/Applications/Cursor.app"), None);
         assert_eq!(mac_result("not found"), None);
+        let bundle = std::env::temp_dir()
+            .join(format!("sidevoice-mac-app-{}", Uuid::new_v4()))
+            .join("Cursor.app");
+        std::fs::create_dir_all(&bundle).unwrap();
+        assert_eq!(
+            mac_result(&format!("{}\n", bundle.display())),
+            Some(bundle.clone())
+        );
+        std::fs::remove_dir_all(bundle.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -202,6 +211,11 @@ mod tests {
             "[Desktop Entry]\nType=Application\nHidden=true\nExec=cursor\n",
         )
         .unwrap();
+        assert_eq!(
+            linux_entry(CURSOR, &[user.clone(), system.clone()], None),
+            None
+        );
+        std::fs::write(&user_file, "[Desktop Entry]\nType=Link\nExec=cursor\n").unwrap();
         assert_eq!(
             linux_entry(CURSOR, &[user.clone(), system.clone()], None),
             None

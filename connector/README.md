@@ -118,9 +118,10 @@ released before it asks. With `--json` (the desktop app reads it) or without a t
 An agent is found (listed by `agents`, `agents.list` and the install offer, with `present: true`) only when its
 CLI is executable on the person's captured login-shell PATH, or its desktop app is registered with the OS. Claude
 Code's `claude`, Codex's `codex`, and Cursor's `cursor-agent` or `cursor` are looked up only on that PATH, in process.
-The connector captures the PATH by running `$SHELL -lc 'printf %s "$PATH"'` for each scan. If that fails, no CLI is
-detected. Cursor's desktop app is found by LaunchServices bundle ID on macOS, the uninstall registry on Windows, or
-its XDG `cursor.desktop` entry on Linux. A failed OS lookup does not count as installed. Its configuration directory,
+The connector captures the PATH by running `$SHELL -lc 'printf %s "$PATH"'` for each scan. If that fails, no agent is
+listed; the person can use Other to connect by hand. Cursor's desktop app is found by LaunchServices bundle ID on
+macOS, the uninstall registry on Windows, or its XDG `cursor.desktop` entry on Linux. A failed OS lookup does not
+count as installed. Its configuration directory,
 which other tools and an uninstall leave behind, never counts by itself. The row's `evidence` says why: `binary` and
 `app` are the program found; `config-dir` is a detail. An agent not found is not listed; any agent is connected by
 hand with the listing's `custom`.
