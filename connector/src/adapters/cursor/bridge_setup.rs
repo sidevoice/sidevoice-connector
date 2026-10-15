@@ -39,10 +39,13 @@ fn inventory(dir: &Path) -> BridgeFiles {
         let Ok(file) = File::open(&path) else {
             continue;
         };
-        let Ok(metadata) = file.metadata() else {
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
             continue;
         };
-        if !metadata.is_file() || metadata.len() > MAX_DESCRIPTOR {
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_DESCRIPTOR
+        {
             continue;
         }
         let mut bytes = Vec::new();
@@ -168,10 +171,12 @@ fn assess(
         Some("cursor_version_unknown" | "registration_unknown") => "unknown",
         Some(_) => "needs_attention",
     };
+    let normalized_version =
+        version.map(|[major, minor, patch]| format!("{major}.{minor}.{patch}"));
     json!({
         "state":state,
         "reason":reason,
-        "cursor_version":cursor_version,
+        "cursor_version":normalized_version,
         "minimum_cursor_version":"3.22.12",
         "minimum_connector_version":"0.9.0",
         "steps":[
@@ -189,6 +194,57 @@ fn assess(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    #[test]
+    fn temporary_bridge_descriptors_cover_missing_empty_live_and_stale() {
+        let root = env::temp_dir().join(format!(
+            "sidevoice-cursor-bridge-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let bridge = root.join("desktop-bridge");
+        assert_eq!(inventory(&bridge), BridgeFiles::Missing);
+        fs::create_dir_all(&bridge).unwrap();
+        assert_eq!(inventory(&bridge), BridgeFiles::Missing);
+        let socket = root.join("socket");
+        fs::write(&socket, b"").unwrap();
+        let descriptor = bridge.join("one.json");
+        let payload = json!({
+            "protocolVersion":1,
+            "pid":std::process::id(),
+            "socketPath":socket,
+            "token":"private-do-not-report",
+            "userDataDir":"/private/also-do-not-report",
+        });
+        fs::write(&descriptor, serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert_eq!(inventory(&bridge), BridgeFiles::Live);
+        fs::remove_file(&socket).unwrap();
+        assert_eq!(inventory(&bridge), BridgeFiles::Stale);
+        fs::write(&socket, b"").unwrap();
+        fs::remove_file(&descriptor).unwrap();
+        symlink(&socket, &descriptor).unwrap();
+        assert_eq!(inventory(&bridge), BridgeFiles::Stale);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sqlite_check_uses_only_the_supplied_path() {
+        let root = env::temp_dir().join(format!(
+            "sidevoice-sqlite-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).unwrap();
+        let path = root.to_str().unwrap();
+        assert!(!sqlite3_available(Some(path)));
+        let stub = root.join("sqlite3");
+        fs::write(&stub, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(sqlite3_available(Some(path)));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn states_are_keyed_and_conservative() {
         assert_eq!(

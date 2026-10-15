@@ -132,6 +132,51 @@ output`, `timed out`, `protocol mismatch`); `checked_at` is when (ISO 8601, UTC)
 (`agents.check`, `{"id"}`, or `agents check <id>`); a listing from the cache, and a request with too little time
 left, keep the last one found (in `agents.json`).
 
+### Cursor Desktop Bridge status
+
+The Cursor row in `agents.list` / `agents --json` also has `cursor_bridge`, separate from MCP `registration` and
+`health`. The web translates its stable step IDs and reason keys. It contains no display text, home path, bridge
+token, or socket path. Example:
+
+```json
+{
+  "state": "needs_attention",
+  "reason": "bridge_missing",
+  "cursor_version": "3.22.12",
+  "minimum_cursor_version": "3.22.12",
+  "minimum_connector_version": "0.9.0",
+  "steps": [
+    {"id":"cursor_version","state":"done"},
+    {"id":"enable_desktop_bridge","state":"unknown"},
+    {"id":"bridge_running","state":"needs_action"},
+    {"id":"sqlite3","state":"done"},
+    {"id":"register_sidevoice","state":"done"},
+    {"id":"join_editor_chat","state":"unknown"},
+    {"id":"wait_for_chat_registration","state":"unknown"}
+  ]
+}
+```
+
+`state` is `ready`, `needs_attention`, or `unknown`. `reason` is null when ready, otherwise one of
+`cursor_version_too_old`, `bridge_missing`, `bridge_stale`, `sqlite3_missing`, `sidevoice_not_registered`,
+`cursor_version_unknown`, or `registration_unknown`. Step states are `done`, `needs_action`, or `unknown`.
+`cursor_version` is the parsed version from the editor's `cursor --version`, or null when unavailable. The minimum
+Cursor version is 3.22.12; the minimum connector version is 0.9.0. A live bridge requires a usable protocol-1
+descriptor under `~/.cursor/desktop-bridge/*.json`, with a live process and an existing socket. `sqlite3` must be
+executable on the captured login PATH. Missing and empty directories both give `bridge_missing`; unusable descriptors
+give `bridge_stale`. `agents.list` with `rescan` or `watch`, and `agents check cursor`, refresh the checks; a cached
+list returns the last result.
+
+For `enable_desktop_bridge`, the web should explain Cursor → Settings → Beta → “Allow CLI to access desktop agents”
+(visible only with the account's `desktop_bridge` beta). Cursor exposes no readable setting for this check: it is
+`done` when a live bridge proves it is enabled and `unknown` otherwise. For `register_sidevoice`, the person
+connects Cursor to Sidevoice, restarts Cursor if needed, and approves the Sidevoice MCP server. Then they ask a
+**new editor chat** to join the voice room. The join result has `route: "cursor-editor-bridge"` and a `chat_marker`;
+the per-chat `voice_status.bridge.state` becomes `registered` with `bridge_chat_known: true` once Cursor records the
+join (it can first say `waiting for Cursor to register this chat`). These last two steps remain `unknown` in the
+machine-wide row because they can only be checked for that chat. After registration, selecting the conversation in
+the room and sending text should make it appear in the editor chat, where the agent can reply by voice.
+
 `uninstall` unloads both jobs and stops what runs on demand (a refusal stops it there, with nothing deleted), removes
 the agents' registrations Sidevoice wrote (current or not), then `R` and everything in `D` but its lock files and the
 stop, so that a launcher on its way finds the stop and starts nothing. The room keeps this machine's pairing until it is revoked

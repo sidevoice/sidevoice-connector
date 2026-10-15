@@ -129,6 +129,57 @@ fn row<'a>(answer: &'a Value, id: &str) -> &'a Value {
         .unwrap()
 }
 
+#[tokio::test]
+async fn cursor_agent_row_exposes_bridge_steps_without_home_paths_or_secrets() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let bin = fixture.root.join("bin");
+    private_mkdir(&bin);
+    let cursor = bin.join("cursor");
+    private_write(&cursor, b"#!/bin/sh\necho 'Cursor 3.22.12'\n");
+    fs::set_permissions(&cursor, fs::Permissions::from_mode(0o700)).unwrap();
+    let sqlite = bin.join("sqlite3");
+    private_write(&sqlite, b"#!/bin/sh\nexit 0\n");
+    fs::set_permissions(&sqlite, fs::Permissions::from_mode(0o700)).unwrap();
+    write_json(
+        &fixture.profile.data.join("agents.json"),
+        &json!({
+            "version":1,"scanned_at":null,"login_path":bin,"binaries":{},"seen":{},"dismissed":{}
+        }),
+    );
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let missing = host.handle("agents.list", json!({"watch":"cursor"})).await;
+    let bridge = &row(&missing, "cursor")["cursor_bridge"];
+    assert_eq!(bridge["reason"], "bridge_missing");
+    assert_eq!(bridge["cursor_version"], "3.22.12");
+    assert_eq!(bridge["steps"][1]["state"], "unknown");
+    let cached = host.handle("agents.list", json!({})).await;
+    assert_eq!(row(&cached, "cursor")["cursor_bridge"], *bridge);
+
+    let dir = fixture
+        .profile
+        .agent_home("CURSOR_CONFIG_DIR")
+        .join("desktop-bridge");
+    private_mkdir(&dir);
+    let socket = fixture.root.join("bridge.sock");
+    private_write(&socket, b"");
+    write_json(
+        &dir.join("one.json"),
+        &json!({
+            "protocolVersion":1,"pid":std::process::id(),"socketPath":socket,
+            "token":"secret-token","userDataDir":fixture.root.join("private-cursor-data")
+        }),
+    );
+    let rescanned = host.handle("agents.list", json!({"watch":"cursor"})).await;
+    let bridge = &row(&rescanned, "cursor")["cursor_bridge"];
+    assert_eq!(bridge["reason"], "sidevoice_not_registered");
+    assert_eq!(bridge["steps"][1]["state"], "done");
+    assert_eq!(bridge["steps"][2]["state"], "done");
+    let serialized = bridge.to_string();
+    assert!(!serialized.contains(&fixture.root.to_string_lossy().to_string()));
+    assert!(!serialized.contains("secret-token"));
+}
+
 fn identity_signature(id: &str, version: Option<&str>, evidence: &[Evidence<'_>]) -> String {
     let identity = format!(
         "{{\"id\":{},\"version\":{},\"evidence\":{}}}",
