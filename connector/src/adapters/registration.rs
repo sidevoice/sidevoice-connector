@@ -96,6 +96,37 @@ pub enum ReadinessCheck {
     Unsupported(&'static str),
 }
 
+pub fn aggregate_readiness(checks: &[ReadinessCheck]) -> Option<Value> {
+    if checks.is_empty() {
+        return None;
+    }
+    let state = if checks
+        .iter()
+        .any(|check| matches!(check, ReadinessCheck::Unsupported(_)))
+    {
+        "unsupported"
+    } else if checks
+        .iter()
+        .any(|check| matches!(check, ReadinessCheck::NeedsAttention(_)))
+    {
+        "needs_attention"
+    } else {
+        "ready"
+    };
+    let reasons = checks
+        .iter()
+        .filter_map(|check| match check {
+            ReadinessCheck::Ok => None,
+            ReadinessCheck::NeedsAttention(reason) | ReadinessCheck::Unsupported(reason) => {
+                Some(*reason)
+            }
+        })
+        .collect::<Vec<_>>();
+    Some(json!({"state":state,"reasons":reasons}))
+}
+
+/// The variable naming an agent's CLI explicitly: `SIDEVOICE_<ID>_BIN`.
+
 pub trait Registration: Send + Sync {
     /// The agent's home.
     fn config_root<'a>(&self, profile: &'a Profile) -> &'a Path;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::adapters::registration::ReadinessCheck;
 use fs2::FileExt;
 use std::fs::OpenOptions;
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
@@ -238,19 +239,17 @@ fn readiness_aggregation_prioritizes_unsupported_then_attention_then_ready() {
             ),
         ),
     ] {
-        assert_eq!(readiness(&checks), expected);
+        assert_eq!(aggregate_readiness(&checks), expected);
     }
 }
 
-#[tokio::test]
-async fn other_agents_have_no_readiness_when_their_hook_is_empty() {
-    let _turn = agent_env().await;
+#[test]
+fn other_agents_have_no_readiness_when_their_hook_is_empty() {
     let fixture = Fixture::new();
-    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
-    let answer = host.handle("agents.list", json!({"watch":"claude"})).await;
-    for id in ["claude", "codex"] {
-        assert!(row(&answer, id).get("readiness").is_none());
-    }
+    let claude = crate::adapters::claude::Claude.readiness_checks(&fixture.profile, None);
+    let codex = crate::adapters::codex::Codex.readiness_checks(&fixture.profile, None);
+    assert_eq!(aggregate_readiness(&claude), None);
+    assert_eq!(aggregate_readiness(&codex), None);
 }
 
 fn identity_signature(id: &str, version: Option<&str>, evidence: &[Evidence<'_>]) -> String {

@@ -6,8 +6,8 @@
 
 use crate::adapters::health::{self, Health};
 use crate::adapters::registration::{
-    mcp_servers_json, shell_command, AgentError, AgentHost, CliError, CliOutput, Launch, Manual,
-    ReadinessCheck, Registration,
+    aggregate_readiness, mcp_servers_json, shell_command, AgentError, AgentHost, CliError,
+    CliOutput, Launch, Manual, Registration,
 };
 use crate::adapters::Registry;
 use crate::messages::message;
@@ -102,36 +102,6 @@ struct ActiveOperation {
 /// An agent, by the id of its harness.
 type AgentId = &'static str;
 
-fn readiness(checks: &[ReadinessCheck]) -> Option<Value> {
-    if checks.is_empty() {
-        return None;
-    }
-    let state = if checks
-        .iter()
-        .any(|check| matches!(check, ReadinessCheck::Unsupported(_)))
-    {
-        "unsupported"
-    } else if checks
-        .iter()
-        .any(|check| matches!(check, ReadinessCheck::NeedsAttention(_)))
-    {
-        "needs_attention"
-    } else {
-        "ready"
-    };
-    let reasons = checks
-        .iter()
-        .filter_map(|check| match check {
-            ReadinessCheck::Ok => None,
-            ReadinessCheck::NeedsAttention(reason) | ReadinessCheck::Unsupported(reason) => {
-                Some(*reason)
-            }
-        })
-        .collect::<Vec<_>>();
-    Some(json!({"state":state,"reasons":reasons}))
-}
-
-/// The variable naming an agent's CLI explicitly: `SIDEVOICE_<ID>_BIN`.
 fn override_name(id: AgentId) -> String {
     format!("SIDEVOICE_{}_BIN", id.to_ascii_uppercase())
 }
@@ -1487,7 +1457,9 @@ impl HostAgents {
             "actionable":false,
             "health":Value::Null,
         });
-        if let Some(value) = readiness(&agent.readiness_checks(&self.profile, binary.as_deref())) {
+        if let Some(value) =
+            aggregate_readiness(&agent.readiness_checks(&self.profile, binary.as_deref()))
+        {
             row["readiness"] = value;
         }
         Ok(Observation {
