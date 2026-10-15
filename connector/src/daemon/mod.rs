@@ -803,6 +803,7 @@ impl Daemon {
                     if previous == 0 {
                         existing.owner.store(owner, Ordering::Relaxed);
                     }
+                    harness_adapter.refresh_registration(&existing, &delivery);
                     let binding_id = existing.id.lock().await.clone();
                     drop(_state_transaction);
                     return Ok(
@@ -850,6 +851,7 @@ impl Daemon {
                     if previous == 0 {
                         existing.owner.store(owner, Ordering::Relaxed);
                     }
+                    harness_adapter.refresh_registration(&existing, &delivery);
                     let binding_id = existing.id.lock().await.clone();
                     drop(_state_transaction);
                     return Ok(json!({"binding_id":binding_id,"thread":thread,
@@ -1345,6 +1347,7 @@ mod tests {
         use anyhow::Result;
         use futures_util::future::BoxFuture;
         use serde_json::{Map, Value};
+        use std::sync::atomic::Ordering;
         use std::sync::{Arc, Mutex};
 
         struct Fake {
@@ -1451,7 +1454,7 @@ mod tests {
                 1,
                 "register",
                 json!({"client_ref":"fake-1","thread":"t-1","title":"Fake","harness":"fake",
-                "delivery":{"kind":"fake-route","thread":"t-1"}}),
+                "delivery":{"kind":"fake-route","thread":"t-1"},"detachable":true}),
             )
             .await
             .unwrap();
@@ -1478,8 +1481,22 @@ mod tests {
         assert_eq!(listed["engine"]["model"], "fake-1");
         assert_eq!(listed["capabilities"]["working"], "unsupported");
 
+        let binding = daemon.bindings.lock().await.get("fake-1").cloned().unwrap();
+        binding.owner.store(0, Ordering::Relaxed);
+        let resumed = daemon
+            .command(
+                2,
+                "register",
+                json!({"client_ref":"fake-1","thread":"t-1","harness":"fake",
+                "delivery":{"kind":"fake-route","thread":"t-1"},"detachable":true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed["binding_id"], joined["binding_id"]);
+        assert_eq!(binding.owner.load(Ordering::Relaxed), 2);
+
         daemon
-            .command(1, "unregister", json!({"client_ref":"fake-1"}))
+            .command(2, "unregister", json!({"client_ref":"fake-1"}))
             .await
             .unwrap();
         assert_eq!(

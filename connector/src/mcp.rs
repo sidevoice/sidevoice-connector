@@ -380,12 +380,6 @@ impl Facade {
                     crate::logfile::log("cursor identity map could not be saved");
                 }
                 let stable = chat.thread();
-                if stable == original {
-                    if let Some(joined) = this.joined.lock().await.get_mut(&original) {
-                        joined.identity.delivery["identity_state"] = json!("verified");
-                    }
-                    return;
-                }
                 let mut verified = identity.clone();
                 verified.thread = stable.clone();
                 verified.delivery["thread"] = json!(stable);
@@ -404,6 +398,14 @@ impl Facade {
                 let Some(binding_id) = registered.get("binding_id").and_then(Value::as_str) else {
                     continue;
                 };
+                if stable == original {
+                    if let Some(joined) = this.joined.lock().await.get_mut(&original) {
+                        if joined.identity.chat_marker == identity.chat_marker {
+                            joined.identity = verified;
+                        }
+                    }
+                    return;
+                }
                 let old_id = this
                     .joined
                     .lock()

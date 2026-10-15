@@ -59,6 +59,9 @@ pub trait Harness: Send + Sync {
         Box::new(())
     }
 
+    /// A same-thread registration can provide stronger route evidence without replacing the binding.
+    fn refresh_registration(&self, _conversation: &Conversation, _delivery: &Value) {}
+
     /// Starts what the harness keeps for all its conversations on this machine, once the room exists.
     fn attach(&self, _profile: &Profile, _room: Weak<dyn Room>) -> Result<()> {
         Ok(())

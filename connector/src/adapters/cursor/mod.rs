@@ -26,6 +26,9 @@ pub fn config_home(profile: &crate::profile::Profile) -> &std::path::Path {
     profile.agent_home(HOMES[0].var)
 }
 
+#[cfg(test)]
+mod tests;
+
 use super::{envelope, Identity};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -626,6 +629,27 @@ pub struct BridgeChat {
 }
 
 impl BridgeChat {
+    fn from_verified_delivery(delivery: &Value, thread: &str) -> Option<Self> {
+        if delivery.get("identity_state") != Some(&json!("verified")) {
+            return None;
+        }
+        let composer = delivery.get("composer")?.as_str()?;
+        let profile_id = delivery.get("profile_id")?.as_str()?;
+        if !safe_chat_id(composer)
+            || profile_id.len() != 16
+            || !profile_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        let chat = Self {
+            composer: composer.into(),
+            profile_id: profile_id.into(),
+        };
+        (chat.thread() == thread).then_some(chat)
+    }
+}
+
+impl BridgeChat {
     pub fn thread(&self) -> String {
         format!("cursor-editor-{}-{}", self.profile_id, self.composer)
     }
@@ -882,12 +906,6 @@ async fn calling_thread(instances: &[BridgeInstance]) -> Option<BridgeChat> {
         .flatten()
 }
 
-pub async fn composer_holding(delivery: &Value) -> Option<String> {
-    composer_holding_identity(delivery)
-        .await
-        .map(|chat| chat.composer)
-}
-
 pub async fn composer_holding_identity(delivery: &Value) -> Option<BridgeChat> {
     let marker = delivery.get("marker").and_then(Value::as_str)?;
     if marker.len() != 64 || !marker.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -972,20 +990,44 @@ async fn query_bridge_chat(
 }
 
 pub async fn deliver_editor(delivery: &Value, event: &Value) -> Option<Value> {
-    let composer = if let Some(composer) = delivery.get("composer").and_then(Value::as_str) {
-        composer.to_owned()
-    } else {
-        composer_holding(delivery).await?
+    let instances = bridge_instances();
+    deliver_editor_with_instances(delivery, event, &instances).await
+}
+
+async fn deliver_editor_with_instances(
+    delivery: &Value,
+    event: &Value,
+    instances: &[BridgeInstance],
+) -> Option<Value> {
+    let chat = BridgeChat::from_verified_delivery(
+        delivery,
+        delivery.get("thread").and_then(Value::as_str).unwrap_or(""),
+    )
+    .or_else(|| {
+        let composer = delivery.get("composer")?.as_str()?;
+        let profile_id = delivery.get("profile_id")?.as_str()?;
+        let chat = BridgeChat {
+            composer: composer.into(),
+            profile_id: profile_id.into(),
+        };
+        (safe_chat_id(composer)
+            && delivery.get("thread").and_then(Value::as_str) == Some(chat.thread().as_str()))
+        .then_some(chat)
+    });
+    let chat = match chat {
+        Some(chat) => chat,
+        None => composer_holding_identity(delivery).await?,
     };
     let text = match envelope(event) {
         Ok(text) => text,
         Err(error) => return Some(json!({"status":"failed","detail":error.to_string()})),
     };
-    let instances = bridge_instances();
-    for instance in &instances {
+    for instance in instances.iter().filter(|instance| {
+        profile_id(&instance.user_data).as_deref() == Some(chat.profile_id.as_str())
+    }) {
         match bridge_request(
             instance,
-            &json!({"type":"sendMessage","threadId":composer,"text":text,"force":false}),
+            &json!({"type":"sendMessage","threadId":chat.composer,"text":text,"force":false}),
         )
         .await
         {
