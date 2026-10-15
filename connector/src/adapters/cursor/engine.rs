@@ -11,7 +11,7 @@ use tokio::io::AsyncReadExt;
 use tokio::time::{timeout, Duration};
 
 const MAX_RESULT: usize = 32 * 1024;
-const QUERY_DEADLINE: Duration = Duration::from_millis(500);
+const QUERY_DEADLINE: Duration = Duration::from_secs(2);
 
 fn text(value: Option<&Value>) -> Option<&str> {
     value
@@ -98,21 +98,23 @@ async fn query_editor_with(binary: &Path, database: &Path, sql: &str) -> Option<
         .ok()?;
     let stdout = child.stdout.take()?;
     let mut bytes = Vec::new();
-    let result = timeout(QUERY_DEADLINE, async {
-        stdout
-            .take((MAX_RESULT + 1) as u64)
-            .read_to_end(&mut bytes)
-            .await
-            .ok()?;
-        child.wait().await.ok()
-    })
+    let read = timeout(
+        QUERY_DEADLINE,
+        stdout.take((MAX_RESULT + 1) as u64).read_to_end(&mut bytes),
+    )
     .await;
-    let Some(status) = result.ok().flatten() else {
+    if !matches!(read, Ok(Ok(_))) || bytes.len() > MAX_RESULT {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return None;
+    }
+    let status = timeout(QUERY_DEADLINE, child.wait()).await;
+    let Ok(Ok(status)) = status else {
         let _ = child.start_kill();
         let _ = child.wait().await;
         return None;
     };
-    if !status.success() || bytes.len() > MAX_RESULT {
+    if !status.success() {
         return None;
     }
     serde_json::from_slice(&bytes).ok()
@@ -347,7 +349,7 @@ mod tests {
             query_editor_with(&script, Path::new("unused"), "SELECT 1").await,
             None
         );
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(3));
         let pid: i32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
         // The query waits for the killed child before returning.
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
