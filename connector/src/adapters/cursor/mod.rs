@@ -686,9 +686,19 @@ fn log_correlation(
     chat: &str,
     instance: Option<&BridgeInstance>,
 ) {
-    crate::logfile::log(&correlation_diagnostic(
-        stage, result, marker, chat, instance,
-    ));
+    let line = correlation_diagnostic(stage, result, marker, chat, instance);
+    #[cfg(test)]
+    correlation_lines()
+        .lock()
+        .expect("correlation test sink")
+        .push(line.clone());
+    crate::logfile::log(&line);
+}
+
+#[cfg(test)]
+fn correlation_lines() -> &'static std::sync::Mutex<Vec<String>> {
+    static LINES: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+    LINES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
 fn bridge_instances() -> Vec<BridgeInstance> {
@@ -1260,7 +1270,11 @@ mod bridge_tests {
         let storage = user_data.join("User/globalStorage");
         fs::create_dir_all(&storage).unwrap();
         let database = storage.join("state.vscdb");
-        let marker = "a".repeat(64);
+        let marker = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
         let sql = format!(
             "CREATE TABLE cursorDiskKV(key TEXT, value TEXT); INSERT INTO cursorDiskKV VALUES ('bubbleId:chat-1:turn', 'join {marker}');"
         );
@@ -1288,13 +1302,6 @@ mod bridge_tests {
         // carry enough provenance to correlate a later cached send with the accepting bridge.
         let chat = composer_holding_in(&json!({"marker":marker}), &instances, false).await;
         assert_eq!(chat.as_deref(), Some("chat-1"));
-        let mapping = correlation_diagnostic(
-            "mapping",
-            "sqlite_scan",
-            Some(&marker),
-            chat.as_deref().unwrap(),
-            Some(&instances[0]),
-        );
 
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -1309,20 +1316,30 @@ mod bridge_tests {
             // that it queued the request; no later input.read can be inferred from it.
         });
         let event = json!({"channel":"voice","session_id":"s","revision":1,"message_id":"m","text":"private words"});
-        let result = deliver_editor_to_instances(&json!({"composer":chat}), &event, &instances)
-            .await
-            .unwrap();
+        let result = deliver_editor_to_instances(
+            &json!({"composer":chat,"marker":marker}),
+            &event,
+            &instances,
+        )
+        .await
+        .unwrap();
         server.await.unwrap();
         assert_eq!(result["status"], "accepted");
         assert_eq!(result["detail"], "Cursor Desktop Bridge: queued");
         assert!(!scratch.0.join("chat.jsonl").exists());
-        let accepted = correlation_diagnostic(
-            "accepted",
-            "queued",
-            Some(&marker),
-            chat.as_deref().unwrap(),
-            Some(&instances[0]),
-        );
+        let lines = correlation_lines().lock().unwrap();
+        let matching = lines
+            .iter()
+            .filter(|line| line.contains(&format!("marker_hash={}", short_hash(&marker))))
+            .collect::<Vec<_>>();
+        let mapping = matching
+            .iter()
+            .find(|line| line.contains("stage=mapping result=sqlite_scan"))
+            .unwrap();
+        let accepted = matching
+            .iter()
+            .find(|line| line.contains("stage=accepted result=queued"))
+            .unwrap();
         for field in ["marker_hash", "chat_hash", "instance_id"] {
             let value = mapping
                 .split_whitespace()
