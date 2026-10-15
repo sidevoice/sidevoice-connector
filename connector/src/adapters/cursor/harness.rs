@@ -3,7 +3,7 @@
 
 use super::{
     bridge_running, composer_holding, composer_holding_for_delivery, deliver_editor,
-    editor_transcript_chat, engine, log_bridge, log_correlation, sqlite3_found, transcript_path,
+    editor_transcript_chat, engine, log_bridge, log_correlation, transcript_path,
 };
 use crate::adapters::conversation::{Conversation, Room};
 use crate::adapters::harness::{no_route, Harness, Route};
@@ -26,10 +26,6 @@ use tokio::time::Duration;
 const WAITING: &str = "waiting for Cursor to register this chat";
 /// What they say when Cursor's Desktop Bridge is not running at all.
 const NO_BRIDGE: &str = "Cursor's Desktop Bridge is not running";
-/// What they say when the chat cannot be looked up: Cursor's records are read with `sqlite3`.
-const NO_SQLITE: &str =
-    "sqlite3 is not installed, and Sidevoice needs it to find which Cursor chat this is";
-
 /// Cursor.
 #[derive(Default)]
 pub struct Cursor;
@@ -198,27 +194,55 @@ impl Harness for Cursor {
         match conversation.route_kind() {
             Some("cursor-tmux" | "none") => {
                 let chat = conversation.thread.clone();
+                watch_engine(conversation.clone(), room.clone(), false);
                 transcript::follow(conversation, room, Reader::new(chat, false));
             }
-            Some("cursor-bridge") => watch_editor(conversation, room),
+            Some("cursor-bridge") => {
+                watch_engine(conversation.clone(), room.clone(), true);
+                watch_editor(conversation, room);
+            }
             _ => {}
         }
     }
 }
 
+fn watch_engine(conversation: Arc<Conversation>, room: Arc<dyn Room>, editor: bool) {
+    tokio::spawn(async move {
+        let mut last = None;
+        while !conversation.stopped.load(Ordering::Relaxed) {
+            let chat = if editor {
+                bridge(&conversation)
+                    .filter(|chat| followed(&conversation).as_deref() == Some(chat))
+            } else {
+                Some(conversation.thread.clone())
+            };
+            if let Some(chat) = chat {
+                if let Some(found) = engine(&chat).await {
+                    let still_current = !editor
+                        || (bridge(&conversation).as_deref() == Some(chat.as_str())
+                            && followed(&conversation).as_deref() == Some(chat.as_str()));
+                    if still_current && last.as_ref() != Some(&found) {
+                        room.engine(&conversation, found.clone()).await;
+                        last = Some(found);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+}
+
 /// Where an editor chat's route stands: registered when the Desktop Bridge knows which chat it is, else why not
 /// yet.
 fn route_state(chat_known: bool) -> &'static str {
-    state_of(chat_known, bridge_running(), sqlite3_found())
+    state_of(chat_known, bridge_running())
 }
 
-fn state_of(chat_known: bool, bridge_running: bool, sqlite3: bool) -> &'static str {
+fn state_of(chat_known: bool, bridge_running: bool) -> &'static str {
     if chat_known {
         "registered"
     } else if !bridge_running {
         NO_BRIDGE
-    } else if !sqlite3 {
-        NO_SQLITE
     } else {
         WAITING
     }
@@ -372,16 +396,11 @@ fn watch_editor(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
 struct Reader {
     chat: String,
     editor: bool,
-    engine_checked: bool,
 }
 
 impl Reader {
     fn new(chat: String, editor: bool) -> Self {
-        Self {
-            chat,
-            editor,
-            engine_checked: false,
-        }
+        Self { chat, editor }
     }
 }
 
@@ -402,25 +421,9 @@ impl TranscriptReader for Reader {
         true
     }
 
-    fn begin(&mut self, authenticated: bool) -> Vec<Observed> {
-        if !authenticated || self.engine_checked {
-            return Vec::new();
-        }
-        self.engine_checked = true;
-        engine(&self.chat)
-            .map(Observed::Engine)
-            .into_iter()
-            .collect()
-    }
-
-    fn item(&mut self, item: &Value, authenticated: bool) -> Vec<Observed> {
+    fn item(&mut self, item: &Value, _authenticated: bool) -> Vec<Observed> {
         let mut observed = Vec::new();
         let text = transcript::user_text(item, false);
-        if authenticated && text.is_some() {
-            if let Some(engine) = engine(&self.chat) {
-                observed.push(Observed::Engine(engine));
-            }
-        }
         if item.get("type") == Some(&json!("turn_ended")) {
             observed.push(Observed::Working(false));
         } else if item.get("role") == Some(&json!("user")) {
@@ -631,14 +634,12 @@ mod tests {
         assert_eq!(events, vec![vec![true], vec![], vec![false]]);
     }
 
-    /// Why an editor chat is not reached yet, in the order a person fixes it: the bridge, then sqlite3, then Cursor
-    /// recording the join.
+    /// Why an editor chat is not reached yet: the bridge, then Cursor recording the join.
     #[test]
     fn an_unregistered_chat_says_what_it_waits_for() {
-        assert_eq!(state_of(true, false, false), "registered");
-        assert_eq!(state_of(false, false, true), NO_BRIDGE);
-        assert_eq!(state_of(false, true, false), NO_SQLITE);
-        assert_eq!(state_of(false, true, true), WAITING);
+        assert_eq!(state_of(true, false), "registered");
+        assert_eq!(state_of(false, false), NO_BRIDGE);
+        assert_eq!(state_of(false, true), WAITING);
     }
 
     /// An editor chat joins on the Desktop Bridge route, with a marker of its own the bridge finds it by, which its
