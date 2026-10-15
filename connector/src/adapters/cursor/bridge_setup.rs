@@ -1,6 +1,7 @@
 //! Read-only, local facts for the Cursor agent card. No bridge secret or home path enters the status row.
 
 use crate::profile::Profile;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::env;
 use std::fs::{self, File};
@@ -15,6 +16,17 @@ enum BridgeFiles {
     Missing,
     Stale,
     Live,
+}
+
+/// Parse only fields needed to decide whether a bridge instance is usable. All other JSON fields
+/// (including Cursor's user data directory) are ignored, and none of these values leaves this module.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadinessDescriptor {
+    protocol_version: Option<u64>,
+    pid: Option<u64>,
+    socket_path: Option<PathBuf>,
+    token: Option<String>,
 }
 
 fn bridge_dir(profile: &Profile) -> PathBuf {
@@ -58,21 +70,18 @@ fn inventory(dir: &Path) -> BridgeFiles {
         {
             continue;
         }
-        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        let Ok(value) = serde_json::from_slice::<ReadinessDescriptor>(&bytes) else {
             continue;
         };
-        let Some(pid) = value.get("pid").and_then(Value::as_u64) else {
+        let Some(pid) = value.pid else {
             continue;
         };
-        let Some(socket) = value.get("socketPath").and_then(Value::as_str) else {
+        let Some(socket) = value.socket_path else {
             continue;
         };
-        if value.get("protocolVersion") == Some(&json!(1))
-            && value
-                .get("token")
-                .and_then(Value::as_str)
-                .is_some_and(|token| !token.is_empty())
-            && Path::new(socket).exists()
+        if value.protocol_version == Some(1)
+            && value.token.is_some_and(|token| !token.is_empty())
+            && socket.exists()
             && pid > 0
             && pid <= i32::MAX as u64
             && super::process_alive(pid)
