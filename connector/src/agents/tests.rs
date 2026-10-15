@@ -12,9 +12,15 @@ struct Fixture {
 
 /// Agent tests take turns: an agent's CLI is found through process-wide variables (`SIDEVOICE_<AGENT>_BIN`) that some
 /// of them set, and every scan resolves every agent, so two at once would run each other's stand-ins.
+static AGENT_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub(crate) async fn agent_env() -> tokio::sync::MutexGuard<'static, ()> {
-    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    LOCK.lock().await
+    AGENT_ENV.lock().await
+}
+
+/// The same turn, for a test with no runtime: every fixture installs a Cursor CLI stand-in through those variables.
+fn agent_env_blocking() -> tokio::sync::MutexGuard<'static, ()> {
+    AGENT_ENV.blocking_lock()
 }
 
 pub(crate) struct EnvGuard {
@@ -179,6 +185,7 @@ fn agent_refusals_labels_and_manual_text_use_the_shared_english_bundle() {
 
 #[test]
 fn ownership_is_exact_and_js_release_fixtures_stay_narrow() {
+    let _turn = agent_env_blocking();
     let fixture = Fixture::new();
     let own = InstalledCommand::executable().unwrap();
     assert_eq!(own.args, ["mcp"]);
