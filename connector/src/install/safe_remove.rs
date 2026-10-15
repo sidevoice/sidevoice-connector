@@ -261,13 +261,15 @@ impl Guard {
         remove: bool,
         kept: &[&str],
         depth: usize,
-        probe: &impl Fn(RawFd, &Path) -> Result<(), &'static str>,
+        probe: &impl Fn(RawFd, &Path) -> Result<Mount, &'static str>,
     ) -> Result<Vec<String>, &'static str> {
         if depth > 64 {
             return Err("uninstall tree is too deep");
         }
         self.verify_dir(relative, fd)?;
-        probe(fd, relative)?;
+        if probe(fd, relative)? != self.expected {
+            return Err("uninstall mount or device boundary");
+        }
         let mut removed = Vec::new();
         for entry in entries(fd)? {
             if depth == 0 && kept.iter().any(|item| OsStr::new(item) == entry) {
@@ -364,7 +366,7 @@ impl Guard {
         remove_root: bool,
         kept: &[&str],
         remove: bool,
-        probe: &impl Fn(RawFd, &Path) -> Result<(), &'static str>,
+        probe: &impl Fn(RawFd, &Path) -> Result<Mount, &'static str>,
     ) -> Result<bool, &'static str> {
         let Some(root) = self.open_relative(relative)? else {
             return Ok(false);
@@ -395,7 +397,7 @@ impl Guard {
     }
 
     pub(super) fn preflight(&self) -> Result<bool, &'static str> {
-        let probe = |_, _: &Path| Ok(());
+        let probe = |fd, _: &Path| mount(fd);
         let releases = self.tree(
             Path::new(".local/share/sidevoice"),
             false,
@@ -413,7 +415,7 @@ impl Guard {
             true,
             &[],
             true,
-            &|_, _| Ok(()),
+            &|fd, _| mount(fd),
         )?;
         Ok(())
     }
@@ -423,9 +425,14 @@ impl Guard {
         let Some(root) = self.open_relative(relative)? else {
             return Ok(Vec::new());
         };
-        self.walk(root.as_raw_fd(), relative, true, super::KEPT, 0, &|_, _| {
-            Ok(())
-        })
+        self.walk(
+            root.as_raw_fd(),
+            relative,
+            true,
+            super::KEPT,
+            0,
+            &|fd, _| mount(fd),
+        )
     }
 }
 
@@ -511,16 +518,16 @@ mod tests {
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("keep"), "untouched").unwrap();
         let guard = Guard::new(&layout).unwrap();
-        let probe = |_: RawFd, path: &Path| {
+        let probe = |fd: RawFd, path: &Path| {
+            let mut observed = mount(fd)?;
             if path == Path::new(".sidevoice/mounted") {
-                Err("simulated device boundary")
-            } else {
-                Ok(())
+                observed.device ^= 1;
             }
+            Ok(observed)
         };
         assert_eq!(
             guard.tree(Path::new(".sidevoice"), false, &[], false, &probe),
-            Err("simulated device boundary")
+            Err("uninstall mount or device boundary")
         );
         assert!(nested.join("keep").exists());
     }
@@ -538,12 +545,12 @@ mod tests {
         fs::write(outside.join("keep"), "outside").unwrap();
         let guard = Guard::new(&layout).unwrap();
         let swapped = AtomicBool::new(false);
-        let probe = |_: RawFd, path: &Path| {
+        let probe = |fd: RawFd, path: &Path| {
             if path == Path::new(".sidevoice/victim") && !swapped.swap(true, Ordering::SeqCst) {
                 fs::rename(&victim, &moved).unwrap();
                 symlink(&outside, &victim).unwrap();
             }
-            Ok(())
+            mount(fd)
         };
         assert!(guard
             .tree(Path::new(".sidevoice"), false, &[], true, &probe)
