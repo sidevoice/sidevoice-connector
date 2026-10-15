@@ -1233,17 +1233,11 @@ async fn deliver_editor_with_instances(
         .await
         {
             Err(BridgeError::Before) => {
-                log_bridge("send", "connect_failed", Some(&composer), Some(index), None);
+                log_bridge("send", "connect_failed", Some(composer), Some(index), None);
                 continue;
             }
             Err(BridgeError::After(error)) => {
-                log_bridge(
-                    "send",
-                    "reply_uncertain",
-                    Some(&composer),
-                    Some(index),
-                    None,
-                );
+                log_bridge("send", "reply_uncertain", Some(composer), Some(index), None);
                 return Some(
                     json!({"status":"unknown","detail":format!("Cursor Desktop Bridge may have taken the message: {error}")}),
                 );
@@ -1264,7 +1258,7 @@ async fn deliver_editor_with_instances(
                             "queued"
                         },
                         delivery.get("marker").and_then(Value::as_str),
-                        &composer,
+                        composer,
                         Some(instance),
                     );
                     log_bridge(
@@ -1274,7 +1268,7 @@ async fn deliver_editor_with_instances(
                         } else {
                             "queued"
                         },
-                        Some(&composer),
+                        Some(composer),
                         Some(index),
                         Some(response.status),
                     );
@@ -1286,7 +1280,7 @@ async fn deliver_editor_with_instances(
                     log_bridge(
                         "send",
                         "unknown_thread",
-                        Some(&composer),
+                        Some(composer),
                         Some(index),
                         Some(response.status),
                     );
@@ -1297,7 +1291,7 @@ async fn deliver_editor_with_instances(
                     log_bridge(
                         "send",
                         "refused",
-                        Some(&composer),
+                        Some(composer),
                         Some(index),
                         Some(response.status),
                     );
@@ -1308,7 +1302,7 @@ async fn deliver_editor_with_instances(
                 log_bridge(
                     "send",
                     "unconfirmed_reply",
-                    Some(&composer),
+                    Some(composer),
                     Some(index),
                     Some(response.status),
                 );
