@@ -60,6 +60,22 @@ fn set_bridge(conversation: &Conversation, chat: String) {
     }
 }
 
+/// Wait for the next discovery scan, unless delivery already identified this chat.
+async fn wait_for_bridge_or_scan(conversation: &Conversation, scan_ms: u64) {
+    // notify_one retains a permit if delivery identifies the chat between this check and wait.
+    let changed = chats(conversation)
+        .expect("Cursor conversation state")
+        .bridge_changed
+        .notified();
+    if bridge(conversation).is_some() {
+        return;
+    }
+    tokio::select! {
+        _ = changed => {},
+        _ = tokio::time::sleep(Duration::from_millis(scan_ms)) => {},
+    }
+}
+
 fn followed(conversation: &Conversation) -> Option<String> {
     chats(conversation).and_then(|chats| chats.transcript.lock().ok()?.clone())
 }
@@ -261,12 +277,6 @@ fn watch_editor(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
             if binding.stopped.load(Ordering::Relaxed) {
                 return;
             }
-            // Register for the wakeup before checking the bridge. notify_one keeps a permit
-            // if delivery identifies the chat between this check and the wait below.
-            let changed = chats(binding)
-                .expect("Cursor conversation state")
-                .bridge_changed
-                .notified();
             if let Some(chat) = bridge(binding) {
                 if followed(binding).as_deref() != Some(chat.as_str()) {
                     set_followed(binding, chat.clone());
@@ -334,10 +344,7 @@ fn watch_editor(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(2_000)
                 .max(10);
-            tokio::select! {
-                _ = changed => {},
-                _ = tokio::time::sleep(Duration::from_millis(scan_ms)) => {},
-            }
+            wait_for_bridge_or_scan(binding, scan_ms).await;
         }
     });
 }
@@ -561,13 +568,26 @@ mod tests {
     async fn bridge_identification_wakes_working_monitor() {
         let identity =
             super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
-        let conversation = conversation(&identity);
-        let changed = chats(&conversation).unwrap().bridge_changed.notified();
+        let conversation = Arc::new(conversation(&identity));
+        let waiter = tokio::spawn({
+            let conversation = conversation.clone();
+            async move { wait_for_bridge_or_scan(&conversation, 2_000).await }
+        });
+        tokio::task::yield_now().await;
         set_bridge(&conversation, "chat-1".into());
-        tokio::time::timeout(Duration::from_millis(100), changed)
+        tokio::time::timeout(Duration::from_millis(500), waiter)
             .await
-            .expect("delivery must wake the monitor without a scan interval");
+            .expect("delivery must wake the monitor without a scan interval")
+            .unwrap();
         assert_eq!(bridge(&conversation).as_deref(), Some("chat-1"));
+
+        // A bridge set just before the wait is also observed without sleeping.
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            wait_for_bridge_or_scan(&conversation, 2_000),
+        )
+        .await
+        .expect("a known bridge must not wait for another scan");
     }
 
     #[test]
