@@ -1,6 +1,6 @@
 //! Desktop app registration, queried through each OS rather than guessed install directories.
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -13,13 +13,15 @@ pub struct Identity {
     pub linux_desktop: &'static str,
 }
 
-/// The exact LaunchServices query arguments (AppleScript's `path to application id`).
+/// Query LaunchServices metadata without asking the application to handle an Apple event.
 #[cfg(any(target_os = "macos", test))]
 pub fn mac_query(identity: Identity) -> Vec<String> {
     vec![
+        "-l".into(),
+        "JavaScript".into(),
         "-e".into(),
         format!(
-            "POSIX path of (path to application id \"{}\")",
+            "ObjC.import('AppKit'); var url = $.NSWorkspace.sharedWorkspace.URLForApplicationWithBundleIdentifier('{}'); if (url) ObjC.unwrap(url.path);",
             identity.mac_bundle
         ),
     ]
@@ -41,21 +43,32 @@ pub fn windows_results(output: &str, identity: Identity) -> Vec<PathBuf> {
     let mut name = String::new();
     let mut publisher = String::new();
     let mut location = String::new();
-    let mut finish = |name: &str, publisher: &str, location: &str| {
-        if name.eq_ignore_ascii_case(identity.windows_name)
+    let mut icon = String::new();
+    let mut finish = |name: &str, publisher: &str, location: &str, icon: &str| {
+        if (name.eq_ignore_ascii_case(identity.windows_name)
+            || (identity.windows_name == "Cursor" && name.eq_ignore_ascii_case("Cursor (User)")))
             && publisher.eq_ignore_ascii_case(identity.windows_publisher)
-            && !location.is_empty()
         {
-            matches.push(PathBuf::from(location));
+            if !location.is_empty() {
+                matches.push(PathBuf::from(location.trim_matches('"')));
+            } else if !icon.is_empty() {
+                let icon = icon.trim().trim_end_matches(",0").trim_matches('"');
+                if let Some((parent, executable)) = icon.rsplit_once('\\') {
+                    if executable.eq_ignore_ascii_case("Cursor.exe") && !parent.is_empty() {
+                        matches.push(PathBuf::from(parent));
+                    }
+                }
+            }
         }
     };
     for line in output.lines().chain(std::iter::once("HKEY_END")) {
         let trimmed = line.trim();
         if trimmed.starts_with("HKEY_") || trimmed.starts_with("HKEY_END") {
-            finish(&name, &publisher, &location);
+            finish(&name, &publisher, &location, &icon);
             name.clear();
             publisher.clear();
             location.clear();
+            icon.clear();
             continue;
         }
         let mut parts = trimmed.split_whitespace();
@@ -69,10 +82,23 @@ pub fn windows_results(output: &str, identity: Identity) -> Vec<PathBuf> {
             "DisplayName" => name = value,
             "Publisher" => publisher = value,
             "InstallLocation" => location = value,
+            "DisplayIcon" => icon = value,
             _ => {}
         }
     }
     matches
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub fn windows_candidate_keys(output: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for line in output.lines() {
+        let key = line.trim();
+        if key.starts_with("HKEY_") && !keys.iter().any(|known| known == key) {
+            keys.push(key.to_owned());
+        }
+    }
+    keys
 }
 
 /// XDG's first desktop file of this ID wins, including a `Hidden=true` tombstone.
@@ -169,10 +195,13 @@ mod tests {
         assert_eq!(
             mac_query(CURSOR),
             [
+                "-l",
+                "JavaScript",
                 "-e",
-                "POSIX path of (path to application id \"com.todesktop.230313mzl4w4u92\")"
+                "ObjC.import('AppKit'); var url = $.NSWorkspace.sharedWorkspace.URLForApplicationWithBundleIdentifier('com.todesktop.230313mzl4w4u92'); if (url) ObjC.unwrap(url.path);"
             ]
         );
+        assert!(!mac_query(CURSOR).join(" ").contains("path to application"));
         assert_eq!(mac_result("/Applications/Cursor.app"), None);
         assert_eq!(mac_result("not found"), None);
         let bundle = std::env::temp_dir()
@@ -194,6 +223,34 @@ mod tests {
             [PathBuf::from("C:\\Cursor")]
         );
         assert!(windows_results("ERROR: Access is denied", CURSOR).is_empty());
+    }
+
+    #[test]
+    fn windows_user_and_machine_registrations_use_verified_identity_and_location_fields() {
+        let output = "HKEY_CURRENT_USER\\Software\\Uninstall\\CursorUser\n    DisplayName    REG_SZ    Cursor (User)\n    Publisher    REG_SZ    Anysphere\n    DisplayIcon    REG_SZ    \"C:\\Users\\Test\\Cursor\\Cursor.exe\",0\nHKEY_LOCAL_MACHINE\\Software\\Uninstall\\Cursor\n    DisplayName    REG_SZ    Cursor\n    Publisher    REG_SZ    Anysphere\n    InstallLocation    REG_SZ    C:\\Program Files\\Cursor\nHKEY_LOCAL_MACHINE\\Software\\Uninstall\\Other\n    DisplayName    REG_SZ    Cursor Pro\n    Publisher    REG_SZ    Anysphere\n    InstallLocation    REG_SZ    C:\\Other\n";
+        assert_eq!(
+            windows_results(output, CURSOR),
+            [
+                PathBuf::from("C:\\Users\\Test\\Cursor"),
+                PathBuf::from("C:\\Program Files\\Cursor")
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_filtered_inventory_finds_late_key_after_large_noise() {
+        let mut inventory = String::new();
+        for i in 0..2500 {
+            inventory.push_str(&format!(
+                "HKEY_LOCAL_MACHINE\\Uninstall\\Other{i}\n    DisplayName    REG_SZ    Other\n"
+            ));
+        }
+        inventory.push_str("HKEY_CURRENT_USER\\Uninstall\\CursorUser\n    DisplayName    REG_SZ    Cursor (User)\n");
+        assert!(inventory.len() > 65536);
+        assert!(windows_candidate_keys(&inventory)
+            .last()
+            .unwrap()
+            .ends_with("CursorUser"));
     }
 
     #[test]

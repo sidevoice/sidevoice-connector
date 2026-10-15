@@ -43,7 +43,7 @@ fn cursor_installed(profile: &Profile) {
     let shell = profile.root.join("login-shell");
     fs::write(
         &shell,
-        "#!/bin/sh\nprintf %s \"$SIDEVOICE_TEST_LOGIN_PATH\"\n",
+        "#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' \"$SIDEVOICE_TEST_LOGIN_PATH\"\n",
     )
     .unwrap();
     fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();

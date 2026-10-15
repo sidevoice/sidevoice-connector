@@ -3,6 +3,111 @@ use fs2::FileExt;
 use std::fs::OpenOptions;
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 
+#[test]
+fn login_path_frame_ignores_banners_and_rejects_empty_or_incomplete_output() {
+    let framed = "\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}/tmp/bin:/usr/bin\u{1e}SIDEVOICE_PATH_END\u{1e}";
+    assert_eq!(
+        parse_login_path(&format!("Welcome!\n{framed}\n")),
+        Some("/tmp/bin:/usr/bin".into())
+    );
+    assert_eq!(parse_login_path("Welcome!\n"), None);
+    assert_eq!(
+        parse_login_path("\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}\u{1e}SIDEVOICE_PATH_END\u{1e}"),
+        None
+    );
+    assert_eq!(
+        parse_login_path("\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}/usr/bin"),
+        None
+    );
+    assert_eq!(
+        parse_login_path("\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}relative\u{1e}SIDEVOICE_PATH_END\u{1e}"),
+        None
+    );
+}
+
+#[tokio::test]
+async fn command_output_limit_reports_truncation_instead_of_parsing_prefix() {
+    let payload = vec![b'x'; 90_000];
+    assert!(read_capped(&payload[..], 65_536).await.is_err());
+    assert_eq!(
+        read_capped(&payload[..], 4 * 1024 * 1024)
+            .await
+            .unwrap()
+            .len(),
+        payload.len()
+    );
+}
+
+#[tokio::test]
+async fn failed_watched_capture_hides_all_agents_and_recovery_reconciles_all() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let claude = fake_claude(&fixture);
+    let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", claude.as_os_str());
+    let shell = fixture.root.join("login-shell");
+    private_write(&shell, b"#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' /usr/bin\n");
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    let _shell = EnvGuard::set("SHELL", shell.as_os_str());
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    assert_eq!(host.capture_login_path(&Cancellation::new(), Instant::now() + StdDuration::from_secs(5)).await.unwrap(), Some("/usr/bin".into()));
+    let first = host.handle("agents.list", json!({"rescan":true})).await;
+    assert!(listed_ids(&first).contains(&"claude".into()), "{first}");
+    assert!(listed_ids(&first).contains(&"cursor".into()), "{first}");
+    private_write(&shell, b"#!/bin/sh\nexit 1\n");
+    let failed = host.handle("agents.list", json!({"watch":"cursor"})).await;
+    assert!(listed_ids(&failed).is_empty(), "{failed}");
+    let cached = host.handle("agents.list", json!({})).await;
+    assert!(listed_ids(&cached).is_empty(), "{cached}");
+    private_write(
+        &shell,
+        b"#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' /bin\n",
+    );
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    let recovered = host.handle("agents.list", json!({"watch":"cursor"})).await;
+    assert!(
+        listed_ids(&recovered).contains(&"claude".into()),
+        "{recovered}"
+    );
+    assert!(
+        listed_ids(&recovered).contains(&"cursor".into()),
+        "{recovered}"
+    );
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn public_app_evidence_redacts_a_user_desktop_entry() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let mut profile = fixture.profile.clone();
+    profile.xdg_data = profile.home.join(".local/share");
+    private_mkdir(&profile.xdg_data);
+    let applications = profile.xdg_data.join("applications");
+    private_mkdir(&applications);
+    private_write(
+        &applications.join("cursor.desktop"),
+        b"[Desktop Entry]\nType=Application\nName=Cursor\nExec=cursor\n",
+    );
+    let shell = fixture.root.join("login-shell");
+    private_write(&shell, b"#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' /usr/bin\n");
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    let _shell = EnvGuard::set("SHELL", shell.as_os_str());
+    let host = HostAgents::with_selected(profile.clone(), fixture.selected());
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    let app = row(&listed, "cursor")["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|value| value["kind"] == "app")
+        .unwrap();
+    assert_eq!(app["path"], "~/.local/share/applications/cursor.desktop");
+    assert!(!app["path"]
+        .as_str()
+        .unwrap()
+        .contains(&profile.home.to_string_lossy().to_string()));
+    host.shutdown().await;
+}
+
 struct Fixture {
     root: PathBuf,
     profile: Profile,

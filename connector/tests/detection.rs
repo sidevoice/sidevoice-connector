@@ -50,7 +50,10 @@ fn cli_detection_uses_only_fresh_login_path_not_overrides_fixed_paths_or_cache()
     let shell = profile.root.join("login-shell");
     program(
         &shell,
-        &format!("#!/bin/sh\nprintf %s {}\n", bin.parent().unwrap().display()),
+        &format!(
+            "#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' {}\n",
+            bin.parent().unwrap().display()
+        ),
     );
 
     let missing = listed(&profile, None, Some(&bin));
@@ -82,7 +85,7 @@ fn cursor_desktop_registration_needs_a_scan_path_and_hidden_entries_are_not_dete
         "failed PATH capture must leave the list empty: {no_shell}"
     );
     let shell = profile.root.join("login-shell");
-    program(&shell, "#!/bin/sh\nprintf %s /usr/bin\n");
+    program(&shell, "#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' /usr/bin\n");
     let found = listed(&profile, Some(&shell), None);
     assert!(
         has(&found, "cursor"),

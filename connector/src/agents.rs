@@ -575,8 +575,24 @@ impl HostAgents {
         let mut rows = Vec::new();
         for (id, _) in self.registry.agents() {
             if let Some(seen) = state.pointer(&format!("/seen/{id}")) {
-                if seen.get("present") == Some(&Value::Bool(true)) {
+                if state.get("login_path").and_then(Value::as_str).is_some()
+                    && seen.get("present") == Some(&Value::Bool(true))
+                {
                     if let Some(mut row) = seen.get("agent").cloned() {
+                        if let Some(evidence) =
+                            row.get_mut("evidence").and_then(Value::as_array_mut)
+                        {
+                            for item in evidence {
+                                if let Some(path) = item.get("path").and_then(Value::as_str) {
+                                    if let Ok(relative) =
+                                        Path::new(path).strip_prefix(&self.profile.home)
+                                    {
+                                        item["path"] =
+                                            json!(Path::new("~").join(relative).to_string_lossy());
+                                    }
+                                }
+                            }
+                        }
                         let dismissed = seen
                             .get("generation")
                             .and_then(Value::as_str)
@@ -624,7 +640,17 @@ impl HostAgents {
         }
         let base = state.clone();
         let login_path = self.capture_login_path(cancel, deadline).await?;
-        let ids: Vec<_> = watch.map_or_else(
+        if login_path.is_none() {
+            return self
+                .merge_scan(base, Vec::new(), None, cancel, deadline)
+                .await;
+        }
+        let ids: Vec<_> = (if base.get("login_path") != Some(&json!(login_path)) {
+            None
+        } else {
+            watch
+        })
+        .map_or_else(
             || self.registry.agents().map(|(id, _)| id).collect(),
             |id| vec![id],
         );
@@ -744,6 +770,14 @@ impl HostAgents {
             let path_unchanged = latest.get("login_path") == base.get("login_path");
             if path_unchanged {
                 latest["login_path"] = json!(captured_path);
+            }
+            if path_unchanged && captured_path.is_none() {
+                latest["binaries"] = json!({});
+                if let Some(seen) = latest.get_mut("seen").and_then(Value::as_object_mut) {
+                    for entry in seen.values_mut() {
+                        entry["present"] = json!(false);
+                    }
+                }
             }
             for (id, observation) in observations {
                 if !path_unchanged
@@ -1183,15 +1217,37 @@ pub(crate) fn find_in_path(names: &[&str], path: Option<&str>) -> Option<String>
     None
 }
 
-async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> std::io::Result<Vec<u8>> {
+fn parse_login_path(output: &str) -> Option<String> {
+    const START: &str = "\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}";
+    const END: &str = "\u{1e}SIDEVOICE_PATH_END\u{1e}";
+    let (_, framed) = output.split_once(START)?;
+    let (value, tail) = framed.split_once(END)?;
+    if tail.contains(START) || tail.contains(END) || value.is_empty() || value.len() > 32_768 {
+        return None;
+    }
+    (value.split(':').all(|part| Path::new(part).is_absolute())
+        && !value.chars().any(char::is_control))
+    .then(|| value.to_owned())
+}
+
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
+    mut reader: R,
+    limit: usize,
+) -> std::io::Result<Vec<u8>> {
     let mut output = Vec::new();
     let mut buffer = [0u8; 8192];
+    let mut truncated = false;
     loop {
         let count = reader.read(&mut buffer).await?;
         if count == 0 {
-            return Ok(output);
+            return if truncated {
+                Err(std::io::Error::other("command output truncated"))
+            } else {
+                Ok(output)
+            };
         }
-        let keep = OUTPUT_LIMIT.saturating_sub(output.len()).min(count);
+        let keep = limit.saturating_sub(output.len()).min(count);
+        truncated |= keep < count;
         output.extend_from_slice(&buffer[..keep]);
     }
 }
@@ -1246,6 +1302,27 @@ async fn run_command(
     cancel: &Cancellation,
     deadline: Instant,
 ) -> std::result::Result<CliOutput, CommandFailure> {
+    run_command_with_limit(
+        profile,
+        agent_config,
+        binary,
+        args,
+        cancel,
+        deadline,
+        OUTPUT_LIMIT,
+    )
+    .await
+}
+
+async fn run_command_with_limit(
+    profile: &Profile,
+    agent_config: Option<&Path>,
+    binary: &str,
+    args: &[String],
+    cancel: &Cancellation,
+    deadline: Instant,
+    output_limit: usize,
+) -> std::result::Result<CliOutput, CommandFailure> {
     if cancel.is_cancelled() {
         return Err(CommandFailure::Cancelled);
     }
@@ -1266,8 +1343,8 @@ async fn run_command(
     let process_group = child.id().ok_or(CommandFailure::Io)?;
     let stdout = child.stdout.take().ok_or(CommandFailure::Io)?;
     let stderr = child.stderr.take().ok_or(CommandFailure::Io)?;
-    let mut stdout_task = tokio::spawn(read_capped(stdout));
-    let mut stderr_task = tokio::spawn(read_capped(stderr));
+    let mut stdout_task = tokio::spawn(read_capped(stdout, output_limit));
+    let mut stderr_task = tokio::spawn(read_capped(stderr, OUTPUT_LIMIT));
     let child_deadline = (Instant::now() + CHILD_LIMIT).min(deadline);
     let status = tokio::select! {
         _ = cancel.cancelled() => {
@@ -1519,18 +1596,54 @@ impl HostAgents {
                         r"{}\Software\Microsoft\Windows\CurrentVersion\Uninstall",
                         root
                     );
-                    let args = ["query".into(), key, "/s".into(), format!("/reg:{view}")];
-                    let Ok(result) =
-                        run_command(&self.profile, None, "reg.exe", &args, cancel, deadline).await
+                    let args = [
+                        "query".into(),
+                        key,
+                        "/s".into(),
+                        "/f".into(),
+                        "Cursor".into(),
+                        "/d".into(),
+                        format!("/reg:{view}"),
+                    ];
+                    let Ok(result) = run_command_with_limit(
+                        &self.profile,
+                        None,
+                        "reg.exe",
+                        &args,
+                        cancel,
+                        deadline,
+                        4 * 1024 * 1024,
+                    )
+                    .await
                     else {
                         continue;
                     };
                     if result.status.success() {
-                        if let Some(path) = app::windows_results(&result.stdout, identity)
+                        for key in app::windows_candidate_keys(&result.stdout)
                             .into_iter()
-                            .find(|path| path.is_dir())
+                            .take(64)
                         {
-                            return Some(path);
+                            let args = ["query".into(), key, format!("/reg:{view}")];
+                            let Ok(entry) = run_command(
+                                &self.profile,
+                                None,
+                                "reg.exe",
+                                &args,
+                                cancel,
+                                deadline,
+                            )
+                            .await
+                            else {
+                                continue;
+                            };
+                            if entry.status.success() {
+                                if let Some(path) = app::windows_results(&entry.stdout, identity)
+                                    .into_iter()
+                                    .find(|path| path.join("Cursor.exe").is_file())
+                                {
+                                    return Some(path);
+                                }
+                            }
                         }
                     }
                 }
@@ -1550,20 +1663,25 @@ impl HostAgents {
         else {
             return Ok(None);
         };
+        let command = if Path::new(&shell)
+            .file_name()
+            .is_some_and(|name| name == "fish")
+        {
+            "printf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' (string join : $PATH)"
+        } else {
+            "printf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' \"$PATH\""
+        };
         let output = run_command(
             &self.profile,
             None,
             &shell,
-            &["-lc".into(), "printf %s \"$PATH\"".into()],
+            &["-lc".into(), command.into()],
             cancel,
             deadline,
         )
         .await;
         match output {
-            Ok(output) if output.status.success() => {
-                let value = output.stdout.trim();
-                Ok((!value.is_empty()).then(|| value.to_owned()))
-            }
+            Ok(output) if output.status.success() => Ok(parse_login_path(&output.stdout)),
             Ok(_) | Err(CommandFailure::Start | CommandFailure::Deadline | CommandFailure::Io) => {
                 Ok(None)
             }
