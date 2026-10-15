@@ -16,11 +16,9 @@
     {
       "voice": {
         "status": "heard-up-to",
-        "heard_chars": 2,
-        "reason": {
-          "reason": "barge-in"
-        }
+        "heard_chars": 2
       },
+      "app_action": "qualified turn in this conversation while playback was sounding",
       "core": {
         "status": "interrupted",
         "reason": "user_interrupted",
@@ -33,11 +31,9 @@
     },
     {
       "voice": {
-        "status": "not-played",
-        "reason": {
-          "reason": "barge-in"
-        }
+        "status": "not-played"
       },
+      "app_action": "qualified turn in this conversation before playback started",
       "core": {
         "status": "unplayed",
         "reason": "newer_turn"
@@ -49,11 +45,10 @@
     },
     {
       "voice": {
-        "type": "agent-interrupted",
-        "utterance_id": "local-handle",
-        "heard_until": 0,
-        "played": true
+        "status": "heard-up-to",
+        "heard_chars": 0
       },
+      "app_action": "qualified turn after playback started, with zero confirmed characters",
       "core": {
         "status": "interrupted",
         "reason": "user_interrupted",
@@ -62,22 +57,6 @@
       "history": {
         "status": "interrupted",
         "audio_reason": "user_interrupted"
-      }
-    },
-    {
-      "voice": {
-        "type": "agent-interrupted",
-        "utterance_id": "local-handle",
-        "heard_until": 0,
-        "played": false
-      },
-      "core": {
-        "status": "unplayed",
-        "reason": "newer_turn"
-      },
-      "history": {
-        "status": "interrupted",
-        "audio_reason": "newer_turn"
       }
     },
     {
@@ -221,6 +200,20 @@
     "known_admission": "return original disposition",
     "known_refusal": "return original terminal refusal"
   },
+  "pending_reconciliation": {
+    "unrelated_full_receipt": {
+      "previously_queued_reply": {"fate": "not_heard", "heard_chars": 0, "text": "A was not heard"},
+      "after": {"fate": "not_heard", "heard_chars": 0, "text": "A was not heard"},
+      "meaning": "A later receipt for another reply cannot delete this untold context"
+    },
+    "empty_turn_after_full_receipt": {
+      "before": {"notice": {"kind": "turn_empty"}, "unheard": {"count": 1}},
+      "after": {"notice": {"kind": "turn_empty"}},
+      "same_message_id": true,
+      "meaning": "Remove satisfied reply evidence but keep the no-words obligation"
+    },
+    "ordinary_miss_after_full_receipt": {"delivered": false}
+  },
   "notice_correction": {
     "kind": "reply_heard",
     "corrects_message_id": "ORIGINAL_MESSAGE_ID",
@@ -249,7 +242,26 @@
       "thread_id": "CAPTURED_THREAD",
       "binding_id": "CAPTURED_FOCUS_BINDING"
     },
+    "source": "app tags the conversation call's turn at start; voice does not supply thread_id or binding_id",
     "meaning": "Start is pinned to this captured focus even after HTTP selects another focus; terminal cannot override it"
+  },
+  "focus_switch": {
+    "started": {
+      "session_id": "SESSION",
+      "turn_id": "A_TURN",
+      "thread_id": "A",
+      "binding_id": "A_FOCUS_BINDING"
+    },
+    "app_focuses": "B",
+    "on_switch": "no terminal turn frame; A remains open until its normal end-of-turn",
+    "normal_end_of_turn": {
+      "session_id": "SESSION",
+      "turn_id": "A_TURN",
+      "phase": "finished",
+      "text": "A's words",
+      "routed_to": "A"
+    },
+    "meaning": "A's later terminal words stay with A; B's separate call can finish in either order"
   },
   "history_resolution": {
     "request": "GET /api/presentation/history?thread_id=t&resolve_id=OLD_REPLY&resolve_id=EVICTED",
@@ -345,6 +357,34 @@
         "globally_heard": true,
         "hearing_unconfirmed": false
       }
+    }
+  ],
+  "hearing_authorization": {
+    "original_retained_history": {
+      "active_authenticated_call": true,
+      "audio_focus": "OTHER_THREAD_OR_NONE",
+      "row_thread": "SAVED_THREAD",
+      "result": "accepted",
+      "meaning": "A presented written reply can be acknowledged without changing audio focus"
+    },
+    "manual_replay_requires_reporting_session_target": true,
+    "absent_call_or_mismatched_pair": "room.stale_utterance"
+  },
+  "invalid_hearing": [
+    {
+      "frame": {
+        "type": "reply-hearing",
+        "data": {
+          "session_id": "SESSION",
+          "client_msg_id": "INVALID_ZERO",
+          "history_id": "HISTORY_ID",
+          "utterance_id": "REPLY_ID",
+          "outcome": "partial",
+          "heard_chars": 0
+        }
+      },
+      "error": "room.receipt_invalid",
+      "physical_playback_zero_remains_valid": true
     }
   ],
   "unconfirmed": {
