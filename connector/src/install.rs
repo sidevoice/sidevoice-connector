@@ -51,6 +51,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -1022,7 +1023,12 @@ async fn uninstall_with_preflight(
     safe_remove::validate_scope(&layout).map_err(failed)?;
     let guard = safe_remove::Guard::new(&layout).map_err(failed)?;
     let had_releases = preflight(&guard).map_err(failed)?;
-    let _lock = crate::service::install_lock(&layout).await?;
+    let data = guard.data_for_lock().map_err(failed)?;
+    guard.preflight().map_err(failed)?;
+    let _lock = crate::lock::wait_uninstall_lock_at(data.as_raw_fd(), Duration::from_secs(30))
+        .await
+        .map_err(failed)?
+        .ok_or_else(|| failed("another install or service command holds install.lock"))?;
     guard.preflight().map_err(failed)?;
     let service = runtime.unload(&layout).await?;
     let agents = if options.agents {
@@ -1624,5 +1630,18 @@ pub(crate) mod tests {
             "{error}"
         );
         assert_eq!(fs::read(&lock).unwrap(), b"sentinel lock contents");
+    }
+
+    #[tokio::test]
+    async fn uninstall_refuses_hard_linked_install_lock_without_touching_sentinel() {
+        let fixture = Fixture::new("hard-linked-uninstall-lock");
+        let outside = fixture.scratch.0.join("outside-sentinel");
+        fs::write(&outside, b"outside contents").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&outside, fixture.layout().install_lock()).unwrap();
+        assert!(uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
+            .await
+            .is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside contents");
     }
 }

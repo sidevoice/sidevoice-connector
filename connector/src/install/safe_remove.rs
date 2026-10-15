@@ -248,6 +248,24 @@ impl Guard {
         }
     }
 
+    pub(super) fn data_for_lock(&self) -> Result<OwnedFd, &'static str> {
+        let child = OsStr::new(".sidevoice");
+        if !exists_at(self.home.as_raw_fd(), child)? {
+            let child_name = name(child)?;
+            if unsafe { libc::mkdirat(self.home.as_raw_fd(), child_name.as_ptr(), 0o700) } != 0 {
+                return Err("cannot create uninstall data root");
+            }
+        }
+        let data = open_dir(self.home.as_raw_fd(), child)?;
+        self.check_mount(data.as_raw_fd())?;
+        self.verify_dir(Path::new(".sidevoice"), data.as_raw_fd())?;
+        let stat = stat_fd(data.as_raw_fd())?;
+        if stat.st_uid != crate::secure_fs::uid() || stat.st_mode & 0o077 != 0 {
+            return Err("unsafe uninstall data root");
+        }
+        Ok(data)
+    }
+
     fn open_relative(&self, path: &Path) -> Result<Option<OwnedFd>, &'static str> {
         let mut current = open_dir(self.home.as_raw_fd(), OsStr::new("."))?;
         for component in path.components() {

@@ -14,6 +14,7 @@ use fs2::FileExt;
 use serde_json::{json, Value};
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
+use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::Duration;
@@ -22,16 +23,18 @@ use std::time::Duration;
 #[derive(Debug)]
 pub struct Lock {
     file: File,
+    clear_record: bool,
 }
 
 impl Drop for Lock {
     fn drop(&mut self) {
         // Another process may have linked the inode after acquisition. Never clear a
         // holder record through a name that could also name an unrelated file.
-        if self
-            .file
-            .metadata()
-            .is_ok_and(|metadata| metadata.nlink() == 1)
+        if self.clear_record
+            && self
+                .file
+                .metadata()
+                .is_ok_and(|metadata| metadata.nlink() == 1)
         {
             let _ = self.file.set_len(0);
         }
@@ -46,6 +49,15 @@ fn contended(error: &std::io::Error) -> bool {
 
 /// Opens (creating it 0600) the lock file without following a link, and checks the descriptor it opened: a regular
 /// file of this user's, open to nobody else.
+fn validate_inode(file: &File, label: &str) -> Result<()> {
+    let m = file.metadata()?;
+    if !m.is_file() || m.uid() != crate::secure_fs::uid() || m.mode() & 0o077 != 0 || m.nlink() != 1
+    {
+        bail!("unsafe lock file {label}");
+    }
+    Ok(())
+}
+
 fn open(path: &Path) -> Result<File> {
     let file = OpenOptions::new()
         .read(true)
@@ -56,11 +68,27 @@ fn open(path: &Path) -> Result<File> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
         .with_context(|| format!("open lock {}", path.display()))?;
-    let m = file.metadata()?;
-    if !m.is_file() || m.uid() != crate::secure_fs::uid() || m.mode() & 0o077 != 0 || m.nlink() != 1
-    {
-        bail!("unsafe lock file {}", path.display());
+    validate_inode(&file, &path.display().to_string())?;
+    Ok(file)
+}
+
+/// Uninstall pins the checked data directory and takes its install lock without
+/// mutating the lock inode, so a link added after validation cannot be cleared
+/// through this action.
+fn open_at(parent: RawFd) -> Result<File> {
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            c"install.lock".as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open uninstall lock");
     }
+    let file = unsafe { File::from_raw_fd(fd) };
+    validate_inode(&file, "install.lock")?;
     Ok(file)
 }
 
@@ -83,7 +111,37 @@ pub fn try_lock(path: &Path, kind: &str) -> Result<Option<Lock>> {
         .set_len(0)
         .and_then(|_| file.seek(SeekFrom::Start(0)).map(|_| ()))
         .and_then(|_| file.write_all(record.to_string().as_bytes()));
-    Ok(Some(Lock { file }))
+    Ok(Some(Lock {
+        file,
+        clear_record: true,
+    }))
+}
+
+pub fn try_uninstall_lock_at(parent: RawFd) -> Result<Option<Lock>> {
+    let file = open_at(parent)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {}
+        Err(error) if contended(&error) => return Ok(None),
+        Err(error) => return Err(error).context("lock install.lock"),
+    }
+    validate_inode(&file, "install.lock")?;
+    Ok(Some(Lock {
+        file,
+        clear_record: false,
+    }))
+}
+
+pub async fn wait_uninstall_lock_at(parent: RawFd, limit: Duration) -> Result<Option<Lock>> {
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        if let Some(lock) = try_uninstall_lock_at(parent)? {
+            return Ok(Some(lock));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// The lock, waiting for it up to `limit`; `None` when another holder kept it all that time.
