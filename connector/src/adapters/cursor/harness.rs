@@ -672,8 +672,7 @@ mod tests {
         let identity =
             super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
         let conversation = conversation(&identity);
-        let frame =
-            json!({"channel":"voice","session_id":"s","revision":1,"epoch":0,"message_id":"m","text":"hola"});
+        let frame = json!({"channel":"voice","session_id":"s","revision":1,"epoch":0,"message_id":"m","text":"hola"});
         let answer = deliver_to_editor(&conversation, &frame).await;
         assert_eq!(answer["status"], "failed", "{answer}");
         // Only the fields the room takes in a delivery answer: a failure it keeps, with why in the detail.
