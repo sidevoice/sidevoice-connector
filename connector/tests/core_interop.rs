@@ -312,9 +312,27 @@ fn t16_pull_claim_ack_redelivery_and_mode_handover_use_the_real_core() {
         recovered["messages"][0]["envelope"],
         first["messages"][0]["envelope"]
     );
-    let ack = mcp.tool("get_messages", json!({"ack_ids":[id]}));
-    assert_eq!(ack["acknowledged"], 1, "{ack}");
-    assert_eq!(ack["count"], 0, "{ack}");
+    // Let core settle the acknowledgement while its MCP answer is never consumed by the caller.
+    mcp.request_without_response(
+        "tools/call",
+        json!({"name":"get_messages",
+        "arguments":{"ack_ids":[id]}}),
+    );
+    until("lost-answer acknowledgement settled", 15, || {
+        let check = mcp.tool("get_messages", json!({"operation":"check"}));
+        (check["count"] == 0).then_some(())
+    });
+    mcp.stop();
+    let mut resumed_command = profile.connector(&["mcp"]);
+    resumed_command
+        .env("SIDEVOICE_THREAD", thread)
+        .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+    let mut mcp = Mcp::start(resumed_command);
+    mcp.initialize("turns-pull-after-lost-ack");
+    mcp.tool("voice_connect", json!({"input_mode":"pull"}));
+    let duplicate = mcp.tool("get_messages", json!({"ack_ids":[id]}));
+    assert_eq!(duplicate["acknowledged"], 0, "{duplicate}");
+    assert_eq!(duplicate["count"], 0, "{duplicate}");
     let push = mcp.tool("voice_connect", json!({"input_mode":"push"}));
     assert_eq!(push["delivery"], "push", "{push}");
     let id2 = uuid::Uuid::new_v4().to_string();
@@ -695,11 +713,11 @@ fn t01_t02a_t02b_real_notices_reach_push_and_pull_with_complete_evidence() {
                     "{message}"
                 );
             }
-            if words.is_none() {
+            if let Some(words) = words {
+                assert_eq!(message["text"], words, "{message}");
+            } else {
                 assert_eq!(message["channel"], "note", "{message}");
                 assert_eq!(message["text"], "", "{message}");
-            } else {
-                assert_eq!(message["text"], words.unwrap(), "{message}");
             }
         }
     }

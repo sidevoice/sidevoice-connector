@@ -423,6 +423,14 @@ impl Mcp {
         }
     }
 
+    /// Send a request whose response the caller deliberately never consumes.
+    pub fn request_without_response(&mut self, method: &str, params: Value) {
+        self.serial += 1;
+        let frame = json!({"jsonrpc":"2.0","id":self.serial,"method":method,"params":params});
+        writeln!(self.stdin, "{frame}").unwrap();
+        self.stdin.flush().unwrap();
+    }
+
     /// `initialize` and `notifications/initialized`; returns the initialize result.
     pub fn initialize(&mut self, client: &str) -> Value {
         let result = self.request(
