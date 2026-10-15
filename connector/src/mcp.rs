@@ -716,6 +716,14 @@ impl Facade {
                     .get("text")
                     .and_then(Value::as_str)
                     .context("text required")?;
+                let event_id = args.get("event_id").and_then(Value::as_str);
+                let utterance_id = args.get("utterance_id").and_then(Value::as_str);
+                if event_id.is_some() != utterance_id.is_some()
+                    || event_id.is_some_and(str::is_empty)
+                    || utterance_id.is_some_and(str::is_empty)
+                {
+                    bail!("voice_say retry requires nonempty event_id and utterance_id together");
+                }
                 let supplied_session = args.get("session_id").and_then(Value::as_str);
                 let named_binding = if let Some(name) = named {
                     self.joined.lock().await.get(name).cloned()
@@ -769,9 +777,6 @@ impl Facade {
                         .get(&chosen)
                         .cloned()
                         .context("not connected")?;
-                    if named.is_some() && !joined.identity.editor {
-                        bail!("conversation is only for a chat of an editor window: answer with the session_id and revision of the voice message.");
-                    }
                     publish["binding_id"] = json!(joined.binding_id);
                     publish["client_ref"] = json!(chosen);
                 }
@@ -954,7 +959,7 @@ fn tools() -> Vec<Tool> {
     let spec = [
         ("voice_connect", "Connect this conversation to the voice room. Only on an explicit request to join or enable voice. Choose input_mode pull to read the ordinary queue with get_messages; otherwise input is injected. Pull learns messages only when called. The reply includes the core's initial_reply_context for speaking first.", json!({"title":{"type":"string","description":"Short label for this conversation in the room"},"room":{"type":"string","description":"The room's address (https://…) when the user names one; omitted, the room this machine is paired with"},"input_mode":{"type":"string","description":"push (injection, default) or pull (get_messages)"}}), vec![]),
         ("voice_pair", "Pair this machine with a room using the one-time code the user read from the room's interface (\"Emparejar máquina\"). Only with a code the user gave you; one room per machine, a new pairing replaces the previous one.", json!({"room":{"type":"string","description":"The room's address (https://…)"},"code":{"type":"string","description":"The one-time pairing code shown by the room"}}), vec!["room","code"]),
-        ("voice_say", "Publish a spoken reply with the session_id, revision and epoch from the message header. To speak first, pass conversation and use the initial_reply_context from voice_connect. A current open user turn is refused immediately: wait for its message. A saved reply is not proof it was heard.", json!({"text":{"type":"string"},"session_id":{"type":"string"},"revision":{"type":"integer","minimum":0},"epoch":{"type":"integer","minimum":0},"conversation":{"type":"string","description":"The conversation id voice_connect returned in this chat: to speak first"},"event_id":{"type":"string","description":"Stable publication ID for an idempotent retry"},"utterance_id":{"type":"string"},"language":{"type":"string","description":"The language of the reply, as a code: es, en, fr, it, pt or hi are the ones known now; the room decides what it speaks"}}), vec!["text"]),
+        ("voice_say", "Publish a spoken reply with the session_id, revision and epoch from the message header. To speak first, pass conversation and use the initial_reply_context from voice_connect. For an idempotent retry, reuse both event_id and utterance_id unchanged. A current open user turn is refused immediately: wait for its message. A saved reply is not proof it was heard.", json!({"text":{"type":"string"},"session_id":{"type":"string"},"revision":{"type":"integer","minimum":0},"epoch":{"type":"integer","minimum":0},"conversation":{"type":"string","description":"The conversation id voice_connect returned in this chat: to speak first"},"event_id":{"type":"string","description":"Supply with utterance_id and reuse both unchanged on retry"},"utterance_id":{"type":"string","description":"Supply with event_id and reuse both unchanged on retry"},"language":{"type":"string","description":"The language of the reply, as a code: es, en, fr, it, pt or hi are the ones known now; the room decides what it speaks"}}), vec!["text"]),
         ("get_messages", "Read this conversation's ordered ordinary input queue in pull mode. Messages include stable IDs, full notice evidence, an envelope, and a journal position. Pass ack_ids only after consuming them. Without an acknowledgement, a claimed message is returned again; after is a journal position, not an acknowledgement. Pull may learn of speech later than injection.", json!({"conversation":{"type":"string","description":"Conversation id when several chats are joined"},"operation":{"type":"string","description":"get (default) or check"},"after":{"type":"integer","minimum":0},"ack_ids":{"type":"array","items":{"type":"string"}}}), vec![]),
         ("voice_disconnect", "Leave the voice room. The conversation and its work continue in writing.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
         ("voice_pair_device", "Show a one-time code to pair a device (the desktop app or a browser) with this machine: the code, a QR of it and how long it is valid. Only when the user asks to pair a device, never on your own initiative; show the user the result as it is.", json!({}), vec![]),

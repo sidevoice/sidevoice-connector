@@ -994,11 +994,19 @@ impl Daemon {
                 if text.is_empty() || text.len() > 65536 {
                     bail!("text length invalid");
                 }
+                let event_id = params.get("event_id").and_then(Value::as_str);
+                let utterance_id = params.get("utterance_id").and_then(Value::as_str);
+                if event_id.is_some() != utterance_id.is_some()
+                    || event_id.is_some_and(str::is_empty)
+                    || utterance_id.is_some_and(str::is_empty)
+                {
+                    bail!("publish requires nonempty event_id and utterance_id together");
+                }
                 let id = binding.id.lock().await;
                 let history_only = !self.link.connected().await;
-                let speech = json!({"event_id":params.get("event_id").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                let speech = json!({"event_id":event_id.map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     "binding_id":*id,"client_ref":binding.client_ref,"session_id":session_id,"revision":revision,"epoch":epoch,
-                    "utterance_id":params.get("utterance_id").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    "utterance_id":utterance_id.map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     "text":text,"language":params.get("language"),"history_only":history_only});
                 self.queue(speech.clone()).await?;
                 drop(id);

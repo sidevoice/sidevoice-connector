@@ -416,3 +416,81 @@ fn t02c_t02d_open_turn_refusal_is_terminal_and_empty_notice_is_pullable() {
     );
     mcp.stop();
 }
+
+#[test]
+fn t04_t05_non_editor_can_speak_first_in_push_and_pull() {
+    let Some(core) = core_dir() else { return };
+    for mode in ["push", "pull"] {
+        let profile = Profile::new(&format!("speak-first-{mode}"));
+        let _core = profile.start_core(&core, &format!("speak-first-core-{mode}"));
+        let _connector = profile.start_connector();
+        profile.wait_linked(&format!("speak-first-core-{mode}"));
+        let thread = format!("speak-first-thread-{mode}");
+        let mut command = profile.connector(&["mcp"]);
+        command.env("SIDEVOICE_THREAD", &thread);
+        let mut mcp = Mcp::start(command);
+        mcp.initialize("speak-first-client");
+        let joined = mcp.tool("voice_connect", json!({"input_mode":mode}));
+        let context = &joined["initial_reply_context"];
+        assert_eq!(context["revision"], 0, "{joined}");
+        assert_eq!(context["epoch"], 0, "{joined}");
+        let said = mcp.tool(
+            "voice_say",
+            json!({"conversation":joined["conversation"],"text":format!("Hello in {mode}")}),
+        );
+        assert_eq!(said["text_saved"], true, "{mode}: {said}");
+        mcp.stop();
+    }
+}
+
+#[test]
+fn t07_retry_identifiers_are_a_pair_and_one_pair_creates_one_reply() {
+    let Some(core) = core_dir() else { return };
+    let profile = Profile::new("retry-ids");
+    let _core = profile.start_core(&core, "retry-ids-core");
+    let _connector = profile.start_connector();
+    profile.wait_linked("retry-ids-core");
+    let call = Presentation::open(&profile.core_socket());
+    let thread = "retry-ids-thread";
+    let mut command = profile.connector(&["mcp"]);
+    command.env("SIDEVOICE_THREAD", thread);
+    let mut mcp = Mcp::start(command);
+    mcp.initialize("retry-ids-client");
+    let joined = mcp.tool("voice_connect", json!({"input_mode":"pull"}));
+    let conversation = joined["conversation"].clone();
+    for single in [
+        json!({"event_id":"event-only"}),
+        json!({"utterance_id":"utterance-only"}),
+    ] {
+        let mut args = json!({"conversation":conversation,"text":"One reply"});
+        args.as_object_mut()
+            .unwrap()
+            .extend(single.as_object().unwrap().clone());
+        let refused = mcp.request("tools/call", json!({"name":"voice_say","arguments":args}));
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert!(refused["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("event_id and utterance_id together"));
+    }
+    let paired = json!({"conversation":conversation,"text":"One reply",
+        "event_id":"paired-event","utterance_id":"paired-utterance"});
+    let first = mcp.tool("voice_say", paired.clone());
+    let again = mcp.tool("voice_say", paired);
+    assert_eq!(first["text_saved"], true, "{first}");
+    assert_eq!(again["text_saved"], true, "{again}");
+    let history = core_json(
+        &profile.core_socket(),
+        "GET",
+        &format!("/api/presentation/history?thread_id={thread}"),
+        None,
+        Some(&call.token),
+    );
+    let rows = history["messages"].as_array().unwrap();
+    assert_eq!(
+        rows.iter().filter(|row| row["role"] == "assistant").count(),
+        1,
+        "{history}"
+    );
+    mcp.stop();
+}
