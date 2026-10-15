@@ -696,6 +696,7 @@ impl Guard {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn remove_data_contents(&self) -> Result<Vec<String>, &'static str> {
         self.remove_data_contents_with_hook(&|_| {})
     }

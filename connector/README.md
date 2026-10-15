@@ -133,13 +133,18 @@ output`, `timed out`, `protocol mismatch`); `checked_at` is when (ISO 8601, UTC)
 left, keep the last one found (in `agents.json`).
 
 `uninstall` unloads both jobs and stops what runs on demand (a refusal stops it there, with nothing deleted), removes
-the agents' registrations Sidevoice wrote (current or not), then `R` and everything in `D` but its lock files and the
-stop, so that a launcher on its way finds the stop and starts nothing. The room keeps this machine's pairing until it is revoked
-there.
+the agents' registrations Sidevoice wrote (current or not), then the owned data and releases. It keeps lock files and
+the stop, so that a launcher on its way finds the stop and starts nothing. The room keeps this machine's pairing until
+it is revoked there.
 
 Before unloading, uninstall checks that `D` is exactly `HOME/.sidevoice` and `R` is exactly
 `HOME/.local/share/sidevoice`. A custom data or release path must be dealt with manually; uninstall refuses it.
-It checks the trees for mount boundaries, then removes entries through directory handles without following links.
+It checks the trees for mount boundaries before taking the install lock, which uninstall holds without writing to it.
+It rejects multiply linked lock files. Before traversal, each owned subtree is atomically moved into a private
+`D/.uninstall-claim` directory on the same filesystem, then revalidated and removed through directory handles
+without following links. It first copies a recovery CLI to `D/.uninstall-recovery/sidevoice-connector` and atomically
+points `D/install.json` at it; both stay available while data or release cleanup can fail. A retry resumes any claimed
+entries. Once owned data and releases are gone, uninstall removes the recovery copy and record.
 A failed check or a path changed during removal makes `uninstall --json` return its normal `ok: false` error and a
 nonzero exit. Symlinks inside an owned tree are removed as links; their targets are left alone. Running uninstall
 again after a successful removal is safe.

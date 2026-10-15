@@ -56,3 +56,15 @@ fn absent_installation_can_be_uninstalled_twice() {
     }
     fs::remove_dir_all(home).unwrap();
 }
+
+#[test]
+fn installed_cli_advertises_safe_uninstall_capability() {
+    let output = Command::new(env!("CARGO_BIN_EXE_sidevoice-connector"))
+        .args(["--version", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let answer: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(answer["ok"], true);
+    assert_eq!(answer["safe_uninstall"], 1);
+}
