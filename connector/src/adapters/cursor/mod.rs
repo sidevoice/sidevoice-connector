@@ -1167,7 +1167,7 @@ async fn query_bridge_chat(
                 }
             }
         }
-        if diagnostics {
+        if diagnostics && rows.len() != 1 {
             log_bridge(
                 "lookup",
                 if rows.is_empty() {
