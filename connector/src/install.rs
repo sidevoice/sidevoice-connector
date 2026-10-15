@@ -1031,7 +1031,6 @@ async fn uninstall_with_preflight(
         json!({})
     };
     let paired = crate::pairing::previous_room(profile);
-    guard.remove_releases().map_err(failed)?;
     let _agents_lock = crate::lock::wait_lock(
         &layout.data.join("agents.lock"),
         "uninstall",
@@ -1039,7 +1038,11 @@ async fn uninstall_with_preflight(
     )
     .await?
     .ok_or_else(|| failed("another agents request holds agents.lock"))?;
+    guard.stage_recovery(&layout).map_err(failed)?;
     let removed = guard.remove_data_contents().map_err(failed)?;
+    guard.remove_releases().map_err(failed)?;
+    guard.finish_claim().map_err(failed)?;
+    guard.finish_recovery().map_err(failed)?;
     let mut advice = Vec::new();
     if let Some(room) = &paired {
         advice.push(format!(

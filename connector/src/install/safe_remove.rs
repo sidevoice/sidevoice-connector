@@ -1,12 +1,26 @@
 //! Uninstall only the installer's two owned roots, using no-follow directory handles.
 
 use crate::service::layout::Layout;
+use serde_json::{json, Value};
 use std::ffi::{CStr, CString, OsStr, OsString};
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+
+const CLAIM: &str = ".uninstall-claim";
+const CLAIM_REL: &str = ".sidevoice/.uninstall-claim";
+const RECOVERY: &str = ".uninstall-recovery";
+const DATA_KEPT: &[&str] = &[
+    "install.lock",
+    "connector.lock",
+    "agents.lock",
+    "node-stopped.json",
+    "install.json",
+    CLAIM,
+    RECOVERY,
+];
 
 fn clean_absolute(path: &Path) -> bool {
     path.is_absolute()
@@ -266,6 +280,179 @@ impl Guard {
         self.check_mount(held)
     }
 
+    fn private_child(&self, parent: RawFd, child: &str) -> Result<OwnedFd, &'static str> {
+        let child_name = name(OsStr::new(child))?;
+        if unsafe { libc::mkdirat(parent, child_name.as_ptr(), 0o700) } != 0
+            && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
+        {
+            return Err("cannot create uninstall claim directory");
+        }
+        let child = open_dir(parent, OsStr::new(child))?;
+        self.check_mount(child.as_raw_fd())?;
+        let stat = stat_fd(child.as_raw_fd())?;
+        if stat.st_uid != crate::secure_fs::uid() || stat.st_mode & 0o777 != 0o700 {
+            return Err("unsafe uninstall claim directory");
+        }
+        Ok(child)
+    }
+
+    fn claim_area(&self) -> Result<Option<(OwnedFd, OwnedFd)>, &'static str> {
+        let Some(data) = self.open_relative(Path::new(".sidevoice"))? else {
+            return Ok(None);
+        };
+        self.verify_dir(Path::new(".sidevoice"), data.as_raw_fd())?;
+        let claim = self.private_child(data.as_raw_fd(), CLAIM)?;
+        self.verify_dir(Path::new(CLAIM_REL), claim.as_raw_fd())?;
+        Ok(Some((data, claim)))
+    }
+
+    /// Pin a copy of this running CLI inside D and atomically point install.json
+    /// at it before any installed release or personal data is removed. A retry
+    /// through the desktop's installed-CLI lookup can then resume the claim.
+    pub(super) fn stage_recovery(&self, layout: &Layout) -> Result<(), &'static str> {
+        let data = self
+            .open_relative(Path::new(".sidevoice"))?
+            .ok_or("uninstall data root disappeared")?;
+        self.verify_dir(Path::new(".sidevoice"), data.as_raw_fd())?;
+        let recovery = self.private_child(data.as_raw_fd(), RECOVERY)?;
+        let executable = OsStr::new("sidevoice-connector");
+        let executable_name = name(executable)?;
+        if exists_at(recovery.as_raw_fd(), executable)? {
+            let fd = unsafe {
+                libc::openat(
+                    recovery.as_raw_fd(),
+                    executable_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err("unsafe uninstall recovery executable");
+            }
+            let file = unsafe { File::from_raw_fd(fd) };
+            let stat = stat_fd(file.as_raw_fd())?;
+            if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+                || stat.st_uid != crate::secure_fs::uid()
+                || stat.st_nlink != 1
+                || stat.st_mode & 0o022 != 0
+                || stat.st_mode & 0o100 == 0
+            {
+                return Err("unsafe uninstall recovery executable");
+            }
+            self.check_mount(file.as_raw_fd())?;
+        } else {
+            let source = std::env::current_exe().map_err(|_| "cannot find recovery executable")?;
+            let mut source = File::open(source).map_err(|_| "cannot read recovery executable")?;
+            let fd = unsafe {
+                libc::openat(
+                    recovery.as_raw_fd(),
+                    executable_name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o700,
+                )
+            };
+            if fd < 0 {
+                return Err("cannot create recovery executable");
+            }
+            let mut target = unsafe { File::from_raw_fd(fd) };
+            io::copy(&mut source, &mut target).map_err(|_| "cannot copy recovery executable")?;
+            target
+                .flush()
+                .map_err(|_| "cannot finish recovery executable")?;
+            target
+                .sync_all()
+                .map_err(|_| "cannot sync recovery executable")?;
+        }
+        self.verify_dir(Path::new(".sidevoice"), data.as_raw_fd())?;
+        self.verify_dir(
+            Path::new(".sidevoice/.uninstall-recovery"),
+            recovery.as_raw_fd(),
+        )?;
+        let mut record = if exists_at(data.as_raw_fd(), OsStr::new("install.json"))? {
+            layout
+                .install_record()
+                .ok_or("unsafe uninstall install record")?
+        } else {
+            json!({})
+        };
+        let path = layout.data.join(RECOVERY).join("sidevoice-connector");
+        record["command"] = json!([path]);
+        record["releases"] = json!(layout.releases);
+        self.write_install_record(data.as_raw_fd(), &record)
+    }
+
+    fn write_install_record(&self, data: RawFd, record: &Value) -> Result<(), &'static str> {
+        let temporary = format!(".uninstall-record-{}", uuid::Uuid::new_v4().simple());
+        let temporary = name(OsStr::new(&temporary))?;
+        let fd = unsafe {
+            libc::openat(
+                data,
+                temporary.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err("cannot create uninstall record");
+        }
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let bytes = serde_json::to_vec(record).map_err(|_| "cannot encode uninstall record")?;
+        file.write_all(&bytes)
+            .map_err(|_| "cannot write uninstall record")?;
+        file.sync_all()
+            .map_err(|_| "cannot sync uninstall record")?;
+        self.verify_dir(Path::new(".sidevoice"), data)?;
+        if unsafe { libc::renameat(data, temporary.as_ptr(), data, c"install.json".as_ptr()) } != 0
+        {
+            return Err("cannot save uninstall record");
+        }
+        Ok(())
+    }
+
+    fn claim_entry(
+        &self,
+        source: RawFd,
+        source_path: &Path,
+        source_name: &OsStr,
+        claim: RawFd,
+        claimed_name: &str,
+        before_rename: &impl Fn(),
+    ) -> Result<(), &'static str> {
+        self.verify_dir(source_path, source)?;
+        self.verify_dir(Path::new(CLAIM_REL), claim)?;
+        let source_name = name(source_name)?;
+        let dest_name = name(OsStr::new(claimed_name))?;
+        if exists_at(claim, OsStr::new(claimed_name))? {
+            return Err("uninstall claim name already exists");
+        }
+        let before = stat_at(source, &source_name)?;
+        if before.st_dev != self.expected.device {
+            return Err("uninstall device boundary");
+        }
+        if before.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            let child = open_dir(source, OsStr::from_bytes(source_name.to_bytes()))?;
+            self.check_mount(child.as_raw_fd())?;
+            if !same(&before, &stat_fd(child.as_raw_fd())?) {
+                return Err("uninstall entry replaced");
+            }
+        }
+        // The rename is the ownership claim. A replacement at the old name is
+        // moved as a link/inode, never followed. Validate that it was the same
+        // inode before traversing anything in the private claim directory.
+        before_rename();
+        if unsafe { libc::renameat(source, source_name.as_ptr(), claim, dest_name.as_ptr()) } != 0 {
+            return Err("cannot claim uninstall entry");
+        }
+        self.verify_dir(Path::new(CLAIM_REL), claim)?;
+        if !same(&before, &stat_at(claim, &dest_name)?) {
+            return Err("uninstall entry replaced during claim");
+        }
+        Ok(())
+    }
+
     fn walk(
         &self,
         fd: RawFd,
@@ -418,7 +605,14 @@ impl Guard {
             &probe,
         )?;
         self.tree(Path::new(".sidevoice"), false, super::KEPT, false, &probe)?;
-        Ok(releases)
+        let claimed_releases = if let Some(claim) = self.open_relative(Path::new(CLAIM_REL))? {
+            entries(claim.as_raw_fd())?
+                .iter()
+                .any(|name| name.as_bytes().starts_with(b"release-"))
+        } else {
+            false
+        };
+        Ok(releases || claimed_releases)
     }
 
     #[cfg(test)]
@@ -435,29 +629,180 @@ impl Guard {
     }
 
     pub(super) fn remove_releases(&self) -> Result<(), &'static str> {
-        self.tree(
-            Path::new(".local/share/sidevoice"),
-            true,
-            &[],
-            true,
-            &|fd, _| mount(fd),
-        )?;
+        let Some((_, claim)) = self.claim_area()? else {
+            return Err("uninstall data root disappeared");
+        };
+        let release_parent = Path::new(".local/share");
+        if let Some(parent) = self.open_relative(release_parent)? {
+            if exists_at(parent.as_raw_fd(), OsStr::new("sidevoice"))? {
+                let claimed_name = format!("release-{}", uuid::Uuid::new_v4().simple());
+                self.claim_entry(
+                    parent.as_raw_fd(),
+                    release_parent,
+                    OsStr::new("sidevoice"),
+                    claim.as_raw_fd(),
+                    &claimed_name,
+                    &|| {},
+                )?;
+            }
+        }
+        for entry in entries(claim.as_raw_fd())? {
+            if !entry.as_bytes().starts_with(b"release-") {
+                continue;
+            }
+            self.verify_dir(Path::new(CLAIM_REL), claim.as_raw_fd())?;
+            let entry_name = name(&entry)?;
+            let before = stat_at(claim.as_raw_fd(), &entry_name)?;
+            if before.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                self.tree(
+                    &Path::new(CLAIM_REL).join(&entry),
+                    true,
+                    &[],
+                    true,
+                    &|fd, _| mount(fd),
+                )?;
+            } else {
+                // A raced replacement may have been claimed as a link. Its
+                // external target is untouched; retry can discard the link.
+                if before.st_dev != self.expected.device {
+                    return Err("uninstall device boundary");
+                }
+                if !same(&before, &stat_at(claim.as_raw_fd(), &entry_name)?) {
+                    return Err("uninstall entry replaced");
+                }
+                if unsafe { libc::unlinkat(claim.as_raw_fd(), entry_name.as_ptr(), 0) } != 0 {
+                    return Err("cannot remove claimed release link");
+                }
+            }
+        }
         Ok(())
     }
 
     pub(super) fn remove_data_contents(&self) -> Result<Vec<String>, &'static str> {
-        let relative = Path::new(".sidevoice");
-        let Some(root) = self.open_relative(relative)? else {
+        self.remove_data_contents_with_hook(&|| {})
+    }
+
+    fn remove_data_contents_with_hook(
+        &self,
+        before_rename: &impl Fn(),
+    ) -> Result<Vec<String>, &'static str> {
+        let Some((root, claim)) = self.claim_area()? else {
             return Ok(Vec::new());
         };
+        let mut removed = Vec::new();
+        for entry in entries(root.as_raw_fd())? {
+            if DATA_KEPT.iter().any(|kept| OsStr::new(kept) == entry) {
+                continue;
+            }
+            let claimed_name = format!("data-{}", uuid::Uuid::new_v4().simple());
+            self.claim_entry(
+                root.as_raw_fd(),
+                Path::new(".sidevoice"),
+                &entry,
+                claim.as_raw_fd(),
+                &claimed_name,
+                before_rename,
+            )?;
+            removed.push(entry.to_string_lossy().into_owned());
+        }
+        let release_names: Vec<String> = entries(claim.as_raw_fd())?
+            .into_iter()
+            .filter(|name| name.as_bytes().starts_with(b"release-"))
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        let kept: Vec<&str> = release_names.iter().map(String::as_str).collect();
         self.walk(
-            root.as_raw_fd(),
-            relative,
+            claim.as_raw_fd(),
+            Path::new(CLAIM_REL),
             true,
-            super::KEPT,
+            &kept,
             0,
             &|fd, _| mount(fd),
-        )
+        )?;
+        Ok(removed)
+    }
+
+    pub(super) fn finish_claim(&self) -> Result<(), &'static str> {
+        let Some(data) = self.open_relative(Path::new(".sidevoice"))? else {
+            return Ok(());
+        };
+        if !exists_at(data.as_raw_fd(), OsStr::new(CLAIM))? {
+            return Ok(());
+        }
+        let claim = open_dir(data.as_raw_fd(), OsStr::new(CLAIM))?;
+        self.verify_dir(Path::new(CLAIM_REL), claim.as_raw_fd())?;
+        if !entries(claim.as_raw_fd())?.is_empty() {
+            return Err("uninstall claim still contains data");
+        }
+        self.verify_dir(Path::new(".sidevoice"), data.as_raw_fd())?;
+        if unsafe {
+            libc::unlinkat(
+                data.as_raw_fd(),
+                name(OsStr::new(CLAIM))?.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        } != 0
+        {
+            return Err("cannot finish uninstall claim");
+        }
+        Ok(())
+    }
+
+    /// Final metadata tail. The executable and record remain usable through
+    /// every failure in substantive data/release cleanup; only this final,
+    /// already empty state can retire them.
+    pub(super) fn finish_recovery(&self) -> Result<(), &'static str> {
+        if self
+            .open_relative(Path::new(".local/share/sidevoice"))?
+            .is_some()
+        {
+            return Err("uninstall releases remain");
+        }
+        let Some(data) = self.open_relative(Path::new(".sidevoice"))? else {
+            return Ok(());
+        };
+        for entry in entries(data.as_raw_fd())? {
+            if !DATA_KEPT.iter().any(|kept| OsStr::new(kept) == entry) {
+                return Err("uninstall data remains");
+            }
+        }
+        if exists_at(data.as_raw_fd(), OsStr::new(CLAIM))? {
+            return Err("uninstall claim remains");
+        }
+        if exists_at(data.as_raw_fd(), OsStr::new(RECOVERY))? {
+            let recovery_path = Path::new(".sidevoice/.uninstall-recovery");
+            let recovery = self
+                .open_relative(recovery_path)?
+                .ok_or("uninstall recovery disappeared")?;
+            let names = entries(recovery.as_raw_fd())?;
+            if names.len() != 1 || names[0] != OsStr::new("sidevoice-connector") {
+                return Err("uninstall recovery directory changed");
+            }
+            self.verify_dir(recovery_path, recovery.as_raw_fd())?;
+            if unsafe { libc::unlinkat(recovery.as_raw_fd(), c"sidevoice-connector".as_ptr(), 0) }
+                != 0
+            {
+                return Err("cannot remove recovery executable");
+            }
+            self.verify_dir(Path::new(".sidevoice"), data.as_raw_fd())?;
+            if unsafe {
+                libc::unlinkat(
+                    data.as_raw_fd(),
+                    c".uninstall-recovery".as_ptr(),
+                    libc::AT_REMOVEDIR,
+                )
+            } != 0
+            {
+                return Err("cannot remove recovery directory");
+            }
+        }
+        if exists_at(data.as_raw_fd(), OsStr::new("install.json"))? {
+            self.verify_dir(Path::new(".sidevoice"), data.as_raw_fd())?;
+            if unsafe { libc::unlinkat(data.as_raw_fd(), c"install.json".as_ptr(), 0) } != 0 {
+                return Err("cannot remove uninstall record");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -581,6 +926,29 @@ mod tests {
             .is_err());
         assert_eq!(fs::read_to_string(outside.join("keep")).unwrap(), "outside");
         assert_eq!(fs::read_to_string(moved.join("inside")).unwrap(), "inside");
+    }
+
+    #[test]
+    fn moved_directory_at_final_claim_boundary_keeps_its_sentinel() {
+        let scratch = crate::secure_fs::tests::Scratch::new("uninstall-claim-race");
+        let layout = layout(&scratch.0.join("home"));
+        let victim = layout.data.join("victim");
+        let moved = scratch.0.join("moved-outside");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("keep"), "outside sentinel").unwrap();
+        let guard = Guard::new(&layout).unwrap();
+        let swapped = AtomicBool::new(false);
+        let hook = || {
+            if !swapped.swap(true, Ordering::SeqCst) {
+                fs::rename(&victim, &moved).unwrap();
+                symlink(&moved, &victim).unwrap();
+            }
+        };
+        assert!(guard.remove_data_contents_with_hook(&hook).is_err());
+        assert_eq!(
+            fs::read_to_string(moved.join("keep")).unwrap(),
+            "outside sentinel"
+        );
     }
 
     #[test]
