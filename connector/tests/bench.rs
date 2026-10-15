@@ -65,7 +65,11 @@ fn what_is_typed_on_the_bench_reaches_a_conversation_and_its_reply_shows() {
     let bin = profile.root.join("person-bin");
     private_dir(&bin);
     let codex = bin.join("codex");
-    std::fs::write(&codex, b"#!/bin/sh\necho 'No such server: sidevoice' >&2\nexit 1\n").unwrap();
+    std::fs::write(
+        &codex,
+        b"#!/bin/sh\necho 'No such server: sidevoice' >&2\nexit 1\n",
+    )
+    .unwrap();
     std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
     let login_path = format!("{}:/usr/bin:/bin", bin.display());
     let shell = profile.root.join("person-login-shell");
