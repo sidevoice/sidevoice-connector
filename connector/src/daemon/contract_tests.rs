@@ -383,6 +383,62 @@ async fn paired_retry_ids_share_one_pending_publication_and_reject_conflicting_r
     assert_eq!(daemon.outbox.lock().await.len(), 1);
 }
 
+#[tokio::test]
+async fn lost_saved_or_refused_admission_ack_never_rewrites_or_replays_a_live_publication() {
+    for outcome in ["saved", "refused"] {
+        let scratch = Scratch::new(&format!("lost-admission-{outcome}"));
+        let link = Link::new();
+        let mut frames = link.attached().await;
+        let (published_tx, mut published_rx) = tokio::sync::mpsc::unbounded_channel();
+        let answering_link = link.clone();
+        tokio::spawn(async move {
+            while let Some(Message::Text(text)) = frames.recv().await {
+                let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+                if frame["method"] == "binding.register" {
+                    answering_link.answer(json!({"jsonrpc":"2.0","id":frame["id"],
+                        "result":{"binding_id":"core-a","initial_reply_context":{"session_id":"s","revision":1,"epoch":0}}})).await.unwrap();
+                } else if frame["method"] == "speech.publish" {
+                    // The fake core stores its outcome but loses the response on the wire.
+                    published_tx.send(frame["params"].clone()).unwrap();
+                }
+            }
+        });
+        let (daemon, _) = daemon(&scratch, link);
+        daemon
+            .command(1, "register", registration("a"))
+            .await
+            .unwrap();
+        let answer = daemon
+            .command(
+                1,
+                "publish",
+                json!({"client_ref":"a","session_id":"s",
+            "revision":1,"epoch":0,"text":format!("{outcome} reply"),
+            "event_id":format!("{outcome}-event"),"utterance_id":format!("{outcome}-utterance")}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer["status"], "admission_unknown", "{answer}");
+        let sent = published_rx.try_recv().unwrap();
+        assert_eq!(sent["history_only"], false, "{sent}");
+        assert!(
+            sent.get("attempted").is_none(),
+            "local state leaked to core: {sent}"
+        );
+        daemon.retire_held_audio().await.unwrap();
+        daemon.flush_outbox().await;
+        assert!(
+            published_rx.try_recv().is_err(),
+            "uncertain admission replayed as audio"
+        );
+        let retained = daemon.outbox.lock().await.clone();
+        assert_eq!(retained.len(), 1, "{retained:?}");
+        assert_eq!(retained[0]["history_only"], false);
+        assert_eq!(retained[0]["attempted"], true);
+        assert_eq!(retained[0]["event_id"], sent["event_id"]);
+    }
+}
+
 /// The façade↔daemon IPC: every command a newer `sidevoice mcp` sends, with fields this daemon does not know at the
 /// top and nested, is answered for what it knows. A command it has never heard of gets a defined refusal.
 #[tokio::test]
