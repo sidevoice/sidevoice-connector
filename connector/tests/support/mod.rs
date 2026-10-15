@@ -656,6 +656,15 @@ impl Presentation {
         }})).unwrap();
     }
 
+    pub fn report_speech(&self, on: bool, reason: Option<&str>) {
+        self.send
+            .send(json!({"type":"voice-speech","data":{
+                "session_id":self.session,"client_msg_id":uuid::Uuid::new_v4().to_string(),
+                "on":on,"reason":reason
+            }}))
+            .unwrap();
+    }
+
     pub fn next_frame(&self, kind: &str, seconds: u64) -> Value {
         let deadline = Instant::now() + Duration::from_secs(seconds);
         loop {

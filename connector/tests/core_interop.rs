@@ -618,9 +618,19 @@ fn actual_notice(
     assert_eq!(message["notice"]["kind"], kind, "{message}");
     let envelope = message["envelope"].as_str().unwrap();
     assert!(
+        envelope.contains(&message["notice"].to_string()),
+        "{message}"
+    );
+    assert!(
         envelope.contains(message["notice"]["instruction"].as_str().unwrap()),
         "{message}"
     );
+    if !message["unheard"].is_null() {
+        assert!(
+            envelope.contains(&message["unheard"].to_string()),
+            "{message}"
+        );
+    }
     if let Some(replies) = message["unheard"]["replies"].as_array() {
         for reply in replies {
             assert!(
@@ -728,5 +738,203 @@ fn t12_real_skip_notice_keeps_choice_outside_unheard_in_push_and_pull() {
             .as_str()
             .unwrap()
             .contains("Do not repeat"));
+    }
+}
+
+#[test]
+fn t03_stale_reply_is_text_only_with_ordinary_notice_in_push_and_pull() {
+    let Some(core) = core_dir() else { return };
+    for mode in ["push", "pull"] {
+        let note = actual_notice(
+            &core,
+            mode,
+            "stale",
+            "reply_not_played",
+            |profile, call, mcp, joined| {
+                call.report_turn("started", "new-turn", None);
+                call.turn_started("new-turn");
+                call.report_turn("finished", "new-turn", Some("New question"));
+                let thread = joined["conversation"].as_str().unwrap();
+                until("new words are in core history", 15, || {
+                    let history = core_json(
+                        &profile.core_socket(),
+                        "GET",
+                        &format!("/api/presentation/history?thread_id={thread}"),
+                        None,
+                        Some(&call.token),
+                    );
+                    history["messages"]
+                        .as_array()
+                        .is_some_and(|rows| rows.iter().any(|row| row["text"] == "New question"))
+                        .then_some(())
+                });
+                let initial = &joined["initial_reply_context"];
+                let said = mcp.tool("voice_say", json!({"text":"Late old answer",
+                "session_id":initial["session_id"],"revision":initial["revision"],
+                "epoch":initial["epoch"],"event_id":"stale-event","utterance_id":"stale-utterance"}));
+                assert_eq!(said["audio"], "text_only", "{said}");
+                assert_eq!(said["reason"], "newer_turn", "{said}");
+            },
+        );
+        assert_eq!(note["channel"], "note", "{note}");
+        assert_eq!(
+            note["unheard"]["replies"][0]["text"], "Late old answer",
+            "{note}"
+        );
+    }
+}
+
+#[test]
+fn t05_checkpoint_interruption_keeps_only_unheard_stage_in_both_modes() {
+    let Some(core) = core_dir() else { return };
+    for mode in ["push", "pull"] {
+        let message = actual_notice(
+            &core,
+            mode,
+            "checkpoint",
+            "reply_interrupted",
+            |_, call, mcp, joined| {
+                for (event, stage) in [
+                    ("ack-event", "ack"),
+                    ("checkpoint-event", "checkpoint"),
+                    ("result-event", "result"),
+                ] {
+                    let said = mcp.tool(
+                        "voice_say",
+                        json!({"conversation":joined["conversation"],
+                    "text":stage,"event_id":event,"utterance_id":stage}),
+                    );
+                    assert_eq!(said["text_saved"], true, "{said}");
+                }
+                call.report_playback("ack", "heard", None, None);
+                call.report_playback("checkpoint", "playing", None, None);
+                call.report_playback(
+                    "checkpoint",
+                    "interrupted",
+                    Some("user_interrupted"),
+                    Some(4),
+                );
+                call.report_turn("started", "next-turn", None);
+                call.turn_started("next-turn");
+                call.report_turn("finished", "next-turn", Some("Stop there"));
+            },
+        );
+        assert_eq!(
+            message["unheard"]["replies"][0]["utterance_id"], "checkpoint",
+            "{message}"
+        );
+        assert_eq!(
+            message["unheard"]["replies"][0]["heard_chars"], 4,
+            "{message}"
+        );
+        assert_eq!(message["text"], "Stop there", "{message}");
+    }
+}
+
+#[test]
+fn t06d_real_return_notice_is_delivered_once_in_push_and_pull() {
+    let Some(core) = core_dir() else { return };
+    for mode in ["push", "pull"] {
+        let notice = actual_notice(
+            &core,
+            mode,
+            "return",
+            "user_returned",
+            |_, call, mcp, joined| {
+                call.report_speech(false, Some("voice_off"));
+                let said = mcp.tool("voice_say", json!({"conversation":joined["conversation"],
+                "text":"Missed update","event_id":"return-event","utterance_id":"return-utterance"}));
+                assert_eq!(said["text_saved"], true, "{said}");
+                call.report_speech(true, None);
+            },
+        );
+        assert_eq!(notice["channel"], "note", "{notice}");
+        assert_eq!(
+            notice["unheard"]["replies"][0]["text"], "Missed update",
+            "{notice}"
+        );
+    }
+}
+
+#[test]
+fn t02c_t02d_refusal_reaches_the_caller_and_words_or_empty_input_in_both_modes() {
+    let Some(core) = core_dir() else { return };
+    for mode in ["push", "pull"] {
+        for (suffix, words) in [("words", Some("Person's words")), ("empty", None)] {
+            let label = format!("refusal-{mode}-{suffix}");
+            let profile = Profile::new(&label);
+            let _core = profile.start_core(&core, &label);
+            let _connector = profile.start_connector();
+            profile.wait_linked(&label);
+            let call = Presentation::open(&profile.core_socket());
+            let receiver = http_receiver();
+            let thread = format!("thread-{label}");
+            let mut command = profile.connector(&["mcp"]);
+            command
+                .env("SIDEVOICE_THREAD", &thread)
+                .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+            let mut mcp = Mcp::start(command);
+            mcp.initialize("refusal-client");
+            mcp.tool("voice_connect", json!({"input_mode":mode}));
+            core_json(
+                &profile.core_socket(),
+                "POST",
+                "/api/presentation/select",
+                Some(&json!({"session_id":call.session,"thread_id":thread})),
+                Some(&call.token),
+            );
+            call.report_turn("started", "open", None);
+            let started = call.turn_started("open");
+            let refused = mcp.tool(
+                "voice_say",
+                json!({"text":"During open turn",
+                "session_id":call.session,"revision":started["revision"],"epoch":started["epoch"],
+                "event_id":"refused-event","utterance_id":"refused-utterance"}),
+            );
+            assert_eq!(refused["status"], "rejected", "{refused}");
+            assert_eq!(refused["reason"], "user_speaking", "{refused}");
+            assert!(refused["instruction"].as_str().unwrap().contains("Wait"));
+            call.report_turn("finished", "open", words);
+            let message = if mode == "push" {
+                receiver
+                    .bodies
+                    .recv_timeout(Duration::from_secs(15))
+                    .unwrap()
+            } else {
+                until("refusal outcome pulled", 15, || {
+                    let page = mcp.tool("get_messages", json!({}));
+                    page["messages"]
+                        .as_array()
+                        .and_then(|items| items.first().cloned())
+                })
+            };
+            if let Some(words) = words {
+                assert_eq!(message["text"], words, "{message}");
+                assert_eq!(message["channel"], "voice", "{message}");
+            } else {
+                assert_eq!(message["text"], "", "{message}");
+                assert_eq!(message["notice"]["kind"], "turn_empty", "{message}");
+                assert!(message["envelope"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Resend what you meant"));
+            }
+            let history = core_json(
+                &profile.core_socket(),
+                "GET",
+                &format!("/api/presentation/history?thread_id={thread}"),
+                None,
+                Some(&call.token),
+            );
+            assert!(
+                history["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row["role"] != "assistant"),
+                "{history}"
+            );
+            mcp.stop();
+        }
     }
 }
