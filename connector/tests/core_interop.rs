@@ -961,6 +961,82 @@ fn t03_stale_reply_is_text_only_with_ordinary_notice_in_push_and_pull() {
 }
 
 #[test]
+fn text_only_written_hearing_is_confirmed_without_an_audio_target_in_both_modes() {
+    let Some(core) = core_dir() else { return };
+    for mode in ["push", "pull"] {
+        let label = format!("written-hearing-{mode}");
+        let profile = Profile::new(&label);
+        let _core = profile.start_core(&core, &label);
+        let _connector = profile.start_connector();
+        profile.wait_linked(&label);
+        let call = Presentation::open(&profile.core_socket());
+        let receiver = http_receiver();
+        let thread = format!("thread-{label}");
+        let mut command = profile.connector(&["mcp"]);
+        command
+            .env("SIDEVOICE_THREAD", &thread)
+            .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+        let mut mcp = Mcp::start(command);
+        mcp.initialize("written-hearing-client");
+        let joined = mcp.tool("voice_connect", json!({"input_mode":mode}));
+        core_json(
+            &profile.core_socket(),
+            "POST",
+            "/api/presentation/select",
+            Some(&json!({"session_id":call.session,"thread_id":thread})),
+            Some(&call.token),
+        );
+        call.report_speech(false, Some("voice_off"));
+        let said = mcp.tool(
+            "voice_say",
+            json!({"conversation":joined["conversation"],
+            "text":"Read in text","event_id":"written-event","utterance_id":"written-utterance"}),
+        );
+        assert_eq!(said["audio"], "text_only", "{said}");
+        assert!(said.get("reason").is_none(), "{said}");
+        confirm_hearing(&profile, &call, &thread, "written-utterance", "heard", None);
+        let history_id = assistant_history_id(&profile, &call, &thread, "written-utterance");
+        let history = core_json(
+            &profile.core_socket(),
+            "GET",
+            &format!("/api/presentation/history?thread_id={thread}"),
+            None,
+            Some(&call.token),
+        );
+        let row = history["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == history_id)
+            .unwrap();
+        assert_eq!(row["hearing"], "heard", "{row}");
+        assert_eq!(row["hearing_unconfirmed"], false, "{row}");
+        call.report_speech(true, None);
+        call.report_turn("started", "after-reading", None);
+        call.turn_started("after-reading");
+        call.report_turn("finished", "after-reading", Some("Next topic"));
+        let message = if mode == "push" {
+            receiver
+                .bodies
+                .recv_timeout(Duration::from_secs(15))
+                .unwrap()
+        } else {
+            until("written receipt next words pulled", 15, || {
+                let page = mcp.tool("get_messages", json!({}));
+                page["messages"]
+                    .as_array()?
+                    .iter()
+                    .find(|message| message["text"] == "Next topic")
+                    .cloned()
+            })
+        };
+        assert_eq!(message["text"], "Next topic", "{message}");
+        assert!(message["unheard"].is_null(), "{message}");
+        mcp.stop();
+    }
+}
+
+#[test]
 fn t05_checkpoint_interruption_keeps_only_unheard_stage_in_both_modes() {
     let Some(core) = core_dir() else { return };
     for mode in ["push", "pull"] {
@@ -1605,6 +1681,11 @@ fn t16_failed_injection_and_pull_expose_identical_real_notice_fields() {
         }
     }
     assert_eq!(pulled["unheard"]["replies"][0]["text"], "Full parity reply");
+    assert_eq!(pulled["unheard"]["replies"][0]["fate"], "partial");
+    assert_eq!(pulled["unheard"]["replies"][0]["heard_chars"], 4);
+    assert!(pulled["unheard"]["replies"][0].get("reason").is_none());
+    assert!(pulled["unheard"]["replies"][0].get("cut").is_none());
+    assert!(pulled["notice"].get("skipped").is_none());
     mcp.stop();
     let mut command = profile.connector(&["mcp"]);
     command
