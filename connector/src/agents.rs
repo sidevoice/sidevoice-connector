@@ -1051,12 +1051,11 @@ fn normalized_state(mut value: Value) -> Value {
     value
 }
 
-/// How an agent's CLI is run outside its registration (an adapter's delivery through it): the executable the scan found
-/// (from the captured login PATH), else its bare name; and the PATH of the person's login shell the scan
-/// captured, so a launcher that is a script (Node's) finds its interpreter where a service manager's PATH does not
-/// reach.
+/// How an adapter runs a CLI outside registration: only the executable found on the captured
+/// login PATH, and that PATH so a script launcher finds its interpreter. A missing program stays
+/// missing; the service manager's unrelated PATH is never used as a fallback.
 pub struct AgentCommand {
-    pub program: String,
+    pub program: Option<String>,
     pub path: Option<String>,
 }
 
@@ -1071,8 +1070,7 @@ pub fn agent_command(profile: &Profile, agent: &str) -> AgentCommand {
     let registry = Registry::standard();
     let program = id
         .and_then(|id| registry.agent(id).map(|(_, registration)| registration))
-        .and_then(|registration| find_in_path(registration.binary_names(), path.as_deref()))
-        .unwrap_or_else(|| agent.to_owned());
+        .and_then(|registration| find_in_path(registration.binary_names(), path.as_deref()));
     AgentCommand { program, path }
 }
 

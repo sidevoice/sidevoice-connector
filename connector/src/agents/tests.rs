@@ -1235,6 +1235,29 @@ async fn the_installed_command_is_registered_and_owns_every_release_of_it() {
 // Delivery runs the Codex the scan found, with the login shell's PATH, not whatever `codex` the daemon's own PATH (a
 // service manager's) reaches; a launcher that is a script finds its interpreter there.
 #[tokio::test]
+async fn codex_delivery_does_not_use_a_cached_binary_without_login_path() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let codex = fake_codex(&fixture);
+    let mut state = empty_state();
+    state["binaries"]["codex"] = json!(codex);
+    write_json(&fixture.profile.data.join("agents.json"), &state);
+    assert!(agent_command(&fixture.profile, "codex").program.is_none());
+    let result = crate::adapters::codex::deliver(
+        &json!({"kind":"codex-queue","thread":"t-1"}),
+        &json!({"channel":"voice","session_id":"s","revision":1,"message_id":"m","text":"hello"}),
+        &fixture.profile,
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(!fixture
+        .profile
+        .agent_home("CODEX_HOME")
+        .join("calls")
+        .exists());
+}
+
+#[tokio::test]
 async fn codex_delivery_runs_the_scanned_codex_with_the_login_path() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();

@@ -125,6 +125,8 @@ count as installed. Its configuration directory,
 which other tools and an uninstall leave behind, never counts by itself. The row's `evidence` says why: `binary` and
 `app` are the program found; `config-dir` is a detail. An agent not found is not listed; any agent is connected by
 hand with the listing's `custom`.
+Codex queue delivery uses the CLI from that captured PATH and fails if none was found; it never runs a different
+`codex` from the connector service's PATH.
 
 An agent whose registration is `connected` also says whether that registration works: its row in `agents` (and the
 connector's `agents.list`) carries `health`, `{"state","error","checked_at"}`. The connector starts the entry as the
