@@ -426,9 +426,7 @@ impl HostAgents {
                 .get("scanned_at")
                 .is_some_and(|value| !value.is_null());
             if rescan || watch.is_some() || !has_cache {
-                state = self
-                    .scan(state, watch, true, cancel, deadline)
-                    .await?;
+                state = self.scan(state, watch, true, cancel, deadline).await?;
             }
             return self.response(&state);
         }
@@ -631,13 +629,8 @@ impl HostAgents {
             let agent = name;
             observations.push((
                 agent,
-                self.inspect(
-                    agent,
-                    login_path.as_deref(),
-                    cancel,
-                    deadline,
-                )
-                .await?,
+                self.inspect(agent, login_path.as_deref(), cancel, deadline)
+                    .await?,
             ));
         }
         self.health(

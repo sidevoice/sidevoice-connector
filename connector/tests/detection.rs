@@ -45,7 +45,10 @@ fn cli_detection_uses_only_fresh_login_path_not_overrides_fixed_paths_or_cache()
     let profile = Profile::new("detect");
     let bin = profile.root.join("found/claude");
     let launched = profile.root.join("cli-launched");
-    program(&bin, &format!("#!/bin/sh\ntouch '{}'\n", launched.display()));
+    program(
+        &bin,
+        &format!("#!/bin/sh\ntouch '{}'\n", launched.display()),
+    );
     let fixed = profile.root.join("home/.local/bin/claude");
     program(&fixed, "#!/bin/sh\nexit 0\n");
     let shell = profile.root.join("login-shell");
