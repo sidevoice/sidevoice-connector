@@ -103,8 +103,8 @@ impl Profile {
             "cursor/config",
             "cursor/data",
             "xdg/config",
-            "xdg/data",
-            "sidevoice/core",
+            "home/.local/share",
+            "home/.sidevoice/core",
         ] {
             let mut path = base.clone();
             for part in child.split('/') {
@@ -116,11 +116,11 @@ impl Profile {
     }
 
     pub fn data(&self) -> PathBuf {
-        self.root.join("sidevoice")
+        self.root.join("home/.sidevoice")
     }
 
     pub fn core_data(&self) -> PathBuf {
-        self.root.join("sidevoice/core")
+        self.data().join("core")
     }
 
     pub fn core_socket(&self) -> PathBuf {
@@ -143,8 +143,8 @@ impl Profile {
             ("CURSOR_CONFIG_DIR".into(), path("cursor/config")),
             ("CURSOR_DATA_DIR".into(), path("cursor/data")),
             ("XDG_CONFIG_HOME".into(), path("xdg/config")),
-            ("XDG_DATA_HOME".into(), path("xdg/data")),
-            ("SIDEVOICE_DATA_DIR".into(), path("sidevoice")),
+            ("XDG_DATA_HOME".into(), path("home/.local/share")),
+            ("SIDEVOICE_DATA_DIR".into(), path("home/.sidevoice")),
         ])
     }
 

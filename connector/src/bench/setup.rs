@@ -65,7 +65,13 @@ fn checked_bench_path(path: String) -> Result<String> {
     Ok(path)
 }
 
-const DIRECTORIES: &[&str] = &["home", "sidevoice", "xdg/config", "xdg/data", "bench"];
+const DIRECTORIES: &[&str] = &[
+    "home",
+    "home/.sidevoice",
+    "home/.local/share",
+    "xdg/config",
+    "bench",
+];
 
 /// Asks this build's connector about the agents its harnesses declare (`bench-agents`).
 fn bench_agents(request: Value) -> Result<Value> {
@@ -142,7 +148,7 @@ impl Profile {
     }
 
     pub fn data(&self) -> PathBuf {
-        self.root.join("sidevoice")
+        self.root.join("home/.sidevoice")
     }
 
     pub fn core_socket(&self) -> PathBuf {
@@ -155,9 +161,9 @@ impl Profile {
     pub fn mcp_env(&self) -> BTreeMap<String, String> {
         let mut env = BTreeMap::from([
             ("HOME".into(), self.path("home")),
-            ("SIDEVOICE_DATA_DIR".into(), self.path("sidevoice")),
+            ("SIDEVOICE_DATA_DIR".into(), self.path("home/.sidevoice")),
             ("XDG_CONFIG_HOME".into(), self.path("xdg/config")),
-            ("XDG_DATA_HOME".into(), self.path("xdg/data")),
+            ("XDG_DATA_HOME".into(), self.path("home/.local/share")),
             ("SIDEVOICE_SERVICE_MANAGER".into(), "none".into()),
             ("SIDEVOICE_CORE_PORT".into(), "0".into()),
             ("SIDEVOICE_STUN_URLS".into(), String::new()),
