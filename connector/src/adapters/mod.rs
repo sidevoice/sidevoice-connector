@@ -149,7 +149,8 @@ pub fn engine(identity: &Identity) -> Option<Value> {
                 json!({"model":model,"effort":std::env::var("CODEX_REASONING_EFFORT").ok(),"thinking":Value::Null}),
             )
         }
-        Some("cursor-tmux" | "none") => cursor::engine(&identity.thread),
+        // Cursor's database is read asynchronously by its watcher after join.
+        Some("cursor-tmux" | "none") => None,
         _ => None,
     }
 }

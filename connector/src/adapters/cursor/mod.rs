@@ -1,5 +1,6 @@
 mod harness;
 mod registration;
+mod state_db;
 
 pub use harness::Cursor;
 
@@ -39,7 +40,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -288,7 +289,7 @@ mod pinned_transcript_tests {
     }
 }
 
-pub fn engine(chat_id: &str) -> Option<Value> {
+pub async fn engine(chat_id: &str) -> Option<Value> {
     let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     let mut roots = Vec::new();
     if let Some(path) = env::var_os("CURSOR_CONFIG_DIR") {
@@ -298,6 +299,13 @@ pub fn engine(chat_id: &str) -> Option<Value> {
         roots.push(PathBuf::from(path).join("cursor"));
     }
     roots.extend([home.join(".config/cursor"), home.join(".cursor")]);
+    engine_in_roots(chat_id, &roots).await
+}
+
+async fn engine_in_roots(chat_id: &str, roots: &[PathBuf]) -> Option<Value> {
+    if !safe_chat_id(chat_id) {
+        return None;
+    }
     for root in roots {
         let chats = root.join("chats");
         let Ok(workspaces) = fs::read_dir(chats) else {
@@ -308,18 +316,9 @@ pub fn engine(chat_id: &str) -> Option<Value> {
             if !database.is_file() {
                 continue;
             }
-            let Ok(output) = Command::new("sqlite3")
-                .args(["-readonly", "-json"])
-                .arg(&database)
-                .arg("SELECT value FROM meta WHERE key = '0';")
-                .output()
+            let Ok(rows) =
+                state_db::query(&database, "SELECT value FROM meta WHERE key = '0' LIMIT 1;").await
             else {
-                continue;
-            };
-            if !output.status.success() {
-                continue;
-            }
-            let Ok(rows) = serde_json::from_slice::<Vec<Value>>(&output.stdout) else {
                 continue;
             };
             let Some(value) = rows
@@ -344,6 +343,33 @@ pub fn engine(chat_id: &str) -> Option<Value> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod embedded_engine_tests {
+    use super::*;
+    use crate::secure_fs::tests::Scratch;
+
+    #[tokio::test]
+    async fn cli_engine_uses_bundled_sqlite_for_only_the_named_chat() {
+        let scratch = Scratch::new("cursor-bundled-cli-engine");
+        let root = scratch.0.join("cursor");
+        let chat = root.join("chats/workspace/chat-a");
+        fs::create_dir_all(&chat).unwrap();
+        state_db::fixture(
+            &chat.join("store.db"),
+            "CREATE TABLE meta(key TEXT, value TEXT); INSERT INTO meta VALUES ('0', '{\"lastUsedModel\":\"gpt-5\"}');",
+        );
+        assert_eq!(
+            engine_in_roots("chat-a", std::slice::from_ref(&root)).await,
+            Some(json!({"model":"gpt-5","effort":null,"thinking":null}))
+        );
+        assert_eq!(
+            engine_in_roots("chat-b", std::slice::from_ref(&root)).await,
+            None
+        );
+        assert_eq!(engine_in_roots("../chat-a", &[root]).await, None);
+    }
 }
 
 /// Find the Cursor chat whose transcript records this join or one of its pending inputs.
@@ -866,17 +892,6 @@ pub fn bridge_running() -> bool {
     !bridge_instances().is_empty()
 }
 
-/// Whether `sqlite3` can be run: finding which chat holds a join reads Cursor's own records with it.
-pub fn sqlite3_found() -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    env::var_os("PATH").is_some_and(|path| {
-        env::split_paths(&path).any(|dir| {
-            fs::metadata(dir.join("sqlite3"))
-                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        })
-    })
-}
-
 fn process_alive(pid: u64) -> bool {
     unsafe {
         libc::kill(pid as i32, 0) == 0
@@ -1109,53 +1124,22 @@ async fn query_bridge_chat(
             None => ("bubbleId:".into(), "bubbleId;".into()),
         };
         let sql = format!("SELECT DISTINCT substr(key, 10, instr(substr(key, 10), ':') - 1) AS chat FROM cursorDiskKV WHERE key >= '{from}' AND key < '{to}' AND instr(CAST(value AS TEXT), '{marker}') > 0 LIMIT 2;");
-        let mut command = tokio::process::Command::new("sqlite3");
-        command
-            .args(["-readonly", "-json"])
-            .arg(&database)
-            .arg(sql)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        let result = command.output();
-        let output = match tokio::time::timeout(Duration::from_secs(3), result).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(_)) => {
+        let rows = match state_db::query(&database, &sql).await {
+            Ok(rows) => rows,
+            Err(error) => {
                 if diagnostics {
-                    log_bridge(
-                        "lookup",
-                        "sqlite_start_failed",
-                        Some(marker),
-                        Some(index),
-                        None,
-                    );
+                    let result = match error {
+                        state_db::DbError::Open => "sqlite_start_failed",
+                        state_db::DbError::TimedOut => "sqlite_timeout",
+                        state_db::DbError::Query => "sqlite_failed",
+                        state_db::DbError::TooLarge | state_db::DbError::InvalidValue => {
+                            "sqlite_output_invalid"
+                        }
+                    };
+                    log_bridge("lookup", result, Some(marker), Some(index), None);
                 }
                 continue;
             }
-            Err(_) => {
-                if diagnostics {
-                    log_bridge("lookup", "sqlite_timeout", Some(marker), Some(index), None);
-                }
-                continue;
-            }
-        };
-        if !output.status.success() {
-            if diagnostics {
-                log_bridge("lookup", "sqlite_failed", Some(marker), Some(index), None);
-            }
-            continue;
-        }
-        let Ok(rows) = sqlite_rows(&output.stdout) else {
-            if diagnostics {
-                log_bridge(
-                    "lookup",
-                    "sqlite_output_invalid",
-                    Some(marker),
-                    Some(index),
-                    None,
-                );
-            }
-            continue;
         };
         if rows.len() == 1 {
             if let Some(chat) = rows[0]
@@ -1200,14 +1184,6 @@ async fn query_bridge_chat(
     (matches.len() == 1)
         .then(|| matches.into_iter().next())
         .flatten()
-}
-
-fn sqlite_rows(stdout: &[u8]) -> serde_json::Result<Vec<Value>> {
-    if stdout.iter().all(u8::is_ascii_whitespace) {
-        Ok(Vec::new())
-    } else {
-        serde_json::from_slice(stdout)
-    }
 }
 
 pub async fn deliver_editor(delivery: &Value, event: &Value) -> Option<Value> {
@@ -1424,12 +1400,7 @@ mod bridge_tests {
         let sql = format!(
             "CREATE TABLE cursorDiskKV(key TEXT, value TEXT); INSERT INTO cursorDiskKV VALUES ('bubbleId:chat-1:turn', 'join {marker}');"
         );
-        assert!(Command::new("sqlite3")
-            .arg(&database)
-            .arg(sql)
-            .status()
-            .unwrap()
-            .success());
+        state_db::fixture(&database, &sql);
 
         let socket = scratch.0.join("bridge.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -1504,26 +1475,25 @@ mod bridge_tests {
         }
     }
 
-    #[test]
-    fn successful_sqlite_query_with_no_rows_is_marker_absent() {
+    #[tokio::test]
+    async fn successful_sqlite_query_with_no_rows_is_marker_absent() {
         let scratch = Scratch::new("cursor-empty-lookup");
         let database = scratch.0.join("state.vscdb");
-        assert!(Command::new("sqlite3")
-            .arg(&database)
-            .arg("CREATE TABLE cursorDiskKV(key TEXT, value TEXT);")
-            .status()
-            .unwrap()
-            .success());
-        let output = Command::new("sqlite3")
-            .args(["-readonly", "-json"])
-            .arg(&database)
-            .arg("SELECT key FROM cursorDiskKV WHERE key = 'missing';")
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        assert!(output.stdout.is_empty());
-        assert!(sqlite_rows(&output.stdout).unwrap().is_empty());
-        assert!(sqlite_rows(b"not-json").is_err());
+        state_db::fixture(
+            &database,
+            "CREATE TABLE cursorDiskKV(key TEXT, value TEXT);",
+        );
+        let rows = state_db::query(
+            &database,
+            "SELECT key FROM cursorDiskKV WHERE key = 'missing';",
+        )
+        .await
+        .unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(
+            state_db::query(&database, "not-sql").await,
+            Err(state_db::DbError::Query)
+        );
     }
 
     #[test]
