@@ -651,6 +651,46 @@ fn log_bridge(
     crate::logfile::log(&bridge_diagnostic(stage, result, id, instance, http_status));
 }
 
+fn short_hash(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))[..12].to_owned()
+}
+
+fn instance_hash(instance: &BridgeInstance) -> String {
+    short_hash(&format!(
+        "{}:{}",
+        instance.socket.display(),
+        instance.created_at
+    ))
+}
+
+/// A mapping or accepted send can be correlated across descriptor reordering without exposing IDs or paths.
+fn correlation_diagnostic(
+    stage: &'static str,
+    result: &'static str,
+    marker: Option<&str>,
+    chat: &str,
+    instance: Option<&BridgeInstance>,
+) -> String {
+    format!(
+        "cursor_bridge stage={stage} result={result} marker_hash={} chat_hash={} instance_id={}",
+        marker.map(short_hash).unwrap_or_else(|| "none".into()),
+        short_hash(chat),
+        instance.map(instance_hash).unwrap_or_else(|| "none".into())
+    )
+}
+
+fn log_correlation(
+    stage: &'static str,
+    result: &'static str,
+    marker: Option<&str>,
+    chat: &str,
+    instance: Option<&BridgeInstance>,
+) {
+    crate::logfile::log(&correlation_diagnostic(
+        stage, result, marker, chat, instance,
+    ));
+}
+
 fn bridge_instances() -> Vec<BridgeInstance> {
     let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     let dir = env::var("CURSOR_DESKTOP_BRIDGE_DIR")
@@ -971,7 +1011,7 @@ async fn query_bridge_chat(
             }
             continue;
         }
-        let Ok(rows) = serde_json::from_slice::<Vec<Value>>(&output.stdout) else {
+        let Ok(rows) = sqlite_rows(&output.stdout) else {
             if diagnostics {
                 log_bridge(
                     "lookup",
@@ -989,6 +1029,17 @@ async fn query_bridge_chat(
                 .and_then(Value::as_str)
                 .filter(|chat| safe_chat_id(chat))
             {
+                log_correlation(
+                    "mapping",
+                    if candidate.is_some() {
+                        "sqlite_candidate"
+                    } else {
+                        "sqlite_scan"
+                    },
+                    Some(marker),
+                    chat,
+                    Some(instance),
+                );
                 if diagnostics {
                     log_bridge("lookup", "chat_found", Some(chat), Some(index), None);
                 }
@@ -1010,6 +1061,14 @@ async fn query_bridge_chat(
         }
     }
     None
+}
+
+fn sqlite_rows(stdout: &[u8]) -> serde_json::Result<Vec<Value>> {
+    if stdout.iter().all(u8::is_ascii_whitespace) {
+        Ok(Vec::new())
+    } else {
+        serde_json::from_slice(stdout)
+    }
 }
 
 pub async fn deliver_editor(delivery: &Value, event: &Value) -> Option<Value> {
@@ -1065,6 +1124,17 @@ async fn deliver_editor_to_instances(
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 if response.status == 200 && matches!(outcome, "submitted" | "queued") {
+                    log_correlation(
+                        "accepted",
+                        if outcome == "submitted" {
+                            "submitted"
+                        } else {
+                            "queued"
+                        },
+                        delivery.get("marker").and_then(Value::as_str),
+                        &composer,
+                        Some(instance),
+                    );
                     log_bridge(
                         "send",
                         if outcome == "submitted" {
@@ -1214,8 +1284,17 @@ mod bridge_tests {
         .unwrap();
         let instances = bridge_instances_in(&descriptors);
         assert_eq!(instances.len(), 1);
-        let chat = query_bridge_chat(&instances, &marker, None, true).await;
+        // The background watcher uses this quiet lookup. Its successful mapping must still
+        // carry enough provenance to correlate a later cached send with the accepting bridge.
+        let chat = composer_holding_in(&json!({"marker":marker}), &instances, false).await;
         assert_eq!(chat.as_deref(), Some("chat-1"));
+        let mapping = correlation_diagnostic(
+            "mapping",
+            "sqlite_scan",
+            Some(&marker),
+            chat.as_deref().unwrap(),
+            Some(&instances[0]),
+        );
 
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -1237,6 +1316,48 @@ mod bridge_tests {
         assert_eq!(result["status"], "accepted");
         assert_eq!(result["detail"], "Cursor Desktop Bridge: queued");
         assert!(!scratch.0.join("chat.jsonl").exists());
+        let accepted = correlation_diagnostic(
+            "accepted",
+            "queued",
+            Some(&marker),
+            chat.as_deref().unwrap(),
+            Some(&instances[0]),
+        );
+        for field in ["marker_hash", "chat_hash", "instance_id"] {
+            let value = mapping
+                .split_whitespace()
+                .find(|word| word.starts_with(&format!("{field}=")))
+                .unwrap();
+            assert!(
+                accepted.contains(value),
+                "{field} cannot correlate: {accepted}"
+            );
+        }
+        for secret in [&marker[..], "chat-1", "fixture-secret", "private words"] {
+            assert!(!mapping.contains(secret) && !accepted.contains(secret));
+        }
+    }
+
+    #[test]
+    fn successful_sqlite_query_with_no_rows_is_marker_absent() {
+        let scratch = Scratch::new("cursor-empty-lookup");
+        let database = scratch.0.join("state.vscdb");
+        assert!(Command::new("sqlite3")
+            .arg(&database)
+            .arg("CREATE TABLE cursorDiskKV(key TEXT, value TEXT);")
+            .status()
+            .unwrap()
+            .success());
+        let output = Command::new("sqlite3")
+            .args(["-readonly", "-json"])
+            .arg(&database)
+            .arg("SELECT key FROM cursorDiskKV WHERE key = 'missing';")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(sqlite_rows(&output.stdout).unwrap().is_empty());
+        assert!(sqlite_rows(b"not-json").is_err());
     }
 
     #[test]

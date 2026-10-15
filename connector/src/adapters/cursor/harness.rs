@@ -3,7 +3,7 @@
 
 use super::{
     bridge_running, composer_holding, composer_holding_for_delivery, deliver_editor,
-    editor_transcript_chat, engine, log_bridge, sqlite3_found, transcript_path,
+    editor_transcript_chat, engine, log_bridge, log_correlation, sqlite3_found, transcript_path,
 };
 use crate::adapters::conversation::{Conversation, Room};
 use crate::adapters::harness::{no_route, Harness, Route};
@@ -308,6 +308,13 @@ fn watch_editor(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
                     );
                 }
                 if pending_message_match {
+                    log_correlation(
+                        "mapping",
+                        "transcript_message",
+                        binding.delivery.get("marker").and_then(Value::as_str),
+                        &chat,
+                        None,
+                    );
                     set_bridge(binding, chat);
                     continue;
                 }
