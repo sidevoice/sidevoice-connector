@@ -1,6 +1,8 @@
 //! Desktop app registration, queried through each OS rather than guessed install directories.
 
-use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", test))]
+use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // Fields for the other operating systems are exercised by fixture tests.
@@ -74,6 +76,7 @@ pub fn windows_results(output: &str, identity: Identity) -> Vec<PathBuf> {
 }
 
 /// XDG's first desktop file of this ID wins, including a `Hidden=true` tombstone.
+#[cfg(any(target_os = "linux", test))]
 pub fn linux_entry(identity: Identity, roots: &[PathBuf], path: Option<&str>) -> Option<PathBuf> {
     for root in roots {
         let file = root.join("applications").join(identity.linux_desktop);
@@ -88,6 +91,7 @@ pub fn linux_entry(identity: Identity, roots: &[PathBuf], path: Option<&str>) ->
     None
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn desktop_valid(contents: &str, path: Option<&str>) -> bool {
     let mut in_entry = false;
     let mut kind = None;
@@ -132,6 +136,7 @@ fn desktop_valid(contents: &str, path: Option<&str>) -> bool {
         })
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub fn linux_roots(user_data: &Path) -> Vec<PathBuf> {
     let system = std::env::var("XDG_DATA_DIRS")
         .ok()

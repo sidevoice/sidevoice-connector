@@ -1487,11 +1487,11 @@ impl HostAgents {
         #[cfg(target_os = "linux")]
         {
             let _ = (cancel, deadline);
-            return app::linux_entry(
+            app::linux_entry(
                 identity,
                 &app::linux_roots(&self.profile.xdg_data),
                 Some(login_path),
-            );
+            )
         }
         #[cfg(target_os = "macos")]
         {
@@ -1505,11 +1505,11 @@ impl HostAgents {
             )
             .await
             .ok()?;
-            return result
+            result
                 .status
                 .success()
                 .then(|| app::mac_result(&result.stdout))
-                .flatten();
+                .flatten()
         }
         #[cfg(target_os = "windows")]
         {
