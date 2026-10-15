@@ -49,12 +49,16 @@ use crate::service::manager::Kind;
 use crate::service::{launcher, status};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::time::{sleep, timeout, Duration, Instant};
+
+mod safe_remove;
 
 /// The connector's program inside a package and inside a release.
 pub const BINARY: &str = "bin/sidevoice-connector";
@@ -1007,8 +1011,27 @@ pub fn human_install(answer: &Value) -> String {
 
 /// `uninstall`: see the module's documentation. The answer is `uninstall --json`'s.
 pub async fn uninstall(profile: &Profile, options: Options, runtime: &Runtime) -> Result<Value> {
+    uninstall_with_hooks(profile, options, runtime, |guard| guard.preflight(), |_| {}).await
+}
+
+async fn uninstall_with_hooks(
+    profile: &Profile,
+    options: Options,
+    runtime: &Runtime,
+    preflight: impl Fn(&safe_remove::Guard) -> std::result::Result<bool, &'static str>,
+    before_claim: impl Fn(&OsStr),
+) -> Result<Value> {
     let layout = Layout::from_profile(profile);
-    let _lock = crate::service::install_lock(&layout).await?;
+    safe_remove::validate_scope(&layout).map_err(failed)?;
+    let guard = safe_remove::Guard::new(&layout).map_err(failed)?;
+    let had_releases = preflight(&guard).map_err(failed)?;
+    let data = guard.data_for_lock().map_err(failed)?;
+    guard.preflight().map_err(failed)?;
+    let _lock = crate::lock::wait_uninstall_lock_at(data.as_raw_fd(), Duration::from_secs(30))
+        .await
+        .map_err(failed)?
+        .ok_or_else(|| failed("another install or service command holds install.lock"))?;
+    guard.preflight().map_err(failed)?;
     let service = runtime.unload(&layout).await?;
     let agents = if options.agents {
         unregister(profile).await
@@ -1016,35 +1039,17 @@ pub async fn uninstall(profile: &Profile, options: Options, runtime: &Runtime) -
         json!({})
     };
     let paired = crate::pairing::previous_room(profile);
-    let had_releases = fs::symlink_metadata(&layout.releases).is_ok();
-    match fs::remove_dir_all(&layout.releases) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(failed(error)),
-        _ => {}
-    }
-    let mut removed = Vec::new();
-    if layout.data.is_dir() {
-        let _agents_lock = crate::lock::wait_lock(
-            &layout.data.join("agents.lock"),
-            "uninstall",
-            Duration::from_secs(30),
-        )
-        .await?
-        .ok_or_else(|| failed("another agents request holds agents.lock"))?;
-        for entry in fs::read_dir(&layout.data)?.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if KEPT.contains(&name.as_str()) {
-                continue;
-            }
-            let path = entry.path();
-            let gone = if entry.file_type()?.is_dir() {
-                fs::remove_dir_all(&path)
-            } else {
-                fs::remove_file(&path)
-            };
-            gone.map_err(|error| failed(format!("{}: {error}", path.display())))?;
-            removed.push(name);
-        }
-    }
+    let _agents_lock =
+        crate::lock::wait_uninstall_agents_lock_at(data.as_raw_fd(), Duration::from_secs(30))
+            .await?
+            .ok_or_else(|| failed("another agents request holds agents.lock"))?;
+    guard.stage_recovery(&layout).map_err(failed)?;
+    let removed = guard
+        .remove_data_contents_with_hook(&before_claim)
+        .map_err(failed)?;
+    guard.remove_releases().map_err(failed)?;
+    guard.finish_claim().map_err(failed)?;
+    guard.finish_recovery().map_err(failed)?;
     let mut advice = Vec::new();
     if let Some(room) = &paired {
         advice.push(format!(
@@ -1054,7 +1059,8 @@ pub async fn uninstall(profile: &Profile, options: Options, runtime: &Runtime) -
     advice
         .push("Conversations already open keep their Sidevoice server until they end.".to_owned());
     Ok(
-        json!({"ok": true, "state": "absent", "service": service.get("service").cloned().unwrap_or(Value::Null),
+        json!({"ok": true, "state": "absent", "safe_uninstall": crate::identity::SAFE_UNINSTALL,
+        "service": service.get("service").cloned().unwrap_or(Value::Null),
         "note": service.get("note").cloned().unwrap_or(Value::Null), "agents": agents,
         "releases": had_releases.then(|| layout.releases.clone()), "data": layout.data, "removed": removed,
         "advice": advice}),
@@ -1111,6 +1117,7 @@ pub(crate) mod tests {
     use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
@@ -1134,10 +1141,33 @@ pub(crate) mod tests {
     impl Fixture {
         fn new(label: &str) -> Self {
             let scratch = Scratch::new(label);
-            let profile = Profile::for_test(
-                &scratch.0.join("profile"),
-                &crate::adapters::Registry::standard().homes(),
-            );
+            let homes = crate::adapters::Registry::standard().homes();
+            let original = Profile::for_test(&scratch.0.join("profile"), &homes);
+            let variables = original.variables();
+            let profile = Profile::from_vars(
+                |name| {
+                    if name == "SIDEVOICE_DATA_DIR" || name == "XDG_DATA_HOME" {
+                        None
+                    } else {
+                        variables
+                            .iter()
+                            .find(|(key, _)| *key == name)
+                            .map(|(_, value)| value.as_os_str().to_owned())
+                    }
+                },
+                &homes,
+            )
+            .unwrap();
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(profile.data.join("core"))
+                .unwrap();
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&profile.xdg_data)
+                .unwrap();
             Self {
                 scratch,
                 profile,
@@ -1390,8 +1420,8 @@ pub(crate) mod tests {
         assert_eq!(removal(&row("unknown", false)), Some(false));
     }
 
-    /// An agent of the registry the connector connects by itself, without its CLI: found in any profile of the tests
-    /// (its configuration directory is there), whatever is installed on the machine that runs them.
+    /// An agent of the registry the connector connects by itself, without its CLI: connected in any profile of the tests
+    /// (its configuration directory is there) once a stand-in of its program says it is installed.
     fn agent_without_cli() -> &'static str {
         crate::adapters::Registry::standard()
             .agents()
@@ -1430,6 +1460,13 @@ pub(crate) mod tests {
         let fixture = Fixture::new("agents");
         let profile = &fixture.profile;
         let id = agent_without_cli();
+        let program = fixture.scratch.0.join("agent-program");
+        fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let _installed = crate::agents::tests::EnvGuard::set(
+            &format!("SIDEVOICE_{}_BIN", id.to_ascii_uppercase()),
+            program.as_os_str(),
+        );
         let label = agent_label(id);
         let with_agents = |version: &'static str| {
             let package = fixture.package(version, "a");
@@ -1583,5 +1620,109 @@ pub(crate) mod tests {
         // And once more: the repaired release is reused as it is.
         fixture.install(&package).await.unwrap();
         assert_eq!(current_release(&layout).unwrap(), repaired);
+    }
+
+    #[tokio::test]
+    async fn mounted_data_refuses_before_install_lock_is_rewritten() {
+        let fixture = Fixture::new("mounted-uninstall-data");
+        let lock = fixture.layout().install_lock();
+        fs::write(&lock, b"sentinel lock contents").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+        let error = uninstall_with_hooks(
+            &fixture.profile,
+            NO_AGENTS,
+            &fixture.runtime(),
+            |guard| guard.preflight_with_simulated_data_mount(),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("mount or device boundary"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&lock).unwrap(), b"sentinel lock contents");
+    }
+
+    #[tokio::test]
+    async fn uninstall_refuses_hard_linked_install_lock_without_touching_sentinel() {
+        let fixture = Fixture::new("hard-linked-uninstall-lock");
+        let outside = fixture.scratch.0.join("outside-sentinel");
+        fs::write(&outside, b"outside contents").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&outside, fixture.layout().install_lock()).unwrap();
+        assert!(uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
+            .await
+            .is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside contents");
+    }
+
+    #[tokio::test]
+    async fn uninstall_refuses_hard_linked_agents_lock_without_touching_sentinel() {
+        let fixture = Fixture::new("hard-linked-uninstall-agents-lock");
+        let outside = fixture.scratch.0.join("outside-agents-sentinel");
+        fs::write(&outside, b"outside contents").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::hard_link(&outside, fixture.layout().data.join("agents.lock")).unwrap();
+        assert!(uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
+            .await
+            .is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside contents");
+    }
+
+    #[tokio::test]
+    async fn failed_claim_keeps_recovery_cli_and_retry_clears_residual_owned_data() {
+        use std::os::unix::fs::symlink;
+        let fixture = Fixture::new("uninstall-retry");
+        let package = fixture.package("1.0.0", "a");
+        fixture.install(&package).await.unwrap();
+        let layout = fixture.layout();
+        let victim = layout.data.join("victim");
+        let moved = fixture.scratch.0.join("outside-victim");
+        fs::create_dir(&victim).unwrap();
+        fs::write(victim.join("keep"), b"outside contents").unwrap();
+        let swapped = AtomicBool::new(false);
+        let hook = |name: &OsStr| {
+            if name == OsStr::new("victim") && !swapped.swap(true, Ordering::SeqCst) {
+                fs::rename(&victim, &moved).unwrap();
+                symlink(&moved, &victim).unwrap();
+            }
+        };
+        assert!(uninstall_with_hooks(
+            &fixture.profile,
+            NO_AGENTS,
+            &fixture.runtime(),
+            |guard| guard.preflight(),
+            hook,
+        )
+        .await
+        .is_err());
+        assert!(
+            layout.releases.exists(),
+            "the installed release is still a retry route"
+        );
+        let record = layout.install_record().unwrap();
+        let recovery = PathBuf::from(record["command"][0].as_str().unwrap());
+        assert!(
+            recovery.is_file(),
+            "the desktop can run the recorded recovery CLI"
+        );
+        let recovery_probe = std::process::Command::new(&recovery)
+            .arg("--list")
+            .output()
+            .unwrap();
+        assert!(
+            recovery_probe.status.success(),
+            "the staged binary must execute"
+        );
+        assert_eq!(fs::read(moved.join("keep")).unwrap(), b"outside contents");
+
+        let answer = uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
+            .await
+            .unwrap();
+        assert_eq!(answer["state"], "absent");
+        assert!(!layout.releases.exists());
+        assert!(!layout.install_file().exists());
+        assert_eq!(fs::read(moved.join("keep")).unwrap(), b"outside contents");
     }
 }

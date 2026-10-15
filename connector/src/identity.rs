@@ -9,6 +9,9 @@ use serde_json::{json, Value};
 /// This build's version: the release version stamped at build time (`build.rs`).
 pub const VERSION: &str = env!("SIDEVOICE_CONNECTOR_VERSION");
 
+/// `--version --json` advertises this only for the guarded, recoverable uninstall contract.
+pub const SAFE_UNINSTALL: u8 = 1;
+
 /// The release target this binary was compiled for (`linux-x86_64`, `linux-aarch64`, `macos-aarch64`), or `None`
 /// on a platform no release is made for.
 pub fn target() -> Option<&'static str> {
