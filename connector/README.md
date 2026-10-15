@@ -132,26 +132,30 @@ output`, `timed out`, `protocol mismatch`); `checked_at` is when (ISO 8601, UTC)
 (`agents.check`, `{"id"}`, or `agents check <id>`); a listing from the cache, and a request with too little time
 left, keep the last one found (in `agents.json`).
 
-### Cursor Desktop Bridge status
+### Agent readiness
 
-The Cursor row in `agents.list` / `agents --json` has exactly this `cursor_bridge` shape:
+Every row in `agents.list` / `agents --json` may carry an optional `readiness` object:
 
 ```json
-{"state":"running","chat_known":null}
+{"readiness":{"state":"needs_attention","reasons":["cursor.bridge_not_running"]}}
 ```
 
-`state` is `running` when a usable Desktop Bridge descriptor has a live process and socket,
-`not_running` when Cursor is available on macOS but no usable bridge is running, or `unsupported`
-on other platforms and when the Cursor editor is absent. A missing or stale descriptor is
-`not_running`; the status does not infer whether a Cursor setting is enabled. No bridge token,
-home path, socket path, version, setup step, or reason code is sent in this field.
+`state` is `ready`, `needs_attention`, or `unsupported`. `reasons` is an array of stable codes
+in the `<agent>.<code>` namespace, without display text, versions, paths, or secrets. An absent
+`readiness` field means ready: adapters with no checks omit it. Every check contributes either
+OK, needs attention with a reason, or unsupported with a reason. The aggregate is `unsupported`
+if any check is unsupported; otherwise `needs_attention` if any check needs attention; otherwise
+`ready`. All non-OK reason codes are retained in check order. A ready object has `reasons: []`.
+The web owns localized copy for each reason code.
 
-`chat_known` is `true` or `false` only when a particular editor chat has been checked while the
-bridge is running. `agents.list` is machine-wide and names no chat, so its value is `null`.
-Per-chat `voice_status.bridge.bridge_chat_known` remains the source for a specific chat.
-`agents.list` with `rescan` or `watch`, and `agents check cursor`, refresh the bridge fact;
-a cached list returns the last result. Cursor's Desktop Bridge can be enabled in Cursor Settings
-→ Beta → “Allow CLI to access desktop agents”.
+Cursor currently has one check: a usable Desktop Bridge descriptor with a live process and socket
+is ready; a missing, empty, stale, or unusable bridge on macOS needs attention with
+`cursor.bridge_not_running`; non-macOS or no detected Cursor editor is unsupported with
+`cursor.unsupported`. Readiness is machine-wide and says nothing about a particular chat.
+Per-chat `voice_status.bridge.bridge_chat_known` remains the source for whether that chat is known.
+The setting is in Cursor Settings → Beta → “Allow CLI to access desktop agents”. `agents.list`
+with `rescan` or `watch`, and `agents check cursor`, refresh readiness; a cached list returns the
+last result.
 
 `uninstall` unloads both jobs and stops what runs on demand (a refusal stops it there, with nothing deleted), removes
 the agents' registrations Sidevoice wrote (current or not), then `R` and everything in `D` but its lock files and the

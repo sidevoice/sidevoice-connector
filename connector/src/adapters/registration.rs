@@ -89,6 +89,13 @@ pub trait AgentHost: Send + Sync {
 
 /// Registering Sidevoice with an agent, reading that registration back and removing it, touching only an entry
 /// Sidevoice wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadinessCheck {
+    Ok,
+    NeedsAttention(&'static str),
+    Unsupported(&'static str),
+}
+
 pub trait Registration: Send + Sync {
     /// The agent's home.
     fn config_root<'a>(&self, profile: &'a Profile) -> &'a Path;
@@ -100,13 +107,9 @@ pub trait Registration: Send + Sync {
     fn evidence(&self) -> Vec<(&'static str, PathBuf)> {
         Vec::new()
     }
-    /// An optional fact attached to this agent's row using its already resolved binary.
-    fn extra_status(
-        &self,
-        _profile: &Profile,
-        _binary: Option<&str>,
-    ) -> Option<(&'static str, Value)> {
-        None
+    /// Checks specific to this agent, using the binary already resolved by discovery.
+    fn readiness_checks(&self, _profile: &Profile, _binary: Option<&str>) -> Vec<ReadinessCheck> {
+        Vec::new()
     }
     /// How to start this agent against the test bench's profile, when it can be: printed when the bench starts.
     fn bench_steps(&self, _setup: &BenchSetup) -> Option<String> {

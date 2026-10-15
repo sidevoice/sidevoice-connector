@@ -130,7 +130,7 @@ fn row<'a>(answer: &'a Value, id: &str) -> &'a Value {
 }
 
 #[tokio::test]
-async fn cursor_agent_row_exposes_only_bridge_fact_without_home_paths_or_secrets() {
+async fn cursor_agent_row_exposes_only_readiness_codes_without_home_paths_or_secrets() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
     let bin = fixture.root.join("bin");
@@ -146,15 +146,15 @@ async fn cursor_agent_row_exposes_only_bridge_fact_without_home_paths_or_secrets
     );
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let missing = host.handle("agents.list", json!({"watch":"cursor"})).await;
-    let bridge = &row(&missing, "cursor")["cursor_bridge"];
-    let absent_state = if cfg!(target_os = "macos") {
-        "not_running"
+    let bridge = &row(&missing, "cursor")["readiness"];
+    let expected = if cfg!(target_os = "macos") {
+        json!({"state":"needs_attention","reasons":["cursor.bridge_not_running"]})
     } else {
-        "unsupported"
+        json!({"state":"unsupported","reasons":["cursor.unsupported"]})
     };
-    assert_eq!(bridge, &json!({"state":absent_state,"chat_known":null}));
+    assert_eq!(bridge, &expected);
     let cached = host.handle("agents.list", json!({})).await;
-    assert_eq!(row(&cached, "cursor")["cursor_bridge"], *bridge);
+    assert_eq!(row(&cached, "cursor")["readiness"], *bridge);
 
     let dir = fixture.profile.home.join(".cursor/desktop-bridge");
     private_mkdir(&fixture.profile.home.join(".cursor"));
@@ -169,20 +169,20 @@ async fn cursor_agent_row_exposes_only_bridge_fact_without_home_paths_or_secrets
         }),
     );
     let rescanned = host.handle("agents.list", json!({"watch":"cursor"})).await;
-    let bridge = &row(&rescanned, "cursor")["cursor_bridge"];
-    let live_state = if cfg!(target_os = "macos") {
-        "running"
+    let bridge = &row(&rescanned, "cursor")["readiness"];
+    let expected = if cfg!(target_os = "macos") {
+        json!({"state":"ready","reasons":[]})
     } else {
-        "unsupported"
+        json!({"state":"unsupported","reasons":["cursor.unsupported"]})
     };
-    assert_eq!(bridge, &json!({"state":live_state,"chat_known":null}));
+    assert_eq!(bridge, &expected);
     let serialized = bridge.to_string();
     assert!(!serialized.contains(&fixture.root.to_string_lossy().to_string()));
     assert!(!serialized.contains("secret-token"));
 }
 
 #[tokio::test]
-async fn cursor_bridge_distinguishes_cli_only_from_editor_with_unreadable_version() {
+async fn cursor_readiness_distinguishes_cli_only_from_editor() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
     let bin = fixture.root.join("bin");
@@ -199,21 +199,58 @@ async fn cursor_bridge_distinguishes_cli_only_from_editor_with_unreadable_versio
     );
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
-    let bridge = &row(&answer, "cursor")["cursor_bridge"];
-    assert_eq!(bridge["state"], "unsupported");
-    assert_eq!(bridge["chat_known"], Value::Null);
+    let bridge = &row(&answer, "cursor")["readiness"];
+    assert_eq!(
+        bridge,
+        &json!({"state":"unsupported","reasons":["cursor.unsupported"]})
+    );
 
     let editor = bin.join("cursor");
     private_write(&editor, b"#!/bin/sh\necho 'unparseable'\n");
     fs::set_permissions(&editor, fs::Permissions::from_mode(0o700)).unwrap();
     let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
-    let bridge = &row(&answer, "cursor")["cursor_bridge"];
-    let editor_state = if cfg!(target_os = "macos") {
-        "not_running"
+    let bridge = &row(&answer, "cursor")["readiness"];
+    let expected = if cfg!(target_os = "macos") {
+        json!({"state":"needs_attention","reasons":["cursor.bridge_not_running"]})
     } else {
-        "unsupported"
+        json!({"state":"unsupported","reasons":["cursor.unsupported"]})
     };
-    assert_eq!(bridge, &json!({"state":editor_state,"chat_known":null}));
+    assert_eq!(bridge, &expected);
+}
+
+#[test]
+fn readiness_aggregation_prioritizes_unsupported_then_attention_then_ready() {
+    use ReadinessCheck::{NeedsAttention, Ok, Unsupported};
+    for (checks, expected) in [
+        (vec![], None),
+        (vec![Ok], Some(json!({"state":"ready","reasons":[]}))),
+        (
+            vec![Ok, NeedsAttention("cursor.bridge_not_running")],
+            Some(json!({"state":"needs_attention","reasons":["cursor.bridge_not_running"]})),
+        ),
+        (
+            vec![
+                NeedsAttention("cursor.bridge_not_running"),
+                Unsupported("cursor.unsupported"),
+            ],
+            Some(
+                json!({"state":"unsupported","reasons":["cursor.bridge_not_running","cursor.unsupported"]}),
+            ),
+        ),
+    ] {
+        assert_eq!(readiness(&checks), expected);
+    }
+}
+
+#[tokio::test]
+async fn other_agents_have_no_readiness_when_their_hook_is_empty() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let answer = host.handle("agents.list", json!({"watch":"claude"})).await;
+    for id in ["claude", "codex"] {
+        assert!(row(&answer, id).get("readiness").is_none());
+    }
 }
 
 fn identity_signature(id: &str, version: Option<&str>, evidence: &[Evidence<'_>]) -> String {

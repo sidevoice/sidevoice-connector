@@ -1,8 +1,9 @@
 //! Read-only, local facts for the Cursor agent card. No bridge secret or home path enters the status row.
 
+use crate::adapters::registration::ReadinessCheck;
 use crate::profile::Profile;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::json;
 use std::env;
 use std::fs::{self, File};
 use std::io::Read;
@@ -95,30 +96,22 @@ fn inventory(dir: &Path) -> BridgeFiles {
     }
 }
 
-pub fn status(profile: &Profile, editor_available: bool) -> Value {
-    // Agent discovery has no particular editor chat. Its chat_known value is therefore unknown.
-    // The per-chat voice status remains the source of a known/unknown chat binding.
-    let bridge = inventory(&bridge_dir(profile));
-    assess(cfg!(target_os = "macos"), editor_available, bridge, None)
+pub fn check(profile: &Profile, editor_available: bool) -> ReadinessCheck {
+    evaluate(
+        cfg!(target_os = "macos"),
+        editor_available,
+        inventory(&bridge_dir(profile)),
+    )
 }
 
-fn assess(
-    macos: bool,
-    editor_available: bool,
-    bridge: BridgeFiles,
-    chat_known: Option<bool>,
-) -> Value {
-    let state = if !macos || !editor_available {
-        "unsupported"
+fn evaluate(macos: bool, editor_available: bool, bridge: BridgeFiles) -> ReadinessCheck {
+    if !macos || !editor_available {
+        ReadinessCheck::Unsupported("cursor.unsupported")
     } else if bridge == BridgeFiles::Live {
-        "running"
+        ReadinessCheck::Ok
     } else {
-        "not_running"
-    };
-    json!({
-        "state": state,
-        "chat_known": if state == "running" { chat_known } else { None },
-    })
+        ReadinessCheck::NeedsAttention("cursor.bridge_not_running")
+    }
 }
 
 #[cfg(test)]
@@ -159,67 +152,21 @@ mod tests {
     }
 
     #[test]
-    fn states_and_chat_knowledge_have_only_the_two_contract_fields() {
-        for (macos, editor, bridge, known, expected) in [
-            (
-                true,
-                true,
-                BridgeFiles::Live,
-                Some(true),
-                json!({"state":"running","chat_known":true}),
-            ),
-            (
-                true,
-                true,
-                BridgeFiles::Live,
-                Some(false),
-                json!({"state":"running","chat_known":false}),
-            ),
-            (
-                true,
-                true,
-                BridgeFiles::Live,
-                None,
-                json!({"state":"running","chat_known":null}),
-            ),
-            (
-                true,
-                true,
-                BridgeFiles::Missing,
-                None,
-                json!({"state":"not_running","chat_known":null}),
-            ),
-            (
-                true,
-                true,
-                BridgeFiles::Stale,
-                Some(true),
-                json!({"state":"not_running","chat_known":null}),
-            ),
-            (
-                false,
-                true,
-                BridgeFiles::Live,
-                Some(true),
-                json!({"state":"unsupported","chat_known":null}),
-            ),
-            (
-                true,
-                false,
-                BridgeFiles::Live,
-                Some(true),
-                json!({"state":"unsupported","chat_known":null}),
-            ),
-        ] {
-            assert_eq!(assess(macos, editor, bridge, known), expected);
+    fn running_not_running_and_unsupported_are_distinct() {
+        assert_eq!(evaluate(true, true, BridgeFiles::Live), ReadinessCheck::Ok);
+        for bridge in [BridgeFiles::Missing, BridgeFiles::Stale] {
+            assert_eq!(
+                evaluate(true, true, bridge),
+                ReadinessCheck::NeedsAttention("cursor.bridge_not_running")
+            );
         }
-    }
-
-    #[test]
-    fn disabled_setting_without_bridge_files_is_not_running() {
         assert_eq!(
-            assess(true, true, BridgeFiles::Missing, None)["state"],
-            "not_running"
+            evaluate(false, true, BridgeFiles::Live),
+            ReadinessCheck::Unsupported("cursor.unsupported")
+        );
+        assert_eq!(
+            evaluate(true, false, BridgeFiles::Live),
+            ReadinessCheck::Unsupported("cursor.unsupported")
         );
     }
 }
