@@ -2,8 +2,9 @@
 //! Bridge once it knows which chat a conversation is, their transcript found the same way.
 
 use super::{
-    bridge_running, composer_holding_identity, deliver_editor, editor_transcript_chat, engine,
-    log_bridge, log_correlation, transcript_path, BridgeChat,
+    bridge_instances, bridge_running, composer_holding_identity, composer_holding_identity_in,
+    deliver_editor, editor_transcript_chat, engine, log_bridge, log_correlation, transcript_path,
+    BridgeChat, BridgeInstance,
 };
 use crate::adapters::conversation::{Conversation, Room};
 use crate::adapters::harness::{no_route, Harness, Route};
@@ -293,10 +294,19 @@ fn bridge_state(state: &str) -> Value {
 /// An editor chat, only by its own id through the Desktop Bridge. Until the bridge knows which chat it is, the
 /// message is not sent and the answer says so.
 async fn deliver_to_editor(conversation: &Conversation, frame: &Value) -> Value {
+    let instances = bridge_instances();
+    deliver_to_editor_with_instances(conversation, frame, &instances).await
+}
+
+async fn deliver_to_editor_with_instances(
+    conversation: &Conversation,
+    frame: &Value,
+    instances: &[BridgeInstance],
+) -> Value {
     let mut delivery = conversation.delivery.clone();
     let chat = match verified_bridge(conversation) {
         Some(chat) => Some(chat),
-        None => composer_holding_identity(&delivery).await,
+        None => composer_holding_identity_in(&delivery, instances, true).await,
     };
     let Some(chat) = chat else {
         log_bridge(
@@ -585,6 +595,7 @@ pub(super) mod client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secure_fs::tests::Scratch;
     use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use tokio::sync::Mutex as AsyncMutex;
@@ -770,6 +781,58 @@ mod tests {
         );
         let listed = Cursor.status(&conversation).await.unwrap();
         assert_eq!(listed["delivery_state"]["state"], "registered");
+    }
+
+    #[tokio::test]
+    async fn failed_editor_delivery_records_the_lookup_cause_without_private_data() {
+        for (case, expected) in [
+            ("missing", "database_missing"),
+            ("absent", "marker_absent"),
+            ("failed", "sqlite_failed"),
+        ] {
+            let scratch = Scratch::new(case);
+            let user_data = scratch.0.join("Cursor");
+            let storage = user_data.join("User/globalStorage");
+            std::fs::create_dir_all(&storage).unwrap();
+            let database = storage.join("state.vscdb");
+            if case == "absent" {
+                super::super::state_db::fixture(
+                    &database,
+                    "CREATE TABLE cursorDiskKV(key TEXT, value TEXT);",
+                );
+            } else if case == "failed" {
+                super::super::state_db::fixture(&database, "CREATE TABLE unrelated(value TEXT);");
+            }
+            let identity =
+                super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
+            let marker = identity.chat_marker.as_deref().unwrap();
+            let conversation = conversation(&identity);
+            let instance = BridgeInstance {
+                socket: scratch.0.join("unused.sock"),
+                token: "private-token".into(),
+                user_data: user_data.clone(),
+                created_at: 1,
+            };
+            let answer = deliver_to_editor_with_instances(
+                &conversation,
+                &json!({"text":"private words"}),
+                &[instance],
+            )
+            .await;
+            assert_eq!(answer["status"], "failed");
+            let hash = super::super::short_hash(marker);
+            let lines = super::super::bridge_lines().lock().unwrap();
+            let diagnostic = lines
+                .iter()
+                .find(|line| {
+                    line.contains(&format!("id_hash={hash}"))
+                        && line.contains(&format!("stage=lookup result={expected}"))
+                })
+                .expect("delivery lookup cause was not logged");
+            for secret in [marker, "private-token", "private words", user_data.to_str().unwrap()] {
+                assert!(!diagnostic.contains(secret), "private data in {diagnostic}");
+            }
+        }
     }
     /// Records Working from the real Cursor and Codex followers with populated histories.
     /// The initial catch-up delay remains after Cursor bridge discovery is woken.

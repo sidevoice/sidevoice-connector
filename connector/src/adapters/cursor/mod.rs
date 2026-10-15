@@ -781,7 +781,16 @@ fn log_bridge(
     instance: Option<usize>,
     http_status: Option<u16>,
 ) {
-    crate::logfile::log(&bridge_diagnostic(stage, result, id, instance, http_status));
+    let line = bridge_diagnostic(stage, result, id, instance, http_status);
+    #[cfg(test)]
+    bridge_lines().lock().expect("bridge test sink").push(line.clone());
+    crate::logfile::log(&line);
+}
+
+#[cfg(test)]
+fn bridge_lines() -> &'static std::sync::Mutex<Vec<String>> {
+    static LINES: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+    LINES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
 fn short_hash(value: &str) -> String {
