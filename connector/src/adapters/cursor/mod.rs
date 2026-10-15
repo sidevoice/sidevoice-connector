@@ -29,6 +29,7 @@ pub fn config_home(profile: &crate::profile::Profile) -> &std::path::Path {
 use super::{envelope, Identity};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -621,6 +622,35 @@ struct BridgeInstance {
     created_at: u64,
 }
 
+/// Diagnostics contain only fixed stage/result codes and a short one-way digest of a random ID.
+/// Never pass a bridge token, message text, response body, database path or socket path here.
+fn bridge_diagnostic(
+    stage: &'static str,
+    result: &'static str,
+    id: Option<&str>,
+    instance: Option<usize>,
+    http_status: Option<u16>,
+) -> String {
+    let id = id
+        .map(|value| hex::encode(Sha256::digest(value.as_bytes()))[..12].to_owned())
+        .unwrap_or_else(|| "none".into());
+    format!(
+        "cursor_bridge stage={stage} result={result} id_hash={id} instance={} http_status={}",
+        instance.map_or_else(|| "none".into(), |index| index.to_string()),
+        http_status.map_or_else(|| "none".into(), |status| status.to_string())
+    )
+}
+
+fn log_bridge(
+    stage: &'static str,
+    result: &'static str,
+    id: Option<&str>,
+    instance: Option<usize>,
+    http_status: Option<u16>,
+) {
+    crate::logfile::log(&bridge_diagnostic(stage, result, id, instance, http_status));
+}
+
 fn bridge_instances() -> Vec<BridgeInstance> {
     let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     let dir = env::var("CURSOR_DESKTOP_BRIDGE_DIR")
@@ -629,6 +659,10 @@ fn bridge_instances() -> Vec<BridgeInstance> {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".cursor/desktop-bridge"));
+    bridge_instances_in(&dir)
+}
+
+fn bridge_instances_in(dir: &Path) -> Vec<BridgeInstance> {
     let mut found = fs::read_dir(dir)
         .ok()
         .into_iter()
@@ -827,20 +861,39 @@ async fn calling_thread(instances: &[BridgeInstance]) -> Option<String> {
 }
 
 pub async fn composer_holding(delivery: &Value) -> Option<String> {
+    composer_holding_in(delivery, &bridge_instances(), false).await
+}
+
+pub async fn composer_holding_for_delivery(delivery: &Value) -> Option<String> {
+    composer_holding_in(delivery, &bridge_instances(), true).await
+}
+
+async fn composer_holding_in(
+    delivery: &Value,
+    instances: &[BridgeInstance],
+    diagnostics: bool,
+) -> Option<String> {
     let marker = delivery.get("marker").and_then(Value::as_str)?;
     if marker.len() != 64 || !marker.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if diagnostics {
+            log_bridge("lookup", "invalid_marker", None, None, None);
+        }
         return None;
     }
     let candidate = delivery.get("candidate").and_then(Value::as_str);
-    let instances = bridge_instances();
+    if diagnostics && instances.is_empty() {
+        log_bridge("lookup", "no_bridge_instance", Some(marker), None, None);
+    }
     if let Some(candidate) = candidate {
         if safe_chat_id(candidate) {
-            if let Some(chat) = query_bridge_chat(&instances, marker, Some(candidate)).await {
+            if let Some(chat) =
+                query_bridge_chat(instances, marker, Some(candidate), diagnostics).await
+            {
                 return Some(chat);
             }
         }
     }
-    query_bridge_chat(&instances, marker, None).await
+    query_bridge_chat(instances, marker, None, diagnostics).await
 }
 
 fn safe_chat_id(value: &str) -> bool {
@@ -855,13 +908,26 @@ async fn query_bridge_chat(
     instances: &[BridgeInstance],
     marker: &str,
     candidate: Option<&str>,
+    diagnostics: bool,
 ) -> Option<String> {
-    for instance in instances {
+    for (index, instance) in instances.iter().enumerate() {
         if instance.user_data.as_os_str().is_empty() {
+            if diagnostics {
+                log_bridge("lookup", "no_user_data", Some(marker), Some(index), None);
+            }
             continue;
         }
         let database = instance.user_data.join("User/globalStorage/state.vscdb");
         if !database.is_file() {
+            if diagnostics {
+                log_bridge(
+                    "lookup",
+                    "database_missing",
+                    Some(marker),
+                    Some(index),
+                    None,
+                );
+            }
             continue;
         }
         let (from, to) = match candidate.filter(|value| safe_chat_id(value)) {
@@ -878,13 +944,43 @@ async fn query_bridge_chat(
             .stderr(Stdio::null())
             .kill_on_drop(true);
         let result = command.output();
-        let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(3), result).await else {
-            continue;
+        let output = match tokio::time::timeout(Duration::from_secs(3), result).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(_)) => {
+                if diagnostics {
+                    log_bridge(
+                        "lookup",
+                        "sqlite_start_failed",
+                        Some(marker),
+                        Some(index),
+                        None,
+                    );
+                }
+                continue;
+            }
+            Err(_) => {
+                if diagnostics {
+                    log_bridge("lookup", "sqlite_timeout", Some(marker), Some(index), None);
+                }
+                continue;
+            }
         };
         if !output.status.success() {
+            if diagnostics {
+                log_bridge("lookup", "sqlite_failed", Some(marker), Some(index), None);
+            }
             continue;
         }
         let Ok(rows) = serde_json::from_slice::<Vec<Value>>(&output.stdout) else {
+            if diagnostics {
+                log_bridge(
+                    "lookup",
+                    "sqlite_output_invalid",
+                    Some(marker),
+                    Some(index),
+                    None,
+                );
+            }
             continue;
         };
         if rows.len() == 1 {
@@ -893,36 +989,73 @@ async fn query_bridge_chat(
                 .and_then(Value::as_str)
                 .filter(|chat| safe_chat_id(chat))
             {
+                if diagnostics {
+                    log_bridge("lookup", "chat_found", Some(chat), Some(index), None);
+                }
                 return Some(chat.to_owned());
             }
+        }
+        if diagnostics {
+            log_bridge(
+                "lookup",
+                if rows.is_empty() {
+                    "marker_absent"
+                } else {
+                    "chat_ambiguous"
+                },
+                Some(marker),
+                Some(index),
+                None,
+            );
         }
     }
     None
 }
 
 pub async fn deliver_editor(delivery: &Value, event: &Value) -> Option<Value> {
+    let instances = bridge_instances();
+    deliver_editor_to_instances(delivery, event, &instances).await
+}
+
+async fn deliver_editor_to_instances(
+    delivery: &Value,
+    event: &Value,
+    instances: &[BridgeInstance],
+) -> Option<Value> {
     let composer = if let Some(composer) = delivery.get("composer").and_then(Value::as_str) {
         composer.to_owned()
     } else {
-        composer_holding(delivery).await?
+        composer_holding_in(delivery, instances, true).await?
     };
     let text = match envelope(event) {
         Ok(text) => text,
         Err(error) => return Some(json!({"status":"failed","detail":error.to_string()})),
     };
-    let instances = bridge_instances();
-    for instance in &instances {
+    if instances.is_empty() {
+        log_bridge("send", "no_bridge_instance", Some(&composer), None, None);
+    }
+    for (index, instance) in instances.iter().enumerate() {
         match bridge_request(
             instance,
             &json!({"type":"sendMessage","threadId":composer,"text":text,"force":false}),
         )
         .await
         {
-            Err(BridgeError::Before) => continue,
+            Err(BridgeError::Before) => {
+                log_bridge("send", "connect_failed", Some(&composer), Some(index), None);
+                continue;
+            }
             Err(BridgeError::After(error)) => {
+                log_bridge(
+                    "send",
+                    "reply_uncertain",
+                    Some(&composer),
+                    Some(index),
+                    None,
+                );
                 return Some(
                     json!({"status":"unknown","detail":format!("Cursor Desktop Bridge may have taken the message: {error}")}),
-                )
+                );
             }
             Ok(response) => {
                 let outcome = response
@@ -932,19 +1065,51 @@ pub async fn deliver_editor(delivery: &Value, event: &Value) -> Option<Value> {
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 if response.status == 200 && matches!(outcome, "submitted" | "queued") {
+                    log_bridge(
+                        "send",
+                        if outcome == "submitted" {
+                            "submitted"
+                        } else {
+                            "queued"
+                        },
+                        Some(&composer),
+                        Some(index),
+                        Some(response.status),
+                    );
                     return Some(
                         json!({"status":"accepted","detail":format!("Cursor Desktop Bridge: {outcome}")}),
                     );
                 }
                 if matches!(outcome, "not-found" | "unknown-thread") {
+                    log_bridge(
+                        "send",
+                        "unknown_thread",
+                        Some(&composer),
+                        Some(index),
+                        Some(response.status),
+                    );
                     continue;
                 }
                 // Refused outright (the request was not taken): nothing reached the chat.
                 if (400..500).contains(&response.status) {
+                    log_bridge(
+                        "send",
+                        "refused",
+                        Some(&composer),
+                        Some(index),
+                        Some(response.status),
+                    );
                     return Some(
                         json!({"status":"failed","detail":format!("Cursor Desktop Bridge refused the message ({}): {}", response.status, response.body.get("reason").or_else(|| response.body.get("message")).or_else(|| response.body.get("error")).and_then(Value::as_str).unwrap_or(outcome))}),
                     );
                 }
+                log_bridge(
+                    "send",
+                    "unconfirmed_reply",
+                    Some(&composer),
+                    Some(index),
+                    Some(response.status),
+                );
                 return Some(
                     json!({"status":"unknown","detail":format!("Cursor Desktop Bridge did not confirm delivery: {}", response.body.get("reason").or_else(|| response.body.get("message")).or_else(|| response.body.get("error")).and_then(Value::as_str).unwrap_or(outcome))}),
                 );
@@ -1008,4 +1173,85 @@ pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
     Ok(
         json!({"status":"unknown","detail":format!("typed into persistent session {session}{}", if attached {" (someone is attached)"} else {""})}),
     )
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+    use crate::secure_fs::tests::Scratch;
+    use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn queued_bridge_submission_has_no_editor_consumption_receipt() {
+        let scratch = Scratch::new("cursor-bridge-delivery");
+        let descriptors = scratch.0.join("desktop-bridge");
+        fs::create_dir(&descriptors).unwrap();
+        let user_data = scratch.0.join("Cursor");
+        let storage = user_data.join("User/globalStorage");
+        fs::create_dir_all(&storage).unwrap();
+        let database = storage.join("state.vscdb");
+        let marker = "a".repeat(64);
+        let sql = format!(
+            "CREATE TABLE cursorDiskKV(key TEXT, value TEXT); INSERT INTO cursorDiskKV VALUES ('bubbleId:chat-1:turn', 'join {marker}');"
+        );
+        assert!(Command::new("sqlite3")
+            .arg(&database)
+            .arg(sql)
+            .status()
+            .unwrap()
+            .success());
+
+        let socket = scratch.0.join("bridge.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::write(
+            descriptors.join("one.json"),
+            serde_json::to_vec(&json!({
+                "protocolVersion":1,"pid":std::process::id(),"socketPath":socket,
+                "token":"fixture-secret","userDataDir":user_data,"createdAt":1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let instances = bridge_instances_in(&descriptors);
+        assert_eq!(instances.len(), 1);
+        let chat = query_bridge_chat(&instances, &marker, None, true).await;
+        assert_eq!(chat.as_deref(), Some("chat-1"));
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let count = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..count]);
+            assert!(request.contains("\"type\":\"sendMessage\""));
+            assert!(request.contains("\"threadId\":\"chat-1\""));
+            let response = r#"{"outcome":"queued"}"#;
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+            // This fake bridge never writes to an editor transcript. The HTTP reply says only
+            // that it queued the request; no later input.read can be inferred from it.
+        });
+        let event = json!({"channel":"voice","session_id":"s","revision":1,"message_id":"m","text":"private words"});
+        let result = deliver_editor_to_instances(&json!({"composer":chat}), &event, &instances)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(result["status"], "accepted");
+        assert_eq!(result["detail"], "Cursor Desktop Bridge: queued");
+        assert!(!scratch.0.join("chat.jsonl").exists());
+    }
+
+    #[test]
+    fn diagnostic_never_contains_ids_or_message_material() {
+        let line = bridge_diagnostic(
+            "send",
+            "queued",
+            Some("private-chat-id"),
+            Some(1),
+            Some(200),
+        );
+        assert!(line.contains("cursor_bridge stage=send result=queued"));
+        assert!(line.contains("instance=1 http_status=200"));
+        assert!(!line.contains("private-chat-id"));
+        assert!(!line.contains("private words"));
+        assert!(!line.contains("fixture-secret"));
+    }
 }

@@ -2,8 +2,8 @@
 //! Bridge once it knows which chat a conversation is, their transcript found the same way.
 
 use super::{
-    bridge_running, composer_holding, deliver_editor, editor_transcript_chat, engine,
-    sqlite3_found, transcript_path,
+    bridge_running, composer_holding, composer_holding_for_delivery, deliver_editor,
+    editor_transcript_chat, engine, log_bridge, sqlite3_found, transcript_path,
 };
 use crate::adapters::conversation::{Conversation, Room};
 use crate::adapters::harness::{no_route, Harness, Route};
@@ -212,10 +212,20 @@ fn bridge_state(state: &str) -> Value {
 async fn deliver_to_editor(conversation: &Conversation, frame: &Value) -> Value {
     let mut delivery = conversation.delivery.clone();
     let composer = match bridge(conversation) {
-        Some(composer) => Some(composer),
-        None => composer_holding(&delivery).await,
+        Some(composer) => {
+            log_bridge("lookup", "cached_chat", Some(&composer), None, None);
+            Some(composer)
+        }
+        None => composer_holding_for_delivery(&delivery).await,
     };
     let Some(composer) = composer else {
+        log_bridge(
+            "delivery",
+            "chat_unresolved",
+            delivery.get("marker").and_then(Value::as_str),
+            None,
+            None,
+        );
         let state = route_state(false);
         return json!({"status":"failed",
             "detail":format!("Not sent, {state}: voice reaches this Cursor chat only through its Desktop Bridge, once Cursor has recorded the chat's join call (up to ~30 s after it).")});
