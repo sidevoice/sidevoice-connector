@@ -51,19 +51,23 @@ fn agents_lists_in_english_or_as_json_and_failures_carry_a_stable_key() {
         .iter()
         .filter_map(|row| row["id"].as_str())
         .collect();
-    // Cursor is found by its home, which the connector edits; Claude Code and Codex only by their CLIs, listed when
-    // this machine has them.
-    assert!(ids.contains(&"cursor"), "{value}");
+    // An agent is listed for its program (its CLI or its app), never for its home alone, which every agent has in this
+    // profile: what is listed is what this machine has installed.
+    assert!(
+        ids.iter()
+            .all(|id| ["claude", "codex", "cursor"].contains(id)),
+        "{value}"
+    );
     for row in value["agents"].as_array().unwrap() {
-        if row["id"] != "cursor" {
-            assert!(row["evidence"].to_string().contains("\"binary\""), "{row}");
-        }
+        let evidence = row["evidence"].to_string();
+        assert!(
+            evidence.contains("\"binary\"") || evidence.contains("\"app\""),
+            "{row}"
+        );
     }
 
     let text = profile.connector(&["agents"]).output().unwrap();
     assert!(text.status.success());
-    let text = String::from_utf8_lossy(&text.stdout);
-    assert!(text.contains("Cursor: "), "{text}");
 
     let refused = profile
         .connector(&["agents", "connect", "nobody", "--json"])

@@ -16,7 +16,12 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-const APP: &str = "/Applications/Cursor.app";
+/// Where Cursor's app is installed: the macOS bundle, and the Linux packages' own directories (`.deb`/`.rpm`).
+const APPS: [&str; 3] = [
+    "/Applications/Cursor.app",
+    "/usr/share/cursor",
+    "/opt/Cursor",
+];
 
 /// The `command` and `args` of an `mcp.json` entry.
 fn entry_command(entry: &Value) -> (&str, Vec<String>) {
@@ -264,11 +269,10 @@ impl Registration for Cursor {
     }
 
     fn evidence(&self) -> Vec<(&'static str, PathBuf)> {
-        if Path::new(APP).exists() {
-            vec![("app", PathBuf::from(APP))]
-        } else {
-            Vec::new()
-        }
+        APPS.iter()
+            .filter(|app| Path::new(app).exists())
+            .map(|app| ("app", PathBuf::from(app)))
+            .collect()
     }
 
     fn connects_without_binary(&self) -> bool {
