@@ -51,12 +51,30 @@ fn agents_lists_in_english_or_as_json_and_failures_carry_a_stable_key() {
         .iter()
         .filter_map(|row| row["id"].as_str())
         .collect();
-    assert_eq!(ids, ["claude", "codex", "cursor"], "{value}");
+    // An agent is listed for its CLI or passive install marker, never for its home alone, which every agent has in this
+    // profile: what is listed is what this machine has installed.
+    assert!(
+        ids.iter()
+            .all(|id| ["claude", "codex", "cursor"].contains(id)),
+        "{value}"
+    );
+    for row in value["agents"].as_array().unwrap() {
+        let evidence = row["evidence"].to_string();
+        assert!(
+            ["cli", "app_bundle", "install_dir", "install_file"]
+                .iter()
+                .any(|kind| evidence.contains(&format!("\"{kind}\""))),
+            "{row}"
+        );
+        assert!(row["evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item.get("path").is_none()));
+    }
 
     let text = profile.connector(&["agents"]).output().unwrap();
     assert!(text.status.success());
-    let text = String::from_utf8_lossy(&text.stdout);
-    assert!(text.contains("Claude Code: "), "{text}");
 
     let refused = profile
         .connector(&["agents", "connect", "nobody", "--json"])

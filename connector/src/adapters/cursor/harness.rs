@@ -2,8 +2,8 @@
 //! Bridge once it knows which chat a conversation is, their transcript found the same way.
 
 use super::{
-    bridge_running, composer_holding, deliver_editor, editor_transcript_chat, engine,
-    sqlite3_found, transcript_path,
+    bridge_running, composer_holding, composer_holding_for_delivery, deliver_editor,
+    editor_transcript_chat, engine, log_bridge, log_correlation, transcript_path,
 };
 use crate::adapters::conversation::{Conversation, Room};
 use crate::adapters::harness::{no_route, Harness, Route};
@@ -19,16 +19,13 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 use tokio::time::Duration;
 
 /// What an editor chat's delivery and status say until the Desktop Bridge knows which chat it is.
 const WAITING: &str = "waiting for Cursor to register this chat";
 /// What they say when Cursor's Desktop Bridge is not running at all.
 const NO_BRIDGE: &str = "Cursor's Desktop Bridge is not running";
-/// What they say when the chat cannot be looked up: Cursor's records are read with `sqlite3`.
-const NO_SQLITE: &str =
-    "sqlite3 is not installed, and Sidevoice needs it to find which Cursor chat this is";
-
 /// Cursor.
 #[derive(Default)]
 pub struct Cursor;
@@ -39,6 +36,7 @@ pub struct Cursor;
 struct Chats {
     bridge: Mutex<Option<String>>,
     transcript: Mutex<Option<String>>,
+    bridge_changed: Notify,
 }
 
 fn chats(conversation: &Conversation) -> Option<&Chats> {
@@ -50,8 +48,27 @@ fn bridge(conversation: &Conversation) -> Option<String> {
 }
 
 fn set_bridge(conversation: &Conversation, chat: String) {
-    if let Some(mut bridge) = chats(conversation).and_then(|chats| chats.bridge.lock().ok()) {
-        *bridge = Some(chat);
+    if let Some(chats) = chats(conversation) {
+        if let Ok(mut bridge) = chats.bridge.lock() {
+            *bridge = Some(chat);
+            chats.bridge_changed.notify_one();
+        }
+    }
+}
+
+/// Wait for the next discovery scan, unless delivery already identified this chat.
+async fn wait_for_bridge_or_scan(conversation: &Conversation, scan_ms: u64) {
+    // notify_one retains a permit if delivery identifies the chat between this check and wait.
+    let changed = chats(conversation)
+        .expect("Cursor conversation state")
+        .bridge_changed
+        .notified();
+    if bridge(conversation).is_some() {
+        return;
+    }
+    tokio::select! {
+        _ = changed => {},
+        _ = tokio::time::sleep(Duration::from_millis(scan_ms)) => {},
     }
 }
 
@@ -177,27 +194,55 @@ impl Harness for Cursor {
         match conversation.route_kind() {
             Some("cursor-tmux" | "none") => {
                 let chat = conversation.thread.clone();
+                watch_engine(conversation.clone(), room.clone(), false);
                 transcript::follow(conversation, room, Reader::new(chat, false));
             }
-            Some("cursor-bridge") => watch_editor(conversation, room),
+            Some("cursor-bridge") => {
+                watch_engine(conversation.clone(), room.clone(), true);
+                watch_editor(conversation, room);
+            }
             _ => {}
         }
     }
 }
 
+fn watch_engine(conversation: Arc<Conversation>, room: Arc<dyn Room>, editor: bool) {
+    tokio::spawn(async move {
+        let mut last = None;
+        while !conversation.stopped.load(Ordering::Relaxed) {
+            let chat = if editor {
+                bridge(&conversation)
+                    .filter(|chat| followed(&conversation).as_deref() == Some(chat))
+            } else {
+                Some(conversation.thread.clone())
+            };
+            if let Some(chat) = chat {
+                if let Some(found) = engine(&chat).await {
+                    let still_current = !editor
+                        || (bridge(&conversation).as_deref() == Some(chat.as_str())
+                            && followed(&conversation).as_deref() == Some(chat.as_str()));
+                    if still_current && last.as_ref() != Some(&found) {
+                        room.engine(&conversation, found.clone()).await;
+                        last = Some(found);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+}
+
 /// Where an editor chat's route stands: registered when the Desktop Bridge knows which chat it is, else why not
 /// yet.
 fn route_state(chat_known: bool) -> &'static str {
-    state_of(chat_known, bridge_running(), sqlite3_found())
+    state_of(chat_known, bridge_running())
 }
 
-fn state_of(chat_known: bool, bridge_running: bool, sqlite3: bool) -> &'static str {
+fn state_of(chat_known: bool, bridge_running: bool) -> &'static str {
     if chat_known {
         "registered"
     } else if !bridge_running {
         NO_BRIDGE
-    } else if !sqlite3 {
-        NO_SQLITE
     } else {
         WAITING
     }
@@ -212,10 +257,20 @@ fn bridge_state(state: &str) -> Value {
 async fn deliver_to_editor(conversation: &Conversation, frame: &Value) -> Value {
     let mut delivery = conversation.delivery.clone();
     let composer = match bridge(conversation) {
-        Some(composer) => Some(composer),
-        None => composer_holding(&delivery).await,
+        Some(composer) => {
+            log_bridge("lookup", "cached_chat", Some(&composer), None, None);
+            Some(composer)
+        }
+        None => composer_holding_for_delivery(&delivery).await,
     };
     let Some(composer) = composer else {
+        log_bridge(
+            "delivery",
+            "chat_unresolved",
+            delivery.get("marker").and_then(Value::as_str),
+            None,
+            None,
+        );
         let state = route_state(false);
         return json!({"status":"failed",
             "detail":format!("Not sent, {state}: voice reaches this Cursor chat only through its Desktop Bridge, once Cursor has recorded the chat's join call (up to ~30 s after it).")});
@@ -298,6 +353,13 @@ fn watch_editor(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
                     );
                 }
                 if pending_message_match {
+                    log_correlation(
+                        "mapping",
+                        "transcript_message",
+                        binding.delivery.get("marker").and_then(Value::as_str),
+                        &chat,
+                        None,
+                    );
                     set_bridge(binding, chat);
                     continue;
                 }
@@ -323,7 +385,7 @@ fn watch_editor(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(2_000)
                 .max(10);
-            tokio::time::sleep(Duration::from_millis(scan_ms)).await;
+            wait_for_bridge_or_scan(binding, scan_ms).await;
         }
     });
 }
@@ -334,16 +396,11 @@ fn watch_editor(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
 struct Reader {
     chat: String,
     editor: bool,
-    engine_checked: bool,
 }
 
 impl Reader {
     fn new(chat: String, editor: bool) -> Self {
-        Self {
-            chat,
-            editor,
-            engine_checked: false,
-        }
+        Self { chat, editor }
     }
 }
 
@@ -364,25 +421,9 @@ impl TranscriptReader for Reader {
         true
     }
 
-    fn begin(&mut self, authenticated: bool) -> Vec<Observed> {
-        if !authenticated || self.engine_checked {
-            return Vec::new();
-        }
-        self.engine_checked = true;
-        engine(&self.chat)
-            .map(Observed::Engine)
-            .into_iter()
-            .collect()
-    }
-
-    fn item(&mut self, item: &Value, authenticated: bool) -> Vec<Observed> {
+    fn item(&mut self, item: &Value, _authenticated: bool) -> Vec<Observed> {
         let mut observed = Vec::new();
         let text = transcript::user_text(item, false);
-        if authenticated && text.is_some() {
-            if let Some(engine) = engine(&self.chat) {
-                observed.push(Observed::Engine(engine));
-            }
-        }
         if item.get("type") == Some(&json!("turn_ended")) {
             observed.push(Observed::Working(false));
         } else if item.get("role") == Some(&json!("user")) {
@@ -545,14 +586,64 @@ mod tests {
         }
     }
 
-    /// Why an editor chat is not reached yet, in the order a person fixes it: the bridge, then sqlite3, then Cursor
-    /// recording the join.
+    /// A delivery can identify the editor chat while the periodic transcript scan sleeps.
+    /// Its retained wakeup must let the watcher attach without waiting for that scan.
+    #[tokio::test]
+    async fn bridge_identification_wakes_working_monitor() {
+        let identity =
+            super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
+        let conversation = Arc::new(conversation(&identity));
+        let waiter = tokio::spawn({
+            let conversation = conversation.clone();
+            async move { wait_for_bridge_or_scan(&conversation, 2_000).await }
+        });
+        tokio::task::yield_now().await;
+        set_bridge(&conversation, "chat-1".into());
+        tokio::time::timeout(Duration::from_millis(500), waiter)
+            .await
+            .expect("delivery must wake the monitor without a scan interval")
+            .unwrap();
+        assert_eq!(bridge(&conversation).as_deref(), Some("chat-1"));
+
+        // A bridge set just before the wait is also observed without sleeping.
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            wait_for_bridge_or_scan(&conversation, 2_000),
+        )
+        .await
+        .expect("a known bridge must not wait for another scan");
+    }
+
+    #[test]
+    fn transcript_fixture_reports_busy_until_turn_ends() {
+        let mut reader = Reader::new("chat-1".into(), true);
+        let fixture = [
+            r#"{"role":"user","message":{"content":"hello"}}"#,
+            r#"{"role":"assistant","message":{"content":"working"}}"#,
+            r#"{"type":"turn_ended"}"#,
+        ];
+        let events = fixture
+            .iter()
+            .map(|line| {
+                reader
+                    .item(&serde_json::from_str::<Value>(line).unwrap(), false)
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        Observed::Working(value) => Some(value),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(events, vec![vec![true], vec![], vec![false]]);
+    }
+
+    /// Why an editor chat is not reached yet: the bridge, then Cursor recording the join.
     #[test]
     fn an_unregistered_chat_says_what_it_waits_for() {
-        assert_eq!(state_of(true, false, false), "registered");
-        assert_eq!(state_of(false, false, true), NO_BRIDGE);
-        assert_eq!(state_of(false, true, false), NO_SQLITE);
-        assert_eq!(state_of(false, true, true), WAITING);
+        assert_eq!(state_of(true, false), "registered");
+        assert_eq!(state_of(false, false), NO_BRIDGE);
+        assert_eq!(state_of(false, true), WAITING);
     }
 
     /// An editor chat joins on the Desktop Bridge route, with a marker of its own the bridge finds it by, which its
@@ -606,5 +697,163 @@ mod tests {
         set_bridge(&conversation, "chat-1".into());
         let listed = Cursor.status(&conversation).await.unwrap();
         assert_eq!(listed["delivery_state"]["state"], "registered");
+    }
+    /// Records Working from the real Cursor and Codex followers with populated histories.
+    /// The initial catch-up delay remains after Cursor bridge discovery is woken.
+    struct HistoryRoom {
+        profile: Profile,
+        events: AsyncMutex<Vec<Value>>,
+    }
+    impl Room for HistoryRoom {
+        fn profile(&self) -> &Profile {
+            &self.profile
+        }
+        fn engine<'a>(&'a self, _: &'a Conversation, _: Value) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+        fn working<'a>(&'a self, _: &'a Conversation, event: Value) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.events.lock().await.push(event);
+            })
+        }
+        fn read<'a>(
+            &'a self,
+            _: &'a Conversation,
+            _: &'a str,
+            _: Value,
+            _: Value,
+            _: Value,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+        fn conversations(&self) -> BoxFuture<'_, Vec<Arc<Conversation>>> {
+            Box::pin(async { vec![] })
+        }
+    }
+    async fn wait_for_caught_up_working(room: &HistoryRoom) {
+        tokio::time::timeout(Duration::from_secs(6), async {
+            while room.events.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn populated_cursor_and_codex_history_delays_initial_working() {
+        use std::{fs, io::Write};
+        let root = std::env::temp_dir().join(format!("sv-history-watch-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let previous_data = std::env::var_os("CURSOR_DATA_DIR");
+        std::env::set_var("CURSOR_DATA_DIR", &root);
+        for large in [false, true] {
+            let chat = if large {
+                "history-large-chat"
+            } else {
+                "history-small-chat"
+            };
+            let path = root.join(format!(
+                "projects/project/agent-transcripts/{chat}/{chat}.jsonl"
+            ));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let history = format!(
+                "{}\n",
+                json!({"role":"assistant","message":{"content":"x".repeat(1024)}})
+            );
+            let mut content = if large {
+                history.repeat(500)
+            } else {
+                String::new()
+            };
+            content.push_str("{\"role\":\"user\",\"message\":{\"content\":\"hello\"}}\n");
+            fs::write(&path, &content).unwrap();
+            let identity =
+                super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
+            let binding = Arc::new(conversation(&identity));
+            let room = Arc::new(HistoryRoom {
+                profile: Profile::for_test(&root.join(chat), &[]),
+                events: AsyncMutex::new(vec![]),
+            });
+            watch_editor(binding.clone(), room.clone());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let start = tokio::time::Instant::now();
+            set_bridge(&binding, chat.to_owned());
+            wait_for_caught_up_working(&room).await;
+            let elapsed = start.elapsed();
+            println!(
+                "History Cursor large={large} bytes={} first_working_ms={}",
+                content.len(),
+                elapsed.as_millis()
+            );
+            assert_eq!(
+                room.events.lock().await.as_slice(),
+                &[json!({"working":true,"turn_id":null})]
+            );
+            if large {
+                assert!(elapsed >= Duration::from_secs(2));
+            } else {
+                assert!(elapsed < Duration::from_secs(2));
+            }
+            for _ in 0..10 {
+                set_bridge(&binding, chat.to_owned());
+            }
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(file, "{{\"type\":\"turn_ended\"}}").unwrap();
+            tokio::time::sleep(Duration::from_millis(850)).await;
+            assert_eq!(
+                room.events.lock().await.as_slice(),
+                &[
+                    json!({"working":true,"turn_id":null}),
+                    json!({"working":false,"turn_id":null})
+                ]
+            );
+            binding.stopped.store(true, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(450)).await;
+        }
+        let profile = Profile::for_test(&root.join("codex"), &[crate::adapters::codex::HOME]);
+        let path = profile
+            .agent_home("CODEX_HOME")
+            .join("sessions/2026/10/15/rollout-history-codex.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let history = format!(
+            "{}\n",
+            json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"x".repeat(1024)}]}})
+        );
+        let mut content = history.repeat(500);
+        content.push_str(
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}\n",
+        );
+        fs::write(&path, &content).unwrap();
+        let identity =
+            super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
+        let mut binding = conversation(&identity);
+        binding.thread = "history-codex".into();
+        binding.delivery = json!({"kind":"codex-queue"});
+        let binding = Arc::new(binding);
+        let room = Arc::new(HistoryRoom {
+            profile,
+            events: AsyncMutex::new(vec![]),
+        });
+        let start = tokio::time::Instant::now();
+        crate::adapters::codex::Codex.watch(binding.clone(), room.clone());
+        wait_for_caught_up_working(&room).await;
+        println!(
+            "History Codex bytes={} first_working_ms={}",
+            content.len(),
+            start.elapsed().as_millis()
+        );
+        assert!(start.elapsed() >= Duration::from_secs(2));
+        assert_eq!(
+            room.events.lock().await.as_slice(),
+            &[json!({"working":true,"turn_id":"t1"})]
+        );
+        binding.stopped.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        if let Some(value) = previous_data {
+            std::env::set_var("CURSOR_DATA_DIR", value);
+        } else {
+            std::env::remove_var("CURSOR_DATA_DIR");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -7,6 +7,7 @@ mod support;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::channel;
 use std::time::Duration;
@@ -61,13 +62,33 @@ fn what_is_typed_on_the_bench_reaches_a_conversation_and_its_reply_shows() {
     let profile = Profile::new("bench");
     // The test's profile has the bench's layout; its bench/ directory marks it as one the bench may use.
     private_dir(&profile.root.join("bench"));
+    let bin = profile.root.join("person-bin");
+    private_dir(&bin);
+    let codex = bin.join("codex");
+    std::fs::write(
+        &codex,
+        b"#!/bin/sh\necho 'No such server: sidevoice' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let login_path = format!("{}:/usr/bin:/bin", bin.display());
+    let shell = profile.root.join("person-login-shell");
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' '{login_path}'\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
     let _uninstall = Uninstall(&profile);
     let mut child = Command::new(BENCH)
         .arg("--profile")
         .arg(&profile.root)
         .args(["--port", "0"])
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", &login_path)
+        .env("SHELL", &shell)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -89,6 +110,12 @@ fn what_is_typed_on_the_bench_reaches_a_conversation_and_its_reply_shows() {
             break url.trim_end_matches('/').to_owned();
         }
     };
+
+    // A fresh bench must finish discovery before it can accept the first Codex delivery.
+    let discovery = read_json(&profile.data().join("agents.json"))
+        .expect("bench startup did not write discovery state");
+    assert_eq!(discovery["login_path"], json!(login_path));
+    assert_eq!(discovery["binaries"]["codex"], json!(codex));
 
     // The bench's call is open on the core the installation started.
     until("the bench's call", 60, || {

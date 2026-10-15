@@ -11,6 +11,7 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -28,11 +29,39 @@ fn settings() -> BTreeMap<String, String> {
     ])
 }
 
+/// Where a test installs Cursor (`cursor_installed`): its CLI on the fake login PATH.
+fn cursor_program(profile: &Profile) -> PathBuf {
+    profile.root.join("cursor-bin/cursor-agent")
+}
+
+/// Cursor installed in the profile: a stand-in of its CLI.
+fn cursor_installed(profile: &Profile) {
+    let program = cursor_program(profile);
+    fs::create_dir_all(program.parent().unwrap()).unwrap();
+    fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    let shell = profile.root.join("login-shell");
+    fs::write(
+        &shell,
+        "#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' \"$SIDEVOICE_TEST_LOGIN_PATH\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 /// `program args… --json` in the profile: its one JSON line and whether it succeeded.
 fn run(profile: &Profile, program: &Path, args: &[&str]) -> (bool, Value) {
     let output = profile
         .command(program)
         .envs(settings())
+        .env("SHELL", profile.root.join("login-shell"))
+        .env(
+            "SIDEVOICE_TEST_LOGIN_PATH",
+            format!(
+                "{}:/usr/bin:/bin",
+                cursor_program(profile).parent().unwrap().display()
+            ),
+        )
         .args(args)
         .arg("--json")
         .stdin(Stdio::null())
@@ -82,6 +111,7 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
     let root = package(&at, &archive, &record, record["sha256"].as_str().unwrap());
     let program = root.join("bin/sidevoice-connector");
     let profile = Profile::new("install");
+    cursor_installed(&profile);
     let _teardown = Teardown(&profile, program.clone());
 
     let (ok, installed) = run(&profile, &program, &["install"]);
@@ -124,7 +154,7 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
     });
     mcp.stop();
 
-    // Cursor (its configuration directory is there) is found and left without Sidevoice, with the command that
+    // Cursor (its CLI is installed) is found and left without Sidevoice, with the command that
     // connects it; connected with it, it runs the installation's command.
     assert_eq!(
         installed["agents"]["cursor"]["outcome"], "not-connected",

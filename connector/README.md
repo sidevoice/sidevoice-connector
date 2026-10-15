@@ -5,6 +5,11 @@ Sidevoice core: it installs itself and the core it carries (`install`, below), s
 runs the machine's connector daemon, which holds the link to the core. On npm it is `sidevoice`, whose launcher runs
 this binary from the platform package (RELEASING.md); the command is then `sidevoice`.
 
+The connector reports `input.working` as soon as its harness observes a busy transition. Claude Code uses its
+session status, Codex uses rollout turn events, and Cursor uses the joined chat's transcript. For an editor chat,
+Cursor's Desktop Bridge must first identify that chat; delivery identifying it wakes transcript monitoring at once.
+The room exposes this as a boolean fact, and the web waits three seconds before showing Working.
+
 ## Commands
 
 | Command | What it does |
@@ -115,6 +120,28 @@ connect the agents it found that the connector can connect itself: all, some (by
 (Enter, or the end of input); those chosen are connected as `agents connect` connects them. The install lock is
 released before it asks. With `--json` (the desktop app reads it) or without a terminal nothing is asked.
 
+An agent is found (listed by `agents`, `agents.list` and the install offer, with `present: true`) when any
+adapter-declared marker matches. CLI commands are resolved with the `which` crate against the person's freshly
+captured login-shell PATH, never the connector service's PATH. Fixed install paths are checked with
+`symlink_metadata` only; checking a path never starts an application or runs an OS registration query. The connector
+captures PATH with a framed `$SHELL -lc` command on each scan, rejects startup banners outside the frame, and lists
+no agents if capture fails. A configuration directory alone is never installation evidence.
+
+| Agent | CLI names (all OS) | macOS fixed markers | Windows fixed markers | Linux fixed markers |
+| --- | --- | --- | --- | --- |
+| Claude Code | `claude` | `~/.local/bin/claude` (native installer) | `%USERPROFILE%\.local\bin\claude.exe` (native installer) | `~/.local/bin/claude` (native installer) |
+| Codex | `codex` | none; npm/Homebrew prefixes vary | none; installation prefixes vary | none; installation prefixes vary |
+| Cursor | `cursor-agent`, `cursor` | `/Applications/Cursor.app`, `~/Applications/Cursor.app` | `%LOCALAPPDATA%\Programs\cursor`, `%ProgramFiles%\cursor` | `/usr/share/cursor` (package install), `~/.local/share/cursor` (per-user extracted install) |
+
+`~` uses the process home; Windows environment roots are read from `LOCALAPPDATA` and `ProgramFiles`. Fixed markers
+are intentionally narrow. A Cursor app installed elsewhere without a `cursor` or `cursor-agent` command on the
+captured PATH is not detected; the person can use Other to connect by hand. Public `evidence` reports only matched
+marker kinds (`cli`, `install_file`, `app_bundle`, `install_dir`), never the resolved paths or home directory.
+Install-marker checks never run candidate commands. Scans do not probe `--version`, so an agent's `version` is `null`.
+
+Codex queue delivery uses the CLI from that captured PATH and fails if none was found; it never runs a different
+`codex` from the connector service's PATH.
+
 An agent whose registration is `connected` also says whether that registration works: its row in `agents` (and the
 connector's `agents.list`) carries `health`, `{"state","error","checked_at"}`. The connector starts the entry as the
 agent would: its command, arguments, environment and (Codex's `cwd`) working directory, read back from the agent's
@@ -132,10 +159,74 @@ output`, `timed out`, `protocol mismatch`); `checked_at` is when (ISO 8601, UTC)
 (`agents.check`, `{"id"}`, or `agents check <id>`); a listing from the cache, and a request with too little time
 left, keep the last one found (in `agents.json`).
 
+### Agent readiness
+
+Every row in `agents.list` / `agents --json` may carry an optional `readiness` object:
+
+```json
+{"readiness":{"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":"Voice in the Cursor editor needs Cursor's Desktop Bridge: in Cursor, open Settings › Beta, enable “Allow CLI to access desktop agents”, then restart Cursor."}]}}
+```
+
+`state` is `ready`, `needs_attention`, or `unsupported`. `reasons` is an ordered array of
+`{"code","message"}` objects. `code` is stable in the `<agent>.<code>` namespace;
+`message` is a plain English fallback instruction supplied by that agent's check, with no paths,
+tokens, versions, or home directories. Consumers use `code` for logic and localization: the web
+shows its `agents.readiness.<code>` translation when present, else `message`. An absent
+`readiness` field means ready: adapters with no checks omit it. Every check contributes either
+OK, needs attention with a reason, or unsupported with a reason. The aggregate is `unsupported`
+if any check is unsupported; otherwise `needs_attention` if any check needs attention; otherwise
+`ready`. All non-OK reason objects are retained in check order. A ready object has `reasons: []`.
+For `cursor.unsupported`, the fallback is “Cursor editor voice is not supported on this computer.”
+
+Cursor currently has one check: a usable Desktop Bridge descriptor with a live process and socket
+is ready even when the selected CLI is `cursor-agent`. A detected Cursor editor in either
+`/Applications` or the user's `Applications` directory with a missing, empty, stale, or unusable
+bridge needs attention with `cursor.bridge_not_running`; non-macOS or no editor or live bridge is
+unsupported with `cursor.unsupported`. A first macOS scan reports provisional needs attention
+until its background refresh finishes. Refreshed status uses a snapshot up to two seconds old;
+filesystem discovery runs off the request worker. Readiness is machine-wide and says nothing about a particular chat.
+Per-chat `voice_status.bridge.bridge_chat_known` remains the source for whether that chat is known.
+The setting is in Cursor Settings → Beta → “Allow CLI to access desktop agents”. `agents.list`
+with `rescan` or `watch`, and `agents check cursor`, refresh readiness; a cached list returns the
+last result.
+
+Cursor's chat lookup and model metadata use a bundled SQLite library through bounded, read-only
+queries on blocking workers. No system `sqlite3` command is required. Read-only mode preserves
+visibility of Cursor's live WAL; immutable mode is avoided because it can miss a newly recorded
+join. The connector does not issue writes to Cursor's databases. A query has a two-second deadline,
+interrupts on timeout, and caps returned data at 64 KiB. SQLite errors in diagnostics are fixed
+codes and contain no query values, chat text, or local paths.
+
+For a Cursor editor chat, a room receipt of `delivered` means Cursor's Desktop Bridge answered `submitted` or
+`queued`; it does not prove the editor displayed or read the message. A later transcript observation supplies the
+`read` receipt. When investigating a missing message, `connector.log` records `cursor_bridge` lines with fixed
+`stage` and `result` codes: `lookup` distinguishes no bridge instance, missing database, SQLite failure, no marker,
+ambiguous chats, and a found chat; `send` records the bridge instance ordinal, HTTP status, and whether it queued,
+submitted, refused, or left the reply uncertain. Instance ordinals follow descriptor creation order (newest first)
+for that scan. `id_hash` is the first 12 hex characters of SHA-256 of the marker or chat ID; the log contains no
+bridge token, message text, bridge response body, socket path, database path, or home path. A request whose write
+may have reached the bridge remains `unknown` and is not retried blindly.
+
 `uninstall` unloads both jobs and stops what runs on demand (a refusal stops it there, with nothing deleted), removes
-the agents' registrations Sidevoice wrote (current or not), then `R` and everything in `D` but its lock files and the
-stop, so that a launcher on its way finds the stop and starts nothing. The room keeps this machine's pairing until it is revoked
-there.
+the agents' registrations Sidevoice wrote (current or not), then the owned data and releases. It keeps lock files and
+the stop, so that a launcher on its way finds the stop and starts nothing. The room keeps this machine's pairing until
+it is revoked there.
+
+Before unloading, uninstall checks that `D` is exactly `HOME/.sidevoice` and `R` is exactly
+`HOME/.local/share/sidevoice`. A custom data or release path must be dealt with manually; uninstall refuses it.
+It checks the trees for mount boundaries before taking the install lock, which uninstall holds without writing to it.
+It rejects multiply linked lock files. Before traversal, each owned subtree is atomically moved into a private
+`D/.uninstall-claim` directory on the same filesystem, then revalidated and removed through directory handles
+without following links. It first copies a recovery CLI to `D/.uninstall-recovery/sidevoice-connector` and atomically
+points `D/install.json` at it; both stay available while data or release cleanup can fail. A retry resumes any claimed
+entries. Once owned data and releases are gone, uninstall removes the recovery copy and record.
+A failed check or a path changed during removal makes `uninstall --json` return its normal `ok: false` error and a
+nonzero exit. Symlinks inside an owned tree are removed as links; their targets are left alone. Running uninstall
+again after a successful removal is safe.
+
+`--version --json` includes top-level `"safe_uninstall": 1` when this guarded uninstall contract is present.
+The successful `uninstall --json` object echoes the same marker. A caller must check the version marker before
+starting a destructive reset; the post-uninstall echo alone is too late to protect an older installed binary.
 
 With `--json` both print one JSON object and nothing else.
 

@@ -2,7 +2,7 @@
 
 use super::Cursor;
 use crate::adapters::registration::{
-    mcp_servers_json, AgentError, AgentHost, Entry, Launch, Manual, Registration,
+    mcp_servers_json, AgentError, AgentHost, Entry, Launch, Manual, ReadinessCheck, Registration,
 };
 use crate::profile::Profile;
 use crate::secure_fs::validate_user_directory;
@@ -15,8 +15,6 @@ use std::io::ErrorKind;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
-
-const APP: &str = "/Applications/Cursor.app";
 
 /// The `command` and `args` of an `mcp.json` entry.
 fn entry_command(entry: &Value) -> (&str, Vec<String>) {
@@ -237,6 +235,10 @@ Cursor's Desktop Bridge, once Cursor has recorded the chat's join call (up to ~3
 Several chats of a window can join.\nIf you type while the room sends, the two mix.";
 
 impl Registration for Cursor {
+    fn readiness_checks(&self, profile: &Profile) -> Vec<ReadinessCheck> {
+        vec![super::bridge_setup::check(profile)]
+    }
+
     fn after_install(&self, _profile: &Profile) -> Vec<String> {
         vec![INSTALL_NOTES.to_owned()]
     }
@@ -249,26 +251,46 @@ impl Registration for Cursor {
         &["cursor-agent", "cursor"]
     }
 
-    fn known_paths(&self, home: &Path) -> Vec<PathBuf> {
-        let bin = home.join(".local/bin");
-        vec![
-            bin.join("cursor-agent"),
-            bin.join("cursor"),
-            PathBuf::from("/usr/local/bin/cursor-agent"),
-            PathBuf::from("/opt/homebrew/bin/cursor-agent"),
-            PathBuf::from("/usr/local/bin/cursor"),
-            PathBuf::from("/opt/homebrew/bin/cursor"),
-            PathBuf::from("/Applications/Cursor.app/Contents/Resources/app/bin/cursor"),
-            home.join("AppData/Local/Programs/cursor/resources/app/bin/cursor.cmd"),
+    fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
+        use crate::adapters::markers::{Marker, Root};
+        &[
+            Marker {
+                os: "macos",
+                kind: "app_bundle",
+                root: Root::Absolute,
+                path: "/Applications/Cursor.app",
+            },
+            Marker {
+                os: "macos",
+                kind: "app_bundle",
+                root: Root::Home,
+                path: "Applications/Cursor.app",
+            },
+            Marker {
+                os: "windows",
+                kind: "install_dir",
+                root: Root::LocalAppData,
+                path: "Programs/cursor",
+            },
+            Marker {
+                os: "windows",
+                kind: "install_dir",
+                root: Root::ProgramFiles,
+                path: "cursor",
+            },
+            Marker {
+                os: "linux",
+                kind: "install_dir",
+                root: Root::Absolute,
+                path: "/usr/share/cursor",
+            },
+            Marker {
+                os: "linux",
+                kind: "install_dir",
+                root: Root::Home,
+                path: ".local/share/cursor",
+            },
         ]
-    }
-
-    fn evidence(&self) -> Vec<(&'static str, PathBuf)> {
-        if Path::new(APP).exists() {
-            vec![("app", PathBuf::from(APP))]
-        } else {
-            Vec::new()
-        }
     }
 
     fn connects_without_binary(&self) -> bool {
