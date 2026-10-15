@@ -938,3 +938,496 @@ fn t02c_t02d_refusal_reaches_the_caller_and_words_or_empty_input_in_both_modes()
         }
     }
 }
+
+#[test]
+fn t04a_multiple_publications_keep_core_playback_fifo_in_both_modes() {
+    let Some(core) = core_dir() else { return };
+    for mode in ["push", "pull"] {
+        let profile = Profile::new(&format!("fifo-{mode}"));
+        let launch = format!("fifo-core-{mode}");
+        let _core = profile.start_core(&core, &launch);
+        let _connector = profile.start_connector();
+        profile.wait_linked(&launch);
+        let call = Presentation::open(&profile.core_socket());
+        let receiver = http_receiver();
+        let thread = format!("fifo-thread-{mode}");
+        let mut command = profile.connector(&["mcp"]);
+        command
+            .env("SIDEVOICE_THREAD", &thread)
+            .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+        let mut mcp = Mcp::start(command);
+        mcp.initialize("fifo-client");
+        let joined = mcp.tool("voice_connect", json!({"input_mode":mode}));
+        core_json(
+            &profile.core_socket(),
+            "POST",
+            "/api/presentation/select",
+            Some(&json!({"session_id":call.session,"thread_id":thread})),
+            Some(&call.token),
+        );
+        for (n, stage) in ["first", "second", "third"].iter().enumerate() {
+            let said = mcp.tool(
+                "voice_say",
+                json!({"conversation":joined["conversation"],
+                "text":stage,"event_id":format!("fifo-event-{n}"),"utterance_id":stage}),
+            );
+            assert_eq!(said["text_saved"], true, "{said}");
+        }
+        let played: Vec<_> = (0..3)
+            .map(|_| {
+                call.next_frame("voice-reply", 15)["data"]["utterance_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(played, ["first", "second", "third"]);
+        for id in played {
+            call.report_playback(&id, "heard", None, None);
+        }
+        mcp.stop();
+    }
+}
+
+#[test]
+fn t04b_nine_withdrawn_replies_reach_complete_ordered_real_core_batches() {
+    let Some(core) = core_dir() else { return };
+    for mode in ["push", "pull"] {
+        let profile = Profile::new(&format!("batches-{mode}"));
+        let launch = format!("batches-core-{mode}");
+        let _core = profile.start_core(&core, &launch);
+        let _connector = profile.start_connector();
+        profile.wait_linked(&launch);
+        let call = Presentation::open(&profile.core_socket());
+        let receiver = http_receiver();
+        let thread = format!("batches-thread-{mode}");
+        let mut command = profile.connector(&["mcp"]);
+        command
+            .env("SIDEVOICE_THREAD", &thread)
+            .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+        let mut mcp = Mcp::start(command);
+        mcp.initialize("batches-client");
+        let joined = mcp.tool("voice_connect", json!({"input_mode":mode}));
+        core_json(
+            &profile.core_socket(),
+            "POST",
+            "/api/presentation/select",
+            Some(&json!({"session_id":call.session,"thread_id":thread})),
+            Some(&call.token),
+        );
+        for n in 0..9 {
+            let said = mcp.tool(
+                "voice_say",
+                json!({"conversation":joined["conversation"],
+                "text":format!("Reply {n}"),"event_id":format!("batch-event-{n}"),
+                "utterance_id":format!("batch-utterance-{n}")}),
+            );
+            assert_eq!(said["text_saved"], true, "{said}");
+        }
+        call.report_turn("started", "turn", None);
+        call.turn_started("turn");
+        for n in 0..9 {
+            call.report_playback(
+                &format!("batch-utterance-{n}"),
+                "unplayed",
+                Some("newer_turn"),
+                None,
+            );
+        }
+        call.report_turn("finished", "turn", Some("New request"));
+        let mut evidence = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut after = 0;
+        until("all nine replies in real delivery batches", 20, || {
+            let messages = if mode == "push" {
+                receiver
+                    .bodies
+                    .recv_timeout(Duration::from_millis(100))
+                    .ok()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            } else {
+                let page = mcp.tool("get_messages", json!({"after":after}));
+                after = page["cursor"].as_u64().unwrap_or(after);
+                page["messages"].as_array().cloned().unwrap_or_default()
+            };
+            for message in messages {
+                if !seen.insert(message["message_id"].as_str().unwrap().to_owned()) {
+                    continue;
+                }
+                let replies = message["unheard"]["replies"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                if !replies.is_empty() {
+                    assert!(replies.len() <= 8, "{message}");
+                    let envelope = message["envelope"].as_str().unwrap();
+                    assert!(
+                        envelope.contains(&message["unheard"].to_string()),
+                        "{message}"
+                    );
+                    evidence.extend(
+                        replies
+                            .into_iter()
+                            .map(|reply| reply["text"].as_str().unwrap().to_owned()),
+                    );
+                }
+            }
+            (evidence.len() >= 9).then_some(())
+        });
+        assert_eq!(
+            evidence,
+            (0..9).map(|n| format!("Reply {n}")).collect::<Vec<_>>()
+        );
+        mcp.stop();
+    }
+}
+
+#[test]
+fn t06e_no_return_notice_without_a_miss_or_after_another_device_heard() {
+    let Some(core) = core_dir() else { return };
+    for mode in ["push", "pull"] {
+        let profile = Profile::new(&format!("no-return-{mode}"));
+        let launch = format!("no-return-core-{mode}");
+        let _core = profile.start_core(&core, &launch);
+        let _connector = profile.start_connector();
+        profile.wait_linked(&launch);
+        let call = Presentation::open(&profile.core_socket());
+        let receiver = http_receiver();
+        let thread = format!("no-return-thread-{mode}");
+        let mut command = profile.connector(&["mcp"]);
+        command
+            .env("SIDEVOICE_THREAD", &thread)
+            .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+        let mut mcp = Mcp::start(command);
+        mcp.initialize("no-return-client");
+        let joined = mcp.tool("voice_connect", json!({"input_mode":mode}));
+        core_json(
+            &profile.core_socket(),
+            "POST",
+            "/api/presentation/select",
+            Some(&json!({"session_id":call.session,"thread_id":thread})),
+            Some(&call.token),
+        );
+        call.report_speech(false, Some("voice_off"));
+        call.report_speech(true, None);
+        std::thread::sleep(Duration::from_secs(6));
+        if mode == "pull" {
+            assert_eq!(
+                mcp.tool("get_messages", json!({"operation":"check"}))["count"],
+                0
+            );
+        } else {
+            assert!(receiver
+                .bodies
+                .recv_timeout(Duration::from_millis(100))
+                .is_err());
+        }
+        let other = Presentation::open_second(&profile);
+        core_json(
+            &profile.core_socket(),
+            "POST",
+            "/api/presentation/select",
+            Some(&json!({"session_id":other.session,"thread_id":thread})),
+            Some(&other.token),
+        );
+        let said = mcp.tool(
+            "voice_say",
+            json!({"conversation":joined["conversation"],
+            "text":"Heard elsewhere","event_id":"heard-event","utterance_id":"heard-utterance"}),
+        );
+        assert_eq!(said["text_saved"], true, "{said}");
+        other.report_playback("heard-utterance", "heard", None, None);
+        std::thread::sleep(Duration::from_millis(150));
+        call.report_speech(false, Some("voice_off"));
+        call.report_speech(true, None);
+        std::thread::sleep(Duration::from_secs(6));
+        if mode == "pull" {
+            assert_eq!(
+                mcp.tool("get_messages", json!({"operation":"check"}))["count"],
+                0
+            );
+        } else {
+            assert!(receiver
+                .bodies
+                .recv_timeout(Duration::from_millis(100))
+                .is_err());
+        }
+        mcp.stop();
+    }
+}
+
+#[test]
+fn t14_real_two_device_corrections_keep_the_original_notice_frozen() {
+    let Some(core) = core_dir() else { return };
+    for mode in ["push", "pull"] {
+        for (fate, status, reason) in [
+            ("heard", "heard", None),
+            ("skipped", "interrupted", Some("user_skipped")),
+        ] {
+            let label = format!("correction-{mode}-{fate}");
+            let profile = Profile::new(&label);
+            let _core = profile.start_core(&core, &label);
+            let _connector = profile.start_connector();
+            profile.wait_linked(&label);
+            let call = Presentation::open(&profile.core_socket());
+            let other = Presentation::open_second(&profile);
+            let receiver = http_receiver();
+            let thread = format!("thread-{label}");
+            let mut command = profile.connector(&["mcp"]);
+            command
+                .env("SIDEVOICE_THREAD", &thread)
+                .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+            let mut mcp = Mcp::start(command);
+            mcp.initialize("correction-client");
+            let joined = mcp.tool("voice_connect", json!({"input_mode":mode}));
+            for device in [&call, &other] {
+                core_json(
+                    &profile.core_socket(),
+                    "POST",
+                    "/api/presentation/select",
+                    Some(&json!({"session_id":device.session,"thread_id":thread})),
+                    Some(&device.token),
+                );
+            }
+            let said = mcp.tool("voice_say", json!({"conversation":joined["conversation"],
+                "text":"Two-device reply","event_id":"correction-event","utterance_id":"correction-utterance"}));
+            assert_eq!(said["text_saved"], true, "{said}");
+            call.report_playback("correction-utterance", "playing", None, None);
+            call.report_playback(
+                "correction-utterance",
+                "interrupted",
+                Some("user_interrupted"),
+                Some(2),
+            );
+            other.report_playback(
+                "correction-utterance",
+                "interrupted",
+                Some("user_interrupted"),
+                Some(1),
+            );
+            call.report_turn("started", "new-turn", None);
+            call.turn_started("new-turn");
+            call.report_turn("finished", "new-turn", Some("What happened?"));
+            let initial = if mode == "push" {
+                until("initial interrupted notice injected", 15, || {
+                    receiver
+                        .bodies
+                        .recv_timeout(Duration::from_millis(100))
+                        .ok()
+                        .filter(|message| message["notice"]["kind"] == "reply_interrupted")
+                })
+            } else {
+                until("initial interrupted notice pulled", 15, || {
+                    let page = mcp.tool("get_messages", json!({}));
+                    page["messages"].as_array().and_then(|items| {
+                        items
+                            .iter()
+                            .find(|message| message["notice"]["kind"] == "reply_interrupted")
+                            .cloned()
+                    })
+                })
+            };
+            let frozen = initial["envelope"].clone();
+            other.report_playback("correction-utterance", status, reason, Some(3));
+            let correction = if mode == "push" {
+                until("heard correction injected", 15, || {
+                    receiver
+                        .bodies
+                        .recv_timeout(Duration::from_millis(100))
+                        .ok()
+                        .filter(|message| message["notice"]["kind"] == "reply_heard")
+                })
+            } else {
+                until("heard correction pulled", 15, || {
+                    let page = mcp.tool("get_messages", json!({}));
+                    page["messages"].as_array().and_then(|items| {
+                        items
+                            .iter()
+                            .find(|message| message["notice"]["kind"] == "reply_heard")
+                            .cloned()
+                    })
+                })
+            };
+            assert_eq!(
+                correction["notice"]["corrects_message_id"], initial["message_id"],
+                "{correction}"
+            );
+            assert_eq!(
+                correction["notice"]["heard"][0]["utterance_id"], "correction-utterance",
+                "{correction}"
+            );
+            assert_eq!(
+                correction["notice"]["heard"][0]["fate"], fate,
+                "{correction}"
+            );
+            assert_eq!(
+                correction["notice"]["heard"][0]["heard_chars"], 16,
+                "{correction}"
+            );
+            assert!(correction["envelope"]
+                .as_str()
+                .unwrap()
+                .contains(&correction["notice"].to_string()));
+            if mode == "pull" {
+                let again = mcp.tool("get_messages", json!({}));
+                let original = again["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["message_id"] == initial["message_id"])
+                    .unwrap();
+                assert_eq!(original["envelope"], frozen);
+            }
+            mcp.stop();
+        }
+    }
+}
+
+#[test]
+fn t16_failed_injection_and_pull_expose_identical_real_notice_fields() {
+    let Some(core) = core_dir() else { return };
+    let profile = Profile::new("notice-parity");
+    let _core = profile.start_core(&core, "notice-parity-core");
+    let _connector = profile.start_connector();
+    profile.wait_linked("notice-parity-core");
+    let call = Presentation::open(&profile.core_socket());
+    let receiver = http_receiver_with_status(503);
+    let thread = "notice-parity-thread";
+    let mut command = profile.connector(&["mcp"]);
+    command
+        .env("SIDEVOICE_THREAD", thread)
+        .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+    let mut mcp = Mcp::start(command);
+    mcp.initialize("notice-parity-client");
+    let joined = mcp.tool("voice_connect", json!({"input_mode":"push"}));
+    core_json(
+        &profile.core_socket(),
+        "POST",
+        "/api/presentation/select",
+        Some(&json!({"session_id":call.session,"thread_id":thread})),
+        Some(&call.token),
+    );
+    let said = mcp.tool(
+        "voice_say",
+        json!({"conversation":joined["conversation"],
+        "text":"Full parity reply","event_id":"parity-event","utterance_id":"parity-utterance"}),
+    );
+    assert_eq!(said["text_saved"], true, "{said}");
+    call.report_playback("parity-utterance", "playing", None, None);
+    call.report_playback(
+        "parity-utterance",
+        "interrupted",
+        Some("user_interrupted"),
+        Some(4),
+    );
+    call.report_turn("started", "parity-turn", None);
+    call.turn_started("parity-turn");
+    call.report_turn("finished", "parity-turn", Some("New words"));
+    let injected = until("failed injected notice", 15, || {
+        receiver
+            .bodies
+            .recv_timeout(Duration::from_millis(100))
+            .ok()
+            .filter(|message| message["notice"]["kind"] == "reply_interrupted")
+    });
+    let switched = mcp.tool("voice_connect", json!({"input_mode":"pull"}));
+    assert_eq!(switched["delivery"], "pull", "{switched}");
+    let pulled = until("same notice in pull", 15, || {
+        let page = mcp.tool("get_messages", json!({}));
+        page["messages"].as_array().and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["message_id"] == injected["message_id"])
+                .cloned()
+        })
+    });
+    for field in [
+        "thread_id",
+        "message_id",
+        "session_id",
+        "revision",
+        "epoch",
+        "channel",
+        "text",
+        "notice",
+        "unheard",
+        "envelope",
+    ] {
+        if let (Some(injected_field), Some(pulled_field)) = (injected.get(field), pulled.get(field))
+        {
+            assert_eq!(
+                injected_field, pulled_field,
+                "{field}: injected={injected}, pulled={pulled}"
+            );
+        }
+    }
+    assert_eq!(pulled["unheard"]["replies"][0]["text"], "Full parity reply");
+    let acknowledged = mcp.tool("get_messages", json!({"ack_ids":[pulled["message_id"]]}));
+    assert_eq!(acknowledged["acknowledged"], 1, "{acknowledged}");
+    mcp.stop();
+}
+
+#[test]
+fn t02c_t02d_backlogged_other_conversation_cannot_hide_real_core_refusal() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(core) = core_dir() else { return };
+    for (suffix, words) in [("words", Some("New request")), ("empty", None)] {
+        let label = format!("backlog-{suffix}");
+        let profile = Profile::new(&label);
+        let _core = profile.start_core(&core, &label);
+        let held = json!([{"client_ref":"older-conversation","binding_id":"old-binding",
+            "event_id":"old-event","utterance_id":"old-utterance","session_id":"old-session",
+            "revision":0,"epoch":0,"text":"uncertain earlier work","history_only":false,"attempted":true}]);
+        let outbox_path = profile.data().join("outbox.json");
+        std::fs::write(&outbox_path, held.to_string()).unwrap();
+        std::fs::set_permissions(&outbox_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let _connector = profile.start_connector();
+        profile.wait_linked(&label);
+        let call = Presentation::open(&profile.core_socket());
+        let receiver = http_receiver();
+        let thread = format!("thread-{label}");
+        let mut command = profile.connector(&["mcp"]);
+        command
+            .env("SIDEVOICE_THREAD", &thread)
+            .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+        let mut mcp = Mcp::start(command);
+        mcp.initialize("backlog-client");
+        mcp.tool("voice_connect", json!({"input_mode":"pull"}));
+        core_json(
+            &profile.core_socket(),
+            "POST",
+            "/api/presentation/select",
+            Some(&json!({"session_id":call.session,"thread_id":thread})),
+            Some(&call.token),
+        );
+        call.report_turn("started", "open", None);
+        let started = call.turn_started("open");
+        let refused = mcp.tool(
+            "voice_say",
+            json!({"text":"Refuse now",
+            "session_id":call.session,"revision":started["revision"],"epoch":started["epoch"],
+            "event_id":"new-event","utterance_id":"new-utterance"}),
+        );
+        assert_eq!(refused["status"], "rejected", "{refused}");
+        assert_eq!(refused["reason"], "user_speaking", "{refused}");
+        assert!(refused["instruction"].as_str().unwrap().contains("Wait"));
+        call.report_turn("finished", "open", words);
+        let message = until("backlogged refusal outcome", 15, || {
+            let page = mcp.tool("get_messages", json!({}));
+            page["messages"]
+                .as_array()
+                .and_then(|items| items.first().cloned())
+        });
+        if let Some(words) = words {
+            assert_eq!(message["text"], words, "{message}");
+        } else {
+            assert_eq!(message["notice"]["kind"], "turn_empty", "{message}");
+        }
+        let retained: Value =
+            serde_json::from_slice(&std::fs::read(&outbox_path).unwrap()).unwrap();
+        assert_eq!(retained.as_array().unwrap().len(), 1, "{retained}");
+        assert_eq!(retained[0]["event_id"], "old-event", "{retained}");
+        mcp.stop();
+    }
+}

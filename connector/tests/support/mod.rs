@@ -455,6 +455,10 @@ pub struct HttpReceiver {
 }
 
 pub fn http_receiver() -> HttpReceiver {
+    http_receiver_with_status(200)
+}
+
+pub fn http_receiver_with_status(status: u16) -> HttpReceiver {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/input", listener.local_addr().unwrap());
     let (tx, bodies) = channel();
@@ -489,8 +493,9 @@ pub fn http_receiver() -> HttpReceiver {
                     let _ = tx.send(value);
                 }
             }
-            let _ = stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let response =
+                format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(response.as_bytes());
         }
     });
     HttpReceiver { url, bodies }
@@ -567,6 +572,10 @@ impl Presentation {
             .as_str()
             .expect("device token")
             .to_string();
+        Self::open_with_token(socket, token)
+    }
+
+    pub fn open_with_token(socket: &Path, token: String) -> Self {
         let (session_tx, session_rx) = channel();
         let (frame_tx, frames) = channel();
         let (send, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
@@ -630,6 +639,27 @@ impl Presentation {
             stop: Some(stop),
             thread: Some(thread),
         }
+    }
+
+    pub fn open_second(profile: &Profile) -> Self {
+        let output = profile
+            .connector(&["pair-device", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let code: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let secret = code["payload"]["secret"].as_str().expect("pairing secret");
+        let paired = core_json(
+            &profile.core_socket(),
+            "POST",
+            "/api/device/pair",
+            Some(&json!({"secret":secret,"name":"second test device"})),
+            None,
+        );
+        Self::open_with_token(
+            &profile.core_socket(),
+            paired["token"].as_str().unwrap().to_owned(),
+        )
     }
 
     pub fn report_turn(&self, phase: &str, turn_id: &str, text: Option<&str>) {

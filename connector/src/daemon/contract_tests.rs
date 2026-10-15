@@ -357,6 +357,32 @@ async fn uncertain_publication_keeps_its_fingerprint_and_unsent_work_is_suppress
     assert_eq!(outbox[0]["event_id"], "event-a");
 }
 
+#[tokio::test]
+async fn paired_retry_ids_share_one_pending_publication_and_reject_conflicting_reuse() {
+    let scratch = Scratch::new("pending-retry-ids");
+    let (daemon, _) = daemon(&scratch, Link::new());
+    daemon
+        .command(1, "register", registration("a"))
+        .await
+        .unwrap();
+    let args = json!({"client_ref":"a","session_id":"s","revision":1,"epoch":0,
+        "text":"same reply","event_id":"same-event","utterance_id":"same-utterance"});
+    let first = daemon.command(1, "publish", args.clone()).await.unwrap();
+    let second = daemon.command(1, "publish", args.clone()).await.unwrap();
+    assert_eq!(first["status"], "queued", "{first}");
+    assert_eq!(second["status"], "queued", "{second}");
+    assert_eq!(daemon.outbox.lock().await.len(), 1);
+    let mut changed = args;
+    changed["text"] = json!("different reply");
+    assert!(daemon
+        .command(1, "publish", changed)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("conflict"));
+    assert_eq!(daemon.outbox.lock().await.len(), 1);
+}
+
 /// The façade↔daemon IPC: every command a newer `sidevoice mcp` sends, with fields this daemon does not know at the
 /// top and nested, is answered for what it knows. A command it has never heard of gets a defined refusal.
 #[tokio::test]

@@ -1059,6 +1059,48 @@ impl Daemon {
                     "binding_id":*id,"client_ref":binding.client_ref,"session_id":session_id,"revision":revision,"epoch":epoch,
                     "utterance_id":utterance_id.map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                     "text":text,"language":params.get("language"),"history_only":history_only});
+                let prior = self
+                    .outbox
+                    .lock()
+                    .await
+                    .iter()
+                    .find(|item| {
+                        item["event_id"] == speech["event_id"]
+                            || item["utterance_id"] == speech["utterance_id"]
+                    })
+                    .cloned();
+                if let Some(prior) = prior {
+                    for field in [
+                        "event_id",
+                        "utterance_id",
+                        "client_ref",
+                        "session_id",
+                        "revision",
+                        "epoch",
+                        "text",
+                        "language",
+                    ] {
+                        if prior[field] != speech[field] {
+                            bail!("publish retry IDs conflict with a pending publication");
+                        }
+                    }
+                    drop(id);
+                    let answer = self.publish_one(&prior).await?;
+                    let mut result = answer.unwrap_or_else(|| {
+                        if prior["attempted"] == true {
+                            json!({"status":"admission_unknown","event_id":prior["event_id"],
+                                "utterance_id":prior["utterance_id"],"instruction":"Core admission is uncertain; wait for the next message before replying again."})
+                        } else {
+                            json!({"status":"queued","event_id":prior["event_id"],"utterance_id":prior["utterance_id"]})
+                        }
+                    });
+                    if adopted {
+                        result["adopted"] = json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,
+                            "harness":binding.harness,"title":binding.title,"delivery":binding.delivery,"route":binding.route,
+                            "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound});
+                    }
+                    return Ok(result);
+                }
                 self.queue(speech.clone()).await?;
                 drop(id);
                 let earlier_same_conversation = self.outbox.lock().await.iter().any(|item| {
