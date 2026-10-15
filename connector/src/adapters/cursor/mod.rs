@@ -296,6 +296,13 @@ pub async fn engine(chat_id: &str) -> Option<Value> {
         roots.push(PathBuf::from(path).join("cursor"));
     }
     roots.extend([home.join(".config/cursor"), home.join(".cursor")]);
+    engine_in_roots(chat_id, &roots).await
+}
+
+async fn engine_in_roots(chat_id: &str, roots: &[PathBuf]) -> Option<Value> {
+    if !safe_chat_id(chat_id) {
+        return None;
+    }
     for root in roots {
         let chats = root.join("chats");
         let Ok(workspaces) = fs::read_dir(chats) else {
@@ -333,6 +340,33 @@ pub async fn engine(chat_id: &str) -> Option<Value> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod embedded_engine_tests {
+    use super::*;
+    use crate::secure_fs::tests::Scratch;
+
+    #[tokio::test]
+    async fn cli_engine_uses_bundled_sqlite_for_only_the_named_chat() {
+        let scratch = Scratch::new("cursor-bundled-cli-engine");
+        let root = scratch.0.join("cursor");
+        let chat = root.join("chats/workspace/chat-a");
+        fs::create_dir_all(&chat).unwrap();
+        state_db::fixture(
+            &chat.join("store.db"),
+            "CREATE TABLE meta(key TEXT, value TEXT); INSERT INTO meta VALUES ('0', '{\"lastUsedModel\":\"gpt-5\"}');",
+        );
+        assert_eq!(
+            engine_in_roots("chat-a", std::slice::from_ref(&root)).await,
+            Some(json!({"model":"gpt-5","effort":null,"thinking":null}))
+        );
+        assert_eq!(
+            engine_in_roots("chat-b", std::slice::from_ref(&root)).await,
+            None
+        );
+        assert_eq!(engine_in_roots("../chat-a", &[root]).await, None);
+    }
 }
 
 /// Find the Cursor chat whose transcript records this join or one of its pending inputs.
