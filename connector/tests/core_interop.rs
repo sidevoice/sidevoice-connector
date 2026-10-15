@@ -1449,3 +1449,92 @@ fn t02c_t02d_backlogged_other_conversation_cannot_hide_real_core_refusal() {
         mcp.stop();
     }
 }
+
+#[test]
+fn t02a_late_receipt_follows_real_words_with_related_message_id_in_both_modes() {
+    let Some(core) = core_dir() else { return };
+    for mode in ["push", "pull"] {
+        let profile = Profile::new(&format!("late-followup-{mode}"));
+        let launch = format!("late-followup-core-{mode}");
+        let _core = profile.start_core(&core, &launch);
+        let _connector = profile.start_connector();
+        profile.wait_linked(&launch);
+        let call = Presentation::open(&profile.core_socket());
+        let receiver = http_receiver();
+        let thread = format!("late-followup-thread-{mode}");
+        let mut command = profile.connector(&["mcp"]);
+        command
+            .env("SIDEVOICE_THREAD", &thread)
+            .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+        let mut mcp = Mcp::start(command);
+        mcp.initialize("late-followup-client");
+        let joined = mcp.tool("voice_connect", json!({"input_mode":mode}));
+        core_json(
+            &profile.core_socket(),
+            "POST",
+            "/api/presentation/select",
+            Some(&json!({"session_id":call.session,"thread_id":thread})),
+            Some(&call.token),
+        );
+        let said = mcp.tool(
+            "voice_say",
+            json!({"conversation":joined["conversation"],
+            "text":"Late receipt reply","event_id":"late-event","utterance_id":"late-utterance"}),
+        );
+        assert_eq!(said["text_saved"], true, "{said}");
+        call.report_turn("started", "new-turn", None);
+        call.turn_started("new-turn");
+        call.report_turn("finished", "new-turn", Some("New words"));
+        let words = if mode == "push" {
+            receiver
+                .bodies
+                .recv_timeout(Duration::from_secs(15))
+                .unwrap()
+        } else {
+            until("new words pulled", 15, || {
+                let page = mcp.tool("get_messages", json!({}));
+                page["messages"].as_array().and_then(|items| {
+                    items
+                        .iter()
+                        .find(|item| item["text"] == "New words")
+                        .cloned()
+                })
+            })
+        };
+        assert_eq!(words["text"], "New words", "{words}");
+        assert!(words["unheard"].is_null(), "{words}");
+        call.report_playback("late-utterance", "unplayed", Some("newer_turn"), None);
+        let followup = if mode == "push" {
+            until("late follow-up injected", 15, || {
+                receiver
+                    .bodies
+                    .recv_timeout(Duration::from_millis(100))
+                    .ok()
+                    .filter(|message| message["notice"]["kind"] == "reply_not_played")
+            })
+        } else {
+            until("late follow-up pulled", 15, || {
+                let page = mcp.tool("get_messages", json!({}));
+                page["messages"].as_array().and_then(|items| {
+                    items
+                        .iter()
+                        .find(|item| item["notice"]["kind"] == "reply_not_played")
+                        .cloned()
+                })
+            })
+        };
+        assert_eq!(followup["channel"], "note", "{followup}");
+        assert_eq!(
+            followup["notice"]["related_message_id"], words["message_id"],
+            "{followup}"
+        );
+        assert_eq!(
+            followup["unheard"]["replies"][0]["text"], "Late receipt reply",
+            "{followup}"
+        );
+        let envelope = followup["envelope"].as_str().unwrap();
+        assert!(envelope.contains(&followup["notice"].to_string()));
+        assert!(envelope.contains(&followup["unheard"].to_string()));
+        mcp.stop();
+    }
+}
