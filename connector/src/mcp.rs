@@ -18,7 +18,7 @@ const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the person
 - Call voice_connect only when the person asks to join or enable voice. Select input_mode pull when this harness will call get_messages; otherwise the core injects input. One binding uses one mode.
 - Each voice or note message carries a stable message_id, conversation epoch, session_id and revision. A repeated ID is redelivery, not new input. A note contains Sidevoice facts and no words from the person. The full notice and unheard evidence, including corrections and related message IDs, matter in both modes.
 - In pull mode, call get_messages at useful hooks. Acknowledge IDs with ack_ids only after processing them. Pull may learn later than injection. After is a journal position, not an acknowledgement.
-- Reply with voice_say using the message's session_id, revision and epoch. For speech before any message, use voice_connect's initial_reply_context. Typing does not advance the epoch. Several replies in one epoch play in publication order.
+- When a reply is appropriate, use voice_say with the message's session_id, revision and epoch. For speech before any message, use voice_connect's initial_reply_context. A typed message is context: it updates what you know without requiring a response and does not advance the epoch; you decide whether to answer, and a quick acknowledgement is optional. Several replies in one epoch play in publication order.
 - If voice_say says the person is speaking, the call was refused and nothing was queued: wait for their message. If that turn ends without words, a Sidevoice note may ask you to resend what still matters. A published reply is not proof it was heard.
 - A reply is heard, partially heard with a confirmed prefix, or not heard. For a partial reply, use the full text and confirmed extent to understand what remains unheard. Use notices and their instructions when answering in the current context; do not automatically resend an unheard backlog.
 - For substantive work, first a short acknowledgement, then meaningful checkpoints, then the result. No filler or tool narration. Take in new input at tool results before starting the next step.
@@ -1315,6 +1315,15 @@ mod tests {
         for method in ["register", "status", "publish", "unregister", "adopt"] {
             assert_eq!(ipc_limit(method), Duration::from_secs(20), "{method}");
         }
+    }
+
+    #[test]
+    fn instructions_make_typed_messages_context_and_replies_conditional() {
+        assert!(INSTRUCTIONS.contains("When a reply is appropriate, use voice_say"));
+        assert!(INSTRUCTIONS.contains("A typed message is context"));
+        assert!(INSTRUCTIONS.contains("without requiring a response"));
+        assert!(INSTRUCTIONS.contains("does not advance the epoch"));
+        assert!(!INSTRUCTIONS.contains("- Reply with voice_say"));
     }
 
     #[test]

@@ -265,12 +265,7 @@ pub fn envelope(event: &Value) -> Result<String> {
         body.push_str(text);
     }
     if channel != "room-control" {
-        let verb = if channel == "note" {
-            "If a reply is appropriate, use voice_say"
-        } else {
-            "Reply with voice_say"
-        };
-        body.push_str(&format!("\n\n[Sidevoice] {verb} (session_id {}, revision {revision}, epoch {epoch}). Treat this message ID as stable: a redelivery is not new input.", serde_json::to_string(session_id)?));
+        body.push_str(&format!("\n\n[Sidevoice] If a reply is appropriate, use voice_say (session_id {}, revision {revision}, epoch {epoch}). Treat this message ID as stable: a redelivery is not new input.", serde_json::to_string(session_id)?));
     }
     if let Some(notice) = event.get("notice").filter(|v| !v.is_null()) {
         body.push_str("\n[Sidevoice] Notice: ");
@@ -390,6 +385,23 @@ mod tests {
                 assert!(injected.contains("person sent no words"), "{scenario}");
             }
         }
+    }
+
+    #[test]
+    fn typed_context_keeps_its_epoch_and_leaves_the_reply_to_the_agent() {
+        let mut push = event("typed_context", "voice", "also use the second table");
+        push.as_object_mut().unwrap().remove("notice");
+        let mut pull = push.clone();
+        pull["cursor"] = json!(25);
+        pull["arrival_time"] = json!(1792000000);
+        let injected = envelope(&push).unwrap();
+        assert_eq!(injected, envelope(&pull).unwrap());
+        let header: Value = serde_json::from_str(injected.lines().next().unwrap()).unwrap();
+        assert_eq!(header["epoch"], 2);
+        assert!(injected.contains("\n\nalso use the second table\n\n"));
+        assert!(injected.contains("If a reply is appropriate, use voice_say"));
+        assert!(injected.contains("epoch 2"));
+        assert!(!injected.contains("Reply with voice_say"));
     }
 
     #[test]

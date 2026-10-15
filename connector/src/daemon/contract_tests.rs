@@ -214,7 +214,7 @@ async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_
         header,
         json!({"channel":"voice","session_id":"s","revision":3,"epoch":1,"message_id":"m-1"})
     );
-    assert!(envelope.contains("\n\nhello\n\n[Sidevoice] Reply with voice_say"));
+    assert!(envelope.contains("\n\nhello\n\n[Sidevoice] If a reply is appropriate, use voice_say"));
     assert!(envelope.contains("Complete unheard evidence"));
 
     // speech.publish answered with a status and fields this connector does not know: saved is saved.
