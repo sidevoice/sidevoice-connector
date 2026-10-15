@@ -289,6 +289,7 @@ async fn cursor_version_command_is_shared_only_for_same_binary() {
     let cli = bin.join("cursor-agent");
     private_write(&cli, b"#!/bin/sh\necho 'cursor-agent 1.2.3'\n");
     fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+    let _registration_binary = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cli.as_os_str());
     let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
     assert_eq!(fs::read_to_string(&count).unwrap().lines().count(), 2);
     assert_eq!(row(&answer, "cursor")["version"], "cursor-agent 1.2.3");

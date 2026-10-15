@@ -235,7 +235,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn states_are_keyed_and_conservative() {
         assert_eq!(
             assess(
