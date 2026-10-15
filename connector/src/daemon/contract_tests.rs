@@ -10,6 +10,7 @@ use crate::secure_fs::tests::Scratch;
 use anyhow::Result;
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -276,4 +277,68 @@ async fn ipc_commands_with_unknown_fields_are_read_for_what_they_know() {
         .await
         .unwrap_err();
     assert_eq!(unknown.to_string(), "unknown IPC method");
+}
+
+#[tokio::test]
+async fn refused_target_registration_stays_pending_until_core_accepts_it() {
+    let scratch = Scratch::new("registration-retry");
+    let link = Link::new();
+    let mut frames = link.attached().await;
+    let reject = Arc::new(AtomicBool::new(false));
+    let refusal = reject.clone();
+    let core = link.clone();
+    tokio::spawn(async move {
+        while let Some(Message::Text(text)) = frames.recv().await {
+            let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+            let Some(id) = frame.get("id").cloned() else {
+                continue;
+            };
+            let result = if frame["method"] == "binding.register"
+                && refusal.load(Ordering::Relaxed)
+            {
+                json!({"error":"room.input_backlog_full"})
+            } else {
+                json!({"binding_id":format!("core-{}", frame["params"]["client_ref"].as_str().unwrap())})
+            };
+            core.answer(json!({"jsonrpc":"2.0","id":id,"result":result}))
+                .await
+                .unwrap();
+        }
+    });
+    let (daemon, _) = daemon(&scratch, link);
+    let original = daemon
+        .command(7, "register", registration("original"))
+        .await
+        .unwrap();
+    assert_eq!(original["connected"], true);
+    reject.store(true, Ordering::Relaxed);
+    let first = daemon
+        .command(7, "register", registration("stable"))
+        .await
+        .unwrap();
+    assert_eq!(first["pending"], true);
+    assert!(first["binding_id"].as_str().unwrap().starts_with("local-"));
+    let retry = daemon
+        .command(7, "register", registration("stable"))
+        .await
+        .unwrap();
+    assert_eq!(retry["pending"], true, "a refused target cannot retire its source: {retry}");
+    assert_eq!(retry["connected"], false);
+    assert_eq!(retry["binding_id"], first["binding_id"]);
+    assert!(daemon.bindings.lock().await.contains_key("original"));
+    reject.store(false, Ordering::Relaxed);
+    let accepted = daemon
+        .command(7, "register", registration("stable"))
+        .await
+        .unwrap();
+    assert_eq!(accepted["pending"], false);
+    assert_eq!(accepted["connected"], true);
+    assert_eq!(accepted["binding_id"], "core-stable");
+    assert!(daemon.bindings.lock().await.contains_key("original"));
+    daemon
+        .command(7, "unregister", json!({"client_ref":"original"}))
+        .await
+        .unwrap();
+    assert!(!daemon.bindings.lock().await.contains_key("original"));
+    assert!(daemon.bindings.lock().await.contains_key("stable"));
 }

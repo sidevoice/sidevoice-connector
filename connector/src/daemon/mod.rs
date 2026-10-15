@@ -216,6 +216,21 @@ impl Daemon {
         Ok(reply)
     }
 
+    async fn existing_registration(&self, binding: &Arc<Conversation>, thread: &str) -> Value {
+        let local = binding.id.lock().await.starts_with("local-");
+        let connected = if local {
+            self.register_core(binding).await.is_ok()
+        } else {
+            self.link.connected().await
+        };
+        let binding_id = binding.id.lock().await.clone();
+        if connected {
+            self.request_replay();
+        }
+        json!({"binding_id":binding_id,"thread":thread,"connected":connected,
+            "pending":!connected,"prepared":null})
+    }
+
     async fn on_welcome(self: &Arc<Self>) {
         let bindings: Vec<_> = self.bindings.lock().await.values().cloned().collect();
         for binding in bindings {
@@ -804,11 +819,8 @@ impl Daemon {
                         existing.owner.store(owner, Ordering::Relaxed);
                     }
                     harness_adapter.refresh_registration(&existing, &delivery);
-                    let binding_id = existing.id.lock().await.clone();
                     drop(_state_transaction);
-                    return Ok(
-                        json!({"binding_id":binding_id,"thread":thread,"connected":self.link.connected().await,"prepared":null}),
-                    );
+                    return Ok(self.existing_registration(&existing, &thread).await);
                 }
                 drop(_state_transaction);
                 let binding = Arc::new(Conversation {
@@ -852,10 +864,8 @@ impl Daemon {
                         existing.owner.store(owner, Ordering::Relaxed);
                     }
                     harness_adapter.refresh_registration(&existing, &delivery);
-                    let binding_id = existing.id.lock().await.clone();
                     drop(_state_transaction);
-                    return Ok(json!({"binding_id":binding_id,"thread":thread,
-                        "connected":self.link.connected().await,"prepared":null}));
+                    return Ok(self.existing_registration(&existing, &thread).await);
                 }
                 let prepared = harness_adapter.prepare(&binding).await?;
                 self.bindings
