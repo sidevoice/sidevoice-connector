@@ -2,54 +2,359 @@
   "text": "é🐙ab",
   "playback": [
     {
-      "voice": {"status": "heard"},
-      "core": {"status": "heard"},
-      "history": {"status": "playback_finished", "audio_reason": null, "heard_chars": 4, "globally_heard": true}
+      "voice": {
+        "status": "heard"
+      },
+      "core": {
+        "status": "heard"
+      },
+      "history": {
+        "status": "playback_finished",
+        "audio_reason": null
+      }
     },
     {
-      "voice": {"status": "heard-up-to", "heard_chars": 2, "reason": {"reason": "barge-in"}},
-      "core": {"status": "interrupted", "reason": "user_interrupted", "heard_chars": 2},
-      "history": {"status": "interrupted", "audio_reason": "user_interrupted", "heard_chars": 2, "globally_heard": false}
+      "voice": {
+        "status": "heard-up-to",
+        "heard_chars": 2,
+        "reason": {
+          "reason": "barge-in"
+        }
+      },
+      "core": {
+        "status": "interrupted",
+        "reason": "user_interrupted",
+        "heard_chars": 2
+      },
+      "history": {
+        "status": "interrupted",
+        "audio_reason": "user_interrupted"
+      }
     },
     {
-      "voice": {"status": "not-played", "reason": {"reason": "barge-in"}},
-      "core": {"status": "unplayed", "reason": "newer_turn"},
-      "history": {"status": "interrupted", "audio_reason": "newer_turn", "heard_chars": null, "globally_heard": false}
+      "voice": {
+        "status": "not-played",
+        "reason": {
+          "reason": "barge-in"
+        }
+      },
+      "core": {
+        "status": "unplayed",
+        "reason": "newer_turn"
+      },
+      "history": {
+        "status": "interrupted",
+        "audio_reason": "newer_turn"
+      }
     },
     {
-      "voice": {"type": "agent-interrupted", "utterance_id": "local-handle", "heard_until": 0, "played": true},
-      "core": {"status": "interrupted", "reason": "user_interrupted", "heard_chars": 0},
-      "history": {"status": "interrupted", "audio_reason": "user_interrupted", "heard_chars": 0, "globally_heard": false}
+      "voice": {
+        "type": "agent-interrupted",
+        "utterance_id": "local-handle",
+        "heard_until": 0,
+        "played": true
+      },
+      "core": {
+        "status": "interrupted",
+        "reason": "user_interrupted",
+        "heard_chars": 0
+      },
+      "history": {
+        "status": "interrupted",
+        "audio_reason": "user_interrupted"
+      }
     },
     {
-      "voice": {"type": "agent-interrupted", "utterance_id": "local-handle", "heard_until": 0, "played": false},
-      "core": {"status": "unplayed", "reason": "newer_turn"},
-      "history": {"status": "interrupted", "audio_reason": "newer_turn", "heard_chars": null, "globally_heard": false}
+      "voice": {
+        "type": "agent-interrupted",
+        "utterance_id": "local-handle",
+        "heard_until": 0,
+        "played": false
+      },
+      "core": {
+        "status": "unplayed",
+        "reason": "newer_turn"
+      },
+      "history": {
+        "status": "interrupted",
+        "audio_reason": "newer_turn"
+      }
     },
     {
-      "voice": {"status": "heard-up-to", "heard_chars": 1, "reason": {"reason": "cancelled"}, "local_action": "skip"},
-      "core": {"status": "interrupted", "reason": "user_skipped", "heard_chars": 1},
-      "history": {"status": "skipped", "audio_reason": "user_skipped", "heard_chars": 4, "globally_heard": true}
+      "voice": {
+        "status": "heard-up-to",
+        "heard_chars": 2,
+        "reason": {
+          "reason": "stopped"
+        },
+        "local_action": "voice_off"
+      },
+      "core": {
+        "status": "interrupted",
+        "reason": "voice_off",
+        "heard_chars": 2
+      },
+      "history": {
+        "status": "interrupted",
+        "audio_reason": "voice_off"
+      }
     },
     {
-      "voice": {"status": "not-played", "reason": {"reason": "cancelled"}, "local_action": "skip"},
-      "core": {"status": "unplayed", "reason": "user_skipped"},
-      "history": {"status": "skipped", "audio_reason": "user_skipped", "heard_chars": 4, "globally_heard": true}
+      "voice": {
+        "status": "heard-up-to",
+        "heard_chars": 2,
+        "reason": {
+          "reason": "failed",
+          "code": "speech-failed"
+        }
+      },
+      "core": {
+        "status": "failed",
+        "heard_chars": 2
+      },
+      "history": {
+        "status": "failed",
+        "audio_reason": "playback_failed"
+      }
     },
     {
-      "voice": {"status": "heard-up-to", "heard_chars": 2, "reason": {"reason": "stopped"}, "local_action": "voice_off"},
-      "core": {"status": "interrupted", "reason": "voice_off", "heard_chars": 2},
-      "history": {"status": "interrupted", "audio_reason": "voice_off", "heard_chars": 2, "globally_heard": false}
-    },
-    {
-      "voice": {"status": "heard-up-to", "heard_chars": 2, "reason": {"reason": "failed", "code": "speech-failed"}},
-      "core": {"status": "failed", "heard_chars": 2},
-      "history": {"status": "failed", "audio_reason": "playback_failed", "heard_chars": 2, "globally_heard": false}
+      "voice": {
+        "status": "heard-up-to",
+        "heard_chars": 2,
+        "reason": {
+          "reason": "cancelled"
+        }
+      },
+      "core": {
+        "status": "interrupted",
+        "heard_chars": 2
+      },
+      "history": {
+        "status": "interrupted",
+        "audio_reason": null
+      }
     }
   ],
   "turns": [
-    {"voice": {"phase": "cancelled", "turn_id": "earlier", "merged": true}, "core": {"type": "voice-user-turn", "data": {"session_id": "SESSION", "client_msg_id": "C1", "phase": "cancelled", "turn_id": "earlier", "merged": true}}, "meaning": "transfer empty obligation to continuing turn"},
-    {"voice": {"phase": "finished", "turn_id": "later", "text": "Merged words", "merged": true}, "core": {"type": "voice-user-turn", "data": {"session_id": "SESSION", "client_msg_id": "C2", "phase": "finished", "turn_id": "later", "text": "Merged words", "merged": true}}, "meaning": "transcript already includes earlier turn"},
-    {"voice": {"phase": "finished", "turn_id": "offline", "text": "Offline words", "merged": false}, "core": {"type": "voice-user-turn", "data": {"session_id": "SESSION", "client_msg_id": "C3", "phase": "finished", "turn_id": "offline", "text": "Offline words", "offline": true, "thread_id": "t", "binding_id": "FOCUS_BINDING", "started_at": 1792000000000}}, "meaning": "accept once at captured focus and assign one epoch"}
-  ]
+    {
+      "voice": {
+        "phase": "cancelled",
+        "turn_id": "earlier",
+        "merged": true
+      },
+      "core": {
+        "type": "voice-user-turn",
+        "data": {
+          "session_id": "SESSION",
+          "client_msg_id": "C1",
+          "phase": "cancelled",
+          "turn_id": "earlier",
+          "merged": true
+        }
+      },
+      "meaning": "transfer empty obligation to continuing turn"
+    },
+    {
+      "voice": {
+        "phase": "finished",
+        "turn_id": "later",
+        "text": "Merged words",
+        "merged": true
+      },
+      "core": {
+        "type": "voice-user-turn",
+        "data": {
+          "session_id": "SESSION",
+          "client_msg_id": "C2",
+          "phase": "finished",
+          "turn_id": "later",
+          "text": "Merged words",
+          "merged": true
+        }
+      },
+      "meaning": "transcript already includes earlier turn"
+    },
+    {
+      "voice": {
+        "phase": "finished",
+        "turn_id": "offline",
+        "text": "Offline words",
+        "merged": false
+      },
+      "core": {
+        "type": "voice-user-turn",
+        "data": {
+          "session_id": "SESSION",
+          "client_msg_id": "C3",
+          "phase": "finished",
+          "turn_id": "offline",
+          "text": "Offline words",
+          "offline": true,
+          "thread_id": "t",
+          "binding_id": "FOCUS_BINDING",
+          "started_at": 1792000000000
+        }
+      },
+      "meaning": "accept once at captured focus and assign one epoch"
+    }
+  ],
+  "speech_recovery": {
+    "method": "speech.recover",
+    "request_extra": {
+      "recovery_binding_id": "CURRENT_BINDING"
+    },
+    "same_original_fields": [
+      "event_id",
+      "utterance_id",
+      "binding_id",
+      "session_id",
+      "revision",
+      "epoch",
+      "text",
+      "language",
+      "history_only"
+    ],
+    "missing_first_admission": {
+      "status": "text_only",
+      "text_saved": true
+    },
+    "known_admission": "return original disposition",
+    "known_refusal": "return original terminal refusal"
+  },
+  "notice_correction": {
+    "kind": "reply_heard",
+    "corrects_message_id": "ORIGINAL_MESSAGE_ID",
+    "heard": [
+      {
+        "utterance_id": "REPLY_ID",
+        "history_id": "HISTORY_ID",
+        "fate": "partial",
+        "heard_chars": 2
+      }
+    ],
+    "original_message_id_and_payload_stay_unchanged_after_push_retry_or_pull_release": true,
+    "late_original_4_after_replay_8": {
+      "history_heard_chars": 8,
+      "additional_correction": false
+    },
+    "after_first_exposure_same_reply_only_corrects_prior_envelope": true
+  },
+  "turn_start": {
+    "type": "voice-user-turn",
+    "data": {
+      "session_id": "SESSION",
+      "client_msg_id": "START1",
+      "phase": "started",
+      "turn_id": "SOURCE_TURN",
+      "thread_id": "CAPTURED_THREAD",
+      "binding_id": "CAPTURED_FOCUS_BINDING"
+    },
+    "meaning": "Start is pinned to this captured focus even after HTTP selects another focus; terminal cannot override it"
+  },
+  "history_resolution": {
+    "request": "GET /api/presentation/history?thread_id=t&resolve_id=OLD_REPLY&resolve_id=EVICTED",
+    "response_extra": {
+      "resolved": [
+        {
+          "id": "OLD_REPLY",
+          "globally_heard": true,
+          "heard_chars": 4
+        }
+      ],
+      "missing_ids": [
+        "EVICTED"
+      ]
+    },
+    "meaning": "Explicit IDs are authoritative even when absent from recent messages"
+  },
+  "hearing": [
+    {
+      "app_policy": "full audio or full written delivery",
+      "frame": {
+        "type": "reply-hearing",
+        "data": {
+          "session_id": "SESSION",
+          "client_msg_id": "HEAR1",
+          "history_id": "HISTORY_ID",
+          "utterance_id": "REPLY_ID",
+          "outcome": "heard"
+        }
+      },
+      "history": {
+        "hearing": "heard",
+        "heard_chars": 4,
+        "globally_heard": true,
+        "hearing_unconfirmed": false
+      }
+    },
+    {
+      "app_policy": "confirmed prefix after any local stop",
+      "frame": {
+        "type": "reply-hearing",
+        "data": {
+          "session_id": "SESSION",
+          "client_msg_id": "HEAR2",
+          "history_id": "HISTORY_ID",
+          "utterance_id": "REPLY_ID",
+          "outcome": "partial",
+          "heard_chars": 2
+        }
+      },
+      "history": {
+        "hearing": "partial",
+        "heard_chars": 2,
+        "globally_heard": false,
+        "hearing_unconfirmed": false
+      }
+    },
+    {
+      "app_policy": "confirmed zero after any local stop",
+      "frame": {
+        "type": "reply-hearing",
+        "data": {
+          "session_id": "SESSION",
+          "client_msg_id": "HEAR3",
+          "history_id": "HISTORY_ID",
+          "utterance_id": "REPLY_ID",
+          "outcome": "not_heard"
+        }
+      },
+      "history": {
+        "hearing": "not_heard",
+        "heard_chars": 0,
+        "globally_heard": false,
+        "hearing_unconfirmed": false
+      }
+    },
+    {
+      "app_policy": "reading mode text-only delivery",
+      "publication_status": "text_only",
+      "frame": {
+        "type": "reply-hearing",
+        "data": {
+          "session_id": "SESSION",
+          "client_msg_id": "HEAR4",
+          "history_id": "HISTORY_ID",
+          "utterance_id": "REPLY_ID",
+          "outcome": "heard"
+        }
+      },
+      "history": {
+        "hearing": "heard",
+        "heard_chars": 4,
+        "globally_heard": true,
+        "hearing_unconfirmed": false
+      }
+    }
+  ],
+  "unconfirmed": {
+    "history": {
+      "hearing": null,
+      "heard_chars": null,
+      "hearing_unconfirmed": true
+    },
+    "agent_evidence": null,
+    "meaning": "No terminal semantic receipt; no confirmed not_heard fact",
+    "bounded_eviction": "stale identity after journal eviction; never converted to not_heard"
+  }
 }

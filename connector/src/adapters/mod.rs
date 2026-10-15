@@ -327,29 +327,28 @@ mod tests {
             serde_json::from_str(include_str!("../../tests/fixtures/conversation-flow.json"))
                 .unwrap();
         let original = fixture["text"].as_str().unwrap();
-        let cut_extent = fixture["playback"][1]["history"]["heard_chars"].clone();
+        let partial_extent = fixture["hearing"][1]["history"]["heard_chars"].clone();
         for scenario in [
-            "cut_words",
-            "cut_empty_early",
-            "cut_empty_late",
-            "unplayed_words",
-            "unplayed_empty_early",
-            "unplayed_empty_late",
+            "partial_words",
+            "partial_empty_early",
+            "partial_empty_late",
+            "not_heard_words",
+            "not_heard_empty_early",
+            "not_heard_empty_late",
             "refused_empty",
             "return",
-            "skip",
+            "local_stop",
             "stale",
             "full_evidence",
         ] {
             let (kind, channel, words) = match scenario {
-                "cut_words" => ("reply_interrupted", "voice", "Wait"),
-                "cut_empty_early" | "cut_empty_late" => ("reply_interrupted", "note", ""),
-                "unplayed_words" => ("reply_not_played", "voice", "Next"),
-                "unplayed_empty_early" | "unplayed_empty_late" => ("reply_not_played", "note", ""),
+                "partial_words" => ("reply_not_heard", "voice", "Wait"),
+                "partial_empty_early" | "partial_empty_late" => ("reply_not_heard", "note", ""),
+                "not_heard_words" => ("reply_not_heard", "voice", "Next"),
+                "not_heard_empty_early" | "not_heard_empty_late" => ("reply_not_heard", "note", ""),
                 "refused_empty" => ("turn_empty", "note", ""),
                 "return" => ("user_returned", "note", ""),
-                "skip" => ("reply_skipped", "note", ""),
-                "stale" | "full_evidence" => ("reply_not_played", "note", ""),
+                "local_stop" | "stale" | "full_evidence" => ("reply_not_heard", "note", ""),
                 _ => unreachable!(),
             };
             let mut push = event(kind, channel, words);
@@ -358,14 +357,10 @@ mod tests {
             let evidence = |n: usize| {
                 json!({"utterance_id":format!("u{n}"),
                 "history_id":format!("h{n}"),"session_id":"s","revision":3,"epoch":1,
-                "text":long.clone(),"fate":if scenario.starts_with("cut") {"interrupted"} else {"unplayed"},
-                "reason":if scenario == "stale" {"newer_turn"} else {"user_interrupted"},
-                "cut":scenario.starts_with("cut"),"heard_chars":if scenario.starts_with("cut") {cut_extent.clone()} else {Value::Null}})
+                "text":long.clone(),"fate":if scenario.starts_with("partial") || scenario == "local_stop" {"partial"} else {"not_heard"},
+                "heard_chars":if scenario.starts_with("partial") || scenario == "local_stop" {partial_extent.clone()} else {json!(0)}})
             };
-            if scenario == "skip" {
-                push["notice"]["skipped"] =
-                    json!([{"utterance_id":"u0","history_id":"h0","fate":"skipped"}]);
-            } else if scenario != "refused_empty" {
+            if scenario != "refused_empty" {
                 let count = if scenario == "full_evidence" { 8 } else { 1 };
                 push["unheard"] = json!({"count":count,
                     "replies":(0..count).map(evidence).collect::<Vec<_>>()});
@@ -377,13 +372,13 @@ mod tests {
             assert_eq!(injected, envelope(&pull).unwrap(), "{scenario}");
             assert!(injected.contains(&format!("m-{scenario}")));
             assert!(injected.contains("m-original"), "related ID: {scenario}");
-            if scenario != "refused_empty" && scenario != "skip" {
+            if scenario != "refused_empty" {
                 assert!(
                     injected.contains(&"z".repeat(300)),
                     "full text clipped: {scenario}"
                 );
             }
-            if scenario.starts_with("cut") {
+            if scenario.starts_with("partial") || scenario == "local_stop" {
                 assert!(
                     injected.contains("heard prefix \"é🐙\""),
                     "scalar split: {scenario}"
@@ -415,11 +410,11 @@ mod tests {
     fn t04b_t05_nine_reply_evidence_keeps_both_batches_in_publication_order() {
         let mut delivered = Vec::new();
         for batch in [0..8, 8..9] {
-            let mut note = event("reply_not_played", "note", "");
+            let mut note = event("reply_not_heard", "note", "");
             note["message_id"] = json!(format!("batch-{}", batch.start));
             note["unheard"] = json!({"count":9,"replies":batch.map(|n| json!({
                 "utterance_id":format!("u{n}"),"history_id":format!("h{n}"),
-                "text":format!("reply {n}"),"heard_chars":null,"fate":"unplayed"
+                "text":format!("reply {n}"),"heard_chars":0,"fate":"not_heard"
             })).collect::<Vec<_>>()});
             delivered.push(envelope(&note).unwrap());
         }
@@ -439,11 +434,11 @@ mod tests {
             serde_json::from_str(include_str!("../../tests/fixtures/conversation-flow.json"))
                 .unwrap();
         let original = fixture["text"].as_str().unwrap();
-        for (index, case) in fixture["playback"].as_array().unwrap().iter().enumerate() {
-            let mut frame = event("reply_interrupted", "voice", "Current words");
+        for (index, case) in fixture["hearing"].as_array().unwrap().iter().enumerate() {
+            let mut frame = event("reply_not_heard", "voice", "Current words");
             frame["unheard"] = json!({"count":1,"replies":[{"utterance_id":format!("u{index}"),
                 "text":original,"heard_chars":case["history"]["heard_chars"],
-                "fate":case["history"]["status"],"reason":case["history"]["audio_reason"]}]});
+                "fate":case["history"]["hearing"]}]});
             let rendered = envelope(&frame).unwrap();
             assert!(rendered.contains(original));
             if case["history"]["heard_chars"] == 2 {

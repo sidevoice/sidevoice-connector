@@ -20,7 +20,7 @@ const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the person
 - In pull mode, call get_messages at useful hooks. Acknowledge IDs with ack_ids only after processing them. Pull may learn later than injection. After is a journal position, not an acknowledgement.
 - Reply with voice_say using the message's session_id, revision and epoch. For speech before any message, use voice_connect's initial_reply_context. Typing does not advance the epoch. Several replies in one epoch play in publication order.
 - If voice_say says the person is speaking, the call was refused and nothing was queued: wait for their message. If that turn ends without words, a Sidevoice note may ask you to resend what still matters. A published reply is not proof it was heard.
-- When a notice says a reply was interrupted, not played, skipped, later heard, or that the person returned, use its full evidence and instruction. Do not automatically resend an unheard backlog; say what still matters in the current context.
+- A reply is heard, partially heard with a confirmed prefix, or not heard. For a partial reply, use the full text and confirmed extent to understand what remains unheard. Use notices and their instructions when answering in the current context; do not automatically resend an unheard backlog.
 - For substantive work, first a short acknowledgement, then meaningful checkpoints, then the result. No filler or tool narration. Take in new input at tool results before starting the next step.
 - Pairing a machine or device is the person's act. Ask for their room address and one-time code only when needed; never fetch a code yourself. If inbound.ok is false, explain its reason and remedy without changing settings unasked."#;
 
@@ -805,7 +805,7 @@ impl Facade {
                 }
                 if result.get("text_saved") == Some(&json!(true)) {
                     Ok(
-                        json!({"status":"published","text_saved":true,"audio":result.get("status"),"reason":result.get("reason")}),
+                        json!({"status":"published","text_saved":true,"audio":result.get("status")}),
                     )
                 } else {
                     if adopted.is_some() {

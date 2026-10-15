@@ -38,7 +38,7 @@ app, a browser).
 
 If a reply to the connector's speech request is lost, the connector keeps the original request and asks the core for its disposition with `speech.recover` after reconnecting. The core returns the original saved or refused result; if it never received the request, it saves the text without playing delayed audio. The connector retains a bounded receipt for the recovered result so an agent retry with the same IDs sees it, even if background recovery finished first. Once that attempt is settled, a new reply in the current conversation can play normally. A queued reply is never retried as new audio when its first admission is uncertain.
 
-Notices delivered through the agent's push or pull mode carry the same hearing evidence. An already delivered notice keeps its message ID and content across retries; late partial, full, or skipped hearing arrives as a separate `reply_heard` correction with the confirmed Unicode character count.
+Notices delivered through the agent's push or pull mode carry the same confirmed hearing evidence: heard, partially heard with a Unicode-scalar extent, or not heard. The full reply text remains available so the agent knows what was left unheard. A missing receipt stays unconfirmed and does not become a not-heard claim. An already delivered notice keeps its message ID and content across retries; stronger late hearing arrives as a separate `reply_heard` correction.
 
 ## Get started
 
