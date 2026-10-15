@@ -643,6 +643,32 @@ impl Presentation {
             .unwrap();
     }
 
+    pub fn report_playback(
+        &self,
+        utterance_id: &str,
+        status: &str,
+        reason: Option<&str>,
+        heard_chars: Option<u64>,
+    ) {
+        self.send.send(json!({"type":"voice-playback","data":{
+            "session_id":self.session,"client_msg_id":uuid::Uuid::new_v4().to_string(),
+            "utterance_id":utterance_id,"status":status,"reason":reason,"heard_chars":heard_chars
+        }})).unwrap();
+    }
+
+    pub fn next_frame(&self, kind: &str, seconds: u64) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        loop {
+            let frame = self
+                .frames
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|_| panic!("no {kind} frame"));
+            if frame["type"] == kind {
+                return frame;
+            }
+        }
+    }
+
     pub fn turn_started(&self, turn_id: &str) -> Value {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {

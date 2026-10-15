@@ -6,6 +6,7 @@
 mod support;
 
 use serde_json::json;
+use serde_json::Value;
 use std::time::Duration;
 use support::*;
 
@@ -426,8 +427,11 @@ fn t04_t05_non_editor_can_speak_first_in_push_and_pull() {
         let _connector = profile.start_connector();
         profile.wait_linked(&format!("speak-first-core-{mode}"));
         let thread = format!("speak-first-thread-{mode}");
+        let receiver = http_receiver();
         let mut command = profile.connector(&["mcp"]);
-        command.env("SIDEVOICE_THREAD", &thread);
+        command
+            .env("SIDEVOICE_THREAD", &thread)
+            .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
         let mut mcp = Mcp::start(command);
         mcp.initialize("speak-first-client");
         let joined = mcp.tool("voice_connect", json!({"input_mode":mode}));
@@ -452,8 +456,11 @@ fn t07_retry_identifiers_are_a_pair_and_one_pair_creates_one_reply() {
     profile.wait_linked("retry-ids-core");
     let call = Presentation::open(&profile.core_socket());
     let thread = "retry-ids-thread";
+    let receiver = http_receiver();
     let mut command = profile.connector(&["mcp"]);
-    command.env("SIDEVOICE_THREAD", thread);
+    command
+        .env("SIDEVOICE_THREAD", thread)
+        .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
     let mut mcp = Mcp::start(command);
     mcp.initialize("retry-ids-client");
     let joined = mcp.tool("voice_connect", json!({"input_mode":"pull"}));
@@ -504,8 +511,11 @@ fn t16_large_valid_pull_page_arrives_in_complete_cursor_order() {
     profile.wait_linked("pull-large-core");
     let call = Presentation::open(&profile.core_socket());
     let thread = "pull-large-thread";
+    let receiver = http_receiver();
     let mut command = profile.connector(&["mcp"]);
-    command.env("SIDEVOICE_THREAD", thread);
+    command
+        .env("SIDEVOICE_THREAD", thread)
+        .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
     let mut mcp = Mcp::start(command);
     mcp.initialize("pull-large-client");
     mcp.tool("voice_connect", json!({"input_mode":"pull"}));
@@ -554,4 +564,169 @@ fn t16_large_valid_pull_page_arrives_in_complete_cursor_order() {
     assert_eq!(ack["acknowledged"], 32, "{ack}");
     assert_eq!(ack["count"], 0, "{ack}");
     mcp.stop();
+}
+
+fn actual_notice(
+    core: &std::path::Path,
+    mode: &str,
+    label: &str,
+    kind: &str,
+    produce: impl FnOnce(&Profile, &Presentation, &mut Mcp, &Value),
+) -> Value {
+    let profile = Profile::new(&format!("notice-{label}-{mode}"));
+    let launch = format!("notice-core-{label}-{mode}");
+    let _core = profile.start_core(core, &launch);
+    let _connector = profile.start_connector();
+    profile.wait_linked(&launch);
+    let call = Presentation::open(&profile.core_socket());
+    let receiver = http_receiver();
+    let thread = format!("notice-thread-{label}-{mode}");
+    let mut command = profile.connector(&["mcp"]);
+    command
+        .env("SIDEVOICE_THREAD", &thread)
+        .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+    let mut mcp = Mcp::start(command);
+    mcp.initialize("notice-client");
+    let joined = mcp.tool("voice_connect", json!({"input_mode":mode}));
+    core_json(
+        &profile.core_socket(),
+        "POST",
+        "/api/presentation/select",
+        Some(&json!({"session_id":call.session,"thread_id":thread})),
+        Some(&call.token),
+    );
+    produce(&profile, &call, &mut mcp, &joined);
+    let message = if mode == "push" {
+        until(&format!("{kind} injected"), 20, || {
+            receiver
+                .bodies
+                .recv_timeout(Duration::from_millis(150))
+                .ok()
+                .filter(|body| body["notice"]["kind"] == kind)
+        })
+    } else {
+        until(&format!("{kind} pulled"), 20, || {
+            let page = mcp.tool("get_messages", json!({}));
+            page["messages"].as_array().and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message["notice"]["kind"] == kind)
+                    .cloned()
+            })
+        })
+    };
+    assert_eq!(message["notice"]["kind"], kind, "{message}");
+    let envelope = message["envelope"].as_str().unwrap();
+    assert!(
+        envelope.contains(message["notice"]["instruction"].as_str().unwrap()),
+        "{message}"
+    );
+    if let Some(replies) = message["unheard"]["replies"].as_array() {
+        for reply in replies {
+            assert!(
+                envelope.contains(reply["text"].as_str().unwrap()),
+                "{message}"
+            );
+        }
+    }
+    mcp.stop();
+    message
+}
+
+#[test]
+fn t01_t02a_t02b_real_notices_reach_push_and_pull_with_complete_evidence() {
+    let Some(core) = core_dir() else { return };
+    for mode in ["push", "pull"] {
+        for (label, playback, words, kind) in [
+            (
+                "interrupted",
+                "interrupted",
+                Some("Wait"),
+                "reply_interrupted",
+            ),
+            (
+                "unstarted-words",
+                "unplayed",
+                Some("Actually"),
+                "reply_not_played",
+            ),
+            ("unstarted-empty", "unplayed", None, "turn_empty"),
+        ] {
+            let message = actual_notice(&core, mode, label, kind, |_, call, mcp, joined| {
+                let said = mcp.tool(
+                    "voice_say",
+                    json!({"conversation":joined["conversation"],
+                    "text":"é🐙 original","event_id":"event-1","utterance_id":"utterance-1"}),
+                );
+                assert_eq!(said["text_saved"], true, "{said}");
+                if playback == "interrupted" {
+                    call.report_playback("utterance-1", "playing", None, None);
+                    call.report_playback(
+                        "utterance-1",
+                        "interrupted",
+                        Some("user_interrupted"),
+                        Some(2),
+                    );
+                }
+                call.report_turn("started", "turn-1", None);
+                call.turn_started("turn-1");
+                if playback == "unplayed" {
+                    call.report_playback("utterance-1", "unplayed", Some("newer_turn"), None);
+                }
+                call.report_turn("finished", "turn-1", words);
+            });
+            assert_eq!(
+                message["unheard"]["replies"][0]["text"], "é🐙 original",
+                "{message}"
+            );
+            if playback == "interrupted" {
+                assert_eq!(
+                    message["unheard"]["replies"][0]["heard_chars"], 2,
+                    "{message}"
+                );
+            }
+            if words.is_none() {
+                assert_eq!(message["channel"], "note", "{message}");
+                assert_eq!(message["text"], "", "{message}");
+            } else {
+                assert_eq!(message["text"], words.unwrap(), "{message}");
+            }
+        }
+    }
+}
+
+#[test]
+fn t12_real_skip_notice_keeps_choice_outside_unheard_in_push_and_pull() {
+    let Some(core) = core_dir() else { return };
+    for mode in ["push", "pull"] {
+        let note = actual_notice(
+            &core,
+            mode,
+            "skip",
+            "reply_skipped",
+            |_, call, mcp, joined| {
+                let said = mcp.tool(
+                    "voice_say",
+                    json!({"conversation":joined["conversation"],
+                "text":"Skip this","event_id":"skip-event","utterance_id":"skip-utterance"}),
+                );
+                assert_eq!(said["text_saved"], true, "{said}");
+                call.report_playback(
+                    "skip-utterance",
+                    "interrupted",
+                    Some("user_skipped"),
+                    Some(2),
+                );
+            },
+        );
+        assert_eq!(note["notice"]["skipped"][0]["text"], "Skip this", "{note}");
+        assert!(
+            note.get("unheard").is_none() || note["unheard"].is_null(),
+            "{note}"
+        );
+        assert!(note["notice"]["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("Do not repeat"));
+    }
 }
