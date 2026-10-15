@@ -29,8 +29,7 @@ fn settings() -> BTreeMap<String, String> {
     ])
 }
 
-/// Where a test installs Cursor (`cursor_installed`): its CLI, which every command here names. A profile without it has
-/// no Cursor.
+/// Where a test installs Cursor (`cursor_installed`): its CLI on the fake login PATH.
 fn cursor_program(profile: &Profile) -> PathBuf {
     profile.root.join("cursor-bin/cursor-agent")
 }
@@ -41,6 +40,13 @@ fn cursor_installed(profile: &Profile) {
     fs::create_dir_all(program.parent().unwrap()).unwrap();
     fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    let shell = profile.root.join("login-shell");
+    fs::write(
+        &shell,
+        "#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' \"$SIDEVOICE_TEST_LOGIN_PATH\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 /// `program args… --json` in the profile: its one JSON line and whether it succeeded.
@@ -48,7 +54,14 @@ fn run(profile: &Profile, program: &Path, args: &[&str]) -> (bool, Value) {
     let output = profile
         .command(program)
         .envs(settings())
-        .env("SIDEVOICE_CURSOR_BIN", cursor_program(profile))
+        .env("SHELL", profile.root.join("login-shell"))
+        .env(
+            "SIDEVOICE_TEST_LOGIN_PATH",
+            format!(
+                "{}:/usr/bin:/bin",
+                cursor_program(profile).parent().unwrap().display()
+            ),
+        )
         .args(args)
         .arg("--json")
         .stdin(Stdio::null())

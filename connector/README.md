@@ -125,13 +125,27 @@ connect the agents it found that the connector can connect itself: all, some (by
 (Enter, or the end of input); those chosen are connected as `agents connect` connects them. The install lock is
 released before it asks. With `--json` (the desktop app reads it) or without a terminal nothing is asked.
 
-An agent is found (listed by `agents`, `agents.list` and the install offer, with `present: true`) only when its
-program is installed, each adapter saying how: Claude Code's `claude` and Codex's `codex` on the login PATH, in
-`SIDEVOICE_<AGENT>_BIN`, or in their standard install places; Cursor's `cursor-agent` or `cursor` the same way, or its
-app (`/Applications/Cursor.app`, `/usr/share/cursor`, `/opt/Cursor`). Its configuration directory, which other tools
-and an uninstall leave behind, never counts by itself. The row's `evidence` says why: `binary` and `app` are the
-program found; `config-dir` is a detail. An agent not found is not listed; any agent is connected by hand with the
-listing's `custom`.
+An agent is found (listed by `agents`, `agents.list` and the install offer, with `present: true`) when any
+adapter-declared marker matches. CLI commands are resolved with the `which` crate against the person's freshly
+captured login-shell PATH, never the connector service's PATH. Fixed install paths are checked with
+`symlink_metadata` only; checking a path never starts an application or runs an OS registration query. The connector
+captures PATH with a framed `$SHELL -lc` command on each scan, rejects startup banners outside the frame, and lists
+no agents if capture fails. A configuration directory alone is never installation evidence.
+
+| Agent | CLI names (all OS) | macOS fixed markers | Windows fixed markers | Linux fixed markers |
+| --- | --- | --- | --- | --- |
+| Claude Code | `claude` | `~/.local/bin/claude` (native installer) | `%USERPROFILE%\.local\bin\claude.exe` (native installer) | `~/.local/bin/claude` (native installer) |
+| Codex | `codex` | none; npm/Homebrew prefixes vary | none; installation prefixes vary | none; installation prefixes vary |
+| Cursor | `cursor-agent`, `cursor` | `/Applications/Cursor.app`, `~/Applications/Cursor.app` | `%LOCALAPPDATA%\Programs\cursor`, `%ProgramFiles%\cursor` | `/usr/share/cursor` (package install), `~/.local/share/cursor` (per-user extracted install) |
+
+`~` uses the process home; Windows environment roots are read from `LOCALAPPDATA` and `ProgramFiles`. Fixed markers
+are intentionally narrow. A Cursor app installed elsewhere without a `cursor` or `cursor-agent` command on the
+captured PATH is not detected; the person can use Other to connect by hand. Public `evidence` reports only matched
+marker kinds (`cli`, `install_file`, `app_bundle`, `install_dir`), never the resolved paths or home directory.
+Install-marker checks never run candidate commands. Scans do not probe `--version`, so an agent's `version` is `null`.
+
+Codex queue delivery uses the CLI from that captured PATH and fails if none was found; it never runs a different
+`codex` from the connector service's PATH.
 
 An agent whose registration is `connected` also says whether that registration works: its row in `agents` (and the
 connector's `agents.list`) carries `health`, `{"state","error","checked_at"}`. The connector starts the entry as the

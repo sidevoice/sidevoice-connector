@@ -16,13 +16,6 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-/// Where Cursor's app is installed: the macOS bundle, and the Linux packages' own directories (`.deb`/`.rpm`).
-const APPS: [&str; 3] = [
-    "/Applications/Cursor.app",
-    "/usr/share/cursor",
-    "/opt/Cursor",
-];
-
 /// The `command` and `args` of an `mcp.json` entry.
 fn entry_command(entry: &Value) -> (&str, Vec<String>) {
     let command = entry.get("command").and_then(Value::as_str).unwrap_or("");
@@ -254,25 +247,46 @@ impl Registration for Cursor {
         &["cursor-agent", "cursor"]
     }
 
-    fn known_paths(&self, home: &Path) -> Vec<PathBuf> {
-        let bin = home.join(".local/bin");
-        vec![
-            bin.join("cursor-agent"),
-            bin.join("cursor"),
-            PathBuf::from("/usr/local/bin/cursor-agent"),
-            PathBuf::from("/opt/homebrew/bin/cursor-agent"),
-            PathBuf::from("/usr/local/bin/cursor"),
-            PathBuf::from("/opt/homebrew/bin/cursor"),
-            PathBuf::from("/Applications/Cursor.app/Contents/Resources/app/bin/cursor"),
-            home.join("AppData/Local/Programs/cursor/resources/app/bin/cursor.cmd"),
+    fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
+        use crate::adapters::markers::{Marker, Root};
+        &[
+            Marker {
+                os: "macos",
+                kind: "app_bundle",
+                root: Root::Absolute,
+                path: "/Applications/Cursor.app",
+            },
+            Marker {
+                os: "macos",
+                kind: "app_bundle",
+                root: Root::Home,
+                path: "Applications/Cursor.app",
+            },
+            Marker {
+                os: "windows",
+                kind: "install_dir",
+                root: Root::LocalAppData,
+                path: "Programs/cursor",
+            },
+            Marker {
+                os: "windows",
+                kind: "install_dir",
+                root: Root::ProgramFiles,
+                path: "cursor",
+            },
+            Marker {
+                os: "linux",
+                kind: "install_dir",
+                root: Root::Absolute,
+                path: "/usr/share/cursor",
+            },
+            Marker {
+                os: "linux",
+                kind: "install_dir",
+                root: Root::Home,
+                path: ".local/share/cursor",
+            },
         ]
-    }
-
-    fn evidence(&self) -> Vec<(&'static str, PathBuf)> {
-        APPS.iter()
-            .filter(|app| Path::new(app).exists())
-            .map(|app| ("app", PathBuf::from(app)))
-            .collect()
     }
 
     fn connects_without_binary(&self) -> bool {
