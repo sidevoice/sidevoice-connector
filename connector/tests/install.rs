@@ -161,7 +161,7 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
         "{installed}"
     );
     assert_eq!(
-        installed["agents"]["cursor"]["command"], "sidevoice agents connect cursor",
+        installed["agents"]["cursor"]["command"], "npx sidevoice agents connect cursor",
         "{installed}"
     );
     let cursor = profile.root.join("cursor/config/mcp.json");

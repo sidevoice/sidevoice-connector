@@ -538,7 +538,7 @@ mod tests {
         );
         assert_eq!(
             human(&refused.value()),
-            "The Sidevoice login service is incomplete (dev.sidevoice.connector is missing), so whether it starts at login was not changed. Repair it with `sidevoice service install`, then try again."
+            "The Sidevoice login service is incomplete (dev.sidevoice.connector is missing), so whether it starts at login was not changed. Repair it with `npx sidevoice service install`, then try again."
         );
     }
 }

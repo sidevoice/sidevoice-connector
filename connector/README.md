@@ -106,7 +106,7 @@ Installing connects no agent. An agent gets Sidevoice only when the person conne
 calls `agents.connect`), `agents connect <id>`, or their answer to the offer below. Unless `--no-agents`, `install`
 lists the agents found (a rescan) and its answer's `agents` has one entry per agent, `{outcome, message}`:
 `registered` when it uses Sidevoice, `not-connected` when it does not and the connector can connect it (with
-`command`, `sidevoice agents connect <id>`), `manual` when that needs a step by hand (the message gives it), or
+`command`, `npx sidevoice agents connect <id>`), `manual` when that needs a step by hand (the message gives it), or
 `failed`, `foreign`, `invalid`, `unknown`. The one entry `install` writes is one Sidevoice wrote that is not current
 (`outdated`: disabled, naming another release, or without the installation's environment): it is written again with
 the installation's command (Claude Code through `claude mcp add`, Codex through its CLI, Cursor in its `mcp.json`,
