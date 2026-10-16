@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.10.2](https://github.com/sidevoice/sidevoice-connector/compare/v0.10.1...v0.10.2) (2026-10-16)
+
+
+### Bug Fixes
+
+* **detect:** find agents whose PATH is set in the shell's rc file ([#149](https://github.com/sidevoice/sidevoice-connector/issues/149)) ([c507326](https://github.com/sidevoice/sidevoice-connector/commit/c5073264fc039be7686571b7ad96d0b7c13747e4))
+* **voice:** tell the agent plainly what wasn't heard, and to say it again if it matters ([#152](https://github.com/sidevoice/sidevoice-connector/issues/152)) ([c41b257](https://github.com/sidevoice/sidevoice-connector/commit/c41b257506f39426c74e0686ec8711c7d20ac369)), closes [#153](https://github.com/sidevoice/sidevoice-connector/issues/153)
+
 ## [0.10.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.10.0...v0.10.1) (2026-10-16)
 
 
