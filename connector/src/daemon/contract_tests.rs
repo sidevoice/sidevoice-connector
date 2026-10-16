@@ -214,8 +214,16 @@ async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_
         header,
         json!({"channel":"voice","session_id":"s","revision":3,"epoch":1,"message_id":"m-1"})
     );
-    assert!(envelope.contains("\n\nhello\n\n[Sidevoice] If a reply is appropriate, use voice_say"));
-    assert!(envelope.contains("Complete unheard evidence"));
+    assert!(envelope.contains("see the end of this message.\n\nhello"));
+    assert!(envelope.contains("The person did not hear the end of your last reply."));
+    assert!(envelope.contains("How much was heard is unknown."));
+    assert!(
+        envelope.find("The person did not hear the end").unwrap()
+            < envelope
+                .find("If a reply is appropriate, use voice_say")
+                .unwrap()
+    );
+    assert!(!envelope.contains("Complete unheard evidence"));
 
     // speech.publish answered with a status and fields this connector does not know: saved is saved.
     let said = daemon

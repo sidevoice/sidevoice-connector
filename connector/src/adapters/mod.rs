@@ -223,8 +223,7 @@ pub fn experimental(identity: &Identity, capabilities: &Value) -> Vec<String> {
     names
 }
 
-/// One agent-visible envelope for both injected input and get_messages. The structured facts are kept in full;
-/// prose is only guidance, never a substitute for the core's evidence.
+/// One agent-visible envelope for both injected input and get_messages.
 pub fn envelope(event: &Value) -> Result<String> {
     let channel = match event.get("channel").and_then(Value::as_str) {
         Some("note") => "note",
@@ -254,6 +253,17 @@ pub fn envelope(event: &Value) -> Result<String> {
     let header = json!({"channel":channel,"session_id":session_id,"revision":revision,
         "epoch":epoch,"message_id":message_id});
     let mut body = format!("{}\n\n", header);
+    let replies = event
+        .get("unheard")
+        .and_then(|unheard| unheard.get("replies"))
+        .and_then(Value::as_array)
+        .filter(|replies| !replies.is_empty());
+    if replies.is_some() {
+        let destination = if channel == "note" { "note" } else { "message" };
+        body.push_str(&format!(
+            "[Sidevoice] Part of your last reply wasn't heard — see the end of this {destination}.\n\n"
+        ));
+    }
     if channel == "note" {
         if !text.is_empty() {
             bail!("a Sidevoice note cannot contain user words");
@@ -264,43 +274,82 @@ pub fn envelope(event: &Value) -> Result<String> {
     } else {
         body.push_str(text);
     }
-    if channel != "room-control" {
-        body.push_str(&format!("\n\n[Sidevoice] If a reply is appropriate, use voice_say (session_id {}, revision {revision}, epoch {epoch}). Treat this message ID as stable: a redelivery is not new input.", serde_json::to_string(session_id)?));
-    }
     if let Some(notice) = event.get("notice").filter(|v| !v.is_null()) {
-        body.push_str("\n[Sidevoice] Notice: ");
+        body.push_str("\n\n[Sidevoice] Notice: ");
         body.push_str(&notice.to_string());
         if let Some(instruction) = notice.get("instruction").and_then(Value::as_str) {
             body.push_str("\n[Sidevoice] ");
             body.push_str(instruction);
         }
     }
-    if let Some(unheard) = event.get("unheard").filter(|v| !v.is_null()) {
-        body.push_str("\n[Sidevoice] Complete unheard evidence: ");
-        body.push_str(&unheard.to_string());
-        if let Some(replies) = unheard.get("replies").and_then(Value::as_array) {
-            for reply in replies {
-                if let Some(full) = reply.get("text").and_then(Value::as_str) {
-                    let (heard, remainder) = match reply.get("heard_chars").and_then(Value::as_u64)
-                    {
-                        Some(count) => {
-                            let split = usize::try_from(count).unwrap_or(usize::MAX);
-                            (
-                                Some(full.chars().take(split).collect::<String>()),
-                                Some(full.chars().skip(split).collect::<String>()),
-                            )
-                        }
-                        None => (None, None),
-                    };
-                    body.push_str(&format!("\n[Sidevoice] Reply {}: heard prefix {}; unheard remainder {}; full text {}.",
-                        reply.get("utterance_id").unwrap_or(&Value::Null),
-                        serde_json::to_string(&heard)?, serde_json::to_string(&remainder)?,
-                        serde_json::to_string(full)?));
+    if let Some(replies) = replies {
+        if channel == "note" {
+            body.push_str("\n\n[Sidevoice] The person didn't hear the end of your last reply and sent no new words. Tell them now what they missed that still matters, in fresh words.\n");
+        } else {
+            body.push_str("\n\n[Sidevoice] The person did not hear the end of your last reply.\n");
+            body.push_str("In this reply, tell them what they missed that still matters, in fresh words (don't repeat what they heard; drop what is now obsolete), together with what they ask now. Skip it only if they changed topic or said to.\n");
+        }
+        for reply in replies {
+            let full = reply.get("text").and_then(Value::as_str).unwrap_or("");
+            body.push_str("\n[Sidevoice] Reply starting ");
+            body.push_str(&serde_json::to_string(&reply_opening(full))?);
+            if let Some(id) = reply.get("utterance_id").and_then(Value::as_str) {
+                body.push_str(" (utterance ");
+                body.push_str(&serde_json::to_string(id)?);
+                body.push(')');
+            }
+            body.push_str(":\n");
+            match reply.get("heard_chars").and_then(Value::as_u64) {
+                Some(0) => body.push_str("Nothing of it was heard.\n"),
+                Some(count) => {
+                    let heard = full
+                        .chars()
+                        .take(usize::try_from(count).unwrap_or(usize::MAX))
+                        .collect::<String>();
+                    body.push_str("Heard up to: ");
+                    body.push_str(&serde_json::to_string(&heard_tail(&heard))?);
+                    body.push_str("\nEverything after that was not heard.\n");
                 }
+                None => body.push_str("How much was heard is unknown.\n"),
             }
         }
     }
+    if channel != "room-control" {
+        let separator = if replies.is_some() { "\n" } else { "\n\n" };
+        body.push_str(&format!("{separator}[Sidevoice] If a reply is appropriate, use voice_say (session_id {}, revision {revision}, epoch {epoch}). Treat this message ID as stable: a redelivery is not new input.", serde_json::to_string(session_id)?));
+    }
     Ok(body)
+}
+
+fn heard_tail(heard: &str) -> String {
+    const LIMIT: usize = 200;
+    let chars = heard.chars().collect::<Vec<_>>();
+    if chars.len() <= LIMIT {
+        return heard.to_owned();
+    }
+    let boundary = chars
+        .iter()
+        .enumerate()
+        .skip(chars.len() - LIMIT)
+        .find(|(index, ch)| *index <= chars.len() - LIMIT + 40 && ch.is_whitespace());
+    let start = boundary.map_or(chars.len() - LIMIT, |(index, _)| index + 1);
+    format!("…{}", chars[start..].iter().collect::<String>())
+}
+
+fn reply_opening(full: &str) -> String {
+    const LIMIT: usize = 60;
+    let chars = full.trim().chars().collect::<Vec<_>>();
+    if chars.len() <= 1 {
+        return "…".to_owned();
+    }
+    // Always leave part of the reply out, even when the whole reply is short.
+    let limit = LIMIT.min(chars.len() - 1);
+    let end = chars[..limit]
+        .iter()
+        .rposition(|ch| ch.is_whitespace())
+        .filter(|index| *index > 0)
+        .unwrap_or(limit);
+    format!("{}…", chars[..end].iter().collect::<String>())
 }
 
 #[cfg(test)]
@@ -371,18 +420,62 @@ mod tests {
             assert!(injected.contains("m-original"), "related ID: {scenario}");
             if scenario != "refused_empty" {
                 assert!(
-                    injected.contains(&"z".repeat(300)),
-                    "full text clipped: {scenario}"
+                    injected.contains(if channel == "note" {
+                        "The person didn't hear the end of your last reply and sent no new words. Tell them now what they missed that still matters, in fresh words."
+                    } else {
+                        "The person did not hear the end of your last reply."
+                    }),
+                    "{scenario}"
                 );
+                assert!(injected.contains("Reply starting \"é🐙ab"), "{scenario}");
+                assert!(!injected.contains(&"z".repeat(300)), "{scenario}");
+                assert!(
+                    !injected.contains("Complete unheard evidence"),
+                    "{scenario}"
+                );
+                assert!(
+                    injected
+                        .find(if channel == "note" {
+                            "The person didn't hear the end"
+                        } else {
+                            "The person did not hear the end"
+                        })
+                        .unwrap()
+                        < injected
+                            .find("If a reply is appropriate, use voice_say")
+                            .unwrap(),
+                    "{scenario}"
+                );
+                let preface = "Part of your last reply wasn't heard — see the end of this";
+                assert!(
+                    injected.find(preface).unwrap() < injected.find("Notice:").unwrap(),
+                    "{scenario}"
+                );
+                if scenario == "full_evidence" {
+                    let positions = (0..8)
+                        .map(|n| injected.find(&format!("(utterance \"u{n}\")")).unwrap())
+                        .collect::<Vec<_>>();
+                    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+                }
+            } else {
+                assert!(!injected.contains("Part of your last reply wasn't heard"));
             }
             if scenario.starts_with("partial") || scenario == "local_stop" {
                 assert!(
-                    injected.contains("heard prefix \"é🐙\""),
+                    injected.contains("Heard up to: \"é🐙\""),
                     "scalar split: {scenario}"
                 );
+            } else if scenario != "refused_empty" {
+                assert!(injected.contains("Nothing of it was heard."), "{scenario}");
             }
             if channel == "note" {
                 assert!(injected.contains("person sent no words"), "{scenario}");
+                assert!(!injected.contains("In your next reply"), "{scenario}");
+            } else {
+                assert!(
+                    injected.contains("\n\nWait\n\n") || injected.contains("\n\nNext\n\n"),
+                    "{scenario}"
+                );
             }
         }
     }
@@ -417,7 +510,13 @@ mod tests {
         assert!(body.contains("m-earlier"));
         assert!(body.contains("Do not resend solely"));
         assert!(body.contains("If a reply is appropriate"));
-        assert!(!body.contains("Complete unheard evidence"));
+        assert!(!body.contains("Part of your last reply wasn't heard"));
+        assert!(!body.contains("The person did not hear the end"));
+
+        correction["unheard"] = json!({"count":0,"replies":[]});
+        let empty = envelope(&correction).unwrap();
+        assert!(!empty.contains("Part of your last reply wasn't heard"));
+        assert!(!empty.contains("The person did not hear the end"));
     }
 
     #[test]
@@ -435,9 +534,10 @@ mod tests {
         let first = &delivered[0];
         let second = &delivered[1];
         for n in 0..8 {
-            assert!(first.contains(&format!("reply {n}")));
+            assert!(first.contains(&format!("Reply starting \"reply…\" (utterance \"u{n}\")")));
+            assert!(!first.contains(&format!("Reply starting \"reply {n}\"")));
         }
-        assert!(second.contains("reply 8"));
+        assert!(second.contains("Reply starting \"reply…\" (utterance \"u8\")"));
         assert!(first.contains("batch-0") && second.contains("batch-8"));
         assert!(first.contains("m-original") && second.contains("m-original"));
     }
@@ -449,16 +549,43 @@ mod tests {
                 .unwrap();
         let original = fixture["text"].as_str().unwrap();
         for (index, case) in fixture["hearing"].as_array().unwrap().iter().enumerate() {
+            if case["history"]["hearing"] == "heard" {
+                continue;
+            }
             let mut frame = event("reply_not_heard", "voice", "Current words");
             frame["unheard"] = json!({"count":1,"replies":[{"utterance_id":format!("u{index}"),
                 "text":original,"heard_chars":case["history"]["heard_chars"],
                 "fate":case["history"]["hearing"]}]});
             let rendered = envelope(&frame).unwrap();
-            assert!(rendered.contains(original));
             if case["history"]["heard_chars"] == 2 {
-                assert!(rendered.contains("heard prefix \"é🐙\""));
+                assert!(rendered.contains("Heard up to: \"é🐙\""));
+                assert!(rendered.contains("Everything after that was not heard."));
+            } else if case["history"]["heard_chars"] == 0 {
+                assert!(rendered.contains("Nothing of it was heard."));
             }
+            assert!(rendered.contains("Reply starting \"é🐙a…\""));
         }
+    }
+
+    #[test]
+    fn long_multibyte_heard_prefix_uses_a_bounded_word_boundary_tail() {
+        let heard = format!("{}é🐙 final sentence.", "Earlier sentence. ".repeat(20));
+        let full = format!("{heard} UNHEARD_SECRET_END");
+        let mut frame = event("reply_not_heard", "voice", "What now?");
+        frame["unheard"] = json!({"count":1,"replies":[{
+            "text":full,"heard_chars":heard.chars().count(),"fate":"partial"
+        }]});
+        let rendered = envelope(&frame).unwrap();
+        let tail = super::heard_tail(&heard);
+        assert!(tail.starts_with('…'));
+        assert!(tail.chars().count() <= 201);
+        assert!(tail.ends_with("é🐙 final sentence."));
+        assert!(rendered.contains(&format!(
+            "Heard up to: {}",
+            serde_json::to_string(&tail).unwrap()
+        )));
+        assert!(!rendered.contains("UNHEARD_SECRET_END"));
+        assert!(!rendered.contains(&heard));
     }
 
     #[test]
