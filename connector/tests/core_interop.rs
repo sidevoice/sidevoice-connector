@@ -45,6 +45,36 @@ fn confirm_hearing(
     call.report_hearing(&history_id, utterance_id, outcome, heard_chars);
 }
 
+fn assert_unheard_envelope(message: &Value) {
+    let envelope = message["envelope"].as_str().unwrap();
+    let replies = message["unheard"]["replies"].as_array().unwrap();
+    assert!(!replies.is_empty(), "{message}");
+    assert!(envelope.contains("Reply starting "), "{message}");
+    assert!(!envelope.contains("Complete unheard evidence"), "{message}");
+    assert!(!envelope.contains("\"unheard\":"), "{message}");
+    if message["channel"] == "note" {
+        assert!(envelope.contains("The person didn't hear the end of your last reply and sent no new words. Tell them now what they missed that still matters, in fresh words."), "{message}");
+    } else {
+        assert!(
+            envelope.contains("together with what they ask now"),
+            "{message}"
+        );
+    }
+    for reply in replies {
+        let utterance = reply["utterance_id"].as_str().unwrap();
+        assert!(
+            envelope.contains(&format!("(utterance \"{utterance}\")")),
+            "{message}"
+        );
+        let marker = match reply["heard_chars"].as_u64() {
+            Some(0) => "Nothing of it was heard.",
+            Some(_) => "Heard up to:",
+            None => "How much was heard is unknown.",
+        };
+        assert!(envelope.contains(marker), "{message}");
+    }
+}
+
 #[test]
 fn a_conversation_talks_to_the_real_core_through_the_connector() {
     let Some(core) = core_dir() else { return };
@@ -778,19 +808,8 @@ fn actual_notice(
         envelope.contains(message["notice"]["instruction"].as_str().unwrap()),
         "{message}"
     );
-    if !message["unheard"].is_null() {
-        assert!(
-            envelope.contains(&message["unheard"].to_string()),
-            "{message}"
-        );
-    }
-    if let Some(replies) = message["unheard"]["replies"].as_array() {
-        for reply in replies {
-            assert!(
-                envelope.contains(reply["text"].as_str().unwrap()),
-                "{message}"
-            );
-        }
+    if message["unheard"]["replies"].is_array() {
+        assert_unheard_envelope(&message);
     }
     mcp.stop();
     message
@@ -1346,11 +1365,7 @@ fn t04b_nine_withdrawn_replies_reach_complete_ordered_real_core_batches() {
                     .unwrap_or_default();
                 if !replies.is_empty() {
                     assert!(replies.len() <= 8, "{message}");
-                    let envelope = message["envelope"].as_str().unwrap();
-                    assert!(
-                        envelope.contains(&message["unheard"].to_string()),
-                        "{message}"
-                    );
+                    assert_unheard_envelope(&message);
                     evidence.extend(
                         replies
                             .into_iter()
@@ -1908,7 +1923,7 @@ fn t02a_late_receipt_follows_real_words_with_related_message_id_in_both_modes() 
         );
         let envelope = followup["envelope"].as_str().unwrap();
         assert!(envelope.contains(&followup["notice"].to_string()));
-        assert!(envelope.contains(&followup["unheard"].to_string()));
+        assert_unheard_envelope(&followup);
         mcp.stop();
     }
 }

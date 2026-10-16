@@ -283,10 +283,10 @@ pub fn envelope(event: &Value) -> Result<String> {
         }
     }
     if let Some(replies) = replies {
-        body.push_str("\n\n[Sidevoice] The person did not hear the end of your last reply.\n");
         if channel == "note" {
-            body.push_str("In your next reply, tell them what they missed that still matters, in fresh words (don't repeat what they heard; drop what is now obsolete). Skip it only if they changed topic or said to.\n");
+            body.push_str("\n\n[Sidevoice] The person didn't hear the end of your last reply and sent no new words. Tell them now what they missed that still matters, in fresh words.\n");
         } else {
+            body.push_str("\n\n[Sidevoice] The person did not hear the end of your last reply.\n");
             body.push_str("In this reply, tell them what they missed that still matters, in fresh words (don't repeat what they heard; drop what is now obsolete), together with what they ask now. Skip it only if they changed topic or said to.\n");
         }
         for reply in replies {
@@ -420,7 +420,11 @@ mod tests {
             assert!(injected.contains("m-original"), "related ID: {scenario}");
             if scenario != "refused_empty" {
                 assert!(
-                    injected.contains("The person did not hear the end"),
+                    injected.contains(if channel == "note" {
+                        "The person didn't hear the end of your last reply and sent no new words. Tell them now what they missed that still matters, in fresh words."
+                    } else {
+                        "The person did not hear the end of your last reply."
+                    }),
                     "{scenario}"
                 );
                 assert!(injected.contains("Reply starting \"é🐙ab"), "{scenario}");
@@ -430,7 +434,13 @@ mod tests {
                     "{scenario}"
                 );
                 assert!(
-                    injected.find("The person did not hear the end").unwrap()
+                    injected
+                        .find(if channel == "note" {
+                            "The person didn't hear the end"
+                        } else {
+                            "The person did not hear the end"
+                        })
+                        .unwrap()
                         < injected
                             .find("If a reply is appropriate, use voice_say")
                             .unwrap(),
@@ -460,9 +470,7 @@ mod tests {
             }
             if channel == "note" {
                 assert!(injected.contains("person sent no words"), "{scenario}");
-                if scenario != "refused_empty" {
-                    assert!(injected.contains("In your next reply"), "{scenario}");
-                }
+                assert!(!injected.contains("In your next reply"), "{scenario}");
             } else {
                 assert!(
                     injected.contains("\n\nWait\n\n") || injected.contains("\n\nNext\n\n"),
