@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.10.0...v0.10.1) (2026-10-16)
+
+
+### Bug Fixes
+
+* **cli:** tell people to run the connector with npx ([#145](https://github.com/sidevoice/sidevoice-connector/issues/145)) ([6a5162e](https://github.com/sidevoice/sidevoice-connector/commit/6a5162ebcb10ff16f24ea6d01579c1f430b5de6e))
+
 ## [0.10.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.9.0...v0.10.0) (2026-10-15)
 
 
