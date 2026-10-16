@@ -227,6 +227,18 @@ impl Registration for Claude {
                 path: ".local/bin/claude",
             },
             Marker {
+                os: "macos",
+                kind: "install_file",
+                root: Root::Absolute,
+                path: "/opt/homebrew/bin/claude",
+            },
+            Marker {
+                os: "macos",
+                kind: "install_file",
+                root: Root::Absolute,
+                path: "/usr/local/bin/claude",
+            },
+            Marker {
                 os: "linux",
                 kind: "install_file",
                 root: Root::Home,

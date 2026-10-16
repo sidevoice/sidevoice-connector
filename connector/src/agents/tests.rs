@@ -24,6 +24,11 @@ fn login_path_frame_ignores_banners_and_rejects_empty_or_incomplete_output() {
         parse_login_path("\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}relative\u{1e}SIDEVOICE_PATH_END\u{1e}"),
         None
     );
+    // One empty or relative entry costs only itself, not the whole PATH.
+    assert_eq!(
+        parse_login_path("\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}/opt/homebrew/bin::.:/usr/bin\u{1e}SIDEVOICE_PATH_END\u{1e}"),
+        Some("/opt/homebrew/bin:/usr/bin".into())
+    );
 }
 
 #[tokio::test]
@@ -2465,4 +2470,54 @@ async fn agents_requests_with_unknown_fields_are_answered_for_what_they_know() {
         "{checked}"
     );
     host.shutdown().await;
+}
+
+/// A shell whose PATH (Homebrew included) is set only by its rc file and the files that rc sources dynamically, with
+/// a noisy prompt line and nothing in the login files: what the capture must still see.
+async fn capture_with_rc_only_path(shell_name: &str, real_shell: &str, rc: &str) {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    // The child's HOME is the profile's, whatever this process's is.
+    let home = fixture.profile.home.clone();
+    fs::create_dir_all(home.join(".config/sh")).unwrap();
+    private_write(
+        &home.join(".config/sh/01-path.sh"),
+        b"export PATH=\"/opt/homebrew/bin:$PATH\"\n",
+    );
+    private_write(
+        &home.join(rc),
+        b"echo 'prompt noise'\nfor f in \"$HOME\"/.config/sh/*.sh; do . \"$f\"; done\n",
+    );
+    let shell = fixture.root.join(shell_name);
+    private_write(
+        &shell,
+        format!("#!/bin/sh\nexec {real_shell} \"$@\"\n").as_bytes(),
+    );
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    let _shell = EnvGuard::set("SHELL", shell.as_os_str());
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let path = host
+        .capture_login_path(
+            &Cancellation::new(),
+            Instant::now() + StdDuration::from_secs(5),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(path.starts_with("/opt/homebrew/bin:"), "{path}");
+}
+
+#[tokio::test]
+async fn login_path_comes_from_a_bashrc_only_path() {
+    capture_with_rc_only_path("bash", "/bin/bash", ".bashrc").await;
+}
+
+#[tokio::test]
+async fn login_path_comes_from_a_zshrc_only_path() {
+    if let Some(zsh) = ["/bin/zsh", "/usr/bin/zsh"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+    {
+        capture_with_rc_only_path("zsh", zsh, ".zshrc").await;
+    }
 }

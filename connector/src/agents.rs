@@ -1181,9 +1181,16 @@ fn parse_login_path(output: &str) -> Option<String> {
     if tail.contains(START) || tail.contains(END) || value.is_empty() || value.len() > 32_768 {
         return None;
     }
-    (value.split(':').all(|part| Path::new(part).is_absolute())
-        && !value.chars().any(char::is_control))
-    .then(|| value.to_owned())
+    // A person's PATH may carry an empty or relative entry (`::`, `.`); only those entries are dropped, never the
+    // whole PATH, and a control character still refuses it.
+    if value.chars().any(char::is_control) {
+        return None;
+    }
+    let kept: Vec<&str> = value
+        .split(':')
+        .filter(|part| Path::new(part).is_absolute())
+        .collect();
+    (!kept.is_empty()).then(|| kept.join(":"))
 }
 
 async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
@@ -1497,19 +1504,25 @@ impl HostAgents {
         else {
             return Ok(None);
         };
-        let command = if Path::new(&shell)
+        // `-l` reads only the login files (`.zprofile`); many people put `brew shellenv`, nvm and their own PATH
+        // in `.zshrc` / `.bashrc`, which only an interactive shell reads. An interactive shell would try to take the
+        // terminal (and stop under job control), so the rc file is sourced by hand, its output and errors dropped.
+        let name = Path::new(&shell)
             .file_name()
-            .is_some_and(|name| name == "fish")
-        {
-            "printf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' (string join : $PATH)"
-        } else {
-            "printf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' \"$PATH\""
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let print = r#"printf '\036SIDEVOICE_PATH_BEGIN\036%s\036SIDEVOICE_PATH_END\036' "$PATH""#;
+        let command = match name {
+            "fish" => "printf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' (string join : $PATH)".to_owned(),
+            "zsh" => format!(r#"[ -r "${{ZDOTDIR:-$HOME}}/.zshrc" ] && . "${{ZDOTDIR:-$HOME}}/.zshrc" >/dev/null 2>&1 </dev/null; {print}"#),
+            "bash" => format!(r#"[ -r "$HOME/.bashrc" ] && . "$HOME/.bashrc" >/dev/null 2>&1 </dev/null; {print}"#),
+            _ => print.to_owned(),
         };
         let output = run_command(
             &self.profile,
             None,
             &shell,
-            &["-lc".into(), command.into()],
+            &["-lc".into(), command],
             cancel,
             deadline,
         )
