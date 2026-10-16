@@ -16,11 +16,11 @@ use tokio::time::{timeout, timeout_at, Duration, Instant};
 
 const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the person's voice room.
 - Call voice_connect only when the person asks to join or enable voice. Select input_mode pull when this harness will call get_messages; otherwise the core injects input. One binding uses one mode.
-- Each voice or note message carries a stable message_id, conversation epoch, session_id and revision. A repeated ID is redelivery, not new input. A note contains Sidevoice facts and no words from the person. The full notice and unheard evidence, including corrections and related message IDs, matter in both modes.
+- Each voice or note message carries a stable message_id, conversation epoch, session_id and revision. A repeated ID is redelivery, not new input. A note contains Sidevoice facts and no words from the person. Follow notice instructions, including corrections and related message IDs, in both modes.
 - In pull mode, call get_messages at useful hooks. Acknowledge IDs with ack_ids only after processing them. Pull may learn later than injection. After is a journal position, not an acknowledgement.
 - When a reply is appropriate, use voice_say with the message's session_id, revision and epoch. For speech before any message, use voice_connect's initial_reply_context. A typed message is context: it updates what you know without requiring a response and does not advance the epoch; you decide whether to answer, and a quick acknowledgement is optional. Several replies in one epoch play in publication order.
 - If voice_say says the person is speaking, the call was refused and nothing was queued: wait for their message. If that turn ends without words, a Sidevoice note may ask you to resend what still matters. A published reply is not proof it was heard.
-- A reply is heard, partially heard with a confirmed prefix, or not heard. For a partial reply, use the full text and confirmed extent to understand what remains unheard. Use notices and their instructions when answering in the current context; do not automatically resend an unheard backlog.
+- When a message says part of your last reply was unheard, use your previous voice_say call and the "Heard up to" marker to tell the person in fresh words what they missed that still matters, together with what they ask now. For a note with no person words, do this in your next reply. Skip it only if they changed topic or said to.
 - For substantive work, first a short acknowledgement, then meaningful checkpoints, then the result. No filler or tool narration. Take in new input at tool results before starting the next step.
 - Pairing a machine or device is the person's act. Ask for their room address and one-time code only when needed; never fetch a code yourself. If inbound.ok is false, explain its reason and remedy without changing settings unasked."#;
 
@@ -1327,10 +1327,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_hearing_instructions_name_only_semantic_outcomes() {
-        assert!(INSTRUCTIONS.contains("heard, partially heard"));
-        assert!(INSTRUCTIONS.contains("not heard"));
-        assert!(INSTRUCTIONS.contains("confirmed prefix"));
+    fn agent_hearing_instructions_give_a_concrete_recovery_rule() {
+        assert!(INSTRUCTIONS.contains("previous voice_say call"));
+        assert!(INSTRUCTIONS.contains("\"Heard up to\" marker"));
+        assert!(INSTRUCTIONS.contains("in fresh words what they missed that still matters"));
+        assert!(INSTRUCTIONS.contains("Skip it only if they changed topic or said to"));
         for cause in [
             "skipped",
             "interrupted",
