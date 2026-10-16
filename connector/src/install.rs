@@ -258,7 +258,7 @@ fn release_id(layout: &Layout, package: &Package, digest: &str) -> Result<(Strin
         }
     }
     Err(failed(
-        "the selected release is another build of this version; run `sidevoice uninstall`, then install again",
+        "the selected release is another build of this version; run `npx sidevoice uninstall`, then install again",
     ))
 }
 
@@ -657,7 +657,7 @@ fn error_message(answer: &Value) -> Option<(String, String)> {
 
 /// The command a person runs to connect Sidevoice with one agent.
 pub fn connect_command(id: &str) -> String {
-    format!("sidevoice agents connect {id}")
+    format!("npx sidevoice agents connect {id}")
 }
 
 /// How the answer names an agent.
@@ -830,7 +830,7 @@ fn advice(profile: &Profile, answer: &Value) -> Vec<String> {
         next.push(
             "This machine is not paired with a room yet. In a conversation, ask to join the voice room and give it \
              the room's address and the code the room shows for pairing a machine; or pair the Sidevoice app on \
-             this computer with `sidevoice pair-device`."
+             this computer with `npx sidevoice pair-device`."
                 .to_owned(),
         );
     }
@@ -1500,7 +1500,7 @@ pub(crate) mod tests {
         let mut third = with_agents("2.0.0").await;
         let agent = &third["agents"][id];
         assert_eq!(agent["outcome"], "not-connected", "{third}");
-        let command = format!("sidevoice agents connect {id}");
+        let command = format!("npx sidevoice agents connect {id}");
         assert_eq!(agent["command"], command.as_str());
         for (found, agent) in third["agents"].as_object().unwrap() {
             assert_ne!(agent["outcome"], "registered", "{found}: {third}");

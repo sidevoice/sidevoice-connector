@@ -300,7 +300,7 @@ pub fn device_text(answer: &Value) -> Result<String> {
         qr_text(code)?
     );
     if reach(&payload) == "local-only" {
-        text.push_str("\n\nThis code only works on this computer: the machine is not reachable from other devices. To use it from elsewhere, pair this machine with your room: run  sidevoice pair <room-url> <code>  with the code the room shows for pairing a machine.");
+        text.push_str("\n\nThis code only works on this computer: the machine is not reachable from other devices. To use it from elsewhere, pair this machine with your room: run  npx sidevoice pair <room-url> <code>  with the code the room shows for pairing a machine.");
     }
     Ok(text)
 }
