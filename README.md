@@ -107,6 +107,8 @@ English message.
 [`connector/README.md`](connector/README.md) describes each command, where things are kept and how the pieces talk
 to each other.
 
+The [reviewed voice-message MCP integration contract](docs/voice-message-contract.md) describes intended behavior for a future implementation; it is not a description of shipped support.
+
 ## Develop
 
 The connector is one Rust binary, the crate in [`connector/`](connector); the build tooling is `cargo xtask`
