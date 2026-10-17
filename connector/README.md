@@ -41,6 +41,13 @@ Every place comes from the environment, so a disposable profile is just a set of
   (the core's own: `core.json`, `local.sock`);
 - the release root `R`: `$XDG_DATA_HOME/sidevoice`, else `~/.local/share/sidevoice`;
 - the core's port: `$SIDEVOICE_CORE_PORT`, else 10829;
+- the core's listen address: `$SIDEVOICE_CORE_HOST`, else `127.0.0.1`. Set it explicitly when this machine's core
+  must answer on a LAN interface (for example, `0.0.0.0`); the same setting is used by the login service and by
+  on-demand starts. Set `SIDEVOICE_ALLOWED_HOSTS` to the address or name the other device uses. A device using the
+  web interface bundled in the current desktop app may enter a private `http://` address during pairing and agree
+  to the unencrypted connection; the pairing code does not announce a LAN HTTP address by default. That consent
+  sends the one-time pairing secret and subsequent device token over the LAN without TLS. A hosted HTTPS page
+  needs an HTTPS/WSS endpoint instead. Configure these variables when installing or updating the service;
 - the agents' homes: `$CLAUDE_CONFIG_DIR` (`~/.claude`), `$CODEX_HOME` (`~/.codex`), `$CURSOR_CONFIG_DIR`
   (`~/.cursor`), `$CURSOR_DATA_DIR`. Each is checked to be the person's and writable by nobody else before it is
   read or written. `CLAUDE_CONFIG_DIR` reaches Claude Code (its CLI, the service jobs) only when the person's

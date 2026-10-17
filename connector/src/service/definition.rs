@@ -293,7 +293,12 @@ pub fn core_arguments(
         "--ready-file".into(),
         path(&layout.core_ready()),
         "--host".into(),
-        "127.0.0.1".into(),
+        layout
+            .settings
+            .get("SIDEVOICE_CORE_HOST")
+            .filter(|host| !host.is_empty())
+            .cloned()
+            .unwrap_or_else(|| "127.0.0.1".into()),
         "--port".into(),
         layout.core_port(),
     ];
@@ -606,7 +611,33 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--ready-file", "/home/u/.sidevoice/core/core.json"]));
+        assert!(args.windows(2).any(|pair| pair == ["--host", "127.0.0.1"]));
         assert!(!args.contains(&"--launch-id".to_owned()));
+    }
+
+    #[test]
+    fn explicitly_configured_core_host_reaches_service_and_on_demand_launches() {
+        let layout = Layout::from_vars(
+            |name| (name == "HOME").then(|| "/home/u".into()),
+            [("SIDEVOICE_CORE_HOST".into(), "0.0.0.0".into())],
+            &[],
+        )
+        .unwrap();
+        for args in [
+            core_arguments(&layout, None, Some(0)),
+            core_arguments(&layout, Some("launch"), Some(600)),
+        ] {
+            assert!(args.windows(2).any(|pair| pair == ["--host", "0.0.0.0"]));
+        }
+        let empty = Layout::from_vars(
+            |name| (name == "HOME").then(|| "/home/u".into()),
+            [("SIDEVOICE_CORE_HOST".into(), "".into())],
+            &[],
+        )
+        .unwrap();
+        assert!(core_arguments(&empty, None, Some(0))
+            .windows(2)
+            .any(|pair| pair == ["--host", "127.0.0.1"]));
     }
 
     /// An agent home the installing environment leaves unset is unset in the job too, whatever the user's manager
