@@ -298,7 +298,7 @@ pub fn core_arguments(
             .get("SIDEVOICE_CORE_HOST")
             .filter(|host| !host.is_empty())
             .cloned()
-            .unwrap_or_else(|| "127.0.0.1".into()),
+            .unwrap_or_else(|| "0.0.0.0".into()),
         "--port".into(),
         layout.core_port(),
     ];
@@ -611,7 +611,7 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair == ["--ready-file", "/home/u/.sidevoice/core/core.json"]));
-        assert!(args.windows(2).any(|pair| pair == ["--host", "127.0.0.1"]));
+        assert!(args.windows(2).any(|pair| pair == ["--host", "0.0.0.0"]));
         assert!(!args.contains(&"--launch-id".to_owned()));
     }
 
@@ -636,6 +636,15 @@ mod tests {
         )
         .unwrap();
         assert!(core_arguments(&empty, None, Some(0))
+            .windows(2)
+            .any(|pair| pair == ["--host", "0.0.0.0"]));
+        let loopback = Layout::from_vars(
+            |name| (name == "HOME").then(|| "/home/u".into()),
+            [("SIDEVOICE_CORE_HOST".into(), "127.0.0.1".into())],
+            &[],
+        )
+        .unwrap();
+        assert!(core_arguments(&loopback, None, Some(0))
             .windows(2)
             .any(|pair| pair == ["--host", "127.0.0.1"]));
     }
