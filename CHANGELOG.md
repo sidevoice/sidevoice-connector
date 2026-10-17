@@ -1,5 +1,67 @@
 # Changelog
 
+## [0.11.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.10.3...v0.11.0) (2026-10-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **connector:** take the room-only core archive (rust-native-v2), no self-test ([#91](https://github.com/sidevoice/sidevoice-connector/issues/91))
+
+### Features
+
+* add host agent management to connector ([#33](https://github.com/sidevoice/sidevoice-connector/issues/33)) ([0a4c62b](https://github.com/sidevoice/sidevoice-connector/commit/0a4c62bd1a28e094d2986cc7c76043c3b0b858eb))
+* add isolated Rust connector proof ([#40](https://github.com/sidevoice/sidevoice-connector/issues/40)) ([ea27002](https://github.com/sidevoice/sidevoice-connector/commit/ea27002d10498b4bf29df0f0dab7e527dcaa8b91))
+* add proof-private Rust host agents ([#43](https://github.com/sidevoice/sidevoice-connector/issues/43)) ([02a2f06](https://github.com/sidevoice/sidevoice-connector/commit/02a2f06fedcfacb74ae5a4b139c4fa8881c2a3c6))
+* add Rust conversation adapters for Claude and Cursor ([#52](https://github.com/sidevoice/sidevoice-connector/issues/52)) ([c0468ba](https://github.com/sidevoice/sidevoice-connector/commit/c0468ba8a705661dc30c5ebc2b743eec7e370fa5))
+* **bench:** a test bench in Rust to talk to real agent sessions without the app ([#84](https://github.com/sidevoice/sidevoice-connector/issues/84)) ([d778ee3](https://github.com/sidevoice/sidevoice-connector/commit/d778ee36e43ad562242b0f5089814ae6bcd48a2d))
+* **connector:** check that a connected agent's MCP entry starts and answers ([#108](https://github.com/sidevoice/sidevoice-connector/issues/108)) ([6dcef8d](https://github.com/sidevoice/sidevoice-connector/commit/6dcef8d34656b6a806580409d3d548184284d10e))
+* **connector:** Cursor's editor chats are reached only through its Desktop Bridge ([#115](https://github.com/sidevoice/sidevoice-connector/issues/115)) ([3a3d54b](https://github.com/sidevoice/sidevoice-connector/commit/3a3d54b17fad1bb427ea13139e4c36c4cd9be869))
+* **connector:** install and uninstall in Rust, with automatic rollback and agent registration ([#78](https://github.com/sidevoice/sidevoice-connector/issues/78)) ([bd1e64c](https://github.com/sidevoice/sidevoice-connector/commit/bd1e64c79147d0fc3aea6d0db520836815fcfbcc))
+* **connector:** pair and pair-device in Rust, with the device code's QR ([#73](https://github.com/sidevoice/sidevoice-connector/issues/73)) ([85504f2](https://github.com/sidevoice/sidevoice-connector/commit/85504f25793d42c187b2b761e7407297d792d720))
+* **connector:** report outdated agent entries and act on them ([#105](https://github.com/sidevoice/sidevoice-connector/issues/105)) ([e251b5d](https://github.com/sidevoice/sidevoice-connector/commit/e251b5d159520cce914f2242f1d1b241e8e052bb))
+* **connector:** say per agent what the connector can do and the manual steps ([#107](https://github.com/sidevoice/sidevoice-connector/issues/107)) ([b45f7a3](https://github.com/sidevoice/sidevoice-connector/commit/b45f7a36552fad9bf801389038541f7e283b2385))
+* **connector:** service login on|off|status, start at login without starting or stopping ([#106](https://github.com/sidevoice/sidevoice-connector/issues/106)) ([237ce13](https://github.com/sidevoice/sidevoice-connector/commit/237ce13899a3c6cd60ba63ab8c5ba05e8724d7e9))
+* **connector:** service management in Rust (launchd, systemd, on demand) ([#71](https://github.com/sidevoice/sidevoice-connector/issues/71)) ([55568c8](https://github.com/sidevoice/sidevoice-connector/commit/55568c8fc25539a7062fe83858e310d7a22cd405))
+* **connector:** ship source-built Rust Connector and Core pair ([435fd31](https://github.com/sidevoice/sidevoice-connector/commit/435fd315e657a4f1372fc524f773387797195f38))
+* **connector:** Sidevoice at login as two native jobs; immutable releases with atomic switch and rollback (onboarding R1-b) ([#25](https://github.com/sidevoice/sidevoice-connector/issues/25)) ([249ca5e](https://github.com/sidevoice/sidevoice-connector/commit/249ca5e0ffb052a0832236981561f1c53afb088b))
+* **connector:** take the room-only core archive (rust-native-v2), no self-test ([#91](https://github.com/sidevoice/sidevoice-connector/issues/91)) ([ff0644c](https://github.com/sidevoice/sidevoice-connector/commit/ff0644cb50e9c964e91c303bec7e619130c12fde))
+* **connector:** tell the agent what the user did not hear ([#90](https://github.com/sidevoice/sidevoice-connector/issues/90)) ([14f868d](https://github.com/sidevoice/sidevoice-connector/commit/14f868d5bbb2d23dda1a5b540adbdcafb16f0bd6))
+* **connector:** the core travels inside the package, staged and self-tested at install ([#74](https://github.com/sidevoice/sidevoice-connector/issues/74)) ([72902e4](https://github.com/sidevoice/sidevoice-connector/commit/72902e4564c6389bee0a53168433ce1db7b1fc95))
+* **connector:** the core's default port is 10829 ([#119](https://github.com/sidevoice/sidevoice-connector/issues/119)) ([6a56cdb](https://github.com/sidevoice/sidevoice-connector/commit/6a56cdb6f2e39610f9dcaf08029a57478ccdf4d9))
+* **cursor:** expose Desktop Bridge setup and readiness ([#130](https://github.com/sidevoice/sidevoice-connector/issues/130)) ([f610f60](https://github.com/sidevoice/sidevoice-connector/commit/f610f6057c69aa7f9d05c6dfb0f525a1b32dcace)), closes [#120](https://github.com/sidevoice/sidevoice-connector/issues/120)
+* **detect:** find agents via login PATH and passive markers ([#139](https://github.com/sidevoice/sidevoice-connector/issues/139)) ([b369577](https://github.com/sidevoice/sidevoice-connector/commit/b3695776ff29d5bd8bc3b6af853c35c40507b4f8)), closes [#134](https://github.com/sidevoice/sidevoice-connector/issues/134)
+* implement Sigstore-verified Node SEA core installation ([#29](https://github.com/sidevoice/sidevoice-connector/issues/29)) ([c509c95](https://github.com/sidevoice/sidevoice-connector/commit/c509c95d2d54e933f3c1041f5ebbca4b68c9019d))
+* **npm:** publish the connector as sidevoice with one package per platform ([#75](https://github.com/sidevoice/sidevoice-connector/issues/75)) ([f42cc7d](https://github.com/sidevoice/sidevoice-connector/commit/f42cc7d7c765a7f0cf5ac437ae8b2ddd56076b9f))
+* **rust:** add private macOS service lifecycle proof ([#47](https://github.com/sidevoice/sidevoice-connector/issues/47)) ([f2589c7](https://github.com/sidevoice/sidevoice-connector/commit/f2589c7cbe8f5037e6f1d85e177f2d0cb4db196c))
+* **turns:** carry conversation epochs through connector delivery ([#126](https://github.com/sidevoice/sidevoice-connector/issues/126)) ([4bf9a90](https://github.com/sidevoice/sidevoice-connector/commit/4bf9a903b9307dd60c4ae4cfc06667b800809719))
+
+
+### Bug Fixes
+
+* agents reach and leave this installation, systemd enables for the next login, install repairs a damaged core ([#94](https://github.com/sidevoice/sidevoice-connector/issues/94)) ([1f33488](https://github.com/sidevoice/sidevoice-connector/commit/1f33488428ae8247c136959cfa147ec030dc8a59))
+* **agents:** an agent is installed by its program, never by its configuration directory ([#128](https://github.com/sidevoice/sidevoice-connector/issues/128)) ([0b1d6a8](https://github.com/sidevoice/sidevoice-connector/commit/0b1d6a83ddd435f169d9c10554c6bb745cba16ce))
+* **bench:** the page names its API relative to itself ([#92](https://github.com/sidevoice/sidevoice-connector/issues/92)) ([0b925d4](https://github.com/sidevoice/sidevoice-connector/commit/0b925d48e1c72049e12049d488d61b03f9d85b33))
+* **cli:** tell people to run the connector with npx ([#145](https://github.com/sidevoice/sidevoice-connector/issues/145)) ([6a5162e](https://github.com/sidevoice/sidevoice-connector/commit/6a5162ebcb10ff16f24ea6d01579c1f430b5de6e))
+* **connector:** a Codex conversation reports its effort, the model's default when none was chosen ([#123](https://github.com/sidevoice/sidevoice-connector/issues/123)) ([e28f24d](https://github.com/sidevoice/sidevoice-connector/commit/e28f24dc4983dad6aac294dafa56b022399cb7d2))
+* **connector:** every wire reader ignores unknown fields and enum values ([#117](https://github.com/sidevoice/sidevoice-connector/issues/117)) ([5ee9348](https://github.com/sidevoice/sidevoice-connector/commit/5ee93480e28fbf2bf92751afc00e135ad6acaeb7))
+* **connector:** give voice_pair_device time for a core that is still starting ([#82](https://github.com/sidevoice/sidevoice-connector/issues/82)) ([1e39517](https://github.com/sidevoice/sidevoice-connector/commit/1e3951711e3ec5cc5e661d545c9d17f64dc15f5a))
+* **connector:** pass CLAUDE_CONFIG_DIR to Claude Code only when the person's environment sets it ([#110](https://github.com/sidevoice/sidevoice-connector/issues/110)) ([da54743](https://github.com/sidevoice/sidevoice-connector/commit/da5474303093aa3f7d13fed1ddfe2e1fcf1991a7))
+* **connector:** pin core 0.2.1, which runs on glibc 2.28 ([#85](https://github.com/sidevoice/sidevoice-connector/issues/85)) ([2096803](https://github.com/sidevoice/sidevoice-connector/commit/2096803eb9c126eb2a316c9269131fed026eee05))
+* **connector:** read each tool call's _meta where rmcp puts it, so Codex Desktop joins voice ([#97](https://github.com/sidevoice/sidevoice-connector/issues/97)) ([e90ca99](https://github.com/sidevoice/sidevoice-connector/commit/e90ca99d681bb93c3271e3921a553f004d38cafe))
+* **connector:** report each conversation's reasoning effort from its transcript ([#99](https://github.com/sidevoice/sidevoice-connector/issues/99)) ([a554912](https://github.com/sidevoice/sidevoice-connector/commit/a5549120962c63e78f3315be283a9d98a66cf32e))
+* **core:** create the core's environment with uv's own Python, never the machine's ([#20](https://github.com/sidevoice/sidevoice-connector/issues/20)) ([6d5e27e](https://github.com/sidevoice/sidevoice-connector/commit/6d5e27e92c314e0251f7092b8fac9601c5a0e627))
+* **cursor:** expose bridge delivery diagnostics ([#135](https://github.com/sidevoice/sidevoice-connector/issues/135)) ([1aeb09c](https://github.com/sidevoice/sidevoice-connector/commit/1aeb09c00d985ae1ffdf5a3345eca678721d650b)), closes [#131](https://github.com/sidevoice/sidevoice-connector/issues/131)
+* **detect:** find agents whose PATH is set in the shell's rc file ([#149](https://github.com/sidevoice/sidevoice-connector/issues/149)) ([c507326](https://github.com/sidevoice/sidevoice-connector/commit/c5073264fc039be7686571b7ad96d0b7c13747e4))
+* install dependencies before desktop pin verification ([#31](https://github.com/sidevoice/sidevoice-connector/issues/31)) ([86a0ab1](https://github.com/sidevoice/sidevoice-connector/commit/86a0ab1a5363af303b25f77fc7254aef5db1fea3))
+* **install:** installing registers Sidevoice with no agent; the person connects each one ([#121](https://github.com/sidevoice/sidevoice-connector/issues/121)) ([101a826](https://github.com/sidevoice/sidevoice-connector/commit/101a82691cd8e508cfff4153648bededb7b47912))
+* **mcp:** answer current Claude Code's server/discover with valid lists (rmcp 3.5.1) ([#87](https://github.com/sidevoice/sidevoice-connector/issues/87)) ([134f993](https://github.com/sidevoice/sidevoice-connector/commit/134f993e6dfc87c62678c1fce7d67f672e78b204))
+* pin actual core attestation builder identity ([#30](https://github.com/sidevoice/sidevoice-connector/issues/30)) ([30c1757](https://github.com/sidevoice/sidevoice-connector/commit/30c175715d95d45d73b847a73328cb8dcf622b1a))
+* protect queued speech outbox ([#44](https://github.com/sidevoice/sidevoice-connector/issues/44)) ([7c86f28](https://github.com/sidevoice/sidevoice-connector/commit/7c86f28766b7a844f23f0b369a0222101072c1c4))
+* **service:** listen on the network with the compatible core ([#158](https://github.com/sidevoice/sidevoice-connector/issues/158)) ([4a21ff9](https://github.com/sidevoice/sidevoice-connector/commit/4a21ff9aed9f6816d55f35d2ae84eab23aec6fb5))
+* **uninstall:** confine deletion to owned roots ([#127](https://github.com/sidevoice/sidevoice-connector/issues/127)) ([ed2d0f9](https://github.com/sidevoice/sidevoice-connector/commit/ed2d0f959008aa8498ffb0a24a67d2a5b4653a5a))
+* **voice:** tell the agent plainly what wasn't heard, and to say it again if it matters ([#152](https://github.com/sidevoice/sidevoice-connector/issues/152)) ([c41b257](https://github.com/sidevoice/sidevoice-connector/commit/c41b257506f39426c74e0686ec8711c7d20ac369)), closes [#153](https://github.com/sidevoice/sidevoice-connector/issues/153)
+* **working:** wake Cursor monitor when bridge identifies chat ([#137](https://github.com/sidevoice/sidevoice-connector/issues/137)) ([f69a451](https://github.com/sidevoice/sidevoice-connector/commit/f69a45105e78ffec4a5a6f208af60c6b736dd0d6)), closes [#132](https://github.com/sidevoice/sidevoice-connector/issues/132)
+
 ## [0.10.3](https://github.com/sidevoice/sidevoice-connector/compare/v0.10.2...v0.10.3) (2026-10-17)
 
 
