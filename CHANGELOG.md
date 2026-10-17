@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.3](https://github.com/sidevoice/sidevoice-connector/compare/v0.10.2...v0.10.3) (2026-10-17)
+
+
+### Bug Fixes
+
+* **service:** listen on the network with the compatible core ([#158](https://github.com/sidevoice/sidevoice-connector/issues/158)) ([4a21ff9](https://github.com/sidevoice/sidevoice-connector/commit/4a21ff9aed9f6816d55f35d2ae84eab23aec6fb5))
+
 ## [0.10.2](https://github.com/sidevoice/sidevoice-connector/compare/v0.10.1...v0.10.2) (2026-10-16)
 
 
