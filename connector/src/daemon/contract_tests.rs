@@ -695,6 +695,167 @@ async fn a_detached_pull_binding_reconnects_under_its_original_client_ref() {
 }
 
 #[tokio::test]
+async fn voluntary_agent_leave_is_saved_and_replayed_after_core_or_daemon_restart() {
+    let scratch = Scratch::new("durable-agent-leave");
+    let link = Link::new();
+    let core = link.attached().await;
+    play_core(link.clone(), core);
+    let (initial_daemon, _) = daemon(&scratch, link);
+    let first = initial_daemon
+        .command(7, "register", registration("old-thread"))
+        .await
+        .unwrap();
+    assert_eq!(first["binding_id"], "core-old-thread");
+    let left = initial_daemon
+        .command(7, "unregister", json!({"client_ref":"old-thread"}))
+        .await
+        .unwrap();
+    assert_eq!(left["left"], true);
+    let saved: Value = serde_json::from_slice(
+        &std::fs::read(scratch.0.join("sidevoice/conversation-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["left_by_agent"]["old-thread"]["thread"], "old-thread");
+    assert_eq!(saved["left_by_agent"]["old-thread"]["leave"], true);
+    drop(initial_daemon);
+
+    let next_link = Link::new();
+    let mut next_core = next_link.attached().await;
+    let (restarted, _) = daemon(&scratch, next_link.clone());
+    restarted.on_welcome().await;
+    let frame: Value =
+        serde_json::from_str(next_core.recv().await.unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(frame["method"], "binding.unregister");
+    assert_eq!(frame["params"]["thread"], "old-thread");
+    assert_eq!(frame["params"]["leave"], true);
+    assert!(
+        restarted
+            .check_registration_allowed("old-thread", true)
+            .await
+            .is_err(),
+        "automatic facade replay is not a new explicit join"
+    );
+    play_core(next_link, next_core);
+    let fresh = restarted
+        .command(8, "register", registration("old-thread"))
+        .await
+        .unwrap();
+    assert_eq!(fresh["binding_id"], "core-old-thread");
+    let saved: Value = serde_json::from_slice(
+        &std::fs::read(scratch.0.join("sidevoice/conversation-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        saved["left_by_agent"].get("old-thread").is_none(),
+        "new explicit join retires the pending leave"
+    );
+}
+
+#[tokio::test]
+async fn a_fresh_explicit_join_waits_for_a_pending_leave_to_be_confirmed() {
+    let scratch = Scratch::new("leave-rejoin-order");
+    let link = Link::new();
+    let core = link.attached().await;
+    play_core(link.clone(), core); // Older Core: no durable-leave acknowledgement.
+    let (initial, _) = daemon(&scratch, link);
+    initial
+        .command(7, "register", registration("same-thread"))
+        .await
+        .unwrap();
+    initial
+        .command(7, "unregister", json!({"client_ref":"same-thread"}))
+        .await
+        .unwrap();
+    assert!(initial
+        .left_by_agent
+        .lock()
+        .await
+        .contains_key("same-thread"));
+    drop(initial);
+
+    let next_link = Link::new();
+    let mut next_core = next_link.attached().await;
+    let (restarted, _) = daemon(&scratch, next_link.clone());
+    let welcome = tokio::spawn({
+        let daemon = restarted.clone();
+        async move { daemon.on_welcome().await }
+    });
+    let leave: Value =
+        serde_json::from_str(next_core.recv().await.unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(leave["method"], "binding.unregister");
+    assert_eq!(leave["params"]["leave"], true);
+    let rejoin = tokio::spawn({
+        let daemon = restarted.clone();
+        async move {
+            daemon
+                .command(8, "register", registration("same-thread"))
+                .await
+        }
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), next_core.recv())
+            .await
+            .is_err(),
+        "a fresh binding must not overtake its pending leave"
+    );
+    next_link
+        .answer(json!({"jsonrpc":"2.0","id":leave["id"],"result":{"left":true}}))
+        .await
+        .unwrap();
+    welcome.await.unwrap();
+    let register: Value =
+        serde_json::from_str(next_core.recv().await.unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(register["method"], "binding.register");
+    next_link.answer(json!({"jsonrpc":"2.0","id":register["id"],"result":{
+        "binding_id":"new-binding","epoch":0,"initial_reply_context":{"session_id":"binding:new-binding","revision":0,"epoch":0,"thread_id":"same-thread"}
+    }})).await.unwrap();
+    assert_eq!(rejoin.await.unwrap().unwrap()["binding_id"], "new-binding");
+    assert!(restarted.left_by_agent.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn old_binding_rejected_as_closed_by_restarted_core_is_retired_locally() {
+    let scratch = Scratch::new("core-close-replay");
+    let link = Link::new();
+    let core = link.attached().await;
+    play_core(link.clone(), core);
+    let (daemon, _) = daemon(&scratch, link.clone());
+    daemon
+        .command(7, "register", registration("old-thread"))
+        .await
+        .unwrap();
+    let mut restarted_core = link.attached().await;
+    let answering = link.clone();
+    tokio::spawn(async move {
+        let frame: Value =
+            serde_json::from_str(restarted_core.recv().await.unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(frame["method"], "binding.register");
+        answering
+            .answer(
+                json!({"jsonrpc":"2.0","id":frame["id"],"result":{"error":"room.binding_closed"}}),
+            )
+            .await
+            .unwrap();
+    });
+    daemon.on_welcome().await;
+    assert!(daemon.bindings.lock().await.is_empty());
+    assert_eq!(
+        daemon
+            .closed_by_room
+            .lock()
+            .await
+            .get("old-thread")
+            .map(String::as_str),
+        Some("binding_closed")
+    );
+    let saved: Value = serde_json::from_slice(
+        &std::fs::read(scratch.0.join("sidevoice/conversation-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["closed_by_room"]["old-thread"], "binding_closed");
+}
+
+#[tokio::test]
 async fn acknowledged_pull_pages_keep_recent_routing_bounded_across_rejoin() {
     let scratch = Scratch::new("pull-context-bound");
     let link = Link::new();
