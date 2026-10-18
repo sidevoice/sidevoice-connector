@@ -71,7 +71,7 @@ your machine (`@sidevoice/sidevoice-<os>-<cpu>`, with the core inside); installi
 | Agent | Setup | What you say reaches the conversation |
 |---|---|---|
 | Claude Code | Connected when you choose it. | Delivered into the running session. |
-| Codex | Connected when you choose it, through the Codex CLI (without it, Sidevoice prints what to add to `~/.codex/config.toml`); then restart Codex. | Queued into the thread with `codex queue`. |
+| Codex | Connected when you choose it, through the Codex CLI (without it, Sidevoice prints what to add to `~/.codex/config.toml`); then restart Codex. | Steered into the running turn through the Codex daemon (Codex 0.157 or later, session on the shared daemon); otherwise queued into the thread with `codex queue`. |
 | Cursor (experimental) | Connected when you choose it, in `~/.cursor/mcp.json`; approve the new MCP server once. | Cursor offers no route of its own. The CLI receives it only in a chat started with `cursor-agent persist` (needs tmux); the editor, only through Cursor's Desktop Bridge (it must be on; SQLite support is bundled with the connector), once Cursor has recorded the chat's join call; until then nothing is sent. |
 
 Any other agent can receive through an HTTP endpoint of its own (`SIDEVOICE_DELIVERY_URL`).
@@ -106,6 +106,8 @@ English message.
 
 [`connector/README.md`](connector/README.md) describes each command, where things are kept and how the pieces talk
 to each other.
+
+The [reviewed voice-message MCP integration contract](docs/voice-message-contract.md) describes intended behavior for a future implementation; it is not a description of shipped support.
 
 ## Develop
 

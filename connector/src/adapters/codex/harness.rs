@@ -1,4 +1,4 @@
-//! Codex as a harness: voice through its queue, the rollout followed.
+//! Codex as a harness: voice steered into the running turn when Codex allows it, else through its queue; the rollout followed.
 
 use crate::adapters::conversation::{Conversation, Room};
 use crate::adapters::harness::{no_route, Harness, Route};
