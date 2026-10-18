@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.11.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.10.4...v0.11.0) (2026-10-18)
+
+
+### Features
+
+* **codex:** steer a running turn when the installed Codex supports it ([#168](https://github.com/sidevoice/sidevoice-connector/issues/168)) ([a29f60b](https://github.com/sidevoice/sidevoice-connector/commit/a29f60b7030c0ac293dcd983dfa4db89894fdbe8))
+
+
+### Bug Fixes
+
+* **daemon:** replay explicit agent leaves after core recovery ([#167](https://github.com/sidevoice/sidevoice-connector/issues/167)) ([243d024](https://github.com/sidevoice/sidevoice-connector/commit/243d0244e44d436eb762efdca9474666939c50a7))
+
 ## [0.10.4](https://github.com/sidevoice/sidevoice-connector/compare/v0.10.3...v0.10.4) (2026-10-18)
 
 
