@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.12.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.11.0...v0.12.0) (2026-10-18)
+
+
+### Features
+
+* **cursor:** report recorded chat model and effort ([#136](https://github.com/sidevoice/sidevoice-connector/issues/136)) ([ab2f678](https://github.com/sidevoice/sidevoice-connector/commit/ab2f67884b4516815172d026dfde64ffdec18b9d)), closes [#133](https://github.com/sidevoice/sidevoice-connector/issues/133)
+
+
+### Bug Fixes
+
+* **cursor:** trace and complete Desktop Bridge push delivery ([#173](https://github.com/sidevoice/sidevoice-connector/issues/173)) ([82bae14](https://github.com/sidevoice/sidevoice-connector/commit/82bae14e921c8ca0e70251ab5297aa6c58791156)), closes [#172](https://github.com/sidevoice/sidevoice-connector/issues/172)
+
 ## [0.11.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.10.4...v0.11.0) (2026-10-18)
 
 
