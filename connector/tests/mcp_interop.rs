@@ -188,17 +188,24 @@ fn a_tool_call_with_arguments_this_server_does_not_know_is_answered_for_what_it_
     assert_eq!(status["joined"], true, "{status}");
     assert_eq!(status["conversation"], thread, "{status}");
 
-    // A language the schema does not list (it lists none as a closed set) is passed on, not refused.
+    // The language and future argument pass schema parsing. Without a Core
+    // binding there is no initial_reply_context, so the missing context is
+    // the first actual contract error.
     let said = mcp.request(
         "tools/call",
         json!({"name": "voice_say", "_meta": meta,
-               "arguments": {"text": "Hello", "session_id": "test-session", "revision": 0, "epoch": 0,
-                             "language": "tlh", "future_argument": {"nested": 1}}}),
+               "arguments": {"text": "Hello", "event_id": "extra-args-voice-1",
+                             "utterance_id": "extra-args-voice-1", "language": "tlh",
+                             "future_argument": {"nested": 1}}}),
     );
-    assert_ne!(said["isError"], true, "{said}");
-    let said: Value =
-        serde_json::from_str(said["content"][0]["text"].as_str().unwrap_or("")).unwrap_or_default();
-    assert_eq!(said["status"], "queued", "{said}");
+    assert_eq!(said["isError"], true, "{said}");
+    assert!(
+        said["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("initial_reply_context"),
+        "{said}"
+    );
 
     let left = mcp.request(
         "tools/call",

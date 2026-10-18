@@ -7,8 +7,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 fn temp_home() -> std::path::PathBuf {
-    let home = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("uninstall-unsafe-{}", uuid::Uuid::new_v4()));
+    // The workspace can be group-writable in CI. Put this safety fixture under
+    // the system temporary root so an unrelated ancestor is not the failure.
+    let home = std::env::temp_dir().join(format!("uninstall-unsafe-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&home).unwrap();
     fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
     home

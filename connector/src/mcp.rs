@@ -16,12 +16,13 @@ use tokio::time::{timeout, timeout_at, Duration, Instant};
 
 const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the person's voice room.
 - Call voice_connect only when the person asks to join or enable voice. Select input_mode pull when this harness will call get_messages; otherwise the core injects input. One binding uses one mode.
-- Each voice or note message carries a stable message_id, conversation epoch, session_id and revision. A repeated ID is redelivery, not new input. A note contains Sidevoice facts and no words from the person. Follow notice instructions, including corrections and related message IDs, in both modes.
+- A voice event is one JSON header, a blank line, and the person's exact words. A note is JSON only and contains no person words. Both carry stable message_id, session_id, revision and epoch. The same message_id with identical content is redelivery, not another input or authorization; changed content under that ID is a conflict. A genuine correction uses a new correlated message ID. While connected, keep full written answers for native-harness typed chat and use appropriate voice too, including several spoken updates when useful.
 - In pull mode, call get_messages at useful hooks. Acknowledge IDs with ack_ids only after processing them. Pull may learn later than injection. After is a journal position, not an acknowledgement.
-- When a reply is appropriate, use voice_say with the message's session_id, revision and epoch. For speech before any message, use voice_connect's initial_reply_context. A typed message is context: it updates what you know without requiring a response and does not advance the epoch; you decide whether to answer, and a quick acknowledgement is optional. Several replies in one epoch play in publication order.
-- If voice_say says the person is speaking, the call was refused and nothing was queued: wait for their message. If that turn ends without words, a Sidevoice note may ask you to resend what still matters. A published reply is not proof it was heard.
-- When a message says part of your last reply was unheard, use your previous voice_say call and the "Heard up to" marker to tell the person in fresh words what they missed that still matters, together with what they ask now. For a note with no person words, tell them now. Skip it only if they changed topic or said to.
-- For substantive work, first a short acknowledgement, then meaningful checkpoints, then the result. No filler or tool narration. Take in new input at tool results before starting the next step.
+- When a reply is appropriate, use voice_say with stable nonempty event_id and utterance_id, the latest received message's complete session_id, revision, epoch and context_message_id. Before any room event, either omit all four context fields and let the connector use voice_connect's initial_reply_context, or pass that exact complete initial session_id/revision/epoch triple with no context_message_id. Never mix an initial triple with a room message ID. A typed message is context: it updates what you know without requiring a response, does not advance the spoken epoch and does not interrupt sound already playing. Several replies in one epoch may be appropriate and play in publication order.
+- An accepted voice_say or voice_replay result reports admission only. pending means held while a spoken turn is open; queued means scheduled; text_only means the original was retained without audio. None proves playback or hearing. A transport timeout is indeterminate: retry with exactly the same IDs and arguments, never invent a replacement publication. A rejected result was not admitted. On capacity_full, do not blindly retry; wait for new context or a deliberate later choice.
+- For spoken words, playback_at_turn_start describes evidence captured at acoustic onset. known with last_played null means none had played; unknown is missing evidence, not silence. not_played_at_turn_start identifies later publications the app certifies were not played at onset. All playback and hearing fields describe what the person physically heard of your earlier voice_say replies, never how much of the person's incoming words you received; the words after the header are the delivered input. Hearing is physical evidence, not proof of comprehension. Preserve holes and unknown values. Interpret the person's actual words in this causal context: a bare assent after clearly hearing question A, before later question B played, can authorize A without authorizing B or requiring reflexive clarification. Before acting on a bare assent, compare the confirmed heard prefix with your exact prior reply and its necessary conditions. If a necessary condition lies beyond that prefix, the assent does not establish it; ask a narrow question before acting. Multiple heard targets may also need a narrow question when the words do not select one. Explicit words can select a visually read unplayed target. An utterance ID by itself is not semantic approval.
+- hearing_changes and playback_outcomes are correlated physical facts. If the person missed relevant content, use voice_get_reply when its exact original is needed, and tell them naturally what still matters with the latest context; omit obsolete content. An unavailable original is not evidence it was heard and must not be invented. If an empty interruption can resume, Sidevoice owns automatic recovery. A recovery_needed or user_returned note hands the relevance decision to you; new normal words can also justify explicit replay, including an additive request or a request to repeat. A note alone is not new user assent. Replay resume may repeat a sentence for coherence; restart deliberately repeats the full original. Use the latest received context_message_id and do not authorize replay from an older context.
+- For substantive work while connected, use voice_say for a short acknowledgement, meaningful checkpoints when useful, and the result, each with a distinct stable original ID. Also speak a short result after a brief action taken from a spoken-room request. Give full written updates in native chat as appropriate. No filler or tool narration. Take in new input at tool results before starting the next step.
 - Pairing a machine or device is the person's act. Ask for their room address and one-time code only when needed; never fetch a code yourself. If inbound.ok is false, explain its reason and remedy without changing settings unasked."#;
 
 /// Overall budget for an IPC round trip, before the daemon's reply (or lack of one) gives up on
@@ -491,6 +492,7 @@ impl Facade {
                     "harness":identity.harness,"conversation":identity.thread,"binding_id":binding_id,
                     "delivery":if input_mode == "pull" {"pull"} else if pushed {"push"} else {"none"},"room_reachable":result.get("connected"),
                     "epoch":result.get("epoch"),"initial_reply_context":result.get("initial_reply_context"),
+                    "voice_contract":result.get("voice_contract") == Some(&json!(true)),
                     "capabilities":capabilities,"inbound":identity.inbound,
                     "local_only":"This machine is not paired with any room, so this conversation is reachable only from devices paired with this machine itself (the Sidevoice app on this computer, at this machine's own address). Tell the user in one line. Pairing the app is voice_pair_device, only if they ask; reaching it from elsewhere needs a room's address and code (voice_pair).",
                     "version":self.profile.connector_version(),"connector_version":connector.get("version")
@@ -716,14 +718,16 @@ impl Facade {
                     .get("text")
                     .and_then(Value::as_str)
                     .context("text required")?;
-                let event_id = args.get("event_id").and_then(Value::as_str);
-                let utterance_id = args.get("utterance_id").and_then(Value::as_str);
-                if event_id.is_some() != utterance_id.is_some()
-                    || event_id.is_some_and(str::is_empty)
-                    || utterance_id.is_some_and(str::is_empty)
-                {
-                    bail!("voice_say retry requires nonempty event_id and utterance_id together");
-                }
+                let event_id = args
+                    .get("event_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .context("voice_say requires a nonempty stable event_id")?;
+                let utterance_id = args
+                    .get("utterance_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .context("voice_say requires a nonempty stable utterance_id")?;
                 let supplied_session = args.get("session_id").and_then(Value::as_str);
                 let named_binding = if let Some(name) = named {
                     self.joined.lock().await.get(name).cloned()
@@ -733,6 +737,7 @@ impl Facade {
                 let initial = named_binding
                     .as_ref()
                     .map(|joined| &joined.initial_reply_context);
+                let context_message_id = args.get("context_message_id").and_then(Value::as_str);
                 let (session_id, revision, epoch) = if let (
                     Some(session),
                     Some(revision),
@@ -742,10 +747,27 @@ impl Facade {
                     args.get("revision").and_then(Value::as_i64),
                     args.get("epoch").and_then(Value::as_u64),
                 ) {
+                    if session.is_empty() {
+                        bail!("voice_say needs a nonempty session_id");
+                    }
+                    if context_message_id.is_none() {
+                        let initial = initial.context(
+                            "voice_say needs a nonempty context_message_id with room context",
+                        )?;
+                        if initial["session_id"] != session
+                            || initial["revision"] != revision
+                            || initial["epoch"] != epoch
+                        {
+                            bail!("voice_say needs a nonempty context_message_id unless the complete triple exactly matches voice_connect's initial_reply_context");
+                        }
+                    } else if context_message_id.is_some_and(str::is_empty) {
+                        bail!("voice_say needs a nonempty context_message_id");
+                    }
                     (session.to_owned(), revision, epoch)
                 } else if supplied_session.is_none()
                     && args.get("revision").is_none()
                     && args.get("epoch").is_none()
+                    && args.get("context_message_id").is_none()
                 {
                     let context = initial.context("voice_say needs the message's session_id, revision and epoch, or a conversation with initial_reply_context")?;
                     (
@@ -763,7 +785,11 @@ impl Facade {
                 };
                 let turn_route = self.several_chats() && named.is_none();
                 let mut publish = json!({"session_id":session_id,"revision":revision,"epoch":epoch,"text":text,
-                    "event_id":args.get("event_id"),"utterance_id":args.get("utterance_id"),"language":args.get("language")});
+                    "event_id":event_id,"utterance_id":utterance_id,"language":args.get("language"),
+                    "voice_contract":1});
+                if let Some(context_message_id) = context_message_id {
+                    publish["context_message_id"] = json!(context_message_id);
+                }
                 if turn_route {
                     publish["client_refs"] =
                         json!(self.joined.lock().await.keys().cloned().collect::<Vec<_>>());
@@ -803,19 +829,110 @@ impl Facade {
                 if let Some(adopted) = &adopted {
                     self.adopt_by_id(adopted, &client).await;
                 }
-                if result.get("text_saved") == Some(&json!(true)) {
-                    Ok(json!({"status":"published","text_saved":true,"audio":result.get("status")}))
-                } else {
+                let mut response = result;
+                if let Some(fields) = response.as_object_mut() {
+                    fields.remove("voice_contract");
+                    if fields.get("attempt_id").is_some_and(Value::is_null) {
+                        fields.remove("attempt_id");
+                    }
                     if adopted.is_some() {
-                        let mut response = result;
-                        if let Some(fields) = response.as_object_mut() {
-                            fields.remove("adopted");
-                        }
-                        Ok(response)
-                    } else {
-                        Ok(result)
+                        fields.remove("adopted");
                     }
                 }
+                Ok(response)
+            }
+            "voice_get_reply" => {
+                let named = args
+                    .get("conversation")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty());
+                if let Some(name) = named {
+                    self.adopt_by_id(name, &client).await;
+                }
+                let chosen = self.pick(named).await?.context("not connected")?;
+                let joined = self
+                    .joined
+                    .lock()
+                    .await
+                    .get(&chosen)
+                    .cloned()
+                    .context("not connected")?;
+                let utterance_id = args
+                    .get("utterance_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .context("voice_get_reply requires utterance_id")?;
+                let mut result = self
+                    .ipc
+                    .call(
+                        "get_reply",
+                        json!({"binding_id":joined.binding_id,"client_ref":chosen,
+                            "utterance_id":utterance_id}),
+                    )
+                    .await?;
+                if let Some(fields) = result.as_object_mut() {
+                    fields.remove("voice_contract");
+                    if fields.get("attempt_id").is_some_and(Value::is_null) {
+                        fields.remove("attempt_id");
+                    }
+                }
+                Ok(result)
+            }
+            "voice_replay" => {
+                let named = args
+                    .get("conversation")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty());
+                if let Some(name) = named {
+                    self.adopt_by_id(name, &client).await;
+                }
+                let chosen = self.pick(named).await?.context("not connected")?;
+                let joined = self
+                    .joined
+                    .lock()
+                    .await
+                    .get(&chosen)
+                    .cloned()
+                    .context("not connected")?;
+                let required = |key: &str| -> Result<&str> {
+                    args.get(key)
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .with_context(|| format!("voice_replay requires {key}"))
+                };
+                let utterance_id = required("utterance_id")?;
+                let replay_id = required("replay_id")?;
+                let context_message_id = required("context_message_id")?;
+                let session_id = required("session_id")?;
+                let revision = args
+                    .get("revision")
+                    .and_then(Value::as_i64)
+                    .context("voice_replay requires revision")?;
+                let epoch = args
+                    .get("epoch")
+                    .and_then(Value::as_u64)
+                    .context("voice_replay requires epoch")?;
+                let mode = args.get("mode").and_then(Value::as_str).unwrap_or("resume");
+                if !matches!(mode, "resume" | "restart") {
+                    bail!("voice_replay mode must be resume or restart");
+                }
+                let mut result = self
+                    .ipc
+                    .call(
+                        "replay",
+                        json!({"binding_id":joined.binding_id,"client_ref":chosen,
+                            "utterance_id":utterance_id,"replay_id":replay_id,"mode":mode,
+                            "session_id":session_id,"revision":revision,"epoch":epoch,
+                            "context_message_id":context_message_id}),
+                    )
+                    .await?;
+                if let Some(fields) = result.as_object_mut() {
+                    fields.remove("voice_contract");
+                    if fields.get("attempt_id").is_some_and(Value::is_null) {
+                        fields.remove("attempt_id");
+                    }
+                }
+                Ok(result)
             }
             "voice_disconnect" => {
                 let named = args
@@ -957,7 +1074,9 @@ fn tools() -> Vec<Tool> {
     let spec = [
         ("voice_connect", "Connect this conversation to the voice room. Only on an explicit request to join or enable voice. Choose input_mode pull to read the ordinary queue with get_messages; otherwise input is injected. Pull learns messages only when called. The reply includes the core's initial_reply_context for speaking first.", json!({"title":{"type":"string","description":"Short label for this conversation in the room"},"room":{"type":"string","description":"The room's address (https://…) when the user names one; omitted, the room this machine is paired with"},"input_mode":{"type":"string","description":"push (injection, default) or pull (get_messages)"}}), vec![]),
         ("voice_pair", "Pair this machine with a room using the one-time code the user read from the room's interface (\"Emparejar máquina\"). Only with a code the user gave you; one room per machine, a new pairing replaces the previous one.", json!({"room":{"type":"string","description":"The room's address (https://…)"},"code":{"type":"string","description":"The one-time pairing code shown by the room"}}), vec!["room","code"]),
-        ("voice_say", "Publish a spoken reply with the session_id, revision and epoch from the message header. To speak first, pass conversation and use the initial_reply_context from voice_connect. For an idempotent retry, reuse both event_id and utterance_id unchanged. A current open user turn is refused immediately: wait for its message. A saved reply is not proof it was heard.", json!({"text":{"type":"string"},"session_id":{"type":"string"},"revision":{"type":"integer","minimum":0},"epoch":{"type":"integer","minimum":0},"conversation":{"type":"string","description":"The conversation id voice_connect returned in this chat: to speak first"},"event_id":{"type":"string","description":"Supply with utterance_id and reuse both unchanged on retry"},"utterance_id":{"type":"string","description":"Supply with event_id and reuse both unchanged on retry"},"language":{"type":"string","description":"The language of the reply, as a code: es, en, fr, it, pt or hi are the ones known now; the room decides what it speaks"}}), vec!["text"]),
+        ("voice_say", "Submit a spoken reply for prompt admission. Supply stable nonempty event_id and utterance_id; retry the same IDs with identical text, language and original context if admission is uncertain. After room input, pass its latest received full session_id, revision, epoch and context_message_id. Before any room input, either omit all four and name the conversation returned by voice_connect, or pass exactly its complete initial session_id/revision/epoch triple with no context_message_id. Accepted pending, queued or text_only never means sound started or was heard. Rejected means it was not admitted.", json!({"text":{"type":"string"},"session_id":{"type":"string"},"revision":{"type":"integer","minimum":0},"epoch":{"type":"integer","minimum":0},"context_message_id":{"type":"string","description":"The latest received room voice or note message_id; omit only before the first room event"},"conversation":{"type":"string","description":"Conversation id voice_connect returned in this chat; required to speak before any room event"},"event_id":{"type":"string","description":"Stable nonempty call ID; reuse unchanged on retry"},"utterance_id":{"type":"string","description":"Stable nonempty original publication ID; reuse unchanged on retry"},"language":{"type":"string","description":"Language code; known now: es, en, fr, it, pt or hi"}}), vec!["text","event_id","utterance_id"]),
+        ("voice_get_reply", "Read an available original reply in this owned live conversation without changing playback or hearing. unavailable means the original is missing, expired, evicted, restarted or outside this binding; do not invent its text or heard portion. audience_hearing is a conservative current-audience lower bound, not proof that no listener heard more.", json!({"utterance_id":{"type":"string","description":"Original publication ID"},"conversation":{"type":"string","description":"Conversation id when several chats are joined"}}), vec!["utterance_id"]),
+        ("voice_replay", "Explicitly authorize a new attempt for an available original in the current focused conversation. Supply stable replay_id and the latest received full session_id, revision, epoch and context_message_id, including for a recovery note. resume starts at a conservative sentence boundary for target listeners; restart deliberately repeats from the beginning. A timeout is indeterminate: retry the identical call. Accepted pending or queued means admission only; failed unavailable, rejected, no_listener and already_heard have distinct meanings.", json!({"utterance_id":{"type":"string"},"replay_id":{"type":"string","description":"Stable nonempty attempt request ID; reuse with identical arguments on retry"},"mode":{"type":"string","description":"resume (default) or restart"},"session_id":{"type":"string"},"revision":{"type":"integer","minimum":0},"epoch":{"type":"integer","minimum":0},"context_message_id":{"type":"string"},"conversation":{"type":"string","description":"Conversation id when several chats are joined"}}), vec!["utterance_id","replay_id","session_id","revision","epoch","context_message_id"]),
         ("get_messages", "Read this conversation's ordered ordinary input queue in pull mode. Messages include stable IDs, full notice evidence, an envelope, and a journal position. Pass ack_ids only after consuming them. Without an acknowledgement, a claimed message is returned again; after is a journal position, not an acknowledgement. Pull may learn of speech later than injection.", json!({"conversation":{"type":"string","description":"Conversation id when several chats are joined"},"operation":{"type":"string","description":"get (default) or check"},"after":{"type":"integer","minimum":0},"ack_ids":{"type":"array","items":{"type":"string"}}}), vec![]),
         ("voice_disconnect", "Leave the voice room. The conversation and its work continue in writing.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
         ("voice_pair_device", "Show a one-time code to pair a device (the desktop app or a browser) with this machine: the code, a QR of it and how long it is valid. Only when the user asks to pair a device, never on your own initiative; show the user the result as it is.", json!({}), vec![]),
@@ -1237,8 +1356,10 @@ mod tests {
             .find(|tool| tool.name == "voice_say")
             .unwrap();
         for arguments in [
-            json!({"text":"hola","session_id":"s","revision":1,"language":"es"}),
-            json!({"text":"hello","session_id":"s","revision":1,"language":"tlh","future":{"nested":1}}),
+            json!({"text":"hola","event_id":"e1","utterance_id":"u1","session_id":"s",
+                "revision":1,"epoch":1,"context_message_id":"m1","language":"es"}),
+            json!({"text":"hello","event_id":"e2","utterance_id":"u2","session_id":"s",
+                "revision":1,"epoch":1,"context_message_id":"m1","language":"tlh","future":{"nested":1}}),
         ] {
             assert!(
                 schema_lets_through(&say.input_schema, &arguments),
@@ -1322,25 +1443,19 @@ mod tests {
         assert!(INSTRUCTIONS.contains("When a reply is appropriate, use voice_say"));
         assert!(INSTRUCTIONS.contains("A typed message is context"));
         assert!(INSTRUCTIONS.contains("without requiring a response"));
-        assert!(INSTRUCTIONS.contains("does not advance the epoch"));
+        assert!(INSTRUCTIONS.contains("does not advance the spoken epoch"));
+        assert!(INSTRUCTIONS.contains("full written answers for native-harness typed chat"));
+        assert!(INSTRUCTIONS.contains("use voice_say for a short acknowledgement"));
         assert!(!INSTRUCTIONS.contains("- Reply with voice_say"));
     }
 
     #[test]
     fn agent_hearing_instructions_give_a_concrete_recovery_rule() {
-        assert!(INSTRUCTIONS.contains("previous voice_say call"));
-        assert!(INSTRUCTIONS.contains("\"Heard up to\" marker"));
-        assert!(INSTRUCTIONS.contains("in fresh words what they missed that still matters"));
-        assert!(INSTRUCTIONS.contains("Skip it only if they changed topic or said to"));
-        for cause in [
-            "skipped",
-            "interrupted",
-            "not played",
-            "muted",
-            "disconnected",
-        ] {
-            assert!(!INSTRUCTIONS.contains(cause), "{cause}");
-        }
+        assert!(INSTRUCTIONS.contains("voice_get_reply when its exact original is needed"));
+        assert!(INSTRUCTIONS.contains("Sidevoice owns automatic recovery"));
+        assert!(INSTRUCTIONS.contains("new normal words can also justify explicit replay"));
+        assert!(INSTRUCTIONS.contains("unavailable original is not evidence it was heard"));
+        assert!(!INSTRUCTIONS.contains("The person did not hear the end of your last reply"));
     }
 
     #[test]

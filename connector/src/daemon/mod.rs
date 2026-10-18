@@ -6,6 +6,7 @@ use crate::secure_fs::atomic_json;
 use anyhow::{bail, Context, Result};
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
@@ -23,8 +24,9 @@ mod files;
 mod run;
 
 use files::{
-    prepare_conversation_guard, read_conversation_state, read_outbox, write_conversation_guard,
-    CONVERSATION_STATE_MAX_BYTES, GUARD_BLOCK_RESUME, GUARD_CLEAR, GUARD_REVOKED,
+    prepare_conversation_guard, prepare_speech_identities, read_conversation_state, read_outbox,
+    write_conversation_guard, CONVERSATION_STATE_MAX_BYTES, GUARD_BLOCK_RESUME, GUARD_CLEAR,
+    GUARD_REVOKED, SPEECH_IDENTITIES_MAX_BYTES,
 };
 pub use run::run;
 
@@ -33,6 +35,15 @@ const PAIR_DEVICE_LINK_WAIT: Duration = Duration::from_secs(15);
 const RESUME_REASON_NONE: u8 = 0;
 const RESUME_REASON_HISTORY: u8 = 1;
 const RESUME_REASON_STORAGE: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdentityCheck {
+    Fresh,
+    Same,
+    Stale,
+    Conflict,
+    Full,
+}
 
 /// An optional field of a message, `null` read as absent: a sender of another version may write either.
 fn present<'a>(params: &'a Value, key: &str) -> Option<&'a Value> {
@@ -44,6 +55,7 @@ pub struct Daemon {
     link: Arc<Link>,
     bindings: Mutex<HashMap<String, Arc<Conversation>>>,
     outbox: Mutex<Vec<Value>>,
+    speech_identities: Mutex<Vec<Value>>,
     replay_tx: mpsc::Sender<()>,
     host_agents: Arc<HostAgents>,
     registry: Arc<Registry>,
@@ -72,6 +84,8 @@ impl Daemon {
         shutdown: watch::Sender<bool>,
     ) -> Result<Arc<Self>> {
         let outbox = read_outbox(&profile.data.join("outbox.json"))?;
+        let speech_identities =
+            prepare_speech_identities(&profile.data.join("speech-identities.json"))?;
         let host_agents = HostAgents::new(profile.clone())?;
         let guard_path = profile.data.join("conversation-state.guard");
         let (guard_state, conversation_guard) = prepare_conversation_guard(&guard_path)?;
@@ -126,6 +140,7 @@ impl Daemon {
             link,
             bindings: Mutex::new(HashMap::new()),
             outbox: Mutex::new(outbox),
+            speech_identities: Mutex::new(speech_identities),
             replay_tx,
             host_agents,
             registry: Arc::new(registry),
@@ -170,7 +185,7 @@ impl Daemon {
         let mut frame = json!({"client_ref":binding.client_ref,"harness":binding.harness,"thread":binding.thread,"title":binding.title,"delivery":binding.delivery,
             "inbound":binding.inbound,"capabilities":binding.capabilities,
             "experimental":binding.experimental,"route":binding.route,"engine":engine,"focus":false,
-            "input_mode":*binding.input_mode.lock().await});
+            "input_mode":*binding.input_mode.lock().await,"voice_contract":1});
         if !current.starts_with("local-") {
             frame["binding_id"] = json!(*current);
         }
@@ -181,6 +196,15 @@ impl Daemon {
         // An answer may carry fields this connector does not know, `"error": null` among them: only an error is one.
         if let Some(error) = reply.get("error").filter(|error| !error.is_null()) {
             bail!("Core binding refusal: {error}");
+        }
+        if reply["status"] == "closed" {
+            if reply["voice_contract"] == 1
+                && reply["reason"] == "binding_closed"
+                && reply["binding_id"] == *current
+            {
+                bail!("CORE_BINDING_CLOSED");
+            }
+            bail!("Core returned an invalid closed-binding result");
         }
         let id = reply
             .get("binding_id")
@@ -198,7 +222,7 @@ impl Daemon {
             let old = outbox.clone();
             let mut changed = false;
             for item in outbox.iter_mut() {
-                if item["attempted"] == true {
+                if item["attempted"] == true || item["voice_contract"] == 1 {
                     continue;
                 }
                 if item.get("binding_id").and_then(Value::as_str) == Some(current.as_str())
@@ -221,6 +245,16 @@ impl Daemon {
             .get("initial_reply_context")
             .cloned()
             .unwrap_or(Value::Null);
+        let instance = reply
+            .get("voice_contract_instance")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        binding.voice_contract.store(
+            reply.get("voice_contract") == Some(&json!(1)) && instance.is_some(),
+            Ordering::Release,
+        );
+        *binding.voice_contract_instance.lock().await = instance;
         Ok(reply)
     }
 
@@ -232,6 +266,15 @@ impl Daemon {
         let bindings: Vec<_> = self.bindings.lock().await.values().cloned().collect();
         for binding in bindings {
             if let Err(error) = self.register_core(&binding).await {
+                if error.to_string() == "CORE_BINDING_CLOSED" {
+                    if let Err(close_error) = self
+                        .close_binding_from_room(&binding, "binding_closed")
+                        .await
+                    {
+                        crate::logfile::log(&format!("close refused binding: {close_error}"));
+                    }
+                    continue;
+                }
                 crate::logfile::log(&format!("binding replay: {error}"));
                 continue;
             }
@@ -246,6 +289,54 @@ impl Daemon {
     fn request_replay(&self) {
         // A full slot already requests a pass; the run loop owns its one replay task.
         let _ = self.replay_tx.try_send(());
+    }
+
+    async fn close_binding_from_room(
+        &self,
+        binding: &Arc<Conversation>,
+        reason: &str,
+    ) -> Result<()> {
+        let _state_transaction = self.conversation_state_serial.lock().await;
+        if !self
+            .bindings
+            .lock()
+            .await
+            .get(&binding.client_ref)
+            .is_some_and(|current| Arc::ptr_eq(current, binding))
+        {
+            return Ok(());
+        }
+        if let Err(error) = self.retire_client_identities(&binding.client_ref).await {
+            *self.refusal.lock().await = Some("identity_storage_failed".to_owned());
+            self.mark_state_write_failed(true);
+            let _ = self.shutdown.send(true);
+            return Err(error);
+        }
+        if let Err(error) = self
+            .discard_retired_client_speech(&binding.client_ref)
+            .await
+        {
+            *self.refusal.lock().await = Some("identity_storage_failed".to_owned());
+            self.mark_state_write_failed(true);
+            let _ = self.shutdown.send(true);
+            return Err(error);
+        }
+        if let Err(error) = self.arm_conversation_guard(false) {
+            crate::logfile::log(&format!("arm conversation guard: {error}"));
+            self.mark_state_write_failed(false);
+            let _ = self.shutdown.send(true);
+        }
+        binding.stopped.store(true, Ordering::Relaxed);
+        self.bindings.lock().await.remove(&binding.client_ref);
+        {
+            let mut closed = self.closed_by_room.lock().await;
+            closed.insert(binding.client_ref.clone(), reason.to_owned());
+            *self.latest_closed.lock().await =
+                Some((binding.client_ref.clone(), reason.to_owned()));
+        }
+        self.persist_conversation_state().await;
+        self.registry.get(&binding.harness).close(binding).await;
+        Ok(())
     }
 
     fn resume_block_reason(&self) -> Option<&'static str> {
@@ -438,6 +529,253 @@ impl Daemon {
         self.profile.data.join("outbox.json")
     }
 
+    fn speech_identities_path(&self) -> PathBuf {
+        self.profile.data.join("speech-identities.json")
+    }
+
+    fn identity_record(
+        kind: &str,
+        client_ref: &str,
+        call_id: &str,
+        utterance_id: &str,
+        instance: &str,
+        binding_id: &str,
+        fingerprint_source: Value,
+    ) -> Result<Value> {
+        let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&json!({
+            "binding_id":binding_id,"request":fingerprint_source
+        }))?));
+        Ok(
+            json!({"kind":kind,"client_ref":client_ref,"call_id":call_id,
+            "utterance_id":utterance_id,"voice_contract_instance":instance,"binding_id":binding_id,
+            "fingerprint":fingerprint}),
+        )
+    }
+
+    /// Persist the ID fence before sending to Core. A full ledger refuses new work instead of
+    /// evicting an older ID and letting a pre-restart retry become fresh audio.
+    async fn remember_identity(&self, record: Value) -> Result<IdentityCheck> {
+        let mut rows = self.speech_identities.lock().await;
+        if let Some(prior) = rows.iter().find(|row| {
+            row["client_ref"] == record["client_ref"]
+                && ((row["kind"] == record["kind"] && row["call_id"] == record["call_id"])
+                    || (record["kind"] == "say"
+                        && row["kind"] == "say"
+                        && row["utterance_id"] == record["utterance_id"]))
+        }) {
+            return Ok(
+                if prior["retired"] == true
+                    || prior["voice_contract_instance"] != record["voice_contract_instance"]
+                {
+                    IdentityCheck::Stale
+                } else if prior["fingerprint"] != record["fingerprint"] {
+                    IdentityCheck::Conflict
+                } else {
+                    IdentityCheck::Same
+                },
+            );
+        }
+        if rows.len() >= 8192 {
+            return Ok(IdentityCheck::Full);
+        }
+        rows.push(record);
+        // Every row may later acquire a retired marker after an explicit leave.
+        if serde_json::to_vec(&*rows)?.len() + rows.len() * 16 + 512 > SPEECH_IDENTITIES_MAX_BYTES {
+            rows.pop();
+            return Ok(IdentityCheck::Full);
+        }
+        if let Err(error) = atomic_json(&self.speech_identities_path(), &*rows) {
+            rows.pop();
+            return Err(error);
+        }
+        Ok(IdentityCheck::Fresh)
+    }
+
+    async fn identity_result(&self, kind: &str, client_ref: &str, call_id: &str) -> Option<Value> {
+        self.speech_identities
+            .lock()
+            .await
+            .iter()
+            .find(|row| {
+                row["kind"] == kind && row["client_ref"] == client_ref && row["call_id"] == call_id
+            })
+            .and_then(|row| row.get("result").cloned())
+    }
+
+    async fn identity_request(&self, kind: &str, client_ref: &str, call_id: &str) -> Option<Value> {
+        self.speech_identities
+            .lock()
+            .await
+            .iter()
+            .find(|row| {
+                row["kind"] == kind && row["client_ref"] == client_ref && row["call_id"] == call_id
+            })
+            .and_then(|row| row.get("request").cloned())
+    }
+
+    async fn identity_row(&self, kind: &str, client_ref: &str, call_id: &str) -> Option<Value> {
+        self.speech_identities
+            .lock()
+            .await
+            .iter()
+            .find(|row| {
+                row["kind"] == kind && row["client_ref"] == client_ref && row["call_id"] == call_id
+            })
+            .cloned()
+    }
+
+    /// A replacement binding may receive an old result only after Core proves that this
+    /// live binding still owns the original. `unavailable` is deliberately inconclusive.
+    async fn cached_result_for_live_scope(
+        &self,
+        kind: &str,
+        client_ref: &str,
+        call_id: &str,
+        live_id: &str,
+        instance: &str,
+    ) -> Option<Value> {
+        let row = self.identity_row(kind, client_ref, call_id).await?;
+        let result = row.get("result")?.clone();
+        if row["retired"] == true || row["voice_contract_instance"] != instance {
+            return None;
+        }
+        let original_id = row["binding_id"].as_str()?;
+        if !self.link.connected().await {
+            return None;
+        }
+        if result["status"] == "rejected" && original_id == live_id {
+            return Some(result);
+        }
+        let mut request = json!({"voice_contract":1,"binding_id":original_id,
+            "voice_contract_instance":instance,"utterance_id":row["utterance_id"]});
+        if original_id != live_id {
+            request["recovery_binding_id"] = json!(live_id);
+        }
+        let proof = self
+            .link
+            .request("speech.get_reply", request, Duration::from_secs(10))
+            .await
+            .ok()?;
+        if proof["voice_contract"] == 1
+            && proof["status"] == "available"
+            && proof["utterance_id"] == row["utterance_id"]
+        {
+            Some(result)
+        } else {
+            None
+        }
+    }
+
+    /// A deliberate leave ends this binding lifetime. Mark old IDs before removing the
+    /// binding, so a rejoin under the same client_ref cannot surface a cached admission.
+    async fn retire_client_identities(&self, client_ref: &str) -> Result<()> {
+        let mut rows = self.speech_identities.lock().await;
+        let before = rows.clone();
+        let mut changed = false;
+        for row in rows
+            .iter_mut()
+            .filter(|row| row["client_ref"] == client_ref)
+        {
+            if row["retired"] != true {
+                row["retired"] = json!(true);
+                changed = true;
+            }
+        }
+        if changed {
+            if serde_json::to_vec(&*rows)?.len() > SPEECH_IDENTITIES_MAX_BYTES {
+                *rows = before;
+                bail!("speech identity ledger full");
+            }
+            if let Err(error) = atomic_json(&self.speech_identities_path(), &*rows) {
+                *rows = before;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    async fn discard_retired_client_speech(&self, client_ref: &str) -> Result<()> {
+        let mut outbox = self.outbox.lock().await;
+        let before = outbox.clone();
+        outbox.retain(|row| row["voice_contract"] != 1 || row["client_ref"] != client_ref);
+        if *outbox != before {
+            if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+                *outbox = before;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// The original's binding is part of its ownership, even after this client reconnects.
+    async fn original_scope(
+        &self,
+        client_ref: &str,
+        utterance_id: &str,
+    ) -> Option<(String, String)> {
+        self.speech_identities
+            .lock()
+            .await
+            .iter()
+            .find(|row| {
+                row["kind"] == "say"
+                    && row["client_ref"] == client_ref
+                    && row["utterance_id"] == utterance_id
+                    && row["retired"] != true
+            })
+            .and_then(|row| {
+                Some((
+                    row["binding_id"].as_str()?.to_owned(),
+                    row["voice_contract_instance"].as_str()?.to_owned(),
+                ))
+            })
+    }
+
+    async fn settle_identity(
+        &self,
+        kind: &str,
+        client_ref: &str,
+        call_id: &str,
+        reply: &Value,
+    ) -> Result<()> {
+        let mut rows = self.speech_identities.lock().await;
+        let index = rows
+            .iter()
+            .position(|row| {
+                row["kind"] == kind && row["client_ref"] == client_ref && row["call_id"] == call_id
+            })
+            .context("speech identity missing before result")?;
+        let row = &mut rows[index];
+        if row.get("result").is_some() {
+            return Ok(());
+        }
+        let mut compact = json!({});
+        for key in [
+            "status",
+            "event_id",
+            "utterance_id",
+            "replay_id",
+            "attempt_id",
+            "playback",
+            "reason",
+            "voice_contract",
+        ] {
+            if let Some(value) = reply.get(key).filter(|value| !value.is_null()) {
+                compact[key] = value.clone();
+            }
+        }
+        row["result"] = compact;
+        if serde_json::to_vec(&*rows)?.len() > SPEECH_IDENTITIES_MAX_BYTES {
+            rows[index].as_object_mut().unwrap().remove("result");
+            bail!("speech identity ledger full");
+        }
+        if let Err(error) = atomic_json(&self.speech_identities_path(), &*rows) {
+            rows[index].as_object_mut().unwrap().remove("result");
+            return Err(error);
+        }
+        Ok(())
+    }
+
     async fn queue(&self, speech: Value) -> Result<()> {
         let mut outbox = self.outbox.lock().await;
         let before = outbox.clone();
@@ -470,10 +808,12 @@ impl Daemon {
         let ids_match = ["event_id", "utterance_id"].iter().all(|key| {
             speech.get(key).and_then(Value::as_str).is_some() && speech.get(key) == reply.get(key)
         });
+        let v1 = speech.get("voice_contract") == Some(&json!(1));
         ids_match
             && (reply.get("text_saved") == Some(&json!(true))
+                || (v1 && reply.get("status") == Some(&json!("accepted")))
                 || (reply.get("status") == Some(&json!("rejected"))
-                    && reply.get("terminal") == Some(&json!(true))))
+                    && (v1 || reply.get("terminal") == Some(&json!(true)))))
     }
 
     async fn make_history_only(&self, event_id: &Value) -> Result<()> {
@@ -511,6 +851,19 @@ impl Daemon {
         Ok(())
     }
 
+    async fn remove_unattempted(&self, event_id: &Value) -> Result<()> {
+        let mut outbox = self.outbox.lock().await;
+        let before = outbox.clone();
+        outbox.retain(|item| item.get("event_id") != Some(event_id) || item["attempted"] == true);
+        if *outbox != before {
+            if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+                *outbox = before;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     async fn rebind_known_unknown(&self, event_id: &Value, binding_id: &str) -> Result<Value> {
         let mut outbox = self.outbox.lock().await;
         let before = outbox.clone();
@@ -536,6 +889,7 @@ impl Daemon {
             return Ok(());
         }
         let before = outbox.clone();
+        outbox.retain(|item| item["attempted"] == true || item["voice_contract"] != 1);
         for item in outbox.iter_mut() {
             if item["attempted"] != true {
                 item["history_only"] = json!(true);
@@ -550,7 +904,9 @@ impl Daemon {
 
     async fn publish_one(&self, speech: &Value) -> Result<Option<Value>> {
         if !self.link.connected().await {
-            self.make_history_only(&speech["event_id"]).await?;
+            if speech.get("voice_contract") != Some(&json!(1)) {
+                self.make_history_only(&speech["event_id"]).await?;
+            }
             return Ok(None);
         }
         // Persist the attempt before transport can take the frame. A lost answer leaves an
@@ -594,6 +950,11 @@ impl Daemon {
             }
         };
         if reply.get("status") == Some(&json!("unknown_binding")) {
+            if published["voice_contract"] == 1 {
+                // An attempted v1 request belongs to its original binding. Recovery may
+                // name a live replacement separately; publication may never be rebound.
+                return Ok(None);
+            }
             if let Some(binding) = self
                 .binding_for_id(
                     published
@@ -603,7 +964,10 @@ impl Daemon {
                 )
                 .await
             {
-                if self.register_core(&binding).await.is_ok() {
+                if self.register_core(&binding).await.is_ok()
+                    && (speech.get("voice_contract") != Some(&json!(1))
+                        || binding.voice_contract.load(Ordering::Acquire))
+                {
                     published = self
                         .rebind_known_unknown(&speech["event_id"], &binding.id.lock().await)
                         .await?;
@@ -628,7 +992,24 @@ impl Daemon {
                 return Ok(None);
             }
         }
+        if published.get("voice_contract") == Some(&json!(1))
+            && reply.get("voice_contract") != Some(&json!(1))
+        {
+            crate::logfile::log(
+                "speech admission response omitted voice contract; same-key recovery retained",
+            );
+            return Ok(None);
+        }
         if Self::ack_allows_removal(&published, &reply) {
+            if speech["voice_contract"] == 1 {
+                self.settle_identity(
+                    "say",
+                    speech["client_ref"].as_str().unwrap_or(""),
+                    speech["event_id"].as_str().unwrap_or(""),
+                    &reply,
+                )
+                .await?;
+            }
             let event_id = speech.get("event_id");
             let mut outbox = self.outbox.lock().await;
             let before = outbox.clone();
@@ -650,9 +1031,25 @@ impl Daemon {
             .get("client_ref")
             .and_then(Value::as_str)
             .unwrap_or("");
+        if speech["voice_contract"] == 1 {
+            let Some(row) = self
+                .identity_row("say", client_ref, speech["event_id"].as_str().unwrap_or(""))
+                .await
+            else {
+                return Ok(None);
+            };
+            if row["retired"] == true {
+                return Ok(None);
+            }
+        }
         let Some(binding) = self.bindings.lock().await.get(client_ref).cloned() else {
             return Ok(None);
         };
+        if speech.get("voice_contract") == Some(&json!(1))
+            && !binding.voice_contract.load(Ordering::Acquire)
+        {
+            return Ok(None);
+        }
         let mut original = speech.clone();
         original.as_object_mut().unwrap().remove("attempted");
         for retry in 0..2 {
@@ -661,6 +1058,7 @@ impl Daemon {
             }
             let mut request = original.clone();
             request["recovery_binding_id"] = json!(*binding.id.lock().await);
+            request["voice_contract"] = json!(1);
             let reply = match self
                 .link
                 .request("speech.recover", request, Duration::from_secs(15))
@@ -673,17 +1071,40 @@ impl Daemon {
                 }
             };
             if reply.get("status") == Some(&json!("unknown_binding")) {
-                if retry == 0 && self.register_core(&binding).await.is_ok() {
+                if retry == 0
+                    && self.register_core(&binding).await.is_ok()
+                    && (speech.get("voice_contract") != Some(&json!(1))
+                        || binding.voice_contract.load(Ordering::Acquire))
+                {
                     continue;
                 }
+                return Ok(None);
+            }
+            if original.get("voice_contract") == Some(&json!(1))
+                && reply.get("voice_contract") != Some(&json!(1))
+            {
+                crate::logfile::log(
+                    "speech recovery response omitted voice contract; same-key recovery retained",
+                );
                 return Ok(None);
             }
             if !Self::ack_allows_removal(&original, &reply) {
                 return Ok(None);
             }
+            if original["voice_contract"] == 1 {
+                self.settle_identity(
+                    "say",
+                    original["client_ref"].as_str().unwrap_or(""),
+                    original["event_id"].as_str().unwrap_or(""),
+                    &reply,
+                )
+                .await?;
+            }
             let mut outbox = self.outbox.lock().await;
             let before = outbox.clone();
-            if let Some(item) = outbox
+            if original["voice_contract"] == 1 {
+                outbox.retain(|item| item.get("event_id") != speech.get("event_id"));
+            } else if let Some(item) = outbox
                 .iter_mut()
                 .find(|item| item.get("event_id") == speech.get("event_id"))
             {
@@ -705,9 +1126,22 @@ impl Daemon {
             if speech.get("resolved").is_some() {
                 continue;
             }
+            if speech["voice_contract"] == 1 && speech["attempted"] != true {
+                let _ = self.remove_unattempted(&speech["event_id"]).await;
+                continue;
+            }
             let Some(client_ref) = speech.get("client_ref").and_then(Value::as_str) else {
                 continue;
             };
+            if speech["voice_contract"] == 1
+                && self
+                    .identity_row("say", client_ref, speech["event_id"].as_str().unwrap_or(""))
+                    .await
+                    .is_some_and(|row| row["retired"] == true)
+            {
+                let _ = self.discard_retired_client_speech(client_ref).await;
+                continue;
+            }
             let Some(binding) = self.bindings.lock().await.get(client_ref).cloned() else {
                 continue;
             };
@@ -753,33 +1187,19 @@ impl Daemon {
             }
             "input.deliver" => self.deliver(params).await,
             "binding.close" => {
-                let _state_transaction = self.conversation_state_serial.lock().await;
                 let id = params
                     .get("binding_id")
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 if let Some(binding) = self.binding_for_id(id).await {
-                    if let Err(error) = self.arm_conversation_guard(false) {
-                        crate::logfile::log(&format!("arm conversation guard: {error}"));
-                        self.mark_state_write_failed(false);
-                        let _ = self.shutdown.send(true);
-                    }
-                    binding.stopped.store(true, Ordering::Relaxed);
-                    self.bindings.lock().await.remove(&binding.client_ref);
                     let reason = params
                         .get("reason")
                         .and_then(Value::as_str)
-                        .unwrap_or("closed_from_room")
-                        .to_owned();
-                    {
-                        let mut closed = self.closed_by_room.lock().await;
-                        closed.insert(binding.client_ref.clone(), reason.clone());
-                        *self.latest_closed.lock().await =
-                            Some((binding.client_ref.clone(), reason));
+                        .unwrap_or("closed_from_room");
+                    if let Err(error) = self.close_binding_from_room(&binding, reason).await {
+                        crate::logfile::log(&format!("retire closed speech identities: {error}"));
+                        return json!({"error":{"key":"connector.identity-storage-failed"}});
                     }
-                    self.persist_conversation_state().await;
-                    self.registry.get(&binding.harness).close(&binding).await;
-                    drop(_state_transaction);
                 }
                 json!({})
             }
@@ -801,6 +1221,24 @@ impl Daemon {
                     *self.refusal.lock().await = Some(reason);
                     let bindings: Vec<_> = self.bindings.lock().await.values().cloned().collect();
                     for binding in &bindings {
+                        if let Err(error) = self.retire_client_identities(&binding.client_ref).await
+                        {
+                            crate::logfile::log(&format!(
+                                "retire revoked speech identities: {error}"
+                            ));
+                            self.mark_state_write_failed(true);
+                            let _ = self.shutdown.send(true);
+                            return json!({"error":{"key":"connector.identity-storage-failed"}});
+                        }
+                        if let Err(error) = self
+                            .discard_retired_client_speech(&binding.client_ref)
+                            .await
+                        {
+                            crate::logfile::log(&format!("discard revoked speech: {error}"));
+                            self.mark_state_write_failed(true);
+                            let _ = self.shutdown.send(true);
+                            return json!({"error":{"key":"connector.identity-storage-failed"}});
+                        }
                         binding.stopped.store(true, Ordering::Relaxed);
                         self.bindings.lock().await.remove(&binding.client_ref);
                         {
@@ -873,6 +1311,35 @@ impl Daemon {
         if message_id.is_empty() || session_id.is_empty() || (text.is_empty() && !note) {
             return json!({"status":"failed","detail":"invalid input"});
         }
+        let identity_payload = match crate::adapters::envelope(frame) {
+            Ok(_) => {
+                let mut logical = frame.clone();
+                if let Some(fields) = logical.as_object_mut() {
+                    for key in [
+                        "binding_id",
+                        crate::adapters::PULL_POSITION_FIELD,
+                        "arrival_time",
+                    ] {
+                        fields.remove(key);
+                    }
+                }
+                logical.to_string()
+            }
+            Err(error) => return json!({"status":"failed","detail":error.to_string()}),
+        };
+        if let Some((_, prior, result)) = binding
+            .delivered_results
+            .lock()
+            .await
+            .iter()
+            .find(|(id, _, _)| id == message_id)
+        {
+            return if prior == &identity_payload {
+                result.clone()
+            } else {
+                json!({"status":"failed","detail":"identity_conflict"})
+            };
+        }
         {
             let mut pending = binding.pending.lock().await;
             if !pending.iter().any(|id| id == message_id) {
@@ -896,7 +1363,16 @@ impl Daemon {
             .deliver(&binding, frame, &self.profile)
             .await
         {
-            Ok(result) => result,
+            Ok(result) => {
+                if result["status"] == "accepted" {
+                    let mut delivered = binding.delivered_results.lock().await;
+                    delivered.push_back((message_id.to_owned(), identity_payload, result.clone()));
+                    while delivered.len() > 512 {
+                        delivered.pop_front();
+                    }
+                }
+                result
+            }
             Err(error) => {
                 binding.pending.lock().await.retain(|id| id != message_id);
                 binding.forget_input(message_id, session_id, revision).await;
@@ -983,12 +1459,22 @@ impl Daemon {
                         bail!("binding belongs to another façade");
                     }
                     *existing.input_mode.lock().await = input_mode.to_owned();
-                    let registered = self.register_core(&existing).await?;
+                    let registered = match self.register_core(&existing).await {
+                        Ok(reply) => reply,
+                        Err(error) if error.to_string() == "CORE_BINDING_CLOSED" => {
+                            drop(_state_transaction);
+                            self.close_binding_from_room(&existing, "binding_closed")
+                                .await?;
+                            bail!("CLOSED_BY_ROOM:binding_closed:{client_ref}");
+                        }
+                        Err(error) => return Err(error),
+                    };
                     let binding_id = existing.id.lock().await.clone();
                     drop(_state_transaction);
                     return Ok(
                         json!({"binding_id":binding_id,"thread":thread,"connected":self.link.connected().await,"prepared":null,
-                            "epoch":registered.get("epoch"),"initial_reply_context":registered.get("initial_reply_context")}),
+                            "epoch":registered.get("epoch"),"initial_reply_context":registered.get("initial_reply_context"),
+                            "voice_contract":existing.voice_contract.load(Ordering::Acquire)}),
                     );
                 }
                 drop(_state_transaction);
@@ -1000,6 +1486,8 @@ impl Daemon {
                     delivery: delivery.clone(),
                     input_mode: Mutex::new(input_mode.to_owned()),
                     initial_reply_context: Mutex::new(Value::Null),
+                    voice_contract: AtomicBool::new(false),
+                    voice_contract_instance: Mutex::new(None),
                     engine: Mutex::new(
                         params
                             .get("engine")
@@ -1016,6 +1504,7 @@ impl Daemon {
                     serial: Mutex::new(()),
                     publication: Mutex::new(()),
                     pending: Mutex::new(VecDeque::new()),
+                    delivered_results: Mutex::new(VecDeque::new()),
                     turns: Mutex::new(HashMap::new()),
                     input_context: Mutex::new(HashMap::new()),
                     recent_inputs: Mutex::new(VecDeque::new()),
@@ -1039,7 +1528,8 @@ impl Daemon {
                     drop(_state_transaction);
                     return Ok(json!({"binding_id":binding_id,"thread":thread,
                         "connected":self.link.connected().await,"prepared":null,
-                        "epoch":registered.get("epoch"),"initial_reply_context":registered.get("initial_reply_context")}));
+                        "epoch":registered.get("epoch"),"initial_reply_context":registered.get("initial_reply_context"),
+                        "voice_contract":existing.voice_contract.load(Ordering::Acquire)}));
                 }
                 let prepared = harness_adapter.prepare(&binding).await?;
                 self.bindings
@@ -1068,7 +1558,8 @@ impl Daemon {
                 Ok(
                     json!({"binding_id":id,"thread":thread,"connected":result.is_ok(),"pending":result.is_err(),"prepared":prepared,
                         "epoch":result.as_ref().ok().and_then(|v| v.get("epoch")),
-                        "initial_reply_context":result.as_ref().ok().and_then(|v| v.get("initial_reply_context"))}),
+                        "initial_reply_context":result.as_ref().ok().and_then(|v| v.get("initial_reply_context")),
+                        "voice_contract":binding.voice_contract.load(Ordering::Acquire)}),
                 )
             }
             "publish" => {
@@ -1119,21 +1610,134 @@ impl Daemon {
                 if text.is_empty() || text.len() > 65536 {
                     bail!("text length invalid");
                 }
-                let event_id = params.get("event_id").and_then(Value::as_str);
-                let utterance_id = params.get("utterance_id").and_then(Value::as_str);
-                if event_id.is_some() != utterance_id.is_some()
-                    || event_id.is_some_and(str::is_empty)
-                    || utterance_id.is_some_and(str::is_empty)
-                {
+                let v1 = params.get("voice_contract") == Some(&json!(1));
+                if v1 && !binding.voice_contract.load(Ordering::Acquire) {
+                    bail!("contract_unavailable: the connected Core does not support voice contract v1");
+                }
+                let event_id = params
+                    .get("event_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty());
+                let utterance_id = params
+                    .get("utterance_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty());
+                if v1 {
+                    if event_id.is_none() || utterance_id.is_none() {
+                        bail!("publish requires nonempty event_id and utterance_id");
+                    }
+                } else if event_id.is_some() != utterance_id.is_some() {
                     bail!("publish requires nonempty event_id and utterance_id together");
                 }
                 let _publication = binding.publication.lock().await;
-                let id = binding.id.lock().await;
-                let history_only = !self.link.connected().await;
-                let speech = json!({"event_id":event_id.map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                    "binding_id":*id,"client_ref":binding.client_ref,"session_id":session_id,"revision":revision,"epoch":epoch,
+                let live_id = binding.id.lock().await.clone();
+                let original_id = if v1 {
+                    self.identity_row("say", &binding.client_ref, event_id.unwrap())
+                        .await
+                        .and_then(|row| row["binding_id"].as_str().map(str::to_owned))
+                        .unwrap_or_else(|| live_id.clone())
+                } else {
+                    live_id.clone()
+                };
+                let mut speech = json!({"event_id":event_id.map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    "binding_id":original_id,"client_ref":binding.client_ref,"session_id":session_id,"revision":revision,"epoch":epoch,
                     "utterance_id":utterance_id.map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                    "text":text,"language":params.get("language"),"history_only":history_only});
+                    "text":text,"language":params.get("language"),"history_only":!self.link.connected().await});
+                if v1 {
+                    speech["voice_contract"] = json!(1);
+                    if let Some(context_message_id) = params
+                        .get("context_message_id")
+                        .filter(|value| !value.is_null())
+                    {
+                        speech["context_message_id"] = context_message_id.clone();
+                    }
+                    let instance = binding
+                        .voice_contract_instance
+                        .lock()
+                        .await
+                        .clone()
+                        .context("contract_unavailable: Core omitted voice contract instance")?;
+                    speech["voice_contract_instance"] = json!(instance);
+                    let record = Self::identity_record(
+                        "say",
+                        &binding.client_ref,
+                        event_id.unwrap(),
+                        utterance_id.unwrap(),
+                        &instance,
+                        &original_id,
+                        json!({"client_ref":binding.client_ref,"event_id":event_id,
+                            "utterance_id":utterance_id,"session_id":session_id,
+                            "revision":revision,"epoch":epoch,
+                            "context_message_id":speech["context_message_id"],
+                            "text":text,"language":params.get("language")}),
+                    )?;
+                    match self.remember_identity(record).await? {
+                        IdentityCheck::Fresh => {}
+                        IdentityCheck::Same => {
+                            let settled = self
+                                .identity_result("say", &binding.client_ref, event_id.unwrap())
+                                .await
+                                .is_some();
+                            if let Some(mut result) = self
+                                .cached_result_for_live_scope(
+                                    "say",
+                                    &binding.client_ref,
+                                    event_id.unwrap(),
+                                    &live_id,
+                                    &instance,
+                                )
+                                .await
+                            {
+                                if adopted {
+                                    result["adopted"] = json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,
+                                        "harness":binding.harness,"title":binding.title,"delivery":binding.delivery,"route":binding.route,
+                                        "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound});
+                                }
+                                return Ok(result);
+                            }
+                            if settled {
+                                return Ok(json!({"status":"admission_unknown",
+                                    "event_id":event_id,"utterance_id":utterance_id}));
+                            }
+                            let missing_outbox = {
+                                let outbox = self.outbox.lock().await;
+                                outbox
+                                    .iter()
+                                    .all(|item| item["event_id"] != speech["event_id"])
+                            };
+                            if missing_outbox {
+                                // Reservation survived but the outbox did not. Recovery is the
+                                // only safe send: a new publication could repeat old audio.
+                                speech["attempted"] = json!(true);
+                                self.queue(speech.clone()).await?;
+                            }
+                            let prior = self
+                                .outbox
+                                .lock()
+                                .await
+                                .iter()
+                                .find(|item| item["event_id"] == speech["event_id"])
+                                .cloned()
+                                .context("reserved speech missing from outbox")?;
+                            return Ok(self.recover_one(&prior).await?.unwrap_or_else(|| {
+                                json!({"status":"admission_unknown","event_id":event_id,
+                                    "utterance_id":utterance_id})
+                            }));
+                        }
+                        IdentityCheck::Stale => {
+                            return Ok(json!({"status":"rejected","reason":"context_stale",
+                                "event_id":event_id,"utterance_id":utterance_id}))
+                        }
+                        IdentityCheck::Conflict => {
+                            return Ok(json!({"status":"rejected","reason":"identity_conflict",
+                                "event_id":event_id,"utterance_id":utterance_id}))
+                        }
+                        IdentityCheck::Full => {
+                            return Ok(json!({"status":"rejected","reason":"capacity_full",
+                                "event_id":event_id,"utterance_id":utterance_id}))
+                        }
+                    }
+                }
                 let prior = self
                     .outbox
                     .lock()
@@ -1145,7 +1749,7 @@ impl Daemon {
                     })
                     .cloned();
                 if let Some(prior) = prior {
-                    for field in [
+                    let mut fields = vec![
                         "event_id",
                         "utterance_id",
                         "client_ref",
@@ -1154,20 +1758,28 @@ impl Daemon {
                         "epoch",
                         "text",
                         "language",
-                    ] {
+                    ];
+                    if v1 {
+                        fields.push("context_message_id");
+                        fields.push("voice_contract_instance");
+                    }
+                    for field in fields {
                         if prior[field] != speech[field] {
+                            if v1 {
+                                return Ok(
+                                    json!({"status":"rejected","reason":"identity_conflict",
+                                    "event_id":event_id,"utterance_id":utterance_id}),
+                                );
+                            }
                             bail!("publish retry IDs conflict with a pending publication");
                         }
                     }
-                    drop(id);
                     let answer = self.publish_one(&prior).await?;
-                    let mut result = answer.unwrap_or_else(|| {
-                        if prior["attempted"] == true {
-                            json!({"status":"admission_unknown","event_id":prior["event_id"],
-                                "utterance_id":prior["utterance_id"],"instruction":"Core admission is uncertain; wait for the next message before replying again."})
-                        } else {
-                            json!({"status":"queued","event_id":prior["event_id"],"utterance_id":prior["utterance_id"]})
-                        }
+                    let mut result = answer.unwrap_or_else(|| if v1 || prior["attempted"] == true {
+                        json!({"status":"admission_unknown","event_id":prior["event_id"],
+                            "utterance_id":prior["utterance_id"]})
+                    } else {
+                        json!({"status":"queued","event_id":prior["event_id"],"utterance_id":prior["utterance_id"]})
                     });
                     if adopted {
                         result["adopted"] = json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,
@@ -1176,7 +1788,9 @@ impl Daemon {
                     }
                     return Ok(result);
                 }
-                drop(id);
+                if v1 && !self.link.connected().await {
+                    bail!("core_unavailable: admission not attempted; retry the same event_id and utterance_id");
+                }
                 // Settle older attempts before deciding whether this new answer can play.
                 // An uncertain first admission is recovered, never published again.
                 let earlier = self
@@ -1192,6 +1806,9 @@ impl Daemon {
                 let mut unresolved = false;
                 for item in earlier {
                     if self.publish_one(&item).await?.is_none() {
+                        if v1 {
+                            bail!("prior_admission_unresolved: retry the same event_id and utterance_id after the earlier publication is recovered");
+                        }
                         unresolved = true;
                         break;
                     }
@@ -1213,9 +1830,12 @@ impl Daemon {
                         .is_some_and(|item| item["attempted"] == true);
                     if attempted {
                         json!({"status":"admission_unknown","event_id":speech["event_id"],
-                            "utterance_id":speech["utterance_id"],"instruction":"Core admission is uncertain; wait for the next message before replying again."})
-                    } else {
+                            "utterance_id":speech["utterance_id"]})
+                    } else if !v1 {
                         json!({"status":"queued","event_id":speech["event_id"],"utterance_id":speech["utterance_id"]})
+                    } else {
+                        self.remove_unattempted(&speech["event_id"]).await?;
+                        bail!("core_unavailable: admission not attempted; retry the same event_id and utterance_id")
                     }
                 };
                 if adopted {
@@ -1224,6 +1844,175 @@ impl Daemon {
                         "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound});
                 }
                 Ok(result)
+            }
+            "get_reply" => {
+                let binding = self.find_owned(owner, &params).await?;
+                if !binding.voice_contract.load(Ordering::Acquire) {
+                    bail!("contract_unavailable: the connected Core does not support voice contract v1");
+                }
+                let utterance_id = params
+                    .get("utterance_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .context("utterance_id required")?;
+                let instance = binding
+                    .voice_contract_instance
+                    .lock()
+                    .await
+                    .clone()
+                    .context("contract_unavailable: Core omitted voice contract instance")?;
+                let live_id = binding.id.lock().await.clone();
+                let (original_id, original_instance) = self
+                    .original_scope(&binding.client_ref, utterance_id)
+                    .await
+                    .unwrap_or_else(|| (live_id.clone(), instance.clone()));
+                if original_instance != instance {
+                    bail!("context_stale: original belongs to a prior Core incarnation");
+                }
+                let mut request = json!({"voice_contract":1,"binding_id":original_id,
+                    "voice_contract_instance":instance,"utterance_id":utterance_id});
+                if original_id != live_id {
+                    request["recovery_binding_id"] = json!(live_id);
+                }
+                let reply = self
+                    .link
+                    .request("speech.get_reply", request, Duration::from_secs(10))
+                    .await?;
+                if reply.get("voice_contract") != Some(&json!(1)) {
+                    bail!("contract_unavailable: Core did not confirm voice contract v1");
+                }
+                Ok(reply)
+            }
+            "replay" => {
+                let binding = self.find_owned(owner, &params).await?;
+                if !binding.voice_contract.load(Ordering::Acquire) {
+                    bail!("contract_unavailable: the connected Core does not support voice contract v1");
+                }
+                let utterance_id = params
+                    .get("utterance_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .context("utterance_id required")?;
+                let replay_id = params
+                    .get("replay_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .context("replay_id required")?;
+                let context_message_id = params
+                    .get("context_message_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .context("context_message_id required")?;
+                let session_id = params
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .context("session_id required")?;
+                let revision = params
+                    .get("revision")
+                    .and_then(Value::as_i64)
+                    .context("revision required")?;
+                let epoch = params
+                    .get("epoch")
+                    .and_then(Value::as_u64)
+                    .context("epoch required")?;
+                let mode = params
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("resume");
+                if !matches!(mode, "resume" | "restart") {
+                    bail!("replay mode must be resume or restart");
+                }
+                let _publication = binding.publication.lock().await;
+                let instance = binding
+                    .voice_contract_instance
+                    .lock()
+                    .await
+                    .clone()
+                    .context("contract_unavailable: Core omitted voice contract instance")?;
+                let live_id = binding.id.lock().await.clone();
+                let (original_id, original_instance) = self
+                    .identity_row("replay", &binding.client_ref, replay_id)
+                    .await
+                    .and_then(|row| {
+                        Some((
+                            row["binding_id"].as_str()?.to_owned(),
+                            row["voice_contract_instance"].as_str()?.to_owned(),
+                        ))
+                    })
+                    .or(self.original_scope(&binding.client_ref, utterance_id).await)
+                    .unwrap_or_else(|| (live_id.clone(), instance.clone()));
+                if original_instance != instance {
+                    return Ok(json!({"status":"rejected","reason":"context_stale"}));
+                }
+                let original_request = json!({"voice_contract":1,"binding_id":original_id,
+                    "utterance_id":utterance_id,"replay_id":replay_id,"mode":mode,
+                    "session_id":session_id,"revision":revision,"epoch":epoch,
+                    "context_message_id":context_message_id,
+                    "voice_contract_instance":instance});
+                let mut record = Self::identity_record(
+                    "replay",
+                    &binding.client_ref,
+                    replay_id,
+                    utterance_id,
+                    &instance,
+                    &original_id,
+                    json!({"client_ref":binding.client_ref,"utterance_id":utterance_id,
+                        "replay_id":replay_id,"mode":mode,"session_id":session_id,
+                        "revision":revision,"epoch":epoch,
+                        "context_message_id":context_message_id}),
+                )?;
+                record["request"] = original_request.clone();
+                match self.remember_identity(record).await? {
+                    IdentityCheck::Fresh => {}
+                    IdentityCheck::Same => {
+                        let settled = self
+                            .identity_result("replay", &binding.client_ref, replay_id)
+                            .await
+                            .is_some();
+                        if let Some(reply) = self
+                            .cached_result_for_live_scope(
+                                "replay",
+                                &binding.client_ref,
+                                replay_id,
+                                &live_id,
+                                &instance,
+                            )
+                            .await
+                        {
+                            return Ok(reply);
+                        }
+                        if settled {
+                            bail!("replay outcome indeterminate; retry the same replay_id while the original binding is available");
+                        }
+                    }
+                    IdentityCheck::Stale => {
+                        return Ok(json!({"status":"rejected","reason":"context_stale"}))
+                    }
+                    IdentityCheck::Conflict => {
+                        return Ok(json!({"status":"rejected","reason":"identity_conflict"}))
+                    }
+                    IdentityCheck::Full => {
+                        return Ok(json!({"status":"rejected","reason":"capacity_full"}))
+                    }
+                }
+                let mut request = self
+                    .identity_request("replay", &binding.client_ref, replay_id)
+                    .await
+                    .context("replay identity request missing after durable reservation")?;
+                if request["binding_id"] != live_id {
+                    request["recovery_binding_id"] = json!(live_id);
+                }
+                let reply = self
+                    .link
+                    .request("speech.replay", request, Duration::from_secs(15))
+                    .await?;
+                if reply.get("voice_contract") != Some(&json!(1)) {
+                    bail!("contract_unavailable: replay outcome indeterminate; retry the same replay_id");
+                }
+                self.settle_identity("replay", &binding.client_ref, replay_id, &reply)
+                    .await?;
+                Ok(reply)
             }
             "get_messages" => {
                 let binding = self.find_owned(owner, &params).await?;
@@ -1280,6 +2069,9 @@ impl Daemon {
             "unregister" => {
                 let _state_transaction = self.conversation_state_serial.lock().await;
                 let binding = self.find_owned(owner, &params).await?;
+                self.retire_client_identities(&binding.client_ref).await?;
+                self.discard_retired_client_speech(&binding.client_ref)
+                    .await?;
                 binding.stopped.store(true, Ordering::Relaxed);
                 self.bindings.lock().await.remove(&binding.client_ref);
                 self.registry.get(&binding.harness).close(&binding).await;
@@ -1359,7 +2151,8 @@ impl Daemon {
                         "harness":binding.harness,"thread":binding.thread,"title":binding.title,"delivery":binding.delivery,
                         "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound,
                         "engine":engine,"working":working,"input_mode":*binding.input_mode.lock().await,
-                        "initial_reply_context":*binding.initial_reply_context.lock().await});
+                        "initial_reply_context":*binding.initial_reply_context.lock().await,
+                        "voice_contract":binding.voice_contract.load(Ordering::Acquire)});
                     if let Some(fields) = self.registry.get(&binding.harness).status(&binding).await
                     {
                         for (key, value) in fields {
@@ -1796,7 +2589,7 @@ mod tests {
         let delivered = daemon
             .deliver(
                 &json!({"binding_id":joined["binding_id"],"message_id":"m-1","session_id":"s",
-                "revision":1,"text":"hola"}),
+                "revision":1,"epoch":0,"text":"hola"}),
             )
             .await;
         assert_eq!(delivered["status"], "accepted");

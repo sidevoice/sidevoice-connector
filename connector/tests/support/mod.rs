@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,23 +30,21 @@ pub const CONNECTOR: &str = env!("CARGO_BIN_EXE_sidevoice-connector");
 
 /// The unpacked core (`<dir>/bin/sidevoice-core-rust`, `<dir>/models`), or `None` when the test must be skipped.
 pub fn core_dir() -> Option<PathBuf> {
-    let dir = std::env::var_os("SIDEVOICE_TEST_CORE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../target/sidevoice-core/sidevoice-core-rust")
-        });
+    let explicit = std::env::var_os("SIDEVOICE_TEST_CORE_DIR");
+    let dir = explicit.as_ref().map(PathBuf::from).unwrap_or_else(|| {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/sidevoice-core/sidevoice-core-rust")
+    });
     if dir.join("bin/sidevoice-core-rust").is_file() {
         return Some(dir.canonicalize().expect("core directory"));
     }
-    if std::env::var_os("CI").is_some() {
+    if explicit.is_some() || std::env::var_os("CI").is_some() {
         panic!(
-            "no core at {}: run `cargo xtask core` before `cargo test`",
+            "SIDEVOICE_TEST_CORE_DIR names no Core binary at {}: run `cargo xtask core` or supply a valid frozen Core directory",
             dir.display()
         );
     }
     eprintln!(
-        "skipped: no core at {} (run `cargo xtask core`)",
+        "SKIPPED_REAL_CORE_INTEROP: no Core at {}; passing test names in this run are skips (run `cargo xtask core` or set SIDEVOICE_TEST_CORE_DIR)",
         dir.display()
     );
     None
@@ -565,6 +564,7 @@ pub struct Presentation {
     socket: PathBuf,
     send: tokio::sync::mpsc::UnboundedSender<Value>,
     frames: Receiver<Value>,
+    attempts: Arc<Mutex<BTreeMap<String, (String, u64)>>>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -587,6 +587,8 @@ impl Presentation {
     pub fn open_with_token(socket: &Path, token: String) -> Self {
         let (session_tx, session_rx) = channel();
         let (frame_tx, frames) = channel();
+        let attempts = Arc::new(Mutex::new(BTreeMap::new()));
+        let received_attempts = attempts.clone();
         let (send, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let socket = socket.to_path_buf();
@@ -627,6 +629,18 @@ impl Presentation {
                             let Some(Ok(frame)) = frame else { break };
                             if let Message::Text(text) = frame {
                                 let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                                if value["type"] == "voice-reply" {
+                                    if let (Some(uid), Some(aid), Some(reply)) = (
+                                        value["data"]["utterance_id"].as_str(),
+                                        value["data"]["attempt_id"].as_str(),
+                                        value["data"]["text"].as_str(),
+                                    ) {
+                                        received_attempts.lock().unwrap().insert(
+                                            uid.to_owned(),
+                                            (aid.to_owned(), reply.chars().count() as u64),
+                                        );
+                                    }
+                                }
                                 if value["type"] == "voice-session" {
                                     let _ = session_tx.send(value["data"]["session_id"].as_str().unwrap_or("").to_string());
                                 }
@@ -647,6 +661,7 @@ impl Presentation {
             socket: held_socket,
             send,
             frames,
+            attempts,
             stop: Some(stop),
             thread: Some(thread),
         }
@@ -674,8 +689,21 @@ impl Presentation {
     }
 
     pub fn report_turn(&self, phase: &str, turn_id: &str, text: Option<&str>) {
+        self.report_turn_with_evidence(phase, turn_id, text, &Value::Null, &Value::Null);
+    }
+
+    pub fn report_turn_with_evidence(
+        &self,
+        phase: &str,
+        turn_id: &str,
+        text: Option<&str>,
+        playback_at_turn_start: &Value,
+        not_played_at_turn_start: &Value,
+    ) {
         let mut data = json!({"session_id":self.session,"client_msg_id":uuid::Uuid::new_v4().to_string(),
-            "phase":phase,"turn_id":turn_id});
+            "phase":phase,"turn_id":turn_id,
+            "playback_at_turn_start":playback_at_turn_start,
+            "not_played_at_turn_start":not_played_at_turn_start});
         if phase == "started" {
             let state = core_json(
                 &self.socket,
@@ -702,10 +730,46 @@ impl Presentation {
         reason: Option<&str>,
         heard_chars: Option<u64>,
     ) {
+        if let Some((attempt_id, text_chars)) =
+            self.attempts.lock().unwrap().get(utterance_id).cloned()
+        {
+            let (hearing, chars) = match (status, heard_chars) {
+                ("heard", _) => ("complete", text_chars),
+                ("unplayed", _) => ("not_played", 0),
+                ("interrupted", Some(n)) if n > 0 && n < text_chars => ("partial", n),
+                _ => ("unknown", 0),
+            };
+            self.send
+                .send(json!({"type":"voice-playback","data":{
+                    "session_id":self.session,"client_msg_id":uuid::Uuid::new_v4().to_string(),
+                    "utterance_id":utterance_id,"attempt_id":attempt_id,"status":status,
+                    "reason":reason,"hearing":hearing,
+                    "heard_chars":if hearing == "unknown" { Value::Null } else { json!(chars) }
+                }}))
+                .unwrap();
+            return;
+        }
         self.send.send(json!({"type":"voice-playback","data":{
             "session_id":self.session,"client_msg_id":uuid::Uuid::new_v4().to_string(),
             "utterance_id":utterance_id,"status":status,"reason":reason,"heard_chars":heard_chars
         }})).unwrap();
+    }
+
+    pub fn report_contract_playback(
+        &self,
+        utterance_id: &str,
+        attempt_id: &str,
+        status: &str,
+        hearing: &str,
+        heard_chars: u64,
+    ) {
+        self.send
+            .send(json!({"type":"voice-playback","data":{
+                "session_id":self.session,"client_msg_id":uuid::Uuid::new_v4().to_string(),
+                "utterance_id":utterance_id,"attempt_id":attempt_id,"status":status,
+                "hearing":hearing,"heard_chars":heard_chars
+            }}))
+            .unwrap();
     }
 
     pub fn report_hearing(
@@ -757,6 +821,21 @@ impl Presentation {
                 .unwrap_or_else(|_| panic!("no {kind} frame"));
             if frame["type"] == kind {
                 return frame;
+            }
+        }
+    }
+
+    pub fn saw_frame_within(&self, kind: &str, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            match self.frames.recv_timeout(left) {
+                Ok(frame) if frame["type"] == kind => return true,
+                Ok(_) => {}
+                Err(_) => return false,
             }
         }
     }

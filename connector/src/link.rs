@@ -135,6 +135,11 @@ impl Link {
         rx
     }
 
+    #[cfg(test)]
+    pub async fn detached(&self) {
+        self.reset().await;
+    }
+
     /// An answer from the core's side of an `attached` link, read as the link reads it.
     #[cfg(test)]
     pub async fn answer(&self, frame: Value) -> Result<()> {

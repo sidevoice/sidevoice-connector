@@ -127,6 +127,630 @@ fn play_core(link: Arc<Link>, mut frames: tokio::sync::mpsc::Receiver<Message>) 
     });
 }
 
+#[tokio::test]
+async fn v1_speech_fails_closed_against_an_older_core() {
+    let scratch = Scratch::new("v1-old-core");
+    let link = Link::new();
+    let core = link.attached().await;
+    play_core(link.clone(), core); // register response intentionally has no voice_contract echo
+    let (daemon, _) = daemon(&scratch, link);
+    let joined = daemon
+        .command(1, "register", registration("t-1"))
+        .await
+        .unwrap();
+    assert_eq!(joined["voice_contract"], false);
+    let failure = daemon
+        .command(
+            1,
+            "publish",
+            json!({"voice_contract":1,"client_ref":"t-1",
+        "session_id":"s","revision":0,"epoch":0,"text":"Do not publish",
+        "event_id":"e-v1","utterance_id":"u-v1"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(failure.to_string().contains("contract_unavailable"));
+    assert!(daemon.outbox.lock().await.is_empty());
+    for method in ["get_reply", "replay"] {
+        let failure = daemon
+            .command(
+                1,
+                method,
+                json!({"client_ref":"t-1",
+            "utterance_id":"u-v1","replay_id":"r-v1","session_id":"s",
+            "revision":0,"epoch":0,"context_message_id":"m-v1"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            failure.to_string().contains("contract_unavailable"),
+            "{method}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn v1_ids_cannot_re_admit_after_both_processes_restart() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn mock_v1(
+        link: Arc<Link>,
+        mut frames: tokio::sync::mpsc::Receiver<Message>,
+        instance: &'static str,
+        publications: Arc<AtomicUsize>,
+    ) {
+        tokio::spawn(async move {
+            while let Some(Message::Text(text)) = frames.recv().await {
+                let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+                let Some(id) = frame.get("id") else { continue };
+                let params = &frame["params"];
+                let result = match frame["method"].as_str() {
+                    Some("binding.register") => json!({"binding_id":"core-t-1","voice_contract":1,
+                        "voice_contract_instance":instance,"initial_reply_context":{
+                            "session_id":format!("start-{instance}"),"revision":0,"epoch":0}}),
+                    Some("speech.publish") => {
+                        publications.fetch_add(1, Ordering::Relaxed);
+                        assert_eq!(params["voice_contract_instance"], instance);
+                        json!({"voice_contract":1,"status":"accepted","playback":"queued",
+                            "event_id":params["event_id"],"utterance_id":params["utterance_id"],
+                            "attempt_id":"attempt-1"})
+                    }
+                    Some("speech.replay") => {
+                        publications.fetch_add(1, Ordering::Relaxed);
+                        assert_eq!(params["voice_contract_instance"], instance);
+                        json!({"voice_contract":1,"status":"accepted","playback":"queued",
+                            "utterance_id":params["utterance_id"],"replay_id":params["replay_id"],
+                            "attempt_id":"attempt-2"})
+                    }
+                    Some("speech.get_reply") => json!({"voice_contract":1,"status":"available",
+                            "utterance_id":params["utterance_id"],"text":"Original words"}),
+                    _ => json!({}),
+                };
+                link.answer(json!({"jsonrpc":"2.0","id":id,"result":result}))
+                    .await
+                    .unwrap();
+            }
+        });
+    }
+
+    let scratch = Scratch::new("v1-restart-identity");
+    let first_link = Link::new();
+    let first_calls = Arc::new(AtomicUsize::new(0));
+    mock_v1(
+        first_link.clone(),
+        first_link.attached().await,
+        "inc-a",
+        first_calls.clone(),
+    );
+    let (first, _) = daemon(&scratch, first_link);
+    first
+        .command(1, "register", registration("t-1"))
+        .await
+        .unwrap();
+    let first_say = json!({"voice_contract":1,"client_ref":"t-1","session_id":"start-inc-a",
+        "revision":0,"epoch":0,"text":"Original words","event_id":"e-1","utterance_id":"u-1"});
+    let answer = first
+        .command(1, "publish", first_say.clone())
+        .await
+        .unwrap();
+    assert_eq!(answer["status"], "accepted");
+    assert!(
+        first.outbox.lock().await.is_empty(),
+        "accepted outbox was cleared"
+    );
+    assert_eq!(
+        first
+            .command(1, "publish", first_say.clone())
+            .await
+            .unwrap(),
+        answer
+    );
+    assert_eq!(first_calls.load(Ordering::Relaxed), 1);
+    let mut conflict = first_say.clone();
+    conflict["text"] = json!("Changed words");
+    assert_eq!(
+        first.command(1, "publish", conflict).await.unwrap()["reason"],
+        "identity_conflict"
+    );
+
+    let first_replay = json!({"client_ref":"t-1","utterance_id":"u-1","replay_id":"r-1",
+        "mode":"resume","session_id":"start-inc-a","revision":0,"epoch":0,
+        "context_message_id":"m-1"});
+    let replayed = first
+        .command(1, "replay", first_replay.clone())
+        .await
+        .unwrap();
+    assert_eq!(replayed["status"], "accepted");
+    assert_eq!(
+        first.command(1, "replay", first_replay).await.unwrap(),
+        replayed
+    );
+    assert_eq!(first_calls.load(Ordering::Relaxed), 2);
+
+    first.link.detached().await;
+    assert_eq!(
+        first
+            .command(1, "publish", first_say.clone())
+            .await
+            .unwrap()["status"],
+        "admission_unknown",
+        "a disconnected Core cannot prove that the old binding is still owned"
+    );
+    let mut not_sent = first_say.clone();
+    not_sent["event_id"] = json!("e-new");
+    not_sent["utterance_id"] = json!("u-new");
+    let unavailable = first.command(1, "publish", not_sent).await.unwrap_err();
+    assert!(
+        unavailable.to_string().contains("core_unavailable"),
+        "{unavailable}"
+    );
+    assert!(first.outbox.lock().await.is_empty());
+    assert!(
+        first
+            .command(
+                1,
+                "replay",
+                json!({"client_ref":"t-1",
+            "utterance_id":"u-1","replay_id":"r-1","mode":"resume",
+            "session_id":"start-inc-a","revision":0,"epoch":0,
+            "context_message_id":"m-1"})
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("indeterminate"),
+        "a settled replay retry cannot claim a proven owner while disconnected"
+    );
+
+    drop(first);
+    let second_link = Link::new();
+    let second_calls = Arc::new(AtomicUsize::new(0));
+    mock_v1(
+        second_link.clone(),
+        second_link.attached().await,
+        "inc-b",
+        second_calls.clone(),
+    );
+    let (second, _) = daemon(&scratch, second_link);
+    second
+        .command(1, "register", registration("t-1"))
+        .await
+        .unwrap();
+    let mut old_say = first_say;
+    old_say["session_id"] = json!("start-inc-b"); // omitted context silently refreshed by MCP
+    assert_eq!(
+        second.command(1, "publish", old_say).await.unwrap()["reason"],
+        "context_stale"
+    );
+    let old_replay = json!({"client_ref":"t-1","utterance_id":"u-1","replay_id":"r-1",
+        "mode":"resume","session_id":"start-inc-b","revision":0,"epoch":0,
+        "context_message_id":"m-2"});
+    assert_eq!(
+        second.command(1, "replay", old_replay).await.unwrap()["reason"],
+        "context_stale"
+    );
+    assert_eq!(
+        second_calls.load(Ordering::Relaxed),
+        0,
+        "old IDs never reached Core again"
+    );
+}
+
+#[tokio::test]
+async fn uncertain_replay_keeps_its_original_request_across_a_replacement_binding() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let scratch = Scratch::new("v1-replay-rebinding");
+    let link = Link::new();
+    let mut frames = link.attached().await;
+    let answered = link.clone();
+    let registrations = Arc::new(AtomicUsize::new(0));
+    let count = registrations.clone();
+    tokio::spawn(async move {
+        while let Some(Message::Text(text)) = frames.recv().await {
+            let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+            let Some(id) = frame.get("id") else { continue };
+            let result = match frame["method"].as_str() {
+                Some("binding.register") => {
+                    let number = count.fetch_add(1, Ordering::Relaxed);
+                    json!({"binding_id":if number == 0 { "original" } else { "replacement" },
+                        "voice_contract":1,"voice_contract_instance":"same-core-incarnation",
+                        "initial_reply_context":{"session_id":"start","revision":0,"epoch":0}})
+                }
+                Some("speech.replay") => {
+                    assert_eq!(frame["params"]["binding_id"], "original");
+                    assert_eq!(frame["params"]["recovery_binding_id"], "replacement");
+                    assert_eq!(
+                        frame["params"]["voice_contract_instance"],
+                        "same-core-incarnation"
+                    );
+                    assert!(matches!(
+                        frame["params"]["replay_id"].as_str(),
+                        Some("r-lost" | "r-fresh")
+                    ));
+                    json!({"voice_contract":1,"status":"accepted","playback":"queued",
+                        "utterance_id":"u-old","replay_id":frame["params"]["replay_id"],
+                        "attempt_id":if frame["params"]["replay_id"] == "r-lost" {
+                            "unchanged-attempt" } else { "fresh-attempt" }})
+                }
+                Some("speech.get_reply") => {
+                    assert_eq!(frame["params"]["binding_id"], "original");
+                    assert_eq!(frame["params"]["recovery_binding_id"], "replacement");
+                    assert_eq!(
+                        frame["params"]["voice_contract_instance"],
+                        "same-core-incarnation"
+                    );
+                    json!({"voice_contract":1,"status":"available","utterance_id":"u-old","text":"Original"})
+                }
+                _ => json!({}),
+            };
+            answered
+                .answer(json!({"jsonrpc":"2.0","id":id,"result":result}))
+                .await
+                .unwrap();
+        }
+    });
+    let (daemon, _) = daemon(&scratch, link);
+    daemon
+        .command(1, "register", registration("t-1"))
+        .await
+        .unwrap();
+    let mut record = Daemon::identity_record(
+        "replay",
+        "t-1",
+        "r-lost",
+        "u-old",
+        "same-core-incarnation",
+        "original",
+        json!({"client_ref":"t-1","utterance_id":"u-old",
+            "replay_id":"r-lost","mode":"resume","session_id":"s","revision":1,
+            "epoch":0,"context_message_id":"m"}),
+    )
+    .unwrap();
+    record["request"] = json!({"voice_contract":1,"binding_id":"original",
+        "voice_contract_instance":"same-core-incarnation","utterance_id":"u-old",
+        "replay_id":"r-lost","mode":"resume","session_id":"s","revision":1,
+        "epoch":0,"context_message_id":"m"});
+    assert_eq!(
+        daemon.remember_identity(record).await.unwrap(),
+        super::IdentityCheck::Fresh
+    );
+    let mut original = Daemon::identity_record(
+        "say",
+        "t-1",
+        "e-old",
+        "u-old",
+        "same-core-incarnation",
+        "original",
+        json!({"original":"fixture"}),
+    )
+    .unwrap();
+    original["binding_id"] = json!("original");
+    assert_eq!(
+        daemon.remember_identity(original).await.unwrap(),
+        super::IdentityCheck::Fresh
+    );
+    daemon
+        .command(1, "register", registration("t-1"))
+        .await
+        .unwrap();
+    let recovered = daemon
+        .command(
+            1,
+            "replay",
+            json!({"client_ref":"t-1",
+        "utterance_id":"u-old","replay_id":"r-lost","mode":"resume",
+        "session_id":"s","revision":1,"epoch":0,"context_message_id":"m"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered["status"], "accepted", "{recovered}");
+    assert_eq!(recovered["attempt_id"], "unchanged-attempt");
+    let lookup = daemon
+        .command(
+            1,
+            "get_reply",
+            json!({"client_ref":"t-1",
+        "utterance_id":"u-old"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lookup["status"], "available", "{lookup}");
+    let fresh = daemon
+        .command(
+            1,
+            "replay",
+            json!({"client_ref":"t-1",
+        "utterance_id":"u-old","replay_id":"r-fresh","mode":"restart",
+        "session_id":"s","revision":1,"epoch":0,"context_message_id":"m"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fresh["attempt_id"], "fresh-attempt", "{fresh}");
+}
+
+#[tokio::test]
+async fn settled_ids_need_live_owner_proof_after_replacement_and_retire_on_leave() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let scratch = Scratch::new("v1-binding-lifetimes");
+    let link = Link::new();
+    let mut frames = link.attached().await;
+    let answered = link.clone();
+    let registrations = Arc::new(AtomicUsize::new(0));
+    let publications = Arc::new(AtomicUsize::new(0));
+    let replays = Arc::new(AtomicUsize::new(0));
+    let proof_available = Arc::new(AtomicBool::new(true));
+    let (registered, published, replayed) =
+        (registrations.clone(), publications.clone(), replays.clone());
+    let proof = proof_available.clone();
+    tokio::spawn(async move {
+        while let Some(Message::Text(text)) = frames.recv().await {
+            let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+            let Some(id) = frame.get("id") else { continue };
+            let params = &frame["params"];
+            let result = match frame["method"].as_str() {
+                Some("binding.register") => {
+                    let number = registered.fetch_add(1, Ordering::Relaxed);
+                    json!({"binding_id":format!("binding-{number}"),"voice_contract":1,
+                        "voice_contract_instance":"same-instance",
+                        "initial_reply_context":{"session_id":"start","revision":0,"epoch":0}})
+                }
+                Some("speech.publish") => {
+                    published.fetch_add(1, Ordering::Relaxed);
+                    assert!(matches!(
+                        params["binding_id"].as_str(),
+                        Some("binding-0" | "binding-2")
+                    ));
+                    json!({"voice_contract":1,"status":"accepted","playback":"queued",
+                        "event_id":params["event_id"],"utterance_id":params["utterance_id"],
+                        "attempt_id":"say-attempt"})
+                }
+                Some("speech.replay") => {
+                    replayed.fetch_add(1, Ordering::Relaxed);
+                    assert!(matches!(
+                        params["binding_id"].as_str(),
+                        Some("binding-0" | "binding-2")
+                    ));
+                    json!({"voice_contract":1,"status":"accepted","playback":"queued",
+                        "replay_id":params["replay_id"],"utterance_id":params["utterance_id"],
+                        "attempt_id":"replay-attempt"})
+                }
+                Some("speech.get_reply") => {
+                    assert!(matches!(
+                        params["binding_id"].as_str(),
+                        Some("binding-0" | "binding-2")
+                    ));
+                    if params.get("recovery_binding_id").is_some() {
+                        assert!(matches!(
+                            params["recovery_binding_id"].as_str(),
+                            Some("binding-1" | "binding-3")
+                        ));
+                    }
+                    if proof.load(Ordering::Relaxed) {
+                        json!({"voice_contract":1,"status":"available","utterance_id":params["utterance_id"],
+                            "text":"Original"})
+                    } else {
+                        json!({"voice_contract":1,"status":"unavailable","utterance_id":"u-one"})
+                    }
+                }
+                _ => json!({}),
+            };
+            answered
+                .answer(json!({"jsonrpc":"2.0","id":id,"result":result}))
+                .await
+                .unwrap();
+        }
+    });
+    let (daemon, _) = daemon(&scratch, link);
+    daemon
+        .command(1, "register", registration("t-one"))
+        .await
+        .unwrap();
+    let say = json!({"voice_contract":1,"client_ref":"t-one","session_id":"start",
+        "revision":0,"epoch":0,"text":"Original","event_id":"e-one",
+        "utterance_id":"u-one"});
+    let original = daemon.command(1, "publish", say.clone()).await.unwrap();
+    let replay = json!({"client_ref":"t-one","utterance_id":"u-one",
+        "replay_id":"r-one","mode":"resume","session_id":"start",
+        "revision":0,"epoch":0,"context_message_id":"m-one"});
+    let replay_result = daemon.command(1, "replay", replay.clone()).await.unwrap();
+    daemon
+        .command(1, "register", registration("t-one"))
+        .await
+        .unwrap();
+    assert_eq!(
+        daemon.command(1, "publish", say.clone()).await.unwrap(),
+        original
+    );
+    assert_eq!(
+        daemon.command(1, "replay", replay.clone()).await.unwrap(),
+        replay_result
+    );
+    assert_eq!(publications.load(Ordering::Relaxed), 1);
+    assert_eq!(replays.load(Ordering::Relaxed), 1);
+
+    proof_available.store(false, Ordering::Relaxed);
+    let unproven = daemon.command(1, "publish", say.clone()).await.unwrap();
+    assert_eq!(unproven["status"], "admission_unknown", "{unproven}");
+    assert!(daemon
+        .command(1, "replay", replay.clone())
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("indeterminate"));
+    proof_available.store(true, Ordering::Relaxed);
+
+    daemon
+        .queue(json!({"voice_contract":1,"client_ref":"t-one",
+        "event_id":"pending-event","utterance_id":"pending-utterance",
+        "binding_id":"binding-1","text":"uncertain","attempted":true}))
+        .await
+        .unwrap();
+
+    daemon
+        .command(1, "unregister", json!({"client_ref":"t-one"}))
+        .await
+        .unwrap();
+    assert!(
+        daemon.outbox.lock().await.is_empty(),
+        "a deliberate leave discards old uncertain speech without recovering it under a rejoin"
+    );
+    daemon
+        .command(1, "register", registration("t-one"))
+        .await
+        .unwrap();
+    let denied = daemon.command(1, "publish", say).await.unwrap();
+    assert_eq!(denied["reason"], "context_stale", "{denied}");
+    let denied = daemon.command(1, "replay", replay).await.unwrap();
+    assert_eq!(denied["reason"], "context_stale", "{denied}");
+    assert_eq!(publications.load(Ordering::Relaxed), 1);
+    assert_eq!(replays.load(Ordering::Relaxed), 1);
+
+    // A room-initiated close is another deliberate lifetime boundary, even though the
+    // Core can authorize same-owner recovery for an ordinary replacement binding.
+    let second_say = json!({"voice_contract":1,"client_ref":"t-one",
+        "session_id":"start","revision":0,"epoch":0,"text":"Second original",
+        "event_id":"e-two","utterance_id":"u-two"});
+    let second_replay = json!({"client_ref":"t-one","utterance_id":"u-two",
+        "replay_id":"r-two","mode":"resume","session_id":"start",
+        "revision":0,"epoch":0,"context_message_id":"m-two"});
+    assert_eq!(
+        daemon
+            .command(1, "publish", second_say.clone())
+            .await
+            .unwrap()["status"],
+        "accepted"
+    );
+    assert_eq!(
+        daemon
+            .command(1, "replay", second_replay.clone())
+            .await
+            .unwrap()["status"],
+        "accepted"
+    );
+    assert_eq!(
+        daemon
+            .handle_incoming(
+                "binding.close",
+                &json!({"binding_id":"binding-2","reason":"room_closed"})
+            )
+            .await,
+        json!({})
+    );
+    daemon
+        .command(1, "register", registration("t-one"))
+        .await
+        .unwrap();
+    let denied = daemon.command(1, "publish", second_say).await.unwrap();
+    assert_eq!(denied["reason"], "context_stale", "{denied}");
+    let denied = daemon.command(1, "replay", second_replay).await.unwrap();
+    assert_eq!(denied["reason"], "context_stale", "{denied}");
+    assert_eq!(publications.load(Ordering::Relaxed), 2);
+    assert_eq!(replays.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn a_closed_registration_on_welcome_retires_old_ids_before_a_fresh_join() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let scratch = Scratch::new("v1-closed-reregistration");
+    let link = Link::new();
+    let mut frames = link.attached().await;
+    let answered = link.clone();
+    let closed = Arc::new(AtomicBool::new(false));
+    let publications = Arc::new(AtomicUsize::new(0));
+    let replays = Arc::new(AtomicUsize::new(0));
+    let (closed_core, published, replayed) =
+        (closed.clone(), publications.clone(), replays.clone());
+    tokio::spawn(async move {
+        while let Some(Message::Text(text)) = frames.recv().await {
+            let frame: Value = serde_json::from_str(text.as_str()).unwrap();
+            let Some(id) = frame.get("id") else { continue };
+            let p = &frame["params"];
+            let result = match frame["method"].as_str() {
+                Some("binding.register")
+                    if p["binding_id"] == "old-binding" && closed_core.load(Ordering::Relaxed) =>
+                {
+                    json!({"status":"closed","reason":"binding_closed",
+                        "binding_id":"old-binding","voice_contract":1})
+                }
+                Some("binding.register") => {
+                    json!({"binding_id":if p["binding_id"] == "old-binding" {
+                        "old-binding" } else if closed_core.load(Ordering::Relaxed) {
+                        "new-binding" } else { "old-binding" },
+                        "voice_contract":1,"voice_contract_instance":"same-instance",
+                        "initial_reply_context":{"session_id":"start","revision":0,"epoch":0}})
+                }
+                Some("speech.publish") => {
+                    published.fetch_add(1, Ordering::Relaxed);
+                    json!({"voice_contract":1,"status":"accepted","playback":"queued",
+                        "event_id":p["event_id"],"utterance_id":p["utterance_id"],
+                        "attempt_id":"first-attempt"})
+                }
+                Some("speech.replay") => {
+                    replayed.fetch_add(1, Ordering::Relaxed);
+                    json!({"voice_contract":1,"status":"accepted","playback":"queued",
+                        "replay_id":p["replay_id"],"utterance_id":p["utterance_id"],
+                        "attempt_id":"replay-attempt"})
+                }
+                Some("speech.get_reply") => json!({"voice_contract":1,"status":"available",
+                    "utterance_id":p["utterance_id"],"text":"Original"}),
+                _ => json!({}),
+            };
+            answered
+                .answer(json!({"jsonrpc":"2.0","id":id,"result":result}))
+                .await
+                .unwrap();
+        }
+    });
+    let (daemon, _) = daemon(&scratch, link);
+    daemon
+        .command(1, "register", registration("t-1"))
+        .await
+        .unwrap();
+    let say = json!({"voice_contract":1,"client_ref":"t-1","session_id":"start",
+        "revision":0,"epoch":0,"text":"Original","event_id":"old-event",
+        "utterance_id":"old-utterance"});
+    let replay = json!({"client_ref":"t-1","utterance_id":"old-utterance",
+        "replay_id":"old-replay","mode":"resume","session_id":"start",
+        "revision":0,"epoch":0,"context_message_id":"m-1"});
+    assert_eq!(
+        daemon.command(1, "publish", say.clone()).await.unwrap()["status"],
+        "accepted"
+    );
+    assert_eq!(
+        daemon.command(1, "replay", replay.clone()).await.unwrap()["status"],
+        "accepted"
+    );
+    daemon
+        .queue(json!({"voice_contract":1,"client_ref":"t-1",
+        "event_id":"uncertain-event","utterance_id":"uncertain-utterance",
+        "binding_id":"old-binding","text":"uncertain","attempted":true}))
+        .await
+        .unwrap();
+    closed.store(true, Ordering::Relaxed);
+    daemon.on_welcome().await;
+    assert!(daemon.bindings.lock().await.is_empty());
+    assert!(daemon.outbox.lock().await.is_empty());
+    assert_eq!(daemon.closed_by_room.lock().await["t-1"], "binding_closed");
+    let new_join = daemon
+        .command(1, "register", registration("t-1"))
+        .await
+        .unwrap();
+    assert_eq!(new_join["binding_id"], "new-binding");
+    assert_eq!(
+        daemon.command(1, "publish", say).await.unwrap()["reason"],
+        "context_stale"
+    );
+    assert_eq!(
+        daemon.command(1, "replay", replay).await.unwrap()["reason"],
+        "context_stale"
+    );
+    assert_eq!(publications.load(Ordering::Relaxed), 1);
+    assert_eq!(replays.load(Ordering::Relaxed), 1);
+}
+
 #[test]
 fn t16_complete_pull_pages_fit_ipc_and_keep_the_next_position() {
     let source: Vec<Value> = (1..=32)
@@ -208,22 +832,27 @@ async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_
         frames.lock().unwrap().as_slice(),
         std::slice::from_ref(&frame)
     );
+    assert_eq!(
+        daemon.handle_incoming("input.deliver", &frame).await["status"],
+        "accepted"
+    );
+    let mut conflict = frame.clone();
+    conflict["text"] = json!("different words under the same ID");
+    assert_eq!(
+        daemon.handle_incoming("input.deliver", &conflict).await["detail"],
+        "identity_conflict"
+    );
+    assert_eq!(frames.lock().unwrap().len(), 1);
     let envelope = crate::adapters::envelope(&frame).unwrap();
     let header: Value = serde_json::from_str(envelope.lines().next().unwrap()).unwrap();
     assert_eq!(
         header,
-        json!({"channel":"voice","session_id":"s","revision":3,"epoch":1,"message_id":"m-1"})
+        json!({"channel":"voice","origin":"spoken_room","session_id":"s","revision":3,"epoch":1,
+            "message_id":"m-1","hearing_changes":[],
+            "playback_at_turn_start":{"knowledge":"unknown","last_played":null,"recent":[],"truncated":false}})
     );
-    assert!(envelope.contains("see the end of this message.\n\nhello"));
-    assert!(envelope.contains("The person did not hear the end of your last reply."));
-    assert!(envelope.contains("How much was heard is unknown."));
-    assert!(
-        envelope.find("The person did not hear the end").unwrap()
-            < envelope
-                .find("If a reply is appropriate, use voice_say")
-                .unwrap()
-    );
-    assert!(!envelope.contains("Complete unheard evidence"));
+    assert!(envelope.ends_with("\n\nhello"));
+    assert!(!envelope.contains("[Sidevoice]"));
 
     // speech.publish answered with a status and fields this connector does not know: saved is saved.
     let said = daemon

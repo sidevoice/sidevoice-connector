@@ -37,7 +37,9 @@ Every place comes from the environment, so a disposable profile is just a set of
 - the data directory `D`: `$SIDEVOICE_DATA_DIR`, else `~/.sidevoice`. Private (0700), created by the daemon when
   missing and refused, never repaired, when someone else could enter it or any directory above it could have its
   entries replaced. It holds `connector.sock`, `connector.lock`, `connector.log`, `agents.json`, `agents.lock`,
-  `node-stopped.json` (a person's stop), `credentials.json` (the room pairing), the speech outbox, and `core/`
+  `node-stopped.json` (a person's stop), `credentials.json` (the room pairing), the speech outbox,
+  `speech-identities.json` (bounded v1 ID and result hashes; no original reply text), its
+  `speech-identities.guard` initialization marker, and `core/`
   (the core's own: `core.json`, `local.sock`);
 - the release root `R`: `$XDG_DATA_HOME/sidevoice`, else `~/.local/share/sidevoice`;
 - the core's port: `$SIDEVOICE_CORE_PORT`, else 10829;
@@ -232,9 +234,11 @@ With `--json` both print one JSON object and nothing else.
 
 ## Conversation flow
 
-`voice_connect` returns the core's conversation `epoch` and `initial_reply_context`. After an incoming message, pass its `session_id`, `revision`, and `epoch` together to `voice_say`; for speech before the first message, pass `conversation` to use the returned initial context. Only a confirmed spoken turn advances the epoch. Typed context does not interrupt playback. A refused `voice_say` while a person is speaking is terminal: wait for that person's message; nothing is queued for later audio. A saved publication records admission, not proof of hearing.
+`voice_connect` returns the core's `initial_reply_context` and whether it supports voice contract v1. After a room message, pass its `session_id`, `revision`, `epoch`, and `message_id` as `context_message_id` to `voice_say`, with stable nonempty `event_id` and `utterance_id`. Before any room message, pass `conversation` and omit the whole context to use `initial_reply_context`. A partial context is invalid. Native chat still gets a full written answer and appropriate voice. Typed room context fences older pending audio without interrupting sound already playing or advancing the spoken epoch. `accepted` means only that Core stored the original and admitted `queued`, `pending`, or `text_only` disposition; it never claims sound started or was heard. `rejected` was not admitted. A lost transport response is indeterminate, so retry the same IDs and arguments.
 
-Each binding chooses `input_mode: "push"` (default) or `"pull"` at `voice_connect`. In pull mode, `get_messages` reads the same ordered core queue as injection. Its `get` operation returns full messages and their agent envelope, with stable `message_id` and cursor. An unacknowledged claim is returned again; pass `ack_ids` only after processing the messages. `check` reports pending counts without claiming. Calling `voice_connect` again with another mode switches the binding and releases claims through core registration. Pull delivery may be later because the harness must call the tool. Sidevoice only notes have `channel: "note"` and empty user text; `reply_not_heard`, empty turn, return, and `reply_heard` correction notices remain in the ordinary queue in both modes. Core evidence uses only confirmed `partial` or `not_heard` fates, with full reply text and a Unicode-scalar extent. The agent envelope tells the agent to revisit what still matters, identifies each reply by its opening words, and shows only the tail of the confirmed heard prefix; the full reply remains in its `voice_say` context. A note with no person words asks the agent to tell them now what still matters. Physical playback causes stay in app diagnostics.
+Each binding chooses `input_mode: "push"` (default) or `"pull"` at `voice_connect`. Both expose one logical event: a canonical JSON header, a blank line, and the person's exact words for `channel:"voice"`; a `channel:"note"` event is JSON only. The same message ID and content is one input on redelivery. Spoken words include the app's acoustic-start snapshot and compact hearing changes; typed words omit acoustic-start fields. No full original reply or routine receipt-only model turn is appended. General behavior rules live in the MCP server instructions. In pull mode, `get_messages` reads the same ordered Core queue and exposes the same envelope and stable IDs; `ack_ids` confirms processing, while `after` is only a journal position. Pull may arrive later because the harness must call it.
+
+`voice_get_reply` reads an available immutable original and conservative current-audience hearing without changing playback. `voice_replay` explicitly authorizes an available original from fresh context, using a stable `replay_id`; `resume` repeats from a conservative sentence boundary, while `restart` starts at zero. A focus return with relevant unseen content yields a note, never automatic audio. Missing or expired originals return `unavailable`; no eligible listener is a distinct replay rejection. Existing no-listener `text_only` behavior remains until connector #156.
 
 Candidate integration tests can set `SIDEVOICE_TEST_CORE_DIR` to an unpacked source build of the matching core PR head. `core.pin` remains a numbered published release gate for distribution and CI packaging.
 
@@ -256,9 +260,7 @@ Codex never passes the thread to an MCP server through its environment. Older Co
 those need `CODEX_THREAD_ID` in the registration's environment. A queued message can be accepted before Codex reads
 it; the connector sends `input.read` only after the same message appears in that thread's rollout.
 
-The local speech outbox is synced to disk. Core's `text_saved: true` acknowledges admission into its current-process
-journal, which the core keeps in memory; the connector removes an outbox item on that acknowledgement, so a core
-crash immediately afterwards can lose that speech text ([Core issue #43](https://github.com/sidevoice/sidevoice-core/issues/43)).
+The local speech outbox is synced to disk while an admission is uncertain. A v1 result removes its original text from that outbox; Core's replayable original remains best effort and does not survive a Core restart. The private `speech-identities.json` retains only IDs, the original binding, a request hash, the Core incarnation, compact admission results, and explicit-leave markers. It blocks old IDs from becoming fresh audio after Core or Connector restarts. The separate `speech-identities.guard` records that the ledger was initialized: if the ledger alone disappears, Connector refuses to start. Both files are created and synced before v1 speech can be sent. The file is capped at 8,192 records or 2 MiB; when full, new v1 calls are refused rather than evicting safety records. Remove both only as part of removing the Sidevoice data for that installation. Simultaneous removal of the ledger and guard cannot be distinguished from a pristine installation. Legacy unmarked speech still follows its older outbox behavior ([Core issue #43](https://github.com/sidevoice/sidevoice-core/issues/43)).
 A speech row copied from the JavaScript connector has no conversation reference; if the core later remints its
 binding ID, it is retained and reported rather than assigned to another conversation
 ([Connector issue #41](https://github.com/sidevoice/sidevoice-connector/issues/41)).
@@ -285,7 +287,7 @@ When it starts, the bench:
 
 The page lists the conversations that joined (harness, input mode, engine, live or closed). Pick one and type: the
 text goes into the call as voice input (`/api/presentation/select`, then `/api/presentation/text`, which is what the
-app sends for what was said), so the agent receives it with its voice header and `[Sidevoice]` line. Each message
+app sends for what was said), so the agent receives it with the canonical voice header and exact words. Each message
 shows its receipt as the core records it (`pending`, `delivered`, `unconfirmed`, `read`, `not_sent`), the agent's
 `voice_say` replies appear under it, and the call's events (receipts, working state, speech) are listed beside.
 

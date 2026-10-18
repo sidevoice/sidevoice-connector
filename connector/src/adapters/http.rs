@@ -42,19 +42,17 @@ pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         bail!("HTTP receiver URL must use http or https");
     }
-    let payload = json!({
-        "thread_id":delivery.get("thread").and_then(Value::as_str).unwrap_or(""),
-        "text":event.get("text").and_then(Value::as_str).unwrap_or(""),
-        "message_id":event.get("message_id").and_then(Value::as_str).unwrap_or(""),
-        "session_id":event.get("session_id").and_then(Value::as_str).unwrap_or(""),
-        "revision":event.get("revision").and_then(Value::as_i64).unwrap_or(0),
-        "epoch":event.get("epoch").and_then(Value::as_u64).unwrap_or(0),
-        "channel":event.get("channel").and_then(Value::as_str).unwrap_or("voice"),
-        "notice":event.get("notice"),
-        "unheard":event.get("unheard"),
-        "envelope":super::envelope(event)?,
-    })
-    .to_string();
+    let mut payload = event.clone();
+    let fields = payload
+        .as_object_mut()
+        .context("room event is not an object")?;
+    fields.remove("binding_id");
+    fields.insert(
+        "thread_id".into(),
+        json!(delivery.get("thread").and_then(Value::as_str).unwrap_or("")),
+    );
+    fields.insert("envelope".into(), json!(super::envelope(event)?));
+    let payload = payload.to_string();
     let mut child = tokio::process::Command::new("curl")
         .args([
             "--silent",

@@ -300,8 +300,8 @@ mod tests {
     #[test]
     fn a_note_is_read_back_by_its_header_like_a_voice_message() {
         let note = crate::adapters::envelope(
-            &json!({"channel":"note","session_id":"s","revision":2,"epoch":1,
-            "message_id":"note:1","text":"","unheard":{"count":1,"replies":[]}}),
+            &json!({"channel":"note","event":"recovery_needed","session_id":"s","revision":2,"epoch":1,
+            "message_id":"note:1","hearing_changes":[]}),
         )
         .unwrap();
         let header = voice_header(&note).unwrap();
