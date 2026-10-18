@@ -1,9 +1,11 @@
 //! Cursor as a harness: the CLI's chats (tmux, transcript) and the editor's chats, reached through Cursor's Desktop
 //! Bridge once it knows which chat a conversation is, their transcript found the same way.
 
+use super::engine::editor_engine_in;
 use super::{
-    bridge_running, composer_holding, composer_holding_for_delivery, deliver_editor,
-    editor_transcript_chat, engine, log_bridge, log_correlation, transcript_path,
+    bridge_instances, bridge_running, composer_holding, composer_holding_for_delivery,
+    deliver_editor, editor_transcript_chat, engine, log_bridge, log_correlation, transcript_path,
+    BridgeInstance,
 };
 use crate::adapters::conversation::{Conversation, Room};
 use crate::adapters::harness::{no_route, Harness, Route};
@@ -314,8 +316,13 @@ fn watch_editor(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
             if let Some(chat) = bridge(binding) {
                 if followed(binding).as_deref() != Some(chat.as_str()) {
                     set_followed(binding, chat.clone());
-                    transcript::follow(binding.clone(), room.clone(), Reader::new(chat, true));
+                    transcript::follow(
+                        binding.clone(),
+                        room.clone(),
+                        Reader::new(chat.clone(), true),
+                    );
                 }
+                follow_editor_engine(binding.clone(), room.clone(), chat, bridge_instances());
                 return;
             }
 
@@ -388,6 +395,35 @@ fn watch_editor(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
             wait_for_bridge_or_scan(binding, scan_ms).await;
         }
     });
+}
+
+/// Observe authenticated editor metadata independently of transcript creation and replay.
+fn follow_editor_engine(
+    conversation: Arc<Conversation>,
+    room: Arc<dyn Room>,
+    chat: String,
+    instances: Vec<BridgeInstance>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if conversation.stopped.load(Ordering::Relaxed)
+                || bridge(&conversation).as_deref() != Some(chat.as_str())
+                || followed(&conversation).as_deref() != Some(chat.as_str())
+            {
+                return;
+            }
+            if let Some(engine) = editor_engine_in(&chat, &instances).await {
+                // The mapping may change while SQLite answers. Never attribute its model to a
+                // chat that is no longer authenticated for this conversation.
+                if bridge(&conversation).as_deref() == Some(chat.as_str())
+                    && followed(&conversation).as_deref() == Some(chat.as_str())
+                {
+                    room.engine(&conversation, engine).await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+    })
 }
 
 /// A Cursor chat's transcript: working from its turns, the engine once the chat is authenticated, and the messages
@@ -547,9 +583,51 @@ pub(super) mod client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secure_fs::tests::Scratch;
     use std::collections::{HashMap, VecDeque};
+    use std::fs;
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use tokio::sync::Mutex as AsyncMutex;
+
+    struct RecordingRoom {
+        profile: Profile,
+        engines: AsyncMutex<Vec<Value>>,
+    }
+
+    impl Room for RecordingRoom {
+        fn profile(&self) -> &Profile {
+            &self.profile
+        }
+        fn engine<'a>(
+            &'a self,
+            _conversation: &'a Conversation,
+            engine: Value,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.engines.lock().await.push(engine);
+            })
+        }
+        fn working<'a>(
+            &'a self,
+            _conversation: &'a Conversation,
+            _event: Value,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+        fn read<'a>(
+            &'a self,
+            _conversation: &'a Conversation,
+            _message_id: &'a str,
+            _session_id: Value,
+            _revision: Value,
+            _turn_id: Value,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+        fn conversations(&self) -> BoxFuture<'_, Vec<Arc<Conversation>>> {
+            Box::pin(async { Vec::new() })
+        }
+    }
 
     /// An editor chat as Cursor's client declares itself at `initialize`: MCP Apps support.
     fn editor_caps() -> Value {
@@ -697,6 +775,82 @@ mod tests {
         let listed = Cursor.status(&conversation).await.unwrap();
         assert_eq!(listed["delivery_state"]["state"], "registered");
     }
+
+    #[tokio::test]
+    async fn authenticated_editor_reports_engine_without_a_transcript_and_retries_missing_metadata()
+    {
+        let scratch = Scratch::new("cursor-engine-before-transcript");
+        let user_data = scratch.0.join("Cursor");
+        let storage = user_data.join("User/globalStorage");
+        fs::create_dir_all(&storage).unwrap();
+        let database = storage.join("state.vscdb");
+        super::super::state_db::fixture(
+            &database,
+            "CREATE TABLE cursorDiskKV(key TEXT, value TEXT);",
+        );
+        let identity =
+            super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
+        let conversation = Arc::new(conversation(&identity));
+        let chat = "chat-model".to_owned();
+        set_followed(&conversation, chat.clone());
+        let profile = Profile::from_vars(
+            |key| (key == "HOME").then(|| scratch.0.as_os_str().to_os_string()),
+            &[],
+        )
+        .unwrap();
+        let room = Arc::new(RecordingRoom {
+            profile,
+            engines: AsyncMutex::new(Vec::new()),
+        });
+        let instance = BridgeInstance {
+            socket: PathBuf::new(),
+            token: String::new(),
+            user_data,
+            created_at: 0,
+        };
+        // A known transcript path is deliberately absent throughout this test.
+        let unauthenticated = follow_editor_engine(
+            conversation.clone(),
+            room.clone(),
+            chat.clone(),
+            vec![instance.clone()],
+        );
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            room.engines.lock().await.is_empty(),
+            "unbound chat reported an engine"
+        );
+        unauthenticated.await.unwrap();
+        set_bridge(&conversation, "chat-model".into());
+        let watcher =
+            follow_editor_engine(conversation.clone(), room.clone(), chat, vec![instance]);
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert!(
+            room.engines.lock().await.is_empty(),
+            "missing metadata was guessed"
+        );
+        super::super::state_db::fixture(&database, "INSERT INTO cursorDiskKV VALUES ('composerData:chat-model', '{\"modelConfig\":{\"modelName\":\"gpt-5\",\"effort\":\"high\"}}');");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !room.engines.lock().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("authenticated metadata was not reported without a transcript");
+        assert_eq!(
+            room.engines.lock().await.as_slice(),
+            &[json!({"model":"gpt-5","effort":"high","thinking":null})]
+        );
+        conversation.stopped.store(true, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(1), watcher)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     /// Records Working from the real Cursor and Codex followers with populated histories.
     /// The initial catch-up delay remains after Cursor bridge discovery is woken.
     struct HistoryRoom {
