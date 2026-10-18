@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.2](https://github.com/sidevoice/sidevoice-connector/compare/v0.12.1...v0.12.2) (2026-10-18)
+
+
+### Bug Fixes
+
+* **cursor:** treat a bridge status error as a failed send and log its reason ([#184](https://github.com/sidevoice/sidevoice-connector/issues/184)) ([29897d2](https://github.com/sidevoice/sidevoice-connector/commit/29897d272a9373f5b5a092ad11f678eff448baea))
+
 ## [0.12.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.12.0...v0.12.1) (2026-10-18)
 
 
