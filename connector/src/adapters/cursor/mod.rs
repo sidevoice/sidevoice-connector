@@ -770,6 +770,22 @@ fn confirmed_send_outcome(response: &BridgeResponse) -> Option<&str> {
         .filter(|outcome| matches!(*outcome, "submitted" | "queued"))
 }
 
+/// The bridge's own error text, short and on one line; withheld if it echoes the message that was sent.
+fn bridge_error_reason(body: &Value, sent: &str) -> String {
+    let reason = ["message", "error", "reason"]
+        .iter()
+        .find_map(|key| body.get(*key).and_then(Value::as_str))
+        .unwrap_or("")
+        .trim();
+    if reason.is_empty() {
+        return "no reason given".into();
+    }
+    if reason.len() > 200 || sent.contains(reason) || reason.contains(sent.trim()) {
+        return "[withheld]".into();
+    }
+    reason.replace(['\n', '\r'], " ")
+}
+
 /// Keep the shape of an unexpected bridge reply, never its arbitrary strings (which may echo input).
 fn diagnostic_reply_body(body: &Value) -> String {
     fn redact(value: &Value, field: &str) -> Value {
@@ -1179,6 +1195,24 @@ async fn deliver_editor_to_instances(
                     );
                     continue;
                 }
+                // The bridge answered that it did not send it (`{"status":"error","message":…}`, even with
+                // HTTP 200): nothing reached the chat, so it is a failure, not something to retry.
+                if outcome == "error" {
+                    let reason = bridge_error_reason(&response.body, &text);
+                    crate::logfile::log(&format!(
+                        "{} reason={reason}",
+                        bridge_diagnostic(
+                            "send",
+                            "bridge_error",
+                            Some(&composer),
+                            Some(index),
+                            Some(response.status)
+                        )
+                    ));
+                    return Some(
+                        json!({"status":"failed","detail":format!("Cursor Desktop Bridge could not send the message: {reason}")}),
+                    );
+                }
                 // Refused outright (the request was not taken): nothing reached the chat.
                 if (400..500).contains(&response.status) {
                     log_bridge(
@@ -1293,6 +1327,29 @@ mod bridge_tests {
             let response = BridgeResponse { status, body };
             assert_eq!(confirmed_send_outcome(&response), expected);
         }
+    }
+
+    #[test]
+    fn bridge_error_reason_is_logged_unless_it_echoes_the_message() {
+        let sent = "please summarise the diff";
+        let reason = |body: Value| bridge_error_reason(&body, sent);
+        assert_eq!(
+            reason(json!({"status":"error","message":"No composer for thread"})),
+            "No composer for thread"
+        );
+        assert_eq!(
+            reason(json!({"status":"error","message":sent})),
+            "[withheld]"
+        );
+        assert_eq!(
+            reason(json!({"status":"error","message":format!("failed: {sent}")})),
+            "[withheld]"
+        );
+        assert_eq!(reason(json!({"status":"error"})), "no reason given");
+        assert_eq!(
+            reason(json!({"status":"error","message":"x".repeat(300)})),
+            "[withheld]"
+        );
     }
 
     #[test]
