@@ -759,6 +759,76 @@ struct BridgeResponse {
     body: Value,
 }
 
+fn confirmed_send_outcome(response: &BridgeResponse) -> Option<&str> {
+    let outcome = response
+        .body
+        .get("outcome")
+        .and_then(Value::as_str)
+        .or_else(|| response.body.get("status").and_then(Value::as_str));
+    (response.status == 200)
+        .then_some(outcome?)
+        .filter(|outcome| matches!(*outcome, "submitted" | "queued"))
+}
+
+/// Keep the shape of an unexpected bridge reply, never its arbitrary strings (which may echo input).
+fn diagnostic_reply_body(body: &Value) -> String {
+    fn redact(value: &Value, field: &str) -> Value {
+        match value {
+            Value::Object(fields) => Value::Object(
+                fields
+                    .iter()
+                    .map(|(key, value)| {
+                        let safe_key = match key.as_str() {
+                            "outcome" | "status" | "success" | "ok" | "error" | "reason"
+                            | "message" | "threadId" | "queued" | "submitted" | "result"
+                            | "code" | "detail" | "data" | "text" | "content" => key.as_str(),
+                            _ => "<other>",
+                        };
+                        (safe_key.to_owned(), redact(value, safe_key))
+                    })
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .take(8)
+                    .map(|item| redact(item, field))
+                    .collect(),
+            ),
+            Value::String(text)
+                if matches!(field, "outcome" | "status")
+                    && matches!(
+                        text.as_str(),
+                        "submitted"
+                            | "queued"
+                            | "not-found"
+                            | "unknown-thread"
+                            | "success"
+                            | "ok"
+                            | "error"
+                            | "failed"
+                            | "accepted"
+                            | "done"
+                    ) =>
+            {
+                Value::String(text.clone())
+            }
+            Value::String(_) => Value::String("[redacted]".into()),
+            _ => value.clone(),
+        }
+    }
+    let rendered = redact(body, "").to_string();
+    if rendered.len() <= 512 {
+        rendered
+    } else {
+        let mut end = 512;
+        while !rendered.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &rendered[..end])
+    }
+}
+
 async fn bridge_request(
     instance: &BridgeInstance,
     body: &Value,
@@ -1069,10 +1139,10 @@ async fn deliver_editor_to_instances(
                 let outcome = response
                     .body
                     .get("outcome")
-                    .or_else(|| response.body.get("status"))
                     .and_then(Value::as_str)
+                    .or_else(|| response.body.get("status").and_then(Value::as_str))
                     .unwrap_or("");
-                if response.status == 200 && matches!(outcome, "submitted" | "queued") {
+                if let Some(outcome) = confirmed_send_outcome(&response) {
                     log_correlation(
                         "accepted",
                         if outcome == "submitted" {
@@ -1122,13 +1192,17 @@ async fn deliver_editor_to_instances(
                         json!({"status":"failed","detail":format!("Cursor Desktop Bridge refused the message ({}): {}", response.status, response.body.get("reason").or_else(|| response.body.get("message")).or_else(|| response.body.get("error")).and_then(Value::as_str).unwrap_or(outcome))}),
                     );
                 }
-                log_bridge(
-                    "send",
-                    "unconfirmed_reply",
-                    Some(&composer),
-                    Some(index),
-                    Some(response.status),
-                );
+                crate::logfile::log(&format!(
+                    "{} reply_body={}",
+                    bridge_diagnostic(
+                        "send",
+                        "unconfirmed_reply",
+                        Some(&composer),
+                        Some(index),
+                        Some(response.status)
+                    ),
+                    diagnostic_reply_body(&response.body)
+                ));
                 return Some(
                     json!({"status":"unknown","detail":format!("Cursor Desktop Bridge did not confirm delivery: {}", response.body.get("reason").or_else(|| response.body.get("message")).or_else(|| response.body.get("error")).and_then(Value::as_str).unwrap_or(outcome))}),
                 );
@@ -1199,6 +1273,43 @@ mod bridge_tests {
     use super::*;
     use crate::secure_fs::tests::Scratch;
     use tokio::net::UnixListener;
+
+    #[test]
+    fn send_reply_requires_explicit_confirmation() {
+        for (status, body, expected) in [
+            (200, json!({"outcome":"submitted"}), Some("submitted")),
+            (200, json!({"status":"queued","extra":true}), Some("queued")),
+            (
+                200,
+                json!({"outcome":null,"status":"submitted"}),
+                Some("submitted"),
+            ),
+            (200, json!({"success":true}), None),
+            (200, json!({"status":"success"}), None),
+            (200, json!({"outcome":"unknown-thread"}), None),
+            (200, Value::Null, None),
+            (202, json!({"outcome":"queued"}), None),
+        ] {
+            let response = BridgeResponse { status, body };
+            assert_eq!(confirmed_send_outcome(&response), expected);
+        }
+    }
+
+    #[test]
+    fn unconfirmed_reply_diagnostic_keeps_shape_without_private_text() {
+        let secret = "private voice message";
+        let body = json!({"success":true,"status":"success","message":secret,
+            "data":{"text":secret,"error":"not in focused chat","count":3},
+            "unknown_field":secret});
+        let rendered = diagnostic_reply_body(&body);
+        assert!(rendered.contains("\"success\":true"));
+        assert!(rendered.contains("\"status\":\"success\""));
+        assert!(!rendered.contains("\"count\":3"));
+        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains("not in focused chat"));
+        assert!(rendered.len() <= 515);
+        assert!(diagnostic_reply_body(&json!({"message":"x".repeat(1000)})).len() <= 515);
+    }
 
     #[tokio::test]
     async fn bridge_response_finishes_at_content_length_without_waiting_for_socket_close() {
