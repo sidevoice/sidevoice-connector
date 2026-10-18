@@ -184,9 +184,13 @@ fn what_is_typed_on_the_bench_reaches_a_conversation_and_its_reply_shows() {
     let said = mcp.tool(
         "voice_say",
         json!({"session_id": delivered["session_id"], "revision": delivered["revision"], "epoch": delivered["epoch"],
+               "context_message_id": delivered["message_id"], "conversation": thread,
+               "event_id": "bench-reply-event", "utterance_id": "bench-reply-utterance",
                "text": "A reply for the bench"}),
     );
-    assert_eq!(said["text_saved"], true, "{said}");
+    assert_eq!(said["status"], "accepted", "{said}");
+    assert_eq!(said["event_id"], "bench-reply-event", "{said}");
+    assert_eq!(said["utterance_id"], "bench-reply-utterance", "{said}");
     let history = until("the reply on the bench", 30, || {
         let (_, history) = bench_http(
             &address,
