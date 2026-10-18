@@ -264,7 +264,8 @@ fn pair_device_gives_the_cores_code_with_its_qr() {
         "a fresh code: {text}"
     );
     assert!(text.contains('█') && text.contains('▀'), "{text}");
-    assert!(text.contains("only works on this computer"), "{text}");
+    assert!(text.contains("no address for another device"), "{text}");
+    assert!(text.contains("IP address and port"), "{text}");
 
     let mut mcp = Mcp::start(profile.connector(&["mcp"]));
     mcp.initialize("connector-pair-device");

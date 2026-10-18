@@ -23,7 +23,7 @@ const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the person
 - For spoken words, playback_at_turn_start describes evidence captured at acoustic onset. known with last_played null means none had played; unknown is missing evidence, not silence. not_played_at_turn_start identifies later publications the app certifies were not played at onset. All playback and hearing fields describe what the person physically heard of your earlier voice_say replies, never how much of the person's incoming words you received; the words after the header are the delivered input. Hearing is physical evidence, not proof of comprehension. Preserve holes and unknown values. Interpret the person's actual words in this causal context: a bare assent after clearly hearing question A, before later question B played, can authorize A without authorizing B or requiring reflexive clarification. Before acting on a bare assent, compare the confirmed heard prefix with your exact prior reply and its necessary conditions. If a necessary condition lies beyond that prefix, the assent does not establish it; ask a narrow question before acting. Multiple heard targets may also need a narrow question when the words do not select one. Explicit words can select a visually read unplayed target. An utterance ID by itself is not semantic approval.
 - hearing_changes and playback_outcomes are correlated physical facts. If the person missed relevant content, use voice_get_reply when its exact original is needed, and tell them naturally what still matters with the latest context; omit obsolete content. An unavailable original is not evidence it was heard and must not be invented. If an empty interruption can resume, Sidevoice owns automatic recovery. A recovery_needed or user_returned note hands the relevance decision to you; new normal words can also justify explicit replay, including an additive request or a request to repeat. A note alone is not new user assent. Replay resume may repeat a sentence for coherence; restart deliberately repeats the full original. Use the latest received context_message_id and do not authorize replay from an older context.
 - For substantive work while connected, use voice_say for a short acknowledgement, meaningful checkpoints when useful, and the result, each with a distinct stable original ID. Also speak a short result after a brief action taken from a spoken-room request. Give full written updates in native chat as appropriate. No filler or tool narration. Take in new input at tool results before starting the next step.
-- Pairing a machine or device is the person's act. Ask for their room address and one-time code only when needed; never fetch a code yourself. If inbound.ok is false, explain its reason and remedy without changing settings unasked."#;
+- A room code pairs this machine with a separate room. Only the person can get that code from the room; ask them for it when needed, and never fetch a room code yourself. A device code pairs the person's app or browser with this machine: when the person asks for that code or asks to pair their device, call voice_pair_device and show its result. Do not ask the person to generate a device code. Neither action is automatic without the person's request. If inbound.ok is false, explain its reason and remedy without changing settings unasked."#;
 
 /// Overall budget for an IPC round trip, before the daemon's reply (or lack of one) gives up on
 /// its own. `pair_device` gets longer: the daemon can spend up to 15 s waiting for the core link
@@ -494,7 +494,7 @@ impl Facade {
                     "epoch":result.get("epoch"),"initial_reply_context":result.get("initial_reply_context"),
                     "voice_contract":result.get("voice_contract") == Some(&json!(true)),
                     "capabilities":capabilities,"inbound":identity.inbound,
-                    "local_only":"This machine is not paired with any room, so this conversation is reachable only from devices paired with this machine itself (the Sidevoice app on this computer, at this machine's own address). Tell the user in one line. Pairing the app is voice_pair_device, only if they ask; reaching it from elsewhere needs a room's address and code (voice_pair).",
+                    "local_only":"This machine is not paired with a separate room. This conversation is on this machine's Core and can be seen by any device paired directly with this machine that can reach its address, including another computer on the same LAN. If the person asks for a device pairing code, call voice_pair_device and show it; the person enters it in their app. A separate room pairing is needed only for a room route, not for direct LAN access.",
                     "version":self.profile.connector_version(),"connector_version":connector.get("version")
                 });
                 if !pushed && input_mode != "pull" {
@@ -1079,7 +1079,7 @@ fn tools() -> Vec<Tool> {
         ("voice_replay", "Explicitly authorize a new attempt for an available original in the current focused conversation. Supply stable replay_id and the latest received full session_id, revision, epoch and context_message_id, including for a recovery note. resume starts at a conservative sentence boundary for target listeners; restart deliberately repeats from the beginning. A timeout is indeterminate: retry the identical call. Accepted pending or queued means admission only; failed unavailable, rejected, no_listener and already_heard have distinct meanings.", json!({"utterance_id":{"type":"string"},"replay_id":{"type":"string","description":"Stable nonempty attempt request ID; reuse with identical arguments on retry"},"mode":{"type":"string","description":"resume (default) or restart"},"session_id":{"type":"string"},"revision":{"type":"integer","minimum":0},"epoch":{"type":"integer","minimum":0},"context_message_id":{"type":"string"},"conversation":{"type":"string","description":"Conversation id when several chats are joined"}}), vec!["utterance_id","replay_id","session_id","revision","epoch","context_message_id"]),
         ("get_messages", "Read this conversation's ordered ordinary input queue in pull mode. Messages include stable IDs, full notice evidence, an envelope, and a journal position. Pass ack_ids only after consuming them. Without an acknowledgement, a claimed message is returned again; after is a journal position, not an acknowledgement. Pull may learn of speech later than injection.", json!({"conversation":{"type":"string","description":"Conversation id when several chats are joined"},"operation":{"type":"string","description":"get (default) or check"},"after":{"type":"integer","minimum":0},"ack_ids":{"type":"array","items":{"type":"string"}}}), vec![]),
         ("voice_disconnect", "Leave the voice room. The conversation and its work continue in writing.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
-        ("voice_pair_device", "Show a one-time code to pair a device (the desktop app or a browser) with this machine: the code, a QR of it and how long it is valid. Only when the user asks to pair a device, never on your own initiative; show the user the result as it is.", json!({}), vec![]),
+        ("voice_pair_device", "Generate a one-time code to pair the person's device (the desktop app or a browser) with this machine. When the person asks for a code or asks to pair their device, call this tool and show its code, QR, validity and address as returned. Do not ask the person to generate the device code. Never call it on your own initiative. This is different from voice_pair: only the person can obtain a room code from the room interface.", json!({}), vec![]),
         ("voice_status", "Whether the room can currently reach this conversation.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
     ];
     // No `additionalProperties: false`: an argument this server does not know (an agent's own, or one a newer server
@@ -1308,6 +1308,21 @@ mod tests {
     use rmcp::model::InitializeRequestParams;
     use serde_json::{json, Value};
     use std::time::Duration;
+
+    #[test]
+    fn device_code_instructions_distinguish_it_from_a_room_code() {
+        assert!(INSTRUCTIONS.contains("call voice_pair_device"));
+        assert!(INSTRUCTIONS.contains("Do not ask the person to generate a device code"));
+        let device = tools()
+            .into_iter()
+            .find(|tool| tool.name.as_ref() == "voice_pair_device")
+            .unwrap();
+        assert!(device
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .contains("Generate"));
+    }
 
     /// Whether a client that checks a call against `schema` (the keywords these schemas use: `required`, each
     /// property's `type` and `enum`, `additionalProperties: false`) lets `arguments` through.

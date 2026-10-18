@@ -46,8 +46,9 @@ Every place comes from the environment, so a disposable profile is just a set of
 - the core's listen address: `$SIDEVOICE_CORE_HOST`, else `0.0.0.0` (all IPv4 interfaces). Set it to `127.0.0.1`
   to restrict the core to this machine. The same setting is used by the login service and on-demand starts. With a
   compatible core, another device can enter this machine's LAN IP address during pairing without an extra Host
-  setting. The pairing code does not discover or announce a LAN address; enter it manually in the current desktop
-  app and agree to its private `http://` connection warning. That sends the one-time pairing secret and device
+  setting. The compatible Core includes its private interface IP addresses and actual listening port in new pairing
+  codes, up to the web client's code URL limit. The desktop app can prefill one of these addresses; agree to its
+  private `http://` connection warning to continue. That sends the one-time pairing secret and device
   token over the LAN without TLS. Setting `SIDEVOICE_ALLOWED_HOSTS` disables automatic acceptance of numeric IP
   Hosts; include the address the other device enters. Allowed Origins may still grant their own Host names. A hosted
   HTTPS page or public port forward needs a trusted HTTPS/WSS endpoint, not public plain HTTP. Configure these
