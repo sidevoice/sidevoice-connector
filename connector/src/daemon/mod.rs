@@ -55,6 +55,8 @@ pub struct Daemon {
     rendezvous: Mutex<Option<Value>>,
     refusal: Mutex<Option<String>>,
     closed_by_room: Mutex<HashMap<String, String>>,
+    /// Voluntary agent exits waiting to be replayed to Core after a transport or Core restart.
+    left_by_agent: Mutex<HashMap<String, Value>>,
     latest_closed: Mutex<Option<(String, String)>>,
     resume_blocked: AtomicBool,
     resume_block_reason: AtomicU8,
@@ -111,6 +113,26 @@ impl Daemon {
                     .collect()
             })
             .unwrap_or_default();
+        let left_by_agent = state
+            .get("left_by_agent")
+            .and_then(Value::as_object)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|(client_ref, leave)| {
+                        let thread = leave.get("thread").and_then(Value::as_str)?;
+                        let id = leave.get("binding_id").and_then(Value::as_str)?;
+                        (client_ref.len() <= 200
+                            && !client_ref.is_empty()
+                            && !thread.is_empty()
+                            && thread.len() <= 200
+                            && !id.is_empty()
+                            && id.len() <= 200)
+                            .then(|| (client_ref.clone(), leave.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut refusal = state
             .get("refused")
             .and_then(Value::as_str)
@@ -137,6 +159,7 @@ impl Daemon {
             rendezvous: Mutex::new(None),
             refusal: Mutex::new(refusal.clone()),
             closed_by_room: Mutex::new(closed_by_room),
+            left_by_agent: Mutex::new(left_by_agent),
             latest_closed: Mutex::new(None),
             resume_blocked: AtomicBool::new(resume_blocked),
             resume_block_reason: AtomicU8::new(resume_block_reason),
@@ -180,6 +203,9 @@ impl Daemon {
             .await?;
         // An answer may carry fields this connector does not know, `"error": null` among them: only an error is one.
         if let Some(error) = reply.get("error").filter(|error| !error.is_null()) {
+            if error.as_str() == Some("room.binding_closed") {
+                bail!("CORE_BINDING_CLOSED");
+            }
             bail!("Core binding refusal: {error}");
         }
         let id = reply
@@ -229,9 +255,28 @@ impl Daemon {
             crate::logfile::log(&format!("speech outbox retained: {error}"));
             return;
         }
+        // Core may have restarted after a deliberate agent exit. Replay leaves before any live bindings so an old
+        // registration cannot make a closed conversation visible while Core rebuilds its inventory.
+        let _state_transaction = self.conversation_state_serial.lock().await;
+        let left = self.left_by_agent.lock().await.clone();
+        for (client_ref, leave) in left {
+            if let Err(error) = self.confirm_agent_leave(&client_ref, &leave).await {
+                crate::logfile::log(&format!("agent leave replay: {error}"));
+            }
+        }
+        drop(_state_transaction);
         let bindings: Vec<_> = self.bindings.lock().await.values().cloned().collect();
         for binding in bindings {
             if let Err(error) = self.register_core(&binding).await {
+                if error.to_string() == "CORE_BINDING_CLOSED" {
+                    if let Err(close_error) = self
+                        .close_binding_from_room(&binding, "binding_closed")
+                        .await
+                    {
+                        crate::logfile::log(&format!("close refused binding: {close_error}"));
+                    }
+                    continue;
+                }
                 crate::logfile::log(&format!("binding replay: {error}"));
                 continue;
             }
@@ -241,6 +286,70 @@ impl Daemon {
             }
         }
         self.request_replay();
+    }
+
+    async fn close_binding_from_room(
+        &self,
+        binding: &Arc<Conversation>,
+        reason: &str,
+    ) -> Result<()> {
+        let _state_transaction = self.conversation_state_serial.lock().await;
+        if !self
+            .bindings
+            .lock()
+            .await
+            .get(&binding.client_ref)
+            .is_some_and(|current| Arc::ptr_eq(current, binding))
+        {
+            return Ok(());
+        }
+        if let Err(error) = self.arm_conversation_guard(false) {
+            self.mark_state_write_failed(false);
+            let _ = self.shutdown.send(true);
+            return Err(error);
+        }
+        binding.stopped.store(true, Ordering::Relaxed);
+        self.bindings.lock().await.remove(&binding.client_ref);
+        {
+            let mut closed = self.closed_by_room.lock().await;
+            closed.insert(binding.client_ref.clone(), reason.to_owned());
+            *self.latest_closed.lock().await =
+                Some((binding.client_ref.clone(), reason.to_owned()));
+        }
+        if !self.persist_conversation_state().await {
+            bail!("closed binding could not be saved");
+        }
+        self.registry.get(&binding.harness).close(binding).await;
+        Ok(())
+    }
+
+    /// A new Core confirms a leave only after persisting it. An older Core returns no confirmation, so the
+    /// record stays pending until a compatible Core answers. Call while holding conversation_state_serial.
+    async fn confirm_agent_leave(&self, client_ref: &str, leave: &Value) -> Result<()> {
+        let answer = self
+            .link
+            .request("binding.unregister", leave.clone(), Duration::from_secs(3))
+            .await?;
+        if answer.get("left") != Some(&Value::Bool(true)) {
+            bail!("Core did not confirm durable agent leave");
+        }
+        let removed = {
+            let mut pending = self.left_by_agent.lock().await;
+            if pending.get(client_ref) != Some(leave) {
+                return Ok(());
+            }
+            pending.remove(client_ref)
+        };
+        if !self.persist_conversation_state().await {
+            if let Some(leave) = removed {
+                self.left_by_agent
+                    .lock()
+                    .await
+                    .insert(client_ref.to_owned(), leave);
+            }
+            bail!("confirmed agent leave could not be cleared from local state");
+        }
+        Ok(())
     }
 
     fn request_replay(&self) {
@@ -277,6 +386,9 @@ impl Daemon {
             bail!("the room revoked this connector pairing: {reason}");
         }
         if resume {
+            if self.left_by_agent.lock().await.contains_key(client_ref) {
+                bail!("CLOSED_BY_ROOM:left_by_agent:{client_ref}");
+            }
             let closed = self.closed_by_room.lock().await;
             if self.resume_blocked.load(Ordering::Acquire) {
                 bail!("CLOSED_BY_ROOM:conversation_history_limit:{client_ref}");
@@ -308,10 +420,11 @@ impl Daemon {
         }
     }
 
-    async fn persist_conversation_state(&self) {
+    async fn persist_conversation_state(&self) -> bool {
         let mut refused = self.refusal.lock().await.clone();
         let mut closed = self.closed_by_room.lock().await;
-        let mut state = json!({"refused":refused.clone(),"closed_by_room":closed.clone(),
+        let left = self.left_by_agent.lock().await.clone();
+        let mut state = json!({"refused":refused.clone(),"closed_by_room":closed.clone(),"left_by_agent":left,
             "resume_blocked":self.resume_blocked.load(Ordering::Acquire),
             "resume_block_reason":self.resume_block_reason()});
         let encoded = serde_json::to_vec(&state);
@@ -331,13 +444,13 @@ impl Daemon {
                     *self.refusal.lock().await = refused.clone();
                 }
                 state = json!({"refused":refused.clone(),
-                    "closed_by_room":closed.clone(),"resume_blocked":true,
+                    "closed_by_room":closed.clone(),"left_by_agent":left,"resume_blocked":true,
                     "resume_block_reason":self.resume_block_reason()});
             }
             Err(error) => {
                 crate::logfile::log(&format!("conversation state: {error}"));
                 self.mark_state_write_failed(refused.is_some());
-                return;
+                return false;
             }
             _ => {}
         }
@@ -346,19 +459,20 @@ impl Daemon {
         {
             closed.clear();
             self.mark_state_write_failed(refused.is_some());
-            state = json!({"refused":refused.clone(),"closed_by_room":{},
+            state = json!({"refused":refused.clone(),"closed_by_room":{},"left_by_agent":left,
                 "resume_blocked":true,"resume_block_reason":self.resume_block_reason()});
             if serde_json::to_vec(&state)
                 .map_or(true, |bytes| bytes.len() > CONVERSATION_STATE_MAX_BYTES)
             {
                 crate::logfile::log("compact conversation state exceeds its size limit");
-                return;
+                return false;
             }
         }
         if let Err(error) = atomic_json(&self.profile.data.join("conversation-state.json"), &state)
         {
             crate::logfile::log(&format!("conversation state: {error}"));
             self.mark_state_write_failed(refused.is_some());
+            false
         } else if let Err(error) = self
             .conversation_guard
             .lock()
@@ -367,6 +481,9 @@ impl Daemon {
         {
             crate::logfile::log(&format!("clear conversation guard: {error}"));
             self.mark_state_write_failed(refused.is_some());
+            false
+        } else {
+            true
         }
     }
 
@@ -753,33 +870,18 @@ impl Daemon {
             }
             "input.deliver" => self.deliver(params).await,
             "binding.close" => {
-                let _state_transaction = self.conversation_state_serial.lock().await;
                 let id = params
                     .get("binding_id")
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 if let Some(binding) = self.binding_for_id(id).await {
-                    if let Err(error) = self.arm_conversation_guard(false) {
-                        crate::logfile::log(&format!("arm conversation guard: {error}"));
-                        self.mark_state_write_failed(false);
-                        let _ = self.shutdown.send(true);
-                    }
-                    binding.stopped.store(true, Ordering::Relaxed);
-                    self.bindings.lock().await.remove(&binding.client_ref);
                     let reason = params
                         .get("reason")
                         .and_then(Value::as_str)
-                        .unwrap_or("closed_from_room")
-                        .to_owned();
-                    {
-                        let mut closed = self.closed_by_room.lock().await;
-                        closed.insert(binding.client_ref.clone(), reason.clone());
-                        *self.latest_closed.lock().await =
-                            Some((binding.client_ref.clone(), reason));
+                        .unwrap_or("closed_from_room");
+                    if let Err(error) = self.close_binding_from_room(&binding, reason).await {
+                        crate::logfile::log(&format!("close binding: {error}"));
                     }
-                    self.persist_conversation_state().await;
-                    self.registry.get(&binding.harness).close(&binding).await;
-                    drop(_state_transaction);
                 }
                 json!({})
             }
@@ -1046,9 +1148,10 @@ impl Daemon {
                     .lock()
                     .await
                     .insert(client_ref, binding.clone());
-                {
+                let prior_latest = self.latest_closed.lock().await.clone();
+                let prior_closed = {
                     let mut closed = self.closed_by_room.lock().await;
-                    closed.remove(&binding.client_ref);
+                    let prior = closed.remove(&binding.client_ref);
                     let mut latest_closed = self.latest_closed.lock().await;
                     if latest_closed
                         .as_ref()
@@ -1056,8 +1159,28 @@ impl Daemon {
                     {
                         *latest_closed = None;
                     }
+                    prior
+                };
+                let prior_leave = self.left_by_agent.lock().await.remove(&binding.client_ref);
+                if !self.persist_conversation_state().await {
+                    self.bindings.lock().await.remove(&binding.client_ref);
+                    if let Some(reason) = prior_closed {
+                        self.closed_by_room
+                            .lock()
+                            .await
+                            .insert(binding.client_ref.clone(), reason);
+                    }
+                    *self.latest_closed.lock().await = prior_latest;
+                    if let Some(leave) = prior_leave {
+                        self.left_by_agent
+                            .lock()
+                            .await
+                            .insert(binding.client_ref.clone(), leave);
+                    }
+                    binding.stopped.store(true, Ordering::Relaxed);
+                    self.registry.get(&binding.harness).close(&binding).await;
+                    bail!("explicit join could not be saved");
                 }
-                self.persist_conversation_state().await;
                 drop(_state_transaction);
                 self.clone().watch_binding(binding.clone());
                 let result = self.register_core(&binding).await;
@@ -1280,17 +1403,25 @@ impl Daemon {
             "unregister" => {
                 let _state_transaction = self.conversation_state_serial.lock().await;
                 let binding = self.find_owned(owner, &params).await?;
+                let leave = json!({"binding_id":*binding.id.lock().await,"thread":binding.thread,"leave":true});
+                self.arm_conversation_guard(false)?;
+                self.left_by_agent
+                    .lock()
+                    .await
+                    .insert(binding.client_ref.clone(), leave.clone());
+                if !self.persist_conversation_state().await {
+                    bail!("agent leave could not be saved");
+                }
                 binding.stopped.store(true, Ordering::Relaxed);
                 self.bindings.lock().await.remove(&binding.client_ref);
                 self.registry.get(&binding.harness).close(&binding).await;
+                if self.link.connected().await {
+                    if let Err(error) = self.confirm_agent_leave(&binding.client_ref, &leave).await
+                    {
+                        crate::logfile::log(&format!("agent leave confirmation: {error}"));
+                    }
+                }
                 drop(_state_transaction);
-                let _ = self
-                    .link
-                    .notify(
-                        "binding.unregister",
-                        json!({"binding_id":*binding.id.lock().await}),
-                    )
-                    .await;
                 Ok(json!({"left":true,"connected":self.link.connected().await}))
             }
             "node.status" => Ok(self.node_status().await),
