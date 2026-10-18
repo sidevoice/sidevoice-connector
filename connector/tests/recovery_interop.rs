@@ -1,14 +1,13 @@
 //! A voluntary leave while Core is unavailable, exercised with real Core, daemon and MCP processes.
-//! Run against the matching Core candidate with SIDEVOICE_TEST_CORE_DIR until core.pin is advanced.
+//! Runs against the released Core pinned in core.pin.
 mod support;
 
 use serde_json::json;
 use support::*;
 
 #[test]
-#[ignore = "requires the matching unreleased Core candidate until core.pin is advanced"]
 fn agent_leave_while_core_is_down_stays_closed_after_restart_until_explicit_rejoin() {
-    let core = core_dir().expect("matching Core candidate required");
+    let core = core_dir().expect("released pinned Core required");
     let profile = Profile::new("recoverleave");
     let mut first_core = profile.start_core(&core, "before-leave");
     let _connector = profile.start_connector();
