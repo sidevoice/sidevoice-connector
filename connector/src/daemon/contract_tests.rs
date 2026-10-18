@@ -35,7 +35,7 @@ impl Harness for Recorder {
         }
     }
 
-    fn deliver<'a>(
+    fn inject<'a>(
         &'a self,
         _: &'a Conversation,
         frame: &'a Value,
@@ -673,14 +673,13 @@ async fn ipc_commands_with_unknown_fields_are_read_for_what_they_know() {
 }
 
 #[tokio::test]
-async fn a_detached_pull_binding_reconnects_under_its_original_client_ref() {
+async fn a_detached_binding_reconnects_under_its_original_client_ref() {
     let scratch = Scratch::new("pull-reconnect");
     let link = Link::new();
     let core = link.attached().await;
     play_core(link.clone(), core);
     let (daemon, _) = daemon(&scratch, link);
-    let mut params = registration("pull-thread");
-    params["input_mode"] = json!("pull");
+    let params = registration("pull-thread");
     let first = daemon.command(7, "register", params.clone()).await.unwrap();
     let binding = daemon.bindings.lock().await["pull-thread"].clone();
     binding.owner.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -691,7 +690,6 @@ async fn a_detached_pull_binding_reconnects_under_its_original_client_ref() {
         first["initial_reply_context"]
     );
     assert_eq!(binding.owner.load(std::sync::atomic::Ordering::Relaxed), 8);
-    assert_eq!(*binding.input_mode.lock().await, "pull");
 }
 
 #[tokio::test]
@@ -862,8 +860,7 @@ async fn acknowledged_pull_pages_keep_recent_routing_bounded_across_rejoin() {
     let core = link.attached().await;
     play_core(link.clone(), core);
     let (daemon, _) = daemon(&scratch, link);
-    let mut params = registration("pull-bound");
-    params["input_mode"] = json!("pull");
+    let params = registration("pull-bound");
     daemon.command(7, "register", params.clone()).await.unwrap();
     let binding = daemon.bindings.lock().await["pull-bound"].clone();
     for after in 0..620 {

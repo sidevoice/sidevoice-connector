@@ -16,7 +16,6 @@ pub struct Conversation {
     pub thread: String,
     pub title: String,
     pub delivery: Value,
-    pub input_mode: Mutex<String>,
     pub initial_reply_context: Mutex<Value>,
     pub engine: Mutex<Option<Value>>,
     pub route: Option<String>,

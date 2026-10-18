@@ -72,13 +72,16 @@ pub trait Harness: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
-    /// Puts a message from the room into the conversation.
-    fn deliver<'a>(
+    /// Attempts to put a message into the conversation. The default leaves it in the journal
+    /// for get_messages.
+    fn inject<'a>(
         &'a self,
-        conversation: &'a Conversation,
-        frame: &'a Value,
-        profile: &'a Profile,
-    ) -> BoxFuture<'a, Result<Value>>;
+        _conversation: &'a Conversation,
+        _frame: &'a Value,
+        _profile: &'a Profile,
+    ) -> BoxFuture<'a, Result<Value>> {
+        Box::pin(async { Ok(json!({"status":"unsupported"})) })
+    }
 
     /// Releases what `prepare` held, when the conversation leaves.
     fn close<'a>(&'a self, _conversation: &'a Conversation) -> BoxFuture<'a, ()> {
