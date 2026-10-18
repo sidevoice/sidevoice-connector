@@ -2,15 +2,22 @@
 
 ## [0.12.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.11.0...v0.12.0) (2026-10-18)
 
+v0.11.0 remains a draft release. This release includes its pending changes as well as the changes below.
 
 ### Features
 
+* **codex:** steer a running turn when the installed Codex supports it ([#168](https://github.com/sidevoice/sidevoice-connector/issues/168)) ([a29f60b](https://github.com/sidevoice/sidevoice-connector/commit/a29f60b7030c0ac293dcd983dfa4db89894fdbe8))
 * **cursor:** report recorded chat model and effort ([#136](https://github.com/sidevoice/sidevoice-connector/issues/136)) ([ab2f678](https://github.com/sidevoice/sidevoice-connector/commit/ab2f67884b4516815172d026dfde64ffdec18b9d)), closes [#133](https://github.com/sidevoice/sidevoice-connector/issues/133)
 
 
 ### Bug Fixes
 
+* **daemon:** replay explicit agent leaves after core recovery ([#167](https://github.com/sidevoice/sidevoice-connector/issues/167)) ([243d024](https://github.com/sidevoice/sidevoice-connector/commit/243d0244e44d436eb762efdca9474666939c50a7))
 * **cursor:** trace and complete Desktop Bridge push delivery ([#173](https://github.com/sidevoice/sidevoice-connector/issues/173)) ([82bae14](https://github.com/sidevoice/sidevoice-connector/commit/82bae14e921c8ca0e70251ab5297aa6c58791156)), closes [#172](https://github.com/sidevoice/sidevoice-connector/issues/172)
+
+### CI
+
+* Move macOS jobs to macos-15 ([#170](https://github.com/sidevoice/sidevoice-connector/issues/170)) ([3b536fd](https://github.com/sidevoice/sidevoice-connector/commit/3b536fd8ff396ba8cc0b26703c0e81f3cc6afdcc))
 
 ## [0.11.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.10.4...v0.11.0) (2026-10-18)
 
