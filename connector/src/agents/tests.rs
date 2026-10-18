@@ -163,9 +163,10 @@ impl Drop for EnvGuard {
 impl Fixture {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!(
-            "sidevoice-agent-test-{}-{}",
+            // Short: a Unix socket path in it (the Codex daemon's) must fit in SUN_LEN.
+            "sv-agent-{}-{}",
             std::process::id(),
-            Uuid::new_v4()
+            &Uuid::new_v4().simple().to_string()[..8]
         ));
         private_mkdir(&root);
         let root = root.canonicalize().unwrap();
@@ -2520,4 +2521,126 @@ async fn login_path_comes_from_a_zshrc_only_path() {
     {
         capture_with_rc_only_path("zsh", zsh, ".zshrc").await;
     }
+}
+
+/// A scanned fake `codex` that reports `version` and records every call it gets in `calls`, in a profile whose Codex
+/// home may hold a daemon socket.
+fn steer_fixture(version: &str) -> (Fixture, PathBuf) {
+    let fixture = Fixture::new();
+    let bin = fixture.root.join("login-bin");
+    private_mkdir(&bin);
+    let calls = fixture.root.join("calls");
+    let codex = bin.join("codex");
+    private_write(
+        &codex,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli {version}'; exit 0; fi\nprintf '%s\\n' \"$@\" >> '{}'\n",
+            calls.display()
+        )
+        .as_bytes(),
+    );
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut state = empty_state();
+    state["login_path"] = json!(format!("{}:/usr/bin:/bin", bin.display()));
+    write_json(&fixture.profile.data.join("agents.json"), &state);
+    (fixture, calls)
+}
+
+fn voice_event(id: &str) -> Value {
+    json!({"channel":"voice","session_id":"s","revision":1,"epoch":1,"message_id":id,"text":"hola"})
+}
+
+fn running_turn_answers(steer: Value) -> Vec<Value> {
+    vec![
+        json!({"userAgent":"x"}),
+        json!({"data":[{"id":"turn-1","status":"inProgress"}]}),
+        steer,
+    ]
+}
+
+async fn deliver_to(fixture: &Fixture, id: &str) -> Value {
+    crate::adapters::codex::deliver(
+        &json!({"kind":"codex-queue","thread":"t-1"}),
+        &voice_event(id),
+        &fixture.profile,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn codex_delivery_steers_the_running_turn_when_the_version_allows() {
+    let _turn = agent_env().await;
+    let (fixture, calls) = steer_fixture("0.157.0");
+    let socket =
+        crate::adapters::codex::steer::socket_path(fixture.profile.agent_home("CODEX_HOME"));
+    let daemon = crate::adapters::codex::steer::daemon_at(
+        socket,
+        running_turn_answers(json!({"turnId":"turn-1"})),
+    )
+    .await;
+    let answer = deliver_to(&fixture, "m-steer").await;
+    assert_eq!(answer["status"], "accepted");
+    assert!(
+        answer["detail"].as_str().unwrap().contains("steered"),
+        "{answer}"
+    );
+    assert!(!calls.exists(), "the queue was not used");
+    let seen = daemon.await.unwrap();
+    let steer = seen
+        .iter()
+        .find(|frame| frame["method"] == "turn/steer")
+        .unwrap();
+    assert_eq!(steer["params"]["clientUserMessageId"], "m-steer");
+    let text = steer["params"]["input"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("\"message_id\":\"m-steer\"") && text.contains("hola"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn codex_delivery_queues_when_the_version_is_too_old() {
+    let _turn = agent_env().await;
+    let (fixture, calls) = steer_fixture("0.156.0");
+    let socket =
+        crate::adapters::codex::steer::socket_path(fixture.profile.agent_home("CODEX_HOME"));
+    let daemon = crate::adapters::codex::steer::daemon_at(socket, vec![]).await;
+    let answer = deliver_to(&fixture, "m-old").await;
+    assert_eq!(answer["detail"], "codex queue confirmed the thread");
+    assert!(fs::read_to_string(calls)
+        .unwrap()
+        .starts_with("queue\n--thread\nt-1\n--message\n"));
+    daemon.abort();
+}
+
+#[tokio::test]
+async fn codex_delivery_queues_when_no_daemon_socket_exists() {
+    let _turn = agent_env().await;
+    let (fixture, calls) = steer_fixture("0.163.0");
+    let answer = deliver_to(&fixture, "m-nosock").await;
+    assert_eq!(answer["detail"], "codex queue confirmed the thread");
+    assert!(fs::read_to_string(calls).unwrap().starts_with("queue\n"));
+}
+
+#[tokio::test]
+async fn codex_delivery_queues_when_the_steer_is_refused() {
+    let _turn = agent_env().await;
+    let (fixture, calls) = steer_fixture("0.163.0");
+    let socket =
+        crate::adapters::codex::steer::socket_path(fixture.profile.agent_home("CODEX_HOME"));
+    let daemon = crate::adapters::codex::steer::daemon_at(
+        socket,
+        running_turn_answers(json!({"code":-32600,"message":"active turn not steerable"})),
+    )
+    .await;
+    let answer = deliver_to(&fixture, "m-refused").await;
+    assert_eq!(answer["detail"], "codex queue confirmed the thread");
+    let queued = fs::read_to_string(calls).unwrap();
+    assert!(queued.starts_with("queue\n--thread\nt-1\n--message\n"));
+    assert!(
+        queued.contains("\"message_id\":\"m-refused\""),
+        "same message, same id"
+    );
+    daemon.await.unwrap();
 }
