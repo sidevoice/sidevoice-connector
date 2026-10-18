@@ -18,6 +18,9 @@ use tokio::time::Duration;
 use tokio::time::Instant;
 
 #[cfg(test)]
+#[path = "tests.rs"]
+mod bridge_tests;
+#[cfg(test)]
 mod contract_tests;
 mod files;
 mod run;
@@ -190,6 +193,11 @@ impl Daemon {
     async fn register_core(&self, binding: &Arc<Conversation>) -> Result<Value> {
         let mut current = binding.id.lock().await;
         let engine = binding.engine.lock().await.clone().unwrap_or(Value::Null);
+        crate::logfile::log(&format!(
+            "delivery stage=register result=attempt mode={} route={}",
+            *binding.input_mode.lock().await,
+            binding.route_kind().unwrap_or("none")
+        ));
         let mut frame = json!({"client_ref":binding.client_ref,"harness":binding.harness,"thread":binding.thread,"title":binding.title,"delivery":binding.delivery,
             "inbound":binding.inbound,"capabilities":binding.capabilities,
             "experimental":binding.experimental,"route":binding.route,"engine":engine,"focus":false,
@@ -197,12 +205,20 @@ impl Daemon {
         if !current.starts_with("local-") {
             frame["binding_id"] = json!(*current);
         }
-        let reply = self
+        let reply = match self
             .link
             .request("binding.register", frame, Duration::from_secs(10))
-            .await?;
+            .await
+        {
+            Ok(reply) => reply,
+            Err(error) => {
+                crate::logfile::log("delivery stage=register result=link_failed");
+                return Err(error);
+            }
+        };
         // An answer may carry fields this connector does not know, `"error": null` among them: only an error is one.
         if let Some(error) = reply.get("error").filter(|error| !error.is_null()) {
+            crate::logfile::log("delivery stage=register result=core_refused");
             if error.as_str() == Some("room.binding_closed") {
                 bail!("CORE_BINDING_CLOSED");
             }
@@ -247,6 +263,7 @@ impl Daemon {
             .get("initial_reply_context")
             .cloned()
             .unwrap_or(Value::Null);
+        crate::logfile::log("delivery stage=register result=registered");
         Ok(reply)
     }
 
@@ -949,14 +966,17 @@ impl Daemon {
     }
 
     async fn deliver(&self, frame: &Value) -> Value {
+        crate::logfile::log("delivery stage=daemon result=received");
         let id = frame
             .get("binding_id")
             .and_then(Value::as_str)
             .unwrap_or("");
         let Some(binding) = self.binding_for_id(id).await else {
+            crate::logfile::log("delivery stage=daemon result=unknown_binding");
             return json!({"status":"unknown_binding"});
         };
         if *binding.input_mode.lock().await == "pull" {
+            crate::logfile::log("delivery stage=daemon result=pull_binding");
             return json!({"status":"failed","detail":"binding uses pull delivery"});
         }
         let _serial = binding.serial.lock().await;
@@ -973,6 +993,7 @@ impl Daemon {
         // A note from the room carries no words of the user's.
         let note = frame.get("channel").and_then(Value::as_str) == Some("note");
         if message_id.is_empty() || session_id.is_empty() || (text.is_empty() && !note) {
+            crate::logfile::log("delivery stage=daemon result=invalid_input");
             return json!({"status":"failed","detail":"invalid input"});
         }
         {
@@ -992,7 +1013,11 @@ impl Daemon {
                 frame["epoch"].as_u64().unwrap_or(0),
             )
             .await;
-        match self
+        crate::logfile::log(&format!(
+            "delivery stage=adapter result=attempt route={}",
+            binding.route_kind().unwrap_or("none")
+        ));
+        let result = match self
             .registry
             .get(&binding.harness)
             .deliver(&binding, frame, &self.profile)
@@ -1004,7 +1029,16 @@ impl Daemon {
                 binding.forget_input(message_id, session_id, revision).await;
                 json!({"status":"failed","detail":error.to_string()})
             }
-        }
+        };
+        let status = match result.get("status").and_then(Value::as_str) {
+            Some("accepted") => "accepted",
+            Some("failed") => "failed",
+            Some("unknown") => "unconfirmed",
+            Some("unsupported") => "unsupported",
+            _ => "unrecognized",
+        };
+        crate::logfile::log(&format!("delivery stage=adapter result={status}"));
+        result
     }
 
     async fn command(self: &Arc<Self>, owner: u64, method: &str, params: Value) -> Result<Value> {

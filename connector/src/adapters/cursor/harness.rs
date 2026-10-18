@@ -258,6 +258,13 @@ fn bridge_state(state: &str) -> Value {
 /// message is not sent and the answer says so.
 async fn deliver_to_editor(conversation: &Conversation, frame: &Value) -> Value {
     let mut delivery = conversation.delivery.clone();
+    log_bridge(
+        "delivery",
+        "attempt",
+        delivery.get("marker").and_then(Value::as_str),
+        None,
+        None,
+    );
     let composer = match bridge(conversation) {
         Some(composer) => {
             log_bridge("lookup", "cached_chat", Some(&composer), None, None);
@@ -279,10 +286,23 @@ async fn deliver_to_editor(conversation: &Conversation, frame: &Value) -> Value 
     };
     delivery["composer"] = json!(composer);
     set_bridge(conversation, composer);
-    deliver_editor(&delivery, frame).await.unwrap_or_else(|| {
+    let result = deliver_editor(&delivery, frame).await.unwrap_or_else(|| {
         json!({"status":"failed",
             "detail":"Not sent: Cursor's Desktop Bridge did not take the message (it may not be running)."})
-    })
+    });
+    let outcome = match result.get("status").and_then(Value::as_str) {
+        Some("accepted") => "accepted",
+        Some("unknown") => "unconfirmed",
+        _ => "bridge_failed",
+    };
+    log_bridge(
+        "delivery",
+        outcome,
+        delivery.get("marker").and_then(Value::as_str),
+        None,
+        None,
+    );
+    result
 }
 
 /// Finds which Cursor chat an editor conversation is (by the Desktop Bridge, or by a delivered message showing up

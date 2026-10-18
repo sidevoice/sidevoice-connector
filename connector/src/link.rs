@@ -271,6 +271,9 @@ impl Link {
                             let value: Value = serde_json::from_str(&text)?;
                             if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") { bail!("invalid Core JSON-RPC"); }
                             if let Some(method) = value.get("method").and_then(Value::as_str) {
+                                if method == "input.deliver" {
+                                    crate::logfile::log("delivery stage=core_link result=received");
+                                }
                                 if method == "connector.welcome" {
                                     let _ = incoming.send(Incoming { session, method: method.into(), params: value.get("params").cloned().unwrap_or(Value::Null), reply: None }).await;
                                     continue;
@@ -279,6 +282,7 @@ impl Link {
                                 if tasks.len() >= 65 { bail!("Core handler limit"); }
                                 let reply_tx = tx.clone();
                                 let method = method.to_owned();
+                                let delivery_frame = method == "input.deliver";
                                 let params = value.get("params").cloned().unwrap_or(Value::Null);
                                 let (answer_tx, answer_rx) = oneshot::channel();
                                 let inbound = Incoming {
@@ -288,6 +292,9 @@ impl Link {
                                     reply: id.as_ref().map(|_| answer_tx),
                                 };
                                 if !matches!(timeout(Duration::from_secs(2), incoming.send(inbound)).await, Ok(Ok(()))) {
+                                    if delivery_frame {
+                                        crate::logfile::log("delivery stage=core_link result=queue_unavailable");
+                                    }
                                     bail!("Core inbound queue unavailable");
                                 }
                                 if let Some(id) = id {
