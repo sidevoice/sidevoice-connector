@@ -44,21 +44,6 @@ fn identity_for(harness: &str, thread: String, url: Option<String>) -> Identity 
     identity
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_harness_without_an_injector_uses_get_messages() {
-        let identity = identity_for("http", "thread".into(), None);
-        assert_eq!(identity.delivery["kind"], "none");
-        assert_eq!(identity.capabilities["deliver"], "unsupported");
-        assert_eq!(accepts(&identity.delivery, "thread"), Route::Accepted);
-        let with_injector = identity_for("http", "thread".into(), Some("http://local".into()));
-        assert_eq!(with_injector.capabilities["deliver"], "supported");
-    }
-}
-
 pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
     let url = delivery
         .get("url")
@@ -167,5 +152,20 @@ impl Harness for Http {
                 _ => Ok(no_route(&conversation.thread)),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_harness_without_an_injector_uses_get_messages() {
+        let identity = identity_for("http", "thread".into(), None);
+        assert_eq!(identity.delivery["kind"], "none");
+        assert_eq!(identity.capabilities["deliver"], "unsupported");
+        assert_eq!(accepts(&identity.delivery, "thread"), Route::Accepted);
+        let with_injector = identity_for("http", "thread".into(), Some("http://local".into()));
+        assert_eq!(with_injector.capabilities["deliver"], "supported");
     }
 }
