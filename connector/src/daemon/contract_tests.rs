@@ -74,7 +74,7 @@ fn registration(client_ref: &str) -> Value {
 
 /// Plays the core's side of the link: every request is answered as a newer core would, with fields this connector
 /// does not know and, for speech, a status it has never heard of.
-fn play_core(link: Arc<Link>, mut frames: tokio::sync::mpsc::Receiver<Message>) {
+pub(super) fn play_core(link: Arc<Link>, mut frames: tokio::sync::mpsc::Receiver<Message>) {
     tokio::spawn(async move {
         while let Some(Message::Text(text)) = frames.recv().await {
             let frame: Value = serde_json::from_str(text.as_str()).unwrap();
