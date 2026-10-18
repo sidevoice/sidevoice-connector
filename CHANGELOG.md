@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.4](https://github.com/sidevoice/sidevoice-connector/compare/v0.10.3...v0.10.4) (2026-10-18)
+
+
+### Bug Fixes
+
+* **pairing:** show LAN address and request device codes ([#162](https://github.com/sidevoice/sidevoice-connector/issues/162)) ([cd8ec48](https://github.com/sidevoice/sidevoice-connector/commit/cd8ec4838bd2129c17bf1c6e6054ccaadbca7268))
+
 ## [0.10.3](https://github.com/sidevoice/sidevoice-connector/compare/v0.10.2...v0.10.3) (2026-10-17)
 
 
