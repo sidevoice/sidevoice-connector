@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.12.0...v0.12.1) (2026-10-18)
+
+
+### Bug Fixes
+
+* **cursor:** log unconfirmed bridge replies safely ([#181](https://github.com/sidevoice/sidevoice-connector/issues/181)) ([0affe13](https://github.com/sidevoice/sidevoice-connector/commit/0affe13d696d35b01067cfa9efdcfa1e7bb9839b)), closes [#180](https://github.com/sidevoice/sidevoice-connector/issues/180) [#173](https://github.com/sidevoice/sidevoice-connector/issues/173)
+
 ## [0.12.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.11.0...v0.12.0) (2026-10-18)
 
 v0.11.0 remains a draft release. This release includes its pending changes as well as the changes below.
