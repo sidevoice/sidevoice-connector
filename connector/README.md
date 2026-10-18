@@ -219,8 +219,11 @@ For a Cursor editor chat, a room receipt of `delivered` means Cursor's Desktop B
 ambiguous chats, and a found chat; `send` records the bridge instance ordinal, HTTP status, and whether it queued,
 submitted, refused, or left the reply uncertain. Instance ordinals follow descriptor creation order (newest first)
 for that scan. `id_hash` is the first 12 hex characters of SHA-256 of the marker or chat ID; the log contains no
-bridge token, message text, bridge response body, socket path, database path, or home path. A request whose write
-may have reached the bridge remains `unknown` and is not retried blindly.
+bridge token, message text, socket path, database path, or home path. An unconfirmed send also logs
+`reply_body`, capped at 512 bytes: arbitrary string values and unknown keys are redacted, while known
+status codes, booleans and the JSON shape remain visible. Cursor owns this Desktop Bridge; the connector
+checks descriptor `protocolVersion: 1`, not the Cursor application or extension build version. A request whose
+write may have reached the bridge remains `unknown` and is not retried blindly.
 
 `uninstall` unloads both jobs and stops what runs on demand (a refusal stops it there, with nothing deleted), removes
 the agents' registrations Sidevoice wrote (current or not), then the owned data and releases. It keeps lock files and
