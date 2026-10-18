@@ -174,7 +174,8 @@ mod tests {
     use super::*;
 
     async fn daemon(answers: Vec<Value>) -> (PathBuf, tokio::task::JoinHandle<Vec<Value>>) {
-        let path = std::env::temp_dir()
+        // macOS's per-user temp dir can already consume most of SUN_LEN.
+        let path = Path::new("/tmp")
             .join(format!("sv-steer-{}", uuid::Uuid::new_v4()))
             .join("daemon.sock");
         (path.clone(), daemon_at(path, answers).await)

@@ -162,8 +162,8 @@ impl Drop for EnvGuard {
 
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            // Short: a Unix socket path in it (the Codex daemon's) must fit in SUN_LEN.
+        let root = Path::new("/tmp").join(format!(
+            // macOS's per-user temp dir can be too long for the Codex daemon socket's SUN_LEN.
             "sv-agent-{}-{}",
             std::process::id(),
             &Uuid::new_v4().simple().to_string()[..8]
