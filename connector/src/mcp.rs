@@ -15,8 +15,8 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{timeout, timeout_at, Duration, Instant};
 
 const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the person's voice room.
-- Read the person's exact words after the header first. Explicit "do B" selects B even if B has not played; confirm any unheard necessary condition. Use heard-prefix evidence only for bare assent, never over explicit words.
-- For a spoken-room request, give a concise result or targeted clarification by voice as well as writing. After an action, speak its result, not only a pre-action acknowledgement. A typed note alone need not get a reply.
+- Exact words first: "do B" selects B even if unplayed, subject to necessary conditions. Bare assent answers the single clear fully heard question despite later unplayed speech; act only if its conditions were heard. Clarify genuine ambiguity or unheard conditions.
+- For spoken-room input, call voice_say with a result or needed clarification before final writing. After action, speak the actual result, not just a prior acknowledgement.
 - Call voice_connect only when the person asks to join or enable voice. Select input_mode pull when this harness will call get_messages; otherwise the core injects input. One binding uses one mode.
 - A voice event is one JSON header, a blank line, and the person's exact words. A note is JSON only and contains no person words. Both carry stable message_id, session_id, revision and epoch. The same message_id with identical content is redelivery, not another input or authorization; changed content under that ID is a conflict. A genuine correction uses a new correlated message ID. While connected, keep full written answers for native-harness typed chat and use appropriate voice too, including several spoken updates when useful.
 - In pull mode, call get_messages at useful hooks. Acknowledge IDs with ack_ids only after processing them. Pull may learn later than injection. After is a journal position, not an acknowledgement.
