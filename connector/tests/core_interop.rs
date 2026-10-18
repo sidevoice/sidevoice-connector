@@ -745,7 +745,7 @@ fn actual_notice(
                 .bodies
                 .recv_timeout(Duration::from_millis(150))
                 .ok()
-                .filter(&matches_kind)
+                .filter(|message| matches_kind(message))
         })
     } else {
         until(&format!("{kind} pulled"), 20, || {
