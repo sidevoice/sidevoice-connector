@@ -788,6 +788,20 @@ async fn bridge_request(
                 anyhow::bail!("Cursor Desktop Bridge response too large");
             }
             response.extend_from_slice(&block[..count]);
+            if let Some(headers_end) = response.windows(4).position(|window| window == b"\r\n\r\n")
+            {
+                let headers = String::from_utf8_lossy(&response[..headers_end]);
+                if let Some(length) = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                }) {
+                    if response.len() >= headers_end + 4 + length {
+                        break;
+                    }
+                }
+            }
         }
         Ok::<Vec<u8>, anyhow::Error>(response)
     };
@@ -1187,6 +1201,46 @@ mod bridge_tests {
     use tokio::net::UnixListener;
 
     #[tokio::test]
+    async fn bridge_response_finishes_at_content_length_without_waiting_for_socket_close() {
+        let scratch = Scratch::new("cursor-bridge-response-length");
+        let socket = scratch.0.join("bridge.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let instance = BridgeInstance {
+            socket,
+            token: "fixture-secret".into(),
+            user_data: scratch.0.clone(),
+            created_at: 1,
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8192];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let body = r#"{"outcome":"submitted"}"#;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+        let response = tokio::time::timeout(
+            Duration::from_millis(100),
+            bridge_request(&instance, &json!({"type":"sendMessage"})),
+        )
+        .await
+        .expect("a complete response must beat the ten-second delivery deadline")
+        .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body["outcome"], "submitted");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn queued_bridge_submission_has_no_editor_consumption_receipt() {
         let scratch = Scratch::new("cursor-bridge-delivery");
         let descriptors = scratch.0.join("desktop-bridge");
@@ -1232,16 +1286,21 @@ mod bridge_tests {
             assert!(request.contains("\"threadId\":\"chat-1\""));
             let response = r#"{"outcome":"queued"}"#;
             stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
             // This fake bridge never writes to an editor transcript. The HTTP reply says only
             // that it queued the request; no later input.read can be inferred from it.
         });
         let event = json!({"channel":"voice","session_id":"s","revision":1,"epoch":0,"message_id":"m","text":"private words"});
-        let result = deliver_editor_to_instances(
-            &json!({"composer":chat,"marker":marker}),
-            &event,
-            &instances,
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            deliver_editor_to_instances(
+                &json!({"composer":chat,"marker":marker}),
+                &event,
+                &instances,
+            ),
         )
         .await
+        .expect("bridge acceptance must arrive before the ten-second delivery deadline")
         .unwrap();
         server.await.unwrap();
         assert_eq!(result["status"], "accepted");
