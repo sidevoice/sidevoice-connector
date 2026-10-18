@@ -36,6 +36,10 @@ app, a browser).
 | [sidevoice-desktop](https://github.com/sidevoice/sidevoice-desktop) | The app you call from. |
 | [sidevoice-web](https://github.com/sidevoice/sidevoice-web) | The call interface the app bundles; it can also be served as a static site. |
 
+If a reply to the connector's speech request is lost, the connector keeps the original request and asks the core for its disposition with `speech.recover` after reconnecting. The core returns the original saved or refused result; if it never received the request, it saves the text without playing delayed audio. The connector retains a bounded receipt for the recovered result so an agent retry with the same IDs sees it, even if background recovery finished first. Once that attempt is settled, a new reply in the current conversation can play normally. A queued reply is never retried as new audio when its first admission is uncertain.
+
+Notices delivered through the agent's push or pull mode carry the same confirmed hearing evidence: heard, partially heard with a Unicode-scalar extent, or not heard. The full reply text remains available so the agent knows what was left unheard. A missing receipt stays unconfirmed and does not become a not-heard claim. An already delivered notice keeps its message ID and content across retries; stronger late hearing arrives as a separate `reply_heard` correction.
+
 ## Get started
 
 You need macOS on Apple silicon, or Linux on x64 or arm64 with glibc (see [Status](#status)), and Node.js 18 or
@@ -67,7 +71,7 @@ your machine (`@sidevoice/sidevoice-<os>-<cpu>`, with the core inside); installi
 | Agent | Setup | What you say reaches the conversation |
 |---|---|---|
 | Claude Code | Connected when you choose it. | Delivered into the running session. |
-| Codex | Connected when you choose it, through the Codex CLI (without it, Sidevoice prints what to add to `~/.codex/config.toml`); then restart Codex. | Queued into the thread with `codex queue`. |
+| Codex | Connected when you choose it, through the Codex CLI (without it, Sidevoice prints what to add to `~/.codex/config.toml`); then restart Codex. | Steered into the running turn through the Codex daemon (Codex 0.157 or later, session on the shared daemon); otherwise queued into the thread with `codex queue`. |
 | Cursor (experimental) | Connected when you choose it, in `~/.cursor/mcp.json`; approve the new MCP server once. | Cursor offers no route of its own. The CLI receives it only in a chat started with `cursor-agent persist` (needs tmux); the editor, only through Cursor's Desktop Bridge (it must be on; SQLite support is bundled with the connector), once Cursor has recorded the chat's join call; until then nothing is sent. |
 
 Any other agent can receive through an HTTP endpoint of its own (`SIDEVOICE_DELIVERY_URL`).
@@ -102,6 +106,8 @@ English message.
 
 [`connector/README.md`](connector/README.md) describes each command, where things are kept and how the pieces talk
 to each other.
+
+The [reviewed voice-message MCP integration contract](docs/voice-message-contract.md) describes intended behavior for a future implementation; it is not a description of shipped support.
 
 ## Develop
 

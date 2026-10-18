@@ -222,29 +222,30 @@ pub fn reach(payload: &Value) -> &'static str {
     if payload.get("rv").is_some_and(|rv| !rv.is_null()) {
         return "room";
     }
-    let loopback = |url: &str| {
-        let Ok(uri) = url.parse::<Uri>() else {
-            return true;
-        };
-        let host = uri.host().unwrap_or("");
-        let host = host.trim_start_matches('[').trim_end_matches(']');
-        host.is_empty()
-            || host.eq_ignore_ascii_case("localhost")
-            || host == "::1"
-            || host.starts_with("127.")
-    };
     let direct = payload
         .get("urls")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .any(|url| !loopback(url));
+        .any(|url| !loopback_url(url));
     if direct {
         "direct"
     } else {
         "local-only"
     }
+}
+
+fn loopback_url(url: &str) -> bool {
+    let Ok(uri) = url.parse::<Uri>() else {
+        return true;
+    };
+    let host = uri.host().unwrap_or("");
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.is_empty()
+        || host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host.starts_with("127.")
 }
 
 /// The code as a QR a terminal shows as it is: two modules per character (UTF-8 half blocks, a dark module drawn),
@@ -299,8 +300,19 @@ pub fn device_text(answer: &Value) -> Result<String> {
         "One-time code to pair a device with this machine{host}, valid for {valid}:\n\n{code}\n\n{}\n\nPaste it in the Sidevoice app where it asks to pair a machine.",
         qr_text(code)?
     );
-    if reach(&payload) == "local-only" {
-        text.push_str("\n\nThis code only works on this computer: the machine is not reachable from other devices. To use it from elsewhere, pair this machine with your room: run  sidevoice pair <room-url> <code>  with the code the room shows for pairing a machine.");
+    let direct: Vec<_> = payload
+        .get("urls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|url| !loopback_url(url))
+        .map(printable)
+        .collect();
+    if !direct.is_empty() {
+        text.push_str(&format!("\n\nAddresses included in this code: {}. A private HTTP connection in the native app asks for your consent before pairing.", direct.join(", ")));
+    } else if reach(&payload) == "local-only" {
+        text.push_str("\n\nThis code has no address for another device. If this Core listens on the LAN, enter its IP address and port in the native app when pairing; otherwise configure a reachable address. A separate room pairing is optional for direct LAN access.");
     }
     Ok(text)
 }
@@ -454,7 +466,12 @@ mod tests {
             "One-time code to pair a device with this machine (studio), valid for 10 minutes:\n\nSV1.abc\n\n"
         ));
         assert!(text.contains(&qr_text("SV1.abc").unwrap()));
-        assert!(text.contains("only works on this computer"));
+        assert!(text.contains("no address for another device"));
+        let lan = json!({"code":"SV1.abc", "expires_in":600,
+            "payload":{"host":"studio","urls":["http://127.0.0.1:10829","http://192.168.1.7:10829"],"rv":null}});
+        let lan_text = device_text(&lan).unwrap();
+        assert!(lan_text.contains("http://192.168.1.7:10829"));
+        assert!(lan_text.contains("asks for your consent"));
         let remote =
             json!({"code": "SV1.abc", "expires_in": 90, "payload": {"rv": {"room": "https://r"}}});
         let text = device_text(&remote).unwrap();

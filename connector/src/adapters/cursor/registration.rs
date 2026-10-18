@@ -2,7 +2,7 @@
 
 use super::Cursor;
 use crate::adapters::registration::{
-    mcp_servers_json, AgentError, AgentHost, Entry, Launch, Manual, Registration,
+    mcp_servers_json, AgentError, AgentHost, Entry, Launch, Manual, ReadinessCheck, Registration,
 };
 use crate::profile::Profile;
 use crate::secure_fs::validate_user_directory;
@@ -235,6 +235,10 @@ Cursor's Desktop Bridge, once Cursor has recorded the chat's join call (up to ~3
 Several chats of a window can join.\nIf you type while the room sends, the two mix.";
 
 impl Registration for Cursor {
+    fn readiness_checks(&self, profile: &Profile) -> Vec<ReadinessCheck> {
+        vec![super::bridge_setup::check(profile)]
+    }
+
     fn after_install(&self, _profile: &Profile) -> Vec<String> {
         vec![INSTALL_NOTES.to_owned()]
     }

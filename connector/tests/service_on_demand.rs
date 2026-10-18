@@ -7,6 +7,8 @@
 mod support;
 
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, TcpStream, UdpSocket};
 use std::process::Stdio;
 
 use serde_json::json;
@@ -67,6 +69,30 @@ fn with_no_manager_a_conversation_starts_the_connector_and_the_connector_the_cor
     );
     let first = linked["core"]["pid"].as_u64().unwrap();
     profile.wait_linked(linked["core"]["launch_id"].as_str().unwrap());
+    let port = read_json(&profile.core_data().join("core.json")).unwrap()["port"]
+        .as_u64()
+        .unwrap();
+    // Select this host's nonloopback IPv4 route without sending a packet to the probe address.
+    // The installed connector must actually start a core that answers on that interface.
+    let route = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    route.connect(("192.0.2.1", 9)).unwrap();
+    let ip = route.local_addr().unwrap().ip();
+    assert!(
+        !ip.is_loopback(),
+        "test runner needs a nonloopback IPv4 route"
+    );
+    let mut stream = TcpStream::connect((ip, port as u16)).unwrap();
+    stream
+        .write_all(
+            b"GET /api/rendezvous HTTP/1.1\r\nHost: 192.168.1.4:10829\r\nConnection: close\r\n\r\n",
+        )
+        .unwrap();
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).unwrap();
+    assert!(
+        answer.starts_with("HTTP/1.1 200 "),
+        "installed core must accept a LAN IP Host: {answer}"
+    );
     let joined = mcp.tool("voice_connect", json!({"title": "On demand"}));
     assert_eq!(joined["conversation"], "on-demand-thread", "{joined}");
 

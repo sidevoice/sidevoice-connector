@@ -1,3 +1,4 @@
+pub mod bridge_setup;
 mod engine;
 mod harness;
 mod registration;
@@ -1234,7 +1235,7 @@ mod bridge_tests {
             // This fake bridge never writes to an editor transcript. The HTTP reply says only
             // that it queued the request; no later input.read can be inferred from it.
         });
-        let event = json!({"channel":"voice","session_id":"s","revision":1,"message_id":"m","text":"private words"});
+        let event = json!({"channel":"voice","session_id":"s","revision":1,"epoch":0,"message_id":"m","text":"private words"});
         let result = deliver_editor_to_instances(
             &json!({"composer":chat,"marker":marker}),
             &event,

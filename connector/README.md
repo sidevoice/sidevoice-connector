@@ -41,6 +41,16 @@ Every place comes from the environment, so a disposable profile is just a set of
   (the core's own: `core.json`, `local.sock`);
 - the release root `R`: `$XDG_DATA_HOME/sidevoice`, else `~/.local/share/sidevoice`;
 - the core's port: `$SIDEVOICE_CORE_PORT`, else 10829;
+- the core's listen address: `$SIDEVOICE_CORE_HOST`, else `0.0.0.0` (all IPv4 interfaces). Set it to `127.0.0.1`
+  to restrict the core to this machine. The same setting is used by the login service and on-demand starts. With a
+  compatible core, another device can enter this machine's LAN IP address during pairing without an extra Host
+  setting. The compatible Core includes its private interface IP addresses and actual listening port in new pairing
+  codes, up to the web client's code URL limit. The desktop app can prefill one of these addresses; agree to its
+  private `http://` connection warning to continue. That sends the one-time pairing secret and device
+  token over the LAN without TLS. Setting `SIDEVOICE_ALLOWED_HOSTS` disables automatic acceptance of numeric IP
+  Hosts; include the address the other device enters. Allowed Origins may still grant their own Host names. A hosted
+  HTTPS page or public port forward needs a trusted HTTPS/WSS endpoint, not public plain HTTP. Configure these
+  variables when installing or updating the service;
 - the agents' homes: `$CLAUDE_CONFIG_DIR` (`~/.claude`), `$CODEX_HOME` (`~/.codex`), `$CURSOR_CONFIG_DIR`
   (`~/.cursor`), `$CURSOR_DATA_DIR`. Each is checked to be the person's and writable by nobody else before it is
   read or written. `CLAUDE_CONFIG_DIR` reaches Claude Code (its CLI, the service jobs) only when the person's
@@ -111,7 +121,7 @@ Installing connects no agent. An agent gets Sidevoice only when the person conne
 calls `agents.connect`), `agents connect <id>`, or their answer to the offer below. Unless `--no-agents`, `install`
 lists the agents found (a rescan) and its answer's `agents` has one entry per agent, `{outcome, message}`:
 `registered` when it uses Sidevoice, `not-connected` when it does not and the connector can connect it (with
-`command`, `sidevoice agents connect <id>`), `manual` when that needs a step by hand (the message gives it), or
+`command`, `npx sidevoice agents connect <id>`), `manual` when that needs a step by hand (the message gives it), or
 `failed`, `foreign`, `invalid`, `unknown`. The one entry `install` writes is one Sidevoice wrote that is not current
 (`outdated`: disabled, naming another release, or without the installation's environment): it is written again with
 the installation's command (Claude Code through `claude mcp add`, Codex through its CLI, Cursor in its `mcp.json`,
@@ -164,6 +174,37 @@ output`, `timed out`, `protocol mismatch`); `checked_at` is when (ISO 8601, UTC)
 (`agents.check`, `{"id"}`, or `agents check <id>`); a listing from the cache, and a request with too little time
 left, keep the last one found (in `agents.json`).
 
+### Agent readiness
+
+Every row in `agents.list` / `agents --json` may carry an optional `readiness` object:
+
+```json
+{"readiness":{"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":"Voice in the Cursor editor needs Cursor's Desktop Bridge: in Cursor, open Settings › Beta, enable “Allow CLI to access desktop agents”, then restart Cursor."}]}}
+```
+
+`state` is `ready`, `needs_attention`, or `unsupported`. `reasons` is an ordered array of
+`{"code","message"}` objects. `code` is stable in the `<agent>.<code>` namespace;
+`message` is a plain English fallback instruction supplied by that agent's check, with no paths,
+tokens, versions, or home directories. Consumers use `code` for logic and localization: the web
+shows its `agents.readiness.<code>` translation when present, else `message`. An absent
+`readiness` field means ready: adapters with no checks omit it. Every check contributes either
+OK, needs attention with a reason, or unsupported with a reason. The aggregate is `unsupported`
+if any check is unsupported; otherwise `needs_attention` if any check needs attention; otherwise
+`ready`. All non-OK reason objects are retained in check order. A ready object has `reasons: []`.
+For `cursor.unsupported`, the fallback is “Cursor editor voice is not supported on this computer.”
+
+Cursor currently has one check: a usable Desktop Bridge descriptor with a live process and socket
+is ready even when the selected CLI is `cursor-agent`. A detected Cursor editor in either
+`/Applications` or the user's `Applications` directory with a missing, empty, stale, or unusable
+bridge needs attention with `cursor.bridge_not_running`; non-macOS or no editor or live bridge is
+unsupported with `cursor.unsupported`. A first macOS scan reports provisional needs attention
+until its background refresh finishes. Refreshed status uses a snapshot up to two seconds old;
+filesystem discovery runs off the request worker. Readiness is machine-wide and says nothing about a particular chat.
+Per-chat `voice_status.bridge.bridge_chat_known` remains the source for whether that chat is known.
+The setting is in Cursor Settings → Beta → “Allow CLI to access desktop agents”. `agents.list`
+with `rescan` or `watch`, and `agents check cursor`, refresh readiness; a cached list returns the
+last result.
+
 Cursor's chat lookup and model metadata use a bundled SQLite library through bounded, read-only
 queries on blocking workers. No system `sqlite3` command is required. Read-only mode preserves
 visibility of Cursor's live WAL; immutable mode is avoided because it can miss a newly recorded
@@ -203,6 +244,14 @@ The successful `uninstall --json` object echoes the same marker. A caller must c
 starting a destructive reset; the post-uninstall echo alone is too late to protect an older installed binary.
 
 With `--json` both print one JSON object and nothing else.
+
+## Conversation flow
+
+`voice_connect` returns the core's conversation `epoch` and `initial_reply_context`. After an incoming message, pass its `session_id`, `revision`, and `epoch` together to `voice_say`; for speech before the first message, pass `conversation` to use the returned initial context. Only a confirmed spoken turn advances the epoch. Typed context does not interrupt playback. A refused `voice_say` while a person is speaking is terminal: wait for that person's message; nothing is queued for later audio. A saved publication records admission, not proof of hearing.
+
+Each binding chooses `input_mode: "push"` (default) or `"pull"` at `voice_connect`. In pull mode, `get_messages` reads the same ordered core queue as injection. Its `get` operation returns full messages and their agent envelope, with stable `message_id` and cursor. An unacknowledged claim is returned again; pass `ack_ids` only after processing the messages. `check` reports pending counts without claiming. Calling `voice_connect` again with another mode switches the binding and releases claims through core registration. Pull delivery may be later because the harness must call the tool. Sidevoice only notes have `channel: "note"` and empty user text; `reply_not_heard`, empty turn, return, and `reply_heard` correction notices remain in the ordinary queue in both modes. Core evidence uses only confirmed `partial` or `not_heard` fates, with full reply text and a Unicode-scalar extent. The agent envelope tells the agent to revisit what still matters, identifies each reply by its opening words, and shows only the tail of the confirmed heard prefix; the full reply remains in its `voice_say` context. A note with no person words asks the agent to tell them now what still matters. Physical playback causes stay in app diagnostics.
+
+Candidate integration tests can set `SIDEVOICE_TEST_CORE_DIR` to an unpacked source build of the matching core PR head. `core.pin` remains a numbered published release gate for distribution and CI packaging.
 
 ## Tests
 

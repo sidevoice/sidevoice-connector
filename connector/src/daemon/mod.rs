@@ -169,7 +169,8 @@ impl Daemon {
         let engine = binding.engine.lock().await.clone().unwrap_or(Value::Null);
         let mut frame = json!({"client_ref":binding.client_ref,"harness":binding.harness,"thread":binding.thread,"title":binding.title,"delivery":binding.delivery,
             "inbound":binding.inbound,"capabilities":binding.capabilities,
-            "experimental":binding.experimental,"route":binding.route,"engine":engine,"focus":false});
+            "experimental":binding.experimental,"route":binding.route,"engine":engine,"focus":false,
+            "input_mode":*binding.input_mode.lock().await});
         if !current.starts_with("local-") {
             frame["binding_id"] = json!(*current);
         }
@@ -197,6 +198,9 @@ impl Daemon {
             let old = outbox.clone();
             let mut changed = false;
             for item in outbox.iter_mut() {
+                if item["attempted"] == true {
+                    continue;
+                }
                 if item.get("binding_id").and_then(Value::as_str) == Some(current.as_str())
                     || item.get("client_ref").and_then(Value::as_str)
                         == Some(binding.client_ref.as_str())
@@ -213,10 +217,18 @@ impl Daemon {
             }
         }
         *current = id.to_owned();
+        *binding.initial_reply_context.lock().await = reply
+            .get("initial_reply_context")
+            .cloned()
+            .unwrap_or(Value::Null);
         Ok(reply)
     }
 
     async fn on_welcome(self: &Arc<Self>) {
+        if let Err(error) = self.retire_held_audio().await {
+            crate::logfile::log(&format!("speech outbox retained: {error}"));
+            return;
+        }
         let bindings: Vec<_> = self.bindings.lock().await.values().cloned().collect();
         for binding in bindings {
             if let Err(error) = self.register_core(&binding).await {
@@ -428,13 +440,27 @@ impl Daemon {
 
     async fn queue(&self, speech: Value) -> Result<()> {
         let mut outbox = self.outbox.lock().await;
+        let before = outbox.clone();
         outbox.push(speech);
-        if serde_json::to_vec(&*outbox)?.len() > 8 << 20 {
-            outbox.pop();
-            bail!("outbox full");
+        while outbox
+            .iter()
+            .filter(|item| item.get("resolved").is_some())
+            .count()
+            > 2048
+            || serde_json::to_vec(&*outbox)?.len() > 8 << 20
+        {
+            if let Some(index) = outbox
+                .iter()
+                .position(|item| item.get("resolved").is_some())
+            {
+                outbox.remove(index);
+            } else {
+                *outbox = before;
+                bail!("outbox full");
+            }
         }
         if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
-            outbox.pop();
+            *outbox = before;
             return Err(error);
         }
         Ok(())
@@ -447,22 +473,115 @@ impl Daemon {
         ids_match
             && (reply.get("text_saved") == Some(&json!(true))
                 || (reply.get("status") == Some(&json!("rejected"))
-                    && reply.get("terminal") == Some(&json!(true))
-                    && reply.get("reason_code") == Some(&json!("application_refusal"))))
+                    && reply.get("terminal") == Some(&json!(true))))
+    }
+
+    async fn make_history_only(&self, event_id: &Value) -> Result<()> {
+        let mut outbox = self.outbox.lock().await;
+        let before = outbox.clone();
+        if let Some(item) = outbox
+            .iter_mut()
+            .find(|item| item.get("event_id") == Some(event_id))
+        {
+            if item["attempted"] == true || item["history_only"] == true {
+                return Ok(());
+            }
+            item["history_only"] = json!(true);
+            if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+                *outbox = before;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    async fn clear_attempted(&self, event_id: &Value) -> Result<()> {
+        let mut outbox = self.outbox.lock().await;
+        let before = outbox.clone();
+        if let Some(item) = outbox
+            .iter_mut()
+            .find(|item| item.get("event_id") == Some(event_id))
+        {
+            item.as_object_mut().unwrap().remove("attempted");
+            if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+                *outbox = before;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    async fn rebind_known_unknown(&self, event_id: &Value, binding_id: &str) -> Result<Value> {
+        let mut outbox = self.outbox.lock().await;
+        let before = outbox.clone();
+        let item = outbox
+            .iter_mut()
+            .find(|item| item.get("event_id") == Some(event_id))
+            .context("speech disappeared during binding repair")?;
+        item["binding_id"] = json!(binding_id);
+        let published = item.clone();
+        if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+            *outbox = before;
+            return Err(error);
+        }
+        Ok(published)
+    }
+
+    async fn retire_held_audio(&self) -> Result<()> {
+        let mut outbox = self.outbox.lock().await;
+        if outbox
+            .iter()
+            .all(|item| item["history_only"] == true || item["attempted"] == true)
+        {
+            return Ok(());
+        }
+        let before = outbox.clone();
+        for item in outbox.iter_mut() {
+            if item["attempted"] != true {
+                item["history_only"] = json!(true);
+            }
+        }
+        if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+            *outbox = before;
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn publish_one(&self, speech: &Value) -> Result<Option<Value>> {
         if !self.link.connected().await {
+            self.make_history_only(&speech["event_id"]).await?;
             return Ok(None);
         }
-        let mut published = self
-            .outbox
-            .lock()
-            .await
-            .iter()
-            .find(|item| item.get("event_id") == speech.get("event_id"))
-            .cloned()
-            .unwrap_or_else(|| speech.clone());
+        // Persist the attempt before transport can take the frame. A lost answer leaves an
+        // uncertain admission; its immutable fingerprint must never be rewritten or replayed
+        // with late-audio risk.
+        let mut published = {
+            let mut outbox = self.outbox.lock().await;
+            let before = outbox.clone();
+            let Some(item) = outbox
+                .iter_mut()
+                .find(|item| item.get("event_id") == speech.get("event_id"))
+            else {
+                return Ok(None);
+            };
+            if let Some(reply) = item.get("resolved") {
+                return Ok(Some(reply.clone()));
+            }
+            if item["attempted"] == true {
+                let original = item.clone();
+                drop(outbox);
+                return self.recover_one(&original).await;
+            }
+            item["attempted"] = json!(true);
+            let published = item.clone();
+            if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+                *outbox = before;
+                return Err(error);
+            }
+            published
+        };
+        published.as_object_mut().unwrap().remove("attempted");
         let result = self
             .link
             .request("speech.publish", published.clone(), Duration::from_secs(15))
@@ -486,13 +605,9 @@ impl Daemon {
             {
                 if self.register_core(&binding).await.is_ok() {
                     published = self
-                        .outbox
-                        .lock()
-                        .await
-                        .iter()
-                        .find(|item| item.get("event_id") == speech.get("event_id"))
-                        .cloned()
-                        .context("speech disappeared during binding repair")?;
+                        .rebind_known_unknown(&speech["event_id"], &binding.id.lock().await)
+                        .await?;
+                    published.as_object_mut().unwrap().remove("attempted");
                     reply = match self
                         .link
                         .request("speech.publish", published.clone(), Duration::from_secs(15))
@@ -505,9 +620,11 @@ impl Daemon {
                         }
                     };
                 } else {
+                    self.clear_attempted(&speech["event_id"]).await?;
                     return Ok(None);
                 }
             } else {
+                self.clear_attempted(&speech["event_id"]).await?;
                 return Ok(None);
             }
         }
@@ -528,10 +645,79 @@ impl Daemon {
         }
     }
 
+    async fn recover_one(&self, speech: &Value) -> Result<Option<Value>> {
+        let client_ref = speech
+            .get("client_ref")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let Some(binding) = self.bindings.lock().await.get(client_ref).cloned() else {
+            return Ok(None);
+        };
+        let mut original = speech.clone();
+        original.as_object_mut().unwrap().remove("attempted");
+        for retry in 0..2 {
+            if !self.link.connected().await {
+                return Ok(None);
+            }
+            let mut request = original.clone();
+            request["recovery_binding_id"] = json!(*binding.id.lock().await);
+            let reply = match self
+                .link
+                .request("speech.recover", request, Duration::from_secs(15))
+                .await
+            {
+                Ok(reply) => reply,
+                Err(error) => {
+                    crate::logfile::log(&format!("speech recovery retained: {error}"));
+                    return Ok(None);
+                }
+            };
+            if reply.get("status") == Some(&json!("unknown_binding")) {
+                if retry == 0 && self.register_core(&binding).await.is_ok() {
+                    continue;
+                }
+                return Ok(None);
+            }
+            if !Self::ack_allows_removal(&original, &reply) {
+                return Ok(None);
+            }
+            let mut outbox = self.outbox.lock().await;
+            let before = outbox.clone();
+            if let Some(item) = outbox
+                .iter_mut()
+                .find(|item| item.get("event_id") == speech.get("event_id"))
+            {
+                item["resolved"] = reply.clone();
+            }
+            if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+                *outbox = before;
+                return Err(error);
+            }
+            return Ok(Some(reply));
+        }
+        Ok(None)
+    }
+
     async fn flush_outbox(&self) {
         let items = self.outbox.lock().await.clone();
+        let mut blocked = std::collections::HashSet::new();
         for speech in items {
-            let _ = self.publish_one(&speech).await;
+            if speech.get("resolved").is_some() {
+                continue;
+            }
+            let Some(client_ref) = speech.get("client_ref").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(binding) = self.bindings.lock().await.get(client_ref).cloned() else {
+                continue;
+            };
+            let _publication = binding.publication.lock().await;
+            if blocked.contains(client_ref) {
+                let _ = self.make_history_only(&speech["event_id"]).await;
+            }
+            if self.publish_one(&speech).await.ok().flatten().is_none() {
+                blocked.insert(client_ref.to_owned());
+            }
         }
     }
 
@@ -668,6 +854,9 @@ impl Daemon {
         let Some(binding) = self.binding_for_id(id).await else {
             return json!({"status":"unknown_binding"});
         };
+        if *binding.input_mode.lock().await == "pull" {
+            return json!({"status":"failed","detail":"binding uses pull delivery"});
+        }
         let _serial = binding.serial.lock().await;
         let message_id = frame
             .get("message_id")
@@ -693,20 +882,14 @@ impl Daemon {
                 pending.pop_front();
             }
         }
-        {
-            let mut turns = binding.turns.lock().await;
-            turns.insert(format!("{session_id}:{revision}"), message_id.to_owned());
-            if turns.len() > 512 {
-                if let Some(oldest) = turns.keys().next().cloned() {
-                    turns.remove(&oldest);
-                }
-            }
-        }
         binding
-            .input_context
-            .lock()
-            .await
-            .insert(message_id.to_owned(), (session_id.to_owned(), revision));
+            .remember_input(
+                message_id,
+                session_id,
+                revision,
+                frame["epoch"].as_u64().unwrap_or(0),
+            )
+            .await;
         match self
             .registry
             .get(&binding.harness)
@@ -716,12 +899,7 @@ impl Daemon {
             Ok(result) => result,
             Err(error) => {
                 binding.pending.lock().await.retain(|id| id != message_id);
-                binding
-                    .turns
-                    .lock()
-                    .await
-                    .remove(&format!("{session_id}:{revision}"));
-                binding.input_context.lock().await.remove(message_id);
+                binding.forget_input(message_id, session_id, revision).await;
                 json!({"status":"failed","detail":error.to_string()})
             }
         }
@@ -752,6 +930,13 @@ impl Daemon {
                     .context("harness required")?
                     .to_owned();
                 let harness_adapter = self.registry.get(&harness).clone();
+                let input_mode = params
+                    .get("input_mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("push");
+                if !matches!(input_mode, "push" | "pull") {
+                    bail!("input_mode must be push or pull");
+                }
                 let mut delivery = present(&params, "delivery")
                     .cloned()
                     .unwrap_or_else(|| json!({"kind":"none"}));
@@ -791,13 +976,19 @@ impl Daemon {
                 self.check_registration_allowed(&client_ref, resume).await?;
                 let existing = { self.bindings.lock().await.get(&client_ref).cloned() };
                 if let Some(existing) = existing {
-                    if existing.owner.load(Ordering::Relaxed) != owner {
+                    let previous_owner = existing.owner.load(Ordering::Relaxed);
+                    if previous_owner == 0 && existing.detachable {
+                        existing.owner.store(owner, Ordering::Relaxed);
+                    } else if previous_owner != owner {
                         bail!("binding belongs to another façade");
                     }
+                    *existing.input_mode.lock().await = input_mode.to_owned();
+                    let registered = self.register_core(&existing).await?;
                     let binding_id = existing.id.lock().await.clone();
                     drop(_state_transaction);
                     return Ok(
-                        json!({"binding_id":binding_id,"thread":thread,"connected":self.link.connected().await,"prepared":null}),
+                        json!({"binding_id":binding_id,"thread":thread,"connected":self.link.connected().await,"prepared":null,
+                            "epoch":registered.get("epoch"),"initial_reply_context":registered.get("initial_reply_context")}),
                     );
                 }
                 drop(_state_transaction);
@@ -807,6 +998,8 @@ impl Daemon {
                     thread: thread.clone(),
                     title,
                     delivery: delivery.clone(),
+                    input_mode: Mutex::new(input_mode.to_owned()),
+                    initial_reply_context: Mutex::new(Value::Null),
                     engine: Mutex::new(
                         params
                             .get("engine")
@@ -821,9 +1014,11 @@ impl Daemon {
                     owner: AtomicU64::new(owner),
                     id: Mutex::new(format!("local-{}", uuid::Uuid::new_v4())),
                     serial: Mutex::new(()),
+                    publication: Mutex::new(()),
                     pending: Mutex::new(VecDeque::new()),
                     turns: Mutex::new(HashMap::new()),
                     input_context: Mutex::new(HashMap::new()),
+                    recent_inputs: Mutex::new(VecDeque::new()),
                     read: Mutex::new(VecDeque::new()),
                     working: Mutex::new(None),
                     stopped: AtomicBool::new(false),
@@ -832,13 +1027,19 @@ impl Daemon {
                 let _state_transaction = self.conversation_state_serial.lock().await;
                 self.check_registration_allowed(&client_ref, resume).await?;
                 if let Some(existing) = self.bindings.lock().await.get(&client_ref).cloned() {
-                    if existing.owner.load(Ordering::Relaxed) != owner {
+                    let previous_owner = existing.owner.load(Ordering::Relaxed);
+                    if previous_owner == 0 && existing.detachable {
+                        existing.owner.store(owner, Ordering::Relaxed);
+                    } else if previous_owner != owner {
                         bail!("binding belongs to another façade");
                     }
+                    *existing.input_mode.lock().await = input_mode.to_owned();
+                    let registered = self.register_core(&existing).await?;
                     let binding_id = existing.id.lock().await.clone();
                     drop(_state_transaction);
                     return Ok(json!({"binding_id":binding_id,"thread":thread,
-                        "connected":self.link.connected().await,"prepared":null}));
+                        "connected":self.link.connected().await,"prepared":null,
+                        "epoch":registered.get("epoch"),"initial_reply_context":registered.get("initial_reply_context")}));
                 }
                 let prepared = harness_adapter.prepare(&binding).await?;
                 self.bindings
@@ -865,7 +1066,9 @@ impl Daemon {
                     self.request_replay();
                 }
                 Ok(
-                    json!({"binding_id":id,"thread":thread,"connected":result.is_ok(),"pending":result.is_err(),"prepared":prepared}),
+                    json!({"binding_id":id,"thread":thread,"connected":result.is_ok(),"pending":result.is_err(),"prepared":prepared,
+                        "epoch":result.as_ref().ok().and_then(|v| v.get("epoch")),
+                        "initial_reply_context":result.as_ref().ok().and_then(|v| v.get("initial_reply_context"))}),
                 )
             }
             "publish" => {
@@ -897,6 +1100,10 @@ impl Daemon {
                     .get("revision")
                     .and_then(Value::as_i64)
                     .context("revision required")?;
+                let epoch = params
+                    .get("epoch")
+                    .and_then(Value::as_u64)
+                    .context("epoch required")?;
                 let routed = present(&params, "client_refs").is_some()
                     || params.get("adopt_orphans") == Some(&json!(true));
                 let (binding, adopted) = if routed {
@@ -912,21 +1119,161 @@ impl Daemon {
                 if text.is_empty() || text.len() > 65536 {
                     bail!("text length invalid");
                 }
+                let event_id = params.get("event_id").and_then(Value::as_str);
+                let utterance_id = params.get("utterance_id").and_then(Value::as_str);
+                if event_id.is_some() != utterance_id.is_some()
+                    || event_id.is_some_and(str::is_empty)
+                    || utterance_id.is_some_and(str::is_empty)
+                {
+                    bail!("publish requires nonempty event_id and utterance_id together");
+                }
+                let _publication = binding.publication.lock().await;
                 let id = binding.id.lock().await;
-                let speech = json!({"event_id":params.get("event_id").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                    "binding_id":*id,"client_ref":binding.client_ref,"session_id":session_id,"revision":revision,
-                    "utterance_id":params.get("utterance_id").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                    "text":text,"language":params.get("language")});
-                self.queue(speech.clone()).await?;
+                let history_only = !self.link.connected().await;
+                let speech = json!({"event_id":event_id.map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    "binding_id":*id,"client_ref":binding.client_ref,"session_id":session_id,"revision":revision,"epoch":epoch,
+                    "utterance_id":utterance_id.map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    "text":text,"language":params.get("language"),"history_only":history_only});
+                let prior = self
+                    .outbox
+                    .lock()
+                    .await
+                    .iter()
+                    .find(|item| {
+                        item["event_id"] == speech["event_id"]
+                            || item["utterance_id"] == speech["utterance_id"]
+                    })
+                    .cloned();
+                if let Some(prior) = prior {
+                    for field in [
+                        "event_id",
+                        "utterance_id",
+                        "client_ref",
+                        "session_id",
+                        "revision",
+                        "epoch",
+                        "text",
+                        "language",
+                    ] {
+                        if prior[field] != speech[field] {
+                            bail!("publish retry IDs conflict with a pending publication");
+                        }
+                    }
+                    drop(id);
+                    let answer = self.publish_one(&prior).await?;
+                    let mut result = answer.unwrap_or_else(|| {
+                        if prior["attempted"] == true {
+                            json!({"status":"admission_unknown","event_id":prior["event_id"],
+                                "utterance_id":prior["utterance_id"],"instruction":"Core admission is uncertain; wait for the next message before replying again."})
+                        } else {
+                            json!({"status":"queued","event_id":prior["event_id"],"utterance_id":prior["utterance_id"]})
+                        }
+                    });
+                    if adopted {
+                        result["adopted"] = json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,
+                            "harness":binding.harness,"title":binding.title,"delivery":binding.delivery,"route":binding.route,
+                            "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound});
+                    }
+                    return Ok(result);
+                }
                 drop(id);
+                // Settle older attempts before deciding whether this new answer can play.
+                // An uncertain first admission is recovered, never published again.
+                let earlier = self
+                    .outbox
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|item| {
+                        item["client_ref"] == speech["client_ref"] && item.get("resolved").is_none()
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let mut unresolved = false;
+                for item in earlier {
+                    if self.publish_one(&item).await?.is_none() {
+                        unresolved = true;
+                        break;
+                    }
+                }
+                self.queue(speech.clone()).await?;
+                if unresolved {
+                    self.make_history_only(&speech["event_id"]).await?;
+                }
                 let answer = self.publish_one(&speech).await?;
-                let mut result = answer.unwrap_or_else(
-                    || json!({"status":"queued","utterance_id":speech["utterance_id"]}),
-                );
+                let mut result = if let Some(answer) = answer {
+                    answer
+                } else {
+                    let attempted = self
+                        .outbox
+                        .lock()
+                        .await
+                        .iter()
+                        .find(|item| item["event_id"] == speech["event_id"])
+                        .is_some_and(|item| item["attempted"] == true);
+                    if attempted {
+                        json!({"status":"admission_unknown","event_id":speech["event_id"],
+                            "utterance_id":speech["utterance_id"],"instruction":"Core admission is uncertain; wait for the next message before replying again."})
+                    } else {
+                        json!({"status":"queued","event_id":speech["event_id"],"utterance_id":speech["utterance_id"]})
+                    }
+                };
                 if adopted {
                     result["adopted"] = json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,
                         "harness":binding.harness,"title":binding.title,"delivery":binding.delivery,"route":binding.route,
                         "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound});
+                }
+                Ok(result)
+            }
+            "get_messages" => {
+                let binding = self.find_owned(owner, &params).await?;
+                let _serial = binding.serial.lock().await;
+                if *binding.input_mode.lock().await != "pull" {
+                    bail!("get_messages requires a pull binding");
+                }
+                let operation = params
+                    .get("operation")
+                    .and_then(Value::as_str)
+                    .unwrap_or("get");
+                if !matches!(operation, "get" | "check") {
+                    bail!("invalid pull operation");
+                }
+                let binding_id = binding.id.lock().await.clone();
+                let mut request = json!({"binding_id":binding_id,"operation":operation});
+                if let Some(after) = params.get("after") {
+                    request["after"] = after.clone();
+                }
+                if let Some(ack_ids) = params.get("ack_ids") {
+                    request["ack_ids"] = ack_ids.clone();
+                }
+                let mut result = self
+                    .link
+                    .request("input.pull", request, Duration::from_secs(10))
+                    .await?;
+                if let Err(error) = crate::adapters::prepare_pull_page(
+                    &mut result,
+                    params.get("after").and_then(Value::as_u64).unwrap_or(0),
+                ) {
+                    // A malformed or unrepresentable page cannot be delivered or acknowledged.
+                    let _ = self
+                        .link
+                        .notify("binding.unregister", json!({"binding_id":binding_id}))
+                        .await;
+                    let _ = self.register_core(&binding).await;
+                    return Err(error);
+                }
+                if let Some(ids) = params.get("ack_ids").and_then(Value::as_array) {
+                    let mut context = binding.input_context.lock().await;
+                    for id in ids.iter().filter_map(Value::as_str) {
+                        context.remove(id);
+                    }
+                }
+                for message in result["messages"].as_array().expect("validated pull page") {
+                    let session = message["session_id"].as_str().unwrap();
+                    let revision = message["revision"].as_i64().unwrap();
+                    let epoch = message["epoch"].as_u64().unwrap();
+                    let id = message["message_id"].as_str().unwrap();
+                    binding.remember_input(id, session, revision, epoch).await;
                 }
                 Ok(result)
             }
@@ -998,7 +1345,8 @@ impl Daemon {
                     json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,"thread":binding.thread,
                     "harness":binding.harness,"title":binding.title,"delivery":binding.delivery,"route":binding.route,
                     "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound,"detachable":binding.detachable,
-                    "engine":binding.engine.lock().await.clone()}),
+                    "engine":binding.engine.lock().await.clone(),"input_mode":*binding.input_mode.lock().await,
+                    "initial_reply_context":*binding.initial_reply_context.lock().await}),
                 )
             }
             "status" => {
@@ -1010,7 +1358,8 @@ impl Daemon {
                     let mut item = json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,
                         "harness":binding.harness,"thread":binding.thread,"title":binding.title,"delivery":binding.delivery,
                         "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound,
-                        "engine":engine,"working":working});
+                        "engine":engine,"working":working,"input_mode":*binding.input_mode.lock().await,
+                        "initial_reply_context":*binding.initial_reply_context.lock().await});
                     if let Some(fields) = self.registry.get(&binding.harness).status(&binding).await
                     {
                         for (key, value) in fields {
@@ -1094,7 +1443,16 @@ impl Daemon {
                     && previous == 0
                     && binding.detachable
                     && self.registry.get(&binding.harness).adopts(None));
-            if !is_allowed || !binding.turns.lock().await.contains_key(&key) {
+            if !is_allowed
+                || binding
+                    .turns
+                    .lock()
+                    .await
+                    .get(&key)
+                    .is_none_or(|(_, epoch)| {
+                        Some(*epoch) != params.get("epoch").and_then(Value::as_u64)
+                    })
+            {
                 continue;
             }
             if previous == owner {
@@ -1174,7 +1532,7 @@ impl Daemon {
             loop {
                 let line = tokio::select! {
                     _ = shutdown.changed() => break,
-                    line = crate::bounded_line(&mut reader, 1 << 20) => line?,
+                    line = crate::bounded_line(&mut reader, crate::IPC_FRAME_LIMIT) => line?,
                 };
                 let Some(line) = line else {
                     break;
@@ -1308,7 +1666,7 @@ mod tests {
             json!({}),
             json!({"event_id":"e","utterance_id":"u","status":"unknown_binding"}),
             json!({"event_id":"e","utterance_id":"wrong","text_saved":true}),
-            json!({"event_id":"e","utterance_id":"u","status":"rejected","terminal":true}),
+            json!({"event_id":"e","utterance_id":"u","status":"rejected"}),
         ] {
             assert!(!Daemon::ack_allows_removal(&speech, &reply));
         }

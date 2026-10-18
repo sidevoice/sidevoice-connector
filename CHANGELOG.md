@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.10.4](https://github.com/sidevoice/sidevoice-connector/compare/v0.10.3...v0.10.4) (2026-10-18)
+
+
+### Bug Fixes
+
+* **pairing:** show LAN address and request device codes ([#162](https://github.com/sidevoice/sidevoice-connector/issues/162)) ([cd8ec48](https://github.com/sidevoice/sidevoice-connector/commit/cd8ec4838bd2129c17bf1c6e6054ccaadbca7268))
+
+## [0.10.3](https://github.com/sidevoice/sidevoice-connector/compare/v0.10.2...v0.10.3) (2026-10-17)
+
+
+### Bug Fixes
+
+* **service:** listen on the network with the compatible core ([#158](https://github.com/sidevoice/sidevoice-connector/issues/158)) ([4a21ff9](https://github.com/sidevoice/sidevoice-connector/commit/4a21ff9aed9f6816d55f35d2ae84eab23aec6fb5))
+
+## [0.10.2](https://github.com/sidevoice/sidevoice-connector/compare/v0.10.1...v0.10.2) (2026-10-16)
+
+
+### Bug Fixes
+
+* **detect:** find agents whose PATH is set in the shell's rc file ([#149](https://github.com/sidevoice/sidevoice-connector/issues/149)) ([c507326](https://github.com/sidevoice/sidevoice-connector/commit/c5073264fc039be7686571b7ad96d0b7c13747e4))
+* **voice:** tell the agent plainly what wasn't heard, and to say it again if it matters ([#152](https://github.com/sidevoice/sidevoice-connector/issues/152)) ([c41b257](https://github.com/sidevoice/sidevoice-connector/commit/c41b257506f39426c74e0686ec8711c7d20ac369)), closes [#153](https://github.com/sidevoice/sidevoice-connector/issues/153)
+
+## [0.10.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.10.0...v0.10.1) (2026-10-16)
+
+
+### Bug Fixes
+
+* **cli:** tell people to run the connector with npx ([#145](https://github.com/sidevoice/sidevoice-connector/issues/145)) ([6a5162e](https://github.com/sidevoice/sidevoice-connector/commit/6a5162ebcb10ff16f24ea6d01579c1f430b5de6e))
+
+## [0.10.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.9.0...v0.10.0) (2026-10-15)
+
+
+### Features
+
+* **cursor:** expose Desktop Bridge setup and readiness ([#130](https://github.com/sidevoice/sidevoice-connector/issues/130)) ([f610f60](https://github.com/sidevoice/sidevoice-connector/commit/f610f6057c69aa7f9d05c6dfb0f525a1b32dcace)), closes [#120](https://github.com/sidevoice/sidevoice-connector/issues/120)
+* **detect:** find agents via login PATH and passive markers ([#139](https://github.com/sidevoice/sidevoice-connector/issues/139)) ([b369577](https://github.com/sidevoice/sidevoice-connector/commit/b3695776ff29d5bd8bc3b6af853c35c40507b4f8)), closes [#134](https://github.com/sidevoice/sidevoice-connector/issues/134)
+* **turns:** carry conversation epochs through connector delivery ([#126](https://github.com/sidevoice/sidevoice-connector/issues/126)) ([4bf9a90](https://github.com/sidevoice/sidevoice-connector/commit/4bf9a903b9307dd60c4ae4cfc06667b800809719))
+
+
+### Bug Fixes
+
+* **agents:** an agent is installed by its program, never by its configuration directory ([#128](https://github.com/sidevoice/sidevoice-connector/issues/128)) ([0b1d6a8](https://github.com/sidevoice/sidevoice-connector/commit/0b1d6a83ddd435f169d9c10554c6bb745cba16ce))
+* **cursor:** expose bridge delivery diagnostics ([#135](https://github.com/sidevoice/sidevoice-connector/issues/135)) ([1aeb09c](https://github.com/sidevoice/sidevoice-connector/commit/1aeb09c00d985ae1ffdf5a3345eca678721d650b)), closes [#131](https://github.com/sidevoice/sidevoice-connector/issues/131)
+* **uninstall:** confine deletion to owned roots ([#127](https://github.com/sidevoice/sidevoice-connector/issues/127)) ([ed2d0f9](https://github.com/sidevoice/sidevoice-connector/commit/ed2d0f959008aa8498ffb0a24a67d2a5b4653a5a))
+* **working:** wake Cursor monitor when bridge identifies chat ([#137](https://github.com/sidevoice/sidevoice-connector/issues/137)) ([f69a451](https://github.com/sidevoice/sidevoice-connector/commit/f69a45105e78ffec4a5a6f208af60c6b736dd0d6)), closes [#132](https://github.com/sidevoice/sidevoice-connector/issues/132)
+
 ## [0.9.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.8.1...v0.9.0) (2026-10-14)
 
 

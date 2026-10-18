@@ -1,4 +1,5 @@
 use super::*;
+use crate::adapters::registration::{aggregate_readiness, ReadinessCheck};
 use fs2::FileExt;
 use std::fs::OpenOptions;
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
@@ -22,6 +23,11 @@ fn login_path_frame_ignores_banners_and_rejects_empty_or_incomplete_output() {
     assert_eq!(
         parse_login_path("\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}relative\u{1e}SIDEVOICE_PATH_END\u{1e}"),
         None
+    );
+    // One empty or relative entry costs only itself, not the whole PATH.
+    assert_eq!(
+        parse_login_path("\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}/opt/homebrew/bin::.:/usr/bin\u{1e}SIDEVOICE_PATH_END\u{1e}"),
+        Some("/opt/homebrew/bin:/usr/bin".into())
     );
 }
 
@@ -156,10 +162,11 @@ impl Drop for EnvGuard {
 
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "sidevoice-agent-test-{}-{}",
+        let root = Path::new("/tmp").join(format!(
+            // macOS's per-user temp dir can be too long for the Codex daemon socket's SUN_LEN.
+            "sv-agent-{}-{}",
             std::process::id(),
-            Uuid::new_v4()
+            &Uuid::new_v4().simple().to_string()[..8]
         ));
         private_mkdir(&root);
         let root = root.canonicalize().unwrap();
@@ -262,6 +269,200 @@ fn row<'a>(answer: &'a Value, id: &str) -> &'a Value {
         .iter()
         .find(|agent| agent["id"] == id)
         .unwrap()
+}
+
+const BRIDGE_MESSAGE: &str = "Voice in the Cursor editor needs Cursor's Desktop Bridge: in Cursor, open Settings › Beta, enable “Allow CLI to access desktop agents”, then restart Cursor.";
+const UNSUPPORTED_MESSAGE: &str = "Cursor editor voice is not supported on this computer.";
+
+#[tokio::test]
+async fn cursor_agent_row_exposes_readiness_codes_and_fallbacks_without_private_data() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let bin = fixture.root.join("bin");
+    private_mkdir(&bin);
+    let cursor = bin.join("cursor");
+    private_write(&cursor, b"#!/bin/sh\necho 'Cursor 3.22.12'\n");
+    fs::set_permissions(&cursor, fs::Permissions::from_mode(0o700)).unwrap();
+    let _cursor_bin = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cursor.as_os_str());
+    write_json(
+        &fixture.profile.data.join("agents.json"),
+        &json!({
+            "version":1,"scanned_at":null,"login_path":bin,"binaries":{},"seen":{},"dismissed":{}
+        }),
+    );
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let missing = host.handle("agents.list", json!({"watch":"cursor"})).await;
+    let bridge = &row(&missing, "cursor")["readiness"];
+    let expected = if cfg!(target_os = "macos") {
+        json!({"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]})
+    } else {
+        json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
+    };
+    assert_eq!(bridge, &expected);
+    let cached = host.handle("agents.list", json!({})).await;
+    assert_eq!(row(&cached, "cursor")["readiness"], *bridge);
+
+    let dir = fixture.profile.home.join(".cursor/desktop-bridge");
+    private_mkdir(&fixture.profile.home.join(".cursor"));
+    private_mkdir(&dir);
+    let socket = fixture.root.join("bridge.sock");
+    private_write(&socket, b"");
+    write_json(
+        &dir.join("one.json"),
+        &json!({
+            "protocolVersion":1,"pid":std::process::id(),"socketPath":socket,
+            "token":"secret-token","userDataDir":fixture.root.join("private-cursor-data")
+        }),
+    );
+    let rescanned = if cfg!(target_os = "macos") {
+        tokio::time::timeout(StdDuration::from_secs(4), async {
+            loop {
+                let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
+                if row(&answer, "cursor")["readiness"]["state"] == "ready" {
+                    break answer;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    } else {
+        host.handle("agents.list", json!({"watch":"cursor"})).await
+    };
+    let bridge = &row(&rescanned, "cursor")["readiness"];
+    let expected = if cfg!(target_os = "macos") {
+        json!({"state":"ready","reasons":[]})
+    } else {
+        json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
+    };
+    assert_eq!(bridge, &expected);
+    let serialized = bridge.to_string();
+    assert!(!serialized.contains(&fixture.root.to_string_lossy().to_string()));
+    assert!(!serialized.contains("secret-token"));
+}
+
+#[tokio::test]
+async fn cursor_readiness_distinguishes_cli_only_from_editor() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let bin = fixture.root.join("bin");
+    private_mkdir(&bin);
+    let _path = EnvGuard::set("PATH", bin.as_os_str());
+    let cli = bin.join("cursor-agent");
+    private_write(&cli, b"#!/bin/sh\necho 'cursor-agent 1.0.0'\n");
+    fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+    write_json(
+        &fixture.profile.data.join("agents.json"),
+        &json!({
+            "version":1,"scanned_at":null,"login_path":bin,"binaries":{},"seen":{},"dismissed":{}
+        }),
+    );
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let answer = if cfg!(target_os = "macos") {
+        tokio::time::timeout(StdDuration::from_secs(4), async {
+            loop {
+                let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
+                if row(&answer, "cursor")["readiness"]["state"] == "unsupported" {
+                    break answer;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    } else {
+        host.handle("agents.list", json!({"watch":"cursor"})).await
+    };
+    let bridge = &row(&answer, "cursor")["readiness"];
+    assert_eq!(
+        bridge,
+        &json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
+    );
+
+    let app = fixture.profile.home.join("Applications/Cursor.app");
+    private_mkdir(&fixture.profile.home.join("Applications"));
+    private_mkdir(&app);
+    let answer = if cfg!(target_os = "macos") {
+        tokio::time::timeout(StdDuration::from_secs(4), async {
+            loop {
+                let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
+                if row(&answer, "cursor")["readiness"]["state"] == "needs_attention" {
+                    break answer;
+                }
+                tokio::time::sleep(StdDuration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    } else {
+        host.handle("agents.list", json!({"watch":"cursor"})).await
+    };
+    let bridge = &row(&answer, "cursor")["readiness"];
+    let expected = if cfg!(target_os = "macos") {
+        json!({"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]})
+    } else {
+        json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
+    };
+    assert_eq!(bridge, &expected);
+}
+
+#[test]
+fn readiness_aggregation_prioritizes_unsupported_then_attention_then_ready() {
+    use ReadinessCheck::{NeedsAttention, Ok, Unsupported};
+    for (checks, expected) in [
+        (vec![], None),
+        (vec![Ok], Some(json!({"state":"ready","reasons":[]}))),
+        (
+            vec![
+                Ok,
+                NeedsAttention("cursor.bridge_not_running", BRIDGE_MESSAGE),
+            ],
+            Some(
+                json!({"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]}),
+            ),
+        ),
+        (
+            vec![
+                NeedsAttention("cursor.bridge_not_running", BRIDGE_MESSAGE),
+                Unsupported("cursor.unsupported", UNSUPPORTED_MESSAGE),
+            ],
+            Some(
+                json!({"state":"unsupported","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE},{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]}),
+            ),
+        ),
+    ] {
+        assert_eq!(aggregate_readiness(&checks), expected);
+    }
+}
+
+#[test]
+fn readiness_row_helper_attaches_only_nonempty_check_sets() {
+    assert_eq!(
+        with_readiness(
+            json!({"id":"cursor"}),
+            vec![ReadinessCheck::NeedsAttention(
+                "cursor.bridge_not_running",
+                BRIDGE_MESSAGE
+            )]
+        ),
+        json!({"id":"cursor","readiness":{"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]}})
+    );
+    assert_eq!(
+        with_readiness(json!({"id":"claude"}), vec![]),
+        json!({"id":"claude"})
+    );
+}
+
+#[tokio::test]
+async fn profile_only_readiness_hook_defaults_empty_for_other_agents() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let claude = crate::adapters::claude::Claude.readiness_checks(&fixture.profile);
+    let codex = crate::adapters::codex::Codex.readiness_checks(&fixture.profile);
+    assert_eq!(aggregate_readiness(&claude), None);
+    assert_eq!(aggregate_readiness(&codex), None);
+    let cursor: &dyn Registration = &crate::adapters::cursor::Cursor;
+    assert_eq!(cursor.readiness_checks(&fixture.profile).len(), 1);
 }
 
 fn identity_signature(
@@ -1340,7 +1541,7 @@ async fn codex_delivery_does_not_use_a_cached_binary_without_login_path() {
     assert!(agent_command(&fixture.profile, "codex").program.is_none());
     let result = crate::adapters::codex::deliver(
         &json!({"kind":"codex-queue","thread":"t-1"}),
-        &json!({"channel":"voice","session_id":"s","revision":1,"message_id":"m","text":"hello"}),
+        &json!({"channel":"voice","session_id":"s","revision":1,"epoch":0,"message_id":"m","text":"hello"}),
         &fixture.profile,
     )
     .await;
@@ -1388,7 +1589,7 @@ async fn codex_delivery_runs_the_scanned_codex_with_the_login_path() {
 
     let answer = crate::adapters::codex::deliver(
         &json!({"kind":"codex-queue","thread":"t-1"}),
-        &json!({"channel":"voice","session_id":"s","revision":1,"message_id":"m","text":"hola"}),
+        &json!({"channel":"voice","session_id":"s","revision":1,"epoch":1,"message_id":"m","text":"hola"}),
         &fixture.profile,
     )
     .await
@@ -2270,4 +2471,176 @@ async fn agents_requests_with_unknown_fields_are_answered_for_what_they_know() {
         "{checked}"
     );
     host.shutdown().await;
+}
+
+/// A shell whose PATH (Homebrew included) is set only by its rc file and the files that rc sources dynamically, with
+/// a noisy prompt line and nothing in the login files: what the capture must still see.
+async fn capture_with_rc_only_path(shell_name: &str, real_shell: &str, rc: &str) {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    // The child's HOME is the profile's, whatever this process's is.
+    let home = fixture.profile.home.clone();
+    fs::create_dir_all(home.join(".config/sh")).unwrap();
+    private_write(
+        &home.join(".config/sh/01-path.sh"),
+        b"export PATH=\"/opt/homebrew/bin:$PATH\"\n",
+    );
+    private_write(
+        &home.join(rc),
+        b"echo 'prompt noise'\nfor f in \"$HOME\"/.config/sh/*.sh; do . \"$f\"; done\n",
+    );
+    let shell = fixture.root.join(shell_name);
+    private_write(
+        &shell,
+        format!("#!/bin/sh\nexec {real_shell} \"$@\"\n").as_bytes(),
+    );
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    let _shell = EnvGuard::set("SHELL", shell.as_os_str());
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let path = host
+        .capture_login_path(
+            &Cancellation::new(),
+            Instant::now() + StdDuration::from_secs(5),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(path.starts_with("/opt/homebrew/bin:"), "{path}");
+}
+
+#[tokio::test]
+async fn login_path_comes_from_a_bashrc_only_path() {
+    capture_with_rc_only_path("bash", "/bin/bash", ".bashrc").await;
+}
+
+#[tokio::test]
+async fn login_path_comes_from_a_zshrc_only_path() {
+    if let Some(zsh) = ["/bin/zsh", "/usr/bin/zsh"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+    {
+        capture_with_rc_only_path("zsh", zsh, ".zshrc").await;
+    }
+}
+
+/// A scanned fake `codex` that reports `version` and records every call it gets in `calls`, in a profile whose Codex
+/// home may hold a daemon socket.
+fn steer_fixture(version: &str) -> (Fixture, PathBuf) {
+    let fixture = Fixture::new();
+    let bin = fixture.root.join("login-bin");
+    private_mkdir(&bin);
+    let calls = fixture.root.join("calls");
+    let codex = bin.join("codex");
+    private_write(
+        &codex,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli {version}'; exit 0; fi\nprintf '%s\\n' \"$@\" >> '{}'\n",
+            calls.display()
+        )
+        .as_bytes(),
+    );
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut state = empty_state();
+    state["login_path"] = json!(format!("{}:/usr/bin:/bin", bin.display()));
+    write_json(&fixture.profile.data.join("agents.json"), &state);
+    (fixture, calls)
+}
+
+fn voice_event(id: &str) -> Value {
+    json!({"channel":"voice","session_id":"s","revision":1,"epoch":1,"message_id":id,"text":"hola"})
+}
+
+fn running_turn_answers(steer: Value) -> Vec<Value> {
+    vec![
+        json!({"userAgent":"x"}),
+        json!({"data":[{"id":"turn-1","status":"inProgress"}]}),
+        steer,
+    ]
+}
+
+async fn deliver_to(fixture: &Fixture, id: &str) -> Value {
+    crate::adapters::codex::deliver(
+        &json!({"kind":"codex-queue","thread":"t-1"}),
+        &voice_event(id),
+        &fixture.profile,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn codex_delivery_steers_the_running_turn_when_the_version_allows() {
+    let _turn = agent_env().await;
+    let (fixture, calls) = steer_fixture("0.157.0");
+    let socket =
+        crate::adapters::codex::steer::socket_path(fixture.profile.agent_home("CODEX_HOME"));
+    let daemon = crate::adapters::codex::steer::daemon_at(
+        socket,
+        running_turn_answers(json!({"turnId":"turn-1"})),
+    )
+    .await;
+    let answer = deliver_to(&fixture, "m-steer").await;
+    assert_eq!(answer["status"], "accepted");
+    assert!(
+        answer["detail"].as_str().unwrap().contains("steered"),
+        "{answer}"
+    );
+    assert!(!calls.exists(), "the queue was not used");
+    let seen = daemon.await.unwrap();
+    let steer = seen
+        .iter()
+        .find(|frame| frame["method"] == "turn/steer")
+        .unwrap();
+    assert_eq!(steer["params"]["clientUserMessageId"], "m-steer");
+    let text = steer["params"]["input"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("\"message_id\":\"m-steer\"") && text.contains("hola"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn codex_delivery_queues_when_the_version_is_too_old() {
+    let _turn = agent_env().await;
+    let (fixture, calls) = steer_fixture("0.156.0");
+    let socket =
+        crate::adapters::codex::steer::socket_path(fixture.profile.agent_home("CODEX_HOME"));
+    let daemon = crate::adapters::codex::steer::daemon_at(socket, vec![]).await;
+    let answer = deliver_to(&fixture, "m-old").await;
+    assert_eq!(answer["detail"], "codex queue confirmed the thread");
+    assert!(fs::read_to_string(calls)
+        .unwrap()
+        .starts_with("queue\n--thread\nt-1\n--message\n"));
+    daemon.abort();
+}
+
+#[tokio::test]
+async fn codex_delivery_queues_when_no_daemon_socket_exists() {
+    let _turn = agent_env().await;
+    let (fixture, calls) = steer_fixture("0.163.0");
+    let answer = deliver_to(&fixture, "m-nosock").await;
+    assert_eq!(answer["detail"], "codex queue confirmed the thread");
+    assert!(fs::read_to_string(calls).unwrap().starts_with("queue\n"));
+}
+
+#[tokio::test]
+async fn codex_delivery_queues_when_the_steer_is_refused() {
+    let _turn = agent_env().await;
+    let (fixture, calls) = steer_fixture("0.163.0");
+    let socket =
+        crate::adapters::codex::steer::socket_path(fixture.profile.agent_home("CODEX_HOME"));
+    let daemon = crate::adapters::codex::steer::daemon_at(
+        socket,
+        running_turn_answers(json!({"code":-32600,"message":"active turn not steerable"})),
+    )
+    .await;
+    let answer = deliver_to(&fixture, "m-refused").await;
+    assert_eq!(answer["detail"], "codex queue confirmed the thread");
+    let queued = fs::read_to_string(calls).unwrap();
+    assert!(queued.starts_with("queue\n--thread\nt-1\n--message\n"));
+    assert!(
+        queued.contains("\"message_id\":\"m-refused\""),
+        "same message, same id"
+    );
+    daemon.await.unwrap();
 }

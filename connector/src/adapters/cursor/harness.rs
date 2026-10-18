@@ -641,6 +641,8 @@ mod tests {
             thread: identity.thread.clone(),
             title: "chat".into(),
             delivery: identity.delivery.clone(),
+            input_mode: AsyncMutex::new("push".into()),
+            initial_reply_context: AsyncMutex::new(Value::Null),
             engine: AsyncMutex::new(None),
             route: identity.route.clone(),
             capabilities: identity.capabilities.clone(),
@@ -650,9 +652,11 @@ mod tests {
             owner: AtomicU64::new(1),
             id: AsyncMutex::new("local-1".into()),
             serial: AsyncMutex::new(()),
+            publication: AsyncMutex::new(()),
             pending: AsyncMutex::new(VecDeque::new()),
             turns: AsyncMutex::new(HashMap::new()),
             input_context: AsyncMutex::new(HashMap::new()),
+            recent_inputs: AsyncMutex::new(VecDeque::new()),
             read: AsyncMutex::new(VecDeque::new()),
             working: AsyncMutex::new(None),
             stopped: AtomicBool::new(false),
@@ -746,8 +750,7 @@ mod tests {
         let identity =
             super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
         let conversation = conversation(&identity);
-        let frame =
-            json!({"channel":"voice","session_id":"s","revision":1,"message_id":"m","text":"hola"});
+        let frame = json!({"channel":"voice","session_id":"s","revision":1,"epoch":0,"message_id":"m","text":"hola"});
         let answer = deliver_to_editor(&conversation, &frame).await;
         assert_eq!(answer["status"], "failed", "{answer}");
         // Only the fields the room takes in a delivery answer: a failure it keeps, with why in the detail.
