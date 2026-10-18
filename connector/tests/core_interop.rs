@@ -311,23 +311,20 @@ fn pair_device_gives_the_cores_code_with_its_qr() {
 }
 
 #[test]
-fn t16_pull_claim_ack_redelivery_and_mode_handover_use_the_real_core() {
+fn t16_fetch_claim_ack_and_redelivery_use_the_real_core() {
     let Some(core) = core_dir() else { return };
     let profile = Profile::new("turns-pull");
     let _core = profile.start_core(&core, "turns-pull-core");
     let _connector = profile.start_connector();
     profile.wait_linked("turns-pull-core");
     let call = Presentation::open(&profile.core_socket());
-    let receiver = http_receiver();
     let thread = "turns-pull-thread";
     let mut command = profile.connector(&["mcp"]);
-    command
-        .env("SIDEVOICE_THREAD", thread)
-        .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+    command.env("SIDEVOICE_THREAD", thread);
     let mut mcp = Mcp::start(command);
     mcp.initialize("turns-pull-client");
-    let joined = mcp.tool("voice_connect", json!({"input_mode":"pull"}));
-    assert_eq!(joined["delivery"], "pull", "{joined}");
+    let joined = mcp.tool("voice_connect", json!({}));
+    assert_eq!(joined["delivery"], "get_messages", "{joined}");
     assert_eq!(joined["initial_reply_context"]["epoch"], 0, "{joined}");
     let selected = core_json(
         &profile.core_socket(),
@@ -348,10 +345,6 @@ fn t16_pull_claim_ack_redelivery_and_mode_handover_use_the_real_core() {
         Some(&call.token),
     );
     assert_eq!(posted["accepted"], true, "{posted}");
-    assert!(receiver
-        .bodies
-        .recv_timeout(Duration::from_millis(250))
-        .is_err());
     let check = mcp.tool("get_messages", json!({"operation":"check"}));
     assert_eq!(check["count"], 1, "{check}");
     let first = mcp.tool("get_messages", json!({}));
@@ -365,13 +358,11 @@ fn t16_pull_claim_ack_redelivery_and_mode_handover_use_the_real_core() {
     assert_eq!(again["messages"][0]["message_id"], id, "{again}");
     mcp.stop();
     let mut reconnected_command = profile.connector(&["mcp"]);
-    reconnected_command
-        .env("SIDEVOICE_THREAD", thread)
-        .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+    reconnected_command.env("SIDEVOICE_THREAD", thread);
     let mut mcp = Mcp::start(reconnected_command);
     mcp.initialize("turns-pull-reconnected");
-    let rejoined = mcp.tool("voice_connect", json!({"input_mode":"pull"}));
-    assert_eq!(rejoined["delivery"], "pull", "{rejoined}");
+    let rejoined = mcp.tool("voice_connect", json!({}));
+    assert_eq!(rejoined["delivery"], "get_messages", "{rejoined}");
     let recovered = mcp.tool("get_messages", json!({}));
     assert_eq!(recovered["messages"][0]["message_id"], id, "{recovered}");
     assert_eq!(
@@ -390,36 +381,13 @@ fn t16_pull_claim_ack_redelivery_and_mode_handover_use_the_real_core() {
     });
     mcp.stop();
     let mut resumed_command = profile.connector(&["mcp"]);
-    resumed_command
-        .env("SIDEVOICE_THREAD", thread)
-        .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+    resumed_command.env("SIDEVOICE_THREAD", thread);
     let mut mcp = Mcp::start(resumed_command);
     mcp.initialize("turns-pull-after-lost-ack");
-    mcp.tool("voice_connect", json!({"input_mode":"pull"}));
+    mcp.tool("voice_connect", json!({}));
     let duplicate = mcp.tool("get_messages", json!({"ack_ids":[id]}));
     assert_eq!(duplicate["acknowledged"], 0, "{duplicate}");
     assert_eq!(duplicate["count"], 0, "{duplicate}");
-    let push = mcp.tool("voice_connect", json!({"input_mode":"push"}));
-    assert_eq!(push["delivery"], "push", "{push}");
-    let id2 = uuid::Uuid::new_v4().to_string();
-    let posted = core_json(
-        &profile.core_socket(),
-        "POST",
-        "/api/presentation/text",
-        Some(
-            &json!({"text":"Push words","session_id":call.session,"thread_id":thread,
-            "binding_id":selected["binding"]["binding_id"],"message_id":id2}),
-        ),
-        Some(&call.token),
-    );
-    assert_eq!(posted["accepted"], true, "{posted}");
-    let pushed = receiver
-        .bodies
-        .recv_timeout(Duration::from_secs(15))
-        .unwrap();
-    assert_eq!(pushed["message_id"], id2, "{pushed}");
-    assert_eq!(pushed["epoch"], 0, "{pushed}");
-    assert!(pushed["envelope"].as_str().unwrap().contains("Push words"));
     mcp.stop();
 }
 
@@ -431,16 +399,13 @@ fn t02c_t02d_open_turn_refusal_is_terminal_and_empty_notice_is_pullable() {
     let _connector = profile.start_connector();
     profile.wait_linked("turns-refusal-core");
     let call = Presentation::open(&profile.core_socket());
-    let receiver = http_receiver();
     let thread = "turns-refusal-thread";
     let mut command = profile.connector(&["mcp"]);
-    command
-        .env("SIDEVOICE_THREAD", thread)
-        .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+    command.env("SIDEVOICE_THREAD", thread);
     let mut mcp = Mcp::start(command);
     mcp.initialize("turns-refusal-client");
-    let joined = mcp.tool("voice_connect", json!({"input_mode":"pull"}));
-    assert_eq!(joined["delivery"], "pull", "{joined}");
+    let joined = mcp.tool("voice_connect", json!({}));
+    assert_eq!(joined["delivery"], "get_messages", "{joined}");
     core_json(
         &profile.core_socket(),
         "POST",
@@ -513,12 +478,17 @@ fn t04_t05_non_editor_can_speak_first_in_push_and_pull() {
         let thread = format!("speak-first-thread-{mode}");
         let receiver = http_receiver();
         let mut command = profile.connector(&["mcp"]);
-        command
-            .env("SIDEVOICE_THREAD", &thread)
-            .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+        command.env("SIDEVOICE_THREAD", &thread).env(
+            "SIDEVOICE_DELIVERY_URL",
+            if mode == "push" {
+                receiver.url.as_str()
+            } else {
+                ""
+            },
+        );
         let mut mcp = Mcp::start(command);
         mcp.initialize("speak-first-client");
-        let joined = mcp.tool("voice_connect", json!({"input_mode":mode}));
+        let joined = mcp.tool("voice_connect", json!({}));
         let context = &joined["initial_reply_context"];
         assert_eq!(context["revision"], 0, "{joined}");
         assert_eq!(context["epoch"], 0, "{joined}");
@@ -547,7 +517,7 @@ fn t07_retry_identifiers_are_a_pair_and_one_pair_creates_one_reply() {
         .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
     let mut mcp = Mcp::start(command);
     mcp.initialize("retry-ids-client");
-    let joined = mcp.tool("voice_connect", json!({"input_mode":"pull"}));
+    let joined = mcp.tool("voice_connect", json!({}));
     let conversation = joined["conversation"].clone();
     for single in [
         json!({"event_id":"event-only"}),
@@ -695,14 +665,11 @@ fn t16_large_valid_pull_page_arrives_in_complete_cursor_order() {
     profile.wait_linked("pull-large-core");
     let call = Presentation::open(&profile.core_socket());
     let thread = "pull-large-thread";
-    let receiver = http_receiver();
     let mut command = profile.connector(&["mcp"]);
-    command
-        .env("SIDEVOICE_THREAD", thread)
-        .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+    command.env("SIDEVOICE_THREAD", thread);
     let mut mcp = Mcp::start(command);
     mcp.initialize("pull-large-client");
-    mcp.tool("voice_connect", json!({"input_mode":"pull"}));
+    mcp.tool("voice_connect", json!({}));
     let selected = core_json(
         &profile.core_socket(),
         "POST",
@@ -766,12 +733,17 @@ fn actual_notice(
     let receiver = http_receiver();
     let thread = format!("notice-thread-{label}-{mode}");
     let mut command = profile.connector(&["mcp"]);
-    command
-        .env("SIDEVOICE_THREAD", &thread)
-        .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+    command.env("SIDEVOICE_THREAD", &thread).env(
+        "SIDEVOICE_DELIVERY_URL",
+        if mode == "push" {
+            receiver.url.as_str()
+        } else {
+            ""
+        },
+    );
     let mut mcp = Mcp::start(command);
     mcp.initialize("notice-client");
-    let joined = mcp.tool("voice_connect", json!({"input_mode":mode}));
+    let joined = mcp.tool("voice_connect", json!({}));
     core_json(
         &profile.core_socket(),
         "POST",
@@ -993,12 +965,17 @@ fn text_only_written_hearing_is_confirmed_without_an_audio_target_in_both_modes(
         let receiver = http_receiver();
         let thread = format!("thread-{label}");
         let mut command = profile.connector(&["mcp"]);
-        command
-            .env("SIDEVOICE_THREAD", &thread)
-            .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+        command.env("SIDEVOICE_THREAD", &thread).env(
+            "SIDEVOICE_DELIVERY_URL",
+            if mode == "push" {
+                receiver.url.as_str()
+            } else {
+                ""
+            },
+        );
         let mut mcp = Mcp::start(command);
         mcp.initialize("written-hearing-client");
-        let joined = mcp.tool("voice_connect", json!({"input_mode":mode}));
+        let joined = mcp.tool("voice_connect", json!({}));
         core_json(
             &profile.core_socket(),
             "POST",
@@ -1166,12 +1143,17 @@ fn t02c_t02d_refusal_reaches_the_caller_and_words_or_empty_input_in_both_modes()
             let receiver = http_receiver();
             let thread = format!("thread-{label}");
             let mut command = profile.connector(&["mcp"]);
-            command
-                .env("SIDEVOICE_THREAD", &thread)
-                .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+            command.env("SIDEVOICE_THREAD", &thread).env(
+                "SIDEVOICE_DELIVERY_URL",
+                if mode == "push" {
+                    receiver.url.as_str()
+                } else {
+                    ""
+                },
+            );
             let mut mcp = Mcp::start(command);
             mcp.initialize("refusal-client");
-            mcp.tool("voice_connect", json!({"input_mode":mode}));
+            mcp.tool("voice_connect", json!({}));
             core_json(
                 &profile.core_socket(),
                 "POST",
@@ -1248,12 +1230,17 @@ fn t04a_multiple_publications_keep_core_playback_fifo_in_both_modes() {
         let receiver = http_receiver();
         let thread = format!("fifo-thread-{mode}");
         let mut command = profile.connector(&["mcp"]);
-        command
-            .env("SIDEVOICE_THREAD", &thread)
-            .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+        command.env("SIDEVOICE_THREAD", &thread).env(
+            "SIDEVOICE_DELIVERY_URL",
+            if mode == "push" {
+                receiver.url.as_str()
+            } else {
+                ""
+            },
+        );
         let mut mcp = Mcp::start(command);
         mcp.initialize("fifo-client");
-        let joined = mcp.tool("voice_connect", json!({"input_mode":mode}));
+        let joined = mcp.tool("voice_connect", json!({}));
         core_json(
             &profile.core_socket(),
             "POST",
@@ -1299,12 +1286,17 @@ fn t04b_nine_withdrawn_replies_reach_complete_ordered_real_core_batches() {
         let receiver = http_receiver();
         let thread = format!("batches-thread-{mode}");
         let mut command = profile.connector(&["mcp"]);
-        command
-            .env("SIDEVOICE_THREAD", &thread)
-            .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+        command.env("SIDEVOICE_THREAD", &thread).env(
+            "SIDEVOICE_DELIVERY_URL",
+            if mode == "push" {
+                receiver.url.as_str()
+            } else {
+                ""
+            },
+        );
         let mut mcp = Mcp::start(command);
         mcp.initialize("batches-client");
-        let joined = mcp.tool("voice_connect", json!({"input_mode":mode}));
+        let joined = mcp.tool("voice_connect", json!({}));
         core_json(
             &profile.core_socket(),
             "POST",
@@ -1397,12 +1389,17 @@ fn t06e_no_return_notice_without_a_miss_or_after_another_device_heard() {
         let receiver = http_receiver();
         let thread = format!("no-return-thread-{mode}");
         let mut command = profile.connector(&["mcp"]);
-        command
-            .env("SIDEVOICE_THREAD", &thread)
-            .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+        command.env("SIDEVOICE_THREAD", &thread).env(
+            "SIDEVOICE_DELIVERY_URL",
+            if mode == "push" {
+                receiver.url.as_str()
+            } else {
+                ""
+            },
+        );
         let mut mcp = Mcp::start(command);
         mcp.initialize("no-return-client");
-        let joined = mcp.tool("voice_connect", json!({"input_mode":mode}));
+        let joined = mcp.tool("voice_connect", json!({}));
         core_json(
             &profile.core_socket(),
             "POST",
@@ -1477,12 +1474,17 @@ fn t14_real_two_device_corrections_keep_the_original_notice_frozen() {
             let receiver = http_receiver();
             let thread = format!("thread-{label}");
             let mut command = profile.connector(&["mcp"]);
-            command
-                .env("SIDEVOICE_THREAD", &thread)
-                .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+            command.env("SIDEVOICE_THREAD", &thread).env(
+                "SIDEVOICE_DELIVERY_URL",
+                if mode == "push" {
+                    receiver.url.as_str()
+                } else {
+                    ""
+                },
+            );
             let mut mcp = Mcp::start(command);
             mcp.initialize("correction-client");
-            let joined = mcp.tool("voice_connect", json!({"input_mode":mode}));
+            let joined = mcp.tool("voice_connect", json!({}));
             for device in [&call, &other] {
                 core_json(
                     &profile.core_socket(),
@@ -1618,7 +1620,7 @@ fn t16_failed_injection_and_pull_expose_identical_real_notice_fields() {
         .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
     let mut mcp = Mcp::start(command);
     mcp.initialize("notice-parity-client");
-    let joined = mcp.tool("voice_connect", json!({"input_mode":"push"}));
+    let joined = mcp.tool("voice_connect", json!({}));
     core_json(
         &profile.core_socket(),
         "POST",
@@ -1665,8 +1667,8 @@ fn t16_failed_injection_and_pull_expose_identical_real_notice_fields() {
             .ok()
             .filter(|message| message["notice"]["kind"] == "reply_not_heard")
     });
-    let switched = mcp.tool("voice_connect", json!({"input_mode":"pull"}));
-    assert_eq!(switched["delivery"], "pull", "{switched}");
+    let switched = mcp.tool("voice_connect", json!({}));
+    assert_eq!(switched["delivery"], "push", "{switched}");
     let pulled = until("same notice in pull", 15, || {
         let page = mcp.tool("get_messages", json!({}));
         page["messages"].as_array().and_then(|items| {
@@ -1711,7 +1713,7 @@ fn t16_failed_injection_and_pull_expose_identical_real_notice_fields() {
         .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
     let mut mcp = Mcp::start(command);
     mcp.initialize("notice-parity-after-claim-release");
-    mcp.tool("voice_connect", json!({"input_mode":"pull"}));
+    mcp.tool("voice_connect", json!({}));
     other.report_playback(
         "parity-utterance",
         "interrupted",
@@ -1765,15 +1767,12 @@ fn t02c_t02d_backlogged_other_conversation_cannot_hide_real_core_refusal() {
         let _connector = profile.start_connector();
         profile.wait_linked(&label);
         let call = Presentation::open(&profile.core_socket());
-        let receiver = http_receiver();
         let thread = format!("thread-{label}");
         let mut command = profile.connector(&["mcp"]);
-        command
-            .env("SIDEVOICE_THREAD", &thread)
-            .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+        command.env("SIDEVOICE_THREAD", &thread);
         let mut mcp = Mcp::start(command);
         mcp.initialize("backlog-client");
-        mcp.tool("voice_connect", json!({"input_mode":"pull"}));
+        mcp.tool("voice_connect", json!({}));
         core_json(
             &profile.core_socket(),
             "POST",
@@ -1825,12 +1824,17 @@ fn t02a_late_receipt_follows_real_words_with_related_message_id_in_both_modes() 
         let receiver = http_receiver();
         let thread = format!("late-followup-thread-{mode}");
         let mut command = profile.connector(&["mcp"]);
-        command
-            .env("SIDEVOICE_THREAD", &thread)
-            .env("SIDEVOICE_DELIVERY_URL", &receiver.url);
+        command.env("SIDEVOICE_THREAD", &thread).env(
+            "SIDEVOICE_DELIVERY_URL",
+            if mode == "push" {
+                receiver.url.as_str()
+            } else {
+                ""
+            },
+        );
         let mut mcp = Mcp::start(command);
         mcp.initialize("late-followup-client");
-        let joined = mcp.tool("voice_connect", json!({"input_mode":mode}));
+        let joined = mcp.tool("voice_connect", json!({}));
         core_json(
             &profile.core_socket(),
             "POST",
@@ -1951,6 +1955,11 @@ fn t07_t16_detachable_pull_claim_reaches_the_next_real_ipc_owner() {
             }
         }
         fn call(&mut self, method: &str, params: Value) -> Value {
+            let answer = self.try_call(method, params);
+            assert_eq!(answer["ok"], true, "{answer}");
+            answer["result"].clone()
+        }
+        fn try_call(&mut self, method: &str, params: Value) -> Value {
             self.serial += 1;
             writeln!(
                 self.reader.get_mut(),
@@ -1961,9 +1970,7 @@ fn t07_t16_detachable_pull_claim_reaches_the_next_real_ipc_owner() {
             self.reader.get_mut().flush().unwrap();
             let mut line = String::new();
             self.reader.read_line(&mut line).unwrap();
-            let answer: Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(answer["ok"], true, "{answer}");
-            answer["result"].clone()
+            serde_json::from_str(&line).unwrap()
         }
     }
 
@@ -1974,10 +1981,10 @@ fn t07_t16_detachable_pull_claim_reaches_the_next_real_ipc_owner() {
     profile.wait_linked("detachable-core");
     let call = Presentation::open(&profile.core_socket());
     let thread = "detachable-thread";
-    let receiver = http_receiver();
     let registration = json!({"client_ref":"detachable-ref","thread":thread,
-        "title":"Detached pull","harness":"http","delivery":{"kind":"http","url":receiver.url,"thread":thread},
-        "detachable":true,"input_mode":"pull"});
+        "title":"Detached fetch","harness":"http","delivery":{"kind":"none"},
+        "capabilities":{"deliver":"unsupported"},
+        "detachable":true});
     let mut first = Ipc::open(&profile.connector_socket());
     let joined = first.call("register", registration.clone());
     assert!(joined["binding_id"].is_string(), "{joined}");
@@ -2008,7 +2015,10 @@ fn t07_t16_detachable_pull_claim_reaches_the_next_real_ipc_owner() {
     assert_eq!(first_page["messages"][0]["message_id"], id, "{first_page}");
     drop(first);
     let mut next = Ipc::open(&profile.connector_socket());
-    let reclaimed = next.call("register", registration);
+    let reclaimed = until("detached owner released", 5, || {
+        let answer = next.try_call("register", registration.clone());
+        (answer["ok"] == true).then(|| answer["result"].clone())
+    });
     assert!(reclaimed["binding_id"].is_string(), "{reclaimed}");
     let again = next.call("get_messages", json!({"client_ref":"detachable-ref"}));
     assert_eq!(again["messages"][0]["message_id"], id, "{again}");

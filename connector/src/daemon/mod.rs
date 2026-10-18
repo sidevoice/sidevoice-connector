@@ -194,8 +194,8 @@ impl Daemon {
         let mut current = binding.id.lock().await;
         let engine = binding.engine.lock().await.clone().unwrap_or(Value::Null);
         crate::logfile::log(&format!(
-            "delivery stage=register result=attempt mode={} route={}",
-            *binding.input_mode.lock().await,
+            "delivery stage=register result=attempt inject={} route={}",
+            binding.capabilities["deliver"] == "supported",
             binding.route_kind().unwrap_or("none")
         ));
         let mut frame = json!({"client_ref":binding.client_ref,"harness":binding.harness,"thread":binding.thread,"title":binding.title,"delivery":binding.delivery,
