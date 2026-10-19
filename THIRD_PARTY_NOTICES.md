@@ -1,34 +1,15 @@
 # Third-party components
 
-Sidevoice's Apache-2.0 license applies to its own code. Dependencies and models keep
-their original licenses. This repository does not bundle weights or generated
-browser assets.
+Sidevoice's Apache-2.0 licence applies to its own code. The components it ships keep their original licences, and
+every release carries their notices:
 
-Major components include Pipecat, Transformers.js, ONNX Runtime, Kokoro-82M and
-its ONNX conversion, eSpeak NG, the OpenTelemetry SDKs for Python and the browser
-(Apache-2.0), Socket.IO (MIT) at both ends of the connector link, and the MCP
-TypeScript SDK in the Claude draft.
-Earlier experiments reference MLX Audio, Pocket TTS and FluidAudio.
+- **The connector binary** links Rust crates (among them Tokio, Tungstenite, rustls, rmcp, clap, serde and
+  qrcodegen). Each release archive, and each npm platform package made from it, carries the licence expression and
+  licence texts of every crate linked into the binary on that target, in `notices/` (`rust-dependencies.json` and
+  `licenses/`, written by `cargo xtask dist`, `xtask/src/notices.rs`).
+- **The core** ([sidevoice-core](https://github.com/sidevoice/sidevoice-core)) travels inside the package as the
+  core release's own archive, unchanged. Its components, models and their notices are inside that archive and
+  described by the core's repository.
+- **The npm launcher** `sidevoice` is one script of ours with no dependencies.
 
-The published client `@sidevoice/uplink` declares no runtime dependencies
-because it is bundled: esbuild puts `socket.io-client` inside `dist/cli.mjs`,
-so that file redistributes Socket.IO's client and its own dependencies under
-their MIT licenses.
-
-In particular, eSpeak NG has GPL license obligations when redistributing its
-generated WASM/bundles. Review upstream licenses and model cards before
-redistributing compiled assets or weights; the repository's Apache-2.0 license does
-not replace those terms.
-
-- https://github.com/pipecat-ai/pipecat
-- https://github.com/huggingface/transformers.js
-- https://github.com/microsoft/onnxruntime
-- https://huggingface.co/hexgrad/Kokoro-82M
-- https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX
-- https://github.com/espeak-ng/espeak-ng
-- https://github.com/open-telemetry/opentelemetry-python
-- https://github.com/open-telemetry/opentelemetry-js
-- https://github.com/socketio/socket.io
-- https://github.com/socketio/socket.io-client
-- https://github.com/miguelgrinberg/python-socketio
-- https://github.com/modelcontextprotocol/typescript-sdk
+The repository's Apache-2.0 licence does not replace those terms.

@@ -6,10 +6,10 @@
 </picture>
 
 <p>
-  <a href="https://www.npmjs.com/package/@sidevoice/uplink"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/npm/v/@sidevoice/uplink.svg?variant=secondary&size=sm&mode=dark" /><img alt="npm version" src="https://shieldcn.dev/npm/v/@sidevoice/uplink.svg?variant=secondary&size=sm&mode=light" /></picture></a>
-  <a href="https://github.com/sidevoice/sidevoice-connector/actions/workflows/ci.yml"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/ci/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&workflow=ci.yml&branch=main&mode=dark" /><img alt="CI status" src="https://shieldcn.dev/github/ci/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&workflow=ci.yml&branch=main&mode=light" /></picture></a>
+  <a href="https://www.npmjs.com/package/sidevoice"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/npm/v/sidevoice.svg?variant=secondary&size=sm&mode=dark" /><img alt="npm version" src="https://shieldcn.dev/npm/v/sidevoice.svg?variant=secondary&size=sm&mode=light" /></picture></a>
+  <a href="https://github.com/sidevoice/sidevoice-connector/actions/workflows/release.yml"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/ci/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&workflow=release.yml&branch=main&mode=dark" /><img alt="release build status" src="https://shieldcn.dev/github/ci/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&workflow=release.yml&branch=main&mode=light" /></picture></a>
   <a href="LICENSE"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/license/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&mode=dark" /><img alt="licence" src="https://shieldcn.dev/github/license/sidevoice/sidevoice-connector.svg?variant=secondary&size=sm&mode=light" /></picture></a>
-  <picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/node-22+.svg?variant=secondary&size=sm&logo=nodedotjs&mode=dark" /><img alt="requires Node.js 22 or newer" src="https://shieldcn.dev/badge/node-22+.svg?variant=secondary&size=sm&logo=nodedotjs&mode=light" /></picture>
+  <picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/node-18+.svg?variant=secondary&size=sm&logo=nodedotjs&mode=dark" /><img alt="requires Node.js 18 or newer" src="https://shieldcn.dev/badge/node-18+.svg?variant=secondary&size=sm&logo=nodedotjs&mode=light" /></picture>
   <picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/status-beta.svg?variant=secondary&size=sm&mode=dark" /><img alt="status: beta" src="https://shieldcn.dev/badge/status-beta.svg?variant=secondary&size=sm&mode=light" /></picture>
 </p>
 
@@ -20,7 +20,7 @@ already have with your agent into a voice call. The agent keeps its context and 
 speaks its replies, and you answer by voice and can interrupt it — from the sofa or on a walk, not only at your desk.
 
 **sidevoice-connector** is what you install on the machine where your agents run, published on npm as
-[`@sidevoice/uplink`](https://www.npmjs.com/package/@sidevoice/uplink). It gives each agent conversation its voice
+[`sidevoice`](https://www.npmjs.com/package/sidevoice). It gives each agent conversation its voice
 tools (an MCP server), delivers what you say into that same conversation, and installs and starts the
 machine's [core](https://github.com/sidevoice/sidevoice-core).
 
@@ -36,20 +36,31 @@ app, a browser).
 | [sidevoice-desktop](https://github.com/sidevoice/sidevoice-desktop) | The app you call from. |
 | [sidevoice-web](https://github.com/sidevoice/sidevoice-web) | The call interface the app bundles; it can also be served as a static site. |
 
+If a reply to the connector's speech request is lost, the connector keeps the original request and asks the core for its disposition with `speech.recover` after reconnecting. The core returns the original saved or refused result; if it never received the request, it saves the text without playing delayed audio. The connector retains a bounded receipt for the recovered result so an agent retry with the same IDs sees it, even if background recovery finished first. Once that attempt is settled, a new reply in the current conversation can play normally. A queued reply is never retried as new audio when its first admission is uncertain.
+
+Notices delivered through the agent's push or pull mode carry the same confirmed hearing evidence: heard, partially heard with a Unicode-scalar extent, or not heard. The full reply text remains available so the agent knows what was left unheard. A missing receipt stays unconfirmed and does not become a not-heard claim. An already delivered notice keeps its message ID and content across retries; stronger late hearing arrives as a separate `reply_heard` correction.
+
 ## Get started
 
-You need Node.js 22 or newer and [uv](https://docs.astral.sh/uv/) (the core runs on Python, which uv provides).
+You need macOS on Apple silicon, or Linux on x64 or arm64 with glibc (see [Status](#status)), and Node.js 18 or
+newer for `npx`. The npm package `sidevoice` is a small launcher: npm installs beside it the connector built for
+your machine (`@sidevoice/sidevoice-<os>-<cpu>`, with the core inside); installing downloads nothing else.
 
 1. **Install**, on the machine where your agents run:
 
    ```sh
-   npx -y @sidevoice/uplink install
+   npx sidevoice install
    ```
 
-   It installs and starts this machine's core, registers the voice tools with the agents it finds, and tells you
-   what, if anything, needs a manual step (see [Supported agents](#supported-agents)).
+   It installs and starts this machine's core and lists the agents it finds. It connects none of them by itself:
+   run in a terminal, it offers to connect them (none unless you choose); otherwise connect each one you want from
+   the desktop app, or with `npx sidevoice agents connect <claude|codex|cursor>`. It tells you what, if anything,
+   needs a manual step (see [Supported agents](#supported-agents)). An agent you connected with an older Sidevoice
+   stays connected.
 
-2. **Pair your device.** Ask your agent to pair a device, or run `npx @sidevoice/uplink pair-device`. You get a
+   A release candidate, when there is one: `npx sidevoice@next install`.
+
+2. **Pair your device.** Ask your agent to pair a device, or run `npx sidevoice pair-device`. You get a
    one-time code; enter it in the [desktop app](https://github.com/sidevoice/sidevoice-desktop). Pairing is always
    your act: nothing pairs on its own.
 
@@ -59,9 +70,9 @@ You need Node.js 22 or newer and [uv](https://docs.astral.sh/uv/) (the core runs
 
 | Agent | Setup | What you say reaches the conversation |
 |---|---|---|
-| Claude Code | Registered by `install`. | Delivered into the running session. |
-| Codex | `install` prints the lines to add to `~/.codex/config.toml`; then restart Codex. | Queued into the thread with `codex queue`. |
-| Cursor (experimental) | Registered by `install` in `~/.cursor/mcp.json`; approve the new MCP server once. | Cursor offers no route of its own. The CLI receives it only in a chat started with `cursor-agent persist` (needs tmux); the editor, while the small Sidevoice card stays open in that chat. |
+| Claude Code | Connected when you choose it. | Delivered into the running session. |
+| Codex | Connected when you choose it, through the Codex CLI (without it, Sidevoice prints what to add to `~/.codex/config.toml`); then restart Codex. | Steered into the running turn through the Codex daemon (Codex 0.157 or later, session on the shared daemon); otherwise queued into the thread with `codex queue`. |
+| Cursor (experimental) | Connected when you choose it, in `~/.cursor/mcp.json`; approve the new MCP server once. | Cursor offers no route of its own. The CLI receives it only in a chat started with `cursor-agent persist` (needs tmux); the editor, only through Cursor's Desktop Bridge (it must be on; SQLite support is bundled with the connector), once Cursor has recorded the chat's join call; until then nothing is sent. |
 
 Any other agent can receive through an HTTP endpoint of its own (`SIDEVOICE_DELIVERY_URL`).
 
@@ -71,31 +82,59 @@ Beta. What works today: the install above on macOS and Linux, pairing devices wi
 your agents' conversations from the desktop app, interrupting a reply, and replies spoken while the agent keeps
 working. Reaching your machine from outside your network needs a relay, which is still being built.
 
+The connector's own binaries, published on [GitHub Releases](https://github.com/sidevoice/sidevoice-connector/releases),
+run on macOS on Apple silicon and on Linux x86_64 and arm64 with **glibc 2.28 or newer** (Debian 10, Ubuntu 20.04,
+RHEL 8 and their later releases, and most other distributions since 2019; not musl-based ones such as Alpine).
+
 ## Commands
 
-The package installs one command, `sidevoice`:
+The package installs one command, `sidevoice` (the release archive's binary is `sidevoice-connector`; same
+commands). With `--json`, a command prints one JSON object on stdout, and a failure as a stable key with an
+English message.
 
 | Command | What it does |
 |---|---|
-| `install` | Installs this machine's core, starts it, checks it answers, then registers the voice tools. `--no-core` skips the core. |
-| `uninstall` | The reverse of `install`: unregisters the voice tools, stops the connector and removes what it installed. Agent configuration files it did not write are never edited; it prints what to remove. |
+| `install` | Installs this package's connector and the core it carries (or updates to them), starts both, checks they answer (or goes back to the previous version), then lists the agents it finds and how to connect each one. It connects none by itself; in a terminal it offers to (`--no-prompt` does not ask). An agent connected by an older Sidevoice is kept working. `--no-agents` leaves the agents alone. |
+| `uninstall` | The reverse of `install`: stops Sidevoice, removes its service jobs and the agent registrations it wrote, then what it installed and its data. Agent configuration it did not write is never edited. |
 | `pair-device` | Prints a one-time code (and its QR) that pairs a device with this machine. |
+| `pair <room-url> <code>` | Pairs this machine with a room, with the one-time code the room shows. |
+| `agents` | The agents on this machine and whether they use Sidevoice; `agents connect\|disconnect\|dismiss <claude\|codex\|cursor>` changes one. |
+| `service <install\|start\|stop\|restart\|status\|uninstall>` | Sidevoice at login: the core and the connector as two jobs of launchd or the systemd user manager. Without a service manager, Sidevoice runs on demand. |
 | `mcp` | The MCP server an agent starts, one per conversation. You do not run it yourself. |
 | `connector` | The per-machine process the MCP servers share; started on demand, gone when the last conversation leaves. |
+| `--version` | The version; with `--json`, also the target and the source commit. |
 
-[`packages/connector/README.md`](packages/connector/README.md) describes how the pieces talk to each other.
+[`connector/README.md`](connector/README.md) describes each command, where things are kept and how the pieces talk
+to each other.
+
+The [reviewed voice-message MCP integration contract](docs/voice-message-contract.md) describes intended behavior for a future implementation; it is not a description of shipped support.
+
+## When something doesn't arrive or isn't heard
+
+Ask the agent to call the MCP tool `voice_diagnose` in the conversation concerned. It is read-only and answers
+with the versions, whether the core runs and the connector is linked to it, the room pairing, this conversation's
+delivery route (and whether its socket exists), its last deliveries with how each ended and whether the agent has
+read it, the harness's capabilities and inbound check, the editor bridge state, and where the logs are
+(by default `~/.sidevoice/connector.log` and `core.log`). It never includes message text, keys or tokens. A delivery that ends
+`unconfirmed` and is never read usually means the agent holds incoming messages (see its inbound check).
 
 ## Develop
 
+The connector is one Rust binary, the crate in [`connector/`](connector); the build tooling is `cargo xtask`
+([`xtask/`](xtask)). You need the Rust toolchain pinned in [`.github/actions/setup`](.github/actions/setup/action.yml).
+
 ```sh
-npm ci
-npm test               # node --test, on the source
-npm run build          # the bundled dist/cli.mjs that npm publishes
+cargo xtask fixtures   # what the tests run against: the sidevoice-core release pinned in core.pin, the pinned Codex CLI
+cargo test --locked    # unit tests, and the connector against the real core, Codex and the service managers
+cargo xtask dist       # this machine's release archive, built and verified as a release builds it
+                       # (Linux: needs zig and cargo-zigbuild, to link against glibc 2.28; RELEASING.md)
+cargo xtask npm target/dist/sidevoice-connector-<target>.tar.zst && cargo xtask npm-smoke
+                       # its npm packages, installed into a temporary prefix and run (needs Node.js)
+cargo xtask bench      # the test bench: talk to a real Claude Code or Codex session through this build, no app
+                       # needed (connector/README.md, "Test bench")
 ```
 
-The published package has no runtime dependencies: esbuild bundles everything into `dist/cli.mjs`.
-`SIDEVOICE_CORE_WHEEL=<wheel> npm run build` embeds the pinned core's wheel; installing it still lets uv download
-Python and the core's dependencies.
+How a version is built, verified and published (GitHub Releases and npm): [`RELEASING.md`](RELEASING.md).
 
 ## Contributing
 
@@ -111,4 +150,4 @@ which release notes are written ([`RELEASING.md`](RELEASING.md)).
 
 ## Third-party components
 
-The bundle redistributes its dependencies under their own licences: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+The package redistributes its dependencies and the core under their own licences: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

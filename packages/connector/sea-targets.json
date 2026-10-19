@@ -1,8 +1,0 @@
-{
-  "nodeVersion": "v22.23.3",
-  "targets": [
-    { "name": "macos-aarch64", "platform": "darwin", "nodeArch": "arm64" },
-    { "name": "linux-x86_64", "platform": "linux", "nodeArch": "x64" },
-    { "name": "linux-aarch64", "platform": "linux", "nodeArch": "arm64" }
-  ]
-}
