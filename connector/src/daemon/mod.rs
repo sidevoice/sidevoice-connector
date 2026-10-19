@@ -1038,6 +1038,10 @@ impl Daemon {
             _ => "unrecognized",
         };
         crate::logfile::log(&format!("delivery stage=adapter result={status}"));
+        binding
+            .record_delivery(json!({"message_id":message_id,
+                "channel":frame.get("channel").and_then(Value::as_str).unwrap_or("voice"),"at":crate::logfile::timestamp(),"result":status}))
+            .await;
         result
     }
 
@@ -1156,6 +1160,7 @@ impl Daemon {
                     input_context: Mutex::new(HashMap::new()),
                     recent_inputs: Mutex::new(VecDeque::new()),
                     read: Mutex::new(VecDeque::new()),
+                    deliveries: Mutex::new(VecDeque::new()),
                     working: Mutex::new(None),
                     stopped: AtomicBool::new(false),
                     state: harness_adapter.conversation_state(),
@@ -1525,6 +1530,24 @@ impl Daemon {
                         "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound,
                         "engine":engine,"working":working,"input_mode":*binding.input_mode.lock().await,
                         "initial_reply_context":*binding.initial_reply_context.lock().await});
+                    if params.get("deliveries") == Some(&json!(true)) {
+                        // Each recent delivery, and whether the harness has since recorded reading it.
+                        let read = binding.read.lock().await.clone();
+                        let pending = binding.pending.lock().await.clone();
+                        item["deliveries"] = binding
+                            .deliveries
+                            .lock()
+                            .await
+                            .iter()
+                            .map(|delivery| {
+                                let id = delivery["message_id"].as_str().unwrap_or("");
+                                let mut delivery = delivery.clone();
+                                delivery["read"] = json!(read.iter().any(|seen| seen == id));
+                                delivery
+                            })
+                            .collect();
+                        item["awaiting_read"] = json!(pending.len());
+                    }
                     if let Some(fields) = self.registry.get(&binding.harness).status(&binding).await
                     {
                         for (key, value) in fields {

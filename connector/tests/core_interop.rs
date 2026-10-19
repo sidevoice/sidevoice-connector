@@ -146,6 +146,7 @@ fn a_conversation_talks_to_the_real_core_through_the_connector() {
         [
             "get_messages",
             "voice_connect",
+            "voice_diagnose",
             "voice_disconnect",
             "voice_pair",
             "voice_pair_device",

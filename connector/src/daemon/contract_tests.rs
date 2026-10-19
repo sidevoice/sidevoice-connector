@@ -596,6 +596,20 @@ async fn ipc_commands_with_unknown_fields_are_read_for_what_they_know() {
         listed["delivery"]["kind"], "recorder",
         "the route is kept as it was sent: {status}"
     );
+    assert!(
+        listed.get("deliveries").is_none(),
+        "only when asked: {status}"
+    );
+    let diagnosed = daemon
+        .command(7, "status", json!({"deliveries":true,"future":1}))
+        .await
+        .unwrap();
+    assert_eq!(
+        diagnosed["bindings"][0]["deliveries"],
+        json!([]),
+        "{diagnosed}"
+    );
+    assert_eq!(diagnosed["bindings"][0]["awaiting_read"], 0, "{diagnosed}");
 
     // No core: the speech is queued, whatever else the call carried.
     let said = daemon

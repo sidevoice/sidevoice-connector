@@ -678,6 +678,7 @@ mod tests {
             input_context: AsyncMutex::new(HashMap::new()),
             recent_inputs: AsyncMutex::new(VecDeque::new()),
             read: AsyncMutex::new(VecDeque::new()),
+            deliveries: AsyncMutex::new(VecDeque::new()),
             working: AsyncMutex::new(None),
             stopped: AtomicBool::new(false),
             state: Cursor.conversation_state(),

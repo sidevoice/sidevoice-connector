@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// How many recent deliveries a conversation keeps for diagnostics.
+pub const DELIVERIES_KEPT: usize = 20;
+
 /// One joined conversation. `state` is its harness's own (`Harness::conversation_state`).
 pub struct Conversation {
     pub client_ref: String,
@@ -33,6 +36,8 @@ pub struct Conversation {
     pub input_context: Mutex<HashMap<String, (String, i64)>>,
     pub recent_inputs: Mutex<VecDeque<(String, String)>>,
     pub read: Mutex<VecDeque<String>>,
+    /// How the last few deliveries to it ended (`{message_id, channel, at, result}`), for diagnostics. Never text.
+    pub deliveries: Mutex<VecDeque<Value>>,
     pub working: Mutex<Option<bool>>,
     pub stopped: AtomicBool,
     pub state: Box<dyn Any + Send + Sync>,
@@ -59,6 +64,15 @@ impl Conversation {
                     turns.remove(&old_key);
                 }
             }
+        }
+    }
+
+    /// Keep how a delivery ended: the last [`DELIVERIES_KEPT`] of them.
+    pub async fn record_delivery(&self, record: Value) {
+        let mut deliveries = self.deliveries.lock().await;
+        deliveries.push_back(record);
+        while deliveries.len() > DELIVERIES_KEPT {
+            deliveries.pop_front();
         }
     }
 
