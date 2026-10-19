@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.13.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.12.2...v0.13.0) (2026-10-19)
+
+
+### Features
+
+* **mcp:** add a read-only voice_diagnose tool ([#191](https://github.com/sidevoice/sidevoice-connector/issues/191)) ([2b5de8a](https://github.com/sidevoice/sidevoice-connector/commit/2b5de8ac26b453abfbbcdce79983c12a7d99646c))
+
+
+### Bug Fixes
+
+* **claude:** keep the working state until the turn ends ([#190](https://github.com/sidevoice/sidevoice-connector/issues/190)) ([01b7d59](https://github.com/sidevoice/sidevoice-connector/commit/01b7d599d9c482671200f07471249fa36b7b7351))
+* **detect:** don't report Cursor's registration as unreadable when it never ran ([#193](https://github.com/sidevoice/sidevoice-connector/issues/193)) ([81e2530](https://github.com/sidevoice/sidevoice-connector/commit/81e2530f849c49bf2991bcda291068dbbf033bab))
+* **transcript:** read a transcript to its end at once on attach ([#188](https://github.com/sidevoice/sidevoice-connector/issues/188)) ([5145e84](https://github.com/sidevoice/sidevoice-connector/commit/5145e8431445e0d800349ef974e9cbbd577c2821))
+
 ## [0.12.2](https://github.com/sidevoice/sidevoice-connector/compare/v0.12.1...v0.12.2) (2026-10-18)
 
 
