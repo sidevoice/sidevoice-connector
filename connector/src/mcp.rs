@@ -14,7 +14,7 @@ use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{timeout, timeout_at, Duration, Instant};
 
-const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the person's voice room.
+const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the person's voice.
 - Call voice_connect only when the person asks to join or enable voice. Select input_mode pull when this harness will call get_messages; otherwise the core injects input. One binding uses one mode.
 - Each voice or note message carries a stable message_id, conversation epoch, session_id and revision. A repeated ID is redelivery, not new input. A note contains Sidevoice facts and no words from the person. Follow notice instructions, including corrections and related message IDs, in both modes.
 - In pull mode, call get_messages at useful hooks. Acknowledge IDs with ack_ids only after processing them. Pull may learn later than injection. After is a journal position, not an acknowledgement.
@@ -22,7 +22,7 @@ const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the person
 - If voice_say says the person is speaking, the call was refused and nothing was queued: wait for their message. If that turn ends without words, a Sidevoice note may ask you to resend what still matters. A published reply is not proof it was heard.
 - When a message says part of your last reply was unheard, use your previous voice_say call and the "Heard up to" marker to tell the person in fresh words what they missed that still matters, together with what they ask now. For a note with no person words, tell them now. Skip it only if they changed topic or said to.
 - For substantive work, first a short acknowledgement, then meaningful checkpoints, then the result. No filler or tool narration. Take in new input at tool results before starting the next step.
-- A room code pairs this machine with a separate room. Only the person can get that code from the room; ask them for it when needed, and never fetch a room code yourself. A device code pairs the person's app or browser with this machine: when the person asks for that code or asks to pair their device, call voice_pair_device and show its result. Do not ask the person to generate a device code. Neither action is automatic without the person's request. If inbound.ok is false, explain its reason and remedy without changing settings unasked.
+- A device code pairs the person's app or browser with this machine: when the person asks for that code or asks to pair their device, call voice_pair_device and show its result. Do not ask the person to generate a device code, and never call it unasked. If inbound.ok is false, explain its reason and remedy without changing settings unasked.
 - When something does not arrive or is not heard, call voice_diagnose before guessing: it is read-only and shows the route, the last deliveries and whether each was read, the core link and pairing, and where the logs are. Report what it shows; change nothing unasked."#;
 
 /// Overall budget for an IPC round trip, before the daemon's reply (or lack of one) gives up on
@@ -365,13 +365,13 @@ fn pairing_needed(room: &str, paired: Option<String>) -> Option<String> {
 
 fn closed_note(reason: &str) -> &'static str {
     if reason == "conversation_history_limit" {
-        "The connector reached its private conversation history limit and cannot safely restore this older conversation automatically. Its prior room state may be unavailable. Call voice_connect again if the user wants to rejoin."
+        "The connector reached its private conversation history limit and cannot safely restore this older conversation automatically. Its prior state may be unavailable. Call voice_connect again if the user wants to rejoin."
     } else if reason == "state_write_failed" {
         "The connector could not save conversation state and cannot safely restore this older conversation automatically. Call voice_connect again if the user wants to rejoin; confirm the connector can write to its private data folder."
     } else if reason == "connector_revoked" {
-        "This machine's pairing was revoked from the room, so this conversation has no voice. Tell the user; to have voice again they must pair this machine with the one-time code the room shows under Emparejar máquina (voice_pair), and then you can call voice_connect. Continue in writing meanwhile."
+        "This machine's pairing was revoked, so this conversation has no voice. Tell the user; to have voice again they must pair again, and then you can call voice_connect. Continue in writing meanwhile."
     } else {
-        "The user closed this conversation's voice channel from the room. Continue in writing and do not publish speech; call voice_connect again only if the user asks for voice."
+        "The user closed this conversation's voice channel. Continue in writing and do not publish speech; call voice_connect again only if the user asks for voice."
     }
 }
 
@@ -565,13 +565,13 @@ impl Facade {
                     "delivery":if input_mode == "pull" {"pull"} else if pushed {"push"} else {"none"},"room_reachable":result.get("connected"),
                     "epoch":result.get("epoch"),"initial_reply_context":result.get("initial_reply_context"),
                     "capabilities":capabilities,"inbound":identity.inbound,
-                    "local_only":"This machine is not paired with a separate room. This conversation is on this machine's Core and can be seen by any device paired directly with this machine that can reach its address, including another computer on the same LAN. If the person asks for a device pairing code, call voice_pair_device and show it; the person enters it in their app. A separate room pairing is needed only for a room route, not for direct LAN access.",
+                    "local_only":"This conversation is on this machine's core and can be reached by any device paired with this machine that can reach its address, including another computer on the same LAN. If the person asks for a device pairing code, call voice_pair_device and show it; the person enters it in their app.",
                     "version":self.profile.connector_version(),"connector_version":connector.get("version")
                 });
                 if !pushed && input_mode != "pull" {
                     response["voice_in"] = json!({"supported":false,"speak_with":result.get("initial_reply_context"),
-                        "reason":format!("What the user says in the room cannot reach this conversation: {} The user types here as usual.", identity.deliver_note.as_deref().unwrap_or("this harness offers no way to put a message into it.")),
-                        "how":"Use initial_reply_context to speak first. Tell the user once that the room hears this conversation but cannot talk to it."});
+                        "reason":format!("What the user says by voice cannot reach this conversation: {} The user types here as usual.", identity.deliver_note.as_deref().unwrap_or("this harness offers no way to put a message into it.")),
+                        "how":"Use initial_reply_context to speak first. Tell the user once that voice hears this conversation but cannot talk to it."});
                 }
                 if let Some(note) = &identity.watch_note {
                     response["watch_note"] = json!(note);
@@ -1085,13 +1085,13 @@ impl Facade {
 
 fn tools() -> Vec<Tool> {
     let spec = [
-        ("voice_connect", "Connect this conversation to the voice room. Only on an explicit request to join or enable voice. Choose input_mode pull to read the ordinary queue with get_messages; otherwise input is injected. Pull learns messages only when called. The reply includes the core's initial_reply_context for speaking first.", json!({"title":{"type":"string","description":"Short label for this conversation in the room"},"room":{"type":"string","description":"The room's address (https://…) when the user names one; omitted, the room this machine is paired with"},"input_mode":{"type":"string","description":"push (injection, default) or pull (get_messages)"}}), vec![]),
+        ("voice_connect", "Connect this conversation to voice. Only on an explicit request to join or enable voice. Choose input_mode pull to read the ordinary queue with get_messages; otherwise input is injected. Pull learns messages only when called. The reply includes the core's initial_reply_context for speaking first.", json!({"title":{"type":"string","description":"Short label for this conversation"},"room":{"type":"string","description":"The room's address (https://…) when the user names one; omitted, the room this machine is paired with"},"input_mode":{"type":"string","description":"push (injection, default) or pull (get_messages)"}}), vec![]),
         ("voice_pair", "Pair this machine with a room using the one-time code the user read from the room's interface (\"Emparejar máquina\"). Only with a code the user gave you; one room per machine, a new pairing replaces the previous one.", json!({"room":{"type":"string","description":"The room's address (https://…)"},"code":{"type":"string","description":"The one-time pairing code shown by the room"}}), vec!["room","code"]),
         ("voice_say", "Publish a spoken reply with the session_id, revision and epoch from the message header. To speak first, pass conversation and use the initial_reply_context from voice_connect. For an idempotent retry, reuse both event_id and utterance_id unchanged. A current open user turn is refused immediately: wait for its message. A saved reply is not proof it was heard.", json!({"text":{"type":"string"},"session_id":{"type":"string"},"revision":{"type":"integer","minimum":0},"epoch":{"type":"integer","minimum":0},"conversation":{"type":"string","description":"The conversation id voice_connect returned in this chat: to speak first"},"event_id":{"type":"string","description":"Supply with utterance_id and reuse both unchanged on retry"},"utterance_id":{"type":"string","description":"Supply with event_id and reuse both unchanged on retry"},"language":{"type":"string","description":"The language of the reply, as a code: es, en, fr, it, pt or hi are the ones known now; the room decides what it speaks"}}), vec!["text"]),
         ("get_messages", "Read this conversation's ordered ordinary input queue in pull mode. Messages include stable IDs, full notice evidence, an envelope, and a journal position. Pass ack_ids only after consuming them. Without an acknowledgement, a claimed message is returned again; after is a journal position, not an acknowledgement. Pull may learn of speech later than injection.", json!({"conversation":{"type":"string","description":"Conversation id when several chats are joined"},"operation":{"type":"string","description":"get (default) or check"},"after":{"type":"integer","minimum":0},"ack_ids":{"type":"array","items":{"type":"string"}}}), vec![]),
-        ("voice_disconnect", "Leave the voice room. The conversation and its work continue in writing.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
-        ("voice_pair_device", "Generate a one-time code to pair the person's device (the desktop app or a browser) with this machine. When the person asks for a code or asks to pair their device, call this tool and show its code, QR, validity and address as returned. Do not ask the person to generate the device code. Never call it on your own initiative. This is different from voice_pair: only the person can obtain a room code from the room interface.", json!({}), vec![]),
-        ("voice_status", "Whether the room can currently reach this conversation.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
+        ("voice_disconnect", "Leave voice. The conversation and its work continue in writing.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
+        ("voice_pair_device", "Generate a one-time code to pair the person's device (the desktop app or a browser) with this machine. When the person asks for a code or asks to pair their device, call this tool and show its code, QR, validity and address as returned. Do not ask the person to generate the device code. Never call it on your own initiative.", json!({}), vec![]),
+        ("voice_status", "Whether voice can currently reach this conversation.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
         ("voice_diagnose", "Read-only diagnostics for when something does not arrive or is not heard: versions, the core and its link, the pairing, this conversation's delivery route, its last deliveries and whether each was read, harness capabilities and the inbound check, the editor bridge state, and where the logs are. Never message text, keys or tokens. Changes nothing.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
     ];
     // No `additionalProperties: false`: an argument this server does not know (an agent's own, or one a newer server
@@ -1116,7 +1116,7 @@ fn prompt_text(args: Option<&serde_json::Map<String, Value>>) -> String {
         serde_json::to_string(title)
             .unwrap_or_else(|_| "a short label of what this conversation is about".into())
     };
-    format!("Join the voice room for this conversation and keep it reachable.\n\n1. Call voice_status. If it reports joined and room_reachable (or local_only), say so in one line and stop.\n2. Call voice_connect with the title {title}. If the user named a room, pass its address as room.\n   If it returns local_only, the machine has no room: relay that note in one line and continue.\n   If it fails saying this machine is not paired with the room (or is paired with a different one), ask the user for the room's address and the one-time code the room shows them under \"Emparejar máquina\"; call voice_pair with both, then voice_connect again. Never try to get a code from the room yourself.\n3. Tell the user in one line whether the room can reach this conversation. If inbound.ok is false, relay inbound.reason and offer inbound.remedy in your own words, including what safeguard it removes; change nothing yourself.\n\nNothing else is registered: the room learns that a message was read and whether this conversation is working from what the harness itself records about it. How to behave once joined is in this server's instructions.")
+    format!("Join voice with this conversation and keep it reachable.\n\n1. Call voice_status. If it reports joined and room_reachable (or local_only), say so in one line and stop.\n2. Call voice_connect with the title {title}. If it returns local_only, relay that note in one line and continue.\n3. Tell the user in one line whether voice can reach this conversation. If inbound.ok is false, relay inbound.reason and offer inbound.remedy in your own words, including what safeguard it removes; change nothing yourself.\n\nNothing else is registered: voice learns that a message was read and whether this conversation is working from what the harness itself records about it. How to behave once joined is in this server's instructions.")
 }
 
 impl ServerHandler for Facade {
@@ -1191,7 +1191,7 @@ impl ServerHandler for Facade {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListPromptsResult, McpError> {
-        let prompt: Prompt = serde_json::from_value(json!({"name":"voice-room","description":"Join the user's Sidevoice voice room with this conversation.","arguments":[{"name":"title","description":"Title for this conversation in the room","required":false}]}))
+        let prompt: Prompt = serde_json::from_value(json!({"name":"voice-room","description":"Connect this conversation to the user's Sidevoice voice.","arguments":[{"name":"title","description":"Title for this conversation","required":false}]}))
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(ListPromptsResult::with_all_items(vec![prompt]))
     }
@@ -1325,7 +1325,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn device_code_instructions_distinguish_it_from_a_room_code() {
+    fn device_code_instructions_say_when_to_call_it() {
         assert!(INSTRUCTIONS.contains("call voice_pair_device"));
         assert!(INSTRUCTIONS.contains("Do not ask the person to generate a device code"));
         let device = tools()
