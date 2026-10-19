@@ -225,6 +225,16 @@ status codes, booleans and the JSON shape remain visible. Cursor owns this Deskt
 checks descriptor `protocolVersion: 1`, not the Cursor application or extension build version. A request whose
 write may have reached the bridge remains `unknown` and is not retried blindly.
 
+Cursor editor chats cannot be steered. Claude Code takes a voice message into the running turn and Codex can steer
+one, but the Desktop Bridge's `sendMessage` has no documented way to add input to a turn in progress. The connector
+sends every message with `force:false`, leaving Cursor to decide: for an idle chat the bridge answers `submitted` (a
+turn starts), for a busy one `queued`, which the connector reports as delivered like `submitted`; the message is
+then held by Cursor and runs after the current turn. The `force` field is undocumented and its effect is
+unverified (it may interrupt the running turn), so it is not used. A reply that is neither accepted nor an explicit
+refusal stays `unknown` and is not retried blindly; `status: "error"` or a 4xx is a failed send. The room's working
+state comes from the chat's transcript, so it stays right while a message waits in Cursor's queue. The decision is
+`classify_send_reply` in `adapters/cursor/mod.rs`, with unit tests over mock bridge replies.
+
 `uninstall` unloads both jobs and stops what runs on demand (a refusal stops it there, with nothing deleted), removes
 the agents' registrations Sidevoice wrote (current or not), then the owned data and releases. It keeps lock files and
 the stop, so that a launcher on its way finds the stop and starts nothing. The room keeps this machine's pairing until
