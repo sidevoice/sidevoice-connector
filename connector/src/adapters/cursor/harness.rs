@@ -962,11 +962,7 @@ mod tests {
                 room.events.lock().await.as_slice(),
                 &[json!({"working":true,"turn_id":null})]
             );
-            if large {
-                assert!(elapsed >= Duration::from_secs(2));
-            } else {
-                assert!(elapsed < Duration::from_secs(2));
-            }
+            assert!(elapsed < Duration::from_secs(2));
             for _ in 0..10 {
                 set_bridge(&binding, chat.to_owned());
             }

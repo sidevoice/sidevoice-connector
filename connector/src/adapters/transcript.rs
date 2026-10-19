@@ -132,6 +132,7 @@ async fn follow_file<R: TranscriptReader>(
                 announced_initial = false;
             }
         }
+        let before = offset;
         if input.seek(SeekFrom::Start(offset)).is_ok() {
             let mut bytes = [0u8; 65536];
             let limit = bytes.len().min(meta.len().saturating_sub(offset) as usize);
@@ -182,6 +183,11 @@ async fn follow_file<R: TranscriptReader>(
                 report_working(room, conversation, state).await;
             }
             announced_initial = true;
+        }
+        // More of the file waits: read on at once. One 64 KiB read per poll took minutes to reach the end of a
+        // large transcript, and a message delivered meanwhile stayed unconfirmed until then.
+        if offset > before && offset < meta.len() {
+            continue;
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
