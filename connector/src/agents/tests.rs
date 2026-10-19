@@ -114,6 +114,17 @@ async fn public_marker_evidence_names_kind_without_home_path() {
     host.shutdown().await;
 }
 
+#[tokio::test]
+async fn cursor_cli_without_a_configuration_directory_is_not_connected_rather_than_unreadable() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    fs::remove_dir_all(crate::adapters::cursor::config_home(&fixture.profile)).ok();
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_eq!(row(&listed, "cursor")["registration"], "not-connected");
+    host.shutdown().await;
+}
+
 struct Fixture {
     root: PathBuf,
     profile: Profile,
