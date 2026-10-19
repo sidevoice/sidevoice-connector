@@ -35,6 +35,10 @@ fn entry_command(entry: &Value) -> (&str, Vec<String>) {
 fn registration_state(host: &dyn AgentHost) -> Result<Entry> {
     let profile = host.profile();
     profile.validate_existing_private()?;
+    // Cursor never ran here (say, only its CLI is installed): nothing is registered and nothing is broken.
+    if !super::config_home(profile).exists() {
+        return Ok(Entry::bare("not-connected"));
+    }
     let file = super::config_home(profile).join("mcp.json");
     let root = profile.agent_root(super::config_home(profile))?;
     let Some((mut config, _mode, _target)) = read_cursor_config(&file, &root)? else {
