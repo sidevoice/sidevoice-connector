@@ -150,7 +150,13 @@ pub fn assistant_model(entry: &Value) -> Option<&str> {
     (entry.get("type") == Some(&json!("assistant")))
         .then(|| entry.pointer("/message/model").and_then(Value::as_str))
         .flatten()
-        .filter(|model| !model.is_empty())
+        .filter(|model| !model.is_empty() && !is_placeholder_model(model))
+}
+
+/// Claude Code records its own synthetic turns (a rate-limit error, for instance) under a bracketed
+/// placeholder such as `<synthetic>`. That names no engine, so the last real model stays.
+fn is_placeholder_model(model: &str) -> bool {
+    model.starts_with('<') && model.ends_with('>')
 }
 
 /// The engine an assistant transcript entry records: its model and the effort of that turn,
@@ -377,6 +383,18 @@ mod tests {
             assistant_engine(&entry, &json!({})),
             Some(json!({"model":"claude-opus-5-5","effort":null,"thinking":null}))
         );
+    }
+
+    #[test]
+    fn a_synthetic_placeholder_model_is_not_an_engine() {
+        let synthetic = json!({"type":"assistant","message":{"model":"<synthetic>"}});
+        assert_eq!(assistant_model(&synthetic), None);
+        assert_eq!(
+            assistant_engine(&synthetic, &json!({"effort":"medium"})),
+            None
+        );
+        let real = json!({"type":"assistant","message":{"model":"claude-opus-5-5"}});
+        assert_eq!(assistant_model(&real), Some("claude-opus-5-5"));
     }
 
     #[test]
