@@ -1442,8 +1442,7 @@ exit 2
             .handle("agents.connect", json!({"id":"codex"}))
             .await
     });
-    wait_for_file(&pid_file).await;
-    let pid: i32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+    let pid = wait_for_pid(&pid_file).await;
     abandoned.abort();
     let _ = abandoned.await;
     tokio::time::sleep(StdDuration::from_millis(100)).await;
@@ -1461,6 +1460,21 @@ exit 2
     assert_eq!(row(&recovered, "codex")["registration"], "connected");
 
     host.shutdown().await;
+}
+
+/// Waits until the fixture has written a whole pid: the file exists a moment before its content does.
+async fn wait_for_pid(path: &Path) -> i32 {
+    let deadline = Instant::now() + StdDuration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Some(pid) = fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            return pid;
+        }
+        sleep(StdDuration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for a pid in {}", path.display());
 }
 
 async fn wait_for_file(path: &Path) {
