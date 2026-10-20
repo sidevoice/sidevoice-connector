@@ -20,7 +20,7 @@ const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the person
 - In pull mode, call get_messages at useful hooks. Acknowledge IDs with ack_ids only after processing them. Pull may learn later than injection. After is a journal position, not an acknowledgement.
 - When a reply is appropriate, use voice_say with the message's session_id, revision and epoch. For speech before any message, use voice_connect's initial_reply_context. A typed message is context: it updates what you know without requiring a response and does not advance the epoch; you decide whether to answer, and a quick acknowledgement is optional. Several replies in one epoch play in publication order.
 - If voice_say says the person is speaking, the call was refused and nothing was queued: wait for their message. If that turn ends without words, a Sidevoice note may ask you to resend what still matters. A published reply is not proof it was heard.
-- When a message says part of your last reply was unheard, use your previous voice_say call and the "Heard up to" marker to tell the person in fresh words what they missed that still matters, together with what they ask now. For a note with no person words, tell them now. Skip it only if they changed topic or said to.
+- When a message says part of your last reply was unheard, use your previous voice_say call and the "Heard up to" marker to weave anything that still matters into your next reply, in fresh words, together with what they ask now. Never say or hint that something was missed or that you are repeating yourself; drop what is obsolete or minor, and send no standalone catch-up unless something really matters. For a note with no person words, fold it into your next reply the same way.
 - For substantive work, first a short acknowledgement, then meaningful checkpoints, then the result. No filler or tool narration. Take in new input at tool results before starting the next step.
 - A device code pairs the person's app or browser with this machine: when the person asks for that code or asks to pair their device, call voice_pair_device and show its result. Do not ask the person to generate a device code, and never call it unasked. If inbound.ok is false, explain its reason and remedy without changing settings unasked.
 - When something does not arrive or is not heard, call voice_diagnose before guessing: it is read-only and shows the route, the last deliveries and whether each was read, the core link and pairing, and where the logs are. Report what it shows; change nothing unasked."#;
@@ -1479,8 +1479,8 @@ mod tests {
     fn agent_hearing_instructions_give_a_concrete_recovery_rule() {
         assert!(INSTRUCTIONS.contains("previous voice_say call"));
         assert!(INSTRUCTIONS.contains("\"Heard up to\" marker"));
-        assert!(INSTRUCTIONS.contains("in fresh words what they missed that still matters"));
-        assert!(INSTRUCTIONS.contains("Skip it only if they changed topic or said to"));
+        assert!(INSTRUCTIONS.contains("weave anything that still matters into your next reply"));
+        assert!(INSTRUCTIONS.contains("Never say or hint that something was missed"));
         for cause in [
             "skipped",
             "interrupted",

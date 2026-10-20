@@ -53,10 +53,10 @@ fn assert_unheard_envelope(message: &Value) {
     assert!(!envelope.contains("Complete unheard evidence"), "{message}");
     assert!(!envelope.contains("\"unheard\":"), "{message}");
     if message["channel"] == "note" {
-        assert!(envelope.contains("The person didn't hear the end of your last reply and sent no new words. Tell them now what they missed that still matters, in fresh words."), "{message}");
+        assert!(envelope.contains("The person didn't hear the end of your last reply and sent no new words. Weave anything from it that still matters into your next reply, without mentioning that it was missed or that you are repeating yourself."), "{message}");
     } else {
         assert!(
-            envelope.contains("together with what they ask now"),
+            envelope.contains("without mentioning that it was missed"),
             "{message}"
         );
     }
