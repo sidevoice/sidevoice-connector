@@ -442,10 +442,14 @@ fn t02c_t02d_open_turn_refusal_is_terminal_and_empty_notice_is_pullable() {
     });
     assert_eq!(note["channel"], "note", "{note}");
     assert_eq!(note["text"], "", "{note}");
-    assert!(note["envelope"]
-        .as_str()
-        .unwrap()
-        .contains("person sent no words"));
+    let envelope = note["envelope"].as_str().unwrap();
+    assert!(envelope.contains("person sent no words"), "{envelope}");
+    assert!(
+        envelope.contains(
+            "This note tells you when to speak again, not whether: the person can hear you now."
+        ),
+        "{envelope}"
+    );
     let after = mcp.tool("voice_say", args);
     assert_eq!(after["status"], "rejected", "{after}");
     assert_eq!(after["reason"], "user_speaking", "{after}");
@@ -1189,13 +1193,22 @@ fn t02c_t02d_refusal_reaches_the_caller_and_words_or_empty_input_in_both_modes()
             if let Some(words) = words {
                 assert_eq!(message["text"], words, "{message}");
                 assert_eq!(message["channel"], "voice", "{message}");
+                assert!(
+                    message["envelope"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Only its content decides whether to answer by voice"),
+                    "{message}"
+                );
             } else {
                 assert_eq!(message["text"], "", "{message}");
                 assert_eq!(message["notice"]["kind"], "turn_empty", "{message}");
-                assert!(message["envelope"]
-                    .as_str()
-                    .unwrap()
-                    .contains("Resend what you meant"));
+                let envelope = message["envelope"].as_str().unwrap();
+                assert!(envelope.contains("Resend what you meant"), "{envelope}");
+                assert!(
+                    envelope.contains("give it now with voice_say (session_id"),
+                    "{envelope}"
+                );
             }
             let history = core_json(
                 &profile.core_socket(),

@@ -318,9 +318,35 @@ pub fn envelope(event: &Value) -> Result<String> {
     }
     if channel != "room-control" {
         let separator = if replies.is_some() { "\n" } else { "\n\n" };
-        body.push_str(&format!("{separator}[Sidevoice] If a reply is appropriate, use voice_say (session_id {}, revision {revision}, epoch {epoch}). Treat this message ID as stable: a redelivery is not new input.", serde_json::to_string(session_id)?));
+        let say = format!(
+            "voice_say (session_id {}, revision {revision}, epoch {epoch})",
+            serde_json::to_string(session_id)?
+        );
+        let kind = event
+            .get("notice")
+            .and_then(|notice| notice.get("kind"))
+            .and_then(Value::as_str);
+        body.push_str(separator);
+        body.push_str(&reply_rule(channel, kind, &say));
+        body.push_str(" Treat this message ID as stable: a redelivery is not new input.");
     }
     Ok(body)
+}
+
+/// When and whether to answer. Only the content of the person's message decides whether; a note
+/// says when the agent can speak again, never whether it should.
+fn reply_rule(channel: &str, kind: Option<&str>, say: &str) -> String {
+    match (channel, kind) {
+        ("note", Some("turn_empty" | "user_returned")) => format!(
+            "[Sidevoice] This note tells you when to speak again, not whether: the person can hear you now. If you still owe them an answer (a refused or unheard reply, or a result), give it now with {say}, with what is new and relevant at this moment, in fresh words, without saying it was missed."
+        ),
+        ("note", _) => format!(
+            "[Sidevoice] This note tells you when to speak again, not whether: what the person asked decides that. Use {say} for your next spoken reply."
+        ),
+        _ => format!(
+            "[Sidevoice] Only its content decides whether to answer by voice: if it asks or needs something, answer with {say}, short, with the details in writing."
+        ),
+    }
 }
 
 fn heard_tail(heard: &str) -> String {
@@ -443,9 +469,7 @@ mod tests {
                             "The person did not hear the end"
                         })
                         .unwrap()
-                        < injected
-                            .find("If a reply is appropriate, use voice_say")
-                            .unwrap(),
+                        < injected.find("voice_say (session_id").unwrap(),
                     "{scenario}"
                 );
                 let preface = "Part of your last reply wasn't heard — see the end of this";
@@ -483,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_context_keeps_its_epoch_and_leaves_the_reply_to_the_agent() {
+    fn typed_context_keeps_its_epoch_and_its_content_decides_the_reply() {
         let mut push = event("typed_context", "voice", "also use the second table");
         push.as_object_mut().unwrap().remove("notice");
         let mut pull = push.clone();
@@ -494,9 +518,10 @@ mod tests {
         let header: Value = serde_json::from_str(injected.lines().next().unwrap()).unwrap();
         assert_eq!(header["epoch"], 2);
         assert!(injected.contains("\n\nalso use the second table\n\n"));
-        assert!(injected.contains("If a reply is appropriate, use voice_say"));
-        assert!(injected.contains("epoch 2"));
-        assert!(!injected.contains("Reply with voice_say"));
+        assert!(injected.contains(
+            "Only its content decides whether to answer by voice: if it asks or needs something, answer with voice_say (session_id \"s\", revision 4, epoch 2), short, with the details in writing."
+        ));
+        assert!(!injected.contains("If a reply is appropriate"));
     }
 
     #[test]
@@ -511,7 +536,7 @@ mod tests {
         let body = envelope(&correction).unwrap();
         assert!(body.contains("m-earlier"));
         assert!(body.contains("Do not resend solely"));
-        assert!(body.contains("If a reply is appropriate"));
+        assert!(body.contains("This note tells you when to speak again, not whether"));
         assert!(!body.contains("Part of your last reply wasn't heard"));
         assert!(!body.contains("The person did not hear the end"));
 

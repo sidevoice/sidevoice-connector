@@ -219,9 +219,7 @@ async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_
     assert!(envelope.contains("How much was heard is unknown."));
     assert!(
         envelope.find("The person did not hear the end").unwrap()
-            < envelope
-                .find("If a reply is appropriate, use voice_say")
-                .unwrap()
+            < envelope.find("voice_say (session_id").unwrap()
     );
     assert!(!envelope.contains("Complete unheard evidence"));
 
