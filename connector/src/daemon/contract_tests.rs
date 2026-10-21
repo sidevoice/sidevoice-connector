@@ -35,7 +35,7 @@ impl Harness for Recorder {
         }
     }
 
-    fn inject<'a>(
+    fn deliver<'a>(
         &'a self,
         _: &'a Conversation,
         frame: &'a Value,
