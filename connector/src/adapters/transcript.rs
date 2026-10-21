@@ -1,6 +1,6 @@
 //! Following a conversation's JSONL transcript as the harness appends it, and what the harness reads in each line.
 
-use super::conversation::{report_working, Conversation, Room};
+use super::conversation::{report_working, Conversation, Reporter};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -47,7 +47,7 @@ pub trait TranscriptReader: Send + 'static {
 /// Follows the conversation's transcript until it stops: waits for the file, then reads it as it grows.
 pub fn follow<R: TranscriptReader>(
     conversation: Arc<Conversation>,
-    room: Arc<dyn Room>,
+    reporter: Arc<dyn Reporter>,
     reader: R,
 ) {
     tokio::spawn(async move {
@@ -56,7 +56,7 @@ pub fn follow<R: TranscriptReader>(
                 return;
             }
             if let Some(path) = reader.path() {
-                follow_file(&*room, &conversation, path, reader).await;
+                follow_file(&*reporter, &conversation, path, reader).await;
                 return;
             }
             tokio::time::sleep(Duration::from_millis(400)).await;
@@ -65,7 +65,7 @@ pub fn follow<R: TranscriptReader>(
 }
 
 async fn follow_file<R: TranscriptReader>(
-    room: &dyn Room,
+    reporter: &dyn Reporter,
     conversation: &Conversation,
     path: PathBuf,
     mut reader: R,
@@ -89,7 +89,7 @@ async fn follow_file<R: TranscriptReader>(
         let authenticated = reader.authenticated(conversation);
         for observed in reader.begin(authenticated) {
             report(
-                room,
+                reporter,
                 conversation,
                 observed,
                 &mut working,
@@ -132,6 +132,7 @@ async fn follow_file<R: TranscriptReader>(
                 announced_initial = false;
             }
         }
+        let before = offset;
         if input.seek(SeekFrom::Start(offset)).is_ok() {
             let mut bytes = [0u8; 65536];
             let limit = bytes.len().min(meta.len().saturating_sub(offset) as usize);
@@ -157,7 +158,7 @@ async fn follow_file<R: TranscriptReader>(
                             if let Ok(item) = serde_json::from_slice::<Value>(&partial) {
                                 for observed in reader.item(&item, authenticated) {
                                     report(
-                                        room,
+                                        reporter,
                                         conversation,
                                         observed,
                                         &mut working,
@@ -179,9 +180,14 @@ async fn follow_file<R: TranscriptReader>(
         }
         if !catching_up && authenticated && !announced_initial {
             if let Some(state) = working {
-                report_working(room, conversation, state).await;
+                report_working(reporter, conversation, state).await;
             }
             announced_initial = true;
+        }
+        // More of the file waits: read on at once. One 64 KiB read per poll took minutes to reach the end of a
+        // large transcript, and a message delivered meanwhile stayed unconfirmed until then.
+        if offset > before && offset < meta.len() {
+            continue;
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
@@ -190,7 +196,7 @@ async fn follow_file<R: TranscriptReader>(
 /// Reports one observation. Working is only remembered while catching up or before the transcript is authenticated;
 /// the latest is announced once both are past.
 async fn report(
-    room: &dyn Room,
+    reporter: &dyn Reporter,
     conversation: &Conversation,
     observed: Observed,
     working: &mut Option<bool>,
@@ -198,11 +204,11 @@ async fn report(
     authenticated: bool,
 ) {
     match observed {
-        Observed::Engine(engine) => room.engine(conversation, engine).await,
+        Observed::Engine(engine) => reporter.engine(conversation, engine).await,
         Observed::Working(state) => {
             *working = Some(state);
             if !catching_up && authenticated {
-                report_working(room, conversation, state).await;
+                report_working(reporter, conversation, state).await;
             }
         }
         Observed::Read(header) => {
@@ -214,14 +220,15 @@ async fn report(
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let revision = header.get("revision").and_then(Value::as_i64).unwrap_or(0);
-            room.read(
-                conversation,
-                message_id,
-                json!(session_id),
-                json!(revision),
-                Value::Null,
-            )
-            .await;
+            reporter
+                .read(
+                    conversation,
+                    message_id,
+                    json!(session_id),
+                    json!(revision),
+                    Value::Null,
+                )
+                .await;
         }
     }
 }

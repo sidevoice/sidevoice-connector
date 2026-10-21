@@ -1,5 +1,85 @@
 # Changelog
 
+## [0.14.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.14.0...v0.14.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* **core:** ship sidevoice-core 0.5.0 ([#210](https://github.com/sidevoice/sidevoice-connector/issues/210)) ([45db5e1](https://github.com/sidevoice/sidevoice-connector/commit/45db5e17dd3601964c38174893d3f9084c259006))
+
+## [0.14.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.13.1...v0.14.0) (2026-10-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **connector:** remove the room concept ([#208](https://github.com/sidevoice/sidevoice-connector/issues/208))
+
+### Bug Fixes
+
+* **claude:** ignore the synthetic placeholder model ([#206](https://github.com/sidevoice/sidevoice-connector/issues/206)) ([5b343ba](https://github.com/sidevoice/sidevoice-connector/commit/5b343ba8bd83fcbc2abcb93863794bfd228296de))
+* **cursor:** read the effort from the chat's selected model parameters ([#207](https://github.com/sidevoice/sidevoice-connector/issues/207)) ([30af7ed](https://github.com/sidevoice/sidevoice-connector/commit/30af7eda23ad7df94e0a111ec663724f9ab8e9df))
+* **mcp:** catch up on unheard replies implicitly ([#203](https://github.com/sidevoice/sidevoice-connector/issues/203)) ([e1451e3](https://github.com/sidevoice/sidevoice-connector/commit/e1451e3dda7e0a982320795d9952cec0a5eac9c2)), closes [#201](https://github.com/sidevoice/sidevoice-connector/issues/201)
+* **test:** wait for a whole pid in the agents gate test ([#205](https://github.com/sidevoice/sidevoice-connector/issues/205)) ([8738368](https://github.com/sidevoice/sidevoice-connector/commit/8738368b0f81892a5e916e564cd308ba2b5b5127)), closes [#118](https://github.com/sidevoice/sidevoice-connector/issues/118)
+
+
+### Code Refactoring
+
+* **connector:** remove the room concept ([#208](https://github.com/sidevoice/sidevoice-connector/issues/208)) ([ad6ed10](https://github.com/sidevoice/sidevoice-connector/commit/ad6ed105a89c947c30c0ce167491df2c78fefb7f))
+
+## [0.13.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.13.0...v0.13.1) (2026-10-19)
+
+
+### Bug Fixes
+
+* **core:** ship sidevoice-core 0.4.7 ([#195](https://github.com/sidevoice/sidevoice-connector/issues/195)) ([1de4da4](https://github.com/sidevoice/sidevoice-connector/commit/1de4da4343d3fc99e8a17a5ad866e25403fd9752))
+
+## [0.13.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.12.2...v0.13.0) (2026-10-19)
+
+
+### Features
+
+* **mcp:** add a read-only voice_diagnose tool ([#191](https://github.com/sidevoice/sidevoice-connector/issues/191)) ([2b5de8a](https://github.com/sidevoice/sidevoice-connector/commit/2b5de8ac26b453abfbbcdce79983c12a7d99646c))
+
+
+### Bug Fixes
+
+* **claude:** keep the working state until the turn ends ([#190](https://github.com/sidevoice/sidevoice-connector/issues/190)) ([01b7d59](https://github.com/sidevoice/sidevoice-connector/commit/01b7d599d9c482671200f07471249fa36b7b7351))
+* **detect:** don't report Cursor's registration as unreadable when it never ran ([#193](https://github.com/sidevoice/sidevoice-connector/issues/193)) ([81e2530](https://github.com/sidevoice/sidevoice-connector/commit/81e2530f849c49bf2991bcda291068dbbf033bab))
+* **transcript:** read a transcript to its end at once on attach ([#188](https://github.com/sidevoice/sidevoice-connector/issues/188)) ([5145e84](https://github.com/sidevoice/sidevoice-connector/commit/5145e8431445e0d800349ef974e9cbbd577c2821))
+
+## [0.12.2](https://github.com/sidevoice/sidevoice-connector/compare/v0.12.1...v0.12.2) (2026-10-18)
+
+
+### Bug Fixes
+
+* **cursor:** treat a bridge status error as a failed send and log its reason ([#184](https://github.com/sidevoice/sidevoice-connector/issues/184)) ([29897d2](https://github.com/sidevoice/sidevoice-connector/commit/29897d272a9373f5b5a092ad11f678eff448baea))
+
+## [0.12.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.12.0...v0.12.1) (2026-10-18)
+
+
+### Bug Fixes
+
+* **cursor:** log unconfirmed bridge replies safely ([#181](https://github.com/sidevoice/sidevoice-connector/issues/181)) ([0affe13](https://github.com/sidevoice/sidevoice-connector/commit/0affe13d696d35b01067cfa9efdcfa1e7bb9839b)), closes [#180](https://github.com/sidevoice/sidevoice-connector/issues/180) [#173](https://github.com/sidevoice/sidevoice-connector/issues/173)
+
+## [0.12.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.11.0...v0.12.0) (2026-10-18)
+
+v0.11.0 remains a draft release. This release includes its pending changes as well as the changes below.
+
+### Features
+
+* **codex:** steer a running turn when the installed Codex supports it ([#168](https://github.com/sidevoice/sidevoice-connector/issues/168)) ([a29f60b](https://github.com/sidevoice/sidevoice-connector/commit/a29f60b7030c0ac293dcd983dfa4db89894fdbe8))
+* **cursor:** report recorded chat model and effort ([#136](https://github.com/sidevoice/sidevoice-connector/issues/136)) ([ab2f678](https://github.com/sidevoice/sidevoice-connector/commit/ab2f67884b4516815172d026dfde64ffdec18b9d)), closes [#133](https://github.com/sidevoice/sidevoice-connector/issues/133)
+
+
+### Bug Fixes
+
+* **daemon:** replay explicit agent leaves after core recovery ([#167](https://github.com/sidevoice/sidevoice-connector/issues/167)) ([243d024](https://github.com/sidevoice/sidevoice-connector/commit/243d0244e44d436eb762efdca9474666939c50a7))
+* **cursor:** trace and complete Desktop Bridge push delivery ([#173](https://github.com/sidevoice/sidevoice-connector/issues/173)) ([82bae14](https://github.com/sidevoice/sidevoice-connector/commit/82bae14e921c8ca0e70251ab5297aa6c58791156)), closes [#172](https://github.com/sidevoice/sidevoice-connector/issues/172)
+
+### CI
+
+* Move macOS jobs to macos-15 ([#170](https://github.com/sidevoice/sidevoice-connector/issues/170)) ([3b536fd](https://github.com/sidevoice/sidevoice-connector/commit/3b536fd8ff396ba8cc0b26703c0e81f3cc6afdcc))
+
 ## [0.11.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.10.4...v0.11.0) (2026-10-18)
 
 

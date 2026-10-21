@@ -121,13 +121,16 @@ mod tests {
 
     #[test]
     fn json_failures_carry_a_stable_key_and_an_english_message() {
-        let error = anyhow::Error::new(Keyed::new("pair.missing", json!({})));
+        let error = anyhow::Error::new(Keyed::new(
+            "pair-device.failed",
+            json!({"detail":"no core"}),
+        ));
         let value = keyed(&error).value();
         assert_eq!(value["ok"], false);
-        assert_eq!(value["error"]["key"], "pair.missing");
+        assert_eq!(value["error"]["key"], "pair-device.failed");
         assert_eq!(
             value["error"]["message"],
-            "Pairing needs the room's address and the one-time code."
+            "No pairing code could be had from this machine's core: no core"
         );
         let other = keyed(&anyhow::anyhow!("disk\nfull")).value();
         assert_eq!(other["error"]["key"], "connector.failed");

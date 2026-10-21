@@ -7,7 +7,7 @@ use super::{
     deliver_editor, editor_transcript_chat, engine, log_bridge, log_correlation, transcript_path,
     BridgeInstance,
 };
-use crate::adapters::conversation::{Conversation, Room};
+use crate::adapters::conversation::{Conversation, Reporter};
 use crate::adapters::harness::{no_route, Harness, Route};
 use crate::adapters::registration::Registration;
 use crate::adapters::transcript::{self, Observed, TranscriptReader};
@@ -192,23 +192,23 @@ impl Harness for Cursor {
         Some(client::adopted_identity(name, adopted))
     }
 
-    fn watch(&self, conversation: Arc<Conversation>, room: Arc<dyn Room>) {
+    fn watch(&self, conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
         match conversation.route_kind() {
             Some("cursor-tmux" | "none") => {
                 let chat = conversation.thread.clone();
-                watch_engine(conversation.clone(), room.clone(), false);
-                transcript::follow(conversation, room, Reader::new(chat, false));
+                watch_engine(conversation.clone(), reporter.clone(), false);
+                transcript::follow(conversation, reporter, Reader::new(chat, false));
             }
             Some("cursor-bridge") => {
-                watch_engine(conversation.clone(), room.clone(), true);
-                watch_editor(conversation, room);
+                watch_engine(conversation.clone(), reporter.clone(), true);
+                watch_editor(conversation, reporter);
             }
             _ => {}
         }
     }
 }
 
-fn watch_engine(conversation: Arc<Conversation>, room: Arc<dyn Room>, editor: bool) {
+fn watch_engine(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>, editor: bool) {
     tokio::spawn(async move {
         let mut last = None;
         while !conversation.stopped.load(Ordering::Relaxed) {
@@ -224,7 +224,7 @@ fn watch_engine(conversation: Arc<Conversation>, room: Arc<dyn Room>, editor: bo
                         || (bridge(&conversation).as_deref() == Some(chat.as_str())
                             && followed(&conversation).as_deref() == Some(chat.as_str()));
                     if still_current && last.as_ref() != Some(&found) {
-                        room.engine(&conversation, found.clone()).await;
+                        reporter.engine(&conversation, found.clone()).await;
                         last = Some(found);
                     }
                 }
@@ -307,7 +307,7 @@ async fn deliver_to_editor(conversation: &Conversation, frame: &Value) -> Value 
 
 /// Finds which Cursor chat an editor conversation is (by the Desktop Bridge, or by a delivered message showing up
 /// in a transcript), then follows that chat's transcript.
-fn watch_editor(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
+fn watch_editor(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
     tokio::spawn(async move {
         let binding = &conversation;
         let lookup_at = std::env::var("SIDEVOICE_CURSOR_LOOKUP_AT")
@@ -338,11 +338,11 @@ fn watch_editor(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
                     set_followed(binding, chat.clone());
                     transcript::follow(
                         binding.clone(),
-                        room.clone(),
+                        reporter.clone(),
                         Reader::new(chat.clone(), true),
                     );
                 }
-                follow_editor_engine(binding.clone(), room.clone(), chat, bridge_instances());
+                follow_editor_engine(binding.clone(), reporter.clone(), chat, bridge_instances());
                 return;
             }
 
@@ -354,7 +354,7 @@ fn watch_editor(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
                 .cloned()
                 .collect::<Vec<_>>();
             let mut excluded = HashSet::new();
-            for other in room.conversations().await {
+            for other in reporter.conversations().await {
                 if other.client_ref == binding.client_ref {
                     continue;
                 }
@@ -375,7 +375,7 @@ fn watch_editor(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
                     set_followed(binding, chat.clone());
                     transcript::follow(
                         binding.clone(),
-                        room.clone(),
+                        reporter.clone(),
                         Reader::new(chat.clone(), true),
                     );
                 }
@@ -420,7 +420,7 @@ fn watch_editor(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
 /// Observe authenticated editor metadata independently of transcript creation and replay.
 fn follow_editor_engine(
     conversation: Arc<Conversation>,
-    room: Arc<dyn Room>,
+    reporter: Arc<dyn Reporter>,
     chat: String,
     instances: Vec<BridgeInstance>,
 ) -> tokio::task::JoinHandle<()> {
@@ -438,7 +438,7 @@ fn follow_editor_engine(
                 if bridge(&conversation).as_deref() == Some(chat.as_str())
                     && followed(&conversation).as_deref() == Some(chat.as_str())
                 {
-                    room.engine(&conversation, engine).await;
+                    reporter.engine(&conversation, engine).await;
                 }
             }
             tokio::time::sleep(Duration::from_millis(400)).await;
@@ -502,8 +502,8 @@ pub(super) mod client {
 
     pub fn experimental_note(capability: &str, identity: &Identity) -> Option<&'static str> {
         match (capability, identity.delivery["kind"].as_str()) {
-            ("deliver", Some("cursor-tmux")) => Some("Voice from the room reaches this conversation by an experimental route: it is pasted into this chat's terminal through tmux and sent with Enter. If the user is typing at the same moment, the two texts mix. Tell the user once."),
-            ("deliver", Some("cursor-bridge")) => Some("Voice from the room reaches this chat by an experimental route: Cursor's Desktop Bridge submits it to this chat as if the user had typed it, once Cursor has recorded this join call (up to ~30 s). If the user is typing at the same moment, the two may mix. Tell the user once."),
+            ("deliver", Some("cursor-tmux")) => Some("Voice reaches this conversation by an experimental route: it is pasted into this chat's terminal through tmux and sent with Enter. If the user is typing at the same moment, the two texts mix. Tell the user once."),
+            ("deliver", Some("cursor-bridge")) => Some("Voice reaches this chat by an experimental route: Cursor's Desktop Bridge submits it to this chat as if the user had typed it, once Cursor has recorded this join call (up to ~30 s). If the user is typing at the same moment, the two may mix. Tell the user once."),
             ("sessionIdentity", _) => Some("This conversation is identified by Sidevoice, not by an id Cursor gives: each chat of this window that joins gets a conversation of its own. Asking this same chat to join again gives it a second one; leave the old one with voice_disconnect and its conversation id."),
             _ => None,
         }
@@ -609,12 +609,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use tokio::sync::Mutex as AsyncMutex;
 
-    struct RecordingRoom {
+    struct RecordingReporter {
         profile: Profile,
         engines: AsyncMutex<Vec<Value>>,
     }
 
-    impl Room for RecordingRoom {
+    impl Reporter for RecordingReporter {
         fn profile(&self) -> &Profile {
             &self.profile
         }
@@ -677,6 +677,7 @@ mod tests {
             input_context: AsyncMutex::new(HashMap::new()),
             recent_inputs: AsyncMutex::new(VecDeque::new()),
             read: AsyncMutex::new(VecDeque::new()),
+            deliveries: AsyncMutex::new(VecDeque::new()),
             working: AsyncMutex::new(None),
             stopped: AtomicBool::new(false),
             state: Cursor.conversation_state(),
@@ -772,7 +773,7 @@ mod tests {
         let frame = json!({"channel":"voice","session_id":"s","revision":1,"epoch":0,"message_id":"m","text":"hola"});
         let answer = deliver_to_editor(&conversation, &frame).await;
         assert_eq!(answer["status"], "failed", "{answer}");
-        // Only the fields the room takes in a delivery answer: a failure it keeps, with why in the detail.
+        // Only the fields the core takes in a delivery answer: a failure it keeps, with why in the detail.
         assert_eq!(
             answer.as_object().unwrap().keys().collect::<Vec<_>>(),
             ["detail", "status"],
@@ -817,7 +818,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        let room = Arc::new(RecordingRoom {
+        let reporter = Arc::new(RecordingReporter {
             profile,
             engines: AsyncMutex::new(Vec::new()),
         });
@@ -830,28 +831,28 @@ mod tests {
         // A known transcript path is deliberately absent throughout this test.
         let unauthenticated = follow_editor_engine(
             conversation.clone(),
-            room.clone(),
+            reporter.clone(),
             chat.clone(),
             vec![instance.clone()],
         );
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert!(
-            room.engines.lock().await.is_empty(),
+            reporter.engines.lock().await.is_empty(),
             "unbound chat reported an engine"
         );
         unauthenticated.await.unwrap();
         set_bridge(&conversation, "chat-model".into());
         let watcher =
-            follow_editor_engine(conversation.clone(), room.clone(), chat, vec![instance]);
+            follow_editor_engine(conversation.clone(), reporter.clone(), chat, vec![instance]);
         tokio::time::sleep(Duration::from_millis(450)).await;
         assert!(
-            room.engines.lock().await.is_empty(),
+            reporter.engines.lock().await.is_empty(),
             "missing metadata was guessed"
         );
         super::super::state_db::fixture(&database, "INSERT INTO cursorDiskKV VALUES ('composerData:chat-model', '{\"modelConfig\":{\"modelName\":\"gpt-5\",\"effort\":\"high\"}}');");
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if !room.engines.lock().await.is_empty() {
+                if !reporter.engines.lock().await.is_empty() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -860,7 +861,7 @@ mod tests {
         .await
         .expect("authenticated metadata was not reported without a transcript");
         assert_eq!(
-            room.engines.lock().await.as_slice(),
+            reporter.engines.lock().await.as_slice(),
             &[json!({"model":"gpt-5","effort":"high","thinking":null})]
         );
         conversation.stopped.store(true, Ordering::Relaxed);
@@ -872,11 +873,11 @@ mod tests {
 
     /// Records Working from the real Cursor and Codex followers with populated histories.
     /// The initial catch-up delay remains after Cursor bridge discovery is woken.
-    struct HistoryRoom {
+    struct HistoryReporter {
         profile: Profile,
         events: AsyncMutex<Vec<Value>>,
     }
-    impl Room for HistoryRoom {
+    impl Reporter for HistoryReporter {
         fn profile(&self) -> &Profile {
             &self.profile
         }
@@ -902,9 +903,9 @@ mod tests {
             Box::pin(async { vec![] })
         }
     }
-    async fn wait_for_caught_up_working(room: &HistoryRoom) {
+    async fn wait_for_caught_up_working(reporter: &HistoryReporter) {
         tokio::time::timeout(Duration::from_secs(6), async {
-            while room.events.lock().await.is_empty() {
+            while reporter.events.lock().await.is_empty() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
@@ -942,15 +943,15 @@ mod tests {
             let identity =
                 super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
             let binding = Arc::new(conversation(&identity));
-            let room = Arc::new(HistoryRoom {
+            let reporter = Arc::new(HistoryReporter {
                 profile: Profile::for_test(&root.join(chat), &[]),
                 events: AsyncMutex::new(vec![]),
             });
-            watch_editor(binding.clone(), room.clone());
+            watch_editor(binding.clone(), reporter.clone());
             tokio::time::sleep(Duration::from_millis(50)).await;
             let start = tokio::time::Instant::now();
             set_bridge(&binding, chat.to_owned());
-            wait_for_caught_up_working(&room).await;
+            wait_for_caught_up_working(&reporter).await;
             let elapsed = start.elapsed();
             println!(
                 "History Cursor large={large} bytes={} first_working_ms={}",
@@ -958,14 +959,10 @@ mod tests {
                 elapsed.as_millis()
             );
             assert_eq!(
-                room.events.lock().await.as_slice(),
+                reporter.events.lock().await.as_slice(),
                 &[json!({"working":true,"turn_id":null})]
             );
-            if large {
-                assert!(elapsed >= Duration::from_secs(2));
-            } else {
-                assert!(elapsed < Duration::from_secs(2));
-            }
+            assert!(elapsed < Duration::from_secs(2));
             for _ in 0..10 {
                 set_bridge(&binding, chat.to_owned());
             }
@@ -973,7 +970,7 @@ mod tests {
             writeln!(file, "{{\"type\":\"turn_ended\"}}").unwrap();
             tokio::time::sleep(Duration::from_millis(850)).await;
             assert_eq!(
-                room.events.lock().await.as_slice(),
+                reporter.events.lock().await.as_slice(),
                 &[
                     json!({"working":true,"turn_id":null}),
                     json!({"working":false,"turn_id":null})
@@ -1002,13 +999,13 @@ mod tests {
         binding.thread = "history-codex".into();
         binding.delivery = json!({"kind":"codex-queue"});
         let binding = Arc::new(binding);
-        let room = Arc::new(HistoryRoom {
+        let reporter = Arc::new(HistoryReporter {
             profile,
             events: AsyncMutex::new(vec![]),
         });
         let start = tokio::time::Instant::now();
-        crate::adapters::codex::Codex.watch(binding.clone(), room.clone());
-        wait_for_caught_up_working(&room).await;
+        crate::adapters::codex::Codex.watch(binding.clone(), reporter.clone());
+        wait_for_caught_up_working(&reporter).await;
         println!(
             "History Codex bytes={} first_working_ms={}",
             content.len(),
@@ -1016,7 +1013,7 @@ mod tests {
         );
         assert!(start.elapsed() >= Duration::from_secs(2));
         assert_eq!(
-            room.events.lock().await.as_slice(),
+            reporter.events.lock().await.as_slice(),
             &[json!({"working":true,"turn_id":"t1"})]
         );
         binding.stopped.store(true, Ordering::Relaxed);

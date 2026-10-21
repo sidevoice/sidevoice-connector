@@ -35,6 +35,10 @@ fn entry_command(entry: &Value) -> (&str, Vec<String>) {
 fn registration_state(host: &dyn AgentHost) -> Result<Entry> {
     let profile = host.profile();
     profile.validate_existing_private()?;
+    // Cursor never ran here (say, only its CLI is installed): nothing is registered and nothing is broken.
+    if !super::config_home(profile).exists() {
+        return Ok(Entry::bare("not-connected"));
+    }
     let file = super::config_home(profile).join("mcp.json");
     let root = profile.agent_root(super::config_home(profile))?;
     let Some((mut config, _mode, _target)) = read_cursor_config(&file, &root)? else {
@@ -226,13 +230,12 @@ fn write_cursor_config(profile: &Profile, file: &Path, config: &Value) -> Result
     result
 }
 
-/// What Cursor can and cannot do with a room, said at install so that nobody expects more.
-const INSTALL_NOTES: &str = "Cursor: ask a chat to join the voice room; it speaks its replies there. The first time, \
-Cursor asks to approve the new MCP server (cursor-agent: or run  cursor-agent mcp enable sidevoice ). What you say in \
-the room reaches Cursor only by experimental routes, because Cursor offers none of its own:\n  - Cursor CLI: only a \
-chat started with  cursor-agent persist  (needs tmux); the room types into its terminal.\n  - Cursor editor: through \
+/// What Cursor can and cannot do with voice, said at install so that nobody expects more.
+const INSTALL_NOTES: &str = "Cursor: ask a chat to join voice; it speaks its replies there. The first time, \
+Cursor asks to approve the new MCP server (cursor-agent: or run  cursor-agent mcp enable sidevoice ). What you say reaches Cursor only by experimental routes, because Cursor offers none of its own:\n  - Cursor CLI: only a \
+chat started with  cursor-agent persist  (needs tmux); Sidevoice types into its terminal.\n  - Cursor editor: through \
 Cursor's Desktop Bridge, once Cursor has recorded the chat's join call (up to ~30 s); until then nothing is sent. \
-Several chats of a window can join.\nIf you type while the room sends, the two mix.";
+Several chats of a window can join.\nIf you type while Sidevoice sends, the two mix.";
 
 impl Registration for Cursor {
     fn readiness_checks(&self, profile: &Profile) -> Vec<ReadinessCheck> {

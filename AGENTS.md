@@ -24,7 +24,7 @@ client's move to English-keyed bundles is sidevoice/sidevoice-web#17.
 
 ## The protocol evolves like a production API
 
-The core and the room, the connector daemon and an agent's `sidevoice mcp`, and the agents themselves run different
+The core and its clients, the connector daemon and an agent's `sidevoice mcp`, and the agents themselves run different
 versions: a machine installed long ago, a conversation keeping an older `sidevoice mcp`, a newer core
 (sidevoice/sidevoice-core#112). Every boundary the connector speaks (the core link, the IPC over `connector.sock`, the
 MCP tools, the files another version may have written) follows these rules:
@@ -38,7 +38,7 @@ MCP tools, the files another version may have written) follows these rules:
   `additionalProperties: false` in a tool schema; an unknown field is ignored, and a whole message is never refused
   for one. An unknown enum value gets a defined default (`#[serde(other)]`, a default variant, a `_ =>` arm that does
   something sensible), written down where it is read: an unknown `channel` is delivered as `voice`, an unknown close
-  reason reads as closed from the room, a delivery route kind a harness does not know joins the conversation with no
+  reason reads as closed by the client, a delivery route kind a harness does not know joins the conversation with no
   route in (deliver unsupported; its speech still goes out), a speech answer that is neither saved nor a refusal it
   knows keeps the speech in the outbox, an unknown method or command gets a defined refusal
   (`connector.unknown-method`, `unknown IPC method`). A `null` optional field reads as an absent one.
@@ -55,3 +55,7 @@ MCP tools, the files another version may have written) follows these rules:
 - **Contract tests** send each boundary's messages with extra fields, top level and nested, and unknown enum values,
   and assert they are accepted and behave per their known part (`src/daemon/contract_tests.rs`, `src/link.rs`,
   `tests/mcp_interop.rs`, `tests/ipc_interop.rs`). A new message or field gets its case there.
+
+## Public product information
+
+For changes to user-visible behavior, supported platforms/models, setup, security/privacy practices, availability, limitations, or release/download details, follow the shared [public-information process](https://github.com/sidevoice/landing/blob/main/AGENTS.md#keep-public-product-information-current). Record the landing change/PR or a linked `sidevoice/landing` issue in the PR checklist. Landing issues are the follow-up triage queue.

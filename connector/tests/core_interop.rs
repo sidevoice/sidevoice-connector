@@ -53,10 +53,10 @@ fn assert_unheard_envelope(message: &Value) {
     assert!(!envelope.contains("Complete unheard evidence"), "{message}");
     assert!(!envelope.contains("\"unheard\":"), "{message}");
     if message["channel"] == "note" {
-        assert!(envelope.contains("The person didn't hear the end of your last reply and sent no new words. Tell them now what they missed that still matters, in fresh words."), "{message}");
+        assert!(envelope.contains("The person didn't hear the end of your last reply and sent no new words. Weave anything from it that still matters into your next reply, without mentioning that it was missed or that you are repeating yourself."), "{message}");
     } else {
         assert!(
-            envelope.contains("together with what they ask now"),
+            envelope.contains("without mentioning that it was missed"),
             "{message}"
         );
     }
@@ -87,7 +87,7 @@ fn a_conversation_talks_to_the_real_core_through_the_connector() {
 
     let call = Presentation::open(&profile.core_socket());
 
-    // The machine as the room will list it (asked as the device the call paired): what this machine actually is,
+    // The machine as a client will list it (asked as the device the call paired): what this machine actually is,
     // not a placeholder.
     let listed = core_json(
         &profile.core_socket(),
@@ -146,8 +146,8 @@ fn a_conversation_talks_to_the_real_core_through_the_connector() {
         [
             "get_messages",
             "voice_connect",
+            "voice_diagnose",
             "voice_disconnect",
-            "voice_pair",
             "voice_pair_device",
             "voice_say",
             "voice_status"
@@ -273,7 +273,7 @@ fn pair_device_gives_the_cores_code_with_its_qr() {
         answer["expires_in"].as_u64().is_some_and(|s| s > 0),
         "{answer}"
     );
-    // The test's core has only its loopback address and no room.
+    // The test's core has only its loopback address.
     assert_eq!(answer["reach"], "local-only", "{answer}");
     assert!(answer["payload"]["urls"].is_array(), "{answer}");
 

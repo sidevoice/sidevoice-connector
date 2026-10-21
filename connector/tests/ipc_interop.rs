@@ -50,7 +50,7 @@ fn binding<'a>(status: &'a Value, client_ref: &str) -> &'a Value {
 }
 
 /// A newer façade names a route kind Claude Code's harness does not know: the conversation joins with no route in
-/// (deliver unsupported), so the room cannot push to it and its speech still goes out. A route kind the harness
+/// (deliver unsupported), so the core cannot push to it and its speech still goes out. A route kind the harness
 /// knows, naming another conversation, is still refused.
 #[test]
 fn an_unknown_route_kind_joins_with_no_route_in_and_a_known_one_is_still_checked() {

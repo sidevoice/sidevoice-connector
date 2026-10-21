@@ -1,6 +1,6 @@
 //! The harness adapter: everything the connector knows about one agent, behind one trait, found by its id.
 
-use super::conversation::{Conversation, Room};
+use super::conversation::{Conversation, Reporter};
 use super::registration::Registration;
 use super::Identity;
 use crate::profile::{AgentHome, Profile};
@@ -62,8 +62,8 @@ pub trait Harness: Send + Sync {
         Box::new(())
     }
 
-    /// Starts what the harness keeps for all its conversations on this machine, once the room exists.
-    fn attach(&self, _profile: &Profile, _room: Weak<dyn Room>) -> Result<()> {
+    /// Starts what the harness keeps for all its conversations on this machine, once the core link exists.
+    fn attach(&self, _profile: &Profile, _reporter: Weak<dyn Reporter>) -> Result<()> {
         Ok(())
     }
 
@@ -154,8 +154,8 @@ pub trait Harness: Send + Sync {
     }
 
     /// Follows what the harness records about the conversation (transcript, rollout, session state), reporting it
-    /// to the room until the conversation stops.
-    fn watch(&self, _conversation: Arc<Conversation>, _room: Arc<dyn Room>) {}
+    /// to the core until the conversation stops.
+    fn watch(&self, _conversation: Arc<Conversation>, _reporter: Arc<dyn Reporter>) {}
 }
 
 /// Unsupported delivery, as a delivery result.

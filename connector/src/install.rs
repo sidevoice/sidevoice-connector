@@ -620,7 +620,7 @@ pub async fn install(
     let mut answer = json!({"ok": true, "action": action, "version": id, "previous": previous,
         "command": [stable_command(&layout)], "releases": layout.releases, "pruned": pruned,
         "service": kind.as_str(), "state": state.get("state").cloned().unwrap_or(Value::Null),
-        "agents": agents, "paired": crate::pairing::previous_room(profile)});
+        "agents": agents});
     if kind == Kind::Systemd {
         answer["linger"] = crate::service::manager::linger().await;
     }
@@ -826,14 +826,10 @@ fn advice(profile: &Profile, answer: &Value) -> Vec<String> {
             linger["command"].as_str().unwrap_or_default()
         ));
     }
-    if answer["paired"].is_null() {
-        next.push(
-            "This machine is not paired with a room yet. In a conversation, ask to join the voice room and give it \
-             the room's address and the code the room shows for pairing a machine; or pair the Sidevoice app on \
-             this computer with `npx sidevoice pair-device`."
-                .to_owned(),
-        );
-    }
+    next.push(
+        "To pair the Sidevoice app with this machine, run `npx sidevoice pair-device` (or ask an agent for a device code)."
+            .to_owned(),
+    );
     // What to do next with an agent that uses Sidevoice; one without it has its own line in the answer.
     for (id, registration) in crate::adapters::Registry::standard().agents() {
         if answer["agents"][id]["outcome"] == "registered" {
@@ -984,10 +980,6 @@ pub fn human_install(answer: &Value) -> String {
             }
         }
     }
-    match answer["paired"].as_str() {
-        Some(room) => done.push(format!("This machine is paired with {room}.")),
-        None => done.push("This machine is not paired with any room yet.".into()),
-    }
     let mut out = done
         .iter()
         .map(|line| format!("· {line}"))
@@ -1038,7 +1030,6 @@ async fn uninstall_with_hooks(
     } else {
         json!({})
     };
-    let paired = crate::pairing::previous_room(profile);
     let _agents_lock =
         crate::lock::wait_uninstall_agents_lock_at(data.as_raw_fd(), Duration::from_secs(30))
             .await?
@@ -1050,14 +1041,8 @@ async fn uninstall_with_hooks(
     guard.remove_releases().map_err(failed)?;
     guard.finish_claim().map_err(failed)?;
     guard.finish_recovery().map_err(failed)?;
-    let mut advice = Vec::new();
-    if let Some(room) = &paired {
-        advice.push(format!(
-            "The room at {room} still lists this machine as paired until you revoke it on the room's page."
-        ));
-    }
-    advice
-        .push("Conversations already open keep their Sidevoice server until they end.".to_owned());
+    let advice =
+        vec!["Conversations already open keep their Sidevoice server until they end.".to_owned()];
     Ok(
         json!({"ok": true, "state": "absent", "safe_uninstall": crate::identity::SAFE_UNINSTALL,
         "service": service.get("service").cloned().unwrap_or(Value::Null),

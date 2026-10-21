@@ -8,7 +8,7 @@ this binary from the platform package (RELEASING.md); the command is then `sidev
 The connector reports `input.working` as soon as its harness observes a busy transition. Claude Code uses its
 session status, Codex uses rollout turn events, and Cursor uses the joined chat's transcript. For an editor chat,
 Cursor's Desktop Bridge must first identify that chat; delivery identifying it wakes transcript monitoring at once.
-The room exposes this as a boolean fact, and the web waits three seconds before showing Working.
+The core exposes this as a boolean fact, and the web waits three seconds before showing Working.
 
 ## Commands
 
@@ -22,8 +22,7 @@ The room exposes this as a boolean fact, and the web waits three seconds before 
 | `agents connect\|disconnect\|dismiss\|check <claude\|codex\|cursor> [--json]` | Registers Sidevoice with an agent, removes its registration, dismisses the new-agent notice, or checks that its registration works (below). Only an entry Sidevoice wrote is ever changed. |
 | `service <install\|start\|stop\|restart\|status\|uninstall> [--json]` | The login service: two jobs under launchd or the systemd user manager; with no manager, Sidevoice on demand (below). |
 | `service login <on\|off\|status> [--json]` | Whether the login service starts at the next login, and only that: turning it off stops nothing, turning it on starts nothing (below). |
-| `pair <room-url> <code> [--json]` | Pairs this machine with a room: redeems the one-time code the room shows at its `POST /api/connectors/pair` and writes `credentials.json` (0600). https only; plain http only to loopback or a host in `SIDEVOICE_TRUSTED_CLUSTER_HOSTS` (`.suffix` or exact host, comma-separated). The core follows the file; nothing restarts. |
-| `pair-device [--json]` | A one-time code from this machine's core (through the connector, started on demand) to pair a device such as the Sidevoice app: the code, its QR, its validity and where it works (`reach`: `room`, `direct` or `local-only`). `--json`: `{ok, code, expires_in, reach, payload}`. The MCP tool `voice_pair_device` says the same text. |
+| `pair-device [--json]` | A one-time code from this machine's core (through the connector, started on demand) to pair a device such as the Sidevoice app: the code, its QR, its validity and where it works (`reach`: `direct` or `local-only`). `--json`: `{ok, code, expires_in, reach, payload}`. The MCP tool `voice_pair_device` says the same text. |
 | `--version [--json]` | The release version; with `--json`, also the target and the source commit. |
 
 The command line is English only and is not translated. With `--json` a command prints one JSON object on stdout; a
@@ -37,7 +36,7 @@ Every place comes from the environment, so a disposable profile is just a set of
 - the data directory `D`: `$SIDEVOICE_DATA_DIR`, else `~/.sidevoice`. Private (0700), created by the daemon when
   missing and refused, never repaired, when someone else could enter it or any directory above it could have its
   entries replaced. It holds `connector.sock`, `connector.lock`, `connector.log`, `agents.json`, `agents.lock`,
-  `node-stopped.json` (a person's stop), `credentials.json` (the room pairing), the speech outbox, and `core/`
+  `node-stopped.json` (a person's stop), the speech outbox, and `core/`
   (the core's own: `core.json`, `local.sock`);
 - the release root `R`: `$XDG_DATA_HOME/sidevoice`, else `~/.local/share/sidevoice`;
 - the core's port: `$SIDEVOICE_CORE_PORT`, else 10829;
@@ -64,11 +63,11 @@ people; a pid is signalled only after checking it is still the process recorded 
 stderr and the file; run by a service manager, to the file only.
 
 When it links to the core, the daemon says what this machine is: its host name, its platform (`macOS arm64`,
-`Linux x64`), the connector's version and the agents whose homes exist here. The core keeps the latest and the room
+`Linux x64`), the connector's version and the agents whose homes exist here. The core keeps the latest and the app
 lists the machine by it.
 
 Each conversation also reports its engine, `{"model","effort","thinking"}`, on joining and again (`input.engine`)
-whenever it changes; the room shows it as the participant's `engine`. A value nobody recorded is `null`, never
+whenever it changes; the app shows it as the participant's `engine`. A value nobody recorded is `null`, never
 guessed, and nothing is reported without a model. Claude Code: the model and effort of each assistant entry in the
 transcript, with the launch flags (`--effort`, `--thinking`) for what the entry lacks. Codex: `model` and `effort`
 of the rollout's `turn_context`. Cursor CLI: the chat's `lastUsedModel` in its own `store.db`, including an explicit
@@ -76,7 +75,7 @@ of the rollout's `turn_context`. Cursor CLI: the chat's `lastUsedModel` in its o
 configuration in the Desktop Bridge user-data database. Its `effort` is the chat's `effort` or `effort` model
 parameter, then a model-specific default recorded with that configuration. A global Cursor picker is never used
 for another chat; if the chat records no effort or model-specific default, `effort` stays null. `thinking` stays
-null. These are raw model and effort IDs for the room to render, not English display text.
+null. These are raw model and effort IDs for the app to render, not English display text.
 
 ## The core inside
 
@@ -212,20 +211,32 @@ join. The connector does not issue writes to Cursor's databases. A query has a t
 interrupts on timeout, and caps returned data at 64 KiB. SQLite errors in diagnostics are fixed
 codes and contain no query values, chat text, or local paths.
 
-For a Cursor editor chat, a room receipt of `delivered` means Cursor's Desktop Bridge answered `submitted` or
+For a Cursor editor chat, a receipt of `delivered` means Cursor's Desktop Bridge answered `submitted` or
 `queued`; it does not prove the editor displayed or read the message. A later transcript observation supplies the
 `read` receipt. When investigating a missing message, `connector.log` records `cursor_bridge` lines with fixed
 `stage` and `result` codes: `lookup` distinguishes no bridge instance, missing database, SQLite failure, no marker,
 ambiguous chats, and a found chat; `send` records the bridge instance ordinal, HTTP status, and whether it queued,
 submitted, refused, or left the reply uncertain. Instance ordinals follow descriptor creation order (newest first)
 for that scan. `id_hash` is the first 12 hex characters of SHA-256 of the marker or chat ID; the log contains no
-bridge token, message text, bridge response body, socket path, database path, or home path. A request whose write
-may have reached the bridge remains `unknown` and is not retried blindly.
+bridge token, message text, socket path, database path, or home path. An unconfirmed send also logs
+`reply_body`, capped at 512 bytes: arbitrary string values and unknown keys are redacted, while known
+status codes, booleans and the JSON shape remain visible. Cursor owns this Desktop Bridge; the connector
+checks descriptor `protocolVersion: 1`, not the Cursor application or extension build version. A request whose
+write may have reached the bridge remains `unknown` and is not retried blindly.
+
+Cursor editor chats cannot be steered. Claude Code takes a voice message into the running turn and Codex can steer
+one, but the Desktop Bridge's `sendMessage` has no documented way to add input to a turn in progress. The connector
+sends every message with `force:false`, leaving Cursor to decide: for an idle chat the bridge answers `submitted` (a
+turn starts), for a busy one `queued`, which the connector reports as delivered like `submitted`; the message is
+then held by Cursor and runs after the current turn. The `force` field is undocumented and its effect is
+unverified (it may interrupt the running turn), so it is not used. A reply that is neither accepted nor an explicit
+refusal stays `unknown` and is not retried blindly; `status: "error"` or a 4xx is a failed send. The working
+state comes from the chat's transcript, so it stays right while a message waits in Cursor's queue. The decision is
+`classify_send_reply` in `adapters/cursor/mod.rs`, with unit tests over mock bridge replies.
 
 `uninstall` unloads both jobs and stops what runs on demand (a refusal stops it there, with nothing deleted), removes
 the agents' registrations Sidevoice wrote (current or not), then the owned data and releases. It keeps lock files and
-the stop, so that a launcher on its way finds the stop and starts nothing. The room keeps this machine's pairing until
-it is revoked there.
+the stop, so that a launcher on its way finds the stop and starts nothing.
 
 Before unloading, uninstall checks that `D` is exactly `HOME/.sidevoice` and `R` is exactly
 `HOME/.local/share/sidevoice`. A custom data or release path must be dealt with manually; uninstall refuses it.
@@ -259,7 +270,7 @@ Candidate integration tests can set `SIDEVOICE_TEST_CORE_DIR` to an unpacked sou
 `core.pin` at the repository root (a conversation joins through MCP, input from a call is delivered, a reply is
 saved, the core restarts and the link comes back), against the real Codex CLI in a disposable profile, as a
 login service under the real launchd (macOS) and the real systemd user manager (Linux; on a CI runner the test
-enables lingering for the runner's user), with no service manager at all; `pair` against a room on loopback; and the
+enables lingering for the runner's user), with no service manager at all; and the
 core staged from a package into a release; and `install`, `install` again and
 `uninstall` from such a package with no service manager (upgrade, rollback and pruning are unit tests, with a
 stand-in for the services). `cargo xtask fixtures` fetches the core and
@@ -280,8 +291,7 @@ binding ID, it is retained and reported rather than assigned to another conversa
 
 ## Test bench
 
-`cargo xtask bench` drives this build and the pinned core from a page on loopback, without the desktop app or a
-room, so that a real Claude Code or Codex session can be talked to by typing. It is a developer tool
+`cargo xtask bench` drives this build and the pinned core from a page on loopback, without the desktop app, so that a real Claude Code or Codex session can be talked to by typing. It is a developer tool
 (`src/bench/`, the package's second binary, `sidevoice-bench`), never part of a release.
 
 When it starts, the bench:

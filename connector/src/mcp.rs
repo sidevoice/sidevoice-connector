@@ -14,15 +14,16 @@ use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{timeout, timeout_at, Duration, Instant};
 
-const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the person's voice room.
-- Call voice_connect only when the person asks to join or enable voice. Sidevoice injects input when this harness can receive it; get_messages reads uninjected input as a safeguard.
-- Each voice or note message carries a stable message_id, conversation epoch, session_id and revision. A repeated ID is redelivery, not new input. A note contains Sidevoice facts and no words from the person. Follow notice instructions, including corrections and related message IDs, in both modes.
-- Where injection is unavailable, call get_messages at useful hooks. Acknowledge IDs with ack_ids only after processing them. After is a journal position, not an acknowledgement.
+const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the person's voice.
+- Call voice_connect only when the person asks to join or enable voice. Sidevoice puts what the person says into this conversation by itself whenever this harness allows it; there is nothing to choose.
+- Each voice or note message carries a stable message_id, conversation epoch, session_id and revision. A repeated ID is redelivery, not new input. A note contains Sidevoice facts and no words from the person. Follow notice instructions, including corrections and related message IDs.
+- get_messages returns what has not reached this conversation by itself. Call it at useful hooks when voice_connect's voice_in says so, or whenever you expect a message you have not seen. Acknowledge IDs with ack_ids only after processing them. After is a journal position, not an acknowledgement.
 - When a reply is appropriate, use voice_say with the message's session_id, revision and epoch. For speech before any message, use voice_connect's initial_reply_context. A typed message is context: it updates what you know without requiring a response and does not advance the epoch; you decide whether to answer, and a quick acknowledgement is optional. Several replies in one epoch play in publication order.
 - If voice_say says the person is speaking, the call was refused and nothing was queued: wait for their message. If that turn ends without words, a Sidevoice note may ask you to resend what still matters. A published reply is not proof it was heard.
-- When a message says part of your last reply was unheard, use your previous voice_say call and the "Heard up to" marker to tell the person in fresh words what they missed that still matters, together with what they ask now. For a note with no person words, tell them now. Skip it only if they changed topic or said to.
+- When a message says part of your last reply was unheard, use your previous voice_say call and the "Heard up to" marker to weave anything that still matters into your next reply, in fresh words, together with what they ask now. Never say or hint that something was missed or that you are repeating yourself; drop what is obsolete or minor, and send no standalone catch-up unless something really matters. For a note with no person words, fold it into your next reply the same way.
 - For substantive work, first a short acknowledgement, then meaningful checkpoints, then the result. No filler or tool narration. Take in new input at tool results before starting the next step.
-- A room code pairs this machine with a separate room. Only the person can get that code from the room; ask them for it when needed, and never fetch a room code yourself. A device code pairs the person's app or browser with this machine: when the person asks for that code or asks to pair their device, call voice_pair_device and show its result. Do not ask the person to generate a device code. Neither action is automatic without the person's request. If inbound.ok is false, explain its reason and remedy without changing settings unasked."#;
+- A device code pairs the person's app or browser with this machine: when the person asks for that code or asks to pair their device, call voice_pair_device and show its result. Do not ask the person to generate a device code, and never call it unasked. If inbound.ok is false, explain its reason and remedy without changing settings unasked.
+- When something does not arrive or is not heard, call voice_diagnose before guessing: it is read-only and shows the route, the last deliveries and whether each was read, the core link, and where the logs are. Report what it shows; change nothing unasked."#;
 
 /// Overall budget for an IPC round trip, before the daemon's reply (or lack of one) gives up on
 /// its own. `pair_device` gets longer: the daemon can spend up to 15 s waiting for the core link
@@ -178,7 +179,7 @@ impl Ipc {
             replay["resume"] = json!(true);
             let result = match self.call_ready("register", replay).await {
                 Ok(result) => result,
-                Err(error) if error.to_string().starts_with("CLOSED_BY_ROOM:") => {
+                Err(error) if error.to_string().starts_with("CLOSED_BY_CLIENT:") => {
                     if let Some(client_ref) = client_ref {
                         self.registrations.lock().await.remove(&client_ref);
                         self.joined.lock().await.remove(&client_ref);
@@ -270,34 +271,82 @@ struct Joined {
     experimental: Vec<String>,
 }
 
-/// Asked to join a named room: what to ask the user when this machine is not paired with it, or nothing when it is.
-/// The code exists only on the room's screen, so the agent asks the user and never fetches one itself.
-fn pairing_needed(room: &str, paired: Option<String>) -> Option<String> {
-    let Some(target) = crate::pairing::normalize_origin(room) else {
-        return Some(format!(
-            "\"{room}\" is not a room address; expected something like https://voice.example"
-        ));
-    };
-    match paired {
-        None => Some(format!(
-            "This machine is not paired with the room at {target}. Ask the user for the room's address (confirm {target}) and the one-time pairing code the room shows under \"Emparejar máquina\", then call voice_pair with both. Do not fetch a code yourself."
-        )),
-        Some(paired) if paired != target => Some(format!(
-            "This machine is paired with {paired}, not {target}. One room per machine: to switch, ask the user for the pairing code that {target} shows under \"Emparejar máquina\" and call voice_pair (it replaces the current pairing); to stay, call voice_connect without a room."
-        )),
-        Some(_) => None,
+/// What `voice_diagnose` knows from this process rather than from the connector.
+struct Facts<'a> {
+    connector_version: &'a str,
+    logs: Value,
+    several_chats: bool,
+}
+
+/// Only the named fields of an object, so nothing a newer peer adds reaches a diagnosis unread.
+fn only(value: Option<&Value>, keys: &[&str]) -> Value {
+    match value {
+        Some(Value::Object(object)) => keys
+            .iter()
+            .filter_map(|key| {
+                object
+                    .get(*key)
+                    .map(|field| ((*key).to_owned(), field.clone()))
+            })
+            .collect::<serde_json::Map<_, _>>()
+            .into(),
+        _ => Value::Null,
     }
+}
+
+/// The `voice_diagnose` answer: versions, the core and its link, and this conversation's route and recent
+/// deliveries. Built from named fields only: never message text, a token, a credential or a log line.
+fn diagnosis(
+    facts: &Facts,
+    status: &Value,
+    node: &Value,
+    binding: Option<(&str, &Joined)>,
+    listed: Option<&Value>,
+    bridge: Option<Value>,
+) -> Value {
+    let conversation = binding.map(|(name, joined)| {
+        let delivery = &joined.identity.delivery;
+        let mut route = json!({"kind":delivery.get("kind")});
+        if let Some(socket) = delivery.get("socket").and_then(Value::as_str) {
+            route["socket"] = json!(socket);
+            route["socket_exists"] = json!(std::path::Path::new(socket).exists());
+        }
+        json!({"conversation":name,"binding_id":joined.binding_id,"harness":joined.identity.harness,
+            "route":route,"capabilities":joined.capabilities,
+            "experimental":joined.experimental,"inbound":joined.identity.inbound,
+            "known_to_connector":listed.is_some(),
+            "working":listed.and_then(|item| item.get("working")),
+            "engine":only(listed.and_then(|item| item.get("engine")), &["model","effort","thinking"]),
+            "deliveries":listed.and_then(|item| item.get("deliveries")).and_then(Value::as_array)
+                .map(|items| items.iter().map(|item| only(Some(item), &["message_id","channel","at","result","read"])).collect::<Vec<_>>()),
+            "awaiting_read":listed.and_then(|item| item.get("awaiting_read")),
+            "bridge":bridge.or_else(|| listed.and_then(|item| item.get("delivery_state")).map(|state| only(Some(state), &["state","bridge_chat_known"])))})
+    });
+    let mut report = json!({
+        "versions":{"connector":facts.connector_version,"connector_daemon":status.get("version"),
+            "core":node.pointer("/core/version"),"core_api":node.pointer("/core/api"),
+            "core_protocol":status.pointer("/core/protocol")},
+        "connector":{"reachable":status.get("error").is_none(),"error":status.get("error"),
+            "conversations":status.get("bindings").and_then(Value::as_array).map(Vec::len)},
+        "core":{"state":node.get("state"),"service":node.get("service"),"linked":status.get("connected"),
+            "failure":only(node.get("failure"), &["key","step","at","message"])},
+        "resume":{"blocked":status.get("resume_blocked"),"reason":status.get("resume_block_reason")},
+        "conversation":conversation,
+        "logs":facts.logs,
+    });
+    if facts.several_chats {
+        report["note"] = json!("Several chats of this window are joined: pass the conversation id voice_connect returned in this chat to see its route and deliveries.");
+    }
+    report
 }
 
 fn closed_note(reason: &str) -> &'static str {
     if reason == "conversation_history_limit" {
-        "The connector reached its private conversation history limit and cannot safely restore this older conversation automatically. Its prior room state may be unavailable. Call voice_connect again if the user wants to rejoin."
+        "The connector reached its private conversation history limit and cannot safely restore this older conversation automatically. Its prior state may be unavailable. Call voice_connect again if the user wants to rejoin."
     } else if reason == "state_write_failed" {
         "The connector could not save conversation state and cannot safely restore this older conversation automatically. Call voice_connect again if the user wants to rejoin; confirm the connector can write to its private data folder."
-    } else if reason == "connector_revoked" {
-        "This machine's pairing was revoked from the room, so this conversation has no voice. Tell the user; to have voice again they must pair this machine with the one-time code the room shows under Emparejar máquina (voice_pair), and then you can call voice_connect. Continue in writing meanwhile."
     } else {
-        "The user closed this conversation's voice channel from the room. Continue in writing and do not publish speech; call voice_connect again only if the user asks for voice."
+        "The user closed this conversation's voice channel. Continue in writing and do not publish speech; call voice_connect again only if the user asks for voice."
     }
 }
 
@@ -367,13 +416,6 @@ impl Facade {
     ) -> Result<Value> {
         match name {
             "voice_connect" => {
-                if let Some(room) = args.get("room").and_then(Value::as_str) {
-                    if let Some(refusal) =
-                        pairing_needed(room, crate::pairing::previous_room(&self.profile))
-                    {
-                        bail!("{refusal}");
-                    }
-                }
                 let mut identity = adapters::identify(&meta, Some(&client), &client_caps)?;
                 let explicit_title = args.get("title").and_then(Value::as_str).unwrap_or("");
                 let title = if !explicit_title.is_empty() {
@@ -479,16 +521,17 @@ impl Facade {
                 let mut response = json!({
                     "status":if result.get("pending") == Some(&json!(true)) {"joining"} else {"joined"},
                     "harness":identity.harness,"conversation":identity.thread,"binding_id":binding_id,
-                    "delivery":if pushed {"push"} else {"get_messages"},"room_reachable":result.get("connected"),
+                    "delivery":if pushed {"push"} else {"get_messages"},"reachable":result.get("connected"),
                     "epoch":result.get("epoch"),"initial_reply_context":result.get("initial_reply_context"),
                     "capabilities":capabilities,"inbound":identity.inbound,
-                    "local_only":"This machine is not paired with a separate room. This conversation is on this machine's Core and can be seen by any device paired directly with this machine that can reach its address, including another computer on the same LAN. If the person asks for a device pairing code, call voice_pair_device and show it; the person enters it in their app. A separate room pairing is needed only for a room route, not for direct LAN access.",
+                    "local_only":"This conversation is on this machine's core and can be reached by any device paired with this machine that can reach its address, including another computer on the same LAN. If the person asks for a device pairing code, call voice_pair_device and show it; the person enters it in their app.",
                     "version":self.profile.connector_version(),"connector_version":connector.get("version")
                 });
                 if !pushed {
                     response["voice_in"] = json!({"supported":true,"via":"get_messages",
                         "speak_with":result.get("initial_reply_context"),
-                        "how":"Call get_messages to read voice input, then acknowledge its message ID after processing it."});
+                        "reason":format!("Voice cannot be put into this conversation by itself: {}", identity.deliver_note.as_deref().unwrap_or("this harness offers no way to put a message into it.")),
+                        "how":"Call get_messages to read what the person says, at the start of each turn and between steps, then acknowledge each message ID after processing it."});
                 }
                 if let Some(note) = &identity.watch_note {
                     response["watch_note"] = json!(note);
@@ -517,13 +560,8 @@ impl Facade {
                 }
                 let status = self.ipc.call("status", json!({})).await?;
                 self.refresh_binding_ids(&status).await;
-                if status.get("refused").and_then(Value::as_str).is_some() {
-                    return Ok(json!({"joined":false,"conversation":named,
-                        "room_reachable":status.get("connected"),"connector":status,
-                        "closed_by_room":true,"note":closed_note("connector_revoked")}));
-                }
                 let closed_now = status
-                    .get("closed_by_room")
+                    .get("closed_by_client")
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
@@ -556,25 +594,25 @@ impl Facade {
                     let reason = closed_reasons
                         .get(name)
                         .and_then(Value::as_str)
-                        .unwrap_or("closed_from_room");
+                        .unwrap_or("closed_from_client");
                     return Ok(
-                        json!({"joined":false,"conversation":name,"room_reachable":status.get("connected"),
-                        "connector":status,"closed_by_room":true,"note":closed_note(reason)}),
+                        json!({"joined":false,"conversation":name,"reachable":status.get("connected"),
+                        "connector":status,"closed_by_client":true,"note":closed_note(reason)}),
                     );
                 }
                 if status.get("resume_blocked") == Some(&json!(true))
                     && !self.has_active_binding(&status, named).await
                 {
                     return Ok(json!({"joined":false,"conversation":named,
-                        "room_reachable":status.get("connected"),"connector":status,
+                        "reachable":status.get("connected"),"connector":status,
                         "note":closed_note(status.pointer("/resume_block_reason").and_then(Value::as_str).unwrap_or("conversation_history_limit"))}));
                 }
                 if named.is_none() && self.several_chats() && !self.joined.lock().await.is_empty() {
                     let conversations = self.joined.lock().await.values().map(|binding| json!({"title":binding.title,"harness":binding.identity.harness})).collect::<Vec<_>>();
                     return Ok(
-                        json!({"joined":Value::Null,"conversation":Value::Null,"room_reachable":status.get("connected"),"connector":status,
-                        "conversations":conversations,"closed_by_room":closed_now.iter().filter_map(|item| item.as_str()).map(|name| json!({
-                            "title":closed_titles.get(name),"note":closed_note(closed_reasons.get(name).and_then(Value::as_str).unwrap_or("closed_from_room"))
+                        json!({"joined":Value::Null,"conversation":Value::Null,"reachable":status.get("connected"),"connector":status,
+                        "conversations":conversations,"closed_by_client":closed_now.iter().filter_map(|item| item.as_str()).map(|name| json!({
+                            "title":closed_titles.get(name),"note":closed_note(closed_reasons.get(name).and_then(Value::as_str).unwrap_or("closed_from_client"))
                         })).collect::<Vec<_>>(),
                         "note":"Chats of this window are joined, and this call does not say which chat is asking. If voice_connect returned a conversation id in this chat, pass it as conversation to ask about this one; if it never did, this chat is not joined."}),
                     );
@@ -598,7 +636,7 @@ impl Facade {
                             })
                         });
                     let mut response = json!({"joined":true,"conversation":name,"binding_id":binding.binding_id,"harness":binding.identity.harness,
-                        "room_reachable":status.get("connected"),"connector":status,"capabilities":binding.capabilities,
+                        "reachable":status.get("connected"),"connector":status,"capabilities":binding.capabilities,
                         "experimental":binding.experimental,"inbound":binding.identity.inbound});
                     if let Some(client_harness) = self.registry.client(&client) {
                         for (key, value) in
@@ -610,12 +648,68 @@ impl Facade {
                     Ok(response)
                 } else {
                     Ok(
-                        json!({"joined":false,"conversation":Value::Null,"room_reachable":status.get("connected"),"connector":status,
-                            "closed_by_room":closed_now.iter().filter_map(|item| item.as_str()).map(|name| json!({
-                                "title":closed_titles.get(name),"note":closed_note(closed_reasons.get(name).and_then(Value::as_str).unwrap_or("closed_from_room"))
+                        json!({"joined":false,"conversation":Value::Null,"reachable":status.get("connected"),"connector":status,
+                            "closed_by_client":closed_now.iter().filter_map(|item| item.as_str()).map(|name| json!({
+                                "title":closed_titles.get(name),"note":closed_note(closed_reasons.get(name).and_then(Value::as_str).unwrap_or("closed_from_client"))
                             })).collect::<Vec<_>>()}),
                     )
                 }
+            }
+            "voice_diagnose" => {
+                let named = args
+                    .get("conversation")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty());
+                if let Some(name) = named {
+                    self.adopt_by_id(name, &client).await;
+                }
+                // Read-only: a connector that does not answer is itself a finding, not a failure of this tool.
+                let status = match self.ipc.call("status", json!({"deliveries":true})).await {
+                    Ok(status) => {
+                        self.refresh_binding_ids(&status).await;
+                        status
+                    }
+                    Err(error) => json!({"error":error.to_string()}),
+                };
+                let node = crate::service::node_status(&self.profile).await;
+                let chosen = match self.pick(named).await {
+                    Ok(chosen) => chosen,
+                    Err(_) if named.is_none() => None,
+                    Err(error) => return Err(error),
+                };
+                let binding = match &chosen {
+                    Some(name) => self.joined.lock().await.get(name).cloned(),
+                    None => None,
+                };
+                let listed = chosen.as_deref().and_then(|name| {
+                    status
+                        .pointer("/bindings")
+                        .and_then(Value::as_array)
+                        .and_then(|items| {
+                            items
+                                .iter()
+                                .find(|item| item["client_ref"].as_str() == Some(name))
+                        })
+                });
+                let bridge = binding.as_ref().and_then(|binding| {
+                    self.registry
+                        .client(&client)
+                        .map(|harness| harness.status_fields(&binding.identity, listed))
+                        .and_then(|mut fields| fields.remove("bridge"))
+                });
+                let layout = crate::service::layout::Layout::from_profile(&self.profile);
+                Ok(diagnosis(
+                    &Facts {
+                        connector_version: self.profile.connector_version(),
+                        logs: json!({"connector":layout.connector_log(),"core":layout.core_log()}),
+                        several_chats: chosen.is_none() && self.several_chats(),
+                    },
+                    &status,
+                    &node,
+                    chosen.as_deref().zip(binding.as_ref()),
+                    listed,
+                    bridge,
+                ))
             }
             "get_messages" => {
                 let named = args
@@ -653,11 +747,8 @@ impl Facade {
                 }
                 let status = self.ipc.call("status", json!({})).await?;
                 self.refresh_binding_ids(&status).await;
-                if status.get("refused").and_then(Value::as_str).is_some() {
-                    bail!("{}", closed_note("connector_revoked"));
-                }
                 let closed_now = status
-                    .get("closed_by_room")
+                    .get("closed_by_client")
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
@@ -683,7 +774,7 @@ impl Facade {
                     let reason = closed_reasons
                         .get(&name)
                         .and_then(Value::as_str)
-                        .unwrap_or("closed_from_room");
+                        .unwrap_or("closed_from_client");
                     bail!("{}", closed_note(reason));
                 }
                 if status.get("resume_blocked") == Some(&json!(true))
@@ -771,9 +862,9 @@ impl Facade {
                     Ok(result) => result,
                     Err(error) => {
                         let detail = error.to_string();
-                        if let Some(rest) = detail.strip_prefix("CLOSED_BY_ROOM:") {
+                        if let Some(rest) = detail.strip_prefix("CLOSED_BY_CLIENT:") {
                             let mut parts = rest.splitn(2, ':');
-                            let reason = parts.next().unwrap_or("closed_from_room");
+                            let reason = parts.next().unwrap_or("closed_from_client");
                             if let Some(name) = parts.next() {
                                 self.ipc.forget_registration(name).await;
                                 self.joined.lock().await.remove(name);
@@ -829,43 +920,13 @@ impl Facade {
                     .await?;
                 self.joined.lock().await.remove(&chosen);
                 Ok(
-                    json!({"status":"left","conversation":chosen,"room_reachable":result.get("connected")}),
+                    json!({"status":"left","conversation":chosen,"reachable":result.get("connected")}),
                 )
             }
             "voice_pair_device" => {
                 let answer =
                     crate::pairing::device_answer(self.ipc.call("pair_device", json!({})).await?)?;
                 Ok(Value::String(crate::pairing::device_text(&answer)?))
-            }
-            "voice_pair" => {
-                let room = args
-                    .get("room")
-                    .and_then(Value::as_str)
-                    .filter(|room| !room.is_empty())
-                    .context(
-                        "voice_pair needs the room's address and the code the user read from it.",
-                    )?;
-                let code = args
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .filter(|code| !code.is_empty())
-                    .context(
-                        "voice_pair needs the room's address and the code the user read from it.",
-                    )?;
-                let previous = crate::pairing::previous_room(&self.profile);
-                let redeemed =
-                    crate::pairing::pair(&self.profile, room, &code.trim().to_uppercase()).await?;
-                let origin = redeemed.origin.as_str();
-                let connector_id = redeemed.connector_id.as_str();
-                let active = !self.joined.lock().await.is_empty();
-                let mut paired = json!({"status":"paired","room":origin,"connector_id":connector_id,
-                    "next":if active {"Conversations already joined stay joined; the room reaches them within seconds."}
-                        else {"Call voice_connect to join."}});
-                if let Some(previous) = previous.filter(|previous| previous != origin) {
-                    paired["replaced"] = json!(previous);
-                    paired["note"] = json!(format!("Every conversation on this machine is reached through {origin} now, not {previous}."));
-                }
-                Ok(paired)
             }
             _ => bail!("unknown tool"),
         }
@@ -940,13 +1001,13 @@ impl Facade {
 
 fn tools() -> Vec<Tool> {
     let spec = [
-        ("voice_connect", "Connect this conversation to the voice room. Only on an explicit request to join or enable voice. Sidevoice injects input when this harness can receive it; get_messages reads uninjected input. The reply includes the core's initial_reply_context for speaking first.", json!({"title":{"type":"string","description":"Short label for this conversation in the room"},"room":{"type":"string","description":"The room's address (https://…) when the user names one; omitted, the room this machine is paired with"}}), vec![]),
-        ("voice_pair", "Pair this machine with a room using the one-time code the user read from the room's interface (\"Emparejar máquina\"). Only with a code the user gave you; one room per machine, a new pairing replaces the previous one.", json!({"room":{"type":"string","description":"The room's address (https://…)"},"code":{"type":"string","description":"The one-time pairing code shown by the room"}}), vec!["room","code"]),
+        ("voice_connect", "Connect this conversation to voice. Only on an explicit request to join or enable voice. What the person says is put into this conversation by itself whenever this harness allows it; when it does not, the reply's voice_in says to read it with get_messages. The reply includes the core's initial_reply_context for speaking first.", json!({"title":{"type":"string","description":"Short label for this conversation"}}), vec![]),
         ("voice_say", "Publish a spoken reply with the session_id, revision and epoch from the message header. To speak first, pass conversation and use the initial_reply_context from voice_connect. For an idempotent retry, reuse both event_id and utterance_id unchanged. A current open user turn is refused immediately: wait for its message. A saved reply is not proof it was heard.", json!({"text":{"type":"string"},"session_id":{"type":"string"},"revision":{"type":"integer","minimum":0},"epoch":{"type":"integer","minimum":0},"conversation":{"type":"string","description":"The conversation id voice_connect returned in this chat: to speak first"},"event_id":{"type":"string","description":"Supply with utterance_id and reuse both unchanged on retry"},"utterance_id":{"type":"string","description":"Supply with event_id and reuse both unchanged on retry"},"language":{"type":"string","description":"The language of the reply, as a code: es, en, fr, it, pt or hi are the ones known now; the room decides what it speaks"}}), vec!["text"]),
-        ("get_messages", "Read this conversation's uninjected input from the journal. Messages include stable IDs, full notice evidence, an envelope, and a journal position. Pass ack_ids only after consuming them. Without acknowledgement, a claimed message is returned again; after is a journal position, not an acknowledgement.", json!({"conversation":{"type":"string","description":"Conversation id when several chats are joined"},"operation":{"type":"string","description":"get (default) or check"},"after":{"type":"integer","minimum":0},"ack_ids":{"type":"array","items":{"type":"string"}}}), vec![]),
-        ("voice_disconnect", "Leave the voice room. The conversation and its work continue in writing.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
-        ("voice_pair_device", "Generate a one-time code to pair the person's device (the desktop app or a browser) with this machine. When the person asks for a code or asks to pair their device, call this tool and show its code, QR, validity and address as returned. Do not ask the person to generate the device code. Never call it on your own initiative. This is different from voice_pair: only the person can obtain a room code from the room interface.", json!({}), vec![]),
-        ("voice_status", "Whether the room can currently reach this conversation.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
+        ("get_messages", "Read, in order, this conversation's input that has not reached it by itself: everything when this harness cannot receive input, otherwise only what injection could not deliver. Messages include stable IDs, full notice evidence, an envelope, and a journal position. Pass ack_ids only after consuming them. Without an acknowledgement, a claimed message is returned again; after is a journal position, not an acknowledgement.", json!({"conversation":{"type":"string","description":"Conversation id when several chats are joined"},"operation":{"type":"string","description":"get (default) or check"},"after":{"type":"integer","minimum":0},"ack_ids":{"type":"array","items":{"type":"string"}}}), vec![]),
+        ("voice_disconnect", "Leave voice. The conversation and its work continue in writing.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
+        ("voice_pair_device", "Generate a one-time code to pair the person's device (the desktop app or a browser) with this machine. When the person asks for a code or asks to pair their device, call this tool and show its code, QR, validity and address as returned. Do not ask the person to generate the device code. Never call it on your own initiative.", json!({}), vec![]),
+        ("voice_status", "Whether voice can currently reach this conversation.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
+        ("voice_diagnose", "Read-only diagnostics for when something does not arrive or is not heard: versions, the core and its link, this conversation's delivery route, its last deliveries and whether each was read, harness capabilities and the inbound check, the editor bridge state, and where the logs are. Never message text, keys or tokens. Changes nothing.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
     ];
     // No `additionalProperties: false`: an argument this server does not know (an agent's own, or one a newer server
     // added) is ignored, never refused, by the server or by a client that checks calls against the schema.
@@ -970,7 +1031,7 @@ fn prompt_text(args: Option<&serde_json::Map<String, Value>>) -> String {
         serde_json::to_string(title)
             .unwrap_or_else(|_| "a short label of what this conversation is about".into())
     };
-    format!("Join the voice room for this conversation and keep it reachable.\n\n1. Call voice_status. If it reports joined and room_reachable (or local_only), say so in one line and stop.\n2. Call voice_connect with the title {title}. If the user named a room, pass its address as room.\n   If it returns local_only, the machine has no room: relay that note in one line and continue.\n   If it fails saying this machine is not paired with the room (or is paired with a different one), ask the user for the room's address and the one-time code the room shows them under \"Emparejar máquina\"; call voice_pair with both, then voice_connect again. Never try to get a code from the room yourself.\n3. Tell the user in one line whether the room can reach this conversation. If inbound.ok is false, relay inbound.reason and offer inbound.remedy in your own words, including what safeguard it removes; change nothing yourself.\n\nNothing else is registered: the room learns that a message was read and whether this conversation is working from what the harness itself records about it. How to behave once joined is in this server's instructions.")
+    format!("Join voice with this conversation and keep it reachable.\n\n1. Call voice_status. If it reports joined and reachable (or local_only), say so in one line and stop.\n2. Call voice_connect with the title {title}. If it returns local_only, relay that note in one line and continue.\n3. Tell the user in one line whether voice can reach this conversation. If inbound.ok is false, relay inbound.reason and offer inbound.remedy in your own words, including what safeguard it removes; change nothing yourself.\n\nNothing else is registered: voice learns that a message was read and whether this conversation is working from what the harness itself records about it. How to behave once joined is in this server's instructions.")
 }
 
 impl ServerHandler for Facade {
@@ -1045,7 +1106,7 @@ impl ServerHandler for Facade {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListPromptsResult, McpError> {
-        let prompt: Prompt = serde_json::from_value(json!({"name":"voice-room","description":"Join the user's Sidevoice voice room with this conversation.","arguments":[{"name":"title","description":"Title for this conversation in the room","required":false}]}))
+        let prompt: Prompt = serde_json::from_value(json!({"name":"voice-join","description":"Connect this conversation to the user's Sidevoice voice.","arguments":[{"name":"title","description":"Title for this conversation","required":false}]}))
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(ListPromptsResult::with_all_items(vec![prompt]))
     }
@@ -1055,7 +1116,7 @@ impl ServerHandler for Facade {
         request: GetPromptRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<GetPromptResponse, McpError> {
-        if request.name != "voice-room" {
+        if request.name != "voice-join" {
             return Err(McpError::invalid_params("unknown prompt", None));
         }
         let message = prompt_text(request.arguments.as_ref());
@@ -1170,13 +1231,14 @@ fn call_meta(context: &impl serde::Serialize, params: Option<impl serde::Seriali
 
 #[cfg(test)]
 mod tests {
-    use super::{closed_note, ipc_limit, pairing_needed, tools, INSTRUCTIONS};
+    use super::{closed_note, diagnosis, ipc_limit, tools, Facts, Joined, INSTRUCTIONS};
+    use crate::adapters::Identity;
     use rmcp::model::InitializeRequestParams;
     use serde_json::{json, Value};
     use std::time::Duration;
 
     #[test]
-    fn device_code_instructions_distinguish_it_from_a_room_code() {
+    fn device_code_instructions_say_when_to_call_it() {
         assert!(INSTRUCTIONS.contains("call voice_pair_device"));
         assert!(INSTRUCTIONS.contains("Do not ask the person to generate a device code"));
         let device = tools()
@@ -1218,7 +1280,7 @@ mod tests {
     }
 
     /// No tool refuses an argument it does not know, or a value a closed list would not name, in the server or in a
-    /// client that checks calls against the schema: a reply in a language the room learns later goes through.
+    /// client that checks calls against the schema: a reply in a language the core learns later goes through.
     #[test]
     fn no_tool_schema_refuses_an_argument_or_a_value_it_does_not_know() {
         for tool in tools() {
@@ -1300,12 +1362,12 @@ mod tests {
             assert_eq!(super::tolerant_message(&untouched), untouched);
         }
     }
-    /// A reason the room closes a conversation for that this connector does not know reads as the room's close.
+    /// A reason a conversation is closed for that this connector does not know reads as the user closing it.
     #[test]
-    fn an_unknown_close_reason_reads_as_closed_from_the_room() {
+    fn an_unknown_close_reason_reads_as_closed_from_the_client() {
         assert_eq!(
             closed_note("a_reason_from_the_future"),
-            closed_note("closed_from_room")
+            closed_note("closed_from_client")
         );
     }
 
@@ -1315,6 +1377,32 @@ mod tests {
         for method in ["register", "status", "publish", "unregister", "adopt"] {
             assert_eq!(ipc_limit(method), Duration::from_secs(20), "{method}");
         }
+    }
+
+    #[test]
+    fn the_agent_has_no_delivery_mode_to_choose() {
+        for text in [
+            "input_mode",
+            "pull mode",
+            "push",
+            "One binding uses one mode",
+        ] {
+            assert!(!INSTRUCTIONS.contains(text), "{text}");
+        }
+        assert!(INSTRUCTIONS.contains("there is nothing to choose"));
+        assert!(INSTRUCTIONS
+            .contains("get_messages returns what has not reached this conversation by itself"));
+        let connect = tools()
+            .into_iter()
+            .find(|tool| tool.name == "voice_connect")
+            .unwrap();
+        assert!(connect
+            .input_schema
+            .get("properties")
+            .unwrap()
+            .get("input_mode")
+            .is_none());
+        assert!(!connect.description.unwrap().contains("input_mode"));
     }
 
     #[test]
@@ -1330,8 +1418,8 @@ mod tests {
     fn agent_hearing_instructions_give_a_concrete_recovery_rule() {
         assert!(INSTRUCTIONS.contains("previous voice_say call"));
         assert!(INSTRUCTIONS.contains("\"Heard up to\" marker"));
-        assert!(INSTRUCTIONS.contains("in fresh words what they missed that still matters"));
-        assert!(INSTRUCTIONS.contains("Skip it only if they changed topic or said to"));
+        assert!(INSTRUCTIONS.contains("weave anything that still matters into your next reply"));
+        assert!(INSTRUCTIONS.contains("Never say or hint that something was missed"));
         for cause in [
             "skipped",
             "interrupted",
@@ -1343,30 +1431,71 @@ mod tests {
         }
     }
 
+    /// A diagnosis names only the fields it reads: a token in the route, a message's text, a credential or a log
+    /// line anywhere in what the connector or the core answered never reaches the agent.
     #[test]
-    fn a_named_room_joins_only_when_this_machine_is_paired_with_it() {
+    fn a_diagnosis_carries_no_text_tokens_or_log_lines() {
+        let identity = Identity {
+            harness: "a-harness".into(),
+            thread: "thread-1".into(),
+            delivery: json!({"kind":"socket-route","socket":"/nonexistent/sidevoice.sock","token":"SECRET-TOKEN"}),
+            capability_overrides: json!({}),
+            route: None,
+            capabilities: json!({"deliver":"supported"}),
+            experimental: vec![],
+            inbound: Some(json!({"ok":true})),
+            editor: false,
+            detachable: true,
+            chat_marker: None,
+            deliver_note: None,
+            watch_note: None,
+        };
+        let joined = Joined {
+            binding_id: "b1".into(),
+            initial_reply_context: json!({"text":"SECRET-TEXT"}),
+            title: "chat".into(),
+            identity,
+            capabilities: json!({"deliver":"supported"}),
+            experimental: vec![],
+        };
+        let listed = json!({"client_ref":"thread-1","delivery":{"kind":"socket-route","token":"SECRET-TOKEN"},
+            "initial_reply_context":{"text":"SECRET-TEXT"},"working":false,"awaiting_read":1,
+            "deliveries":[{"message_id":"m1","channel":"voice","at":"t","result":"unconfirmed","read":false,"text":"SECRET-TEXT"}]});
+        let status = json!({"version":"1.0.0","connected":true,"core":{"protocol":3,"token":"SECRET-TOKEN"},
+            "bindings":[listed.clone()]});
+        let node = json!({"state":"failed","core":{"version":"0.4.5","api":1},
+            "failure":{"key":"hang","step":"health","log_tail":"auth SECRET-TOKEN","detail":"SECRET-KEY"}});
+        let facts = Facts {
+            connector_version: "1.0.0",
+            logs: json!({"connector":"/d/connector.log"}),
+            several_chats: false,
+        };
+        let report = diagnosis(
+            &facts,
+            &status,
+            &node,
+            Some(("thread-1", &joined)),
+            Some(&listed),
+            None,
+        );
+        let text = report.to_string();
+        for secret in [
+            "SECRET-TOKEN",
+            "SECRET-TEXT",
+            "SECRET-KEY",
+            "token",
+            "log_tail",
+        ] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+        assert_eq!(report["conversation"]["route"]["kind"], "socket-route");
+        assert_eq!(report["conversation"]["route"]["socket_exists"], false);
         assert_eq!(
-            pairing_needed(
-                "https://Room.example/x",
-                Some("https://room.example".into())
-            ),
-            None
+            report["conversation"]["deliveries"][0]["result"],
+            "unconfirmed"
         );
-        let unpaired = pairing_needed("https://room.example", None).unwrap();
-        assert!(
-            unpaired.contains("not paired with the room at https://room.example"),
-            "{unpaired}"
-        );
-        let other =
-            pairing_needed("https://other.example", Some("https://room.example".into())).unwrap();
-        assert!(
-            other.starts_with(
-                "This machine is paired with https://room.example, not https://other.example"
-            ),
-            "{other}"
-        );
-        assert!(pairing_needed("room", None)
-            .unwrap()
-            .contains("is not a room address"));
+        assert_eq!(report["conversation"]["deliveries"][0]["read"], false);
+        assert_eq!(report["versions"]["core"], "0.4.5");
+        assert_eq!(report["core"]["failure"]["key"], "hang");
     }
 }

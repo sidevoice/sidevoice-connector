@@ -46,7 +46,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 const EDITOR_NOTE: &str = "Sidevoice cannot tell which Cursor chat this is: this Cursor did not declare MCP Apps support (the io.modelcontextprotocol/ui extension) when it started this server, which is how the editor is told apart, nor is this a Cursor CLI chat (cursor-agent), whose open chat Sidevoice can see. ~/.sidevoice/mcp.log shows what it declared.";
-const NOT_PERSISTED: &str = "This chat is not running under cursor-agent persist, so nothing can put a message into it. To let the room talk to a Cursor CLI chat (experimental), start it with  cursor-agent persist  (it needs tmux).";
+const NOT_PERSISTED: &str = "This chat is not running under cursor-agent persist, so nothing can put a message into it. To let Sidevoice talk to a Cursor CLI chat (experimental), start it with  cursor-agent persist  (it needs tmux).";
 
 pub fn capabilities() -> Value {
     json!({"deliver":"supported","inspectInbound":"unsupported","working":"supported","endOfTurn":"supported","sessionIdentity":"supported"})
@@ -104,7 +104,7 @@ pub fn identity(_client: &Value, capabilities: &Value) -> Result<Identity> {
             "working".into(),
             "endOfTurn".into(),
         ]);
-        identity.watch_note = Some("The room learns that this chat took a voice message, and when it is working, from Cursor itself: from this chat's transcript, once the Desktop Bridge knows which chat it is.".into());
+        identity.watch_note = Some("Sidevoice learns that this chat took a voice message, and when it is working, from Cursor itself: from this chat's transcript, once the Desktop Bridge knows which chat it is.".into());
         return Ok(identity);
     }
     let Some(found) = find_chat() else {
@@ -759,6 +759,142 @@ struct BridgeResponse {
     body: Value,
 }
 
+fn confirmed_send_outcome(response: &BridgeResponse) -> Option<&str> {
+    let outcome = response
+        .body
+        .get("outcome")
+        .and_then(Value::as_str)
+        .or_else(|| response.body.get("status").and_then(Value::as_str));
+    (response.status == 200)
+        .then_some(outcome?)
+        .filter(|outcome| matches!(*outcome, "submitted" | "queued"))
+}
+
+/// What a `sendMessage` reply means for delivery.
+///
+/// The send always carries `force:false`: Cursor decides what to do with a message for a chat whose agent is
+/// running. `queued` is the bridge saying it took the message but will not run it now (it waits for the running
+/// turn); `submitted` is a turn started. The connector cannot steer a running Cursor turn: no documented request
+/// field delivers input mid-turn (`force` is undocumented and its effect unverified, and it may interrupt the turn),
+/// so a busy chat holds the message and Cursor runs it when its queue reaches it.
+#[derive(Debug, PartialEq)]
+enum SendReply {
+    /// Taken: `submitted` (idle chat, turn started) or `queued` (busy chat, held behind the running turn).
+    Accepted(&'static str),
+    UnknownThread,
+    /// The bridge says it did not send it, even with HTTP 200: nothing reached the chat.
+    Error(String),
+    /// Refused outright (4xx): nothing reached the chat.
+    Refused(String),
+    /// Anything else: the message may or may not have been taken.
+    Unconfirmed(String),
+}
+
+fn classify_send_reply(response: &BridgeResponse, sent: &str) -> SendReply {
+    let outcome = response
+        .body
+        .get("outcome")
+        .and_then(Value::as_str)
+        .or_else(|| response.body.get("status").and_then(Value::as_str))
+        .unwrap_or("");
+    let plain_reason = || {
+        ["reason", "message", "error"]
+            .iter()
+            .find_map(|key| response.body.get(*key).and_then(Value::as_str))
+            .unwrap_or(outcome)
+            .to_owned()
+    };
+    match confirmed_send_outcome(response) {
+        Some("submitted") => return SendReply::Accepted("submitted"),
+        Some(_) => return SendReply::Accepted("queued"),
+        None => {}
+    }
+    if matches!(outcome, "not-found" | "unknown-thread") {
+        SendReply::UnknownThread
+    } else if outcome == "error" {
+        SendReply::Error(bridge_error_reason(&response.body, sent))
+    } else if (400..500).contains(&response.status) {
+        SendReply::Refused(plain_reason())
+    } else {
+        SendReply::Unconfirmed(plain_reason())
+    }
+}
+
+/// The bridge's own error text, short and on one line; withheld if it echoes the message that was sent.
+fn bridge_error_reason(body: &Value, sent: &str) -> String {
+    let reason = ["message", "error", "reason"]
+        .iter()
+        .find_map(|key| body.get(*key).and_then(Value::as_str))
+        .unwrap_or("")
+        .trim();
+    if reason.is_empty() {
+        return "no reason given".into();
+    }
+    if reason.len() > 200 || sent.contains(reason) || reason.contains(sent.trim()) {
+        return "[withheld]".into();
+    }
+    reason.replace(['\n', '\r'], " ")
+}
+
+/// Keep the shape of an unexpected bridge reply, never its arbitrary strings (which may echo input).
+fn diagnostic_reply_body(body: &Value) -> String {
+    fn redact(value: &Value, field: &str) -> Value {
+        match value {
+            Value::Object(fields) => Value::Object(
+                fields
+                    .iter()
+                    .map(|(key, value)| {
+                        let safe_key = match key.as_str() {
+                            "outcome" | "status" | "success" | "ok" | "error" | "reason"
+                            | "message" | "threadId" | "queued" | "submitted" | "result"
+                            | "code" | "detail" | "data" | "text" | "content" => key.as_str(),
+                            _ => "<other>",
+                        };
+                        (safe_key.to_owned(), redact(value, safe_key))
+                    })
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .take(8)
+                    .map(|item| redact(item, field))
+                    .collect(),
+            ),
+            Value::String(text)
+                if matches!(field, "outcome" | "status")
+                    && matches!(
+                        text.as_str(),
+                        "submitted"
+                            | "queued"
+                            | "not-found"
+                            | "unknown-thread"
+                            | "success"
+                            | "ok"
+                            | "error"
+                            | "failed"
+                            | "accepted"
+                            | "done"
+                    ) =>
+            {
+                Value::String(text.clone())
+            }
+            Value::String(_) => Value::String("[redacted]".into()),
+            _ => value.clone(),
+        }
+    }
+    let rendered = redact(body, "").to_string();
+    if rendered.len() <= 512 {
+        rendered
+    } else {
+        let mut end = 512;
+        while !rendered.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &rendered[..end])
+    }
+}
+
 async fn bridge_request(
     instance: &BridgeInstance,
     body: &Value,
@@ -1065,32 +1201,18 @@ async fn deliver_editor_to_instances(
                     json!({"status":"unknown","detail":format!("Cursor Desktop Bridge may have taken the message: {error}")}),
                 );
             }
-            Ok(response) => {
-                let outcome = response
-                    .body
-                    .get("outcome")
-                    .or_else(|| response.body.get("status"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if response.status == 200 && matches!(outcome, "submitted" | "queued") {
+            Ok(response) => match classify_send_reply(&response, &text) {
+                SendReply::Accepted(outcome) => {
                     log_correlation(
                         "accepted",
-                        if outcome == "submitted" {
-                            "submitted"
-                        } else {
-                            "queued"
-                        },
+                        outcome,
                         delivery.get("marker").and_then(Value::as_str),
                         &composer,
                         Some(instance),
                     );
                     log_bridge(
                         "send",
-                        if outcome == "submitted" {
-                            "submitted"
-                        } else {
-                            "queued"
-                        },
+                        outcome,
                         Some(&composer),
                         Some(index),
                         Some(response.status),
@@ -1099,7 +1221,7 @@ async fn deliver_editor_to_instances(
                         json!({"status":"accepted","detail":format!("Cursor Desktop Bridge: {outcome}")}),
                     );
                 }
-                if matches!(outcome, "not-found" | "unknown-thread") {
+                SendReply::UnknownThread => {
                     log_bridge(
                         "send",
                         "unknown_thread",
@@ -1109,8 +1231,22 @@ async fn deliver_editor_to_instances(
                     );
                     continue;
                 }
-                // Refused outright (the request was not taken): nothing reached the chat.
-                if (400..500).contains(&response.status) {
+                SendReply::Error(reason) => {
+                    crate::logfile::log(&format!(
+                        "{} reason={reason}",
+                        bridge_diagnostic(
+                            "send",
+                            "bridge_error",
+                            Some(&composer),
+                            Some(index),
+                            Some(response.status)
+                        )
+                    ));
+                    return Some(
+                        json!({"status":"failed","detail":format!("Cursor Desktop Bridge could not send the message: {reason}")}),
+                    );
+                }
+                SendReply::Refused(reason) => {
                     log_bridge(
                         "send",
                         "refused",
@@ -1119,20 +1255,26 @@ async fn deliver_editor_to_instances(
                         Some(response.status),
                     );
                     return Some(
-                        json!({"status":"failed","detail":format!("Cursor Desktop Bridge refused the message ({}): {}", response.status, response.body.get("reason").or_else(|| response.body.get("message")).or_else(|| response.body.get("error")).and_then(Value::as_str).unwrap_or(outcome))}),
+                        json!({"status":"failed","detail":format!("Cursor Desktop Bridge refused the message ({}): {reason}", response.status)}),
                     );
                 }
-                log_bridge(
-                    "send",
-                    "unconfirmed_reply",
-                    Some(&composer),
-                    Some(index),
-                    Some(response.status),
-                );
-                return Some(
-                    json!({"status":"unknown","detail":format!("Cursor Desktop Bridge did not confirm delivery: {}", response.body.get("reason").or_else(|| response.body.get("message")).or_else(|| response.body.get("error")).and_then(Value::as_str).unwrap_or(outcome))}),
-                );
-            }
+                SendReply::Unconfirmed(reason) => {
+                    crate::logfile::log(&format!(
+                        "{} reply_body={}",
+                        bridge_diagnostic(
+                            "send",
+                            "unconfirmed_reply",
+                            Some(&composer),
+                            Some(index),
+                            Some(response.status)
+                        ),
+                        diagnostic_reply_body(&response.body)
+                    ));
+                    return Some(
+                        json!({"status":"unknown","detail":format!("Cursor Desktop Bridge did not confirm delivery: {reason}")}),
+                    );
+                }
+            },
         }
     }
     None
@@ -1199,6 +1341,104 @@ mod bridge_tests {
     use super::*;
     use crate::secure_fs::tests::Scratch;
     use tokio::net::UnixListener;
+
+    #[test]
+    fn send_reply_requires_explicit_confirmation() {
+        for (status, body, expected) in [
+            (200, json!({"outcome":"submitted"}), Some("submitted")),
+            (200, json!({"status":"queued","extra":true}), Some("queued")),
+            (
+                200,
+                json!({"outcome":null,"status":"submitted"}),
+                Some("submitted"),
+            ),
+            (200, json!({"success":true}), None),
+            (200, json!({"status":"success"}), None),
+            (200, json!({"outcome":"unknown-thread"}), None),
+            (200, Value::Null, None),
+            (202, json!({"outcome":"queued"}), None),
+        ] {
+            let response = BridgeResponse { status, body };
+            assert_eq!(confirmed_send_outcome(&response), expected);
+        }
+    }
+
+    #[test]
+    fn send_replies_are_classified_for_idle_and_busy_chats() {
+        let reply = |status, body| classify_send_reply(&BridgeResponse { status, body }, "hola");
+        // Idle chat: a turn starts. Busy chat: held behind the running turn. Both are accepted.
+        assert_eq!(
+            reply(200, json!({"outcome":"submitted"})),
+            SendReply::Accepted("submitted")
+        );
+        assert_eq!(
+            reply(200, json!({"status":"queued"})),
+            SendReply::Accepted("queued")
+        );
+        // HTTP 200 alone, or an unknown outcome, proves nothing and is never reported as a failure.
+        assert!(matches!(reply(200, json!({})), SendReply::Unconfirmed(_)));
+        assert!(matches!(
+            reply(200, json!({"outcome":"busy"})),
+            SendReply::Unconfirmed(r) if r == "busy"
+        ));
+        assert!(matches!(reply(500, Value::Null), SendReply::Unconfirmed(_)));
+        // A busy-chat rejection is a failure (the core can fall back), not a retry loop.
+        assert_eq!(
+            reply(200, json!({"status":"error","message":"agent is running"})),
+            SendReply::Error("agent is running".into())
+        );
+        assert_eq!(
+            reply(409, json!({"reason":"agent is running"})),
+            SendReply::Refused("agent is running".into())
+        );
+        assert_eq!(
+            reply(200, json!({"outcome":"unknown-thread"})),
+            SendReply::UnknownThread
+        );
+        assert_eq!(
+            reply(404, json!({"status":"not-found"})),
+            SendReply::UnknownThread
+        );
+    }
+
+    #[test]
+    fn bridge_error_reason_is_logged_unless_it_echoes_the_message() {
+        let sent = "please summarise the diff";
+        let reason = |body: Value| bridge_error_reason(&body, sent);
+        assert_eq!(
+            reason(json!({"status":"error","message":"No composer for thread"})),
+            "No composer for thread"
+        );
+        assert_eq!(
+            reason(json!({"status":"error","message":sent})),
+            "[withheld]"
+        );
+        assert_eq!(
+            reason(json!({"status":"error","message":format!("failed: {sent}")})),
+            "[withheld]"
+        );
+        assert_eq!(reason(json!({"status":"error"})), "no reason given");
+        assert_eq!(
+            reason(json!({"status":"error","message":"x".repeat(300)})),
+            "[withheld]"
+        );
+    }
+
+    #[test]
+    fn unconfirmed_reply_diagnostic_keeps_shape_without_private_text() {
+        let secret = "private voice message";
+        let body = json!({"success":true,"status":"success","message":secret,
+            "data":{"text":secret,"error":"not in focused chat","count":3},
+            "unknown_field":secret});
+        let rendered = diagnostic_reply_body(&body);
+        assert!(rendered.contains("\"success\":true"));
+        assert!(rendered.contains("\"status\":\"success\""));
+        assert!(!rendered.contains("\"count\":3"));
+        assert!(!rendered.contains(secret));
+        assert!(!rendered.contains("not in focused chat"));
+        assert!(rendered.len() <= 515);
+        assert!(diagnostic_reply_body(&json!({"message":"x".repeat(1000)})).len() <= 515);
+    }
 
     #[tokio::test]
     async fn bridge_response_finishes_at_content_length_without_waiting_for_socket_close() {

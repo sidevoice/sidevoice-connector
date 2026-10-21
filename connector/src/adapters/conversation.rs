@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// How many recent deliveries a conversation keeps for diagnostics.
+pub const DELIVERIES_KEPT: usize = 20;
+
 /// One joined conversation. `state` is its harness's own (`Harness::conversation_state`).
 pub struct Conversation {
     pub client_ref: String,
@@ -32,6 +35,8 @@ pub struct Conversation {
     pub input_context: Mutex<HashMap<String, (String, i64)>>,
     pub recent_inputs: Mutex<VecDeque<(String, String)>>,
     pub read: Mutex<VecDeque<String>>,
+    /// How the last few deliveries to it ended (`{message_id, channel, at, result}`), for diagnostics. Never text.
+    pub deliveries: Mutex<VecDeque<Value>>,
     pub working: Mutex<Option<bool>>,
     pub stopped: AtomicBool,
     pub state: Box<dyn Any + Send + Sync>,
@@ -61,6 +66,15 @@ impl Conversation {
         }
     }
 
+    /// Keep how a delivery ended: the last [`DELIVERIES_KEPT`] of them.
+    pub async fn record_delivery(&self, record: Value) {
+        let mut deliveries = self.deliveries.lock().await;
+        deliveries.push_back(record);
+        while deliveries.len() > DELIVERIES_KEPT {
+            deliveries.pop_front();
+        }
+    }
+
     pub async fn forget_input(&self, id: &str, session: &str, revision: i64) {
         let key = format!("{session}:{revision}");
         self.recent_inputs
@@ -80,8 +94,8 @@ impl Conversation {
     }
 }
 
-/// Where a harness reports what it observes about a conversation: the connector's link to the room.
-pub trait Room: Send + Sync {
+/// Where a harness reports what it observes about a conversation: the connector's link to the core.
+pub trait Reporter: Send + Sync {
     fn profile(&self) -> &Profile;
     /// The engine it runs on: `{model, effort, thinking}`, reported when it changes.
     fn engine<'a>(&'a self, conversation: &'a Conversation, engine: Value) -> BoxFuture<'a, ()>;
@@ -101,10 +115,11 @@ pub trait Room: Send + Sync {
 }
 
 /// Working state without a turn id.
-pub async fn report_working(room: &dyn Room, conversation: &Conversation, working: bool) {
-    room.working(
-        conversation,
-        json!({"working":working,"turn_id":Value::Null}),
-    )
-    .await;
+pub async fn report_working(reporter: &dyn Reporter, conversation: &Conversation, working: bool) {
+    reporter
+        .working(
+            conversation,
+            json!({"working":working,"turn_id":Value::Null}),
+        )
+        .await;
 }
