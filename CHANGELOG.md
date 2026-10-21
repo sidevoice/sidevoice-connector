@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.14.0...v0.14.1) (2026-10-21)
+
+
+### Bug Fixes
+
+* **core:** ship sidevoice-core 0.5.0 ([#210](https://github.com/sidevoice/sidevoice-connector/issues/210)) ([45db5e1](https://github.com/sidevoice/sidevoice-connector/commit/45db5e17dd3601964c38174893d3f9084c259006))
+
 ## [0.14.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.13.1...v0.14.0) (2026-10-21)
 
 
