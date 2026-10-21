@@ -56,6 +56,11 @@ fn selected_engine(model: &str, configuration: Option<&Value>) -> Option<Value> 
         text(config.get("effort"))
             .or_else(|| parameter(config.get("parameters"), "effort"))
             .or_else(|| parameter(config.get("modelParams"), "effort"))
+            .or_else(|| {
+                // Current Cursor keeps the chat's picker parameters on its first selected model.
+                let first = config.get("selectedModels")?.get(0)?;
+                parameter(first.get("parameters"), "effort")
+            })
     });
     // Only a default stored with this chat's model configuration can fill an absent selection.
     // Cursor's global picker can describe a different open chat and is never used here.
@@ -198,6 +203,25 @@ mod tests {
             Value::Null
         );
         assert_eq!(selected_engine("default", None), None);
+    }
+
+    #[test]
+    fn effort_is_read_from_the_first_selected_model_parameters() {
+        let config = json!({"selectedModels":[{"modelId":"claude-opus","parameters":[{"id":"effort","value":"high"},{"id":"fast","value":"false"}]}]});
+        assert_eq!(
+            selected_engine("claude-opus", Some(&config)).unwrap(),
+            json!({"model":"claude-opus","effort":"high","thinking":null})
+        );
+        let no_effort = json!({"selectedModels":[{"modelId":"claude-opus","parameters":[{"id":"fast","value":"true"}]}]});
+        assert_eq!(
+            selected_engine("claude-opus", Some(&no_effort)).unwrap()["effort"],
+            Value::Null
+        );
+        let empty = json!({"selectedModels":[]});
+        assert_eq!(
+            selected_engine("claude-opus", Some(&empty)).unwrap()["effort"],
+            Value::Null
+        );
     }
 
     #[tokio::test]
