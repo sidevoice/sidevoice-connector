@@ -202,7 +202,7 @@ impl Registration for Claude {
     }
 
     fn after_install(&self, profile: &Profile) -> Vec<String> {
-        let mut notes = vec!["In a conversation, ask to join the voice room. Sessions already open need a restart before they \
+        let mut notes = vec!["In a conversation, ask to join voice. Sessions already open need a restart before they \
              see the server."
             .to_owned()];
         notes.extend(inbound_warning(profile));
@@ -326,7 +326,7 @@ fn inbound_warning(profile: &Profile) -> Option<String> {
         return None;
     }
     Some(format!(
-        "This machine runs Claude Code sessions in bypassPermissions, and those hold what the room sends instead of \
+        "This machine runs Claude Code sessions in bypassPermissions, and those hold what Sidevoice sends instead of \
          delivering it: voice looks sent and never arrives. Either start a session with\n  --settings \
          '{{\"crossSessionInbound\":\"accept\"}}'\nor add \"crossSessionInbound\": \"accept\" to {}. That second one \
          lets any local process post into every Claude session on this machine, which is the safeguard it removes: \

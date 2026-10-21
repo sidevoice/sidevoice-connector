@@ -1,4 +1,4 @@
-//! `sidevoice-bench`: the connector on this machine without the desktop app or a room, to talk to real agent
+//! `sidevoice-bench`: the connector on this machine without the desktop app, to talk to real agent
 //! sessions by typing. A developer tool: it is not shipped in the release archive.
 //!
 //! It makes a private profile (every directory the connector reads, under one root), installs this build there with
@@ -18,7 +18,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::Parser;
 
-/// Drive the connector and the pinned core from a local page, without the desktop app or a room.
+/// Drive the connector and the pinned core from a local page, without the desktop app.
 #[derive(Parser)]
 #[command(name = "sidevoice-bench", version)]
 struct Args {

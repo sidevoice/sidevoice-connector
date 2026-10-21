@@ -171,7 +171,7 @@ fn t16_complete_pull_pages_fit_ipc_and_keep_the_next_position() {
 }
 
 /// The core link: the frames a newer core sends this daemon (`connector.welcome`, `input.deliver`,
-/// `node.rendezvous`, `binding.close`, a method it has never heard of) and its answers to the daemon's own requests
+/// `binding.close`, a method it has never heard of) and its answers to the daemon's own requests
 /// (`binding.register`, `speech.publish`), all with extra fields, nested too, and enum values it does not know.
 #[tokio::test]
 async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_know() {
@@ -257,16 +257,7 @@ async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_
         "a terminal refusal cannot retry as speech"
     );
 
-    // node.rendezvous with fields of its own and no refusal: nothing is refused.
-    let rendezvous = daemon
-        .handle_incoming(
-            "node.rendezvous",
-            &json!({"refused":null,"reachable":true,"future":{"nested":{"x":1}}}),
-        )
-        .await;
-    assert_eq!(rendezvous, json!({}));
     let status = daemon.command(1, "status", json!({})).await.unwrap();
-    assert_eq!(status["refused"], Value::Null, "{status}");
     assert_eq!(status["bindings"][0]["binding_id"], "core-t-1", "{status}");
 
     // A method this connector has never heard of, asked with an ID: a defined answer, and the link stays.
@@ -279,7 +270,7 @@ async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_
     let closed = daemon
         .handle_incoming(
             "binding.close",
-            &json!({"binding_id":"core-t-1","reason":"a_reason_from_the_future","future":{"by":"room"}}),
+            &json!({"binding_id":"core-t-1","reason":"a_reason_from_the_future","future":{"by":"client"}}),
         )
         .await;
     assert_eq!(closed, json!({}));
@@ -855,7 +846,7 @@ async fn old_binding_rejected_as_closed_by_restarted_core_is_retired_locally() {
     assert!(daemon.bindings.lock().await.is_empty());
     assert_eq!(
         daemon
-            .closed_by_room
+            .closed_by_client
             .lock()
             .await
             .get("old-thread")
@@ -866,7 +857,7 @@ async fn old_binding_rejected_as_closed_by_restarted_core_is_retired_locally() {
         &std::fs::read(scratch.0.join("sidevoice/conversation-state.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(saved["closed_by_room"]["old-thread"], "binding_closed");
+    assert_eq!(saved["closed_by_client"]["old-thread"], "binding_closed");
 }
 
 #[tokio::test]

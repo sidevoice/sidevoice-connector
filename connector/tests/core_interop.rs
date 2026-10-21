@@ -87,7 +87,7 @@ fn a_conversation_talks_to_the_real_core_through_the_connector() {
 
     let call = Presentation::open(&profile.core_socket());
 
-    // The machine as the room will list it (asked as the device the call paired): what this machine actually is,
+    // The machine as a client will list it (asked as the device the call paired): what this machine actually is,
     // not a placeholder.
     let listed = core_json(
         &profile.core_socket(),
@@ -148,7 +148,6 @@ fn a_conversation_talks_to_the_real_core_through_the_connector() {
             "voice_connect",
             "voice_diagnose",
             "voice_disconnect",
-            "voice_pair",
             "voice_pair_device",
             "voice_say",
             "voice_status"
@@ -274,7 +273,7 @@ fn pair_device_gives_the_cores_code_with_its_qr() {
         answer["expires_in"].as_u64().is_some_and(|s| s > 0),
         "{answer}"
     );
-    // The test's core has only its loopback address and no room.
+    // The test's core has only its loopback address.
     assert_eq!(answer["reach"], "local-only", "{answer}");
     assert!(answer["payload"]["urls"].is_array(), "{answer}");
 

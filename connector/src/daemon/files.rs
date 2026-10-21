@@ -12,7 +12,6 @@ pub(super) const CONVERSATION_STATE_MAX_BYTES: usize = 1 << 20;
 const CONVERSATION_GUARD_MAGIC: &[u8; 8] = b"SVGUARD1";
 pub(super) const GUARD_CLEAR: u8 = 0;
 pub(super) const GUARD_BLOCK_RESUME: u8 = 1;
-pub(super) const GUARD_REVOKED: u8 = 2;
 
 pub(super) fn prepare_conversation_guard(path: &Path) -> Result<(u8, fs::File)> {
     match fs::symlink_metadata(path) {
@@ -28,7 +27,7 @@ pub(super) fn prepare_conversation_guard(path: &Path) -> Result<(u8, fs::File)> 
             if &bytes[..8] != CONVERSATION_GUARD_MAGIC || bytes[9..].iter().any(|byte| *byte != 0) {
                 bail!("invalid conversation state guard");
             }
-            if !matches!(bytes[8], GUARD_CLEAR | GUARD_BLOCK_RESUME | GUARD_REVOKED) {
+            if !matches!(bytes[8], GUARD_CLEAR | GUARD_BLOCK_RESUME) {
                 bail!("invalid conversation state guard");
             }
             Ok((bytes[8], file))
@@ -58,7 +57,7 @@ pub(super) fn write_conversation_guard(file: &mut fs::File, state: u8) -> Result
     Ok(())
 }
 
-/// The speech waiting for the room, as this connector writes it: every row a speech of a conversation (its event,
+/// The speech waiting for the core, as this connector writes it: every row a speech of a conversation (its event,
 /// binding, conversation reference, utterance and text). A row of any other shape makes the outbox invalid.
 pub(super) fn read_outbox(path: &Path) -> Result<Vec<Value>> {
     if !path.exists() {
@@ -136,10 +135,7 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        let state = write(
-            "conversation-state.json",
-            br#"{"refused":null,"closed_by_room":{}}"#,
-        );
+        let state = write("conversation-state.json", br#"{"closed_by_client":{}}"#);
         assert!(super::read_conversation_state(&state).unwrap().is_some());
         let oversized = write(
             "conversation-state.json",

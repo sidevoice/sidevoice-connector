@@ -229,10 +229,6 @@ impl Layout {
         self.data.join("node-stopped.json")
     }
 
-    pub fn room_credential(&self) -> PathBuf {
-        self.data.join("credentials.json")
-    }
-
     pub fn install_file(&self) -> PathBuf {
         self.data.join("install.json")
     }

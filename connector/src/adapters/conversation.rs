@@ -95,8 +95,8 @@ impl Conversation {
     }
 }
 
-/// Where a harness reports what it observes about a conversation: the connector's link to the room.
-pub trait Room: Send + Sync {
+/// Where a harness reports what it observes about a conversation: the connector's link to the core.
+pub trait Reporter: Send + Sync {
     fn profile(&self) -> &Profile;
     /// The engine it runs on: `{model, effort, thinking}`, reported when it changes.
     fn engine<'a>(&'a self, conversation: &'a Conversation, engine: Value) -> BoxFuture<'a, ()>;
@@ -116,10 +116,11 @@ pub trait Room: Send + Sync {
 }
 
 /// Working state without a turn id.
-pub async fn report_working(room: &dyn Room, conversation: &Conversation, working: bool) {
-    room.working(
-        conversation,
-        json!({"working":working,"turn_id":Value::Null}),
-    )
-    .await;
+pub async fn report_working(reporter: &dyn Reporter, conversation: &Conversation, working: bool) {
+    reporter
+        .working(
+            conversation,
+            json!({"working":working,"turn_id":Value::Null}),
+        )
+        .await;
 }

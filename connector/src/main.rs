@@ -129,13 +129,6 @@ enum Action {
         #[command(subcommand)]
         command: ServiceAction,
     },
-    /// Pair this machine with a room, with the one-time code the room shows for pairing a machine.
-    Pair {
-        /// The room's address (https://…).
-        room: String,
-        /// The one-time code the room shows.
-        code: String,
-    },
     /// Show a one-time code (and its QR) to pair a device, such as the Sidevoice app, with this machine.
     PairDevice,
     /// The installer's step for the core: stage the core this package carries into RELEASE/core.
@@ -359,23 +352,6 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
                 .map(|()| ExitCode::SUCCESS)
         }
         Action::Agents { action } => agents_command(profile, action, json).await,
-        Action::Pair { room, code } => {
-            let paired = pairing::pair(&profile, &room, &code).await?;
-            if json {
-                println!(
-                    "{}",
-                    json!({"ok":true,"room":paired.origin,"connector_id":paired.connector_id})
-                );
-            } else {
-                println!(
-                    "Paired with {} as connector {}; credential saved to {}",
-                    paired.origin,
-                    paired.connector_id,
-                    paired.file.display()
-                );
-            }
-            Ok(ExitCode::SUCCESS)
-        }
         Action::PairDevice => {
             let answer = pairing::device_code(&profile).await?;
             if json {
@@ -499,8 +475,11 @@ mod tests {
     fn an_ipc_refusal_is_read_as_text_or_keyed() {
         let fallback = "IPC error";
         assert_eq!(
-            ipc_failure(&json!({"ok":false,"error":"CLOSED_BY_ROOM:x:t"}), fallback),
-            "CLOSED_BY_ROOM:x:t"
+            ipc_failure(
+                &json!({"ok":false,"error":"CLOSED_BY_CLIENT:x:t"}),
+                fallback
+            ),
+            "CLOSED_BY_CLIENT:x:t"
         );
         let keyed = json!({"ok":false,"error":{"key":"ipc.future","params":{},"message":"Refused.","future":1}});
         assert_eq!(ipc_failure(&keyed, fallback), "Refused.");
