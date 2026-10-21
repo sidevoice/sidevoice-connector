@@ -305,12 +305,7 @@ pub fn core_arguments(
     if let Some(launch_id) = launch_id {
         args.extend(["--launch-id".into(), launch_id.to_owned()]);
     }
-    args.extend([
-        "--log-file".into(),
-        path(&layout.core_log()),
-        "--room-credential".into(),
-        path(&layout.room_credential()),
-    ]);
+    args.extend(["--log-file".into(), path(&layout.core_log())]);
     if let Some(idle_exit) = idle_exit {
         args.extend(["--idle-exit".into(), idle_exit.to_string()]);
     }

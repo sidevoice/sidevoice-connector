@@ -1,7 +1,7 @@
 //! Following a Codex thread's rollout: its engine, its turns (working) and the messages it read.
 
 use super::{default_effort, rollout_engine};
-use crate::adapters::conversation::{Conversation, Room};
+use crate::adapters::conversation::{Conversation, Reporter};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::time::Duration;
 
 /// Follows the rollout until the conversation stops, finding it again when it moves.
-pub fn follow(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
+pub fn follow(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
     tokio::spawn(async move {
         let binding = &*conversation;
         let mut path: Option<PathBuf> = None;
@@ -23,13 +23,16 @@ pub fn follow(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
         let mut turn: Option<String> = None;
         let mut working = None;
         let mut catching_up = true;
-        let mut defaults = DefaultEffort::new(room.profile().agent_home(super::HOME.var));
+        let mut defaults = DefaultEffort::new(reporter.profile().agent_home(super::HOME.var));
         loop {
             if binding.stopped.load(Ordering::Relaxed) {
                 break;
             }
             if path.is_none() {
-                path = rollout_path(room.profile().agent_home(super::HOME.var), &binding.thread);
+                path = rollout_path(
+                    reporter.profile().agent_home(super::HOME.var),
+                    &binding.thread,
+                );
                 if let Some(file) = &path {
                     if let Ok(meta) = fs::metadata(file) {
                         offset = 0;
@@ -71,7 +74,7 @@ pub fn follow(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
                                         if let Ok(item) = serde_json::from_slice::<Value>(&partial)
                                         {
                                             observe(
-                                                &*room,
+                                                &*reporter,
                                                 binding,
                                                 &item,
                                                 &mut turn,
@@ -90,7 +93,7 @@ pub fn follow(conversation: Arc<Conversation>, room: Arc<dyn Room>) {
                         if catching_up && offset >= meta.len() {
                             catching_up = false;
                             if let Some(state) = working {
-                                room.working(
+                                reporter.working(
                                     binding,
                                     json!({
                                         "working":state,"turn_id":if state { turn.clone() } else { None }
@@ -142,7 +145,7 @@ impl DefaultEffort {
 }
 
 async fn observe(
-    room: &dyn Room,
+    reporter: &dyn Reporter,
     binding: &Conversation,
     item: &Value,
     turn: &mut Option<String>,
@@ -151,7 +154,7 @@ async fn observe(
     catching_up: bool,
 ) {
     if let Some(engine) = rollout_engine(item) {
-        room.engine(binding, defaults.complete(engine)).await;
+        reporter.engine(binding, defaults.complete(engine)).await;
     }
     if item.get("type") == Some(&json!("event_msg")) {
         let phase = item
@@ -164,7 +167,8 @@ async fn observe(
                 *turn = Some(turn_id.to_owned());
                 *working = Some(true);
                 if !catching_up {
-                    room.working(binding, json!({"working":true,"turn_id":turn_id}))
+                    reporter
+                        .working(binding, json!({"working":true,"turn_id":turn_id}))
                         .await;
                 }
             }
@@ -176,7 +180,8 @@ async fn observe(
                 }
                 *working = Some(false);
                 if !catching_up {
-                    room.working(binding, json!({"working":false,"turn_id":turn_id}))
+                    reporter
+                        .working(binding, json!({"working":false,"turn_id":turn_id}))
                         .await;
                 }
             }
@@ -210,14 +215,15 @@ async fn observe(
         let Some(message_id) = header.get("message_id").and_then(Value::as_str) else {
             return;
         };
-        room.read(
-            binding,
-            message_id,
-            header["session_id"].clone(),
-            header["revision"].clone(),
-            json!(turn),
-        )
-        .await;
+        reporter
+            .read(
+                binding,
+                message_id,
+                header["session_id"].clone(),
+                header["revision"].clone(),
+                json!(turn),
+            )
+            .await;
     }
 }
 

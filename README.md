@@ -97,7 +97,6 @@ English message.
 | `install` | Installs this package's connector and the core it carries (or updates to them), starts both, checks they answer (or goes back to the previous version), then lists the agents it finds and how to connect each one. It connects none by itself; in a terminal it offers to (`--no-prompt` does not ask). An agent connected by an older Sidevoice is kept working. `--no-agents` leaves the agents alone. |
 | `uninstall` | The reverse of `install`: stops Sidevoice, removes its service jobs and the agent registrations it wrote, then what it installed and its data. Agent configuration it did not write is never edited. |
 | `pair-device` | Prints a one-time code (and its QR) that pairs a device with this machine. |
-| `pair <room-url> <code>` | Pairs this machine with a room, with the one-time code the room shows. |
 | `agents` | The agents on this machine and whether they use Sidevoice; `agents connect\|disconnect\|dismiss <claude\|codex\|cursor>` changes one. |
 | `service <install\|start\|stop\|restart\|status\|uninstall>` | Sidevoice at login: the core and the connector as two jobs of launchd or the systemd user manager. Without a service manager, Sidevoice runs on demand. |
 | `mcp` | The MCP server an agent starts, one per conversation. You do not run it yourself. |
@@ -112,7 +111,7 @@ The [reviewed voice-message MCP integration contract](docs/voice-message-contrac
 ## When something doesn't arrive or isn't heard
 
 Ask the agent to call the MCP tool `voice_diagnose` in the conversation concerned. It is read-only and answers
-with the versions, whether the core runs and the connector is linked to it, the room pairing, this conversation's
+with the versions, whether the core runs and the connector is linked to it, this conversation's
 delivery route (and whether its socket exists), its last deliveries with how each ended and whether the agent has
 read it, the harness's capabilities and inbound check, the editor bridge state, and where the logs are
 (by default `~/.sidevoice/connector.log` and `core.log`). It never includes message text, keys or tokens. A delivery that ends

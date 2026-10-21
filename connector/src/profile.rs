@@ -4,7 +4,7 @@
 //! - `D`, the data directory: `$SIDEVOICE_DATA_DIR`, else `~/.sidevoice`. Private (0700). The connector is the
 //!   one writer of its records there, each written whole (`secure_fs.rs`); `D/core/` is the core's.
 //!   `connector.sock`, `connector.lock`, `connector.log`, `agents.json`, `agents.lock`, `install.lock`,
-//!   `node-stopped.json` (a person's stop), `credentials.json` (the room pairing), `outbox.json`, `core/core.json`
+//!   `node-stopped.json` (a person's stop), `outbox.json`, `core/core.json`
 //!   and `core/local.sock`.
 //! - `R`, the release root: `$XDG_DATA_HOME/sidevoice` (else `~/.local/share/sidevoice`), as `service/layout.rs` names it.
 //! - The agents' homes, each named by a variable its harness declares ([`AgentHome`]): the variable's value, else

@@ -1,7 +1,7 @@
 //! Claude Code as a harness: voice through its messaging socket, the transcript and session record followed.
 
 use super::{assistant_engine, assistant_model, session_engine, transcript_path, working_state};
-use crate::adapters::conversation::{report_working, Conversation, Room};
+use crate::adapters::conversation::{report_working, Conversation, Reporter};
 use crate::adapters::harness::{no_route, Harness, Route};
 use crate::adapters::registration::Registration;
 use crate::adapters::transcript::{self, Observed, TranscriptReader};
@@ -70,27 +70,31 @@ impl Harness for Claude {
         })
     }
 
-    fn watch(&self, conversation: Arc<Conversation>, room: Arc<dyn Room>) {
+    fn watch(&self, conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
         if conversation.route_kind() != Some("claude-uds") {
             return;
         }
         let turn = Arc::new(AtomicU64::new(0));
         transcript::follow(
             conversation.clone(),
-            room.clone(),
+            reporter.clone(),
             Reader {
                 session: conversation.thread.clone(),
                 turn: turn.clone(),
             },
         );
-        watch_working(conversation, room, turn);
+        watch_working(conversation, reporter, turn);
     }
 }
 
 /// Working state: the session record says busy, or the transcript holds a turn open (a message in, no final answer
 /// yet) and was written to lately. The record alone reads idle between a message arriving and the turn starting, and
 /// between tool calls. Reported working at once, idle once it has held for [`IDLE_DEBOUNCE`].
-fn watch_working(conversation: Arc<Conversation>, room: Arc<dyn Room>, turn: Arc<AtomicU64>) {
+fn watch_working(
+    conversation: Arc<Conversation>,
+    reporter: Arc<dyn Reporter>,
+    turn: Arc<AtomicU64>,
+) {
     tokio::spawn(async move {
         let mut reported = None;
         let mut idle_since = Instant::now();
@@ -103,7 +107,7 @@ fn watch_working(conversation: Arc<Conversation>, room: Arc<dyn Room>, turn: Arc
             }
             let state = working || idle_since.elapsed() < IDLE_DEBOUNCE;
             if reported != Some(state) {
-                report_working(&*room, &conversation, state).await;
+                report_working(&*reporter, &conversation, state).await;
                 reported = Some(state);
             }
             tokio::time::sleep(Duration::from_millis(400)).await;

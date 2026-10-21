@@ -9,7 +9,7 @@ pub(crate) mod markers;
 pub mod registration;
 mod transcript;
 
-pub use conversation::{Conversation, Room};
+pub use conversation::{Conversation, Reporter};
 pub use harness::{Harness, Registry, Route};
 
 use anyhow::{bail, Context, Result};
@@ -269,7 +269,7 @@ pub fn envelope(event: &Value) -> Result<String> {
             bail!("a Sidevoice note cannot contain user words");
         }
         body.push_str(
-            "[Sidevoice] A note from the room; the person sent no words in this message.",
+            "[Sidevoice] A note from Sidevoice; the person sent no words in this message.",
         );
     } else {
         body.push_str(text);

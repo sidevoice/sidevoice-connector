@@ -1,6 +1,6 @@
 //! Codex as a harness: voice steered into the running turn when Codex allows it, else through its queue; the rollout followed.
 
-use crate::adapters::conversation::{Conversation, Room};
+use crate::adapters::conversation::{Conversation, Reporter};
 use crate::adapters::harness::{no_route, Harness, Route};
 use crate::adapters::registration::Registration;
 use crate::profile::Profile;
@@ -52,14 +52,14 @@ impl Harness for Codex {
         })
     }
 
-    fn watch(&self, conversation: Arc<Conversation>, room: Arc<dyn Room>) {
+    fn watch(&self, conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
         let follows = match conversation.route_kind() {
             Some("codex-queue") => true,
             Some("http") => conversation.capabilities["working"] == "supported",
             _ => false,
         };
         if follows {
-            super::rollout::follow(conversation, room);
+            super::rollout::follow(conversation, reporter);
         }
     }
 }

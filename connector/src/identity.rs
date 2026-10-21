@@ -1,6 +1,6 @@
 //! What this machine says about itself, in the one place that says it: at every handshake with the core, which
 //! keeps the latest so that a person looking at the list of paired machines reads a machine and not a UUID. Every
-//! field is read from what this machine actually is: nothing is asked of a harness or of the room, and nothing is
+//! field is read from what this machine actually is: nothing is asked of a harness or of a client, and nothing is
 //! guessed.
 
 use crate::profile::Profile;
@@ -58,7 +58,7 @@ pub fn host() -> String {
     }
 }
 
-/// The platform, said the way a person reading the room's list calls it: `macOS arm64`, `Linux x64`. A system or
+/// The platform, said the way a person reading the app's list of machines calls it: `macOS arm64`, `Linux x64`. A system or
 /// architecture not named here travels as Rust names it.
 pub fn platform() -> String {
     platform_of(std::env::consts::OS, std::env::consts::ARCH)
@@ -88,7 +88,7 @@ pub fn harnesses(profile: &Profile) -> Vec<&'static str> {
         .collect()
 }
 
-/// This machine, as the room will list it.
+/// This machine, as a client will list it.
 pub fn machine(profile: &Profile) -> Value {
     json!({"host":host(),"platform":platform(),"version":profile.connector_version(),
         "harnesses":harnesses(profile)})
