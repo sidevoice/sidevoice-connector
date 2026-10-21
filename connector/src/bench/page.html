@@ -74,7 +74,7 @@ async function refresh() {
       card.className = "binding" + (binding.thread === selected ? " selected" : "") + (binding.connected ? "" : " closed");
       card.append(text("div", "", binding.title || binding.thread));
       const engine = binding.engine ? ` · ${binding.engine.model || ""} ${binding.engine.effort || ""}` : "";
-      card.append(text("div", "muted", `${binding.harness} · ${binding.input_mode} · ${binding.connected ? "live" : "closed"}${engine}`));
+      card.append(text("div", "muted", `${binding.harness} · ${binding.connected ? "live" : "closed"}${engine}`));
       card.append(text("div", "muted", `thread ${binding.thread}`));
       card.onclick = () => { selected = binding.thread; $("title").textContent = binding.title || binding.thread; refresh(); };
       list.append(card);

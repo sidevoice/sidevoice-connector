@@ -37,8 +37,11 @@ pub trait Harness: Send + Sync {
     /// The id conversations and the agent list name it by (`claude`, `codex`, …).
     fn id(&self) -> &'static str;
 
-    /// What its conversations can do when the client declares nothing.
-    fn capabilities(&self) -> Value;
+    /// What its conversations can do when the client declares nothing. Harnesses with an
+    /// injection route declare `deliver: supported`; the default uses get_messages.
+    fn capabilities(&self) -> Value {
+        json!({"deliver":"unsupported"})
+    }
 
     /// The directories the agent keeps, named by environment variables: what the profile resolves for it.
     fn homes(&self) -> &'static [AgentHome] {
@@ -72,13 +75,16 @@ pub trait Harness: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
-    /// Puts a message from the core into the conversation.
-    fn deliver<'a>(
+    /// Attempts to put a message into the conversation. The default leaves it in the journal
+    /// for get_messages.
+    fn inject<'a>(
         &'a self,
-        conversation: &'a Conversation,
-        frame: &'a Value,
-        profile: &'a Profile,
-    ) -> BoxFuture<'a, Result<Value>>;
+        _conversation: &'a Conversation,
+        _frame: &'a Value,
+        _profile: &'a Profile,
+    ) -> BoxFuture<'a, Result<Value>> {
+        Box::pin(async { Ok(json!({"status":"unsupported"})) })
+    }
 
     /// Releases what `prepare` held, when the conversation leaves.
     fn close<'a>(&'a self, _conversation: &'a Conversation) -> BoxFuture<'a, ()> {

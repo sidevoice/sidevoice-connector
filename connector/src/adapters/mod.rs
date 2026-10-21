@@ -119,7 +119,9 @@ pub fn identify(
     client_capabilities: &Value,
 ) -> Result<Identity> {
     if client.is_some_and(cursor::is_cursor_client) {
-        if let Some(identity) = http::identity()? {
+        if let Some(identity) =
+            http::identity()?.filter(|identity| identity.delivery["kind"] == "http")
+        {
             return Ok(identity);
         }
         return cursor::identity(client.unwrap(), client_capabilities);

@@ -15,23 +15,33 @@ pub fn capabilities() -> Value {
 }
 
 pub fn identity() -> Result<Option<Identity>> {
-    let (Ok(thread), Ok(url)) = (
-        env::var("SIDEVOICE_THREAD"),
-        env::var("SIDEVOICE_DELIVERY_URL"),
-    ) else {
+    let Ok(thread) = env::var("SIDEVOICE_THREAD") else {
         return Ok(None);
     };
-    if thread.is_empty() || url.is_empty() {
+    if thread.is_empty() {
         return Ok(None);
     }
+    let url = env::var("SIDEVOICE_DELIVERY_URL")
+        .ok()
+        .filter(|url| !url.is_empty());
     let harness = env::var("SIDEVOICE_HARNESS").unwrap_or_else(|_| "http".into());
+    Ok(Some(identity_for(&harness, thread, url)))
+}
+
+fn identity_for(harness: &str, thread: String, url: Option<String>) -> Identity {
     let mut identity = Identity::new(
-        &harness,
+        harness,
         thread.clone(),
-        json!({"kind":"http","url":url,"thread":thread}),
+        url.as_ref().map_or_else(
+            || json!({"kind":"none"}),
+            |url| json!({"kind":"http","url":url,"thread":thread}),
+        ),
     );
     identity.capabilities = capabilities();
-    Ok(Some(identity))
+    if url.is_none() {
+        identity.capabilities["deliver"] = json!("unsupported");
+    }
+    identity
 }
 
 pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
@@ -106,6 +116,7 @@ pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
 /// The HTTP route, which every harness knows: `Unknown` for any other kind.
 pub fn accepts(delivery: &Value, thread: &str) -> Route {
     match delivery.get("kind").and_then(Value::as_str) {
+        Some("none") => Route::Accepted,
         Some("http") => {
             Route::known(delivery.get("thread").and_then(Value::as_str) == Some(thread))
         }
@@ -129,7 +140,7 @@ impl Harness for Http {
         accepts(delivery, thread)
     }
 
-    fn deliver<'a>(
+    fn inject<'a>(
         &'a self,
         conversation: &'a Conversation,
         frame: &'a Value,
@@ -141,5 +152,20 @@ impl Harness for Http {
                 _ => Ok(no_route(&conversation.thread)),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_harness_without_an_injector_uses_get_messages() {
+        let identity = identity_for("http", "thread".into(), None);
+        assert_eq!(identity.delivery["kind"], "none");
+        assert_eq!(identity.capabilities["deliver"], "unsupported");
+        assert_eq!(accepts(&identity.delivery, "thread"), Route::Accepted);
+        let with_injector = identity_for("http", "thread".into(), Some("http://local".into()));
+        assert_eq!(with_injector.capabilities["deliver"], "supported");
     }
 }

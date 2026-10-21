@@ -119,7 +119,7 @@ impl Harness for Cursor {
         Box::new(Chats::default())
     }
 
-    fn deliver<'a>(
+    fn inject<'a>(
         &'a self,
         conversation: &'a Conversation,
         frame: &'a Value,
@@ -661,7 +661,6 @@ mod tests {
             thread: identity.thread.clone(),
             title: "chat".into(),
             delivery: identity.delivery.clone(),
-            input_mode: AsyncMutex::new("push".into()),
             initial_reply_context: AsyncMutex::new(Value::Null),
             engine: AsyncMutex::new(None),
             route: identity.route.clone(),

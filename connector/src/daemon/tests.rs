@@ -20,11 +20,18 @@ async fn cursor_push_frame_reaches_bridge_adapter() {
     let (replay_tx, _replay_rx) = mpsc::channel(1);
     let (shutdown, _) = watch::channel(false);
     let daemon = Daemon::new(profile, link, replay_tx, registry, false, shutdown).unwrap();
-    let joined = daemon.command(1, "register", json!({
-        "client_ref":"cursor-editor-test","harness":"cursor","thread":"cursor-editor-test",
-        "input_mode":"push","delivery":{"kind":"cursor-bridge","thread":"cursor-editor-test",
-            "marker":"0000000000000000000000000000000000000000000000000000000000000000"}
-    })).await.unwrap();
+    let joined = daemon
+        .command(
+            1,
+            "register",
+            json!({
+                "client_ref":"cursor-editor-test","harness":"cursor","thread":"cursor-editor-test",
+                "delivery":{"kind":"cursor-bridge","thread":"cursor-editor-test",
+                    "marker":"0000000000000000000000000000000000000000000000000000000000000000"}
+            }),
+        )
+        .await
+        .unwrap();
     let answer = daemon
         .handle_incoming(
             "input.deliver",

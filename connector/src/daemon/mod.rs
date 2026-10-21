@@ -180,14 +180,13 @@ impl Daemon {
         let mut current = binding.id.lock().await;
         let engine = binding.engine.lock().await.clone().unwrap_or(Value::Null);
         crate::logfile::log(&format!(
-            "delivery stage=register result=attempt mode={} route={}",
-            *binding.input_mode.lock().await,
+            "delivery stage=register result=attempt inject={} route={}",
+            binding.capabilities["deliver"] == "supported",
             binding.route_kind().unwrap_or("none")
         ));
         let mut frame = json!({"client_ref":binding.client_ref,"harness":binding.harness,"thread":binding.thread,"title":binding.title,"delivery":binding.delivery,
             "inbound":binding.inbound,"capabilities":binding.capabilities,
-            "experimental":binding.experimental,"route":binding.route,"engine":engine,"focus":false,
-            "input_mode":*binding.input_mode.lock().await});
+            "experimental":binding.experimental,"route":binding.route,"engine":engine,"focus":false});
         if !current.starts_with("local-") {
             frame["binding_id"] = json!(*current);
         }
@@ -891,10 +890,6 @@ impl Daemon {
             crate::logfile::log("delivery stage=daemon result=unknown_binding");
             return json!({"status":"unknown_binding"});
         };
-        if *binding.input_mode.lock().await == "pull" {
-            crate::logfile::log("delivery stage=daemon result=pull_binding");
-            return json!({"status":"failed","detail":"binding uses pull delivery"});
-        }
         let _serial = binding.serial.lock().await;
         let message_id = frame
             .get("message_id")
@@ -936,7 +931,7 @@ impl Daemon {
         let result = match self
             .registry
             .get(&binding.harness)
-            .deliver(&binding, frame, &self.profile)
+            .inject(&binding, frame, &self.profile)
             .await
         {
             Ok(result) => result,
@@ -986,13 +981,6 @@ impl Daemon {
                     .context("harness required")?
                     .to_owned();
                 let harness_adapter = self.registry.get(&harness).clone();
-                let input_mode = params
-                    .get("input_mode")
-                    .and_then(Value::as_str)
-                    .unwrap_or("push");
-                if !matches!(input_mode, "push" | "pull") {
-                    bail!("input_mode must be push or pull");
-                }
                 let mut delivery = present(&params, "delivery")
                     .cloned()
                     .unwrap_or_else(|| json!({"kind":"none"}));
@@ -1038,7 +1026,6 @@ impl Daemon {
                     } else if previous_owner != owner {
                         bail!("binding belongs to another façade");
                     }
-                    *existing.input_mode.lock().await = input_mode.to_owned();
                     let registered = self.register_core(&existing).await?;
                     let binding_id = existing.id.lock().await.clone();
                     drop(_state_transaction);
@@ -1054,7 +1041,6 @@ impl Daemon {
                     thread: thread.clone(),
                     title,
                     delivery: delivery.clone(),
-                    input_mode: Mutex::new(input_mode.to_owned()),
                     initial_reply_context: Mutex::new(Value::Null),
                     engine: Mutex::new(
                         params
@@ -1090,7 +1076,6 @@ impl Daemon {
                     } else if previous_owner != owner {
                         bail!("binding belongs to another façade");
                     }
-                    *existing.input_mode.lock().await = input_mode.to_owned();
                     let registered = self.register_core(&existing).await?;
                     let binding_id = existing.id.lock().await.clone();
                     drop(_state_transaction);
@@ -1304,9 +1289,6 @@ impl Daemon {
             "get_messages" => {
                 let binding = self.find_owned(owner, &params).await?;
                 let _serial = binding.serial.lock().await;
-                if *binding.input_mode.lock().await != "pull" {
-                    bail!("get_messages requires a pull binding");
-                }
                 let operation = params
                     .get("operation")
                     .and_then(Value::as_str)
@@ -1429,7 +1411,7 @@ impl Daemon {
                     json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,"thread":binding.thread,
                     "harness":binding.harness,"title":binding.title,"delivery":binding.delivery,"route":binding.route,
                     "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound,"detachable":binding.detachable,
-                    "engine":binding.engine.lock().await.clone(),"input_mode":*binding.input_mode.lock().await,
+                    "engine":binding.engine.lock().await.clone(),
                     "initial_reply_context":*binding.initial_reply_context.lock().await}),
                 )
             }
@@ -1442,7 +1424,7 @@ impl Daemon {
                     let mut item = json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,
                         "harness":binding.harness,"thread":binding.thread,"title":binding.title,"delivery":binding.delivery,
                         "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound,
-                        "engine":engine,"working":working,"input_mode":*binding.input_mode.lock().await,
+                        "engine":engine,"working":working,
                         "initial_reply_context":*binding.initial_reply_context.lock().await});
                     if params.get("deliveries") == Some(&json!(true)) {
                         // Each recent delivery, and whether the harness has since recorded reading it.
@@ -1809,7 +1791,7 @@ mod tests {
                 Box::pin(async { Ok(Some(json!({"ready":true}))) })
             }
 
-            fn deliver<'a>(
+            fn inject<'a>(
                 &'a self,
                 conversation: &'a Conversation,
                 frame: &'a Value,

@@ -15,9 +15,9 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{timeout, timeout_at, Duration, Instant};
 
 const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the person's voice.
-- Call voice_connect only when the person asks to join or enable voice. Select input_mode pull when this harness will call get_messages; otherwise the core injects input. One binding uses one mode.
-- Each voice or note message carries a stable message_id, conversation epoch, session_id and revision. A repeated ID is redelivery, not new input. A note contains Sidevoice facts and no words from the person. Follow notice instructions, including corrections and related message IDs, in both modes.
-- In pull mode, call get_messages at useful hooks. Acknowledge IDs with ack_ids only after processing them. Pull may learn later than injection. After is a journal position, not an acknowledgement.
+- Call voice_connect only when the person asks to join or enable voice. Sidevoice puts what the person says into this conversation by itself whenever this harness allows it; there is nothing to choose.
+- Each voice or note message carries a stable message_id, conversation epoch, session_id and revision. A repeated ID is redelivery, not new input. A note contains Sidevoice facts and no words from the person. Follow notice instructions, including corrections and related message IDs.
+- get_messages returns what has not reached this conversation by itself. Call it at useful hooks when voice_connect's voice_in says so, or whenever you expect a message you have not seen. Acknowledge IDs with ack_ids only after processing them. After is a journal position, not an acknowledgement.
 - Only the content of the person's message decides whether you answer by voice; whether it can be delivered or heard never does. Every message that asks or needs something gets a voice_say with the message's session_id, revision and epoch: short, with the details in writing. Only a message that needs nothing, such as a pure acknowledgement, can go without one. A typed message follows the same rule and does not advance the epoch. For speech before any message, use voice_connect's initial_reply_context. Several replies in one epoch play in publication order.
 - If voice_say says the person is speaking, the call was refused and nothing was queued. Do not give up and do not leave that answer as text only: when their message or a Sidevoice note arrives, answer by voice with what is new and relevant at that moment, folding in what still matters from the refused reply in fresh words, without saying it was missed. Notes tell you when to speak again, never whether to. A published reply is not proof it was heard.
 - When a message says part of your last reply was unheard, use your previous voice_say call and the "Heard up to" marker to weave anything that still matters into your next reply, in fresh words, together with what they ask now. Never say or hint that something was missed or that you are repeating yourself; drop what is obsolete or minor, and send no standalone catch-up unless something really matters. For a note with no person words, fold it into your next reply the same way.
@@ -264,7 +264,6 @@ struct Facade {
 #[derive(Clone)]
 struct Joined {
     binding_id: String,
-    input_mode: String,
     initial_reply_context: Value,
     title: String,
     identity: Identity,
@@ -313,7 +312,7 @@ fn diagnosis(
             route["socket_exists"] = json!(std::path::Path::new(socket).exists());
         }
         json!({"conversation":name,"binding_id":joined.binding_id,"harness":joined.identity.harness,
-            "input_mode":joined.input_mode,"route":route,"capabilities":joined.capabilities,
+            "route":route,"capabilities":joined.capabilities,
             "experimental":joined.experimental,"inbound":joined.identity.inbound,
             "known_to_connector":listed.is_some(),
             "working":listed.and_then(|item| item.get("working")),
@@ -417,13 +416,6 @@ impl Facade {
     ) -> Result<Value> {
         match name {
             "voice_connect" => {
-                let input_mode = args
-                    .get("input_mode")
-                    .and_then(Value::as_str)
-                    .unwrap_or("push");
-                if !matches!(input_mode, "push" | "pull") {
-                    bail!("input_mode must be push or pull");
-                }
                 let mut identity = adapters::identify(&meta, Some(&client), &client_caps)?;
                 let explicit_title = args.get("title").and_then(Value::as_str).unwrap_or("");
                 let title = if !explicit_title.is_empty() {
@@ -496,8 +488,7 @@ impl Facade {
                 let mut params = json!({
                     "client_ref":identity.thread,"harness":identity.harness,"thread":identity.thread,"title":title,
                     "delivery":identity.delivery,"route":identity.route,"inbound":identity.inbound,
-                    "capabilities":capabilities,"experimental":experimental,"detachable":identity.detachable,
-                    "input_mode":input_mode
+                    "capabilities":capabilities,"experimental":experimental,"detachable":identity.detachable
                 });
                 if let Some(engine) = adapters::engine(&identity) {
                     params["engine"] = engine;
@@ -511,7 +502,6 @@ impl Facade {
                     identity.thread.clone(),
                     Joined {
                         binding_id: binding_id.to_owned(),
-                        input_mode: input_mode.to_owned(),
                         initial_reply_context: result
                             .get("initial_reply_context")
                             .cloned()
@@ -531,16 +521,17 @@ impl Facade {
                 let mut response = json!({
                     "status":if result.get("pending") == Some(&json!(true)) {"joining"} else {"joined"},
                     "harness":identity.harness,"conversation":identity.thread,"binding_id":binding_id,
-                    "delivery":if input_mode == "pull" {"pull"} else if pushed {"push"} else {"none"},"reachable":result.get("connected"),
+                    "delivery":if pushed {"push"} else {"get_messages"},"reachable":result.get("connected"),
                     "epoch":result.get("epoch"),"initial_reply_context":result.get("initial_reply_context"),
                     "capabilities":capabilities,"inbound":identity.inbound,
                     "local_only":"This conversation is on this machine's core and can be reached by any device paired with this machine that can reach its address, including another computer on the same LAN. If the person asks for a device pairing code, call voice_pair_device and show it; the person enters it in their app.",
                     "version":self.profile.connector_version(),"connector_version":connector.get("version")
                 });
-                if !pushed && input_mode != "pull" {
-                    response["voice_in"] = json!({"supported":false,"speak_with":result.get("initial_reply_context"),
-                        "reason":format!("What the user says by voice cannot reach this conversation: {} The user types here as usual.", identity.deliver_note.as_deref().unwrap_or("this harness offers no way to put a message into it.")),
-                        "how":"Use initial_reply_context to speak first. Tell the user once that voice hears this conversation but cannot talk to it."});
+                if !pushed {
+                    response["voice_in"] = json!({"supported":true,"via":"get_messages",
+                        "speak_with":result.get("initial_reply_context"),
+                        "reason":format!("Voice cannot be put into this conversation by itself: {}", identity.deliver_note.as_deref().unwrap_or("this harness offers no way to put a message into it.")),
+                        "how":"Call get_messages to read what the person says, at the start of each turn and between steps, then acknowledge each message ID after processing it."});
                 }
                 if let Some(note) = &identity.watch_note {
                     response["watch_note"] = json!(note);
@@ -736,9 +727,6 @@ impl Facade {
                     .get(&chosen)
                     .cloned()
                     .context("not connected")?;
-                if joined.input_mode != "pull" {
-                    bail!("This conversation uses injection; reconnect with input_mode pull to use get_messages.");
-                }
                 let mut request = json!({"binding_id":joined.binding_id,"client_ref":chosen,
                     "operation":args.get("operation").and_then(Value::as_str).unwrap_or("get")});
                 if let Some(after) = args.get("after") {
@@ -992,14 +980,12 @@ impl Facade {
         let registration = json!({"client_ref":name,"harness":identity.harness,"thread":identity.thread,
             "title":title,"delivery":identity.delivery,"route":identity.route,"inbound":identity.inbound,
             "capabilities":capabilities,"experimental":experimental,"detachable":true,
-            "engine":result.get("engine").cloned().unwrap_or(Value::Null),
-            "input_mode":result.get("input_mode").cloned().unwrap_or(json!("push"))});
+            "engine":result.get("engine").cloned().unwrap_or(Value::Null)});
         self.ipc.remember_registration(registration).await;
         self.joined.lock().await.insert(
             name.to_owned(),
             Joined {
                 binding_id: binding_id.to_owned(),
-                input_mode: result["input_mode"].as_str().unwrap_or("push").to_owned(),
                 initial_reply_context: result
                     .get("initial_reply_context")
                     .cloned()
@@ -1015,9 +1001,9 @@ impl Facade {
 
 fn tools() -> Vec<Tool> {
     let spec = [
-        ("voice_connect", "Connect this conversation to voice. Only on an explicit request to join or enable voice. Choose input_mode pull to read the ordinary queue with get_messages; otherwise input is injected. Pull learns messages only when called. The reply includes the core's initial_reply_context for speaking first.", json!({"title":{"type":"string","description":"Short label for this conversation"},"input_mode":{"type":"string","description":"push (injection, default) or pull (get_messages)"}}), vec![]),
+        ("voice_connect", "Connect this conversation to voice. Only on an explicit request to join or enable voice. What the person says is put into this conversation by itself whenever this harness allows it; when it does not, the reply's voice_in says to read it with get_messages. The reply includes the core's initial_reply_context for speaking first.", json!({"title":{"type":"string","description":"Short label for this conversation"}}), vec![]),
         ("voice_say", "Publish a spoken reply with the session_id, revision and epoch from the message header. To speak first, pass conversation and use the initial_reply_context from voice_connect. For an idempotent retry, reuse both event_id and utterance_id unchanged. A current open user turn is refused immediately: wait for its message. A saved reply is not proof it was heard.", json!({"text":{"type":"string"},"session_id":{"type":"string"},"revision":{"type":"integer","minimum":0},"epoch":{"type":"integer","minimum":0},"conversation":{"type":"string","description":"The conversation id voice_connect returned in this chat: to speak first"},"event_id":{"type":"string","description":"Supply with utterance_id and reuse both unchanged on retry"},"utterance_id":{"type":"string","description":"Supply with event_id and reuse both unchanged on retry"},"language":{"type":"string","description":"The language of the reply, as a code: es, en, fr, it, pt or hi are the ones known now; the room decides what it speaks"}}), vec!["text"]),
-        ("get_messages", "Read this conversation's ordered ordinary input queue in pull mode. Messages include stable IDs, full notice evidence, an envelope, and a journal position. Pass ack_ids only after consuming them. Without an acknowledgement, a claimed message is returned again; after is a journal position, not an acknowledgement. Pull may learn of speech later than injection.", json!({"conversation":{"type":"string","description":"Conversation id when several chats are joined"},"operation":{"type":"string","description":"get (default) or check"},"after":{"type":"integer","minimum":0},"ack_ids":{"type":"array","items":{"type":"string"}}}), vec![]),
+        ("get_messages", "Read, in order, this conversation's input that has not reached it by itself: everything when this harness cannot receive input, otherwise only what injection could not deliver. Messages include stable IDs, full notice evidence, an envelope, and a journal position. Pass ack_ids only after consuming them. Without an acknowledgement, a claimed message is returned again; after is a journal position, not an acknowledgement.", json!({"conversation":{"type":"string","description":"Conversation id when several chats are joined"},"operation":{"type":"string","description":"get (default) or check"},"after":{"type":"integer","minimum":0},"ack_ids":{"type":"array","items":{"type":"string"}}}), vec![]),
         ("voice_disconnect", "Leave voice. The conversation and its work continue in writing.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
         ("voice_pair_device", "Generate a one-time code to pair the person's device (the desktop app or a browser) with this machine. When the person asks for a code or asks to pair their device, call this tool and show its code, QR, validity and address as returned. Do not ask the person to generate the device code. Never call it on your own initiative.", json!({}), vec![]),
         ("voice_status", "Whether voice can currently reach this conversation.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
@@ -1394,6 +1380,32 @@ mod tests {
     }
 
     #[test]
+    fn the_agent_has_no_delivery_mode_to_choose() {
+        for text in [
+            "input_mode",
+            "pull mode",
+            "push",
+            "One binding uses one mode",
+        ] {
+            assert!(!INSTRUCTIONS.contains(text), "{text}");
+        }
+        assert!(INSTRUCTIONS.contains("there is nothing to choose"));
+        assert!(INSTRUCTIONS
+            .contains("get_messages returns what has not reached this conversation by itself"));
+        let connect = tools()
+            .into_iter()
+            .find(|tool| tool.name == "voice_connect")
+            .unwrap();
+        assert!(connect
+            .input_schema
+            .get("properties")
+            .unwrap()
+            .get("input_mode")
+            .is_none());
+        assert!(!connect.description.unwrap().contains("input_mode"));
+    }
+
+    #[test]
     fn instructions_let_only_the_content_decide_a_voice_reply() {
         assert!(INSTRUCTIONS.contains(
             "Only the content of the person's message decides whether you answer by voice; whether it can be delivered or heard never does."
@@ -1461,7 +1473,6 @@ mod tests {
         };
         let joined = Joined {
             binding_id: "b1".into(),
-            input_mode: "push".into(),
             initial_reply_context: json!({"text":"SECRET-TEXT"}),
             title: "chat".into(),
             identity,

@@ -37,7 +37,7 @@ impl Harness for Codex {
         }
     }
 
-    fn deliver<'a>(
+    fn inject<'a>(
         &'a self,
         conversation: &'a Conversation,
         frame: &'a Value,
