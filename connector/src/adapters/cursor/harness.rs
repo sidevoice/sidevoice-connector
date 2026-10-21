@@ -119,7 +119,7 @@ impl Harness for Cursor {
         Box::new(Chats::default())
     }
 
-    fn inject<'a>(
+    fn deliver<'a>(
         &'a self,
         conversation: &'a Conversation,
         frame: &'a Value,

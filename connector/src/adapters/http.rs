@@ -140,7 +140,7 @@ impl Harness for Http {
         accepts(delivery, thread)
     }
 
-    fn inject<'a>(
+    fn deliver<'a>(
         &'a self,
         conversation: &'a Conversation,
         frame: &'a Value,

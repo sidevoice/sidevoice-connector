@@ -55,7 +55,7 @@ impl Harness for Claude {
         }
     }
 
-    fn inject<'a>(
+    fn deliver<'a>(
         &'a self,
         conversation: &'a Conversation,
         frame: &'a Value,

@@ -77,7 +77,7 @@ pub trait Harness: Send + Sync {
 
     /// Attempts to put a message into the conversation. The default leaves it in the journal
     /// for get_messages.
-    fn inject<'a>(
+    fn deliver<'a>(
         &'a self,
         _conversation: &'a Conversation,
         _frame: &'a Value,

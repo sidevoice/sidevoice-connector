@@ -931,7 +931,7 @@ impl Daemon {
         let result = match self
             .registry
             .get(&binding.harness)
-            .inject(&binding, frame, &self.profile)
+            .deliver(&binding, frame, &self.profile)
             .await
         {
             Ok(result) => result,
@@ -1791,7 +1791,7 @@ mod tests {
                 Box::pin(async { Ok(Some(json!({"ready":true}))) })
             }
 
-            fn inject<'a>(
+            fn deliver<'a>(
                 &'a self,
                 conversation: &'a Conversation,
                 frame: &'a Value,
