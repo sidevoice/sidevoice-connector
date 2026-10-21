@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.15.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.14.1...v0.15.0) (2026-10-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **delivery:** inject when possible and keep get_messages available ([#176](https://github.com/sidevoice/sidevoice-connector/issues/176))
+
+### Features
+
+* **delivery:** inject when possible and keep get_messages available ([#176](https://github.com/sidevoice/sidevoice-connector/issues/176)) ([88a3b2a](https://github.com/sidevoice/sidevoice-connector/commit/88a3b2a447cd53d6136739c9a094bc466c4526fa))
+
+
+### Bug Fixes
+
+* **agent:** let only the message's content decide a voice reply ([#212](https://github.com/sidevoice/sidevoice-connector/issues/212)) ([9b8b836](https://github.com/sidevoice/sidevoice-connector/commit/9b8b83648dea29009d787a01285b97a4b85c216a))
+
 ## [0.14.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.14.0...v0.14.1) (2026-10-21)
 
 
