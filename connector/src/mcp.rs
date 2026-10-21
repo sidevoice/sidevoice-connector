@@ -18,8 +18,8 @@ const INSTRUCTIONS: &str = r#"Sidevoice connects this conversation to the person
 - Call voice_connect only when the person asks to join or enable voice. Select input_mode pull when this harness will call get_messages; otherwise the core injects input. One binding uses one mode.
 - Each voice or note message carries a stable message_id, conversation epoch, session_id and revision. A repeated ID is redelivery, not new input. A note contains Sidevoice facts and no words from the person. Follow notice instructions, including corrections and related message IDs, in both modes.
 - In pull mode, call get_messages at useful hooks. Acknowledge IDs with ack_ids only after processing them. Pull may learn later than injection. After is a journal position, not an acknowledgement.
-- When a reply is appropriate, use voice_say with the message's session_id, revision and epoch. For speech before any message, use voice_connect's initial_reply_context. A typed message is context: it updates what you know without requiring a response and does not advance the epoch; you decide whether to answer, and a quick acknowledgement is optional. Several replies in one epoch play in publication order.
-- If voice_say says the person is speaking, the call was refused and nothing was queued: wait for their message. If that turn ends without words, a Sidevoice note may ask you to resend what still matters. A published reply is not proof it was heard.
+- Only the content of the person's message decides whether you answer by voice; whether it can be delivered or heard never does. Every message that asks or needs something gets a voice_say with the message's session_id, revision and epoch: short, with the details in writing. Only a message that needs nothing, such as a pure acknowledgement, can go without one. A typed message follows the same rule and does not advance the epoch. For speech before any message, use voice_connect's initial_reply_context. Several replies in one epoch play in publication order.
+- If voice_say says the person is speaking, the call was refused and nothing was queued. Do not give up and do not leave that answer as text only: when their message or a Sidevoice note arrives, answer by voice with what is new and relevant at that moment, folding in what still matters from the refused reply in fresh words, without saying it was missed. Notes tell you when to speak again, never whether to. A published reply is not proof it was heard.
 - When a message says part of your last reply was unheard, use your previous voice_say call and the "Heard up to" marker to weave anything that still matters into your next reply, in fresh words, together with what they ask now. Never say or hint that something was missed or that you are repeating yourself; drop what is obsolete or minor, and send no standalone catch-up unless something really matters. For a note with no person words, fold it into your next reply the same way.
 - For substantive work, first a short acknowledgement, then meaningful checkpoints, then the result. No filler or tool narration. Take in new input at tool results before starting the next step.
 - A device code pairs the person's app or browser with this machine: when the person asks for that code or asks to pair their device, call voice_pair_device and show its result. Do not ask the person to generate a device code, and never call it unasked. If inbound.ok is false, explain its reason and remedy without changing settings unasked.
@@ -1394,12 +1394,33 @@ mod tests {
     }
 
     #[test]
-    fn instructions_make_typed_messages_context_and_replies_conditional() {
-        assert!(INSTRUCTIONS.contains("When a reply is appropriate, use voice_say"));
-        assert!(INSTRUCTIONS.contains("A typed message is context"));
-        assert!(INSTRUCTIONS.contains("without requiring a response"));
+    fn instructions_let_only_the_content_decide_a_voice_reply() {
+        assert!(INSTRUCTIONS.contains(
+            "Only the content of the person's message decides whether you answer by voice; whether it can be delivered or heard never does."
+        ));
+        assert!(
+            INSTRUCTIONS.contains("Every message that asks or needs something gets a voice_say")
+        );
+        assert!(INSTRUCTIONS.contains("short, with the details in writing"));
+        assert!(INSTRUCTIONS.contains("A typed message follows the same rule"));
         assert!(INSTRUCTIONS.contains("does not advance the epoch"));
-        assert!(!INSTRUCTIONS.contains("- Reply with voice_say"));
+        for permissive in [
+            "When a reply is appropriate",
+            "you decide whether to answer",
+            "without requiring a response",
+        ] {
+            assert!(!INSTRUCTIONS.contains(permissive), "{permissive}");
+        }
+    }
+
+    #[test]
+    fn a_refused_reply_is_answered_again_when_the_person_finishes() {
+        assert!(INSTRUCTIONS.contains("Do not give up and do not leave that answer as text only"));
+        assert!(
+            INSTRUCTIONS.contains("answer by voice with what is new and relevant at that moment")
+        );
+        assert!(INSTRUCTIONS.contains("without saying it was missed"));
+        assert!(INSTRUCTIONS.contains("Notes tell you when to speak again, never whether to."));
     }
 
     #[test]
