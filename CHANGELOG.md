@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.14.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.13.1...v0.14.0) (2026-10-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* **connector:** remove the room concept ([#208](https://github.com/sidevoice/sidevoice-connector/issues/208))
+
+### Bug Fixes
+
+* **claude:** ignore the synthetic placeholder model ([#206](https://github.com/sidevoice/sidevoice-connector/issues/206)) ([5b343ba](https://github.com/sidevoice/sidevoice-connector/commit/5b343ba8bd83fcbc2abcb93863794bfd228296de))
+* **cursor:** read the effort from the chat's selected model parameters ([#207](https://github.com/sidevoice/sidevoice-connector/issues/207)) ([30af7ed](https://github.com/sidevoice/sidevoice-connector/commit/30af7eda23ad7df94e0a111ec663724f9ab8e9df))
+* **mcp:** catch up on unheard replies implicitly ([#203](https://github.com/sidevoice/sidevoice-connector/issues/203)) ([e1451e3](https://github.com/sidevoice/sidevoice-connector/commit/e1451e3dda7e0a982320795d9952cec0a5eac9c2)), closes [#201](https://github.com/sidevoice/sidevoice-connector/issues/201)
+* **test:** wait for a whole pid in the agents gate test ([#205](https://github.com/sidevoice/sidevoice-connector/issues/205)) ([8738368](https://github.com/sidevoice/sidevoice-connector/commit/8738368b0f81892a5e916e564cd308ba2b5b5127)), closes [#118](https://github.com/sidevoice/sidevoice-connector/issues/118)
+
+
+### Code Refactoring
+
+* **connector:** remove the room concept ([#208](https://github.com/sidevoice/sidevoice-connector/issues/208)) ([ad6ed10](https://github.com/sidevoice/sidevoice-connector/commit/ad6ed105a89c947c30c0ce167491df2c78fefb7f))
+
 ## [0.13.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.13.0...v0.13.1) (2026-10-19)
 
 
