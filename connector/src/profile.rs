@@ -2,7 +2,7 @@
 //! layout.
 //!
 //! - `D`, the data directory: `$SIDEVOICE_DATA_DIR`, else `~/.sidevoice`. Private (0700). The connector is the
-//!   one writer of its records there, each written whole (`secure_fs.rs`); `D/core/` is the core's.
+//!   one writer of its records there, each written whole (`platform/fs`); `D/core/` is the core's.
 //!   `connector.sock`, `connector.lock`, `connector.log`, `agents.json`, `agents.lock`, `install.lock`,
 //!   `node-stopped.json` (a person's stop), `outbox.json`, `core/core.json`
 //!   and `core/local.sock`.
@@ -15,7 +15,7 @@
 //! Every path is absolute. The directories are checked again at each operation boundary, not trusted from startup:
 //! they are passed to agents' command lines and written into.
 
-use crate::secure_fs::{private_dir, private_file, validate_user_directory};
+use crate::platform::fs::{Files, Fs};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -224,7 +224,8 @@ impl Profile {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error.into()),
             Ok(_) => {
-                private_file(&marker)?;
+                Files::check_private(&Files::open_read(&marker)?)
+                    .with_context(|| format!("unsafe private file {}", marker.display()))?;
                 Ok(true)
             }
         }
@@ -236,7 +237,8 @@ impl Profile {
     pub fn validate_existing_private(&self) -> Result<()> {
         for dir in [&self.data, &self.data.join("core")] {
             match fs::symlink_metadata(dir) {
-                Ok(_) => private_dir(dir)?,
+                Ok(_) => Files::check_private(&Files::open_read(dir)?)
+                    .with_context(|| format!("unsafe private directory {}", dir.display()))?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
@@ -260,7 +262,7 @@ impl Profile {
         for path in paths {
             match fs::symlink_metadata(path) {
                 Ok(_) => {
-                    validate_user_directory(path)?;
+                    Files::check_user_directory(path)?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
@@ -280,7 +282,7 @@ impl Profile {
         {
             bail!("unknown agent configuration directory");
         }
-        validate_user_directory(config_root)?;
+        Files::check_user_directory(config_root)?;
         Ok(())
     }
 
@@ -304,7 +306,6 @@ impl Profile {
     /// A profile entirely inside `root`, with every directory made private: what unit tests run in.
     #[cfg(test)]
     pub fn for_test(root: &Path, homes: &[AgentHome]) -> Self {
-        use std::os::unix::fs::DirBuilderExt;
         let mut children = vec![
             "home".to_owned(),
             "xdg/config".into(),
@@ -317,11 +318,7 @@ impl Profile {
                 .map(|home| format!("agents/{}", home.var.to_ascii_lowercase())),
         );
         for child in &children {
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(root.join(child))
-                .unwrap();
+            Files::ensure_private_dir(&root.join(child)).unwrap();
         }
         let root = root.canonicalize().unwrap();
         let path = |child: &str| -> OsString { root.join(child).into_os_string() };
@@ -353,7 +350,6 @@ impl Profile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secure_fs::tests::Scratch;
     use std::os::unix::fs::PermissionsExt;
 
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
@@ -396,29 +392,38 @@ mod tests {
 
     #[test]
     fn the_layout_derives_from_home_unless_each_place_is_named() {
-        let scratch = Scratch::new("layout");
-        let home = scratch.0.to_string_lossy().into_owned();
+        let scratch = crate::test_support::temp_dir("layout");
+        let home = scratch.path().to_string_lossy().into_owned();
         let profile = Profile::from_vars(vars(&[("HOME", &home)]), &HOMES).unwrap();
-        assert_eq!(profile.data, scratch.0.join(".sidevoice"));
-        assert_eq!(profile.socket, scratch.0.join(".sidevoice/connector.sock"));
+        assert_eq!(profile.data, scratch.path().join(".sidevoice"));
+        assert_eq!(
+            profile.socket,
+            scratch.path().join(".sidevoice/connector.sock")
+        );
         assert_eq!(
             profile.core_socket,
-            scratch.0.join(".sidevoice/core/local.sock")
+            scratch.path().join(".sidevoice/core/local.sock")
         );
         assert_eq!(
             profile.core_ready,
-            scratch.0.join(".sidevoice/core/core.json")
+            scratch.path().join(".sidevoice/core/core.json")
         );
-        assert_eq!(profile.agent_home("ALPHA_HOME"), scratch.0.join(".alpha"));
-        assert_eq!(profile.agent_home("BETA_HOME"), scratch.0.join(".beta"));
+        assert_eq!(
+            profile.agent_home("ALPHA_HOME"),
+            scratch.path().join(".alpha")
+        );
+        assert_eq!(
+            profile.agent_home("BETA_HOME"),
+            scratch.path().join(".beta")
+        );
         assert_eq!(
             profile.agent_home("BETA_DATA"),
-            scratch.0.join(".beta/data")
+            scratch.path().join(".beta/data")
         );
         assert_eq!(profile.connector_version(), crate::identity::VERSION);
 
-        let data = scratch.0.join("elsewhere");
-        let beta = scratch.0.join("beta");
+        let data = scratch.path().join("elsewhere");
+        let beta = scratch.path().join("beta");
         let named = Profile::from_vars(
             vars(&[
                 ("HOME", &home),
@@ -437,8 +442,8 @@ mod tests {
     /// inherited value is removed; one passed always reaches it either way.
     #[test]
     fn a_home_passed_only_when_set_reaches_a_child_only_then() {
-        let scratch = Scratch::new("passed-when-set");
-        let home = scratch.0.to_string_lossy().into_owned();
+        let scratch = crate::test_support::temp_dir("passed-when-set");
+        let home = scratch.path().to_string_lossy().into_owned();
         let passed = |profile: &Profile, key: &str| {
             let mut command = tokio::process::Command::new("true");
             profile.command_env(&mut command);
@@ -458,13 +463,13 @@ mod tests {
         );
         assert_eq!(
             passed(&unset, "ALPHA_HOME"),
-            Some(Some(scratch.0.join(".alpha").into_os_string()))
+            Some(Some(scratch.path().join(".alpha").into_os_string()))
         );
         let layout = crate::service::layout::Layout::from_profile(&unset);
         assert!(!layout.agent_dirs.contains_key("BETA_HOME"));
         assert!(layout.agent_dirs_unset().contains(&"BETA_HOME"));
 
-        let named = scratch.0.join("beta-home");
+        let named = scratch.path().join("beta-home");
         fs::create_dir(&named).unwrap();
         fs::set_permissions(&named, fs::Permissions::from_mode(0o700)).unwrap();
         let set = Profile::from_vars(
@@ -496,8 +501,8 @@ mod tests {
 
     #[test]
     fn a_data_directory_others_can_enter_or_a_replaced_agent_home_is_refused() {
-        let scratch = Scratch::new("trust");
-        let profile = Profile::for_test(&scratch.0, &HOMES);
+        let scratch = crate::test_support::temp_dir("trust");
+        let profile = Profile::for_test(scratch.path(), &HOMES);
         let config = profile
             .agent_homes
             .iter()
@@ -523,11 +528,11 @@ mod tests {
 
     #[test]
     fn missing_directories_are_not_unsafe_and_one_connector_holds_the_data_directory() {
-        let scratch = Scratch::new("fresh");
-        let home = scratch.0.to_string_lossy().into_owned();
+        let scratch = crate::test_support::temp_dir("fresh");
+        let home = scratch.path().to_string_lossy().into_owned();
         let profile = Profile::from_vars(vars(&[("HOME", &home)]), &HOMES).unwrap();
         assert!(!profile.data.exists());
-        crate::secure_fs::ensure_private_dir(&profile.data).unwrap();
+        Files::ensure_private_dir(&profile.data).unwrap();
         let held = profile.try_connector_lock().unwrap();
         assert!(profile.try_connector_lock().is_err());
         drop(held);
@@ -536,11 +541,11 @@ mod tests {
 
     #[test]
     fn a_person_stop_marker_is_honoured_and_must_be_private() {
-        let scratch = Scratch::new("stop");
-        let profile = Profile::for_test(&scratch.0, &HOMES);
+        let scratch = crate::test_support::temp_dir("stop");
+        let profile = Profile::for_test(scratch.path(), &HOMES);
         assert!(!profile.service_stopped().unwrap());
         let marker = profile.data.join("node-stopped.json");
-        crate::secure_fs::atomic_json(&marker, &json!({"at":"now"})).unwrap();
+        Files::write_json(&marker, &json!({"at":"now"})).unwrap();
         assert!(profile.service_stopped().unwrap());
         fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(profile.service_stopped().is_err());

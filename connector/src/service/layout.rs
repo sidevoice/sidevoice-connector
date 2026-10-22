@@ -14,6 +14,7 @@
 //!
 //! The release layout below `R/current` is the installer's; it is named here once (`CORE_ENTRYPOINT`).
 
+use crate::platform::fs::{Files, Fs};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -250,7 +251,7 @@ impl Layout {
 
     /// `D/install.json`, read only when it is this user's regular file and nobody else can change it.
     pub fn install_record(&self) -> Option<Value> {
-        let bytes = crate::secure_fs::read_trusted(&self.install_file(), 64 * 1024).ok()??;
+        let bytes = Files::read_trusted(&self.install_file(), 64 * 1024).ok()??;
         serde_json::from_slice(&bytes).ok()
     }
 

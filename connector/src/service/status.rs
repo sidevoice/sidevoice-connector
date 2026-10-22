@@ -6,6 +6,7 @@ use super::layout::Layout;
 use super::manager::{self, Job, JobState};
 use crate::core_ready::Ready;
 use crate::messages::message;
+use crate::platform::fs::{Files, Fs};
 use crate::platform::process::{Process, Processes};
 use serde_json::{json, Value};
 use std::fs;
@@ -210,10 +211,9 @@ pub fn log_tail(layout: &Layout, lines: usize) -> Vec<String> {
 /// The core's report of its last failed start (written before ready, deleted once it holds its lock), as a person
 /// reads it: its own key, step and message, with the log tail.
 pub fn read_failure(layout: &Layout, at: &str) -> Option<Value> {
-    let report: Value = serde_json::from_slice(
-        &crate::secure_fs::read_trusted(&layout.core_failure(), 64 * 1024).ok()??,
-    )
-    .ok()?;
+    let report: Value =
+        serde_json::from_slice(&Files::read_trusted(&layout.core_failure(), 64 * 1024).ok()??)
+            .ok()?;
     let text = |name: &str, limit: usize| {
         report.get(name).and_then(Value::as_str).map(|value| {
             value

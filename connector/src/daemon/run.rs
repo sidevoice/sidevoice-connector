@@ -3,9 +3,10 @@
 use super::Daemon;
 use crate::adapters::Registry;
 use crate::link::Link;
+use crate::platform::fs::{Files, Fs};
 use crate::profile::Profile;
-use crate::secure_fs::{private_dir, verify_socket};
-use anyhow::{bail, Result};
+use crate::secure_fs::verify_socket;
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
@@ -23,7 +24,7 @@ pub(super) fn prune_binding_order(order: &mut HashMap<String, oneshot::Receiver<
 
 pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     // Refused, not repaired: a data directory others can write into is not one to serve from.
-    crate::secure_fs::ensure_private_dir(&profile.data)?;
+    Files::ensure_private_dir(&profile.data)?;
     crate::logfile::init(profile.data.join("connector.log"), managed);
     profile.validate_existing_private()?;
     if managed {
@@ -40,7 +41,8 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
         ));
         return Ok(());
     }
-    private_dir(&profile.data)?;
+    Files::check_private(&Files::open_read(&profile.data)?)
+        .with_context(|| format!("unsafe private directory {}", profile.data.display()))?;
     let lock = profile.try_connector_lock()?;
     if profile.service_stopped()? {
         return Ok(());

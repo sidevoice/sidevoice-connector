@@ -87,7 +87,6 @@ pub fn machine(profile: &Profile) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secure_fs::tests::Scratch;
 
     #[test]
     fn platforms_are_named_for_people() {
@@ -98,8 +97,11 @@ mod tests {
 
     #[test]
     fn the_machine_names_its_real_host_version_and_the_harnesses_it_has() {
-        let scratch = Scratch::new("identity");
-        let profile = Profile::for_test(&scratch.0, &crate::adapters::Registry::standard().homes());
+        let scratch = crate::test_support::temp_dir("identity");
+        let profile = Profile::for_test(
+            scratch.path(),
+            &crate::adapters::Registry::standard().homes(),
+        );
         let registry = crate::adapters::Registry::standard();
         let mut agents: Vec<_> = registry.agents().collect();
         let (gone, registration) = agents.pop().unwrap();

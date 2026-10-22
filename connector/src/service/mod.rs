@@ -22,8 +22,8 @@ pub mod manager;
 pub mod status;
 
 use crate::lock::Lock;
+use crate::platform::fs::{Files, Fs};
 use crate::profile::Profile;
-use crate::secure_fs::{atomic_json, ensure_private_dir};
 use layout::Layout;
 use manager::{Job, Kind};
 use serde_json::{json, Value};
@@ -119,7 +119,7 @@ pub type Result<T> = std::result::Result<T, Failure>;
 
 /// `D`, created private when missing.
 fn data_dir(layout: &Layout) -> Result<()> {
-    ensure_private_dir(&layout.data).map_err(Failure::plain)
+    Files::ensure_private_dir(&layout.data).map_err(Failure::plain)
 }
 
 /// The install lock, waited for up to 30 s.
@@ -138,7 +138,7 @@ pub async fn install_lock(layout: &Layout) -> Result<Lock> {
 
 fn write_stop(layout: &Layout) -> Result<()> {
     data_dir(layout)?;
-    atomic_json(
+    Files::write_json(
         &layout.stop_marker(),
         &json!({"at": crate::logfile::timestamp()}),
     )

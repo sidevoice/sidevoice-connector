@@ -7,7 +7,6 @@ use crate::adapters::{prepare_pull_page, PULL_POSITION_FIELD};
 use crate::adapters::{Conversation, Harness, Registry, Route};
 use crate::link::Link;
 use crate::profile::Profile;
-use crate::secure_fs::tests::Scratch;
 use anyhow::Result;
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
@@ -52,8 +51,8 @@ impl Harness for Recorder {
     }
 }
 
-fn daemon(scratch: &Scratch, link: Arc<Link>) -> (Arc<Daemon>, Arc<Mutex<Vec<Value>>>) {
-    let profile = Profile::for_test(&scratch.0, &Registry::standard().homes());
+fn daemon(scratch: &tempfile::TempDir, link: Arc<Link>) -> (Arc<Daemon>, Arc<Mutex<Vec<Value>>>) {
+    let profile = Profile::for_test(scratch.path(), &Registry::standard().homes());
     let frames = Arc::new(Mutex::new(Vec::new()));
     let registry = Registry::new(vec![Arc::new(Recorder {
         frames: frames.clone(),
@@ -175,7 +174,7 @@ fn t16_complete_pull_pages_fit_ipc_and_keep_the_next_position() {
 /// (`binding.register`, `speech.publish`), all with extra fields, nested too, and enum values it does not know.
 #[tokio::test]
 async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_know() {
-    let scratch = Scratch::new("contract-link");
+    let scratch = crate::test_support::temp_dir("contract-link");
     let link = Link::new();
     let core = link.attached().await;
     play_core(link.clone(), core);
@@ -282,7 +281,7 @@ async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_
 
 #[tokio::test]
 async fn unresolved_other_conversation_does_not_hide_live_refusal() {
-    let scratch = Scratch::new("outbox-other-conversation");
+    let scratch = crate::test_support::temp_dir("outbox-other-conversation");
     let link = Link::new();
     let core = link.attached().await;
     play_core(link.clone(), core);
@@ -322,7 +321,7 @@ async fn unresolved_other_conversation_does_not_hide_live_refusal() {
 
 #[tokio::test]
 async fn uncertain_publication_keeps_its_fingerprint_and_unsent_work_is_suppressed() {
-    let scratch = Scratch::new("outbox-immutable");
+    let scratch = crate::test_support::temp_dir("outbox-immutable");
     let link = Link::new();
     let core = link.attached().await;
     play_core(link.clone(), core);
@@ -355,7 +354,7 @@ async fn uncertain_publication_keeps_its_fingerprint_and_unsent_work_is_suppress
 
 #[tokio::test]
 async fn paired_retry_ids_share_one_pending_publication_and_reject_conflicting_reuse() {
-    let scratch = Scratch::new("pending-retry-ids");
+    let scratch = crate::test_support::temp_dir("pending-retry-ids");
     let (daemon, _) = daemon(&scratch, Link::new());
     daemon
         .command(1, "register", registration("a"))
@@ -382,7 +381,7 @@ async fn paired_retry_ids_share_one_pending_publication_and_reject_conflicting_r
 #[tokio::test]
 async fn lost_admission_recovers_original_and_does_not_bar_new_audio() {
     for outcome in ["saved", "refused", "missing"] {
-        let scratch = Scratch::new(&format!("lost-admission-{outcome}"));
+        let scratch = crate::test_support::temp_dir(&format!("lost-admission-{outcome}"));
         let link = Link::new();
         let mut frames = link.attached().await;
         let (published_tx, mut published_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -480,7 +479,7 @@ async fn lost_admission_recovers_original_and_does_not_bar_new_audio() {
 
 #[tokio::test]
 async fn recovery_re_registers_an_unknown_binding_without_changing_original_fields() {
-    let scratch = Scratch::new("recover-unknown-binding");
+    let scratch = crate::test_support::temp_dir("recover-unknown-binding");
     let link = Link::new();
     let mut frames = link.attached().await;
     let answering_link = link.clone();
@@ -564,7 +563,7 @@ async fn recovery_re_registers_an_unknown_binding_without_changing_original_fiel
 /// top and nested, is answered for what it knows. A command it has never heard of gets a defined refusal.
 #[tokio::test]
 async fn ipc_commands_with_unknown_fields_are_read_for_what_they_know() {
-    let scratch = Scratch::new("contract-ipc");
+    let scratch = crate::test_support::temp_dir("contract-ipc");
     let (daemon, _) = daemon(&scratch, Link::new());
 
     let joined = daemon
@@ -626,9 +625,10 @@ async fn ipc_commands_with_unknown_fields_are_read_for_what_they_know() {
     assert_eq!(outbox[0]["text"], "queued");
     assert_eq!(outbox[1]["text"], "queued second");
     assert!(outbox.iter().all(|item| item["history_only"] == true));
-    let persisted: Value =
-        serde_json::from_slice(&std::fs::read(scratch.0.join("sidevoice/outbox.json")).unwrap())
-            .unwrap();
+    let persisted: Value = serde_json::from_slice(
+        &std::fs::read(scratch.path().join("sidevoice/outbox.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         persisted,
         json!(outbox),
@@ -677,7 +677,7 @@ async fn ipc_commands_with_unknown_fields_are_read_for_what_they_know() {
 
 #[tokio::test]
 async fn a_detached_binding_reconnects_under_its_original_client_ref() {
-    let scratch = Scratch::new("pull-reconnect");
+    let scratch = crate::test_support::temp_dir("pull-reconnect");
     let link = Link::new();
     let core = link.attached().await;
     play_core(link.clone(), core);
@@ -697,7 +697,7 @@ async fn a_detached_binding_reconnects_under_its_original_client_ref() {
 
 #[tokio::test]
 async fn voluntary_agent_leave_is_saved_and_replayed_after_core_or_daemon_restart() {
-    let scratch = Scratch::new("durable-agent-leave");
+    let scratch = crate::test_support::temp_dir("durable-agent-leave");
     let link = Link::new();
     let core = link.attached().await;
     play_core(link.clone(), core);
@@ -713,7 +713,7 @@ async fn voluntary_agent_leave_is_saved_and_replayed_after_core_or_daemon_restar
         .unwrap();
     assert_eq!(left["left"], true);
     let saved: Value = serde_json::from_slice(
-        &std::fs::read(scratch.0.join("sidevoice/conversation-state.json")).unwrap(),
+        &std::fs::read(scratch.path().join("sidevoice/conversation-state.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(saved["left_by_agent"]["old-thread"]["thread"], "old-thread");
@@ -743,7 +743,7 @@ async fn voluntary_agent_leave_is_saved_and_replayed_after_core_or_daemon_restar
         .unwrap();
     assert_eq!(fresh["binding_id"], "core-old-thread");
     let saved: Value = serde_json::from_slice(
-        &std::fs::read(scratch.0.join("sidevoice/conversation-state.json")).unwrap(),
+        &std::fs::read(scratch.path().join("sidevoice/conversation-state.json")).unwrap(),
     )
     .unwrap();
     assert!(
@@ -754,7 +754,7 @@ async fn voluntary_agent_leave_is_saved_and_replayed_after_core_or_daemon_restar
 
 #[tokio::test]
 async fn a_fresh_explicit_join_waits_for_a_pending_leave_to_be_confirmed() {
-    let scratch = Scratch::new("leave-rejoin-order");
+    let scratch = crate::test_support::temp_dir("leave-rejoin-order");
     let link = Link::new();
     let core = link.attached().await;
     play_core(link.clone(), core); // Older Core: no durable-leave acknowledgement.
@@ -816,7 +816,7 @@ async fn a_fresh_explicit_join_waits_for_a_pending_leave_to_be_confirmed() {
 
 #[tokio::test]
 async fn old_binding_rejected_as_closed_by_restarted_core_is_retired_locally() {
-    let scratch = Scratch::new("core-close-replay");
+    let scratch = crate::test_support::temp_dir("core-close-replay");
     let link = Link::new();
     let core = link.attached().await;
     play_core(link.clone(), core);
@@ -850,7 +850,7 @@ async fn old_binding_rejected_as_closed_by_restarted_core_is_retired_locally() {
         Some("binding_closed")
     );
     let saved: Value = serde_json::from_slice(
-        &std::fs::read(scratch.0.join("sidevoice/conversation-state.json")).unwrap(),
+        &std::fs::read(scratch.path().join("sidevoice/conversation-state.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(saved["closed_by_client"]["old-thread"], "binding_closed");
@@ -858,7 +858,7 @@ async fn old_binding_rejected_as_closed_by_restarted_core_is_retired_locally() {
 
 #[tokio::test]
 async fn acknowledged_pull_pages_keep_recent_routing_bounded_across_rejoin() {
-    let scratch = Scratch::new("pull-context-bound");
+    let scratch = crate::test_support::temp_dir("pull-context-bound");
     let link = Link::new();
     let core = link.attached().await;
     play_core(link.clone(), core);

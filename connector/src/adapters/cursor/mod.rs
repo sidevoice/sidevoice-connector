@@ -1304,7 +1304,6 @@ pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
 #[cfg(test)]
 mod bridge_tests {
     use super::*;
-    use crate::secure_fs::tests::Scratch;
     use tokio::net::UnixListener;
 
     #[test]
@@ -1407,13 +1406,13 @@ mod bridge_tests {
 
     #[tokio::test]
     async fn bridge_response_finishes_at_content_length_without_waiting_for_socket_close() {
-        let scratch = Scratch::new("cursor-bridge-response-length");
-        let socket = scratch.0.join("bridge.sock");
+        let scratch = crate::test_support::temp_dir("cursor-bridge-response-length");
+        let socket = scratch.path().join("bridge.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let instance = BridgeInstance {
             socket,
             token: "fixture-secret".into(),
-            user_data: scratch.0.clone(),
+            user_data: scratch.path().to_path_buf(),
             created_at: 1,
         };
         let server = tokio::spawn(async move {
@@ -1447,10 +1446,10 @@ mod bridge_tests {
 
     #[tokio::test]
     async fn queued_bridge_submission_has_no_editor_consumption_receipt() {
-        let scratch = Scratch::new("cursor-bridge-delivery");
-        let descriptors = scratch.0.join("desktop-bridge");
+        let scratch = crate::test_support::temp_dir("cursor-bridge-delivery");
+        let descriptors = scratch.path().join("desktop-bridge");
         fs::create_dir(&descriptors).unwrap();
-        let user_data = scratch.0.join("Cursor");
+        let user_data = scratch.path().join("Cursor");
         let storage = user_data.join("User/globalStorage");
         fs::create_dir_all(&storage).unwrap();
         let database = storage.join("state.vscdb");
@@ -1464,7 +1463,7 @@ mod bridge_tests {
         );
         state_db::fixture(&database, &sql);
 
-        let socket = scratch.0.join("bridge.sock");
+        let socket = scratch.path().join("bridge.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         fs::write(
             descriptors.join("one.json"),
@@ -1510,7 +1509,7 @@ mod bridge_tests {
         server.await.unwrap();
         assert_eq!(result["status"], "accepted");
         assert_eq!(result["detail"], "Cursor Desktop Bridge: queued");
-        assert!(!scratch.0.join("chat.jsonl").exists());
+        assert!(!scratch.path().join("chat.jsonl").exists());
         let lines = correlation_lines().lock().unwrap();
         let matching = lines
             .iter()
@@ -1541,8 +1540,8 @@ mod bridge_tests {
 
     #[tokio::test]
     async fn successful_sqlite_query_with_no_rows_is_marker_absent() {
-        let scratch = Scratch::new("cursor-empty-lookup");
-        let database = scratch.0.join("state.vscdb");
+        let scratch = crate::test_support::temp_dir("cursor-empty-lookup");
+        let database = scratch.path().join("state.vscdb");
         state_db::fixture(
             &database,
             "CREATE TABLE cursorDiskKV(key TEXT, value TEXT);",

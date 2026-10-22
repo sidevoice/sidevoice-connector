@@ -1,8 +1,8 @@
 use crate::adapters::{Conversation, Registry, Reporter, Route};
 use crate::agents::HostAgents;
 use crate::link::{Incoming, Link};
+use crate::platform::fs::{Files, Fs};
 use crate::profile::Profile;
-use crate::secure_fs::atomic_json;
 use anyhow::{bail, Context, Result};
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
@@ -237,7 +237,7 @@ impl Daemon {
                 }
             }
             if changed {
-                if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+                if let Err(error) = Files::write_json(&self.outbox_path(), &*outbox) {
                     *outbox = old;
                     return Err(error);
                 }
@@ -451,7 +451,8 @@ impl Daemon {
                 return false;
             }
         }
-        if let Err(error) = atomic_json(&self.profile.data.join("conversation-state.json"), &state)
+        if let Err(error) =
+            Files::write_json(&self.profile.data.join("conversation-state.json"), &state)
         {
             crate::logfile::log(&format!("conversation state: {error}"));
             self.mark_state_write_failed();
@@ -559,7 +560,7 @@ impl Daemon {
                 bail!("outbox full");
             }
         }
-        if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+        if let Err(error) = Files::write_json(&self.outbox_path(), &*outbox) {
             *outbox = before;
             return Err(error);
         }
@@ -587,7 +588,7 @@ impl Daemon {
                 return Ok(());
             }
             item["history_only"] = json!(true);
-            if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+            if let Err(error) = Files::write_json(&self.outbox_path(), &*outbox) {
                 *outbox = before;
                 return Err(error);
             }
@@ -603,7 +604,7 @@ impl Daemon {
             .find(|item| item.get("event_id") == Some(event_id))
         {
             item.as_object_mut().unwrap().remove("attempted");
-            if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+            if let Err(error) = Files::write_json(&self.outbox_path(), &*outbox) {
                 *outbox = before;
                 return Err(error);
             }
@@ -620,7 +621,7 @@ impl Daemon {
             .context("speech disappeared during binding repair")?;
         item["binding_id"] = json!(binding_id);
         let published = item.clone();
-        if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+        if let Err(error) = Files::write_json(&self.outbox_path(), &*outbox) {
             *outbox = before;
             return Err(error);
         }
@@ -641,7 +642,7 @@ impl Daemon {
                 item["history_only"] = json!(true);
             }
         }
-        if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+        if let Err(error) = Files::write_json(&self.outbox_path(), &*outbox) {
             *outbox = before;
             return Err(error);
         }
@@ -675,7 +676,7 @@ impl Daemon {
             }
             item["attempted"] = json!(true);
             let published = item.clone();
-            if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+            if let Err(error) = Files::write_json(&self.outbox_path(), &*outbox) {
                 *outbox = before;
                 return Err(error);
             }
@@ -733,7 +734,7 @@ impl Daemon {
             let mut outbox = self.outbox.lock().await;
             let before = outbox.clone();
             outbox.retain(|item| item.get("event_id") != event_id);
-            if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+            if let Err(error) = Files::write_json(&self.outbox_path(), &*outbox) {
                 *outbox = before;
                 return Err(error);
             }
@@ -789,7 +790,7 @@ impl Daemon {
             {
                 item["resolved"] = reply.clone();
             }
-            if let Err(error) = atomic_json(&self.outbox_path(), &*outbox) {
+            if let Err(error) = Files::write_json(&self.outbox_path(), &*outbox) {
                 *outbox = before;
                 return Err(error);
             }
@@ -1834,8 +1835,11 @@ mod tests {
             }
         }
 
-        let scratch = crate::secure_fs::tests::Scratch::new("fake-harness");
-        let profile = Profile::for_test(&scratch.0, &crate::adapters::Registry::standard().homes());
+        let scratch = crate::test_support::temp_dir("fake-harness");
+        let profile = Profile::for_test(
+            scratch.path(),
+            &crate::adapters::Registry::standard().homes(),
+        );
         let calls = Arc::new(Mutex::new(Vec::new()));
         let registry = Registry::new(vec![Arc::new(Fake {
             calls: calls.clone(),
