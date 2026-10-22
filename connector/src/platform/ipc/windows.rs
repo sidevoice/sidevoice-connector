@@ -1,15 +1,18 @@
 //! Windows: a named pipe, `\\.\pipe\sidevoice-<hash of (user name, data dir)>-<name>`. The pipe is created as the
 //! first instance (a name already taken is an error) and refusing remote clients, both `interprocess`'s defaults,
 //! with a protected descriptor that lets in only its owner (`OW`: the user whose process made it), SYSTEM and
-//! Administrators. The peer check is the trait's one body: the pipe's other process belongs to this user.
+//! Administrators. The peer check: the process at the other end of the pipe belongs to this user.
 
-use super::Listener;
+use super::{Listener, Stream};
+use crate::platform::process::{Process, Processes};
 use crate::platform::user::{User, UserId};
+use interprocess::local_socket::traits::StreamCommon as _;
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, Name, ToFsName};
 use interprocess::os::windows::local_socket::ListenerOptionsExt;
 use interprocess::os::windows::security_descriptor::SecurityDescriptor;
 use sha2::{Digest, Sha256};
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::path::Path;
 
@@ -47,15 +50,31 @@ impl super::Channel for Endpoint {
     fn listen(&self) -> io::Result<Listener> {
         let descriptor = widestring::U16CString::from_str(OWNER_ONLY).map_err(io::Error::other)?;
         ListenerOptions::new()
-            .name(self.to_connect()?)
+            .name(self.name()?)
             .security_descriptor(SecurityDescriptor::deserialize(&descriptor)?)
             .create_tokio()
             .map(Listener)
     }
 
-    fn to_connect(&self) -> io::Result<Name<'static>> {
+    fn connect(&self) -> impl Future<Output = io::Result<Stream>> + Send {
+        super::dial(self.name(), self.to_string())
+    }
+}
+
+impl Endpoint {
+    fn name(&self) -> io::Result<Name<'static>> {
         self.0.clone().to_fs_name::<GenericFilePath>()
     }
+}
+
+/// Whether the process at the other end of `stream` is this user's: the pipe's client or server pid, as
+/// `interprocess` reports it, is a live process of this user's (`platform::process`, through `sysinfo`).
+pub(super) fn peer_is_this_user(stream: &Stream) -> io::Result<bool> {
+    let pid = stream
+        .peer_creds()?
+        .pid()
+        .ok_or_else(|| io::Error::other("the peer process is unknown"))?;
+    Ok(Processes::is_process(pid, |_| true))
 }
 
 impl fmt::Display for Endpoint {

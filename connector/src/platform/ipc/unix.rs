@@ -9,6 +9,7 @@ use interprocess::local_socket::traits::StreamCommon as _;
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, Name, ToFsName};
 use interprocess::os::unix::local_socket::ListenerOptionsExt;
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -47,14 +48,16 @@ impl super::Channel for Endpoint {
         Ok(Listener(listener))
     }
 
-    fn to_connect(&self) -> io::Result<Name<'static>> {
-        verify_socket(&self.0)?;
-        self.name()
+    fn connect(&self) -> impl Future<Output = io::Result<Stream>> + Send {
+        let name = verify_socket(&self.0).and_then(|()| self.name());
+        super::dial(name, self.to_string())
     }
+}
 
-    fn peer_is_this_user(stream: &Stream) -> io::Result<bool> {
-        Ok(stream.peer_creds()?.euid() == Some(rustix::process::geteuid().as_raw()))
-    }
+/// Whether the process at the other end of `stream` is this user: the connection's own credentials, the peer's
+/// effective uid (`SO_PEERCRED` / `LOCAL_PEERCRED`), which the kernel vouches for (macOS gives no peer pid).
+pub(super) fn peer_is_this_user(stream: &Stream) -> io::Result<bool> {
+    Ok(stream.peer_creds()?.euid() == Some(rustix::process::geteuid().as_raw()))
 }
 
 impl fmt::Display for Endpoint {

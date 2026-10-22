@@ -21,10 +21,8 @@ mod imp;
 
 pub use imp::Endpoint;
 
-use crate::platform::process::{Process, Processes};
 use interprocess::local_socket::tokio::Listener as RawListener;
 use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
-use interprocess::local_socket::traits::StreamCommon as _;
 use interprocess::local_socket::Name;
 use std::fmt;
 use std::future::Future;
@@ -34,9 +32,9 @@ use std::path::Path;
 /// One connection. `AsyncRead + AsyncWrite + Unpin`; its peer has been checked to be this user.
 pub type Stream = interprocess::local_socket::tokio::Stream;
 
-/// What every OS implements ([`Endpoint`], in `ipc/unix.rs` and `ipc/windows.rs`): where a channel is, and how a
-/// listener is made private to this user. Connecting and the peer check have one body for every OS; an OS overrides
-/// them only if it must.
+/// What every OS implements ([`Endpoint`], in `ipc/unix.rs` and `ipc/windows.rs`): where a channel is, how a
+/// listener is made private to this user, and what is checked before connecting. The peer check is internal: each
+/// OS file has its `peer_is_this_user`, which [`Listener::accept`] and [`Channel::connect`] apply.
 pub trait Channel: Sized + Clone + fmt::Debug + fmt::Display + PartialEq + Send + Sync {
     /// Our own endpoint called `name` for the data directory `dir`. Unix: the socket `dir/<name>.sock`. Windows: the
     /// pipe `\\.\pipe\sidevoice-<hash of (user, dir)>-<name>`, so two profiles or two users never meet on one name.
@@ -52,39 +50,22 @@ pub trait Channel: Sized + Clone + fmt::Debug + fmt::Display + PartialEq + Send 
     /// that lets in its owner, SYSTEM and Administrators only, refusing remote clients.
     fn listen(&self) -> io::Result<Listener>;
 
-    /// What [`Channel::connect`] connects to, once what must hold of the endpoint before talking to it holds. Unix:
-    /// a socket of this user's, open to nobody else, in a private directory. Windows: nothing; the server is checked
-    /// once connected.
-    fn to_connect(&self) -> io::Result<Name<'static>>;
+    /// Connects, refusing a server that is not this user. Unix: first, the socket must be this user's, open to
+    /// nobody else, in a private directory. No timeout: callers bound it.
+    fn connect(&self) -> impl Future<Output = io::Result<Stream>> + Send;
+}
 
-    /// Connects, refusing a server that is not this user ([`Channel::peer_is_this_user`]). No timeout: callers
-    /// bound it.
-    fn connect(&self) -> impl Future<Output = io::Result<Stream>> + Send {
-        async move {
-            let stream = Stream::connect(self.to_connect()?).await?;
-            if !Self::peer_is_this_user(&stream)? {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("the server at {self} is not this user"),
-                ));
-            }
-            Ok(stream)
-        }
+/// The one body of [`Channel::connect`] once an OS has checked the endpoint and named it: connects to `name` and
+/// keeps the stream only if the server is this user (`at` names the endpoint in the refusal).
+async fn dial(name: io::Result<Name<'static>>, at: String) -> io::Result<Stream> {
+    let stream = Stream::connect(name?).await?;
+    if !imp::peer_is_this_user(&stream)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("the server at {at} is not this user"),
+        ));
     }
-
-    /// Whether the process at the other end of `stream` is this user's. One body: the peer's pid, as the OS reports
-    /// it for the connection (Windows: the pipe's client or server process), is a live process of this user's
-    /// ([`Process::is_process`]). Unix overrides it with the connection's own credentials (the peer's effective
-    /// uid, `SO_PEERCRED` / `LOCAL_PEERCRED`): the kernel's word, and macOS gives no peer pid.
-    fn peer_is_this_user(stream: &Stream) -> io::Result<bool> {
-        let pid = stream
-            .peer_creds()?
-            .pid()
-            // `interprocess` gives the OS's pid type (u32 on Windows, i32 on Unix): widened, then narrowed.
-            .and_then(|pid| u32::try_from(i64::from(pid)).ok())
-            .ok_or_else(|| io::Error::other("the peer process is unknown"))?;
-        Ok(Processes::is_process(pid, |_| true))
-    }
+    Ok(stream)
 }
 
 /// A listening endpoint ([`Channel::listen`]).
@@ -95,7 +76,7 @@ impl Listener {
     pub async fn accept(&self) -> io::Result<Stream> {
         loop {
             let stream = self.0.accept().await?;
-            if Endpoint::peer_is_this_user(&stream).unwrap_or(false) {
+            if imp::peer_is_this_user(&stream).unwrap_or(false) {
                 return Ok(stream);
             }
         }
@@ -146,13 +127,13 @@ mod tests {
         let listener = endpoint.listen().unwrap();
         let server = tokio::spawn(async move {
             let mut stream = listener.accept().await.unwrap();
-            assert!(Endpoint::peer_is_this_user(&stream).unwrap());
+            assert!(imp::peer_is_this_user(&stream).unwrap());
             let mut line = [0u8; 5];
             stream.read_exact(&mut line).await.unwrap();
             stream.write_all(&line).await.unwrap();
         });
         let mut client = endpoint.connect().await.unwrap();
-        assert!(Endpoint::peer_is_this_user(&client).unwrap());
+        assert!(imp::peer_is_this_user(&client).unwrap());
         client.write_all(b"hello").await.unwrap();
         let mut echoed = [0u8; 5];
         client.read_exact(&mut echoed).await.unwrap();
