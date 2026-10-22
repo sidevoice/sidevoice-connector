@@ -1259,9 +1259,7 @@ dependencies = [
  "atomic-write-file",
  "clap",
  "futures-util",
- "gethostname",
  "hex",
- "interprocess",
  "libc",
  "plist",
  "process-wrap",
@@ -1274,6 +1272,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sidevoice-platform",
  "sysinfo",
  "tar",
  "tempfile",
@@ -1285,11 +1284,26 @@ dependencies = [
  "uuid",
  "which",
  "whoami",
- "widestring",
  "winapi-util",
  "windows",
  "windows-sys 0.61.2",
  "zstd",
+]
+
+[[package]]
+name = "sidevoice-platform"
+version = "0.7.0"
+source = "git+https://github.com/sidevoice/sidevoice-core?tag=v0.7.0#085b4eaf8b2b9ba5a0dea32ed79a908a7ef106e4"
+dependencies = [
+ "gethostname",
+ "hex",
+ "interprocess",
+ "rustix",
+ "sha2",
+ "sysinfo",
+ "whoami",
+ "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
