@@ -17,7 +17,6 @@ path = "src/bench/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
-fs2 = "0.4"
 futures-util = "0.3"
 gethostname = "1"
 whoami = "2"

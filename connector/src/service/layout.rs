@@ -10,6 +10,7 @@
 //! | `D/core` | the core's data: `local.sock`, `core.json` (ready), `core-failure.json` |
 //! | `D/connector.sock`, `D/connector.lock` | the connector daemon's socket and lock |
 //! | `D/install.lock`, `D/agents.lock` | the install/service lock and the agents lock |
+//! | `D/<lock>.holder` | who holds that lock (`lock.rs`) |
 //! | `D/node-stopped.json` | a person's stop |
 //!
 //! The release layout below `R/current` is the installer's; it is named here once (`CORE_ENTRYPOINT`).
