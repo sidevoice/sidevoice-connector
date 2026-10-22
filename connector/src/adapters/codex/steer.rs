@@ -53,8 +53,7 @@ pub async fn steer(socket: &Path, thread: &str, message_id: &str, text: &str) ->
     tokio::time::timeout(TIMEOUT, async {
         // Where Codex documents a local endpoint for the daemon (a Unix socket, today) this connects; where it does
         // not (Windows: nothing documented) the route is refused as unsupported and the caller queues instead.
-        let route = socket.to_str().context("the Codex daemon socket path is not text")?;
-        let stream = Foreigners::connect(route)
+        let stream = Foreigners::connect(socket)
             .await
             .map_err(|error| anyhow!("no Codex daemon socket: {error}"))?;
         let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/", stream).await?;

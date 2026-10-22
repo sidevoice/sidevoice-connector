@@ -87,7 +87,7 @@ pub fn identity() -> Result<Option<Identity>> {
     else {
         return Ok(None);
     };
-    let route_check = Foreigners::check(&socket);
+    let route_check = Foreigners::check(std::ffi::OsStr::new(&socket));
     let mut identity = Identity::new(
         "claude",
         thread,
