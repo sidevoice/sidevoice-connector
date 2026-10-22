@@ -53,6 +53,11 @@ dunce = "1"
 # through `sysinfo`; spawning a detached process or a stoppable tree (process group, Job Object) through `process-wrap`.
 process-wrap = { version = "10", features = ["tokio1", "process-group", "job-object", "creation-flags", "kill-on-drop"] }
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+# Third parties' endpoints (src/platform/foreign): the same transport as the local channel, a Unix socket or a named pipe.
+interprocess = { version = "2.4", features = ["tokio"] }
+# Which file a tailed transcript is now, across a rotation (src/adapters): an inode on Unix, a file index on Windows,
+# read from the path and holding nothing open.
+file-id = "0.2"
 
 [dev-dependencies]
 # Scratch directories in unit tests (src/test_support.rs).
@@ -71,6 +76,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_RestartManager",
 ] }
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
 # The user and machine `Path` a Windows login has instead of a login shell's (src/platform/env/windows.rs).

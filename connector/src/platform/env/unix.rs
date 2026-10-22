@@ -20,9 +20,18 @@ impl super::Env for Os {
         "sidevoice"
     };
     const SYSTEM: &'static [&'static str] = &[];
+    const CALL: &'static str = "";
 
     fn base_path() -> OsString {
         BASE_PATH.into()
+    }
+
+    fn quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    fn set(variable: &str, quoted_value: &str) -> String {
+        format!("{variable}={quoted_value} ")
     }
 
     // `$SHELL` as a login shell prints its `PATH`. `-l` reads only the login files (`.zprofile`); many people put

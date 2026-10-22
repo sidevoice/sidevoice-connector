@@ -7,15 +7,12 @@
 //! server, or `--no-daemon`) is not on that socket, and `codex queue` stays the only way in.
 //!
 //! Every outcome that is not an accepted steer is an error the caller answers by queueing.
-// adapters block: this is the harness's own socket, not ours; it moves behind platform::ipc with that block.
-#![allow(clippy::disallowed_types)]
-
+use crate::platform::foreign::{Foreign, ForeignStream, Foreigners};
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::net::UnixStream;
 use tokio_tungstenite::tungstenite::Message;
 
 /// The first Codex that hosts sessions on the shared daemon by default (0.157.0, "Enable automatic daemon startup by
@@ -48,15 +45,18 @@ pub fn socket_path(home: &Path) -> PathBuf {
     home.join(SOCKET)
 }
 
-type Socket = tokio_tungstenite::WebSocketStream<UnixStream>;
+type Socket = tokio_tungstenite::WebSocketStream<ForeignStream>;
 
 /// Steers the active turn of `thread` with `text`, naming the message `message_id` (Codex's `clientUserMessageId`,
 /// so a redelivery is the same message). Returns the id of the turn that took it.
 pub async fn steer(socket: &Path, thread: &str, message_id: &str, text: &str) -> Result<String> {
     tokio::time::timeout(TIMEOUT, async {
-        let stream = UnixStream::connect(socket)
+        // Where Codex documents a local endpoint for the daemon (a Unix socket, today) this connects; where it does
+        // not (Windows: nothing documented) the route is refused as unsupported and the caller queues instead.
+        let route = socket.to_str().context("the Codex daemon socket path is not text")?;
+        let stream = Foreigners::connect(route)
             .await
-            .context("no Codex daemon socket")?;
+            .map_err(|error| anyhow!("no Codex daemon socket: {error}"))?;
         let (mut ws, _) = tokio_tungstenite::client_async("ws://localhost/", stream).await?;
         request(
             &mut ws,
@@ -134,8 +134,10 @@ async fn request(ws: &mut Socket, id: u64, method: &str, params: Value) -> Resul
     bail!("Codex daemon closed the connection")
 }
 
-#[cfg(test)]
 /// A daemon that answers each request with the next canned answer and records what it was asked.
+// A Unix socket of a test's own: Codex documents no daemon endpoint on Windows (the steer is unsupported there).
+#[cfg(all(test, unix))]
+#[allow(clippy::disallowed_types)]
 pub(crate) async fn daemon_at(
     path: PathBuf,
     answers: Vec<Value>,
@@ -175,6 +177,7 @@ pub(crate) async fn daemon_at(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     async fn daemon(answers: Vec<Value>) -> (PathBuf, tokio::task::JoinHandle<Vec<Value>>) {
         // macOS's per-user temp dir can already consume most of SUN_LEN.
         let path = Path::new("/tmp")
@@ -221,6 +224,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn steers_the_running_turn_with_the_message_id() {
         let (path, daemon) = daemon(vec![
             json!({"userAgent":"x"}),
@@ -249,6 +253,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn an_idle_thread_is_not_steered() {
         let (path, daemon) = daemon(vec![
             json!({"userAgent":"x"}),
@@ -261,6 +266,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn a_refused_steer_is_an_error() {
         let (path, _daemon) = daemon(vec![
             json!({"userAgent":"x"}),

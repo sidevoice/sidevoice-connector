@@ -82,8 +82,20 @@ pub trait Env {
     /// and its like; a child without them cannot use the network or the system's crypto). None on Unix.
     const SYSTEM: &'static [&'static str];
 
+    /// What starts a command line that runs a quoted program name: nothing in a POSIX shell, the call operator `& `
+    /// in PowerShell (a quoted name alone is only a string there).
+    const CALL: &'static str;
+
     /// The `PATH` of a child started with nothing else: where this OS's programs and a package manager's are.
     fn base_path() -> OsString;
+
+    /// `value` as one word of the command line a person types or pastes on this OS: single-quoted for a POSIX shell,
+    /// single-quoted for PowerShell (nothing inside is special there but the quote itself, doubled).
+    fn quote(value: &str) -> String;
+
+    /// The start of a command line that sets `variable` to `quoted_value` (already [`Env::quote`]d) for the command
+    /// that follows: `NAME='v' ` in a POSIX shell, `$env:NAME = 'v'; ` in PowerShell.
+    fn set(variable: &str, quoted_value: &str) -> String;
 
     /// How this user's login `PATH` is asked for; `None` when this process has no way to know it.
     fn login_path() -> Option<LoginPath>;
@@ -183,6 +195,16 @@ mod tests {
             assert!(Environment::SYSTEM.iter().any(|system| name == system));
             assert_eq!(std::env::var_os(name).as_ref(), Some(value));
         }
+    }
+
+    #[test]
+    fn a_value_is_quoted_as_one_word_and_set_before_a_command() {
+        for value in ["", "plain", "two words", "it's", "a\"b", "$HOME;rm"] {
+            let quoted = Environment::quote(value);
+            assert!(quoted.len() > value.len(), "{value:?} -> {quoted}");
+        }
+        let line = Environment::set("NAME", &Environment::quote("a b"));
+        assert!(line.contains("NAME") && line.contains("a b"), "{line}");
     }
 
     #[test]

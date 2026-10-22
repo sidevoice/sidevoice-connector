@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::path::PathBuf;
 
 const REMOVE: [&str; 5] = ["mcp", "remove", "--scope", "user", "sidevoice"];
@@ -335,7 +335,9 @@ fn inbound_warning(profile: &Profile) -> Option<String> {
     ))
 }
 
-#[cfg(test)]
+// POSIX fixtures: mode bits, FIFOs and links the user-configuration reader must refuse. Windows has no equivalents
+// the interface could express; its checks are measured on a runner.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::adapters::registration::{CliError, CliOutput};

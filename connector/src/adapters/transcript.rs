@@ -1,10 +1,10 @@
 //! Following a conversation's JSONL transcript as the harness appends it, and what the harness reads in each line.
 
 use super::conversation::{report_working, Conversation, Reporter};
+use file_id::{get_file_id, FileId};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -70,7 +70,7 @@ async fn follow_file<R: TranscriptReader>(
     path: PathBuf,
     mut reader: R,
 ) {
-    let mut file_id: Option<(u64, u64)> = None;
+    let mut file_id: Option<FileId> = None;
     let mut offset = 0u64;
     let mut partial = Vec::new();
     let mut tail = Vec::new();
@@ -105,9 +105,10 @@ async fn follow_file<R: TranscriptReader>(
         let Ok(meta) = input.metadata() else {
             continue;
         };
-        let current = (meta.dev(), meta.ino());
-        if file_id != Some(current) || meta.len() < offset {
-            file_id = Some(current);
+        // Which file the path is now: a different one after a rotation or a replacement.
+        let current = get_file_id(&path).ok();
+        if file_id != current || meta.len() < offset {
+            file_id = current;
             offset = 0;
             partial.clear();
             tail.clear();

@@ -2550,6 +2550,7 @@ async fn deliver_to(fixture: &Fixture, id: &str) -> Value {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn codex_delivery_steers_the_running_turn_when_the_version_allows() {
     let _turn = agent_env().await;
     let (fixture, calls) = steer_fixture("0.157.0");
@@ -2581,6 +2582,7 @@ async fn codex_delivery_steers_the_running_turn_when_the_version_allows() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn codex_delivery_queues_when_the_version_is_too_old() {
     let _turn = agent_env().await;
     let (fixture, calls) = steer_fixture("0.156.0");
@@ -2605,6 +2607,7 @@ async fn codex_delivery_queues_when_no_daemon_socket_exists() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn codex_delivery_queues_when_the_steer_is_refused() {
     let _turn = agent_env().await;
     let (fixture, calls) = steer_fixture("0.163.0");

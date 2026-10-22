@@ -19,26 +19,41 @@ impl super::Process for Os {
         wrap
     }
 
-    // `/proc/<pid>/fd` where there is one, else `lsof`.
-    fn open_files(pid: u32) -> Option<Vec<PathBuf>> {
-        if let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
-            return Some(
-                entries
-                    .flatten()
-                    .filter_map(|entry| std::fs::read_link(entry.path()).ok())
-                    .collect(),
-            );
-        }
-        let output = std::process::Command::new("lsof")
-            .args(["-n", "-P", "-Fn", "-p", &pid.to_string()])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())?;
+    // What `pid` has open, filtered to the candidates: `/proc/<pid>/fd` where there is one, else `lsof`. Both name a
+    // file by where it really is, so a candidate is matched by its canonical path as well as by the one given.
+    fn open_among(pid: u32, candidates: &[PathBuf]) -> Option<Vec<PathBuf>> {
+        let open = open_files(pid)?;
         Some(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter_map(|line| line.strip_prefix('n').map(PathBuf::from))
+            candidates
+                .iter()
+                .filter(|candidate| {
+                    open.contains(*candidate)
+                        || std::fs::canonicalize(candidate).is_ok_and(|real| open.contains(&real))
+                })
+                .cloned()
                 .collect(),
         )
     }
+}
+
+fn open_files(pid: u32) -> Option<Vec<PathBuf>> {
+    if let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
+        return Some(
+            entries
+                .flatten()
+                .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+                .collect(),
+        );
+    }
+    let output = std::process::Command::new("lsof")
+        .args(["-n", "-P", "-Fn", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.strip_prefix('n').map(PathBuf::from))
+            .collect(),
+    )
 }

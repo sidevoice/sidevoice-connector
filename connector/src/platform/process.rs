@@ -50,10 +50,12 @@ pub trait Process {
     /// (Windows) that holds everything it starts.
     fn tree(command: Command) -> CommandWrap;
 
-    /// The files `pid` has open, as far as the OS shows them to this user. `None` where it does not (Windows:
-    /// nothing in the standard API lists another process's handles, and the one caller, an adapter's chat lookup,
-    /// is a heuristic that this decision leaves out there).
-    fn open_files(pid: u32) -> Option<Vec<PathBuf>>;
+    /// Which of `candidates` `pid` has open, as far as the OS shows this user: a question about files named in
+    /// advance, never a listing of the process's handles (no OS lists those for another process in a standard way).
+    /// The answer keeps the order of `candidates`; `None` when the OS cannot tell (Unix: no `/proc` and no `lsof`;
+    /// Windows: no Restart Manager). Unix reads the process's descriptors; Windows asks the Restart Manager which
+    /// processes hold the files.
+    fn open_among(pid: u32, candidates: &[PathBuf]) -> Option<Vec<PathBuf>>;
 
     /// Starts `command` so that it outlives this process and its terminal. The caller owns stdio and the
     /// environment.
@@ -454,12 +456,25 @@ mod tests {
     }
 
     #[test]
-    fn open_files_are_listed_where_the_os_shows_them() {
-        let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
-        let file = std::fs::File::open(&exe).unwrap();
-        if let Some(files) = Processes::open_files(std::process::id()) {
-            assert!(files.iter().any(|path| path == &exe));
+    fn the_candidates_a_process_has_open_are_told_from_those_it_has_not() {
+        let scratch = crate::test_support::temp_dir("open-among");
+        let (held, not_held, missing) = (
+            scratch.path().join("held"),
+            scratch.path().join("not-held"),
+            scratch.path().join("missing"),
+        );
+        std::fs::write(&held, b"x").unwrap();
+        std::fs::write(&not_held, b"x").unwrap();
+        let file = std::fs::File::open(&held).unwrap();
+        let candidates = [not_held, held.clone(), missing];
+        // `None` is a host that cannot tell (no `lsof`, no Restart Manager): the question has no answer there.
+        if let Some(open) = Processes::open_among(std::process::id(), &candidates) {
+            assert_eq!(open, [held]);
         }
+        assert!(Processes::open_among(std::process::id(), &[]).is_none_or(|open| open.is_empty()));
         drop(file);
+        if let Some(open) = Processes::open_among(std::process::id(), &candidates) {
+            assert!(open.is_empty(), "{open:?}");
+        }
     }
 }

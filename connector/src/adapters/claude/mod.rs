@@ -1,6 +1,3 @@
-// adapters block: this is the harness's own socket, not ours; it moves behind platform::ipc with that block.
-#![allow(clippy::disallowed_types)]
-
 mod harness;
 mod registration;
 
@@ -18,6 +15,8 @@ pub const HOME: crate::profile::AgentHome = crate::profile::AgentHome {
 };
 
 use super::{envelope, Identity};
+use crate::platform::env::{Env, Environment};
+use crate::platform::foreign::{Foreign, Foreigners};
 use crate::platform::process::{Process, Processes};
 use crate::profile::Profile;
 use anyhow::{Context, Result};
@@ -27,7 +26,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 
 pub fn capabilities() -> Value {
     json!({"deliver":"supported","inspectInbound":"supported","working":"supported","endOfTurn":"supported","sessionIdentity":"supported"})
@@ -36,7 +34,9 @@ pub fn capabilities() -> Value {
 fn config_dir() -> PathBuf {
     env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env::var_os("HOME").unwrap_or_default()).join(".claude"))
+        .unwrap_or_else(|| {
+            PathBuf::from(env::var_os(Environment::HOME).unwrap_or_default()).join(".claude")
+        })
 }
 
 /// The file Claude Code keeps its user configuration in, user-scope MCP servers included, resolved as its CLI resolves
@@ -87,6 +87,7 @@ pub fn identity() -> Result<Option<Identity>> {
     else {
         return Ok(None);
     };
+    let route_check = Foreigners::check(&socket);
     let mut identity = Identity::new(
         "claude",
         thread,
@@ -97,6 +98,14 @@ pub fn identity() -> Result<Option<Identity>> {
         }),
     );
     identity.inbound = Some(inspect_inbound(&identity.thread)?);
+    // A route this OS cannot open (native Windows documents a named pipe and nothing else) is no way in: said now,
+    // not found out at the first message.
+    if let Err(error) = route_check {
+        identity.capability_overrides = json!({"deliver":"unsupported"});
+        identity.deliver_note = Some(format!(
+            "Claude Code's inbox cannot be reached from here: {error}"
+        ));
+    }
     Ok(Some(identity))
 }
 
@@ -294,9 +303,11 @@ pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .context("Claude inbox socket missing")?;
     let token = delivery.get("token").and_then(Value::as_str).unwrap_or("");
-    let mut socket = UnixStream::connect(path)
+    // The route is the agent's own endpoint (a Unix socket; a named pipe on native Windows, where the first line
+    // below is required: Claude Code closes a connection that does not start with a valid auth line).
+    let mut socket = Foreigners::connect(path)
         .await
-        .context("Claude inbox refused the connection")?;
+        .map_err(|error| anyhow::anyhow!("Claude inbox refused the connection: {error}"))?;
     let content = envelope(event)?;
     socket
         .write_all(json!({"type":"auth","token":token}).to_string().as_bytes())

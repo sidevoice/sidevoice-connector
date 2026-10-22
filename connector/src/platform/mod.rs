@@ -8,6 +8,7 @@
 //! operation does not compile; a host that has nothing to do implements it as a no-op, so the gap is a decision.
 
 pub mod env;
+pub mod foreign;
 pub mod fs;
 pub mod process;
 pub mod service;

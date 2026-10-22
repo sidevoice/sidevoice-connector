@@ -198,7 +198,9 @@ fn exited(status: ExitStatus) -> String {
     }
 }
 
-#[cfg(test)]
+// POSIX fixtures: `sh` scripts as the fake MCP servers, and mode bits. Windows has no equivalents of either that
+// the interface could express; its checks are measured on a runner.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;

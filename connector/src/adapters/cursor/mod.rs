@@ -1,6 +1,3 @@
-// adapters block: this is the harness's own socket, not ours; it moves behind platform::ipc with that block.
-#![allow(clippy::disallowed_types)]
-
 pub mod bridge_setup;
 mod engine;
 mod harness;
@@ -34,6 +31,8 @@ pub fn config_home(profile: &crate::profile::Profile) -> &std::path::Path {
 }
 
 use super::{envelope, Identity};
+use crate::platform::env::{Env, Environment};
+use crate::platform::foreign::{Foreign, Foreigners};
 use crate::platform::process::{Process, Processes};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -42,12 +41,10 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 
 const EDITOR_NOTE: &str = "Sidevoice cannot tell which Cursor chat this is: this Cursor did not declare MCP Apps support (the io.modelcontextprotocol/ui extension) when it started this server, which is how the editor is told apart, nor is this a Cursor CLI chat (cursor-agent), whose open chat Sidevoice can see. voice_diagnose shows where Sidevoice's logs are.";
 const NOT_PERSISTED: &str = "This chat is not running under cursor-agent persist, so nothing can put a message into it. To let Sidevoice talk to a Cursor CLI chat (experimental), start it with  cursor-agent persist  (it needs tmux).";
@@ -167,7 +164,43 @@ fn chat_from_store(path: &Path) -> Option<StorePath> {
     })
 }
 
+/// Every Cursor CLI chat database there is: `store.db` two directories below a root's `chats` (a workspace, a chat).
+/// The files a chat's process could have open, named in advance, so asking the OS which of them it has open is one
+/// question about these and a walk of nothing else.
+fn chat_stores() -> Vec<PathBuf> {
+    let read = |dir: &Path| {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>()
+    };
+    let mut stores = Vec::new();
+    for root in engine::config_roots() {
+        for workspace in read(&root.join("chats")) {
+            for chat in read(&workspace) {
+                let store = chat.join("store.db");
+                if chat_from_store(&store).is_some() && !stores.contains(&store) {
+                    stores.push(store);
+                }
+            }
+        }
+    }
+    stores
+}
+
+/// A file's modification time in milliseconds since the epoch (0 when the OS gives none).
+fn modified_ms(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_millis() as u64)
+}
+
 fn find_chat() -> Option<Chat> {
+    let stores = chat_stores();
     let mut pid = std::process::id();
     for _ in 0..4 {
         let parent = Processes::parent(pid)?;
@@ -175,7 +208,7 @@ fn find_chat() -> Option<Chat> {
             return None;
         }
         let mut chats = Vec::<Chat>::new();
-        for path in Processes::open_files(parent).unwrap_or_default() {
+        for path in Processes::open_among(parent, &stores).unwrap_or_default() {
             let Some(store) = chat_from_store(&path) else {
                 continue;
             };
@@ -189,7 +222,7 @@ fn find_chat() -> Option<Chat> {
             }
             let modified = fs::metadata(&store.path)
                 .ok()
-                .map(|meta| meta.mtime() as u64 * 1000 + meta.mtime_nsec() as u64 / 1_000_000)
+                .map(|meta| modified_ms(&meta))
                 .unwrap_or(0);
             let updated = metadata
                 .get("updatedAtMs")
@@ -301,8 +334,7 @@ pub fn editor_transcript_chat(
                 let Ok(metadata) = fs::metadata(&path) else {
                     continue;
                 };
-                let modified =
-                    metadata.mtime() as u64 * 1000 + metadata.mtime_nsec() as u64 / 1_000_000;
+                let modified = modified_ms(&metadata);
                 if modified < unix_ms().saturating_sub(10 * 60_000) {
                     continue;
                 }
@@ -354,7 +386,7 @@ pub fn editor_transcript_chat(
 }
 
 fn transcript_roots() -> Vec<PathBuf> {
-    let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = engine::home();
     let mut roots = env::var("CURSOR_DATA_DIR")
         .ok()
         .map(|value| value.trim().to_owned())
@@ -458,7 +490,10 @@ fn tmux_process(binary: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
     let mut command = std::process::Command::new(binary);
     command
         .env_clear()
-        .env("HOME", env::var("HOME").unwrap_or_default())
+        .env(
+            Environment::HOME,
+            env::var(Environment::HOME).unwrap_or_default(),
+        )
         .env("TMUX_TMPDIR", "/tmp")
         .env(
             "PATH",
@@ -474,7 +509,10 @@ fn tmux_async_process(binary: impl AsRef<std::ffi::OsStr>) -> tokio::process::Co
     let mut command = tokio::process::Command::new(binary);
     command
         .env_clear()
-        .env("HOME", env::var("HOME").unwrap_or_default())
+        .env(
+            Environment::HOME,
+            env::var(Environment::HOME).unwrap_or_default(),
+        )
         .env("TMUX_TMPDIR", "/tmp")
         .env(
             "PATH",
@@ -648,7 +686,7 @@ fn correlation_lines() -> &'static std::sync::Mutex<Vec<String>> {
 }
 
 fn bridge_instances() -> Vec<BridgeInstance> {
-    let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = engine::home();
     let dir = env::var("CURSOR_DESKTOP_BRIDGE_DIR")
         .ok()
         .map(|value| value.trim().to_owned())
@@ -869,7 +907,7 @@ async fn bridge_request(
 ) -> std::result::Result<BridgeResponse, BridgeError> {
     let mut stream = match tokio::time::timeout(
         Duration::from_secs(3),
-        UnixStream::connect(&instance.socket),
+        Foreigners::connect(instance.socket.to_str().unwrap_or_default()),
     )
     .await
     {
@@ -1307,6 +1345,9 @@ pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
 #[cfg(test)]
 mod bridge_tests {
     use super::*;
+    // The Desktop Bridge is Cursor's own socket, macOS-only by design: these tests stand one up, so they are Unix's.
+    #[cfg(unix)]
+    #[allow(clippy::disallowed_types)]
     use tokio::net::UnixListener;
 
     #[test]
@@ -1408,6 +1449,8 @@ mod bridge_tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    #[allow(clippy::disallowed_types)]
     async fn bridge_response_finishes_at_content_length_without_waiting_for_socket_close() {
         let scratch = crate::test_support::temp_dir("cursor-bridge-response-length");
         let socket = scratch.path().join("bridge.sock");
@@ -1448,6 +1491,8 @@ mod bridge_tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    #[allow(clippy::disallowed_types)]
     async fn queued_bridge_submission_has_no_editor_consumption_receipt() {
         let scratch = crate::test_support::temp_dir("cursor-bridge-delivery");
         let descriptors = scratch.path().join("desktop-bridge");

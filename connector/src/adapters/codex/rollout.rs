@@ -2,10 +2,10 @@
 
 use super::{default_effort, rollout_engine};
 use crate::adapters::conversation::{Conversation, Reporter};
+use file_id::{get_file_id, FileId};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ pub fn follow(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
         let binding = &*conversation;
         let mut path: Option<PathBuf> = None;
         let mut offset = 0u64;
-        let mut file_id: Option<(u64, u64)> = None;
+        let mut file_id: Option<FileId> = None;
         let mut partial = Vec::new();
         let mut oversized = false;
         let mut turn: Option<String> = None;
@@ -34,9 +34,9 @@ pub fn follow(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
                     &binding.thread,
                 );
                 if let Some(file) = &path {
-                    if let Ok(meta) = fs::metadata(file) {
+                    if fs::metadata(file).is_ok() {
                         offset = 0;
-                        file_id = Some((meta.dev(), meta.ino()));
+                        file_id = get_file_id(file).ok();
                     }
                 }
             }
@@ -45,8 +45,8 @@ pub fn follow(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
                     let Ok(meta) = input.metadata() else {
                         continue;
                     };
-                    let current = (meta.dev(), meta.ino());
-                    if file_id != Some(current) || meta.len() < offset {
+                    let current = get_file_id(file).ok();
+                    if file_id != current || meta.len() < offset {
                         offset = 0;
                         partial.clear();
                         oversized = false;
@@ -54,7 +54,7 @@ pub fn follow(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
                         working = None;
                         catching_up = true;
                     }
-                    file_id = Some(current);
+                    file_id = current;
                     if input.seek(SeekFrom::Start(offset)).is_ok() {
                         let mut bytes = [0u8; 65536];
                         let limit = bytes.len().min(meta.len().saturating_sub(offset) as usize);

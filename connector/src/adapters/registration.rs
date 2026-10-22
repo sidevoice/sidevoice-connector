@@ -328,21 +328,17 @@ pub fn looks_absent(text: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-/// `value` quoted for a POSIX shell.
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-/// `command args`, each quoted for a POSIX shell.
+/// `command args`, each quoted for the shell a person types into on this OS (a POSIX shell; PowerShell on Windows).
 pub fn shell_command(command: &str, args: &[String]) -> String {
-    std::iter::once(command)
+    let words = std::iter::once(command)
         .chain(args.iter().map(String::as_str))
-        .map(shell_quote)
+        .map(Environment::quote)
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    format!("{}{words}", Environment::CALL)
 }
 
-/// `command args` for a POSIX shell, run with the agent's home `variable` as the connector runs its CLI: named when the
+/// `command args` for that shell, run with the agent's home `variable` as the connector runs its CLI: named when the
 /// person's environment sets it, else left to the agent's own default, as in the person's shell. A step done by hand
 /// then changes the same configuration as the connector would.
 pub fn shell_command_in(
@@ -355,8 +351,11 @@ pub fn shell_command_in(
         return shell_command(command, args);
     }
     format!(
-        "{variable}={} {}",
-        shell_quote(&profile.agent_home(variable).to_string_lossy()),
+        "{}{}",
+        Environment::set(
+            variable,
+            &Environment::quote(&profile.agent_home(variable).to_string_lossy())
+        ),
         shell_command(command, args)
     )
 }
