@@ -100,6 +100,84 @@ async fn failed_watched_capture_keeps_the_last_scan_and_recovery_reconciles_all(
     host.shutdown().await;
 }
 
+#[tokio::test]
+async fn actions_refuse_while_the_last_scan_failed_instead_of_trusting_the_cache() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let bin = fixture.root.join("bin");
+    private_mkdir(&bin);
+    let cursor = bin.join("cursor");
+    private_write(&cursor, b"#!/bin/sh\necho 'Cursor 3.22.12'\n");
+    fs::set_permissions(&cursor, fs::Permissions::from_mode(0o700)).unwrap();
+    let _cursor_bin = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cursor.as_os_str());
+    write_json(
+        &fixture.profile.data.join("agents.json"),
+        &json!({
+            "version":1,"scanned_at":null,"login_path":bin,"binaries":{},"seen":{},"dismissed":{}
+        }),
+    );
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let first = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_eq!(first["scan_failed"], false, "{first}");
+    let broken = fixture.root.join("broken-login-shell");
+    private_write(&broken, b"#!/bin/sh\nexit 1\n");
+    fs::set_permissions(&broken, fs::Permissions::from_mode(0o700)).unwrap();
+    let _shell = EnvGuard::set("SHELL", broken.as_os_str());
+    for action in ["agents.connect", "agents.disconnect"] {
+        let refused = host.handle(action, json!({"id":"cursor"})).await;
+        assert_eq!(
+            refused.pointer("/error/key"),
+            Some(&json!("agents.scan-failed")),
+            "{refused}"
+        );
+    }
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn only_a_scan_of_every_agent_clears_a_recorded_failure() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    write_json(
+        &fixture.profile.data.join("agents.json"),
+        &json!({
+            "version":1,"scanned_at":"old","login_path":"/usr/bin","scan_failed":true,
+            "binaries":{},"seen":{},"dismissed":{}
+        }),
+    );
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let base = json!({
+        "version":1,"scanned_at":"old","login_path":"/usr/bin","scan_failed":false,
+        "binaries":{},"seen":{},"dismissed":{}
+    });
+    let deadline = Instant::now() + StdDuration::from_secs(5);
+    let watched = host
+        .merge_scan(
+            base.clone(),
+            Vec::new(),
+            Some("/usr/bin".into()),
+            false,
+            &Cancellation::new(),
+            deadline,
+        )
+        .await
+        .unwrap();
+    assert_eq!(watched["scan_failed"], true, "{watched}");
+    let full = host
+        .merge_scan(
+            base,
+            Vec::new(),
+            Some("/usr/bin".into()),
+            true,
+            &Cancellation::new(),
+            deadline,
+        )
+        .await
+        .unwrap();
+    assert_eq!(full["scan_failed"], false, "{full}");
+    host.shutdown().await;
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn public_marker_evidence_names_kind_without_home_path() {
@@ -888,10 +966,11 @@ async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn()
     fs::remove_dir_all(fixture.profile.agent_home("CODEX_HOME")).unwrap();
     symlink(&external, fixture.profile.agent_home("CODEX_HOME")).unwrap();
 
+    // A symlinked agent home also stops the login-shell capture, so the scan fails and the action is refused.
     let answer = host.handle("agents.connect", json!({"id":"codex"})).await;
     assert_eq!(
         answer.pointer("/error/key"),
-        Some(&json!("agents.not-present"))
+        Some(&json!("agents.scan-failed"))
     );
     assert!(
         !marker.exists(),

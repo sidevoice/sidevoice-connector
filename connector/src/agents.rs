@@ -444,6 +444,9 @@ impl HostAgents {
         let mut state = self
             .scan(state, Some(agent), action == "check", cancel, deadline)
             .await?;
+        if action != "check" {
+            require_scanned(&state, agent)?;
+        }
         let current = seen_agent(&state, agent).ok_or_else(|| not_present(agent))?;
         if action == "check" {
             return self.response(&state);
@@ -492,6 +495,7 @@ impl HostAgents {
             state = self
                 .scan(state, Some(agent), true, cancel, deadline)
                 .await?;
+            require_scanned(&state, agent)?;
             match seen_agent(&state, agent)
                 .and_then(|row| row.get("registration"))
                 .and_then(Value::as_str)
@@ -540,6 +544,7 @@ impl HostAgents {
         state = self
             .scan(state, Some(agent), false, cancel, deadline)
             .await?;
+        require_scanned(&state, agent)?;
         match seen_agent(&state, agent)
             .and_then(|row| row.get("registration"))
             .and_then(Value::as_str)
@@ -634,6 +639,7 @@ impl HostAgents {
             || self.registry.agents().map(|(id, _)| id).collect(),
             |id| vec![id],
         );
+        let full = ids.len() == self.registry.agents().count();
         let mut observations = Vec::new();
         for name in ids {
             check_live(cancel, deadline)?;
@@ -653,7 +659,7 @@ impl HostAgents {
             deadline,
         )
         .await?;
-        self.merge_scan(base, observations, login_path, cancel, deadline)
+        self.merge_scan(base, observations, login_path, full, cancel, deadline)
             .await
     }
 
@@ -730,6 +736,7 @@ impl HostAgents {
         base: Value,
         observations: Vec<(AgentId, Observation)>,
         captured_path: Option<String>,
+        full: bool,
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<Value, Failure> {
@@ -796,7 +803,10 @@ impl HostAgents {
                 });
             }
             latest["scanned_at"] = json!(iso_now());
-            latest["scan_failed"] = json!(false);
+            // Only a scan of every agent, on the path it started from, recovers from a failed one.
+            if full && path_unchanged {
+                latest["scan_failed"] = json!(false);
+            }
         })
         .await
     }
@@ -992,6 +1002,14 @@ fn parse_id(registry: &Registry, value: &str) -> std::result::Result<AgentId, Fa
             json!({"id":value.chars().take(120).collect::<String>()}),
         )
     })
+}
+
+/// An action on an agent trusts only a scan that happened: while the last one failed, what is cached may be stale.
+fn require_scanned(state: &Value, id: AgentId) -> std::result::Result<(), Failure> {
+    if state.get("scan_failed") == Some(&Value::Bool(true)) {
+        return Err(agent_failure("agents.scan-failed", id));
+    }
+    Ok(())
 }
 
 fn not_present(id: AgentId) -> Failure {
