@@ -38,6 +38,8 @@ uuid = { version = "1", features = ["v4"] }
 which = "=8.0.6"
 zstd = "0.13"
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
+# Records written whole (src/platform/fs): a temporary file beside the record, synced, renamed over it.
+atomic-write-file = "0.3"
 # Processes (src/platform/process): what every OS reads the same (owner, start, command line, parent) and the stop,
 # through `sysinfo`; spawning a detached process or a stoppable tree (process group, Job Object) through `process-wrap`.
 process-wrap = { version = "10", features = ["tokio1", "process-group", "job-object", "creation-flags", "kill-on-drop"] }

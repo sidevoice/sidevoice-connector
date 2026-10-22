@@ -15,7 +15,7 @@
 //! Every path is absolute. The directories are checked again at each operation boundary, not trusted from startup:
 //! they are passed to agents' command lines and written into.
 
-use crate::platform::fs::{check_private_dir, check_private_file, check_user_directory};
+use crate::platform::fs::{Files, Fs};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -224,7 +224,7 @@ impl Profile {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error.into()),
             Ok(_) => {
-                check_private_file(&marker)?;
+                Files::check_private_file(&marker)?;
                 Ok(true)
             }
         }
@@ -236,7 +236,7 @@ impl Profile {
     pub fn validate_existing_private(&self) -> Result<()> {
         for dir in [&self.data, &self.data.join("core")] {
             match fs::symlink_metadata(dir) {
-                Ok(_) => check_private_dir(dir)?,
+                Ok(_) => Files::check_private_dir(dir)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
@@ -260,7 +260,7 @@ impl Profile {
         for path in paths {
             match fs::symlink_metadata(path) {
                 Ok(_) => {
-                    check_user_directory(path)?;
+                    Files::check_user_directory(path)?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
@@ -280,7 +280,7 @@ impl Profile {
         {
             bail!("unknown agent configuration directory");
         }
-        check_user_directory(config_root)?;
+        Files::check_user_directory(config_root)?;
         Ok(())
     }
 
@@ -316,7 +316,7 @@ impl Profile {
                 .map(|home| format!("agents/{}", home.var.to_ascii_lowercase())),
         );
         for child in &children {
-            crate::platform::fs::create_private_dir_all(&root.join(child)).unwrap();
+            Files::create_private_dir_all(&root.join(child)).unwrap();
         }
         let root = root.canonicalize().unwrap();
         let path = |child: &str| -> OsString { root.join(child).into_os_string() };
@@ -522,7 +522,7 @@ mod tests {
         let home = scratch.0.to_string_lossy().into_owned();
         let profile = Profile::from_vars(vars(&[("HOME", &home)]), &HOMES).unwrap();
         assert!(!profile.data.exists());
-        crate::platform::fs::ensure_private_dir(&profile.data).unwrap();
+        Files::ensure_private_dir(&profile.data).unwrap();
         let held = profile.try_connector_lock().unwrap();
         assert!(profile.try_connector_lock().is_err());
         drop(held);

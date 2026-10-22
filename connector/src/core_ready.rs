@@ -1,8 +1,9 @@
 //! What the connector reads of its core: the ready file the core writes once it serves (`D/core/core.json`) and
 //! its health on the private socket, which must name the same launch and process.
 
-use crate::platform::fs::{check_private_file, verify_socket};
+use crate::platform::fs::{Files, Fs};
 use crate::profile::Profile;
+use crate::secure_fs::verify_socket;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
@@ -26,7 +27,7 @@ pub struct Ready {
 
 /// The ready file at `path`, when it is this user's private file naming a launch on `socket`.
 pub fn read(path: &Path, socket: &Path) -> Result<Ready> {
-    check_private_file(path)?;
+    Files::check_private_file(path)?;
     let bytes = fs::read(path)?;
     if bytes.len() > 65536 {
         bail!("Core ready file too large");

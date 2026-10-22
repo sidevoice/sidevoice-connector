@@ -42,7 +42,7 @@
 
 use crate::agents::HostAgents;
 use crate::messages::Keyed;
-use crate::platform::fs::ensure_private_dir;
+use crate::platform::fs::{Create, Files, Fs};
 use crate::profile::Profile;
 use crate::records::{atomic_json, digest_file};
 use crate::service::layout::Layout;
@@ -159,7 +159,7 @@ fn point_current(layout: &Layout, id: &str) -> Result<()> {
 
 /// `D/install.json`: the installation's command and where its releases are.
 fn record(layout: &Layout) -> Result<()> {
-    ensure_private_dir(&layout.data)?;
+    Files::ensure_private_dir(&layout.data)?;
     atomic_json(
         &layout.install_file(),
         &json!({"command": [stable_command(layout)], "releases": layout.releases}),
@@ -265,7 +265,7 @@ fn release_id(layout: &Layout, package: &Package, digest: &str) -> Result<(Strin
 /// Copies `from` to `to` (created, 0700) and syncs it.
 fn copy_executable(from: &Path, to: &Path) -> Result<()> {
     let mut source = File::open(from).with_context(|| format!("open {}", from.display()))?;
-    let mut target = crate::platform::fs::create_private_executable_new(to)
+    let mut target = Files::open_private(to, Create::NewProgram)
         .with_context(|| format!("create {}", to.display()))?;
     io::copy(&mut source, &mut target)?;
     target.sync_all()?;
@@ -305,14 +305,15 @@ async fn check_binary(binary: &Path, version: &str) -> Result<()> {
 /// or not at all.
 async fn stage(layout: &Layout, package: &Package, id: &str, digest: &str) -> Result<()> {
     let releases = releases_dir(layout);
-    ensure_private_dir(&releases)?;
+    Files::ensure_private_dir(&releases)?;
     let partial = releases.join(format!(".{id}.partial-{}", uuid::Uuid::new_v4().simple()));
-    crate::platform::fs::create_private_dir(&partial)?;
+    Files::create_private_dir(&partial)?;
     let result = async {
-        crate::platform::fs::create_private_dir(&partial.join("bin"))?;
+        Files::create_private_dir(&partial.join("bin"))?;
         let binary = partial.join(BINARY);
         copy_executable(&package.binary, &binary)?;
-        crate::platform::fs::trusted_executable(&binary)?;
+        Files::check_private_file(&binary)?;
+        which::which(&binary).context("the staged connector cannot be run")?;
         if digest_file(&binary)? != digest {
             return Err(failed("the connector changed while it was being copied"));
         }
@@ -558,7 +559,7 @@ pub async fn install(
 ) -> Result<Value> {
     let layout = Layout::from_profile(profile);
     let lock = crate::service::install_lock(&layout).await?;
-    ensure_private_dir(&layout.releases)?;
+    Files::ensure_private_dir(&layout.releases)?;
     remove_leftovers(&layout);
     let previous = current_release(&layout);
     let digest = digest_file(&package.binary)?;
@@ -1136,8 +1137,8 @@ pub(crate) mod tests {
                 &homes,
             )
             .unwrap();
-            crate::platform::fs::create_private_dir_all(&profile.data.join("core")).unwrap();
-            crate::platform::fs::create_private_dir_all(&profile.xdg_data).unwrap();
+            Files::create_private_dir_all(&profile.data.join("core")).unwrap();
+            Files::create_private_dir_all(&profile.xdg_data).unwrap();
             Self {
                 scratch,
                 profile,

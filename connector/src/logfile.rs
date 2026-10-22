@@ -9,6 +9,7 @@
 //! only: the manager already puts its stderr in that same file, so writing both would say everything twice. Before
 //! [`init`] (the MCP server, the CLI) lines go to stderr only.
 
+use crate::platform::fs::{Create, Files, Fs};
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -50,7 +51,8 @@ pub fn rotate(file: &Path, max: u64) -> bool {
     }
     let copied = (|| -> std::io::Result<()> {
         let mut source = fs::File::open(file)?;
-        let mut target = crate::platform::fs::open_private_truncate(&numbered(1))?;
+        let mut target = Files::open_private(&numbered(1), Create::ReadWrite)?;
+        target.set_len(0)?;
         std::io::copy(&mut source, &mut target)?;
         OpenOptions::new().write(true).open(file)?.set_len(0)
     })();
@@ -60,7 +62,7 @@ pub fn rotate(file: &Path, max: u64) -> bool {
 /// One line appended to a rotated log, created 0600.
 pub fn append_line(file: &Path, line: &str) {
     rotate(file, LOG_MAX);
-    let opened = crate::platform::fs::open_private_append(file);
+    let opened = Files::open_private(file, Create::Append);
     if let Ok(mut opened) = opened {
         let mut text = line.to_owned();
         if !text.ends_with('\n') {
@@ -166,7 +168,7 @@ mod tests {
         let scratch = Scratch::new("log");
         let file = scratch.0.join("connector.log");
         append_line(&file, "first");
-        crate::platform::fs::check_private_file(&file).unwrap();
+        Files::check_private_file(&file).unwrap();
         // A writer holding the file open, as a service manager does.
         let mut held = OpenOptions::new().append(true).open(&file).unwrap();
         let inode = fs::metadata(&file).unwrap().ino();

@@ -2,6 +2,7 @@
 //! it for one request.
 
 use crate::messages::message;
+use crate::platform::fs::{Files, Fs};
 use crate::profile::Profile;
 use futures_util::future::BoxFuture;
 use serde::Serialize;
@@ -394,7 +395,11 @@ pub fn mcp_servers_json(
 /// most `limit` bytes. A link is followed wherever it leads (a dotfiles manager's, say), and the file it leads to is
 /// judged. A FIFO or a device is refused without waiting on it.
 pub fn read_profile_file(path: &Path, limit: u64) -> anyhow::Result<String> {
-    crate::platform::fs::read_user_text(path, limit)
+    use anyhow::Context;
+    let bytes = Files::read_trusted(&path.canonicalize()?, limit)
+        .context("unsafe profile file")?
+        .context("missing profile file")?;
+    String::from_utf8(bytes).context("profile file is not UTF-8")
 }
 
 /// What the test bench asks the connector about the agents (`bench-agents`, a separate binary that cannot read the
@@ -422,12 +427,10 @@ pub fn bench_agents(request: &Value) -> Value {
         let binaries: serde_json::Map<String, Value> = registry
             .agents()
             .filter_map(|(id, registration)| {
-                let found = registration.binary_names().iter().find_map(|name| {
-                    path.split(':')
-                        .filter(|dir| !dir.is_empty())
-                        .map(|dir| Path::new(dir).join(name))
-                        .find(|candidate| executable(candidate))
-                })?;
+                let found = registration
+                    .binary_names()
+                    .iter()
+                    .find_map(|name| which::which_in(name, Some(&path), "/").ok())?;
                 Some((
                     format!("SIDEVOICE_{}_BIN", id.to_ascii_uppercase()),
                     Value::from(found.to_string_lossy().into_owned()),
@@ -467,36 +470,9 @@ pub fn bench_agents(request: &Value) -> Value {
     serde_json::json!({"steps": steps})
 }
 
-/// A file anyone may run.
-fn executable(path: &Path) -> bool {
-    crate::platform::fs::is_executable_file(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    /// The bench's CLI lookup passes over a file of an agent's CLI name that cannot be run, as a shell would.
-    #[test]
-    fn a_cli_that_cannot_be_run_is_passed_over() {
-        let scratch = crate::platform::fs::tests::Scratch::new("bench-cli");
-        let (first, second) = (scratch.0.join("first"), scratch.0.join("second"));
-        let name = super::super::Registry::standard()
-            .agents()
-            .next()
-            .map(|(_, registration)| registration.binary_names()[0])
-            .unwrap();
-        for (dir, mode) in [(&first, 0o644), (&second, 0o755)] {
-            std::fs::create_dir_all(dir).unwrap();
-            std::fs::write(dir.join(name), "#!/bin/sh\n").unwrap();
-            std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(mode))
-                .unwrap();
-        }
-        assert!(!executable(&first.join(name)));
-        assert!(executable(&second.join(name)));
-    }
-
     /// The older single-step fields: commands run in order, each once the one before succeeded; file steps keep the
     /// snippet that adds.
     #[test]

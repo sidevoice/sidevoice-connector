@@ -1,5 +1,6 @@
 use super::*;
 use crate::adapters::registration::{aggregate_readiness, ReadinessCheck};
+use crate::platform::fs::{Create, Files, Fs};
 use fs2::FileExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
 
@@ -1331,7 +1332,7 @@ exit 2
     });
     wait_for_file(&slow_scan).await;
     let lock_path = fixture.profile.data.join("agents.lock");
-    let lock = crate::platform::fs::open_private_lock(&lock_path).unwrap();
+    let lock = Files::open_private(&lock_path, Create::ReadWrite).unwrap();
     lock.lock_exclusive().unwrap();
     state["dismissed"]["codex"] = generation;
     atomic_json(&state_path, &state).unwrap();

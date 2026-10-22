@@ -14,6 +14,8 @@
 use super::layout::Layout;
 use super::manager::{Job, Kind};
 use super::{Failure, Result};
+use crate::platform::fs::{Files, Fs};
+use crate::platform::user::{User, UserId};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
@@ -419,11 +421,11 @@ fn unsafe_definition(detail: impl Into<String>) -> Failure {
 fn definition_directory(dir: &Path) -> Result<()> {
     match fs::symlink_metadata(dir) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            crate::platform::fs::create_private_dir_all(dir).map_err(Failure::plain)
+            Files::create_private_dir_all(dir).map_err(Failure::plain)
         }
         Err(error) => Err(Failure::plain(error)),
         Ok(_) => {
-            if !crate::platform::fs::is_user_directory(dir) {
+            if Files::check_user_directory(dir).is_err() {
                 return Err(unsafe_definition(dir.to_string_lossy()));
             }
             Ok(())
@@ -437,7 +439,10 @@ pub fn existing(file: &Path) -> Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(Failure::plain(error)),
         Ok(metadata) => {
-            if !crate::platform::fs::is_owned_file(file) || metadata.len() > 128 * 1024 {
+            if !metadata.is_file()
+                || !UserId::current().owns_path(file).map_err(Failure::plain)?
+                || metadata.len() > 128 * 1024
+            {
                 return Err(unsafe_definition(file.to_string_lossy()));
             }
             Ok(true)
@@ -454,7 +459,7 @@ pub fn write(file: &Path, text: &str) -> Result<bool> {
     if existing(file)? && fs::read(file).ok().as_deref() == Some(text.as_bytes()) {
         return Ok(false);
     }
-    crate::platform::fs::write_atomic(file, text.as_bytes()).map_err(Failure::plain)?;
+    Files::replace(file, text.as_bytes()).map_err(Failure::plain)?;
     Ok(true)
 }
 
@@ -675,7 +680,7 @@ mod tests {
         assert!(!write(&file, "one").unwrap());
         assert!(write(&file, "two").unwrap());
         assert_eq!(fs::read_to_string(&file).unwrap(), "two");
-        crate::platform::fs::check_private_file(&file).unwrap();
+        Files::check_private_file(&file).unwrap();
         assert_eq!(
             program_problem(Some(&words(&["/no/such/program"]))),
             Some("executable-missing")

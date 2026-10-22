@@ -12,6 +12,7 @@ use crate::adapters::registration::{
 };
 use crate::adapters::Registry;
 use crate::messages::message;
+use crate::platform::fs::{Files, Fs};
 use crate::profile::Profile;
 use crate::records::atomic_json;
 use anyhow::Result;
@@ -1088,7 +1089,7 @@ fn load_state_file(profile: &Profile) -> std::result::Result<Value, Failure> {
 }
 
 fn private_state_file(path: &Path) -> std::result::Result<(), Failure> {
-    crate::platform::fs::check_private_file(path).map_err(|_| Failure::Internal)
+    Files::check_private_file(path).map_err(|_| Failure::Internal)
 }
 
 fn check_live(cancel: &Cancellation, deadline: Instant) -> std::result::Result<(), Failure> {
@@ -1153,7 +1154,7 @@ pub(crate) fn executable(value: &str) -> bool {
     if !path.is_absolute() {
         return false;
     }
-    crate::platform::fs::is_executable_file(path)
+    which::which(path).is_ok()
 }
 
 pub(crate) fn find_in_path(names: &[&str], path: Option<&str>) -> Option<String> {

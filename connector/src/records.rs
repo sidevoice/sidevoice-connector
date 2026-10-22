@@ -1,6 +1,6 @@
 //! Records the connector keeps, host-agnostic: a value written whole as private JSON, and the digest of a file.
 
-use crate::platform::fs::write_private;
+use crate::platform::fs::{Files, Fs};
 use anyhow::Result;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -8,9 +8,9 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-/// [`write_private`] of a value as JSON.
+/// [`Fs::write_private`] of a value as JSON.
 pub fn atomic_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
-    write_private(path, &serde_json::to_vec(value)?)
+    Files::write_private(path, &serde_json::to_vec(value)?)
 }
 
 pub fn digest_file(path: &Path) -> Result<String> {

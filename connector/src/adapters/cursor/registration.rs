@@ -4,16 +4,15 @@ use super::Cursor;
 use crate::adapters::registration::{
     mcp_servers_json, AgentError, AgentHost, Entry, Launch, Manual, ReadinessCheck, Registration,
 };
-use crate::platform::fs::check_user_directory;
+use crate::platform::fs::{Files, Fs};
 use crate::profile::Profile;
 use anyhow::{Context, Result};
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use uuid::Uuid;
 
 /// The `command` and `args` of an `mcp.json` entry.
 fn entry_command(entry: &Value) -> (&str, Vec<String>) {
@@ -40,7 +39,7 @@ fn registration_state(host: &dyn AgentHost) -> Result<Entry> {
     }
     let file = super::config_home(profile).join("mcp.json");
     let root = profile.agent_root(super::config_home(profile))?;
-    let Some((mut config, _mode, _target)) = read_cursor_config(&file, &root)? else {
+    let Some((mut config, _target)) = read_cursor_config(&file, &root)? else {
         return Ok(Entry::bare("not-connected"));
     };
     let current = config
@@ -82,7 +81,7 @@ fn connect_entry(host: &dyn AgentHost) -> Result<(), AgentError> {
         .agent_root(super::config_home(profile))
         .map_err(|_| AgentError::Key("agents.invalid"))?;
     let mut config = match read_cursor_config(&file, &root) {
-        Ok(Some((config, _, _))) => config,
+        Ok(Some((config, _))) => config,
         Ok(None) => json!({}),
         Err(_) => return Err(AgentError::Key("agents.invalid")),
     };
@@ -127,7 +126,7 @@ fn disconnect_entry(host: &dyn AgentHost) -> Result<(), AgentError> {
     let root = profile
         .agent_root(super::config_home(profile))
         .map_err(|_| AgentError::Key("agents.invalid"))?;
-    let Some((mut config, _, _)) =
+    let Some((mut config, _)) =
         read_cursor_config(&file, &root).map_err(|_| AgentError::Key("agents.invalid"))?
     else {
         return Ok(());
@@ -159,10 +158,9 @@ fn cursor_env(entry: &Value) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-fn read_cursor_config(
-    file: &Path,
-    root: &Path,
-) -> Result<Option<(Value, crate::platform::fs::Mode, PathBuf)>> {
+/// The configuration and the file it is in (a link is followed, within `root`): this user's, nobody else able to
+/// change it, at most 1 MiB.
+fn read_cursor_config(file: &Path, root: &Path) -> Result<Option<(Value, PathBuf)>> {
     let link_metadata = match fs::symlink_metadata(file) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -173,55 +171,37 @@ fn read_cursor_config(
     } else {
         file.to_path_buf()
     };
-    let metadata = fs::symlink_metadata(&target)?;
-    if !crate::platform::fs::is_user_file(&target)
-        || metadata.len() > (1 << 20)
-        || !target.canonicalize()?.starts_with(root)
-    {
+    if !target.canonicalize()?.starts_with(root) {
         anyhow::bail!("unsafe Cursor profile file");
     }
-    let text = fs::read_to_string(&target)?;
-    let config: Value = serde_json::from_str(&text)?;
+    let bytes = Files::read_trusted(&target, 1 << 20)
+        .context("unsafe Cursor profile file")?
+        .context("Cursor profile file vanished")?;
+    let config: Value = serde_json::from_slice(&bytes)?;
     if !config.is_object() {
         anyhow::bail!("Cursor configuration is not an object");
     }
-    Ok(Some((
-        config,
-        crate::platform::fs::mode_of(&metadata),
-        target,
-    )))
+    Ok(Some((config, target)))
 }
 
+/// Written whole; an existing file keeps its access, a new one is private.
 fn write_cursor_config(profile: &Profile, file: &Path, config: &Value) -> Result<()> {
     profile.validate_for_agent(super::config_home(profile))?;
     let root = profile.agent_root(super::config_home(profile))?;
-    let (target, mode) = match read_cursor_config(file, &root)? {
-        Some((_, mode, target)) => (target, mode),
-        None => (file.to_path_buf(), crate::platform::fs::Mode::PRIVATE),
+    let target = match read_cursor_config(file, &root)? {
+        Some((_, target)) => target,
+        None => file.to_path_buf(),
     };
     let parent = target.parent().context("Cursor config parent")?;
-    check_user_directory(parent)?;
+    Files::check_user_directory(parent)?;
     if !parent.canonicalize()?.starts_with(&root) {
         anyhow::bail!("Cursor config escaped its directory");
     }
-    let temporary = parent.join(format!(".mcp.json.{}.tmp", Uuid::new_v4()));
-    let result = (|| -> Result<()> {
-        profile.validate_for_agent(super::config_home(profile))?;
-        let mut output = crate::platform::fs::create_private_new(&temporary)?;
-        serde_json::to_writer_pretty(&mut output, config)?;
-        use std::io::Write;
-        output.write_all(b"\n")?;
-        output.sync_all()?;
-        crate::platform::fs::set_mode(&temporary, mode)?;
-        profile.validate_for_agent(super::config_home(profile))?;
-        fs::rename(&temporary, &target)?;
-        File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    let mut bytes = serde_json::to_vec_pretty(config)?;
+    bytes.push(b'\n');
+    profile.validate_for_agent(super::config_home(profile))?;
+    Files::replace(&target, &bytes)?;
+    Ok(())
 }
 
 /// What Cursor can and cannot do with voice, said at install so that nobody expects more.

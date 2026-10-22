@@ -1,6 +1,6 @@
 use crate::core_ready::Ready;
-use crate::platform::fs::verify_socket;
 use crate::profile::Profile;
+use crate::secure_fs::verify_socket;
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};

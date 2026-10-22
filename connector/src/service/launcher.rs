@@ -22,8 +22,9 @@ use super::status::{self, read_ready, serving};
 use super::{Failure, Result};
 use crate::core_ready::Ready;
 use crate::messages::message;
+use crate::platform::fs::{Create, Files, Fs};
 use crate::platform::process::{Identity, Process, Processes};
-use crate::platform::fs::verify_socket;
+use crate::secure_fs::verify_socket;
 use serde_json::{json, Value};
 use std::fs;
 use std::io;
@@ -199,7 +200,7 @@ fn core_failure(failure: Value) -> Failure {
 }
 
 fn private_data_dir(path: &Path) -> Result<()> {
-    crate::platform::fs::ensure_private_dir(path).map_err(Failure::plain)
+    Files::ensure_private_dir(path).map_err(Failure::plain)
 }
 
 /// The core serving this data directory without a service manager: the one already serving, or one started here,
@@ -214,7 +215,7 @@ pub async fn ensure_core(layout: &Layout) -> Result<Ready> {
     let program = layout.core_program();
     let launch_id = uuid::Uuid::new_v4().to_string();
     let output =
-        crate::platform::fs::open_private_append(&layout.core_output()).map_err(Failure::plain)?;
+        Files::open_private(&layout.core_output(), Create::Append).map_err(Failure::plain)?;
     let mut command = Command::new(&program);
     command
         .args(core_arguments(
