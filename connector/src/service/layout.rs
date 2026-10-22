@@ -316,7 +316,7 @@ mod tests {
         let home_var = home.to_str().unwrap();
         let standard = absolute("s");
         let plain = layout(&[
-            ("HOME", home_var),
+            (Environment::HOME, home_var),
             ("SIDEVOICE_DATA_DIR", standard.to_str().unwrap()),
         ])
         .unwrap();
@@ -331,7 +331,7 @@ mod tests {
 
         let (data, alpha) = (absolute("d"), absolute("c"));
         let named = layout(&[
-            ("HOME", home_var),
+            (Environment::HOME, home_var),
             ("SIDEVOICE_DATA_DIR", data.to_str().unwrap()),
             ("ALPHA_HOME", alpha.to_str().unwrap()),
             ("SIDEVOICE_CORE_PORT", "0"),
@@ -352,10 +352,10 @@ mod tests {
 
     #[test]
     fn relative_paths_are_refused() {
-        assert!(layout(&[("HOME", "relative")]).is_err());
+        assert!(layout(&[(Environment::HOME, "relative")]).is_err());
         let home = absolute("h");
         assert!(layout(&[
-            ("HOME", home.to_str().unwrap()),
+            (Environment::HOME, home.to_str().unwrap()),
             ("SIDEVOICE_DATA_DIR", "d")
         ])
         .is_err());
@@ -368,7 +368,7 @@ mod tests {
         let data = scratch.path().join("data");
         let home = scratch.path().join("home");
         let layout = layout(&[
-            ("HOME", home.to_str().unwrap()),
+            (Environment::HOME, home.to_str().unwrap()),
             ("SIDEVOICE_DATA_DIR", data.to_str().unwrap()),
         ])
         .unwrap();

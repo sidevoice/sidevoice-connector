@@ -314,7 +314,7 @@ impl Profile {
         let root = root.canonicalize().unwrap();
         let path = |child: &str| -> OsString { root.join(child).into_os_string() };
         let mut variables = vec![
-            ("HOME".to_owned(), path("home")),
+            (Environment::HOME.to_owned(), path("home")),
             ("XDG_CONFIG_HOME".into(), path("xdg/config")),
             ("SIDEVOICE_DATA_DIR".into(), path("sidevoice")),
         ];
@@ -387,7 +387,7 @@ mod tests {
         let standard = scratch.path().join("data");
         let data = standard.to_str().unwrap();
         let profile = Profile::from_vars(
-            vars(&[("HOME", &home), ("SIDEVOICE_DATA_DIR", data)]),
+            vars(&[(Environment::HOME, &home), ("SIDEVOICE_DATA_DIR", data)]),
             &HOMES,
         )
         .unwrap();
@@ -412,7 +412,7 @@ mod tests {
         let beta = scratch.path().join("beta");
         let named = Profile::from_vars(
             vars(&[
-                ("HOME", &home),
+                (Environment::HOME, &home),
                 ("SIDEVOICE_DATA_DIR", data.to_str().unwrap()),
                 ("BETA_HOME", beta.to_str().unwrap()),
             ]),
@@ -442,7 +442,7 @@ mod tests {
         let data = scratch.path().join("data");
         let data = data.to_str().unwrap();
         let unset = Profile::from_vars(
-            vars(&[("HOME", &home), ("SIDEVOICE_DATA_DIR", data)]),
+            vars(&[(Environment::HOME, &home), ("SIDEVOICE_DATA_DIR", data)]),
             &HOMES,
         )
         .unwrap();
@@ -465,7 +465,7 @@ mod tests {
         fs::set_permissions(&named, fs::Permissions::from_mode(0o700)).unwrap();
         let set = Profile::from_vars(
             vars(&[
-                ("HOME", &home),
+                (Environment::HOME, &home),
                 ("SIDEVOICE_DATA_DIR", data),
                 ("BETA_HOME", named.to_str().unwrap()),
             ]),
@@ -483,15 +483,17 @@ mod tests {
     #[test]
     fn relative_or_missing_places_are_refused() {
         assert!(Profile::from_vars(vars(&[]), &HOMES).is_err());
-        assert!(Profile::from_vars(vars(&[("HOME", "relative")]), &HOMES).is_err());
+        assert!(Profile::from_vars(vars(&[(Environment::HOME, "relative")]), &HOMES).is_err());
         assert!(Profile::from_vars(
-            vars(&[("HOME", "/tmp"), ("SIDEVOICE_DATA_DIR", "data")]),
+            vars(&[(Environment::HOME, "/tmp"), ("SIDEVOICE_DATA_DIR", "data")]),
             &HOMES
         )
         .is_err());
-        assert!(
-            Profile::from_vars(vars(&[("HOME", "/tmp"), ("ALPHA_HOME", "alpha")]), &HOMES).is_err()
-        );
+        assert!(Profile::from_vars(
+            vars(&[(Environment::HOME, "/tmp"), ("ALPHA_HOME", "alpha")]),
+            &HOMES
+        )
+        .is_err());
     }
 
     #[test]
@@ -528,7 +530,7 @@ mod tests {
         let data = scratch.path().join("data");
         let data = data.to_str().unwrap();
         let profile = Profile::from_vars(
-            vars(&[("HOME", &home), ("SIDEVOICE_DATA_DIR", data)]),
+            vars(&[(Environment::HOME, &home), ("SIDEVOICE_DATA_DIR", data)]),
             &HOMES,
         )
         .unwrap();
