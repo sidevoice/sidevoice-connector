@@ -241,11 +241,15 @@ state comes from the chat's transcript, so it stays right while a message waits 
 the agents' registrations Sidevoice wrote (current or not), then the owned data and releases. It keeps lock files and
 the stop, so that a launcher on its way finds the stop and starts nothing.
 
-Before unloading, uninstall checks that `R` is `D/install` and that `D` is ours: exactly the OS's standard place
-above (wherever `XDG_DATA_HOME` puts it, inside the home or not), or, for a `$SIDEVOICE_DATA_DIR` elsewhere, a
-directory holding an installation of ours (an `install.json` of this user's that nobody else can change, naming `R`
-as its releases) or nothing but what an uninstall leaves. Anything else, such as a folder that merely has the
-program's name, is refused with nothing deleted.
+Before unloading, uninstall checks that `R` is `D/install` and that `D` is ours: never the home directory, a directory
+the home is in, or a file-system or volume root, whatever it holds; and either exactly the OS's standard place above
+(wherever `XDG_DATA_HOME` puts it, inside the home or not), or, for a `$SIDEVOICE_DATA_DIR` elsewhere, a directory
+holding an installation of ours (an `install.json` of this user's that nobody else can change, naming `R` as its
+releases). Anything else, such as a folder that merely has the program's name, is refused with nothing deleted. A
+directory elsewhere with no `install.json` and nothing but what an uninstall leaves proves nothing: uninstall answers
+`installed: false` and writes, stops and deletes nothing. What `D` is (its file id) is recorded when it is checked, or
+when uninstall makes it, and every later use compares it, so a directory swapped in meanwhile is refused and left alone;
+whether `D` is still ours is checked again once the install lock is held.
 It checks the trees for mount boundaries before taking the install lock, which uninstall holds without writing to it.
 It rejects multiply linked lock files. Before traversal, each owned subtree is atomically moved into a private
 `D/.uninstall-claim` directory on the same filesystem, then revalidated and removed through directory handles
