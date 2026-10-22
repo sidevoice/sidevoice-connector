@@ -2745,3 +2745,18 @@ async fn codex_delivery_queues_when_the_steer_is_refused() {
     );
     daemon.await.unwrap();
 }
+
+#[test]
+fn a_scan_that_fails_after_an_action_says_the_change_was_applied() {
+    let failed = json!({"scan_failed":true});
+    let key = |result: std::result::Result<(), Failure>| match result {
+        Err(Failure::Key(key, _)) => key,
+        _ => "",
+    };
+    assert_eq!(key(require_scanned(&failed, "codex")), "agents.scan-failed");
+    assert_eq!(
+        key(require_verified(&failed, "codex")),
+        "agents.scan-failed-after"
+    );
+    assert!(require_verified(&json!({"scan_failed":false}), "codex").is_ok());
+}

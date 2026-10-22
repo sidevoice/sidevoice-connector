@@ -495,7 +495,7 @@ impl HostAgents {
             state = self
                 .scan(state, Some(agent), true, cancel, deadline)
                 .await?;
-            require_scanned(&state, agent)?;
+            require_verified(&state, agent)?;
             match seen_agent(&state, agent)
                 .and_then(|row| row.get("registration"))
                 .and_then(Value::as_str)
@@ -544,7 +544,7 @@ impl HostAgents {
         state = self
             .scan(state, Some(agent), false, cancel, deadline)
             .await?;
-        require_scanned(&state, agent)?;
+        require_verified(&state, agent)?;
         match seen_agent(&state, agent)
             .and_then(|row| row.get("registration"))
             .and_then(Value::as_str)
@@ -1006,8 +1006,17 @@ fn parse_id(registry: &Registry, value: &str) -> std::result::Result<AgentId, Fa
 
 /// An action on an agent trusts only a scan that happened: while the last one failed, what is cached may be stale.
 fn require_scanned(state: &Value, id: AgentId) -> std::result::Result<(), Failure> {
+    scanned_or(state, id, "agents.scan-failed")
+}
+
+/// The same check after the action ran: the change was applied, only the look afterwards failed.
+fn require_verified(state: &Value, id: AgentId) -> std::result::Result<(), Failure> {
+    scanned_or(state, id, "agents.scan-failed-after")
+}
+
+fn scanned_or(state: &Value, id: AgentId, key: &'static str) -> std::result::Result<(), Failure> {
     if state.get("scan_failed") == Some(&Value::Bool(true)) {
-        return Err(agent_failure("agents.scan-failed", id));
+        return Err(agent_failure(key, id));
     }
     Ok(())
 }

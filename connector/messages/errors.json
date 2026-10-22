@@ -3,6 +3,7 @@
   "agents.unknown-request": "Unknown agent request: {route}.",
   "agents.not-present": "{agent} is not detected on this computer.",
   "agents.scan-failed": "Could not look for {agent} on this computer just now; nothing was changed. Try again.",
+  "agents.scan-failed-after": "{agent} was changed, but Sidevoice could not check the result just now. Refresh to see its state.",
   "agents.foreign": "{agent} already has a Sidevoice registration that Sidevoice did not create; it was left unchanged.",
   "agents.invalid": "{agent} has an unreadable or malformed Sidevoice registration; it was left unchanged.",
   "agents.manual-required": "{agent} needs its manual Sidevoice configuration.",
