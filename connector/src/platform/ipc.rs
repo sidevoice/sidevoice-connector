@@ -1,15 +1,14 @@
 //! The local channel between this user's processes: the connector's endpoint for its clients, and the core's.
 //!
-//! The interface is the [`Channel`] trait; [`Channels`] is the one OS implementation compiled in, chosen below: a
-//! Unix socket on macOS and Linux, a named pipe on Windows, both through `interprocess`. [`Endpoint`] is the
-//! address, defined once here and made like std's: `Endpoint::new(dir, name)` for our own, `record.parse()`
-//! (`FromStr`) for one another process published, `Display` writing that record; it asks the trait only for what
-//! differs per OS ([`Channel::address`], [`Channel::check`]). What this module adds is the user check, on every OS
-//! and on both ends: a listener only ever hands out streams whose peer is this user, and a client only talks to a
+//! The interface is two traits, each implemented once per OS and chosen below: [`Address`], what an endpoint is
+//! ([`Endpoint`]: a socket path on macOS and Linux, a pipe name on Windows), and [`Channel`], listening and
+//! connecting at one ([`Channels`]), both through `interprocess`. What this module adds is the user check, on every
+//! OS and on both ends: a listener only ever hands out streams whose peer is this user, and a client only talks to a
 //! server that is this user. Streams are plain `AsyncRead + AsyncWrite + Unpin`, so the line-JSON protocol, the
-//! WebSocket handshake and the HTTP health probe run over them unchanged. Callers, std-style
-//! (`TcpListener::bind(addr)`): `use crate::platform::ipc::{Channel, Channels, Endpoint};` then
-//! `Channels::listen(&Endpoint::new(dir, "connector"))`, `Channels::connect(&endpoint).await`.
+//! WebSocket handshake and the HTTP health probe run over them unchanged. Callers, std-style (`Path::new`,
+//! `str::parse`, `TcpListener::bind(addr)`): `use crate::platform::ipc::{Address, Channel, Channels, Endpoint};`
+//! then `Endpoint::new(&data, "connector")`, `record.parse::<Endpoint>()`, `Channels::listen(&endpoint)`,
+//! `Channels::connect(&endpoint).await`.
 
 #[cfg(unix)]
 #[path = "ipc/unix.rs"]
@@ -18,12 +17,10 @@ mod imp;
 #[path = "ipc/windows.rs"]
 mod imp;
 
-pub use imp::Os as Channels;
+pub use imp::{Endpoint, Os as Channels};
 
 use interprocess::local_socket::tokio::Listener as RawListener;
 use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
-use interprocess::local_socket::{GenericFilePath, Name, ToFsName};
-use std::ffi::OsString;
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -33,53 +30,25 @@ use std::str::FromStr;
 /// One connection. `AsyncRead + AsyncWrite + Unpin`; its peer has been checked to be this user.
 pub type Stream = interprocess::local_socket::tokio::Stream;
 
-/// Where a channel is: a socket path (Unix) or a pipe name (Windows), as one opaque value. Nothing outside derives
-/// one from another or looks inside.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Endpoint(OsString);
-
-impl Endpoint {
-    /// Our own endpoint called `name` for the data directory `dir` ([`Channel::address`]).
-    pub fn new(dir: &Path, name: &str) -> Endpoint {
-        Endpoint(Channels::address(dir, name))
-    }
-
-    /// The endpoint as `interprocess` names it.
-    fn name(&self) -> io::Result<Name<'static>> {
-        self.0.clone().to_fs_name::<GenericFilePath>()
-    }
+/// What an endpoint is on this OS ([`Endpoint`], in `ipc/unix.rs` and `ipc/windows.rs`): where a channel is, as
+/// one opaque value. Nothing outside derives one from another or looks inside.
+///
+/// - [`Address::new`] makes our own.
+/// - `FromStr` (`record.parse()`) reads one another process published (the core's ready file keeps one), refusing
+///   anything that is not an endpoint on this OS: Unix, an absolute socket path; Windows, a full local pipe name,
+///   `\\.\pipe\...`.
+/// - `Display` writes that record.
+pub trait Address:
+    Sized + Clone + fmt::Debug + fmt::Display + PartialEq + FromStr<Err = io::Error>
+{
+    /// Our own endpoint called `name` for the data directory `dir`. Unix: the socket `dir/<name>.sock`. Windows: the
+    /// pipe `\\.\pipe\sidevoice-<hash of (user, dir)>-<name>`, so two profiles or two users never meet on one name.
+    fn new(dir: &Path, name: &str) -> Self;
 }
 
-/// An endpoint another process published, as `Display` writes it; refused unless [`Channel::check`] accepts it.
-impl FromStr for Endpoint {
-    type Err = io::Error;
-
-    fn from_str(record: &str) -> io::Result<Endpoint> {
-        Channels::check(record)?;
-        Ok(Endpoint(record.into()))
-    }
-}
-
-/// The record another process reads back with `parse`.
-impl fmt::Display for Endpoint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.to_string_lossy().fmt(f)
-    }
-}
-
-/// What every OS implements ([`Channels`], in `ipc/unix.rs` and `ipc/windows.rs`): what an address is, and how a
-/// listener is made private to this user. Connecting is one body for every OS; the peer check is internal to each
-/// OS file (`peer_is_this_user`).
+/// What every OS implements ([`Channels`], in `ipc/unix.rs` and `ipc/windows.rs`): how a listener is made private to
+/// this user. Connecting is one body for every OS; the peer check is internal to each OS file (`peer_is_this_user`).
 pub trait Channel {
-    /// The address of our own endpoint called `name` for the data directory `dir`. Unix: the socket
-    /// `dir/<name>.sock`. Windows: the pipe `\\.\pipe\sidevoice-<hash of (user, dir)>-<name>`, so two profiles or two
-    /// users never meet on one name.
-    fn address(dir: &Path, name: &str) -> OsString;
-
-    /// Whether `record` is an address this OS can use. Unix: an absolute socket path. Windows: a full local pipe
-    /// name, `\\.\pipe\...`.
-    fn check(record: &str) -> io::Result<()>;
-
     /// Starts listening at `endpoint`, reachable by this user alone. Unix: a socket left by a dead process is
     /// replaced, but only once it is checked to be this user's and private; the socket file is `0600` and goes away
     /// when the listener is dropped. Windows: the first instance of the pipe (a name already taken is an error),

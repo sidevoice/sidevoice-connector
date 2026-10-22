@@ -16,7 +16,7 @@
 //! they are passed to agents' command lines and written into.
 
 use crate::platform::fs::{Files, Fs};
-use crate::platform::ipc::Endpoint;
+use crate::platform::ipc::{Address, Endpoint};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::ffi::OsString;

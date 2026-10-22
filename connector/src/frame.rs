@@ -186,7 +186,7 @@ mod tests {
     #[tokio::test]
     async fn whole_messages_cross_the_channel_and_oversized_ones_do_not() {
         use crate::platform::fs::{Files, Fs};
-        use crate::platform::ipc::{Channel, Channels, Endpoint};
+        use crate::platform::ipc::{Address, Channel, Channels, Endpoint};
         let scratch = crate::test_support::temp_dir("frame");
         let dir = scratch.path().join("private");
         Files::create_private_dir(&dir).unwrap();

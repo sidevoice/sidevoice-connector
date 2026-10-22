@@ -126,7 +126,7 @@ impl Profile {
 #[cfg(test)]
 mod tests {
     use super::{read, require_v3};
-    use crate::platform::ipc::Endpoint;
+    use crate::platform::ipc::{Address, Endpoint};
     use std::os::unix::fs::PermissionsExt;
 
     /// A newer core's ready file: fields this connector does not know, at the top and nested, and a protocol

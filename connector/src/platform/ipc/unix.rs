@@ -2,36 +2,59 @@
 //! (`SO_PEERCRED` / `LOCAL_PEERCRED`, through `peer_creds()`); a socket left behind is replaced only when it
 //! is a socket, this user's, open to nobody else, in a private directory.
 
-use super::{Endpoint, Listener, Stream};
+use super::{Listener, Stream};
 use crate::platform::fs::{Files, Fs};
 use crate::platform::user::{User, UserId};
 use interprocess::local_socket::traits::StreamCommon as _;
-use interprocess::local_socket::ListenerOptions;
-use std::ffi::OsString;
+use interprocess::local_socket::{GenericFilePath, ListenerOptions, Name, ToFsName};
+use std::fmt;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
-/// Unix side of [`super::Channel`].
-pub struct Os;
+/// Unix side of [`super::Address`]: an endpoint is its socket path.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Endpoint(PathBuf);
 
-impl super::Channel for Os {
-    // The socket `dir/<name>.sock`.
-    fn address(dir: &Path, name: &str) -> OsString {
-        dir.join(format!("{name}.sock")).into_os_string()
+impl super::Address for Endpoint {
+    fn new(dir: &Path, name: &str) -> Endpoint {
+        Endpoint(dir.join(format!("{name}.sock")))
     }
+}
 
-    // An absolute socket path.
-    fn check(record: &str) -> io::Result<()> {
-        if !Path::new(record).is_absolute() {
+impl FromStr for Endpoint {
+    type Err = io::Error;
+
+    fn from_str(record: &str) -> io::Result<Endpoint> {
+        let path = PathBuf::from(record);
+        if !path.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("not an absolute socket path: {record:?}"),
             ));
         }
-        Ok(())
+        Ok(Endpoint(path))
     }
+}
 
+impl fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.display().fmt(f)
+    }
+}
+
+impl Endpoint {
+    /// The endpoint as `interprocess` names it.
+    pub(super) fn name(&self) -> io::Result<Name<'static>> {
+        self.0.clone().to_fs_name::<GenericFilePath>()
+    }
+}
+
+/// Unix side of [`super::Channel`].
+pub struct Os;
+
+impl super::Channel for Os {
     fn listen(endpoint: &Endpoint) -> io::Result<Listener> {
         // Only in a private directory: nobody else can reach the socket between its creation and its `chmod` below.
         // (Choosing the mode before `bind`, `interprocess`'s `mode`, is `Unsupported` on macOS, whose `fchmod`
@@ -58,7 +81,7 @@ pub(super) fn peer_is_this_user(stream: &Stream) -> io::Result<bool> {
 
 /// The socket file an endpoint names.
 fn socket(endpoint: &Endpoint) -> &Path {
-    Path::new(&endpoint.0)
+    &endpoint.0
 }
 
 /// A socket before anything talks to it or replaces it: in a private directory ([`verify_dir`]), a socket, this
@@ -98,7 +121,7 @@ fn unsafe_socket(path: &Path) -> io::Error {
 // pipe has no file, no mode, and goes with its last handle.
 #[cfg(test)]
 mod tests {
-    use super::super::Channel as _;
+    use super::super::{Address as _, Channel as _};
     use super::*;
     use std::path::PathBuf;
 
