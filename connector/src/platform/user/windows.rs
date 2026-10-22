@@ -59,21 +59,20 @@ impl PartialEq for Sid {
 
 impl Eq for Sid {}
 
-/// The user this process runs as, as owned SIDs. Opaque: callers ask it questions and never see what it is made of.
+/// Windows side of [`super::UserId`]: the user as owned SIDs.
 ///
 /// Two SIDs, because Windows gives a file two candidate owners: the user, and the token's default owner, which is
 /// what files this process creates get. For a normal token they are the same; for an elevated administrator the
 /// default owner is the Administrators group, and what it creates is its own. Identity (`==`) is the user alone.
 #[derive(Clone, Debug)]
-pub struct UserId {
+pub(super) struct Id {
     user: Sid,
     default_owner: Sid,
 }
 
-impl UserId {
-    #[allow(dead_code)] // its callers arrive with `platform::fs`, which replaces the `owns(&Metadata)` ones
-    /// Whether this user owns what `path` names. A symlink or junction is judged itself, not what it points to.
-    pub fn owns_path(&self, path: &Path) -> io::Result<bool> {
+impl Id {
+    // A symlink or junction is judged itself (`OPEN_REPARSE_POINT`).
+    pub(super) fn owns_path(&self, path: &Path) -> io::Result<bool> {
         // `BACKUP_SEMANTICS` lets a directory be opened; `READ_CONTROL` is all the owner query needs.
         let file = OpenOptions::new()
             .access_mode(READ_CONTROL)
@@ -82,9 +81,7 @@ impl UserId {
         self.owns_file(&file)
     }
 
-    #[allow(dead_code)] // as `owns_path`
-    /// Whether this user owns the file behind an open handle.
-    pub fn owns_file(&self, file: &File) -> io::Result<bool> {
+    pub(super) fn owns_file(&self, file: &File) -> io::Result<bool> {
         let mut owner: PSID = null_mut();
         let mut descriptor = null_mut();
         // SAFETY: the handle is open for the call's duration; on success `owner` points inside `descriptor`, which
@@ -110,20 +107,20 @@ impl UserId {
     }
 }
 
-impl PartialEq for UserId {
+impl PartialEq for Id {
     fn eq(&self, other: &Self) -> bool {
         self.user == other.user
     }
 }
 
-impl Eq for UserId {}
+impl Eq for Id {}
 
 /// The user of this process: the SIDs in its token.
-pub fn current() -> UserId {
+pub(super) fn current() -> Id {
     read_token().expect("the process token is readable")
 }
 
-fn read_token() -> io::Result<UserId> {
+fn read_token() -> io::Result<Id> {
     let mut token: HANDLE = null_mut();
     // SAFETY: the pseudo-handle of the current process needs no closing; the token is closed below.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
@@ -133,7 +130,7 @@ fn read_token() -> io::Result<UserId> {
         token_sid(token, TokenUser).and_then(|user| Ok((user, token_sid(token, TokenOwner)?)));
     unsafe { CloseHandle(token) };
     let (user, default_owner) = sids?;
-    Ok(UserId {
+    Ok(Id {
         user,
         default_owner,
     })
@@ -167,7 +164,7 @@ fn token_sid(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<Sid> {
 }
 
 /// Windows names the user to the system by SID; there is no login name any caller needs.
-pub fn name() -> Option<String> {
+pub(super) fn name() -> Option<String> {
     None
 }
 
@@ -191,7 +188,7 @@ mod tests {
         let system = Sid {
             words: vec![0x0000_0101, 0x0500_0000, 0x0000_0012],
         };
-        let stranger = UserId {
+        let stranger = Id {
             user: system.clone(),
             default_owner: system,
         };
