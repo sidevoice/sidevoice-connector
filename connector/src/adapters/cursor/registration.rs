@@ -174,7 +174,7 @@ fn read_cursor_config(file: &Path, root: &Path) -> Result<Option<(Value, u32, Pa
     let metadata = fs::symlink_metadata(&target)?;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || !crate::platform::user::current().owns(&metadata)
         || metadata.mode() & 0o022 != 0
         || metadata.len() > (1 << 20)
         || !target.canonicalize()?.starts_with(root)

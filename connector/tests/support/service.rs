@@ -110,6 +110,8 @@ pub fn wait_gone(pid: u64, what: &str) {
 /// This user's systemd user manager, reachable: the variables `systemctl --user` needs. On a CI runner with no
 /// session, lingering is enabled for this user first (the runner's own account, on a disposable machine).
 pub fn systemd_user_manager() -> Option<BTreeMap<String, String>> {
+    // An integration test is its own crate and cannot reach `platform`.
+    #[allow(clippy::disallowed_methods)]
     let uid = unsafe { libc::getuid() };
     let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| format!("/run/user/{uid}"));
     let bus = format!("unix:path={runtime}/bus");

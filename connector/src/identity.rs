@@ -40,17 +40,7 @@ pub fn host() -> String {
     {
         return id;
     }
-    let mut buffer = [0u8; 256];
-    let read = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
-    let name = if read == 0 {
-        let end = buffer
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(buffer.len());
-        String::from_utf8_lossy(&buffer[..end]).trim().to_owned()
-    } else {
-        String::new()
-    };
+    let name = crate::platform::user::host_name();
     if name.is_empty() {
         "unknown".into()
     } else {

@@ -28,6 +28,8 @@ const JOBS: [(&str, &str); 2] = [
 /// Whether the manager has the job loaded.
 fn manager_has(extra: &BTreeMap<String, String>, job: (&str, &str)) -> bool {
     if cfg!(target_os = "macos") {
+        // An integration test is its own crate and cannot reach `platform`.
+        #[allow(clippy::disallowed_methods)]
         let uid = unsafe { libc::getuid() };
         Command::new("/bin/launchctl")
             .args(["print", &format!("gui/{uid}/{}", job.0)])
@@ -49,6 +51,8 @@ fn manager_has(extra: &BTreeMap<String, String>, job: (&str, &str)) -> bool {
 /// `is-enabled`.
 fn manager_starts_at_login(extra: &BTreeMap<String, String>, job: (&str, &str)) -> bool {
     if cfg!(target_os = "macos") {
+        // An integration test is its own crate and cannot reach `platform`.
+        #[allow(clippy::disallowed_methods)]
         let uid = unsafe { libc::getuid() };
         let output = Command::new("/bin/launchctl")
             .args(["print-disabled", &format!("gui/{uid}")])

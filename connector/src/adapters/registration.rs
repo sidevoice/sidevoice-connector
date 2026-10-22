@@ -399,7 +399,7 @@ pub fn read_profile_file(path: &Path, limit: u64) -> anyhow::Result<String> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let regular = |metadata: &std::fs::Metadata| {
         metadata.is_file()
-            && metadata.uid() == unsafe { libc::geteuid() }
+            && crate::platform::user::current().owns(metadata)
             && metadata.mode() & 0o022 == 0
             && metadata.len() <= limit
     };

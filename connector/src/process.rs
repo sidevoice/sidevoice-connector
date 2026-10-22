@@ -173,7 +173,7 @@ pub fn is_process(pid: u32, expected: &Expected<'_>) -> bool {
     let Lookup::Alive(found) = lookup(pid) else {
         return false;
     };
-    found.uid == crate::secure_fs::uid()
+    found.uid == crate::platform::user::current().raw()
         && expected.start.is_none_or(|start| found.start == start)
         && expected
             .command_contains
@@ -193,7 +193,9 @@ pub fn find(matches: impl Fn(&str) -> bool) -> Vec<u32> {
         .into_iter()
         .filter(|pid| *pid != std::process::id())
         .filter(|pid| match lookup(*pid) {
-            Lookup::Alive(found) => found.uid == crate::secure_fs::uid() && matches(&found.command),
+            Lookup::Alive(found) => {
+                found.uid == crate::platform::user::current().raw() && matches(&found.command)
+            }
             _ => false,
         })
         .collect()
@@ -296,7 +298,7 @@ mod tests {
     #[test]
     fn this_process_is_identified_by_owner_start_and_command() {
         let me = self_identity().expect("own identity");
-        assert_eq!(me.uid, crate::secure_fs::uid());
+        assert_eq!(me.uid, crate::platform::user::current().raw());
         assert!(!me.start.is_empty());
         assert!(is_process(
             std::process::id(),
