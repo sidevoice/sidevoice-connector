@@ -17,28 +17,24 @@ use tokio::time::{timeout, Duration};
 pub struct Ready {
     pub pid: u32,
     pub launch_id: String,
-    /// Where the core listens, as an endpoint record (`Endpoint`'s `FromStr`). Newer cores write it.
-    pub endpoint: Option<String>,
-    /// The Unix socket path an older core writes (and newer ones still do on Unix, deprecated): what is read when
-    /// there is no `endpoint`.
-    pub socket: Option<String>,
+    /// Where the core listens: its endpoint record, read with `Endpoint`'s `FromStr`. Required: a ready file without a
+    /// valid one is refused. (The ready file is the only source; the endpoint is never derived from where the core
+    /// was told to put it.)
+    #[serde(deserialize_with = "endpoint")]
+    pub endpoint: Endpoint,
     pub connector_id: String,
     pub token: String,
     /// The link protocols this core speaks; a number this connector does not know is only not one it speaks.
     pub connector_protocols: Option<Vec<u64>>,
 }
 
-impl Ready {
-    /// The core's endpoint: its `endpoint` record, else the `socket` of a core that predates it. The ready file is
-    /// the only source: it is never derived from where the core was told to put it.
-    pub fn endpoint(&self) -> Result<Endpoint> {
-        let record = self
-            .endpoint
-            .as_deref()
-            .or(self.socket.as_deref())
-            .context("Core ready file names no endpoint")?;
-        Ok(record.parse::<Endpoint>()?)
-    }
+/// An [`Endpoint`] from its record.
+fn endpoint<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Endpoint, D::Error> {
+    String::deserialize(deserializer)?
+        .parse()
+        .map_err(serde::de::Error::custom)
 }
 
 /// The ready file at `path`, when it is this user's private file naming a launch and an endpoint.
@@ -53,7 +49,6 @@ pub fn read(path: &Path) -> Result<Ready> {
     if ready.launch_id.is_empty() || ready.pid == 0 {
         bail!("Core ready identity mismatch");
     }
-    ready.endpoint()?;
     Ok(ready)
 }
 
@@ -107,7 +102,7 @@ impl Profile {
             bail!("Core ready identity mismatch");
         }
         require_v3(ready)?;
-        let health = health(&ready.endpoint()?, Duration::from_secs(2)).await?;
+        let health = health(&ready.endpoint, Duration::from_secs(2)).await?;
         if health.get("launch_id").and_then(Value::as_str) != Some(&ready.launch_id)
             || health.get("pid").and_then(Value::as_u64) != Some(ready.pid as u64)
         {
@@ -134,9 +129,9 @@ mod tests {
     #[test]
     fn a_ready_file_with_fields_and_protocols_this_connector_does_not_know_is_read() {
         let scratch = crate::test_support::temp_dir("ready");
-        let socket = scratch.path().join("local.sock");
+        let endpoint = Endpoint::new(scratch.path(), "local").to_string();
         let path = scratch.path().join("core.json");
-        let ready = serde_json::json!({"pid":42,"launch_id":"launch-1","socket":socket,"connector_id":"c-1",
+        let ready = serde_json::json!({"pid":42,"launch_id":"launch-1","endpoint":endpoint,"connector_id":"c-1",
             "token":"t","connector_protocols":[3, 4, 1000],"future_field":{"nested":[1, 2]},"listen":"x"});
         std::fs::write(&path, serde_json::to_vec(&ready).unwrap()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -146,29 +141,22 @@ mod tests {
         require_v3(&read).unwrap();
     }
 
-    /// `endpoint` is what a newer core publishes; the `socket` of an older one is read when there is none.
+    /// The ready file names the core's endpoint as its record; without a valid one it is refused.
     #[test]
-    fn the_endpoint_is_read_from_the_ready_file_and_falls_back_to_the_socket() {
-        let ready = |extra: serde_json::Value| -> super::Ready {
+    fn the_endpoint_is_read_from_the_ready_file_and_required() {
+        let ready = |extra: serde_json::Value| {
             let mut file =
                 serde_json::json!({"pid":1,"launch_id":"l","connector_id":"c","token":"t"});
             file.as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
-            serde_json::from_value(file).unwrap()
+            serde_json::from_value::<super::Ready>(file)
         };
-        let dir = std::env::temp_dir();
-        let (new, old) = (
-            Endpoint::new(&dir, "new").to_string(),
-            Endpoint::new(&dir, "old").to_string(),
-        );
-        let both = ready(serde_json::json!({"endpoint": new, "socket": old}));
-        assert_eq!(both.endpoint().unwrap().to_string(), new);
-        let only_socket = ready(serde_json::json!({"socket": old}));
-        assert_eq!(only_socket.endpoint().unwrap().to_string(), old);
-        assert!(ready(serde_json::json!({})).endpoint().is_err());
-        assert!(ready(serde_json::json!({"endpoint":"relative"}))
-            .endpoint()
-            .is_err());
+        let endpoint = Endpoint::new(&std::env::temp_dir(), "core");
+        let read = ready(serde_json::json!({"endpoint": endpoint.to_string()})).unwrap();
+        assert_eq!(read.endpoint, endpoint);
+        assert!(ready(serde_json::json!({})).is_err());
+        assert!(ready(serde_json::json!({"endpoint":"relative"})).is_err());
+        assert!(ready(serde_json::json!({"endpoint":1})).is_err());
     }
 }

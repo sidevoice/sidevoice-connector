@@ -204,11 +204,7 @@ impl Link {
         session: u64,
     ) -> Result<()> {
         let ready = profile.ready().await?;
-        let stream = timeout(
-            Duration::from_secs(2),
-            Channels::connect(&ready.endpoint()?),
-        )
-        .await??;
+        let stream = timeout(Duration::from_secs(2), Channels::connect(&ready.endpoint)).await??;
         let mut config = WebSocketConfig::default();
         config.max_message_size = Some(1 << 20);
         config.max_frame_size = Some(1 << 20);

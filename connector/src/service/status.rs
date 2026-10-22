@@ -179,7 +179,7 @@ pub async fn health(endpoint: &Endpoint, limit: Duration) -> Option<Value> {
 /// The core serving now: its ready file, and its health answering for that same launch.
 pub async fn serving(layout: &Layout, limit: Duration) -> Option<(Ready, Value)> {
     let ready = read_ready(layout)?;
-    let body = health(&ready.endpoint().ok()?, limit).await?;
+    let body = health(&ready.endpoint, limit).await?;
     (body.get("launch_id").and_then(Value::as_str) == Some(ready.launch_id.as_str()))
         .then_some((ready, body))
 }
@@ -268,8 +268,8 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
         None => None,
     };
     let ready = read_ready(layout);
-    let health = match ready.as_ref().and_then(|ready| ready.endpoint().ok()) {
-        Some(endpoint) => health(&endpoint, Duration::from_millis(1500)).await,
+    let health = match ready.as_ref().map(|ready| &ready.endpoint) {
+        Some(endpoint) => health(endpoint, Duration::from_millis(1500)).await,
         None => None,
     };
     let at = crate::logfile::timestamp();
@@ -319,13 +319,14 @@ pub async fn status(layout: &Layout, connector_running: Option<bool>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::ipc::Address;
+    use std::path::Path;
 
     fn ready(pid: u32) -> Ready {
         Ready {
             pid,
             launch_id: "launch".into(),
-            endpoint: None,
-            socket: Some("/d/core/local.sock".into()),
+            endpoint: Endpoint::new(Path::new("/d/core"), "local"),
             connector_id: "id".into(),
             token: "secret".into(),
             connector_protocols: Some(vec![2, 3]),
