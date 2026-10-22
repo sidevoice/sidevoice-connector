@@ -14,11 +14,10 @@
 //! reported. It also brings a task back only after a failure, so a connector that exits cleanly stays down until
 //! the next login or start. `/End` is a hard stop; the graceful request is the caller's, in band, first.
 
-use super::{
-    command, write_file, xml, Job, JobId, JobState, Output, Places, Refusal, Service, Stored,
-};
+use super::{command, write_file, Job, JobId, JobState, Output, Places, Refusal, Service, Stored};
 use crate::platform::fs::{Files, Fs};
 use crate::platform::process::{Process, Processes};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -208,27 +207,47 @@ async fn registered(task: &str) -> bool {
     schtasks(&["/Query", "/TN", task]).await.ok
 }
 
+/// What is read back from a task's XML: whether its logon trigger and the task itself are enabled (Task Scheduler
+/// leaves out an `Enabled` that is `true`).
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct Queried {
+    triggers: Option<QueriedTriggers>,
+    settings: Option<Switch>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct QueriedTriggers {
+    logon_trigger: Option<Switch>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct Switch {
+    enabled: Option<bool>,
+}
+
 /// Whether the task starts at the next logon, from its XML (`/Query /XML`, UTF-16 or not): its logon trigger and
 /// the task itself both enabled. `None`: the output is not a task.
 fn parse_login(text: &str) -> Option<bool> {
-    let text: String = text.chars().filter(|ch| *ch != '\0').collect();
-    if !text.contains("<Task") {
-        return None;
-    }
-    let block = |tag: &str| {
-        let start = text.find(&format!("<{tag}"))?;
-        let end = text[start..].find(&format!("</{tag}>"))?;
-        Some(text[start..start + end].to_owned())
-    };
-    let disabled = |block: &str| block.contains("<Enabled>false</Enabled>");
-    let Some(trigger) = block("LogonTrigger") else {
-        return Some(false);
-    };
-    let task_off = block("Settings").is_some_and(|settings| {
-        // The idle settings nest no `Enabled`; the task's own is the one directly in `Settings`.
-        disabled(&settings)
-    });
-    Some(!disabled(&trigger) && !task_off)
+    let text: String = text
+        .chars()
+        .filter(|ch| !matches!(ch, '\0' | '\u{feff}'))
+        .collect();
+    let task: Queried = quick_xml::de::from_str(text.trim()).ok()?;
+    let on = |switch: Option<&Switch>| switch.is_some_and(|switch| switch.enabled != Some(false));
+    let trigger = task
+        .triggers
+        .as_ref()
+        .and_then(|triggers| triggers.logon_trigger.as_ref());
+    Some(
+        on(trigger)
+            && task
+                .settings
+                .as_ref()
+                .is_none_or(|settings| settings.enabled != Some(false)),
+    )
 }
 
 /// One argument as the program's C runtime reads it back (`CommandLineToArgvW` rules): quoted when it has a space,
@@ -259,6 +278,105 @@ fn quote(argument: &str) -> String {
     out
 }
 
+/// A task as Task Scheduler reads it (`/Create /XML`); written by `quick-xml`.
+#[derive(Serialize)]
+#[serde(rename = "Task", rename_all = "PascalCase")]
+struct Task<'a> {
+    #[serde(rename = "@version")]
+    version: &'a str,
+    #[serde(rename = "@xmlns")]
+    xmlns: &'a str,
+    registration_info: RegistrationInfo<'a>,
+    triggers: Triggers<'a>,
+    principals: Principals<'a>,
+    settings: Settings,
+    actions: Actions<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct RegistrationInfo<'a> {
+    description: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct Triggers<'a> {
+    logon_trigger: LogonTrigger<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct LogonTrigger<'a> {
+    enabled: bool,
+    user_id: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct Principals<'a> {
+    principal: Principal<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct Principal<'a> {
+    #[serde(rename = "@id")]
+    id: &'a str,
+    user_id: &'a str,
+    logon_type: &'a str,
+    run_level: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct Settings {
+    multiple_instances_policy: &'static str,
+    disallow_start_if_on_batteries: bool,
+    stop_if_going_on_batteries: bool,
+    allow_hard_terminate: bool,
+    start_when_available: bool,
+    run_only_if_network_available: bool,
+    idle_settings: IdleSettings,
+    allow_start_on_demand: bool,
+    enabled: bool,
+    hidden: bool,
+    run_only_if_idle: bool,
+    wake_to_run: bool,
+    execution_time_limit: &'static str,
+    priority: u8,
+    restart_on_failure: RestartOnFailure,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct IdleSettings {
+    stop_on_idle_end: bool,
+    restart_on_idle: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct RestartOnFailure {
+    interval: &'static str,
+    count: u16,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct Actions<'a> {
+    #[serde(rename = "@Context")]
+    context: &'a str,
+    exec: Exec<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct Exec<'a> {
+    command: &'a str,
+    arguments: String,
+}
+
 /// The task: at this user's logon (`login`: its trigger enabled), as this user with their interactive token and
 /// least privilege, one instance at a time, no time limit, not stopped on battery, restarted once a minute after a
 /// failure; its action runs the job's runner on the job's definition. Task Scheduler expands `%NAME%` in an action,
@@ -271,66 +389,68 @@ fn task_xml(job: &Stored, user: &str, login: bool) -> Result<String, String> {
     if job.runner.iter().any(|word| word.contains('%')) {
         return Err("a runner word contains %, which Task Scheduler would expand".into());
     }
-    let arguments = runner_args
-        .iter()
-        .map(|word| quote(word))
-        .collect::<Vec<_>>()
-        .join(" ");
-    Ok(format!(
-        r#"<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Description>{description}</Description>
-  </RegistrationInfo>
-  <Triggers>
-    <LogonTrigger>
-      <Enabled>{login}</Enabled>
-      <UserId>{user}</UserId>
-    </LogonTrigger>
-  </Triggers>
-  <Principals>
-    <Principal id="Author">
-      <UserId>{user}</UserId>
-      <LogonType>InteractiveToken</LogonType>
-      <RunLevel>LeastPrivilege</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>false</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <IdleSettings>
-      <StopOnIdleEnd>false</StopOnIdleEnd>
-      <RestartOnIdle>false</RestartOnIdle>
-    </IdleSettings>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
-    <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
-    <RestartOnFailure>
-      <Interval>PT1M</Interval>
-      <Count>999</Count>
-    </RestartOnFailure>
-  </Settings>
-  <Actions Context="Author">
-    <Exec>
-      <Command>{command}</Command>
-      <Arguments>{arguments}</Arguments>
-    </Exec>
-  </Actions>
-</Task>
-"#,
-        description = xml(&job.description),
-        user = xml(user),
-        command = xml(command),
-        arguments = xml(&arguments),
-    ))
+    let task = Task {
+        version: "1.2",
+        xmlns: "http://schemas.microsoft.com/windows/2004/02/mit/task",
+        registration_info: RegistrationInfo {
+            description: &job.description,
+        },
+        triggers: Triggers {
+            logon_trigger: LogonTrigger {
+                enabled: login,
+                user_id: user,
+            },
+        },
+        principals: Principals {
+            principal: Principal {
+                id: "Author",
+                user_id: user,
+                logon_type: "InteractiveToken",
+                run_level: "LeastPrivilege",
+            },
+        },
+        settings: Settings {
+            multiple_instances_policy: "IgnoreNew",
+            disallow_start_if_on_batteries: false,
+            stop_if_going_on_batteries: false,
+            allow_hard_terminate: true,
+            start_when_available: false,
+            run_only_if_network_available: false,
+            idle_settings: IdleSettings {
+                stop_on_idle_end: false,
+                restart_on_idle: false,
+            },
+            allow_start_on_demand: true,
+            enabled: true,
+            hidden: false,
+            run_only_if_idle: false,
+            wake_to_run: false,
+            execution_time_limit: "PT0S",
+            priority: 7,
+            restart_on_failure: RestartOnFailure {
+                interval: "PT1M",
+                count: 999,
+            },
+        },
+        actions: Actions {
+            context: "Author",
+            exec: Exec {
+                command,
+                arguments: runner_args
+                    .iter()
+                    .map(|word| quote(word))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            },
+        },
+    };
+    let mut text = String::from("<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n");
+    let mut serializer = quick_xml::se::Serializer::new(&mut text);
+    serializer.indent(' ', 2);
+    task.serialize(serializer)
+        .map_err(|error| error.to_string())?;
+    text.push('\n');
+    Ok(text)
 }
 
 /// UTF-16 little-endian with its byte-order mark: how Task Scheduler writes task XML, and reads it surely.
@@ -365,16 +485,29 @@ mod tests {
             "C:\\Users\\A B\\data\\service\\sidevoice-core.json",
         ]);
         let text = task_xml(&job, "alice@example.com", true).unwrap();
+        assert!(text.starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"), "{text}");
         assert!(text
             .contains("<Command>C:\\Program Files\\Sidevoice\\sidevoice-connector.exe</Command>"));
-        assert!(text.contains(
-            "<Arguments>run-job &quot;C:\\Users\\A B\\data\\service\\sidevoice-core.json&quot;</Arguments>"
-        ));
-        assert!(text.contains("<LogonTrigger>\n      <Enabled>true</Enabled>\n      <UserId>alice@example.com</UserId>"));
-        assert!(text.contains("<LogonType>InteractiveToken</LogonType>"));
-        assert!(text.contains("<RunLevel>LeastPrivilege</RunLevel>"));
-        assert!(text.contains("<RestartOnFailure>\n      <Interval>PT1M</Interval>"));
-        assert!(text.contains("<Description>Sidevoice core &amp; &lt;voice&gt;</Description>"));
+        assert!(
+            text.replace("&quot;", "\"").contains(
+                "<Arguments>run-job \"C:\\Users\\A B\\data\\service\\sidevoice-core.json\"</Arguments>"
+            ),
+            "{text}"
+        );
+        for element in [
+            "<UserId>alice@example.com</UserId>",
+            "<Principal id=\"Author\">",
+            "<LogonType>InteractiveToken</LogonType>",
+            "<RunLevel>LeastPrivilege</RunLevel>",
+            "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+            "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
+            "<Interval>PT1M</Interval>",
+            "<Count>999</Count>",
+            "<Actions Context=\"Author\">",
+            "<Description>Sidevoice core &amp; &lt;voice&gt;</Description>",
+        ] {
+            assert!(text.contains(element), "{element}: {text}");
+        }
         assert_eq!(parse_login(&text), Some(true));
         let off = task_xml(&job, "alice", false).unwrap();
         assert_eq!(parse_login(&off), Some(false));
@@ -407,7 +540,7 @@ mod tests {
     #[test]
     fn login_is_read_from_the_trigger_and_the_task() {
         let task = |trigger: &str, task: &str| {
-            format!("<?xml?>\n<Task>\n<Triggers><LogonTrigger><Enabled>{trigger}</Enabled></LogonTrigger></Triggers>\n<Settings><IdleSettings></IdleSettings><Enabled>{task}</Enabled></Settings></Task>")
+            format!("<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n<RegistrationInfo><URI>\\\\sidevoice-core-alice</URI></RegistrationInfo>\n<Triggers><LogonTrigger><Enabled>{trigger}</Enabled><UserId>alice</UserId></LogonTrigger></Triggers>\n<Settings><IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd></IdleSettings><Enabled>{task}</Enabled></Settings></Task>")
         };
         assert_eq!(parse_login(&task("true", "true")), Some(true));
         assert_eq!(parse_login(&task("false", "true")), Some(false));
@@ -421,6 +554,13 @@ mod tests {
             parse_login("<Task><Triggers/></Task>"),
             Some(false),
             "no logon trigger"
+        );
+        assert_eq!(
+            parse_login(
+                "<Task><Triggers><LogonTrigger><UserId>a</UserId></LogonTrigger></Triggers></Task>"
+            ),
+            Some(true),
+            "an Enabled left out is true"
         );
         assert_eq!(parse_login("ERROR: access denied"), None);
     }

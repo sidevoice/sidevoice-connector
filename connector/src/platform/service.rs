@@ -400,16 +400,6 @@ async fn command(program: &str, args: &[&str]) -> Output {
     }
 }
 
-/// `value` as XML text (a plist, a task).
-#[cfg_attr(target_os = "linux", allow(dead_code))]
-fn xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
 fn unsafe_definition(detail: impl Into<String>) -> Refusal {
     Refusal::Definition(detail.into())
 }

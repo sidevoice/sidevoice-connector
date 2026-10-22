@@ -4,7 +4,9 @@
 //! starts; its output goes to the job's log. Whether it starts at login is launchd's override for its label
 //! (`enable` / `disable`), which a plist's RunAtLoad obeys.
 
-use super::{command, xml, Job, JobId, JobState, Output, Places, Refusal, Restart, Service};
+use super::{command, Job, JobId, JobState, Output, Places, Refusal, Restart, Service};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use tokio::time::{sleep, Duration, Instant};
@@ -37,18 +39,9 @@ impl Service for Os {
     }
 
     fn program_of(text: &str) -> Option<Vec<String>> {
-        let start = text.find("<key>ProgramArguments</key>")?;
-        let rest = &text[start..];
-        let open = rest.find("<array>")? + "<array>".len();
-        let close = rest.find("</array>")?;
-        let block = rest.get(open..close)?;
-        Some(
-            block
-                .split("<string>")
-                .skip(1)
-                .filter_map(|part| part.split_once("</string>").map(|(word, _)| unxml(word)))
-                .collect(),
-        )
+        plist::from_bytes::<Program>(text.as_bytes())
+            .ok()
+            .map(|program| program.program_arguments)
     }
 
     // A changed plist is loaded again (launchd reads it only when it is bootstrapped); a running job is restarted
@@ -346,70 +339,62 @@ where
     Ok(())
 }
 
-fn unxml(value: &str) -> String {
-    value
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&amp;", "&")
+/// A LaunchAgent, as launchd reads it; written and read by `plist`.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct Agent {
+    label: String,
+    program_arguments: Vec<String>,
+    environment_variables: BTreeMap<String, String>,
+    run_at_load: bool,
+    keep_alive: KeepAlive,
+    throttle_interval: u64,
+    standard_out_path: PathBuf,
+    standard_error_path: PathBuf,
+}
+
+/// `KeepAlive`: always (`true`), or only after a crash or a non-zero exit.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum KeepAlive {
+    Always(bool),
+    #[serde(rename_all = "PascalCase")]
+    Unless {
+        successful_exit: bool,
+        crashed: bool,
+    },
+}
+
+/// What is read back from a plist: its program.
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct Program {
+    program_arguments: Vec<String>,
 }
 
 /// A LaunchAgent. [`Restart::OnFailure`]: back after a crash or a non-zero exit, never after exit 0 (the core);
-/// [`Restart::Always`]: back whenever it exits (the connector). At most one start every 10 s.
+/// [`Restart::Always`]: back whenever it exits (the connector). At most one start every 10 s. Output to the job's
+/// log.
 fn plist_text(job: &Job) -> String {
-    let arguments = job
-        .program
-        .iter()
-        .map(|word| format!("    <string>{}</string>", xml(word)))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let variables = job
-        .environment
-        .iter()
-        .map(|(name, value)| {
-            format!(
-                "    <key>{}</key>\n    <string>{}</string>",
-                xml(name),
-                xml(value)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let keep_alive = match job.restart {
-        Restart::OnFailure => "<dict>\n    <key>SuccessfulExit</key>\n    <false/>\n    <key>Crashed</key>\n    <true/>\n  </dict>",
-        Restart::Always => "<true/>",
+    let agent = Agent {
+        label: job.id.label.to_owned(),
+        program_arguments: job.program.clone(),
+        environment_variables: job.environment.clone(),
+        run_at_load: true,
+        keep_alive: match job.restart {
+            Restart::OnFailure => KeepAlive::Unless {
+                successful_exit: false,
+                crashed: true,
+            },
+            Restart::Always => KeepAlive::Always(true),
+        },
+        throttle_interval: 10,
+        standard_out_path: job.log.clone(),
+        standard_error_path: job.log.clone(),
     };
-    let log = xml(&job.log.to_string_lossy());
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>{label}</string>
-  <key>ProgramArguments</key>
-  <array>
-{arguments}
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-{variables}
-  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  {keep_alive}
-  <key>ThrottleInterval</key>
-  <integer>10</integer>
-  <key>StandardOutPath</key>
-  <string>{log}</string>
-  <key>StandardErrorPath</key>
-  <string>{log}</string>
-</dict>
-</plist>
-"#,
-        label = xml(job.id.label),
-    )
+    let mut text = Vec::new();
+    plist::to_writer_xml(&mut text, &agent).expect("a LaunchAgent serializes");
+    String::from_utf8(text).expect("plist writes UTF-8")
 }
 
 // launchd's own answers and steps, which cannot be phrased for every manager: its text, its overrides.
@@ -471,16 +456,32 @@ mod tests {
 
     #[test]
     fn plists_keep_the_two_restart_policies() {
-        let core = plist_text(&job(Restart::OnFailure, "dev.sidevoice.core"));
-        let connector = plist_text(&job(Restart::Always, "dev.sidevoice.connector"));
-        assert!(core.contains(
-            "<key>SuccessfulExit</key>\n    <false/>\n    <key>Crashed</key>\n    <true/>"
-        ));
-        assert!(connector.contains("<key>KeepAlive</key>\n  <true/>"));
-        assert!(core.contains("<integer>10</integer>"));
-        assert!(core.contains("<string>/d/core &amp; &lt;x&gt;</string>"));
-        assert!(core.contains("<key>HOME</key>\n    <string>/home/u</string>"));
-        assert!(core.contains("<key>StandardOutPath</key>\n  <string>/d/core.stderr.log</string>"));
+        let read = |text: String| {
+            plist::from_bytes::<plist::Dictionary>(text.as_bytes()).expect("a plist")
+        };
+        let core = read(plist_text(&job(Restart::OnFailure, "dev.sidevoice.core")));
+        let connector = read(plist_text(&job(Restart::Always, "dev.sidevoice.connector")));
+        let keep_alive = core["KeepAlive"].as_dictionary().unwrap();
+        assert_eq!(keep_alive["SuccessfulExit"].as_boolean(), Some(false));
+        assert_eq!(keep_alive["Crashed"].as_boolean(), Some(true));
+        assert_eq!(connector["KeepAlive"].as_boolean(), Some(true));
+        assert_eq!(core["Label"].as_string(), Some("dev.sidevoice.core"));
+        assert_eq!(core["RunAtLoad"].as_boolean(), Some(true));
+        assert_eq!(core["ThrottleInterval"].as_signed_integer(), Some(10));
+        let arguments = core["ProgramArguments"].as_array().unwrap();
+        assert_eq!(arguments[2].as_string(), Some("/d/core & <x>"));
+        let environment = core["EnvironmentVariables"].as_dictionary().unwrap();
+        assert_eq!(environment["HOME"].as_string(), Some("/home/u"));
+        for key in ["StandardOutPath", "StandardErrorPath"] {
+            assert_eq!(core[key].as_string(), Some("/d/core.stderr.log"));
+        }
+        let text = plist_text(&job(Restart::Always, "dev.sidevoice.connector"));
+        assert!(text.contains("&amp; &lt;x&gt;"), "{text}");
+        assert_eq!(
+            Os::program_of(&text).unwrap()[2],
+            "/d/core & <x>",
+            "escaped by plist, read back by plist"
+        );
     }
 
     #[tokio::test]
