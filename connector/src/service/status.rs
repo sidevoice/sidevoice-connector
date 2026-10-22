@@ -7,6 +7,7 @@ use super::manager::{self, Job, JobState};
 use crate::core_ready::Ready;
 use crate::messages::message;
 use crate::platform::ipc::Endpoint;
+use crate::platform::process::{Process, Processes};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -277,7 +278,7 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
         .filter(|job| job.running)
         .and_then(|job| job.pid)
     {
-        Some(pid) => crate::process::age(pid),
+        Some(pid) => Processes::age(pid),
         None => None,
     };
     let start_at_login = match &installed {

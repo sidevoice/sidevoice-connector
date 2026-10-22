@@ -1,8 +1,9 @@
 //! This process's user: who it is, whether a file is theirs, what the host is called.
 //!
-//! The host-agnostic face lives here; what differs per OS is one submodule, chosen once below. Unix: the effective
-//! uid, from `rustix`, compared with the file's owner. Windows: the user's SID, read from the process token,
-//! compared (`EqualSid`) with the owner of the file's security descriptor.
+//! The interface is the [`User`] trait; [`UserId`] is the one OS implementation compiled in, chosen below. Unix:
+//! the effective uid, from `rustix`, compared with the file's owner. Windows: the user's SID, read from the process
+//! token, compared (`EqualSid`) with the owner of the file's security descriptor. Callers import both:
+//! `use crate::platform::user::{User, UserId};` then `UserId::current().owns_path(..)`, `UserId::name()`.
 
 #[cfg(unix)]
 #[path = "user/unix.rs"]
@@ -11,77 +12,35 @@ mod imp;
 #[path = "user/windows.rs"]
 mod imp;
 
+pub use imp::Id as UserId;
+
 use std::fs::File;
 use std::io;
 use std::path::Path;
 
-// The whole interface is here, documented once; `imp` only implements it per OS, so a side that does not provide
-// an operation does not compile.
-
-/// The user this process runs as. Opaque: callers ask it questions and never see what it is made of.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(unix, derive(Copy))]
-pub struct UserId(imp::Id);
-
-/// The user this process runs as (Unix: the effective uid; Windows: the SID in its token).
-pub fn current() -> UserId {
-    UserId(imp::current())
-}
-
-impl UserId {
-    #[allow(dead_code)] // its callers arrive with `platform::fs`, which replaces the `owns(&Metadata)` ones
+/// What every OS implements ([`UserId`], in `user/unix.rs` and `user/windows.rs`).
+#[allow(dead_code)] // `owns_path`/`owns_file`: their callers arrive with `platform::fs`
+pub trait User: Sized {
+    /// The user this process runs as (Unix: the effective uid; Windows: the SID in its token).
+    fn current() -> Self;
     /// Whether this user owns what `path` names. A symlink (or Windows junction) is judged itself, not what it
     /// points to.
-    pub fn owns_path(&self, path: &Path) -> io::Result<bool> {
-        self.0.owns_path(path)
-    }
-
-    #[allow(dead_code)] // as `owns_path`
+    fn owns_path(&self, path: &Path) -> io::Result<bool>;
     /// Whether this user owns the file behind an open handle.
-    pub fn owns_file(&self, file: &File) -> io::Result<bool> {
-        self.0.owns_file(file)
+    fn owns_file(&self, file: &File) -> io::Result<bool>;
+    /// The login name, for what must name the user to the system (`loginctl enable-linger`); `None` when the
+    /// system cannot tell. One body for every OS (`whoami`); an OS overrides it only if it must.
+    fn name() -> Option<String> {
+        whoami::username().ok()
     }
-
-    /// The user's SID in its string form. Windows-only: it names the user where Unix would use the uid.
-    #[cfg(windows)]
-    pub fn sid_string(&self) -> String {
-        self.0.sid_string()
+    /// The host name as the operating system reports it, trimmed; empty when it cannot be read. One body for every OS
+    /// (`gethostname`).
+    fn host_name() -> String {
+        gethostname::gethostname()
+            .to_string_lossy()
+            .trim()
+            .to_owned()
     }
-
-    /// Whether this user owns the file `metadata` describes. Unix-only: `Metadata` carries no owner on Windows, so
-    /// host-agnostic callers use [`UserId::owns_path`] or [`UserId::owns_file`].
-    #[cfg(unix)]
-    pub fn owns(&self, metadata: &std::fs::Metadata) -> bool {
-        self.0.owns(metadata)
-    }
-
-    /// The numeric uid, for the places that must put it in a Unix-shaped value: `ps`'s uid column, a `stat`
-    /// owner, launchd's `gui/<uid>` domain. Unix-only; nothing host-agnostic should need it.
-    #[cfg(unix)]
-    pub(crate) fn raw(&self) -> u32 {
-        self.0.raw()
-    }
-}
-
-/// The user the process `pid` runs as. Windows-only (Unix reads the peer's uid from the socket itself); fails
-/// when the process is gone or its token is not readable.
-#[cfg(windows)]
-pub fn of_process(pid: u32) -> io::Result<UserId> {
-    imp::of_process(pid).map(UserId)
-}
-
-/// This user's login name, for what must name the user to the system (`loginctl enable-linger`). `None` where
-/// the system has no name for it, and always on Windows, which names users by SID.
-pub fn name() -> Option<String> {
-    imp::name()
-}
-
-/// The host name as the operating system reports it, trimmed; empty when it cannot be read.
-pub fn host_name() -> String {
-    gethostname::gethostname()
-        .to_string_lossy()
-        .trim()
-        .to_owned()
 }
 
 #[cfg(test)]
@@ -92,9 +51,9 @@ mod tests {
     fn owns_what_it_creates() {
         let dir = std::env::temp_dir().join(format!("sv-platform-user-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(current().owns_path(&dir).unwrap());
+        assert!(UserId::current().owns_path(&dir).unwrap());
         let file = std::fs::File::create(dir.join("f")).unwrap();
-        assert!(current().owns_file(&file).unwrap());
+        assert!(UserId::current().owns_file(&file).unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -102,17 +61,17 @@ mod tests {
     fn owns_path_reports_a_missing_path() {
         let missing =
             std::env::temp_dir().join(format!("sv-platform-missing-{}", std::process::id()));
-        assert!(current().owns_path(&missing).is_err());
+        assert!(UserId::current().owns_path(&missing).is_err());
     }
 
     #[test]
-    fn current_is_stable() {
-        assert_eq!(current(), current());
+    fn name_is_known() {
+        assert!(UserId::name().is_some_and(|name| !name.is_empty()));
     }
 
     #[test]
     fn host_name_is_trimmed() {
-        let name = host_name();
+        let name = UserId::host_name();
         assert_eq!(name, name.trim());
     }
 }

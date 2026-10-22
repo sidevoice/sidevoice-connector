@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::{private_dir, until, Profile, CONNECTOR};
+use super::{alive, private_dir, until, Profile, CONNECTOR};
 
 /// `R`.
 pub fn releases(profile: &Profile) -> PathBuf {
@@ -97,10 +97,6 @@ pub fn wait_state(
         })
     }));
     found.unwrap_or_else(|_| panic!("timed out: {what}; last status {last}"))
-}
-
-pub fn alive(pid: u64) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
 pub fn wait_gone(pid: u64, what: &str) {

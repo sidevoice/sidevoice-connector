@@ -262,9 +262,7 @@ impl Process {
         if self.0.try_wait().ok().flatten().is_some() {
             return;
         }
-        unsafe {
-            libc::kill(self.0.id() as i32, libc::SIGTERM);
-        }
+        terminate(self.0.id().into());
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if self.0.try_wait().ok().flatten().is_some() {
@@ -740,4 +738,36 @@ impl Drop for Presentation {
             let _ = thread.join();
         }
     }
+}
+
+// Other processes, by pid, through `sysinfo` (an integration test cannot reach `platform::process`): the one place
+// the tests look at or stop a process they did not spawn.
+
+/// What `pid` names now, `None` when there is no such process.
+fn with_process<T>(pid: u64, act: impl FnOnce(&sysinfo::Process) -> T) -> Option<T> {
+    let pid = sysinfo::Pid::from_u32(pid as u32);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    system.process(pid).map(act)
+}
+
+/// Whether there is a process `pid` (a zombie included, as a signal 0 would tell).
+pub fn alive(pid: u64) -> bool {
+    with_process(pid, |_| ()).is_some()
+}
+
+/// Stops `pid` at once (`SIGKILL`, `TerminateProcess`). Whether it was stopped.
+pub fn kill(pid: u64) -> bool {
+    with_process(pid, sysinfo::Process::kill).unwrap_or(false)
+}
+
+/// Asks `pid` to leave: `SIGTERM` where the OS has it; where it does not (Windows), it is stopped at once. Whether
+/// the request was sent.
+pub fn terminate(pid: u64) -> bool {
+    with_process(pid, |process| {
+        process
+            .kill_with(sysinfo::Signal::Term)
+            .unwrap_or_else(|| process.kill())
+    })
+    .unwrap_or(false)
 }

@@ -17,6 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
+use crate::platform::process::{Process, Processes};
 use crate::setup::Profile;
 
 /// The call events kept for the page.
@@ -77,14 +78,13 @@ impl Call {
     /// The installation's connector, detached, as an MCP server starts it on demand; it starts the core.
     async fn start_connector(&self) -> Result<()> {
         let mut command: tokio::process::Command = self.profile.command(&self.command[0]).into();
-        let mut child = command
+        command
             .args(&self.command[1..])
             .arg("connector")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .process_group(0)
-            .spawn()?;
+            .stderr(std::process::Stdio::null());
+        let mut child = Processes::spawn_detached(command).await?;
         tokio::spawn(async move { child.wait().await });
         for _ in 0..600 {
             if self.core_answers().await {

@@ -13,9 +13,7 @@ use std::path::Path;
 use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE};
-use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT,
-};
+use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
 use windows_sys::Win32::Security::{
     EqualSid, GetLengthSid, GetTokenInformation, TokenOwner, TokenUser, OWNER_SECURITY_INFORMATION,
     PSID, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER,
@@ -23,12 +21,10 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL,
 };
-use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
-};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// An owned SID. A SID is a DWORD-aligned structure: the words keep that alignment.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Sid {
     words: Vec<u32>,
 }
@@ -55,28 +51,24 @@ impl Sid {
     }
 }
 
-impl PartialEq for Sid {
-    fn eq(&self, other: &Self) -> bool {
-        self.is(other.as_psid())
-    }
-}
-
-impl Eq for Sid {}
-
-/// Windows side of [`super::UserId`]: the user as owned SIDs.
+/// The user as owned SIDs.
 ///
 /// Two SIDs, because Windows gives a file two candidate owners: the user, and the token's default owner, which is
 /// what files this process creates get. For a normal token they are the same; for an elevated administrator the
-/// default owner is the Administrators group, and what it creates is its own. Identity (`==`) is the user alone.
-#[derive(Clone, Debug)]
-pub(super) struct Id {
+/// default owner is the Administrators group, and what it creates is its own.
+#[derive(Debug)]
+pub struct Id {
     user: Sid,
     default_owner: Sid,
 }
 
-impl Id {
+impl super::User for Id {
+    fn current() -> Id {
+        read_token().expect("the process token is readable")
+    }
+
     // A symlink or junction is judged itself (`OPEN_REPARSE_POINT`).
-    pub(super) fn owns_path(&self, path: &Path) -> io::Result<bool> {
+    fn owns_path(&self, path: &Path) -> io::Result<bool> {
         // `BACKUP_SEMANTICS` lets a directory be opened; `READ_CONTROL` is all the owner query needs.
         let file = OpenOptions::new()
             .access_mode(READ_CONTROL)
@@ -85,7 +77,7 @@ impl Id {
         self.owns_file(&file)
     }
 
-    pub(super) fn owns_file(&self, file: &File) -> io::Result<bool> {
+    fn owns_file(&self, file: &File) -> io::Result<bool> {
         let mut owner: PSID = null_mut();
         let mut descriptor = null_mut();
         // SAFETY: the handle is open for the call's duration; on success `owner` points inside `descriptor`, which
@@ -111,54 +103,10 @@ impl Id {
     }
 }
 
-impl PartialEq for Id {
-    fn eq(&self, other: &Self) -> bool {
-        self.user == other.user
-    }
-}
-
-impl Eq for Id {}
-
-/// The user of this process: the SIDs in its token.
-pub(super) fn current() -> Id {
-    // SAFETY: the pseudo-handle of the current process is always valid and needs no closing.
-    read_token(unsafe { GetCurrentProcess() }).expect("the process token is readable")
-}
-
-/// The user of the process `pid`. Fails when the process is gone or its token cannot be opened.
-pub(super) fn of_process(pid: u32) -> io::Result<Id> {
-    // SAFETY: the handle is closed below, after the token has been read.
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if process.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    let id = read_token(process);
-    unsafe { CloseHandle(process) };
-    id
-}
-
-impl Id {
-    /// The user's SID in its string form (`S-1-5-21-...`), for what names the user in text.
-    pub(super) fn sid_string(&self) -> String {
-        let mut text: *mut u16 = null_mut();
-        // SAFETY: the SID is a copy of a valid one; on success `text` is a NUL-terminated string released below.
-        unsafe {
-            assert!(ConvertSidToStringSidW(self.user.as_psid(), &mut text) != 0);
-            let mut len = 0;
-            while *text.add(len) != 0 {
-                len += 1;
-            }
-            let string = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
-            LocalFree(text as *mut _);
-            string
-        }
-    }
-}
-
-fn read_token(process: HANDLE) -> io::Result<Id> {
+fn read_token() -> io::Result<Id> {
     let mut token: HANDLE = null_mut();
-    // SAFETY: the caller's process handle is valid for the call; the token is closed below.
-    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+    // SAFETY: the pseudo-handle of the current process needs no closing; the token is closed below.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
     }
     let sids =
@@ -196,49 +144,4 @@ fn token_sid(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<Sid> {
     }
     // SAFETY: success filled the buffer with a TOKEN_USER / TOKEN_OWNER (same layout) whose SID points inside it.
     Ok(unsafe { Sid::copy_of((*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid) })
-}
-
-/// Windows names the user to the system by SID; there is no login name any caller needs.
-pub(super) fn name() -> Option<String> {
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn this_process_is_this_user_and_its_sid_has_the_string_form() {
-        let me = current();
-        assert_eq!(of_process(std::process::id()).unwrap(), me);
-        assert!(me.sid_string().starts_with("S-1-"));
-    }
-
-    #[test]
-    fn current_is_a_valid_sid() {
-        let me = current();
-        // SAFETY: the SID is one this module copied from a valid one.
-        let len = unsafe { GetLengthSid(me.user.as_psid()) };
-        assert!(len >= 8, "a SID is at least 8 bytes, got {len}");
-        assert_eq!(me, me.clone());
-    }
-
-    #[test]
-    fn does_not_own_what_another_sid_owns() {
-        // Local System, S-1-5-18: revision 1, one sub-authority, NT authority, 18. Neither a user nor an
-        // administrator's default owner, so nothing a test creates is its.
-        let system = Sid {
-            words: vec![0x0000_0101, 0x0500_0000, 0x0000_0012],
-        };
-        let stranger = Id {
-            user: system.clone(),
-            default_owner: system,
-        };
-        assert_ne!(current(), stranger);
-        let dir =
-            std::env::temp_dir().join(format!("sv-platform-user-win-other-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(!stranger.owns_path(&dir).unwrap());
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
 }
