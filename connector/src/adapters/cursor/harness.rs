@@ -603,7 +603,7 @@ pub(super) mod client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secure_fs::tests::Scratch;
+    use crate::platform::fs::tests::Scratch;
     use std::collections::{HashMap, VecDeque};
     use std::fs;
     use std::sync::atomic::{AtomicBool, AtomicU64};

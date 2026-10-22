@@ -6,8 +6,8 @@ use super::Daemon;
 use crate::adapters::{prepare_pull_page, PULL_POSITION_FIELD};
 use crate::adapters::{Conversation, Harness, Registry, Route};
 use crate::link::Link;
+use crate::platform::fs::tests::Scratch;
 use crate::profile::Profile;
-use crate::secure_fs::tests::Scratch;
 use anyhow::Result;
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
@@ -152,7 +152,7 @@ fn t16_complete_pull_pages_fit_ipc_and_keep_the_next_position() {
             serde_json::to_vec(&json!({"id":u64::MAX,"ok":true,"result":page.clone()}))
                 .unwrap()
                 .len()
-                < crate::IPC_FRAME_LIMIT
+                < crate::frame::IPC_FRAME_LIMIT
         );
         for message in messages {
             assert!(message["envelope"]

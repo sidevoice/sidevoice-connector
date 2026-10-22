@@ -42,17 +42,18 @@
 
 use crate::agents::HostAgents;
 use crate::messages::Keyed;
+use crate::platform::fs::{Create, Files, Fs};
 use crate::profile::Profile;
-use crate::secure_fs::{atomic_json, digest_file, ensure_private_dir};
+use crate::records::{atomic_json, digest_file};
 use crate::service::layout::Layout;
 use crate::service::manager::Kind;
 use crate::service::{launcher, status};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::time::{sleep, timeout, Duration, Instant};
@@ -158,7 +159,7 @@ fn point_current(layout: &Layout, id: &str) -> Result<()> {
 
 /// `D/install.json`: the installation's command and where its releases are.
 fn record(layout: &Layout) -> Result<()> {
-    ensure_private_dir(&layout.data)?;
+    Files::ensure_private_dir(&layout.data)?;
     atomic_json(
         &layout.install_file(),
         &json!({"command": [stable_command(layout)], "releases": layout.releases}),
@@ -264,12 +265,7 @@ fn release_id(layout: &Layout, package: &Package, digest: &str) -> Result<(Strin
 /// Copies `from` to `to` (created, 0700) and syncs it.
 fn copy_executable(from: &Path, to: &Path) -> Result<()> {
     let mut source = File::open(from).with_context(|| format!("open {}", from.display()))?;
-    let mut target = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o700)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(to)
+    let mut target = Files::open_private(to, Create::NewProgram)
         .with_context(|| format!("create {}", to.display()))?;
     io::copy(&mut source, &mut target)?;
     target.sync_all()?;
@@ -309,16 +305,15 @@ async fn check_binary(binary: &Path, version: &str) -> Result<()> {
 /// or not at all.
 async fn stage(layout: &Layout, package: &Package, id: &str, digest: &str) -> Result<()> {
     let releases = releases_dir(layout);
-    ensure_private_dir(&releases)?;
+    Files::ensure_private_dir(&releases)?;
     let partial = releases.join(format!(".{id}.partial-{}", uuid::Uuid::new_v4().simple()));
-    fs::DirBuilder::new().mode(0o700).create(&partial)?;
+    Files::create_private_dir(&partial)?;
     let result = async {
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(partial.join("bin"))?;
+        Files::create_private_dir(&partial.join("bin"))?;
         let binary = partial.join(BINARY);
         copy_executable(&package.binary, &binary)?;
-        crate::secure_fs::safe_executable(&binary)?;
+        Files::check_private_file(&binary)?;
+        which::which(&binary).context("the staged connector cannot be run")?;
         if digest_file(&binary)? != digest {
             return Err(failed("the connector changed while it was being copied"));
         }
@@ -564,7 +559,7 @@ pub async fn install(
 ) -> Result<Value> {
     let layout = Layout::from_profile(profile);
     let lock = crate::service::install_lock(&layout).await?;
-    ensure_private_dir(&layout.releases)?;
+    Files::ensure_private_dir(&layout.releases)?;
     remove_leftovers(&layout);
     let previous = current_release(&layout);
     let digest = digest_file(&package.binary)?;
@@ -1018,7 +1013,7 @@ async fn uninstall_with_hooks(
     let had_releases = preflight(&guard).map_err(failed)?;
     let data = guard.data_for_lock().map_err(failed)?;
     guard.preflight().map_err(failed)?;
-    let _lock = crate::lock::wait_uninstall_lock_at(&data, Duration::from_secs(30))
+    let _lock = crate::lock::wait_uninstall_lock_at(data.as_raw_fd(), Duration::from_secs(30))
         .await
         .map_err(failed)?
         .ok_or_else(|| failed("another install or service command holds install.lock"))?;
@@ -1029,9 +1024,10 @@ async fn uninstall_with_hooks(
     } else {
         json!({})
     };
-    let _agents_lock = crate::lock::wait_uninstall_agents_lock_at(&data, Duration::from_secs(30))
-        .await?
-        .ok_or_else(|| failed("another agents request holds agents.lock"))?;
+    let _agents_lock =
+        crate::lock::wait_uninstall_agents_lock_at(data.as_raw_fd(), Duration::from_secs(30))
+            .await?
+            .ok_or_else(|| failed("another agents request holds agents.lock"))?;
     guard.stage_recovery(&layout).map_err(failed)?;
     let removed = guard
         .remove_data_contents_with_hook(&before_claim)
@@ -1096,7 +1092,7 @@ pub fn human_uninstall(answer: &Value) -> String {
 pub(crate) mod tests {
     use super::*;
     use crate::core_package::tests::{core_archive, core_files};
-    use crate::secure_fs::tests::Scratch;
+    use crate::platform::fs::tests::Scratch;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
     use std::os::unix::fs::PermissionsExt;
@@ -1104,7 +1100,7 @@ pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
-    pub(crate) struct Fake {
+    pub struct Fake {
         /// The releases whose pair does not answer.
         pub failing: BTreeSet<String>,
         /// The release `current` named at each restart.
@@ -1141,16 +1137,8 @@ pub(crate) mod tests {
                 &homes,
             )
             .unwrap();
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(profile.data.join("core"))
-                .unwrap();
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&profile.xdg_data)
-                .unwrap();
+            Files::create_private_dir_all(&profile.data.join("core")).unwrap();
+            Files::create_private_dir_all(&profile.xdg_data).unwrap();
             Self {
                 scratch,
                 profile,
@@ -1308,7 +1296,7 @@ pub(crate) mod tests {
         );
 
         // Uninstall: the releases and the data go; the locks and the stop stay.
-        crate::secure_fs::atomic_json(&layout.data.join("outbox.json"), &json!([])).unwrap();
+        crate::records::atomic_json(&layout.data.join("outbox.json"), &json!([])).unwrap();
         crate::lock::try_lock(&layout.data.join("agents.lock"), "test").unwrap();
         let removed = uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
             .await

@@ -24,6 +24,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use sidevoice_connector::platform::process::{Process as _, Processes};
 
 pub const CONNECTOR: &str = env!("CARGO_BIN_EXE_sidevoice-connector");
 
@@ -261,15 +262,9 @@ impl Process {
         if self.0.try_wait().ok().flatten().is_some() {
             return;
         }
-        unsafe {
-            libc::kill(self.0.id() as i32, libc::SIGTERM);
-        }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if self.0.try_wait().ok().flatten().is_some() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
+        stop(self.0.id(), Duration::from_secs(10));
+        if self.0.try_wait().ok().flatten().is_some() {
+            return;
         }
         let _ = self.0.kill();
         let _ = self.0.wait();
@@ -739,4 +734,26 @@ impl Drop for Presentation {
             let _ = thread.join();
         }
     }
+}
+
+// Other processes, by pid, through the connector's own `platform::process`: the one place the tests look at or stop a
+// process they did not spawn.
+
+/// Whether there is a live process `pid` (a zombie is gone).
+pub fn alive(pid: u64) -> bool {
+    u32::try_from(pid).is_ok_and(|pid| Processes::identity(pid).is_some())
+}
+
+/// Stops `pid` at once (`SIGKILL`, `TerminateProcess`). Whether it was stopped.
+pub fn kill(pid: u64) -> bool {
+    u32::try_from(pid).is_ok_and(|pid| Processes::kill(pid, |_| true))
+}
+
+/// Asks `pid` to leave (`SIGTERM` where the OS has it) and waits up to `grace` for it to go, then stops it at once.
+pub fn stop(pid: u32, grace: Duration) {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+        .block_on(Processes::stop(pid, |_| true, grace));
 }

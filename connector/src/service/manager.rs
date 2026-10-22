@@ -969,7 +969,7 @@ pub async fn linger() -> serde_json::Value {
     let user = std::env::var("USER")
         .ok()
         .filter(|user| !user.is_empty())
-        .or_else(crate::platform::user::name)
+        .or_else(<crate::platform::user::UserId as crate::platform::user::User>::name)
         .unwrap_or_default();
     let shown = manage("loginctl", &["show-user", &user, "-p", "Linger"]).await;
     let enabled = shown.output.lines().any(|line| line.trim() == "Linger=yes");

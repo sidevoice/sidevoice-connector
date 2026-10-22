@@ -1,11 +1,12 @@
 //! Uninstall only the installer's two owned roots, using no-follow directory handles.
 
+use crate::platform::user::{User, UserId};
 use crate::service::layout::Layout;
 use serde_json::{json, Value};
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -72,6 +73,17 @@ struct Mount {
     id: u64,
     #[cfg(target_os = "macos")]
     mounted_at: Vec<u8>,
+}
+
+/// Whether this user owns what `fd` is (`platform::user`).
+fn ours(fd: RawFd) -> Result<bool, &'static str> {
+    // SAFETY: the callers hold `fd` open for the call.
+    let owned = unsafe { BorrowedFd::borrow_raw(fd) }
+        .try_clone_to_owned()
+        .map_err(|_| "cannot read uninstall owner")?;
+    UserId::current()
+        .owns_file(&File::from(owned))
+        .map_err(|_| "cannot read uninstall owner")
 }
 
 fn stat_fd(fd: RawFd) -> Result<libc::stat, &'static str> {
@@ -260,7 +272,7 @@ impl Guard {
         self.check_mount(data.as_raw_fd())?;
         self.verify_dir(Path::new(".sidevoice"), data.as_raw_fd())?;
         let stat = stat_fd(data.as_raw_fd())?;
-        if stat.st_uid != crate::platform::user::current().raw() || stat.st_mode & 0o077 != 0 {
+        if !ours(data.as_raw_fd())? || stat.st_mode & 0o077 != 0 {
             return Err("unsafe uninstall data root");
         }
         Ok(data)
@@ -308,7 +320,7 @@ impl Guard {
         let child = open_dir(parent, OsStr::new(child))?;
         self.check_mount(child.as_raw_fd())?;
         let stat = stat_fd(child.as_raw_fd())?;
-        if stat.st_uid != crate::platform::user::current().raw() || stat.st_mode & 0o777 != 0o700 {
+        if !ours(child.as_raw_fd())? || stat.st_mode & 0o777 != 0o700 {
             return Err("unsafe uninstall claim directory");
         }
         Ok(child)
@@ -349,7 +361,7 @@ impl Guard {
             let file = unsafe { File::from_raw_fd(fd) };
             let stat = stat_fd(file.as_raw_fd())?;
             if stat.st_mode & libc::S_IFMT != libc::S_IFREG
-                || stat.st_uid != crate::platform::user::current().raw()
+                || !ours(file.as_raw_fd())?
                 || stat.st_nlink != 1
                 || stat.st_mode & 0o022 != 0
                 || stat.st_mode & 0o100 == 0
@@ -842,7 +854,7 @@ mod tests {
 
     #[test]
     fn only_exact_owned_roots_can_be_uninstalled() {
-        let scratch = crate::secure_fs::tests::Scratch::new("uninstall-scope");
+        let scratch = crate::platform::fs::tests::Scratch::new("uninstall-scope");
         let home = scratch.0.join("home");
         fs::create_dir(&home).unwrap();
         let mut layout = layout(&home);
@@ -871,7 +883,7 @@ mod tests {
 
     #[test]
     fn links_inside_owned_roots_never_delete_their_targets() {
-        let scratch = crate::secure_fs::tests::Scratch::new("uninstall-links");
+        let scratch = crate::platform::fs::tests::Scratch::new("uninstall-links");
         let home = scratch.0.join("home");
         let outside = scratch.0.join("outside");
         let layout = layout(&home);
@@ -900,7 +912,7 @@ mod tests {
 
     #[test]
     fn injected_mount_boundary_refuses_before_deleting() {
-        let scratch = crate::secure_fs::tests::Scratch::new("uninstall-mount");
+        let scratch = crate::platform::fs::tests::Scratch::new("uninstall-mount");
         let layout = layout(&scratch.0.join("home"));
         let nested = layout.data.join("mounted");
         fs::create_dir_all(&nested).unwrap();
@@ -922,7 +934,7 @@ mod tests {
 
     #[test]
     fn directory_replaced_by_link_during_removal_is_refused() {
-        let scratch = crate::secure_fs::tests::Scratch::new("uninstall-race");
+        let scratch = crate::platform::fs::tests::Scratch::new("uninstall-race");
         let layout = layout(&scratch.0.join("home"));
         let victim = layout.data.join("victim");
         let moved = layout.data.join("moved");
@@ -949,7 +961,7 @@ mod tests {
 
     #[test]
     fn moved_directory_at_final_claim_boundary_keeps_its_sentinel() {
-        let scratch = crate::secure_fs::tests::Scratch::new("uninstall-claim-race");
+        let scratch = crate::platform::fs::tests::Scratch::new("uninstall-claim-race");
         let layout = layout(&scratch.0.join("home"));
         let victim = layout.data.join("victim");
         let moved = scratch.0.join("moved-outside");
@@ -972,7 +984,7 @@ mod tests {
 
     #[test]
     fn home_replaced_after_opening_is_refused() {
-        let scratch = crate::secure_fs::tests::Scratch::new("uninstall-home-race");
+        let scratch = crate::platform::fs::tests::Scratch::new("uninstall-home-race");
         let home = scratch.0.join("home");
         let moved = scratch.0.join("moved-home");
         let layout = layout(&home);

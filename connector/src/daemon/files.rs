@@ -1,11 +1,10 @@
 //! The daemon's own files: the conversation state, its guard, and the outbox.
 
-use crate::secure_fs::private_file;
+use crate::platform::fs::{Create, Files, Fs};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 pub(super) const CONVERSATION_STATE_MAX_BYTES: usize = 1 << 20;
@@ -16,9 +15,9 @@ pub(super) const GUARD_BLOCK_RESUME: u8 = 1;
 pub(super) fn prepare_conversation_guard(path: &Path) -> Result<(u8, fs::File)> {
     match fs::symlink_metadata(path) {
         Ok(_) => {
-            private_file(path)?;
+            Files::check_private_file(path)?;
             let metadata = fs::metadata(path)?;
-            if metadata.len() != 16 || metadata.mode() & 0o200 == 0 {
+            if metadata.len() != 16 || metadata.permissions().readonly() {
                 bail!("invalid conversation state guard");
             }
             let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
@@ -33,11 +32,7 @@ pub(super) fn prepare_conversation_guard(path: &Path) -> Result<(u8, fs::File)> 
             Ok((bytes[8], file))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)?;
+            let mut file = Files::open_private(path, Create::New)?;
             let mut bytes = [0; 16];
             bytes[..8].copy_from_slice(CONVERSATION_GUARD_MAGIC);
             file.write_all(&bytes)?;
@@ -63,7 +58,7 @@ pub(super) fn read_outbox(path: &Path) -> Result<Vec<Value>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    private_file(path)?;
+    Files::check_private_file(path)?;
     let bytes = fs::read(path)?;
     if bytes.len() > 8 << 20 {
         bail!("outbox too large");
@@ -90,7 +85,7 @@ pub(super) fn read_conversation_state(path: &Path) -> Result<Option<Vec<u8>>> {
     if !path.exists() {
         return Ok(None);
     }
-    private_file(path)?;
+    Files::check_private_file(path)?;
     if fs::metadata(path)?.len() > CONVERSATION_STATE_MAX_BYTES as u64 {
         bail!("conversation state too large");
     }

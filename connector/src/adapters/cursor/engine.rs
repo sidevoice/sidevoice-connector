@@ -169,7 +169,7 @@ pub(super) async fn editor_engine_in(chat_id: &str, instances: &[BridgeInstance]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secure_fs::tests::Scratch;
+    use crate::platform::fs::tests::Scratch;
 
     fn database(path: &Path, sql: &str) {
         state_db::fixture(path, sql);

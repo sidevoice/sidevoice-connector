@@ -2,7 +2,7 @@
 //! layout.
 //!
 //! - `D`, the data directory: `$SIDEVOICE_DATA_DIR`, else `~/.sidevoice`. Private (0700). The connector is the
-//!   one writer of its records there, each written whole (`secure_fs.rs`); `D/core/` is the core's.
+//!   one writer of its records there, each written whole (`platform/fs`); `D/core/` is the core's.
 //!   `connector.sock`, `connector.lock`, `connector.log`, `agents.json`, `agents.lock`, `install.lock`,
 //!   `node-stopped.json` (a person's stop), `outbox.json`, `core/core.json`
 //!   and `core/local.sock`.
@@ -15,7 +15,7 @@
 //! Every path is absolute. The directories are checked again at each operation boundary, not trusted from startup:
 //! they are passed to agents' command lines and written into.
 
-use crate::secure_fs::{private_dir, private_file, validate_user_directory};
+use crate::platform::fs::{Files, Fs};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -224,7 +224,7 @@ impl Profile {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error.into()),
             Ok(_) => {
-                private_file(&marker)?;
+                Files::check_private_file(&marker)?;
                 Ok(true)
             }
         }
@@ -236,7 +236,7 @@ impl Profile {
     pub fn validate_existing_private(&self) -> Result<()> {
         for dir in [&self.data, &self.data.join("core")] {
             match fs::symlink_metadata(dir) {
-                Ok(_) => private_dir(dir)?,
+                Ok(_) => Files::check_private_dir(dir)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
@@ -260,7 +260,7 @@ impl Profile {
         for path in paths {
             match fs::symlink_metadata(path) {
                 Ok(_) => {
-                    validate_user_directory(path)?;
+                    Files::check_user_directory(path)?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
@@ -280,7 +280,7 @@ impl Profile {
         {
             bail!("unknown agent configuration directory");
         }
-        validate_user_directory(config_root)?;
+        Files::check_user_directory(config_root)?;
         Ok(())
     }
 
@@ -295,7 +295,7 @@ impl Profile {
         let path = self.data.join("connector.lock");
         crate::lock::try_lock(&path, "connector")?.with_context(|| {
             let pid = crate::lock::holder(&path)
-                .map(|record| record.pid)
+                .and_then(|record| record["pid"].as_u64())
                 .map_or_else(String::new, |pid| format!(" (pid {pid})"));
             format!("another Sidevoice connector{pid} already serves this data directory")
         })
@@ -304,7 +304,6 @@ impl Profile {
     /// A profile entirely inside `root`, with every directory made private: what unit tests run in.
     #[cfg(test)]
     pub fn for_test(root: &Path, homes: &[AgentHome]) -> Self {
-        use std::os::unix::fs::DirBuilderExt;
         let mut children = vec![
             "home".to_owned(),
             "xdg/config".into(),
@@ -317,11 +316,7 @@ impl Profile {
                 .map(|home| format!("agents/{}", home.var.to_ascii_lowercase())),
         );
         for child in &children {
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(root.join(child))
-                .unwrap();
+            Files::create_private_dir_all(&root.join(child)).unwrap();
         }
         let root = root.canonicalize().unwrap();
         let path = |child: &str| -> OsString { root.join(child).into_os_string() };
@@ -353,7 +348,7 @@ impl Profile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secure_fs::tests::Scratch;
+    use crate::platform::fs::tests::Scratch;
     use std::os::unix::fs::PermissionsExt;
 
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
@@ -527,7 +522,7 @@ mod tests {
         let home = scratch.0.to_string_lossy().into_owned();
         let profile = Profile::from_vars(vars(&[("HOME", &home)]), &HOMES).unwrap();
         assert!(!profile.data.exists());
-        crate::secure_fs::ensure_private_dir(&profile.data).unwrap();
+        Files::ensure_private_dir(&profile.data).unwrap();
         let held = profile.try_connector_lock().unwrap();
         assert!(profile.try_connector_lock().is_err());
         drop(held);
@@ -540,7 +535,7 @@ mod tests {
         let profile = Profile::for_test(&scratch.0, &HOMES);
         assert!(!profile.service_stopped().unwrap());
         let marker = profile.data.join("node-stopped.json");
-        crate::secure_fs::atomic_json(&marker, &json!({"at":"now"})).unwrap();
+        crate::records::atomic_json(&marker, &json!({"at":"now"})).unwrap();
         assert!(profile.service_stopped().unwrap());
         fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(profile.service_stopped().is_err());

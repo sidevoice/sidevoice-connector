@@ -21,13 +21,13 @@
 //! libraries.
 
 use crate::messages::Keyed;
+use crate::platform::fs::{Create, Fs};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 /// The package's inventory, at its root.
@@ -90,10 +90,7 @@ fn lower_hex(value: &str, length: usize) -> bool {
 }
 
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+    let file = crate::platform::fs::Files::open_read(path)
         .with_context(|| format!("open {}", path.display()))?;
     if !file.metadata()?.is_file() {
         bail!("{} is not a file", path.display());
@@ -237,10 +234,7 @@ fn unpack(bytes: &[u8], into: &Path) -> Result<(Files, Vec<u8>)> {
         let relative = member(&name).ok_or_else(|| mismatch(format!("unsafe path {raw:?}")))?;
         let path = into.join(relative);
         if kind.is_dir() {
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&path)?;
+            crate::platform::fs::Files::create_private_dir_all(&path)?;
             continue;
         }
         if !kind.is_file() {
@@ -261,17 +255,12 @@ fn unpack(bytes: &[u8], into: &Path) -> Result<(Files, Vec<u8>)> {
             continue;
         }
         let parent = path.parent().context("member parent")?;
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
-        let mode = if relative == ENTRYPOINT { 0o700 } else { 0o600 };
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)?;
+        crate::platform::fs::Files::create_private_dir_all(parent)?;
+        let mut file = if relative == ENTRYPOINT {
+            crate::platform::fs::Files::open_private(&path, Create::NewProgram)?
+        } else {
+            crate::platform::fs::Files::open_private(&path, Create::New)?
+        };
         let mut hasher = Sha256::new();
         let mut block = [0u8; 65536];
         let mut length = 0u64;
@@ -355,7 +344,7 @@ pub fn stage(core: &PackagedCore, release: &Path) -> Result<PathBuf> {
     if !release.is_absolute() {
         bail!("{} is not an absolute path", release.display());
     }
-    crate::secure_fs::private_dir(release)?;
+    crate::platform::fs::Files::check_private_dir(release)?;
     let destination = release.join(crate::service::layout::CORE_DIRECTORY);
     if fs::symlink_metadata(&destination).is_ok() {
         bail!("{} already exists", destination.display());
@@ -381,11 +370,11 @@ pub fn stage(core: &PackagedCore, release: &Path) -> Result<PathBuf> {
         )));
     }
     let partial = release.join(format!(".core-{}.partial", uuid::Uuid::new_v4()));
-    fs::DirBuilder::new().mode(0o700).create(&partial)?;
+    crate::platform::fs::Files::create_private_dir(&partial)?;
     let result = (|| -> Result<()> {
         let (written, inventory) = unpack(&bytes, &partial)?;
         check_inventory(core, &inventory, &written)?;
-        crate::secure_fs::write_private(&partial.join(CORE_INVENTORY), &inventory)?;
+        crate::platform::fs::Files::write_private(&partial.join(CORE_INVENTORY), &inventory)?;
         fs::rename(&partial, &destination)?;
         fs::File::open(release)?.sync_all()?;
         Ok(())
@@ -426,10 +415,7 @@ fn staged_files(root: &Path, dir: &Path, files: &mut Files) -> Result<()> {
         if files.len() >= MAX_ENTRIES {
             return Err(mismatch("the staged core has too many files"));
         }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)?;
+        let mut file = crate::platform::fs::Files::open_read(&path)?;
         let mut hasher = Sha256::new();
         let length = std::io::copy(&mut file, &mut hasher)?;
         files.insert(relative, (length, hex::encode(hasher.finalize())));
@@ -468,7 +454,6 @@ impl Installed {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     struct Scratch(PathBuf);
 
@@ -478,7 +463,7 @@ pub(crate) mod tests {
                 "sidevoice-core-package-{label}-{}",
                 uuid::Uuid::new_v4()
             ));
-            fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            crate::platform::fs::Files::create_private_dir(&path).unwrap();
             Self(path)
         }
     }
@@ -553,7 +538,7 @@ pub(crate) mod tests {
 
     fn release(scratch: &Path) -> PathBuf {
         let release = scratch.join("release");
-        fs::DirBuilder::new().mode(0o700).create(&release).unwrap();
+        crate::platform::fs::Files::create_private_dir(&release).unwrap();
         release
     }
 
@@ -570,8 +555,8 @@ pub(crate) mod tests {
         assert_eq!(installed.path, release.join("core"));
         assert_eq!(installed.core.version, "0.2.0");
         let program = release.join(crate::service::layout::CORE_ENTRYPOINT);
-        let mode = fs::metadata(&program).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o700, "only the entrypoint is executable");
+        crate::platform::fs::Files::check_private_file(&program).unwrap();
+        assert!(which::which(&program).is_ok(), "the entrypoint can be run");
         assert!(release.join("core/native-core.json").is_file());
         let value = installed.value();
         assert_eq!(value["ok"], true);

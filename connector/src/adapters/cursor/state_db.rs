@@ -118,7 +118,7 @@ pub(super) fn fixture(database: &Path, sql: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secure_fs::tests::Scratch;
+    use crate::platform::fs::tests::Scratch;
 
     #[tokio::test]
     async fn read_only_query_does_not_create_missing_database_and_needs_no_cli() {

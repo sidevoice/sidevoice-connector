@@ -1,7 +1,8 @@
 use super::*;
 use crate::adapters::registration::{aggregate_readiness, ReadinessCheck};
-use std::fs::OpenOptions;
-use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
+use crate::platform::fs::{Create, Files, Fs};
+use fs2::FileExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
 
 #[test]
 fn login_path_frame_ignores_banners_and_rejects_empty_or_incomplete_output() {
@@ -1331,18 +1332,11 @@ exit 2
     });
     wait_for_file(&slow_scan).await;
     let lock_path = fixture.profile.data.join("agents.lock");
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(lock_path)
-        .unwrap();
-    lock.lock().unwrap();
+    let lock = Files::open_private(&lock_path, Create::ReadWrite).unwrap();
+    lock.lock_exclusive().unwrap();
     state["dismissed"]["codex"] = generation;
     atomic_json(&state_path, &state).unwrap();
-    lock.unlock().unwrap();
+    FileExt::unlock(&lock).unwrap();
     let scanned = scanning.await.unwrap();
     assert_eq!(row(&scanned, "codex")["dismissed"], true);
 
@@ -1445,9 +1439,8 @@ exit 2
     abandoned.abort();
     let _ = abandoned.await;
     tokio::time::sleep(StdDuration::from_millis(100)).await;
-    assert_eq!(
-        unsafe { libc::kill(pid, 0) },
-        -1,
+    assert!(
+        Processes::identity(pid as u32).is_none(),
         "cancelled CLI process was reaped"
     );
     assert!(!fixture

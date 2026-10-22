@@ -339,7 +339,7 @@ fn inbound_warning(profile: &Profile) -> Option<String> {
 mod tests {
     use super::*;
     use crate::adapters::registration::{CliError, CliOutput};
-    use crate::secure_fs::tests::Scratch;
+    use crate::platform::fs::tests::Scratch;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
 

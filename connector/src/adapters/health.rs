@@ -3,6 +3,7 @@
 //! after, with every process it started.
 
 use super::registration::Launch;
+use crate::platform::process::{Child, Process, Processes};
 use rmcp::model::{InitializeResult, ListToolsResult, ProtocolVersion};
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -11,7 +12,7 @@ use std::io::ErrorKind;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::time::{timeout, Instant};
 
 /// The name the check gives itself in `initialize`.
@@ -64,26 +65,14 @@ pub async fn check(
         .envs(&launch.env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        // Its own process group, so a wrapper (a shell, Node's launcher) leaves nothing behind.
-        .process_group(0);
-    let mut attempt = 0;
-    let mut child = loop {
-        match command.spawn() {
-            Ok(child) => break child,
-            // The executable is open for writing somewhere (being replaced, or just written and a sibling process
-            // forked before it was closed): a moment later it runs.
-            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempt < 5 => {
-                attempt += 1;
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(error) => return Ok(Health::NotStarting(spawn_error(&error))),
-        }
+        .stderr(Stdio::null());
+    // Its own tree, so a wrapper (a shell, Node's launcher) leaves nothing behind.
+    let mut child = match Processes::spawn_tree(command).await {
+        Ok(child) => child,
+        Err(error) => return Ok(Health::NotStarting(spawn_error(&error))),
     };
-    let group = child.id();
-    let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-        stop(&mut child, group).await;
+    let (Some(stdin), Some(stdout)) = (child.stdin(), child.stdout()) else {
+        child.kill_tree().await;
         return Ok(Health::NotStarting("could not start".into()));
     };
     let outcome = tokio::select! {
@@ -95,7 +84,7 @@ pub async fn check(
             Ok(Err(Stop::Closed)) => Health::NotStarting(closed(&mut child, deadline).await),
         }),
     };
-    stop(&mut child, group).await;
+    child.kill_tree().await;
     outcome
 }
 
@@ -150,7 +139,7 @@ async fn send(stdin: &mut ChildStdin, message: Value) -> Result<(), Stop> {
 /// The result of request `id`. What the server sends of its own (notifications, requests) is passed over.
 async fn answer(reader: &mut BufReader<ChildStdout>, id: u64) -> Result<Value, Stop> {
     loop {
-        let line = match crate::bounded_line(reader, LINE_LIMIT).await {
+        let line = match crate::frame::bounded_line(reader, LINE_LIMIT).await {
             Ok(Some(line)) => line,
             Ok(None) => return Err(Stop::Closed),
             Err(_) => return Err(Stop::Mismatch),
@@ -200,23 +189,11 @@ async fn closed(child: &mut Child, deadline: Instant) -> String {
 }
 
 fn exited(status: ExitStatus) -> String {
-    use std::os::unix::process::ExitStatusExt;
-    match (status.code(), status.signal()) {
-        (Some(code), _) => format!("exited with status {code}"),
-        (None, Some(signal)) => format!("killed by signal {signal}"),
-        (None, None) => "exited".into(),
+    match status.code() {
+        Some(code) => format!("exited with status {code}"),
+        // No exit code: ended by something else (a signal, on Unix), as std words it.
+        None => format!("ended ({status})"),
     }
-}
-
-/// Stops the server and everything it started (its process group, `group`), and reaps it.
-async fn stop(child: &mut Child, group: Option<u32>) {
-    if let Some(pid) = group {
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
-    }
-    let _ = child.start_kill();
-    let _ = timeout(Duration::from_secs(2), child.wait()).await;
 }
 
 #[cfg(test)]
