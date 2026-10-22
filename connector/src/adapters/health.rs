@@ -139,7 +139,7 @@ async fn send(stdin: &mut ChildStdin, message: Value) -> Result<(), Stop> {
 /// The result of request `id`. What the server sends of its own (notifications, requests) is passed over.
 async fn answer(reader: &mut BufReader<ChildStdout>, id: u64) -> Result<Value, Stop> {
     loop {
-        let line = match crate::bounded_line(reader, LINE_LIMIT).await {
+        let line = match crate::frame::bounded_line(reader, LINE_LIMIT).await {
             Ok(Some(line)) => line,
             Ok(None) => return Err(Stop::Closed),
             Err(_) => return Err(Stop::Mismatch),

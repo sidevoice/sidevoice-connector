@@ -152,7 +152,7 @@ fn t16_complete_pull_pages_fit_ipc_and_keep_the_next_position() {
             serde_json::to_vec(&json!({"id":u64::MAX,"ok":true,"result":page.clone()}))
                 .unwrap()
                 .len()
-                < crate::IPC_FRAME_LIMIT
+                < crate::frame::IPC_FRAME_LIMIT
         );
         for message in messages {
             assert!(message["envelope"]
