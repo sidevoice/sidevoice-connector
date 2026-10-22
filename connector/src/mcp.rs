@@ -1,4 +1,5 @@
 use crate::adapters::{self, Identity, Registry};
+use crate::frame::Connection;
 use crate::platform::ipc::Channel;
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
@@ -78,43 +79,28 @@ impl Ipc {
             return Ok(());
         }
         let stream = timeout(Duration::from_secs(2), self.profile.endpoint.connect()).await??;
-        let (read, mut write) = tokio::io::split(stream);
+        let (mut reader, mut writer) = Connection::new(stream).split();
         let (tx, mut rx) = mpsc::channel::<Value>(64);
         *self.tx.lock().await = Some(tx);
         self.generation.fetch_add(1, Ordering::Relaxed);
         let this = self.clone();
         tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
-                if write.write_all(frame.to_string().as_bytes()).await.is_err()
-                    || write.write_all(b"\n").await.is_err()
-                {
+                if writer.write(&frame).await.is_err() {
                     break;
                 }
             }
         });
         tokio::spawn(async move {
-            let mut reader = BufReader::new(read);
             loop {
-                let line =
-                    match crate::frame::bounded_line(&mut reader, crate::frame::IPC_FRAME_LIMIT)
-                        .await
-                    {
-                        Ok(Some(v)) => v,
-                        _ => break,
-                    };
-                let Ok(reply) = serde_json::from_str::<Value>(&line) else {
+                let Ok(Some(reply)) = reader.read().await else {
                     break;
                 };
                 let Some(id) = reply.get("id").and_then(Value::as_u64) else {
                     continue;
                 };
                 if let Some(waiting) = this.pending.lock().await.remove(&id) {
-                    let result = if reply.get("ok") == Some(&json!(true)) {
-                        Ok(reply.get("result").cloned().unwrap_or(Value::Null))
-                    } else {
-                        Err(crate::frame::ipc_failure(&reply, "IPC error"))
-                    };
-                    let _ = waiting.send(result);
+                    let _ = waiting.send(crate::frame::outcome(&reply, "IPC error"));
                 }
             }
             *this.tx.lock().await = None;

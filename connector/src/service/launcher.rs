@@ -21,6 +21,7 @@ use super::manager;
 use super::status::{self, read_ready, serving};
 use super::{Failure, Result};
 use crate::core_ready::Ready;
+use crate::frame::Connection;
 use crate::messages::message;
 use crate::platform::ipc::Channel;
 use crate::platform::process::{Identity, Process, Processes};
@@ -30,7 +31,6 @@ use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{sleep, timeout, Duration, Instant};
 
@@ -64,33 +64,24 @@ pub async fn request_connector(
     limit: Duration,
 ) -> std::result::Result<Value, String> {
     let endpoint = layout.connector_endpoint();
-    let ask = async {
-        let mut stream = endpoint
-            .connect()
-            .await
-            .map_err(|error| error.to_string())?;
-        let request = json!({"id": 1, "method": method, "params": params});
-        stream
-            .write_all(format!("{request}\n").as_bytes())
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut reader = BufReader::new(stream.take(64 * 1024));
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .await
-            .map_err(|error| error.to_string())?;
-        let reply: Value = serde_json::from_str(&line)
-            .map_err(|_| "the connector closed the request without an answer".to_owned())?;
-        if reply.get("ok") == Some(&json!(true)) {
-            Ok(reply.get("result").cloned().unwrap_or(Value::Null))
-        } else {
-            Err(crate::frame::ipc_failure(
-                &reply,
-                "the connector refused the request",
-            ))
-        }
-    };
+    let ask =
+        async {
+            let mut connection = Connection::new(
+                endpoint
+                    .connect()
+                    .await
+                    .map_err(|error| error.to_string())?,
+            );
+            connection
+                .write(&json!({"id": 1, "method": method, "params": params}))
+                .await
+                .map_err(|error| error.to_string())?;
+            let reply =
+                connection.read().await.ok().flatten().ok_or_else(|| {
+                    "the connector closed the request without an answer".to_owned()
+                })?;
+            crate::frame::outcome(&reply, "the connector refused the request")
+        };
     timeout(limit, ask)
         .await
         .unwrap_or_else(|_| Err(format!("no answer within {} s", limit.as_secs())))
