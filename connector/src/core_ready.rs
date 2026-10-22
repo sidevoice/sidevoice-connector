@@ -1,16 +1,15 @@
 //! What the connector reads of its core: the ready file the core writes once it serves (`D/core/core.json`) and
-//! its health on the private socket, which must name the same launch and process.
+//! its health on its local endpoint, which must name the same launch and process.
 
 use crate::platform::fs::{Files, Fs};
+use crate::platform::ipc::{Channel, Channels, Endpoint};
 use crate::profile::Profile;
-use crate::secure_fs::verify_socket;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 use tokio::time::{timeout, Duration};
 
 /// `core.json` as the core writes it. A core of another version may add fields: they are ignored, never refused.
@@ -18,15 +17,28 @@ use tokio::time::{timeout, Duration};
 pub struct Ready {
     pub pid: u32,
     pub launch_id: String,
-    pub socket: PathBuf,
+    /// Where the core listens: its endpoint record, read with `Endpoint`'s `FromStr`. Required: a ready file without a
+    /// valid one is refused. (The ready file is the only source; the endpoint is never derived from where the core
+    /// was told to put it.)
+    #[serde(deserialize_with = "endpoint")]
+    pub endpoint: Endpoint,
     pub connector_id: String,
     pub token: String,
     /// The link protocols this core speaks; a number this connector does not know is only not one it speaks.
     pub connector_protocols: Option<Vec<u64>>,
 }
 
-/// The ready file at `path`, when it is this user's private file naming a launch on `socket`.
-pub fn read(path: &Path, socket: &Path) -> Result<Ready> {
+/// An [`Endpoint`] from its record.
+fn endpoint<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Endpoint, D::Error> {
+    String::deserialize(deserializer)?
+        .parse()
+        .map_err(serde::de::Error::custom)
+}
+
+/// The ready file at `path`, when it is this user's private file naming a launch and an endpoint.
+pub fn read(path: &Path) -> Result<Ready> {
     Files::check_private(&Files::open_read(path)?)
         .with_context(|| format!("unsafe private file {}", path.display()))?;
     let bytes = fs::read(path)?;
@@ -34,17 +46,16 @@ pub fn read(path: &Path, socket: &Path) -> Result<Ready> {
         bail!("Core ready file too large");
     }
     let ready: Ready = serde_json::from_slice(&bytes)?;
-    if ready.socket != socket || ready.launch_id.is_empty() || ready.pid == 0 {
+    if ready.launch_id.is_empty() || ready.pid == 0 {
         bail!("Core ready identity mismatch");
     }
     Ok(ready)
 }
 
-/// `GET /api/local/health` on the core's private socket, within `limit`: the body of its 200.
-pub async fn health(socket: &Path, limit: Duration) -> Result<Value> {
-    verify_socket(socket)?;
+/// `GET /api/local/health` on the core's local endpoint, within `limit`: the body of its 200.
+pub async fn health(endpoint: &Endpoint, limit: Duration) -> Result<Value> {
     let ask = async {
-        let mut stream = UnixStream::connect(socket).await?;
+        let mut stream = Channels::connect(endpoint).await?;
         stream
             .write_all(
                 b"GET /api/local/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -81,18 +92,17 @@ impl Profile {
     }
 
     pub fn read_ready(&self) -> Result<Ready> {
-        let ready = read(&self.core_ready, &self.core_socket)?;
+        let ready = read(&self.core_ready)?;
         require_v3(&ready)?;
-        verify_socket(&ready.socket)?;
         Ok(ready)
     }
 
     pub async fn health_ready(&self, ready: &Ready) -> Result<Value> {
-        if ready.socket != self.core_socket || ready.launch_id.is_empty() || ready.pid == 0 {
+        if ready.launch_id.is_empty() || ready.pid == 0 {
             bail!("Core ready identity mismatch");
         }
         require_v3(ready)?;
-        let health = health(&ready.socket, Duration::from_secs(2)).await?;
+        let health = health(&ready.endpoint, Duration::from_secs(2)).await?;
         if health.get("launch_id").and_then(Value::as_str) != Some(&ready.launch_id)
             || health.get("pid").and_then(Value::as_u64) != Some(ready.pid as u64)
         {
@@ -111,6 +121,7 @@ impl Profile {
 #[cfg(test)]
 mod tests {
     use super::{read, require_v3};
+    use crate::platform::ipc::{Address, Endpoint};
     use std::os::unix::fs::PermissionsExt;
 
     /// A newer core's ready file: fields this connector does not know, at the top and nested, and a protocol
@@ -118,15 +129,34 @@ mod tests {
     #[test]
     fn a_ready_file_with_fields_and_protocols_this_connector_does_not_know_is_read() {
         let scratch = crate::test_support::temp_dir("ready");
-        let socket = scratch.path().join("local.sock");
+        let endpoint = Endpoint::new(scratch.path(), "local").to_string();
         let path = scratch.path().join("core.json");
-        let ready = serde_json::json!({"pid":42,"launch_id":"launch-1","socket":socket,"connector_id":"c-1",
+        let ready = serde_json::json!({"pid":42,"launch_id":"launch-1","endpoint":endpoint,"connector_id":"c-1",
             "token":"t","connector_protocols":[3, 4, 1000],"future_field":{"nested":[1, 2]},"listen":"x"});
         std::fs::write(&path, serde_json::to_vec(&ready).unwrap()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let read = read(&path, &socket).unwrap();
+        let read = read(&path).unwrap();
         assert_eq!((read.pid, read.launch_id.as_str()), (42, "launch-1"));
         assert_eq!(read.connector_protocols, Some(vec![3, 4, 1000]));
         require_v3(&read).unwrap();
+    }
+
+    /// The ready file names the core's endpoint as its record; without a valid one it is refused.
+    #[test]
+    fn the_endpoint_is_read_from_the_ready_file_and_required() {
+        let ready = |extra: serde_json::Value| {
+            let mut file =
+                serde_json::json!({"pid":1,"launch_id":"l","connector_id":"c","token":"t"});
+            file.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<super::Ready>(file)
+        };
+        let endpoint = Endpoint::new(&std::env::temp_dir(), "core");
+        let read = ready(serde_json::json!({"endpoint": endpoint.to_string()})).unwrap();
+        assert_eq!(read.endpoint, endpoint);
+        assert!(ready(serde_json::json!({})).is_err());
+        assert!(ready(serde_json::json!({"endpoint":"relative"})).is_err());
+        assert!(ready(serde_json::json!({"endpoint":1})).is_err());
     }
 }

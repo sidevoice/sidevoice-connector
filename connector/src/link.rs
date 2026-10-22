@@ -1,13 +1,12 @@
 use crate::core_ready::Ready;
+use crate::platform::ipc::{Channel, Channels};
 use crate::profile::Profile;
-use crate::secure_fs::verify_socket;
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, timeout_at, Duration, Instant};
@@ -205,8 +204,7 @@ impl Link {
         session: u64,
     ) -> Result<()> {
         let ready = profile.ready().await?;
-        verify_socket(&ready.socket)?;
-        let stream = timeout(Duration::from_secs(2), UnixStream::connect(&ready.socket)).await??;
+        let stream = timeout(Duration::from_secs(2), Channels::connect(&ready.endpoint)).await??;
         let mut config = WebSocketConfig::default();
         config.max_message_size = Some(1 << 20);
         config.max_frame_size = Some(1 << 20);

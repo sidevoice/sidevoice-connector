@@ -13,3 +13,13 @@ disallowed-methods = [
     { path = "std::os::unix::process::CommandExt::process_group", reason = "use platform::process" },
     { path = "std::os::unix::process::ExitStatusExt::signal", reason = "use platform::process" },
 ]
+
+# Local sockets: `platform::ipc` is the only place that opens one (a Unix socket, a named pipe on Windows).
+# The third-party sockets of `adapters/` stay until that block moves (they carry an `#[allow]`).
+disallowed-types = [
+    { path = "tokio::net::UnixListener", reason = "use platform::ipc" },
+    { path = "tokio::net::UnixStream", reason = "use platform::ipc" },
+    { path = "std::os::unix::net::UnixListener", reason = "use platform::ipc" },
+    { path = "std::os::unix::net::UnixStream", reason = "use platform::ipc" },
+    { path = "std::os::unix::net::UnixDatagram", reason = "use platform::ipc" },
+]

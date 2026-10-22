@@ -4,7 +4,8 @@
 //! The core is the sidevoice-core release pinned in `core.pin`, unpacked by `cargo xtask core` into
 //! `target/sidevoice-core` (or the directory `SIDEVOICE_TEST_CORE_DIR` names). Without it these tests are skipped
 //! locally and fail in CI (`CI` set), so a missing core never passes as green.
-
+// These black-box tests speak the connector's and the core's wire raw, as a client of another version would.
+#![allow(clippy::disallowed_types)]
 #![allow(dead_code)]
 
 pub mod package;
