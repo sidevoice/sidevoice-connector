@@ -22,12 +22,11 @@ use super::status::{self, read_ready, serving};
 use super::{Failure, Result};
 use crate::core_ready::Ready;
 use crate::messages::message;
+use crate::platform::fs::verify_socket;
 use crate::process::{Expected, Lookup};
-use crate::secure_fs::verify_socket;
 use serde_json::{json, Value};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -227,7 +226,7 @@ fn core_failure(failure: Value) -> Failure {
 }
 
 fn private_data_dir(path: &Path) -> Result<()> {
-    crate::secure_fs::ensure_private_dir(path).map_err(Failure::plain)
+    crate::platform::fs::ensure_private_dir(path).map_err(Failure::plain)
 }
 
 /// The core serving this data directory without a service manager: the one already serving, or one started here,
@@ -241,13 +240,8 @@ pub async fn ensure_core(layout: &Layout) -> Result<Ready> {
     private_data_dir(&layout.core_data())?;
     let program = layout.core_program();
     let launch_id = uuid::Uuid::new_v4().to_string();
-    let output = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(layout.core_output())
-        .map_err(Failure::plain)?;
+    let output =
+        crate::platform::fs::open_private_append(&layout.core_output()).map_err(Failure::plain)?;
     let mut command = Command::new(&program);
     command
         .args(core_arguments(

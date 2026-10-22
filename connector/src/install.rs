@@ -42,18 +42,18 @@
 
 use crate::agents::HostAgents;
 use crate::messages::Keyed;
+use crate::platform::fs::ensure_private_dir;
 use crate::profile::Profile;
-use crate::secure_fs::{atomic_json, digest_file, ensure_private_dir};
+use crate::records::{atomic_json, digest_file};
 use crate::service::layout::Layout;
 use crate::service::manager::Kind;
 use crate::service::{launcher, status};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::time::{sleep, timeout, Duration, Instant};
@@ -265,12 +265,7 @@ fn release_id(layout: &Layout, package: &Package, digest: &str) -> Result<(Strin
 /// Copies `from` to `to` (created, 0700) and syncs it.
 fn copy_executable(from: &Path, to: &Path) -> Result<()> {
     let mut source = File::open(from).with_context(|| format!("open {}", from.display()))?;
-    let mut target = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o700)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(to)
+    let mut target = crate::platform::fs::create_private_executable_new(to)
         .with_context(|| format!("create {}", to.display()))?;
     io::copy(&mut source, &mut target)?;
     target.sync_all()?;
@@ -312,14 +307,12 @@ async fn stage(layout: &Layout, package: &Package, id: &str, digest: &str) -> Re
     let releases = releases_dir(layout);
     ensure_private_dir(&releases)?;
     let partial = releases.join(format!(".{id}.partial-{}", uuid::Uuid::new_v4().simple()));
-    fs::DirBuilder::new().mode(0o700).create(&partial)?;
+    crate::platform::fs::create_private_dir(&partial)?;
     let result = async {
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(partial.join("bin"))?;
+        crate::platform::fs::create_private_dir(&partial.join("bin"))?;
         let binary = partial.join(BINARY);
         copy_executable(&package.binary, &binary)?;
-        crate::secure_fs::safe_executable(&binary)?;
+        crate::platform::fs::trusted_executable(&binary)?;
         if digest_file(&binary)? != digest {
             return Err(failed("the connector changed while it was being copied"));
         }
@@ -1098,7 +1091,7 @@ pub fn human_uninstall(answer: &Value) -> String {
 pub(crate) mod tests {
     use super::*;
     use crate::core_package::tests::{core_archive, core_files};
-    use crate::secure_fs::tests::Scratch;
+    use crate::platform::fs::tests::Scratch;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
     use std::os::unix::fs::PermissionsExt;
@@ -1143,16 +1136,8 @@ pub(crate) mod tests {
                 &homes,
             )
             .unwrap();
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(profile.data.join("core"))
-                .unwrap();
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&profile.xdg_data)
-                .unwrap();
+            crate::platform::fs::create_private_dir_all(&profile.data.join("core")).unwrap();
+            crate::platform::fs::create_private_dir_all(&profile.xdg_data).unwrap();
             Self {
                 scratch,
                 profile,
@@ -1310,7 +1295,7 @@ pub(crate) mod tests {
         );
 
         // Uninstall: the releases and the data go; the locks and the stop stay.
-        crate::secure_fs::atomic_json(&layout.data.join("outbox.json"), &json!([])).unwrap();
+        crate::records::atomic_json(&layout.data.join("outbox.json"), &json!([])).unwrap();
         crate::lock::try_lock(&layout.data.join("agents.lock"), "test").unwrap();
         let removed = uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
             .await

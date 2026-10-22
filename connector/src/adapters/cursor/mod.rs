@@ -1339,7 +1339,7 @@ pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
 #[cfg(test)]
 mod bridge_tests {
     use super::*;
-    use crate::secure_fs::tests::Scratch;
+    use crate::platform::fs::tests::Scratch;
     use tokio::net::UnixListener;
 
     #[test]

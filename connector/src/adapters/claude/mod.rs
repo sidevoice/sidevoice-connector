@@ -330,7 +330,7 @@ mod tests {
     #[test]
     fn claude_config_dir_is_passed_on_only_when_the_environment_sets_it() {
         use crate::profile::Profile;
-        let scratch = crate::secure_fs::tests::Scratch::new("claude-home");
+        let scratch = crate::platform::fs::tests::Scratch::new("claude-home");
         let home = scratch.0.to_string_lossy().into_owned();
         let homes = crate::adapters::Registry::standard().homes();
         let unset =

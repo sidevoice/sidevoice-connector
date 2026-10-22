@@ -87,7 +87,7 @@ pub fn machine(profile: &Profile) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secure_fs::tests::Scratch;
+    use crate::platform::fs::tests::Scratch;
 
     #[test]
     fn platforms_are_named_for_people() {

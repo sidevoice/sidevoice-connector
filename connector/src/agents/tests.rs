@@ -1,8 +1,7 @@
 use super::*;
 use crate::adapters::registration::{aggregate_readiness, ReadinessCheck};
 use fs2::FileExt;
-use std::fs::OpenOptions;
-use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{symlink, PermissionsExt};
 
 #[test]
 fn login_path_frame_ignores_banners_and_rejects_empty_or_incomplete_output() {
@@ -1332,14 +1331,7 @@ exit 2
     });
     wait_for_file(&slow_scan).await;
     let lock_path = fixture.profile.data.join("agents.lock");
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(lock_path)
-        .unwrap();
+    let lock = crate::platform::fs::open_private_lock(&lock_path).unwrap();
     lock.lock_exclusive().unwrap();
     state["dismissed"]["codex"] = generation;
     atomic_json(&state_path, &state).unwrap();

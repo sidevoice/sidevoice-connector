@@ -394,32 +394,7 @@ pub fn mcp_servers_json(
 /// most `limit` bytes. A link is followed wherever it leads (a dotfiles manager's, say), and the file it leads to is
 /// judged. A FIFO or a device is refused without waiting on it.
 pub fn read_profile_file(path: &Path, limit: u64) -> anyhow::Result<String> {
-    use anyhow::Context;
-    use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let regular = |metadata: &std::fs::Metadata| {
-        metadata.is_file()
-            && crate::platform::user::current().owns(metadata)
-            && metadata.mode() & 0o022 == 0
-            && metadata.len() <= limit
-    };
-    if !regular(&std::fs::metadata(path)?) {
-        anyhow::bail!("unsafe profile file");
-    }
-    // Opened without waiting (a FIFO put there since would wait for a writer), then judged again as opened.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
-        .open(path)
-        .context("open profile file")?;
-    if !regular(&file.metadata()?) {
-        anyhow::bail!("unsafe profile file");
-    }
-    let mut text = String::new();
-    file.take(limit)
-        .read_to_string(&mut text)
-        .context("read profile file")?;
-    Ok(text)
+    crate::platform::fs::read_user_text(path, limit)
 }
 
 /// What the test bench asks the connector about the agents (`bench-agents`, a separate binary that cannot read the
@@ -494,9 +469,7 @@ pub fn bench_agents(request: &Value) -> Value {
 
 /// A file anyone may run.
 fn executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    crate::platform::fs::is_executable_file(path)
 }
 
 #[cfg(test)]
@@ -507,7 +480,7 @@ mod tests {
     /// The bench's CLI lookup passes over a file of an agent's CLI name that cannot be run, as a shell would.
     #[test]
     fn a_cli_that_cannot_be_run_is_passed_over() {
-        let scratch = crate::secure_fs::tests::Scratch::new("bench-cli");
+        let scratch = crate::platform::fs::tests::Scratch::new("bench-cli");
         let (first, second) = (scratch.0.join("first"), scratch.0.join("second"));
         let name = super::super::Registry::standard()
             .agents()

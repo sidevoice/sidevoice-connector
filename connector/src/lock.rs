@@ -13,10 +13,9 @@ use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use serde_json::{json, Value};
 use std::ffi::CStr;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::{FromRawFd, RawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::Duration;
 
@@ -31,12 +30,7 @@ impl Drop for Lock {
     fn drop(&mut self) {
         // Another process may have linked the inode after acquisition. Never clear a
         // holder record through a name that could also name an unrelated file.
-        if self.clear_record
-            && self
-                .file
-                .metadata()
-                .is_ok_and(|metadata| metadata.nlink() == 1)
-        {
+        if self.clear_record && crate::platform::fs::has_single_link(&self.file).unwrap_or(false) {
             let _ = self.file.set_len(0);
         }
         let _ = FileExt::unlock(&self.file);
@@ -51,26 +45,14 @@ fn contended(error: &std::io::Error) -> bool {
 /// Opens (creating it 0600) the lock file without following a link, and checks the descriptor it opened: a regular
 /// file of this user's, open to nobody else.
 fn validate_inode(file: &File, label: &str) -> Result<()> {
-    let m = file.metadata()?;
-    if !m.is_file()
-        || !crate::platform::user::current().owns(&m)
-        || m.mode() & 0o077 != 0
-        || m.nlink() != 1
-    {
+    if !crate::platform::fs::is_private_unshared_handle(file)? {
         bail!("unsafe lock file {label}");
     }
     Ok(())
 }
 
 fn open(path: &Path) -> Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
+    let file = crate::platform::fs::open_private_lock(path)
         .with_context(|| format!("open lock {}", path.display()))?;
     validate_inode(&file, &path.display().to_string())?;
     Ok(file)
@@ -104,7 +86,7 @@ pub fn try_lock(path: &Path, kind: &str) -> Result<Option<Lock>> {
         Err(error) if contended(&error) => return Ok(None),
         Err(error) => return Err(error).context(format!("lock {}", path.display())),
     }
-    if file.metadata()?.nlink() != 1 {
+    if !crate::platform::fs::has_single_link(&file)? {
         bail!("unsafe lock file {}", path.display());
     }
     let record = json!({"pid":std::process::id(),
@@ -178,7 +160,7 @@ pub async fn wait_lock(path: &Path, kind: &str, limit: Duration) -> Result<Optio
 
 /// The holder's record, when there is a holder that wrote one: information only.
 pub fn holder(path: &Path) -> Option<Value> {
-    let bytes = crate::secure_fs::read_trusted(path, 4096).ok()??;
+    let bytes = crate::platform::fs::read_trusted(path, 4096).ok()??;
     let record: Value = serde_json::from_slice(&bytes).ok()?;
     record.get("pid")?.as_u64()?;
     Some(record)
@@ -187,19 +169,15 @@ pub fn holder(path: &Path) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secure_fs::tests::Scratch;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use crate::platform::fs::tests::Scratch;
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
     #[test]
     fn one_holder_at_a_time_and_released_on_drop() {
         let scratch = Scratch::new("lock");
         let path = scratch.0.join("connector.lock");
         let first = try_lock(&path, "connector").unwrap().expect("first holder");
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().mode() & 0o777,
-            0o600,
-            "created private"
-        );
+        crate::platform::fs::check_private_file(&path).expect("created private");
         // A second open file description, even in this process, does not get it.
         assert!(try_lock(&path, "connector").unwrap().is_none());
         let record = holder(&path).expect("holder record");

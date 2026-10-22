@@ -13,7 +13,7 @@ use crate::adapters::registration::{
 use crate::adapters::Registry;
 use crate::messages::message;
 use crate::profile::Profile;
-use crate::secure_fs::atomic_json;
+use crate::records::atomic_json;
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -22,7 +22,6 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
@@ -1088,15 +1087,7 @@ fn load_state_file(profile: &Profile) -> std::result::Result<Value, Failure> {
 }
 
 fn private_state_file(path: &Path) -> std::result::Result<(), Failure> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| Failure::Internal)?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || !crate::platform::user::current().owns(&metadata)
-        || metadata.mode() & 0o077 != 0
-    {
-        return Err(Failure::Internal);
-    }
-    Ok(())
+    crate::platform::fs::check_private_file(path).map_err(|_| Failure::Internal)
 }
 
 fn check_live(cancel: &Cancellation, deadline: Instant) -> std::result::Result<(), Failure> {
@@ -1161,7 +1152,7 @@ pub(crate) fn executable(value: &str) -> bool {
     if !path.is_absolute() {
         return false;
     }
-    fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && (metadata.mode() & 0o111 != 0))
+    crate::platform::fs::is_executable_file(path)
 }
 
 pub(crate) fn find_in_path(names: &[&str], path: Option<&str>) -> Option<String> {

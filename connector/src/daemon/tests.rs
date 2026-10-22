@@ -4,8 +4,8 @@ use super::contract_tests::play_core;
 use super::Daemon;
 use crate::adapters::Registry;
 use crate::link::Link;
+use crate::platform::fs::tests::Scratch;
 use crate::profile::Profile;
-use crate::secure_fs::tests::Scratch;
 use serde_json::json;
 use tokio::sync::{mpsc, watch};
 

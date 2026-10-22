@@ -4,15 +4,14 @@ use super::Cursor;
 use crate::adapters::registration::{
     mcp_servers_json, AgentError, AgentHost, Entry, Launch, Manual, ReadinessCheck, Registration,
 };
+use crate::platform::fs::check_user_directory;
 use crate::profile::Profile;
-use crate::secure_fs::validate_user_directory;
 use anyhow::{Context, Result};
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::ErrorKind;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -160,7 +159,10 @@ fn cursor_env(entry: &Value) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-fn read_cursor_config(file: &Path, root: &Path) -> Result<Option<(Value, u32, PathBuf)>> {
+fn read_cursor_config(
+    file: &Path,
+    root: &Path,
+) -> Result<Option<(Value, crate::platform::fs::Mode, PathBuf)>> {
     let link_metadata = match fs::symlink_metadata(file) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -172,10 +174,7 @@ fn read_cursor_config(file: &Path, root: &Path) -> Result<Option<(Value, u32, Pa
         file.to_path_buf()
     };
     let metadata = fs::symlink_metadata(&target)?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || !crate::platform::user::current().owns(&metadata)
-        || metadata.mode() & 0o022 != 0
+    if !crate::platform::fs::is_user_file(&target)
         || metadata.len() > (1 << 20)
         || !target.canonicalize()?.starts_with(root)
     {
@@ -188,7 +187,7 @@ fn read_cursor_config(file: &Path, root: &Path) -> Result<Option<(Value, u32, Pa
     }
     Ok(Some((
         config,
-        metadata.permissions().mode() & 0o777,
+        crate::platform::fs::mode_of(&metadata),
         target,
     )))
 }
@@ -198,27 +197,22 @@ fn write_cursor_config(profile: &Profile, file: &Path, config: &Value) -> Result
     let root = profile.agent_root(super::config_home(profile))?;
     let (target, mode) = match read_cursor_config(file, &root)? {
         Some((_, mode, target)) => (target, mode),
-        None => (file.to_path_buf(), 0o600),
+        None => (file.to_path_buf(), crate::platform::fs::Mode::PRIVATE),
     };
     let parent = target.parent().context("Cursor config parent")?;
-    validate_user_directory(parent)?;
+    check_user_directory(parent)?;
     if !parent.canonicalize()?.starts_with(&root) {
         anyhow::bail!("Cursor config escaped its directory");
     }
     let temporary = parent.join(format!(".mcp.json.{}.tmp", Uuid::new_v4()));
     let result = (|| -> Result<()> {
         profile.validate_for_agent(super::config_home(profile))?;
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temporary)?;
+        let mut output = crate::platform::fs::create_private_new(&temporary)?;
         serde_json::to_writer_pretty(&mut output, config)?;
         use std::io::Write;
         output.write_all(b"\n")?;
         output.sync_all()?;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
+        crate::platform::fs::set_mode(&temporary, mode)?;
         profile.validate_for_agent(super::config_home(profile))?;
         fs::rename(&temporary, &target)?;
         File::open(parent)?.sync_all()?;

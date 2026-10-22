@@ -250,7 +250,7 @@ impl Layout {
 
     /// `D/install.json`, read only when it is this user's regular file and nobody else can change it.
     pub fn install_record(&self) -> Option<Value> {
-        let bytes = crate::secure_fs::read_trusted(&self.install_file(), 64 * 1024).ok()??;
+        let bytes = crate::platform::fs::read_trusted(&self.install_file(), 64 * 1024).ok()??;
         serde_json::from_slice(&bytes).ok()
     }
 

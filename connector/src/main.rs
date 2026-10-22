@@ -14,7 +14,7 @@ mod pairing;
 mod platform;
 mod process;
 mod profile;
-mod secure_fs;
+mod records;
 mod service;
 
 use anyhow::{bail, Result};

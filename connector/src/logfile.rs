@@ -12,7 +12,6 @@
 use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,13 +50,7 @@ pub fn rotate(file: &Path, max: u64) -> bool {
     }
     let copied = (|| -> std::io::Result<()> {
         let mut source = fs::File::open(file)?;
-        let mut target = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(numbered(1))?;
+        let mut target = crate::platform::fs::open_private_truncate(&numbered(1))?;
         std::io::copy(&mut source, &mut target)?;
         OpenOptions::new().write(true).open(file)?.set_len(0)
     })();
@@ -67,12 +60,7 @@ pub fn rotate(file: &Path, max: u64) -> bool {
 /// One line appended to a rotated log, created 0600.
 pub fn append_line(file: &Path, line: &str) {
     rotate(file, LOG_MAX);
-    let opened = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(file);
+    let opened = crate::platform::fs::open_private_append(file);
     if let Ok(mut opened) = opened {
         let mut text = line.to_owned();
         if !text.ends_with('\n') {
@@ -170,7 +158,7 @@ fn format_utc(seconds: i64, millis: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secure_fs::tests::Scratch;
+    use crate::platform::fs::tests::Scratch;
     use std::os::unix::fs::MetadataExt;
 
     #[test]
@@ -178,7 +166,7 @@ mod tests {
         let scratch = Scratch::new("log");
         let file = scratch.0.join("connector.log");
         append_line(&file, "first");
-        assert_eq!(fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
+        crate::platform::fs::check_private_file(&file).unwrap();
         // A writer holding the file open, as a service manager does.
         let mut held = OpenOptions::new().append(true).open(&file).unwrap();
         let inode = fs::metadata(&file).unwrap().ino();

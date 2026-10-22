@@ -1,6 +1,6 @@
 use crate::adapters::{self, Identity, Registry};
+use crate::platform::fs::verify_socket;
 use crate::profile::Profile;
-use crate::secure_fs::verify_socket;
 use anyhow::{bail, Context, Result};
 use rmcp::{
     model::*, service::RequestContext, ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,

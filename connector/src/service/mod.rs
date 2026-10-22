@@ -22,8 +22,9 @@ pub mod manager;
 pub mod status;
 
 use crate::lock::Lock;
+use crate::platform::fs::ensure_private_dir;
 use crate::profile::Profile;
-use crate::secure_fs::{atomic_json, ensure_private_dir};
+use crate::records::atomic_json;
 use layout::Layout;
 use manager::{Job, Kind};
 use serde_json::{json, Value};

@@ -2,7 +2,7 @@ use crate::adapters::{Conversation, Registry, Reporter, Route};
 use crate::agents::HostAgents;
 use crate::link::{Incoming, Link};
 use crate::profile::Profile;
-use crate::secure_fs::atomic_json;
+use crate::records::atomic_json;
 use anyhow::{bail, Context, Result};
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
@@ -1834,7 +1834,7 @@ mod tests {
             }
         }
 
-        let scratch = crate::secure_fs::tests::Scratch::new("fake-harness");
+        let scratch = crate::platform::fs::tests::Scratch::new("fake-harness");
         let profile = Profile::for_test(&scratch.0, &crate::adapters::Registry::standard().homes());
         let calls = Arc::new(Mutex::new(Vec::new()));
         let registry = Registry::new(vec![Arc::new(Fake {

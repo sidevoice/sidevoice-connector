@@ -842,7 +842,7 @@ mod tests {
 
     #[test]
     fn only_exact_owned_roots_can_be_uninstalled() {
-        let scratch = crate::secure_fs::tests::Scratch::new("uninstall-scope");
+        let scratch = crate::platform::fs::tests::Scratch::new("uninstall-scope");
         let home = scratch.0.join("home");
         fs::create_dir(&home).unwrap();
         let mut layout = layout(&home);
@@ -871,7 +871,7 @@ mod tests {
 
     #[test]
     fn links_inside_owned_roots_never_delete_their_targets() {
-        let scratch = crate::secure_fs::tests::Scratch::new("uninstall-links");
+        let scratch = crate::platform::fs::tests::Scratch::new("uninstall-links");
         let home = scratch.0.join("home");
         let outside = scratch.0.join("outside");
         let layout = layout(&home);
@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn injected_mount_boundary_refuses_before_deleting() {
-        let scratch = crate::secure_fs::tests::Scratch::new("uninstall-mount");
+        let scratch = crate::platform::fs::tests::Scratch::new("uninstall-mount");
         let layout = layout(&scratch.0.join("home"));
         let nested = layout.data.join("mounted");
         fs::create_dir_all(&nested).unwrap();
@@ -922,7 +922,7 @@ mod tests {
 
     #[test]
     fn directory_replaced_by_link_during_removal_is_refused() {
-        let scratch = crate::secure_fs::tests::Scratch::new("uninstall-race");
+        let scratch = crate::platform::fs::tests::Scratch::new("uninstall-race");
         let layout = layout(&scratch.0.join("home"));
         let victim = layout.data.join("victim");
         let moved = layout.data.join("moved");
@@ -949,7 +949,7 @@ mod tests {
 
     #[test]
     fn moved_directory_at_final_claim_boundary_keeps_its_sentinel() {
-        let scratch = crate::secure_fs::tests::Scratch::new("uninstall-claim-race");
+        let scratch = crate::platform::fs::tests::Scratch::new("uninstall-claim-race");
         let layout = layout(&scratch.0.join("home"));
         let victim = layout.data.join("victim");
         let moved = scratch.0.join("moved-outside");
@@ -972,7 +972,7 @@ mod tests {
 
     #[test]
     fn home_replaced_after_opening_is_refused() {
-        let scratch = crate::secure_fs::tests::Scratch::new("uninstall-home-race");
+        let scratch = crate::platform::fs::tests::Scratch::new("uninstall-home-race");
         let home = scratch.0.join("home");
         let moved = scratch.0.join("moved-home");
         let layout = layout(&home);

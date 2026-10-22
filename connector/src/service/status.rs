@@ -210,7 +210,7 @@ pub fn log_tail(layout: &Layout, lines: usize) -> Vec<String> {
 /// reads it: its own key, step and message, with the log tail.
 pub fn read_failure(layout: &Layout, at: &str) -> Option<Value> {
     let report: Value = serde_json::from_slice(
-        &crate::secure_fs::read_trusted(&layout.core_failure(), 64 * 1024).ok()??,
+        &crate::platform::fs::read_trusted(&layout.core_failure(), 64 * 1024).ok()??,
     )
     .ok()?;
     let text = |name: &str, limit: usize| {
