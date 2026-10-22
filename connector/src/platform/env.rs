@@ -91,6 +91,14 @@ pub trait Env {
 
     /// `value` as one word of the command line a person types or pastes on this OS: single-quoted for a POSIX shell,
     /// single-quoted for PowerShell (nothing inside is special there but the quote itself, doubled).
+    ///
+    /// The contract on Windows: PowerShell reads the word exactly, but what reaches a native program is PowerShell's
+    /// to pass. PowerShell 7.3 and later (`$PSNativeCommandArgumentPassing` `Windows`, the default, or `Standard`)
+    /// passes an `.exe` every argument as given, an empty one and one with `"` in it included. Windows PowerShell
+    /// 5.1, and 7.3+ for `.cmd`/`.bat` targets (their `Legacy` rules), drop an empty argument and mangle an embedded
+    /// `"`; a line with neither is passed right by every version. That is the supported contract: no empty argument
+    /// and no `"` in one, which holds for the lines built with this (paths, flags, `NAME=value` with a path), and has
+    /// to, as an agent's CLI installed by npm is a `.cmd` shim on Windows.
     fn quote(value: &str) -> String;
 
     /// The start of a command line that sets `variable` to `quoted_value` (already [`Env::quote`]d) for the command
@@ -199,12 +207,24 @@ mod tests {
 
     #[test]
     fn a_value_is_quoted_as_one_word_and_set_before_a_command() {
-        for value in ["", "plain", "two words", "it's", "a\"b", "$HOME;rm"] {
-            let quoted = Environment::quote(value);
-            assert!(quoted.len() > value.len(), "{value:?} -> {quoted}");
+        // A quote inside is the one thing each shell spells its own way: POSIX closes, escapes and reopens; PowerShell
+        // doubles it.
+        let (quote_inside, set) = if cfg!(windows) {
+            ("'it''s'", "$env:NAME = 'a b'; ")
+        } else {
+            (r"'it'\''s'", "NAME='a b' ")
+        };
+        for (value, quoted) in [
+            ("", "''"),
+            ("plain", "'plain'"),
+            ("two words", "'two words'"),
+            ("it's", quote_inside),
+            ("a\"b", "'a\"b'"),
+            ("$HOME;rm", "'$HOME;rm'"),
+        ] {
+            assert_eq!(Environment::quote(value), quoted, "{value:?}");
         }
-        let line = Environment::set("NAME", &Environment::quote("a b"));
-        assert!(line.contains("NAME") && line.contains("a b"), "{line}");
+        assert_eq!(Environment::set("NAME", &Environment::quote("a b")), set);
     }
 
     #[test]

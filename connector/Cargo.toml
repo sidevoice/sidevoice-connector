@@ -14,6 +14,12 @@ path = "src/main.rs"
 name = "sidevoice-bench"
 path = "src/bench/main.rs"
 
+# The MCP server check (src/adapters/health.rs) against a fake server that is this test's own binary, on every OS. Not
+# libtest: it writes its own lines to stdout, where the fake server's protocol goes.
+[[test]]
+name = "health"
+harness = false
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
@@ -55,9 +61,6 @@ process-wrap = { version = "10", features = ["tokio1", "process-group", "job-obj
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 # Third parties' endpoints (src/platform/foreign): the same transport as the local channel, a Unix socket or a named pipe.
 interprocess = { version = "2.4", features = ["tokio"] }
-# Which file a tailed transcript is now, across a rotation (src/adapters): an inode on Unix, a file index on Windows,
-# read from the path and holding nothing open.
-file-id = "0.2"
 
 [dev-dependencies]
 # Scratch directories in unit tests (src/test_support.rs).
@@ -81,7 +84,8 @@ windows-sys = { version = "0.61", features = [
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
 # The user and machine `Path` a Windows login has instead of a login shell's (src/platform/env/windows.rs).
 winreg = "0.55"
-# How many names a file has (src/platform/fs), from a handle: `winapi-util` (walkdir, ripgrep), no `unsafe` of ours.
+# How many names a file has, and which file a handle is (src/platform/fs): `winapi-util` (walkdir, ripgrep), no `unsafe`
+# of ours.
 winapi-util = "0.1"
 # The Task Scheduler task's XML (src/platform/service/windows.rs), written and read through serde.
 quick-xml = { version = "0.42", features = ["serialize"] }
