@@ -1,14 +1,15 @@
 //! The local channel between this user's processes: the connector's endpoint for its clients, and the core's.
 //!
 //! The interface is the [`Channel`] trait; [`Channels`] is the one OS implementation compiled in, chosen below: a
-//! Unix socket on macOS and Linux, a named pipe on Windows, both through `interprocess`. [`Endpoint`] is only an
-//! address, opaque, made like std's: `Endpoint::new(dir, name)` for our own, `record.parse::<Endpoint>()` (`FromStr`)
-//! for one another process published, and `Display` writes that record. What this module adds is the user check, on every OS
+//! Unix socket on macOS and Linux, a named pipe on Windows, both through `interprocess`. [`Endpoint`] is the
+//! address, defined once here and made like std's: `Endpoint::new(dir, name)` for our own, `record.parse()`
+//! (`FromStr`) for one another process published, `Display` writing that record; it asks the trait only for what
+//! differs per OS ([`Channel::address`], [`Channel::check`]). What this module adds is the user check, on every OS
 //! and on both ends: a listener only ever hands out streams whose peer is this user, and a client only talks to a
 //! server that is this user. Streams are plain `AsyncRead + AsyncWrite + Unpin`, so the line-JSON protocol, the
-//! WebSocket handshake and the HTTP health probe run over them unchanged. Callers import the trait and the type, std-style (`TcpListener::bind(addr)`):
-//! `use crate::platform::ipc::{Channel, Channels, Endpoint};` then `Channels::listen(&Endpoint::new(dir, "connector"))`,
-//! `Channels::connect(&endpoint).await`.
+//! WebSocket handshake and the HTTP health probe run over them unchanged. Callers, std-style
+//! (`TcpListener::bind(addr)`): `use crate::platform::ipc::{Channel, Channels, Endpoint};` then
+//! `Channels::listen(&Endpoint::new(dir, "connector"))`, `Channels::connect(&endpoint).await`.
 
 #[cfg(unix)]
 #[path = "ipc/unix.rs"]
@@ -17,20 +18,68 @@ mod imp;
 #[path = "ipc/windows.rs"]
 mod imp;
 
-pub use imp::{Endpoint, Os as Channels};
+pub use imp::Os as Channels;
 
 use interprocess::local_socket::tokio::Listener as RawListener;
 use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
+use interprocess::local_socket::{GenericFilePath, Name, ToFsName};
+use std::ffi::OsString;
+use std::fmt;
 use std::future::Future;
 use std::io;
+use std::path::Path;
+use std::str::FromStr;
 
 /// One connection. `AsyncRead + AsyncWrite + Unpin`; its peer has been checked to be this user.
 pub type Stream = interprocess::local_socket::tokio::Stream;
 
-/// What every OS implements ([`Channels`], in `ipc/unix.rs` and `ipc/windows.rs`): how a listener is made private
-/// to this user. Each OS file also defines its [`Endpoint`], with the same `new` and `FromStr`. Connecting is one body for every OS. What is checked before connecting
-/// and the peer check are internal: each OS file has its `to_connect` and `peer_is_this_user`.
+/// Where a channel is: a socket path (Unix) or a pipe name (Windows), as one opaque value. Nothing outside derives
+/// one from another or looks inside.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Endpoint(OsString);
+
+impl Endpoint {
+    /// Our own endpoint called `name` for the data directory `dir` ([`Channel::address`]).
+    pub fn new(dir: &Path, name: &str) -> Endpoint {
+        Endpoint(Channels::address(dir, name))
+    }
+
+    /// The endpoint as `interprocess` names it.
+    fn name(&self) -> io::Result<Name<'static>> {
+        self.0.clone().to_fs_name::<GenericFilePath>()
+    }
+}
+
+/// An endpoint another process published, as `Display` writes it; refused unless [`Channel::check`] accepts it.
+impl FromStr for Endpoint {
+    type Err = io::Error;
+
+    fn from_str(record: &str) -> io::Result<Endpoint> {
+        Channels::check(record)?;
+        Ok(Endpoint(record.into()))
+    }
+}
+
+/// The record another process reads back with `parse`.
+impl fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.to_string_lossy().fmt(f)
+    }
+}
+
+/// What every OS implements ([`Channels`], in `ipc/unix.rs` and `ipc/windows.rs`): what an address is, and how a
+/// listener is made private to this user. Connecting is one body for every OS; what is checked before connecting and
+/// the peer check are internal to each OS file (`to_connect`, `peer_is_this_user`).
 pub trait Channel {
+    /// The address of our own endpoint called `name` for the data directory `dir`. Unix: the socket
+    /// `dir/<name>.sock`. Windows: the pipe `\\.\pipe\sidevoice-<hash of (user, dir)>-<name>`, so two profiles or two
+    /// users never meet on one name.
+    fn address(dir: &Path, name: &str) -> OsString;
+
+    /// Whether `record` is an address this OS can use. Unix: an absolute socket path. Windows: a full local pipe
+    /// name, `\\.\pipe\...`.
+    fn check(record: &str) -> io::Result<()>;
+
     /// Starts listening at `endpoint`, reachable by this user alone. Unix: a socket left by a dead process is
     /// replaced, but only once it is checked to be this user's and private; the socket file is `0600` and goes away
     /// when the listener is dropped. Windows: the first instance of the pipe (a name already taken is an error),
