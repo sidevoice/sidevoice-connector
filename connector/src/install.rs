@@ -53,7 +53,6 @@ use serde_json::{json, Value};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::time::{sleep, timeout, Duration, Instant};
@@ -1013,7 +1012,8 @@ async fn uninstall_with_hooks(
     let had_releases = preflight(&guard).map_err(failed)?;
     let data = guard.data_for_lock().map_err(failed)?;
     guard.preflight().map_err(failed)?;
-    let _lock = crate::lock::wait_uninstall_lock_at(data.as_raw_fd(), Duration::from_secs(30))
+    let install_lock = safe_remove::lock_file(&data, c"install.lock").map_err(failed)?;
+    let _lock = crate::lock::wait_lock_file(install_lock, "install.lock", Duration::from_secs(30))
         .await
         .map_err(failed)?
         .ok_or_else(|| failed("another install or service command holds install.lock"))?;
@@ -1024,8 +1024,9 @@ async fn uninstall_with_hooks(
     } else {
         json!({})
     };
+    let agents_lock = safe_remove::lock_file(&data, c"agents.lock").map_err(failed)?;
     let _agents_lock =
-        crate::lock::wait_uninstall_agents_lock_at(data.as_raw_fd(), Duration::from_secs(30))
+        crate::lock::wait_lock_file(agents_lock, "agents.lock", Duration::from_secs(30))
             .await?
             .ok_or_else(|| failed("another agents request holds agents.lock"))?;
     guard.stage_recovery(&layout).map_err(failed)?;
