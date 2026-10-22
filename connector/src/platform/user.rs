@@ -11,10 +11,57 @@ mod imp;
 #[path = "user/windows.rs"]
 mod imp;
 
-// `UserId` is named by no caller yet: they only chain off `current()`.
-#[allow(unused_imports)]
-pub use imp::UserId;
-pub use imp::{current, name};
+use std::fs::File;
+use std::io;
+use std::path::Path;
+
+// The whole interface is here, documented once; `imp` only implements it per OS, so a side that does not provide
+// an operation does not compile.
+
+/// The user this process runs as. Opaque: callers ask it questions and never see what it is made of.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(unix, derive(Copy))]
+pub struct UserId(imp::Id);
+
+/// The user this process runs as (Unix: the effective uid; Windows: the SID in its token).
+pub fn current() -> UserId {
+    UserId(imp::current())
+}
+
+impl UserId {
+    #[allow(dead_code)] // its callers arrive with `platform::fs`, which replaces the `owns(&Metadata)` ones
+    /// Whether this user owns what `path` names. A symlink (or Windows junction) is judged itself, not what it
+    /// points to.
+    pub fn owns_path(&self, path: &Path) -> io::Result<bool> {
+        self.0.owns_path(path)
+    }
+
+    #[allow(dead_code)] // as `owns_path`
+    /// Whether this user owns the file behind an open handle.
+    pub fn owns_file(&self, file: &File) -> io::Result<bool> {
+        self.0.owns_file(file)
+    }
+
+    /// Whether this user owns the file `metadata` describes. Unix-only: `Metadata` carries no owner on Windows, so
+    /// host-agnostic callers use [`UserId::owns_path`] or [`UserId::owns_file`].
+    #[cfg(unix)]
+    pub fn owns(&self, metadata: &std::fs::Metadata) -> bool {
+        self.0.owns(metadata)
+    }
+
+    /// The numeric uid, for the places that must put it in a Unix-shaped value: `ps`'s uid column, a `stat`
+    /// owner, launchd's `gui/<uid>` domain. Unix-only; nothing host-agnostic should need it.
+    #[cfg(unix)]
+    pub(crate) fn raw(&self) -> u32 {
+        self.0.raw()
+    }
+}
+
+/// This user's login name, for what must name the user to the system (`loginctl enable-linger`). `None` where
+/// the system has no name for it, and always on Windows, which names users by SID.
+pub fn name() -> Option<String> {
+    imp::name()
+}
 
 /// The host name as the operating system reports it, trimmed; empty when it cannot be read.
 pub fn host_name() -> String {
