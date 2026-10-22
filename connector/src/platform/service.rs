@@ -20,13 +20,13 @@
 //! caller's to make first, and arrives with the local channel.
 
 #[cfg(target_os = "macos")]
-#[path = "service/launchd.rs"]
+#[path = "service/macos.rs"]
 mod imp;
 #[cfg(target_os = "linux")]
-#[path = "service/systemd.rs"]
+#[path = "service/linux.rs"]
 mod imp;
 #[cfg(windows)]
-#[path = "service/task_scheduler.rs"]
+#[path = "service/windows.rs"]
 mod imp;
 
 pub use imp::Os as ServiceManager;
@@ -167,9 +167,9 @@ pub enum Refusal {
     NotStarted(JobId, String),
 }
 
-/// What every manager implements ([`ServiceManager`], in `service/launchd.rs`, `service/systemd.rs` and
-/// `service/task_scheduler.rs`): the required methods. The rest is one body for every manager; one overrides it only
-/// if it must.
+/// What every manager implements ([`ServiceManager`], in `service/macos.rs` (launchd), `service/linux.rs` (systemd) and
+/// `service/windows.rs` (Task Scheduler)): the required methods. The rest is one body for every manager; one
+/// overrides it only if it must.
 pub trait Manager: Sized + Send + Sync {
     /// Its name, as `service status` and the jobs' `SIDEVOICE_SERVICE` say it.
     const KIND: &'static str;
