@@ -4,6 +4,7 @@
 
 use super::registration::Launch;
 use crate::platform::process::{Child, Process, Processes};
+use futures_util::StreamExt;
 use rmcp::model::{InitializeResult, ListToolsResult, ProtocolVersion};
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -11,13 +12,14 @@ use std::future::Future;
 use std::io::ErrorKind;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::time::{timeout, Instant};
+use tokio_util::codec::{FramedRead, LinesCodec};
 
 /// The name the check gives itself in `initialize`.
 const CLIENT: &str = "sidevoice-health";
-/// The longest line the check reads from the server.
+/// The longest line the check reads from the server, its newline included.
 const LINE_LIMIT: usize = 1 << 20;
 
 /// What the check found.
@@ -90,7 +92,7 @@ pub async fn check(
 
 /// `initialize`, `notifications/initialized` and `tools/list`, one JSON-RPC message per line.
 async fn handshake(mut stdin: ChildStdin, stdout: ChildStdout) -> Result<(), Stop> {
-    let mut reader = BufReader::new(stdout);
+    let mut reader = FramedRead::new(stdout, LinesCodec::new_with_max_length(LINE_LIMIT - 1));
     send(
         &mut stdin,
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
@@ -137,12 +139,12 @@ async fn send(stdin: &mut ChildStdin, message: Value) -> Result<(), Stop> {
 }
 
 /// The result of request `id`. What the server sends of its own (notifications, requests) is passed over.
-async fn answer(reader: &mut BufReader<ChildStdout>, id: u64) -> Result<Value, Stop> {
+async fn answer(reader: &mut FramedRead<ChildStdout, LinesCodec>, id: u64) -> Result<Value, Stop> {
     loop {
-        let line = match crate::frame::bounded_line(reader, LINE_LIMIT).await {
-            Ok(Some(line)) => line,
-            Ok(None) => return Err(Stop::Closed),
-            Err(_) => return Err(Stop::Mismatch),
+        let line = match reader.next().await {
+            Some(Ok(line)) => line,
+            None => return Err(Stop::Closed),
+            Some(Err(_)) => return Err(Stop::Mismatch),
         };
         if line.trim().is_empty() {
             continue;

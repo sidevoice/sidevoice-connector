@@ -21,6 +21,7 @@ futures-util = "0.3"
 gethostname = "1"
 whoami = "2"
 hex = "0.4"
+interprocess = { version = "2.4", features = ["tokio"] }
 libc = "0.2"
 qrcodegen = "1.8"
 rmcp = { version = "3.5.1", features = ["server", "transport-io", "schemars"] }
@@ -30,6 +31,8 @@ serde_json = "1"
 sha2 = "0.10"
 tar = "0.4"
 tokio = { version = "1", features = ["full"] }
+# One JSON message per line on the local channel and an MCP server's stdout (src/frame.rs): `LinesCodec`.
+tokio-util = { version = "0.7", features = ["codec"] }
 tokio-tungstenite = "0.30"
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 toml = "0.8"
@@ -52,10 +55,11 @@ tempfile = "3"
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
 
-# Windows: this process's user and file owners (src/platform/user). Minimal features; the version the lock already has.
+# Windows: this process's user and file owners (src/platform/user); the pipe's security descriptor (src/platform/ipc). Minimal features; the version the lock already has.
 # `windows`: only for the type `process-wrap`'s `CreationFlags` takes (src/platform/process); it is `process-wrap`'s
 # own dependency, at its version, so it adds nothing to the build.
 [target.'cfg(windows)'.dependencies]
+widestring = "1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

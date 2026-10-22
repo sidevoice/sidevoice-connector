@@ -1,7 +1,9 @@
 use crate::adapters::{self, Identity, Registry};
+use crate::frame;
+use crate::platform::ipc::{Channel, Channels};
 use crate::profile::Profile;
-use crate::secure_fs::verify_socket;
 use anyhow::{bail, Context, Result};
+use futures_util::StreamExt;
 use rmcp::{
     model::*, service::RequestContext, ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
 };
@@ -10,7 +12,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{timeout, timeout_at, Duration, Instant};
 
@@ -78,49 +79,33 @@ impl Ipc {
         if self.tx.lock().await.is_some() {
             return Ok(());
         }
-        verify_socket(&self.profile.socket)?;
         let stream = timeout(
             Duration::from_secs(2),
-            UnixStream::connect(&self.profile.socket),
+            Channels::connect(&self.profile.endpoint),
         )
         .await??;
-        let (read, mut write) = stream.into_split();
+        let (mut writer, mut reader) = frame::connection(stream).split();
         let (tx, mut rx) = mpsc::channel::<Value>(64);
         *self.tx.lock().await = Some(tx);
         self.generation.fetch_add(1, Ordering::Relaxed);
         let this = self.clone();
         tokio::spawn(async move {
-            while let Some(frame) = rx.recv().await {
-                if write.write_all(frame.to_string().as_bytes()).await.is_err()
-                    || write.write_all(b"\n").await.is_err()
-                {
+            while let Some(message) = rx.recv().await {
+                if frame::write(&mut writer, &message).await.is_err() {
                     break;
                 }
             }
         });
         tokio::spawn(async move {
-            let mut reader = BufReader::new(read);
             loop {
-                let line =
-                    match crate::frame::bounded_line(&mut reader, crate::frame::IPC_FRAME_LIMIT)
-                        .await
-                    {
-                        Ok(Some(v)) => v,
-                        _ => break,
-                    };
-                let Ok(reply) = serde_json::from_str::<Value>(&line) else {
+                let Ok(Some(reply)) = frame::read(&mut reader).await else {
                     break;
                 };
                 let Some(id) = reply.get("id").and_then(Value::as_u64) else {
                     continue;
                 };
                 if let Some(waiting) = this.pending.lock().await.remove(&id) {
-                    let result = if reply.get("ok") == Some(&json!(true)) {
-                        Ok(reply.get("result").cloned().unwrap_or(Value::Null))
-                    } else {
-                        Err(crate::frame::ipc_failure(&reply, "IPC error"))
-                    };
-                    let _ = waiting.send(result);
+                    let _ = waiting.send(frame::outcome(&reply, "IPC error"));
                 }
             }
             *this.tx.lock().await = None;

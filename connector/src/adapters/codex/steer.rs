@@ -7,6 +7,8 @@
 //! server, or `--no-daemon`) is not on that socket, and `codex queue` stays the only way in.
 //!
 //! Every outcome that is not an accepted steer is an error the caller answers by queueing.
+// adapters block: this is the harness's own socket, not ours; it moves behind platform::ipc with that block.
+#![allow(clippy::disallowed_types)]
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};

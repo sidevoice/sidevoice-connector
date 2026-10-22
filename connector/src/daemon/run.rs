@@ -4,16 +4,13 @@ use super::Daemon;
 use crate::adapters::Registry;
 use crate::link::Link;
 use crate::platform::fs::{Files, Fs};
+use crate::platform::ipc::{Channel, Channels};
 use crate::profile::Profile;
-use crate::secure_fs::verify_socket;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
@@ -47,10 +44,6 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     if profile.service_stopped()? {
         return Ok(());
     }
-    if profile.socket.exists() {
-        verify_socket(&profile.socket)?;
-        fs::remove_file(&profile.socket)?;
-    }
     let link = Link::new();
     let (replay_tx, mut replay_rx) = mpsc::channel(1);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -72,8 +65,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     let mut binding_order = HashMap::<String, oneshot::Receiver<()>>::new();
     // Accept MCP before Core is ready. The link task retries the private Core socket until the
     // separately manager-owned Core job becomes healthy.
-    let listener = UnixListener::bind(&profile.socket)?;
-    fs::set_permissions(&profile.socket, fs::Permissions::from_mode(0o600))?;
+    let listener = Channels::listen(&profile.endpoint)?;
     let (ready_tx, ready_rx) = oneshot::channel();
     let supervisor = Arc::new(crate::service::core_supervisor(&profile));
     let link_task = tokio::spawn(link.run(profile.clone(), incoming_tx, ready_tx, supervisor));
@@ -129,7 +121,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
                 prune_binding_order(&mut binding_order);
             }
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                let stream = accepted?;
                 if let Ok(permit) = clients.clone().try_acquire_owned() {
                     let daemon = daemon.clone();
                     client_tasks.spawn(async move { let _permit = permit; daemon.serve_client(stream).await });
@@ -229,7 +221,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     core_tasks.abort_all();
     while core_tasks.join_next().await.is_some() {}
     daemon.host_agents.shutdown().await;
-    fs::remove_file(&profile.socket)?;
+    drop(listener);
     drop(lock);
     if link_exited {
         bail!("Core authentication was refused or its link task exited");

@@ -1,7 +1,9 @@
 use crate::adapters::{Conversation, Registry, Reporter, Route};
 use crate::agents::HostAgents;
+use crate::frame;
 use crate::link::{Incoming, Link};
 use crate::platform::fs::{Files, Fs};
+use crate::platform::ipc::Stream;
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use futures_util::future::BoxFuture;
@@ -11,8 +13,6 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::Duration;
 use tokio::time::Instant;
@@ -1605,22 +1605,20 @@ impl Daemon {
             .await;
     }
 
-    async fn serve_client(self: Arc<Self>, stream: UnixStream) -> Result<()> {
+    async fn serve_client(self: Arc<Self>, stream: Stream) -> Result<()> {
         let owner = self.owner_serial.fetch_add(1, Ordering::Relaxed);
         let mut active = false;
         let mut shutdown = self.shutdown.subscribe();
-        let (read, mut write) = stream.into_split();
-        let mut reader = BufReader::new(read);
+        let mut connection = frame::connection(stream);
         let result = async {
             loop {
-                let line = tokio::select! {
+                let request = tokio::select! {
                     _ = shutdown.changed() => break,
-                    line = crate::frame::bounded_line(&mut reader, crate::frame::IPC_FRAME_LIMIT) => line?,
+                    request = frame::read(&mut connection) => request?,
                 };
-                let Some(line) = line else {
+                let Some(request) = request else {
                     break;
                 };
-                let request: Value = serde_json::from_str(&line)?;
                 let id = request.get("id").cloned().unwrap_or(Value::Null);
                 let method = request.get("method").and_then(Value::as_str).unwrap_or("");
                 let params = request.get("params").cloned().unwrap_or(json!({}));
@@ -1637,8 +1635,7 @@ impl Daemon {
                 };
                 let shutdown_after_reply =
                     method == "shutdown" && answer.get("ok") == Some(&json!(true));
-                write.write_all(answer.to_string().as_bytes()).await?;
-                write.write_all(b"\n").await?;
+                frame::write(&mut connection, &answer).await?;
                 if shutdown_after_reply {
                     self.shutdown.send_replace(true);
                     break;

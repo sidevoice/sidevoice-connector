@@ -3,9 +3,9 @@
 //!
 //! - `D`, the data directory: `$SIDEVOICE_DATA_DIR`, else `~/.sidevoice`. Private (0700). The connector is the
 //!   one writer of its records there, each written whole (`platform/fs`); `D/core/` is the core's.
-//!   `connector.sock`, `connector.lock`, `connector.log`, `agents.json`, `agents.lock`, `install.lock`,
+//!   the connector's endpoint (`connector.sock` on Unix), `connector.lock`, `connector.log`, `agents.json`, `agents.lock`, `install.lock`,
 //!   `node-stopped.json` (a person's stop), `outbox.json`, `core/core.json`
-//!   and `core/local.sock`.
+//!   and the core's endpoint, which its ready file names.
 //! - `R`, the release root: `$XDG_DATA_HOME/sidevoice` (else `~/.local/share/sidevoice`), as `service/layout.rs` names it.
 //! - The agents' homes, each named by a variable its harness declares ([`AgentHome`]): the variable's value, else
 //!   its default below `HOME` (or below another home of the same agent). A home that is not always passed on reaches
@@ -16,6 +16,7 @@
 //! they are passed to agents' command lines and written into.
 
 use crate::platform::fs::{Files, Fs};
+use crate::platform::ipc::{Address, Endpoint};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -62,8 +63,8 @@ pub struct Profile {
     pub agent_homes: Vec<ResolvedHome>,
     pub xdg_config: PathBuf,
     pub xdg_data: PathBuf,
-    pub socket: PathBuf,
-    pub core_socket: PathBuf,
+    /// The connector daemon's endpoint, for its clients.
+    pub endpoint: Endpoint,
     pub core_ready: PathBuf,
 }
 
@@ -116,8 +117,7 @@ impl Profile {
         let core = data.join("core");
         let profile = Self {
             home,
-            socket: data.join("connector.sock"),
-            core_socket: core.join("local.sock"),
+            endpoint: Endpoint::new(&data, "connector"),
             core_ready: core.join("core.json"),
             data,
             agent_homes,
@@ -397,12 +397,8 @@ mod tests {
         let profile = Profile::from_vars(vars(&[("HOME", &home)]), &HOMES).unwrap();
         assert_eq!(profile.data, scratch.path().join(".sidevoice"));
         assert_eq!(
-            profile.socket,
-            scratch.path().join(".sidevoice/connector.sock")
-        );
-        assert_eq!(
-            profile.core_socket,
-            scratch.path().join(".sidevoice/core/local.sock")
+            profile.endpoint,
+            Endpoint::new(&scratch.path().join(".sidevoice"), "connector")
         );
         assert_eq!(
             profile.core_ready,

@@ -1,3 +1,6 @@
+// adapters block: this is the harness's own socket, not ours; it moves behind platform::ipc with that block.
+#![allow(clippy::disallowed_types)]
+
 mod harness;
 mod registration;
 

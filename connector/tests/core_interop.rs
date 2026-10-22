@@ -1946,6 +1946,8 @@ fn t02a_late_receipt_follows_real_words_with_related_message_id_in_both_modes() 
     }
 }
 
+// A façade of another version speaks the wire raw, so this test opens the Unix socket itself.
+#[allow(clippy::disallowed_types)]
 #[test]
 fn t07_t16_detachable_pull_claim_reaches_the_next_real_ipc_owner() {
     use std::io::{BufRead, BufReader, Write};
