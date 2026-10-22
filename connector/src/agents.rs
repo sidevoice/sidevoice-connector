@@ -588,6 +588,7 @@ impl HostAgents {
         Ok(json!({
             "agents": rows,
             "scanned_at": state.get("scanned_at").cloned().unwrap_or(Value::Null),
+            "scan_failed": state.get("scan_failed") == Some(&Value::Bool(true)),
             "custom": {
                 "command": shell_command(&self.selected.command, &self.selected.args),
                 "snippet": snippet,
@@ -610,9 +611,10 @@ impl HostAgents {
         let base = state.clone();
         let login_path = self.capture_login_path(cancel, deadline).await?;
         if login_path.is_none() {
-            return self
-                .merge_scan(base, Vec::new(), None, cancel, deadline)
-                .await;
+            // A failed capture says nothing about what is installed: keep the last scan and report the failure.
+            let mut kept = base;
+            kept["scan_failed"] = json!(true);
+            return Ok(kept);
         }
         let ids: Vec<_> = (if base.get("login_path") != Some(&json!(login_path)) {
             None
@@ -724,14 +726,6 @@ impl HostAgents {
     ) -> std::result::Result<Value, Failure> {
         self.update_state(cancel, deadline, true, move |latest| {
             if captured_path.is_none() {
-                latest["login_path"] = Value::Null;
-                latest["binaries"] = json!({});
-                if let Some(seen) = latest.get_mut("seen").and_then(Value::as_object_mut) {
-                    for entry in seen.values_mut() {
-                        entry["present"] = json!(false);
-                    }
-                }
-                latest["scanned_at"] = json!(iso_now());
                 return;
             }
             let path_unchanged = latest.get("login_path") == base.get("login_path");

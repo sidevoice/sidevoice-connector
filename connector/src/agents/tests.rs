@@ -44,7 +44,7 @@ async fn command_output_limit_reports_truncation_instead_of_parsing_prefix() {
 }
 
 #[tokio::test]
-async fn failed_watched_capture_hides_all_agents_and_recovery_reconciles_all() {
+async fn failed_watched_capture_keeps_the_last_scan_and_recovery_reconciles_all() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
     let _no_cursor_override = EnvGuard::set("SIDEVOICE_CURSOR_BIN", std::ffi::OsStr::new(""));
@@ -74,9 +74,11 @@ async fn failed_watched_capture_hides_all_agents_and_recovery_reconciles_all() {
     assert!(listed_ids(&first).contains(&"cursor".into()), "{first}");
     private_write(&shell, b"#!/bin/sh\nexit 1\n");
     let failed = host.handle("agents.list", json!({"watch":"cursor"})).await;
-    assert!(listed_ids(&failed).is_empty(), "{failed}");
+    assert_eq!(failed["scan_failed"], true, "{failed}");
+    assert_eq!(listed_ids(&failed), listed_ids(&first), "{failed}");
     let cached = host.handle("agents.list", json!({})).await;
-    assert!(listed_ids(&cached).is_empty(), "{cached}");
+    assert_eq!(cached["scan_failed"], false, "{cached}");
+    assert_eq!(listed_ids(&cached), listed_ids(&first), "{cached}");
     private_write(
         &shell,
         format!("#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' '{}'\n", bin.display()).as_bytes(),
