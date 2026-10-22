@@ -185,13 +185,11 @@ mod tests {
 
     #[tokio::test]
     async fn whole_messages_cross_the_channel_and_oversized_ones_do_not() {
+        use crate::platform::fs::{Files, Fs};
         use crate::platform::ipc::{Channel, Endpoint};
-        let dir = std::env::temp_dir()
-            .canonicalize()
-            .unwrap()
-            .join(format!("sv-frame-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        crate::secure_fs::ensure_private_dir(&dir).unwrap();
+        let scratch = crate::test_support::temp_dir("frame");
+        let dir = scratch.path().join("private");
+        Files::create_private_dir(&dir).unwrap();
         let endpoint = Endpoint::in_dir(&dir, "frame");
         let listener = endpoint.listen().unwrap();
         let server = tokio::spawn(async move {
@@ -214,7 +212,6 @@ mod tests {
         // The peer sees the end once the connection is gone (both halves).
         drop((reader, writer));
         server.await.unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

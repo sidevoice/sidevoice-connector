@@ -105,33 +105,22 @@ impl Listener {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::fs::{Files, Fs};
+    use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    /// A private scratch directory, removed on drop.
-    struct Scratch(std::path::PathBuf);
-
-    impl Scratch {
-        fn new(label: &str) -> Scratch {
-            let dir = std::env::temp_dir()
-                .canonicalize()
-                .unwrap()
-                .join(format!("sv-ipc-{label}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            crate::secure_fs::ensure_private_dir(&dir).unwrap();
-            Scratch(dir)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+    /// A private directory for one test, inside a scratch directory that goes when the guard is dropped.
+    fn private_dir(label: &str) -> (tempfile::TempDir, PathBuf) {
+        let scratch = crate::test_support::temp_dir(label);
+        let dir = scratch.path().join("private");
+        Files::create_private_dir(&dir).unwrap();
+        (scratch, dir)
     }
 
     #[test]
     fn an_endpoint_survives_its_record_and_nothing_else_is_one() {
-        let dir = Scratch::new("record");
-        let endpoint = Endpoint::in_dir(&dir.0, "test");
+        let (_scratch, dir) = private_dir("record");
+        let endpoint = Endpoint::in_dir(&dir, "test");
         assert_eq!(
             Endpoint::from_record(&endpoint.to_string()).unwrap(),
             endpoint
@@ -142,18 +131,18 @@ mod tests {
 
     #[test]
     fn a_directory_and_a_name_make_one_endpoint_and_nothing_else_does() {
-        let (a, b) = (Scratch::new("a"), Scratch::new("b"));
-        let endpoint = Endpoint::in_dir(&a.0, "connector");
-        assert_eq!(endpoint, Endpoint::in_dir(&a.0, "connector"));
-        assert_ne!(endpoint, Endpoint::in_dir(&b.0, "connector"));
-        assert_ne!(endpoint, Endpoint::in_dir(&a.0, "core"));
+        let ((_a, a), (_b, b)) = (private_dir("a"), private_dir("b"));
+        let endpoint = Endpoint::in_dir(&a, "connector");
+        assert_eq!(endpoint, Endpoint::in_dir(&a, "connector"));
+        assert_ne!(endpoint, Endpoint::in_dir(&b, "connector"));
+        assert_ne!(endpoint, Endpoint::in_dir(&a, "core"));
         assert!(endpoint.to_string().contains("connector"));
     }
 
     #[tokio::test]
     async fn this_user_listens_and_connects_and_bytes_flow_both_ways() {
-        let dir = Scratch::new("echo");
-        let endpoint = Endpoint::in_dir(&dir.0, "test");
+        let (_scratch, dir) = private_dir("echo");
+        let endpoint = Endpoint::in_dir(&dir, "test");
         let listener = endpoint.listen().unwrap();
         let server = tokio::spawn(async move {
             let mut stream = listener.accept().await.unwrap();
@@ -173,14 +162,14 @@ mod tests {
 
     #[tokio::test]
     async fn an_endpoint_nobody_listens_at_is_an_error_not_a_hang() {
-        let dir = Scratch::new("none");
-        assert!(Endpoint::in_dir(&dir.0, "test").connect().await.is_err());
+        let (_scratch, dir) = private_dir("none");
+        assert!(Endpoint::in_dir(&dir, "test").connect().await.is_err());
     }
 
     #[tokio::test]
     async fn an_endpoint_is_free_again_once_its_listener_is_dropped() {
-        let dir = Scratch::new("again");
-        let endpoint = Endpoint::in_dir(&dir.0, "test");
+        let (_scratch, dir) = private_dir("again");
+        let endpoint = Endpoint::in_dir(&dir, "test");
         drop(endpoint.listen().unwrap());
         let _listener = endpoint.listen().unwrap();
         endpoint.connect().await.unwrap();

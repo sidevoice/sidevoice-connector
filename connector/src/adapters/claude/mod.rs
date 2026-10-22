@@ -331,14 +331,14 @@ mod tests {
     #[test]
     fn claude_config_dir_is_passed_on_only_when_the_environment_sets_it() {
         use crate::profile::Profile;
-        let scratch = crate::secure_fs::tests::Scratch::new("claude-home");
-        let home = scratch.0.to_string_lossy().into_owned();
+        let scratch = crate::test_support::temp_dir("claude-home");
+        let home = scratch.path().to_string_lossy().into_owned();
         let homes = crate::adapters::Registry::standard().homes();
         let unset =
             Profile::from_vars(|key| (key == "HOME").then(|| home.clone().into()), &homes).unwrap();
         assert_eq!(
             unset.agent_home(HOME.var),
-            scratch.0.join(".claude"),
+            scratch.path().join(".claude"),
             "its data stays in ~/.claude"
         );
         assert!(!unset
@@ -346,7 +346,7 @@ mod tests {
             .iter()
             .any(|(key, _)| *key == "CLAUDE_CONFIG_DIR"));
 
-        let named = scratch.0.join("elsewhere");
+        let named = scratch.path().join("elsewhere");
         let set = Profile::from_vars(
             |key| match key {
                 "HOME" => Some(home.clone().into()),

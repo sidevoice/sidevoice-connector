@@ -3,13 +3,14 @@
 //! is a socket, this user's, and open to nobody else.
 
 use super::{Listener, Stream};
+use crate::platform::fs::{Files, Fs};
 use crate::platform::user::{User, UserId};
 use interprocess::local_socket::traits::StreamCommon as _;
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, Name, ToFsName};
 use interprocess::os::unix::local_socket::ListenerOptionsExt;
 use std::fmt;
 use std::io;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// An endpoint as its socket path.
@@ -72,12 +73,17 @@ impl Endpoint {
 /// nobody else.
 fn verify_socket(path: &Path) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| unsafe_socket(path))?;
-    crate::secure_fs::private_dir(parent)
-        .map_err(|error| io::Error::other(format!("{error:#}")))?;
+    Files::check_private(&Files::open_read(parent)?).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("unsafe private directory {}: {error:#}", parent.display()),
+        )
+    })?;
+    // A socket cannot be opened: judged by its path.
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_socket()
         || !UserId::current().owns_path(path)?
-        || metadata.mode() & 0o077 != 0
+        || metadata.permissions().mode() & 0o077 != 0
     {
         return Err(unsafe_socket(path));
     }
@@ -97,7 +103,15 @@ fn unsafe_socket(path: &Path) -> io::Error {
 mod tests {
     use super::super::Channel as _;
     use super::*;
-    use crate::secure_fs::tests::Scratch;
+    use std::path::PathBuf;
+
+    /// A private directory for one test, inside a scratch directory that goes when the guard is dropped.
+    fn private_dir(label: &str) -> (tempfile::TempDir, PathBuf) {
+        let scratch = crate::test_support::temp_dir(label);
+        let dir = scratch.path().join("private");
+        Files::create_private_dir(&dir).unwrap();
+        (scratch, dir)
+    }
 
     fn chmod(path: &Path, mode: u32) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -105,25 +119,25 @@ mod tests {
 
     #[tokio::test]
     async fn a_socket_is_trusted_only_in_a_private_directory_and_open_to_nobody_else() {
-        let scratch = Scratch::new("sock");
-        let endpoint = Endpoint::in_dir(&scratch.0, "s");
+        let (_scratch, dir) = private_dir("sock");
+        let endpoint = Endpoint::in_dir(&dir, "s");
         let _listener = endpoint.listen().unwrap();
         endpoint.connect().await.unwrap();
         chmod(&endpoint.0, 0o666);
         assert!(endpoint.connect().await.is_err());
         chmod(&endpoint.0, 0o600);
-        chmod(&scratch.0, 0o755);
+        chmod(&dir, 0o755);
         assert!(endpoint.connect().await.is_err());
-        chmod(&scratch.0, 0o700);
-        let file = Endpoint::in_dir(&scratch.0, "plain");
-        crate::secure_fs::write_private(&file.0, b"").unwrap();
+        chmod(&dir, 0o700);
+        let file = Endpoint::in_dir(&dir, "plain");
+        Files::write_private(&file.0, b"").unwrap();
         assert!(file.connect().await.is_err());
     }
 
     #[tokio::test]
     async fn a_stale_socket_is_replaced_but_a_file_that_is_not_one_is_not() {
-        let scratch = Scratch::new("stale");
-        let endpoint = Endpoint::in_dir(&scratch.0, "t");
+        let (_scratch, dir) = private_dir("stale");
+        let endpoint = Endpoint::in_dir(&dir, "t");
         // Left behind by a process that died: the file stays, nothing listens. (A listener whose file is not
         // reclaimed on drop leaves exactly that.)
         let mut dead = endpoint.listen().unwrap();
@@ -140,7 +154,7 @@ mod tests {
             "the socket file goes with its listener"
         );
         // Something that is not a socket is never unlinked.
-        crate::secure_fs::write_private(&endpoint.0, b"mine").unwrap();
+        Files::write_private(&endpoint.0, b"mine").unwrap();
         assert!(endpoint.listen().is_err());
         assert_eq!(std::fs::read(&endpoint.0).unwrap(), b"mine");
     }

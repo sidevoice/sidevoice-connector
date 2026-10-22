@@ -18,5 +18,6 @@ pub mod messages;
 pub mod pairing;
 pub mod platform;
 pub mod profile;
-mod secure_fs;
 pub mod service;
+#[cfg(test)]
+mod test_support;

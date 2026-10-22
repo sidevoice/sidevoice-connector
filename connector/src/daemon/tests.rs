@@ -5,15 +5,14 @@ use super::Daemon;
 use crate::adapters::Registry;
 use crate::link::Link;
 use crate::profile::Profile;
-use crate::secure_fs::tests::Scratch;
 use serde_json::json;
 use tokio::sync::{mpsc, watch};
 
 #[tokio::test]
 async fn cursor_push_frame_reaches_bridge_adapter() {
-    let scratch = Scratch::new("cursor-push-route");
+    let scratch = crate::test_support::temp_dir("cursor-push-route");
     let registry = Registry::standard();
-    let profile = Profile::for_test(&scratch.0, &registry.homes());
+    let profile = Profile::for_test(scratch.path(), &registry.homes());
     let link = Link::new();
     let core = link.attached().await;
     play_core(link.clone(), core);

@@ -14,11 +14,12 @@
 use super::layout::Layout;
 use super::manager::{Job, Kind};
 use super::{Failure, Result};
+use crate::platform::fs::{Files, Fs};
+use crate::platform::user::{User, UserId};
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::fs;
+use std::io;
 use std::path::Path;
 
 /// systemd's start limit, the same for both jobs; launchd has none.
@@ -419,17 +420,12 @@ fn unsafe_definition(detail: impl Into<String>) -> Failure {
 /// A definition's directory: created (`0700`) when missing, else this user's and writable by nobody else.
 fn definition_directory(dir: &Path) -> Result<()> {
     match fs::symlink_metadata(dir) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-            .map_err(Failure::plain),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Files::ensure_private_dir(dir).map_err(Failure::plain)
+        }
         Err(error) => Err(Failure::plain(error)),
-        Ok(metadata) => {
-            if !metadata.is_dir()
-                || !crate::platform::user::current().owns(&metadata)
-                || metadata.mode() & 0o022 != 0
-            {
+        Ok(_) => {
+            if Files::check_user_directory(dir).is_err() {
                 return Err(unsafe_definition(dir.to_string_lossy()));
             }
             Ok(())
@@ -444,7 +440,7 @@ pub fn existing(file: &Path) -> Result<bool> {
         Err(error) => Err(Failure::plain(error)),
         Ok(metadata) => {
             if !metadata.is_file()
-                || !crate::platform::user::current().owns(&metadata)
+                || !UserId::current().owns_path(file).map_err(Failure::plain)?
                 || metadata.len() > 128 * 1024
             {
                 return Err(unsafe_definition(file.to_string_lossy()));
@@ -463,27 +459,7 @@ pub fn write(file: &Path, text: &str) -> Result<bool> {
     if existing(file)? && fs::read(file).ok().as_deref() == Some(text.as_bytes()) {
         return Ok(false);
     }
-    let temporary = dir.join(format!(
-        ".{}.{}.tmp",
-        file.file_name().unwrap_or_default().to_string_lossy(),
-        uuid::Uuid::new_v4()
-    ));
-    let written = (|| -> io::Result<()> {
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temporary)?;
-        output.write_all(text.as_bytes())?;
-        output.sync_all()?;
-        fs::rename(&temporary, file)?;
-        File::open(dir)?.sync_all()
-    })();
-    if let Err(error) = written {
-        let _ = fs::remove_file(&temporary);
-        return Err(Failure::plain(error));
-    }
+    Files::replace(file, text.as_bytes()).map_err(Failure::plain)?;
     Ok(true)
 }
 
@@ -704,7 +680,7 @@ mod tests {
         assert!(!write(&file, "one").unwrap());
         assert!(write(&file, "two").unwrap());
         assert_eq!(fs::read_to_string(&file).unwrap(), "two");
-        assert_eq!(fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
+        Files::check_private(&Files::open_read(&file).unwrap()).unwrap();
         assert_eq!(
             program_problem(Some(&words(&["/no/such/program"]))),
             Some("executable-missing")
