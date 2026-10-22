@@ -33,12 +33,15 @@ English (`messages/errors.json`, compiled in). Without `--json` a failure is one
 
 Every place comes from the environment, so a disposable profile is just a set of variables (the tests use one):
 
-- the data directory `D`: `$SIDEVOICE_DATA_DIR`, else `~/.sidevoice`. Private (0700), created by the daemon when
+- the data directory `D`: `$SIDEVOICE_DATA_DIR`, else the OS's standard place for a program's data: macOS
+  `~/Library/Application Support/Sidevoice`, Linux `$XDG_DATA_HOME/sidevoice` (else `~/.local/share/sidevoice`),
+  Windows `%LOCALAPPDATA%\Sidevoice` (`src/data_dir.rs`). Private (0700), created by the daemon when
   missing and refused, never repaired, when someone else could enter it or any directory above it could have its
   entries replaced. It holds `connector.sock`, `connector.lock`, `connector.log`, `agents.json`, `agents.lock`,
   `node-stopped.json` (a person's stop), the speech outbox, and `core/`
   (the core's own: `core.json`, `local.sock`);
-- the release root `R`: `$XDG_DATA_HOME/sidevoice`, else `~/.local/share/sidevoice`;
+- the release root `R`: `D/install`, always inside `D`;
+- the home: `$HOME` (Windows: `%USERPROFILE%`);
 - the core's port: `$SIDEVOICE_CORE_PORT`, else 10829;
 - the core's listen address: `$SIDEVOICE_CORE_HOST`, else `0.0.0.0` (all IPv4 interfaces). Set it to `127.0.0.1`
   to restrict the core to this machine. The same setting is used by the login service and on-demand starts. With a
@@ -126,7 +129,7 @@ lists the agents found (a rescan) and its answer's `agents` has one entry per ag
 the installation's command (Claude Code through `claude mcp add`, Codex through its CLI, Cursor in its `mcp.json`,
 only the `sidevoice` entry). That is not a new consent: the person connected that agent already, and the entry would
 stop working once the release it names is pruned. Each registration carries the installation's `SIDEVOICE_DATA_DIR`
-and `XDG_DATA_HOME`, so an agent opened from any shell reaches this installation. An agent whose MCP settings cannot
+(`R` is derived from it), so an agent opened from any shell reaches this installation. An agent whose MCP settings cannot
 be read is `invalid` and left alone.
 
 At a terminal (standard input and output both, no `--json`, no `--no-prompt`, `CI` unset), `install` then offers to
@@ -238,8 +241,11 @@ state comes from the chat's transcript, so it stays right while a message waits 
 the agents' registrations Sidevoice wrote (current or not), then the owned data and releases. It keeps lock files and
 the stop, so that a launcher on its way finds the stop and starts nothing.
 
-Before unloading, uninstall checks that `D` is exactly `HOME/.sidevoice` and `R` is exactly
-`HOME/.local/share/sidevoice`. A custom data or release path must be dealt with manually; uninstall refuses it.
+Before unloading, uninstall checks that `R` is `D/install` and that `D` is ours: exactly the OS's standard place
+above (wherever `XDG_DATA_HOME` puts it, inside the home or not), or, for a `$SIDEVOICE_DATA_DIR` elsewhere, a
+directory holding an installation of ours (an `install.json` of this user's that nobody else can change, naming `R`
+as its releases) or nothing but what an uninstall leaves. Anything else, such as a folder that merely has the
+program's name, is refused with nothing deleted.
 It checks the trees for mount boundaries before taking the install lock, which uninstall holds without writing to it.
 It rejects multiply linked lock files. Before traversal, each owned subtree is atomically moved into a private
 `D/.uninstall-claim` directory on the same filesystem, then revalidated and removed through directory handles

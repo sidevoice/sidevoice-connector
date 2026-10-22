@@ -49,7 +49,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-const EDITOR_NOTE: &str = "Sidevoice cannot tell which Cursor chat this is: this Cursor did not declare MCP Apps support (the io.modelcontextprotocol/ui extension) when it started this server, which is how the editor is told apart, nor is this a Cursor CLI chat (cursor-agent), whose open chat Sidevoice can see. ~/.sidevoice/mcp.log shows what it declared.";
+const EDITOR_NOTE: &str = "Sidevoice cannot tell which Cursor chat this is: this Cursor did not declare MCP Apps support (the io.modelcontextprotocol/ui extension) when it started this server, which is how the editor is told apart, nor is this a Cursor CLI chat (cursor-agent), whose open chat Sidevoice can see. voice_diagnose shows where Sidevoice's logs are.";
 const NOT_PERSISTED: &str = "This chat is not running under cursor-agent persist, so nothing can put a message into it. To let Sidevoice talk to a Cursor CLI chat (experimental), start it with  cursor-agent persist  (it needs tmux).";
 
 pub fn capabilities() -> Value {
