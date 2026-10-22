@@ -100,7 +100,10 @@ pub fn wait_state(
 }
 
 pub fn alive(pid: u64) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    let pid = sysinfo::Pid::from_u32(pid as u32);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    system.process(pid).is_some()
 }
 
 pub fn wait_gone(pid: u64, what: &str) {

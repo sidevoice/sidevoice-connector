@@ -38,3 +38,9 @@ uuid = { version = "1", features = ["v4"] }
 which = "=8.0.6"
 zstd = "0.13"
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
+process-wrap = { version = "10", features = ["tokio1", "process-group", "job-object", "creation-flags", "kill-on-drop"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+
+[target.'cfg(windows)'.dependencies]
+# The creation flags `process-wrap` takes (its own dependency, same version).
+windows = { version = "0.62", features = ["Win32_System_Threading"] }

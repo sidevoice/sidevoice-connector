@@ -278,7 +278,7 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
         .filter(|job| job.running)
         .and_then(|job| job.pid)
     {
-        Some(pid) => crate::process::age(pid),
+        Some(pid) => crate::platform::process::age(pid),
         None => None,
     };
     let start_at_login = match &installed {

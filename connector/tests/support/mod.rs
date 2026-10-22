@@ -261,9 +261,7 @@ impl Process {
         if self.0.try_wait().ok().flatten().is_some() {
             return;
         }
-        unsafe {
-            libc::kill(self.0.id() as i32, libc::SIGTERM);
-        }
+        signal(self.0.id().into(), sysinfo::Signal::Term);
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if self.0.try_wait().ok().flatten().is_some() {
@@ -739,4 +737,14 @@ impl Drop for Presentation {
             let _ = thread.join();
         }
     }
+}
+
+/// Sends `signal` to `pid`; whether there was such a process to send it to.
+pub fn signal(pid: u64, signal: sysinfo::Signal) -> bool {
+    let pid = sysinfo::Pid::from_u32(pid as u32);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    system
+        .process(pid)
+        .is_some_and(|process| process.kill_with(signal).unwrap_or(false))
 }

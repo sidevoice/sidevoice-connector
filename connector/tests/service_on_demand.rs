@@ -97,9 +97,7 @@ fn with_no_manager_a_conversation_starts_the_connector_and_the_connector_the_cor
     assert_eq!(joined["conversation"], "on-demand-thread", "{joined}");
 
     // The core dies: the connector that started it starts another.
-    unsafe {
-        libc::kill(first as i32, libc::SIGKILL);
-    }
+    signal(first, sysinfo::Signal::Kill);
     let second = wait_state(
         &profile,
         &extra,

@@ -27,12 +27,13 @@ use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 pub(crate) mod tests;
+use crate::platform::process::Child;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, sleep_until, timeout, Instant};
@@ -1226,24 +1227,8 @@ async fn collect_pipe(task: &mut JoinHandle<std::io::Result<Vec<u8>>>) -> Option
 }
 
 async fn kill_and_reap(child: &mut Child) {
-    if let Some(pid) = child.id() {
-        // Each probe gets its own process group so a shell wrapper cannot leave a delayed writer behind.
-        kill_process_group(pid);
-    }
-    let _ = child.start_kill();
-    if timeout(StdDuration::from_secs(2), child.wait())
-        .await
-        .is_err()
-    {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-    }
-}
-
-fn kill_process_group(pid: u32) {
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
-    }
+    // Each probe leads its own tree so a shell wrapper cannot leave a delayed writer behind.
+    child.kill_tree().await;
 }
 
 fn validate_command_profile(
@@ -1295,17 +1280,16 @@ async fn run_command_with_limit(
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .process_group(0);
+        .stderr(Stdio::piped());
     profile.command_env(&mut command);
     // Recheck immediately before passing these profile roots to a host CLI. The binary may have
     // been selected during an earlier scan, before an agent config directory was replaced.
     validate_command_profile(profile, agent_config)?;
-    let mut child = command.spawn().map_err(|_| CommandFailure::Start)?;
-    let process_group = child.id().ok_or(CommandFailure::Io)?;
-    let stdout = child.stdout.take().ok_or(CommandFailure::Io)?;
-    let stderr = child.stderr.take().ok_or(CommandFailure::Io)?;
+    let mut child = crate::platform::process::spawn_tree(command)
+        .await
+        .map_err(|_| CommandFailure::Start)?;
+    let stdout = child.stdout().ok_or(CommandFailure::Io)?;
+    let stderr = child.stderr().ok_or(CommandFailure::Io)?;
     let mut stdout_task = tokio::spawn(read_capped(stdout, output_limit));
     let mut stderr_task = tokio::spawn(read_capped(stderr, OUTPUT_LIMIT));
     let child_deadline = (Instant::now() + CHILD_LIMIT).min(deadline);
@@ -1334,7 +1318,7 @@ async fn run_command_with_limit(
     };
     // The direct CLI is reaped now. Kill any wrapper grandchildren before waiting on their pipes so
     // a detached helper cannot complete a delayed configuration write after this request returns.
-    kill_process_group(process_group);
+    child.kill_tree().await;
     let stdout = collect_pipe(&mut stdout_task)
         .await
         .ok_or(CommandFailure::Io)?;

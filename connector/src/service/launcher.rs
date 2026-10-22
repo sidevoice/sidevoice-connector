@@ -22,7 +22,7 @@ use super::status::{self, read_ready, serving};
 use super::{Failure, Result};
 use crate::core_ready::Ready;
 use crate::messages::message;
-use crate::process::{Expected, Lookup};
+use crate::platform::process::{self, Expected};
 use crate::secure_fs::verify_socket;
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
@@ -115,13 +115,7 @@ fn is_our_core(layout: &Layout, command_line: &str) -> bool {
 
 /// Whether `pid` is, now, this user's core of this data directory.
 pub fn core_running(layout: &Layout, pid: u32) -> bool {
-    match crate::process::lookup(pid) {
-        Lookup::Alive(found) => {
-            found.uid == crate::platform::user::current().raw()
-                && is_our_core(layout, &found.command)
-        }
-        _ => false,
-    }
+    process::is_process(pid, |found| is_our_core(layout, &found.command))
 }
 
 /// Every core of this data directory still alive: the one its ready file names, and any still starting.
@@ -131,21 +125,16 @@ pub fn core_processes(layout: &Layout) -> Vec<u32> {
         .filter(|pid| core_running(layout, *pid))
         .into_iter()
         .collect();
-    pids.extend(crate::process::find(|command| is_our_core(layout, command)));
+    pids.extend(process::find(|command| is_our_core(layout, command)));
     pids.sort_unstable();
     pids.dedup();
     pids
 }
 
-/// `signal` to `pid` only while it is provably this data directory's core.
-fn signal_core(layout: &Layout, pid: u32, signal: i32) -> bool {
-    core_running(layout, pid) && unsafe { libc::kill(pid as i32, signal) } == 0
-}
-
 /// Ask a core of this data directory to leave and wait until it has: SIGTERM, a grace period, SIGKILL; each sent
 /// only while it is provably that core.
 pub async fn terminate_core(layout: &Layout, pid: u32, grace: Duration) {
-    if !signal_core(layout, pid, libc::SIGTERM) {
+    if !process::terminate(pid, |found| is_our_core(layout, &found.command)) {
         return;
     }
     let deadline = Instant::now() + grace;
@@ -157,7 +146,7 @@ pub async fn terminate_core(layout: &Layout, pid: u32, grace: Duration) {
             "the core (pid {pid}) did not leave within {} s; killing it",
             grace.as_secs()
         ));
-        signal_core(layout, pid, libc::SIGKILL);
+        process::kill(pid, |found| is_our_core(layout, &found.command));
         let deadline = Instant::now() + Duration::from_secs(5);
         while core_running(layout, pid) && Instant::now() < deadline {
             sleep(Duration::from_millis(50)).await;
@@ -195,10 +184,7 @@ fn failure_cause(
             "run",
             code.code()
                 .map(Value::from)
-                .or_else(|| {
-                    std::os::unix::process::ExitStatusExt::signal(code)
-                        .map(|signal| json!(format!("signal {signal}")))
-                })
+                .or_else(|| Some(json!(code.to_string())))
                 .unwrap_or(Value::Null),
         ),
         None => describe("launch.exited", "run", Value::Null),
@@ -257,11 +243,10 @@ pub async fn ensure_core(layout: &Layout) -> Result<Ready> {
         ))
         .stdin(Stdio::null())
         .stdout(output.try_clone().map_err(Failure::plain)?)
-        .stderr(output)
-        .process_group(0);
+        .stderr(output);
     let environment = super::definition::core_environment(layout, &std::env::vars().collect());
     command.env_clear().envs(environment);
-    let mut child = match command.spawn() {
+    let mut child = match process::spawn_detached(command).await {
         Ok(child) => child,
         Err(error) => return Err(core_failure(spawn_failure(layout, &program, &error))),
     };
@@ -350,7 +335,8 @@ impl OnDemand {
     }
 
     fn up(&self) -> bool {
-        crate::process::is_process(self.pid, &self.expected())
+        let expected = self.expected();
+        process::is_process(self.pid, |found| expected.matches(found))
     }
 }
 
@@ -417,7 +403,8 @@ pub async fn stop_on_demand(layout: &Layout) -> Teardown {
             None => false,
         };
         if !asked {
-            crate::process::signal_verified(found.pid, libc::SIGTERM, &found.expected());
+            let expected = found.expected();
+            process::terminate(found.pid, |is| expected.matches(is));
         }
     }
     let up = |connector: &Option<OnDemand>| connector.as_ref().is_some_and(OnDemand::up);
@@ -426,7 +413,8 @@ pub async fn stop_on_demand(layout: &Layout) -> Teardown {
         sleep(Duration::from_millis(100)).await;
     }
     if let Some(found) = connector.as_ref().filter(|found| found.up()) {
-        if crate::process::signal_verified(found.pid, libc::SIGKILL, &found.expected()) {
+        let expected = found.expected();
+        if process::kill(found.pid, |is| expected.matches(is)) {
             teardown.killed.push(found.pid);
         }
     }
@@ -538,9 +526,8 @@ where
         )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0);
-    let mut child = command.spawn().map_err(|error| {
+        .stderr(Stdio::null());
+    let mut child = process::spawn_detached(command).await.map_err(|error| {
         Failure::keyed(
             "connector.not-started",
             json!({"detail": error.to_string()}),
@@ -566,10 +553,7 @@ where
             break;
         }
     }
-    let _ = child.start_kill();
-    tokio::spawn(async move {
-        let _ = child.wait().await;
-    });
+    tokio::spawn(async move { child.kill_tree().await });
     Err(Failure::keyed("connector.not-started", json!({})))
 }
 

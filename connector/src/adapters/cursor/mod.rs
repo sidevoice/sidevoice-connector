@@ -137,29 +137,6 @@ struct Chat {
     updated: u64,
 }
 
-fn open_files(pid: u32) -> Vec<PathBuf> {
-    let linux = PathBuf::from(format!("/proc/{pid}/fd"));
-    if let Ok(entries) = fs::read_dir(linux) {
-        return entries
-            .flatten()
-            .filter_map(|entry| fs::read_link(entry.path()).ok())
-            .collect();
-    }
-    let output = std::process::Command::new("lsof")
-        .args(["-n", "-P", "-Fn", "-p", &pid.to_string()])
-        .output()
-        .ok();
-    output
-        .filter(|out| out.status.success())
-        .map(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter_map(|line| line.strip_prefix('n').map(PathBuf::from))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 struct StorePath {
     chat: String,
     path: PathBuf,
@@ -189,22 +166,12 @@ fn chat_from_store(path: &Path) -> Option<StorePath> {
 fn find_chat() -> Option<Chat> {
     let mut pid = std::process::id();
     for _ in 0..4 {
-        let parent = std::process::Command::new("ps")
-            .args(["-o", "ppid=", "-p", &pid.to_string()])
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .and_then(|out| {
-                String::from_utf8_lossy(&out.stdout)
-                    .trim()
-                    .parse::<u32>()
-                    .ok()
-            })?;
+        let parent = crate::platform::process::parent(pid)?;
         if parent <= 1 {
             return None;
         }
         let mut chats = Vec::<Chat>::new();
-        for path in open_files(parent) {
+        for path in crate::platform::process::open_files(parent).unwrap_or_default() {
             let Some(store) = chat_from_store(&path) else {
                 continue;
             };
@@ -735,10 +702,7 @@ pub fn bridge_running() -> bool {
 }
 
 fn process_alive(pid: u64) -> bool {
-    unsafe {
-        libc::kill(pid as i32, 0) == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
+    u32::try_from(pid).is_ok_and(|pid| crate::platform::process::identity(pid).is_some())
 }
 
 fn unix_ms() -> u64 {

@@ -108,7 +108,7 @@ pub fn try_lock(path: &Path, kind: &str) -> Result<Option<Lock>> {
         bail!("unsafe lock file {}", path.display());
     }
     let record = json!({"pid":std::process::id(),
-        "start":crate::process::self_identity().map(|identity| identity.start),
+        "start":crate::platform::process::self_identity().map(|identity| identity.start),
         "kind":kind,"at":crate::logfile::timestamp()});
     // Into the locked file itself: a replaced file would leave the lock on an inode nobody else opens.
     let _ = file
@@ -268,7 +268,7 @@ mod tests {
             libc::close(pipe[0]);
             assert_eq!(byte[0], 1, "the child took the lock");
             assert!(try_lock(&path, "agents").unwrap().is_none());
-            libc::kill(pid, libc::SIGKILL);
+            assert!(crate::platform::process::kill(pid as u32, |_| true));
             let mut status = 0;
             libc::waitpid(pid, &mut status, 0);
         }
