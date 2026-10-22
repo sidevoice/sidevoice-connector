@@ -986,7 +986,7 @@ pub async fn uninstall(profile: &Profile, options: Options, runtime: &Runtime) -
 /// The two roots `uninstall` may remove, as this installation names them.
 fn removal_roots(layout: &Layout) -> Roots {
     Roots {
-        home: layout.home.clone(),
+        standard: crate::data_dir::standard(),
         data: layout.data.clone(),
         releases: layout.releases.clone(),
         kept: KEPT,
@@ -1589,7 +1589,14 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_preflight_refusal_stops_before_install_lock_is_rewritten() {
         let fixture = Fixture::new("mounted-uninstall-data");
-        let lock = fixture.layout().install_lock();
+        let layout = fixture.layout();
+        // An installation of ours in this scratch `D`, so the refusal tested is the preflight's.
+        fs::write(
+            layout.data.join("install.json"),
+            json!({"releases": layout.releases}).to_string(),
+        )
+        .unwrap();
+        let lock = layout.install_lock();
         fs::write(&lock, b"sentinel lock contents").unwrap();
         fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
         let error = uninstall_with_hooks(

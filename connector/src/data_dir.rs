@@ -1,5 +1,5 @@
 //! `D`, the connector's data directory, and `R`, where its releases are: one rule, used by every place that needs
-//! them (`profile`, `service/layout`, the uninstall's allowlist).
+//! them (`profile`, `service/layout`, the uninstall's allowlist, which accepts the standard place as ours).
 //!
 //! `D` is one directory for the program, in the OS's standard place for a program's data (`dirs`):
 //!
@@ -32,11 +32,15 @@ pub fn data_dir(var: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf> {
             }
             Ok(path)
         }
-        None => dirs::data_local_dir()
-            .map(|place| place.join(Environment::DATA_NAME))
-            .filter(|path| path.is_absolute())
-            .context("this user has no standard data directory"),
+        None => standard().context("this user has no standard data directory"),
     }
+}
+
+/// `D` in this OS's standard place for this user, whatever `$SIDEVOICE_DATA_DIR` says; `None` when the user has none.
+pub fn standard() -> Option<PathBuf> {
+    dirs::data_local_dir()
+        .map(|place| place.join(Environment::DATA_NAME))
+        .filter(|path| path.is_absolute())
 }
 
 /// `R`, the releases' directory, for the data directory `data`.
@@ -55,6 +59,7 @@ mod tests {
     #[test]
     fn the_default_is_one_directory_in_the_standard_place_and_the_override_wins() {
         let default = data_dir(none).unwrap();
+        assert_eq!(standard(), Some(default.clone()));
         assert_eq!(default.file_name().unwrap(), Environment::DATA_NAME);
         assert_eq!(
             default.parent().unwrap(),

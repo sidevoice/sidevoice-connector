@@ -2,8 +2,9 @@
 //! as long as it runs. Each is opened as itself (`FILE_FLAG_OPEN_REPARSE_POINT`: a link or junction there is opened,
 //! seen and refused, never followed) and without `FILE_SHARE_DELETE`, so while it is held nobody can rename it,
 //! delete it or put a link in its place: the paths the step then uses can only lead through those directories. The
-//! home is compared (volume and file id, `winapi-util`) with the one seen when the removal started; an entry is
-//! claimed by renaming it into the private claim directory and compared before and after; the standard library's
+//! anchor (the nearest directory above `D` there at the start) is compared (volume and file id, `winapi-util`) with
+//! the one seen when the removal started; an entry is claimed by renaming it into the private claim directory and
+//! compared before and after; the standard library's
 //! handle-based `remove_dir_all` deletes what was claimed (it removes a link or junction itself and never follows one,
 //! so it never leaves the volume). `D` and the claim directory are checked private with
 //! [`platform::fs`](crate::platform::fs).
@@ -17,8 +18,8 @@
 //! No `unsafe` here: `std`'s `OpenOptionsExt` sets the sharing and the flags, `winapi-util` reads the file id.
 
 use super::{
-    recovery_record, Removal, Roots, CLAIM, DATA_PREFIX, RECORD, RECOVERY, RECOVERY_PROGRAM,
-    RELEASE_PREFIX,
+    recovery_record, Removal, Roots, CLAIM, DATA_PREFIX, RECORD, RECORD_LIMIT, RECOVERY,
+    RECOVERY_PROGRAM, RELEASE_PREFIX,
 };
 use crate::platform::fs::{Create, Files, Fs};
 use std::ffi::{OsStr, OsString};
@@ -136,27 +137,37 @@ fn claim_entry(
 /// Directories held for one step; released when dropped.
 struct Held(Vec<File>);
 
-/// This OS's removal: the roots, and the home as it was when the removal started.
+/// This OS's removal: the roots, and the anchor as it was when the removal started.
 pub struct Os {
     roots: Roots,
-    home: (File, Identity),
+    anchor: (PathBuf, File, Identity),
 }
 
 impl Os {
-    /// `path` (the home or below it) and every directory above it, held, with the home checked to be the one seen
-    /// when the removal started.
+    /// `path` (the anchor or below it) and every directory above it, held, with the anchor checked to be the one
+    /// seen when the removal started.
     fn hold_down_to(&self, path: &Path) -> Result<Held, &'static str> {
         self.roots.validate()?;
         let mut chain: Vec<&Path> = path.ancestors().collect();
         chain.reverse();
         let held = chain.into_iter().map(hold).collect::<Result<Vec<_>, _>>()?;
-        let home = held
-            .get(self.roots.home.ancestors().count() - 1)
+        let anchor = held
+            .get(self.anchor.0.ancestors().count() - 1)
             .ok_or("unsafe uninstall path")?;
-        if identity_of(home)? != self.home.1 {
-            return Err("uninstall home replaced during removal");
+        if identity_of(anchor)? != self.anchor.2 {
+            return Err("uninstall anchor replaced during removal");
         }
         Ok(Held(held))
+    }
+
+    /// `D`'s names and its record, read with `D` held, for [`Roots::check_owned`].
+    fn contents(&self) -> Result<super::Contents, &'static str> {
+        let Some(_held) = self.data()? else {
+            return Ok(None);
+        };
+        let record = Files::read_trusted(&self.roots.data.join(RECORD), RECORD_LIMIT)
+            .map_err(|_| "unsafe uninstall install record")?;
+        Ok(Some((names(&self.roots.data)?, record)))
     }
 
     /// `D` held (with all above it) when it is there, checked: this user's, open to nobody else.
@@ -183,7 +194,7 @@ impl Os {
     }
 
     /// Refused when the running program is inside what an uninstall removes: Windows cannot delete it while it
-    /// runs, so the uninstall would stop half-way, every retry from the same place again.
+    /// This OS's removal: the anchor held open, and the mount every directory below it must be on.
     fn check_not_running_inside(&self) -> Result<(), &'static str> {
         let program = std::env::current_exe()
             .and_then(fs::canonicalize)
@@ -215,8 +226,14 @@ impl Os {
 impl Removal for Os {
     fn new(roots: Roots) -> Result<Self, &'static str> {
         roots.validate()?;
-        let home = identity(&roots.home)?;
-        Ok(Self { roots, home })
+        let path = roots.anchor()?;
+        let (file, id) = identity(&path)?;
+        let removal = Self {
+            roots,
+            anchor: (path, file, id),
+        };
+        removal.roots.check_owned(|| removal.contents())?;
+        Ok(removal)
     }
 
     fn roots(&self) -> &Roots {
