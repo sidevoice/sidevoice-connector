@@ -11,16 +11,16 @@
 //! tells the manager whether to restart it (0 after a failed start: not again; 75 while another core holds its
 //! directory: later; a crash after ready: again).
 
+use super::jobs::Job;
 use super::layout::Layout;
-use super::manager::Job;
 use super::{Failure, Result};
-use crate::platform::service::{Job as Definition, Manager, Refusal, Restart, ServiceManager};
+use crate::platform::service::{Job as Definition, Refusal, Restart, Service, Services};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::Path;
 
 /// The subcommand that runs a job from its definition file, for a manager that cannot set a job's environment and
-/// output itself (`main.rs`, `platform::service::Manager::run_job`).
+/// output itself (`main.rs`, `platform::service::Service::run_job`).
 pub const RUN_JOB: &str = "run-job";
 
 /// What each job runs: the core through `R/current`, the connector as `install.json`'s `command` says.
@@ -86,7 +86,7 @@ pub fn environment(layout: &Layout) -> BTreeMap<String, String> {
     for (name, dir) in &layout.agent_dirs {
         environment.insert(name.clone(), path(dir));
     }
-    environment.insert("SIDEVOICE_SERVICE".into(), ServiceManager::KIND.into());
+    environment.insert("SIDEVOICE_SERVICE".into(), Services::KIND.into());
     environment
 }
 
@@ -242,10 +242,7 @@ mod tests {
         .unwrap();
         assert_eq!(unset.agent_dirs_unset(), ["ALPHA_HOME", "BETA_HOME"]);
         assert!(!environment(&unset).contains_key("ALPHA_HOME"));
-        assert_eq!(
-            environment(&unset)["SIDEVOICE_SERVICE"],
-            ServiceManager::KIND
-        );
+        assert_eq!(environment(&unset)["SIDEVOICE_SERVICE"], Services::KIND);
 
         let named = Layout::from_vars(
             |name| match name {

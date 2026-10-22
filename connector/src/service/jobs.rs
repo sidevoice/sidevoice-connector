@@ -5,7 +5,7 @@
 use super::definition;
 use super::layout::Layout;
 use super::{Failure, Result};
-use crate::platform::service::{JobId, Linger, Manager, Refusal, ServiceManager};
+use crate::platform::service::{JobId, Linger, Refusal, Service, Services};
 use serde_json::{json, Value};
 
 /// A manager runs the jobs, or none does (Sidevoice on demand).
@@ -19,7 +19,7 @@ impl Kind {
     /// The manager's name (`launchd`, `systemd`, `task-scheduler`), or `none`.
     pub fn as_str(self) -> &'static str {
         match self {
-            Kind::Manager => ServiceManager::KIND,
+            Kind::Manager => Services::KIND,
             Kind::None => "none",
         }
     }
@@ -69,7 +69,7 @@ pub async fn kind() -> Kind {
     let kind = platform_kind();
     if kind == Kind::Manager
         && std::env::var_os("SIDEVOICE_SERVICE_MANAGER").is_none()
-        && !ServiceManager::answers().await
+        && !Services::answers().await
     {
         return Kind::None;
     }
@@ -77,8 +77,8 @@ pub async fn kind() -> Kind {
 }
 
 /// This user's manager, keeping its definitions where this installation's environment says.
-pub fn manager(layout: &Layout) -> ServiceManager {
-    ServiceManager::new(layout.places())
+pub fn manager(layout: &Layout) -> Services {
+    Services::new(layout.places())
 }
 
 /// The jobs defined on this machine, found by their definitions alone.
@@ -128,14 +128,14 @@ pub fn missing(installed: &Installed) -> Vec<Job> {
 
 pub fn names(jobs: &[Job]) -> String {
     jobs.iter()
-        .map(|job| ServiceManager::name(job.id()))
+        .map(|job| Services::name(job.id()))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
 /// A manager's refusal as the service says it, with its stable key. A start the manager refused is said by why, when
 /// that can be told: the job's start limit, or a program that cannot run.
-pub async fn failure(manager: &impl Manager, refusal: Refusal) -> Failure {
+pub async fn failure(manager: &impl Service, refusal: Refusal) -> Failure {
     let (key, params) = match refusal {
         Refusal::Unsafe(what) => ("service.unsafe-value", json!({"what": what})),
         Refusal::Definition(detail) => ("service.definition-unsafe", json!({"detail": detail})),
@@ -158,11 +158,11 @@ pub async fn failure(manager: &impl Manager, refusal: Refusal) -> Failure {
     Failure::keyed(key, params)
 }
 
-/// Each of `jobs` started from its definition as it is now ([`Manager::start`]): a changed one loaded again, with
+/// Each of `jobs` started from its definition as it is now ([`Service::start`]): a changed one loaded again, with
 /// `restart` a running one restarted, with `login` each enabled for the next login.
 pub async fn start(
     layout: &Layout,
-    manager: &impl Manager,
+    manager: &impl Service,
     changed: &[Job],
     restart: bool,
     login: bool,
@@ -181,10 +181,10 @@ pub async fn start(
     }
 }
 
-/// The defined jobs stopped, the connector first ([`Manager::stop`]); with `disable`, not at the next login either.
+/// The defined jobs stopped, the connector first ([`Service::stop`]); with `disable`, not at the next login either.
 /// The first refusal, or none.
 pub async fn unload(
-    manager: &impl Manager,
+    manager: &impl Service,
     installed: &Installed,
     disable: bool,
 ) -> Option<String> {
@@ -200,7 +200,7 @@ pub async fn unload(
 }
 
 /// After the definitions are deleted: the manager forgets both jobs.
-pub async fn forget(manager: &impl Manager) -> Result<()> {
+pub async fn forget(manager: &impl Service) -> Result<()> {
     manager
         .forget(&ids(&Job::ALL))
         .await
@@ -220,7 +220,7 @@ pub fn combine_login(jobs: impl IntoIterator<Item = Option<bool>>) -> Option<boo
     }
 }
 
-async fn login_of(manager: &impl Manager, jobs: &[Job]) -> Option<bool> {
+async fn login_of(manager: &impl Service, jobs: &[Job]) -> Option<bool> {
     let mut each = Vec::new();
     for &job in jobs {
         each.push(manager.login(job.id()).await);
@@ -230,7 +230,7 @@ async fn login_of(manager: &impl Manager, jobs: &[Job]) -> Option<bool> {
 
 /// Whether both jobs start at the next login, as their manager says now; `None` when it cannot tell, or a job is not
 /// defined (with a job missing, whether Sidevoice comes up at login is not that of either job).
-pub async fn start_at_login(manager: &impl Manager, installed: &Installed) -> Option<bool> {
+pub async fn start_at_login(manager: &impl Service, installed: &Installed) -> Option<bool> {
     if !missing(installed).is_empty() {
         return None;
     }
@@ -245,24 +245,24 @@ pub fn enable_on_start(new: bool, defined_now: Option<bool>) -> bool {
 }
 
 /// [`enable_on_start`] for the jobs defined here (`None`: none was).
-pub async fn keeps_login(manager: &impl Manager, installed: Option<&Installed>) -> bool {
+pub async fn keeps_login(manager: &impl Service, installed: Option<&Installed>) -> bool {
     match installed {
         None => enable_on_start(true, None),
         Some(found) => enable_on_start(false, login_of(manager, &defined(found)).await),
     }
 }
 
-/// The jobs defined here set to start at the next login or not, and nothing else ([`Manager::set_login`]): a
+/// The jobs defined here set to start at the next login or not, and nothing else ([`Service::set_login`]): a
 /// running job keeps running, a stopped one stays stopped. Each change is read back. The first job refused or not
 /// confirmed, said with its name.
 pub async fn set_start_at_login(
-    manager: &impl Manager,
+    manager: &impl Service,
     installed: &Installed,
     on: bool,
 ) -> std::result::Result<(), String> {
     let verb = if on { "enable" } else { "disable" };
     for job in defined(installed) {
-        let name = ServiceManager::name(job.id());
+        let name = Services::name(job.id());
         manager
             .set_login(job.id(), on)
             .await
@@ -278,7 +278,7 @@ pub async fn set_start_at_login(
 
 /// Where the manager asks for it (Linux): whether this user's services run without a session, the command that
 /// would make them (never run), and why.
-pub async fn linger(manager: &impl Manager) -> Option<Value> {
+pub async fn linger(manager: &impl Service) -> Option<Value> {
     let Linger { enabled, command } = manager.linger().await?;
     Some(json!({"enabled": enabled, "command": command,
         "reason": crate::messages::message("service.linger-reason", &Value::Null)}))
@@ -312,7 +312,7 @@ mod tests {
         }
     }
 
-    impl Manager for Fake {
+    impl Service for Fake {
         const KIND: &'static str = "fake";
         fn new(_: Places) -> Fake {
             Fake::default()
@@ -455,7 +455,7 @@ mod tests {
             refuse: vec!["sidevoice-core"],
             ..Fake::with(Some(true))
         };
-        let name = ServiceManager::name(Job::Core.id());
+        let name = Services::name(Job::Core.id());
         assert_eq!(
             set_start_at_login(&refusing, &both, false).await,
             Err(format!("{name}: disable: Access denied"))

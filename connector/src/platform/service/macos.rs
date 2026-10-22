@@ -4,7 +4,7 @@
 //! starts; its output goes to the job's log. Whether it starts at login is launchd's override for its label
 //! (`enable` / `disable`), which a plist's RunAtLoad obeys.
 
-use super::{command, xml, Job, JobId, JobState, Manager, Output, Places, Refusal, Restart};
+use super::{command, xml, Job, JobId, JobState, Output, Places, Refusal, Restart, Service};
 use std::future::Future;
 use std::path::PathBuf;
 use tokio::time::{sleep, Duration, Instant};
@@ -14,7 +14,7 @@ pub struct Os {
     places: Places,
 }
 
-impl Manager for Os {
+impl Service for Os {
     const KIND: &'static str = "launchd";
 
     fn new(places: Places) -> Os {

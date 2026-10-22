@@ -17,7 +17,7 @@
 
 use crate::platform::fs::{Files, Fs};
 use crate::platform::ipc::{Address, Endpoint};
-use crate::platform::service::{Manager, ServiceManager};
+use crate::platform::service::{Service, Services};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -198,7 +198,7 @@ impl Profile {
     pub fn validate_service_environment(&self) -> Result<()> {
         let service = std::env::var("SIDEVOICE_SERVICE")
             .context("the service manager is not identified (SIDEVOICE_SERVICE)")?;
-        if service != ServiceManager::KIND {
+        if service != Services::KIND {
             bail!("unsupported service manager {service:?}");
         }
         for (key, expected) in self.variables() {

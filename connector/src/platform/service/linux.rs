@@ -4,7 +4,7 @@
 //! login (`WantedBy=default.target`). Its output goes to the journal. A user's units run only while the user has a
 //! session, unless the machine's owner enables linger (`loginctl enable-linger`): printed, never run.
 
-use super::{command, Job, JobId, JobState, Linger, Manager, Output, Places, Refusal, Restart};
+use super::{command, Job, JobId, JobState, Linger, Output, Places, Refusal, Restart, Service};
 use crate::platform::user::{User, UserId};
 use std::future::Future;
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ pub struct Os {
     places: Places,
 }
 
-impl Manager for Os {
+impl Service for Os {
     const KIND: &'static str = "systemd";
     const START_LIMIT: Option<u64> = Some(START_LIMIT);
 

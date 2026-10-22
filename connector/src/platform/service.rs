@@ -1,13 +1,13 @@
 //! Start at login and supervision: this user's service manager, which runs each job, starts it at the next login or
 //! not, and brings it back when it ends.
 //!
-//! The interface is the [`Manager`] trait; [`ServiceManager`] is the one manager compiled in, chosen by the OS below:
+//! The interface is the [`Service`] trait; [`Services`] is the one manager compiled in, chosen by the OS below:
 //! launchd on macOS (a LaunchAgent in this user's GUI domain), systemd's user manager on Linux (a user unit), Task
 //! Scheduler on Windows (a task that runs at this user's logon, as this user, with no administrator: a Windows
 //! service would need one, and runs outside the user's session). Where there is no manager to use (none answers, or
 //! `SIDEVOICE_SERVICE_MANAGER=none`), the caller runs Sidevoice on demand instead; that is not a manager. Callers
-//! import both: `use crate::platform::service::{Manager, ServiceManager};` then
-//! `ServiceManager::new(places).start(..)`.
+//! import both: `use crate::platform::service::{Service, Services};` then
+//! `Services::new(places).start(..)`.
 //!
 //! What a job runs is host-agnostic data, a [`Job`], built by the caller; each manager turns it into its own
 //! definition (a plist, a unit, a task) and reads the program back from it. Every manager command has an absolute
@@ -29,7 +29,7 @@ mod imp;
 #[path = "service/windows.rs"]
 mod imp;
 
-pub use imp::Os as ServiceManager;
+pub use imp::Os as Services;
 
 use super::fs::{Create, Files, Fs};
 use super::process::{Process, Processes};
@@ -57,7 +57,7 @@ pub struct Places {
 }
 
 /// A job's names, fixed: `label` reverse-DNS (`dev.sidevoice.core`), `name` short (`sidevoice-core`). Each manager
-/// derives what it calls the job from them ([`Manager::name`]).
+/// derives what it calls the job from them ([`Service::name`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct JobId {
     pub label: &'static str,
@@ -85,7 +85,7 @@ pub struct Job {
     pub restart: Restart,
     /// Where its output goes, where the manager does not keep it itself (systemd keeps it in the journal).
     pub log: PathBuf,
-    /// The command that runs a job from its definition file ([`Manager::run_job`], the file appended), for a
+    /// The command that runs a job from its definition file ([`Service::run_job`], the file appended), for a
     /// manager that cannot set a job's environment and output itself (Task Scheduler).
     pub runner: Vec<String>,
 }
@@ -167,10 +167,10 @@ pub enum Refusal {
     NotStarted(JobId, String),
 }
 
-/// What every manager implements ([`ServiceManager`], in `service/macos.rs` (launchd), `service/linux.rs` (systemd) and
+/// What every manager implements ([`Services`], in `service/macos.rs` (launchd), `service/linux.rs` (systemd) and
 /// `service/windows.rs` (Task Scheduler)): the required methods. The rest is one body for every manager; one
 /// overrides it only if it must.
-pub trait Manager: Sized + Send + Sync {
+pub trait Service: Sized + Send + Sync {
     /// Its name, as `service status` and the jobs' `SIDEVOICE_SERVICE` say it.
     const KIND: &'static str;
     /// How many starts it allows before it gives up (systemd's start limit); none where it has none to report.
@@ -296,7 +296,7 @@ pub trait Manager: Sized + Send + Sync {
     }
 }
 
-/// A job as a file a runner reads ([`Manager::run_job`]): everything in [`Job`] but its names.
+/// A job as a file a runner reads ([`Service::run_job`]): everything in [`Job`] but its names.
 #[derive(Serialize, Deserialize)]
 pub struct Stored {
     pub description: String,
@@ -505,14 +505,14 @@ mod tests {
                 &[("HOME", "/home/u"), ("PRICE", "$5 at 50% \"off\"")],
             );
             job.check().unwrap();
-            let text = ServiceManager::definition(&job);
+            let text = Services::definition(&job);
             assert_eq!(
-                ServiceManager::program_of(&text),
+                Services::program_of(&text),
                 Some(job.program.clone()),
                 "{text}"
             );
         }
-        assert_eq!(ServiceManager::program_of(""), None);
+        assert_eq!(Services::program_of(""), None);
     }
 
     #[test]
@@ -558,10 +558,10 @@ mod tests {
         stored.log = dir.path().join("job.log");
         let file = dir.path().join("job.json");
         write_definition(&file, &serde_json::to_string(&stored).unwrap()).unwrap();
-        assert_eq!(ServiceManager::run_job(&file).await.unwrap(), 0);
+        assert_eq!(Services::run_job(&file).await.unwrap(), 0);
         let log = std::fs::read_to_string(&stored.log).unwrap();
         assert!(log.contains("run_job_child"), "{log}");
-        let missing = ServiceManager::run_job(&dir.path().join("none.json")).await;
+        let missing = Services::run_job(&dir.path().join("none.json")).await;
         assert_eq!(missing.unwrap_err().kind(), io::ErrorKind::NotFound);
     }
 

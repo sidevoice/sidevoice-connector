@@ -9,13 +9,13 @@
 //!
 //! A task cannot set its program's environment or send its output to a file, so its action runs the job's runner
 //! ([`Job::runner`], the connector's `run-job`) on the job's definition, `<data>/service/<name>.json`
-//! ([`Stored`]), which does both ([`Manager::run_job`](super::Manager::run_job)). Task Scheduler cannot tell a job's
+//! ([`Stored`]), which does both ([`Service::run_job`](super::Service::run_job)). Task Scheduler cannot tell a job's
 //! pid or count its restarts: a job runs when this user has a process running its program, and restarts are not
 //! reported. It also brings a task back only after a failure, so a connector that exits cleanly stays down until
 //! the next login or start. `/End` is a hard stop; the graceful request is the caller's, in band, first.
 
 use super::{
-    command, write_file, xml, Job, JobId, JobState, Manager, Output, Places, Refusal, Stored,
+    command, write_file, xml, Job, JobId, JobState, Output, Places, Refusal, Service, Stored,
 };
 use crate::platform::fs::{Files, Fs};
 use crate::platform::process::{Process, Processes};
@@ -27,7 +27,7 @@ pub struct Os {
     places: Places,
 }
 
-impl Manager for Os {
+impl Service for Os {
     const KIND: &'static str = "task-scheduler";
 
     fn new(places: Places) -> Os {

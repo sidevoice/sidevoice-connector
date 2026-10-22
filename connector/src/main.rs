@@ -1,4 +1,4 @@
-use sidevoice_connector::platform::service::{Manager, ServiceManager};
+use sidevoice_connector::platform::service::{Service, Services};
 use sidevoice_connector::{
     adapters, agents, core_package, daemon, identity, install, logfile, mcp, messages, pairing,
     profile, service,
@@ -222,7 +222,7 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     if let Action::RunJob { definition } = &action {
-        let code = ServiceManager::run_job(definition).await?;
+        let code = Services::run_job(definition).await?;
         return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
     }
     if let Action::StageCore { release } = &action {
@@ -283,8 +283,8 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
         }
         Action::Mcp => mcp::run(profile).await.map(|()| ExitCode::SUCCESS),
         Action::Connector { service } => {
-            let managed = service
-                || std::env::var("SIDEVOICE_SERVICE").as_deref() == Ok(ServiceManager::KIND);
+            let managed =
+                service || std::env::var("SIDEVOICE_SERVICE").as_deref() == Ok(Services::KIND);
             daemon::run(profile, managed)
                 .await
                 .map(|()| ExitCode::SUCCESS)

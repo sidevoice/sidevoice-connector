@@ -2,14 +2,14 @@
 //! health, the same answer for `service status --json` and for a connector's `node.status`.
 
 use super::definition;
+use super::jobs::{self, Job, Kind};
 use super::layout::Layout;
-use super::manager::{self, Job, Kind};
 use crate::core_ready::Ready;
 use crate::messages::message;
 use crate::platform::fs::{Files, Fs};
 use crate::platform::ipc::Endpoint;
 use crate::platform::process::{Process, Processes};
-use crate::platform::service::{JobState, Manager, ServiceManager};
+use crate::platform::service::{JobState, Service, Services};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -245,12 +245,12 @@ pub fn stopped(layout: &Layout) -> bool {
 
 /// Everything `derive` needs, read fresh. `connector_running`: the connector answering this (itself), else asked.
 pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observation {
-    let installed = manager::installed(layout).await;
+    let installed = jobs::installed(layout).await;
     let kind = match &installed {
         Some(_) => Kind::Manager,
-        None => manager::kind().await,
+        None => jobs::kind().await,
     };
-    let service = manager::manager(layout);
+    let service = jobs::manager(layout);
     let defined_core = installed.as_ref().is_some_and(|found| found.core);
     let defined_connector = installed.as_ref().is_some_and(|found| found.connector);
     let (core_job, program) = if defined_core {
@@ -277,7 +277,7 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
         None => None,
     };
     let start_at_login = match &installed {
-        Some(found) => manager::start_at_login(&service, found).await,
+        Some(found) => jobs::start_at_login(&service, found).await,
         None => None,
     };
     let connector_running = match connector_running {
@@ -293,7 +293,7 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
         defined_connector,
         core_job,
         limit: match kind {
-            Kind::Manager => ServiceManager::START_LIMIT,
+            Kind::Manager => Services::START_LIMIT,
             Kind::None => None,
         },
         stopped: stopped(layout),
