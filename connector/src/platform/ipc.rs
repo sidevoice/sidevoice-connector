@@ -18,8 +18,31 @@ mod imp;
 
 use interprocess::local_socket::tokio::{Listener as RawListener, Stream as RawStream};
 use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
+use interprocess::local_socket::Name;
 use std::io;
 use std::path::Path;
+
+/// What every OS implements (`imp::Os` in `ipc/unix.rs` and `ipc/windows.rs`). The public functions below are this,
+/// documented for callers; nothing else is OS-specific.
+trait Channel {
+    /// What an endpoint is made of: a socket path on Unix, a pipe name on Windows.
+    type Addr: Clone + std::fmt::Debug + PartialEq + Eq;
+    /// The address of `name` for the data directory `dir`.
+    fn in_dir(dir: &Path, name: &str) -> Self::Addr;
+    /// The address a record names, or an error when it is not one this OS can use.
+    fn from_record(record: &str) -> io::Result<Self::Addr>;
+    /// The record of an address.
+    #[cfg(test)]
+    fn record(addr: &Self::Addr) -> String;
+    /// The address as `interprocess` names it.
+    fn name(addr: &Self::Addr) -> io::Result<Name<'static>>;
+    /// A listener at the address, private to this user.
+    fn listen(addr: &Self::Addr) -> io::Result<RawListener>;
+    /// What must hold of the address before connecting (Unix: a private socket of this user's).
+    fn verify_before_connect(addr: &Self::Addr) -> io::Result<()>;
+    /// Whether the process at the other end of `stream` is this user.
+    fn peer_is_this_user(stream: &RawStream) -> io::Result<bool>;
+}
 
 /// One connection. `AsyncRead + AsyncWrite + Unpin`; its peer has been checked to be this user.
 pub type Stream = RawStream;
@@ -27,26 +50,26 @@ pub type Stream = RawStream;
 /// Where a channel is. Opaque: ours is made by [`Endpoint::in_dir`], the core's is read from its ready file as a
 /// record ([`Endpoint::from_record`]); nothing outside derives one from the other or looks inside.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Endpoint(imp::Addr);
+pub struct Endpoint(<imp::Os as Channel>::Addr);
 
 impl Endpoint {
     /// Our own endpoint called `name` for the data directory `dir`. Unix: the socket `dir/<name>.sock`. Windows: a
     /// pipe named after the user and `dir`, so two profiles or two users never meet on one name.
     pub fn in_dir(dir: &Path, name: &str) -> Endpoint {
-        Endpoint(imp::in_dir(dir, name))
+        Endpoint(<imp::Os as Channel>::in_dir(dir, name))
     }
 
     /// An endpoint another process published, as [`Endpoint::record`] writes it (the core's ready file keeps one).
     /// Unix: an absolute socket path. Windows: a full pipe name, `\\.\pipe\...`. Anything else is refused.
     pub fn from_record(record: &str) -> io::Result<Endpoint> {
-        imp::from_record(record).map(Endpoint)
+        <imp::Os as Channel>::from_record(record).map(Endpoint)
     }
 
     /// The text [`Endpoint::from_record`] reads back (what a process publishes for the others; only the core does,
     /// so here it serves the round trip the tests check).
     #[cfg(test)]
     pub fn record(&self) -> String {
-        imp::record(&self.0)
+        <imp::Os as Channel>::record(&self.0)
     }
 }
 
@@ -58,7 +81,7 @@ pub struct Listener(RawListener);
 /// listener is dropped. Windows: the first instance of the pipe, with a security descriptor for this user (plus
 /// SYSTEM and Administrators), refusing remote clients; a pipe that already exists is an error.
 pub fn listen(endpoint: &Endpoint) -> io::Result<Listener> {
-    imp::listen(&endpoint.0).map(Listener)
+    <imp::Os as Channel>::listen(&endpoint.0).map(Listener)
 }
 
 impl Listener {
@@ -66,7 +89,7 @@ impl Listener {
     pub async fn accept(&self) -> io::Result<Stream> {
         loop {
             let stream = self.0.accept().await?;
-            if imp::peer_is_this_user(&stream).unwrap_or(false) {
+            if <imp::Os as Channel>::peer_is_this_user(&stream).unwrap_or(false) {
                 return Ok(stream);
             }
         }
@@ -76,9 +99,9 @@ impl Listener {
 /// Connects to `endpoint`, refusing a server that is not this user (Unix: also a socket that is not private to
 /// this user). No timeout: callers bound it.
 pub async fn connect(endpoint: &Endpoint) -> io::Result<Stream> {
-    imp::verify_before_connect(&endpoint.0)?;
-    let stream = RawStream::connect(imp::name(&endpoint.0)?).await?;
-    if !imp::peer_is_this_user(&stream)? {
+    <imp::Os as Channel>::verify_before_connect(&endpoint.0)?;
+    let stream = RawStream::connect(<imp::Os as Channel>::name(&endpoint.0)?).await?;
+    if !<imp::Os as Channel>::peer_is_this_user(&stream)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "the server at the endpoint is not this user",

@@ -14,78 +14,90 @@ use std::path::Path;
 
 const PREFIX: &str = r"\\.\pipe\";
 
-pub(super) type Addr = String;
+/// Windows side of [`super::Channel`].
+pub(super) struct Os;
 
-pub(super) fn in_dir(dir: &Path, name: &str) -> Addr {
-    let user = crate::platform::user::current().sid_string();
-    let mut hash = Sha256::new();
-    hash.update(user.as_bytes());
-    hash.update([0]);
-    hash.update(dir.to_string_lossy().to_lowercase().as_bytes());
-    format!(
-        "{PREFIX}sidevoice-{}-{name}",
-        hex::encode(&hash.finalize()[..8])
-    )
-}
+impl super::Channel for Os {
+    type Addr = String;
 
-pub(super) fn from_record(record: &str) -> io::Result<Addr> {
-    if record.len() <= PREFIX.len() || !record.starts_with(PREFIX) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("not a local pipe name: {record:?}"),
-        ));
+    fn in_dir(dir: &Path, name: &str) -> Self::Addr {
+        let user = crate::platform::user::current().sid_string();
+        let mut hash = Sha256::new();
+        hash.update(user.as_bytes());
+        hash.update([0]);
+        hash.update(dir.to_string_lossy().to_lowercase().as_bytes());
+        format!(
+            "{PREFIX}sidevoice-{}-{name}",
+            hex::encode(&hash.finalize()[..8])
+        )
     }
-    Ok(record.to_owned())
-}
 
-#[cfg(test)]
-pub(super) fn record(endpoint: &Addr) -> String {
-    endpoint.clone()
-}
+    fn from_record(record: &str) -> io::Result<Self::Addr> {
+        if record.len() <= PREFIX.len() || !record.starts_with(PREFIX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("not a local pipe name: {record:?}"),
+            ));
+        }
+        Ok(record.to_owned())
+    }
 
-pub(super) fn name(endpoint: &Addr) -> io::Result<Name<'static>> {
-    endpoint.clone().to_fs_name::<GenericFilePath>()
-}
+    #[cfg(test)]
+    fn record(endpoint: &Self::Addr) -> String {
+        endpoint.clone()
+    }
 
-pub(super) fn listen(endpoint: &Addr) -> io::Result<Listener> {
-    // Protected DACL: full access for this user, SYSTEM (SY) and Administrators (BA), nobody else.
-    let sddl = format!(
-        "D:P(A;;GA;;;{})(A;;GA;;;SY)(A;;GA;;;BA)",
-        crate::platform::user::current().sid_string()
-    );
-    let wide = widestring::U16CString::from_str(sddl).map_err(io::Error::other)?;
-    ListenerOptions::new()
-        .name(name(endpoint)?)
-        .security_descriptor(SecurityDescriptor::deserialize(&wide)?)
-        .create_tokio()
-}
+    fn name(endpoint: &Self::Addr) -> io::Result<Name<'static>> {
+        endpoint.clone().to_fs_name::<GenericFilePath>()
+    }
 
-/// Nothing to look at before connecting: the server is checked once connected.
-pub(super) fn verify_before_connect(_endpoint: &Addr) -> io::Result<()> {
-    Ok(())
-}
+    fn listen(endpoint: &Self::Addr) -> io::Result<Listener> {
+        // Protected DACL: full access for this user, SYSTEM (SY) and Administrators (BA), nobody else.
+        let sddl = format!(
+            "D:P(A;;GA;;;{})(A;;GA;;;SY)(A;;GA;;;BA)",
+            crate::platform::user::current().sid_string()
+        );
+        let wide = widestring::U16CString::from_str(sddl).map_err(io::Error::other)?;
+        ListenerOptions::new()
+            .name(Self::name(endpoint)?)
+            .security_descriptor(SecurityDescriptor::deserialize(&wide)?)
+            .create_tokio()
+    }
 
-pub(super) fn peer_is_this_user(stream: &Stream) -> io::Result<bool> {
-    let pid = stream
-        .peer_creds()?
-        .pid()
-        .ok_or_else(|| io::Error::other("the pipe's peer process is unknown"))?;
-    Ok(crate::platform::user::of_process(pid)? == crate::platform::user::current())
+    /// Nothing to look at before connecting: the server is checked once connected.
+    fn verify_before_connect(_endpoint: &Self::Addr) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn peer_is_this_user(stream: &Stream) -> io::Result<bool> {
+        let pid = stream
+            .peer_creds()?
+            .pid()
+            .ok_or_else(|| io::Error::other("the pipe's peer process is unknown"))?;
+        Ok(crate::platform::user::of_process(pid)? == crate::platform::user::current())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::platform::ipc;
+    use crate::platform::ipc::Channel as _;
 
     #[test]
     fn a_pipe_is_named_after_the_user_and_the_directory() {
-        let a = in_dir(Path::new(r"C:\Users\a\.sidevoice"), "connector");
+        let a = Os::in_dir(Path::new(r"C:\Users\a\.sidevoice"), "connector");
         assert!(a.starts_with(r"\\.\pipe\sidevoice-") && a.ends_with("-connector"));
-        assert_eq!(a, in_dir(Path::new(r"c:\users\a\.sidevoice"), "connector"));
-        assert_ne!(a, in_dir(Path::new(r"C:\Users\b\.sidevoice"), "connector"));
-        assert_eq!(from_record(&a).unwrap(), a);
-        assert!(from_record(r"C:\somewhere").is_err());
+        assert_eq!(
+            a,
+            Os::in_dir(Path::new(r"c:\users\a\.sidevoice"), "connector")
+        );
+        assert_ne!(
+            a,
+            Os::in_dir(Path::new(r"C:\Users\b\.sidevoice"), "connector")
+        );
+        assert_eq!(Os::from_record(&a).unwrap(), a);
+        assert!(Os::from_record(r"C:\somewhere").is_err());
     }
 
     #[tokio::test]
@@ -94,7 +106,7 @@ mod tests {
         let listener = ipc::listen(&endpoint).unwrap();
         let client = ipc::connect(&endpoint).await.unwrap();
         let served = listener.accept().await.unwrap();
-        assert!(peer_is_this_user(&client).unwrap());
-        assert!(peer_is_this_user(&served).unwrap());
+        assert!(Os::peer_is_this_user(&client).unwrap());
+        assert!(Os::peer_is_this_user(&served).unwrap());
     }
 }
