@@ -20,6 +20,7 @@ clap = { version = "4.5", features = ["derive"] }
 fs2 = "0.4"
 futures-util = "0.3"
 gethostname = "1"
+whoami = "2"
 hex = "0.4"
 libc = "0.2"
 qrcodegen = "1.8"

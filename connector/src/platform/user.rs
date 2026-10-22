@@ -50,6 +50,12 @@ impl UserId {
     }
 }
 
+/// This user's login name, for what must name the user to the system (`loginctl enable-linger`). `None` when
+/// the system cannot tell. Same code on every OS (`whoami`).
+pub fn name() -> Option<String> {
+    whoami::username().ok()
+}
+
 /// The host name as the operating system reports it, trimmed; empty when it cannot be read.
 pub fn host_name() -> String {
     gethostname::gethostname()
