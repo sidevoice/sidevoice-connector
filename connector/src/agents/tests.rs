@@ -77,22 +77,26 @@ async fn failed_watched_capture_keeps_the_last_scan_and_recovery_reconciles_all(
     assert_eq!(failed["scan_failed"], true, "{failed}");
     assert_eq!(listed_ids(&failed), listed_ids(&first), "{failed}");
     let cached = host.handle("agents.list", json!({})).await;
-    assert_eq!(cached["scan_failed"], false, "{cached}");
+    assert_eq!(cached["scan_failed"], true, "{cached}");
+    assert!(cached["scanned_at"].is_string(), "{cached}");
     assert_eq!(listed_ids(&cached), listed_ids(&first), "{cached}");
     private_write(
         &shell,
         format!("#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' '{}'\n", bin.display()).as_bytes(),
     );
     fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    // What is installed changed while the capture was failing: recovery must look at every agent again.
+    fs::remove_file(bin.join("claude")).unwrap();
     let recovered = host.handle("agents.list", json!({"watch":"cursor"})).await;
     assert!(
-        listed_ids(&recovered).contains(&"claude".into()),
+        !listed_ids(&recovered).contains(&"claude".into()),
         "{recovered}"
     );
     assert!(
         listed_ids(&recovered).contains(&"cursor".into()),
         "{recovered}"
     );
+    assert_eq!(recovered["scan_failed"], false, "{recovered}");
     host.shutdown().await;
 }
 

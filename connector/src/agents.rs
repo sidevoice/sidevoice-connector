@@ -611,12 +611,21 @@ impl HostAgents {
         let base = state.clone();
         let login_path = self.capture_login_path(cancel, deadline).await?;
         if login_path.is_none() {
-            // A failed capture says nothing about what is installed: keep the last scan and report the failure.
-            let mut kept = base;
-            kept["scan_failed"] = json!(true);
-            return Ok(kept);
+            // A failed capture says nothing about what is installed: keep the last scan and record the failure, which
+            // stays until a scan succeeds. Web needs a `scanned_at`, so a machine never scanned gets the time of this try.
+            return self
+                .update_state(cancel, deadline, true, |latest| {
+                    latest["scan_failed"] = json!(true);
+                    if latest.get("scanned_at").is_none_or(Value::is_null) {
+                        latest["scanned_at"] = json!(iso_now());
+                    }
+                })
+                .await;
         }
-        let ids: Vec<_> = (if base.get("login_path") != Some(&json!(login_path)) {
+        // After a failed scan every agent is looked at again, not only the watched one.
+        let ids: Vec<_> = (if base.get("login_path") != Some(&json!(login_path))
+            || base.get("scan_failed") == Some(&Value::Bool(true))
+        {
             None
         } else {
             watch
@@ -787,6 +796,7 @@ impl HostAgents {
                 });
             }
             latest["scanned_at"] = json!(iso_now());
+            latest["scan_failed"] = json!(false);
         })
         .await
     }
