@@ -71,6 +71,18 @@ pub struct UserId {
 }
 
 impl UserId {
+    /// The user's SID, valid while this `UserId` lives. For what must name the user in a security descriptor (a DACL
+    /// that grants only them); nothing host-agnostic needs it.
+    pub(crate) fn sid(&self) -> PSID {
+        self.user.as_psid()
+    }
+
+    /// Whether `sid` is this user: the user itself, or the token's default owner (what files this process creates
+    /// are owned by when it runs elevated).
+    pub(crate) fn is(&self, sid: PSID) -> bool {
+        self.user.is(sid) || self.default_owner.is(sid)
+    }
+
     #[allow(dead_code)] // its callers arrive with `platform::fs`, which replaces the `owns(&Metadata)` ones
     /// Whether this user owns what `path` names. A symlink or junction is judged itself, not what it points to.
     pub fn owns_path(&self, path: &Path) -> io::Result<bool> {
