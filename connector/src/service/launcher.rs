@@ -24,7 +24,7 @@ use crate::core_ready::Ready;
 use crate::frame::Connection;
 use crate::messages::message;
 use crate::platform::fs::{Create, Files, Fs};
-use crate::platform::ipc::Channel;
+use crate::platform::ipc::{Channel, Channels};
 use crate::platform::process::{Identity, Process, Processes};
 use serde_json::{json, Value};
 use std::fs;
@@ -67,8 +67,7 @@ pub async fn request_connector(
     let ask =
         async {
             let mut connection = Connection::new(
-                endpoint
-                    .connect()
+                Channels::connect(&endpoint)
                     .await
                     .map_err(|error| error.to_string())?,
             );

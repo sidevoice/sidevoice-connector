@@ -12,7 +12,6 @@ use interprocess::os::windows::local_socket::ListenerOptionsExt;
 use interprocess::os::windows::security_descriptor::SecurityDescriptor;
 use sha2::{Digest, Sha256};
 use std::fmt;
-use std::future::Future;
 use std::io;
 use std::path::Path;
 
@@ -21,12 +20,15 @@ const PREFIX: &str = r"\\.\pipe\";
 /// Full access for the pipe's owner, SYSTEM and Administrators; nobody else, nothing inherited.
 const OWNER_ONLY: &str = "D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)";
 
-/// An endpoint as its full pipe name.
+/// An endpoint: its full pipe name.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Endpoint(String);
 
-impl super::Channel for Endpoint {
-    fn in_dir(dir: &Path, name: &str) -> Endpoint {
+/// Windows side of [`super::Channel`].
+pub struct Os;
+
+impl super::Channel for Os {
+    fn endpoint(dir: &Path, name: &str) -> Endpoint {
         let mut hash = Sha256::new();
         hash.update(UserId::name().unwrap_or_default().to_lowercase().as_bytes());
         hash.update([0]);
@@ -37,7 +39,7 @@ impl super::Channel for Endpoint {
         ))
     }
 
-    fn from_record(record: &str) -> io::Result<Endpoint> {
+    fn parse(record: &str) -> io::Result<Endpoint> {
         if record.len() <= PREFIX.len() || !record.starts_with(PREFIX) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -47,17 +49,13 @@ impl super::Channel for Endpoint {
         Ok(Endpoint(record.to_owned()))
     }
 
-    fn listen(&self) -> io::Result<Listener> {
+    fn listen(endpoint: &Endpoint) -> io::Result<Listener> {
         let descriptor = widestring::U16CString::from_str(OWNER_ONLY).map_err(io::Error::other)?;
         ListenerOptions::new()
-            .name(self.name()?)
+            .name(endpoint.name()?)
             .security_descriptor(SecurityDescriptor::deserialize(&descriptor)?)
             .create_tokio()
             .map(Listener)
-    }
-
-    fn connect(&self) -> impl Future<Output = io::Result<Stream>> + Send {
-        super::dial(self.name(), self.to_string())
     }
 }
 
@@ -65,6 +63,11 @@ impl Endpoint {
     fn name(&self) -> io::Result<Name<'static>> {
         self.0.clone().to_fs_name::<GenericFilePath>()
     }
+}
+
+/// What [`super::Channel::connect`] dials: the pipe by its name; the server is checked once connected.
+pub(super) fn to_connect(endpoint: &Endpoint) -> io::Result<Name<'static>> {
+    endpoint.name()
 }
 
 /// Whether the process at the other end of `stream` is this user's: the pipe's client or server pid, as

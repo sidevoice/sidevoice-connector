@@ -16,7 +16,7 @@
 //! they are passed to agents' command lines and written into.
 
 use crate::platform::fs::{Files, Fs};
-use crate::platform::ipc::{Channel, Endpoint};
+use crate::platform::ipc::{Channel, Channels, Endpoint};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -117,7 +117,7 @@ impl Profile {
         let core = data.join("core");
         let profile = Self {
             home,
-            endpoint: Endpoint::in_dir(&data, "connector"),
+            endpoint: Channels::endpoint(&data, "connector"),
             core_ready: core.join("core.json"),
             data,
             agent_homes,
@@ -398,7 +398,7 @@ mod tests {
         assert_eq!(profile.data, scratch.path().join(".sidevoice"));
         assert_eq!(
             profile.endpoint,
-            Endpoint::in_dir(&scratch.path().join(".sidevoice"), "connector")
+            Channels::endpoint(&scratch.path().join(".sidevoice"), "connector")
         );
         assert_eq!(
             profile.core_ready,

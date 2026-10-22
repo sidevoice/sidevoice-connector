@@ -2,7 +2,7 @@
 //! its health on its local endpoint, which must name the same launch and process.
 
 use crate::platform::fs::{Files, Fs};
-use crate::platform::ipc::{Channel, Endpoint};
+use crate::platform::ipc::{Channel, Channels, Endpoint};
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -17,7 +17,7 @@ use tokio::time::{timeout, Duration};
 pub struct Ready {
     pub pid: u32,
     pub launch_id: String,
-    /// Where the core listens, as an endpoint record (`Endpoint::from_record`). Newer cores write it.
+    /// Where the core listens, as an endpoint record (`Channel::parse`). Newer cores write it.
     pub endpoint: Option<String>,
     /// The Unix socket path an older core writes (and newer ones still do on Unix, deprecated): what is read when
     /// there is no `endpoint`.
@@ -37,7 +37,7 @@ impl Ready {
             .as_deref()
             .or(self.socket.as_deref())
             .context("Core ready file names no endpoint")?;
-        Ok(Endpoint::from_record(record)?)
+        Ok(Channels::parse(record)?)
     }
 }
 
@@ -60,7 +60,7 @@ pub fn read(path: &Path) -> Result<Ready> {
 /// `GET /api/local/health` on the core's local endpoint, within `limit`: the body of its 200.
 pub async fn health(endpoint: &Endpoint, limit: Duration) -> Result<Value> {
     let ask = async {
-        let mut stream = endpoint.connect().await?;
+        let mut stream = Channels::connect(endpoint).await?;
         stream
             .write_all(
                 b"GET /api/local/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -126,7 +126,7 @@ impl Profile {
 #[cfg(test)]
 mod tests {
     use super::{read, require_v3};
-    use crate::platform::ipc::{Channel, Endpoint};
+    use crate::platform::ipc::{Channel, Channels};
     use std::os::unix::fs::PermissionsExt;
 
     /// A newer core's ready file: fields this connector does not know, at the top and nested, and a protocol
@@ -159,8 +159,8 @@ mod tests {
         };
         let dir = std::env::temp_dir();
         let (new, old) = (
-            Endpoint::in_dir(&dir, "new").to_string(),
-            Endpoint::in_dir(&dir, "old").to_string(),
+            Channels::endpoint(&dir, "new").to_string(),
+            Channels::endpoint(&dir, "old").to_string(),
         );
         let both = ready(serde_json::json!({"endpoint": new, "socket": old}));
         assert_eq!(both.endpoint().unwrap().to_string(), new);

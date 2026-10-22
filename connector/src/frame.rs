@@ -186,19 +186,20 @@ mod tests {
     #[tokio::test]
     async fn whole_messages_cross_the_channel_and_oversized_ones_do_not() {
         use crate::platform::fs::{Files, Fs};
-        use crate::platform::ipc::{Channel, Endpoint};
+        use crate::platform::ipc::{Channel, Channels};
         let scratch = crate::test_support::temp_dir("frame");
         let dir = scratch.path().join("private");
         Files::create_private_dir(&dir).unwrap();
-        let endpoint = Endpoint::in_dir(&dir, "frame");
-        let listener = endpoint.listen().unwrap();
+        let endpoint = Channels::endpoint(&dir, "frame");
+        let listener = Channels::listen(&endpoint).unwrap();
         let server = tokio::spawn(async move {
             let mut connection = Connection::new(listener.accept().await.unwrap());
             while let Some(message) = connection.read().await.unwrap() {
                 connection.write(&message).await.unwrap();
             }
         });
-        let (mut reader, mut writer) = Connection::new(endpoint.connect().await.unwrap()).split();
+        let (mut reader, mut writer) =
+            Connection::new(Channels::connect(&endpoint).await.unwrap()).split();
         for message in [
             json!({"id":1,"method":"status"}),
             json!("line\nbreak"),

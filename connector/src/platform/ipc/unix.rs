@@ -9,21 +9,23 @@ use interprocess::local_socket::traits::StreamCommon as _;
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, Name, ToFsName};
 use interprocess::os::unix::local_socket::ListenerOptionsExt;
 use std::fmt;
-use std::future::Future;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-/// An endpoint as its socket path.
+/// An endpoint: its socket path.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Endpoint(PathBuf);
 
-impl super::Channel for Endpoint {
-    fn in_dir(dir: &Path, name: &str) -> Endpoint {
+/// Unix side of [`super::Channel`].
+pub struct Os;
+
+impl super::Channel for Os {
+    fn endpoint(dir: &Path, name: &str) -> Endpoint {
         Endpoint(dir.join(format!("{name}.sock")))
     }
 
-    fn from_record(record: &str) -> io::Result<Endpoint> {
+    fn parse(record: &str) -> io::Result<Endpoint> {
         let path = PathBuf::from(record);
         if !path.is_absolute() {
             return Err(io::Error::new(
@@ -34,24 +36,26 @@ impl super::Channel for Endpoint {
         Ok(Endpoint(path))
     }
 
-    fn listen(&self) -> io::Result<Listener> {
+    fn listen(endpoint: &Endpoint) -> io::Result<Listener> {
         // A socket left by a dead process is replaced, once it is known to be ours and private.
-        if self.0.exists() {
-            verify_socket(&self.0)?;
-            std::fs::remove_file(&self.0)?;
+        if endpoint.0.exists() {
+            verify_socket(&endpoint.0)?;
+            std::fs::remove_file(&endpoint.0)?;
         }
         let listener = ListenerOptions::new()
-            .name(self.name()?)
+            .name(endpoint.name()?)
             .mode(0o600)
             .create_tokio()?;
-        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(&endpoint.0, std::fs::Permissions::from_mode(0o600))?;
         Ok(Listener(listener))
     }
+}
 
-    fn connect(&self) -> impl Future<Output = io::Result<Stream>> + Send {
-        let name = verify_socket(&self.0).and_then(|()| self.name());
-        super::dial(name, self.to_string())
-    }
+/// What [`super::Channel::connect`] dials: the socket, once it is this user's, open to nobody else, in a private
+/// directory.
+pub(super) fn to_connect(endpoint: &Endpoint) -> io::Result<Name<'static>> {
+    verify_socket(&endpoint.0)?;
+    endpoint.name()
 }
 
 /// Whether the process at the other end of `stream` is this user: the connection's own credentials, the peer's
@@ -123,34 +127,34 @@ mod tests {
     #[tokio::test]
     async fn a_socket_is_trusted_only_in_a_private_directory_and_open_to_nobody_else() {
         let (_scratch, dir) = private_dir("sock");
-        let endpoint = Endpoint::in_dir(&dir, "s");
-        let _listener = endpoint.listen().unwrap();
-        endpoint.connect().await.unwrap();
+        let endpoint = Os::endpoint(&dir, "s");
+        let _listener = Os::listen(&endpoint).unwrap();
+        Os::connect(&endpoint).await.unwrap();
         chmod(&endpoint.0, 0o666);
-        assert!(endpoint.connect().await.is_err());
+        assert!(Os::connect(&endpoint).await.is_err());
         chmod(&endpoint.0, 0o600);
         chmod(&dir, 0o755);
-        assert!(endpoint.connect().await.is_err());
+        assert!(Os::connect(&endpoint).await.is_err());
         chmod(&dir, 0o700);
-        let file = Endpoint::in_dir(&dir, "plain");
+        let file = Os::endpoint(&dir, "plain");
         Files::write_private(&file.0, b"").unwrap();
-        assert!(file.connect().await.is_err());
+        assert!(Os::connect(&file).await.is_err());
     }
 
     #[tokio::test]
     async fn a_stale_socket_is_replaced_but_a_file_that_is_not_one_is_not() {
         let (_scratch, dir) = private_dir("stale");
-        let endpoint = Endpoint::in_dir(&dir, "t");
+        let endpoint = Os::endpoint(&dir, "t");
         // Left behind by a process that died: the file stays, nothing listens. (A listener whose file is not
         // reclaimed on drop leaves exactly that.)
-        let mut dead = endpoint.listen().unwrap();
+        let mut dead = Os::listen(&endpoint).unwrap();
         interprocess::local_socket::traits::tokio::Listener::do_not_reclaim_name_on_drop(
             &mut dead.0,
         );
         drop(dead);
         assert!(endpoint.0.exists());
-        let listener = endpoint.listen().unwrap();
-        endpoint.connect().await.unwrap();
+        let listener = Os::listen(&endpoint).unwrap();
+        Os::connect(&endpoint).await.unwrap();
         drop(listener);
         assert!(
             !endpoint.0.exists(),
@@ -158,7 +162,7 @@ mod tests {
         );
         // Something that is not a socket is never unlinked.
         Files::write_private(&endpoint.0, b"mine").unwrap();
-        assert!(endpoint.listen().is_err());
+        assert!(Os::listen(&endpoint).is_err());
         assert_eq!(std::fs::read(&endpoint.0).unwrap(), b"mine");
     }
 }

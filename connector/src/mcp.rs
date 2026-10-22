@@ -1,6 +1,6 @@
 use crate::adapters::{self, Identity, Registry};
 use crate::frame::Connection;
-use crate::platform::ipc::Channel;
+use crate::platform::ipc::{Channel, Channels};
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use rmcp::{
@@ -78,7 +78,11 @@ impl Ipc {
         if self.tx.lock().await.is_some() {
             return Ok(());
         }
-        let stream = timeout(Duration::from_secs(2), self.profile.endpoint.connect()).await??;
+        let stream = timeout(
+            Duration::from_secs(2),
+            Channels::connect(&self.profile.endpoint),
+        )
+        .await??;
         let (mut reader, mut writer) = Connection::new(stream).split();
         let (tx, mut rx) = mpsc::channel::<Value>(64);
         *self.tx.lock().await = Some(tx);
