@@ -1,7 +1,7 @@
 //! Following a conversation's JSONL transcript as the harness appends it, and what the harness reads in each line.
 
 use super::conversation::{report_working, Conversation, Reporter};
-use file_id::{get_file_id, FileId};
+use crate::platform::fs::{FileId, Files, Fs};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -105,10 +105,14 @@ async fn follow_file<R: TranscriptReader>(
         let Ok(meta) = input.metadata() else {
             continue;
         };
-        // Which file the path is now: a different one after a rotation or a replacement.
-        let current = get_file_id(&path).ok();
-        if file_id != current || meta.len() < offset {
-            file_id = current;
+        // Which file was opened, from the handle read below: a different one after a rotation or a replacement. When
+        // the OS cannot tell, nothing is read this round.
+        let Ok(current) = Files::identity(&input) else {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            continue;
+        };
+        if file_id.as_ref() != Some(&current) || meta.len() < offset {
+            file_id = Some(current);
             offset = 0;
             partial.clear();
             tail.clear();

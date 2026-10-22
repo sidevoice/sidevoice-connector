@@ -2,7 +2,7 @@
 
 use super::{default_effort, rollout_engine};
 use crate::adapters::conversation::{Conversation, Reporter};
-use file_id::{get_file_id, FileId};
+use crate::platform::fs::{FileId, Files, Fs};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -34,9 +34,10 @@ pub fn follow(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
                     &binding.thread,
                 );
                 if let Some(file) = &path {
-                    if fs::metadata(file).is_ok() {
+                    if let Ok(found) = fs::File::open(file) {
                         offset = 0;
-                        file_id = get_file_id(file).ok();
+                        // Unknown when the OS cannot tell: the first read below then starts afresh.
+                        file_id = Files::identity(&found).ok();
                     }
                 }
             }
@@ -45,8 +46,13 @@ pub fn follow(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
                     let Ok(meta) = input.metadata() else {
                         continue;
                     };
-                    let current = get_file_id(file).ok();
-                    if file_id != current || meta.len() < offset {
+                    // Which file was opened, from the handle read below. When the OS cannot tell, nothing is read
+                    // this round.
+                    let Ok(current) = Files::identity(&input) else {
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        continue;
+                    };
+                    if file_id.as_ref() != Some(&current) || meta.len() < offset {
                         offset = 0;
                         partial.clear();
                         oversized = false;
@@ -54,7 +60,7 @@ pub fn follow(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
                         working = None;
                         catching_up = true;
                     }
-                    file_id = current;
+                    file_id = Some(current);
                     if input.seek(SeekFrom::Start(offset)).is_ok() {
                         let mut bytes = [0u8; 65536];
                         let limit = bytes.len().min(meta.len().saturating_sub(offset) as usize);

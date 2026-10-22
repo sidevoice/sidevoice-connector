@@ -52,6 +52,14 @@ pub enum Create {
     ReadWrite,
 }
 
+/// Which file a handle is open on ([`Fs::identity`]): equal for two handles to one file, different for a file that
+/// took its path (a rotation, a replacement). Compared only with another reading on this machine; holds nothing open.
+#[derive(PartialEq)]
+pub struct FileId {
+    volume: u64,
+    index: u64,
+}
+
 /// What every OS implements ([`Files`], in `fs/unix.rs` and `fs/windows.rs`): the required methods. The rest is one
 /// body for every OS; an OS overrides it only if it must.
 pub trait Fs {
@@ -67,6 +75,10 @@ pub trait Fs {
 
     /// What others may do with the file or directory behind an open handle.
     fn others_of(file: &File) -> io::Result<Others>;
+
+    /// Which file is behind an open handle (Unix: device and inode; Windows: volume serial number and file index),
+    /// read from the handle itself: the file being read, not whatever its path names a moment later.
+    fn identity(file: &File) -> io::Result<FileId>;
 
     /// A private directory, made (with any missing parents, each private) when it does not exist, then checked with
     /// its ancestors: each this user's or the system's, nobody else able to replace what is in it. An existing
@@ -324,6 +336,19 @@ mod tests {
         let program = scratch.path().join("program");
         Files::open_private(&program, Create::NewProgram).unwrap();
         assert!(private(&program));
+    }
+
+    #[test]
+    fn a_file_is_told_apart_from_the_one_that_takes_its_path() {
+        let scratch = temp_dir("identity");
+        let (path, next) = (scratch.path().join("log"), scratch.path().join("next"));
+        fs::write(&path, b"first").unwrap();
+        let first = Files::identity(&File::open(&path).unwrap()).unwrap();
+        assert!(first == Files::identity(&File::open(&path).unwrap()).unwrap());
+        // Rotated: another file takes the path while the first still exists.
+        fs::write(&next, b"second").unwrap();
+        fs::rename(&next, &path).unwrap();
+        assert!(first != Files::identity(&File::open(&path).unwrap()).unwrap());
     }
 
     #[test]

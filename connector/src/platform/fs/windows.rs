@@ -8,9 +8,9 @@
 //!
 //! Own `unsafe` over `windows-sys`: no maintained crate covers "create with this DACL" and "read what this handle's
 //! DACL grants" (`windows-acl` is unmaintained; `windows-permissions` is a thin binding with the same calls left to
-//! us), and the surface is a few calls. The link count comes from `winapi-util`.
+//! us), and the surface is a few calls. The link count and a file's identity come from `winapi-util`.
 
-use super::{Create, Others};
+use super::{Create, FileId, Others};
 use crate::platform::user::{User, UserId};
 use anyhow::{bail, Context, Result};
 use std::ffi::c_void;
@@ -98,6 +98,15 @@ impl super::Fs for Os {
             Others::Read
         } else {
             Others::Nothing
+        })
+    }
+
+    // `GetFileInformationByHandle` through `winapi-util`.
+    fn identity(file: &File) -> io::Result<FileId> {
+        let information = winapi_util::file::information(file)?;
+        Ok(FileId {
+            volume: information.volume_serial_number(),
+            index: information.file_index(),
         })
     }
 }

@@ -3,7 +3,7 @@
 // The raw calls the rest of the crate is not allowed to make (`clippy.toml`) are made here.
 #![allow(clippy::disallowed_methods)]
 
-use super::{Create, Others};
+use super::{Create, FileId, Others};
 use crate::platform::user::{User, UserId};
 use anyhow::{bail, Result};
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -44,6 +44,14 @@ impl super::Fs for Os {
 
     fn others_of(file: &File) -> io::Result<Others> {
         Ok(others(file.metadata()?.mode()))
+    }
+
+    fn identity(file: &File) -> io::Result<FileId> {
+        let metadata = file.metadata()?;
+        Ok(FileId {
+            volume: metadata.dev(),
+            index: metadata.ino(),
+        })
     }
 }
 
