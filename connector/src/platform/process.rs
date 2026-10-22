@@ -50,12 +50,30 @@ pub trait Process {
     /// (Windows) that holds everything it starts.
     fn tree(command: Command) -> CommandWrap;
 
-    /// Which of `candidates` `pid` has open, as far as the OS shows this user: a question about files named in
-    /// advance, never a listing of the process's handles (no OS lists those for another process in a standard way).
-    /// The answer keeps the order of `candidates`; `None` when the OS cannot tell (Unix: no `/proc` and no `lsof`;
-    /// Windows: no Restart Manager). Unix reads the process's descriptors; Windows asks the Restart Manager which
-    /// processes hold the files.
-    fn open_among(pid: u32, candidates: &[PathBuf]) -> Option<Vec<PathBuf>>;
+    /// The files `pid` has open, as far as the OS shows them to this user: `/proc/<pid>/fd`, else `lsof`, on Unix.
+    /// `Unsupported` on Windows, where nothing in the standard API lists another process's handles (ask
+    /// [`Process::open_among`] there, about files named in advance); another error when the OS shows nothing (no
+    /// `/proc` and no `lsof`).
+    fn open_files(pid: u32) -> io::Result<Vec<PathBuf>>;
+
+    /// Which of `candidates` `pid` has open: a question about files named in advance, for an OS that cannot list a
+    /// process's files. The answer keeps the order of `candidates`. Unix filters [`Process::open_files`] (a file
+    /// matched by the path given or its canonical one). Windows asks the Restart Manager which processes hold the
+    /// files, then narrows by halves to the ones `pid` holds, within a bounded number of questions: an error when it
+    /// cannot be asked or the bound is reached. A pid now naming another process than the one that holds a file
+    /// (reused) does not count: the Restart Manager's start time must be `pid`'s. Not used yet: the one caller this
+    /// was made for, an adapter's chat lookup, needs on Windows where that agent keeps its chats, which is unmeasured.
+    fn open_among(pid: u32, candidates: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
+        let open = Self::open_files(pid)?;
+        Ok(candidates
+            .iter()
+            .filter(|candidate| {
+                open.contains(*candidate)
+                    || std::fs::canonicalize(candidate).is_ok_and(|real| open.contains(&real))
+            })
+            .cloned()
+            .collect())
+    }
 
     /// Starts `command` so that it outlives this process and its terminal. The caller owns stdio and the
     /// environment.
@@ -456,24 +474,42 @@ mod tests {
     }
 
     #[test]
+    fn the_files_a_process_has_open_are_listed_where_the_os_lists_them() {
+        let scratch = crate::test_support::temp_dir("open-files");
+        let held = scratch.path().join("held");
+        std::fs::write(&held, b"x").unwrap();
+        let file = std::fs::File::open(&held).unwrap();
+        // An error is an OS that lists no process's files (Windows) or a host that shows none (no `lsof`).
+        if let Ok(open) = Processes::open_files(std::process::id()) {
+            assert!(open.contains(&held.canonicalize().unwrap()), "{open:?}");
+        }
+        drop(file);
+    }
+
+    #[test]
     fn the_candidates_a_process_has_open_are_told_from_those_it_has_not() {
         let scratch = crate::test_support::temp_dir("open-among");
-        let (held, not_held, missing) = (
-            scratch.path().join("held"),
-            scratch.path().join("not-held"),
-            scratch.path().join("missing"),
-        );
-        std::fs::write(&held, b"x").unwrap();
-        std::fs::write(&not_held, b"x").unwrap();
-        let file = std::fs::File::open(&held).unwrap();
-        let candidates = [not_held, held.clone(), missing];
-        // `None` is a host that cannot tell (no `lsof`, no Restart Manager): the question has no answer there.
-        if let Some(open) = Processes::open_among(std::process::id(), &candidates) {
-            assert_eq!(open, [held]);
+        // Enough candidates that Windows narrows a positive answer by halves more than once.
+        let mut candidates: Vec<PathBuf> = (0..12)
+            .map(|index| scratch.path().join(format!("file-{index}")))
+            .collect();
+        for candidate in &candidates {
+            std::fs::write(candidate, b"x").unwrap();
         }
-        assert!(Processes::open_among(std::process::id(), &[]).is_none_or(|open| open.is_empty()));
-        drop(file);
-        if let Some(open) = Processes::open_among(std::process::id(), &candidates) {
+        candidates.push(scratch.path().join("missing"));
+        let held = [candidates[3].clone(), candidates[10].clone()];
+        let files = held
+            .each_ref()
+            .map(|path| std::fs::File::open(path).unwrap());
+        // An error is a host that cannot tell (no `lsof`, no Restart Manager): the question has no answer there.
+        if let Ok(open) = Processes::open_among(std::process::id(), &candidates) {
+            assert_eq!(open, held);
+        }
+        if let Ok(open) = Processes::open_among(std::process::id(), &[]) {
+            assert!(open.is_empty(), "{open:?}");
+        }
+        drop(files);
+        if let Ok(open) = Processes::open_among(std::process::id(), &candidates) {
             assert!(open.is_empty(), "{open:?}");
         }
     }

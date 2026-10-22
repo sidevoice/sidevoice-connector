@@ -47,6 +47,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const EDITOR_NOTE: &str = "Sidevoice cannot tell which Cursor chat this is: this Cursor did not declare MCP Apps support (the io.modelcontextprotocol/ui extension) when it started this server, which is how the editor is told apart, nor is this a Cursor CLI chat (cursor-agent), whose open chat Sidevoice can see. voice_diagnose shows where Sidevoice's logs are.";
+/// Where the OS lists no process's open files (Windows), a Cursor CLI chat would have to be found among its chat
+/// databases named in advance, and where Cursor keeps them there is not measured yet: never guessed.
+const CLI_UNSUPPORTED: &str = "Sidevoice cannot tell which Cursor chat this is: this Cursor did not declare MCP Apps support (the io.modelcontextprotocol/ui extension) when it started this server, which is how the editor is told apart, and finding a Cursor CLI chat (cursor-agent) is not supported on this system yet, because it cannot see which chat cursor-agent has open";
 const NOT_PERSISTED: &str = "This chat is not running under cursor-agent persist, so nothing can put a message into it. To let Sidevoice talk to a Cursor CLI chat (experimental), start it with  cursor-agent persist  (it needs tmux).";
 
 pub fn capabilities() -> Value {
@@ -108,8 +111,10 @@ pub fn identity(_client: &Value, capabilities: &Value) -> Result<Identity> {
         identity.watch_note = Some("Sidevoice learns that this chat took a voice message, and when it is working, from Cursor itself: from this chat's transcript, once the Desktop Bridge knows which chat it is.".into());
         return Ok(identity);
     }
-    let Some(found) = find_chat() else {
-        bail!("{EDITOR_NOTE}");
+    let found = match find_chat() {
+        Ok(Some(found)) => found,
+        Ok(None) => bail!("{EDITOR_NOTE}"),
+        Err(error) => bail!("{CLI_UNSUPPORTED} ({error})."),
     };
     let persisted = persist_session(&found.chat)?;
     if let Some((name, pane, in_mode, attached)) = persisted {
@@ -164,32 +169,6 @@ fn chat_from_store(path: &Path) -> Option<StorePath> {
     })
 }
 
-/// Every Cursor CLI chat database there is: `store.db` two directories below a root's `chats` (a workspace, a chat).
-/// The files a chat's process could have open, named in advance, so asking the OS which of them it has open is one
-/// question about these and a walk of nothing else.
-fn chat_stores() -> Vec<PathBuf> {
-    let read = |dir: &Path| {
-        fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>()
-    };
-    let mut stores = Vec::new();
-    for root in engine::config_roots() {
-        for workspace in read(&root.join("chats")) {
-            for chat in read(&workspace) {
-                let store = chat.join("store.db");
-                if chat_from_store(&store).is_some() && !stores.contains(&store) {
-                    stores.push(store);
-                }
-            }
-        }
-    }
-    stores
-}
-
 /// A file's modification time in milliseconds since the epoch (0 when the OS gives none).
 fn modified_ms(metadata: &fs::Metadata) -> u64 {
     metadata
@@ -199,20 +178,28 @@ fn modified_ms(metadata: &fs::Metadata) -> u64 {
         .map_or(0, |since| since.as_millis() as u64)
 }
 
-fn find_chat() -> Option<Chat> {
-    let stores = chat_stores();
+/// The Cursor CLI chat this server serves: the newest chat database (`<root>/chats/<workspace>/<chat>/store.db`) one of
+/// its first ancestors has open. An error only where the OS lists no process's open files (`Unsupported`, Windows).
+fn find_chat() -> std::io::Result<Option<Chat>> {
     let mut pid = std::process::id();
     for _ in 0..4 {
-        let parent = Processes::parent(pid)?;
-        if parent <= 1 {
-            return None;
-        }
+        let Some(parent) = Processes::parent(pid).filter(|parent| *parent > 1) else {
+            return Ok(None);
+        };
+        let open = match Processes::open_files(parent) {
+            Ok(open) => open,
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return Err(error),
+            Err(_) => Vec::new(),
+        };
         let mut chats = Vec::<Chat>::new();
-        for path in Processes::open_among(parent, &stores).unwrap_or_default() {
+        for path in open {
             let Some(store) = chat_from_store(&path) else {
                 continue;
             };
-            let metadata_path = store.path.parent()?.join("meta.json");
+            let Some(chat_dir) = store.path.parent() else {
+                return Ok(None);
+            };
+            let metadata_path = chat_dir.join("meta.json");
             let metadata = fs::read(&metadata_path)
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -238,11 +225,11 @@ fn find_chat() -> Option<Chat> {
             }
         }
         if let Some(chat) = chats.into_iter().max_by_key(|chat| chat.updated) {
-            return Some(chat);
+            return Ok(Some(chat));
         }
         pid = parent;
     }
-    None
+    Ok(None)
 }
 
 pub fn transcript_path(chat_id: &str) -> Option<PathBuf> {
@@ -907,7 +894,7 @@ async fn bridge_request(
 ) -> std::result::Result<BridgeResponse, BridgeError> {
     let mut stream = match tokio::time::timeout(
         Duration::from_secs(3),
-        Foreigners::connect(instance.socket.to_str().unwrap_or_default()),
+        Foreigners::connect(&instance.socket),
     )
     .await
     {
