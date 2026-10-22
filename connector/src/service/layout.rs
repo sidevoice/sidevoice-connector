@@ -325,32 +325,38 @@ mod tests {
         )
     }
 
+    /// An absolute path on this OS (not necessarily there): `name` under the temporary directory.
+    fn absolute(name: &str) -> PathBuf {
+        std::env::temp_dir().join(name)
+    }
+
     #[test]
     fn paths_follow_the_environment_with_the_documented_defaults() {
-        let plain = layout(&[("HOME", "/home/u")]).unwrap();
-        assert_eq!(plain.data, Path::new("/home/u/.sidevoice"));
-        assert_eq!(plain.releases, Path::new("/home/u/.local/share/sidevoice"));
-        assert_eq!(plain.config_home, Path::new("/home/u/.config"));
-        assert_eq!(
-            plain.current_record(),
-            Path::new("/home/u/.local/share/sidevoice/current.json")
-        );
+        let home = absolute("u");
+        let home_var = home.to_str().unwrap();
+        let plain = layout(&[("HOME", home_var)]).unwrap();
+        let releases = home.join(".local").join("share").join("sidevoice");
+        assert_eq!(plain.data, home.join(".sidevoice"));
+        assert_eq!(plain.releases, releases);
+        assert_eq!(plain.config_home, home.join(".config"));
+        assert_eq!(plain.current_record(), releases.join("current.json"));
         assert_eq!(plain.core_program(), None, "nothing selected");
         assert!(plain.agent_dirs.is_empty());
         assert_eq!(plain.core_port(), "10829");
 
+        let (data, xdg, alpha) = (absolute("d"), absolute("x"), absolute("c"));
         let named = layout(&[
-            ("HOME", "/home/u"),
-            ("SIDEVOICE_DATA_DIR", "/d"),
-            ("XDG_DATA_HOME", "/x"),
-            ("ALPHA_HOME", "/c"),
+            ("HOME", home_var),
+            ("SIDEVOICE_DATA_DIR", data.to_str().unwrap()),
+            ("XDG_DATA_HOME", xdg.to_str().unwrap()),
+            ("ALPHA_HOME", alpha.to_str().unwrap()),
             ("SIDEVOICE_CORE_PORT", "0"),
             ("SIDEVOICE_CONNECTOR_TOKEN", "secret"),
             ("SIDEVOICE_SERVICE", "launchd"),
         ])
         .unwrap();
-        assert_eq!(named.releases, Path::new("/x/sidevoice"));
-        assert_eq!(named.agent_dirs["ALPHA_HOME"], Path::new("/c"));
+        assert_eq!(named.releases, xdg.join("sidevoice"));
+        assert_eq!(named.agent_dirs["ALPHA_HOME"], alpha);
         assert_eq!(named.core_port(), "0");
         assert_eq!(
             named.settings.keys().collect::<Vec<_>>(),
@@ -362,7 +368,12 @@ mod tests {
     #[test]
     fn relative_paths_are_refused() {
         assert!(layout(&[("HOME", "relative")]).is_err());
-        assert!(layout(&[("HOME", "/h"), ("SIDEVOICE_DATA_DIR", "d")]).is_err());
+        let home = absolute("h");
+        assert!(layout(&[
+            ("HOME", home.to_str().unwrap()),
+            ("SIDEVOICE_DATA_DIR", "d")
+        ])
+        .is_err());
         assert!(layout(&[]).is_err(), "no HOME, no layout");
     }
 
@@ -370,7 +381,12 @@ mod tests {
     fn with_releases(ids: &[&str]) -> (tempfile::TempDir, Layout) {
         let scratch = crate::test_support::temp_dir("selected");
         let xdg = scratch.path().join("xdg");
-        let layout = layout(&[("HOME", "/h"), ("XDG_DATA_HOME", xdg.to_str().unwrap())]).unwrap();
+        let home = scratch.path().join("home");
+        let layout = layout(&[
+            ("HOME", home.to_str().unwrap()),
+            ("XDG_DATA_HOME", xdg.to_str().unwrap()),
+        ])
+        .unwrap();
         Files::ensure_private_dir(&layout.releases).unwrap();
         for id in ids {
             fs::create_dir_all(layout.releases_dir().join(id)).unwrap();
