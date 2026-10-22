@@ -40,7 +40,7 @@ pub fn host() -> String {
     {
         return id;
     }
-    let name = crate::platform::user::host_name();
+    let name = <crate::platform::user::UserId as crate::platform::user::User>::host_name();
     if name.is_empty() {
         "unknown".into()
     } else {

@@ -189,9 +189,7 @@ fn the_login_service_runs_recovers_stops_and_leaves_nothing_behind() {
     profile.wait_linked(running["core"]["launch_id"].as_str().unwrap());
 
     // The core dies: its manager starts it again, and the connector job links to the new one.
-    unsafe {
-        libc::kill(first_core as i32, libc::SIGKILL);
-    }
+    kill(first_core);
     let restarted = wait_state(
         &profile,
         &extra,
@@ -268,12 +266,7 @@ fn the_login_service_runs_recovers_stops_and_leaves_nothing_behind() {
         "{unchanged}"
     );
     assert!(alive(retried["core"]["pid"].as_u64().unwrap()));
-    unsafe {
-        libc::kill(
-            retried["core"]["pid"].as_u64().unwrap() as i32,
-            libc::SIGKILL,
-        );
-    }
+    kill(retried["core"]["pid"].as_u64().unwrap());
     wait_state(
         &profile,
         &extra,

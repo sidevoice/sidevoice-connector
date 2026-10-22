@@ -7,8 +7,10 @@
 //! second open of the same file, even in this process, does not get it while the first is held.
 //!
 //! The holder writes who it is (pid, start time, kind) into the locked file itself, for people and for teardown,
-//! which signals that process only as its verified self (`process.rs`). That record is information, never the lock.
+//! which stops that process only as its verified self (`platform::process`). That record is information, never the
+//! lock.
 
+use crate::platform::process::{Process, Processes};
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use serde_json::{json, Value};
@@ -90,7 +92,7 @@ pub fn try_lock(path: &Path, kind: &str) -> Result<Option<Lock>> {
         bail!("unsafe lock file {}", path.display());
     }
     let record = json!({"pid":std::process::id(),
-        "start":crate::process::self_identity().map(|identity| identity.start),
+        "start":Processes::identity(std::process::id()).map(|identity| identity.start),
         "kind":kind,"at":crate::logfile::timestamp()});
     // Into the locked file itself: a replaced file would leave the lock on an inode nobody else opens.
     let _ = file
@@ -246,7 +248,7 @@ mod tests {
             libc::close(pipe[0]);
             assert_eq!(byte[0], 1, "the child took the lock");
             assert!(try_lock(&path, "agents").unwrap().is_none());
-            libc::kill(pid, libc::SIGKILL);
+            assert!(Processes::kill(pid as u32, |_| true));
             let mut status = 0;
             libc::waitpid(pid, &mut status, 0);
         }

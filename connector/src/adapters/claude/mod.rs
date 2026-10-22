@@ -15,13 +15,13 @@ pub const HOME: crate::profile::AgentHome = crate::profile::AgentHome {
 };
 
 use super::{envelope, Identity};
+use crate::platform::process::{Process, Processes};
 use crate::profile::Profile;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -186,12 +186,10 @@ pub fn transcript_path(session_id: &str) -> Option<PathBuf> {
 
 fn launch_args(pid: Option<i64>) -> String {
     let Some(pid) = pid else { return String::new() };
-    Command::new("ps")
-        .args(["-o", "args=", "-p", &pid.to_string()])
-        .output()
+    u32::try_from(pid)
         .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .and_then(Processes::identity)
+        .map(|found| found.command)
         .unwrap_or_default()
 }
 
