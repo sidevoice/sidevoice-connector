@@ -98,10 +98,13 @@ impl Ipc {
         tokio::spawn(async move {
             let mut reader = BufReader::new(read);
             loop {
-                let line = match crate::bounded_line(&mut reader, crate::IPC_FRAME_LIMIT).await {
-                    Ok(Some(v)) => v,
-                    _ => break,
-                };
+                let line =
+                    match crate::frame::bounded_line(&mut reader, crate::frame::IPC_FRAME_LIMIT)
+                        .await
+                    {
+                        Ok(Some(v)) => v,
+                        _ => break,
+                    };
                 let Ok(reply) = serde_json::from_str::<Value>(&line) else {
                     break;
                 };
@@ -112,7 +115,7 @@ impl Ipc {
                     let result = if reply.get("ok") == Some(&json!(true)) {
                         Ok(reply.get("result").cloned().unwrap_or(Value::Null))
                     } else {
-                        Err(crate::ipc_failure(&reply, "IPC error"))
+                        Err(crate::frame::ipc_failure(&reply, "IPC error"))
                     };
                     let _ = waiting.send(result);
                 }

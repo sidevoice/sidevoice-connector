@@ -1614,7 +1614,7 @@ impl Daemon {
             loop {
                 let line = tokio::select! {
                     _ = shutdown.changed() => break,
-                    line = crate::bounded_line(&mut reader, crate::IPC_FRAME_LIMIT) => line?,
+                    line = crate::frame::bounded_line(&mut reader, crate::frame::IPC_FRAME_LIMIT) => line?,
                 };
                 let Some(line) = line else {
                     break;
