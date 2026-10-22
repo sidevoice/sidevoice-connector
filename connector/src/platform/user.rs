@@ -86,6 +86,11 @@ mod tests {
     }
 
     #[test]
+    fn name_is_known() {
+        assert!(name().is_some_and(|name| !name.is_empty()));
+    }
+
+    #[test]
     fn host_name_is_trimmed() {
         let name = host_name();
         assert_eq!(name, name.trim());

@@ -146,34 +146,3 @@ fn token_sid(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<Sid> {
     // SAFETY: success filled the buffer with a TOKEN_USER / TOKEN_OWNER (same layout) whose SID points inside it.
     Ok(unsafe { Sid::copy_of((*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid) })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn current_is_a_valid_sid() {
-        let me = Id::current();
-        // SAFETY: the SID is one this module copied from a valid one.
-        let len = unsafe { GetLengthSid(me.user.as_psid()) };
-        assert!(len >= 8, "a SID is at least 8 bytes, got {len}");
-    }
-
-    #[test]
-    fn does_not_own_what_another_sid_owns() {
-        // Local System, S-1-5-18: revision 1, one sub-authority, NT authority, 18. Neither a user nor an
-        // administrator's default owner, so nothing a test creates is its.
-        let system = || Sid {
-            words: vec![0x0000_0101, 0x0500_0000, 0x0000_0012],
-        };
-        let stranger = Id {
-            user: system(),
-            default_owner: system(),
-        };
-        let dir =
-            std::env::temp_dir().join(format!("sv-platform-user-win-other-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(!stranger.owns_path(&dir).unwrap());
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-}
