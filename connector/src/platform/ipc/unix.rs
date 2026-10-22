@@ -2,29 +2,26 @@
 //! (`SO_PEERCRED` / `LOCAL_PEERCRED`, through `peer_creds()`); a socket is trusted before it is touched only when it
 //! is a socket, this user's, and open to nobody else.
 
-// The tests below open sockets themselves to speak as a peer.
-#![allow(clippy::disallowed_types)]
-
-use anyhow::{bail, Context, Result};
-use interprocess::local_socket::tokio::{Listener, Stream};
+use super::{Listener, Stream};
+use crate::platform::user::{User, UserId};
 use interprocess::local_socket::traits::StreamCommon as _;
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, Name, ToFsName};
 use interprocess::os::unix::local_socket::ListenerOptionsExt;
+use std::fmt;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-/// Unix side of [`super::Channel`].
-pub(super) struct Os;
+/// An endpoint as its socket path.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Endpoint(PathBuf);
 
-impl super::Channel for Os {
-    type Addr = PathBuf;
-
-    fn in_dir(dir: &Path, name: &str) -> Self::Addr {
-        dir.join(format!("{name}.sock"))
+impl super::Channel for Endpoint {
+    fn in_dir(dir: &Path, name: &str) -> Endpoint {
+        Endpoint(dir.join(format!("{name}.sock")))
     }
 
-    fn from_record(record: &str) -> io::Result<Self::Addr> {
+    fn from_record(record: &str) -> io::Result<Endpoint> {
         let path = PathBuf::from(record);
         if !path.is_absolute() {
             return Err(io::Error::new(
@@ -32,119 +29,119 @@ impl super::Channel for Os {
                 format!("not an absolute socket path: {record:?}"),
             ));
         }
-        Ok(path)
+        Ok(Endpoint(path))
     }
 
-    #[cfg(test)]
-    fn record(endpoint: &Self::Addr) -> String {
-        endpoint.to_string_lossy().into_owned()
-    }
-
-    fn name(endpoint: &Self::Addr) -> io::Result<Name<'static>> {
-        endpoint.clone().to_fs_name::<GenericFilePath>()
-    }
-
-    fn listen(endpoint: &Self::Addr) -> io::Result<Listener> {
+    fn listen(&self) -> io::Result<Listener> {
         // A socket left by a dead process is replaced, once it is known to be ours and private.
-        if endpoint.exists() {
-            verify_socket(endpoint).map_err(|error| io::Error::other(format!("{error:#}")))?;
-            std::fs::remove_file(endpoint)?;
+        if self.0.exists() {
+            verify_socket(&self.0)?;
+            std::fs::remove_file(&self.0)?;
         }
         let listener = ListenerOptions::new()
-            .name(Self::name(endpoint)?)
+            .name(self.name()?)
             .mode(0o600)
             .create_tokio()?;
-        std::fs::set_permissions(endpoint, std::fs::Permissions::from_mode(0o600))?;
-        Ok(listener)
+        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o600))?;
+        Ok(Listener(listener))
     }
 
-    /// A socket before anything talks to it: in a private directory, a socket, this user's, open to nobody else.
-    fn verify_before_connect(endpoint: &Self::Addr) -> io::Result<()> {
-        verify_socket(endpoint).map_err(|error| io::Error::other(format!("{error:#}")))
+    fn to_connect(&self) -> io::Result<Name<'static>> {
+        verify_socket(&self.0)?;
+        self.name()
     }
 
     fn peer_is_this_user(stream: &Stream) -> io::Result<bool> {
-        let me = rustix::process::geteuid().as_raw();
-        Ok(stream.peer_creds()?.euid() == Some(me))
+        Ok(stream.peer_creds()?.euid() == Some(rustix::process::geteuid().as_raw()))
     }
 }
 
-fn verify_socket(path: &Path) -> Result<()> {
-    crate::secure_fs::private_dir(path.parent().context("socket parent")?)?;
+impl fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.display().fmt(f)
+    }
+}
+
+impl Endpoint {
+    fn name(&self) -> io::Result<Name<'static>> {
+        self.0.clone().to_fs_name::<GenericFilePath>()
+    }
+}
+
+/// A socket before anything talks to it or replaces it: in a private directory, a socket, this user's, open to
+/// nobody else.
+fn verify_socket(path: &Path) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| unsafe_socket(path))?;
+    crate::secure_fs::private_dir(parent)
+        .map_err(|error| io::Error::other(format!("{error:#}")))?;
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_socket()
-        || !crate::platform::user::current().owns_path(path)?
+        || !UserId::current().owns_path(path)?
         || metadata.mode() & 0o077 != 0
     {
-        bail!("unsafe socket {}", path.display());
+        return Err(unsafe_socket(path));
     }
     Ok(())
 }
 
+fn unsafe_socket(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("unsafe socket {}", path.display()),
+    )
+}
+
+// Unix only: file modes and the socket file a dead process leaves behind have no counterpart on Windows, where a
+// pipe has no file, no mode, and goes with its last handle.
 #[cfg(test)]
 mod tests {
+    use super::super::Channel as _;
     use super::*;
-    use crate::platform::ipc;
-    use crate::platform::ipc::Channel as _;
     use crate::secure_fs::tests::Scratch;
-    use std::os::unix::net::UnixListener;
 
     fn chmod(path: &Path, mode: u32) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
-    #[test]
-    fn a_socket_is_trusted_only_in_a_private_directory_and_open_to_nobody_else() {
+    #[tokio::test]
+    async fn a_socket_is_trusted_only_in_a_private_directory_and_open_to_nobody_else() {
         let scratch = Scratch::new("sock");
-        let path = scratch.0.join("s.sock");
-        let _listener = UnixListener::bind(&path).unwrap();
-        chmod(&path, 0o600);
-        verify_socket(&path).unwrap();
-        chmod(&path, 0o666);
-        assert!(verify_socket(&path).is_err());
-        chmod(&path, 0o600);
+        let endpoint = Endpoint::in_dir(&scratch.0, "s");
+        let _listener = endpoint.listen().unwrap();
+        endpoint.connect().await.unwrap();
+        chmod(&endpoint.0, 0o666);
+        assert!(endpoint.connect().await.is_err());
+        chmod(&endpoint.0, 0o600);
         chmod(&scratch.0, 0o755);
-        assert!(verify_socket(&path).is_err());
+        assert!(endpoint.connect().await.is_err());
         chmod(&scratch.0, 0o700);
-        let file = scratch.0.join("plain");
-        crate::secure_fs::write_private(&file, b"").unwrap();
-        assert!(verify_socket(&file).is_err());
+        let file = Endpoint::in_dir(&scratch.0, "plain");
+        crate::secure_fs::write_private(&file.0, b"").unwrap();
+        assert!(file.connect().await.is_err());
     }
 
     #[tokio::test]
-    async fn a_stale_socket_is_replaced_but_a_file_that_is_not_ours_is_not() {
+    async fn a_stale_socket_is_replaced_but_a_file_that_is_not_one_is_not() {
         let scratch = Scratch::new("stale");
-        let endpoint = Os::in_dir(&scratch.0, "t");
-        // Left behind by a process that died: the file stays, nothing listens.
-        drop(UnixListener::bind(&endpoint).unwrap());
-        chmod(&endpoint, 0o600);
-        assert!(endpoint.exists());
-        let listener = Os::listen(&endpoint).unwrap();
-        assert!(ipc::connect(&ipc::Endpoint(endpoint.clone())).await.is_ok());
+        let endpoint = Endpoint::in_dir(&scratch.0, "t");
+        // Left behind by a process that died: the file stays, nothing listens. (A listener whose file is not
+        // reclaimed on drop leaves exactly that.)
+        let mut dead = endpoint.listen().unwrap();
+        interprocess::local_socket::traits::tokio::Listener::do_not_reclaim_name_on_drop(
+            &mut dead.0,
+        );
+        drop(dead);
+        assert!(endpoint.0.exists());
+        let listener = endpoint.listen().unwrap();
+        endpoint.connect().await.unwrap();
         drop(listener);
-        assert!(!endpoint.exists(), "the socket file goes with its listener");
+        assert!(
+            !endpoint.0.exists(),
+            "the socket file goes with its listener"
+        );
         // Something that is not a socket is never unlinked.
-        crate::secure_fs::write_private(&endpoint, b"mine").unwrap();
-        assert!(Os::listen(&endpoint).is_err());
-        assert_eq!(std::fs::read(&endpoint).unwrap(), b"mine");
-    }
-
-    #[tokio::test]
-    async fn a_peer_is_this_user_when_its_effective_uid_is_ours() {
-        let scratch = Scratch::new("peer");
-        let endpoint = ipc::Endpoint::in_dir(&scratch.0, "t");
-        let listener = ipc::listen(&endpoint).unwrap();
-        let stream = ipc::connect(&endpoint).await.unwrap();
-        assert!(Os::peer_is_this_user(&stream).unwrap());
-        drop(listener);
-    }
-
-    #[tokio::test]
-    async fn a_socket_open_to_others_is_refused_before_connecting() {
-        let scratch = Scratch::new("open");
-        let endpoint = ipc::Endpoint::in_dir(&scratch.0, "t");
-        let _listener = ipc::listen(&endpoint).unwrap();
-        chmod(&scratch.0.join("t.sock"), 0o666);
-        assert!(ipc::connect(&endpoint).await.is_err());
+        crate::secure_fs::write_private(&endpoint.0, b"mine").unwrap();
+        assert!(endpoint.listen().is_err());
+        assert_eq!(std::fs::read(&endpoint.0).unwrap(), b"mine");
     }
 }

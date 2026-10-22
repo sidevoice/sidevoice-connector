@@ -1,4 +1,5 @@
 use crate::core_ready::Ready;
+use crate::platform::ipc::Channel;
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -203,11 +204,7 @@ impl Link {
         session: u64,
     ) -> Result<()> {
         let ready = profile.ready().await?;
-        let stream = timeout(
-            Duration::from_secs(2),
-            crate::platform::ipc::connect(&ready.endpoint()?),
-        )
-        .await??;
+        let stream = timeout(Duration::from_secs(2), ready.endpoint()?.connect()).await??;
         let mut config = WebSocketConfig::default();
         config.max_message_size = Some(1 << 20);
         config.max_frame_size = Some(1 << 20);

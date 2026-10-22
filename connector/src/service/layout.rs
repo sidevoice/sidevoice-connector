@@ -14,7 +14,7 @@
 //!
 //! The release layout below `R/current` is the installer's; it is named here once (`CORE_ENTRYPOINT`).
 
-use crate::platform::ipc::Endpoint;
+use crate::platform::ipc::{Channel, Endpoint};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::OsString;

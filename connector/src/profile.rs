@@ -15,7 +15,7 @@
 //! Every path is absolute. The directories are checked again at each operation boundary, not trusted from startup:
 //! they are passed to agents' command lines and written into.
 
-use crate::platform::ipc::Endpoint;
+use crate::platform::ipc::{Channel, Endpoint};
 use crate::secure_fs::{private_dir, private_file, validate_user_directory};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};

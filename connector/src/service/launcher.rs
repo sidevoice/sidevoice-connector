@@ -22,6 +22,7 @@ use super::status::{self, read_ready, serving};
 use super::{Failure, Result};
 use crate::core_ready::Ready;
 use crate::messages::message;
+use crate::platform::ipc::Channel;
 use crate::platform::process::{Identity, Process, Processes};
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
@@ -64,7 +65,8 @@ pub async fn request_connector(
 ) -> std::result::Result<Value, String> {
     let endpoint = layout.connector_endpoint();
     let ask = async {
-        let mut stream = crate::platform::ipc::connect(&endpoint)
+        let mut stream = endpoint
+            .connect()
             .await
             .map_err(|error| error.to_string())?;
         let request = json!({"id": 1, "method": method, "params": params});
@@ -131,6 +133,9 @@ pub fn core_processes(layout: &Layout) -> Vec<u32> {
 /// Stop a core of this data directory and wait until it has gone: asked to leave, the grace period, then killed;
 /// each only while it is provably that core.
 pub async fn terminate_core(layout: &Layout, pid: u32, grace: Duration) {
+    // TODO(sidevoice/sidevoice-core#165): ask the core to leave in band first, over its endpoint, once the core has
+    // that shutdown method. On Windows it is the only request there is (decision "Graceful stop", 2026-10-22):
+    // until then `stop` there waits the grace and kills. Its method and fields are core#165's to define.
     if Processes::stop(pid, |found| is_our_core(layout, &found.command), grace).await {
         crate::logfile::log(&format!(
             "the core (pid {pid}) did not leave by itself: killed it"

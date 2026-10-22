@@ -1,4 +1,5 @@
 use crate::adapters::{self, Identity, Registry};
+use crate::platform::ipc::Channel;
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use rmcp::{
@@ -76,11 +77,7 @@ impl Ipc {
         if self.tx.lock().await.is_some() {
             return Ok(());
         }
-        let stream = timeout(
-            Duration::from_secs(2),
-            crate::platform::ipc::connect(&self.profile.endpoint),
-        )
-        .await??;
+        let stream = timeout(Duration::from_secs(2), self.profile.endpoint.connect()).await??;
         let (read, mut write) = tokio::io::split(stream);
         let (tx, mut rx) = mpsc::channel::<Value>(64);
         *self.tx.lock().await = Some(tx);

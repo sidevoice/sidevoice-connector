@@ -1,7 +1,7 @@
 //! What the connector reads of its core: the ready file the core writes once it serves (`D/core/core.json`) and
 //! its health on its local endpoint, which must name the same launch and process.
 
-use crate::platform::ipc::{self, Endpoint};
+use crate::platform::ipc::{Channel, Endpoint};
 use crate::profile::Profile;
 use crate::secure_fs::private_file;
 use anyhow::{bail, Context, Result};
@@ -59,7 +59,7 @@ pub fn read(path: &Path) -> Result<Ready> {
 /// `GET /api/local/health` on the core's local endpoint, within `limit`: the body of its 200.
 pub async fn health(endpoint: &Endpoint, limit: Duration) -> Result<Value> {
     let ask = async {
-        let mut stream = ipc::connect(endpoint).await?;
+        let mut stream = endpoint.connect().await?;
         stream
             .write_all(
                 b"GET /api/local/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -125,6 +125,7 @@ impl Profile {
 #[cfg(test)]
 mod tests {
     use super::{read, require_v3};
+    use crate::platform::ipc::{Channel, Endpoint};
     use crate::secure_fs::tests::Scratch;
     use std::os::unix::fs::PermissionsExt;
 
@@ -156,11 +157,15 @@ mod tests {
                 .extend(extra.as_object().unwrap().clone());
             serde_json::from_value(file).unwrap()
         };
-        let both =
-            ready(serde_json::json!({"endpoint":"/d/core/new.sock","socket":"/d/core/old.sock"}));
-        assert_eq!(both.endpoint().unwrap().record(), "/d/core/new.sock");
-        let old = ready(serde_json::json!({"socket":"/d/core/old.sock"}));
-        assert_eq!(old.endpoint().unwrap().record(), "/d/core/old.sock");
+        let dir = std::env::temp_dir();
+        let (new, old) = (
+            Endpoint::in_dir(&dir, "new").to_string(),
+            Endpoint::in_dir(&dir, "old").to_string(),
+        );
+        let both = ready(serde_json::json!({"endpoint": new, "socket": old}));
+        assert_eq!(both.endpoint().unwrap().to_string(), new);
+        let only_socket = ready(serde_json::json!({"socket": old}));
+        assert_eq!(only_socket.endpoint().unwrap().to_string(), old);
         assert!(ready(serde_json::json!({})).endpoint().is_err());
         assert!(ready(serde_json::json!({"endpoint":"relative"}))
             .endpoint()

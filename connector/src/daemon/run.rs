@@ -3,6 +3,7 @@
 use super::Daemon;
 use crate::adapters::Registry;
 use crate::link::Link;
+use crate::platform::ipc::Channel;
 use crate::profile::Profile;
 use crate::secure_fs::private_dir;
 use anyhow::{bail, Result};
@@ -63,7 +64,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     let mut binding_order = HashMap::<String, oneshot::Receiver<()>>::new();
     // Accept MCP before Core is ready. The link task retries the private Core socket until the
     // separately manager-owned Core job becomes healthy.
-    let listener = crate::platform::ipc::listen(&profile.endpoint)?;
+    let listener = profile.endpoint.listen()?;
     let (ready_tx, ready_rx) = oneshot::channel();
     let supervisor = Arc::new(crate::service::core_supervisor(&profile));
     let link_task = tokio::spawn(link.run(profile.clone(), incoming_tx, ready_tx, supervisor));
