@@ -297,7 +297,7 @@ impl Profile {
         let path = self.data.join("connector.lock");
         crate::lock::try_lock(&path, "connector")?.with_context(|| {
             let pid = crate::lock::holder(&path)
-                .and_then(|record| record["pid"].as_u64())
+                .map(|record| record.pid)
                 .map_or_else(String::new, |pid| format!(" (pid {pid})"));
             format!("another Sidevoice connector{pid} already serves this data directory")
         })

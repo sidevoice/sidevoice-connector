@@ -162,6 +162,24 @@ fn open_dir(parent: RawFd, child: &OsStr) -> Result<OwnedFd, &'static str> {
     }
 }
 
+/// A lock file in the pinned data directory `data`, opened relative to it: created private when missing, a link in
+/// its place refused (`lock::wait_lock_file` checks the rest).
+pub(super) fn lock_file(data: &OwnedFd, entry: &CStr) -> Result<File, &'static str> {
+    let fd = unsafe {
+        libc::openat(
+            data.as_raw_fd(),
+            entry.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        Err("cannot open uninstall lock")
+    } else {
+        Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+}
+
 fn absolute_dir(path: &Path) -> Result<OwnedFd, &'static str> {
     if !clean_absolute(path) {
         return Err("unsafe uninstall path");
