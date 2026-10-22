@@ -105,40 +105,12 @@ pub trait Env {
         // A rooted directory, so a relative entry of `path` or a relative `name` finds nothing of this process's.
         which::which_in(name, Some(path), Path::new(std::path::MAIN_SEPARATOR_STR)).ok()
     }
-
-    /// `text` with every `%NAME%` replaced by the variable `var` gives for it (one left as written when there is
-    /// none): how Windows writes a `Path` in the registry.
-    fn expand(text: &str, var: impl Fn(&str) -> Option<String>) -> String {
-        let mut out = String::new();
-        let mut rest = text;
-        while let Some(start) = rest.find('%') {
-            out.push_str(&rest[..start]);
-            let after = &rest[start + 1..];
-            match after.find('%') {
-                Some(end) => match var(&after[..end]).filter(|_| end > 0) {
-                    Some(value) => {
-                        out.push_str(&value);
-                        rest = &after[end + 1..];
-                    }
-                    None => {
-                        out.push('%');
-                        rest = after;
-                    }
-                },
-                None => {
-                    out.push('%');
-                    rest = after;
-                }
-            }
-        }
-        out.push_str(rest);
-        out
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::fs::{Create, Files, Fs};
 
     /// Two absolute directories of this OS, as a list in its own form.
     fn absolute() -> (PathBuf, PathBuf, String) {
@@ -218,8 +190,12 @@ mod tests {
         let scratch = crate::test_support::temp_dir("env-find");
         let name = format!("sv-tool{}", std::env::consts::EXE_SUFFIX);
         let program = scratch.path().join(&name);
-        std::fs::write(&program, "#!/bin/sh\n").unwrap();
-        crate::test_support::make_executable(&program);
+        // A program as the platform makes one (executable where the OS marks that on the file).
+        std::io::Write::write_all(
+            &mut Files::open_private(&program, Create::NewProgram).unwrap(),
+            b"#!/bin/sh\n",
+        )
+        .unwrap();
         let path = std::env::join_paths([scratch.path()]).unwrap();
         assert_eq!(Environment::find_program("sv-tool", &path), Some(program));
         assert_eq!(Environment::find_program("sv-absent", &path), None);
@@ -227,15 +203,6 @@ mod tests {
             Environment::find_program("sv-tool", OsStr::new("")),
             None,
             "an empty path finds nothing"
-        );
-    }
-
-    #[test]
-    fn variables_in_percent_signs_are_expanded_and_unknown_ones_left() {
-        let var = |name: &str| (name == "ROOT").then(|| "C:\\Windows".to_owned());
-        assert_eq!(
-            Environment::expand("%ROOT%\\System32;%NOPE%;100%;%;%%", var),
-            "C:\\Windows\\System32;%NOPE%;100%;%;%%"
         );
     }
 }

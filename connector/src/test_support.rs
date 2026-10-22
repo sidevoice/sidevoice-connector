@@ -22,12 +22,3 @@ pub(crate) fn symlink(target: &std::path::Path, link: &std::path::Path) {
         std::os::windows::fs::symlink_file(target, link).unwrap();
     }
 }
-
-/// `path` made runnable by its owner, for a test that needs a program a lookup finds. Where a file's name makes it
-/// one (Windows), nothing to do.
-pub(crate) fn make_executable(path: &std::path::Path) {
-    #[cfg(unix)]
-    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
-    #[cfg(windows)]
-    let _ = path;
-}
