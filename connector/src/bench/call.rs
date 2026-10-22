@@ -15,8 +15,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
-use crate::platform::process::{Process, Processes};
 use crate::setup::Profile;
+use sidevoice_connector::platform::process::{Process, Processes};
 
 /// The call events kept for the page.
 const EVENTS: usize = 300;

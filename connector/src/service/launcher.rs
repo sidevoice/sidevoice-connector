@@ -86,7 +86,7 @@ pub async fn request_connector(
         if reply.get("ok") == Some(&json!(true)) {
             Ok(reply.get("result").cloned().unwrap_or(Value::Null))
         } else {
-            Err(crate::ipc_failure(
+            Err(crate::frame::ipc_failure(
                 &reply,
                 "the connector refused the request",
             ))

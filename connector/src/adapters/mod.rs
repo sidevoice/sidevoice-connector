@@ -51,7 +51,8 @@ pub(crate) fn prepare_pull_page(result: &mut Value, after: u64) -> Result<()> {
         result["more"] = json!(core_more || exposed < total);
         let bytes =
             serde_json::to_vec(&json!({"id":u64::MAX,"ok":true,"result":result}))?.len() + 1;
-        if bytes > crate::IPC_FRAME_LIMIT || (exposed > 1 && bytes > PULL_PAGE_TARGET_BYTES) {
+        if bytes > crate::frame::IPC_FRAME_LIMIT || (exposed > 1 && bytes > PULL_PAGE_TARGET_BYTES)
+        {
             result["messages"].as_array_mut().unwrap().pop();
             break;
         }
