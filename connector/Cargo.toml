@@ -20,10 +20,10 @@ clap = { version = "4.5", features = ["derive"] }
 fs2 = "0.4"
 futures-util = "0.3"
 gethostname = "1"
+whoami = "2"
 hex = "0.4"
 libc = "0.2"
 qrcodegen = "1.8"
-rustix = { version = "1", features = ["process"] }
 rmcp = { version = "3.5.1", features = ["server", "transport-io", "schemars"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
@@ -38,9 +38,24 @@ uuid = { version = "1", features = ["v4"] }
 which = "=8.0.6"
 zstd = "0.13"
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
+# Processes (src/platform/process): what every OS reads the same (owner, start, command line, parent) and the stop,
+# through `sysinfo`; spawning a detached process or a stoppable tree (process group, Job Object) through `process-wrap`.
 process-wrap = { version = "10", features = ["tokio1", "process-group", "job-object", "creation-flags", "kill-on-drop"] }
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
+# Unix: the effective uid (src/platform/user), with no `unsafe` of ours.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
+# Windows: this process's user and file owners (src/platform/user). Minimal features; the version the lock already has.
+# `windows`: only for the type `process-wrap`'s `CreationFlags` takes (src/platform/process); it is `process-wrap`'s
+# own dependency, at its version, so it adds nothing to the build.
 [target.'cfg(windows)'.dependencies]
-# The creation flags `process-wrap` takes (its own dependency, same version).
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
