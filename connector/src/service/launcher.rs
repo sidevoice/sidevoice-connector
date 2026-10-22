@@ -363,15 +363,12 @@ async fn on_demand_connector(layout: &Layout) -> Option<OnDemand> {
     }
     let holder =
         crate::lock::holder(&layout.connector_lock()).filter(|_| connector_lock_held(layout));
-    let holder_pid = holder
-        .as_ref()
-        .and_then(|record| record.get("pid")?.as_u64())
-        .and_then(|pid| u32::try_from(pid).ok());
+    let holder_pid = holder.as_ref().map(|record| record.pid);
     let holder_start = |pid: u32| {
         holder
             .as_ref()
             .filter(|_| holder_pid == Some(pid))
-            .and_then(|record| record.get("start")?.as_str().map(str::to_owned))
+            .and_then(|record| record.start.clone())
     };
     let found = match identity {
         Some((pid, executable, _)) => OnDemand {

@@ -1,6 +1,5 @@
 use super::*;
 use crate::adapters::registration::{aggregate_readiness, ReadinessCheck};
-use fs2::FileExt;
 use std::fs::OpenOptions;
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 
@@ -1340,10 +1339,10 @@ exit 2
         .mode(0o600)
         .open(lock_path)
         .unwrap();
-    lock.lock_exclusive().unwrap();
+    lock.lock().unwrap();
     state["dismissed"]["codex"] = generation;
     atomic_json(&state_path, &state).unwrap();
-    FileExt::unlock(&lock).unwrap();
+    lock.unlock().unwrap();
     let scanned = scanning.await.unwrap();
     assert_eq!(row(&scanned, "codex")["dismissed"], true);
 

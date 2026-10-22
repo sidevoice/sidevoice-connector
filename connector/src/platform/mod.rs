@@ -3,4 +3,5 @@
 //! the same on every host; what differs per OS is chosen inside a submodule. Maintained crates come first, our own
 //! `unsafe` last. Clippy refuses the raw calls outside this module (`clippy.toml`).
 
+pub mod lock;
 pub mod user;
