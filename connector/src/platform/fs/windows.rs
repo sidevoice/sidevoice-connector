@@ -8,7 +8,7 @@
 //!
 //! Own `unsafe` over `windows-sys`: no maintained crate covers "create with this DACL" and "read what this handle's
 //! DACL grants" (`windows-acl` is unmaintained; `windows-permissions` is a thin binding with the same calls left to
-//! us), and the surface is a few calls.
+//! us), and the surface is a few calls. The link count comes from `winapi-util`.
 
 use super::{Create, Others};
 use crate::platform::user::{User, UserId};
@@ -33,10 +33,9 @@ use windows_sys::Win32::Security::{
     SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-    CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
-    READ_CONTROL,
+    CreateDirectoryW, CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_ALWAYS, READ_CONTROL,
 };
 
 /// This OS's files.
@@ -103,15 +102,9 @@ impl super::Fs for Os {
     }
 }
 
-/// How many names the file behind `file` has.
+/// How many names the file behind `file` has (`winapi-util`).
 pub(super) fn link_count(file: &File) -> io::Result<u64> {
-    // SAFETY: zeroed is a valid value of the plain struct the call fills.
-    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: the handle is open for the call.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(u64::from(info.nNumberOfLinks))
+    Ok(winapi_util::file::information(file)?.number_of_links())
 }
 
 /// A directory on the way to something private: this user's or the system's, nobody else able to delete or rename

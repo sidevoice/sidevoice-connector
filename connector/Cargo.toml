@@ -64,3 +64,5 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
+# How many names a file has (src/platform/fs), from a handle: `winapi-util` (walkdir, ripgrep), no `unsafe` of ours.
+winapi-util = "0.1"
