@@ -7,11 +7,16 @@
 //!
 //! What every OS guarantees, and what [`Roots::validate`] and the implementations enforce:
 //!
+//! - **Never the home or above.** `D` is never the home directory, a directory the home is in, or a file-system
+//!   or volume root, whatever it holds: no record in it makes it ours.
 //! - **Owned roots only.** `D` is either exactly the OS's standard place for this user (`data_dir` with no
 //!   override, wherever that is, inside the home or not), or a directory that holds an installation of ours: an
-//!   `install.json` of this user's that nobody else can change, naming `R` as its releases (what `install` writes),
-//!   or nothing at all but what an uninstall leaves. `R` is directly inside `D`. Anything else is refused before
-//!   anything is touched, so a folder that merely has the program's name is never emptied.
+//!   `install.json` of this user's that nobody else can change, naming `R` as its releases (what `install` writes).
+//!   `R` is directly inside `D`. Anything else is refused before anything is touched, so a folder that merely has
+//!   the program's name is never emptied. Another directory holding nothing but what an uninstall leaves proves
+//!   nothing: it is reported ([`Ownership::Leftovers`]) and the caller leaves it as it is.
+//! - **The `D` that was checked.** What `D` is (its file id) is recorded when it is checked, or when the removal
+//!   makes it, and every later use of `D` is refused when what is there is something else.
 //! - **No link is followed.** A link met inside a root is removed as a link; what it points to is untouched.
 //! - **No root swapped mid-step.** A root, or a directory above it, replaced by a link while a step runs is never
 //!   reached through: the step is refused, or the replacement cannot happen while it runs.
@@ -76,6 +81,20 @@ pub struct Roots {
     pub standard: Option<PathBuf>,
     /// The names in `D` that an uninstall leaves (its permanent lock files and the stop).
     pub kept: &'static [&'static str],
+    /// This user's home directory; `None` when it is not known, and then nothing is removed.
+    pub home: Option<PathBuf>,
+}
+
+/// What `D` is to a removal, as [`Removal::ownership`] finds it. Anything that is not ours is refused instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ownership {
+    /// The standard place, or a directory holding an installation of ours.
+    Ours,
+    /// Not the standard place, and not there.
+    Absent,
+    /// Not the standard place, no installation record, and nothing in it but what an uninstall leaves: nothing
+    /// proves it is ours, so it is not written to and nothing in it is deleted.
+    Leftovers,
 }
 
 /// What a removal reads through the `D` it holds, for [`Roots::check_owned`]: `D`'s names and its `install.json`
@@ -84,9 +103,10 @@ pub struct Roots {
 type Contents = Option<(Vec<OsString>, Option<Vec<u8>>)>;
 
 impl Roots {
-    /// That these are plain roots: absolute paths of plain components, `D` not a file-system root, `R` directly
-    /// inside `D`, both real canonical directories when they exist, and the anchor ([`Roots::anchor`]) one too.
-    /// Whether `D` is ours is [`Roots::check_owned`]'s, which [`Removal::new`] asks through what it holds.
+    /// That these are plain roots: absolute paths of plain components, `D` not a file-system or volume root, not
+    /// the home and not a directory the home is in, `R` directly inside `D`, both real canonical directories when
+    /// they exist, and the anchor ([`Roots::anchor`]) one too. Whether `D` is ours is [`Roots::check_owned`]'s,
+    /// which [`Removal::new`] asks through what it holds.
     pub fn validate(&self) -> Result<(), &'static str> {
         let data = dunce::simplified(&self.data);
         if !clean_absolute(&self.data)
@@ -97,6 +117,7 @@ impl Roots {
         {
             return Err("uninstall path is outside known Sidevoice roots");
         }
+        self.check_below_home()?;
         if !canonical(&self.anchor()?) {
             return Err("unsafe uninstall anchor");
         }
@@ -109,6 +130,30 @@ impl Roots {
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => return Err("cannot inspect uninstall root"),
+            }
+        }
+        Ok(())
+    }
+
+    /// That `D` is not the home nor a directory the home is in: compared as written and, when both are there, as
+    /// the OS resolves them (so another spelling of the same directory, through a link or in another case, is seen
+    /// too). Refused when the home is not known.
+    fn check_below_home(&self) -> Result<(), &'static str> {
+        const REFUSED: &str =
+            "uninstall refused: the data directory is the home directory or a directory it is in";
+        let home = self
+            .home
+            .as_deref()
+            .ok_or("uninstall refused: this user's home directory is not known")?;
+        if dunce::simplified(home).starts_with(dunce::simplified(&self.data)) {
+            return Err(REFUSED);
+        }
+        if let (Ok(home), Ok(data)) = (
+            std::fs::canonicalize(home),
+            std::fs::canonicalize(&self.data),
+        ) {
+            if dunce::simplified(&home).starts_with(dunce::simplified(&data)) {
+                return Err(REFUSED);
             }
         }
         Ok(())
@@ -129,23 +174,23 @@ impl Roots {
         Err("unsafe uninstall anchor")
     }
 
-    /// That `D` is ours to empty: exactly the standard place ([`Roots::standard`]), not there at all, or, as `read`
-    /// gives it through the `D` the removal holds, an installation of ours: an `install.json` naming `R` as its
-    /// releases (what `install` writes, and the retry record too), or nothing but what an uninstall leaves (`kept`).
-    /// `read` is only asked when `D` is not the standard place.
+    /// What `D` is: ours when it is exactly the standard place ([`Roots::standard`]) or, as `read` gives it through
+    /// the `D` the removal holds, it holds an installation of ours (an `install.json` naming `R` as its releases:
+    /// what `install` writes, and the retry record too); else absent, or leftovers when it holds nothing but what an
+    /// uninstall leaves (`kept`); refused otherwise. `read` is only asked when `D` is not the standard place.
     fn check_owned(
         &self,
         read: impl FnOnce() -> Result<Contents, &'static str>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<Ownership, &'static str> {
         let standard = self
             .standard
             .as_deref()
             .is_some_and(|standard| dunce::simplified(standard) == dunce::simplified(&self.data));
         if standard {
-            return Ok(());
+            return Ok(Ownership::Ours);
         }
         let Some((names, record)) = read()? else {
-            return Ok(());
+            return Ok(Ownership::Absent);
         };
         let installed = record
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -153,8 +198,10 @@ impl Roots {
         let empty = names
             .iter()
             .all(|name| self.kept.iter().any(|kept| OsStr::new(kept) == name));
-        if installed || empty {
-            Ok(())
+        if installed {
+            Ok(Ownership::Ours)
+        } else if empty {
+            Ok(Ownership::Leftovers)
         } else {
             Err("uninstall refused: the data directory is not the standard one and holds no installation of ours")
         }
@@ -212,10 +259,15 @@ fn recovery_record(roots: &Roots) -> Result<Value, &'static str> {
 pub trait Removal: Sized {
     /// Holds `roots` (validated here) so that the steps below act on them and on nothing else, and refuses a `D`
     /// that is not ours ([`Roots::check_owned`], read through what it holds) before anything is touched.
+    /// What `D` is (its file id) is recorded here when it is there; every later use of `D` compares it.
     fn new(roots: Roots) -> Result<Self, &'static str>;
 
     /// The roots this removal is for.
     fn roots(&self) -> &Roots;
+
+    /// What `D` is now ([`Roots::check_owned`], read again through the `D` recorded by [`Removal::new`] or made by
+    /// [`Removal::lock_file`]); refused when it is not ours.
+    fn ownership(&self) -> Result<Ownership, &'static str>;
 
     /// Checks both roots without removing anything, refusing at the first thing that is not safe to remove (a mount
     /// or volume boundary, an entry that is not what it was, a running program this OS cannot delete). Whether
@@ -223,7 +275,8 @@ pub trait Removal: Sized {
     fn preflight(&self) -> Result<bool, &'static str>;
 
     /// The lock file `name` in `D` (created private when missing), opened so that a link in its place is refused;
-    /// the caller then takes the lock on it (`lock::wait_lock_file` checks the rest). `D` is made when missing.
+    /// the caller then takes the lock on it (`lock::wait_lock_file` checks the rest). `D` is made when missing and
+    /// recorded as made; a `D` missing when the removal started that something else made since is refused.
     fn lock_file(&self, name: &str) -> Result<File, &'static str>;
 
     /// The retry route, before any release or data is removed: a copy of the running program placed private in
@@ -263,13 +316,15 @@ mod tests {
 
     const DATA: &str = Environment::DATA_NAME;
 
-    /// `D` at `data`, `R` inside it, and `standard` as the OS's place for this user.
+    /// `D` at `data`, `R` inside it, `standard` as the OS's place for this user and the directory it is in as the
+    /// home.
     fn at(data: PathBuf, standard: &Path) -> Roots {
         Roots {
             releases: data.join("install"),
             data,
             standard: Some(standard.to_path_buf()),
             kept: KEPT,
+            home: standard.parent().map(Path::to_path_buf),
         }
     }
 
@@ -361,19 +416,22 @@ mod tests {
     }
 
     #[test]
-    fn another_directory_is_accepted_with_an_installation_of_ours_or_nothing_in_it() {
+    fn another_directory_is_ours_only_with_an_installation_of_ours_in_it() {
         let scratch = temp_dir("uninstall-custom");
         let standard = scratch.path().join("home").join(DATA);
         let custom = scratch.path().join("custom").join("profile");
-        assert!(
-            Remover::new(at(custom.clone(), &standard)).is_ok(),
+        let ownership = |removal: Remover| removal.ownership().unwrap();
+        assert_eq!(
+            ownership(Remover::new(at(custom.clone(), &standard)).unwrap()),
+            Ownership::Absent,
             "not there: nothing to remove"
         );
         Files::ensure_private_dir(&custom).unwrap();
-        fs::write(custom.join(KEPT[0]), "").unwrap();
-        assert!(
-            Remover::new(at(custom.clone(), &standard)).is_ok(),
-            "only what an uninstall leaves"
+        fs::write(custom.join(KEPT[2]), "theirs").unwrap();
+        assert_eq!(
+            ownership(Remover::new(at(custom.clone(), &standard)).unwrap()),
+            Ownership::Leftovers,
+            "only what an uninstall leaves proves nothing"
         );
         with_entry(&custom);
         let layout = at(custom.clone(), &standard);
@@ -383,7 +441,98 @@ mod tests {
         )
         .unwrap();
         let removal = Remover::new(layout).unwrap();
+        assert_eq!(removal.ownership().unwrap(), Ownership::Ours);
         assert_eq!(removal.remove_data_contents(&|_| {}).unwrap(), ["entry"]);
+    }
+
+    #[test]
+    fn the_home_a_directory_it_is_in_or_a_root_is_never_emptied_whatever_it_holds() {
+        let scratch = temp_dir("uninstall-home");
+        let outer = scratch.path().join("outer");
+        let home = outer.join("home");
+        let standard = home.join(".local").join("share").join(DATA);
+        Files::ensure_private_dir(&home).unwrap();
+        fs::write(home.join("entry"), "theirs").unwrap();
+        let root = home
+            .ancestors()
+            .last()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        for data in [home.clone(), outer, root] {
+            let layout = at(data.clone(), &standard);
+            if data.parent().is_some() {
+                Files::write_json(
+                    &data.join(RECORD),
+                    &json!({"command": ["x"], "releases": layout.releases}),
+                )
+                .unwrap();
+            }
+            assert!(Remover::new(layout).is_err(), "{}", data.display());
+        }
+        let mut unknown = at(home.join("custom"), &standard);
+        unknown.home = None;
+        assert!(Remover::new(unknown).is_err(), "an unknown home");
+        let mut spelled = at(home.clone(), &standard);
+        spelled.home = Some(fs::canonicalize(&home).unwrap().join("."));
+        assert!(Remover::new(spelled).is_err(), "the home written otherwise");
+        assert_eq!(fs::read_to_string(home.join("entry")).unwrap(), "theirs");
+    }
+
+    #[test]
+    fn a_data_directory_swapped_for_another_after_it_was_checked_is_refused_and_left_untouched() {
+        // Between two steps (nothing is held then, on any OS), and in the middle of one.
+        for during_step in [false, true] {
+            let (scratch, layout, removal) = installed("uninstall-data-swap");
+            fs::write(layout.data.join("entry"), "ours").unwrap();
+            let moved = scratch.path().join("moved");
+            let swapped = AtomicBool::new(false);
+            let ran = AtomicBool::new(false);
+            let swap = || {
+                ran.store(true, Ordering::SeqCst);
+                if fs::rename(&layout.data, &moved).is_ok() {
+                    with_entry(&layout.data);
+                    swapped.store(true, Ordering::SeqCst);
+                }
+            };
+            if during_step {
+                let once = AtomicBool::new(false);
+                let hook = |_: &OsStr| {
+                    if !once.swap(true, Ordering::SeqCst) {
+                        swap();
+                    }
+                };
+                let result = removal.remove_data_contents(&hook);
+                assert!(ran.load(Ordering::SeqCst), "the hook never ran");
+                assert!(
+                    !swapped.load(Ordering::SeqCst) || result.is_err(),
+                    "a swap the OS allowed must be refused"
+                );
+            } else {
+                swap();
+                assert!(swapped.load(Ordering::SeqCst));
+            }
+            if !swapped.load(Ordering::SeqCst) {
+                continue;
+            }
+            assert!(removal.ownership().is_err());
+            assert!(removal.preflight().is_err());
+            assert!(removal.lock_file("install.lock").is_err());
+            assert!(removal.stage_recovery().is_err());
+            assert!(removal.remove_data_contents(&|_| {}).is_err());
+            assert!(removal.remove_releases().is_err());
+            assert!(removal.finish_claim().is_err());
+            assert!(removal.finish_recovery().is_err());
+            let mut left: Vec<_> = fs::read_dir(&layout.data)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            left.sort();
+            assert_eq!(left, ["entry"], "the substitute is untouched");
+            assert_eq!(
+                fs::read_to_string(layout.data.join("entry")).unwrap(),
+                "theirs"
+            );
+        }
     }
 
     #[test]

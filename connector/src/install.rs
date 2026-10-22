@@ -38,14 +38,16 @@
 //!
 //! `uninstall`, under the install lock: both jobs unloaded and what runs on demand stopped (a refusal stops
 //! everything here, with nothing deleted), the agents' registrations removed, then `R` and everything in `D` but
-//! its permanent lock files and the stop, so that a launcher on its way finds the stop and does not serve.
+//! its permanent lock files and the stop, so that a launcher on its way finds the stop and does not serve. A `D`
+//! that is not the standard place and holds nothing but those leftovers, with no installation record, proves no
+//! installation: `uninstall` answers that nothing is installed there and changes nothing at all.
 
 use crate::agents::HostAgents;
 use crate::data_dir;
 use crate::messages::Keyed;
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Create, Files, Fs};
-use crate::platform::uninstall::{Removal, Remover, Roots};
+use crate::platform::uninstall::{Ownership, Removal, Remover, Roots};
 use crate::profile::Profile;
 use crate::service::jobs::Kind;
 use crate::service::layout::Layout;
@@ -990,6 +992,7 @@ fn removal_roots(layout: &Layout) -> Roots {
         data: layout.data.clone(),
         releases: layout.releases.clone(),
         kept: KEPT,
+        home: dirs::home_dir(),
     }
 }
 
@@ -1002,6 +1005,13 @@ async fn uninstall_with_hooks(
 ) -> Result<Value> {
     let layout = Layout::from_profile(profile);
     let guard = Remover::new(removal_roots(&layout)).map_err(failed)?;
+    let found = guard.ownership().map_err(failed)?;
+    if found == Ownership::Leftovers {
+        // Nothing proves an installation of ours there: nothing is written, stopped or deleted.
+        return Ok(json!({"ok": true, "state": "absent", "installed": false,
+            "safe_uninstall": crate::identity::SAFE_UNINSTALL, "data": layout.data, "removed": [],
+            "advice": []}));
+    }
     let had_releases = preflight(&guard).map_err(failed)?;
     guard.preflight().map_err(failed)?;
     let install_lock = guard.lock_file("install.lock").map_err(failed)?;
@@ -1009,6 +1019,16 @@ async fn uninstall_with_hooks(
         .await
         .map_err(failed)?
         .ok_or_else(|| failed("another install or service command holds install.lock"))?;
+    // What `D` holds may have changed while the lock was awaited: still ours, or (missing at the start) only the
+    // lock this uninstall just made there.
+    match (found, guard.ownership().map_err(failed)?) {
+        (_, Ownership::Ours) | (Ownership::Absent, Ownership::Leftovers) => {}
+        _ => {
+            return Err(failed(
+                "the data directory changed while uninstall waited for install.lock",
+            ))
+        }
+    }
     guard.preflight().map_err(failed)?;
     let service = runtime.unload(&layout).await?;
     let agents = if options.agents {
@@ -1039,6 +1059,12 @@ async fn uninstall_with_hooks(
 
 /// `uninstall` as a person reads it.
 pub fn human_uninstall(answer: &Value) -> String {
+    if answer["installed"] == false {
+        return format!(
+            "· Nothing of Sidevoice is installed in {}; nothing was changed.",
+            answer["data"].as_str().unwrap_or("?")
+        );
+    }
     let mut done = vec![format!(
         "Sidevoice no longer runs here ({}).",
         answer["service"].as_str().unwrap_or("none")

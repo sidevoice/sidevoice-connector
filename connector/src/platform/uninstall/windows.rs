@@ -3,7 +3,8 @@
 //! seen and refused, never followed) and without `FILE_SHARE_DELETE`, so while it is held nobody can rename it,
 //! delete it or put a link in its place: the paths the step then uses can only lead through those directories. The
 //! anchor (the nearest directory above `D` there at the start) is compared (volume and file id, `winapi-util`) with
-//! the one seen when the removal started; an entry is claimed by renaming it into the private claim directory and
+//! the one seen when the removal started, and `D` with the one recorded when it was checked or made; an entry is
+//! claimed by renaming it into the private claim directory and
 //! compared before and after; the standard library's
 //! handle-based `remove_dir_all` deletes what was claimed (it removes a link or junction itself and never follows one,
 //! so it never leaves the volume). `D` and the claim directory are checked private with
@@ -141,12 +142,31 @@ struct Held(Vec<File>);
 pub struct Os {
     roots: Roots,
     anchor: (PathBuf, File, Identity),
+    /// What `D` is: recorded when the removal starts with `D` there, or when it makes `D`.
+    data_id: std::sync::OnceLock<Identity>,
 }
 
 impl Os {
     /// `path` (the anchor or below it) and every directory above it, held, with the anchor checked to be the one
-    /// seen when the removal started.
+    /// seen when the removal started and `D`, when `path` is in it, the one recorded.
     fn hold_down_to(&self, path: &Path) -> Result<Held, &'static str> {
+        let held = self.hold_unchecked(path)?;
+        if path.starts_with(&self.roots.data) {
+            let data = held
+                .0
+                .get(self.roots.data.ancestors().count() - 1)
+                .ok_or("unsafe uninstall path")?;
+            match self.data_id.get() {
+                Some(id) if *id == identity_of(data)? => {}
+                Some(_) => return Err("uninstall data directory replaced during removal"),
+                None => return Err("uninstall data directory appeared during removal"),
+            }
+        }
+        Ok(held)
+    }
+
+    /// [`Os::hold_down_to`] without comparing `D`: for recording it.
+    fn hold_unchecked(&self, path: &Path) -> Result<Held, &'static str> {
         self.roots.validate()?;
         let mut chain: Vec<&Path> = path.ancestors().collect();
         chain.reverse();
@@ -158,6 +178,31 @@ impl Os {
             return Err("uninstall anchor replaced during removal");
         }
         Ok(Held(held))
+    }
+
+    /// `D` as it is now, recorded as the one every later use compares.
+    fn record_data(&self) -> Result<(), &'static str> {
+        let held = self.hold_unchecked(&self.roots.data)?;
+        let id = identity_of(held.0.last().ok_or("unsafe uninstall path")?)?;
+        let _ = self.data_id.set(id);
+        Ok(())
+    }
+
+    /// `D` made by this removal (with any missing directories above it, each private) and recorded; refused when
+    /// something else is already there.
+    fn make_data(&self) -> Result<(), &'static str> {
+        let data = &self.roots.data;
+        let parent = data.parent().ok_or("unsafe uninstall path")?;
+        if !exists(parent)? {
+            Files::ensure_private_dir(parent).map_err(|_| "unsafe uninstall data root")?;
+        }
+        match Files::create_private_dir(data) {
+            Ok(()) => self.record_data(),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                Err("uninstall data directory appeared during removal")
+            }
+            Err(_) => Err("cannot create uninstall data root"),
+        }
     }
 
     /// `D`'s names and its record, read with `D` held, for [`Roots::check_owned`].
@@ -231,13 +276,23 @@ impl Removal for Os {
         let removal = Self {
             roots,
             anchor: (path, file, id),
+            data_id: std::sync::OnceLock::new(),
         };
-        removal.roots.check_owned(|| removal.contents())?;
+        if exists(&removal.roots.data)? {
+            removal.record_data()?;
+        }
+        removal.ownership()?;
         Ok(removal)
     }
 
     fn roots(&self) -> &Roots {
         &self.roots
+    }
+
+    fn ownership(&self) -> Result<super::Ownership, &'static str> {
+        // `D` compared with the one recorded even where its contents are not read (the standard place).
+        self.data()?;
+        self.roots.check_owned(|| self.contents())
     }
 
     fn preflight(&self) -> Result<bool, &'static str> {
@@ -256,7 +311,9 @@ impl Removal for Os {
 
     fn lock_file(&self, name: &str) -> Result<File, &'static str> {
         self.roots.validate()?;
-        Files::ensure_private_dir(&self.roots.data).map_err(|_| "unsafe uninstall data root")?;
+        if self.data_id.get().is_none() {
+            self.make_data()?;
+        }
         let _held = self.data()?.ok_or("uninstall data root disappeared")?;
         Files::open_private(&self.roots.data.join(name), Create::ReadWrite)
             .map_err(|_| "cannot open uninstall lock")

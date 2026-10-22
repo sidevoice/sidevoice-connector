@@ -68,3 +68,43 @@ fn installed_cli_advertises_safe_uninstall_capability() {
     assert_eq!(answer["ok"], true);
     assert_eq!(answer["safe_uninstall"], 1);
 }
+
+#[test]
+fn the_home_is_refused_even_with_a_record_naming_its_releases() {
+    let home = temp_home();
+    fs::write(home.join("keep"), "untouched").unwrap();
+    let record = serde_json::json!({"command": ["x"], "releases": home.join("install")});
+    fs::write(home.join("install.json"), record.to_string()).unwrap();
+    fs::set_permissions(home.join("install.json"), fs::Permissions::from_mode(0o600)).unwrap();
+    let output = uninstall(&home, &home);
+    assert!(!output.status.success());
+    let answer: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(fs::read_to_string(home.join("keep")).unwrap(), "untouched");
+    assert!(home.join("install.json").is_file());
+    fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn a_directory_with_only_leftovers_and_no_record_is_left_exactly_as_it_is() {
+    let home = temp_home();
+    let data = home.join("unrelated");
+    fs::create_dir(&data).unwrap();
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(data.join("node-stopped.json"), "theirs").unwrap();
+    let output = uninstall(&home, &data);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success(), "{stdout}");
+    let answer: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(answer["installed"], false, "{answer}");
+    let names: Vec<_> = fs::read_dir(&data)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["node-stopped.json"], "nothing written");
+    assert_eq!(
+        fs::read_to_string(data.join("node-stopped.json")).unwrap(),
+        "theirs"
+    );
+    fs::remove_dir_all(home).unwrap();
+}

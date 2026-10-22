@@ -197,9 +197,22 @@ pub struct Os {
     releases_rel: PathBuf,
     /// `D` as opened for the first lock; the same descriptor serves every lock of this removal.
     lock_data: std::sync::OnceLock<OwnedFd>,
+    /// What `D` is (device and inode): recorded when the removal starts with `D` there, or when it makes `D`.
+    data_id: std::sync::OnceLock<(libc::dev_t, libc::ino_t)>,
 }
 
 impl Os {
+    /// That `data`, opened as `D`, is the `D` recorded: refused when it is another directory, or when `D` was not
+    /// there at the start and this removal did not make it.
+    fn check_data(&self, data: RawFd) -> Result<(), &'static str> {
+        let stat = stat_fd(data)?;
+        match self.data_id.get() {
+            Some(&id) if id == (stat.st_dev, stat.st_ino) => Ok(()),
+            Some(_) => Err("uninstall data directory replaced during removal"),
+            None => Err("uninstall data directory appeared during removal"),
+        }
+    }
+
     fn check_mount(&self, fd: RawFd) -> Result<(), &'static str> {
         if mount(fd)? == self.expected {
             Ok(())
@@ -214,19 +227,28 @@ impl Os {
         }
         // Each missing directory on the way down from the anchor is made private, as the XDG rules ask.
         let mut data = open_dir(self.anchor.as_raw_fd(), OsStr::new("."))?;
+        let mut made = false;
         for component in self.data_rel.components() {
             let Component::Normal(part) = component else {
                 return Err("unsafe uninstall path");
             };
+            made = false;
             if !exists_at(data.as_raw_fd(), part)? {
                 let part_name = name(part)?;
                 if unsafe { libc::mkdirat(data.as_raw_fd(), part_name.as_ptr(), 0o700) } != 0 {
                     return Err("cannot create uninstall data root");
                 }
+                made = true;
             }
             data = open_dir(data.as_raw_fd(), part)?;
             self.check_mount(data.as_raw_fd())?;
         }
+        if made {
+            // `D` made here, now: recorded as it is opened, so every later use compares it.
+            let stat = stat_fd(data.as_raw_fd())?;
+            let _ = self.data_id.set((stat.st_dev, stat.st_ino));
+        }
+        self.check_data(data.as_raw_fd())?;
         self.verify_dir(&self.data_rel, data.as_raw_fd())?;
         let stat = stat_fd(data.as_raw_fd())?;
         if !ours(data.as_raw_fd())? || stat.st_mode & 0o077 != 0 {
@@ -235,8 +257,14 @@ impl Os {
         Ok(self.lock_data.get_or_init(|| data))
     }
 
+    /// `path` below the anchor, opened one directory at a time; `D`, on the way, compared with the one recorded.
     fn open_relative(&self, path: &Path) -> Result<Option<OwnedFd>, &'static str> {
+        self.open_below(path, true)
+    }
+
+    fn open_below(&self, path: &Path, check_data: bool) -> Result<Option<OwnedFd>, &'static str> {
         let mut current = open_dir(self.anchor.as_raw_fd(), OsStr::new("."))?;
+        let mut walked = PathBuf::new();
         for component in path.components() {
             let Component::Normal(part) = component else {
                 return Err("unsafe uninstall path");
@@ -246,6 +274,10 @@ impl Os {
             }
             current = open_dir(current.as_raw_fd(), part)?;
             self.check_mount(current.as_raw_fd())?;
+            walked.push(part);
+            if check_data && walked == self.data_rel {
+                self.check_data(current.as_raw_fd())?;
+            }
         }
         Ok(Some(current))
     }
@@ -570,13 +602,24 @@ impl Removal for Os {
             anchor_path,
             expected,
             lock_data: std::sync::OnceLock::new(),
+            data_id: std::sync::OnceLock::new(),
         };
-        removal.roots.check_owned(|| removal.contents())?;
+        if let Some(data) = removal.open_below(&removal.data_rel, false)? {
+            let stat = stat_fd(data.as_raw_fd())?;
+            let _ = removal.data_id.set((stat.st_dev, stat.st_ino));
+        }
+        removal.ownership()?;
         Ok(removal)
     }
 
     fn roots(&self) -> &Roots {
         &self.roots
+    }
+
+    fn ownership(&self) -> Result<super::Ownership, &'static str> {
+        // `D` compared with the one recorded even where its contents are not read (the standard place).
+        self.open_relative(&self.data_rel)?;
+        self.roots.check_owned(|| self.contents())
     }
 
     fn lock_file(&self, entry: &str) -> Result<File, &'static str> {
@@ -885,6 +928,7 @@ mod tests {
             data,
             releases,
             kept: KEPT,
+            home: Some(home.to_path_buf()),
         })
         .unwrap()
     }
