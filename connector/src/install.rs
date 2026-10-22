@@ -1099,7 +1099,7 @@ pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
-    pub(crate) struct Fake {
+    pub struct Fake {
         /// The releases whose pair does not answer.
         pub failing: BTreeSet<String>,
         /// The release `current` named at each restart.
