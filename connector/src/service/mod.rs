@@ -197,7 +197,7 @@ pub async fn install(layout: &Layout) -> Result<Value> {
 }
 
 /// Both definitions written for the selected installation and both jobs started; with `restart`, restarted even
-/// when their definitions did not change, so that both run what `current` names now. When no job was defined,
+/// when their definitions did not change, so that both run what `R/current.json` names now. When no job was defined,
 /// anything running on demand is stopped first, and both start at login; otherwise that stays as it was. The caller
 /// holds the install lock.
 pub async fn define_and_start(layout: &Layout, restart: bool) -> Result<()> {

@@ -5,8 +5,8 @@
 //! | What | Where |
 //! |---|---|
 //! | `R/releases/<id>/` | one release per version: `bin/sidevoice-connector`, a copy of the installing binary, and `core/`, the core the package carries, staged and checked against its inventory (`core_package.rs`) |
-//! | `R/current` | a link to the selected release, switched by renaming a new link over it |
-//! | `D/install.json` | `command`: `[R/current/bin/sidevoice-connector]`, what the service jobs, the desktop app and every agent registration run, never the package's own path (npm's cache is not stable); `releases`: `R` |
+//! | `R/current.json` | the pointer record `{"release": "<id>"}`, written whole over the old one: the selected release |
+//! | `D/install.json` | `command`: `[R/releases/<id>/bin/sidevoice-connector]` of the selected release, rewritten at each switch, what the service jobs, the desktop app and every agent registration run, never the package's own path (npm's cache is not stable); `releases`: `R` |
 //!
 //! `<id>` is the version; another build of a version already there (a nightly, a local build) is
 //! `<version>+<the first 12 hex digits of its binary's digest>`.
@@ -43,6 +43,7 @@
 use crate::agents::HostAgents;
 use crate::messages::Keyed;
 use crate::platform::fs::{Create, Files, Fs};
+use crate::platform::uninstall::{Removal, Remover, Roots};
 use crate::profile::Profile;
 use crate::service::jobs::Kind;
 use crate::service::layout::Layout;
@@ -56,8 +57,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::time::{sleep, timeout, Duration, Instant};
-
-mod safe_remove;
 
 /// The connector's program inside a package and inside a release.
 pub const BINARY: &str = "bin/sidevoice-connector";
@@ -122,50 +121,23 @@ fn cause_text(failure: &Value) -> String {
         .to_owned()
 }
 
-/// `R/current/bin/sidevoice-connector`: the installation's command.
-pub fn stable_command(layout: &Layout) -> PathBuf {
-    layout.current().join(BINARY)
+/// `R/releases/<id>/bin/sidevoice-connector`: the installation's command while `id` is selected. It names the
+/// release itself, so `select` writes it again at each switch, into `install.json` and so into the service jobs.
+fn release_command(layout: &Layout, id: &str) -> PathBuf {
+    layout.releases_dir().join(id).join(BINARY)
 }
 
-fn releases_dir(layout: &Layout) -> PathBuf {
-    layout.releases.join("releases")
-}
-
-/// The release `R/current` names, by its directory name, when it is one of `R/releases`.
-fn current_release(layout: &Layout) -> Option<String> {
-    let target = fs::read_link(layout.current()).ok()?;
-    let mut parts = target.components();
-    if parts.next()?.as_os_str() != "releases" {
-        return None;
-    }
-    let id = parts.next()?.as_os_str().to_str()?.to_owned();
-    (parts.next().is_none() && releases_dir(layout).join(&id).is_dir()).then_some(id)
-}
-
-/// `R/current` names `releases/<id>`: a new link renamed over it, then `R` synced.
-fn point_current(layout: &Layout, id: &str) -> Result<()> {
-    let temporary = layout
-        .releases
-        .join(format!(".current-{}.tmp", uuid::Uuid::new_v4().simple()));
-    std::os::unix::fs::symlink(Path::new("releases").join(id), &temporary)?;
-    if let Err(error) = fs::rename(&temporary, layout.current()) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error.into());
-    }
-    File::open(&layout.releases)?.sync_all()?;
-    Ok(())
-}
-
-/// `D/install.json`: the installation's command and where its releases are.
-fn record(layout: &Layout) -> Result<()> {
+/// `R/current.json` names release `id`, written whole (`platform::fs`), then `D/install.json` names its command.
+fn select(layout: &Layout, id: &str) -> Result<()> {
+    Files::write_json(&layout.current_record(), &json!({"release": id}))?;
     Files::ensure_private_dir(&layout.data)?;
     Files::write_json(
         &layout.install_file(),
-        &json!({"command": [stable_command(layout)], "releases": layout.releases}),
+        &json!({"command": [release_command(layout, id)], "releases": layout.releases}),
     )
 }
 
-/// What a dead installer left: partial releases and temporary links.
+/// What a dead installer left: partial releases and the temporary file of a pointer record being written.
 fn remove_leftovers(layout: &Layout) {
     let leftovers = |dir: &Path, prefix: &str| {
         fs::read_dir(dir)
@@ -176,10 +148,10 @@ fn remove_leftovers(layout: &Layout) {
             .map(|entry| entry.path())
             .collect::<Vec<_>>()
     };
-    for path in leftovers(&releases_dir(layout), ".") {
+    for path in leftovers(&layout.releases_dir(), ".") {
         let _ = fs::remove_dir_all(&path).or_else(|_| fs::remove_file(&path));
     }
-    for path in leftovers(&layout.releases, ".current-") {
+    for path in leftovers(&layout.releases, ".current.json.") {
         let _ = fs::remove_file(path);
     }
 }
@@ -223,25 +195,25 @@ fn release_id(layout: &Layout, package: &Package, digest: &str) -> Result<(Strin
             package.version
         )));
     }
-    let current = current_release(layout);
+    let current = layout.selected_id();
     let names = [
         package.version.clone(),
         format!("{}+{}", package.version, &digest[..12]),
     ];
     let same = |id: &str| {
-        digest_file(&releases_dir(layout).join(id).join(BINARY))
+        digest_file(&layout.releases_dir().join(id).join(BINARY))
             .ok()
             .as_deref()
             == Some(digest)
     };
     if let Some(whole) = names.iter().find(|id| {
-        let release = releases_dir(layout).join(id);
+        let release = layout.releases_dir().join(id);
         same(id) && complete(&release) && core_intact(&release, package)
     }) {
         return Ok((whole.clone(), false));
     }
     for id in names {
-        let release = releases_dir(layout).join(&id);
+        let release = layout.releases_dir().join(&id);
         if fs::symlink_metadata(&release).is_err() {
             return Ok((id, true));
         }
@@ -310,7 +282,7 @@ async fn check_binary(binary: &Path, version: &str) -> Result<()> {
 /// Stages the package as `R/releases/<id>`: built beside it, then renamed into place, so a release is there whole
 /// or not at all.
 async fn stage(layout: &Layout, package: &Package, id: &str, digest: &str) -> Result<()> {
-    let releases = releases_dir(layout);
+    let releases = layout.releases_dir();
     Files::ensure_private_dir(&releases)?;
     let partial = releases.join(format!(".{id}.partial-{}", uuid::Uuid::new_v4().simple()));
     Files::create_private_dir(&partial)?;
@@ -349,7 +321,7 @@ async fn stage(layout: &Layout, package: &Package, id: &str, digest: &str) -> Re
 /// Every release but `keep` deleted.
 fn prune(layout: &Layout, keep: &[&str]) -> Vec<String> {
     let mut pruned = Vec::new();
-    for entry in fs::read_dir(releases_dir(layout))
+    for entry in fs::read_dir(layout.releases_dir())
         .into_iter()
         .flatten()
         .flatten()
@@ -412,7 +384,7 @@ impl Runtime {
             }
             #[cfg(test)]
             Runtime::Fake(fake) => {
-                let selected = current_release(layout).unwrap_or_default();
+                let selected = layout.selected_id().unwrap_or_default();
                 fake.lock().unwrap().restarts.push(selected);
                 Ok(Kind::None)
             }
@@ -432,7 +404,7 @@ impl Runtime {
             Runtime::Machine => {
                 let binary = release.join(BINARY);
                 if kind == Kind::None {
-                    let fallback = vec![stable_command(layout).to_string_lossy().into_owned()];
+                    let fallback = vec![binary.to_string_lossy().into_owned()];
                     launcher::ensure_connector(
                         layout,
                         fallback,
@@ -544,7 +516,7 @@ async fn start_and_verify(
         .await
         .map_err(|failure| failure_value(&failure))?;
     runtime
-        .verify(layout, kind, &releases_dir(layout).join(id), before)
+        .verify(layout, kind, &layout.releases_dir().join(id), before)
         .await?;
     Ok(kind)
 }
@@ -568,14 +540,13 @@ pub async fn install(
     let lock = crate::service::install_lock(&layout).await?;
     Files::ensure_private_dir(&layout.releases)?;
     remove_leftovers(&layout);
-    let previous = current_release(&layout);
+    let previous = layout.selected_id();
     let digest = digest_file(&package.binary)?;
     let (id, fresh) = release_id(&layout, package, &digest)?;
     if fresh {
         stage(&layout, package, &id, &digest).await?;
     }
-    point_current(&layout, &id)?;
-    record(&layout)?;
+    select(&layout, &id)?;
     let kind = match start_and_verify(runtime, &layout, &id).await {
         Ok(kind) => kind,
         Err(cause) => {
@@ -585,9 +556,9 @@ pub async fn install(
                     json!({"version": id, "cause": cause_text(&cause), "failure": cause}),
                 ));
             };
-            point_current(&layout, &back)?;
+            select(&layout, &back)?;
             let again = start_and_verify(runtime, &layout, &back).await;
-            let _ = fs::remove_dir_all(releases_dir(&layout).join(&id));
+            let _ = fs::remove_dir_all(layout.releases_dir().join(&id));
             return Err(match again {
                 Ok(_) => keyed(
                     "install.rolled-back",
@@ -619,7 +590,7 @@ pub async fn install(
         Some(_) => "updated",
     };
     let mut answer = json!({"ok": true, "action": action, "version": id, "previous": previous,
-        "command": [stable_command(&layout)], "releases": layout.releases, "pruned": pruned,
+        "command": [release_command(&layout, &id)], "releases": layout.releases, "pruned": pruned,
         "service": kind.as_str(), "state": state.get("state").cloned().unwrap_or(Value::Null),
         "agents": agents});
     if kind == Kind::Manager {
@@ -1010,20 +981,29 @@ pub async fn uninstall(profile: &Profile, options: Options, runtime: &Runtime) -
     uninstall_with_hooks(profile, options, runtime, |guard| guard.preflight(), |_| {}).await
 }
 
+/// The two roots `uninstall` may remove, as this installation names them.
+fn removal_roots(layout: &Layout) -> Roots {
+    Roots {
+        home: layout.home.clone(),
+        data: layout.data.clone(),
+        data_home: layout.data_home.clone(),
+        releases: layout.releases.clone(),
+        kept: KEPT,
+    }
+}
+
 async fn uninstall_with_hooks(
     profile: &Profile,
     options: Options,
     runtime: &Runtime,
-    preflight: impl Fn(&safe_remove::Guard) -> std::result::Result<bool, &'static str>,
+    preflight: impl Fn(&Remover) -> std::result::Result<bool, &'static str>,
     before_claim: impl Fn(&OsStr),
 ) -> Result<Value> {
     let layout = Layout::from_profile(profile);
-    safe_remove::validate_scope(&layout).map_err(failed)?;
-    let guard = safe_remove::Guard::new(&layout).map_err(failed)?;
+    let guard = Remover::new(removal_roots(&layout)).map_err(failed)?;
     let had_releases = preflight(&guard).map_err(failed)?;
-    let data = guard.data_for_lock().map_err(failed)?;
     guard.preflight().map_err(failed)?;
-    let install_lock = safe_remove::lock_file(&data, c"install.lock").map_err(failed)?;
+    let install_lock = guard.lock_file("install.lock").map_err(failed)?;
     let _lock = crate::lock::wait_lock_file(install_lock, "install.lock", Duration::from_secs(30))
         .await
         .map_err(failed)?
@@ -1035,15 +1015,13 @@ async fn uninstall_with_hooks(
     } else {
         json!({})
     };
-    let agents_lock = safe_remove::lock_file(&data, c"agents.lock").map_err(failed)?;
+    let agents_lock = guard.lock_file("agents.lock").map_err(failed)?;
     let _agents_lock =
         crate::lock::wait_lock_file(agents_lock, "agents.lock", Duration::from_secs(30))
             .await?
             .ok_or_else(|| failed("another agents request holds agents.lock"))?;
-    guard.stage_recovery(&layout).map_err(failed)?;
-    let removed = guard
-        .remove_data_contents_with_hook(&before_claim)
-        .map_err(failed)?;
+    guard.stage_recovery().map_err(failed)?;
+    let removed = guard.remove_data_contents(&before_claim).map_err(failed)?;
     guard.remove_releases().map_err(failed)?;
     guard.finish_claim().map_err(failed)?;
     guard.finish_recovery().map_err(failed)?;
@@ -1202,7 +1180,7 @@ pub(crate) mod tests {
         }
 
         fn releases(&self) -> Vec<String> {
-            let mut names: Vec<String> = fs::read_dir(releases_dir(&self.layout()))
+            let mut names: Vec<String> = fs::read_dir(self.layout().releases_dir())
                 .unwrap()
                 .flatten()
                 .map(|entry| entry.file_name().to_string_lossy().into_owned())
@@ -1221,7 +1199,7 @@ pub(crate) mod tests {
         let fixture = Fixture::new("install");
         let layout = fixture.layout();
 
-        // First install: the release, `current`, and the stable command recorded.
+        // First install: the release, `current`, and its command recorded.
         let answer = fixture
             .install(&fixture.package("1.0.0", "a"))
             .await
@@ -1230,15 +1208,15 @@ pub(crate) mod tests {
         assert_eq!(answer["version"], "1.0.0");
         assert!(answer["previous"].is_null());
         assert_eq!(fixture.releases(), ["1.0.0"]);
-        assert_eq!(current_release(&layout).as_deref(), Some("1.0.0"));
+        assert_eq!(layout.selected_id().as_deref(), Some("1.0.0"));
         assert_eq!(
-            fs::read_link(layout.current()).unwrap(),
-            Path::new("releases/1.0.0")
+            serde_json::from_slice::<Value>(&fs::read(layout.current_record()).unwrap()).unwrap(),
+            json!({"release": "1.0.0"})
         );
-        let release = releases_dir(&layout).join("1.0.0");
+        let release = layout.releases_dir().join("1.0.0");
         assert!(complete(&release));
         assert!(release.join("core/native-core.json").is_file());
-        let stable = layout.current().join("bin/sidevoice-connector");
+        let stable = release.join("bin/sidevoice-connector");
         assert_eq!(answer["command"], json!([stable]));
         assert_eq!(
             layout.connector_command(),
@@ -1285,7 +1263,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(third["pruned"], json!(["1.0.0"]));
         assert_eq!(fixture.releases(), ["2.0.0", "3.0.0"]);
-        assert_eq!(current_release(&layout).as_deref(), Some("3.0.0"));
+        assert_eq!(layout.selected_id().as_deref(), Some("3.0.0"));
 
         // A release whose pair does not answer: back to the one before, restarted, and the failed one deleted.
         fixture.fake.lock().unwrap().failing.insert("4.0.0".into());
@@ -1298,7 +1276,7 @@ pub(crate) mod tests {
         assert_eq!(keyed.params["previous"], "3.0.0");
         assert_eq!(keyed.params["failure"]["key"], "launch.exited");
         assert!(error.to_string().contains("back on 3.0.0"), "{error}");
-        assert_eq!(current_release(&layout).as_deref(), Some("3.0.0"));
+        assert_eq!(layout.selected_id().as_deref(), Some("3.0.0"));
         assert_eq!(fixture.releases(), ["2.0.0", "3.0.0"]);
         let restarts = fixture.fake.lock().unwrap().restarts.clone();
         assert_eq!(
@@ -1347,7 +1325,7 @@ pub(crate) mod tests {
             .unwrap_err();
         assert_eq!(key(&error), "install.verify-failed", "{error}");
         assert!(error.to_string().contains("the core exited"), "{error}");
-        assert_eq!(current_release(&fixture.layout()).as_deref(), Some("1.0.0"));
+        assert_eq!(fixture.layout().selected_id().as_deref(), Some("1.0.0"));
     }
 
     #[tokio::test]
@@ -1374,16 +1352,16 @@ pub(crate) mod tests {
     async fn leftovers_of_a_dead_installer_are_removed() {
         let fixture = Fixture::new("leftovers");
         let layout = fixture.layout();
-        fs::create_dir_all(releases_dir(&layout).join(".1.0.0.partial-x/core")).unwrap();
+        fs::create_dir_all(layout.releases_dir().join(".1.0.0.partial-x/core")).unwrap();
         fs::set_permissions(&layout.releases, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::set_permissions(releases_dir(&layout), fs::Permissions::from_mode(0o700)).unwrap();
-        std::os::unix::fs::symlink("releases/x", layout.releases.join(".current-x.tmp")).unwrap();
+        fs::set_permissions(layout.releases_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(layout.releases.join(".current.json.x"), b"{}").unwrap();
         fixture
             .install(&fixture.package("1.0.0", "a"))
             .await
             .unwrap();
         assert_eq!(fixture.releases(), ["1.0.0"]);
-        assert!(fs::symlink_metadata(layout.releases.join(".current-x.tmp")).is_err());
+        assert!(fs::symlink_metadata(layout.releases.join(".current.json.x")).is_err());
     }
 
     #[test]
@@ -1579,31 +1557,34 @@ pub(crate) mod tests {
         let layout = fixture.layout();
         let package = fixture.package("1.0.0", "a");
         fixture.install(&package).await.unwrap();
-        let first = current_release(&layout).unwrap();
-        let notice = releases_dir(&layout)
+        let first = layout.selected_id().unwrap();
+        let notice = layout
+            .releases_dir()
             .join(&first)
             .join(crate::service::layout::CORE_DIRECTORY)
             .join("notices/LICENSE");
         fs::write(&notice, b"damaged").unwrap();
-        assert!(!core_intact(&releases_dir(&layout).join(&first), &package));
+        assert!(!core_intact(&layout.releases_dir().join(&first), &package));
 
         // The same package again: staged anew beside the damaged release, which stayed selected until then.
         fixture.install(&package).await.unwrap();
-        let repaired = current_release(&layout).unwrap();
+        let repaired = layout.selected_id().unwrap();
         assert_ne!(
             repaired, first,
             "a fresh release, not the damaged one reused"
         );
         assert!(core_intact(
-            &releases_dir(&layout).join(&repaired),
+            &layout.releases_dir().join(&repaired),
             &package
         ));
 
         // And once more: the repaired release is reused as it is.
         fixture.install(&package).await.unwrap();
-        assert_eq!(current_release(&layout).unwrap(), repaired);
+        assert_eq!(layout.selected_id().unwrap(), repaired);
     }
 
+    // Unix only: it injects a mount boundary into the descriptor-based removal; Windows never leaves the volume.
+    #[cfg(unix)]
     #[tokio::test]
     async fn mounted_data_refuses_before_install_lock_is_rewritten() {
         let fixture = Fixture::new("mounted-uninstall-data");
@@ -1654,7 +1635,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn failed_claim_keeps_recovery_cli_and_retry_clears_residual_owned_data() {
-        use std::os::unix::fs::symlink;
         let fixture = Fixture::new("uninstall-retry");
         let package = fixture.package("1.0.0", "a");
         fixture.install(&package).await.unwrap();
@@ -1667,7 +1647,7 @@ pub(crate) mod tests {
         let hook = |name: &OsStr| {
             if name == OsStr::new("victim") && !swapped.swap(true, Ordering::SeqCst) {
                 fs::rename(&victim, &moved).unwrap();
-                symlink(&moved, &victim).unwrap();
+                crate::test_support::symlink(&moved, &victim);
             }
         };
         assert!(uninstall_with_hooks(

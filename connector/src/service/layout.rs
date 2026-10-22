@@ -6,22 +6,22 @@
 //! | `D`, the data directory | `$SIDEVOICE_DATA_DIR`, else `~/.sidevoice` |
 //! | `D/install.json` | the installation record: `command` (the absolute argv prefix that runs this binary), `releases` |
 //! | `R`, the releases | `install.json`'s `releases`, else `$XDG_DATA_HOME/sidevoice` |
-//! | `R/current` | a link to the selected release; its core at `core/bin/sidevoice-core-rust`, with `core/models` |
+//! | `R/current.json` | the pointer record `{"release": "<id>"}`: the selected release, `R/releases/<id>`, with its core at `core/bin/sidevoice-core-rust` and `core/models` |
 //! | `D/core` | the core's data: `local.sock`, `core.json` (ready), `core-failure.json` |
 //! | `D/connector.sock`, `D/connector.lock` | the connector daemon's socket and lock |
 //! | `D/install.lock`, `D/agents.lock` | the install/service lock and the agents lock |
 //! | `D/<lock>.holder` | who holds that lock (`lock.rs`) |
 //! | `D/node-stopped.json` | a person's stop |
 //!
-//! The release layout below `R/current` is the installer's; it is named here once (`CORE_ENTRYPOINT`).
+//! The release layout below `R/releases/<id>` is the installer's; it is named here once (`CORE_ENTRYPOINT`).
 
 use crate::platform::fs::{Files, Fs};
 use crate::platform::ipc::{Address, Endpoint};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// The core's program inside a release, and the directory its models are in (`core/models`).
 pub const CORE_ENTRYPOINT: &str = "core/bin/sidevoice-core-rust";
@@ -188,12 +188,44 @@ impl Layout {
         }
     }
 
-    pub fn current(&self) -> PathBuf {
-        self.releases.join("current")
+    /// `R/current.json`, the pointer record naming the selected release.
+    pub fn current_record(&self) -> PathBuf {
+        self.releases.join("current.json")
     }
 
-    pub fn core_program(&self) -> PathBuf {
-        self.current().join(CORE_ENTRYPOINT)
+    /// `R/releases`, where each release is a directory named by its id.
+    pub fn releases_dir(&self) -> PathBuf {
+        self.releases.join("releases")
+    }
+
+    /// The selected release's id: what `R/current.json` names, when it is the name of a directory of `R/releases`.
+    /// The record is read as a trusted file (this user's, nobody else able to change it); anything else is none.
+    pub fn selected_id(&self) -> Option<String> {
+        let bytes = Files::read_trusted(&self.current_record(), 4096).ok()??;
+        let id = serde_json::from_slice::<Value>(&bytes)
+            .ok()?
+            .get("release")?
+            .as_str()?
+            .to_owned();
+        let mut parts = Path::new(&id).components();
+        let one_name = matches!(
+            (parts.next(), parts.next()),
+            (Some(Component::Normal(name)), None) if name == OsStr::new(&id)
+        );
+        (one_name
+            && !id.starts_with('.')
+            && fs::symlink_metadata(self.releases_dir().join(&id)).is_ok_and(|m| m.is_dir()))
+        .then_some(id)
+    }
+
+    /// The selected release's directory, `R/releases/<id>`.
+    pub fn selected(&self) -> Option<PathBuf> {
+        Some(self.releases_dir().join(self.selected_id()?))
+    }
+
+    /// The core's program in the selected release.
+    pub fn core_program(&self) -> Option<PathBuf> {
+        Some(self.selected()?.join(CORE_ENTRYPOINT))
     }
 
     pub fn core_data(&self) -> PathBuf {
@@ -250,10 +282,9 @@ impl Layout {
             .unwrap_or_else(|| DEFAULT_CORE_PORT.to_owned())
     }
 
-    /// Whether a release is selected: `R/current` is a link to a directory.
+    /// Whether a release is selected: `R/current.json` names a release directory.
     pub fn installed(&self) -> bool {
-        fs::symlink_metadata(self.current()).is_ok_and(|metadata| metadata.file_type().is_symlink())
-            && self.current().is_dir()
+        self.selected().is_some()
     }
 
     /// `D/install.json`, read only when it is this user's regular file and nobody else can change it.
@@ -301,9 +332,10 @@ mod tests {
         assert_eq!(plain.releases, Path::new("/home/u/.local/share/sidevoice"));
         assert_eq!(plain.config_home, Path::new("/home/u/.config"));
         assert_eq!(
-            plain.core_program(),
-            Path::new("/home/u/.local/share/sidevoice/current/core/bin/sidevoice-core-rust")
+            plain.current_record(),
+            Path::new("/home/u/.local/share/sidevoice/current.json")
         );
+        assert_eq!(plain.core_program(), None, "nothing selected");
         assert!(plain.agent_dirs.is_empty());
         assert_eq!(plain.core_port(), "10829");
 
@@ -332,5 +364,70 @@ mod tests {
         assert!(layout(&[("HOME", "relative")]).is_err());
         assert!(layout(&[("HOME", "/h"), ("SIDEVOICE_DATA_DIR", "d")]).is_err());
         assert!(layout(&[]).is_err(), "no HOME, no layout");
+    }
+
+    /// A layout whose releases are in a private scratch directory, with release directories `ids` made in it.
+    fn with_releases(ids: &[&str]) -> (tempfile::TempDir, Layout) {
+        let scratch = crate::test_support::temp_dir("selected");
+        let xdg = scratch.path().join("xdg");
+        let layout = layout(&[("HOME", "/h"), ("XDG_DATA_HOME", xdg.to_str().unwrap())]).unwrap();
+        Files::ensure_private_dir(&layout.releases).unwrap();
+        for id in ids {
+            fs::create_dir_all(layout.releases_dir().join(id)).unwrap();
+        }
+        (scratch, layout)
+    }
+
+    #[test]
+    fn the_pointer_record_selects_a_release_that_is_there() {
+        let (_scratch, layout) = with_releases(&["1.0.0", "2.0.0+abc"]);
+        assert_eq!(layout.selected_id(), None, "no record, nothing selected");
+        assert!(!layout.installed());
+        Files::write_json(
+            &layout.current_record(),
+            &serde_json::json!({"release": "1.0.0"}),
+        )
+        .unwrap();
+        assert_eq!(layout.selected_id().as_deref(), Some("1.0.0"));
+        assert_eq!(layout.selected(), Some(layout.releases_dir().join("1.0.0")));
+        assert_eq!(
+            layout.core_program(),
+            Some(layout.releases_dir().join("1.0.0").join(CORE_ENTRYPOINT))
+        );
+        assert!(layout.installed());
+        Files::write_json(
+            &layout.current_record(),
+            &serde_json::json!({"release": "2.0.0+abc"}),
+        )
+        .unwrap();
+        assert_eq!(layout.selected_id().as_deref(), Some("2.0.0+abc"));
+    }
+
+    #[test]
+    fn a_pointer_record_that_names_anything_else_selects_nothing() {
+        let (_scratch, layout) = with_releases(&["1.0.0", ".1.0.0.partial-x"]);
+        for record in [
+            serde_json::json!({"release": "3.0.0"}),
+            serde_json::json!({"release": "../releases/1.0.0"}),
+            serde_json::json!({"release": "1.0.0/"}),
+            serde_json::json!({"release": ".1.0.0.partial-x"}),
+            serde_json::json!({"release": ""}),
+            serde_json::json!({"release": 1}),
+            serde_json::json!(["1.0.0"]),
+        ] {
+            Files::write_json(&layout.current_record(), &record).unwrap();
+            assert_eq!(layout.selected_id(), None, "{record}");
+        }
+        Files::write_private(&layout.current_record(), b"not json").unwrap();
+        assert!(!layout.installed());
+    }
+
+    #[test]
+    fn a_pointer_record_is_not_read_through_a_link() {
+        let (_scratch, layout) = with_releases(&["1.0.0"]);
+        let outside = layout.releases.join("outside.json");
+        Files::write_json(&outside, &serde_json::json!({"release": "1.0.0"})).unwrap();
+        crate::test_support::symlink(&outside, &layout.current_record());
+        assert_eq!(layout.selected_id(), None);
     }
 }

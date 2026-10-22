@@ -118,7 +118,7 @@ fn label(id: AgentId) -> String {
 enum Ownership {
     /// This very binary, run by path: what a connector registers when nothing is installed.
     Executable { executable: PathBuf },
-    /// The installation's stable command (`install.json`'s, through `R/current`): an entry naming it, a release's
+    /// The installation's command (`install.json`'s, the selected release's binary): an entry naming it, a release's
     /// binary below `R/releases`, or this very binary is ours.
     Installed {
         releases: PathBuf,
@@ -152,7 +152,7 @@ impl InstalledCommand {
     }
 
     /// The installation's command, when `install.json` names one program (what `install` writes): what every
-    /// agent registers, so that an upgrade changes no registration.
+    /// agent registers; an upgrade changes it, and `install` writes again the entries that name an older release.
     fn installed(profile: &Profile) -> Option<Self> {
         let layout = crate::service::layout::Layout::from_profile(profile);
         let command = layout.connector_command()?;

@@ -1489,8 +1489,7 @@ async fn the_installed_command_is_registered_and_owns_every_release_of_it() {
     private_mkdir(binary.parent().unwrap());
     private_write(&binary, b"#!/bin/sh\n");
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
-    symlink("releases/1.0.0", releases.join("current")).unwrap();
-    let stable = releases.join("current/bin/sidevoice-connector");
+    let stable = binary.clone();
     assert!(
         InstalledCommand::installed(profile).is_none(),
         "nothing recorded"
@@ -1504,9 +1503,12 @@ async fn the_installed_command_is_registered_and_owns_every_release_of_it() {
     assert_eq!(installed.args, ["mcp"]);
     let mcp = ["mcp".to_owned()];
     assert!(installed.owns(&stable.to_string_lossy(), &mcp));
+    let other = releases.join("releases/2.0.0/bin/sidevoice-connector");
+    private_mkdir(other.parent().unwrap());
+    private_write(&other, b"#!/bin/sh\n");
     assert!(
-        installed.owns(&binary.to_string_lossy(), &mcp),
-        "a release's own binary"
+        installed.owns(&other.to_string_lossy(), &mcp),
+        "another release's own binary"
     );
     assert!(!installed.owns(&stable.to_string_lossy(), &["connector".into()]));
     assert!(!installed.owns("/usr/local/bin/sidevoice-connector", &mcp));

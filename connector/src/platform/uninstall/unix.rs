@@ -1,70 +1,20 @@
-//! Uninstall only the installer's two owned roots, using no-follow directory handles.
+//! Unix: every step relative to directory descriptors held open from the home down, no link followed
+//! (`O_NOFOLLOW`), each directory checked against its path again before it is used and its mount compared with the
+//! home's (the device and the mount id on Linux, the device and where it is mounted on macOS).
 
+use super::{
+    clean_absolute, Removal, Roots, CLAIM, DATA_PREFIX, RECOVERY, RECOVERY_PROGRAM, RELEASE_PREFIX,
+};
 use crate::platform::user::{User, UserId};
-use crate::service::layout::Layout;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::ffi::{CStr, CString, OsStr, OsString};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
-const CLAIM: &str = ".uninstall-claim";
 const CLAIM_REL: &str = ".sidevoice/.uninstall-claim";
-const RECOVERY: &str = ".uninstall-recovery";
-const DATA_KEPT: &[&str] = &[
-    "install.lock",
-    "connector.lock",
-    "agents.lock",
-    "node-stopped.json",
-    "install.json",
-    CLAIM,
-    RECOVERY,
-];
-
-fn clean_absolute(path: &Path) -> bool {
-    path.is_absolute()
-        && path
-            .components()
-            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
-}
-
-pub(super) fn validate_scope(layout: &Layout) -> Result<(), &'static str> {
-    let home = &layout.home;
-    if !clean_absolute(home)
-        || home == Path::new("/")
-        || fs::canonicalize(home).ok().as_deref() != Some(home)
-    {
-        return Err("unsafe home for uninstall");
-    }
-    let data = home.join(".sidevoice");
-    let data_home = home.join(".local/share");
-    let releases = data_home.join("sidevoice");
-    if !clean_absolute(&layout.data)
-        || !clean_absolute(&layout.data_home)
-        || !clean_absolute(&layout.releases)
-        || layout.data != data
-        || layout.data_home != data_home
-        || layout.releases != releases
-    {
-        return Err("uninstall path is outside known Sidevoice roots");
-    }
-    for path in [&layout.data, &layout.releases] {
-        match fs::symlink_metadata(path) {
-            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
-                return Err("uninstall root is not a real directory")
-            }
-            Ok(_) if fs::canonicalize(path).ok().as_deref() != Some(path) => {
-                return Err("uninstall root is not canonical")
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => return Err("cannot inspect uninstall root"),
-        }
-    }
-    Ok(())
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Mount {
@@ -113,7 +63,7 @@ fn same(a: &libc::stat, b: &libc::stat) -> bool {
 #[cfg(target_os = "linux")]
 fn mount(fd: RawFd) -> Result<Mount, &'static str> {
     let stat = stat_fd(fd)?;
-    let info = fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
         .map_err(|_| "cannot inspect uninstall mount")?;
     let id = info
         .lines()
@@ -159,24 +109,6 @@ fn open_dir(parent: RawFd, child: &OsStr) -> Result<OwnedFd, &'static str> {
         Err("uninstall directory changed or is a link")
     } else {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
-}
-
-/// A lock file in the pinned data directory `data`, opened relative to it: created private when missing, a link in
-/// its place refused (`lock::wait_lock_file` checks the rest).
-pub(super) fn lock_file(data: &OwnedFd, entry: &CStr) -> Result<File, &'static str> {
-    let fd = unsafe {
-        libc::openat(
-            data.as_raw_fd(),
-            entry.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600 as libc::c_uint,
-        )
-    };
-    if fd < 0 {
-        Err("cannot open uninstall lock")
-    } else {
-        Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 }
 
@@ -252,24 +184,14 @@ fn entries(fd: RawFd) -> Result<Vec<OsString>, &'static str> {
     result
 }
 
-pub(super) struct Guard {
-    home_path: PathBuf,
+/// This OS's removal: the home held open, and the mount every directory below it must be on.
+pub struct Os {
+    roots: Roots,
     home: OwnedFd,
     expected: Mount,
 }
 
-impl Guard {
-    pub(super) fn new(layout: &Layout) -> Result<Self, &'static str> {
-        validate_scope(layout)?;
-        let home = absolute_dir(&layout.home)?;
-        let expected = mount(home.as_raw_fd())?;
-        Ok(Self {
-            home_path: layout.home.clone(),
-            home,
-            expected,
-        })
-    }
-
+impl Os {
     fn check_mount(&self, fd: RawFd) -> Result<(), &'static str> {
         if mount(fd)? == self.expected {
             Ok(())
@@ -278,7 +200,7 @@ impl Guard {
         }
     }
 
-    pub(super) fn data_for_lock(&self) -> Result<OwnedFd, &'static str> {
+    fn data_for_lock(&self) -> Result<OwnedFd, &'static str> {
         let child = OsStr::new(".sidevoice");
         if !exists_at(self.home.as_raw_fd(), child)? {
             let child_name = name(child)?;
@@ -312,7 +234,7 @@ impl Guard {
     }
 
     fn verify_dir(&self, path: &Path, held: RawFd) -> Result<(), &'static str> {
-        let named_home = absolute_dir(&self.home_path)?;
+        let named_home = absolute_dir(&self.roots.home)?;
         if !same(
             &stat_fd(named_home.as_raw_fd())?,
             &stat_fd(self.home.as_raw_fd())?,
@@ -356,110 +278,6 @@ impl Guard {
 
     /// Pin a copy of this running CLI inside D and atomically point install.json
     /// at it before any installed release or personal data is removed. A retry
-    /// through the desktop's installed-CLI lookup can then resume the claim.
-    pub(super) fn stage_recovery(&self, layout: &Layout) -> Result<(), &'static str> {
-        let data = self
-            .open_relative(Path::new(".sidevoice"))?
-            .ok_or("uninstall data root disappeared")?;
-        self.verify_dir(Path::new(".sidevoice"), data.as_raw_fd())?;
-        let recovery = self.private_child(data.as_raw_fd(), RECOVERY)?;
-        let executable = OsStr::new("sidevoice-connector");
-        let executable_name = name(executable)?;
-        if exists_at(recovery.as_raw_fd(), executable)? {
-            let fd = unsafe {
-                libc::openat(
-                    recovery.as_raw_fd(),
-                    executable_name.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                return Err("unsafe uninstall recovery executable");
-            }
-            let file = unsafe { File::from_raw_fd(fd) };
-            let stat = stat_fd(file.as_raw_fd())?;
-            if stat.st_mode & libc::S_IFMT != libc::S_IFREG
-                || !ours(file.as_raw_fd())?
-                || stat.st_nlink != 1
-                || stat.st_mode & 0o022 != 0
-                || stat.st_mode & 0o100 == 0
-            {
-                return Err("unsafe uninstall recovery executable");
-            }
-            self.check_mount(file.as_raw_fd())?;
-        } else {
-            let source = std::env::current_exe().map_err(|_| "cannot find recovery executable")?;
-            let mut source = File::open(source).map_err(|_| "cannot read recovery executable")?;
-            let fd = unsafe {
-                libc::openat(
-                    recovery.as_raw_fd(),
-                    executable_name.as_ptr(),
-                    libc::O_WRONLY
-                        | libc::O_CREAT
-                        | libc::O_EXCL
-                        | libc::O_NOFOLLOW
-                        | libc::O_CLOEXEC,
-                    0o700,
-                )
-            };
-            if fd < 0 {
-                return Err("cannot create recovery executable");
-            }
-            let mut target = unsafe { File::from_raw_fd(fd) };
-            io::copy(&mut source, &mut target).map_err(|_| "cannot copy recovery executable")?;
-            target
-                .flush()
-                .map_err(|_| "cannot finish recovery executable")?;
-            target
-                .sync_all()
-                .map_err(|_| "cannot sync recovery executable")?;
-        }
-        self.verify_dir(Path::new(".sidevoice"), data.as_raw_fd())?;
-        self.verify_dir(
-            Path::new(".sidevoice/.uninstall-recovery"),
-            recovery.as_raw_fd(),
-        )?;
-        let mut record = if exists_at(data.as_raw_fd(), OsStr::new("install.json"))? {
-            layout
-                .install_record()
-                .ok_or("unsafe uninstall install record")?
-        } else {
-            json!({})
-        };
-        let path = layout.data.join(RECOVERY).join("sidevoice-connector");
-        record["command"] = json!([path]);
-        record["releases"] = json!(layout.releases);
-        self.write_install_record(data.as_raw_fd(), &record)
-    }
-
-    fn write_install_record(&self, data: RawFd, record: &Value) -> Result<(), &'static str> {
-        let temporary = format!(".uninstall-record-{}", uuid::Uuid::new_v4().simple());
-        let temporary = name(OsStr::new(&temporary))?;
-        let fd = unsafe {
-            libc::openat(
-                data,
-                temporary.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return Err("cannot create uninstall record");
-        }
-        let mut file = unsafe { File::from_raw_fd(fd) };
-        let bytes = serde_json::to_vec(record).map_err(|_| "cannot encode uninstall record")?;
-        file.write_all(&bytes)
-            .map_err(|_| "cannot write uninstall record")?;
-        file.sync_all()
-            .map_err(|_| "cannot sync uninstall record")?;
-        self.verify_dir(Path::new(".sidevoice"), data)?;
-        if unsafe { libc::renameat(data, temporary.as_ptr(), data, c"install.json".as_ptr()) } != 0
-        {
-            return Err("cannot save uninstall record");
-        }
-        Ok(())
-    }
-
     fn claim_entry(
         &self,
         source: RawFd,
@@ -467,7 +285,7 @@ impl Guard {
         source_name: &OsStr,
         claim: RawFd,
         claimed_name: &str,
-        before_rename: &impl Fn(&OsStr),
+        before_rename: &dyn Fn(&OsStr),
     ) -> Result<(), &'static str> {
         self.verify_dir(source_path, source)?;
         self.verify_dir(Path::new(CLAIM_REL), claim)?;
@@ -643,7 +461,158 @@ impl Guard {
         Ok(true)
     }
 
-    pub(super) fn preflight(&self) -> Result<bool, &'static str> {
+    #[cfg(test)]
+    pub(crate) fn preflight_with_simulated_data_mount(&self) -> Result<bool, &'static str> {
+        let probe = |fd, path: &Path| {
+            let mut observed = mount(fd)?;
+            if path == Path::new(".sidevoice") {
+                observed.device ^= 1;
+            }
+            Ok(observed)
+        };
+        self.tree(
+            Path::new(".sidevoice"),
+            false,
+            self.roots.kept,
+            false,
+            &probe,
+        )?;
+        Ok(false)
+    }
+}
+
+impl Removal for Os {
+    fn new(roots: Roots) -> Result<Self, &'static str> {
+        roots.validate()?;
+        let home = absolute_dir(&roots.home)?;
+        let expected = mount(home.as_raw_fd())?;
+        Ok(Self {
+            roots,
+            home,
+            expected,
+        })
+    }
+
+    fn roots(&self) -> &Roots {
+        &self.roots
+    }
+
+    fn lock_file(&self, entry: &str) -> Result<File, &'static str> {
+        let data = self.data_for_lock()?;
+        let entry = name(OsStr::new(entry))?;
+        let fd = unsafe {
+            libc::openat(
+                data.as_raw_fd(),
+                entry.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            Err("cannot open uninstall lock")
+        } else {
+            Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+        }
+    }
+
+    fn place_recovery_program(&self) -> Result<(), &'static str> {
+        let data = self
+            .open_relative(Path::new(".sidevoice"))?
+            .ok_or("uninstall data root disappeared")?;
+        self.verify_dir(Path::new(".sidevoice"), data.as_raw_fd())?;
+        let recovery = self.private_child(data.as_raw_fd(), RECOVERY)?;
+        let executable = OsStr::new(RECOVERY_PROGRAM);
+        let executable_name = name(executable)?;
+        if exists_at(recovery.as_raw_fd(), executable)? {
+            let fd = unsafe {
+                libc::openat(
+                    recovery.as_raw_fd(),
+                    executable_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err("unsafe uninstall recovery executable");
+            }
+            let file = unsafe { File::from_raw_fd(fd) };
+            let stat = stat_fd(file.as_raw_fd())?;
+            if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+                || !ours(file.as_raw_fd())?
+                || stat.st_nlink != 1
+                || stat.st_mode & 0o022 != 0
+                || stat.st_mode & 0o100 == 0
+            {
+                return Err("unsafe uninstall recovery executable");
+            }
+            self.check_mount(file.as_raw_fd())?;
+        } else {
+            let source = std::env::current_exe().map_err(|_| "cannot find recovery executable")?;
+            let mut source = File::open(source).map_err(|_| "cannot read recovery executable")?;
+            let fd = unsafe {
+                libc::openat(
+                    recovery.as_raw_fd(),
+                    executable_name.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o700,
+                )
+            };
+            if fd < 0 {
+                return Err("cannot create recovery executable");
+            }
+            let mut target = unsafe { File::from_raw_fd(fd) };
+            io::copy(&mut source, &mut target).map_err(|_| "cannot copy recovery executable")?;
+            target
+                .flush()
+                .map_err(|_| "cannot finish recovery executable")?;
+            target
+                .sync_all()
+                .map_err(|_| "cannot sync recovery executable")?;
+        }
+        self.verify_dir(Path::new(".sidevoice"), data.as_raw_fd())?;
+        self.verify_dir(
+            Path::new(".sidevoice/.uninstall-recovery"),
+            recovery.as_raw_fd(),
+        )?;
+        Ok(())
+    }
+
+    fn write_install_record(&self, record: &Value) -> Result<(), &'static str> {
+        let data_dir = self
+            .open_relative(Path::new(".sidevoice"))?
+            .ok_or("uninstall data root disappeared")?;
+        let data = data_dir.as_raw_fd();
+        let temporary = format!(".uninstall-record-{}", uuid::Uuid::new_v4().simple());
+        let temporary = name(OsStr::new(&temporary))?;
+        let fd = unsafe {
+            libc::openat(
+                data,
+                temporary.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err("cannot create uninstall record");
+        }
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let bytes = serde_json::to_vec(record).map_err(|_| "cannot encode uninstall record")?;
+        file.write_all(&bytes)
+            .map_err(|_| "cannot write uninstall record")?;
+        file.sync_all()
+            .map_err(|_| "cannot sync uninstall record")?;
+        self.verify_dir(Path::new(".sidevoice"), data)?;
+        if unsafe { libc::renameat(data, temporary.as_ptr(), data, c"install.json".as_ptr()) } != 0
+        {
+            return Err("cannot save uninstall record");
+        }
+        Ok(())
+    }
+
+    fn preflight(&self) -> Result<bool, &'static str> {
         let probe = |fd, _: &Path| mount(fd);
         let releases = self.tree(
             Path::new(".local/share/sidevoice"),
@@ -652,38 +621,31 @@ impl Guard {
             false,
             &probe,
         )?;
-        self.tree(Path::new(".sidevoice"), false, super::KEPT, false, &probe)?;
+        self.tree(
+            Path::new(".sidevoice"),
+            false,
+            self.roots.kept,
+            false,
+            &probe,
+        )?;
         let claimed_releases = if let Some(claim) = self.open_relative(Path::new(CLAIM_REL))? {
             entries(claim.as_raw_fd())?
                 .iter()
-                .any(|name| name.as_bytes().starts_with(b"release-"))
+                .any(|name| name.as_bytes().starts_with(RELEASE_PREFIX.as_bytes()))
         } else {
             false
         };
         Ok(releases || claimed_releases)
     }
 
-    #[cfg(test)]
-    pub(super) fn preflight_with_simulated_data_mount(&self) -> Result<bool, &'static str> {
-        let probe = |fd, path: &Path| {
-            let mut observed = mount(fd)?;
-            if path == Path::new(".sidevoice") {
-                observed.device ^= 1;
-            }
-            Ok(observed)
-        };
-        self.tree(Path::new(".sidevoice"), false, super::KEPT, false, &probe)?;
-        Ok(false)
-    }
-
-    pub(super) fn remove_releases(&self) -> Result<(), &'static str> {
+    fn remove_releases(&self) -> Result<(), &'static str> {
         let Some((_, claim)) = self.claim_area()? else {
             return Err("uninstall data root disappeared");
         };
         let release_parent = Path::new(".local/share");
         if let Some(parent) = self.open_relative(release_parent)? {
             if exists_at(parent.as_raw_fd(), OsStr::new("sidevoice"))? {
-                let claimed_name = format!("release-{}", uuid::Uuid::new_v4().simple());
+                let claimed_name = format!("{RELEASE_PREFIX}{}", uuid::Uuid::new_v4().simple());
                 self.claim_entry(
                     parent.as_raw_fd(),
                     release_parent,
@@ -695,7 +657,7 @@ impl Guard {
             }
         }
         for entry in entries(claim.as_raw_fd())? {
-            if !entry.as_bytes().starts_with(b"release-") {
+            if !entry.as_bytes().starts_with(RELEASE_PREFIX.as_bytes()) {
                 continue;
             }
             self.verify_dir(Path::new(CLAIM_REL), claim.as_raw_fd())?;
@@ -726,24 +688,19 @@ impl Guard {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(super) fn remove_data_contents(&self) -> Result<Vec<String>, &'static str> {
-        self.remove_data_contents_with_hook(&|_| {})
-    }
-
-    pub(super) fn remove_data_contents_with_hook(
+    fn remove_data_contents(
         &self,
-        before_rename: &impl Fn(&OsStr),
+        before_rename: &dyn Fn(&OsStr),
     ) -> Result<Vec<String>, &'static str> {
         let Some((root, claim)) = self.claim_area()? else {
             return Ok(Vec::new());
         };
         let mut removed = Vec::new();
         for entry in entries(root.as_raw_fd())? {
-            if DATA_KEPT.iter().any(|kept| OsStr::new(kept) == entry) {
+            if self.roots.is_kept(&entry) {
                 continue;
             }
-            let claimed_name = format!("data-{}", uuid::Uuid::new_v4().simple());
+            let claimed_name = format!("{DATA_PREFIX}{}", uuid::Uuid::new_v4().simple());
             self.claim_entry(
                 root.as_raw_fd(),
                 Path::new(".sidevoice"),
@@ -756,7 +713,7 @@ impl Guard {
         }
         let release_names: Vec<String> = entries(claim.as_raw_fd())?
             .into_iter()
-            .filter(|name| name.as_bytes().starts_with(b"release-"))
+            .filter(|name| name.as_bytes().starts_with(RELEASE_PREFIX.as_bytes()))
             .map(|name| name.to_string_lossy().into_owned())
             .collect();
         let kept: Vec<&str> = release_names.iter().map(String::as_str).collect();
@@ -771,7 +728,7 @@ impl Guard {
         Ok(removed)
     }
 
-    pub(super) fn finish_claim(&self) -> Result<(), &'static str> {
+    fn finish_claim(&self) -> Result<(), &'static str> {
         let Some(data) = self.open_relative(Path::new(".sidevoice"))? else {
             return Ok(());
         };
@@ -800,7 +757,7 @@ impl Guard {
     /// Final metadata tail. The executable and record remain usable through
     /// every failure in substantive data/release cleanup; only this final,
     /// already empty state can retire them.
-    pub(super) fn finish_recovery(&self) -> Result<(), &'static str> {
+    fn finish_recovery(&self) -> Result<(), &'static str> {
         if self
             .open_relative(Path::new(".local/share/sidevoice"))?
             .is_some()
@@ -811,7 +768,7 @@ impl Guard {
             return Ok(());
         };
         for entry in entries(data.as_raw_fd())? {
-            if !DATA_KEPT.iter().any(|kept| OsStr::new(kept) == entry) {
+            if !self.roots.is_kept(&entry) {
                 return Err("uninstall data remains");
             }
         }
@@ -824,7 +781,7 @@ impl Guard {
                 .open_relative(recovery_path)?
                 .ok_or("uninstall recovery disappeared")?;
             let names = entries(recovery.as_raw_fd())?;
-            if names.len() != 1 || names[0] != OsStr::new("sidevoice-connector") {
+            if names.len() != 1 || names[0] != OsStr::new(RECOVERY_PROGRAM) {
                 return Err("uninstall recovery directory changed");
             }
             self.verify_dir(recovery_path, recovery.as_raw_fd())?;
@@ -855,87 +812,39 @@ impl Guard {
     }
 }
 
+/// What only the descriptor-based removal can be asked: its mount probe and the exact refusals. The rest of its
+/// behaviour is tested against the interface, in `uninstall.rs`.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use crate::platform::fs::{Files, Fs};
+    use crate::test_support::{symlink, temp_dir};
+    use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    fn layout(home: &Path) -> Layout {
-        Layout::from_vars(
-            |name| (name == "HOME").then(|| home.as_os_str().to_owned()),
-            std::iter::empty(),
-            &[],
-        )
+    const KEPT: &[&str] = &["install.lock"];
+
+    fn removal(home: &Path) -> Os {
+        let data = home.join(".sidevoice");
+        Files::ensure_private_dir(&data).unwrap();
+        Os::new(Roots {
+            home: home.to_path_buf(),
+            data,
+            data_home: home.join(".local/share"),
+            releases: home.join(".local/share/sidevoice"),
+            kept: KEPT,
+        })
         .unwrap()
     }
 
     #[test]
-    fn only_exact_owned_roots_can_be_uninstalled() {
-        let scratch = crate::test_support::temp_dir("uninstall-scope");
-        let home = scratch.path().join("home");
-        fs::create_dir(&home).unwrap();
-        let mut layout = layout(&home);
-        assert!(validate_scope(&layout).is_ok());
-        for unsafe_path in [
-            PathBuf::new(),
-            PathBuf::from("relative"),
-            PathBuf::from("/"),
-            home.clone(),
-            home.join(".sidevoice/.."),
-            home.join("elsewhere"),
-        ] {
-            layout.data = unsafe_path;
-            assert!(validate_scope(&layout).is_err());
-        }
-        layout.data = home.join(".sidevoice");
-        layout.releases = home.clone();
-        assert!(validate_scope(&layout).is_err());
-        layout.releases = home.join(".local/share/sidevoice");
-        layout.data_home = home.clone();
-        assert!(validate_scope(&layout).is_err());
-        layout.data_home = home.join(".local/share");
-        symlink(&home, &layout.data).unwrap();
-        assert!(validate_scope(&layout).is_err());
-    }
-
-    #[test]
-    fn links_inside_owned_roots_never_delete_their_targets() {
-        let scratch = crate::test_support::temp_dir("uninstall-links");
-        let home = scratch.path().join("home");
-        let outside = scratch.path().join("outside");
-        let layout = layout(&home);
-        fs::create_dir_all(&layout.data).unwrap();
-        fs::create_dir_all(&layout.releases).unwrap();
-        fs::create_dir(&outside).unwrap();
-        fs::write(outside.join("keep"), "untouched").unwrap();
-        symlink(&outside, layout.data.join("external")).unwrap();
-        symlink(&outside, layout.releases.join("current")).unwrap();
-        fs::write(layout.data.join("remove"), "gone").unwrap();
-
-        let guard = Guard::new(&layout).unwrap();
-        assert!(guard.preflight().unwrap());
-        guard.remove_releases().unwrap();
-        let removed = guard.remove_data_contents().unwrap();
-        assert_eq!(removed.len(), 2);
-        assert!(!layout.releases.exists());
-        assert!(layout.data.exists());
-        assert_eq!(
-            fs::read_to_string(outside.join("keep")).unwrap(),
-            "untouched"
-        );
-        assert!(!guard.preflight().unwrap());
-        assert!(guard.remove_data_contents().unwrap().is_empty());
-    }
-
-    #[test]
     fn injected_mount_boundary_refuses_before_deleting() {
-        let scratch = crate::test_support::temp_dir("uninstall-mount");
-        let layout = layout(&scratch.path().join("home"));
-        let nested = layout.data.join("mounted");
+        let scratch = temp_dir("uninstall-mount");
+        let home = scratch.path().join("home");
+        let guard = removal(&home);
+        let nested = home.join(".sidevoice/mounted");
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("keep"), "untouched").unwrap();
-        let guard = Guard::new(&layout).unwrap();
         let probe = |fd: RawFd, path: &Path| {
             let mut observed = mount(fd)?;
             if path == Path::new(".sidevoice/mounted") {
@@ -948,25 +857,29 @@ mod tests {
             Err("uninstall mount or device boundary")
         );
         assert!(nested.join("keep").exists());
+        assert_eq!(
+            guard.preflight_with_simulated_data_mount(),
+            Err("uninstall mount or device boundary")
+        );
     }
 
     #[test]
     fn directory_replaced_by_link_during_removal_is_refused() {
-        let scratch = crate::test_support::temp_dir("uninstall-race");
-        let layout = layout(&scratch.path().join("home"));
-        let victim = layout.data.join("victim");
-        let moved = layout.data.join("moved");
+        let scratch = temp_dir("uninstall-race");
+        let home = scratch.path().join("home");
+        let guard = removal(&home);
+        let victim = home.join(".sidevoice/victim");
+        let moved = home.join(".sidevoice/moved");
         let outside = scratch.path().join("outside");
         fs::create_dir_all(&victim).unwrap();
         fs::create_dir(&outside).unwrap();
         fs::write(victim.join("inside"), "inside").unwrap();
         fs::write(outside.join("keep"), "outside").unwrap();
-        let guard = Guard::new(&layout).unwrap();
         let swapped = AtomicBool::new(false);
         let probe = |fd: RawFd, path: &Path| {
             if path == Path::new(".sidevoice/victim") && !swapped.swap(true, Ordering::SeqCst) {
                 fs::rename(&victim, &moved).unwrap();
-                symlink(&outside, &victim).unwrap();
+                symlink(&outside, &victim);
             }
             mount(fd)
         };
@@ -978,43 +891,25 @@ mod tests {
     }
 
     #[test]
-    fn moved_directory_at_final_claim_boundary_keeps_its_sentinel() {
-        let scratch = crate::test_support::temp_dir("uninstall-claim-race");
-        let layout = layout(&scratch.path().join("home"));
-        let victim = layout.data.join("victim");
+    fn moved_directory_at_final_claim_boundary_is_an_error_and_keeps_its_sentinel() {
+        let scratch = temp_dir("uninstall-claim-race");
+        let home = scratch.path().join("home");
+        let guard = removal(&home);
+        let victim = home.join(".sidevoice/victim");
         let moved = scratch.path().join("moved-outside");
         fs::create_dir_all(&victim).unwrap();
         fs::write(victim.join("keep"), "outside sentinel").unwrap();
-        let guard = Guard::new(&layout).unwrap();
         let swapped = AtomicBool::new(false);
         let hook = |_: &OsStr| {
             if !swapped.swap(true, Ordering::SeqCst) {
                 fs::rename(&victim, &moved).unwrap();
-                symlink(&moved, &victim).unwrap();
+                symlink(&moved, &victim);
             }
         };
-        assert!(guard.remove_data_contents_with_hook(&hook).is_err());
+        assert!(guard.remove_data_contents(&hook).is_err());
         assert_eq!(
             fs::read_to_string(moved.join("keep")).unwrap(),
             "outside sentinel"
-        );
-    }
-
-    #[test]
-    fn home_replaced_after_opening_is_refused() {
-        let scratch = crate::test_support::temp_dir("uninstall-home-race");
-        let home = scratch.path().join("home");
-        let moved = scratch.path().join("moved-home");
-        let layout = layout(&home);
-        fs::create_dir_all(&layout.data).unwrap();
-        fs::write(layout.data.join("keep"), "untouched").unwrap();
-        let guard = Guard::new(&layout).unwrap();
-        fs::rename(&home, &moved).unwrap();
-        symlink(&moved, &home).unwrap();
-        assert!(guard.remove_data_contents().is_err());
-        assert_eq!(
-            fs::read_to_string(moved.join(".sidevoice/keep")).unwrap(),
-            "untouched"
         );
     }
 }
