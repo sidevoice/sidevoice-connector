@@ -29,7 +29,7 @@ pub fn current() -> UserId {
 }
 
 impl UserId {
-    #[allow(dead_code)] // its callers arrive with `platform::fs`, which replaces the `owns(&Metadata)` ones
+    #[allow(dead_code)] // its callers arrive with `platform::fs`
     /// Whether this user owns what `path` names. A symlink (or Windows junction) is judged itself, not what it
     /// points to.
     pub fn owns_path(&self, path: &Path) -> io::Result<bool> {
@@ -40,20 +40,6 @@ impl UserId {
     /// Whether this user owns the file behind an open handle.
     pub fn owns_file(&self, file: &File) -> io::Result<bool> {
         self.0.owns_file(file)
-    }
-
-    /// Whether this user owns the file `metadata` describes. Unix-only: `Metadata` carries no owner on Windows, so
-    /// host-agnostic callers use [`UserId::owns_path`] or [`UserId::owns_file`].
-    #[cfg(unix)]
-    pub fn owns(&self, metadata: &std::fs::Metadata) -> bool {
-        self.0.owns(metadata)
-    }
-
-    /// The numeric uid, for the places that must put it in a Unix-shaped value: `ps`'s uid column, a `stat`
-    /// owner, launchd's `gui/<uid>` domain. Unix-only; nothing host-agnostic should need it.
-    #[cfg(unix)]
-    pub(crate) fn raw(&self) -> u32 {
-        self.0.raw()
     }
 }
 

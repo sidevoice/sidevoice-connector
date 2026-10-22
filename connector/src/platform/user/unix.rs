@@ -26,17 +26,9 @@ impl Id {
         Ok(self.owns(&file.metadata()?))
     }
 
-    /// Whether this user owns the file `metadata` describes. Unix-only: `Metadata` carries no owner on Windows, so
-    /// host-agnostic callers use [`super::UserId::owns_path`] or [`super::UserId::owns_file`].
-    pub(super) fn owns(&self, metadata: &Metadata) -> bool {
+    fn owns(&self, metadata: &Metadata) -> bool {
         use std::os::unix::fs::MetadataExt;
         metadata.uid() == self.0
-    }
-
-    /// The numeric uid, for the places that must put it in a Unix-shaped value: `ps`'s uid column, a `stat` owner,
-    /// launchd's `gui/<uid>` domain. Nothing host-agnostic should need it.
-    pub(super) fn raw(&self) -> u32 {
-        self.0
     }
 }
 
@@ -49,23 +41,4 @@ pub(super) fn name() -> Option<String> {
     }
     let name = unsafe { std::ffi::CStr::from_ptr((*entry).pw_name) };
     name.to_str().ok().map(str::to_owned)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn raw_is_the_effective_uid() {
-        assert_eq!(current().raw(), unsafe { libc::geteuid() });
-    }
-
-    #[test]
-    fn owns_metadata_of_what_it_creates() {
-        let dir =
-            std::env::temp_dir().join(format!("sv-platform-user-unix-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(current().owns(&std::fs::metadata(&dir).unwrap()));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
 }
