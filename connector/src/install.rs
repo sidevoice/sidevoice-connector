@@ -128,9 +128,10 @@ fn release_command(layout: &Layout, id: &str) -> PathBuf {
 }
 
 /// `R/current.json` names release `id`, written whole (`platform::fs`), then `D/install.json` names its command.
+/// `D` is made first, so that failing to make it never leaves the pointer switched and the command not.
 fn select(layout: &Layout, id: &str) -> Result<()> {
-    Files::write_json(&layout.current_record(), &json!({"release": id}))?;
     Files::ensure_private_dir(&layout.data)?;
+    Files::write_json(&layout.current_record(), &json!({"release": id}))?;
     Files::write_json(
         &layout.install_file(),
         &json!({"command": [release_command(layout, id)], "releases": layout.releases}),
@@ -1595,7 +1596,7 @@ pub(crate) mod tests {
             &fixture.profile,
             NO_AGENTS,
             &fixture.runtime(),
-            |guard| guard.preflight_with_simulated_data_mount(),
+            |_| Err("uninstall mount or device boundary"),
             |_| {},
         )
         .await
