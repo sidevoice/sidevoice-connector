@@ -15,6 +15,7 @@ pub const HOME: crate::profile::AgentHome = crate::profile::AgentHome {
 };
 
 use super::{envelope, Identity};
+use crate::platform::process::{Process, Processes};
 use crate::profile::Profile;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -187,7 +188,7 @@ fn launch_args(pid: Option<i64>) -> String {
     let Some(pid) = pid else { return String::new() };
     u32::try_from(pid)
         .ok()
-        .and_then(crate::platform::process::identity)
+        .and_then(Processes::identity)
         .map(|found| found.command)
         .unwrap_or_default()
 }

@@ -10,10 +10,12 @@
 
 mod call;
 mod page;
-// The one OS-facing module of the connector, shared as it is: the bench uses a part of it.
+// The part of the connector's OS-facing module the bench uses, shared as it is.
 #[allow(dead_code)]
-#[path = "../platform/mod.rs"]
-mod platform;
+#[path = "../platform"]
+mod platform {
+    pub mod process;
+}
 mod setup;
 
 use std::path::PathBuf;

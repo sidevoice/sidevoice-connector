@@ -31,6 +31,7 @@ pub fn config_home(profile: &crate::profile::Profile) -> &std::path::Path {
 }
 
 use super::{envelope, Identity};
+use crate::platform::process::{Process, Processes};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -166,12 +167,12 @@ fn chat_from_store(path: &Path) -> Option<StorePath> {
 fn find_chat() -> Option<Chat> {
     let mut pid = std::process::id();
     for _ in 0..4 {
-        let parent = crate::platform::process::parent(pid)?;
+        let parent = Processes::parent(pid)?;
         if parent <= 1 {
             return None;
         }
         let mut chats = Vec::<Chat>::new();
-        for path in crate::platform::process::open_files(parent).unwrap_or_default() {
+        for path in Processes::open_files(parent).unwrap_or_default() {
             let Some(store) = chat_from_store(&path) else {
                 continue;
             };
@@ -702,7 +703,7 @@ pub fn bridge_running() -> bool {
 }
 
 fn process_alive(pid: u64) -> bool {
-    u32::try_from(pid).is_ok_and(|pid| crate::platform::process::identity(pid).is_some())
+    u32::try_from(pid).is_ok_and(|pid| Processes::identity(pid).is_some())
 }
 
 fn unix_ms() -> u64 {

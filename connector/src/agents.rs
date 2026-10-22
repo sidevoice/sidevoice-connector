@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 pub(crate) mod tests;
-use crate::platform::process::Child;
+use crate::platform::process::{Child, Process, Processes};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1285,7 +1285,7 @@ async fn run_command_with_limit(
     // Recheck immediately before passing these profile roots to a host CLI. The binary may have
     // been selected during an earlier scan, before an agent config directory was replaced.
     validate_command_profile(profile, agent_config)?;
-    let mut child = crate::platform::process::spawn_tree(command)
+    let mut child = Processes::spawn_tree(command)
         .await
         .map_err(|_| CommandFailure::Start)?;
     let stdout = child.stdout().ok_or(CommandFailure::Io)?;

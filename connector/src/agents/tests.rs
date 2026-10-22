@@ -1446,9 +1446,8 @@ exit 2
     abandoned.abort();
     let _ = abandoned.await;
     tokio::time::sleep(StdDuration::from_millis(100)).await;
-    assert_eq!(
-        crate::platform::process::identity(pid as u32),
-        None,
+    assert!(
+        Processes::identity(pid as u32).is_none(),
         "cancelled CLI process was reaped"
     );
     assert!(!fixture

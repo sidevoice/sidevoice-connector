@@ -3,7 +3,7 @@
 //! after, with every process it started.
 
 use super::registration::Launch;
-use crate::platform::process::{self, Child};
+use crate::platform::process::{Child, Process, Processes};
 use rmcp::model::{InitializeResult, ListToolsResult, ProtocolVersion};
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -67,7 +67,7 @@ pub async fn check(
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     // Its own tree, so a wrapper (a shell, Node's launcher) leaves nothing behind.
-    let mut child = match process::spawn_tree(command).await {
+    let mut child = match Processes::spawn_tree(command).await {
         Ok(child) => child,
         Err(error) => return Ok(Health::NotStarting(spawn_error(&error))),
     };

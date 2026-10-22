@@ -15,6 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
+use crate::platform::process::{Process, Processes};
 use crate::setup::Profile;
 
 /// The call events kept for the page.
@@ -81,7 +82,7 @@ impl Call {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        let mut child = crate::platform::process::spawn_detached(command).await?;
+        let mut child = Processes::spawn_detached(command).await?;
         tokio::spawn(async move { child.wait().await });
         for _ in 0..600 {
             if self.core_answers().await {

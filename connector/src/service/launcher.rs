@@ -22,7 +22,7 @@ use super::status::{self, read_ready, serving};
 use super::{Failure, Result};
 use crate::core_ready::Ready;
 use crate::messages::message;
-use crate::platform::process::{self, Expected};
+use crate::platform::process::{Identity, Process, Processes};
 use crate::secure_fs::verify_socket;
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
@@ -115,7 +115,7 @@ fn is_our_core(layout: &Layout, command_line: &str) -> bool {
 
 /// Whether `pid` is, now, this user's core of this data directory.
 pub fn core_running(layout: &Layout, pid: u32) -> bool {
-    process::is_process(pid, |found| is_our_core(layout, &found.command))
+    Processes::is_process(pid, |found| is_our_core(layout, &found.command))
 }
 
 /// Every core of this data directory still alive: the one its ready file names, and any still starting.
@@ -125,32 +125,19 @@ pub fn core_processes(layout: &Layout) -> Vec<u32> {
         .filter(|pid| core_running(layout, *pid))
         .into_iter()
         .collect();
-    pids.extend(process::find(|command| is_our_core(layout, command)));
+    pids.extend(Processes::find(|command| is_our_core(layout, command)));
     pids.sort_unstable();
     pids.dedup();
     pids
 }
 
-/// Ask a core of this data directory to leave and wait until it has: SIGTERM, a grace period, SIGKILL; each sent
-/// only while it is provably that core.
+/// Stop a core of this data directory and wait until it has gone: asked to leave, the grace period, then killed;
+/// each only while it is provably that core.
 pub async fn terminate_core(layout: &Layout, pid: u32, grace: Duration) {
-    if !process::terminate(pid, |found| is_our_core(layout, &found.command)) {
-        return;
-    }
-    let deadline = Instant::now() + grace;
-    while core_running(layout, pid) && Instant::now() < deadline {
-        sleep(Duration::from_millis(50)).await;
-    }
-    if core_running(layout, pid) {
+    if Processes::stop(pid, |found| is_our_core(layout, &found.command), grace).await {
         crate::logfile::log(&format!(
-            "the core (pid {pid}) did not leave within {} s; killing it",
-            grace.as_secs()
+            "the core (pid {pid}) did not leave by itself: killed it"
         ));
-        process::kill(pid, |found| is_our_core(layout, &found.command));
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while core_running(layout, pid) && Instant::now() < deadline {
-            sleep(Duration::from_millis(50)).await;
-        }
     }
 }
 
@@ -246,7 +233,7 @@ pub async fn ensure_core(layout: &Layout) -> Result<Ready> {
         .stderr(output);
     let environment = super::definition::core_environment(layout, &std::env::vars().collect());
     command.env_clear().envs(environment);
-    let mut child = match process::spawn_detached(command).await {
+    let mut child = match Processes::spawn_detached(command).await {
         Ok(child) => child,
         Err(error) => return Err(core_failure(spawn_failure(layout, &program, &error))),
     };
@@ -327,16 +314,19 @@ struct OnDemand {
 }
 
 impl OnDemand {
-    fn expected(&self) -> Expected<'_> {
-        Expected {
-            start: self.start.as_deref(),
-            command_contains: self.executable.as_deref(),
-        }
+    /// Whether `found` is this connector: its recorded start time and executable, each when known.
+    fn is(&self, found: &Identity) -> bool {
+        self.start
+            .as_ref()
+            .is_none_or(|start| found.start == *start)
+            && self
+                .executable
+                .as_ref()
+                .is_none_or(|executable| found.command.contains(executable.as_str()))
     }
 
     fn up(&self) -> bool {
-        let expected = self.expected();
-        process::is_process(self.pid, |found| expected.matches(found))
+        Processes::is_process(self.pid, |found| self.is(found))
     }
 }
 
@@ -391,33 +381,21 @@ pub async fn stop_on_demand(layout: &Layout) -> Teardown {
     let mut teardown = Teardown::default();
     let connector = on_demand_connector(layout).await;
     if let Some(found) = &connector {
-        let asked = match &found.executable {
-            Some(executable) => ask_connector(
+        // In band first, where its executable is known: the request every OS has.
+        if let Some(executable) = &found.executable {
+            ask_connector(
                 layout,
                 "shutdown",
                 json!({"expected_pid": found.pid, "expected_executable": executable}),
                 Duration::from_millis(1500),
             )
-            .await
-            .is_some(),
-            None => false,
-        };
-        if !asked {
-            let expected = found.expected();
-            process::terminate(found.pid, |is| expected.matches(is));
+            .await;
         }
-    }
-    let up = |connector: &Option<OnDemand>| connector.as_ref().is_some_and(OnDemand::up);
-    let deadline = Instant::now() + STOP_GRACE;
-    while up(&connector) && Instant::now() < deadline {
-        sleep(Duration::from_millis(100)).await;
-    }
-    if let Some(found) = connector.as_ref().filter(|found| found.up()) {
-        let expected = found.expected();
-        if process::kill(found.pid, |is| expected.matches(is)) {
+        if Processes::stop(found.pid, |is| found.is(is), STOP_GRACE).await {
             teardown.killed.push(found.pid);
         }
     }
+    let up = |connector: &Option<OnDemand>| connector.as_ref().is_some_and(OnDemand::up);
     for pid in core_processes(layout) {
         terminate_core(layout, pid, STOP_GRACE).await;
         if core_running(layout, pid) {
@@ -527,7 +505,7 @@ where
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut child = process::spawn_detached(command).await.map_err(|error| {
+    let mut child = Processes::spawn_detached(command).await.map_err(|error| {
         Failure::keyed(
             "connector.not-started",
             json!({"detail": error.to_string()}),

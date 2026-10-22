@@ -4,7 +4,8 @@ use process_wrap::tokio::{CommandWrap, ProcessGroup};
 use std::path::PathBuf;
 use tokio::process::Command;
 
-pub(super) struct Os;
+/// This OS's processes.
+pub struct Os;
 
 impl super::Process for Os {
     // A group of its own is also what detaches it: a ^C or a hangup aimed at the caller's group misses it.
