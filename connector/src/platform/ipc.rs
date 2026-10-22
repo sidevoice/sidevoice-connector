@@ -68,8 +68,8 @@ impl fmt::Display for Endpoint {
 }
 
 /// What every OS implements ([`Channels`], in `ipc/unix.rs` and `ipc/windows.rs`): what an address is, and how a
-/// listener is made private to this user. Connecting is one body for every OS; what is checked before connecting and
-/// the peer check are internal to each OS file (`to_connect`, `peer_is_this_user`).
+/// listener is made private to this user. Connecting is one body for every OS; the peer check is internal to each
+/// OS file (`peer_is_this_user`).
 pub trait Channel {
     /// The address of our own endpoint called `name` for the data directory `dir`. Unix: the socket
     /// `dir/<name>.sock`. Windows: the pipe `\\.\pipe\sidevoice-<hash of (user, dir)>-<name>`, so two profiles or two
@@ -86,10 +86,10 @@ pub trait Channel {
     /// with a descriptor that lets in its owner, SYSTEM and Administrators only, refusing remote clients.
     fn listen(endpoint: &Endpoint) -> io::Result<Listener>;
 
-    /// Connects to `endpoint`, refusing a server that is not this user. Unix: first, the socket must be this
-    /// user's, open to nobody else, in a private directory. No timeout: callers bound it.
+    /// Connects to `endpoint`, refusing a server that is not this user (checked on the connection, once made). No
+    /// timeout: callers bound it.
     fn connect(endpoint: &Endpoint) -> impl Future<Output = io::Result<Stream>> + Send {
-        let name = imp::to_connect(endpoint);
+        let name = endpoint.name();
         let at = endpoint.to_string();
         async move {
             let stream = Stream::connect(name?).await?;

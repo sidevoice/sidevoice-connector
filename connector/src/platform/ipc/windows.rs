@@ -7,7 +7,7 @@ use super::{Endpoint, Listener, Stream};
 use crate::platform::process::{Process, Processes};
 use crate::platform::user::{User, UserId};
 use interprocess::local_socket::traits::StreamCommon as _;
-use interprocess::local_socket::{ListenerOptions, Name};
+use interprocess::local_socket::ListenerOptions;
 use interprocess::os::windows::local_socket::ListenerOptionsExt;
 use interprocess::os::windows::security_descriptor::SecurityDescriptor;
 use sha2::{Digest, Sha256};
@@ -56,11 +56,6 @@ impl super::Channel for Os {
             .create_tokio()
             .map(Listener)
     }
-}
-
-/// What [`super::Channel::connect`] dials: the pipe by its name; the server is checked once connected.
-pub(super) fn to_connect(endpoint: &Endpoint) -> io::Result<Name<'static>> {
-    endpoint.name()
 }
 
 /// Whether the process at the other end of `stream` is this user's: the pipe's client or server pid, as

@@ -1,12 +1,12 @@
 //! Unix: a socket file in a private directory. The peer is checked by the kernel's credentials of the connection
-//! (`SO_PEERCRED` / `LOCAL_PEERCRED`, through `peer_creds()`); a socket is trusted before it is touched only when it
-//! is a socket, this user's, and open to nobody else.
+//! (`SO_PEERCRED` / `LOCAL_PEERCRED`, through `peer_creds()`); a socket left behind is replaced only when it
+//! is a socket, this user's, open to nobody else, in a private directory.
 
 use super::{Endpoint, Listener, Stream};
 use crate::platform::fs::{Files, Fs};
 use crate::platform::user::{User, UserId};
 use interprocess::local_socket::traits::StreamCommon as _;
-use interprocess::local_socket::{ListenerOptions, Name};
+use interprocess::local_socket::ListenerOptions;
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -48,13 +48,6 @@ impl super::Channel for Os {
         std::fs::set_permissions(socket(endpoint), std::fs::Permissions::from_mode(0o600))?;
         Ok(Listener(listener))
     }
-}
-
-/// What [`super::Channel::connect`] dials: the socket, once it is this user's, open to nobody else, in a private
-/// directory.
-pub(super) fn to_connect(endpoint: &Endpoint) -> io::Result<Name<'static>> {
-    verify_socket(socket(endpoint))?;
-    endpoint.name()
 }
 
 /// Whether the process at the other end of `stream` is this user: the connection's own credentials, the peer's
@@ -122,20 +115,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_socket_is_trusted_only_in_a_private_directory_and_open_to_nobody_else() {
+    async fn a_stale_socket_is_replaced_only_while_it_is_private() {
         let (_scratch, dir) = private_dir("sock");
         let endpoint = Endpoint::new(&dir, "s");
+        // Left behind by a process that died, then opened to others: not ours to trust, so not replaced.
+        let mut dead = Os::listen(&endpoint).unwrap();
+        interprocess::local_socket::traits::tokio::Listener::do_not_reclaim_name_on_drop(
+            &mut dead.0,
+        );
+        drop(dead);
+        chmod(socket(&endpoint), 0o666);
+        assert!(Os::listen(&endpoint).is_err());
+        chmod(socket(&endpoint), 0o600);
         let _listener = Os::listen(&endpoint).unwrap();
         Os::connect(&endpoint).await.unwrap();
-        chmod(socket(&endpoint), 0o666);
-        assert!(Os::connect(&endpoint).await.is_err());
-        chmod(socket(&endpoint), 0o600);
-        chmod(&dir, 0o755);
-        assert!(Os::connect(&endpoint).await.is_err());
-        chmod(&dir, 0o700);
-        let file = Endpoint::new(&dir, "plain");
-        Files::write_private(socket(&file), b"").unwrap();
-        assert!(Os::connect(&file).await.is_err());
     }
 
     #[tokio::test]
