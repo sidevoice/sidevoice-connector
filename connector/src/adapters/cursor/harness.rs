@@ -603,7 +603,6 @@ pub(super) mod client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::fs::tests::Scratch;
     use std::collections::{HashMap, VecDeque};
     use std::fs;
     use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -799,8 +798,8 @@ mod tests {
     #[tokio::test]
     async fn authenticated_editor_reports_engine_without_a_transcript_and_retries_missing_metadata()
     {
-        let scratch = Scratch::new("cursor-engine-before-transcript");
-        let user_data = scratch.0.join("Cursor");
+        let scratch = crate::test_support::temp_dir("cursor-engine-before-transcript");
+        let user_data = scratch.path().join("Cursor");
         let storage = user_data.join("User/globalStorage");
         fs::create_dir_all(&storage).unwrap();
         let database = storage.join("state.vscdb");
@@ -814,7 +813,7 @@ mod tests {
         let chat = "chat-model".to_owned();
         set_followed(&conversation, chat.clone());
         let profile = Profile::from_vars(
-            |key| (key == "HOME").then(|| scratch.0.as_os_str().to_os_string()),
+            |key| (key == "HOME").then(|| scratch.path().as_os_str().to_os_string()),
             &[],
         )
         .unwrap();

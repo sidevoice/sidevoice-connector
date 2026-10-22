@@ -339,7 +339,6 @@ fn inbound_warning(profile: &Profile) -> Option<String> {
 mod tests {
     use super::*;
     use crate::adapters::registration::{CliError, CliOutput};
-    use crate::platform::fs::tests::Scratch;
     use serde_json::json;
     use std::os::unix::fs::PermissionsExt;
 
@@ -376,9 +375,11 @@ mod tests {
 
     /// A profile whose Claude home is `home/.claude` (left to the default) or its own directory (`set`), created
     /// only when `exists`; and the user configuration file Claude Code reads there.
-    fn profile(scratch: &Scratch, set: bool, exists: bool) -> (Profile, PathBuf) {
-        let mut profile =
-            Profile::for_test(&scratch.0, &crate::adapters::Registry::standard().homes());
+    fn profile(scratch: &tempfile::TempDir, set: bool, exists: bool) -> (Profile, PathBuf) {
+        let mut profile = Profile::for_test(
+            scratch.path(),
+            &crate::adapters::Registry::standard().homes(),
+        );
         let home = profile
             .agent_homes
             .iter_mut()
@@ -409,7 +410,7 @@ mod tests {
                 if set && !exists {
                     continue; // The file lives in the home then: no home, no file.
                 }
-                let scratch = Scratch::new("claude-unparsable");
+                let scratch = crate::test_support::temp_dir("claude-unparsable");
                 let (profile, file) = profile(&scratch, set, exists);
                 fs::write(&file, b"{\"mcpServers\": {").unwrap();
                 fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
@@ -426,7 +427,7 @@ mod tests {
     /// A FIFO where the user configuration belongs is refused at once, never waited on.
     #[tokio::test]
     async fn a_fifo_for_the_user_configuration_is_refused_without_waiting() {
-        let scratch = Scratch::new("claude-fifo");
+        let scratch = crate::test_support::temp_dir("claude-fifo");
         let (profile, file) = profile(&scratch, true, true);
         let path = std::ffi::CString::new(file.to_string_lossy().into_owned()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
@@ -444,8 +445,8 @@ mod tests {
     }
 
     /// Links `file` to `name` in a dotfiles directory (outside Claude's and the home's), and returns where it leads.
-    fn linked(scratch: &Scratch, file: &Path, name: &str) -> PathBuf {
-        let dotfiles = scratch.0.join("dotfiles");
+    fn linked(scratch: &tempfile::TempDir, file: &Path, name: &str) -> PathBuf {
+        let dotfiles = scratch.path().join("dotfiles");
         fs::create_dir_all(&dotfiles).unwrap();
         let target = dotfiles.join(name);
         std::os::unix::fs::symlink(&target, file).unwrap();
@@ -461,7 +462,7 @@ mod tests {
     /// is read, or judged unparsable, as the file itself would be.
     #[tokio::test]
     async fn a_linked_user_configuration_is_read_where_the_link_leads() {
-        let scratch = Scratch::new("claude-linked");
+        let scratch = crate::test_support::temp_dir("claude-linked");
         let (profile, file) = profile(&scratch, false, true);
         let target = linked(&scratch, &file, "claude.json");
         write(&target, b"{\"mcpServers\": {}}", 0o600);
@@ -477,7 +478,7 @@ mod tests {
     /// A link to a FIFO is refused at once, never waited on.
     #[tokio::test]
     async fn a_link_to_a_fifo_is_refused_without_waiting() {
-        let scratch = Scratch::new("claude-linked-fifo");
+        let scratch = crate::test_support::temp_dir("claude-linked-fifo");
         let (profile, file) = profile(&scratch, false, true);
         let target = linked(&scratch, &file, "fifo");
         let path = std::ffi::CString::new(target.to_string_lossy().into_owned()).unwrap();
@@ -500,7 +501,7 @@ mod tests {
     /// nowhere is unreadable, so the CLI is not run over it.
     #[tokio::test]
     async fn a_link_to_a_file_others_may_write_or_to_nothing_is_refused() {
-        let scratch = Scratch::new("claude-linked-mode");
+        let scratch = crate::test_support::temp_dir("claude-linked-mode");
         let (profile, file) = profile(&scratch, false, true);
         let target = linked(&scratch, &file, "claude.json");
         write(&target, b"{}", 0o622);
@@ -521,7 +522,7 @@ mod tests {
     /// older Sidevoice wrote (another environment) is `owned-old`.
     #[tokio::test]
     async fn entries_are_read_through_a_link() {
-        let scratch = Scratch::new("claude-linked-entry");
+        let scratch = crate::test_support::temp_dir("claude-linked-entry");
         let (profile, file) = profile(&scratch, false, true);
         let target = linked(&scratch, &file, "claude.json");
         let host = Host(profile);

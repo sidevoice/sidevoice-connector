@@ -44,12 +44,12 @@ use crate::agents::HostAgents;
 use crate::messages::Keyed;
 use crate::platform::fs::{Create, Files, Fs};
 use crate::profile::Profile;
-use crate::records::{atomic_json, digest_file};
 use crate::service::layout::Layout;
 use crate::service::manager::Kind;
 use crate::service::{launcher, status};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io;
@@ -159,7 +159,7 @@ fn point_current(layout: &Layout, id: &str) -> Result<()> {
 /// `D/install.json`: the installation's command and where its releases are.
 fn record(layout: &Layout) -> Result<()> {
     Files::ensure_private_dir(&layout.data)?;
-    atomic_json(
+    Files::write_json(
         &layout.install_file(),
         &json!({"command": [stable_command(layout)], "releases": layout.releases}),
     )
@@ -261,6 +261,13 @@ fn release_id(layout: &Layout, package: &Package, digest: &str) -> Result<(Strin
     ))
 }
 
+/// The SHA-256 of a file, in lower-case hex.
+fn digest_file(path: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut File::open(path)?, &mut hasher)?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
 /// Copies `from` to `to` (created, 0700) and syncs it.
 fn copy_executable(from: &Path, to: &Path) -> Result<()> {
     let mut source = File::open(from).with_context(|| format!("open {}", from.display()))?;
@@ -311,7 +318,8 @@ async fn stage(layout: &Layout, package: &Package, id: &str, digest: &str) -> Re
         Files::create_private_dir(&partial.join("bin"))?;
         let binary = partial.join(BINARY);
         copy_executable(&package.binary, &binary)?;
-        Files::check_private_file(&binary)?;
+        Files::check_private(&Files::open_read(&binary)?)
+            .with_context(|| format!("unsafe private file {}", binary.display()))?;
         which::which(&binary).context("the staged connector cannot be run")?;
         if digest_file(&binary)? != digest {
             return Err(failed("the connector changed while it was being copied"));
@@ -1093,7 +1101,6 @@ pub fn human_uninstall(answer: &Value) -> String {
 pub(crate) mod tests {
     use super::*;
     use crate::core_package::tests::{core_archive, core_files};
-    use crate::platform::fs::tests::Scratch;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
     use std::os::unix::fs::PermissionsExt;
@@ -1110,7 +1117,7 @@ pub(crate) mod tests {
     }
 
     struct Fixture {
-        scratch: Scratch,
+        scratch: tempfile::TempDir,
         profile: Profile,
         fake: Arc<Mutex<Fake>>,
     }
@@ -1120,9 +1127,9 @@ pub(crate) mod tests {
 
     impl Fixture {
         fn new(label: &str) -> Self {
-            let scratch = Scratch::new(label);
+            let scratch = crate::test_support::temp_dir(label);
             let homes = crate::adapters::Registry::standard().homes();
-            let original = Profile::for_test(&scratch.0.join("profile"), &homes);
+            let original = Profile::for_test(&scratch.path().join("profile"), &homes);
             let variables = original.variables();
             let profile = Profile::from_vars(
                 |name| {
@@ -1138,8 +1145,8 @@ pub(crate) mod tests {
                 &homes,
             )
             .unwrap();
-            Files::create_private_dir_all(&profile.data.join("core")).unwrap();
-            Files::create_private_dir_all(&profile.xdg_data).unwrap();
+            Files::ensure_private_dir(&profile.data.join("core")).unwrap();
+            Files::ensure_private_dir(&profile.xdg_data).unwrap();
             Self {
                 scratch,
                 profile,
@@ -1158,7 +1165,7 @@ pub(crate) mod tests {
         /// A package of connector `version`: a binary that says its version (`build` tells builds apart) and a
         /// core.
         fn package(&self, version: &str, build: &str) -> Package {
-            let root = self.scratch.0.join(format!(
+            let root = self.scratch.path().join(format!(
                 "package-{version}-{build}-{}",
                 uuid::Uuid::new_v4().simple()
             ));
@@ -1297,7 +1304,7 @@ pub(crate) mod tests {
         );
 
         // Uninstall: the releases and the data go; the locks and the stop stay.
-        crate::records::atomic_json(&layout.data.join("outbox.json"), &json!([])).unwrap();
+        Files::write_json(&layout.data.join("outbox.json"), &json!([])).unwrap();
         crate::lock::try_lock(&layout.data.join("agents.lock"), "test").unwrap();
         let removed = uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
             .await
@@ -1432,7 +1439,7 @@ pub(crate) mod tests {
         let fixture = Fixture::new("agents");
         let profile = &fixture.profile;
         let id = agent_without_cli();
-        let program = fixture.scratch.0.join("agent-program");
+        let program = fixture.scratch.path().join("agent-program");
         fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
         let _installed = crate::agents::tests::EnvGuard::set(
@@ -1619,7 +1626,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn uninstall_refuses_hard_linked_install_lock_without_touching_sentinel() {
         let fixture = Fixture::new("hard-linked-uninstall-lock");
-        let outside = fixture.scratch.0.join("outside-sentinel");
+        let outside = fixture.scratch.path().join("outside-sentinel");
         fs::write(&outside, b"outside contents").unwrap();
         fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
         fs::hard_link(&outside, fixture.layout().install_lock()).unwrap();
@@ -1632,7 +1639,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn uninstall_refuses_hard_linked_agents_lock_without_touching_sentinel() {
         let fixture = Fixture::new("hard-linked-uninstall-agents-lock");
-        let outside = fixture.scratch.0.join("outside-agents-sentinel");
+        let outside = fixture.scratch.path().join("outside-agents-sentinel");
         fs::write(&outside, b"outside contents").unwrap();
         fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
         fs::hard_link(&outside, fixture.layout().data.join("agents.lock")).unwrap();
@@ -1650,7 +1657,7 @@ pub(crate) mod tests {
         fixture.install(&package).await.unwrap();
         let layout = fixture.layout();
         let victim = layout.data.join("victim");
-        let moved = fixture.scratch.0.join("outside-victim");
+        let moved = fixture.scratch.path().join("outside-victim");
         fs::create_dir(&victim).unwrap();
         fs::write(victim.join("keep"), b"outside contents").unwrap();
         let swapped = AtomicBool::new(false);

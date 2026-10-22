@@ -6,7 +6,7 @@ use crate::link::Link;
 use crate::platform::fs::{Files, Fs};
 use crate::profile::Profile;
 use crate::secure_fs::verify_socket;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
@@ -41,7 +41,8 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
         ));
         return Ok(());
     }
-    Files::check_private_dir(&profile.data)?;
+    Files::check_private(&Files::open_read(&profile.data)?)
+        .with_context(|| format!("unsafe private directory {}", profile.data.display()))?;
     let lock = profile.try_connector_lock()?;
     if profile.service_stopped()? {
         return Ok(());

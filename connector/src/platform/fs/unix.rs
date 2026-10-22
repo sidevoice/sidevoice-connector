@@ -42,43 +42,42 @@ impl super::Fs for Os {
             .open(path)
     }
 
-    fn others(path: &Path) -> io::Result<Others> {
-        Ok(others(fs::symlink_metadata(path)?.mode()))
-    }
-
     fn others_of(file: &File) -> io::Result<Others> {
         Ok(others(file.metadata()?.mode()))
     }
+}
 
-    fn link_count(file: &File) -> io::Result<u64> {
-        Ok(file.metadata()?.nlink())
-    }
+/// How many names the file behind `file` has.
+pub(super) fn link_count(file: &File) -> io::Result<u64> {
+    Ok(file.metadata()?.nlink())
+}
 
-    // The entry itself (a link is judged as a link); root's counts as the system's. Others writing is harmless only
-    // under the sticky bit (`/tmp`), where nobody can remove or rename what is not theirs.
-    fn check_ancestor(dir: &Path) -> Result<()> {
-        let metadata = fs::symlink_metadata(dir)?;
-        if !UserId::current().owns_path(dir)? && metadata.uid() != 0 {
-            bail!("unsafe directory {}: owned by another user", dir.display());
-        }
-        if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
-            bail!(
-                "unsafe directory {}: others can replace what is in it",
-                dir.display()
-            );
-        }
-        Ok(())
+/// A directory on the way to something private: the entry itself (a link is judged as a link); this user's or
+/// root's; others writing is harmless only under the sticky bit (`/tmp`), where nobody can remove or rename what is
+/// not theirs.
+pub(super) fn check_ancestor(dir: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(dir)?;
+    if !UserId::current().owns_path(dir)? && metadata.uid() != 0 {
+        bail!("unsafe directory {}: owned by another user", dir.display());
     }
+    if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
+        bail!(
+            "unsafe directory {}: others can replace what is in it",
+            dir.display()
+        );
+    }
+    Ok(())
+}
 
-    fn atomic(keep_access: bool) -> atomic_write_file::OpenOptions {
-        use atomic_write_file::unix::OpenOptionsExt as _;
-        let mut options = atomic_write_file::OpenOptions::new();
-        options
-            .mode(0o600)
-            .preserve_mode(keep_access)
-            .preserve_owner(false);
-        options
-    }
+/// How a record is written whole: a new file `0600`, an existing one's mode kept when `keep_access`.
+pub(super) fn atomic(keep_access: bool) -> atomic_write_file::OpenOptions {
+    use atomic_write_file::unix::OpenOptionsExt as _;
+    let mut options = atomic_write_file::OpenOptions::new();
+    options
+        .mode(0o600)
+        .preserve_mode(keep_access)
+        .preserve_owner(false);
+    options
 }
 
 fn others(mode: u32) -> Others {

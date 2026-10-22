@@ -22,6 +22,7 @@ pub use imp::Os as Files;
 
 use super::user::{User, UserId};
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -60,96 +61,60 @@ pub trait Fs {
     /// Opens a file of ours as `how` says.
     fn open_private(path: &Path, how: Create) -> io::Result<File>;
 
-    /// Opens `path` for reading: a link there is refused, not followed, and nothing is waited on (a FIFO or a device
-    /// put in a file's place).
+    /// Opens `path` (a file or a directory) for reading: a link there is refused, not followed, and nothing is
+    /// waited on (a FIFO or a device put in a file's place).
     fn open_read(path: &Path) -> io::Result<File>;
 
-    /// What others may do with what `path` names; a link is judged itself, not what it points to.
-    fn others(path: &Path) -> io::Result<Others>;
-
-    /// What others may do with the file behind an open handle.
+    /// What others may do with the file or directory behind an open handle.
     fn others_of(file: &File) -> io::Result<Others>;
 
-    /// How many names the file behind `file` has.
-    fn link_count(file: &File) -> io::Result<u64>;
-
-    /// A directory on the way to something private: this user's or the system's, and nobody else able to replace
-    /// what is in it. Refused with the reason otherwise.
-    fn check_ancestor(dir: &Path) -> Result<()>;
-
-    /// How a record is written whole: a new file private, an existing one's access kept when `keep_access` (Unix;
-    /// on Windows a new file takes what its directory gives, which in a private directory is private).
-    fn atomic(keep_access: bool) -> atomic_write_file::OpenOptions;
-
-    /// Makes `path` and any missing parents, each private. What is already there is left as it is.
-    fn create_private_dir_all(path: &Path) -> io::Result<()> {
-        match Self::create_private_dir(path) {
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                    Self::create_private_dir_all(parent)?;
-                }
-                match Self::create_private_dir(path) {
-                    Err(error) if error.kind() == ErrorKind::AlreadyExists && path.is_dir() => {
-                        Ok(())
-                    }
-                    other => other,
-                }
-            }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
-            other => other,
-        }
-    }
-
-    /// A private directory, made (with any missing parents) when it does not exist, then checked with its
-    /// ancestors. An existing directory with the wrong owner or access is refused, not repaired.
+    /// A private directory, made (with any missing parents, each private) when it does not exist, then checked with
+    /// its ancestors: each this user's or the system's, nobody else able to replace what is in it. An existing
+    /// directory with the wrong owner or access is refused, not repaired.
     fn ensure_private_dir(path: &Path) -> Result<()> {
         if !path.is_absolute() {
             bail!("{} is not an absolute path", path.display());
         }
-        Self::create_private_dir_all(path)?;
-        Self::check_private_dir(path)?;
+        create_all::<Self>(path)?;
+        let dir = Self::open_read(path)?;
+        if !dir.metadata()?.is_dir() {
+            bail!("{} is not a directory", path.display());
+        }
+        Self::check_private(&dir)
+            .with_context(|| format!("unsafe private directory {}", path.display()))?;
         let mut current = path.parent();
-        while let Some(dir) = current.filter(|dir| !dir.as_os_str().is_empty()) {
-            Self::check_ancestor(dir)?;
-            current = dir.parent();
+        while let Some(ancestor) = current.filter(|dir| !dir.as_os_str().is_empty()) {
+            imp::check_ancestor(ancestor)?;
+            current = ancestor.parent();
         }
         Ok(())
     }
 
-    /// A real directory (not a link), this user's, open to nobody else.
-    fn check_private_dir(path: &Path) -> Result<()> {
-        let metadata = fs::symlink_metadata(path)
-            .with_context(|| format!("missing private directory {}", path.display()))?;
-        if !metadata.is_dir() || !private::<Self>(path)? {
-            bail!("unsafe private directory {}", path.display());
+    /// That what is behind `file` is private: this user's and open to nobody else; a regular file also has no
+    /// other name (a hard link somebody else made would see what is written to it). A directory or a regular file,
+    /// judged from what is there; anything else is refused.
+    fn check_private(file: &File) -> Result<()> {
+        let metadata = file.metadata()?;
+        if !UserId::current().owns_file(file)? {
+            bail!("not this user's");
+        }
+        if Self::others_of(file)? != Others::Nothing {
+            bail!("open to others");
+        }
+        if !metadata.is_dir() && !(metadata.is_file() && imp::link_count(file)? == 1) {
+            bail!("not a directory or a regular file with one name");
         }
         Ok(())
-    }
-
-    /// A regular file (not a link), this user's, open to nobody else.
-    fn check_private_file(path: &Path) -> Result<()> {
-        if !fs::symlink_metadata(path)?.is_file() || !private::<Self>(path)? {
-            bail!("unsafe private file {}", path.display());
-        }
-        Ok(())
-    }
-
-    /// Whether the file behind `file` is a regular file of this user's, open to nobody else, with no other name.
-    fn is_private(file: &File) -> io::Result<bool> {
-        Ok(file.metadata()?.is_file()
-            && UserId::current().owns_file(file)?
-            && Self::others_of(file)? == Others::Nothing
-            && Self::link_count(file)? == 1)
     }
 
     /// A directory of the person's that we read or write in (a home, an agent's configuration): a real directory,
     /// this user's, that nobody else can change. Returns its canonical path.
     fn check_user_directory(path: &Path) -> Result<PathBuf> {
-        let metadata = fs::symlink_metadata(path)
+        let dir = Self::open_read(path)
             .with_context(|| format!("missing user directory {}", path.display()))?;
-        if !metadata.is_dir()
-            || !UserId::current().owns_path(path)?
-            || Self::others(path)? == Others::Change
+        if !dir.metadata()?.is_dir()
+            || !UserId::current().owns_file(&dir)?
+            || Self::others_of(&dir)? == Others::Change
         {
             bail!("unsafe user directory {}", path.display());
         }
@@ -184,20 +149,39 @@ pub trait Fs {
 
     /// Writes `bytes` as `path`, private, whole or not at all, in a directory that must already be private.
     fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-        Self::check_private_dir(path.parent().context("file parent")?)?;
-        write_whole(Self::atomic(false), path, bytes).map_err(Into::into)
+        let parent = path.parent().context("file parent")?;
+        Self::check_private(&Self::open_read(parent)?)
+            .with_context(|| format!("unsafe private directory {}", parent.display()))?;
+        write_whole(imp::atomic(false), path, bytes).map_err(Into::into)
+    }
+
+    /// [`Fs::write_private`] of `value` as JSON.
+    fn write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
+        Self::write_private(path, &serde_json::to_vec(value)?)
     }
 
     /// Writes `bytes` as `path` whole or not at all, in a directory the caller has vouched for: an existing file
     /// keeps its access (Unix), a new one is private.
     fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
-        write_whole(Self::atomic(true), path, bytes)
+        write_whole(imp::atomic(true), path, bytes)
     }
 }
 
-/// This user's, and open to nobody else.
-fn private<F: Fs + ?Sized>(path: &Path) -> io::Result<bool> {
-    Ok(UserId::current().owns_path(path)? && F::others(path)? == Others::Nothing)
+/// Makes `path` and any missing parents, each private; what is already there is left as it is.
+fn create_all<F: Fs + ?Sized>(path: &Path) -> io::Result<()> {
+    let created = match F::create_private_dir(path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                create_all::<F>(parent)?;
+            }
+            F::create_private_dir(path)
+        }
+        other => other,
+    };
+    match created {
+        Err(error) if error.kind() == ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
+        other => other,
+    }
 }
 
 fn write_whole(
@@ -209,55 +193,45 @@ fn write_whole(
     file.write_all(bytes)?;
     file.commit()
 }
-
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
+    use crate::test_support::temp_dir;
 
-    /// A private scratch directory under the temporary directory, removed when dropped.
-    pub(crate) struct Scratch(pub PathBuf);
-
-    impl Scratch {
-        pub(crate) fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().canonicalize().unwrap().join(format!(
-                "sv-{label}-{}-{}",
-                std::process::id(),
-                uuid::Uuid::new_v4().simple()
-            ));
-            Files::create_private_dir(&path).unwrap();
-            Self(path)
-        }
+    /// Whether what `path` names is private, judged on a handle opened without following a link.
+    fn private(path: &Path) -> bool {
+        Files::open_read(path)
+            .map_err(Into::into)
+            .and_then(|file| Files::check_private(&file))
+            .is_ok()
     }
 
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
+    fn others(path: &Path) -> Others {
+        Files::others_of(&Files::open_read(path).unwrap()).unwrap()
     }
 
     #[test]
     fn a_private_directory_is_made_once_owned_and_open_to_nobody_else() {
-        let scratch = Scratch::new("ensure");
-        let dir = scratch.0.join("a").join("b");
+        let scratch = temp_dir("ensure");
+        let dir = scratch.path().join("a").join("b");
         Files::ensure_private_dir(&dir).unwrap();
         Files::ensure_private_dir(&dir).unwrap();
-        Files::check_private_dir(&dir).unwrap();
+        assert!(private(&dir));
         assert!(UserId::current().owns_path(&dir).unwrap());
-        assert_eq!(Files::others(&dir).unwrap(), Others::Nothing);
+        assert_eq!(others(&dir), Others::Nothing);
         assert!(Files::ensure_private_dir(Path::new("relative/dir")).is_err());
-        assert!(Files::check_private_file(&dir).is_err(), "not a file");
     }
 
     #[test]
     fn a_directory_somebody_else_can_change_is_refused_not_repaired() {
-        let scratch = Scratch::new("open-dir");
-        let dir = scratch.0.join("data");
+        let scratch = temp_dir("open-dir");
+        let dir = scratch.path().join("data");
         Files::ensure_private_dir(&dir).unwrap();
         imp::let_others_change(&dir);
-        assert_eq!(Files::others(&dir).unwrap(), Others::Change);
-        assert!(Files::check_private_dir(&dir).is_err());
+        assert_eq!(others(&dir), Others::Change);
+        assert!(!private(&dir));
         assert!(Files::ensure_private_dir(&dir).is_err(), "refused");
-        assert_eq!(Files::others(&dir).unwrap(), Others::Change, "not repaired");
+        assert_eq!(others(&dir), Others::Change, "not repaired");
         assert!(Files::check_user_directory(&dir).is_err());
         assert!(
             Files::ensure_private_dir(&dir.join("inside")).is_err(),
@@ -267,18 +241,20 @@ pub(crate) mod tests {
 
     #[test]
     fn a_private_write_replaces_the_record_whole_and_leaves_no_temporary_file() {
-        let scratch = Scratch::new("write");
-        let file = scratch.0.join("state.json");
+        let scratch = temp_dir("write");
+        let dir = scratch.path().join("private");
+        Files::create_private_dir(&dir).unwrap();
+        let file = dir.join("state.json");
         Files::write_private(&file, b"first").unwrap();
         Files::write_private(&file, b"second").unwrap();
         assert_eq!(fs::read(&file).unwrap(), b"second");
-        Files::check_private_file(&file).unwrap();
-        let names: Vec<_> = fs::read_dir(&scratch.0)
+        assert!(private(&file));
+        let names: Vec<_> = fs::read_dir(&dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(names, ["state.json"]);
-        let open = scratch.0.join("open");
+        let open = scratch.path().join("open");
         Files::create_private_dir(&open).unwrap();
         imp::let_others_change(&open);
         assert!(
@@ -288,19 +264,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_value_is_written_as_json() {
+        let scratch = temp_dir("json");
+        let dir = scratch.path().join("private");
+        Files::create_private_dir(&dir).unwrap();
+        let file = dir.join("value.json");
+        Files::write_json(&file, &serde_json::json!({"a": [1]})).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), br#"{"a":[1]}"#);
+        assert!(private(&file));
+    }
+
+    #[test]
     fn a_replaced_file_is_written_whole_and_a_new_one_is_private() {
-        let scratch = Scratch::new("replace");
-        let file = scratch.0.join("config.json");
+        let scratch = temp_dir("replace");
+        let file = scratch.path().join("config.json");
         Files::replace(&file, b"{}").unwrap();
-        Files::check_private_file(&file).unwrap();
+        assert!(private(&file));
         Files::replace(&file, b"{\"a\":1}").unwrap();
         assert_eq!(fs::read(&file).unwrap(), b"{\"a\":1}");
     }
 
     #[test]
     fn a_trusted_file_is_read_bounded_and_refused_once_somebody_else_can_change_it() {
-        let scratch = Scratch::new("read");
-        let file = scratch.0.join("record.json");
+        let scratch = temp_dir("read");
+        let dir = scratch.path().join("private");
+        Files::create_private_dir(&dir).unwrap();
+        let file = dir.join("record.json");
         assert!(Files::read_trusted(&file, 1024).unwrap().is_none());
         Files::write_private(&file, br#"{"a":1}"#).unwrap();
         assert_eq!(
@@ -309,58 +298,57 @@ pub(crate) mod tests {
         );
         assert!(Files::read_trusted(&file, 3).is_err(), "oversized");
         assert!(
-            Files::read_trusted(&scratch.0, 1024).is_err(),
+            Files::read_trusted(&dir, 1024).is_err(),
             "not a regular file"
         );
         imp::let_others_change(&file);
         assert!(Files::read_trusted(&file, 1024).is_err());
-        assert!(Files::check_private_file(&file).is_err());
+        assert!(!private(&file));
     }
 
     #[test]
     fn the_private_openers_make_private_files_and_keep_what_is_in_them() {
-        let scratch = Scratch::new("open");
-        let log = scratch.0.join("log");
+        let scratch = temp_dir("open");
+        let log = scratch.path().join("log");
         writeln!(Files::open_private(&log, Create::Append).unwrap(), "one").unwrap();
         writeln!(Files::open_private(&log, Create::Append).unwrap(), "two").unwrap();
         assert_eq!(fs::read_to_string(&log).unwrap(), "one\ntwo\n");
-        Files::check_private_file(&log).unwrap();
+        assert!(private(&log));
         let held = Files::open_private(&log, Create::ReadWrite).unwrap();
-        assert!(Files::is_private(&held).unwrap());
+        Files::check_private(&held).unwrap();
         assert_eq!(fs::read_to_string(&log).unwrap(), "one\ntwo\n", "kept");
-        let new = scratch.0.join("new");
+        let new = scratch.path().join("new");
         Files::open_private(&new, Create::New).unwrap();
         assert!(Files::open_private(&new, Create::New).is_err(), "exclusive");
-        Files::check_private_file(&new).unwrap();
-        let program = scratch.0.join("program");
+        assert!(private(&new));
+        let program = scratch.path().join("program");
         Files::open_private(&program, Create::NewProgram).unwrap();
-        Files::check_private_file(&program).unwrap();
+        assert!(private(&program));
     }
 
     #[test]
     fn a_second_name_is_seen_on_the_handle() {
-        let scratch = Scratch::new("links");
-        let file = scratch.0.join("lock");
+        let scratch = temp_dir("links");
+        let file = scratch.path().join("lock");
         let handle = Files::open_private(&file, Create::ReadWrite).unwrap();
-        assert_eq!(Files::link_count(&handle).unwrap(), 1);
-        fs::hard_link(&file, scratch.0.join("other")).unwrap();
-        assert_eq!(Files::link_count(&handle).unwrap(), 2);
-        assert!(!Files::is_private(&handle).unwrap());
+        Files::check_private(&handle).unwrap();
+        fs::hard_link(&file, scratch.path().join("other")).unwrap();
+        assert!(Files::check_private(&handle).is_err(), "a second name");
     }
 
     #[test]
     fn a_user_directory_is_the_users_and_named_canonically() {
-        let scratch = Scratch::new("user");
+        let scratch = temp_dir("user");
         assert_eq!(
-            Files::check_user_directory(&scratch.0).unwrap(),
-            scratch.0.canonicalize().unwrap()
+            Files::check_user_directory(scratch.path()).unwrap(),
+            scratch.path().canonicalize().unwrap()
         );
-        let file = scratch.0.join("config.toml");
+        let file = scratch.path().join("config.toml");
         fs::write(&file, "a = 1\n").unwrap();
         assert!(
             Files::check_user_directory(&file).is_err(),
             "not a directory"
         );
-        assert!(Files::check_user_directory(&scratch.0.join("missing")).is_err());
+        assert!(Files::check_user_directory(&scratch.path().join("missing")).is_err());
     }
 }

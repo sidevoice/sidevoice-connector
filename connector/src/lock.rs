@@ -16,7 +16,7 @@
 
 use crate::platform::fs::{Create, Files, Fs};
 use crate::platform::process::{Process, Processes};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
@@ -61,12 +61,7 @@ fn record_path(path: &Path) -> PathBuf {
 /// Takes the lock on `file` if nobody holds it. The file is checked before and after, so a name added meanwhile is
 /// refused as well.
 fn take(file: &File, label: &str) -> Result<bool> {
-    let check = || -> Result<()> {
-        if !Files::is_private(file)? {
-            bail!("unsafe lock file {label}");
-        }
-        Ok(())
-    };
+    let check = || Files::check_private(file).with_context(|| format!("unsafe lock file {label}"));
     check()?;
     match file.try_lock() {
         Ok(()) => {}
@@ -93,9 +88,7 @@ pub fn try_lock(path: &Path, kind: &str) -> Result<Option<Lock>> {
     };
     let record = record_path(path);
     // Information only: a lock held without its record is still held.
-    let written = serde_json::to_vec(&holder)
-        .map_err(Into::into)
-        .and_then(|bytes| Files::write_private(&record, &bytes));
+    let written = Files::write_json(&record, &holder);
     Ok(Some(Lock {
         file,
         record: written.is_ok().then_some(record),
@@ -143,16 +136,24 @@ pub fn holder(path: &Path) -> Option<Holder> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::fs::tests::Scratch;
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
+    use tempfile::TempDir;
+
+    /// A private directory, as the data directory is (the record is written only in one), inside a scratch one.
+    fn private_dir(label: &str) -> (TempDir, PathBuf) {
+        let tmp = crate::test_support::temp_dir(label);
+        let dir = tmp.path().join("data");
+        Files::create_private_dir(&dir).unwrap();
+        (tmp, dir)
+    }
 
     #[test]
     fn one_holder_at_a_time_and_released_on_drop() {
-        let scratch = Scratch::new("lock");
-        let path = scratch.0.join("connector.lock");
+        let (_tmp, dir) = private_dir("lock");
+        let path = dir.join("connector.lock");
         let first = try_lock(&path, "connector").unwrap().expect("first holder");
-        Files::check_private_file(&path).expect("created private");
+        Files::check_private(&Files::open_read(&path).unwrap()).expect("created private");
         // A second open of the same file, even in this process, does not get it.
         assert!(try_lock(&path, "connector").unwrap().is_none());
         let record = holder(&path).expect("holder record");
@@ -168,8 +169,8 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_gets_the_lock_once_the_holder_lets_go() {
-        let scratch = Scratch::new("wait");
-        let path = scratch.0.join("install.lock");
+        let (_tmp, dir) = private_dir("wait");
+        let path = dir.join("install.lock");
         let held = try_lock(&path, "install").unwrap().unwrap();
         assert!(wait_lock(&path, "install", Duration::from_millis(100))
             .await
@@ -188,8 +189,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_lock_on_an_opened_file_writes_no_record() {
-        let scratch = Scratch::new("file");
-        let path = scratch.0.join("install.lock");
+        let (_tmp, dir) = private_dir("file");
+        let path = dir.join("install.lock");
         let open = || Files::open_private(&path, Create::ReadWrite).unwrap();
         let held = wait_lock_file(open(), "install.lock", Duration::ZERO)
             .await
@@ -207,10 +208,10 @@ mod tests {
 
     #[test]
     fn a_lock_file_with_another_name_is_refused_without_changing_it() {
-        let scratch = Scratch::new("hard-link-lock");
-        let outside = scratch.0.join("outside");
+        let (_tmp, dir) = private_dir("hard-link-lock");
+        let outside = dir.join("outside");
         Files::write_private(&outside, b"sentinel content").unwrap();
-        let lock = scratch.0.join("install.lock");
+        let lock = dir.join("install.lock");
         std::fs::hard_link(&outside, &lock).unwrap();
         assert!(try_lock(&lock, "uninstall").is_err());
         assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel content");
@@ -218,8 +219,8 @@ mod tests {
 
     #[test]
     fn an_unreadable_record_is_no_holder() {
-        let scratch = Scratch::new("garbage");
-        let path = scratch.0.join("x.lock");
+        let (_tmp, dir) = private_dir("garbage");
+        let path = dir.join("x.lock");
         Files::write_private(&record_path(&path), b"not json").unwrap();
         assert!(holder(&path).is_none());
         Files::write_private(&record_path(&path), &[b' '; 5000]).unwrap();
@@ -241,8 +242,8 @@ mod tests {
 
     #[test]
     fn a_lock_is_released_when_its_holder_dies() {
-        let scratch = Scratch::new("death");
-        let path = scratch.0.join("agents.lock");
+        let (_tmp, dir) = private_dir("death");
+        let path = dir.join("agents.lock");
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--ignored",

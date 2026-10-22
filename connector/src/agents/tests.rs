@@ -1334,7 +1334,7 @@ exit 2
     let lock = Files::open_private(&lock_path, Create::ReadWrite).unwrap();
     lock.lock().unwrap();
     state["dismissed"]["codex"] = generation;
-    atomic_json(&state_path, &state).unwrap();
+    Files::write_json(&state_path, &state).unwrap();
     lock.unlock().unwrap();
     let scanned = scanning.await.unwrap();
     assert_eq!(row(&scanned, "codex")["dismissed"], true);

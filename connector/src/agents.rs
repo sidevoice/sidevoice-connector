@@ -14,7 +14,6 @@ use crate::adapters::Registry;
 use crate::messages::message;
 use crate::platform::fs::{Files, Fs};
 use crate::profile::Profile;
-use crate::records::atomic_json;
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -830,7 +829,7 @@ impl HostAgents {
         if path.exists() {
             private_state_file(&path)?;
         }
-        atomic_json(&path, &state).map_err(|_| Failure::Internal)?;
+        Files::write_json(&path, &state).map_err(|_| Failure::Internal)?;
         Ok(state)
     }
 
@@ -1089,7 +1088,8 @@ fn load_state_file(profile: &Profile) -> std::result::Result<Value, Failure> {
 }
 
 fn private_state_file(path: &Path) -> std::result::Result<(), Failure> {
-    Files::check_private_file(path).map_err(|_| Failure::Internal)
+    let file = Files::open_read(path).map_err(|_| Failure::Internal)?;
+    Files::check_private(&file).map_err(|_| Failure::Internal)
 }
 
 fn check_live(cancel: &Cancellation, deadline: Instant) -> std::result::Result<(), Failure> {
