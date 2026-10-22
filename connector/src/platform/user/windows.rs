@@ -5,6 +5,7 @@
 //! names, not the SID; `windows-acl` and `sid` are unmaintained or bring the whole ACL model) do not cover "this
 //! process's SID" plus "owner of this file" together, and the surface needed is a handful of calls.
 
+use super::User as _;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::fs::OpenOptionsExt;
@@ -70,9 +71,18 @@ pub(super) struct Id {
     default_owner: Sid,
 }
 
-impl Id {
+impl super::User for Id {
+    fn current() -> Id {
+        read_token().expect("the process token is readable")
+    }
+
+    /// Windows names the user to the system by SID; there is no login name any caller needs.
+    fn name() -> Option<String> {
+        None
+    }
+
     // A symlink or junction is judged itself (`OPEN_REPARSE_POINT`).
-    pub(super) fn owns_path(&self, path: &Path) -> io::Result<bool> {
+    fn owns_path(&self, path: &Path) -> io::Result<bool> {
         // `BACKUP_SEMANTICS` lets a directory be opened; `READ_CONTROL` is all the owner query needs.
         let file = OpenOptions::new()
             .access_mode(READ_CONTROL)
@@ -81,7 +91,7 @@ impl Id {
         self.owns_file(&file)
     }
 
-    pub(super) fn owns_file(&self, file: &File) -> io::Result<bool> {
+    fn owns_file(&self, file: &File) -> io::Result<bool> {
         let mut owner: PSID = null_mut();
         let mut descriptor = null_mut();
         // SAFETY: the handle is open for the call's duration; on success `owner` points inside `descriptor`, which
@@ -114,11 +124,6 @@ impl PartialEq for Id {
 }
 
 impl Eq for Id {}
-
-/// The user of this process: the SIDs in its token.
-pub(super) fn current() -> Id {
-    read_token().expect("the process token is readable")
-}
 
 fn read_token() -> io::Result<Id> {
     let mut token: HANDLE = null_mut();
@@ -163,18 +168,13 @@ fn token_sid(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> io::Result<Sid> {
     Ok(unsafe { Sid::copy_of((*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid) })
 }
 
-/// Windows names the user to the system by SID; there is no login name any caller needs.
-pub(super) fn name() -> Option<String> {
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn current_is_a_valid_sid() {
-        let me = current();
+        let me = Id::current();
         // SAFETY: the SID is one this module copied from a valid one.
         let len = unsafe { GetLengthSid(me.user.as_psid()) };
         assert!(len >= 8, "a SID is at least 8 bytes, got {len}");
@@ -192,7 +192,7 @@ mod tests {
             user: system.clone(),
             default_owner: system,
         };
-        assert_ne!(current(), stranger);
+        assert_ne!(Id::current(), stranger);
         let dir =
             std::env::temp_dir().join(format!("sv-platform-user-win-other-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

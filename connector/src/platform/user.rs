@@ -15,8 +15,18 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
-// The whole interface is here, documented once; `imp` only implements it per OS, so a side that does not provide
-// an operation does not compile.
+/// What every OS implements (`imp::Id` in `user/unix.rs` and `user/windows.rs`). The public functions below are
+/// this, documented for callers; nothing else is OS-specific.
+trait User: Sized {
+    /// The user this process runs as (Unix: the effective uid; Windows: the SID in its token).
+    fn current() -> Self;
+    /// Whether this user owns what `path` names, the path itself and not what a link points to.
+    fn owns_path(&self, path: &Path) -> io::Result<bool>;
+    /// Whether this user owns the file behind an open handle.
+    fn owns_file(&self, file: &File) -> io::Result<bool>;
+    /// The login name, for what must name the user to the system; `None` where there is none.
+    fn name() -> Option<String>;
+}
 
 /// The user this process runs as. Opaque: callers ask it questions and never see what it is made of.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,7 +35,7 @@ pub struct UserId(imp::Id);
 
 /// The user this process runs as (Unix: the effective uid; Windows: the SID in its token).
 pub fn current() -> UserId {
-    UserId(imp::current())
+    UserId(<imp::Id as User>::current())
 }
 
 impl UserId {
@@ -46,7 +56,7 @@ impl UserId {
 /// This user's login name, for what must name the user to the system (`loginctl enable-linger`). `None` where
 /// the system has no name for it, and always on Windows, which names users by SID.
 pub fn name() -> Option<String> {
-    imp::name()
+    <imp::Id as User>::name()
 }
 
 /// The host name as the operating system reports it, trimmed; empty when it cannot be read.
