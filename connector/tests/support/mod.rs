@@ -179,8 +179,6 @@ impl Profile {
             .envs(self.core_env())
             .arg("--data-dir")
             .arg(self.core_data())
-            .arg("--socket")
-            .arg(self.core_socket())
             .args(["--port", "0", "--idle-exit", "0", "--launch-id", launch_id])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
