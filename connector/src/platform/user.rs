@@ -24,6 +24,19 @@ trait User: Sized {
     fn owns_path(&self, path: &Path) -> io::Result<bool>;
     /// Whether this user owns the file behind an open handle.
     fn owns_file(&self, file: &File) -> io::Result<bool>;
+    /// The login name, for what must name the user to the system (`loginctl enable-linger`); `None` when the
+    /// system cannot tell. One body for every OS (`whoami`); an OS overrides it only if it must.
+    fn name() -> Option<String> {
+        whoami::username().ok()
+    }
+    /// The host name as the operating system reports it, trimmed; empty when it cannot be read. One body for every OS
+    /// (`gethostname`).
+    fn host_name() -> String {
+        gethostname::gethostname()
+            .to_string_lossy()
+            .trim()
+            .to_owned()
+    }
 }
 
 /// The user this process runs as. Opaque: callers ask it questions and never see what it is made of.
@@ -50,18 +63,14 @@ impl UserId {
     }
 }
 
-/// This user's login name, for what must name the user to the system (`loginctl enable-linger`). `None` when
-/// the system cannot tell. Same code on every OS (`whoami`).
+/// This user's login name; see [`User::name`].
 pub fn name() -> Option<String> {
-    whoami::username().ok()
+    <imp::Id as User>::name()
 }
 
-/// The host name as the operating system reports it, trimmed; empty when it cannot be read.
+/// The host name; see [`User::host_name`].
 pub fn host_name() -> String {
-    gethostname::gethostname()
-        .to_string_lossy()
-        .trim()
-        .to_owned()
+    <imp::Id as User>::host_name()
 }
 
 #[cfg(test)]
