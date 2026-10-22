@@ -1,15 +1,15 @@
 //! What the connector reads of its core: the ready file the core writes once it serves (`D/core/core.json`) and
-//! its health on the private socket, which must name the same launch and process.
+//! its health on its local endpoint, which must name the same launch and process.
 
+use crate::platform::ipc::{self, Endpoint};
 use crate::profile::Profile;
-use crate::secure_fs::{private_file, verify_socket};
+use crate::secure_fs::private_file;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 use tokio::time::{timeout, Duration};
 
 /// `core.json` as the core writes it. A core of another version may add fields: they are ignored, never refused.
@@ -17,32 +17,49 @@ use tokio::time::{timeout, Duration};
 pub struct Ready {
     pub pid: u32,
     pub launch_id: String,
-    pub socket: PathBuf,
+    /// Where the core listens, as an endpoint record (`Endpoint::from_record`). Newer cores write it.
+    pub endpoint: Option<String>,
+    /// The Unix socket path an older core writes (and newer ones still do on Unix, deprecated): what is read when
+    /// there is no `endpoint`.
+    pub socket: Option<String>,
     pub connector_id: String,
     pub token: String,
     /// The link protocols this core speaks; a number this connector does not know is only not one it speaks.
     pub connector_protocols: Option<Vec<u64>>,
 }
 
-/// The ready file at `path`, when it is this user's private file naming a launch on `socket`.
-pub fn read(path: &Path, socket: &Path) -> Result<Ready> {
+impl Ready {
+    /// The core's endpoint: its `endpoint` record, else the `socket` of a core that predates it. The ready file is
+    /// the only source: it is never derived from where the core was told to put it.
+    pub fn endpoint(&self) -> Result<Endpoint> {
+        let record = self
+            .endpoint
+            .as_deref()
+            .or(self.socket.as_deref())
+            .context("Core ready file names no endpoint")?;
+        Ok(Endpoint::from_record(record)?)
+    }
+}
+
+/// The ready file at `path`, when it is this user's private file naming a launch and an endpoint.
+pub fn read(path: &Path) -> Result<Ready> {
     private_file(path)?;
     let bytes = fs::read(path)?;
     if bytes.len() > 65536 {
         bail!("Core ready file too large");
     }
     let ready: Ready = serde_json::from_slice(&bytes)?;
-    if ready.socket != socket || ready.launch_id.is_empty() || ready.pid == 0 {
+    if ready.launch_id.is_empty() || ready.pid == 0 {
         bail!("Core ready identity mismatch");
     }
+    ready.endpoint()?;
     Ok(ready)
 }
 
-/// `GET /api/local/health` on the core's private socket, within `limit`: the body of its 200.
-pub async fn health(socket: &Path, limit: Duration) -> Result<Value> {
-    verify_socket(socket)?;
+/// `GET /api/local/health` on the core's local endpoint, within `limit`: the body of its 200.
+pub async fn health(endpoint: &Endpoint, limit: Duration) -> Result<Value> {
     let ask = async {
-        let mut stream = UnixStream::connect(socket).await?;
+        let mut stream = ipc::connect(endpoint).await?;
         stream
             .write_all(
                 b"GET /api/local/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
@@ -79,18 +96,17 @@ impl Profile {
     }
 
     pub fn read_ready(&self) -> Result<Ready> {
-        let ready = read(&self.core_ready, &self.core_socket)?;
+        let ready = read(&self.core_ready)?;
         require_v3(&ready)?;
-        verify_socket(&ready.socket)?;
         Ok(ready)
     }
 
     pub async fn health_ready(&self, ready: &Ready) -> Result<Value> {
-        if ready.socket != self.core_socket || ready.launch_id.is_empty() || ready.pid == 0 {
+        if ready.launch_id.is_empty() || ready.pid == 0 {
             bail!("Core ready identity mismatch");
         }
         require_v3(ready)?;
-        let health = health(&ready.socket, Duration::from_secs(2)).await?;
+        let health = health(&ready.endpoint()?, Duration::from_secs(2)).await?;
         if health.get("launch_id").and_then(Value::as_str) != Some(&ready.launch_id)
             || health.get("pid").and_then(Value::as_u64) != Some(ready.pid as u64)
         {
@@ -123,9 +139,31 @@ mod tests {
             "token":"t","connector_protocols":[3, 4, 1000],"future_field":{"nested":[1, 2]},"listen":"x"});
         std::fs::write(&path, serde_json::to_vec(&ready).unwrap()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let read = read(&path, &socket).unwrap();
+        let read = read(&path).unwrap();
         assert_eq!((read.pid, read.launch_id.as_str()), (42, "launch-1"));
         assert_eq!(read.connector_protocols, Some(vec![3, 4, 1000]));
         require_v3(&read).unwrap();
+    }
+
+    /// `endpoint` is what a newer core publishes; the `socket` of an older one is read when there is none.
+    #[test]
+    fn the_endpoint_is_read_from_the_ready_file_and_falls_back_to_the_socket() {
+        let ready = |extra: serde_json::Value| -> super::Ready {
+            let mut file =
+                serde_json::json!({"pid":1,"launch_id":"l","connector_id":"c","token":"t"});
+            file.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(file).unwrap()
+        };
+        let both =
+            ready(serde_json::json!({"endpoint":"/d/core/new.sock","socket":"/d/core/old.sock"}));
+        assert_eq!(both.endpoint().unwrap().record(), "/d/core/new.sock");
+        let old = ready(serde_json::json!({"socket":"/d/core/old.sock"}));
+        assert_eq!(old.endpoint().unwrap().record(), "/d/core/old.sock");
+        assert!(ready(serde_json::json!({})).endpoint().is_err());
+        assert!(ready(serde_json::json!({"endpoint":"relative"}))
+            .endpoint()
+            .is_err());
     }
 }

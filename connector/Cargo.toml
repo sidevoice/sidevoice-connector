@@ -21,6 +21,7 @@ fs2 = "0.4"
 futures-util = "0.3"
 gethostname = "1"
 hex = "0.4"
+interprocess = { version = "2.4", features = ["tokio"] }
 libc = "0.2"
 qrcodegen = "1.8"
 rmcp = { version = "3.5.1", features = ["server", "transport-io", "schemars"] }
@@ -42,8 +43,9 @@ rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
 
-# Windows: this process's user and file owners (src/platform/user). Minimal features; the version the lock already has.
+# Windows: this process's user and file owners (src/platform/user); the pipe's security descriptor (src/platform/ipc). Minimal features; the version the lock already has.
 [target.'cfg(windows)'.dependencies]
+widestring = "1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

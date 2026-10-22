@@ -42,6 +42,12 @@ impl UserId {
         self.0.owns_file(file)
     }
 
+    /// The user's SID in its string form. Windows-only: it names the user where Unix would use the uid.
+    #[cfg(windows)]
+    pub fn sid_string(&self) -> String {
+        self.0.sid_string()
+    }
+
     /// Whether this user owns the file `metadata` describes. Unix-only: `Metadata` carries no owner on Windows, so
     /// host-agnostic callers use [`UserId::owns_path`] or [`UserId::owns_file`].
     #[cfg(unix)]
@@ -55,6 +61,13 @@ impl UserId {
     pub(crate) fn raw(&self) -> u32 {
         self.0.raw()
     }
+}
+
+/// The user the process `pid` runs as. Windows-only (Unix reads the peer's uid from the socket itself); fails
+/// when the process is gone or its token is not readable.
+#[cfg(windows)]
+pub fn of_process(pid: u32) -> io::Result<UserId> {
+    imp::of_process(pid).map(UserId)
 }
 
 /// This user's login name, for what must name the user to the system (`loginctl enable-linger`). `None` where

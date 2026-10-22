@@ -1,6 +1,7 @@
 use crate::adapters::{Conversation, Registry, Reporter, Route};
 use crate::agents::HostAgents;
 use crate::link::{Incoming, Link};
+use crate::platform::ipc::Stream;
 use crate::profile::Profile;
 use crate::secure_fs::atomic_json;
 use anyhow::{bail, Context, Result};
@@ -12,7 +13,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::Duration;
 use tokio::time::Instant;
@@ -1604,11 +1604,11 @@ impl Daemon {
             .await;
     }
 
-    async fn serve_client(self: Arc<Self>, stream: UnixStream) -> Result<()> {
+    async fn serve_client(self: Arc<Self>, stream: Stream) -> Result<()> {
         let owner = self.owner_serial.fetch_add(1, Ordering::Relaxed);
         let mut active = false;
         let mut shutdown = self.shutdown.subscribe();
-        let (read, mut write) = stream.into_split();
+        let (read, mut write) = tokio::io::split(stream);
         let mut reader = BufReader::new(read);
         let result = async {
             loop {

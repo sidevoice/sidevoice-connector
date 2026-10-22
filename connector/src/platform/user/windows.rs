@@ -13,7 +13,9 @@ use std::path::Path;
 use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE};
-use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT,
+};
 use windows_sys::Win32::Security::{
     EqualSid, GetLengthSid, GetTokenInformation, TokenOwner, TokenUser, OWNER_SECURITY_INFORMATION,
     PSID, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER,
@@ -21,7 +23,9 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, READ_CONTROL,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 /// An owned SID. A SID is a DWORD-aligned structure: the words keep that alignment.
 #[derive(Clone, Debug)]
@@ -117,13 +121,44 @@ impl Eq for Id {}
 
 /// The user of this process: the SIDs in its token.
 pub(super) fn current() -> Id {
-    read_token().expect("the process token is readable")
+    // SAFETY: the pseudo-handle of the current process is always valid and needs no closing.
+    read_token(unsafe { GetCurrentProcess() }).expect("the process token is readable")
 }
 
-fn read_token() -> io::Result<Id> {
+/// The user of the process `pid`. Fails when the process is gone or its token cannot be opened.
+pub(super) fn of_process(pid: u32) -> io::Result<Id> {
+    // SAFETY: the handle is closed below, after the token has been read.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let id = read_token(process);
+    unsafe { CloseHandle(process) };
+    id
+}
+
+impl Id {
+    /// The user's SID in its string form (`S-1-5-21-...`), for what names the user in text.
+    pub(super) fn sid_string(&self) -> String {
+        let mut text: *mut u16 = null_mut();
+        // SAFETY: the SID is a copy of a valid one; on success `text` is a NUL-terminated string released below.
+        unsafe {
+            assert!(ConvertSidToStringSidW(self.user.as_psid(), &mut text) != 0);
+            let mut len = 0;
+            while *text.add(len) != 0 {
+                len += 1;
+            }
+            let string = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+            LocalFree(text as *mut _);
+            string
+        }
+    }
+}
+
+fn read_token(process: HANDLE) -> io::Result<Id> {
     let mut token: HANDLE = null_mut();
-    // SAFETY: the pseudo-handle of the current process needs no closing; the token is closed below.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+    // SAFETY: the caller's process handle is valid for the call; the token is closed below.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
     }
     let sids =
@@ -171,6 +206,13 @@ pub(super) fn name() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn this_process_is_this_user_and_its_sid_has_the_string_form() {
+        let me = current();
+        assert_eq!(of_process(std::process::id()).unwrap(), me);
+        assert!(me.sid_string().starts_with("S-1-"));
+    }
 
     #[test]
     fn current_is_a_valid_sid() {

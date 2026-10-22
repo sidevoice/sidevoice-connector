@@ -3,9 +3,9 @@
 //!
 //! - `D`, the data directory: `$SIDEVOICE_DATA_DIR`, else `~/.sidevoice`. Private (0700). The connector is the
 //!   one writer of its records there, each written whole (`secure_fs.rs`); `D/core/` is the core's.
-//!   `connector.sock`, `connector.lock`, `connector.log`, `agents.json`, `agents.lock`, `install.lock`,
+//!   the connector's endpoint (`connector.sock` on Unix), `connector.lock`, `connector.log`, `agents.json`, `agents.lock`, `install.lock`,
 //!   `node-stopped.json` (a person's stop), `outbox.json`, `core/core.json`
-//!   and `core/local.sock`.
+//!   and the core's endpoint, which its ready file names.
 //! - `R`, the release root: `$XDG_DATA_HOME/sidevoice` (else `~/.local/share/sidevoice`), as `service/layout.rs` names it.
 //! - The agents' homes, each named by a variable its harness declares ([`AgentHome`]): the variable's value, else
 //!   its default below `HOME` (or below another home of the same agent). A home that is not always passed on reaches
@@ -15,6 +15,7 @@
 //! Every path is absolute. The directories are checked again at each operation boundary, not trusted from startup:
 //! they are passed to agents' command lines and written into.
 
+use crate::platform::ipc::Endpoint;
 use crate::secure_fs::{private_dir, private_file, validate_user_directory};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -62,8 +63,8 @@ pub struct Profile {
     pub agent_homes: Vec<ResolvedHome>,
     pub xdg_config: PathBuf,
     pub xdg_data: PathBuf,
-    pub socket: PathBuf,
-    pub core_socket: PathBuf,
+    /// The connector daemon's endpoint, for its clients.
+    pub endpoint: Endpoint,
     pub core_ready: PathBuf,
 }
 
@@ -116,8 +117,7 @@ impl Profile {
         let core = data.join("core");
         let profile = Self {
             home,
-            socket: data.join("connector.sock"),
-            core_socket: core.join("local.sock"),
+            endpoint: Endpoint::in_dir(&data, "connector"),
             core_ready: core.join("core.json"),
             data,
             agent_homes,
@@ -400,10 +400,9 @@ mod tests {
         let home = scratch.0.to_string_lossy().into_owned();
         let profile = Profile::from_vars(vars(&[("HOME", &home)]), &HOMES).unwrap();
         assert_eq!(profile.data, scratch.0.join(".sidevoice"));
-        assert_eq!(profile.socket, scratch.0.join(".sidevoice/connector.sock"));
         assert_eq!(
-            profile.core_socket,
-            scratch.0.join(".sidevoice/core/local.sock")
+            profile.endpoint,
+            Endpoint::in_dir(&scratch.0.join(".sidevoice"), "connector")
         );
         assert_eq!(
             profile.core_ready,

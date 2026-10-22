@@ -5,3 +5,13 @@ disallowed-methods = [
     { path = "libc::gethostname", reason = "use platform::user" },
     { path = "libc::getpwuid", reason = "use platform::user" },
 ]
+
+# Local sockets: `platform::ipc` is the only place that opens one (a Unix socket, a named pipe on Windows).
+# The third-party sockets of `adapters/` stay until that block moves (they carry an `#[allow]`).
+disallowed-types = [
+    { path = "tokio::net::UnixListener", reason = "use platform::ipc" },
+    { path = "tokio::net::UnixStream", reason = "use platform::ipc" },
+    { path = "std::os::unix::net::UnixListener", reason = "use platform::ipc" },
+    { path = "std::os::unix::net::UnixStream", reason = "use platform::ipc" },
+    { path = "std::os::unix::net::UnixDatagram", reason = "use platform::ipc" },
+]

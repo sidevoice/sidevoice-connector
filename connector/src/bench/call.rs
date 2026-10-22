@@ -2,6 +2,8 @@
 //! text is voice input (`/api/presentation/select` + `/api/presentation/text`, as the app sends what was said) and
 //! the call's events (receipts, working state, replies) are seen. When the core is not there, the installation's
 //! connector is started, which starts its core, as an agent's MCP server would.
+// The bench is a Unix-only developer binary that does not link the connector's modules; it speaks the core's socket raw.
+#![allow(clippy::disallowed_types)]
 
 use std::collections::VecDeque;
 use std::path::Path;

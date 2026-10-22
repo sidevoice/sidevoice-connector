@@ -23,7 +23,6 @@ use super::{Failure, Result};
 use crate::core_ready::Ready;
 use crate::messages::message;
 use crate::process::{Expected, Lookup};
-use crate::secure_fs::verify_socket;
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::io;
@@ -31,7 +30,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::time::{sleep, timeout, Duration, Instant};
 
@@ -64,10 +62,9 @@ pub async fn request_connector(
     params: Value,
     limit: Duration,
 ) -> std::result::Result<Value, String> {
-    let socket = layout.connector_socket();
-    verify_socket(&socket).map_err(|error| error.to_string())?;
+    let endpoint = layout.connector_endpoint();
     let ask = async {
-        let mut stream = UnixStream::connect(&socket)
+        let mut stream = crate::platform::ipc::connect(&endpoint)
             .await
             .map_err(|error| error.to_string())?;
         let request = json!({"id": 1, "method": method, "params": params});

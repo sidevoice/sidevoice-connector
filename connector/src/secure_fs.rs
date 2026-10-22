@@ -11,7 +11,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 /// A directory of ours: a real directory (not a link), this user's, open to nobody else.
@@ -54,19 +54,6 @@ pub fn validate_user_directory(path: &Path) -> Result<PathBuf> {
         bail!("unsafe user directory {}", path.display());
     }
     path.canonicalize().map_err(Into::into)
-}
-
-/// A socket before anything talks to it: in a private directory, a socket, this user's, open to nobody else.
-pub fn verify_socket(path: &Path) -> Result<()> {
-    private_dir(path.parent().context("socket parent")?)?;
-    let m = fs::symlink_metadata(path)?;
-    if !m.file_type().is_socket()
-        || !crate::platform::user::current().owns(&m)
-        || m.mode() & 0o077 != 0
-    {
-        bail!("unsafe socket {}", path.display());
-    }
-    Ok(())
 }
 
 /// Every ancestor of `path`: this user's or root's, and if others can write into it, sticky (as `/tmp`), so
@@ -311,24 +298,6 @@ pub(crate) mod tests {
         chmod(&scratch.0, 0o755);
         assert!(write_private(&scratch.0.join("other.json"), b"x").is_err());
         chmod(&scratch.0, 0o700);
-    }
-
-    #[test]
-    fn a_socket_is_trusted_only_in_a_private_directory_and_open_to_nobody_else() {
-        let scratch = Scratch::new("sock");
-        let path = scratch.0.join("s.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        chmod(&path, 0o600);
-        verify_socket(&path).unwrap();
-        chmod(&path, 0o666);
-        assert!(verify_socket(&path).is_err());
-        chmod(&path, 0o600);
-        chmod(&scratch.0, 0o755);
-        assert!(verify_socket(&path).is_err());
-        chmod(&scratch.0, 0o700);
-        let file = scratch.0.join("plain");
-        write_private(&file, b"").unwrap();
-        assert!(verify_socket(&file).is_err());
     }
 
     #[test]

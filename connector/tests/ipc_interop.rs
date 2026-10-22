@@ -1,6 +1,8 @@
 //! The IPC over `connector.sock` as a façade of another version speaks it, against the daemon with its real harnesses
 //! (sidevoice/sidevoice-core#112): a route kind this daemon does not know joins the conversation with no route in,
 //! instead of refusing it, and an optional field sent as `null` reads as absent.
+// A façade of another version speaks the wire raw, so it opens the Unix socket itself.
+#![allow(clippy::disallowed_types)]
 
 mod support;
 

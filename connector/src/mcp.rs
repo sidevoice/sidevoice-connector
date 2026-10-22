@@ -1,6 +1,5 @@
 use crate::adapters::{self, Identity, Registry};
 use crate::profile::Profile;
-use crate::secure_fs::verify_socket;
 use anyhow::{bail, Context, Result};
 use rmcp::{
     model::*, service::RequestContext, ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -10,7 +9,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{timeout, timeout_at, Duration, Instant};
 
@@ -78,13 +76,12 @@ impl Ipc {
         if self.tx.lock().await.is_some() {
             return Ok(());
         }
-        verify_socket(&self.profile.socket)?;
         let stream = timeout(
             Duration::from_secs(2),
-            UnixStream::connect(&self.profile.socket),
+            crate::platform::ipc::connect(&self.profile.endpoint),
         )
         .await??;
-        let (read, mut write) = stream.into_split();
+        let (read, mut write) = tokio::io::split(stream);
         let (tx, mut rx) = mpsc::channel::<Value>(64);
         *self.tx.lock().await = Some(tx);
         self.generation.fetch_add(1, Ordering::Relaxed);
