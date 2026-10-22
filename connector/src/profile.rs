@@ -16,6 +16,7 @@
 //! they are passed to agents' command lines and written into.
 
 use crate::platform::fs::{Files, Fs};
+use crate::platform::service::{Manager, ServiceManager};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -197,7 +198,7 @@ impl Profile {
     pub fn validate_service_environment(&self) -> Result<()> {
         let service = std::env::var("SIDEVOICE_SERVICE")
             .context("the service manager is not identified (SIDEVOICE_SERVICE)")?;
-        if !matches!(service.as_str(), "launchd" | "systemd") {
+        if service != ServiceManager::KIND {
             bail!("unsupported service manager {service:?}");
         }
         for (key, expected) in self.variables() {

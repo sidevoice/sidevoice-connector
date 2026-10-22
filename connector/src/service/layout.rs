@@ -178,6 +178,15 @@ impl Layout {
             .collect()
     }
 
+    /// Where the service manager keeps this installation's job definitions.
+    pub fn places(&self) -> crate::platform::service::Places {
+        crate::platform::service::Places {
+            home: self.home.clone(),
+            config_home: self.config_home.clone(),
+            data: self.data.clone(),
+        }
+    }
+
     pub fn current(&self) -> PathBuf {
         self.releases.join("current")
     }

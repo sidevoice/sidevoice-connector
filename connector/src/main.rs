@@ -1,3 +1,4 @@
+use sidevoice_connector::platform::service::{Manager, ServiceManager};
 use sidevoice_connector::{
     adapters, agents, core_package, daemon, identity, install, logfile, mcp, messages, pairing,
     profile, service,
@@ -56,7 +57,7 @@ enum Action {
         #[command(subcommand)]
         action: Option<AgentsAction>,
     },
-    /// Run Sidevoice at login (launchd, systemd --user), or stop, restart or report it.
+    /// Run Sidevoice at login (launchd, systemd --user, Task Scheduler), or stop, restart or report it.
     Service {
         #[command(subcommand)]
         command: ServiceAction,
@@ -69,6 +70,10 @@ enum Action {
     /// The test bench's question about the agents: a JSON request on stdin, the JSON answer on stdout.
     #[command(hide = true)]
     BenchAgents,
+    /// A service job, as its manager runs it where the manager cannot set its environment and output (Task
+    /// Scheduler): the job its definition file describes.
+    #[command(hide = true)]
+    RunJob { definition: std::path::PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -216,6 +221,10 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
         println!("{}", adapters::registration::bench_agents(&request));
         return Ok(ExitCode::SUCCESS);
     }
+    if let Action::RunJob { definition } = &action {
+        let code = ServiceManager::run_job(definition).await?;
+        return Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)));
+    }
     if let Action::StageCore { release } = &action {
         let installed = core_package::install(&core_package::package_root()?, release)?;
         if json {
@@ -275,10 +284,7 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
         Action::Mcp => mcp::run(profile).await.map(|()| ExitCode::SUCCESS),
         Action::Connector { service } => {
             let managed = service
-                || matches!(
-                    std::env::var("SIDEVOICE_SERVICE").as_deref(),
-                    Ok("launchd" | "systemd")
-                );
+                || std::env::var("SIDEVOICE_SERVICE").as_deref() == Ok(ServiceManager::KIND);
             daemon::run(profile, managed)
                 .await
                 .map(|()| ExitCode::SUCCESS)
@@ -296,6 +302,7 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
         Action::Service { .. } => unreachable!("service commands run before the profile"),
         Action::StageCore { .. } => unreachable!("the core is staged before the profile"),
         Action::BenchAgents => unreachable!("the bench is answered before the profile"),
+        Action::RunJob { .. } => unreachable!("a job runs before the profile"),
     }
 }
 

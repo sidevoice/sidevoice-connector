@@ -286,7 +286,7 @@ pub async fn owns_core(layout: &Layout) -> bool {
         && !status::stopped(layout)
         && manager::installed(layout)
             .await
-            .is_none_or(|found| found.core.is_none())
+            .is_none_or(|found| !found.core)
 }
 
 /// The connector's identity on its socket: `{pid, executable, managed}`.
@@ -451,7 +451,7 @@ where
     }
     if manager::installed(layout)
         .await
-        .is_some_and(|found| found.connector.is_some())
+        .is_some_and(|found| found.connector)
     {
         let deadline = Instant::now() + SERVICE_WAIT;
         while Instant::now() < deadline {

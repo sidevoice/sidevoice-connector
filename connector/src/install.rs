@@ -406,7 +406,7 @@ impl Runtime {
                 if kind == Kind::None {
                     crate::service::stop_on_demand_or_fail(layout).await?;
                 } else {
-                    crate::service::define_and_start(layout, kind, true).await?;
+                    crate::service::define_and_start(layout, true).await?;
                 }
                 Ok(kind)
             }
@@ -622,8 +622,11 @@ pub async fn install(
         "command": [stable_command(&layout)], "releases": layout.releases, "pruned": pruned,
         "service": kind.as_str(), "state": state.get("state").cloned().unwrap_or(Value::Null),
         "agents": agents});
-    if kind == Kind::Systemd {
-        answer["linger"] = crate::service::manager::linger().await;
+    if kind == Kind::Manager {
+        let service = crate::service::manager::manager(&layout);
+        if let Some(linger) = crate::service::manager::linger(&service).await {
+            answer["linger"] = linger;
+        }
     }
     answer["advice"] = json!(advice(profile, &answer));
     Ok(answer)
