@@ -186,11 +186,11 @@ mod tests {
     #[tokio::test]
     async fn whole_messages_cross_the_channel_and_oversized_ones_do_not() {
         use crate::platform::fs::{Files, Fs};
-        use crate::platform::ipc::{Channel, Channels};
+        use crate::platform::ipc::{Channel, Channels, Endpoint};
         let scratch = crate::test_support::temp_dir("frame");
         let dir = scratch.path().join("private");
         Files::create_private_dir(&dir).unwrap();
-        let endpoint = Channels::endpoint(&dir, "frame");
+        let endpoint = Endpoint::new(&dir, "frame");
         let listener = Channels::listen(&endpoint).unwrap();
         let server = tokio::spawn(async move {
             let mut connection = Connection::new(listener.accept().await.unwrap());

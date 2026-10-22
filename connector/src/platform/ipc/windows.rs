@@ -24,11 +24,10 @@ const OWNER_ONLY: &str = "D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)";
 #[derive(Clone, Debug, PartialEq)]
 pub struct Endpoint(String);
 
-/// Windows side of [`super::Channel`].
-pub struct Os;
-
-impl super::Channel for Os {
-    fn endpoint(dir: &Path, name: &str) -> Endpoint {
+impl Endpoint {
+    /// Our own endpoint called `name` for the data directory `dir`: the pipe
+    /// `\\.\pipe\sidevoice-<hash of (user, dir)>-<name>`, so two profiles or two users never meet on one name.
+    pub fn new(dir: &Path, name: &str) -> Endpoint {
         let mut hash = Sha256::new();
         hash.update(UserId::name().unwrap_or_default().to_lowercase().as_bytes());
         hash.update([0]);
@@ -38,8 +37,13 @@ impl super::Channel for Os {
             hex::encode(&hash.finalize()[..8])
         ))
     }
+}
 
-    fn parse(record: &str) -> io::Result<Endpoint> {
+/// An endpoint another process published: a full pipe name, `\\.\pipe\...`; anything else is refused.
+impl std::str::FromStr for Endpoint {
+    type Err = io::Error;
+
+    fn from_str(record: &str) -> io::Result<Endpoint> {
         if record.len() <= PREFIX.len() || !record.starts_with(PREFIX) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -48,7 +52,12 @@ impl super::Channel for Os {
         }
         Ok(Endpoint(record.to_owned()))
     }
+}
 
+/// Windows side of [`super::Channel`].
+pub struct Os;
+
+impl super::Channel for Os {
     fn listen(endpoint: &Endpoint) -> io::Result<Listener> {
         let descriptor = widestring::U16CString::from_str(OWNER_ONLY).map_err(io::Error::other)?;
         ListenerOptions::new()

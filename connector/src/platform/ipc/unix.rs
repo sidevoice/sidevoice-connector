@@ -17,15 +17,18 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, PartialEq)]
 pub struct Endpoint(PathBuf);
 
-/// Unix side of [`super::Channel`].
-pub struct Os;
-
-impl super::Channel for Os {
-    fn endpoint(dir: &Path, name: &str) -> Endpoint {
+impl Endpoint {
+    /// Our own endpoint called `name` for the data directory `dir`: the socket `dir/<name>.sock`.
+    pub fn new(dir: &Path, name: &str) -> Endpoint {
         Endpoint(dir.join(format!("{name}.sock")))
     }
+}
 
-    fn parse(record: &str) -> io::Result<Endpoint> {
+/// An endpoint another process published: an absolute socket path; anything else is refused.
+impl std::str::FromStr for Endpoint {
+    type Err = io::Error;
+
+    fn from_str(record: &str) -> io::Result<Endpoint> {
         let path = PathBuf::from(record);
         if !path.is_absolute() {
             return Err(io::Error::new(
@@ -35,7 +38,12 @@ impl super::Channel for Os {
         }
         Ok(Endpoint(path))
     }
+}
 
+/// Unix side of [`super::Channel`].
+pub struct Os;
+
+impl super::Channel for Os {
     fn listen(endpoint: &Endpoint) -> io::Result<Listener> {
         // A socket left by a dead process is replaced, once it is known to be ours and private.
         if endpoint.0.exists() {
@@ -127,7 +135,7 @@ mod tests {
     #[tokio::test]
     async fn a_socket_is_trusted_only_in_a_private_directory_and_open_to_nobody_else() {
         let (_scratch, dir) = private_dir("sock");
-        let endpoint = Os::endpoint(&dir, "s");
+        let endpoint = Endpoint::new(&dir, "s");
         let _listener = Os::listen(&endpoint).unwrap();
         Os::connect(&endpoint).await.unwrap();
         chmod(&endpoint.0, 0o666);
@@ -136,7 +144,7 @@ mod tests {
         chmod(&dir, 0o755);
         assert!(Os::connect(&endpoint).await.is_err());
         chmod(&dir, 0o700);
-        let file = Os::endpoint(&dir, "plain");
+        let file = Endpoint::new(&dir, "plain");
         Files::write_private(&file.0, b"").unwrap();
         assert!(Os::connect(&file).await.is_err());
     }
@@ -144,7 +152,7 @@ mod tests {
     #[tokio::test]
     async fn a_stale_socket_is_replaced_but_a_file_that_is_not_one_is_not() {
         let (_scratch, dir) = private_dir("stale");
-        let endpoint = Os::endpoint(&dir, "t");
+        let endpoint = Endpoint::new(&dir, "t");
         // Left behind by a process that died: the file stays, nothing listens. (A listener whose file is not
         // reclaimed on drop leaves exactly that.)
         let mut dead = Os::listen(&endpoint).unwrap();

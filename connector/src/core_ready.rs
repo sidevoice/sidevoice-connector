@@ -17,7 +17,7 @@ use tokio::time::{timeout, Duration};
 pub struct Ready {
     pub pid: u32,
     pub launch_id: String,
-    /// Where the core listens, as an endpoint record (`Channel::parse`). Newer cores write it.
+    /// Where the core listens, as an endpoint record (`Endpoint`'s `FromStr`). Newer cores write it.
     pub endpoint: Option<String>,
     /// The Unix socket path an older core writes (and newer ones still do on Unix, deprecated): what is read when
     /// there is no `endpoint`.
@@ -37,7 +37,7 @@ impl Ready {
             .as_deref()
             .or(self.socket.as_deref())
             .context("Core ready file names no endpoint")?;
-        Ok(Channels::parse(record)?)
+        Ok(record.parse::<Endpoint>()?)
     }
 }
 
@@ -126,7 +126,7 @@ impl Profile {
 #[cfg(test)]
 mod tests {
     use super::{read, require_v3};
-    use crate::platform::ipc::{Channel, Channels};
+    use crate::platform::ipc::Endpoint;
     use std::os::unix::fs::PermissionsExt;
 
     /// A newer core's ready file: fields this connector does not know, at the top and nested, and a protocol
@@ -159,8 +159,8 @@ mod tests {
         };
         let dir = std::env::temp_dir();
         let (new, old) = (
-            Channels::endpoint(&dir, "new").to_string(),
-            Channels::endpoint(&dir, "old").to_string(),
+            Endpoint::new(&dir, "new").to_string(),
+            Endpoint::new(&dir, "old").to_string(),
         );
         let both = ready(serde_json::json!({"endpoint": new, "socket": old}));
         assert_eq!(both.endpoint().unwrap().to_string(), new);

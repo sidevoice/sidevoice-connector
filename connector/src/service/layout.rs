@@ -16,7 +16,7 @@
 //! The release layout below `R/current` is the installer's; it is named here once (`CORE_ENTRYPOINT`).
 
 use crate::platform::fs::{Files, Fs};
-use crate::platform::ipc::{Channel, Channels, Endpoint};
+use crate::platform::ipc::Endpoint;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -217,7 +217,7 @@ impl Layout {
     }
 
     pub fn connector_endpoint(&self) -> Endpoint {
-        Channels::endpoint(&self.data, "connector")
+        Endpoint::new(&self.data, "connector")
     }
 
     pub fn connector_lock(&self) -> PathBuf {
