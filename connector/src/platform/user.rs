@@ -24,13 +24,10 @@ trait User: Sized {
     fn owns_path(&self, path: &Path) -> io::Result<bool>;
     /// Whether this user owns the file behind an open handle.
     fn owns_file(&self, file: &File) -> io::Result<bool>;
-    /// The login name, for what must name the user to the system; `None` where there is none.
-    fn name() -> Option<String>;
 }
 
 /// The user this process runs as. Opaque: callers ask it questions and never see what it is made of.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(unix, derive(Copy))]
+#[derive(Debug)]
 pub struct UserId(imp::Id);
 
 /// The user this process runs as (Unix: the effective uid; Windows: the SID in its token).
@@ -51,12 +48,6 @@ impl UserId {
     pub fn owns_file(&self, file: &File) -> io::Result<bool> {
         self.0.owns_file(file)
     }
-}
-
-/// This user's login name, for what must name the user to the system (`loginctl enable-linger`). `None` where
-/// the system has no name for it, and always on Windows, which names users by SID.
-pub fn name() -> Option<String> {
-    <imp::Id as User>::name()
 }
 
 /// The host name as the operating system reports it, trimmed; empty when it cannot be read.
@@ -86,11 +77,6 @@ mod tests {
         let missing =
             std::env::temp_dir().join(format!("sv-platform-missing-{}", std::process::id()));
         assert!(current().owns_path(&missing).is_err());
-    }
-
-    #[test]
-    fn current_is_stable() {
-        assert_eq!(current(), current());
     }
 
     #[test]

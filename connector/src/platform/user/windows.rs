@@ -25,7 +25,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// An owned SID. A SID is a DWORD-aligned structure: the words keep that alignment.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Sid {
     words: Vec<u32>,
 }
@@ -52,20 +52,12 @@ impl Sid {
     }
 }
 
-impl PartialEq for Sid {
-    fn eq(&self, other: &Self) -> bool {
-        self.is(other.as_psid())
-    }
-}
-
-impl Eq for Sid {}
-
 /// Windows side of [`super::UserId`]: the user as owned SIDs.
 ///
 /// Two SIDs, because Windows gives a file two candidate owners: the user, and the token's default owner, which is
 /// what files this process creates get. For a normal token they are the same; for an elevated administrator the
-/// default owner is the Administrators group, and what it creates is its own. Identity (`==`) is the user alone.
-#[derive(Clone, Debug)]
+/// default owner is the Administrators group, and what it creates is its own.
+#[derive(Debug)]
 pub(super) struct Id {
     user: Sid,
     default_owner: Sid,
@@ -74,11 +66,6 @@ pub(super) struct Id {
 impl super::User for Id {
     fn current() -> Id {
         read_token().expect("the process token is readable")
-    }
-
-    /// Windows names the user to the system by SID; there is no login name any caller needs.
-    fn name() -> Option<String> {
-        None
     }
 
     // A symlink or junction is judged itself (`OPEN_REPARSE_POINT`).
@@ -116,14 +103,6 @@ impl super::User for Id {
         Ok(mine)
     }
 }
-
-impl PartialEq for Id {
-    fn eq(&self, other: &Self) -> bool {
-        self.user == other.user
-    }
-}
-
-impl Eq for Id {}
 
 fn read_token() -> io::Result<Id> {
     let mut token: HANDLE = null_mut();
@@ -178,21 +157,19 @@ mod tests {
         // SAFETY: the SID is one this module copied from a valid one.
         let len = unsafe { GetLengthSid(me.user.as_psid()) };
         assert!(len >= 8, "a SID is at least 8 bytes, got {len}");
-        assert_eq!(me, me.clone());
     }
 
     #[test]
     fn does_not_own_what_another_sid_owns() {
         // Local System, S-1-5-18: revision 1, one sub-authority, NT authority, 18. Neither a user nor an
         // administrator's default owner, so nothing a test creates is its.
-        let system = Sid {
+        let system = || Sid {
             words: vec![0x0000_0101, 0x0500_0000, 0x0000_0012],
         };
         let stranger = Id {
-            user: system.clone(),
-            default_owner: system,
+            user: system(),
+            default_owner: system(),
         };
-        assert_ne!(Id::current(), stranger);
         let dir =
             std::env::temp_dir().join(format!("sv-platform-user-win-other-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
