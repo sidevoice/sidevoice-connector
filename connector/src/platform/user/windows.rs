@@ -5,7 +5,6 @@
 //! names, not the SID; `windows-acl` and `sid` are unmaintained or bring the whole ACL model) do not cover "this
 //! process's SID" plus "owner of this file" together, and the surface needed is a handful of calls.
 
-use super::User as _;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::fs::OpenOptionsExt;
