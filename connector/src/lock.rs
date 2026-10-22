@@ -52,7 +52,10 @@ fn contended(error: &std::io::Error) -> bool {
 /// file of this user's, open to nobody else.
 fn validate_inode(file: &File, label: &str) -> Result<()> {
     let m = file.metadata()?;
-    if !m.is_file() || m.uid() != crate::secure_fs::uid() || m.mode() & 0o077 != 0 || m.nlink() != 1
+    if !m.is_file()
+        || !crate::platform::user::current().owns(&m)
+        || m.mode() & 0o077 != 0
+        || m.nlink() != 1
     {
         bail!("unsafe lock file {label}");
     }

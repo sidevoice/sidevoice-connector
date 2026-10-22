@@ -1,0 +1,7 @@
+# What only `platform` may call (connector/src/platform): the OS goes through one module per crate.
+disallowed-methods = [
+    { path = "libc::geteuid", reason = "use platform::user" },
+    { path = "libc::getuid", reason = "use platform::user" },
+    { path = "libc::gethostname", reason = "use platform::user" },
+    { path = "libc::getpwuid", reason = "use platform::user" },
+]

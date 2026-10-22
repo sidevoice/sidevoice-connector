@@ -117,7 +117,8 @@ fn is_our_core(layout: &Layout, command_line: &str) -> bool {
 pub fn core_running(layout: &Layout, pid: u32) -> bool {
     match crate::process::lookup(pid) {
         Lookup::Alive(found) => {
-            found.uid == crate::secure_fs::uid() && is_our_core(layout, &found.command)
+            found.uid == crate::platform::user::current().raw()
+                && is_our_core(layout, &found.command)
         }
         _ => false,
     }

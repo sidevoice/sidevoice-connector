@@ -1091,7 +1091,7 @@ fn private_state_file(path: &Path) -> std::result::Result<(), Failure> {
     let metadata = fs::symlink_metadata(path).map_err(|_| Failure::Internal)?;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != unsafe { libc::geteuid() }
+        || !crate::platform::user::current().owns(&metadata)
         || metadata.mode() & 0o077 != 0
     {
         return Err(Failure::Internal);

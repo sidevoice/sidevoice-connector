@@ -427,7 +427,7 @@ fn definition_directory(dir: &Path) -> Result<()> {
         Err(error) => Err(Failure::plain(error)),
         Ok(metadata) => {
             if !metadata.is_dir()
-                || metadata.uid() != unsafe { libc::geteuid() }
+                || !crate::platform::user::current().owns(&metadata)
                 || metadata.mode() & 0o022 != 0
             {
                 return Err(unsafe_definition(dir.to_string_lossy()));
@@ -444,7 +444,7 @@ pub fn existing(file: &Path) -> Result<bool> {
         Err(error) => Err(Failure::plain(error)),
         Ok(metadata) => {
             if !metadata.is_file()
-                || metadata.uid() != unsafe { libc::geteuid() }
+                || !crate::platform::user::current().owns(&metadata)
                 || metadata.len() > 128 * 1024
             {
                 return Err(unsafe_definition(file.to_string_lossy()));

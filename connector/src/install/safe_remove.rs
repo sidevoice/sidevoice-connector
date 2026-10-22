@@ -260,7 +260,7 @@ impl Guard {
         self.check_mount(data.as_raw_fd())?;
         self.verify_dir(Path::new(".sidevoice"), data.as_raw_fd())?;
         let stat = stat_fd(data.as_raw_fd())?;
-        if stat.st_uid != crate::secure_fs::uid() || stat.st_mode & 0o077 != 0 {
+        if stat.st_uid != crate::platform::user::current().raw() || stat.st_mode & 0o077 != 0 {
             return Err("unsafe uninstall data root");
         }
         Ok(data)
@@ -308,7 +308,7 @@ impl Guard {
         let child = open_dir(parent, OsStr::new(child))?;
         self.check_mount(child.as_raw_fd())?;
         let stat = stat_fd(child.as_raw_fd())?;
-        if stat.st_uid != crate::secure_fs::uid() || stat.st_mode & 0o777 != 0o700 {
+        if stat.st_uid != crate::platform::user::current().raw() || stat.st_mode & 0o777 != 0o700 {
             return Err("unsafe uninstall claim directory");
         }
         Ok(child)
@@ -349,7 +349,7 @@ impl Guard {
             let file = unsafe { File::from_raw_fd(fd) };
             let stat = stat_fd(file.as_raw_fd())?;
             if stat.st_mode & libc::S_IFMT != libc::S_IFREG
-                || stat.st_uid != crate::secure_fs::uid()
+                || stat.st_uid != crate::platform::user::current().raw()
                 || stat.st_nlink != 1
                 || stat.st_mode & 0o022 != 0
                 || stat.st_mode & 0o100 == 0

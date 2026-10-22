@@ -11,6 +11,7 @@ mod logfile;
 mod mcp;
 mod messages;
 mod pairing;
+mod platform;
 mod process;
 mod profile;
 mod secure_fs;

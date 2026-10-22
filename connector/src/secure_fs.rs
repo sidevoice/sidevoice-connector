@@ -14,15 +14,15 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-pub fn uid() -> u32 {
-    unsafe { libc::geteuid() }
-}
-
 /// A directory of ours: a real directory (not a link), this user's, open to nobody else.
 pub fn private_dir(path: &Path) -> Result<()> {
     let m = fs::symlink_metadata(path)
         .with_context(|| format!("missing private directory {}", path.display()))?;
-    if !m.is_dir() || m.file_type().is_symlink() || m.uid() != uid() || m.mode() & 0o077 != 0 {
+    if !m.is_dir()
+        || m.file_type().is_symlink()
+        || !crate::platform::user::current().owns(&m)
+        || m.mode() & 0o077 != 0
+    {
         bail!("unsafe private directory {}", path.display());
     }
     Ok(())
@@ -31,7 +31,11 @@ pub fn private_dir(path: &Path) -> Result<()> {
 /// A record of ours: a regular file (not a link), this user's, open to nobody else.
 pub fn private_file(path: &Path) -> Result<()> {
     let m = fs::symlink_metadata(path)?;
-    if !m.is_file() || m.file_type().is_symlink() || m.uid() != uid() || m.mode() & 0o077 != 0 {
+    if !m.is_file()
+        || m.file_type().is_symlink()
+        || !crate::platform::user::current().owns(&m)
+        || m.mode() & 0o077 != 0
+    {
         bail!("unsafe private file {}", path.display());
     }
     Ok(())
@@ -44,7 +48,7 @@ pub fn validate_user_directory(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("missing user directory {}", path.display()))?;
     if !metadata.is_dir()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != uid()
+        || !crate::platform::user::current().owns(&metadata)
         || metadata.mode() & 0o022 != 0
     {
         bail!("unsafe user directory {}", path.display());
@@ -56,7 +60,10 @@ pub fn validate_user_directory(path: &Path) -> Result<PathBuf> {
 pub fn verify_socket(path: &Path) -> Result<()> {
     private_dir(path.parent().context("socket parent")?)?;
     let m = fs::symlink_metadata(path)?;
-    if !m.file_type().is_socket() || m.uid() != uid() || m.mode() & 0o077 != 0 {
+    if !m.file_type().is_socket()
+        || !crate::platform::user::current().owns(&m)
+        || m.mode() & 0o077 != 0
+    {
         bail!("unsafe socket {}", path.display());
     }
     Ok(())
@@ -71,7 +78,7 @@ pub fn verify_ancestors(path: &Path) -> Result<()> {
             break;
         }
         let m = fs::symlink_metadata(dir).with_context(|| format!("missing {}", dir.display()))?;
-        let owner = m.uid() == uid() || m.uid() == 0;
+        let owner = crate::platform::user::current().owns(&m) || m.uid() == 0;
         let replaceable = m.mode() & 0o022 != 0 && m.mode() & 0o1000 == 0;
         if !owner || replaceable {
             bail!(
@@ -125,7 +132,7 @@ pub fn read_trusted(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
         Err(error) => return Err(error.into()),
     };
     let m = file.metadata()?;
-    if !m.is_file() || m.uid() != uid() || m.mode() & 0o022 != 0 {
+    if !m.is_file() || !crate::platform::user::current().owns(&m) || m.mode() & 0o022 != 0 {
         bail!("unsafe file {}", path.display());
     }
     if m.len() > limit {
@@ -192,7 +199,7 @@ pub fn safe_executable(path: &Path) -> Result<fs::Metadata> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
-        || metadata.uid() != uid()
+        || !crate::platform::user::current().owns(&metadata)
         || metadata.mode() & 0o022 != 0
         || metadata.mode() & 0o111 == 0
     {

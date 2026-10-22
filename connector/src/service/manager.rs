@@ -211,7 +211,7 @@ async fn systemd_run(args: Vec<String>) -> Output {
 }
 
 fn domain() -> String {
-    format!("gui/{}", unsafe { libc::geteuid() })
+    format!("gui/{}", crate::platform::user::current().raw())
 }
 
 fn target(job: Job) -> String {
@@ -969,7 +969,7 @@ pub async fn linger() -> serde_json::Value {
     let user = std::env::var("USER")
         .ok()
         .filter(|user| !user.is_empty())
-        .or_else(user_name)
+        .or_else(crate::platform::user::name)
         .unwrap_or_default();
     let shown = manage("loginctl", &["show-user", &user, "-p", "Linger"]).await;
     let enabled = shown.output.lines().any(|line| line.trim() == "Linger=yes");
@@ -979,15 +979,6 @@ pub async fn linger() -> serde_json::Value {
     }
     json!({"enabled": enabled, "command": command,
         "reason": crate::messages::message("service.linger-reason", &serde_json::Value::Null)})
-}
-
-fn user_name() -> Option<String> {
-    let entry = unsafe { libc::getpwuid(libc::geteuid()) };
-    if entry.is_null() {
-        return None;
-    }
-    let name = unsafe { std::ffi::CStr::from_ptr((*entry).pw_name) };
-    name.to_str().ok().map(str::to_owned)
 }
 
 #[cfg(test)]
