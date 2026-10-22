@@ -20,10 +20,10 @@ clap = { version = "4.5", features = ["derive"] }
 fs2 = "0.4"
 futures-util = "0.3"
 gethostname = "1"
+whoami = "2"
 hex = "0.4"
 libc = "0.2"
 qrcodegen = "1.8"
-rustix = { version = "1", features = ["process"] }
 rmcp = { version = "3.5.1", features = ["server", "transport-io", "schemars"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
@@ -38,3 +38,17 @@ uuid = { version = "1", features = ["v4"] }
 which = "=8.0.6"
 zstd = "0.13"
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
+
+# Unix: the effective uid (src/platform/user), with no `unsafe` of ours.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
+# Windows: this process's user and file owners (src/platform/user). Minimal features; the version the lock already has.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+] }
