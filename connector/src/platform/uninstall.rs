@@ -386,7 +386,22 @@ mod tests {
                     symlink(&target, &victim);
                 }
             };
-            let _ = removal.remove_data_contents(&hook);
+            let first = removal.remove_data_contents(&hook);
+            assert!(
+                done.load(Ordering::SeqCst),
+                "{swapped:?}: the hook never ran"
+            );
+            if moved.exists() {
+                assert!(
+                    first.is_err(),
+                    "{swapped:?}: a swap the OS allowed must be refused"
+                );
+            } else {
+                assert!(
+                    first.is_ok(),
+                    "{swapped:?}: the OS held the directory, so the removal completes"
+                );
+            }
             let _ = removal.remove_releases();
             let _ = removal.finish_claim();
             for kept in ["keep", ".sidevoice/keep", ".local/share/sidevoice/keep"] {

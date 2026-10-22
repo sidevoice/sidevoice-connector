@@ -190,6 +190,8 @@ pub struct Os {
     roots: Roots,
     home: OwnedFd,
     expected: Mount,
+    /// `D` as opened for the first lock; the same descriptor serves every lock of this removal.
+    lock_data: std::sync::OnceLock<OwnedFd>,
 }
 
 impl Os {
@@ -201,7 +203,10 @@ impl Os {
         }
     }
 
-    fn data_for_lock(&self) -> Result<OwnedFd, &'static str> {
+    fn data_for_lock(&self) -> Result<&OwnedFd, &'static str> {
+        if let Some(data) = self.lock_data.get() {
+            return Ok(data);
+        }
         let child = OsStr::new(".sidevoice");
         if !exists_at(self.home.as_raw_fd(), child)? {
             let child_name = name(child)?;
@@ -216,7 +221,7 @@ impl Os {
         if !ours(data.as_raw_fd())? || stat.st_mode & 0o077 != 0 {
             return Err("unsafe uninstall data root");
         }
-        Ok(data)
+        Ok(self.lock_data.get_or_init(|| data))
     }
 
     fn open_relative(&self, path: &Path) -> Result<Option<OwnedFd>, &'static str> {
@@ -502,6 +507,7 @@ impl Removal for Os {
             roots,
             home,
             expected,
+            lock_data: std::sync::OnceLock::new(),
         })
     }
 
