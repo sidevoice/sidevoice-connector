@@ -1236,6 +1236,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
  "toml",
  "ureq",
  "uuid",

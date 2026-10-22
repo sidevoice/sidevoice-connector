@@ -1,6 +1,6 @@
 use crate::adapters::{Conversation, Registry, Reporter, Route};
 use crate::agents::HostAgents;
-use crate::frame::Connection;
+use crate::frame;
 use crate::link::{Incoming, Link};
 use crate::platform::fs::{Files, Fs};
 use crate::platform::ipc::Stream;
@@ -1609,12 +1609,12 @@ impl Daemon {
         let owner = self.owner_serial.fetch_add(1, Ordering::Relaxed);
         let mut active = false;
         let mut shutdown = self.shutdown.subscribe();
-        let mut connection = Connection::new(stream);
+        let mut connection = frame::connection(stream);
         let result = async {
             loop {
                 let request = tokio::select! {
                     _ = shutdown.changed() => break,
-                    request = connection.read() => request?,
+                    request = frame::read(&mut connection) => request?,
                 };
                 let Some(request) = request else {
                     break;
@@ -1635,7 +1635,7 @@ impl Daemon {
                 };
                 let shutdown_after_reply =
                     method == "shutdown" && answer.get("ok") == Some(&json!(true));
-                connection.write(&answer).await?;
+                frame::write(&mut connection, &answer).await?;
                 if shutdown_after_reply {
                     self.shutdown.send_replace(true);
                     break;

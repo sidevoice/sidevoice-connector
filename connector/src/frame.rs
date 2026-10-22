@@ -1,77 +1,50 @@
 //! Messages over the connector's local channel (`platform::ipc`, the connector's endpoint: an agent's `sidevoice
-//! mcp`, the launcher, health probes): one JSON value per line, at most [`MESSAGE_LIMIT`] bytes. A [`Connection`]
-//! owns that framing, so callers read and write whole messages and never see a line or a limit. Host-agnostic: the
-//! same on every OS, over whatever stream the channel gives. Also how an answer's refusal is read, from any daemon
-//! version.
+//! mcp`, the launcher, health probes): one JSON value per line, at most [`MESSAGE_LIMIT`] bytes, newline included.
+//! The lines are `tokio-util`'s `LinesCodec`; what is ours is one message as JSON ([`read`], [`write`]) and how an
+//! answer's refusal is read, from any daemon version ([`outcome`]). Host-agnostic: the same on every OS.
 
 use crate::platform::ipc::Stream;
 use anyhow::{bail, Result};
+use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
+use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
 /// The largest message, its newline included. A core frame is capped at 1 MiB; rendering complete pull evidence can
 /// expand it before the daemon returns it to MCP, so this hop has a larger bound, and pages are sized below it.
 pub const MESSAGE_LIMIT: usize = 16 << 20;
 
-/// A connection on the local channel, as whole messages.
-pub struct Connection {
-    reader: Reader,
-    writer: Writer,
+/// A connection on the local channel, as lines. `StreamExt::split` gives its two directions for a reading task and a
+/// writing one; [`read`] and [`write`] take either.
+pub type Connection = Framed<Stream, LinesCodec>;
+
+/// `stream` as lines of at most [`MESSAGE_LIMIT`] bytes.
+pub fn connection(stream: Stream) -> Connection {
+    Framed::new(stream, LinesCodec::new_with_max_length(MESSAGE_LIMIT - 1))
 }
 
-impl Connection {
-    pub fn new(stream: Stream) -> Connection {
-        let (read, write) = tokio::io::split(stream);
-        Connection {
-            reader: Reader(BufReader::new(read)),
-            writer: Writer(write),
-        }
-    }
-
-    /// Its two directions, to be used apart (a reading task and a writing one).
-    pub fn split(self) -> (Reader, Writer) {
-        (self.reader, self.writer)
-    }
-
-    /// See [`Reader::read`].
-    pub async fn read(&mut self) -> Result<Option<Value>> {
-        self.reader.read().await
-    }
-
-    /// See [`Writer::write`].
-    pub async fn write(&mut self, message: &Value) -> Result<()> {
-        self.writer.write(message).await
+/// The next message; `None` when the peer closed. A line that is too long or not JSON is an error: the connection
+/// is not to be read further.
+pub async fn read<L>(lines: &mut L) -> Result<Option<Value>>
+where
+    L: futures_util::Stream<Item = Result<String, LinesCodecError>> + Unpin,
+{
+    match lines.next().await {
+        Some(line) => Ok(Some(serde_json::from_str(&line?)?)),
+        None => Ok(None),
     }
 }
 
-/// The receiving direction of a [`Connection`].
-pub struct Reader(BufReader<ReadHalf<Stream>>);
-
-impl Reader {
-    /// The next message; `None` when the peer closed between messages. A message that is too large, cut short or
-    /// not JSON is an error: the connection is not to be read further.
-    pub async fn read(&mut self) -> Result<Option<Value>> {
-        match bounded_line(&mut self.0, MESSAGE_LIMIT).await? {
-            Some(line) => Ok(Some(serde_json::from_str(&line)?)),
-            None => Ok(None),
-        }
+/// Sends one message. One larger than [`MESSAGE_LIMIT`] is refused, not sent: the peer would refuse it.
+pub async fn write<L>(lines: &mut L, message: &Value) -> Result<()>
+where
+    L: Sink<String, Error = LinesCodecError> + Unpin,
+{
+    let line = serde_json::to_string(message)?;
+    if line.len() >= MESSAGE_LIMIT {
+        bail!("IPC frame too large");
     }
-}
-
-/// The sending direction of a [`Connection`].
-pub struct Writer(WriteHalf<Stream>);
-
-impl Writer {
-    /// Sends one message. One larger than [`MESSAGE_LIMIT`] is refused, not sent: the peer would refuse it.
-    pub async fn write(&mut self, message: &Value) -> Result<()> {
-        let mut line = serde_json::to_vec(message)?;
-        line.push(b'\n');
-        if line.len() > MESSAGE_LIMIT {
-            bail!("IPC frame too large");
-        }
-        self.0.write_all(&line).await?;
-        Ok(())
-    }
+    lines.send(line).await?;
+    Ok(())
 }
 
 /// An answer's `result`, or what its refusal says ([`failure`]); `refused` when it says nothing readable.
@@ -80,38 +53,6 @@ pub fn outcome(answer: &Value, refused: &str) -> std::result::Result<Value, Stri
         Ok(answer.get("result").cloned().unwrap_or(Value::Null))
     } else {
         Err(failure(answer, refused))
-    }
-}
-
-/// One line of at most `limit` bytes (its newline included), without the newline; `None` at a clean end. The one
-/// bounded line reader: [`Reader`] uses it, and so does what reads another program's line protocol (an MCP
-/// server's stdout).
-pub async fn bounded_line<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
-    limit: usize,
-) -> Result<Option<String>> {
-    let mut line = Vec::new();
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            if line.is_empty() {
-                return Ok(None);
-            }
-            bail!("truncated IPC frame");
-        }
-        let length = available
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(available.len(), |index| index + 1);
-        if line.len() + length > limit {
-            bail!("IPC frame too large");
-        }
-        line.extend_from_slice(&available[..length]);
-        reader.consume(length);
-        if line.last() == Some(&b'\n') {
-            line.pop();
-            return Ok(Some(String::from_utf8(line)?));
-        }
     }
 }
 
@@ -193,39 +134,57 @@ mod tests {
         let endpoint = Endpoint::new(&dir, "frame");
         let listener = Channels::listen(&endpoint).unwrap();
         let server = tokio::spawn(async move {
-            let mut connection = Connection::new(listener.accept().await.unwrap());
-            while let Some(message) = connection.read().await.unwrap() {
-                connection.write(&message).await.unwrap();
+            let mut lines = connection(listener.accept().await.unwrap());
+            while let Some(message) = read(&mut lines).await.unwrap() {
+                write(&mut lines, &message).await.unwrap();
             }
         });
-        let (mut reader, mut writer) =
-            Connection::new(Channels::connect(&endpoint).await.unwrap()).split();
+        let (mut sink, mut stream) =
+            connection(Channels::connect(&endpoint).await.unwrap()).split();
         for message in [
             json!({"id":1,"method":"status"}),
             json!("line\nbreak"),
             json!([]),
         ] {
-            writer.write(&message).await.unwrap();
-            assert_eq!(reader.read().await.unwrap(), Some(message));
+            write(&mut sink, &message).await.unwrap();
+            assert_eq!(read(&mut stream).await.unwrap(), Some(message));
         }
         let oversized = json!("x".repeat(MESSAGE_LIMIT));
-        assert!(writer.write(&oversized).await.is_err());
+        assert!(write(&mut sink, &oversized).await.is_err());
         // The peer sees the end once the connection is gone (both halves).
-        drop((reader, writer));
+        drop((sink, stream));
         server.await.unwrap();
     }
 
+    /// The wire as before the codec: one compact JSON per line, `\n`-terminated, at most `MESSAGE_LIMIT` bytes with
+    /// the newline; a longer line, or one that is not JSON, is an error.
     #[tokio::test]
-    async fn a_line_beyond_its_limit_or_cut_short_is_an_error() {
-        let mut long = &b"0123456789\n"[..];
-        assert!(bounded_line(&mut long, 10).await.is_err());
-        let mut cut = &b"{\"id\":1"[..];
-        assert!(bounded_line(&mut cut, 100).await.is_err());
-        let mut fine = &b"{}\n"[..];
+    async fn the_wire_is_one_json_per_line_within_the_limit() {
+        use tokio_util::codec::{FramedRead, FramedWrite};
+        let codec = || LinesCodec::new_with_max_length(MESSAGE_LIMIT - 1);
+        let mut sent = FramedWrite::new(Vec::new(), codec());
+        write(&mut sent, &json!({"id":1,"ok":true,"result":{"a":[1,2]}}))
+            .await
+            .unwrap();
         assert_eq!(
-            bounded_line(&mut fine, 3).await.unwrap().as_deref(),
-            Some("{}")
+            sent.get_ref(),
+            b"{\"id\":1,\"ok\":true,\"result\":{\"a\":[1,2]}}\n"
         );
-        assert_eq!(bounded_line(&mut fine, 3).await.unwrap(), None);
+
+        let longest = format!("\"{}\"\n", "x".repeat(MESSAGE_LIMIT - 3));
+        assert_eq!(longest.len(), MESSAGE_LIMIT);
+        let mut lines = FramedRead::new(longest.as_bytes(), codec());
+        assert!(read(&mut lines).await.unwrap().is_some());
+        let over = format!("\"{}\"\n", "x".repeat(MESSAGE_LIMIT - 2));
+        assert!(read(&mut FramedRead::new(over.as_bytes(), codec()))
+            .await
+            .is_err());
+        assert!(read(&mut FramedRead::new(&b"{\"id\":1\n"[..], codec()))
+            .await
+            .is_err());
+        assert!(read(&mut FramedRead::new(&b""[..], codec()))
+            .await
+            .unwrap()
+            .is_none());
     }
 }

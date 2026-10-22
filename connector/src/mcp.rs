@@ -1,8 +1,9 @@
 use crate::adapters::{self, Identity, Registry};
-use crate::frame::Connection;
+use crate::frame;
 use crate::platform::ipc::{Channel, Channels};
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
+use futures_util::StreamExt;
 use rmcp::{
     model::*, service::RequestContext, ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
 };
@@ -83,28 +84,28 @@ impl Ipc {
             Channels::connect(&self.profile.endpoint),
         )
         .await??;
-        let (mut reader, mut writer) = Connection::new(stream).split();
+        let (mut writer, mut reader) = frame::connection(stream).split();
         let (tx, mut rx) = mpsc::channel::<Value>(64);
         *self.tx.lock().await = Some(tx);
         self.generation.fetch_add(1, Ordering::Relaxed);
         let this = self.clone();
         tokio::spawn(async move {
-            while let Some(frame) = rx.recv().await {
-                if writer.write(&frame).await.is_err() {
+            while let Some(message) = rx.recv().await {
+                if frame::write(&mut writer, &message).await.is_err() {
                     break;
                 }
             }
         });
         tokio::spawn(async move {
             loop {
-                let Ok(Some(reply)) = reader.read().await else {
+                let Ok(Some(reply)) = frame::read(&mut reader).await else {
                     break;
                 };
                 let Some(id) = reply.get("id").and_then(Value::as_u64) else {
                     continue;
                 };
                 if let Some(waiting) = this.pending.lock().await.remove(&id) {
-                    let _ = waiting.send(crate::frame::outcome(&reply, "IPC error"));
+                    let _ = waiting.send(frame::outcome(&reply, "IPC error"));
                 }
             }
             *this.tx.lock().await = None;

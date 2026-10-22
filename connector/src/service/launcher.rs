@@ -21,7 +21,7 @@ use super::manager;
 use super::status::{self, read_ready, serving};
 use super::{Failure, Result};
 use crate::core_ready::Ready;
-use crate::frame::Connection;
+use crate::frame;
 use crate::messages::message;
 use crate::platform::fs::{Create, Files, Fs};
 use crate::platform::ipc::{Channel, Channels};
@@ -64,23 +64,25 @@ pub async fn request_connector(
     limit: Duration,
 ) -> std::result::Result<Value, String> {
     let endpoint = layout.connector_endpoint();
-    let ask =
-        async {
-            let mut connection = Connection::new(
-                Channels::connect(&endpoint)
-                    .await
-                    .map_err(|error| error.to_string())?,
-            );
-            connection
-                .write(&json!({"id": 1, "method": method, "params": params}))
+    let ask = async {
+        let mut connection = frame::connection(
+            Channels::connect(&endpoint)
                 .await
-                .map_err(|error| error.to_string())?;
-            let reply =
-                connection.read().await.ok().flatten().ok_or_else(|| {
-                    "the connector closed the request without an answer".to_owned()
-                })?;
-            crate::frame::outcome(&reply, "the connector refused the request")
-        };
+                .map_err(|error| error.to_string())?,
+        );
+        frame::write(
+            &mut connection,
+            &json!({"id": 1, "method": method, "params": params}),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let reply = frame::read(&mut connection)
+            .await
+            .ok()
+            .flatten()
+            .ok_or_else(|| "the connector closed the request without an answer".to_owned())?;
+        frame::outcome(&reply, "the connector refused the request")
+    };
     timeout(limit, ask)
         .await
         .unwrap_or_else(|_| Err(format!("no answer within {} s", limit.as_secs())))
