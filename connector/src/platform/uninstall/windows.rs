@@ -1,24 +1,77 @@
-//! Windows: the standard library's handle-based `remove_dir_all` deletes (it never follows a symbolic link or a
-//! junction, so it removes the link itself and never leaves the volume), behind the claim rename, over directories
-//! that [`platform::fs`](crate::platform::fs) has checked: this user's, open to nobody else, no link on the way.
-//! Every step checks the roots again ([`Roots::validate`]), so a home swapped for a link is refused, not followed.
+//! Windows: every step holds the directories it works in, and every directory above them up to the volume root, for
+//! as long as it runs. Each is opened as itself (`FILE_FLAG_OPEN_REPARSE_POINT`: a link or junction there is opened,
+//! seen and refused, never followed) and without `FILE_SHARE_DELETE`, so while it is held nobody can rename it,
+//! delete it or put a link in its place: the paths the step then uses can only lead through those directories. The
+//! home is compared (volume and file id, `winapi-util`) with the one seen when the removal started; an entry is
+//! claimed by renaming it into the private claim directory and compared before and after; the standard library's
+//! handle-based `remove_dir_all` deletes what was claimed (it removes a link or junction itself and never follows one,
+//! so it never leaves the volume). `D` and the claim directory are checked private with
+//! [`platform::fs`](crate::platform::fs).
 //!
-//! Windows has no descriptor-relative open (`openat`) in the standard library, and no maintained crate offers one
-//! that keeps the Unix guarantees as they are (see the pull request that brought this file); a running program
-//! cannot be deleted, so an uninstall started from inside the releases or the recovery copy fails at that file and
-//! is retried from outside.
+//! What Unix has and this does not: no recursive preflight walk (nothing is entered before it is claimed) and no
+//! mount compare (a volume mounted inside a root is a reparse point, removed as one, never entered).
+//!
+//! A running program cannot be deleted on Windows: an uninstall run from inside what it removes (a release, or the
+//! recovery copy on a retry) is refused by [`Removal::preflight`] before anything is touched, with what to do instead.
+//!
+//! No `unsafe` here: `std`'s `OpenOptionsExt` sets the sharing and the flags, `winapi-util` reads the file id.
 
-use super::{Removal, Roots, CLAIM, DATA_PREFIX, RECOVERY, RECOVERY_PROGRAM, RELEASE_PREFIX};
+use super::{
+    recovery_record, Removal, Roots, CLAIM, DATA_PREFIX, RECORD, RECOVERY, RECOVERY_PROGRAM,
+    RELEASE_PREFIX,
+};
 use crate::platform::fs::{Create, Files, Fs};
-use serde_json::Value;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+};
 
-/// This OS's removal.
-pub struct Os {
-    roots: Roots,
+/// What a file or directory is, whatever it is called: its volume and its file id.
+#[derive(PartialEq)]
+struct Identity(u64, u64);
+
+/// What is at `path` itself (a link is not followed), opened only to read its attributes and sharing everything, so
+/// holding it stops nothing (it can still be renamed). Kept open by the caller while the identity is compared, so
+/// the id cannot be reused in between.
+fn identity(path: &Path) -> Result<(File, Identity), &'static str> {
+    let file = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|_| "uninstall entry changed during removal")?;
+    let id = identity_of(&file)?;
+    Ok((file, id))
+}
+
+fn identity_of(file: &File) -> Result<Identity, &'static str> {
+    let info =
+        winapi_util::file::information(file).map_err(|_| "cannot inspect uninstall entry")?;
+    Ok(Identity(info.volume_serial_number(), info.file_index()))
+}
+
+/// The directory `path`, held: opened for reading (so the sharing rules apply to the handle) without
+/// `FILE_SHARE_DELETE`, so that it cannot be renamed or deleted while held, and refused when it is a link, a junction
+/// or not a directory.
+fn hold(path: &Path) -> Result<File, &'static str> {
+    let dir = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|_| "uninstall directory missing or in use")?;
+    let meta = dir
+        .metadata()
+        .map_err(|_| "cannot inspect uninstall directory")?;
+    if !meta.is_dir() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err("uninstall directory is a link or junction");
+    }
+    Ok(dir)
 }
 
 /// Whether something (a link included) is at `path`.
@@ -61,34 +114,109 @@ fn remove_entry(path: &Path) -> Result<(), &'static str> {
     done.map_err(|_| "cannot remove uninstall entry")
 }
 
+/// Renames `source` to `target` (in a held directory), refused when what arrived is not what was there just before.
+fn claim_entry(
+    source: &Path,
+    target: &Path,
+    name: &OsStr,
+    before_claim: &dyn Fn(&OsStr),
+) -> Result<(), &'static str> {
+    if exists(target)? {
+        return Err("uninstall claim name already exists");
+    }
+    let (_held, before) = identity(source)?;
+    before_claim(name);
+    fs::rename(source, target).map_err(|_| "cannot claim uninstall entry")?;
+    if identity(target)?.1 != before {
+        return Err("uninstall entry replaced during claim");
+    }
+    Ok(())
+}
+
+/// Directories held for one step; released when dropped.
+struct Held(Vec<File>);
+
+/// This OS's removal: the roots, and the home as it was when the removal started.
+pub struct Os {
+    roots: Roots,
+    home: (File, Identity),
+}
+
 impl Os {
-    /// `D` when it is there, checked: a real directory of this user's that nobody else can change.
-    fn data(&self) -> Result<Option<PathBuf>, &'static str> {
+    /// `path` (the home or below it) and every directory above it, held, with the home checked to be the one seen
+    /// when the removal started.
+    fn hold_down_to(&self, path: &Path) -> Result<Held, &'static str> {
         self.roots.validate()?;
-        let data = &self.roots.data;
-        if !exists(data)? {
-            return Ok(None);
+        let mut chain: Vec<&Path> = path.ancestors().collect();
+        chain.reverse();
+        let held = chain.into_iter().map(hold).collect::<Result<Vec<_>, _>>()?;
+        let home = held
+            .get(self.roots.home.ancestors().count() - 1)
+            .ok_or("unsafe uninstall path")?;
+        if identity_of(home)? != self.home.1 {
+            return Err("uninstall home replaced during removal");
         }
-        Files::open_read(data)
-            .map_err(Into::into)
-            .and_then(|dir| Files::check_private(&dir))
-            .map_err(|_| "unsafe uninstall data root")?;
-        Ok(Some(data.clone()))
+        Ok(Held(held))
     }
 
-    /// The claim directory in `D`, made private when missing, and `D`.
-    fn claim(&self) -> Result<(PathBuf, PathBuf), &'static str> {
-        let data = self.data()?.ok_or("uninstall data root disappeared")?;
-        let claim = data.join(CLAIM);
-        Files::ensure_private_dir(&claim).map_err(|_| "unsafe uninstall claim directory")?;
-        Ok((data, claim))
+    /// `D` held (with all above it) when it is there, checked: this user's, open to nobody else.
+    fn data(&self) -> Result<Option<Held>, &'static str> {
+        self.roots.validate()?;
+        if !exists(&self.roots.data)? {
+            return Ok(None);
+        }
+        let held = self.hold_down_to(&self.roots.data)?;
+        Files::check_private(held.0.last().ok_or("unsafe uninstall path")?)
+            .map_err(|_| "unsafe uninstall data root")?;
+        Ok(Some(held))
+    }
+
+    /// `D`'s private child `name`, made when missing, held with `D` and all above.
+    fn private_child(&self, name: &str) -> Result<(Held, PathBuf), &'static str> {
+        let mut held = self.data()?.ok_or("uninstall data root disappeared")?;
+        let child = self.roots.data.join(name);
+        Files::ensure_private_dir(&child).map_err(|_| "unsafe uninstall claim directory")?;
+        let dir = hold(&child)?;
+        Files::check_private(&dir).map_err(|_| "unsafe uninstall claim directory")?;
+        held.0.push(dir);
+        Ok((held, child))
+    }
+
+    /// Refused when the running program is inside what an uninstall removes: Windows cannot delete it while it
+    /// runs, so the uninstall would stop half-way, every retry from the same place again.
+    fn check_not_running_inside(&self) -> Result<(), &'static str> {
+        let program = std::env::current_exe()
+            .and_then(fs::canonicalize)
+            .map_err(|_| "cannot find the running program")?;
+        let roots = [&self.roots.data, &self.roots.releases];
+        let inside = |root: &Path| -> Result<bool, &'static str> {
+            if !exists(root)? {
+                return Ok(false);
+            }
+            let root = identity(root)?.1;
+            Ok(program
+                .ancestors()
+                .skip(1)
+                .any(|dir| identity(dir).is_ok_and(|(_, id)| id == root)))
+        };
+        for root in roots {
+            if inside(root)? {
+                return Err(
+                    "uninstall is running from inside what it removes, and Windows cannot \
+                    delete a running program: copy sidevoice-connector.exe to a folder outside the \
+                    Sidevoice folders and run `uninstall` from that copy",
+                );
+            }
+        }
+        Ok(())
     }
 }
 
 impl Removal for Os {
     fn new(roots: Roots) -> Result<Self, &'static str> {
         roots.validate()?;
-        Ok(Self { roots })
+        let home = identity(&roots.home)?;
+        Ok(Self { roots, home })
     }
 
     fn roots(&self) -> &Roots {
@@ -97,38 +225,32 @@ impl Removal for Os {
 
     fn preflight(&self) -> Result<bool, &'static str> {
         let data = self.data()?;
+        self.check_not_running_inside()?;
         let releases = &self.roots.releases;
         let present = exists(releases)?;
         if present {
-            Files::open_read(releases)
-                .ok()
-                .filter(|dir| dir.metadata().is_ok_and(|meta| meta.is_dir()))
-                .ok_or("uninstall root is not a real directory")?;
+            self.hold_down_to(releases)?;
         }
-        let claimed = match data {
-            Some(data) if exists(&data.join(CLAIM))? => names(&data.join(CLAIM))?
-                .iter()
-                .any(|name| is_release(name)),
-            _ => false,
-        };
+        let claim = self.roots.data.join(CLAIM);
+        let claimed =
+            data.is_some() && exists(&claim)? && names(&claim)?.iter().any(|name| is_release(name));
         Ok(present || claimed)
     }
 
     fn lock_file(&self, name: &str) -> Result<File, &'static str> {
         self.roots.validate()?;
         Files::ensure_private_dir(&self.roots.data).map_err(|_| "unsafe uninstall data root")?;
+        let _held = self.data()?.ok_or("uninstall data root disappeared")?;
         Files::open_private(&self.roots.data.join(name), Create::ReadWrite)
             .map_err(|_| "cannot open uninstall lock")
     }
 
-    fn place_recovery_program(&self) -> Result<(), &'static str> {
-        let data = self.data()?.ok_or("uninstall data root disappeared")?;
-        let recovery = data.join(RECOVERY);
-        Files::ensure_private_dir(&recovery).map_err(|_| "unsafe uninstall claim directory")?;
+    fn stage_recovery(&self) -> Result<(), &'static str> {
+        let (_held, recovery) = self.private_child(RECOVERY)?;
         let program = recovery.join(RECOVERY_PROGRAM);
         match Files::open_read(&program) {
             Ok(file) => {
-                Files::check_private(&file).map_err(|_| "unsafe uninstall recovery executable")
+                Files::check_private(&file).map_err(|_| "unsafe uninstall recovery executable")?
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let source =
@@ -141,15 +263,12 @@ impl Removal for Os {
                     .map_err(|_| "cannot copy recovery executable")?;
                 target
                     .sync_all()
-                    .map_err(|_| "cannot sync recovery executable")
+                    .map_err(|_| "cannot sync recovery executable")?;
             }
-            Err(_) => Err("unsafe uninstall recovery executable"),
+            Err(_) => return Err("unsafe uninstall recovery executable"),
         }
-    }
-
-    fn write_install_record(&self, record: &Value) -> Result<(), &'static str> {
-        let data = self.data()?.ok_or("uninstall data root disappeared")?;
-        Files::write_json(&data.join("install.json"), record)
+        let record = recovery_record(&self.roots)?;
+        Files::write_json(&self.roots.data.join(RECORD), &record)
             .map_err(|_| "cannot save uninstall record")
     }
 
@@ -160,15 +279,15 @@ impl Removal for Os {
         if self.data()?.is_none() {
             return Ok(Vec::new());
         }
-        let (data, claim) = self.claim()?;
+        let (_held, claim) = self.private_child(CLAIM)?;
+        let data = &self.roots.data;
         let mut removed = Vec::new();
-        for entry in names(&data)? {
+        for entry in names(data)? {
             if self.roots.is_kept(&entry) {
                 continue;
             }
-            before_claim(&entry);
             let claimed = claim.join(format!("{DATA_PREFIX}{}", uuid::Uuid::new_v4().simple()));
-            fs::rename(data.join(&entry), claimed).map_err(|_| "cannot claim uninstall entry")?;
+            claim_entry(&data.join(&entry), &claimed, &entry, before_claim)?;
             removed.push(entry.to_string_lossy().into_owned());
         }
         for entry in names(&claim)? {
@@ -180,11 +299,12 @@ impl Removal for Os {
     }
 
     fn remove_releases(&self) -> Result<(), &'static str> {
-        let (_, claim) = self.claim()?;
+        let (_held, claim) = self.private_child(CLAIM)?;
         let releases = &self.roots.releases;
         if exists(releases)? {
+            let _parents = self.hold_down_to(&self.roots.data_home)?;
             let claimed = claim.join(format!("{RELEASE_PREFIX}{}", uuid::Uuid::new_v4().simple()));
-            fs::rename(releases, claimed).map_err(|_| "cannot claim uninstall entry")?;
+            claim_entry(releases, &claimed, OsStr::new("sidevoice"), &|_| {})?;
         }
         for entry in names(&claim)? {
             if is_release(&entry) {
@@ -195,15 +315,18 @@ impl Removal for Os {
     }
 
     fn finish_claim(&self) -> Result<(), &'static str> {
-        let Some(data) = self.data()? else {
+        let Some(_held) = self.data()? else {
             return Ok(());
         };
-        let claim = data.join(CLAIM);
+        let claim = self.roots.data.join(CLAIM);
         if !exists(&claim)? {
             return Ok(());
         }
-        if !names(&claim)?.is_empty() {
-            return Err("uninstall claim still contains data");
+        {
+            let _claim = hold(&claim)?;
+            if !names(&claim)?.is_empty() {
+                return Err("uninstall claim still contains data");
+            }
         }
         fs::remove_dir(&claim).map_err(|_| "cannot finish uninstall claim")
     }
@@ -212,10 +335,11 @@ impl Removal for Os {
         if exists(&self.roots.releases)? {
             return Err("uninstall releases remain");
         }
-        let Some(data) = self.data()? else {
+        let Some(_held) = self.data()? else {
             return Ok(());
         };
-        if names(&data)?.iter().any(|name| !self.roots.is_kept(name)) {
+        let data = &self.roots.data;
+        if names(data)?.iter().any(|name| !self.roots.is_kept(name)) {
             return Err("uninstall data remains");
         }
         if exists(&data.join(CLAIM))? {
@@ -223,14 +347,17 @@ impl Removal for Os {
         }
         let recovery = data.join(RECOVERY);
         if exists(&recovery)? {
-            if names(&recovery)? != [OsStr::new(RECOVERY_PROGRAM)] {
-                return Err("uninstall recovery directory changed");
+            {
+                let _recovery = hold(&recovery)?;
+                if names(&recovery)? != [OsStr::new(RECOVERY_PROGRAM)] {
+                    return Err("uninstall recovery directory changed");
+                }
+                fs::remove_file(recovery.join(RECOVERY_PROGRAM))
+                    .map_err(|_| "cannot remove recovery executable")?;
             }
-            fs::remove_file(recovery.join(RECOVERY_PROGRAM))
-                .map_err(|_| "cannot remove recovery executable")?;
             fs::remove_dir(&recovery).map_err(|_| "cannot remove recovery directory")?;
         }
-        let record = data.join("install.json");
+        let record = data.join(RECORD);
         if exists(&record)? {
             fs::remove_file(record).map_err(|_| "cannot remove uninstall record")?;
         }

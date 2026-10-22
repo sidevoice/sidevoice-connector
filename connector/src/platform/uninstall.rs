@@ -10,6 +10,8 @@
 //! - **Owned roots only.** The roots are exactly `~/.sidevoice` and `~/.local/share/sidevoice` of a home that is a
 //!   real, canonical, absolute directory; anything else is refused before anything is touched.
 //! - **No link is followed.** A link met inside a root is removed as a link; what it points to is untouched.
+//! - **No root swapped mid-step.** A root, or a directory above it, replaced by a link while a step runs is never
+//!   reached through: the step is refused, or the replacement cannot happen while it runs.
 //! - **Claim by rename.** An entry is first renamed into a private claim directory inside `D` and only then
 //!   deleted there, so a replacement put at the old name in the meantime is never reached by the deletion.
 //! - **The same volume.** Nothing on another mount or volume is entered.
@@ -18,10 +20,14 @@
 //!
 //! How they are met differs. On Unix every step is relative to directory descriptors held open from the home down
 //! (`openat` with `O_NOFOLLOW`), each checked against the path again before it is used, with the mount compared at
-//! every directory. On Windows the standard library's handle-based `remove_dir_all` (which never follows a link or
-//! junction, so never leaves the volume) does the deleting, behind the claim rename, over directories checked with
-//! [`platform::fs`](super::fs) (this user's, open to nobody else, no link on the way). Everything that does not
-//! touch the OS is one body here: the roots, the retry record, the order of the steps in [`Removal::stage_recovery`].
+//! every directory, walked in full by [`Removal::preflight`] before anything is removed. On Windows each step holds
+//! every directory from the volume root down to the one it works in, each opened as itself (a link or junction there
+//! is refused) and without letting anybody rename or delete it while held, so the paths the step uses reach those
+//! directories and nothing else; the home is compared with the one seen at the start, a claimed entry is compared
+//! before and after its rename, and the standard library's handle-based `remove_dir_all` (which removes a link or
+//! junction itself, never what it leads to, so it never leaves the volume) does the deleting. Windows has no
+//! recursive preflight and no mount compare: it never enters a reparse point, which is how another volume is mounted
+//! there. Everything that does not touch the OS is one body here: the roots and the retry record.
 
 #[cfg(unix)]
 #[path = "uninstall/unix.rs"]
@@ -67,22 +73,19 @@ pub struct Roots {
 
 impl Roots {
     /// That these are the installer's own roots and nothing else: absolute and plain paths, the home canonical,
-    /// `D` and `R` exactly where the home puts them and, when they exist, real directories.
+    /// `D` and `R` exactly where the home puts them and, when they exist, real canonical directories.
     pub fn validate(&self) -> Result<(), &'static str> {
-        let home = &self.home;
-        if !clean_absolute(home)
-            || home.parent().is_none()
-            || dunce::canonicalize(home).ok().as_deref() != Some(home)
-        {
+        if !clean_absolute(&self.home) || self.home.parent().is_none() || !canonical(&self.home) {
             return Err("unsafe home for uninstall");
         }
+        let home = dunce::simplified(&self.home);
         let data_home = home.join(".local").join("share");
         if !clean_absolute(&self.data)
             || !clean_absolute(&self.data_home)
             || !clean_absolute(&self.releases)
-            || self.data != home.join(".sidevoice")
-            || self.data_home != data_home
-            || self.releases != data_home.join("sidevoice")
+            || dunce::simplified(&self.data) != home.join(".sidevoice")
+            || dunce::simplified(&self.data_home) != data_home
+            || dunce::simplified(&self.releases) != data_home.join("sidevoice")
         {
             return Err("uninstall path is outside known Sidevoice roots");
         }
@@ -91,9 +94,7 @@ impl Roots {
                 Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
                     return Err("uninstall root is not a real directory")
                 }
-                Ok(_) if dunce::canonicalize(path).ok().as_deref() != Some(path) => {
-                    return Err("uninstall root is not canonical")
-                }
+                Ok(_) if !canonical(path) => return Err("uninstall root is not canonical"),
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => return Err("cannot inspect uninstall root"),
@@ -123,6 +124,30 @@ fn clean_absolute(path: &Path) -> bool {
         })
 }
 
+/// Whether `path` is what it resolves to: no link, `.` or `..` resolved away. Both sides are compared in one form,
+/// `dunce::simplified` (without the `\\?\` prefix Windows' `canonicalize` adds, wherever dropping it changes
+/// nothing; as it is otherwise), so a path written either way compares. On Unix both sides are left as they are.
+fn canonical(path: &Path) -> bool {
+    std::fs::canonicalize(path)
+        .is_ok_and(|real| dunce::simplified(&real) == dunce::simplified(path))
+}
+
+/// The retry record for [`Removal::stage_recovery`]: `D/install.json` as it is (a JSON object, or nothing), with
+/// `command` naming the recovery program and `releases` naming `R`.
+fn recovery_record(roots: &Roots) -> Result<Value, &'static str> {
+    let mut record = match Files::read_trusted(&roots.data.join(RECORD), 64 * 1024) {
+        Ok(None) => json!({}),
+        Ok(Some(bytes)) => serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .filter(Value::is_object)
+            .ok_or("unsafe uninstall install record")?,
+        Err(_) => return Err("unsafe uninstall install record"),
+    };
+    record["command"] = json!([roots.data.join(RECOVERY).join(RECOVERY_PROGRAM)]);
+    record["releases"] = json!(roots.releases);
+    Ok(record)
+}
+
 /// What every OS implements ([`Remover`], in `uninstall/unix.rs` and `uninstall/windows.rs`). Every method that
 /// can fail says why in a fixed phrase, and every one re-checks what it relies on, so a root swapped for a link
 /// between two calls is refused, not followed.
@@ -133,19 +158,20 @@ pub trait Removal: Sized {
     /// The roots this removal is for.
     fn roots(&self) -> &Roots;
 
-    /// Walks both roots without removing anything, refusing at the first thing that is not safe to remove (a mount
-    /// or volume boundary, an entry that is not what it was). Whether there are releases to remove.
+    /// Checks both roots without removing anything, refusing at the first thing that is not safe to remove (a mount
+    /// or volume boundary, an entry that is not what it was, a running program this OS cannot delete). Whether
+    /// there are releases to remove.
     fn preflight(&self) -> Result<bool, &'static str>;
 
     /// The lock file `name` in `D` (created private when missing), opened so that a link in its place is refused;
     /// the caller then takes the lock on it (`lock::wait_lock_file` checks the rest). `D` is made when missing.
     fn lock_file(&self, name: &str) -> Result<File, &'static str>;
 
-    /// Puts a copy of the running program in `D/.uninstall-recovery`, private.
-    fn place_recovery_program(&self) -> Result<(), &'static str>;
-
-    /// Writes `D/install.json` as `record`, whole or not at all.
-    fn write_install_record(&self, record: &Value) -> Result<(), &'static str>;
+    /// The retry route, before any release or data is removed: a copy of the running program placed private in
+    /// `D/.uninstall-recovery`, then `D/install.json` written whole: the record kept, its `command` naming that copy
+    /// and `releases` naming `R`. `D` is held as one directory from the copy to the record, so a `D` replaced in
+    /// between is refused, not written through. A retry through the desktop's installed-CLI lookup then resumes.
+    fn stage_recovery(&self) -> Result<(), &'static str>;
 
     /// Renames every entry of `D` except the kept ones into the claim directory, calling `before_claim(name)` just
     /// before each rename, then deletes what was claimed (claimed releases wait for [`Removal::remove_releases`]).
@@ -164,25 +190,6 @@ pub trait Removal: Sized {
     /// The tail, once nothing else remains: the recovery program and directory, then `D/install.json`. Refused while
     /// releases or data remain, so that a failure earlier always leaves the way to retry.
     fn finish_recovery(&self) -> Result<(), &'static str>;
-
-    /// The retry route: a copy of the running program placed in `D`, and `D/install.json` naming it (the rest of
-    /// the record kept), before any release or data is removed. A retry through the desktop's installed-CLI
-    /// lookup then resumes.
-    fn stage_recovery(&self) -> Result<(), &'static str> {
-        self.place_recovery_program()?;
-        let roots = self.roots();
-        let mut record = match Files::read_trusted(&roots.data.join(RECORD), 64 * 1024) {
-            Ok(None) => json!({}),
-            Ok(Some(bytes)) => serde_json::from_slice::<Value>(&bytes)
-                .ok()
-                .filter(Value::is_object)
-                .ok_or("unsafe uninstall install record")?,
-            Err(_) => return Err("unsafe uninstall install record"),
-        };
-        record["command"] = json!([roots.data.join(RECOVERY).join(RECOVERY_PROGRAM)]);
-        record["releases"] = json!(roots.releases);
-        self.write_install_record(&record)
-    }
 }
 
 #[cfg(test)]
@@ -351,5 +358,56 @@ mod tests {
             fs::read_to_string(moved.join(".sidevoice/keep")).unwrap(),
             "untouched"
         );
+    }
+
+    /// A root, or the home above it, renamed away and replaced by a link to an outside directory while a removal is
+    /// working in it: whether the OS refuses the rename while the step holds the directory, or the step sees the swap
+    /// and stops, nothing outside is removed.
+    #[test]
+    fn a_root_or_the_home_swapped_for_a_link_mid_removal_never_reaches_outside() {
+        for swapped in [".sidevoice", ""] {
+            let (scratch, layout, removal) = installed("uninstall-ancestor-swap");
+            fs::write(layout.data.join("entry"), "ours").unwrap();
+            let outside = scratch.path().join("outside");
+            for root in [".sidevoice", ".local/share/sidevoice"] {
+                fs::create_dir_all(outside.join(root)).unwrap();
+                fs::write(outside.join(root).join("keep"), "outside").unwrap();
+            }
+            fs::write(outside.join("keep"), "outside").unwrap();
+            let (victim, target) = if swapped.is_empty() {
+                (layout.home.clone(), outside.clone())
+            } else {
+                (layout.home.join(swapped), outside.join(".sidevoice"))
+            };
+            let moved = scratch.path().join("moved");
+            let done = AtomicBool::new(false);
+            let hook = |_: &OsStr| {
+                if !done.swap(true, Ordering::SeqCst) && fs::rename(&victim, &moved).is_ok() {
+                    symlink(&target, &victim);
+                }
+            };
+            let _ = removal.remove_data_contents(&hook);
+            let _ = removal.remove_releases();
+            let _ = removal.finish_claim();
+            for kept in ["keep", ".sidevoice/keep", ".local/share/sidevoice/keep"] {
+                assert_eq!(
+                    fs::read_to_string(outside.join(kept)).unwrap(),
+                    "outside",
+                    "{swapped:?}: {kept}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_home_named_as_the_os_resolves_it_is_accepted() {
+        let scratch = temp_dir("uninstall-resolved");
+        let home = scratch.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let resolved = fs::canonicalize(&home).unwrap();
+        assert!(roots(&resolved).validate().is_ok());
+        let mut mixed = roots(&home);
+        mixed.data = resolved.join(".sidevoice");
+        assert!(mixed.validate().is_ok(), "either form, compared as one");
     }
 }

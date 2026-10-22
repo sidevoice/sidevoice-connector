@@ -1583,10 +1583,10 @@ pub(crate) mod tests {
         assert_eq!(layout.selected_id().unwrap(), repaired);
     }
 
-    // Unix only: it injects a mount boundary into the descriptor-based removal; Windows never leaves the volume.
-    #[cfg(unix)]
+    // A preflight refusal (here the one a mount boundary in `D` gives; the boundary itself is tested in
+    // `platform::uninstall`) stops the uninstall before anything is written, the install lock included.
     #[tokio::test]
-    async fn mounted_data_refuses_before_install_lock_is_rewritten() {
+    async fn a_preflight_refusal_stops_before_install_lock_is_rewritten() {
         let fixture = Fixture::new("mounted-uninstall-data");
         let lock = fixture.layout().install_lock();
         fs::write(&lock, b"sentinel lock contents").unwrap();

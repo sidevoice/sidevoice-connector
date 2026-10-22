@@ -3,7 +3,8 @@
 //! home's (the device and the mount id on Linux, the device and where it is mounted on macOS).
 
 use super::{
-    clean_absolute, Removal, Roots, CLAIM, DATA_PREFIX, RECOVERY, RECOVERY_PROGRAM, RELEASE_PREFIX,
+    clean_absolute, recovery_record, Removal, Roots, CLAIM, DATA_PREFIX, RECOVERY,
+    RECOVERY_PROGRAM, RELEASE_PREFIX,
 };
 use crate::platform::user::{User, UserId};
 use serde_json::Value;
@@ -461,23 +462,34 @@ impl Os {
         Ok(true)
     }
 
-    #[cfg(test)]
-    pub(crate) fn preflight_with_simulated_data_mount(&self) -> Result<bool, &'static str> {
-        let probe = |fd, path: &Path| {
-            let mut observed = mount(fd)?;
-            if path == Path::new(".sidevoice") {
-                observed.device ^= 1;
-            }
-            Ok(observed)
+    /// `record` written as `install.json` in the held `data`, whole: a temporary file, synced, then renamed over it
+    /// once `data` is checked to be `D` still.
+    fn write_install_record(&self, data: RawFd, record: &Value) -> Result<(), &'static str> {
+        let temporary = format!(".uninstall-record-{}", uuid::Uuid::new_v4().simple());
+        let temporary = name(OsStr::new(&temporary))?;
+        let fd = unsafe {
+            libc::openat(
+                data,
+                temporary.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
         };
-        self.tree(
-            Path::new(".sidevoice"),
-            false,
-            self.roots.kept,
-            false,
-            &probe,
-        )?;
-        Ok(false)
+        if fd < 0 {
+            return Err("cannot create uninstall record");
+        }
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let bytes = serde_json::to_vec(record).map_err(|_| "cannot encode uninstall record")?;
+        file.write_all(&bytes)
+            .map_err(|_| "cannot write uninstall record")?;
+        file.sync_all()
+            .map_err(|_| "cannot sync uninstall record")?;
+        self.verify_dir(Path::new(".sidevoice"), data)?;
+        if unsafe { libc::renameat(data, temporary.as_ptr(), data, c"install.json".as_ptr()) } != 0
+        {
+            return Err("cannot save uninstall record");
+        }
+        Ok(())
     }
 }
 
@@ -515,7 +527,7 @@ impl Removal for Os {
         }
     }
 
-    fn place_recovery_program(&self) -> Result<(), &'static str> {
+    fn stage_recovery(&self) -> Result<(), &'static str> {
         let data = self
             .open_relative(Path::new(".sidevoice"))?
             .ok_or("uninstall data root disappeared")?;
@@ -577,39 +589,8 @@ impl Removal for Os {
             Path::new(".sidevoice/.uninstall-recovery"),
             recovery.as_raw_fd(),
         )?;
-        Ok(())
-    }
-
-    fn write_install_record(&self, record: &Value) -> Result<(), &'static str> {
-        let data_dir = self
-            .open_relative(Path::new(".sidevoice"))?
-            .ok_or("uninstall data root disappeared")?;
-        let data = data_dir.as_raw_fd();
-        let temporary = format!(".uninstall-record-{}", uuid::Uuid::new_v4().simple());
-        let temporary = name(OsStr::new(&temporary))?;
-        let fd = unsafe {
-            libc::openat(
-                data,
-                temporary.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return Err("cannot create uninstall record");
-        }
-        let mut file = unsafe { File::from_raw_fd(fd) };
-        let bytes = serde_json::to_vec(record).map_err(|_| "cannot encode uninstall record")?;
-        file.write_all(&bytes)
-            .map_err(|_| "cannot write uninstall record")?;
-        file.sync_all()
-            .map_err(|_| "cannot sync uninstall record")?;
-        self.verify_dir(Path::new(".sidevoice"), data)?;
-        if unsafe { libc::renameat(data, temporary.as_ptr(), data, c"install.json".as_ptr()) } != 0
-        {
-            return Err("cannot save uninstall record");
-        }
-        Ok(())
+        let record = recovery_record(&self.roots)?;
+        self.write_install_record(data.as_raw_fd(), &record)
     }
 
     fn preflight(&self) -> Result<bool, &'static str> {
@@ -824,6 +805,19 @@ mod tests {
 
     const KEPT: &[&str] = &["install.lock"];
 
+    /// The preflight walk of `D`, with the mount probe made to report a different mount for `D` itself.
+    fn preflight_with_simulated_data_mount(guard: &Os) -> Result<bool, &'static str> {
+        let probe = |fd, path: &Path| {
+            let mut observed = mount(fd)?;
+            if path == Path::new(".sidevoice") {
+                observed.device ^= 1;
+            }
+            Ok(observed)
+        };
+        guard.tree(Path::new(".sidevoice"), false, KEPT, false, &probe)?;
+        Ok(false)
+    }
+
     fn removal(home: &Path) -> Os {
         let data = home.join(".sidevoice");
         Files::ensure_private_dir(&data).unwrap();
@@ -858,7 +852,7 @@ mod tests {
         );
         assert!(nested.join("keep").exists());
         assert_eq!(
-            guard.preflight_with_simulated_data_mount(),
+            preflight_with_simulated_data_mount(&guard),
             Err("uninstall mount or device boundary")
         );
     }
