@@ -7,4 +7,5 @@
 //! `<concern>/unix.rs` and `<concern>/windows.rs` only implement it, behind a private `imp`. A side that lacks an
 //! operation does not compile; a host that has nothing to do implements it as a no-op, so the gap is a decision.
 
+pub mod process;
 pub mod user;

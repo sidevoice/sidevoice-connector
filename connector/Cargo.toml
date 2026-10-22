@@ -38,12 +38,18 @@ uuid = { version = "1", features = ["v4"] }
 which = "=8.0.6"
 zstd = "0.13"
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
+# Processes (src/platform/process): what every OS reads the same (owner, start, command line, parent) and the stop,
+# through `sysinfo`; spawning a detached process or a stoppable tree (process group, Job Object) through `process-wrap`.
+process-wrap = { version = "10", features = ["tokio1", "process-group", "job-object", "creation-flags", "kill-on-drop"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 # Unix: the effective uid (src/platform/user), with no `unsafe` of ours.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
 
 # Windows: this process's user and file owners (src/platform/user). Minimal features; the version the lock already has.
+# `windows`: only for the type `process-wrap`'s `CreationFlags` takes (src/platform/process); it is `process-wrap`'s
+# own dependency, at its version, so it adds nothing to the build.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -52,3 +58,4 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Threading",
 ] }
+windows = { version = "0.62", features = ["Win32_System_Threading"] }

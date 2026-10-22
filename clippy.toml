@@ -4,4 +4,8 @@ disallowed-methods = [
     { path = "libc::getuid", reason = "use platform::user" },
     { path = "libc::gethostname", reason = "use platform::user" },
     { path = "libc::getpwuid", reason = "use platform::user" },
+    { path = "libc::kill", reason = "use platform::process" },
+    { path = "tokio::process::Command::process_group", reason = "use platform::process" },
+    { path = "std::os::unix::process::CommandExt::process_group", reason = "use platform::process" },
+    { path = "std::os::unix::process::ExitStatusExt::signal", reason = "use platform::process" },
 ]
