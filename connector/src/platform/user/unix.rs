@@ -5,9 +5,9 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-/// Unix side of [`super::UserId`]: the effective uid.
+/// The user as its effective uid.
 #[derive(Debug)]
-pub(super) struct Id(u32);
+pub struct Id(u32);
 
 impl super::User for Id {
     fn current() -> Id {

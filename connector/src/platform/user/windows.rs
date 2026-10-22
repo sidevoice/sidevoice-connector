@@ -51,13 +51,13 @@ impl Sid {
     }
 }
 
-/// Windows side of [`super::UserId`]: the user as owned SIDs.
+/// The user as owned SIDs.
 ///
 /// Two SIDs, because Windows gives a file two candidate owners: the user, and the token's default owner, which is
 /// what files this process creates get. For a normal token they are the same; for an elevated administrator the
 /// default owner is the Administrators group, and what it creates is its own.
 #[derive(Debug)]
-pub(super) struct Id {
+pub struct Id {
     user: Sid,
     default_owner: Sid,
 }
