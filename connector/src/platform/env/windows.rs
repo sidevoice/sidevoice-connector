@@ -3,7 +3,8 @@
 //! shell and a service or a task starts with whatever `PATH` it was given.
 //!
 //! A `Path` of type `REG_EXPAND_SZ` names other variables (`%NVM_HOME%`, `%SystemRoot%`); they are expanded against
-//! the registry's environment (the user's over the machine's), then this process's own, so a variable a version
+//! the registry's environment (the user's over the machine's, each value's own `%NAME%`s resolved the same way as
+//! deep as they go, a cycle left as written), then this process's own, so a variable a version
 //! manager added after this process started is still found. A `REG_SZ` value is taken as written. Expansion is own
 //! code (`expand`): `ExpandEnvironmentStringsW`, and the crates that wrap it, only know this process's environment.
 
@@ -78,6 +79,45 @@ fn value(variable: &Variable, var: impl Fn(&str) -> Option<String>) -> String {
     }
 }
 
+/// The registry's environment (the user's variables over the machine's) and this process's, as one lookup.
+struct Registry<'a> {
+    user: &'a HashMap<String, Variable>,
+    machine: &'a HashMap<String, Variable>,
+    process: &'a dyn Fn(&str) -> Option<String>,
+}
+
+impl Registry<'_> {
+    /// What the variable `name` stands for: the registry's, with the variables its own `REG_EXPAND_SZ` value names
+    /// resolved the same way, as deep as they go; this process's when the registry has none. `visiting` are the
+    /// names being resolved on the way here: one met again is a cycle, and is left as written.
+    fn resolve(&self, name: &str, visiting: &[String]) -> Option<String> {
+        let name = name.to_uppercase();
+        if visiting.contains(&name) {
+            return None;
+        }
+        match self.user.get(&name).or_else(|| self.machine.get(&name)) {
+            Some(variable) => {
+                let mut visiting = visiting.to_vec();
+                visiting.push(name);
+                Some(value(variable, |inner| self.resolve(inner, &visiting)))
+            }
+            None => (self.process)(&name),
+        }
+    }
+
+    /// The machine's `Path` then the user's, each with the variables it names resolved ([`Registry::resolve`]).
+    fn path(&self) -> String {
+        let visiting = ["PATH".to_owned()];
+        let path = |variables: &HashMap<String, Variable>| {
+            variables
+                .get("PATH")
+                .map(|path| value(path, |name| self.resolve(name, &visiting)))
+                .unwrap_or_default()
+        };
+        [path(self.machine), path(self.user)].join(";")
+    }
+}
+
 impl super::Env for Os {
     const HOME: &'static str = "USERPROFILE";
     const DATA_NAME: &'static str = "Sidevoice";
@@ -116,28 +156,18 @@ impl super::Env for Os {
             .unwrap_or_default()
     }
 
-    // A variable `Path` names is looked up in the registry's environment, the user's over the machine's (its own
-    // `REG_EXPAND_SZ` value expanded against this process's environment, one level, so no loop), then in this
+    // A variable `Path` names is looked up in the registry's environment, the user's over the machine's (and the
+    // variables its own `REG_EXPAND_SZ` value names, as deep as they go, a cycle left as written), then in this
     // process's.
     fn login_path() -> Option<LoginPath> {
         let machine = variables(HKEY_LOCAL_MACHINE, MACHINE);
         let user = variables(HKEY_CURRENT_USER, USER);
-        let process = |name: &str| std::env::var(name).ok();
-        let var = |name: &str| {
-            let name = name.to_uppercase();
-            match user.get(&name).or_else(|| machine.get(&name)) {
-                Some(variable) => Some(value(variable, process)),
-                None => process(&name),
-            }
+        let registry = Registry {
+            user: &user,
+            machine: &machine,
+            process: &|name: &str| std::env::var(name).ok(),
         };
-        let path = |variables: &HashMap<String, Variable>| {
-            variables
-                .get("PATH")
-                .map(|path| value(path, var))
-                .unwrap_or_default()
-        };
-        let joined = [path(&machine), path(&user)].join(";");
-        LoginPath::clean(joined.as_ref()).map(LoginPath::Known)
+        LoginPath::clean(registry.path().as_ref()).map(LoginPath::Known)
     }
 }
 
@@ -186,5 +216,61 @@ mod tests {
             ),
             "%A%"
         );
+    }
+
+    fn table(entries: &[(&str, &str, bool)]) -> HashMap<String, Variable> {
+        entries
+            .iter()
+            .map(|(name, text, expand)| {
+                (
+                    name.to_uppercase(),
+                    Variable {
+                        text: (*text).to_owned(),
+                        expand: *expand,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn registry_variables_naming_registry_variables_resolve_as_deep_as_they_go() {
+        let machine = table(&[
+            ("TOOLS", r"C:\Tools", false),
+            ("NVM_HOME", r"C:\Old", false),
+            ("Path", r"%SystemRoot%\System32;%TOOLS%\bin", true),
+        ]);
+        let user = table(&[
+            ("NVM_HOME", r"%TOOLS%\nvm", true),
+            ("NVM_SYMLINK", r"%NVM_HOME%\current", true),
+            ("Path", "%NVM_SYMLINK%;%Nvm_Home%;%PATH%", true),
+        ]);
+        let process = |name: &str| (name == "SYSTEMROOT").then(|| r"C:\Windows".to_owned());
+        let registry = Registry {
+            user: &user,
+            machine: &machine,
+            process: &process,
+        };
+        assert_eq!(
+            registry.path(),
+            r"C:\Windows\System32;C:\Tools\bin;C:\Tools\nvm\current;C:\Tools\nvm;%PATH%",
+            "the user's over the machine's, then this process's; Path naming itself stays as written"
+        );
+    }
+
+    #[test]
+    fn a_cycle_between_registry_variables_is_left_as_written() {
+        let machine = table(&[]);
+        let user = table(&[
+            ("A", r"%B%\a", true),
+            ("B", r"%A%\b", true),
+            ("Path", r"%A%;C:\ok", true),
+        ]);
+        let registry = Registry {
+            user: &user,
+            machine: &machine,
+            process: &|_: &str| None,
+        };
+        assert_eq!(registry.path(), r";%A%\b\a;C:\ok");
     }
 }
