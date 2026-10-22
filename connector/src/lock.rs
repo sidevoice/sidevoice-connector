@@ -33,7 +33,7 @@ impl Drop for Lock {
     fn drop(&mut self) {
         // Another process may have linked the inode after acquisition. Never clear a
         // holder record through a name that could also name an unrelated file.
-        if self.clear_record && Files::link_count(&self.file).is_ok_and(|links| links == 1) {
+        if self.clear_record && Files::check_private(&self.file).is_ok() {
             let _ = self.file.set_len(0);
         }
         let _ = FileExt::unlock(&self.file);
@@ -48,7 +48,7 @@ fn contended(error: &std::io::Error) -> bool {
 /// Opens (creating it 0600) the lock file without following a link, and checks the descriptor it opened: a regular
 /// file of this user's, open to nobody else.
 fn validate_inode(file: &File, label: &str) -> Result<()> {
-    if !Files::is_private(file)? {
+    if Files::check_private(file).is_err() {
         bail!("unsafe lock file {label}");
     }
     Ok(())
@@ -89,7 +89,7 @@ pub fn try_lock(path: &Path, kind: &str) -> Result<Option<Lock>> {
         Err(error) if contended(&error) => return Ok(None),
         Err(error) => return Err(error).context(format!("lock {}", path.display())),
     }
-    if Files::link_count(&file)? != 1 {
+    if Files::check_private(&file).is_err() {
         bail!("unsafe lock file {}", path.display());
     }
     let record = json!({"pid":std::process::id(),
@@ -172,15 +172,14 @@ pub fn holder(path: &Path) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::fs::tests::Scratch;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
     #[test]
     fn one_holder_at_a_time_and_released_on_drop() {
-        let scratch = Scratch::new("lock");
-        let path = scratch.0.join("connector.lock");
+        let scratch = crate::test_support::temp_dir("lock");
+        let path = scratch.path().join("connector.lock");
         let first = try_lock(&path, "connector").unwrap().expect("first holder");
-        Files::check_private_file(&path).expect("created private");
+        Files::check_private(&Files::open_read(&path).unwrap()).expect("created private");
         // A second open file description, even in this process, does not get it.
         assert!(try_lock(&path, "connector").unwrap().is_none());
         let record = holder(&path).expect("holder record");
@@ -199,8 +198,8 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_gets_the_lock_once_the_holder_lets_go() {
-        let scratch = Scratch::new("wait");
-        let path = scratch.0.join("install.lock");
+        let scratch = crate::test_support::temp_dir("wait");
+        let path = scratch.path().join("install.lock");
         let held = try_lock(&path, "install").unwrap().unwrap();
         assert!(wait_lock(&path, "install", Duration::from_millis(100))
             .await
@@ -222,8 +221,8 @@ mod tests {
         // A forked child takes the lock on a descriptor nobody else shares once the parent closes its copy, then is
         // killed: the kernel releases the lock and nobody reclaims anything. The child calls only async-signal-safe
         // functions.
-        let scratch = Scratch::new("death");
-        let path = scratch.0.join("agents.lock");
+        let scratch = crate::test_support::temp_dir("death");
+        let path = scratch.path().join("agents.lock");
         drop(open(&path).unwrap());
         let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
         let mut pipe = [0i32; 2];
@@ -258,14 +257,14 @@ mod tests {
 
     #[test]
     fn a_lock_file_that_is_a_link_or_open_to_others_is_refused() {
-        let scratch = Scratch::new("unsafe");
-        let target = scratch.0.join("target");
+        let scratch = crate::test_support::temp_dir("unsafe");
+        let target = scratch.path().join("target");
         std::fs::write(&target, b"").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let link = scratch.0.join("link.lock");
+        let link = scratch.path().join("link.lock");
         symlink(&target, &link).unwrap();
         assert!(try_lock(&link, "connector").is_err());
-        let open = scratch.0.join("open.lock");
+        let open = scratch.path().join("open.lock");
         std::fs::write(&open, b"").unwrap();
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(try_lock(&open, "connector").is_err());
@@ -273,11 +272,11 @@ mod tests {
 
     #[test]
     fn a_hard_linked_lock_refuses_without_changing_the_outside_file() {
-        let scratch = Scratch::new("hard-link-lock");
-        let outside = scratch.0.join("outside");
+        let scratch = crate::test_support::temp_dir("hard-link-lock");
+        let outside = scratch.path().join("outside");
         std::fs::write(&outside, b"sentinel content").unwrap();
         std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let lock = scratch.0.join("install.lock");
+        let lock = scratch.path().join("install.lock");
         std::fs::hard_link(&outside, &lock).unwrap();
         assert!(try_lock(&lock, "uninstall").is_err());
         assert_eq!(std::fs::read(&outside).unwrap(), b"sentinel content");

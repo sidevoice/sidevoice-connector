@@ -160,15 +160,14 @@ fn format_utc(seconds: i64, millis: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::fs::tests::Scratch;
     use std::os::unix::fs::MetadataExt;
 
     #[test]
     fn a_log_past_its_limit_is_copied_aside_and_truncated_in_place() {
-        let scratch = Scratch::new("log");
-        let file = scratch.0.join("connector.log");
+        let scratch = crate::test_support::temp_dir("log");
+        let file = scratch.path().join("connector.log");
         append_line(&file, "first");
-        Files::check_private_file(&file).unwrap();
+        Files::check_private(&Files::open_read(&file).unwrap()).unwrap();
         // A writer holding the file open, as a service manager does.
         let mut held = OpenOptions::new().append(true).open(&file).unwrap();
         let inode = fs::metadata(&file).unwrap().ino();
@@ -176,7 +175,9 @@ mod tests {
         fs::write(&file, vec![b'a'; 64]).unwrap();
         assert!(rotate(&file, 32));
         assert_eq!(
-            fs::read(scratch.0.join("connector.log.1")).unwrap().len(),
+            fs::read(scratch.path().join("connector.log.1"))
+                .unwrap()
+                .len(),
             64
         );
         assert_eq!(fs::metadata(&file).unwrap().len(), 0);
@@ -193,15 +194,15 @@ mod tests {
         fs::write(&file, vec![b'c'; 64]).unwrap();
         assert!(rotate(&file, 32));
         assert_eq!(
-            fs::read(scratch.0.join("connector.log.1")).unwrap()[0],
+            fs::read(scratch.path().join("connector.log.1")).unwrap()[0],
             b'c'
         );
         assert_eq!(
-            fs::read(scratch.0.join("connector.log.2")).unwrap()[0],
+            fs::read(scratch.path().join("connector.log.2")).unwrap()[0],
             b'b'
         );
         assert!(
-            !scratch.0.join("connector.log.3").exists(),
+            !scratch.path().join("connector.log.3").exists(),
             "two previous logs are kept"
         );
     }

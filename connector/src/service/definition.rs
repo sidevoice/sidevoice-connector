@@ -421,7 +421,7 @@ fn unsafe_definition(detail: impl Into<String>) -> Failure {
 fn definition_directory(dir: &Path) -> Result<()> {
     match fs::symlink_metadata(dir) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            Files::create_private_dir_all(dir).map_err(Failure::plain)
+            Files::ensure_private_dir(dir).map_err(Failure::plain)
         }
         Err(error) => Err(Failure::plain(error)),
         Ok(_) => {
@@ -680,7 +680,7 @@ mod tests {
         assert!(!write(&file, "one").unwrap());
         assert!(write(&file, "two").unwrap());
         assert_eq!(fs::read_to_string(&file).unwrap(), "two");
-        Files::check_private_file(&file).unwrap();
+        Files::check_private(&Files::open_read(&file).unwrap()).unwrap();
         assert_eq!(
             program_problem(Some(&words(&["/no/such/program"]))),
             Some("executable-missing")

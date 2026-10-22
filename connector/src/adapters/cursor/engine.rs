@@ -169,7 +169,6 @@ pub(super) async fn editor_engine_in(chat_id: &str, instances: &[BridgeInstance]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::fs::tests::Scratch;
 
     fn database(path: &Path, sql: &str) {
         state_db::fixture(path, sql);
@@ -226,8 +225,8 @@ mod tests {
 
     #[tokio::test]
     async fn cli_model_comes_from_its_own_store_and_never_another_chat() {
-        let scratch = Scratch::new("cursor-cli-engine");
-        let root = scratch.0.join("cursor");
+        let scratch = crate::test_support::temp_dir("cursor-cli-engine");
+        let root = scratch.path().join("cursor");
         let chat = root.join("chats/workspace/chat-a");
         fs::create_dir_all(&chat).unwrap();
         let db = chat.join("store.db");
@@ -247,8 +246,8 @@ mod tests {
 
     #[tokio::test]
     async fn editor_model_and_effort_are_scoped_to_the_composer() {
-        let scratch = Scratch::new("cursor-editor-engine");
-        let user_data = scratch.0.join("Cursor");
+        let scratch = crate::test_support::temp_dir("cursor-editor-engine");
+        let user_data = scratch.path().join("Cursor");
         let storage = user_data.join("User/globalStorage");
         fs::create_dir_all(&storage).unwrap();
         let db = storage.join("state.vscdb");
@@ -276,8 +275,8 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_editor_metadata_does_not_claim_an_engine() {
-        let scratch = Scratch::new("cursor-editor-bad-engine");
-        let user_data = scratch.0.join("Cursor");
+        let scratch = crate::test_support::temp_dir("cursor-editor-bad-engine");
+        let user_data = scratch.path().join("Cursor");
         let storage = user_data.join("User/globalStorage");
         fs::create_dir_all(&storage).unwrap();
         let db = storage.join("state.vscdb");
@@ -301,8 +300,8 @@ mod tests {
 
     #[tokio::test]
     async fn model_inventory_lists_effort_structure_without_values() {
-        let scratch = Scratch::new("cursor-model-inventory");
-        let database_path = scratch.0.join("state.vscdb");
+        let scratch = crate::test_support::temp_dir("cursor-model-inventory");
+        let database_path = scratch.path().join("state.vscdb");
         database(&database_path, "CREATE TABLE cursorDiskKV(key TEXT, value TEXT); INSERT INTO cursorDiskKV VALUES ('composerData:object', '{\"modelConfig\":{\"modelName\":\"secret-model\",\"effort\":\"topsecret-effort\",\"privateMessage\":\"chat text\"}}'); INSERT INTO cursorDiskKV VALUES ('composerData:array', '{\"modelConfig\":{\"modelName\":\"secret-model\",\"parameters\":[{\"id\":\"effort\",\"value\":\"topsecret-effort\"}],\"token\":\"fixture-secret\"}}');");
         for (chat, expected) in [
             ("object", "$.modelConfig.effort"),

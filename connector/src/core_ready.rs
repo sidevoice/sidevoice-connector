@@ -27,7 +27,8 @@ pub struct Ready {
 
 /// The ready file at `path`, when it is this user's private file naming a launch on `socket`.
 pub fn read(path: &Path, socket: &Path) -> Result<Ready> {
-    Files::check_private_file(path)?;
+    Files::check_private(&Files::open_read(path)?)
+        .with_context(|| format!("unsafe private file {}", path.display()))?;
     let bytes = fs::read(path)?;
     if bytes.len() > 65536 {
         bail!("Core ready file too large");
@@ -110,16 +111,15 @@ impl Profile {
 #[cfg(test)]
 mod tests {
     use super::{read, require_v3};
-    use crate::platform::fs::tests::Scratch;
     use std::os::unix::fs::PermissionsExt;
 
     /// A newer core's ready file: fields this connector does not know, at the top and nested, and a protocol
     /// number it has never heard of. It is read for what it knows, and v3 is still found among the protocols.
     #[test]
     fn a_ready_file_with_fields_and_protocols_this_connector_does_not_know_is_read() {
-        let scratch = Scratch::new("ready");
-        let socket = scratch.0.join("local.sock");
-        let path = scratch.0.join("core.json");
+        let scratch = crate::test_support::temp_dir("ready");
+        let socket = scratch.path().join("local.sock");
+        let path = scratch.path().join("core.json");
         let ready = serde_json::json!({"pid":42,"launch_id":"launch-1","socket":socket,"connector_id":"c-1",
             "token":"t","connector_protocols":[3, 4, 1000],"future_field":{"nested":[1, 2]},"listen":"x"});
         std::fs::write(&path, serde_json::to_vec(&ready).unwrap()).unwrap();

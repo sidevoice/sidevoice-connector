@@ -234,7 +234,7 @@ fn unpack(bytes: &[u8], into: &Path) -> Result<(Files, Vec<u8>)> {
         let relative = member(&name).ok_or_else(|| mismatch(format!("unsafe path {raw:?}")))?;
         let path = into.join(relative);
         if kind.is_dir() {
-            crate::platform::fs::Files::create_private_dir_all(&path)?;
+            crate::platform::fs::Files::ensure_private_dir(&path)?;
             continue;
         }
         if !kind.is_file() {
@@ -255,7 +255,7 @@ fn unpack(bytes: &[u8], into: &Path) -> Result<(Files, Vec<u8>)> {
             continue;
         }
         let parent = path.parent().context("member parent")?;
-        crate::platform::fs::Files::create_private_dir_all(parent)?;
+        crate::platform::fs::Files::ensure_private_dir(parent)?;
         let mut file = if relative == ENTRYPOINT {
             crate::platform::fs::Files::open_private(&path, Create::NewProgram)?
         } else {
@@ -344,7 +344,8 @@ pub fn stage(core: &PackagedCore, release: &Path) -> Result<PathBuf> {
     if !release.is_absolute() {
         bail!("{} is not an absolute path", release.display());
     }
-    crate::platform::fs::Files::check_private_dir(release)?;
+    crate::platform::fs::Files::check_private(&crate::platform::fs::Files::open_read(release)?)
+        .with_context(|| format!("unsafe private directory {}", release.display()))?;
     let destination = release.join(crate::service::layout::CORE_DIRECTORY);
     if fs::symlink_metadata(&destination).is_ok() {
         bail!("{} already exists", destination.display());
@@ -455,25 +456,6 @@ impl Installed {
 pub(crate) mod tests {
     use super::*;
 
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "sidevoice-core-package-{label}-{}",
-                uuid::Uuid::new_v4()
-            ));
-            crate::platform::fs::Files::create_private_dir(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
     const SOURCE: &str = "0123456789abcdef0123456789abcdef01234567";
 
     /// A core: its program (a script) and a notice.
@@ -548,14 +530,17 @@ pub(crate) mod tests {
 
     #[test]
     fn the_packaged_core_is_staged_into_the_release() {
-        let scratch = Scratch::new("stage");
-        let root = package(&scratch.0, &core_archive(&core_files(), &[]), None);
-        let release = release(&scratch.0);
+        let scratch = crate::test_support::temp_dir("stage");
+        let root = package(scratch.path(), &core_archive(&core_files(), &[]), None);
+        let release = release(scratch.path());
         let installed = install(&root, &release).unwrap();
         assert_eq!(installed.path, release.join("core"));
         assert_eq!(installed.core.version, "0.2.0");
         let program = release.join(crate::service::layout::CORE_ENTRYPOINT);
-        crate::platform::fs::Files::check_private_file(&program).unwrap();
+        crate::platform::fs::Files::check_private(
+            &crate::platform::fs::Files::open_read(&program).unwrap(),
+        )
+        .unwrap();
         assert!(which::which(&program).is_ok(), "the entrypoint can be run");
         assert!(release.join("core/native-core.json").is_file());
         let value = installed.value();
@@ -574,13 +559,13 @@ pub(crate) mod tests {
 
     #[test]
     fn an_archive_whose_digest_is_not_the_inventorys_is_refused() {
-        let scratch = Scratch::new("digest");
+        let scratch = crate::test_support::temp_dir("digest");
         let root = package(
-            &scratch.0,
+            scratch.path(),
             &core_archive(&core_files(), &[]),
             Some("0".repeat(64)),
         );
-        let release = release(&scratch.0);
+        let release = release(scratch.path());
         let error = install(&root, &release).unwrap_err();
         assert_eq!(key(&error), "core.package-mismatch", "{error}");
         assert_eq!(fs::read_dir(&release).unwrap().count(), 0, "nothing staged");
@@ -588,14 +573,14 @@ pub(crate) mod tests {
 
     #[test]
     fn a_core_that_differs_from_its_own_inventory_is_refused() {
-        let scratch = Scratch::new("inventory");
+        let scratch = crate::test_support::temp_dir("inventory");
         // Listed with one notice, shipped with another.
         let archive = core_archive_mismatched(
             &core_files(),
             &[("notices/LICENSE", b"another notice".to_vec())],
         );
-        let root = package(&scratch.0, &archive, None);
-        let error = install(&root, &release(&scratch.0)).unwrap_err();
+        let root = package(scratch.path(), &archive, None);
+        let error = install(&root, &release(scratch.path())).unwrap_err();
         assert_eq!(key(&error), "core.package-mismatch", "{error}");
         assert!(error.to_string().contains("notices/LICENSE"), "{error}");
     }
@@ -627,13 +612,13 @@ pub(crate) mod tests {
 
     #[test]
     fn a_path_outside_the_core_is_refused() {
-        let scratch = Scratch::new("escape");
+        let scratch = crate::test_support::temp_dir("escape");
         let archive = core_archive(&core_files(), &[("sidevoice-core-rust/../escape", b"x")]);
-        let root = package(&scratch.0, &archive, None);
-        let release = release(&scratch.0);
+        let root = package(scratch.path(), &archive, None);
+        let release = release(scratch.path());
         let error = install(&root, &release).unwrap_err();
         assert_eq!(key(&error), "core.package-mismatch", "{error}");
-        assert!(!scratch.0.join("escape").exists());
+        assert!(!scratch.path().join("escape").exists());
         assert_eq!(fs::read_dir(&release).unwrap().count(), 0, "nothing staged");
         assert!(member("sidevoice-core-rust/bin/x").is_some());
         assert!(member("sidevoice-core-rust/etc/x").is_none());
@@ -643,26 +628,26 @@ pub(crate) mod tests {
 
     #[test]
     fn a_package_without_a_core_or_for_another_build_is_refused() {
-        let scratch = Scratch::new("missing");
-        let error = packaged_as(&scratch.0, crate::identity::VERSION).unwrap_err();
+        let scratch = crate::test_support::temp_dir("missing");
+        let error = packaged_as(scratch.path(), crate::identity::VERSION).unwrap_err();
         assert_eq!(key(&error), "core.package-missing", "{error}");
         fs::write(
-            scratch.0.join(INVENTORY),
+            scratch.path().join(INVENTORY),
             json!({"version": "0.0.1", "target": crate::identity::target()}).to_string(),
         )
         .unwrap();
         assert_eq!(
-            key(&packaged_as(&scratch.0, crate::identity::VERSION).unwrap_err()),
+            key(&packaged_as(scratch.path(), crate::identity::VERSION).unwrap_err()),
             "core.package-mismatch"
         );
         fs::write(
-            scratch.0.join(INVENTORY),
+            scratch.path().join(INVENTORY),
             json!({"version": crate::identity::VERSION, "target": crate::identity::target()})
                 .to_string(),
         )
         .unwrap();
         assert_eq!(
-            key(&packaged_as(&scratch.0, crate::identity::VERSION).unwrap_err()),
+            key(&packaged_as(scratch.path(), crate::identity::VERSION).unwrap_err()),
             "core.package-missing"
         );
     }
@@ -679,11 +664,11 @@ pub(crate) mod tests {
 
     #[test]
     fn only_a_rust_native_v2_core_with_bin_and_notices_is_taken() {
-        let scratch = Scratch::new("kind");
+        let scratch = crate::test_support::temp_dir("kind");
         // A core of the old layout: its kind and its voice pipeline's files are refused.
         let old = core_archive_kind(&core_files(), "rust-native-v1");
-        let root = package(&scratch.0, &old, None);
-        let error = install(&root, &release(&scratch.0)).unwrap_err();
+        let root = package(scratch.path(), &old, None);
+        let error = install(&root, &release(scratch.path())).unwrap_err();
         assert_eq!(key(&error), "core.package-mismatch", "{error}");
         assert!(error.to_string().contains("rust-native-v2"), "{error}");
         for directory in ["models", "checks", "lib"] {
@@ -694,9 +679,9 @@ pub(crate) mod tests {
         }
         let mut files = core_files();
         files.retain(|(name, _)| *name != ENTRYPOINT);
-        let scratch = Scratch::new("entrypoint");
-        let root = package(&scratch.0, &core_archive(&files, &[]), None);
-        let error = install(&root, &release(&scratch.0)).unwrap_err();
+        let scratch = crate::test_support::temp_dir("entrypoint");
+        let root = package(scratch.path(), &core_archive(&files, &[]), None);
+        let error = install(&root, &release(scratch.path())).unwrap_err();
         assert!(error.to_string().contains(ENTRYPOINT), "{error}");
     }
 

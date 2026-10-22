@@ -81,17 +81,14 @@ impl super::Fs for Os {
         not_a_link(unsafe { File::from_raw_handle(handle as RawHandle) })
     }
 
+    // `BACKUP_SEMANTICS` lets a directory be opened too.
     fn open_read(path: &Path) -> io::Result<File> {
         not_a_link(
             OpenOptions::new()
                 .read(true)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(path)?,
         )
-    }
-
-    fn others(path: &Path) -> io::Result<Others> {
-        Self::others_of(&open_for_security(path, FILE_FLAG_OPEN_REPARSE_POINT)?)
     }
 
     fn others_of(file: &File) -> io::Result<Others> {
@@ -104,41 +101,42 @@ impl super::Fs for Os {
             Others::Nothing
         })
     }
+}
 
-    fn link_count(file: &File) -> io::Result<u64> {
-        // SAFETY: zeroed is a valid value of the plain struct the call fills.
-        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: the handle is open for the call.
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(u64::from(info.nNumberOfLinks))
+/// How many names the file behind `file` has.
+pub(super) fn link_count(file: &File) -> io::Result<u64> {
+    // SAFETY: zeroed is a valid value of the plain struct the call fills.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is open for the call.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
     }
+    Ok(u64::from(info.nNumberOfLinks))
+}
 
-    // A reparse point on the way (a redirected known folder, a mounted volume) is followed: what is judged is the
-    // directory it leads to. Adding entries is not judged: there is no sticky bit, and `C:\` lets every user add
-    // folders; what matters is that nobody else can delete or rename ours, or take the directory over.
-    fn check_ancestor(dir: &Path) -> Result<()> {
-        let file =
-            open_for_security(dir, 0).with_context(|| format!("missing {}", dir.display()))?;
-        let judged = Judged::of(&file)?;
-        if !UserId::current().owns_file(&file)? && !judged.owner_is_system() {
-            bail!("unsafe directory {}: owned by another user", dir.display());
-        }
-        if judged.grants_others(REPLACES_ENTRIES) {
-            bail!(
-                "unsafe directory {}: others can replace what is in it",
-                dir.display()
-            );
-        }
-        Ok(())
+/// A directory on the way to something private: this user's or the system's, nobody else able to delete or rename
+/// what is in it, or to take it over. A reparse point on the way (a redirected known folder, a mounted volume) is
+/// followed: what is judged is the directory it leads to. Adding entries is not judged: there is no sticky bit, and
+/// `C:\` lets every user add folders.
+pub(super) fn check_ancestor(dir: &Path) -> Result<()> {
+    let file = open_for_security(dir).with_context(|| format!("missing {}", dir.display()))?;
+    let judged = Judged::of(&file)?;
+    if !UserId::current().owns_file(&file)? && !judged.owner_is_system() {
+        bail!("unsafe directory {}: owned by another user", dir.display());
     }
+    if judged.grants_others(REPLACES_ENTRIES) {
+        bail!(
+            "unsafe directory {}: others can replace what is in it",
+            dir.display()
+        );
+    }
+    Ok(())
+}
 
-    // Nothing to set: what is created takes its directory's inheritable entries, private in a private directory. An
-    // existing file's DACL is not carried over to its replacement.
-    fn atomic(_keep_access: bool) -> atomic_write_file::OpenOptions {
-        atomic_write_file::OpenOptions::new()
-    }
+/// How a record is written whole. Nothing to set: what is created takes its directory's inheritable entries,
+/// private in a private directory; an existing file's DACL is not carried over to its replacement.
+pub(super) fn atomic(_keep_access: bool) -> atomic_write_file::OpenOptions {
+    atomic_write_file::OpenOptions::new()
 }
 
 // Access rights (`winnt.h`), written out because they are the contract being checked.
@@ -189,12 +187,11 @@ fn wide(path: &Path) -> Vec<u16> {
         .collect()
 }
 
-/// Opens what `path` names, for reading its security descriptor; `flags` adds `FILE_FLAG_OPEN_REPARSE_POINT` to
-/// judge a link itself.
-fn open_for_security(path: &Path, flags: u32) -> io::Result<File> {
+/// Opens the directory `path` leads to, for reading its security descriptor.
+fn open_for_security(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | flags)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
 }
 

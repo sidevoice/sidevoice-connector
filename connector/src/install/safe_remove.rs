@@ -854,8 +854,8 @@ mod tests {
 
     #[test]
     fn only_exact_owned_roots_can_be_uninstalled() {
-        let scratch = crate::platform::fs::tests::Scratch::new("uninstall-scope");
-        let home = scratch.0.join("home");
+        let scratch = crate::test_support::temp_dir("uninstall-scope");
+        let home = scratch.path().join("home");
         fs::create_dir(&home).unwrap();
         let mut layout = layout(&home);
         assert!(validate_scope(&layout).is_ok());
@@ -883,9 +883,9 @@ mod tests {
 
     #[test]
     fn links_inside_owned_roots_never_delete_their_targets() {
-        let scratch = crate::platform::fs::tests::Scratch::new("uninstall-links");
-        let home = scratch.0.join("home");
-        let outside = scratch.0.join("outside");
+        let scratch = crate::test_support::temp_dir("uninstall-links");
+        let home = scratch.path().join("home");
+        let outside = scratch.path().join("outside");
         let layout = layout(&home);
         fs::create_dir_all(&layout.data).unwrap();
         fs::create_dir_all(&layout.releases).unwrap();
@@ -912,8 +912,8 @@ mod tests {
 
     #[test]
     fn injected_mount_boundary_refuses_before_deleting() {
-        let scratch = crate::platform::fs::tests::Scratch::new("uninstall-mount");
-        let layout = layout(&scratch.0.join("home"));
+        let scratch = crate::test_support::temp_dir("uninstall-mount");
+        let layout = layout(&scratch.path().join("home"));
         let nested = layout.data.join("mounted");
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("keep"), "untouched").unwrap();
@@ -934,11 +934,11 @@ mod tests {
 
     #[test]
     fn directory_replaced_by_link_during_removal_is_refused() {
-        let scratch = crate::platform::fs::tests::Scratch::new("uninstall-race");
-        let layout = layout(&scratch.0.join("home"));
+        let scratch = crate::test_support::temp_dir("uninstall-race");
+        let layout = layout(&scratch.path().join("home"));
         let victim = layout.data.join("victim");
         let moved = layout.data.join("moved");
-        let outside = scratch.0.join("outside");
+        let outside = scratch.path().join("outside");
         fs::create_dir_all(&victim).unwrap();
         fs::create_dir(&outside).unwrap();
         fs::write(victim.join("inside"), "inside").unwrap();
@@ -961,10 +961,10 @@ mod tests {
 
     #[test]
     fn moved_directory_at_final_claim_boundary_keeps_its_sentinel() {
-        let scratch = crate::platform::fs::tests::Scratch::new("uninstall-claim-race");
-        let layout = layout(&scratch.0.join("home"));
+        let scratch = crate::test_support::temp_dir("uninstall-claim-race");
+        let layout = layout(&scratch.path().join("home"));
         let victim = layout.data.join("victim");
-        let moved = scratch.0.join("moved-outside");
+        let moved = scratch.path().join("moved-outside");
         fs::create_dir_all(&victim).unwrap();
         fs::write(victim.join("keep"), "outside sentinel").unwrap();
         let guard = Guard::new(&layout).unwrap();
@@ -984,9 +984,9 @@ mod tests {
 
     #[test]
     fn home_replaced_after_opening_is_refused() {
-        let scratch = crate::platform::fs::tests::Scratch::new("uninstall-home-race");
-        let home = scratch.0.join("home");
-        let moved = scratch.0.join("moved-home");
+        let scratch = crate::test_support::temp_dir("uninstall-home-race");
+        let home = scratch.path().join("home");
+        let moved = scratch.path().join("moved-home");
         let layout = layout(&home);
         fs::create_dir_all(&layout.data).unwrap();
         fs::write(layout.data.join("keep"), "untouched").unwrap();

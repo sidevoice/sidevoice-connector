@@ -45,6 +45,10 @@ atomic-write-file = "0.3"
 process-wrap = { version = "10", features = ["tokio1", "process-group", "job-object", "creation-flags", "kill-on-drop"] }
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
+[dev-dependencies]
+# Scratch directories in unit tests (src/test_support.rs).
+tempfile = "3"
+
 # Unix: the effective uid (src/platform/user), with no `unsafe` of ours.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }

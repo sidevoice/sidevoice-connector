@@ -15,7 +15,8 @@ pub(super) const GUARD_BLOCK_RESUME: u8 = 1;
 pub(super) fn prepare_conversation_guard(path: &Path) -> Result<(u8, fs::File)> {
     match fs::symlink_metadata(path) {
         Ok(_) => {
-            Files::check_private_file(path)?;
+            Files::check_private(&Files::open_read(path)?)
+                .with_context(|| format!("unsafe private file {}", path.display()))?;
             let metadata = fs::metadata(path)?;
             if metadata.len() != 16 || metadata.permissions().readonly() {
                 bail!("invalid conversation state guard");
@@ -58,7 +59,8 @@ pub(super) fn read_outbox(path: &Path) -> Result<Vec<Value>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    Files::check_private_file(path)?;
+    Files::check_private(&Files::open_read(path)?)
+        .with_context(|| format!("unsafe private file {}", path.display()))?;
     let bytes = fs::read(path)?;
     if bytes.len() > 8 << 20 {
         bail!("outbox too large");
@@ -85,7 +87,8 @@ pub(super) fn read_conversation_state(path: &Path) -> Result<Option<Vec<u8>>> {
     if !path.exists() {
         return Ok(None);
     }
-    Files::check_private_file(path)?;
+    Files::check_private(&Files::open_read(path)?)
+        .with_context(|| format!("unsafe private file {}", path.display()))?;
     if fs::metadata(path)?.len() > CONVERSATION_STATE_MAX_BYTES as u64 {
         bail!("conversation state too large");
     }

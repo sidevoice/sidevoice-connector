@@ -118,12 +118,11 @@ pub(super) fn fixture(database: &Path, sql: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::fs::tests::Scratch;
 
     #[tokio::test]
     async fn read_only_query_does_not_create_missing_database_and_needs_no_cli() {
-        let scratch = Scratch::new("cursor-state-db-read-only");
-        let database = scratch.0.join("state.vscdb");
+        let scratch = crate::test_support::temp_dir("cursor-state-db-read-only");
+        let database = scratch.path().join("state.vscdb");
         assert_eq!(query(&database, "SELECT 1").await, Err(DbError::Open));
         assert!(!database.exists());
         fixture(&database, "CREATE TABLE cursorDiskKV(key TEXT, value TEXT); INSERT INTO cursorDiskKV VALUES ('one', 'two');");
@@ -139,8 +138,8 @@ mod tests {
 
     #[tokio::test]
     async fn long_query_is_interrupted_and_large_result_is_refused() {
-        let scratch = Scratch::new("cursor-state-db-bounds");
-        let database = scratch.0.join("state.vscdb");
+        let scratch = crate::test_support::temp_dir("cursor-state-db-bounds");
+        let database = scratch.path().join("state.vscdb");
         fixture(&database, "CREATE TABLE example(value TEXT);");
         let started = Instant::now();
         let expensive = "WITH RECURSIVE count(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM count) SELECT sum(x) FROM count";
