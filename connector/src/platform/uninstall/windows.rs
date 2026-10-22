@@ -302,9 +302,15 @@ impl Removal for Os {
         let (_held, claim) = self.private_child(CLAIM)?;
         let releases = &self.roots.releases;
         if exists(releases)? {
-            let _parents = self.hold_down_to(&self.roots.data_home)?;
+            let parent = releases.parent().ok_or("unsafe uninstall root")?;
+            let _parents = self.hold_down_to(parent)?;
             let claimed = claim.join(format!("{RELEASE_PREFIX}{}", uuid::Uuid::new_v4().simple()));
-            claim_entry(releases, &claimed, OsStr::new("sidevoice"), &|_| {})?;
+            claim_entry(
+                releases,
+                &claimed,
+                releases.file_name().ok_or("unsafe uninstall root")?,
+                &|_| {},
+            )?;
         }
         for entry in names(&claim)? {
             if is_release(&entry) {

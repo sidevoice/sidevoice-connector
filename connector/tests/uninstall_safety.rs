@@ -1,6 +1,7 @@
 //! The desktop consumes the command's existing one-object JSON failure contract.
 
 use serde_json::Value;
+use sidevoice_connector::platform::env::{Env as _, Environment};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -20,7 +21,6 @@ fn uninstall(home: &Path, data: &Path) -> std::process::Output {
         .env_clear()
         .env("HOME", home)
         .env("SIDEVOICE_DATA_DIR", data)
-        .env_remove("XDG_DATA_HOME")
         .env("SIDEVOICE_SERVICE_MANAGER", "none")
         .stdin(Stdio::null())
         .output()
@@ -46,7 +46,7 @@ fn unsafe_root_refusal_is_a_nonzero_json_failure() {
 fn absent_installation_can_be_uninstalled_twice() {
     let home = temp_home();
     for _ in 0..2 {
-        let output = uninstall(&home, &home.join(".sidevoice"));
+        let output = uninstall(&home, &home.join(Environment::DATA_NAME));
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(output.status.success(), "{stdout}");
         assert_eq!(stdout.lines().count(), 1, "{stdout:?}");

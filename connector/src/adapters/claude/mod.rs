@@ -334,8 +334,16 @@ mod tests {
         let scratch = crate::test_support::temp_dir("claude-home");
         let home = scratch.path().to_string_lossy().into_owned();
         let homes = crate::adapters::Registry::standard().homes();
-        let unset =
-            Profile::from_vars(|key| (key == "HOME").then(|| home.clone().into()), &homes).unwrap();
+        let data = scratch.path().join("data").into_os_string();
+        let unset = Profile::from_vars(
+            |key| match key {
+                "HOME" => Some(home.clone().into()),
+                "SIDEVOICE_DATA_DIR" => Some(data.clone()),
+                _ => None,
+            },
+            &homes,
+        )
+        .unwrap();
         assert_eq!(
             unset.agent_home(HOME.var),
             scratch.path().join(".claude"),
@@ -350,6 +358,7 @@ mod tests {
         let set = Profile::from_vars(
             |key| match key {
                 "HOME" => Some(home.clone().into()),
+                "SIDEVOICE_DATA_DIR" => Some(data.clone()),
                 "CLAUDE_CONFIG_DIR" => Some(named.clone().into_os_string()),
                 _ => None,
             },

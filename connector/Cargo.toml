@@ -37,6 +37,9 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 which = "=8.0.6"
+# This user's standard data directory per OS (src/data_dir.rs): `~/Library/Application Support`, `$XDG_DATA_HOME`,
+# `%LOCALAPPDATA%`.
+dirs = "7"
 zstd = "0.13"
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
 # This user and the local channel (src/platform: `user`, `ipc`), shared with the core: its `sidevoice-platform`, at the
@@ -70,6 +73,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
 ] }
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
+# The user and machine `Path` a Windows login has instead of a login shell's (src/platform/env/windows.rs).
+winreg = "0.55"
 # How many names a file has (src/platform/fs), from a handle: `winapi-util` (walkdir, ripgrep), no `unsafe` of ours.
 winapi-util = "0.1"
 # The Task Scheduler task's XML (src/platform/service/windows.rs), written and read through serde.

@@ -41,7 +41,9 @@
 //! its permanent lock files and the stop, so that a launcher on its way finds the stop and does not serve.
 
 use crate::agents::HostAgents;
+use crate::data_dir;
 use crate::messages::Keyed;
+use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Create, Files, Fs};
 use crate::platform::uninstall::{Removal, Remover, Roots};
 use crate::profile::Profile;
@@ -341,9 +343,8 @@ fn prune(layout: &Layout, keep: &[&str]) -> Vec<String> {
 /// The environment a connector started on demand gets: where this installation lives.
 fn connector_environment(layout: &Layout) -> Vec<(String, PathBuf)> {
     let mut environment = vec![
-        ("HOME".to_owned(), layout.home.clone()),
-        ("SIDEVOICE_DATA_DIR".to_owned(), layout.data.clone()),
-        ("XDG_DATA_HOME".to_owned(), layout.data_home.clone()),
+        (Environment::HOME.to_owned(), layout.home.clone()),
+        (data_dir::VARIABLE.to_owned(), layout.data.clone()),
         ("XDG_CONFIG_HOME".to_owned(), layout.config_home.clone()),
     ];
     for (name, dir) in &layout.agent_dirs {
@@ -987,7 +988,6 @@ fn removal_roots(layout: &Layout) -> Roots {
     Roots {
         home: layout.home.clone(),
         data: layout.data.clone(),
-        data_home: layout.data_home.clone(),
         releases: layout.releases.clone(),
         kept: KEPT,
     }
@@ -1115,8 +1115,9 @@ pub(crate) mod tests {
             let variables = original.variables();
             let profile = Profile::from_vars(
                 |name| {
-                    if name == "SIDEVOICE_DATA_DIR" || name == "XDG_DATA_HOME" {
-                        None
+                    // Where an uninstall may remove: a directory of the OS's name below the home.
+                    if name == data_dir::VARIABLE {
+                        Some(original.home.join(Environment::DATA_NAME).into_os_string())
                     } else {
                         variables
                             .iter()
@@ -1128,7 +1129,6 @@ pub(crate) mod tests {
             )
             .unwrap();
             Files::ensure_private_dir(&profile.data.join("core")).unwrap();
-            Files::ensure_private_dir(&profile.xdg_data).unwrap();
             Self {
                 scratch,
                 profile,

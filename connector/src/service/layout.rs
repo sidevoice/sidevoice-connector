@@ -3,9 +3,9 @@
 //!
 //! | What | Where |
 //! |---|---|
-//! | `D`, the data directory | `$SIDEVOICE_DATA_DIR`, else `~/.sidevoice` |
+//! | `D`, the data directory | `$SIDEVOICE_DATA_DIR`, else the OS's standard place (`data_dir`) |
 //! | `D/install.json` | the installation record: `command` (the absolute argv prefix that runs this binary), `releases` |
-//! | `R`, the releases | `install.json`'s `releases`, else `$XDG_DATA_HOME/sidevoice` |
+//! | `R`, the releases | `D/install` |
 //! | `R/current.json` | the pointer record `{"release": "<id>"}`: the selected release, `R/releases/<id>`, with its core at `core/bin/sidevoice-core-rust` and `core/models` |
 //! | `D/core` | the core's data: `local.sock`, `core.json` (ready), `core-failure.json` |
 //! | `D/connector.sock`, `D/connector.lock` | the connector daemon's socket and lock |
@@ -15,6 +15,8 @@
 //!
 //! The release layout below `R/releases/<id>` is the installer's; it is named here once (`CORE_ENTRYPOINT`).
 
+use crate::data_dir::{data_dir, releases_dir};
+use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Files, Fs};
 use crate::platform::ipc::{Address, Endpoint};
 use serde_json::Value;
@@ -56,7 +58,6 @@ pub struct Layout {
     /// `R`.
     pub releases: PathBuf,
     pub config_home: PathBuf,
-    pub data_home: PathBuf,
     /// The agents' homes the installing environment names (only those that are set), by variable.
     pub agent_dirs: BTreeMap<String, PathBuf>,
     /// Every agent home's variable the harnesses declare: a job is given those named, and none of the others.
@@ -96,13 +97,8 @@ impl Layout {
         vars: impl IntoIterator<Item = (OsString, OsString)>,
         agent_vars: &[&'static str],
     ) -> anyhow::Result<Self> {
-        let home = absolute("HOME", var("HOME"), PathBuf::new)?;
-        let data = absolute("SIDEVOICE_DATA_DIR", var("SIDEVOICE_DATA_DIR"), || {
-            home.join(".sidevoice")
-        })?;
-        let data_home = absolute("XDG_DATA_HOME", var("XDG_DATA_HOME"), || {
-            home.join(".local/share")
-        })?;
+        let home = absolute(Environment::HOME, var(Environment::HOME), PathBuf::new)?;
+        let data = data_dir(&var)?;
         let config_home = absolute("XDG_CONFIG_HOME", var("XDG_CONFIG_HOME"), || {
             home.join(".config")
         })?;
@@ -122,31 +118,15 @@ impl Layout {
                 name.starts_with("SIDEVOICE_") && !NOT_SETTINGS.contains(&name.as_str())
             })
             .collect();
-        let mut layout = Self {
-            releases: data_home.join("sidevoice"),
+        Ok(Self {
+            releases: releases_dir(&data),
             home,
             data,
             config_home,
-            data_home,
             agent_dirs,
             agent_vars: agent_vars.to_vec(),
             settings,
-        };
-        if let Some(recorded) = layout
-            .install_record()
-            .and_then(|record| {
-                record
-                    .get("releases")
-                    .and_then(Value::as_str)
-                    .map(PathBuf::from)
-            })
-            .filter(|path| {
-                path.is_absolute() && path.file_name().is_some_and(|name| name == "sidevoice")
-            })
-        {
-            layout.releases = recorded;
-        }
-        Ok(layout)
+        })
     }
 
     /// The paths a running connector's profile names, with this process's `SIDEVOICE_*` settings.
@@ -334,9 +314,14 @@ mod tests {
     fn paths_follow_the_environment_with_the_documented_defaults() {
         let home = absolute("u");
         let home_var = home.to_str().unwrap();
-        let plain = layout(&[("HOME", home_var)]).unwrap();
-        let releases = home.join(".local").join("share").join("sidevoice");
-        assert_eq!(plain.data, home.join(".sidevoice"));
+        let standard = absolute("s");
+        let plain = layout(&[
+            ("HOME", home_var),
+            ("SIDEVOICE_DATA_DIR", standard.to_str().unwrap()),
+        ])
+        .unwrap();
+        let releases = standard.join("install");
+        assert_eq!(plain.data, standard);
         assert_eq!(plain.releases, releases);
         assert_eq!(plain.config_home, home.join(".config"));
         assert_eq!(plain.current_record(), releases.join("current.json"));
@@ -344,18 +329,18 @@ mod tests {
         assert!(plain.agent_dirs.is_empty());
         assert_eq!(plain.core_port(), "10829");
 
-        let (data, xdg, alpha) = (absolute("d"), absolute("x"), absolute("c"));
+        let (data, alpha) = (absolute("d"), absolute("c"));
         let named = layout(&[
             ("HOME", home_var),
             ("SIDEVOICE_DATA_DIR", data.to_str().unwrap()),
-            ("XDG_DATA_HOME", xdg.to_str().unwrap()),
             ("ALPHA_HOME", alpha.to_str().unwrap()),
             ("SIDEVOICE_CORE_PORT", "0"),
             ("SIDEVOICE_CONNECTOR_TOKEN", "secret"),
             ("SIDEVOICE_SERVICE", "launchd"),
         ])
         .unwrap();
-        assert_eq!(named.releases, xdg.join("sidevoice"));
+        assert_eq!(named.data, data);
+        assert_eq!(named.releases, data.join("install"));
         assert_eq!(named.agent_dirs["ALPHA_HOME"], alpha);
         assert_eq!(named.core_port(), "0");
         assert_eq!(
@@ -380,11 +365,11 @@ mod tests {
     /// A layout whose releases are in a private scratch directory, with release directories `ids` made in it.
     fn with_releases(ids: &[&str]) -> (tempfile::TempDir, Layout) {
         let scratch = crate::test_support::temp_dir("selected");
-        let xdg = scratch.path().join("xdg");
+        let data = scratch.path().join("data");
         let home = scratch.path().join("home");
         let layout = layout(&[
             ("HOME", home.to_str().unwrap()),
-            ("XDG_DATA_HOME", xdg.to_str().unwrap()),
+            ("SIDEVOICE_DATA_DIR", data.to_str().unwrap()),
         ])
         .unwrap();
         Files::ensure_private_dir(&layout.releases).unwrap();

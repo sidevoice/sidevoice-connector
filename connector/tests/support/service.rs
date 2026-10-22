@@ -1,7 +1,7 @@
 //! What the service tests share: an installation staged inside a private profile (the real core, this connector),
 //! the service commands run against it, and this user's real service manager.
 //!
-//! The installation is what an installer leaves: `R/current.json` naming `R/releases/r1` (`R` is `$XDG_DATA_HOME/sidevoice`)
+//! The installation is what an installer leaves: `R/current.json` naming `R/releases/r1` (`R` is `D/install`)
 //! with the core at `core/bin/sidevoice-core-rust` (here a wrapper that runs the real one with no STUN and no
 //! browser keepalive) and its models at `core/models`, and `D/install.json` naming the command that runs this
 //! connector.
@@ -19,7 +19,7 @@ use super::{alive, private_dir, until, Profile, CONNECTOR};
 
 /// `R`.
 pub fn releases(profile: &Profile) -> PathBuf {
-    profile.root.join("home/.local/share/sidevoice")
+    profile.data().join("install")
 }
 
 /// Stage the release and the installation record; returns `R/current.json`.

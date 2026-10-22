@@ -25,6 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use sidevoice_connector::platform::env::{Env as _, Environment};
 use sidevoice_connector::platform::process::{Process as _, Processes};
 
 pub const CONNECTOR: &str = env!("CARGO_BIN_EXE_sidevoice-connector");
@@ -98,6 +99,7 @@ impl Profile {
         ));
         let _ = fs::remove_dir_all(&base);
         private_dir(&base);
+        let data_core = format!("home/{}/core", Environment::DATA_NAME);
         for child in [
             "home",
             "claude",
@@ -106,7 +108,7 @@ impl Profile {
             "cursor/data",
             "xdg/config",
             "home/.local/share",
-            "home/.sidevoice/core",
+            data_core.as_str(),
         ] {
             let mut path = base.clone();
             for part in child.split('/') {
@@ -118,7 +120,7 @@ impl Profile {
     }
 
     pub fn data(&self) -> PathBuf {
-        self.root.join("home/.sidevoice")
+        self.root.join("home").join(Environment::DATA_NAME)
     }
 
     pub fn core_data(&self) -> PathBuf {
@@ -145,8 +147,10 @@ impl Profile {
             ("CURSOR_CONFIG_DIR".into(), path("cursor/config")),
             ("CURSOR_DATA_DIR".into(), path("cursor/data")),
             ("XDG_CONFIG_HOME".into(), path("xdg/config")),
-            ("XDG_DATA_HOME".into(), path("home/.local/share")),
-            ("SIDEVOICE_DATA_DIR".into(), path("home/.sidevoice")),
+            (
+                "SIDEVOICE_DATA_DIR".into(),
+                self.data().to_string_lossy().into_owned(),
+            ),
         ])
     }
 

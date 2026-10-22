@@ -7,8 +7,9 @@
 //!
 //! What every OS guarantees, and what [`Roots::validate`] and the implementations enforce:
 //!
-//! - **Owned roots only.** The roots are exactly `~/.sidevoice` and `~/.local/share/sidevoice` of a home that is a
-//!   real, canonical, absolute directory; anything else is refused before anything is touched.
+//! - **Owned roots only.** `D` is a directory below a home that is a real,
+//!   canonical, absolute directory, named as the OS names a program's own directory (`Sidevoice`, `sidevoice`), and
+//!   `R` is directly inside it; anything else is refused before anything is touched.
 //! - **No link is followed.** A link met inside a root is removed as a link; what it points to is untouched.
 //! - **No root swapped mid-step.** A root, or a directory above it, replaced by a link while a step runs is never
 //!   reached through: the step is refused, or the replacement cannot happen while it runs.
@@ -38,6 +39,7 @@ mod imp;
 
 pub use imp::Os as Remover;
 
+use super::env::{Env, Environment};
 use super::fs::{Files, Fs};
 use serde_json::{json, Value};
 use std::ffi::OsStr;
@@ -61,11 +63,9 @@ const DATA_PREFIX: &str = "data-";
 pub struct Roots {
     /// The person's home.
     pub home: PathBuf,
-    /// `D`: `~/.sidevoice`.
+    /// `D`: the OS's standard place for the program's data, below the home (`data_dir`).
     pub data: PathBuf,
-    /// The directory `R` is in: `~/.local/share`.
-    pub data_home: PathBuf,
-    /// `R`: `~/.local/share/sidevoice`.
+    /// `R`: a directory of `D`.
     pub releases: PathBuf,
     /// The names in `D` that an uninstall leaves (its permanent lock files and the stop).
     pub kept: &'static [&'static str],
@@ -73,19 +73,21 @@ pub struct Roots {
 
 impl Roots {
     /// That these are the installer's own roots and nothing else: absolute and plain paths, the home canonical,
-    /// `D` and `R` exactly where the home puts them and, when they exist, real canonical directories.
+    /// `D` a directory below the home named as the OS names a program's own directory ([`Env::DATA_NAME`]) and `R`
+    /// directly inside it and, when they exist, real canonical directories.
     pub fn validate(&self) -> Result<(), &'static str> {
         if !clean_absolute(&self.home) || self.home.parent().is_none() || !canonical(&self.home) {
             return Err("unsafe home for uninstall");
         }
         let home = dunce::simplified(&self.home);
-        let data_home = home.join(".local").join("share");
+        let data = dunce::simplified(&self.data);
         if !clean_absolute(&self.data)
-            || !clean_absolute(&self.data_home)
             || !clean_absolute(&self.releases)
-            || dunce::simplified(&self.data) != home.join(".sidevoice")
-            || dunce::simplified(&self.data_home) != data_home
-            || dunce::simplified(&self.releases) != data_home.join("sidevoice")
+            || data.strip_prefix(home).is_err()
+            || data == home
+            || data.file_name() != Some(OsStr::new(Environment::DATA_NAME))
+            || dunce::simplified(&self.releases).parent() != Some(data)
+            || self.releases.file_name().is_none()
         {
             return Err("uninstall path is outside known Sidevoice roots");
         }
@@ -103,13 +105,14 @@ impl Roots {
         Ok(())
     }
 
-    /// The names in `D` that are never claimed: what the uninstall `kept`, the retry record, the claim and the
-    /// recovery directories.
+    /// The names in `D` that are never claimed as data: what the uninstall `kept`, the retry record, the claim and the
+    /// recovery directories, and `R` (removed as the releases, by itself).
     fn is_kept(&self, name: &OsStr) -> bool {
         self.kept
             .iter()
             .chain(&[RECORD, CLAIM, RECOVERY])
             .any(|kept| OsStr::new(kept) == name)
+            || self.releases.file_name() == Some(name)
     }
 }
 
@@ -201,12 +204,14 @@ mod tests {
 
     const KEPT: &[&str] = &["install.lock", "agents.lock", "node-stopped.json"];
 
+    const DATA: &str = Environment::DATA_NAME;
+
     fn roots(home: &Path) -> Roots {
+        let data = home.join(DATA);
         Roots {
             home: home.to_path_buf(),
-            data: home.join(".sidevoice"),
-            data_home: home.join(".local").join("share"),
-            releases: home.join(".local").join("share").join("sidevoice"),
+            releases: data.join("install"),
+            data,
             kept: KEPT,
         }
     }
@@ -233,8 +238,12 @@ mod tests {
             PathBuf::new(),
             PathBuf::from("relative"),
             home.clone(),
-            home.join(".sidevoice/.."),
+            home.join(DATA).join(".."),
             home.join("elsewhere"),
+            home.join("elsewhere")
+                .join(DATA)
+                .join("..")
+                .join("elsewhere"),
         ] {
             let mut layout = roots(&home);
             layout.data = unsafe_path;
@@ -244,8 +253,17 @@ mod tests {
         layout.releases = home.clone();
         assert!(layout.validate().is_err());
         let mut layout = roots(&home);
-        layout.data_home = home.clone();
-        assert!(layout.validate().is_err());
+        layout.releases = home.join("install");
+        assert!(layout.validate().is_err(), "R is inside D");
+        let layout = Roots {
+            data: home.join(".local").join("share").join(DATA),
+            releases: home.join(".local").join("share").join(DATA).join("install"),
+            ..roots(&home)
+        };
+        assert!(
+            layout.validate().is_ok(),
+            "D is where the OS puts it, however deep"
+        );
         let mut layout = roots(&home);
         layout.home = PathBuf::from(std::path::MAIN_SEPARATOR_STR);
         assert!(layout.validate().is_err(), "never the file-system root");
@@ -355,7 +373,7 @@ mod tests {
         symlink(&moved, &home);
         assert!(removal.remove_data_contents(&|_| {}).is_err());
         assert_eq!(
-            fs::read_to_string(moved.join(".sidevoice/keep")).unwrap(),
+            fs::read_to_string(moved.join(DATA).join("keep")).unwrap(),
             "untouched"
         );
     }
@@ -365,19 +383,19 @@ mod tests {
     /// and stops, nothing outside is removed.
     #[test]
     fn a_root_or_the_home_swapped_for_a_link_mid_removal_never_reaches_outside() {
-        for swapped in [".sidevoice", ""] {
+        for swapped in [DATA, ""] {
             let (scratch, layout, removal) = installed("uninstall-ancestor-swap");
             fs::write(layout.data.join("entry"), "ours").unwrap();
             let outside = scratch.path().join("outside");
-            for root in [".sidevoice", ".local/share/sidevoice"] {
-                fs::create_dir_all(outside.join(root)).unwrap();
-                fs::write(outside.join(root).join("keep"), "outside").unwrap();
+            for root in [DATA.to_owned(), format!("{DATA}/install")] {
+                fs::create_dir_all(outside.join(&root)).unwrap();
+                fs::write(outside.join(&root).join("keep"), "outside").unwrap();
             }
             fs::write(outside.join("keep"), "outside").unwrap();
             let (victim, target) = if swapped.is_empty() {
                 (layout.home.clone(), outside.clone())
             } else {
-                (layout.home.join(swapped), outside.join(".sidevoice"))
+                (layout.home.join(swapped), outside.join(DATA))
             };
             let moved = scratch.path().join("moved");
             let done = AtomicBool::new(false);
@@ -404,9 +422,13 @@ mod tests {
             }
             let _ = removal.remove_releases();
             let _ = removal.finish_claim();
-            for kept in ["keep", ".sidevoice/keep", ".local/share/sidevoice/keep"] {
+            for kept in [
+                "keep".to_owned(),
+                format!("{DATA}/keep"),
+                format!("{DATA}/install/keep"),
+            ] {
                 assert_eq!(
-                    fs::read_to_string(outside.join(kept)).unwrap(),
+                    fs::read_to_string(outside.join(&kept)).unwrap(),
                     "outside",
                     "{swapped:?}: {kept}"
                 );
@@ -422,7 +444,7 @@ mod tests {
         let resolved = fs::canonicalize(&home).unwrap();
         assert!(roots(&resolved).validate().is_ok());
         let mut mixed = roots(&home);
-        mixed.data = resolved.join(".sidevoice");
+        mixed.data = resolved.join(DATA);
         assert!(mixed.validate().is_ok(), "either form, compared as one");
     }
 }
