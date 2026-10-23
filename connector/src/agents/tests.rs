@@ -612,24 +612,15 @@ fn agent_refusals_labels_and_manual_text_use_the_shared_english_bundle() {
     );
 }
 
-/// This program is registered by its plain canonical path, never Windows' `\\?\` form (which agent configurations
-/// and the steps a person runs would carry), and an entry naming either spelling is still ours.
+/// This program is registered by its canonical path in plain form (`dunce`: not Windows' `\\?\` form where a plain
+/// one names it), and an entry naming it in either spelling is ours.
 #[test]
 fn this_program_is_registered_by_its_plain_canonical_path() {
     let own = InstalledCommand::executable().unwrap();
-    let path = Path::new(&own.command);
-    assert!(path.is_absolute(), "{}", own.command);
-    assert!(!own.command.starts_with(r"\\?\"), "{}", own.command);
-    assert_eq!(
-        path,
-        std::env::current_exe()
-            .unwrap()
-            .canonicalize()
-            .map(|p| dunce::simplified(&p).to_path_buf())
-            .unwrap()
-    );
-    let verbatim = std::env::current_exe().unwrap().canonicalize().unwrap();
-    assert!(own.owns(&verbatim.to_string_lossy(), &own.args));
+    let canonical = std::env::current_exe().unwrap().canonicalize().unwrap();
+    assert_eq!(Path::new(&own.command), dunce::simplified(&canonical));
+    assert!(own.owns(&own.command, &own.args));
+    assert!(own.owns(&canonical.to_string_lossy(), &own.args));
 }
 
 #[test]
@@ -1560,6 +1551,18 @@ async fn the_installed_command_is_registered_and_owns_every_release_of_it() {
         installed.owns(&other.to_string_lossy(), &mcp),
         "another release's own binary"
     );
+    // One whose path is too long for a plain form (Windows keeps it `\\?\…`, while the releases' is plain) is ours
+    // all the same.
+    let long = releases
+        .join("releases")
+        .join(format!("2.0.0-{}", "l".repeat(240)))
+        .join(crate::install::binary());
+    fs::create_dir_all(long.parent().unwrap()).unwrap();
+    fs::write(&long, b"").unwrap();
+    assert!(
+        installed.owns(&long.to_string_lossy(), &mcp),
+        "a release with a long path"
+    );
     assert!(!installed.owns(&stable.to_string_lossy(), &["connector".into()]));
     assert!(!installed.owns("/usr/local/bin/sidevoice-connector", &mcp));
     let elsewhere = fixture
@@ -2188,12 +2191,24 @@ async fn each_agent_says_what_the_connector_does_itself_and_how_to_do_it_by_hand
     host.shutdown().await;
 }
 
+/// `connect` (on an outdated entry) and `update` each rewrite an older entry: each runs from one.
+#[tokio::test]
+async fn the_manual_steps_run_by_hand_update_an_older_entry_in_the_agents_own_home() {
+    manual_steps_by_hand(&["connect", "update"]).await;
+}
+
+/// The older `instructions` (connecting as one step) rewrite an older entry too.
 #[tokio::test]
 #[cfg_attr(
     windows,
     ignore = "the joined `instructions` line is not valid PowerShell on Windows (`&&` then a `$env:` assignment): decision pending"
 )]
-async fn the_manual_steps_run_by_hand_update_an_older_entry_in_the_agents_own_home() {
+async fn the_joined_instructions_run_by_hand_update_an_older_entry() {
+    manual_steps_by_hand(&["instructions"]).await;
+}
+
+/// Runs each of `kinds` by hand from an older entry of ours, in the agents' own homes, and checks it connects.
+async fn manual_steps_by_hand(kinds: &[&str]) {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
     let claude = fake_claude(&fixture);
@@ -2202,9 +2217,7 @@ async fn the_manual_steps_run_by_hand_update_an_older_entry_in_the_agents_own_ho
     let _codex = EnvGuard::set("SIDEVOICE_CODEX_BIN", codex.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let selected = fixture.selected();
-    // `connect` (on an outdated entry), `update`, and the older `instructions` (connecting as one step) each rewrite
-    // an older entry: each runs from one.
-    for kind in ["connect", "update", "instructions"] {
+    for kind in kinds {
         // Older entries of ours: this installation's command without its environment.
         claude_older_entry(
             &fixture
@@ -2219,7 +2232,7 @@ async fn the_manual_steps_run_by_hand_update_an_older_entry_in_the_agents_own_ho
         for id in ["claude", "codex"] {
             let agent = row(&listed, id);
             assert_eq!(agent["owned"], true, "{agent}");
-            let steps = if kind == "instructions" {
+            let steps = if *kind == "instructions" {
                 let command = agent["instructions"]["command"].as_str().unwrap();
                 assert!(command.contains(" && "), "removes, then adds: {agent}");
                 vec![agent["instructions"].clone()]

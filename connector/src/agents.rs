@@ -145,11 +145,13 @@ struct InstalledCommand {
 
 impl InstalledCommand {
     fn executable() -> Result<Self> {
-        // Canonical in its plain form (`dunce`): on Windows without the `\\?\` prefix `canonicalize` gives, which agent
-        // configurations and the steps a person runs would otherwise carry.
-        let executable = dunce::canonicalize(std::env::current_exe()?)?;
+        // Compared canonical as the OS gives it (`\\?\…` on Windows, like every path `owns` canonicalizes), but written
+        // in its plain form (`dunce`), which agent configurations and the steps a person runs carry.
+        let executable = std::env::current_exe()?.canonicalize()?;
         Ok(Self {
-            command: executable.to_string_lossy().into_owned(),
+            command: dunce::simplified(&executable)
+                .to_string_lossy()
+                .into_owned(),
             args: vec!["mcp".into()],
             version: crate::identity::VERSION.into(),
             ownership: Ownership::Executable { executable },
@@ -170,7 +172,9 @@ impl InstalledCommand {
             version: profile.connector_version().into(),
             ownership: Ownership::Installed {
                 releases: layout.releases.join("releases"),
-                executable: std::env::current_exe().and_then(dunce::canonicalize).ok(),
+                executable: std::env::current_exe()
+                    .and_then(|path| path.canonicalize())
+                    .ok(),
             },
         })
     }
@@ -1158,9 +1162,10 @@ fn error_value(key: &str, params: Value) -> Value {
     json!({"error":{"key":key,"params":params,"message":message}})
 }
 
-/// `value` canonical in its plain form, as [`InstalledCommand`] records its executable (`dunce`).
+/// `value` canonical as the OS gives it: every path [`InstalledCommand::owns`] compares is in this one form (`dunce`
+/// may simplify one path and not another, a long one, so plain forms do not compare).
 fn canonical(value: &str) -> Option<PathBuf> {
-    dunce::canonicalize(value).ok()
+    Path::new(value).canonicalize().ok()
 }
 
 #[cfg(test)]
