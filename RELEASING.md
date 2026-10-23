@@ -1,7 +1,7 @@
 # Releasing
 
 One version for the connector, tagged `vX.Y.Z`. It lives in `connector/Cargo.toml` (the build tooling at
-the workspace root carries the same one, and `Cargo.lock` both); release-please moves them together
+the workspace root and `testbench/` carry the same one, and `Cargo.lock` both); release-please moves them together
 (`release-please-config.json`). Never edit it by hand. The connector is distributed as GitHub Releases of this
 repository, one archive per target, and on npm as the package `sidevoice` with one package per platform built from
 those very archives ([npm](#npm-what-is-published-and-how-to-add-a-platform)).
