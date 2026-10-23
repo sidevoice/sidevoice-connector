@@ -16,6 +16,9 @@ use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
 
+/// How long the daemon's cleanup after a stop may take in all (see where it is used).
+const CLEANUP_LIMIT: Duration = Duration::from_secs(4);
+
 pub(super) fn prune_binding_order(order: &mut HashMap<String, oneshot::Receiver<()>>) {
     order.retain(|_, tail| matches!(tail.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
 }
@@ -200,28 +203,41 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
             }
         }
     }
+    // All of the cleanup has one deadline, the same on every OS: a console closing on Windows leaves the process about
+    // 5 s before it is ended, launchd and systemd wait longer (20 s, 90 s by default). Cancellation comes first: the
+    // agents' operations are told to stop (their child trees killed) while the clients' requests drain; what is
+    // still running at the deadline is aborted.
+    let cleanup = Instant::now() + CLEANUP_LIMIT;
     daemon.shutdown.send_replace(true);
-    if !client_tasks.is_empty() {
-        let drained = tokio::time::timeout(Duration::from_secs(2), async {
-            while client_tasks.join_next().await.is_some() {}
-        })
-        .await;
-        if drained.is_err() {
-            client_tasks.abort_all();
-            while client_tasks.join_next().await.is_some() {}
+    let clients = async {
+        if !client_tasks.is_empty() {
+            let drain = (Instant::now() + Duration::from_secs(2)).min(cleanup);
+            let drained = tokio::time::timeout_at(drain, async {
+                while client_tasks.join_next().await.is_some() {}
+            })
+            .await;
+            if drained.is_err() {
+                client_tasks.abort_all();
+            }
         }
-    }
-    if let Some(scanner) = scanner {
+    };
+    tokio::join!(daemon.host_agents.shutdown_until(cleanup), clients);
+    if let Some(scanner) = &scanner {
         scanner.abort();
-        let _ = scanner.await;
     }
     link_task.abort();
-    let _ = link_task.await;
     replay_tasks.abort_all();
-    while replay_tasks.join_next().await.is_some() {}
     core_tasks.abort_all();
-    while core_tasks.join_next().await.is_some() {}
-    daemon.host_agents.shutdown().await;
+    let _ = tokio::time::timeout_at(cleanup, async {
+        while client_tasks.join_next().await.is_some() {}
+        if let Some(scanner) = scanner {
+            let _ = scanner.await;
+        }
+        let _ = link_task.await;
+        while replay_tasks.join_next().await.is_some() {}
+        while core_tasks.join_next().await.is_some() {}
+    })
+    .await;
     drop(listener);
     drop(lock);
     if link_exited {
