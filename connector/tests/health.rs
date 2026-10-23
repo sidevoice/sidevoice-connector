@@ -55,18 +55,42 @@ fn main() {
             Box::pin(cancelling_stops_the_check())
         }),
     ];
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|arg| arg == "--list") {
+    // The harness's options: the flags that take no value are accepted and ignored, `--test-threads` and `--skip`
+    // take one (as the next argument or after `=`), anything else is refused. The plain words are name filters.
+    let mut list = false;
+    let mut filters: Vec<String> = Vec::new();
+    let mut skips: Vec<String> = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--list" => list = true,
+            "--nocapture" | "--show-output" | "--quiet" | "-q" | "--exact" | "--ignored"
+            | "--include-ignored" => {}
+            "--test-threads" => {
+                args.next();
+            }
+            "--skip" => skips.extend(args.next()),
+            _ if arg.starts_with("--test-threads=") => {}
+            _ if arg.starts_with("--skip=") => skips.push(arg["--skip=".len()..].to_owned()),
+            _ if arg.starts_with('-') => {
+                eprintln!("unknown option {arg}");
+                std::process::exit(2);
+            }
+            _ => filters.push(arg),
+        }
+    }
+    if list {
         for (name, _) in &tests {
             println!("{name}: test");
         }
         return;
     }
-    let filters: Vec<&String> = args.iter().filter(|arg| !arg.starts_with('-')).collect();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let mut passed = 0;
     for (name, test) in tests {
-        if !filters.is_empty() && !filters.iter().any(|filter| name.contains(filter.as_str())) {
+        if (!filters.is_empty() && !filters.iter().any(|filter| name.contains(filter.as_str())))
+            || skips.iter().any(|skip| name.contains(skip.as_str()))
+        {
             continue;
         }
         print!("test {name} ... ");
@@ -75,6 +99,10 @@ fn main() {
         runtime.block_on(test());
         println!("ok");
         passed += 1;
+    }
+    if passed == 0 && filters.is_empty() {
+        eprintln!("no test ran");
+        std::process::exit(1);
     }
     println!("\ntest result: ok. {passed} passed");
 }

@@ -79,7 +79,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
-    "Win32_System_RestartManager",
 ] }
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
 # The user and machine `Path` a Windows login has instead of a login shell's (src/platform/env/windows.rs).

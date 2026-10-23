@@ -51,29 +51,10 @@ pub trait Process {
     fn tree(command: Command) -> CommandWrap;
 
     /// The files `pid` has open, as far as the OS shows them to this user: `/proc/<pid>/fd`, else `lsof`, on Unix.
-    /// `Unsupported` on Windows, where nothing in the standard API lists another process's handles (ask
-    /// [`Process::open_among`] there, about files named in advance); another error when the OS shows nothing (no
+    /// `Unsupported` on Windows, where nothing in the standard API lists another process's handles (a Windows
+    /// chat lookup waits for its agent's chat roots to be measured); another error when the OS shows nothing (no
     /// `/proc` and no `lsof`).
     fn open_files(pid: u32) -> io::Result<Vec<PathBuf>>;
-
-    /// Which of `candidates` `pid` has open: a question about files named in advance, for an OS that cannot list a
-    /// process's files. The answer keeps the order of `candidates`. Unix filters [`Process::open_files`] (a file
-    /// matched by the path given or its canonical one). Windows asks the Restart Manager which processes hold the
-    /// files, then narrows by halves to the ones `pid` holds, within a bounded number of questions: an error when it
-    /// cannot be asked or the bound is reached. A pid now naming another process than the one that holds a file
-    /// (reused) does not count: the Restart Manager's start time must be `pid`'s. Not used yet: the one caller this
-    /// was made for, an adapter's chat lookup, needs on Windows where that agent keeps its chats, which is unmeasured.
-    fn open_among(pid: u32, candidates: &[PathBuf]) -> io::Result<Vec<PathBuf>> {
-        let open = Self::open_files(pid)?;
-        Ok(candidates
-            .iter()
-            .filter(|candidate| {
-                open.contains(*candidate)
-                    || std::fs::canonicalize(candidate).is_ok_and(|real| open.contains(&real))
-            })
-            .cloned()
-            .collect())
-    }
 
     /// Starts `command` so that it outlives this process and its terminal. The caller owns stdio and the
     /// environment.
@@ -484,33 +465,5 @@ mod tests {
             assert!(open.contains(&held.canonicalize().unwrap()), "{open:?}");
         }
         drop(file);
-    }
-
-    #[test]
-    fn the_candidates_a_process_has_open_are_told_from_those_it_has_not() {
-        let scratch = crate::test_support::temp_dir("open-among");
-        // Enough candidates that Windows narrows a positive answer by halves more than once.
-        let mut candidates: Vec<PathBuf> = (0..12)
-            .map(|index| scratch.path().join(format!("file-{index}")))
-            .collect();
-        for candidate in &candidates {
-            std::fs::write(candidate, b"x").unwrap();
-        }
-        candidates.push(scratch.path().join("missing"));
-        let held = [candidates[3].clone(), candidates[10].clone()];
-        let files = held
-            .each_ref()
-            .map(|path| std::fs::File::open(path).unwrap());
-        // An error is a host that cannot tell (no `lsof`, no Restart Manager): the question has no answer there.
-        if let Ok(open) = Processes::open_among(std::process::id(), &candidates) {
-            assert_eq!(open, held);
-        }
-        if let Ok(open) = Processes::open_among(std::process::id(), &[]) {
-            assert!(open.is_empty(), "{open:?}");
-        }
-        drop(files);
-        if let Ok(open) = Processes::open_among(std::process::id(), &candidates) {
-            assert!(open.is_empty(), "{open:?}");
-        }
     }
 }
