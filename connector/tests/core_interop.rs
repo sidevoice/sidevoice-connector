@@ -19,7 +19,7 @@ fn assistant_history_id(
     let suffix = format!(":voice:{utterance_id}");
     until("assistant history row", 15, || {
         let history = core_json(
-            &profile.core_socket(),
+            &profile.core_endpoint(),
             "GET",
             &format!("/api/presentation/history?thread_id={thread}"),
             None,
@@ -85,12 +85,12 @@ fn a_conversation_talks_to_the_real_core_through_the_connector() {
     assert_eq!(linked["protocol"], 3, "{linked}");
     assert_eq!(linked["pid"], first_core.pid(), "{linked}");
 
-    let call = Presentation::open(&profile.core_socket());
+    let call = Presentation::open(&profile.core_endpoint());
 
     // The machine as a client will list it (asked as the device the call paired): what this machine actually is,
     // not a placeholder.
     let listed = core_json(
-        &profile.core_socket(),
+        &profile.core_endpoint(),
         "GET",
         "/api/connectors",
         None,
@@ -167,7 +167,7 @@ fn a_conversation_talks_to_the_real_core_through_the_connector() {
     );
 
     // The person speaks in the call (as text): the core hands it to the connector, which delivers it.
-    let socket = profile.core_socket();
+    let socket = profile.core_endpoint();
     let selected = core_json(
         &socket,
         "POST",
@@ -237,7 +237,7 @@ fn the_connector_and_core_sockets_are_this_users_alone() {
         profile.data(),
         profile.core_data(),
         profile.connector_socket(),
-        profile.core_socket(),
+        std::path::PathBuf::from(profile.core_endpoint().to_string()),
         profile.data().join("connector.lock"),
     ] {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
@@ -317,7 +317,7 @@ fn t16_fetch_claim_ack_and_redelivery_use_the_real_core() {
     let _core = profile.start_core(&core, "turns-pull-core");
     let _connector = profile.start_connector();
     profile.wait_linked("turns-pull-core");
-    let call = Presentation::open(&profile.core_socket());
+    let call = Presentation::open(&profile.core_endpoint());
     let thread = "turns-pull-thread";
     let mut command = profile.connector(&["mcp"]);
     command.env("SIDEVOICE_THREAD", thread);
@@ -327,7 +327,7 @@ fn t16_fetch_claim_ack_and_redelivery_use_the_real_core() {
     assert_eq!(joined["delivery"], "get_messages", "{joined}");
     assert_eq!(joined["initial_reply_context"]["epoch"], 0, "{joined}");
     let selected = core_json(
-        &profile.core_socket(),
+        &profile.core_endpoint(),
         "POST",
         "/api/presentation/select",
         Some(&json!({"session_id":call.session,"thread_id":thread})),
@@ -335,7 +335,7 @@ fn t16_fetch_claim_ack_and_redelivery_use_the_real_core() {
     );
     let id = uuid::Uuid::new_v4().to_string();
     let posted = core_json(
-        &profile.core_socket(),
+        &profile.core_endpoint(),
         "POST",
         "/api/presentation/text",
         Some(
@@ -398,7 +398,7 @@ fn t02c_t02d_open_turn_refusal_is_terminal_and_empty_notice_is_pullable() {
     let _core = profile.start_core(&core, "turns-refusal-core");
     let _connector = profile.start_connector();
     profile.wait_linked("turns-refusal-core");
-    let call = Presentation::open(&profile.core_socket());
+    let call = Presentation::open(&profile.core_endpoint());
     let thread = "turns-refusal-thread";
     let mut command = profile.connector(&["mcp"]);
     command.env("SIDEVOICE_THREAD", thread);
@@ -407,7 +407,7 @@ fn t02c_t02d_open_turn_refusal_is_terminal_and_empty_notice_is_pullable() {
     let joined = mcp.tool("voice_connect", json!({}));
     assert_eq!(joined["delivery"], "get_messages", "{joined}");
     core_json(
-        &profile.core_socket(),
+        &profile.core_endpoint(),
         "POST",
         "/api/presentation/select",
         Some(&json!({"session_id":call.session,"thread_id":thread})),
@@ -454,7 +454,7 @@ fn t02c_t02d_open_turn_refusal_is_terminal_and_empty_notice_is_pullable() {
     assert_eq!(after["status"], "rejected", "{after}");
     assert_eq!(after["reason"], "user_speaking", "{after}");
     let history = core_json(
-        &profile.core_socket(),
+        &profile.core_endpoint(),
         "GET",
         &format!("/api/presentation/history?thread_id={thread}"),
         None,
@@ -512,7 +512,7 @@ fn t07_retry_identifiers_are_a_pair_and_one_pair_creates_one_reply() {
     let _core = profile.start_core(&core, "retry-ids-core");
     let _connector = profile.start_connector();
     profile.wait_linked("retry-ids-core");
-    let call = Presentation::open(&profile.core_socket());
+    let call = Presentation::open(&profile.core_endpoint());
     let thread = "retry-ids-thread";
     let receiver = http_receiver();
     let mut command = profile.connector(&["mcp"]);
@@ -545,7 +545,7 @@ fn t07_retry_identifiers_are_a_pair_and_one_pair_creates_one_reply() {
     assert_eq!(first["text_saved"], true, "{first}");
     assert_eq!(again["text_saved"], true, "{again}");
     let history = core_json(
-        &profile.core_socket(),
+        &profile.core_endpoint(),
         "GET",
         &format!("/api/presentation/history?thread_id={thread}"),
         None,
@@ -573,7 +573,7 @@ fn t07_recovered_attempt_allows_a_new_context_to_play_with_real_core() {
         let _core = profile.start_core(&core, label);
         let mut connector = profile.start_connector();
         profile.wait_linked(label);
-        let call = Presentation::open(&profile.core_socket());
+        let call = Presentation::open(&profile.core_endpoint());
         let receiver = http_receiver();
         let thread = format!("{label}-thread");
         let mut command = profile.connector(&["mcp"]);
@@ -584,7 +584,7 @@ fn t07_recovered_attempt_allows_a_new_context_to_play_with_real_core() {
         mcp.initialize("recover-first");
         let joined = mcp.tool("voice_connect", json!({}));
         core_json(
-            &profile.core_socket(),
+            &profile.core_endpoint(),
             "POST",
             "/api/presentation/select",
             Some(&json!({"session_id":call.session,"thread_id":thread})),
@@ -667,7 +667,7 @@ fn t16_large_valid_pull_page_arrives_in_complete_cursor_order() {
     let _core = profile.start_core(&core, "pull-large-core");
     let _connector = profile.start_connector();
     profile.wait_linked("pull-large-core");
-    let call = Presentation::open(&profile.core_socket());
+    let call = Presentation::open(&profile.core_endpoint());
     let thread = "pull-large-thread";
     let mut command = profile.connector(&["mcp"]);
     command.env("SIDEVOICE_THREAD", thread);
@@ -675,7 +675,7 @@ fn t16_large_valid_pull_page_arrives_in_complete_cursor_order() {
     mcp.initialize("pull-large-client");
     mcp.tool("voice_connect", json!({}));
     let selected = core_json(
-        &profile.core_socket(),
+        &profile.core_endpoint(),
         "POST",
         "/api/presentation/select",
         Some(&json!({"session_id":call.session,"thread_id":thread})),
@@ -686,7 +686,7 @@ fn t16_large_valid_pull_page_arrives_in_complete_cursor_order() {
     for _ in 0..32 {
         let id = uuid::Uuid::new_v4().to_string();
         let posted = core_json(
-            &profile.core_socket(),
+            &profile.core_endpoint(),
             "POST",
             "/api/presentation/text",
             Some(
@@ -733,7 +733,7 @@ fn actual_notice(
     let _core = profile.start_core(core, &launch);
     let _connector = profile.start_connector();
     profile.wait_linked(&launch);
-    let call = Presentation::open(&profile.core_socket());
+    let call = Presentation::open(&profile.core_endpoint());
     let receiver = http_receiver();
     let thread = format!("notice-thread-{label}-{mode}");
     let mut command = profile.connector(&["mcp"]);
@@ -749,7 +749,7 @@ fn actual_notice(
     mcp.initialize("notice-client");
     let joined = mcp.tool("voice_connect", json!({}));
     core_json(
-        &profile.core_socket(),
+        &profile.core_endpoint(),
         "POST",
         "/api/presentation/select",
         Some(&json!({"session_id":call.session,"thread_id":thread})),
@@ -928,7 +928,7 @@ fn t03_stale_reply_is_text_only_with_ordinary_notice_in_push_and_pull() {
                 let thread = joined["conversation"].as_str().unwrap();
                 until("new words are in core history", 15, || {
                     let history = core_json(
-                        &profile.core_socket(),
+                        &profile.core_endpoint(),
                         "GET",
                         &format!("/api/presentation/history?thread_id={thread}"),
                         None,
@@ -965,7 +965,7 @@ fn text_only_written_hearing_is_confirmed_without_an_audio_target_in_both_modes(
         let _core = profile.start_core(&core, &label);
         let _connector = profile.start_connector();
         profile.wait_linked(&label);
-        let call = Presentation::open(&profile.core_socket());
+        let call = Presentation::open(&profile.core_endpoint());
         let receiver = http_receiver();
         let thread = format!("thread-{label}");
         let mut command = profile.connector(&["mcp"]);
@@ -981,7 +981,7 @@ fn text_only_written_hearing_is_confirmed_without_an_audio_target_in_both_modes(
         mcp.initialize("written-hearing-client");
         let joined = mcp.tool("voice_connect", json!({}));
         core_json(
-            &profile.core_socket(),
+            &profile.core_endpoint(),
             "POST",
             "/api/presentation/select",
             Some(&json!({"session_id":call.session,"thread_id":thread})),
@@ -998,7 +998,7 @@ fn text_only_written_hearing_is_confirmed_without_an_audio_target_in_both_modes(
         confirm_hearing(&profile, &call, &thread, "written-utterance", "heard", None);
         let history_id = assistant_history_id(&profile, &call, &thread, "written-utterance");
         let history = core_json(
-            &profile.core_socket(),
+            &profile.core_endpoint(),
             "GET",
             &format!("/api/presentation/history?thread_id={thread}"),
             None,
@@ -1143,7 +1143,7 @@ fn t02c_t02d_refusal_reaches_the_caller_and_words_or_empty_input_in_both_modes()
             let _core = profile.start_core(&core, &label);
             let _connector = profile.start_connector();
             profile.wait_linked(&label);
-            let call = Presentation::open(&profile.core_socket());
+            let call = Presentation::open(&profile.core_endpoint());
             let receiver = http_receiver();
             let thread = format!("thread-{label}");
             let mut command = profile.connector(&["mcp"]);
@@ -1159,7 +1159,7 @@ fn t02c_t02d_refusal_reaches_the_caller_and_words_or_empty_input_in_both_modes()
             mcp.initialize("refusal-client");
             mcp.tool("voice_connect", json!({}));
             core_json(
-                &profile.core_socket(),
+                &profile.core_endpoint(),
                 "POST",
                 "/api/presentation/select",
                 Some(&json!({"session_id":call.session,"thread_id":thread})),
@@ -1211,7 +1211,7 @@ fn t02c_t02d_refusal_reaches_the_caller_and_words_or_empty_input_in_both_modes()
                 );
             }
             let history = core_json(
-                &profile.core_socket(),
+                &profile.core_endpoint(),
                 "GET",
                 &format!("/api/presentation/history?thread_id={thread}"),
                 None,
@@ -1239,7 +1239,7 @@ fn t04a_multiple_publications_keep_core_playback_fifo_in_both_modes() {
         let _core = profile.start_core(&core, &launch);
         let _connector = profile.start_connector();
         profile.wait_linked(&launch);
-        let call = Presentation::open(&profile.core_socket());
+        let call = Presentation::open(&profile.core_endpoint());
         let receiver = http_receiver();
         let thread = format!("fifo-thread-{mode}");
         let mut command = profile.connector(&["mcp"]);
@@ -1255,7 +1255,7 @@ fn t04a_multiple_publications_keep_core_playback_fifo_in_both_modes() {
         mcp.initialize("fifo-client");
         let joined = mcp.tool("voice_connect", json!({}));
         core_json(
-            &profile.core_socket(),
+            &profile.core_endpoint(),
             "POST",
             "/api/presentation/select",
             Some(&json!({"session_id":call.session,"thread_id":thread})),
@@ -1295,7 +1295,7 @@ fn t04b_nine_withdrawn_replies_reach_complete_ordered_real_core_batches() {
         let _core = profile.start_core(&core, &launch);
         let _connector = profile.start_connector();
         profile.wait_linked(&launch);
-        let call = Presentation::open(&profile.core_socket());
+        let call = Presentation::open(&profile.core_endpoint());
         let receiver = http_receiver();
         let thread = format!("batches-thread-{mode}");
         let mut command = profile.connector(&["mcp"]);
@@ -1311,7 +1311,7 @@ fn t04b_nine_withdrawn_replies_reach_complete_ordered_real_core_batches() {
         mcp.initialize("batches-client");
         let joined = mcp.tool("voice_connect", json!({}));
         core_json(
-            &profile.core_socket(),
+            &profile.core_endpoint(),
             "POST",
             "/api/presentation/select",
             Some(&json!({"session_id":call.session,"thread_id":thread})),
@@ -1398,7 +1398,7 @@ fn t06e_no_return_notice_without_a_miss_or_after_another_device_heard() {
         let _core = profile.start_core(&core, &launch);
         let _connector = profile.start_connector();
         profile.wait_linked(&launch);
-        let call = Presentation::open(&profile.core_socket());
+        let call = Presentation::open(&profile.core_endpoint());
         let receiver = http_receiver();
         let thread = format!("no-return-thread-{mode}");
         let mut command = profile.connector(&["mcp"]);
@@ -1414,7 +1414,7 @@ fn t06e_no_return_notice_without_a_miss_or_after_another_device_heard() {
         mcp.initialize("no-return-client");
         let joined = mcp.tool("voice_connect", json!({}));
         core_json(
-            &profile.core_socket(),
+            &profile.core_endpoint(),
             "POST",
             "/api/presentation/select",
             Some(&json!({"session_id":call.session,"thread_id":thread})),
@@ -1436,7 +1436,7 @@ fn t06e_no_return_notice_without_a_miss_or_after_another_device_heard() {
         }
         let other = Presentation::open_second(&profile);
         core_json(
-            &profile.core_socket(),
+            &profile.core_endpoint(),
             "POST",
             "/api/presentation/select",
             Some(&json!({"session_id":other.session,"thread_id":thread})),
@@ -1482,7 +1482,7 @@ fn t14_real_two_device_corrections_keep_the_original_notice_frozen() {
             let _core = profile.start_core(&core, &label);
             let _connector = profile.start_connector();
             profile.wait_linked(&label);
-            let call = Presentation::open(&profile.core_socket());
+            let call = Presentation::open(&profile.core_endpoint());
             let other = Presentation::open_second(&profile);
             let receiver = http_receiver();
             let thread = format!("thread-{label}");
@@ -1500,7 +1500,7 @@ fn t14_real_two_device_corrections_keep_the_original_notice_frozen() {
             let joined = mcp.tool("voice_connect", json!({}));
             for device in [&call, &other] {
                 core_json(
-                    &profile.core_socket(),
+                    &profile.core_endpoint(),
                     "POST",
                     "/api/presentation/select",
                     Some(&json!({"session_id":device.session,"thread_id":thread})),
@@ -1623,7 +1623,7 @@ fn t16_failed_injection_and_pull_expose_identical_real_notice_fields() {
     let _core = profile.start_core(&core, "notice-parity-core");
     let _connector = profile.start_connector();
     profile.wait_linked("notice-parity-core");
-    let call = Presentation::open(&profile.core_socket());
+    let call = Presentation::open(&profile.core_endpoint());
     let other = Presentation::open_second(&profile);
     let receiver = http_receiver_with_status(503);
     let thread = "notice-parity-thread";
@@ -1635,14 +1635,14 @@ fn t16_failed_injection_and_pull_expose_identical_real_notice_fields() {
     mcp.initialize("notice-parity-client");
     let joined = mcp.tool("voice_connect", json!({}));
     core_json(
-        &profile.core_socket(),
+        &profile.core_endpoint(),
         "POST",
         "/api/presentation/select",
         Some(&json!({"session_id":call.session,"thread_id":thread})),
         Some(&call.token),
     );
     core_json(
-        &profile.core_socket(),
+        &profile.core_endpoint(),
         "POST",
         "/api/presentation/select",
         Some(&json!({"session_id":other.session,"thread_id":thread})),
@@ -1779,7 +1779,7 @@ fn t02c_t02d_backlogged_other_conversation_cannot_hide_real_core_refusal() {
         std::fs::set_permissions(&outbox_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let _connector = profile.start_connector();
         profile.wait_linked(&label);
-        let call = Presentation::open(&profile.core_socket());
+        let call = Presentation::open(&profile.core_endpoint());
         let thread = format!("thread-{label}");
         let mut command = profile.connector(&["mcp"]);
         command.env("SIDEVOICE_THREAD", &thread);
@@ -1787,7 +1787,7 @@ fn t02c_t02d_backlogged_other_conversation_cannot_hide_real_core_refusal() {
         mcp.initialize("backlog-client");
         mcp.tool("voice_connect", json!({}));
         core_json(
-            &profile.core_socket(),
+            &profile.core_endpoint(),
             "POST",
             "/api/presentation/select",
             Some(&json!({"session_id":call.session,"thread_id":thread})),
@@ -1833,7 +1833,7 @@ fn t02a_late_receipt_follows_real_words_with_related_message_id_in_both_modes() 
         let _core = profile.start_core(&core, &launch);
         let _connector = profile.start_connector();
         profile.wait_linked(&launch);
-        let call = Presentation::open(&profile.core_socket());
+        let call = Presentation::open(&profile.core_endpoint());
         let receiver = http_receiver();
         let thread = format!("late-followup-thread-{mode}");
         let mut command = profile.connector(&["mcp"]);
@@ -1849,7 +1849,7 @@ fn t02a_late_receipt_follows_real_words_with_related_message_id_in_both_modes() 
         mcp.initialize("late-followup-client");
         let joined = mcp.tool("voice_connect", json!({}));
         core_json(
-            &profile.core_socket(),
+            &profile.core_endpoint(),
             "POST",
             "/api/presentation/select",
             Some(&json!({"session_id":call.session,"thread_id":thread})),
@@ -1886,7 +1886,7 @@ fn t02a_late_receipt_follows_real_words_with_related_message_id_in_both_modes() 
         let history_id = assistant_history_id(&profile, &call, &thread, "late-utterance");
         until("physical stop remains semantically unconfirmed", 15, || {
             let history = core_json(
-                &profile.core_socket(),
+                &profile.core_endpoint(),
                 "GET",
                 &format!("/api/presentation/history?thread_id={thread}"),
                 None,
@@ -1994,7 +1994,7 @@ fn t07_t16_detachable_pull_claim_reaches_the_next_real_ipc_owner() {
     let _core = profile.start_core(&core, "detachable-core");
     let _connector = profile.start_connector();
     profile.wait_linked("detachable-core");
-    let call = Presentation::open(&profile.core_socket());
+    let call = Presentation::open(&profile.core_endpoint());
     let thread = "detachable-thread";
     let registration = json!({"client_ref":"detachable-ref","thread":thread,
         "title":"Detached fetch","harness":"http","delivery":{"kind":"none"},
@@ -2004,7 +2004,7 @@ fn t07_t16_detachable_pull_claim_reaches_the_next_real_ipc_owner() {
     let joined = first.call("register", registration.clone());
     assert!(joined["binding_id"].is_string(), "{joined}");
     let selected = core_json(
-        &profile.core_socket(),
+        &profile.core_endpoint(),
         "POST",
         "/api/presentation/select",
         Some(&json!({"session_id":call.session,"thread_id":thread})),
@@ -2016,7 +2016,7 @@ fn t07_t16_detachable_pull_claim_reaches_the_next_real_ipc_owner() {
         .to_owned();
     let id = uuid::Uuid::new_v4().to_string();
     let posted = core_json(
-        &profile.core_socket(),
+        &profile.core_endpoint(),
         "POST",
         "/api/presentation/text",
         Some(

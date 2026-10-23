@@ -25,6 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use sidevoice_connector::platform::ipc::{Channel, Channels, Endpoint};
 use sidevoice_connector::platform::process::{Process as _, Processes};
 
 pub const CONNECTOR: &str = env!("CARGO_BIN_EXE_sidevoice-connector");
@@ -125,8 +126,12 @@ impl Profile {
         self.data().join("core")
     }
 
-    pub fn core_socket(&self) -> PathBuf {
-        self.core_data().join("local.sock")
+    /// Where the core listens, as it published it in its ready file (it picks its own endpoint).
+    pub fn core_endpoint(&self) -> Endpoint {
+        until("the core's ready file", 60, || {
+            sidevoice_connector::core_ready::read(&self.core_data().join("core.json")).ok()
+        })
+        .endpoint
     }
 
     pub fn connector_socket(&self) -> PathBuf {
@@ -179,8 +184,6 @@ impl Profile {
             .envs(self.core_env())
             .arg("--data-dir")
             .arg(self.core_data())
-            .arg("--socket")
-            .arg(self.core_socket())
             .args(["--port", "0", "--idle-exit", "0", "--launch-id", launch_id])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -295,18 +298,14 @@ pub fn connector_ipc(socket: &Path, method: &str) -> Option<Value> {
     (answer["ok"] == true).then(|| answer["result"].clone())
 }
 
-/// One HTTP/1.0 request over the core's Unix socket; returns the status and the JSON body.
+/// One HTTP/1.0 request over the core's local endpoint; returns the status and the JSON body.
 pub fn core_http(
-    socket: &Path,
+    socket: &Endpoint,
     method: &str,
     path: &str,
     body: Option<&Value>,
     token: Option<&str>,
 ) -> (u16, Value) {
-    let mut stream = UnixStream::connect(socket).expect("core socket");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(15)))
-        .unwrap();
     let body = body.map(Value::to_string).unwrap_or_default();
     let mut request = format!("{method} {path} HTTP/1.0\r\nHost: localhost\r\n");
     if let Some(token) = token {
@@ -320,9 +319,22 @@ pub fn core_http(
     }
     request.push_str("\r\n");
     request.push_str(&body);
-    stream.write_all(request.as_bytes()).unwrap();
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).unwrap();
+    let response = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            tokio::time::timeout(Duration::from_secs(15), async {
+                let mut stream = Channels::connect(socket).await.expect("core endpoint");
+                stream.write_all(request.as_bytes()).await.unwrap();
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).await.unwrap();
+                response
+            })
+            .await
+            .expect("the core answers within 15 s")
+        });
     let response = String::from_utf8_lossy(&response).into_owned();
     let (head, payload) = response
         .split_once("\r\n\r\n")
@@ -339,7 +351,7 @@ pub fn core_http(
 }
 
 pub fn core_json(
-    socket: &Path,
+    socket: &Endpoint,
     method: &str,
     path: &str,
     body: Option<&Value>,
@@ -510,7 +522,7 @@ pub fn http_receiver_with_status(status: u16) -> HttpReceiver {
 pub struct Presentation {
     pub token: String,
     pub session: String,
-    socket: PathBuf,
+    socket: Endpoint,
     send: tokio::sync::mpsc::UnboundedSender<Value>,
     frames: Receiver<Value>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -518,7 +530,7 @@ pub struct Presentation {
 }
 
 impl Presentation {
-    pub fn open(socket: &Path) -> Self {
+    pub fn open(socket: &Endpoint) -> Self {
         let token = core_json(
             socket,
             "POST",
@@ -532,12 +544,12 @@ impl Presentation {
         Self::open_with_token(socket, token)
     }
 
-    pub fn open_with_token(socket: &Path, token: String) -> Self {
+    pub fn open_with_token(socket: &Endpoint, token: String) -> Self {
         let (session_tx, session_rx) = channel();
         let (frame_tx, frames) = channel();
         let (send, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let socket = socket.to_path_buf();
+        let socket = socket.clone();
         let held_socket = socket.clone();
         let protocol_token = token.clone();
         let thread = thread::spawn(move || {
@@ -557,7 +569,7 @@ impl Presentation {
                         .parse()
                         .unwrap(),
                 );
-                let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+                let stream = Channels::connect(&socket).await.unwrap();
                 let (mut ws, _) = tokio_tungstenite::client_async(request, stream)
                     .await
                     .expect("presentation socket");
@@ -609,14 +621,14 @@ impl Presentation {
         let code: Value = serde_json::from_slice(&output.stdout).unwrap();
         let secret = code["payload"]["secret"].as_str().expect("pairing secret");
         let paired = core_json(
-            &profile.core_socket(),
+            &profile.core_endpoint(),
             "POST",
             "/api/device/pair",
             Some(&json!({"secret":secret,"name":"second test device"})),
             None,
         );
         Self::open_with_token(
-            &profile.core_socket(),
+            &profile.core_endpoint(),
             paired["token"].as_str().unwrap().to_owned(),
         )
     }

@@ -39,9 +39,6 @@ pub fn core_arguments(
     let mut args = vec![
         "--data-dir".into(),
         path(&layout.core_data()),
-        // The pinned core (0.6.0) takes its endpoint as `--socket`; its `--endpoint` arrives with the next core release.
-        "--socket".into(),
-        layout.core_endpoint().to_string(),
         "--ready-file".into(),
         path(&layout.core_ready()),
         "--host".into(),
