@@ -230,8 +230,15 @@ impl Drop for EnvGuard {
 
 impl Fixture {
     fn new() -> Self {
-        let root = Path::new("/tmp").join(format!(
-            // macOS's per-user temp dir can be too long for the Codex daemon socket's SUN_LEN.
+        // macOS's per-user temp dir can be too long for the Codex daemon socket's SUN_LEN: `/tmp` where that is an
+        // absolute path (Unix), the temporary directory elsewhere (Windows, where the socket is a named pipe).
+        let short = Path::new("/tmp");
+        let base = if short.is_absolute() {
+            short.to_path_buf()
+        } else {
+            std::env::temp_dir()
+        };
+        let root = base.join(format!(
             "sv-agent-{}-{}",
             std::process::id(),
             &Uuid::new_v4().simple().to_string()[..8]
@@ -247,7 +254,7 @@ impl Fixture {
         private_mkdir(&root.join("sidevoice/core"));
         let path = |child: &str| root.join(child).into_os_string();
         let variables = [
-            ("HOME", path("home")),
+            (Environment::HOME, path("home")),
             ("CLAUDE_CONFIG_DIR", path("claude")),
             ("CODEX_HOME", path("codex")),
             ("CURSOR_CONFIG_DIR", path("cursor/config")),

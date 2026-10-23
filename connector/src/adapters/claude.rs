@@ -348,7 +348,7 @@ mod tests {
         let data = scratch.path().join("data").into_os_string();
         let unset = Profile::from_vars(
             |key| match key {
-                "HOME" => Some(home.clone().into()),
+                key if key == Environment::HOME => Some(home.clone().into()),
                 "SIDEVOICE_DATA_DIR" => Some(data.clone()),
                 _ => None,
             },
@@ -368,7 +368,7 @@ mod tests {
         let named = scratch.path().join("elsewhere");
         let set = Profile::from_vars(
             |key| match key {
-                "HOME" => Some(home.clone().into()),
+                key if key == Environment::HOME => Some(home.clone().into()),
                 "SIDEVOICE_DATA_DIR" => Some(data.clone()),
                 "CLAUDE_CONFIG_DIR" => Some(named.clone().into_os_string()),
                 _ => None,
