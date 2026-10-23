@@ -44,8 +44,8 @@ use crate::agents::HostAgents;
 use crate::messages::Keyed;
 use crate::platform::fs::{Create, Files, Fs};
 use crate::profile::Profile;
+use crate::service::jobs::Kind;
 use crate::service::layout::Layout;
-use crate::service::manager::Kind;
 use crate::service::{launcher, status};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -402,11 +402,11 @@ impl Runtime {
             Runtime::Machine => {
                 crate::service::clear_stop(layout)?;
                 let _ = fs::remove_file(layout.core_failure());
-                let kind = crate::service::manager::kind().await;
+                let kind = crate::service::jobs::kind().await;
                 if kind == Kind::None {
                     crate::service::stop_on_demand_or_fail(layout).await?;
                 } else {
-                    crate::service::define_and_start(layout, kind, true).await?;
+                    crate::service::define_and_start(layout, true).await?;
                 }
                 Ok(kind)
             }
@@ -622,8 +622,11 @@ pub async fn install(
         "command": [stable_command(&layout)], "releases": layout.releases, "pruned": pruned,
         "service": kind.as_str(), "state": state.get("state").cloned().unwrap_or(Value::Null),
         "agents": agents});
-    if kind == Kind::Systemd {
-        answer["linger"] = crate::service::manager::linger().await;
+    if kind == Kind::Manager {
+        let service = crate::service::jobs::manager(&layout);
+        if let Some(linger) = crate::service::jobs::linger(&service).await {
+            answer["linger"] = linger;
+        }
     }
     answer["advice"] = json!(advice(profile, &answer));
     Ok(answer)

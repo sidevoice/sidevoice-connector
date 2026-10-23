@@ -179,6 +179,15 @@ impl Layout {
             .collect()
     }
 
+    /// Where the service manager keeps this installation's job definitions.
+    pub fn places(&self) -> crate::platform::service::Places {
+        crate::platform::service::Places {
+            home: self.home.clone(),
+            config_home: self.config_home.clone(),
+            data: self.data.clone(),
+        }
+    }
+
     pub fn current(&self) -> PathBuf {
         self.releases.join("current")
     }
@@ -191,8 +200,9 @@ impl Layout {
         self.data.join("core")
     }
 
-    pub fn core_socket(&self) -> PathBuf {
-        self.core_data().join("local.sock")
+    /// Where the core this installation starts listens.
+    pub fn core_endpoint(&self) -> Endpoint {
+        Endpoint::new(&self.core_data(), "local")
     }
 
     pub fn core_ready(&self) -> PathBuf {
@@ -312,7 +322,10 @@ mod tests {
             ("SIDEVOICE_SERVICE", "launchd"),
         ])
         .unwrap();
-        assert_eq!(named.core_socket(), Path::new("/d/core/local.sock"));
+        assert_eq!(
+            named.core_endpoint(),
+            Endpoint::new(Path::new("/d/core"), "local")
+        );
         assert_eq!(named.releases, Path::new("/x/sidevoice"));
         assert_eq!(named.agent_dirs["ALPHA_HOME"], Path::new("/c"));
         assert_eq!(named.core_port(), "0");

@@ -16,8 +16,8 @@
 //! `flock`).
 
 use super::definition::core_arguments;
+use super::jobs;
 use super::layout::Layout;
-use super::manager;
 use super::status::{self, read_ready, serving};
 use super::{Failure, Result};
 use crate::core_ready::Ready;
@@ -278,9 +278,9 @@ pub async fn ensure_core(layout: &Layout) -> Result<Ready> {
 pub async fn owns_core(layout: &Layout) -> bool {
     layout.installed()
         && !status::stopped(layout)
-        && manager::installed(layout)
+        && jobs::installed(layout)
             .await
-            .is_none_or(|found| found.core.is_none())
+            .is_none_or(|found| !found.core)
 }
 
 /// The connector's identity on its socket: `{pid, executable, managed}`.
@@ -443,9 +443,9 @@ where
     if status::stopped(layout) {
         return Err(Failure::keyed("node.stopped", json!({})));
     }
-    if manager::installed(layout)
+    if jobs::installed(layout)
         .await
-        .is_some_and(|found| found.connector.is_some())
+        .is_some_and(|found| found.connector)
     {
         let deadline = Instant::now() + SERVICE_WAIT;
         while Instant::now() < deadline {

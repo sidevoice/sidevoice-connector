@@ -1,6 +1,7 @@
 //! `sidevoice service install | uninstall | start | stop | restart | status | login on|off|status [--json]`: Sidevoice
-//! at login, as two jobs of this user's service manager (launchd on macOS, systemd's user manager on Linux), and
-//! nothing of ours supervising either; and, where there is no manager, Sidevoice on demand (`launcher`).
+//! at login, as two jobs of this user's service manager (`platform::service`: launchd on macOS, systemd's user manager
+//! on Linux, Task Scheduler on Windows), and nothing of ours supervising either; and, where there is no manager,
+//! Sidevoice on demand (`launcher`).
 //!
 //! Whether the jobs start at the next login is the person's (`service login`) and is kept by the manager alone,
 //! never stored: a new service starts at login; `start`, `restart`, `install` over defined jobs and an update leave
@@ -16,16 +17,17 @@
 //! its health, the same answer for `service status --json` and for a connector's `node.status`.
 
 pub mod definition;
+pub mod jobs;
 pub mod launcher;
 pub mod layout;
-pub mod manager;
 pub mod status;
 
 use crate::lock::Lock;
 use crate::platform::fs::{Files, Fs};
+use crate::platform::service::Service;
 use crate::profile::Profile;
+use jobs::{Job, Kind};
 use layout::Layout;
-use manager::{Job, Kind};
 use serde_json::{json, Value};
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -179,17 +181,17 @@ pub async fn install(layout: &Layout) -> Result<Value> {
     if !layout.installed() {
         return Err(Failure::keyed("service.no-installation", json!({})));
     }
-    let kind = manager::kind().await;
+    let kind = jobs::kind().await;
     if kind == Kind::None {
         return Err(Failure::keyed("service.no-manager", json!({})));
     }
-    definition::texts(layout, kind)?;
+    definition::definitions(layout)?;
     clear_stop(layout)?;
-    define_and_start(layout, kind, false).await?;
+    define_and_start(layout, false).await?;
     let now = settle(layout, INSTALL_SETTLE).await;
     let mut result = answer(&now, kind);
-    if kind == Kind::Systemd {
-        result["linger"] = manager::linger().await;
+    if let Some(linger) = jobs::linger(&jobs::manager(layout)).await {
+        result["linger"] = linger;
     }
     Ok(result)
 }
@@ -198,23 +200,23 @@ pub async fn install(layout: &Layout) -> Result<Value> {
 /// when their definitions did not change, so that both run what `current` names now. When no job was defined,
 /// anything running on demand is stopped first, and both start at login; otherwise that stays as it was. The caller
 /// holds the install lock.
-pub async fn define_and_start(layout: &Layout, kind: Kind, restart: bool) -> Result<()> {
-    let texts = definition::texts(layout, kind)?;
-    let had = manager::installed(layout).await;
-    let login = manager::keeps_login(had.as_ref()).await;
+pub async fn define_and_start(layout: &Layout, restart: bool) -> Result<()> {
+    let definitions = definition::definitions(layout)?;
+    let service = jobs::manager(layout);
+    let had = jobs::installed(layout).await;
+    let login = jobs::keeps_login(&service, had.as_ref()).await;
     let mut changed = Vec::new();
-    for job in Job::ALL {
-        let file = manager::definition_path(layout, kind, job)
-            .await
-            .ok_or_else(|| Failure::keyed("service.no-manager", json!({})))?;
-        if definition::write(&file, &texts[&job])? {
-            changed.push(job);
+    for (job, definition) in &definitions {
+        match service.define(definition).await {
+            Ok(true) => changed.push(*job),
+            Ok(false) => {}
+            Err(refusal) => return Err(jobs::failure(&service, refusal).await),
         }
     }
     if had.is_none() {
         stop_on_demand_or_fail(layout).await?;
     }
-    manager::start(layout, kind, &changed, restart, login, &Job::ALL).await
+    jobs::start(layout, &service, &changed, restart, login, &Job::ALL).await
 }
 
 /// What runs outside a manager stopped (`launcher::stop_on_demand`), or the refusal naming what is still running.
@@ -247,19 +249,20 @@ fn killed_note(result: &mut Value, down: &launcher::Teardown) {
 /// `service start`: a stop no longer holds; the manager starts both jobs. With no jobs, nothing is started here:
 /// the next conversation starts Sidevoice on demand.
 pub async fn start(layout: &Layout) -> Result<Value> {
-    let installed = manager::installed(layout).await;
+    let installed = jobs::installed(layout).await;
     {
         let _lock = install_lock(layout).await?;
         clear_stop(layout)?;
         if let Some(found) = &installed {
-            let login = manager::keeps_login(Some(found)).await;
-            manager::start(layout, found.kind, &[], false, login, &Job::ALL).await?;
+            let service = jobs::manager(layout);
+            let login = jobs::keeps_login(&service, Some(found)).await;
+            jobs::start(layout, &service, &[], false, login, &Job::ALL).await?;
         }
     }
     let now = settle(layout, SETTLE).await;
     Ok(answer(
         &now,
-        installed.map_or(Kind::None, |found| found.kind),
+        installed.map_or(Kind::None, |_| Kind::Manager),
     ))
 }
 
@@ -269,9 +272,9 @@ pub async fn start(layout: &Layout) -> Result<Value> {
 pub async fn stop(layout: &Layout) -> Result<Value> {
     let _lock = install_lock(layout).await?;
     write_stop(layout)?;
-    let installed = manager::installed(layout).await;
+    let installed = jobs::installed(layout).await;
     if let Some(found) = &installed {
-        if let Some(refused) = manager::unload(found, false).await {
+        if let Some(refused) = jobs::unload(&jobs::manager(layout), found, false).await {
             return Err(Failure::keyed(
                 "service.unload-failed",
                 json!({"detail": refused}),
@@ -280,7 +283,7 @@ pub async fn stop(layout: &Layout) -> Result<Value> {
     }
     let down = stop_on_demand_or_fail(layout).await?;
     let mut result = json!({"ok": true, "state": "stopped-by-person",
-        "service": installed.map_or(Kind::None, |found| found.kind).as_str()});
+        "service": installed.map_or(Kind::None, |_| Kind::Manager).as_str()});
     killed_note(&mut result, &down);
     Ok(result)
 }
@@ -291,13 +294,14 @@ pub async fn restart(layout: &Layout) -> Result<Value> {
     if status::stopped(layout) {
         return start(layout).await;
     }
-    let installed = manager::installed(layout).await;
+    let installed = jobs::installed(layout).await;
     {
         let _lock = install_lock(layout).await?;
         match &installed {
-            Some(found) if found.core.is_some() => {
-                let login = manager::keeps_login(Some(found)).await;
-                manager::start(layout, found.kind, &[], true, login, &[Job::Core]).await?;
+            Some(found) if found.core => {
+                let service = jobs::manager(layout);
+                let login = jobs::keeps_login(&service, Some(found)).await;
+                jobs::start(layout, &service, &[], true, login, &[Job::Core]).await?;
             }
             _ => {
                 for pid in launcher::core_processes(layout) {
@@ -309,7 +313,7 @@ pub async fn restart(layout: &Layout) -> Result<Value> {
     let now = settle(layout, SETTLE).await;
     Ok(answer(
         &now,
-        installed.map_or(Kind::None, |found| found.kind),
+        installed.map_or(Kind::None, |_| Kind::Manager),
     ))
 }
 
@@ -324,10 +328,10 @@ pub async fn uninstall(layout: &Layout, keep_stopped: bool) -> Result<Value> {
 /// `uninstall`, for a caller that already holds the install lock.
 pub async fn uninstall_held(layout: &Layout, keep_stopped: bool) -> Result<Value> {
     write_stop(layout)?;
-    let installed = manager::installed(layout).await;
-    let kind = installed.as_ref().map_or(Kind::None, |found| found.kind);
+    let installed = jobs::installed(layout).await;
+    let kind = installed.as_ref().map_or(Kind::None, |_| Kind::Manager);
     if let Some(found) = &installed {
-        if let Some(refused) = manager::unload(found, true).await {
+        if let Some(refused) = jobs::unload(&jobs::manager(layout), found, true).await {
             return Err(Failure::keyed(
                 "service.unload-failed",
                 json!({"detail": refused}),
@@ -336,12 +340,13 @@ pub async fn uninstall_held(layout: &Layout, keep_stopped: bool) -> Result<Value
     }
     let down = stop_on_demand_or_fail(layout).await?;
     if let Some(found) = &installed {
-        for file in [&found.core, &found.connector].into_iter().flatten() {
-            if definition::existing(file)? {
-                fs::remove_file(file).map_err(Failure::plain)?;
+        let service = jobs::manager(layout);
+        for job in Job::ALL.into_iter().filter(|&job| found.has(job)) {
+            if let Err(refusal) = service.remove(job.id()).await {
+                return Err(jobs::failure(&service, refusal).await);
             }
         }
-        manager::forget(kind).await?;
+        jobs::forget(&service).await?;
     }
     if !keep_stopped {
         clear_stop(layout)?;
@@ -352,16 +357,16 @@ pub async fn uninstall_held(layout: &Layout, keep_stopped: bool) -> Result<Value
     Ok(result)
 }
 
-/// `service login on|off`: whether both jobs start at the next login, and only that (`manager::set_start_at_login`):
+/// `service login on|off`: whether both jobs start at the next login, and only that (`jobs::set_start_at_login`):
 /// a running service keeps running, a stopped one stays stopped, a person's stop is left as it is. `service login
 /// status` (`on` none) reads it. Answered as `start`, `stop` and `status` are, `{ok, state, service}` from the status
 /// read afterwards, with its `start_at_login`: `null` when the manager cannot tell or the service is not whole.
 pub async fn login(layout: &Layout, on: Option<bool>) -> Result<Value> {
     if let Some(on) = on {
         let _lock = install_lock(layout).await?;
-        let Some(found) = manager::installed(layout).await else {
+        let Some(found) = jobs::installed(layout).await else {
             return Err(Failure::keyed(
-                if manager::kind().await == Kind::None {
+                if jobs::kind().await == Kind::None {
                     "service.no-manager"
                 } else {
                     "service.login-no-service"
@@ -370,14 +375,14 @@ pub async fn login(layout: &Layout, on: Option<bool>) -> Result<Value> {
             ));
         };
         // Half a service cannot be said to start at login or not: nothing is changed until it is whole again.
-        let missing = manager::missing(&found);
+        let missing = jobs::missing(&found);
         if !missing.is_empty() {
             return Err(Failure::keyed(
                 "service.login-incomplete",
-                json!({"missing": manager::names(&missing, found.kind)}),
+                json!({"missing": jobs::names(&missing)}),
             ));
         }
-        if let Err(detail) = manager::set_start_at_login(&found, on).await {
+        if let Err(detail) = jobs::set_start_at_login(&jobs::manager(layout), &found, on).await {
             return Err(Failure::keyed(
                 "service.login-failed",
                 json!({"detail": detail}),

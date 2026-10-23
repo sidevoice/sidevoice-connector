@@ -70,3 +70,9 @@ windows-sys = { version = "0.61", features = [
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
 # How many names a file has (src/platform/fs), from a handle: `winapi-util` (walkdir, ripgrep), no `unsafe` of ours.
 winapi-util = "0.1"
+# The Task Scheduler task's XML (src/platform/service/windows.rs), written and read through serde.
+quick-xml = { version = "0.42", features = ["serialize"] }
+
+# macOS: the LaunchAgent (src/platform/service/macos.rs), written and read as a property list.
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1.10"
