@@ -8,8 +8,7 @@ use serde_json::json;
 
 use crate::archive::unpack_checked;
 use crate::glibc;
-use crate::host::chmod;
-use crate::host::{clean_environment, scratch_base};
+use crate::host::{clean_environment, make_private_dir, scratch_base};
 use crate::util::*;
 use crate::{entrypoint, Result, PACKAGE};
 
@@ -146,7 +145,7 @@ pub(crate) fn verify(archive: &Path, image: Option<&str>) -> Result<()> {
         None => {
             let release = work.0.join("release");
             mkdir(&release)?;
-            chmod(&release, 0o700)?;
+            make_private_dir(&release)?;
             let staged = parse_json(
                 run(&["stage-core", path_str(&release)?, "--json"])?.as_bytes(),
                 "stage-core --json",

@@ -25,6 +25,31 @@ pub(crate) fn chmod(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
+/// Makes the directory `path` private to the user running xtask, as the connector requires of the directory it stages
+/// into: mode `0700` on Unix; on Windows the inherited access is removed and only this user is granted (`icacls`).
+pub(crate) fn make_private_dir(path: &Path) -> Result<()> {
+    if cfg!(windows) {
+        let user = std::env::var("USERNAME").map_err(|error| format!("USERNAME: {error}"))?;
+        let output = Command::new("icacls")
+            .arg(path)
+            .args(["/inheritance:r", "/grant:r"])
+            .arg(format!("{user}:(OI)(CI)F"))
+            .output()
+            .map_err(|error| format!("icacls: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "icacls {}: {}{}",
+                path.display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(())
+    } else {
+        chmod(path, 0o700)
+    }
+}
+
 /// Where `verify` unpacks: a path with a space, away from the checkout (`/tmp`; Windows has no such place, so the
 /// user's temporary directory).
 pub(crate) fn scratch_base() -> PathBuf {
