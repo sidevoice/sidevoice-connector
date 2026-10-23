@@ -12,7 +12,7 @@ fn agent_leave_while_core_is_down_stays_closed_after_restart_until_explicit_rejo
     let mut first_core = profile.start_core(&core, "before-leave");
     let _connector = profile.start_connector();
     profile.wait_linked("before-leave");
-    let call = Presentation::open(&profile.core_socket());
+    let call = Presentation::open(&profile.core_endpoint());
     let receiver = http_receiver();
     let thread = "agent-offline-leave";
     let mut command = profile.connector(&["mcp"]);
@@ -24,7 +24,7 @@ fn agent_leave_while_core_is_down_stays_closed_after_restart_until_explicit_rejo
     let joined = mcp.tool("voice_connect", json!({"title":"Recovery lifecycle"}));
     let original = joined["binding_id"].as_str().unwrap().to_owned();
     let before = core_json(
-        &profile.core_socket(),
+        &profile.core_endpoint(),
         "GET",
         "/api/presentation/participants",
         None,
@@ -43,7 +43,7 @@ fn agent_leave_while_core_is_down_stays_closed_after_restart_until_explicit_rejo
     profile.wait_linked("after-leave");
     let after = until("durable agent closure reaches Core", 30, || {
         let view = core_json(
-            &profile.core_socket(),
+            &profile.core_endpoint(),
             "GET",
             "/api/presentation/participants",
             None,
@@ -74,7 +74,7 @@ fn agent_leave_while_core_is_down_stays_closed_after_restart_until_explicit_rejo
     assert_ne!(fresh["binding_id"], original, "{fresh}");
     let recovered = until("one newly joined conversation", 15, || {
         let view = core_json(
-            &profile.core_socket(),
+            &profile.core_endpoint(),
             "GET",
             "/api/presentation/participants",
             None,

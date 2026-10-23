@@ -565,7 +565,7 @@ mod tests {
         .unwrap();
         assert!(is_our_core(
             &layout,
-            "/r/core --data-dir /h/.sidevoice/core --socket /x"
+            "/r/core --data-dir /h/.sidevoice/core --port 7000"
         ));
         assert!(is_our_core(
             &layout,
@@ -573,7 +573,7 @@ mod tests {
         ));
         assert!(!is_our_core(
             &layout,
-            "/r/core --data-dir /h/.sidevoice/core2 --socket /x"
+            "/r/core --data-dir /h/.sidevoice/core2 --port 7000"
         ));
         assert!(!is_our_core(&layout, "/r/core --data-dir /other/core"));
     }

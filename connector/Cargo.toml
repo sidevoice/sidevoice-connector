@@ -18,10 +18,9 @@ path = "src/bench/main.rs"
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
 futures-util = "0.3"
-gethostname = "1"
+# The login name for the Windows task scheduler (src/platform/service).
 whoami = "2"
 hex = "0.4"
-interprocess = { version = "2.4", features = ["tokio"] }
 libc = "0.2"
 qrcodegen = "1.8"
 rmcp = { version = "3.5.1", features = ["server", "transport-io", "schemars"] }
@@ -40,6 +39,9 @@ uuid = { version = "1", features = ["v4"] }
 which = "=8.0.6"
 zstd = "0.13"
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
+# This user and the local channel (src/platform: `user`, `ipc`), shared with the core: its `sidevoice-platform`, at the
+# tag of the core release `core.pin` names (the two ship together; move both in one PR).
+sidevoice-platform = { git = "https://github.com/sidevoice/sidevoice-core", tag = "v0.7.0" }
 # Records written whole (src/platform/fs): a temporary file beside the record, synced, renamed over it.
 atomic-write-file = "0.3"
 # Processes (src/platform/process): what every OS reads the same (owner, start, command line, parent) and the stop,
@@ -51,21 +53,19 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 # Scratch directories in unit tests (src/test_support.rs).
 tempfile = "3"
 
-# Unix: the effective uid (src/platform/user), with no `unsafe` of ours.
+# Unix: the effective uid (src/platform/service/macos: the launchd domain), with no `unsafe` of ours.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
 
-# Windows: this process's user and file owners (src/platform/user); the pipe's security descriptor (src/platform/ipc). Minimal features; the version the lock already has.
+# Windows: file owners and access (src/platform/fs). Minimal features; the version the lock already has.
 # `windows`: only for the type `process-wrap`'s `CreationFlags` takes (src/platform/process); it is `process-wrap`'s
 # own dependency, at its version, so it adds nothing to the build.
 [target.'cfg(windows)'.dependencies]
-widestring = "1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
-    "Win32_System_Threading",
 ] }
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
 # How many names a file has (src/platform/fs), from a handle: `winapi-util` (walkdir, ripgrep), no `unsafe` of ours.

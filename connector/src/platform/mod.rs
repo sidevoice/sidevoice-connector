@@ -8,7 +8,9 @@
 //! operation does not compile; a host that has nothing to do implements it as a no-op, so the gap is a decision.
 
 pub mod fs;
-pub mod ipc;
 pub mod process;
 pub mod service;
-pub mod user;
+
+// This user and the local channel, shared with the core: `sidevoice-platform`, from the core's repository at the tag
+// of a core release. Re-exported so callers keep their paths (`crate::platform::ipc`, `crate::platform::user`).
+pub use sidevoice_platform::{ipc, user};
