@@ -15,7 +15,7 @@
 //! Every path is absolute. The directories are checked again at each operation boundary, not trusted from startup:
 //! they are passed to agents' command lines and written into.
 
-use crate::platform::data_dir::{self, DataDir, DataDirs};
+use crate::platform::data_dir;
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Files, Fs};
 use crate::platform::ipc::{Address, Endpoint};
@@ -94,7 +94,7 @@ impl Profile {
             bail!("{} must be absolute", Environment::HOME);
         }
         let or = |key: &str, fallback: PathBuf| var(key).map(PathBuf::from).unwrap_or(fallback);
-        let data = DataDirs::resolve(&var)?;
+        let data = data_dir::resolve(&var)?;
         let xdg_config = or("XDG_CONFIG_HOME", home.join(".config"));
         if !xdg_config.is_absolute() {
             bail!("XDG_CONFIG_HOME must be absolute");
@@ -121,7 +121,7 @@ impl Profile {
                 set,
             });
         }
-        let core = DataDirs::core_dir(&data);
+        let core = data_dir::core_dir(&data);
         let profile = Self {
             home,
             endpoint: Endpoint::new(&data, "connector"),

@@ -1,6 +1,6 @@
 use super::*;
 use crate::adapters::registration::{aggregate_readiness, ReadinessCheck};
-use crate::platform::data_dir::{DataDir, DataDirs};
+use crate::platform::data_dir;
 use crate::platform::fs::TestFiles;
 use crate::platform::fs::{Create, Files, Fs};
 
@@ -1545,7 +1545,7 @@ async fn the_installed_command_is_registered_and_owns_every_release_of_it() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
     let profile = &fixture.profile;
-    let releases = DataDirs::releases_dir(&profile.data);
+    let releases = data_dir::releases_dir(&profile.data);
     let binary = releases.join(format!("releases/1.0.0/{}", crate::install::binary()));
     private_mkdir(binary.parent().unwrap());
     private_write(&binary, b"#!/bin/sh\n");
