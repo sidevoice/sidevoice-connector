@@ -84,23 +84,30 @@ const RELEASE_PREFIX: &str = "release-";
 const DATA_PREFIX: &str = "data-";
 
 /// `path` as the OS resolves it: its longest existing ancestor canonicalized, the components that do not exist yet
-/// appended as written.
-fn resolved(path: &Path) -> PathBuf {
+/// appended as written. Fails closed: only "not found" walks up to the parent; any other error (permission, a link
+/// loop...) or a tail that cannot be placed without the OS (`..`) is an error, never a guess.
+fn resolved(path: &Path) -> Result<PathBuf, &'static str> {
+    const UNRESOLVED: &str =
+        "uninstall refused: cannot tell where the shared models folder is relative to the data directory";
     let mut missing = Vec::new();
     let mut existing = path;
     loop {
-        if let Ok(real) = std::fs::canonicalize(existing) {
-            return missing
-                .iter()
-                .rev()
-                .fold(real, |real, part| real.join(part));
+        match std::fs::canonicalize(existing) {
+            Ok(real) => {
+                return Ok(missing
+                    .iter()
+                    .rev()
+                    .fold(real, |real, part| real.join(part)));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(UNRESOLVED),
         }
         match (existing.parent(), existing.file_name()) {
             (Some(parent), Some(name)) => {
                 missing.push(name);
                 existing = parent;
             }
-            _ => return path.to_path_buf(),
+            _ => return Err(UNRESOLVED),
         }
     }
 }
@@ -217,7 +224,7 @@ impl Roots {
             return Err(REFUSED);
         }
         // As the OS resolves them, whether or not the store exists yet (another instance may create it later).
-        if overlaps(&resolved(&models), &resolved(&self.data)) {
+        if overlaps(&resolved(&models)?, &resolved(&self.data)?) {
             return Err(REFUSED);
         }
         Ok(())
@@ -541,6 +548,35 @@ mod tests {
         layout.home = Some(home);
         let refused = layout.validate().unwrap_err();
         assert!(refused.contains("shared models folder"), "{refused}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_standard_place_that_cannot_be_resolved_is_refused() {
+        let scratch = temp_dir("uninstall-models-unresolved");
+        let home = scratch.path().join("home");
+        let data = home.join("data");
+        Files::ensure_private_dir(&data).unwrap();
+        fs::create_dir_all(data.join("nested")).unwrap();
+        let alias = home.join("xdg-alias");
+        Files::symlink(data.join("nested"), &alias);
+        let looped = home.join("loop");
+        Files::symlink(looped.clone(), &looped);
+        // A missing tail with `..` leads back into `D` through the alias; a link loop cannot be resolved at all.
+        for standard in [
+            alias.join("missing").join("..").join("sidevoice"),
+            alias.join("missing").join(".."),
+            looped.join("sidevoice"),
+        ] {
+            let mut layout = at(data.clone(), &standard);
+            layout.home = Some(home.clone());
+            let refused = layout.validate().unwrap_err();
+            assert!(
+                refused.contains("shared models folder"),
+                "{}: {refused}",
+                standard.display()
+            );
+        }
     }
 
     #[test]
