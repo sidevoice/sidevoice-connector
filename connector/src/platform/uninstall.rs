@@ -672,17 +672,17 @@ mod tests {
         future.homes = vec![alias.join("future")];
         let refused = Remover::new(future)
             .err()
+            .expect("a home below a link into D");
+        assert!(
+            refused.contains("the home directory or a directory it is in"),
+            "{refused}"
+        );
         // The same through a link whose target is missing: it cannot be placed, so it refuses.
         let dangling = scratch.path().join("dangling");
         Files::symlink(home.join("missing"), &dangling);
         let mut gone = at(home.clone(), &standard);
         gone.homes = vec![dangling.join("future")];
         assert!(Remover::new(gone).is_err(), "a home below a dangling link");
-            .expect("a home below a link into D");
-        assert!(
-            refused.contains("the home directory or a directory it is in"),
-            "{refused}"
-        );
         // The profile's home and the OS's are two places on Windows: either one is protected, whichever the data
         // directory is compared with.
         let elsewhere = scratch.path().join("elsewhere");
