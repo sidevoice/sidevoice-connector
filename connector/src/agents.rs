@@ -7,7 +7,7 @@
 use crate::adapters::health::{self, Health};
 use crate::adapters::markers::{self, Roots};
 use crate::adapters::registration::{
-    mcp_servers_json, shell_command, with_readiness, AgentError, AgentHost, CliError, CliOutput,
+    hand_command, mcp_servers_json, with_readiness, AgentError, AgentHost, CliError, CliOutput,
     Launch, Manual, Registration,
 };
 use crate::adapters::Registry;
@@ -585,13 +585,15 @@ impl HostAgents {
                 }
             }
         }
+        let command = hand_command(&self.selected.command, &self.selected.args);
         let snippet = mcp_servers_json(&self.selected.command, &self.selected.args, self.mcp_env())
             .map_err(|_| Failure::Internal)?;
         Ok(json!({
             "agents": rows,
             "scanned_at": state.get("scanned_at").cloned().unwrap_or(Value::Null),
             "custom": {
-                "command": shell_command(&self.selected.command, &self.selected.args),
+                "command": command,
+                "note": command.is_none().then(|| message("agents.manual.unsafe-command", &json!({"program": self.selected.command}))),
                 "snippet": snippet,
                 "version": self.selected.version,
             }

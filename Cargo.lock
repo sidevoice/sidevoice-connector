@@ -1305,6 +1305,7 @@ dependencies = [
  "dunce",
  "futures-util",
  "hex",
+ "interprocess",
  "libc",
  "plist",
  "process-wrap",

@@ -82,8 +82,37 @@ pub trait Env {
     /// and its like; a child without them cannot use the network or the system's crypto). None on Unix.
     const SYSTEM: &'static [&'static str];
 
+    /// What starts a command line that runs a quoted program name: nothing in a POSIX shell, the call operator `& `
+    /// in PowerShell (a quoted name alone is only a string there).
+    const CALL: &'static str;
+
     /// The `PATH` of a child started with nothing else: where this OS's programs and a package manager's are.
     fn base_path() -> OsString;
+
+    /// `value` as one word of the command line a person types or pastes on this OS: single-quoted for a POSIX shell,
+    /// single-quoted for PowerShell (nothing inside is special there but the quote itself, doubled).
+    ///
+    /// The contract on Windows: PowerShell reads the word exactly, but what reaches a native program is PowerShell's
+    /// to pass. PowerShell 7.3 and later (`$PSNativeCommandArgumentPassing` `Windows`, the default, or `Standard`)
+    /// passes an `.exe` every argument as given, an empty one and one with `"` in it included. Windows PowerShell
+    /// 5.1, and 7.3+ for `.cmd`/`.bat` targets (their `Legacy` rules), drop an empty argument and mangle an embedded
+    /// `"`. A `.cmd`/`.bat` is also re-parsed by `cmd.exe`, to which `& | < > ^ % !` and `"` are syntax whatever
+    /// PowerShell quoted. So quoting is only half the contract: whoever builds a line to run by hand asks
+    /// [`Env::hand_safe`] first, and passes no empty argument.
+    fn quote(value: &str) -> String;
+
+    /// Whether `program` with `args` can be written as one line to paste in this OS's shell and be read as the
+    /// words given (see [`Env::quote`]). Always on Unix. On Windows a line is safe when the program is an `.exe` or
+    /// `.com` (started directly), or when no word, the program included, has `&`, `|`, `<`, `>`, `^`, `%`, `!` or `"`:
+    /// any other target (a `.cmd`/`.bat` shim, or a name with no extension that may resolve to one) is re-parsed by
+    /// `cmd.exe`, which quoting for PowerShell does not protect against. When it is not safe, no line is made.
+    fn hand_safe(_program: &str, _args: &[&str]) -> bool {
+        true
+    }
+
+    /// The start of a command line that sets `variable` to `quoted_value` (already [`Env::quote`]d) for the command
+    /// that follows: `NAME='v' ` in a POSIX shell, `$env:NAME = 'v'; ` in PowerShell.
+    fn set(variable: &str, quoted_value: &str) -> String;
 
     /// How this user's login `PATH` is asked for; `None` when this process has no way to know it.
     fn login_path() -> Option<LoginPath>;
@@ -183,6 +212,28 @@ mod tests {
             assert!(Environment::SYSTEM.iter().any(|system| name == system));
             assert_eq!(std::env::var_os(name).as_ref(), Some(value));
         }
+    }
+
+    #[test]
+    fn a_value_is_quoted_as_one_word_and_set_before_a_command() {
+        // A quote inside is the one thing each shell spells its own way: POSIX closes, escapes and reopens; PowerShell
+        // doubles it.
+        let (quote_inside, set) = if cfg!(windows) {
+            ("'it''s'", "$env:NAME = 'a b'; ")
+        } else {
+            (r"'it'\''s'", "NAME='a b' ")
+        };
+        for (value, quoted) in [
+            ("", "''"),
+            ("plain", "'plain'"),
+            ("two words", "'two words'"),
+            ("it's", quote_inside),
+            ("a\"b", "'a\"b'"),
+            ("$HOME;rm", "'$HOME;rm'"),
+        ] {
+            assert_eq!(Environment::quote(value), quoted, "{value:?}");
+        }
+        assert_eq!(Environment::set("NAME", &Environment::quote("a b")), set);
     }
 
     #[test]

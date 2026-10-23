@@ -50,10 +50,11 @@ pub trait Process {
     /// (Windows) that holds everything it starts.
     fn tree(command: Command) -> CommandWrap;
 
-    /// The files `pid` has open, as far as the OS shows them to this user. `None` where it does not (Windows:
-    /// nothing in the standard API lists another process's handles, and the one caller, an adapter's chat lookup,
-    /// is a heuristic that this decision leaves out there).
-    fn open_files(pid: u32) -> Option<Vec<PathBuf>>;
+    /// The files `pid` has open, as far as the OS shows them to this user: `/proc/<pid>/fd`, else `lsof`, on Unix.
+    /// `Unsupported` on Windows, where nothing in the standard API lists another process's handles (a Windows
+    /// chat lookup waits for its agent's chat roots to be measured); another error when the OS shows nothing (no
+    /// `/proc` and no `lsof`).
+    fn open_files(pid: u32) -> io::Result<Vec<PathBuf>>;
 
     /// Starts `command` so that it outlives this process and its terminal. The caller owns stdio and the
     /// environment.
@@ -454,11 +455,14 @@ mod tests {
     }
 
     #[test]
-    fn open_files_are_listed_where_the_os_shows_them() {
-        let exe = std::env::current_exe().unwrap().canonicalize().unwrap();
-        let file = std::fs::File::open(&exe).unwrap();
-        if let Some(files) = Processes::open_files(std::process::id()) {
-            assert!(files.iter().any(|path| path == &exe));
+    fn the_files_a_process_has_open_are_listed_where_the_os_lists_them() {
+        let scratch = crate::test_support::temp_dir("open-files");
+        let held = scratch.path().join("held");
+        std::fs::write(&held, b"x").unwrap();
+        let file = std::fs::File::open(&held).unwrap();
+        // An error is an OS that lists no process's files (Windows) or a host that shows none (no `lsof`).
+        if let Ok(open) = Processes::open_files(std::process::id()) {
+            assert!(open.contains(&held.canonicalize().unwrap()), "{open:?}");
         }
         drop(file);
     }

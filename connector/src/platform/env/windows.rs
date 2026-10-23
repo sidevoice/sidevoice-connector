@@ -145,6 +145,39 @@ impl super::Env for Os {
         "PROCESSOR_ARCHITECTURE",
     ];
 
+    const CALL: &'static str = "& ";
+
+    // PowerShell: inside single quotes only a quote is special, and PowerShell reads the typographic single quotes as
+    // quotes too: each is doubled.
+    fn quote(value: &str) -> String {
+        let mut quoted = String::from("'");
+        for c in value.chars() {
+            quoted.push(c);
+            if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+                quoted.push(c);
+            }
+        }
+        quoted.push('\'');
+        quoted
+    }
+
+    fn hand_safe(program: &str, args: &[&str]) -> bool {
+        let direct = std::path::Path::new(program)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("com")
+            });
+        direct
+            || !std::iter::once(program)
+                .chain(args.iter().copied())
+                .any(|word| word.contains(['&', '|', '<', '>', '^', '%', '!', '"']))
+    }
+
+    fn set(variable: &str, quoted_value: &str) -> String {
+        format!("$env:{variable} = {quoted_value}; ")
+    }
+
     // The registry's, or this process's own when the registry gives nothing usable.
     fn base_path() -> OsString {
         Self::login_path()

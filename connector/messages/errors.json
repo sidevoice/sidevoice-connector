@@ -13,6 +13,7 @@
   "harness.codex": "Codex",
   "harness.cursor": "Cursor",
   "agents.manual.delete-entry": "Delete the \"sidevoice\" entry under \"{under}\".",
+  "agents.manual.unsafe-command": "No command line can be shown safely: the agent's CLI \"{program}\" is a batch file (or not known to be a program), and Windows' command interpreter would read characters in this line (& | < > ^ % ! or a double quote) as syntax. Install the CLI, or Sidevoice, at a path without them, or use the file or snippet setup.",
   "agents.manual.delete-other-entry": "Delete the other \"sidevoice\" entry under \"{under}\".",
   "service.failed": "The Sidevoice service command failed: {detail}",
   "service.busy": "Another Sidevoice install or service command is under way ({detail}); nothing was changed. Try again when it has finished.",
