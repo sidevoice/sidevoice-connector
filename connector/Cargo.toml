@@ -42,9 +42,9 @@ which = "=8.0.6"
 dirs = "7"
 zstd = "0.13"
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
-# This user, the local channel and the stop request (src/platform: `user`, `ipc`; `process`, `lifecycle`), shared
-# with the core: its `sidevoice-platform`, at the tag of the core release it bundles. This tag is the one place the
-# core version lives: `cargo xtask` reads it to download, verify and bundle that same release.
+# This user, its private files, the local channel and the stop request (src/platform: `user`, `fs`, `ipc`; `process`,
+# `lifecycle`), shared with the core: its `sidevoice-platform`, at the tag of the core release it bundles. This tag is the
+# one place the core version lives: `cargo xtask` reads it to download, verify and bundle that same release.
 sidevoice-platform = { git = "https://github.com/sidevoice/sidevoice-core", tag = "v0.9.0" }
 # Canonical paths without the `\\?\` prefix Windows gives `canonicalize` (src/platform/uninstall).
 dunce = "1"
@@ -56,43 +56,34 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 interprocess = { version = "2.4", features = ["tokio"] }
 
 [features]
-# What the integration tests do to files and the program never does (src/platform/fs: `TestFiles`). Enabled for them
-# by the dev-dependency on this crate below; never in a release build.
-test-support = []
+# What tests do to files and the program never does (`sidevoice-platform`'s `TestFiles`, re-exported as
+# `platform::fs::TestFiles`). Enabled for the tests by the dev-dependency on this crate below; never in a release build.
+test-support = ["sidevoice-platform/test-support"]
 
 [dev-dependencies]
 # Scratch directories in unit tests (src/test_support.rs).
 tempfile = "3"
-# This crate with `test-support`, for the integration tests (tests/).
+# This crate with `test-support`, for the unit and the integration tests (tests/).
 sidevoice-connector = { path = ".", features = ["test-support"] }
 
 # Unix: the effective uid (src/platform/service/macos: the launchd domain), with no `unsafe` of ours.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process", "fs"] }
-# Records written whole (src/platform/fs/unix.rs): a temporary file beside the record, created 0600, synced, renamed
-# over it.
-atomic-write-file = "0.3"
+rustix = { version = "1", features = ["process"] }
 
-# Windows: file owners and access (src/platform/fs). Minimal features; the version the lock already has.
+# Windows: reparse points and sharing (src/platform/uninstall, src/platform/process). Minimal features; the version the
+# lock already has.
 # `windows`: only for the type `process-wrap`'s `CreationFlags` takes (src/platform/process); it is `process-wrap`'s
 # own dependency, at its version, so it adds nothing to the build.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
-    "Win32_System_Threading",
 ] }
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
+# Which file a handle is (src/platform/uninstall): `winapi-util` (walkdir, ripgrep), no `unsafe` of ours.
+winapi-util = "0.1"
 # The user and machine `Path` a Windows login has instead of a login shell's (src/platform/env/windows.rs).
 winreg = "0.55"
-# How many names a file has, and which file a handle is (src/platform/fs): `winapi-util` (walkdir, ripgrep), no `unsafe`
-# of ours.
-winapi-util = "0.1"
-# A record's staging file (src/platform/fs/windows.rs): a fresh name beside the record, created by `open_private` with
-# the private DACL, removed on failure, renamed over the record.
-tempfile = "3"
 # The Task Scheduler task's XML (src/platform/service/windows.rs), written and read through serde.
 quick-xml = { version = "0.42", features = ["serialize"] }
 

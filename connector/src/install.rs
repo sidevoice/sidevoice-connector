@@ -145,7 +145,8 @@ fn select(layout: &Layout, id: &str) -> Result<()> {
     Files::write_json(
         &layout.install_file(),
         &json!({"command": [release_command(layout, id)], "releases": layout.releases}),
-    )
+    )?;
+    Ok(())
 }
 
 /// What a dead installer left: partial releases and the temporary file of a pointer record being written.

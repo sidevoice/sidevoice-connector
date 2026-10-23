@@ -79,7 +79,10 @@ pub(super) fn read_outbox(path: &Path) -> Result<Vec<Value>> {
 
 /// The conversation state as this connector writes it: never above its size bound, which a larger file makes invalid.
 pub(super) fn read_conversation_state(path: &Path) -> Result<Option<Vec<u8>>> {
-    Files::read_private(path, CONVERSATION_STATE_MAX_BYTES as u64)
+    Ok(Files::read_private(
+        path,
+        CONVERSATION_STATE_MAX_BYTES as u64,
+    )?)
 }
 
 #[cfg(test)]

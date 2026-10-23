@@ -96,7 +96,6 @@ pub fn short_temp_dir() -> PathBuf {
 /// Whether `path` is private to this user, as the connector judges it.
 pub fn is_private(path: &Path) -> bool {
     Files::open_read(path)
-        .map_err(Into::into)
         .and_then(|file| Files::check_private(&file))
         .is_ok()
 }

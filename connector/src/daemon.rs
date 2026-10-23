@@ -239,7 +239,7 @@ impl Daemon {
             if changed {
                 if let Err(error) = Files::write_json(&self.outbox_path(), &*outbox) {
                     *outbox = old;
-                    return Err(error);
+                    return Err(error.into());
                 }
             }
         }
@@ -562,7 +562,7 @@ impl Daemon {
         }
         if let Err(error) = Files::write_json(&self.outbox_path(), &*outbox) {
             *outbox = before;
-            return Err(error);
+            return Err(error.into());
         }
         Ok(())
     }
@@ -590,7 +590,7 @@ impl Daemon {
             item["history_only"] = json!(true);
             if let Err(error) = Files::write_json(&self.outbox_path(), &*outbox) {
                 *outbox = before;
-                return Err(error);
+                return Err(error.into());
             }
         }
         Ok(())
@@ -606,7 +606,7 @@ impl Daemon {
             item.as_object_mut().unwrap().remove("attempted");
             if let Err(error) = Files::write_json(&self.outbox_path(), &*outbox) {
                 *outbox = before;
-                return Err(error);
+                return Err(error.into());
             }
         }
         Ok(())
@@ -623,7 +623,7 @@ impl Daemon {
         let published = item.clone();
         if let Err(error) = Files::write_json(&self.outbox_path(), &*outbox) {
             *outbox = before;
-            return Err(error);
+            return Err(error.into());
         }
         Ok(published)
     }
@@ -644,7 +644,7 @@ impl Daemon {
         }
         if let Err(error) = Files::write_json(&self.outbox_path(), &*outbox) {
             *outbox = before;
-            return Err(error);
+            return Err(error.into());
         }
         Ok(())
     }
@@ -678,7 +678,7 @@ impl Daemon {
             let published = item.clone();
             if let Err(error) = Files::write_json(&self.outbox_path(), &*outbox) {
                 *outbox = before;
-                return Err(error);
+                return Err(error.into());
             }
             published
         };
@@ -736,7 +736,7 @@ impl Daemon {
             outbox.retain(|item| item.get("event_id") != event_id);
             if let Err(error) = Files::write_json(&self.outbox_path(), &*outbox) {
                 *outbox = before;
-                return Err(error);
+                return Err(error.into());
             }
         }
         if Self::ack_allows_removal(&published, &reply) {
@@ -792,7 +792,7 @@ impl Daemon {
             }
             if let Err(error) = Files::write_json(&self.outbox_path(), &*outbox) {
                 *outbox = before;
-                return Err(error);
+                return Err(error.into());
             }
             return Ok(Some(reply));
         }
