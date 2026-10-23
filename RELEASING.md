@@ -61,7 +61,10 @@ stop it keeps on purpose). It changes the machine for real, so it runs only wher
 What the runners need, and why:
 
 - **Windows** (Task Scheduler): the tasks run as the user with their interactive token, so only while that user is
-  logged on. The hosted runner's user is (the job prints its logon sessions first).
+  logged on. The hosted runner's user, `runneradmin`, is: it is logged on at the console (`query user`: session
+  `console`, Active; the job prints it first), so both tasks run (`Running`, `LastTaskResult` 267009, "still
+  running"). A runner without such a session (a self-hosted runner run as a service) would not start them, and the
+  test fails at "both jobs running" rather than pass on something weaker.
 - **Linux** (the systemd user manager): a runner's user has no login session, so no user manager. The job enables
   lingering for it and sets the `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` a login session gives; without them
   the connector falls back to running on demand, which the test refuses (it requires `service: systemd`).
