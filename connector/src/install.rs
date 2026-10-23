@@ -1105,6 +1105,7 @@ pub fn human_uninstall(answer: &Value) -> String {
 pub(crate) mod tests {
     use super::*;
     use crate::core_package::tests::{core_archive, core_files};
+    use crate::platform::fs::TestFiles;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1180,7 +1181,7 @@ pub(crate) mod tests {
                 format!("#!/bin/sh\n# {build}\necho '{{\"ok\":true,\"version\":\"{version}\"}}'\n"),
             )
             .unwrap();
-            crate::test_support::executable(&binary);
+            Files::make_executable(&binary);
             let archive = core_archive(&core_files(), &[]);
             let target = crate::identity::target().unwrap();
             let name = format!("core/sidevoice-core-0.2.0-{target}.tar.zst");
@@ -1380,8 +1381,8 @@ pub(crate) mod tests {
         let fixture = Fixture::new("leftovers");
         let layout = fixture.layout();
         fs::create_dir_all(layout.releases_dir().join(".1.0.0.partial-x/core")).unwrap();
-        crate::test_support::private(&layout.releases);
-        crate::test_support::private(&layout.releases_dir());
+        Files::shut_others_out(&layout.releases);
+        Files::shut_others_out(&layout.releases_dir());
         fs::write(layout.releases.join(".current.json.x"), b"{}").unwrap();
         fixture
             .install(&fixture.package("1.0.0", "a"))
@@ -1449,7 +1450,7 @@ pub(crate) mod tests {
         let id = agent_without_cli();
         let program = fixture.scratch.path().join("agent-program");
         fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
-        crate::test_support::executable(&program);
+        Files::make_executable(&program);
         let _installed = crate::agents::tests::EnvGuard::set(
             &format!("SIDEVOICE_{}_BIN", id.to_ascii_uppercase()),
             program.as_os_str(),
@@ -1624,7 +1625,7 @@ pub(crate) mod tests {
         .unwrap();
         let lock = layout.install_lock();
         fs::write(&lock, b"sentinel lock contents").unwrap();
-        crate::test_support::private(&lock);
+        Files::shut_others_out(&lock);
         let error = uninstall_with_hooks(
             &fixture.profile,
             NO_AGENTS,
@@ -1646,7 +1647,7 @@ pub(crate) mod tests {
         let fixture = Fixture::new("hard-linked-uninstall-lock");
         let outside = fixture.scratch.path().join("outside-sentinel");
         fs::write(&outside, b"outside contents").unwrap();
-        crate::test_support::private(&outside);
+        Files::shut_others_out(&outside);
         fs::hard_link(&outside, fixture.layout().install_lock()).unwrap();
         assert!(uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
             .await
@@ -1659,7 +1660,7 @@ pub(crate) mod tests {
         let fixture = Fixture::new("hard-linked-uninstall-agents-lock");
         let outside = fixture.scratch.path().join("outside-agents-sentinel");
         fs::write(&outside, b"outside contents").unwrap();
-        crate::test_support::private(&outside);
+        Files::shut_others_out(&outside);
         fs::hard_link(&outside, fixture.layout().data.join("agents.lock")).unwrap();
         assert!(uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
             .await
@@ -1681,7 +1682,7 @@ pub(crate) mod tests {
         let hook = |name: &OsStr| {
             if name == OsStr::new("victim") && !swapped.swap(true, Ordering::SeqCst) {
                 fs::rename(&victim, &moved).unwrap();
-                crate::test_support::symlink(&moved, &victim);
+                Files::symlink(&moved, &victim);
             }
         };
         assert!(uninstall_with_hooks(

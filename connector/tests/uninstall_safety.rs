@@ -7,12 +7,13 @@ mod support;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use support::TestFiles;
 
 fn temp_home() -> std::path::PathBuf {
     let home = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("uninstall-unsafe-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&home).unwrap();
-    support::private(&home);
+    support::Files::shut_others_out(&home);
     home
 }
 
@@ -76,7 +77,7 @@ fn the_home_is_refused_even_with_a_record_naming_its_releases() {
     fs::write(home.join("keep"), "untouched").unwrap();
     let record = serde_json::json!({"command": ["x"], "releases": home.join("install")});
     fs::write(home.join("install.json"), record.to_string()).unwrap();
-    support::private(&home.join("install.json"));
+    support::Files::shut_others_out(&home.join("install.json"));
     let output = uninstall(&home, &home);
     assert!(!output.status.success());
     let answer: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -91,7 +92,7 @@ fn a_directory_with_only_leftovers_and_no_record_is_left_exactly_as_it_is() {
     let home = temp_home();
     let data = home.join("unrelated");
     fs::create_dir(&data).unwrap();
-    support::private(&data);
+    support::Files::shut_others_out(&data);
     fs::write(data.join("node-stopped.json"), "theirs").unwrap();
     let output = uninstall(&home, &data);
     let stdout = String::from_utf8(output.stdout).unwrap();

@@ -894,8 +894,9 @@ impl Removal for Os {
 mod tests {
     use super::*;
     use crate::platform::env::{Env, Environment};
+    use crate::platform::fs::TestFiles;
     use crate::platform::fs::{Files, Fs};
-    use crate::test_support::{symlink, temp_dir};
+    use crate::test_support::temp_dir;
     use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -975,7 +976,7 @@ mod tests {
         let probe = |fd: RawFd, path: &Path| {
             if path == data_rel().join("victim") && !swapped.swap(true, Ordering::SeqCst) {
                 fs::rename(&victim, &moved).unwrap();
-                symlink(&outside, &victim);
+                Files::symlink(&outside, &victim);
             }
             mount(fd)
         };
@@ -997,7 +998,7 @@ mod tests {
         let hook = |_: &OsStr| {
             if !swapped.swap(true, Ordering::SeqCst) {
                 fs::rename(&victim, &moved).unwrap();
-                symlink(&moved, &victim);
+                Files::symlink(&moved, &victim);
             }
         };
         assert!(guard.remove_data_contents(&hook).is_err());

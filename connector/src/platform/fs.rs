@@ -20,10 +20,6 @@ mod imp;
 
 pub use imp::Os as Files;
 
-// How a test widens or narrows the access to a path: the interface only makes private things and checks them.
-#[cfg(test)]
-pub(crate) use imp::{let_others_change, shut_others_out};
-
 use super::user::{User, UserId};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -209,6 +205,33 @@ fn write_whole(
     file.write_all(bytes)?;
     file.commit()
 }
+
+/// What tests do to files and the interface above never does: make a link, mark a program, widen and narrow the
+/// access to a path. Only in the crate's own tests and in a build with the `test-support` feature (the integration
+/// tests', through the crate's dev-dependency on itself), never in the program. Implemented by [`Files`];
+/// callers import both: `use crate::platform::fs::{Files, TestFiles};` then `Files::symlink(..)`.
+#[cfg(any(test, feature = "test-support"))]
+pub trait TestFiles {
+    /// A symbolic link at `link` to `target` (a directory or a file), for tests of what must never be followed.
+    fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>);
+
+    /// Makes `path` something a test may run (a script standing in for an agent): executable by its owner on Unix.
+    /// Nothing on Windows, where the extension decides.
+    fn make_executable(path: &Path);
+
+    /// Lets everybody else read (and enter) `path`, as a directory made with a loose mask is: group and others' read
+    /// and search bits on Unix, a read grant to Everyone on Windows.
+    fn let_others_read(path: &Path);
+
+    /// Lets everybody else change `path`: group and others' bits on Unix, a full-control grant to Everyone on Windows.
+    fn let_others_change(path: &Path);
+
+    /// Narrows `path` to its owner: group and others' bits cleared on Unix (also what the umask gave a new file),
+    /// the grants above to Everyone removed on Windows (where a new file in a test's scratch directory inherits the
+    /// owner's access, SYSTEM's and the administrators', and nobody else's).
+    fn shut_others_out(path: &Path);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,7 +266,7 @@ mod tests {
         let scratch = temp_dir("open-dir");
         let dir = scratch.path().join("data");
         Files::ensure_private_dir(&dir).unwrap();
-        imp::let_others_change(&dir);
+        Files::let_others_change(&dir);
         assert_eq!(others(&dir), Others::Change);
         assert!(!private(&dir));
         assert!(Files::ensure_private_dir(&dir).is_err(), "refused");
@@ -272,7 +295,7 @@ mod tests {
         assert_eq!(names, ["state.json"]);
         let open = scratch.path().join("open");
         Files::create_private_dir(&open).unwrap();
-        imp::let_others_change(&open);
+        Files::let_others_change(&open);
         assert!(
             Files::write_private(&open.join("other.json"), b"x").is_err(),
             "never written where others can enter"
@@ -317,7 +340,7 @@ mod tests {
             Files::read_trusted(&dir, 1024).is_err(),
             "not a regular file"
         );
-        imp::let_others_change(&file);
+        Files::let_others_change(&file);
         assert!(Files::read_trusted(&file, 1024).is_err());
         assert!(!private(&file));
     }

@@ -38,14 +38,14 @@ fn cursor_installed(profile: &Profile) {
     let program = cursor_program(profile);
     fs::create_dir_all(program.parent().unwrap()).unwrap();
     fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
-    executable(&program);
+    Files::make_executable(&program);
     let shell = profile.root.join("login-shell");
     fs::write(
         &shell,
         "#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' \"$SIDEVOICE_TEST_LOGIN_PATH\"\n",
     )
     .unwrap();
-    executable(&shell);
+    Files::make_executable(&shell);
 }
 
 /// `program args… --json` in the profile: its one JSON line and whether it succeeded.

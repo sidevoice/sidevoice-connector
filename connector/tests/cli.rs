@@ -103,7 +103,7 @@ fn agents_lists_in_english_or_as_json_and_failures_carry_a_stable_key() {
 #[test]
 fn the_connector_refuses_a_data_directory_others_can_enter() {
     let profile = Profile::new("unsafe");
-    open_to_others(&profile.data());
+    Files::let_others_read(&profile.data());
     let output = profile.connector(&["connector"]).output().unwrap();
     assert!(!output.status.success());
     let said = String::from_utf8_lossy(&output.stderr);

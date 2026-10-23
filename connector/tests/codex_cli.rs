@@ -108,7 +108,7 @@ fn the_connector_registers_with_the_real_codex_cli_and_leaves_foreign_entries_al
         "#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' \"$SIDEVOICE_TEST_LOGIN_PATH\"\n",
     )
     .unwrap();
-    executable(&shell);
+    Files::make_executable(&shell);
     let fixture = Fixture { profile, codex };
     let config = fixture.profile.root.join("codex/config.toml");
 
@@ -145,7 +145,7 @@ fn the_connector_registers_with_the_real_codex_cli_and_leaves_foreign_entries_al
     // A configuration Codex itself cannot parse: refused, untouched.
     let invalid = b"[mcp_servers.sidevoice\ncommand = [broken\n";
     fs::write(&config, invalid).unwrap();
-    private(&config);
+    Files::shut_others_out(&config);
     let refused = fixture.connector("connect", false);
     assert_eq!(refused["error"]["key"], "agents.invalid", "{refused}");
     assert_eq!(fs::read(&config).unwrap(), invalid);

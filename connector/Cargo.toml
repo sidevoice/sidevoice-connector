@@ -62,9 +62,16 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 # Third parties' endpoints (src/platform/foreign): the same transport as the local channel, a Unix socket or a named pipe.
 interprocess = { version = "2.4", features = ["tokio"] }
 
+[features]
+# What the integration tests do to files and the program never does (src/platform/fs: `TestFiles`). Enabled for them
+# by the dev-dependency on this crate below; never in a release build.
+test-support = []
+
 [dev-dependencies]
 # Scratch directories in unit tests (src/test_support.rs).
 tempfile = "3"
+# This crate with `test-support`, for the integration tests (tests/).
+sidevoice-connector = { path = ".", features = ["test-support"] }
 
 # Unix: the effective uid (src/platform/service/macos: the launchd domain), with no `unsafe` of ours.
 [target.'cfg(unix)'.dependencies]

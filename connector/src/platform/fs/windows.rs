@@ -433,26 +433,41 @@ impl Drop for PrivateAttributes {
     }
 }
 
-/// Lets everybody change `path` (tests).
-#[cfg(test)]
-pub(crate) fn let_others_change(path: &Path) {
-    let status = std::process::Command::new("icacls")
-        .arg(path)
-        .args(["/grant", "*S-1-1-0:(F)"])
-        .output()
-        .unwrap()
-        .status;
-    assert!(status.success(), "icacls");
+#[cfg(any(test, feature = "test-support"))]
+impl super::TestFiles for Os {
+    fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) {
+        let (target, link) = (target.as_ref(), link.as_ref());
+        if target.is_dir() {
+            std::os::windows::fs::symlink_dir(target, link).unwrap();
+        } else {
+            std::os::windows::fs::symlink_file(target, link).unwrap();
+        }
+    }
+
+    // The extension decides what runs: nothing to mark.
+    fn make_executable(_: &Path) {}
+
+    fn let_others_read(path: &Path) {
+        icacls(path, &["/grant", "*S-1-1-0:(RX)"]);
+    }
+
+    fn let_others_change(path: &Path) {
+        icacls(path, &["/grant", "*S-1-1-0:(F)"]);
+    }
+
+    fn shut_others_out(path: &Path) {
+        icacls(path, &["/remove:g", "*S-1-1-0"]);
+    }
 }
 
-/// Takes everybody else's access to `path` away again (tests): the grant `let_others_change` made.
-#[cfg(test)]
-pub(crate) fn shut_others_out(path: &Path) {
+/// `icacls <path> <args>` (tests), which must succeed. Everyone is `S-1-1-0`.
+#[cfg(any(test, feature = "test-support"))]
+fn icacls(path: &Path, args: &[&str]) {
     let status = std::process::Command::new("icacls")
         .arg(path)
-        .args(["/remove:g", "*S-1-1-0"])
+        .args(args)
         .output()
         .unwrap()
         .status;
-    assert!(status.success(), "icacls");
+    assert!(status.success(), "icacls {args:?}");
 }

@@ -5,12 +5,12 @@ mod support;
 use serde_json::Value;
 use std::fs;
 use std::path::Path;
-use support::{executable, Profile, CONNECTOR};
+use support::{Files, Profile, TestFiles, CONNECTOR};
 
 fn program(path: &Path, contents: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, contents).unwrap();
-    executable(path);
+    Files::make_executable(path);
 }
 
 fn listed(profile: &Profile, shell: Option<&Path>, override_bin: Option<&Path>) -> Value {

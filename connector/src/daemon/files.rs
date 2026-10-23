@@ -97,6 +97,8 @@ pub(super) fn read_conversation_state(path: &Path) -> Result<Option<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::platform::fs::{Files, TestFiles};
+
     #[test]
     fn an_outbox_or_a_state_of_another_shape_is_invalid() {
         let dir =
@@ -105,7 +107,7 @@ mod tests {
         let write = |name: &str, bytes: &[u8]| {
             let path = dir.join(name);
             std::fs::write(&path, bytes).unwrap();
-            crate::test_support::private(&path);
+            Files::shut_others_out(&path);
             path
         };
         let speech = serde_json::json!({"event_id":"e","binding_id":"b","client_ref":"c","session_id":"s",

@@ -210,6 +210,7 @@ fn evaluate(macos: bool, evidence: Option<BridgeEvidence>) -> ReadinessCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::fs::{Files, TestFiles};
     use serde_json::json;
 
     #[test]
@@ -264,7 +265,7 @@ mod tests {
         assert_eq!(inventory(&bridge), BridgeFiles::Stale);
         fs::write(&socket, b"").unwrap();
         fs::remove_file(&descriptor).unwrap();
-        crate::test_support::symlink(&socket, &descriptor);
+        Files::symlink(&socket, &descriptor);
         assert_eq!(inventory(&bridge), BridgeFiles::Stale);
         fs::remove_dir_all(root).unwrap();
     }

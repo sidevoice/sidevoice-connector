@@ -24,7 +24,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use sidevoice_connector::platform::env::{Env as _, Environment};
-use sidevoice_connector::platform::fs::{Files, Fs as _};
+use sidevoice_connector::platform::fs::Fs as _;
+// What the tests do to files (links, programs, access): the platform's `TestFiles`, for `use support::*`.
+pub use sidevoice_connector::platform::fs::{Files, TestFiles};
 use sidevoice_connector::platform::ipc::{Address as _, Channel as _, Channels, Endpoint};
 use sidevoice_connector::platform::process::{Process as _, Processes};
 
@@ -80,66 +82,6 @@ pub fn short_temp_dir() -> PathBuf {
         std::env::temp_dir()
     };
     base.canonicalize().unwrap()
-}
-
-/// Makes `path` something a test may run (a script standing in for an agent): executable by its owner on Unix.
-/// Windows has no executable bit, the extension decides, so there is nothing to do there.
-pub fn executable(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    #[cfg(windows)]
-    let _ = path;
-}
-
-/// A symbolic link at `link` to `target` (a directory or a file). Made differently on each OS.
-pub fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) {
-    let (target, link) = (target.as_ref(), link.as_ref());
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(target, link).unwrap();
-    #[cfg(windows)]
-    if target.is_dir() {
-        std::os::windows::fs::symlink_dir(target, link).unwrap();
-    } else {
-        std::os::windows::fs::symlink_file(target, link).unwrap();
-    }
-}
-
-/// Narrows `path`, made in a test's scratch directory, to its owner. Unix gives a new file or directory the umask's
-/// access, so it is narrowed; on Windows a new one inherits the scratch directory's access, which is already the
-/// owner's (and SYSTEM's and the administrators'), so there is nothing to do there.
-pub fn private(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = if path.is_dir() { 0o700 } else { 0o600 };
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-    }
-    #[cfg(windows)]
-    let _ = path;
-}
-
-/// Lets everybody else read (and enter) `path`, as a directory made with a loose mask is: `0o755` on Unix, a read
-/// grant to Everyone on Windows.
-pub fn open_to_others(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    #[cfg(windows)]
-    assert!(
-        Command::new("icacls")
-            .arg(path)
-            .args(["/grant", "*S-1-1-0:(RX)"])
-            .output()
-            .unwrap()
-            .status
-            .success(),
-        "icacls"
-    );
 }
 
 /// Whether `path` is private to this user, as the connector judges it.

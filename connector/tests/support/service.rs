@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use sidevoice_connector::platform::fs::{Files, Fs as _};
 
-use super::{alive, executable, private_dir, symlink, until, Profile, CONNECTOR};
+use super::{alive, private_dir, until, Profile, TestFiles, CONNECTOR};
 
 /// `R`.
 pub fn releases(profile: &Profile) -> PathBuf {
@@ -35,8 +35,8 @@ pub fn stage_installation(profile: &Profile, core: &Path) -> PathBuf {
     );
     let program = release.join("core/bin/sidevoice-core-rust");
     fs::write(&program, wrapper).unwrap();
-    executable(&program);
-    symlink(core.join("models"), release.join("core/models"));
+    Files::make_executable(&program);
+    Files::symlink(core.join("models"), release.join("core/models"));
     Files::write_private(
         &releases.join("current.json"),
         json!({"release": "r1"}).to_string().as_bytes(),
