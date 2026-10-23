@@ -103,7 +103,7 @@ impl Call {
                 &socket,
                 "POST",
                 "/api/device/local/pair",
-                Some(&json!({"name": "sidevoice-bench"})),
+                Some(&json!({"name": "sidevoice-testbench"})),
                 None,
             )
             .await?,
@@ -120,7 +120,7 @@ impl Call {
         );
         let stream = Channels::connect(&socket).await?;
         let (mut ws, _) = tokio_tungstenite::client_async(request, stream).await?;
-        let ready = json!({"label": "rtvi-ai", "type": "client-ready", "id": "sidevoice-bench",
+        let ready = json!({"label": "rtvi-ai", "type": "client-ready", "id": "sidevoice-testbench",
                            "data": {"settings": {"turn_end_mode": "timer"}}});
         ws.send(Message::Text(ready.to_string().into())).await?;
         // Any frame tells the core the device is still there (its keepalive drops a silent one).

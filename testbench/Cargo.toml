@@ -1,0 +1,21 @@
+[package]
+name = "sidevoice-testbench"
+version = "0.15.0"
+edition = "2021"
+publish = false
+description = "A developer tool: the connector and the pinned core driven from a local page, without the desktop app. Never part of a release."
+
+[[bin]]
+name = "sidevoice-testbench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+futures-util = "0.3"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.30"
+uuid = { version = "1", features = ["v4"] }
+# The connector's OS-facing layer (platform::env, process, target) and where it installs.
+sidevoice-connector = { path = "../connector" }

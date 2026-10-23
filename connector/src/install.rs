@@ -497,7 +497,7 @@ impl Runtime {
     /// Both jobs unloaded, what runs on demand stopped and both definitions deleted, the stop kept.
     async fn unload(&self, layout: &Layout) -> crate::service::Result<Value> {
         match self {
-            Runtime::Machine => crate::service::uninstall_held(layout, true).await,
+            Runtime::Machine => crate::service::commands::uninstall_held(layout, true).await,
             #[cfg(test)]
             Runtime::Fake(fake) => {
                 fake.lock().unwrap().unloaded = true;

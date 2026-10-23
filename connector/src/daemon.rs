@@ -18,7 +18,7 @@ use tokio::time::Duration;
 use tokio::time::Instant;
 
 #[cfg(test)]
-#[path = "tests.rs"]
+#[path = "daemon/tests.rs"]
 mod bridge_tests;
 #[cfg(test)]
 mod contract_tests;

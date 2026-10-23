@@ -398,8 +398,7 @@ mod tests {
         // The eleven scenarios are the producer matrix in core's flow.rs. The transport extras
         // differ; every agent-visible fact and instruction is rendered by this one formatter.
         let fixture: Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/conversation-flow.json"))
-                .unwrap();
+            serde_json::from_str(include_str!("../tests/fixtures/conversation-flow.json")).unwrap();
         let original = fixture["text"].as_str().unwrap();
         let partial_extent = fixture["hearing"][1]["history"]["heard_chars"].clone();
         for scenario in [
@@ -572,8 +571,7 @@ mod tests {
     #[test]
     fn t01_t02_t12_t14_shared_core_fixture_keeps_scalar_and_fate_meaning() {
         let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/conversation-flow.json"))
-                .unwrap();
+            serde_json::from_str(include_str!("../tests/fixtures/conversation-flow.json")).unwrap();
         let original = fixture["text"].as_str().unwrap();
         for (index, case) in fixture["hearing"].as_array().unwrap().iter().enumerate() {
             if case["history"]["hearing"] == "heard" {
