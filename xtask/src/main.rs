@@ -14,7 +14,7 @@
 //!   `sidevoice-connector-manifest.json` and `SHA256SUMS`; with a tag, the crate version must be that release.
 //! - `publish DIR TAG`: attach every file in DIR to the release TAG (for `nightly`, move the tag here first and drop
 //!   older assets), download them back, check them against `SHA256SUMS` and the attestation, and publish.
-//! - `core [DIR]`: download the sidevoice-core release pinned in `core.pin` for this host, check it against that
+//! - `core [DIR]`: download the sidevoice-core release pinned by the `sidevoice-platform` tag in `connector/Cargo.toml` for this host, check it against that
 //!   release's `SHA256SUMS`, manifest and attestation, and unpack it into DIR (default `target/sidevoice-core`),
 //!   with the checked archive beside it: where the connector's tests find the real core.
 //! - `codex [DIR]`: install the pinned Codex CLI from npm into DIR (default `target/codex`), where the registration
@@ -101,7 +101,7 @@ pub(crate) const TARGETS: &[Target] = &[
         npm_os: "win32",
         npm_cpu: "x64",
         exe_suffix: ".exe",
-        // Not released until the pinned core publishes a windows-x86_64 archive (`core.pin`): with it, `dist` and the
+        // Not released until the pinned core publishes a windows-x86_64 archive (the `sidevoice-platform` tag): with it, `dist` and the
         // manifest would fail and stop every platform's publication. To enable: set this to `true` and add the
         // target to the `release.yml` matrix (RELEASING.md, "Windows x64").
         released: false,

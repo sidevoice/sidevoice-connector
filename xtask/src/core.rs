@@ -1,5 +1,5 @@
 //! `cargo xtask core [DIR]`: the real core the connector's tests run against — the sidevoice-core release pinned in
-//! `core.pin`, for this host, checked before it is unpacked.
+//! `sidevoice-platform` tag in `connector/Cargo.toml`, for this host, checked before it is unpacked.
 
 use std::fs;
 use std::path::Path;
@@ -12,8 +12,9 @@ use crate::util::*;
 use crate::Result;
 
 pub(crate) const DEFAULT_DIR: &str = "target/sidevoice-core";
-/// The pin: one line, the core's version (`X.Y.Z`), nothing else, so a dependency bot can move it.
-pub(crate) const PIN: &str = "core.pin";
+/// The manifest whose `sidevoice-platform` dependency names the core release: the one place the core version lives.
+const MANIFEST_PATH: &str = "connector/Cargo.toml";
+const PLATFORM_CRATE: &str = "sidevoice-platform";
 const REPOSITORY: &str = "sidevoice/sidevoice-core";
 /// The archive's root directory and its entrypoint below it.
 const ROOT: &str = "sidevoice-core-rust";
@@ -31,8 +32,8 @@ fn signer() -> String {
     format!("https://github.com/{REPOSITORY}/.github/workflows/release.yml@refs/heads/main")
 }
 
-/// The pinned version, from the pin file's text: one `X.Y.Z` (an optional pre-release suffix), no leading `v`.
-pub(crate) fn parse_pin(text: &str) -> Result<String> {
+/// A core version: `X.Y.Z` (an optional pre-release suffix), no leading `v`.
+pub(crate) fn parse_version(text: &str) -> Result<String> {
     let version = text.trim();
     let (core, suffix) = version.split_once('-').unwrap_or((version, ""));
     let numeric = core.split('.').count() == 3
@@ -43,11 +44,56 @@ pub(crate) fn parse_pin(text: &str) -> Result<String> {
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.');
     if !numeric || !suffix_ok || version.lines().count() != 1 {
-        return Err(format!(
-            "{PIN} must hold one core version like 0.2.0, not {text:?}"
-        ));
+        return Err(format!("not a core version like 0.2.0: {text:?}"));
     }
     Ok(version.to_string())
+}
+
+/// The core version a connector manifest names: the `tag` (`vX.Y.Z`) of its `sidevoice-platform` git dependency on
+/// the core's repository. Anything else (a path, a registry version, a branch, a rev, another tag shape) is an error.
+pub(crate) fn core_version_from_manifest(text: &str) -> Result<String> {
+    let manifest: toml::Table = text
+        .parse()
+        .map_err(|error| format!("{MANIFEST_PATH} is not valid TOML: {error}"))?;
+    let fail = |why: &str| {
+        format!(
+            "{MANIFEST_PATH}: [dependencies] {PLATFORM_CRATE} {why}; it must be \
+             {{ git = \"https://github.com/{REPOSITORY}\", tag = \"vX.Y.Z\" }}, the core release the connector bundles"
+        )
+    };
+    let table = manifest
+        .get("dependencies")
+        .and_then(|dependencies| dependencies.get(PLATFORM_CRATE))
+        .ok_or_else(|| fail("is missing"))?
+        .as_table()
+        .ok_or_else(|| fail("is not a table"))?;
+    let git = table.get("git").and_then(|git| git.as_str());
+    if !git.is_some_and(|git| {
+        git.trim_end_matches('/').trim_end_matches(".git")
+            == format!("https://github.com/{REPOSITORY}")
+    }) {
+        return Err(fail("is not a git dependency on the core's repository"));
+    }
+    if ["rev", "branch", "path", "version"]
+        .iter()
+        .any(|key| table.contains_key(*key))
+    {
+        return Err(fail("pins by something other than the tag"));
+    }
+    let tag = table
+        .get("tag")
+        .and_then(|tag| tag.as_str())
+        .ok_or_else(|| fail("has no tag"))?;
+    let not_a_tag = || fail(&format!("has tag {tag:?}, not vX.Y.Z"));
+    let version = tag.strip_prefix('v').ok_or_else(not_a_tag)?;
+    parse_version(version).map_err(|_| not_a_tag())
+}
+
+/// The version the connector's `sidevoice-platform` tag names.
+pub(crate) fn pinned_version() -> Result<String> {
+    core_version_from_manifest(&String::from_utf8_lossy(&read(
+        &repo().join(MANIFEST_PATH),
+    )?))
 }
 
 fn asset_url(version: &str, name: &str) -> String {
@@ -78,11 +124,6 @@ impl PinnedCore {
     }
 }
 
-/// The version `core.pin` names.
-pub(crate) fn pinned_version() -> Result<String> {
-    parse_pin(&String::from_utf8_lossy(&read(&repo().join(PIN))?))
-}
-
 /// Downloads the pinned core release's archive for `target` with `SHA256SUMS`, the manifest and the attestation,
 /// and checks the archive is listed in both with the same digest and that the attestation binds the archive and
 /// the manifest to the core's release workflow on main.
@@ -100,7 +141,7 @@ pub(crate) fn fetch(target: &str) -> Result<PinnedCore> {
     {
         return Err(format!(
             "sidevoice-core {version} publishes no {target} archive ({name} is not in its SHA256SUMS): \
-             {PIN} must name a core release built for {target}"
+             the `{PLATFORM_CRATE}` tag in {MANIFEST_PATH} must name a core release built for {target}"
         ));
     }
     for asset in [name.as_str(), MANIFEST, ATTESTATION] {
@@ -198,19 +239,54 @@ mod tests {
         assert_eq!(entrypoint("windows-x86_64"), "bin/sidevoice-core-rust.exe");
     }
 
-    #[test]
-    fn the_pin_is_one_version() {
-        assert_eq!(parse_pin("0.2.0\n").unwrap(), "0.2.0");
-        assert_eq!(parse_pin("0.3.0-rc.1").unwrap(), "0.3.0-rc.1");
-        assert!(parse_pin("v0.2.0").is_err());
-        assert!(parse_pin("nightly").is_err());
-        assert!(parse_pin("0.2").is_err());
-        assert!(parse_pin("0.2.0\n0.3.0\n").is_err());
+    fn manifest(dependency: &str) -> String {
+        format!("[package]\nname = \"connector\"\n\n[dependencies]\nserde = \"1\"\n{dependency}\n")
     }
 
     #[test]
-    fn the_repository_pin_is_valid() {
-        let text = std::fs::read_to_string(repo().join(PIN)).unwrap();
-        parse_pin(&text).unwrap();
+    fn a_version_is_x_y_z() {
+        assert_eq!(parse_version("0.2.0\n").unwrap(), "0.2.0");
+        assert_eq!(parse_version("0.3.0-rc.1").unwrap(), "0.3.0-rc.1");
+        assert!(parse_version("v0.2.0").is_err());
+        assert!(parse_version("nightly").is_err());
+        assert!(parse_version("0.2").is_err());
+        assert!(parse_version("0.2.0\n0.3.0\n").is_err());
+    }
+
+    #[test]
+    fn the_core_version_is_the_platform_tag() {
+        let git = "https://github.com/sidevoice/sidevoice-core";
+        let version = |dependency: &str| core_version_from_manifest(&manifest(dependency));
+        let platform =
+            |fields: &str| format!("sidevoice-platform = {{ git = \"{git}\", {fields} }}");
+        assert_eq!(version(&platform("tag = \"v0.9.0\"")).unwrap(), "0.9.0");
+        assert_eq!(
+            version(&format!(
+                "sidevoice-platform = {{ git = \"{git}.git\", tag = \"v0.10.1-rc.1\" }}"
+            ))
+            .unwrap(),
+            "0.10.1-rc.1"
+        );
+        for bad in [
+            platform("tag = \"0.9.0\""),
+            platform("tag = \"nightly\""),
+            platform("branch = \"main\""),
+            platform("rev = \"abc123\""),
+            platform("tag = \"v0.9.0\", rev = \"abc\""),
+            "sidevoice-platform = { git = \"https://github.com/other/repo\", tag = \"v0.9.0\" }"
+                .into(),
+            "sidevoice-platform = { path = \"../core\" }".into(),
+            "sidevoice-platform = \"0.9.0\"".into(),
+            "sidevoice-platform = { workspace = true }".into(),
+            String::new(),
+        ] {
+            let error = version(&bad).unwrap_err();
+            assert!(error.contains("sidevoice-platform"), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_repository_names_a_core_version() {
+        pinned_version().unwrap();
     }
 }

@@ -246,7 +246,7 @@ fn check_core(inventory: &Value, records: &[Value]) -> Result<()> {
     if fields != BTreeSet::from(["version", "archive", "sha256", "size", "source_sha"]) {
         return Err("wrong core fields".into());
     }
-    let version = crate::core::parse_pin(core["version"].as_str().unwrap_or(""))?;
+    let version = crate::core::parse_version(core["version"].as_str().unwrap_or(""))?;
     let target = inventory["target"].as_str().unwrap_or("");
     let archive = format!("{CORE_DIR}/{}", crate::core::archive_name(&version, target));
     let listed = records

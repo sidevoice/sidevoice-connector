@@ -1,5 +1,5 @@
 //! A voluntary leave while Core is unavailable, exercised with real Core, daemon and MCP processes.
-//! Runs against the released Core pinned in core.pin.
+//! Runs against the released Core pinned by the sidevoice-platform tag.
 mod support;
 
 use serde_json::json;
