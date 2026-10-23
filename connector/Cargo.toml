@@ -44,6 +44,8 @@ rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
 sidevoice-platform = { git = "https://github.com/sidevoice/sidevoice-core", tag = "v0.7.0" }
 # Records written whole (src/platform/fs): a temporary file beside the record, synced, renamed over it.
 atomic-write-file = "0.3"
+# Canonical paths without the `\\?\` prefix Windows gives `canonicalize` (src/platform/uninstall).
+dunce = "1"
 # Processes (src/platform/process): what every OS reads the same (owner, start, command line, parent) and the stop,
 # through `sysinfo`; spawning a detached process or a stoppable tree (process group, Job Object) through `process-wrap`.
 process-wrap = { version = "10", features = ["tokio1", "process-group", "job-object", "creation-flags", "kill-on-drop"] }

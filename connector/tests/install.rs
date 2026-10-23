@@ -15,7 +15,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use support::package::{package, pinned_core};
 use support::service::{releases, wait_gone};
 use support::*;
@@ -120,12 +120,12 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
     assert_eq!(installed["action"], "installed", "{installed}");
     assert_eq!(installed["service"], "none", "{installed}");
     let releases = releases(&profile);
-    let stable = releases.join("current/bin/sidevoice-connector");
-    assert_eq!(installed["command"][0], stable.to_string_lossy().as_ref());
     let release = releases.join("releases").join(&version);
+    let stable = release.join("bin/sidevoice-connector");
+    assert_eq!(installed["command"][0], stable.to_string_lossy().as_ref());
     assert_eq!(
-        fs::read_link(releases.join("current")).unwrap(),
-        Path::new("releases").join(&version)
+        read_json(&releases.join("current.json")).unwrap(),
+        json!({"release": version})
     );
     assert!(release.join("core/bin/sidevoice-core-rust").is_file());
     let record_file = read_json(&profile.data().join("install.json")).unwrap();

@@ -206,7 +206,9 @@ pub async fn ensure_core(layout: &Layout) -> Result<Ready> {
     }
     private_data_dir(&layout.data)?;
     private_data_dir(&layout.core_data())?;
-    let program = layout.core_program();
+    let program = layout
+        .core_program()
+        .ok_or_else(|| Failure::keyed("service.no-installation", json!({})))?;
     let launch_id = uuid::Uuid::new_v4().to_string();
     let output =
         Files::open_private(&layout.core_output(), Create::Append).map_err(Failure::plain)?;

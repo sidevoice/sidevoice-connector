@@ -9,3 +9,16 @@ pub(crate) fn temp_dir(label: &str) -> tempfile::TempDir {
         .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
         .unwrap()
 }
+
+/// A symbolic link at `link` to `target` (a directory or a file), for tests of what must never be followed. The one
+/// place a test names the OS for it: a link is made differently on each.
+pub(crate) fn symlink(target: &std::path::Path, link: &std::path::Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link).unwrap();
+    } else {
+        std::os::windows::fs::symlink_file(target, link).unwrap();
+    }
+}

@@ -3,10 +3,10 @@
 //!
 //! | job | runs | restart | output |
 //! |---|---|---|---|
-//! | core `dev.sidevoice.core` / `sidevoice-core` | `R/current/core/bin/sidevoice-core-rust` with fixed arguments and `idle-exit 0` | on failure | `D/core.stderr.log` |
+//! | core `dev.sidevoice.core` / `sidevoice-core` | the selected release's `core/bin/sidevoice-core-rust` with fixed arguments and `idle-exit 0` | on failure | `D/core.stderr.log` |
 //! | connector `dev.sidevoice.connector` / `sidevoice-connector` | `install.json`'s `command` + `connector` | always | `D/connector.log` |
 //!
-//! Both name paths through `R/current`, so a definition is rewritten only when its text would change. Neither job
+//! Both name paths in the selected release, so a definition is rewritten when the selection changes. Neither job
 //! starts, signals or adopts the other: the connector links to the core when it answers, and the core's exit status
 //! tells the manager whether to restart it (0 after a failed start: not again; 75 while another core holds its
 //! directory: later; a crash after ready: again).
@@ -23,7 +23,7 @@ use std::path::Path;
 /// output itself (`main.rs`, `platform::service::Service::run_job`).
 pub const RUN_JOB: &str = "run-job";
 
-/// What each job runs: the core through `R/current`, the connector as `install.json`'s `command` says.
+/// What each job runs: the core in the selected release, the connector as `install.json`'s `command` says.
 pub struct Programs {
     pub core: Vec<String>,
     pub connector: Vec<String>,
@@ -66,7 +66,10 @@ pub fn programs(layout: &Layout) -> Result<Programs> {
         .connector_command()
         .ok_or_else(|| Failure::keyed("service.no-installation", json!({})))?;
     connector.push("connector".into());
-    let mut core = vec![layout.core_program().to_string_lossy().into_owned()];
+    let program = layout
+        .core_program()
+        .ok_or_else(|| Failure::keyed("service.no-installation", json!({})))?;
+    let mut core = vec![program.to_string_lossy().into_owned()];
     core.extend(core_arguments(layout, None, Some(0)));
     Ok(Programs { core, connector })
 }
