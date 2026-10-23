@@ -178,6 +178,11 @@ impl super::Env for Os {
         format!("$env:{variable} = {quoted_value}; ")
     }
 
+    // Apps installed for one user keep their own programs under `%LOCALAPPDATA%`.
+    fn per_user_app_programs(local_app_data: &Path) -> Option<PathBuf> {
+        Some(local_app_data.to_path_buf())
+    }
+
     // MSIX packages (a Store app) keep their files under `%LOCALAPPDATA%\Packages`.
     fn store_packages(local_app_data: &Path) -> Option<PathBuf> {
         Some(local_app_data.join("Packages"))

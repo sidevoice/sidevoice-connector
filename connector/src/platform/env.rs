@@ -149,6 +149,13 @@ pub trait Env {
         None
     }
 
+    /// Where the apps installed for one user keep programs of their own (Windows: `%LOCALAPPDATA%`, the folder the
+    /// app copies its bundled program to); `None` where the OS has no such place (an app there is a bundle in an
+    /// applications folder).
+    fn per_user_app_programs(_local_app_data: &Path) -> Option<PathBuf> {
+        None
+    }
+
     /// A program the connector found outside `PATH` (somewhere it chose to look), judged before it is used: it and
     /// everything on the way to it from `root` (a directory of this user's, which the program must be under) belong
     /// to this user and cannot be changed by anybody else, and it is a regular file this OS can run. A link is
