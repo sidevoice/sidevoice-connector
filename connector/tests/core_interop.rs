@@ -106,7 +106,9 @@ fn a_conversation_talks_to_the_real_core_through_the_connector() {
     assert!(!host.is_empty() && host != "rust-proof", "{machine}");
     let platform = machine["platform"].as_str().unwrap_or("");
     assert!(
-        platform.starts_with("macOS ") || platform.starts_with("Linux "),
+        platform.starts_with("macOS ")
+            || platform.starts_with("Linux ")
+            || platform.starts_with("Windows "),
         "{machine}"
     );
     assert!(

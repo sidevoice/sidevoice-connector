@@ -103,6 +103,10 @@ impl Fixture {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "the login PATH is asked of a login shell (``) on Unix; Windows reads it from the registry, so a stand-in shell cannot put the CLI on it"
+)]
 fn the_connector_registers_with_the_real_codex_cli_and_leaves_foreign_entries_alone() {
     let Some(codex) = codex_cli() else { return };
     let profile = Profile::new("codex");

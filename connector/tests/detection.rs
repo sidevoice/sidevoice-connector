@@ -40,6 +40,10 @@ fn has(answer: &Value, id: &str) -> bool {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "the login PATH is asked of a login shell (``) on Unix; Windows reads it from the registry, so a stand-in shell cannot put the CLI on it"
+)]
 fn cli_detection_uses_only_fresh_login_path_not_overrides_fixed_paths_or_cache() {
     let profile = Profile::new("detect");
     let bin = profile.root.join("found/claude");
@@ -111,6 +115,10 @@ fn cursor_install_directory_is_passive_and_needs_a_captured_path() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "the login PATH is asked of a login shell (``) on Unix; Windows reads it from the registry, so a stand-in shell cannot put the CLI on it"
+)]
 fn startup_output_is_not_mistaken_for_the_login_path() {
     let profile = Profile::new("noisypath");
     let bin = profile.root.join("found");

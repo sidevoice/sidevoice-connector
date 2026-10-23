@@ -248,6 +248,9 @@ impl Profile {
             ("CURSOR_CONFIG_DIR".into(), path("cursor/config")),
             ("CURSOR_DATA_DIR".into(), path("cursor/data")),
             ("XDG_CONFIG_HOME".into(), path("xdg/config")),
+            // No STUN lookup and no browser keepalive (the test's presentation socket does not answer one) in any core.
+            ("SIDEVOICE_STUN_URLS".into(), String::new()),
+            ("VOICE_BROWSER_HEARTBEAT_SECONDS".into(), "0".into()),
             (
                 "SIDEVOICE_DATA_DIR".into(),
                 self.data().to_string_lossy().into_owned(),
@@ -344,7 +347,11 @@ impl Profile {
 
     pub fn log_tail(&self) -> String {
         let mut out = String::new();
-        for entry in fs::read_dir(&self.root).into_iter().flatten().flatten() {
+        let dirs = [self.root.clone(), self.data(), self.core_data()];
+        for entry in dirs
+            .iter()
+            .flat_map(|dir| fs::read_dir(dir).into_iter().flatten().flatten())
+        {
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "log") {
                 let text = fs::read_to_string(&path).unwrap_or_default();

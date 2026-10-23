@@ -11,8 +11,7 @@ use std::process::{Command, Stdio};
 use support::TestFiles;
 
 fn temp_home() -> std::path::PathBuf {
-    let home = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("uninstall-unsafe-{}", uuid::Uuid::new_v4()));
+    let home = support::short_temp_dir().join(format!("uninstall-unsafe-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&home).unwrap();
     support::Files::shut_others_out(&home);
     home
