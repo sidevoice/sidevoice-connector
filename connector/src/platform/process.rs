@@ -14,11 +14,10 @@
 //! [`Process::kill`] act only on a process that is this user's and that the caller's check recognises (its start
 //! time, its command line). A zombie (dead, not yet reaped) is no process: it will never do anything again.
 //!
-//! Stopping is one operation, [`Process::stop`]: ask the process to leave, give it the grace time, then kill it.
-//! The request is the OS's standard one (decision "Graceful stop", 2026-10-22): `SIGTERM` on Unix; on Windows a
-//! shutdown request over the local channel, which is the caller's to make, in band, before `stop` (for the core,
-//! `core_ready::shutdown`). [`Process::asks_to_leave`] says which of the two this OS is: where it is false, this
-//! layer sends nothing, it waits the grace time (for the request the caller made), then kills.
+//! Stopping is one operation, [`Process::stop`], the same on every OS for its caller: ask the process to leave
+//! ([`Process::ask_to_leave`]), give it the grace time, then kill it. The request is the one `sidevoice-platform`'s
+//! `stop` sends and the core and this daemon listen for (decision "Graceful stop", option C, 2026-10-23): `SIGTERM` on
+//! Unix; on Windows the process's named stop event. A process that does not listen is killed after the grace.
 
 #[cfg(unix)]
 #[path = "process/unix.rs"]
@@ -30,16 +29,17 @@ mod imp;
 pub use imp::Os as Processes;
 
 use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
+use sidevoice_platform::stop::{StopRequest, StopRequests};
 use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::OnceLock;
 use std::time::Duration;
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, Uid, UpdateKind};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, Uid, UpdateKind};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 
-/// What every OS implements ([`Processes`], in `process/unix.rs` and `process/windows.rs`): the five required
+/// What every OS implements ([`Processes`], in `process/unix.rs` and `process/windows.rs`): the four required
 /// methods. The rest is one body for every OS; an OS overrides it only if it must.
 pub trait Process {
     /// `command` set to outlive its caller: its own process group (Unix), no console and its own group
@@ -55,11 +55,6 @@ pub trait Process {
     /// chat lookup waits for its agent's chat roots to be measured); another error when the OS shows nothing (no
     /// `/proc` and no `lsof`).
     fn open_files(pid: u32) -> io::Result<Vec<PathBuf>>;
-
-    /// Whether [`Process::stop`] itself asks a process to leave: `true` on Unix (`SIGTERM`), `false` on Windows, which
-    /// has no request to send a process that has no console. Where it is `false` a caller that wants the process to
-    /// leave by itself asks in band, over the process's local channel, before `stop`.
-    fn asks_to_leave() -> bool;
 
     /// Whether starting a program failed only because something still has it open for writing (one just written):
     /// worth trying again in a moment. Unix: `ETXTBSY`. Windows: a sharing violation.
@@ -91,20 +86,23 @@ pub trait Process {
         with_verified(pid, is_it, |_| true)
     }
 
-    /// Stops `pid`, only while it is this user's and `is_it` recognises it: asks it to leave (`SIGTERM`; nothing where
-    /// [`Process::asks_to_leave`] is false, see the module), waits up to `grace` for it to go (also for a request the caller
-    /// already made in band), then kills it and waits up to 5 s more. Returns whether it had to be killed.
+    /// Asks `pid` to leave, only while it is this user's and `is_it` recognises it: `sidevoice-platform`'s stop
+    /// request (`SIGTERM` on Unix, the process's stop event on Windows). Returns whether it was asked: `false` also for
+    /// a process that does not listen (Windows: it made no event), which only a kill stops. Waits for nothing.
+    fn ask_to_leave(pid: u32, is_it: impl Fn(&Identity) -> bool) -> bool {
+        with_verified(pid, is_it, |_| StopRequests::ask(pid).unwrap_or(false))
+    }
+
+    /// Stops `pid`, only while it is this user's and `is_it` recognises it: asks it to leave
+    /// ([`Process::ask_to_leave`]), waits up to `grace` for it to go, then kills it and waits up to 5 s more. Returns
+    /// whether it had to be killed.
     fn stop(
         pid: u32,
         is_it: impl Fn(&Identity) -> bool + Send + Sync,
         grace: Duration,
     ) -> impl Future<Output = bool> + Send {
         async move {
-            // `sysinfo` sends nothing where the OS has no such signal (Windows): the grace still runs, for a request
-            // the caller made in band.
-            with_verified(pid, &is_it, |process| {
-                process.kill_with(Signal::Term).unwrap_or(false)
-            });
+            Self::ask_to_leave(pid, &is_it);
             gone_within(pid, &is_it, grace).await;
             let killed = Self::kill(pid, &is_it);
             if killed {
@@ -397,12 +395,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_child_is_stopped_asked_first_where_the_os_can_ask() {
+    async fn a_child_that_does_not_listen_is_stopped_anyway() {
         let mut child = Processes::spawn_tree(sleeper_command()).await.unwrap();
         let pid = child.id().unwrap();
         sleeper_identity(pid).await;
-        // Asked (`SIGTERM`, which the sleeper does not handle) on Unix, killed after the grace on Windows: gone
-        // either way.
+        // Asked on Unix (`SIGTERM`, whose default action ends it), killed after the grace on Windows (it made no stop
+        // event): gone either way.
         Processes::stop(
             pid,
             |found| found.command.contains("sleeper"),
@@ -411,6 +409,48 @@ mod tests {
         .await;
         assert!(Processes::identity(pid).is_none());
         assert!(!child.wait().await.unwrap().success());
+    }
+
+    /// What the test below runs: this test binary, listening for a request to leave; it says so on stdout, then
+    /// exits 0 once asked (and fails if nobody asks within 30 s).
+    #[test]
+    #[ignore = "a child of the test below, not a test"]
+    fn listener() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut requests = StopRequests::listen().unwrap();
+            println!("listening");
+            tokio::time::timeout(Duration::from_secs(30), requests.received())
+                .await
+                .expect("nobody asked");
+        });
+    }
+
+    #[tokio::test]
+    async fn a_child_that_listens_is_asked_and_leaves_by_itself() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "--nocapture",
+                "platform::process::tests::listener",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        let mut child = Processes::spawn_tree(command).await.unwrap();
+        let pid = child.id().unwrap();
+        let mut lines = BufReader::new(child.stdout().unwrap()).lines();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if line.contains("listening") {
+                break;
+            }
+        }
+        let is_listener = |found: &Identity| found.command.contains("tests::listener");
+        assert!(!Processes::stop(pid, is_listener, Duration::from_secs(10)).await);
+        assert!(child.wait().await.unwrap().success());
     }
 
     #[tokio::test]
