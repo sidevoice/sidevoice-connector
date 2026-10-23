@@ -4,11 +4,34 @@ use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject};
 use std::io;
 use std::path::PathBuf;
 use tokio::process::Command;
-use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+use windows_sys::Win32::Foundation::{
+    SetHandleInformation, ERROR_SHARING_VIOLATION, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+};
+use windows_sys::Win32::System::Console::{
+    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
 // `windows`, not `windows-sys`: `CreationFlags` takes its flags type.
 use windows::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
 };
+
+/// Rust starts every child with `bInheritHandles`, so a process detached from here would also inherit this one's own
+/// standard handles: when this process was started with a pipe for its output (a desktop app, a test capturing it),
+/// the reader would not see the pipe close until the detached process ended (the core's idle exit, minutes later).
+/// They are made non-inheritable first; `Stdio::inherit` duplicates what it passes on, so no later spawn is
+/// affected. Nothing maintained covers it (`std`'s handle list is unstable): own `unsafe`, three calls.
+fn keep_own_stdio_out() {
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: `GetStdHandle` returns this process's handle or none; only the inherit flag of that handle changes,
+        // and a failure (a console, no handle) is the same as having nothing to close.
+        unsafe {
+            let handle = GetStdHandle(which);
+            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
 
 /// This OS's processes.
 pub struct Os;
@@ -20,6 +43,7 @@ impl super::Process for Os {
 
     // Not `CREATE_BREAKAWAY_FROM_JOB`: it is refused (access denied) when the caller's job does not allow breakaway.
     fn detached(command: Command) -> CommandWrap {
+        keep_own_stdio_out();
         let mut wrap = CommandWrap::from(command);
         wrap.wrap(CreationFlags(
             DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,

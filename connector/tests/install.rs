@@ -13,7 +13,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 use support::package::{package, pinned_core};
@@ -51,7 +50,6 @@ fn cursor_installed(profile: &Profile) {
 
 /// `program args… --json` in the profile: its one JSON line and whether it succeeded.
 fn run(profile: &Profile, program: &Path, args: &[&str]) -> (bool, Value) {
-    let began = std::time::Instant::now();
     let output = profile
         .command(program)
         .envs(settings())
@@ -75,11 +73,6 @@ fn run(profile: &Profile, program: &Path, args: &[&str]) -> (bool, Value) {
         "{args:?} must print one JSON line and nothing else: {text:?} {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    eprintln!(
-        "[{:?}] {args:?} -> {}",
-        began.elapsed(),
-        text.chars().take(1500).collect::<String>()
-    );
     let answer: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(output.status.success(), answer["ok"] == true, "{answer}");
     (output.status.success(), answer)
@@ -100,7 +93,6 @@ impl Drop for Teardown<'_> {
         // The uninstall below removes the logs the failure needs.
         if std::thread::panicking() {
             eprintln!("{}", self.0.log_tail());
-            eprintln!("{}", tree(&self.0.data(), 4));
         }
         let _ = self
             .0
@@ -124,38 +116,7 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
     cursor_installed(&profile);
     let _teardown = Teardown(&profile, program.clone());
 
-    let (ok, installed) = std::thread::scope(|scope| {
-        // TEMPORARY diagnostic: what the connector sees of its core while `install` waits for it.
-        let watcher = scope.spawn(|| {
-            let ready = profile.core_data().join("core.json");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            for _ in 0..8 {
-                std::thread::sleep(Duration::from_secs(4));
-                let raw = fs::read_to_string(&ready)
-                    .map(|text| text.chars().take(700).collect::<String>());
-                let read = sidevoice_connector::core_ready::read(&ready)
-                    .map(|ready| ready.endpoint.to_string());
-                let health = read.as_ref().ok().and_then(|_| {
-                    let ready = sidevoice_connector::core_ready::read(&ready).ok()?;
-                    Some(
-                        runtime
-                            .block_on(sidevoice_connector::core_ready::health(
-                                &ready.endpoint,
-                                Duration::from_secs(2),
-                            ))
-                            .map(|v| v.to_string()),
-                    )
-                });
-                eprintln!("[watch] raw={raw:?}\n[watch] read={read:#?}\n[watch] health={health:?}");
-            }
-        });
-        let answer = run(&profile, &program, &["install"]);
-        let _ = watcher.join();
-        answer
-    });
+    let (ok, installed) = run(&profile, &program, &["install"]);
     assert!(ok, "{installed}");
     let version = installed["version"].as_str().unwrap().to_owned();
     assert_eq!(installed["action"], "installed", "{installed}");
@@ -275,18 +236,4 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
     }
     assert!(left.contains(&"node-stopped.json".to_owned()), "{left:?}");
     fs::remove_dir_all(&at).unwrap();
-}
-
-/// Every file below `dir` with its size, for a failure's message.
-fn tree(dir: &Path, depth: usize) -> String {
-    let mut out = String::new();
-    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
-        let path = entry.path();
-        let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
-        out.push_str(&format!("{} ({size})\n", path.display()));
-        if depth > 0 && path.is_dir() {
-            out.push_str(&tree(&path, depth - 1));
-        }
-    }
-    out
 }

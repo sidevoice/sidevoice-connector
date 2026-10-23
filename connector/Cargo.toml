@@ -79,6 +79,7 @@ rustix = { version = "1", features = ["process"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
 ] }
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
 # Which file a handle is (src/platform/uninstall): `winapi-util` (walkdir, ripgrep), no `unsafe` of ours.
