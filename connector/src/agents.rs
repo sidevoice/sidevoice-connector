@@ -11,7 +11,9 @@ use crate::adapters::registration::{
     Launch, Manual, Registration,
 };
 use crate::adapters::Registry;
+use crate::data_dir;
 use crate::messages::message;
+use crate::platform::env::{Env, Environment, LoginPath};
 use crate::platform::fs::{Files, Fs};
 use crate::profile::Profile;
 use anyhow::Result;
@@ -19,7 +21,7 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
@@ -1160,30 +1162,9 @@ pub(crate) fn executable(value: &str) -> bool {
 pub(crate) fn find_in_path(names: &[&str], path: Option<&str>) -> Option<String> {
     let path = path?;
     names.iter().find_map(|name| {
-        which::which_in(*name, Some(path), Path::new("/"))
-            .ok()
+        Environment::find_program(name, OsStr::new(path))
             .map(|found| found.to_string_lossy().into_owned())
     })
-}
-
-fn parse_login_path(output: &str) -> Option<String> {
-    const START: &str = "\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}";
-    const END: &str = "\u{1e}SIDEVOICE_PATH_END\u{1e}";
-    let (_, framed) = output.split_once(START)?;
-    let (value, tail) = framed.split_once(END)?;
-    if tail.contains(START) || tail.contains(END) || value.is_empty() || value.len() > 32_768 {
-        return None;
-    }
-    // A person's PATH may carry an empty or relative entry (`::`, `.`); only those entries are dropped, never the
-    // whole PATH, and a control character still refuses it.
-    if value.chars().any(char::is_control) {
-        return None;
-    }
-    let kept: Vec<&str> = value
-        .split(':')
-        .filter(|part| Path::new(part).is_absolute())
-        .collect();
-    (!kept.is_empty()).then(|| kept.join(":"))
 }
 
 async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
@@ -1362,13 +1343,10 @@ impl HostAgents {
     /// What a registration hands the MCP server an agent starts: this installation's own places, so an agent opened
     /// from any shell reaches this installation's connector. The agents' homes stay the agent's own.
     pub(super) fn mcp_env(&self) -> BTreeMap<String, String> {
-        [
-            ("SIDEVOICE_DATA_DIR", &self.profile.data),
-            ("XDG_DATA_HOME", &self.profile.xdg_data),
-        ]
-        .into_iter()
-        .map(|(key, path)| (key.to_owned(), path.to_string_lossy().into_owned()))
-        .collect()
+        [(data_dir::VARIABLE, &self.profile.data)]
+            .into_iter()
+            .map(|(key, path)| (key.to_owned(), path.to_string_lossy().into_owned()))
+            .collect()
     }
 
     async fn inspect(
@@ -1474,37 +1452,22 @@ impl HostAgents {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<Option<String>, Failure> {
-        let Some(shell) = std::env::var("SHELL")
-            .ok()
-            .filter(|value| Path::new(value).is_absolute())
-        else {
-            return Ok(None);
-        };
-        // `-l` reads only the login files (`.zprofile`); many people put `brew shellenv`, nvm and their own PATH
-        // in `.zshrc` / `.bashrc`, which only an interactive shell reads. An interactive shell would try to take the
-        // terminal (and stop under job control), so the rc file is sourced by hand, its output and errors dropped.
-        let name = Path::new(&shell)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        let print = r#"printf '\036SIDEVOICE_PATH_BEGIN\036%s\036SIDEVOICE_PATH_END\036' "$PATH""#;
-        let command = match name {
-            "fish" => "printf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' (string join : $PATH)".to_owned(),
-            "zsh" => format!(r#"[ -r "${{ZDOTDIR:-$HOME}}/.zshrc" ] && . "${{ZDOTDIR:-$HOME}}/.zshrc" >/dev/null 2>&1 </dev/null; {print}"#),
-            "bash" => format!(r#"[ -r "$HOME/.bashrc" ] && . "$HOME/.bashrc" >/dev/null 2>&1 </dev/null; {print}"#),
-            _ => print.to_owned(),
+        let (program, args) = match Environment::login_path() {
+            None => return Ok(None),
+            Some(LoginPath::Known(path)) => return Ok(Some(path)),
+            Some(LoginPath::Run { program, args }) => (program, args),
         };
         let output = run_command(
             &self.profile,
             None,
-            &shell,
-            &["-lc".into(), command],
+            &program.to_string_lossy(),
+            &args,
             cancel,
             deadline,
         )
         .await;
         match output {
-            Ok(output) if output.status.success() => Ok(parse_login_path(&output.stdout)),
+            Ok(output) if output.status.success() => Ok(LoginPath::parse(&output.stdout)),
             Ok(_) | Err(CommandFailure::Start | CommandFailure::Deadline | CommandFailure::Io) => {
                 Ok(None)
             }

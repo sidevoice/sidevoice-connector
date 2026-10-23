@@ -3,33 +3,6 @@ use crate::adapters::registration::{aggregate_readiness, ReadinessCheck};
 use crate::platform::fs::{Create, Files, Fs};
 use std::os::unix::fs::{symlink, PermissionsExt};
 
-#[test]
-fn login_path_frame_ignores_banners_and_rejects_empty_or_incomplete_output() {
-    let framed = "\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}/tmp/bin:/usr/bin\u{1e}SIDEVOICE_PATH_END\u{1e}";
-    assert_eq!(
-        parse_login_path(&format!("Welcome!\n{framed}\n")),
-        Some("/tmp/bin:/usr/bin".into())
-    );
-    assert_eq!(parse_login_path("Welcome!\n"), None);
-    assert_eq!(
-        parse_login_path("\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}\u{1e}SIDEVOICE_PATH_END\u{1e}"),
-        None
-    );
-    assert_eq!(
-        parse_login_path("\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}/usr/bin"),
-        None
-    );
-    assert_eq!(
-        parse_login_path("\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}relative\u{1e}SIDEVOICE_PATH_END\u{1e}"),
-        None
-    );
-    // One empty or relative entry costs only itself, not the whole PATH.
-    assert_eq!(
-        parse_login_path("\u{1e}SIDEVOICE_PATH_BEGIN\u{1e}/opt/homebrew/bin::.:/usr/bin\u{1e}SIDEVOICE_PATH_END\u{1e}"),
-        Some("/opt/homebrew/bin:/usr/bin".into())
-    );
-}
-
 #[tokio::test]
 async fn command_output_limit_reports_truncation_instead_of_parsing_prefix() {
     let payload = vec![b'x'; 90_000];
@@ -195,7 +168,6 @@ impl Fixture {
             ("CURSOR_CONFIG_DIR", path("cursor/config")),
             ("CURSOR_DATA_DIR", path("cursor/data")),
             ("XDG_CONFIG_HOME", path("xdg/config")),
-            ("XDG_DATA_HOME", path("xdg/data")),
             ("SIDEVOICE_DATA_DIR", path("sidevoice")),
         ];
         let profile = Profile::from_vars(
@@ -1484,7 +1456,7 @@ async fn the_installed_command_is_registered_and_owns_every_release_of_it() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
     let profile = &fixture.profile;
-    let releases = profile.xdg_data.join("sidevoice");
+    let releases = crate::data_dir::releases_dir(&profile.data);
     let binary = releases.join("releases/1.0.0/bin/sidevoice-connector");
     private_mkdir(binary.parent().unwrap());
     private_write(&binary, b"#!/bin/sh\n");
@@ -1683,7 +1655,7 @@ fn codex_entry(fixture: &Fixture, selected: &InstalledCommand, enabled: bool, en
 }
 
 fn installation_env(fixture: &Fixture) -> Value {
-    json!({"SIDEVOICE_DATA_DIR": fixture.profile.data, "XDG_DATA_HOME": fixture.profile.xdg_data})
+    json!({"SIDEVOICE_DATA_DIR": fixture.profile.data})
 }
 
 #[tokio::test]
@@ -1709,13 +1681,6 @@ async fn codex_registration_carries_the_installation_environment() {
         add.contains(&format!(
             "--env SIDEVOICE_DATA_DIR={}",
             fixture.profile.data.display()
-        )),
-        "{add}"
-    );
-    assert!(
-        add.contains(&format!(
-            "--env XDG_DATA_HOME={}",
-            fixture.profile.xdg_data.display()
         )),
         "{add}"
     );
@@ -1842,9 +1807,8 @@ async fn claude_registration_carries_the_installation_environment_and_an_older_o
         .unwrap();
     assert!(
         add.starts_with(&format!(
-            "mcp add --scope user sidevoice -e SIDEVOICE_DATA_DIR={} -e XDG_DATA_HOME={} --",
-            fixture.profile.data.display(),
-            fixture.profile.xdg_data.display()
+            "mcp add --scope user sidevoice -e SIDEVOICE_DATA_DIR={} --",
+            fixture.profile.data.display()
         )),
         "{add}"
     );
@@ -2114,10 +2078,10 @@ async fn each_agent_says_what_the_connector_does_itself_and_how_to_do_it_by_hand
     let codex = fake_codex(&fixture);
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let selected = fixture.selected();
-    let env = [
-        format!("SIDEVOICE_DATA_DIR={}", fixture.profile.data.display()),
-        format!("XDG_DATA_HOME={}", fixture.profile.xdg_data.display()),
-    ];
+    let env = [format!(
+        "SIDEVOICE_DATA_DIR={}",
+        fixture.profile.data.display()
+    )];
     let quoted = |words: Vec<String>| {
         words
             .iter()
@@ -2414,9 +2378,8 @@ async fn connect_rewrites_an_outdated_entry_and_a_failed_rewrite_is_not_success(
     assert_eq!(mutations[0], "mcp remove --scope user sidevoice");
     assert!(
         mutations[1].starts_with(&format!(
-            "mcp add --scope user sidevoice -e SIDEVOICE_DATA_DIR={} -e XDG_DATA_HOME={} --",
-            fixture.profile.data.display(),
-            fixture.profile.xdg_data.display()
+            "mcp add --scope user sidevoice -e SIDEVOICE_DATA_DIR={} --",
+            fixture.profile.data.display()
         )),
         "{mutations:?}"
     );

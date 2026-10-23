@@ -2,6 +2,7 @@
 //! it for one request.
 
 use crate::messages::message;
+use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Files, Fs};
 use crate::profile::Profile;
 use futures_util::future::BoxFuture;
@@ -33,7 +34,7 @@ pub enum CliError {
     Failed,
 }
 
-/// How the agent starts the server its entry names: the command, its arguments, the environment the entry gives it and
+/// How the agent starts the server its entry .find_map(|name| Environment::find_program(name, &path))?s: the command, its arguments, the environment the entry gives it and
 /// the working directory it names, if any.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Launch {
@@ -423,14 +424,14 @@ pub fn bench_agents(request: &Value) -> Value {
                 )
             })
             .collect();
-        let path = std::env::var("PATH").unwrap_or_default();
+        let path = std::env::var_os("PATH").unwrap_or_default();
         let binaries: serde_json::Map<String, Value> = registry
             .agents()
             .filter_map(|(id, registration)| {
                 let found = registration
                     .binary_names()
                     .iter()
-                    .find_map(|name| which::which_in(name, Some(&path), "/").ok())?;
+                    .find_map(|name| Environment::find_program(name, &path))?;
                 Some((
                     format!("SIDEVOICE_{}_BIN", id.to_ascii_uppercase()),
                     Value::from(found.to_string_lossy().into_owned()),

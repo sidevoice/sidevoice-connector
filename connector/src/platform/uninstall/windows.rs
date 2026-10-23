@@ -2,8 +2,10 @@
 //! as long as it runs. Each is opened as itself (`FILE_FLAG_OPEN_REPARSE_POINT`: a link or junction there is opened,
 //! seen and refused, never followed) and without `FILE_SHARE_DELETE`, so while it is held nobody can rename it,
 //! delete it or put a link in its place: the paths the step then uses can only lead through those directories. The
-//! home is compared (volume and file id, `winapi-util`) with the one seen when the removal started; an entry is
-//! claimed by renaming it into the private claim directory and compared before and after; the standard library's
+//! anchor (the nearest directory above `D` there at the start) is compared (volume and file id, `winapi-util`) with
+//! the one seen when the removal started, and `D` with the one recorded when it was checked or made; an entry is
+//! claimed by renaming it into the private claim directory and
+//! compared before and after; the standard library's
 //! handle-based `remove_dir_all` deletes what was claimed (it removes a link or junction itself and never follows one,
 //! so it never leaves the volume). `D` and the claim directory are checked private with
 //! [`platform::fs`](crate::platform::fs).
@@ -17,8 +19,8 @@
 //! No `unsafe` here: `std`'s `OpenOptionsExt` sets the sharing and the flags, `winapi-util` reads the file id.
 
 use super::{
-    recovery_record, Removal, Roots, CLAIM, DATA_PREFIX, RECORD, RECOVERY, RECOVERY_PROGRAM,
-    RELEASE_PREFIX,
+    recovery_record, Removal, Roots, CLAIM, DATA_PREFIX, RECORD, RECORD_LIMIT, RECOVERY,
+    RECOVERY_PROGRAM, RELEASE_PREFIX,
 };
 use crate::platform::fs::{Create, Files, Fs};
 use std::ffi::{OsStr, OsString};
@@ -136,27 +138,81 @@ fn claim_entry(
 /// Directories held for one step; released when dropped.
 struct Held(Vec<File>);
 
-/// This OS's removal: the roots, and the home as it was when the removal started.
+/// This OS's removal: the roots, and the anchor as it was when the removal started.
 pub struct Os {
     roots: Roots,
-    home: (File, Identity),
+    anchor: (PathBuf, File, Identity),
+    /// What `D` is: recorded when the removal starts with `D` there, or when it makes `D`.
+    data_id: std::sync::OnceLock<Identity>,
 }
 
 impl Os {
-    /// `path` (the home or below it) and every directory above it, held, with the home checked to be the one seen
-    /// when the removal started.
+    /// `path` (the anchor or below it) and every directory above it, held, with the anchor checked to be the one
+    /// seen when the removal started and `D`, when `path` is in it, the one recorded.
     fn hold_down_to(&self, path: &Path) -> Result<Held, &'static str> {
+        let held = self.hold_unchecked(path)?;
+        if path.starts_with(&self.roots.data) {
+            let data = held
+                .0
+                .get(self.roots.data.ancestors().count() - 1)
+                .ok_or("unsafe uninstall path")?;
+            match self.data_id.get() {
+                Some(id) if *id == identity_of(data)? => {}
+                Some(_) => return Err("uninstall data directory replaced during removal"),
+                None => return Err("uninstall data directory appeared during removal"),
+            }
+        }
+        Ok(held)
+    }
+
+    /// [`Os::hold_down_to`] without comparing `D`: for recording it.
+    fn hold_unchecked(&self, path: &Path) -> Result<Held, &'static str> {
         self.roots.validate()?;
         let mut chain: Vec<&Path> = path.ancestors().collect();
         chain.reverse();
         let held = chain.into_iter().map(hold).collect::<Result<Vec<_>, _>>()?;
-        let home = held
-            .get(self.roots.home.ancestors().count() - 1)
+        let anchor = held
+            .get(self.anchor.0.ancestors().count() - 1)
             .ok_or("unsafe uninstall path")?;
-        if identity_of(home)? != self.home.1 {
-            return Err("uninstall home replaced during removal");
+        if identity_of(anchor)? != self.anchor.2 {
+            return Err("uninstall anchor replaced during removal");
         }
         Ok(Held(held))
+    }
+
+    /// `D` as it is now, recorded as the one every later use compares.
+    fn record_data(&self) -> Result<(), &'static str> {
+        let held = self.hold_unchecked(&self.roots.data)?;
+        let id = identity_of(held.0.last().ok_or("unsafe uninstall path")?)?;
+        let _ = self.data_id.set(id);
+        Ok(())
+    }
+
+    /// `D` made by this removal (with any missing directories above it, each private) and recorded; refused when
+    /// something else is already there.
+    fn make_data(&self) -> Result<(), &'static str> {
+        let data = &self.roots.data;
+        let parent = data.parent().ok_or("unsafe uninstall path")?;
+        if !exists(parent)? {
+            Files::ensure_private_dir(parent).map_err(|_| "unsafe uninstall data root")?;
+        }
+        match Files::create_private_dir(data) {
+            Ok(()) => self.record_data(),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                Err("uninstall data directory appeared during removal")
+            }
+            Err(_) => Err("cannot create uninstall data root"),
+        }
+    }
+
+    /// `D`'s names and its record, read with `D` held, for [`Roots::check_owned`].
+    fn contents(&self) -> Result<super::Contents, &'static str> {
+        let Some(_held) = self.data()? else {
+            return Ok(None);
+        };
+        let record = Files::read_trusted(&self.roots.data.join(RECORD), RECORD_LIMIT)
+            .map_err(|_| "unsafe uninstall install record")?;
+        Ok(Some((names(&self.roots.data)?, record)))
     }
 
     /// `D` held (with all above it) when it is there, checked: this user's, open to nobody else.
@@ -183,7 +239,7 @@ impl Os {
     }
 
     /// Refused when the running program is inside what an uninstall removes: Windows cannot delete it while it
-    /// runs, so the uninstall would stop half-way, every retry from the same place again.
+    /// This OS's removal: the anchor held open, and the mount every directory below it must be on.
     fn check_not_running_inside(&self) -> Result<(), &'static str> {
         let program = std::env::current_exe()
             .and_then(fs::canonicalize)
@@ -215,12 +271,28 @@ impl Os {
 impl Removal for Os {
     fn new(roots: Roots) -> Result<Self, &'static str> {
         roots.validate()?;
-        let home = identity(&roots.home)?;
-        Ok(Self { roots, home })
+        let path = roots.anchor()?;
+        let (file, id) = identity(&path)?;
+        let removal = Self {
+            roots,
+            anchor: (path, file, id),
+            data_id: std::sync::OnceLock::new(),
+        };
+        if exists(&removal.roots.data)? {
+            removal.record_data()?;
+        }
+        removal.ownership()?;
+        Ok(removal)
     }
 
     fn roots(&self) -> &Roots {
         &self.roots
+    }
+
+    fn ownership(&self) -> Result<super::Ownership, &'static str> {
+        // `D` compared with the one recorded even where its contents are not read (the standard place).
+        self.data()?;
+        self.roots.check_owned(|| self.contents())
     }
 
     fn preflight(&self) -> Result<bool, &'static str> {
@@ -239,7 +311,9 @@ impl Removal for Os {
 
     fn lock_file(&self, name: &str) -> Result<File, &'static str> {
         self.roots.validate()?;
-        Files::ensure_private_dir(&self.roots.data).map_err(|_| "unsafe uninstall data root")?;
+        if self.data_id.get().is_none() {
+            self.make_data()?;
+        }
         let _held = self.data()?.ok_or("uninstall data root disappeared")?;
         Files::open_private(&self.roots.data.join(name), Create::ReadWrite)
             .map_err(|_| "cannot open uninstall lock")
@@ -302,9 +376,15 @@ impl Removal for Os {
         let (_held, claim) = self.private_child(CLAIM)?;
         let releases = &self.roots.releases;
         if exists(releases)? {
-            let _parents = self.hold_down_to(&self.roots.data_home)?;
+            let parent = releases.parent().ok_or("unsafe uninstall root")?;
+            let _parents = self.hold_down_to(parent)?;
             let claimed = claim.join(format!("{RELEASE_PREFIX}{}", uuid::Uuid::new_v4().simple()));
-            claim_entry(releases, &claimed, OsStr::new("sidevoice"), &|_| {})?;
+            claim_entry(
+                releases,
+                &claimed,
+                releases.file_name().ok_or("unsafe uninstall root")?,
+                &|_| {},
+            )?;
         }
         for entry in names(&claim)? {
             if is_release(&entry) {

@@ -23,6 +23,7 @@ use super::{Failure, Result};
 use crate::core_ready::Ready;
 use crate::frame;
 use crate::messages::message;
+use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Create, Files, Fs};
 use crate::platform::ipc::{Channel, Channels};
 use crate::platform::process::{Identity, Process, Processes};
@@ -42,9 +43,6 @@ const STOP_GRACE: Duration = Duration::from_secs(15);
 const SERVICE_WAIT: Duration = Duration::from_secs(10);
 /// The idle exit of a core started on demand.
 const ON_DEMAND_IDLE_EXIT: u32 = 600;
-/// What an on-demand child's `PATH` is.
-const PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-
 /// One request to the connector on its socket: its `result`, or none when nothing answers within `limit`.
 pub async fn ask_connector(
     layout: &Layout,
@@ -483,7 +481,7 @@ where
     command
         .args(&argv[1..])
         .env_clear()
-        .env("PATH", PATH)
+        .envs(Environment::base())
         .envs(environment)
         .envs(layout.settings.clone())
         .envs(
@@ -560,7 +558,11 @@ mod tests {
     #[test]
     fn a_core_is_ours_only_with_this_data_directory_as_a_whole_argument() {
         let layout = Layout::from_vars(
-            |name| (name == "HOME").then(|| "/h".into()),
+            |name| match name {
+                "HOME" => Some("/h".into()),
+                "SIDEVOICE_DATA_DIR" => Some("/h/.sidevoice".into()),
+                _ => None,
+            },
             Vec::new(),
             &[],
         )

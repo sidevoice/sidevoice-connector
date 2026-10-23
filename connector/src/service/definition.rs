@@ -14,6 +14,8 @@
 use super::jobs::Job;
 use super::layout::Layout;
 use super::{Failure, Result};
+use crate::data_dir;
+use crate::platform::env::{Env, Environment};
 use crate::platform::service::{Job as Definition, Refusal, Restart, Service, Services};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -79,9 +81,8 @@ pub fn programs(layout: &Layout) -> Result<Programs> {
 pub fn environment(layout: &Layout) -> BTreeMap<String, String> {
     let path = |path: &Path| path.to_string_lossy().into_owned();
     let mut environment = layout.settings.clone();
-    environment.insert("HOME".into(), path(&layout.home));
-    environment.insert("SIDEVOICE_DATA_DIR".into(), path(&layout.data));
-    environment.insert("XDG_DATA_HOME".into(), path(&layout.data_home));
+    environment.insert(Environment::HOME.into(), path(&layout.home));
+    environment.insert(data_dir::VARIABLE.into(), path(&layout.data));
     environment.insert("XDG_CONFIG_HOME".into(), path(&layout.config_home));
     for (name, dir) in &layout.agent_dirs {
         environment.insert(name.clone(), path(dir));
@@ -175,7 +176,11 @@ mod tests {
     #[test]
     fn the_core_environment_drops_loader_variables_and_names_its_data() {
         let layout = Layout::from_vars(
-            |name| (name == "HOME").then(|| "/home/u".into()),
+            |name| match name {
+                "HOME" => Some("/home/u".into()),
+                "SIDEVOICE_DATA_DIR" => Some("/home/u/.sidevoice".into()),
+                _ => None,
+            },
             Vec::new(),
             &[],
         )
