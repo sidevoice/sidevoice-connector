@@ -4,6 +4,7 @@ use serde_json::Value;
 use sidevoice_connector::platform::data_dir;
 mod support;
 
+use sidevoice_connector::platform::env::{Env as _, Environment};
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -21,7 +22,8 @@ fn uninstall(home: &Path, data: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_sidevoice-connector"))
         .args(["uninstall", "--json"])
         .env_clear()
-        .env("HOME", home)
+        .envs(Environment::base())
+        .env(Environment::HOME, home)
         .env("SIDEVOICE_DATA_DIR", data)
         .env("SIDEVOICE_SERVICE_MANAGER", "none")
         .stdin(Stdio::null())

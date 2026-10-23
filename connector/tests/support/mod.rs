@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use sidevoice_connector::platform::data_dir;
+use sidevoice_connector::platform::env::{Env as _, Environment};
 use sidevoice_connector::platform::fs::Fs as _;
 // What the tests do to files (links, programs, access): the platform's `TestFiles`, for `use support::*`.
 pub use sidevoice_connector::platform::fs::{Files, TestFiles};
@@ -237,8 +238,11 @@ impl Profile {
     pub fn env(&self) -> BTreeMap<String, String> {
         let path = |child: &str| self.root.join(child).to_string_lossy().into_owned();
         let mut env = BTreeMap::from([
-            ("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()),
-            ("HOME".into(), path("home")),
+            (
+                "PATH".into(),
+                Environment::base_path().to_string_lossy().into_owned(),
+            ),
+            (Environment::HOME.into(), path("home")),
             ("CLAUDE_CONFIG_DIR".into(), path("claude")),
             ("CODEX_HOME".into(), path("codex")),
             ("CURSOR_CONFIG_DIR".into(), path("cursor/config")),
@@ -251,6 +255,11 @@ impl Profile {
         ]);
         // The sockets are in the runtime directory (`$XDG_RUNTIME_DIR` here), which `connector_endpoint` reads from
         // this process: the connector must see the same one, or it listens where the test does not look.
+        // What the system needs of a child (Windows: `SystemRoot` and its like).
+        for (name, value) in Environment::base() {
+            env.entry(name.to_string_lossy().into_owned())
+                .or_insert_with(|| value.to_string_lossy().into_owned());
+        }
         if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
             env.insert(
                 "XDG_RUNTIME_DIR".into(),
