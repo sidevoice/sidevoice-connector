@@ -11,6 +11,7 @@
 pub mod package;
 pub mod service;
 
+use sidevoice_connector::platform::target::{Host, Target as _};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -34,16 +35,10 @@ pub const CONNECTOR: &str = env!("CARGO_BIN_EXE_sidevoice-connector");
 
 /// The connector's and the core's programs inside a package, a release or an unpacked core (`.exe` on Windows).
 pub fn connector_program() -> String {
-    format!(
-        "bin/{}",
-        sidevoice_connector::identity::exe_name("sidevoice-connector")
-    )
+    format!("bin/{}", Host::exe_name("sidevoice-connector"))
 }
 pub fn core_program() -> String {
-    format!(
-        "bin/{}",
-        sidevoice_connector::identity::exe_name("sidevoice-core-rust")
-    )
+    format!("bin/{}", Host::exe_name("sidevoice-core-rust"))
 }
 
 /// The unpacked core (`<dir>/bin/sidevoice-core-rust`, `<dir>/models`), or `None` when the test must be skipped.

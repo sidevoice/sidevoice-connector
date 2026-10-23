@@ -19,6 +19,7 @@ use crate::data_dir::{data_dir, releases_dir};
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Files, Fs};
 use crate::platform::ipc::{Address, Endpoint};
+use crate::platform::target::{Host, Target as _};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -28,10 +29,7 @@ use std::path::{Component, Path, PathBuf};
 /// The core's program inside a release (`core/bin/sidevoice-core-rust`, `.exe` on Windows), and the directory its
 /// models are in (`core/models`).
 pub fn core_entrypoint() -> String {
-    format!(
-        "core/bin/{}",
-        crate::identity::exe_name("sidevoice-core-rust")
-    )
+    format!("core/bin/{}", Host::exe_name("sidevoice-core-rust"))
 }
 pub const CORE_DIRECTORY: &str = "core";
 

@@ -22,6 +22,7 @@
 
 use crate::messages::Keyed;
 use crate::platform::fs::{Create, Fs};
+use crate::platform::target::{Host, Target as _};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -52,9 +53,8 @@ const ARCHIVE_ROOT: &str = "sidevoice-core-rust";
 const CORE_INVENTORY: &str = "native-core.json";
 const CORE_KIND: &str = "rust-native-v2";
 /// The core's program, as its archive names it: `bin/sidevoice-core-rust`, with `.exe` on Windows.
-static ENTRYPOINT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    format!("bin/{}", crate::identity::exe_name("sidevoice-core-rust"))
-});
+static ENTRYPOINT: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("bin/{}", Host::exe_name("sidevoice-core-rust")));
 /// The top-level directories a core may have; its entrypoint is the one file it must.
 const TOP_LEVEL: &[&str] = &["bin", "notices"];
 
@@ -131,7 +131,7 @@ pub fn packaged_as(root: &Path, version: &str) -> Result<PackagedCore> {
     }
     let inventory: Value = serde_json::from_slice(&read_bounded(&path, MAX_INVENTORY)?)
         .map_err(|error| mismatch(format!("{INVENTORY}: {error}")))?;
-    let target = crate::identity::target().context("unsupported target")?;
+    let target = Host::name().context("unsupported target")?;
     if inventory["version"] != version || inventory["target"] != target {
         return Err(mismatch(format!(
             "{INVENTORY} is version {} for {}; this connector is {version} for {target}",
@@ -477,7 +477,7 @@ pub(crate) mod tests {
             })
             .collect();
         records.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-        let target = crate::identity::target().unwrap();
+        let target = Host::name().unwrap();
         let inventory = json!({"schema": 1, "kind": CORE_KIND, "target": target, "source_sha": SOURCE,
             "entrypoint": ENTRYPOINT.as_str(), "files": records});
         let mut builder = tar::Builder::new(Vec::new());
@@ -510,7 +510,7 @@ pub(crate) mod tests {
     /// A package holding `archive` as its core, with the inventory naming `listed` as its digest.
     fn package(scratch: &Path, archive: &[u8], listed: Option<String>) -> PathBuf {
         let root = scratch.join("package");
-        let target = crate::identity::target().unwrap();
+        let target = Host::name().unwrap();
         let name = format!("core/sidevoice-core-0.2.0-{target}.tar.zst");
         fs::create_dir_all(root.join("core")).unwrap();
         fs::write(root.join(&name), archive).unwrap();
@@ -636,7 +636,7 @@ pub(crate) mod tests {
         assert_eq!(key(&error), "core.package-missing", "{error}");
         fs::write(
             scratch.path().join(INVENTORY),
-            json!({"version": "0.0.1", "target": crate::identity::target()}).to_string(),
+            json!({"version": "0.0.1", "target": Host::name()}).to_string(),
         )
         .unwrap();
         assert_eq!(
@@ -645,8 +645,7 @@ pub(crate) mod tests {
         );
         fs::write(
             scratch.path().join(INVENTORY),
-            json!({"version": crate::identity::VERSION, "target": crate::identity::target()})
-                .to_string(),
+            json!({"version": crate::identity::VERSION, "target": Host::name()}).to_string(),
         )
         .unwrap();
         assert_eq!(

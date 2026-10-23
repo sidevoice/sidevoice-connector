@@ -48,6 +48,7 @@ use crate::messages::Keyed;
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Create, Files, Fs};
 use crate::platform::process::{Process, Processes};
+use crate::platform::target::{Host, Target as _};
 use crate::platform::uninstall::{Ownership, Removal, Remover, Roots};
 use crate::profile::Profile;
 use crate::service::jobs::Kind;
@@ -65,7 +66,7 @@ use tokio::time::{sleep, timeout, Duration, Instant};
 
 /// The connector's program inside a package and inside a release (`bin/sidevoice-connector`, `.exe` on Windows).
 pub fn binary() -> String {
-    format!("bin/{}", crate::identity::exe_name("sidevoice-connector"))
+    format!("bin/{}", Host::exe_name("sidevoice-connector"))
 }
 /// How long the pair has to answer after a restart.
 const VERIFY_LIMIT: Duration = Duration::from_secs(60);
@@ -1185,7 +1186,7 @@ pub(crate) mod tests {
             .unwrap();
             Files::make_executable(&binary);
             let archive = core_archive(&core_files(), &[]);
-            let target = crate::identity::target().unwrap();
+            let target = Host::name().unwrap();
             let name = format!("core/sidevoice-core-0.2.0-{target}.tar.zst");
             fs::write(root.join(&name), &archive).unwrap();
             let inventory = json!({"version": version, "target": target,
