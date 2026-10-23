@@ -54,6 +54,10 @@ impl super::Env for Os {
         })
     }
 
+    fn in_sequence(commands: &[&str]) -> String {
+        commands.join(" && ")
+    }
+
     #[cfg(test)]
     fn hand_shell(line: &str) -> std::process::Command {
         let mut command = std::process::Command::new("/bin/sh");
