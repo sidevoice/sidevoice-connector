@@ -431,7 +431,7 @@ impl Drop for Readers {
 }
 
 /// Runs a manager's own command, with no shell; never fails, never outlives its deadline (the command, its output and
-/// everything it started: the tree is killed with it, also when the call is dropped).
+/// what it started in its group or job: the tree is killed with it, also when the call is dropped).
 async fn command(program: &str, args: &[&str]) -> Output {
     let mut command = Command::new(program);
     command
