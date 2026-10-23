@@ -271,6 +271,14 @@ fn parse_systemd(shown: &str) -> JobState {
         } else {
             None
         },
+        state: Some(
+            ["ActiveState", "SubState", "Result"]
+                .iter()
+                .filter_map(|name| field(name).map(|value| format!("{name}={value}")))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+        .filter(|state| !state.is_empty()),
     }
 }
 
@@ -667,6 +675,10 @@ mod tests {
         assert_eq!(
             (state.running, state.restarting, state.runs, state.exit),
             (false, true, Some(2), Some(1))
+        );
+        assert_eq!(
+            state.state.as_deref(),
+            Some("ActiveState=activating SubState=auto-restart Result=exit-code")
         );
 
         let limited = "LoadState=loaded\nActiveState=failed\nSubState=failed\nResult=start-limit-hit\nExecMainPID=0\n";

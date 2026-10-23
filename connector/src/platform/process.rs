@@ -63,7 +63,7 @@ pub trait Process {
     /// Starts `command` so that it outlives this process and its terminal. The caller owns stdio and the
     /// environment.
     fn spawn_detached(command: Command) -> impl Future<Output = io::Result<Child>> + Send {
-        spawn(Self::detached(command))
+        spawn(Self::detached(command), false)
     }
 
     /// Starts `command` as the leader of a tree that [`Child::kill_tree`] stops whole, and that goes with the
@@ -71,7 +71,7 @@ pub trait Process {
     fn spawn_tree(command: Command) -> impl Future<Output = io::Result<Child>> + Send {
         let mut wrap = Self::tree(command);
         wrap.wrap(KillOnDrop);
-        spawn(wrap)
+        spawn(wrap, true)
     }
 
     /// Who `pid` is now, whoever owns it; `None` when there is no such process (or a zombie).
@@ -158,8 +158,18 @@ pub trait Process {
 ///
 /// Not `process-wrap`'s own child: its `wait` on a group or a job waits for every process the leader left behind,
 /// and a leader's exit is what callers ask about. [`Child::wait`] reports the leader's exit; the tree is stopped
-/// with [`Child::kill_tree`].
-pub struct Child(Box<dyn ChildWrapper>);
+/// with [`Child::kill_tree`]. A tree ([`Processes::spawn_tree`]) is killed whole when its `Child` is dropped: its group
+/// (Unix; `KillOnDrop` alone kills only the leader) or its Job Object. A descendant that leaves the group (`setsid`)
+/// or the job is not contained.
+pub struct Child(Box<dyn ChildWrapper>, bool);
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        if self.1 {
+            let _ = self.0.start_kill();
+        }
+    }
+}
 
 impl Child {
     pub fn id(&self) -> Option<u32> {
@@ -214,11 +224,11 @@ pub struct Identity {
 
 // A busy executable (open for writing somewhere: being replaced, or just written while a sibling process forked; std
 // names it the same on every OS) runs a moment later: five tries 50 ms apart.
-async fn spawn(mut wrap: CommandWrap) -> io::Result<Child> {
+async fn spawn(mut wrap: CommandWrap, tree: bool) -> io::Result<Child> {
     let mut attempt = 0;
     loop {
         match wrap.spawn() {
-            Ok(child) => return Ok(Child(child)),
+            Ok(child) => return Ok(Child(child, tree)),
             Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy && attempt < 5 => {
                 attempt += 1;
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -479,6 +489,23 @@ mod tests {
         let pid = child.id().unwrap();
         drop(child);
         gone(pid).await;
+    }
+
+    /// A dropped tree takes a descendant of its leader with it, not only the leader. (Unix: it needs a shell to start
+    /// a descendant.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_tree_takes_a_descendant_with_it() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "sleep 60 & echo $!; wait"])
+            .stdout(std::process::Stdio::piped());
+        let mut child = Processes::spawn_tree(command).await.unwrap();
+        let mut lines = BufReader::new(child.stdout().unwrap()).lines();
+        let descendant: u32 = lines.next_line().await.unwrap().unwrap().parse().unwrap();
+        drop(child);
+        gone(descendant).await;
     }
 
     #[tokio::test]

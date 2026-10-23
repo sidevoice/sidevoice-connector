@@ -26,6 +26,10 @@ pub struct Observation {
     pub defined_connector: bool,
     /// The core job as its manager reports it (only when it is defined).
     pub core_job: Option<JobState>,
+    /// The same job in words: the manager, the job's name, its state and last exit (`Diagnosis`'s `Display`).
+    pub core_job_text: Option<String>,
+    /// Where a launcher appends the core's stdout and stderr (`core.stderr.log`).
+    pub output_log: std::path::PathBuf,
     pub limit: Option<u64>,
     pub stopped: bool,
     /// The core's health answer, when it answered 200.
@@ -68,6 +72,7 @@ pub fn derive(o: &Observation) -> Value {
         "failure": null, "attempts": null, "limit": null, "since": null, "window_started": null,
         "next_retry_at": null, "reachable": body.is_some(), "connector": {"running": o.connector_running},
         "start_at_login": o.start_at_login,
+        "job": o.core_job_text, "output_log": o.output_log,
     });
     let job = o.core_job.as_ref();
     let service_failure = if o.defined_core {
@@ -253,14 +258,16 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
     let service = jobs::manager(layout);
     let defined_core = installed.as_ref().is_some_and(|found| found.core);
     let defined_connector = installed.as_ref().is_some_and(|found| found.connector);
-    let (core_job, program) = if defined_core {
+    let (core_job, core_job_text, program) = if defined_core {
         let program = service.program(Job::Core.id()).await;
+        let diagnosis = service.diagnose(Job::Core.id()).await;
         (
-            Some(service.status(Job::Core.id()).await),
+            Some(diagnosis.job.clone()),
+            Some(diagnosis.to_string()),
             definition::program_problem(program.as_deref()),
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
     let ready = read_ready(layout);
     let health = match ready.as_ref().map(|ready| &ready.endpoint) {
@@ -292,6 +299,8 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
         defined_core,
         defined_connector,
         core_job,
+        core_job_text,
+        output_log: layout.core_output(),
         limit: match kind {
             Kind::Manager => Services::START_LIMIT,
             Kind::None => None,

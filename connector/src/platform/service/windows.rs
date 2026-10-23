@@ -128,7 +128,9 @@ impl Service for Os {
     }
 
     async fn status(&self, job: JobId) -> JobState {
-        if !registered(&Self::name(job)).await {
+        let task = Self::name(job);
+        let queried = schtasks(&["/Query", "/TN", &task, "/FO", "CSV", "/NH", "/V"]).await;
+        if !queried.ok {
             return JobState {
                 reason: Some("not-loaded"),
                 ..JobState::default()
@@ -141,10 +143,17 @@ impl Service for Os {
             }
             None => None,
         };
+        let (state, last_result) = parse_task_row(&queried.output);
         JobState {
             loaded: true,
             running: pid.is_some(),
             pid,
+            // What the task's action last returned (the exit of the program it ran); not the code for "never ran" or
+            // "running now".
+            exit: last_result
+                .filter(|_| pid.is_none())
+                .filter(|code| !matches!(*code, TASK_RUNNING | TASK_NOT_YET_RUN)),
+            state,
             ..JobState::default()
         }
     }
@@ -233,6 +242,27 @@ fn said(out: &Output) -> String {
 /// found" from another failure across languages but the exit.
 async fn registered(task: &str) -> bool {
     schtasks(&["/Query", "/TN", task]).await.ok
+}
+
+/// `LastTaskResult` while the task runs, and before it has ever run.
+const TASK_RUNNING: i64 = 0x41301;
+const TASK_NOT_YET_RUN: i64 = 0x41303;
+
+/// The row `schtasks /Query /FO CSV /NH /V` prints for a task: its `Status` and `Last Result`, by their columns (the
+/// headings and the status words are in the user's language, the positions are not).
+fn parse_task_row(csv: &str) -> (Option<String>, Option<i64>) {
+    let Some(line) = csv.lines().find(|line| line.starts_with('"')) else {
+        return (None, None);
+    };
+    let columns: Vec<&str> = line.trim_end().trim_matches('"').split("\",\"").collect();
+    let state = columns
+        .get(3)
+        .map(|status| status.trim().to_owned())
+        .filter(|status| !status.is_empty());
+    let result = columns
+        .get(6)
+        .and_then(|result| result.trim().parse::<i64>().ok());
+    (state, result)
 }
 
 /// What is read back from a task's XML: whether its logon trigger and the task itself are enabled (Task Scheduler
@@ -515,6 +545,13 @@ mod tests {
             log: PathBuf::from("C:\\d\\core.log"),
             runner: runner.iter().map(|word| (*word).to_owned()).collect(),
         }
+    }
+
+    #[test]
+    fn a_task_row_gives_its_status_and_its_last_result_by_column() {
+        let row = "\"PC\",\"\\sidevoice-core-a\",\"N/A\",\"Ready\",\"Interactive only\",\"23/10/2026 9:00:00\",\"2\",\"a\"\r\n";
+        assert_eq!(parse_task_row(row), (Some("Ready".into()), Some(2)));
+        assert_eq!(parse_task_row(""), (None, None));
     }
 
     #[test]

@@ -287,6 +287,7 @@ fn parse_launchd(ok: bool, printed: &str) -> JobState {
             .and_then(|runs| runs.parse().ok())
             .filter(|runs| *runs > 0),
         reason: None,
+        state: field("state"),
     }
 }
 
