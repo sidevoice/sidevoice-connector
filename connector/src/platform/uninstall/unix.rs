@@ -28,6 +28,14 @@ fn ours(fd: RawFd) -> Result<bool, &'static str> {
         .map_err(|_| "cannot read uninstall owner")
 }
 
+/// What an entry that is not as it was a moment ago is refused with: gone or not a file any more (`CHANGED`), or a
+/// different file there (`REPLACED`), or a directory that is not one any more (`MOVED`).
+const CHANGED: &str = "uninstall entry changed during removal";
+const REPLACED: &str = "uninstall entry replaced";
+const MOVED: &str = "uninstall directory changed or is a link";
+/// How many times a check looks at an entry a running service keeps changing before it refuses.
+const CHECK_ATTEMPTS: usize = 5;
+
 pub(super) fn stat_fd(fd: RawFd) -> Result<libc::stat, &'static str> {
     let mut stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut stat) } == 0 {
@@ -42,7 +50,7 @@ fn stat_at(fd: RawFd, name: &CStr) -> Result<libc::stat, &'static str> {
     if unsafe { libc::fstatat(fd, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) } == 0 {
         Ok(stat)
     } else {
-        Err("uninstall entry changed during removal")
+        Err(CHANGED)
     }
 }
 
@@ -66,7 +74,7 @@ fn open_dir(parent: RawFd, child: &OsStr) -> Result<OwnedFd, &'static str> {
         )
     };
     if fd < 0 {
-        Err("uninstall directory changed or is a link")
+        Err(MOVED)
     } else {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
@@ -291,7 +299,7 @@ impl Os {
             let child = open_dir(source, OsStr::from_bytes(source_name.to_bytes()))?;
             self.check_mount(child.as_raw_fd())?;
             if !same(&before, &stat_fd(child.as_raw_fd())?) {
-                return Err("uninstall entry replaced");
+                return Err(REPLACED);
             }
         }
         // The rename is the ownership claim. A replacement at the old name is
@@ -330,51 +338,24 @@ impl Os {
                 continue;
             }
             self.verify_dir(relative, fd)?;
-            let child_path = relative.join(&entry);
-            let child_name = name(&entry)?;
-            let before = stat_at(fd, &child_name)?;
-            if before.st_dev != self.expected.device {
-                return Err("uninstall device boundary");
-            }
-            if before.st_mode & libc::S_IFMT == libc::S_IFDIR {
-                let child = open_dir(fd, &entry)?;
-                self.check_mount(child.as_raw_fd())?;
-                if !same(&before, &stat_fd(child.as_raw_fd())?) {
-                    return Err("uninstall entry replaced");
-                }
-                self.walk(
-                    child.as_raw_fd(),
-                    &child_path,
-                    remove,
-                    &[],
-                    depth + 1,
-                    probe,
-                )?;
-                if remove {
-                    self.verify_dir(relative, fd)?;
-                    if !same(&before, &stat_at(fd, &child_name)?) {
-                        return Err("uninstall entry replaced");
+            // A check (`remove` false) runs before the service is stopped, so the service may be writing in the
+            // tree: an entry it replaced or removed between the listing and the check is looked at again, and one
+            // that is gone is nothing to check. Every entry still there is checked as strictly as ever, and the
+            // removal itself (after the stop) never retries: there a change is a real one.
+            let mut attempts = 0;
+            loop {
+                match self.visit(fd, relative, &entry, remove, depth, probe) {
+                    Ok(()) => break,
+                    Err(refused @ (CHANGED | REPLACED | MOVED)) if !remove => {
+                        if !exists_at(fd, &entry)? {
+                            break;
+                        }
+                        attempts += 1;
+                        if attempts >= CHECK_ATTEMPTS {
+                            return Err(refused);
+                        }
                     }
-                    self.check_mount(child.as_raw_fd())?;
-                    if unsafe { libc::unlinkat(fd, child_name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
-                        return Err("cannot remove uninstall directory");
-                    }
-                }
-            } else {
-                if let Some(child) = open_entry(fd, &child_name, &before)? {
-                    if !same(&before, &stat_fd(child.as_raw_fd())?) {
-                        return Err("uninstall entry replaced");
-                    }
-                    self.check_mount(child.as_raw_fd())?;
-                }
-                if remove {
-                    self.verify_dir(relative, fd)?;
-                    if !same(&before, &stat_at(fd, &child_name)?) {
-                        return Err("uninstall entry replaced");
-                    }
-                    if unsafe { libc::unlinkat(fd, child_name.as_ptr(), 0) } != 0 {
-                        return Err("cannot remove uninstall entry");
-                    }
+                    Err(refused) => return Err(refused),
                 }
             }
             if depth == 0 && remove {
@@ -382,6 +363,66 @@ impl Os {
             }
         }
         Ok(removed)
+    }
+
+    /// One entry of the directory `fd` (at `relative`): checked, and removed when `remove`.
+    fn visit(
+        &self,
+        fd: RawFd,
+        relative: &Path,
+        entry: &OsStr,
+        remove: bool,
+        depth: usize,
+        probe: &impl Fn(RawFd, &Path) -> Result<Mount, &'static str>,
+    ) -> Result<(), &'static str> {
+        let child_path = relative.join(entry);
+        let child_name = name(entry)?;
+        let before = stat_at(fd, &child_name)?;
+        if before.st_dev != self.expected.device {
+            return Err("uninstall device boundary");
+        }
+        if before.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            let child = open_dir(fd, entry)?;
+            self.check_mount(child.as_raw_fd())?;
+            if !same(&before, &stat_fd(child.as_raw_fd())?) {
+                return Err(REPLACED);
+            }
+            self.walk(
+                child.as_raw_fd(),
+                &child_path,
+                remove,
+                &[],
+                depth + 1,
+                probe,
+            )?;
+            if remove {
+                self.verify_dir(relative, fd)?;
+                if !same(&before, &stat_at(fd, &child_name)?) {
+                    return Err(REPLACED);
+                }
+                self.check_mount(child.as_raw_fd())?;
+                if unsafe { libc::unlinkat(fd, child_name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+                    return Err("cannot remove uninstall directory");
+                }
+            }
+        } else {
+            if let Some(child) = open_entry(fd, &child_name, &before)? {
+                if !same(&before, &stat_fd(child.as_raw_fd())?) {
+                    return Err(REPLACED);
+                }
+                self.check_mount(child.as_raw_fd())?;
+            }
+            if remove {
+                self.verify_dir(relative, fd)?;
+                if !same(&before, &stat_at(fd, &child_name)?) {
+                    return Err(REPLACED);
+                }
+                if unsafe { libc::unlinkat(fd, child_name.as_ptr(), 0) } != 0 {
+                    return Err("cannot remove uninstall entry");
+                }
+            }
+        }
+        Ok(())
     }
 
     fn tree(
@@ -668,7 +709,7 @@ impl Removal for Os {
                     return Err("uninstall device boundary");
                 }
                 if !same(&before, &stat_at(claim.as_raw_fd(), &entry_name)?) {
-                    return Err("uninstall entry replaced");
+                    return Err(REPLACED);
                 }
                 if unsafe { libc::unlinkat(claim.as_raw_fd(), entry_name.as_ptr(), 0) } != 0 {
                     return Err("cannot remove claimed release link");
@@ -869,6 +910,43 @@ mod tests {
         assert_eq!(
             preflight_with_simulated_data_mount(&guard),
             Err("uninstall mount or device boundary")
+        );
+    }
+
+    /// Three directories in `D`; the first one the walk enters removes the other two (the service writing in `D`
+    /// while it is checked), after the listing and before the walk reaches them.
+    fn walk_with_siblings_vanishing(remove: bool) -> Result<bool, &'static str> {
+        let scratch = temp_dir("uninstall-vanish");
+        let home = scratch.path().join("home");
+        let guard = removal(&home);
+        let data = home.join(data_rel());
+        for child in ["a", "b", "c"] {
+            fs::create_dir_all(data.join(child)).unwrap();
+            fs::write(data.join(child).join("file"), "x").unwrap();
+        }
+        let first = std::sync::Mutex::new(None::<String>);
+        let probe = |fd: RawFd, path: &Path| {
+            if path.parent() == Some(data_rel()) {
+                let me = path.file_name().unwrap().to_string_lossy().into_owned();
+                let mut first = first.lock().unwrap();
+                if first.is_none() {
+                    for other in ["a", "b", "c"].into_iter().filter(|other| *other != me) {
+                        fs::remove_dir_all(data.join(other)).unwrap();
+                    }
+                    *first = Some(me);
+                }
+            }
+            mount(fd)
+        };
+        guard.tree(data_rel(), false, &[], remove, &probe)
+    }
+
+    #[test]
+    fn check_ignores_entries_a_running_service_removed_but_removal_refuses_them() {
+        assert_eq!(walk_with_siblings_vanishing(false), Ok(true));
+        assert_eq!(
+            walk_with_siblings_vanishing(true),
+            Err("uninstall entry changed during removal")
         );
     }
 
