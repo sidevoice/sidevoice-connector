@@ -90,6 +90,10 @@ struct Teardown<'a>(&'a Profile, PathBuf);
 
 impl Drop for Teardown<'_> {
     fn drop(&mut self) {
+        // The uninstall below removes the logs the failure needs.
+        if std::thread::panicking() {
+            eprintln!("{}", self.0.log_tail());
+        }
         let _ = self
             .0
             .command(&self.1)

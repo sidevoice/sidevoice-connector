@@ -76,6 +76,10 @@ fn installed_cli_advertises_safe_uninstall_capability() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "the home directory is the Known Folder on Windows (`dirs::home_dir`), not `USERPROFILE`, so a profile's home cannot be told from the real one; `platform::uninstall`'s unit tests give the guard a home"
+)]
 fn the_home_is_refused_even_with_a_record_naming_its_releases() {
     let home = temp_home();
     fs::write(home.join("keep"), "untouched").unwrap();
