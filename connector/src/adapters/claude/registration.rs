@@ -195,9 +195,13 @@ fn add_args(host: &dyn AgentHost) -> Vec<String> {
 
 impl Registration for Claude {
     fn bench_steps(&self, setup: &BenchSetup) -> Option<String> {
+        let start = setup.line(
+            "claude",
+            &strings(&["--mcp-config", setup.mcp_config, "--strict-mcp-config"]),
+            None,
+        );
         Some(format!(
-            "Claude Code (log in once inside the profile with /login):\n  . {} && claude --mcp-config {} --strict-mcp-config",
-            setup.env_script, setup.mcp_config
+            "Claude Code (log in once inside the profile with /login):\n  {start}"
         ))
     }
 

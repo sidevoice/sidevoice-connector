@@ -288,6 +288,21 @@ pub struct BenchSetup<'a> {
     pub env: &'a BTreeMap<String, String>,
 }
 
+impl BenchSetup<'_> {
+    /// One line that sources [`Self::env_script`] (`. 'script'`, read alike by a POSIX shell and PowerShell), then
+    /// runs `command args`, then `tail` (shell text as given, e.g. [`Self::server`]) after it: in sequence
+    /// ([`Env::in_sequence`]), the command only once the script was read.
+    pub fn line(&self, command: &str, args: &[String], tail: Option<&str>) -> String {
+        let source = format!(". {}", Environment::quote(self.env_script));
+        let mut run = shell_command(command, args);
+        if let Some(tail) = tail {
+            run.push(' ');
+            run.push_str(tail);
+        }
+        Environment::in_sequence(&[&source, &run])
+    }
+}
+
 /// Runs the agent's CLI and requires it to succeed.
 pub async fn run_required(
     host: &dyn AgentHost,
@@ -502,6 +517,49 @@ pub fn bench_agents(request: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bench's lines source its script, then run the agent, in sequence as this OS's shell reads them.
+    #[test]
+    fn bench_steps_source_the_profile_then_run_the_agent_in_sequence() {
+        let answer = bench_agents(
+            &json!({"setup": {"env_script": "/b/env.sh", "mcp_config": "/b/mcp.json",
+            "server": "'/r/sidevoice' mcp", "env": {"SIDEVOICE_DATA_DIR": "/d"}}}),
+        );
+        let steps: Vec<&str> = answer["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step.as_str().unwrap())
+            .collect();
+        let source = format!(". {}", Environment::quote("/b/env.sh"));
+        let line = |run: String| Environment::in_sequence(&[&source, &run]);
+        let claude = line(shell_command(
+            "claude",
+            &strings(&["--mcp-config", "/b/mcp.json", "--strict-mcp-config"]),
+        ));
+        let codex_add = line(format!(
+            "{} '/r/sidevoice' mcp",
+            shell_command(
+                "codex",
+                &strings(&[
+                    "mcp",
+                    "add",
+                    "sidevoice",
+                    "--env",
+                    "SIDEVOICE_DATA_DIR=/d",
+                    "--"
+                ])
+            )
+        ));
+        for expected in [claude, codex_add, line(shell_command("codex", &[]))] {
+            assert!(
+                steps
+                    .iter()
+                    .any(|step| step.lines().any(|text| text.trim() == expected)),
+                "{expected} in {steps:?}"
+            );
+        }
+    }
     /// The shell reads each word as given, except where a batch shim would be re-parsed by `cmd.exe`: there no line
     /// is made when any word has `& | < > ^ % !` or `"`.
     #[test]

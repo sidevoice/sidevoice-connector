@@ -2,8 +2,8 @@
 
 use super::Codex;
 use crate::adapters::registration::{
-    cli_step, looks_absent, read_profile_file, run_required, shell_command, strings, AgentError,
-    AgentHost, BenchSetup, CliError, Entry, Launch, Manual, Registration,
+    cli_step, looks_absent, read_profile_file, run_required, strings, AgentError, AgentHost,
+    BenchSetup, CliError, Entry, Launch, Manual, Registration,
 };
 use crate::profile::Profile;
 use anyhow::Result;
@@ -261,17 +261,16 @@ fn add_args(host: &dyn AgentHost) -> Vec<String> {
 
 impl Registration for Codex {
     fn bench_steps(&self, setup: &BenchSetup) -> Option<String> {
-        let env: String = setup
-            .env
-            .iter()
-            .map(|(name, value)| {
-                format!(" --env {}", shell_command(&format!("{name}={value}"), &[]))
-            })
-            .collect();
-        let script = setup.env_script;
+        let mut add = strings(&["mcp", "add", "sidevoice"]);
+        for (name, value) in setup.env {
+            add.extend(["--env".to_owned(), format!("{name}={value}")]);
+        }
+        add.push("--".into());
         Some(format!(
-            "Codex (log in once inside the profile, register once, then start it):\n  . {script} && codex login\n  . {script} && codex mcp add sidevoice{env} -- {}\n  . {script} && codex",
-            setup.server
+            "Codex (log in once inside the profile, register once, then start it):\n  {}\n  {}\n  {}",
+            setup.line("codex", &strings(&["login"]), None),
+            setup.line("codex", &add, Some(setup.server)),
+            setup.line("codex", &[], None),
         ))
     }
 
