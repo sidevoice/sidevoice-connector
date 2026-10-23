@@ -73,7 +73,7 @@ sidevoice-connector = { path = ".", features = ["test-support"] }
 
 # Unix: the effective uid (src/platform/service/macos: the launchd domain), with no `unsafe` of ours.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "fs"] }
 # Records written whole (src/platform/fs/unix.rs): a temporary file beside the record, created 0600, synced, renamed
 # over it.
 atomic-write-file = "0.3"

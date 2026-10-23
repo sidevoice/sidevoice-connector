@@ -15,14 +15,16 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Mount {
-    device: libc::dev_t,
-    #[cfg(target_os = "linux")]
-    id: u64,
-    #[cfg(target_os = "macos")]
-    mounted_at: Vec<u8>,
-}
+#[cfg(target_os = "linux")]
+#[path = "unix/linux.rs"]
+mod linux;
+#[cfg(target_os = "macos")]
+#[path = "unix/macos.rs"]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux::{mount, open_entry, Mount};
+#[cfg(target_os = "macos")]
+use macos::{mount, open_entry, Mount};
 
 /// Whether this user owns what `fd` is (`platform::user`).
 fn ours(fd: RawFd) -> Result<bool, &'static str> {
@@ -57,38 +59,6 @@ fn same(a: &libc::stat, b: &libc::stat) -> bool {
     a.st_dev == b.st_dev
         && a.st_ino == b.st_ino
         && a.st_mode & libc::S_IFMT == b.st_mode & libc::S_IFMT
-}
-
-#[cfg(target_os = "linux")]
-fn mount(fd: RawFd) -> Result<Mount, &'static str> {
-    let stat = stat_fd(fd)?;
-    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
-        .map_err(|_| "cannot inspect uninstall mount")?;
-    let id = info
-        .lines()
-        .find_map(|line| line.strip_prefix("mnt_id:\t"))
-        .and_then(|id| id.trim().parse().ok())
-        .ok_or("cannot inspect uninstall mount")?;
-    Ok(Mount {
-        device: stat.st_dev,
-        id,
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn mount(fd: RawFd) -> Result<Mount, &'static str> {
-    let stat = stat_fd(fd)?;
-    let mut fs_stat: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstatfs(fd, &mut fs_stat) } != 0 {
-        return Err("cannot inspect uninstall mount");
-    }
-    let mounted_at = unsafe { CStr::from_ptr(fs_stat.f_mntonname.as_ptr()) }
-        .to_bytes()
-        .to_vec();
-    Ok(Mount {
-        device: stat.st_dev,
-        mounted_at,
-    })
 }
 
 fn name(name: &OsStr) -> Result<CString, &'static str> {
@@ -150,37 +120,16 @@ fn exists_at(parent: RawFd, child: &OsStr) -> Result<bool, &'static str> {
 fn entries(fd: RawFd) -> Result<Vec<OsString>, &'static str> {
     // A fresh open has its own directory offset; dup() would share the first pass's offset.
     let copy = open_dir(fd, OsStr::new("."))?;
-    let stream = unsafe { libc::fdopendir(std::os::fd::IntoRawFd::into_raw_fd(copy)) };
-    if stream.is_null() {
-        return Err("cannot enumerate uninstall directory");
-    }
-    let result = (|| {
-        let mut found = Vec::new();
-        loop {
-            #[cfg(target_os = "linux")]
-            unsafe {
-                *libc::__errno_location() = 0
-            };
-            #[cfg(target_os = "macos")]
-            unsafe {
-                *libc::__error() = 0
-            };
-            let entry = unsafe { libc::readdir(stream) };
-            if entry.is_null() {
-                if io::Error::last_os_error().raw_os_error() == Some(0) {
-                    break;
-                }
-                return Err("cannot enumerate uninstall directory");
-            }
-            let raw = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-            if raw != b"." && raw != b".." {
-                found.push(OsStr::from_bytes(raw).to_owned());
-            }
+    let dir = rustix::fs::Dir::new(copy).map_err(|_| "cannot enumerate uninstall directory")?;
+    let mut found = Vec::new();
+    for entry in dir {
+        let entry = entry.map_err(|_| "cannot enumerate uninstall directory")?;
+        let raw = entry.file_name().to_bytes();
+        if raw != b"." && raw != b".." {
+            found.push(OsStr::from_bytes(raw).to_owned());
         }
-        Ok(found)
-    })();
-    unsafe { libc::closedir(stream) };
-    result
+    }
+    Ok(found)
 }
 
 /// This OS's removal: the anchor held open, and the mount every directory below it must be on.
@@ -421,37 +370,7 @@ impl Os {
                     }
                 }
             } else {
-                #[cfg(target_os = "linux")]
-                {
-                    let child = unsafe {
-                        libc::openat(
-                            fd,
-                            child_name.as_ptr(),
-                            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                        )
-                    };
-                    if child < 0 {
-                        return Err("uninstall entry replaced");
-                    }
-                    let child = unsafe { OwnedFd::from_raw_fd(child) };
-                    if !same(&before, &stat_fd(child.as_raw_fd())?) {
-                        return Err("uninstall entry replaced");
-                    }
-                    self.check_mount(child.as_raw_fd())?;
-                }
-                #[cfg(target_os = "macos")]
-                if before.st_mode & libc::S_IFMT == libc::S_IFREG {
-                    let child = unsafe {
-                        libc::openat(
-                            fd,
-                            child_name.as_ptr(),
-                            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                        )
-                    };
-                    if child < 0 {
-                        return Err("uninstall entry replaced");
-                    }
-                    let child = unsafe { OwnedFd::from_raw_fd(child) };
+                if let Some(child) = open_entry(fd, &child_name, &before)? {
                     if !same(&before, &stat_fd(child.as_raw_fd())?) {
                         return Err("uninstall entry replaced");
                     }
