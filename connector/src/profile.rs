@@ -3,7 +3,7 @@
 //!
 //! - `D`, the data directory: `$SIDEVOICE_DATA_DIR`, else the OS's standard place for a program's data (`data_dir`). Private (0700). The connector is the
 //!   one writer of its records there, each written whole (`platform/fs`); `D/core/` is the core's.
-//!   the connector's endpoint (`connector.sock` on Unix), `connector.lock`, `connector.log`, `agents.json`, `agents.lock`, `install.lock`,
+//!   the connector's endpoint (`connector.sock` on Unix, in this user's runtime directory when there is one), `connector.lock`, `connector.log`, `agents.json`, `agents.lock`, `install.lock`,
 //!   `node-stopped.json` (a person's stop), `outbox.json`, `core/core.json`
 //!   and the core's endpoint, which its ready file names.
 //! - `R`, the release root: `D/install`, as `service/layout.rs` names it.

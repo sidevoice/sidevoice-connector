@@ -7,8 +7,9 @@
 //! | `D/install.json` | the installation record: `command` (the absolute argv prefix that runs this binary), `releases` |
 //! | `R`, the releases | `D/install` |
 //! | `R/current.json` | the pointer record `{"release": "<id>"}`: the selected release, `R/releases/<id>`, with its core at `core/bin/sidevoice-core-rust` and `core/models` |
-//! | `D/core` | the core's data: `local.sock`, `core.json` (ready), `core-failure.json` |
-//! | `D/connector.sock`, `D/connector.lock` | the connector daemon's socket and lock |
+//! | `D/core` | the core's data: `core.json` (ready, naming the core's endpoint), `core-failure.json` |
+//! | `D/connector.lock` | the connector daemon's lock |
+//! | the endpoints | `Endpoint::new(D, "connector")` and the core's `Endpoint::new(D/core, "local")`: on Unix a socket in this user's runtime directory (`sidevoice-<hash of the data directory>/<name>.sock`), else in that data directory; on Windows a named pipe |
 //! | `D/install.lock`, `D/agents.lock` | the install/service lock and the agents lock |
 //! | `D/<lock>.holder` | who holds that lock (`lock.rs`) |
 //! | `D/node-stopped.json` | a person's stop |

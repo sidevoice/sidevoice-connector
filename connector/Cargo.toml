@@ -50,7 +50,7 @@ zstd = "0.13"
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
 # This user and the local channel (src/platform: `user`, `ipc`), shared with the core: its `sidevoice-platform`, at the
 # tag of the core release `core.pin` names (the two ship together; move both in one PR).
-sidevoice-platform = { git = "https://github.com/sidevoice/sidevoice-core", tag = "v0.7.0" }
+sidevoice-platform = { git = "https://github.com/sidevoice/sidevoice-core", tag = "v0.8.0" }
 # Canonical paths without the `\\?\` prefix Windows gives `canonicalize` (src/platform/uninstall).
 dunce = "1"
 # Processes (src/platform/process): what every OS reads the same (owner, start, command line, parent) and the stop,

@@ -37,9 +37,14 @@ Every place comes from the environment, so a disposable profile is just a set of
   `~/Library/Application Support/Sidevoice`, Linux `$XDG_DATA_HOME/sidevoice` (else `~/.local/share/sidevoice`),
   Windows `%LOCALAPPDATA%\Sidevoice` (`src/data_dir.rs`). Private (0700), created by the daemon when
   missing and refused, never repaired, when someone else could enter it or any directory above it could have its
-  entries replaced. It holds `connector.sock`, `connector.lock`, `connector.log`, `agents.json`, `agents.lock`,
+  entries replaced. It holds `connector.lock`, `connector.log`, `agents.json`, `agents.lock`,
   `node-stopped.json` (a person's stop), the speech outbox, and `core/`
-  (the core's own: `core.json`, `local.sock`);
+  (the core's own: `core.json`, which names the core's endpoint);
+- the local sockets (`connector.sock`, the core's `local.sock`): in this user's runtime directory, each in a private
+  `sidevoice-<hash of its data directory>` directory (`D` for the connector, `D/core` for the core), so their paths
+  stay within the OS limit: Linux `$XDG_RUNTIME_DIR` (`/run/user/<uid>`), macOS the per-user `$TMPDIR`
+  (`/var/folders/…/T/`). Without a runtime directory (Linux with no login session) they are `D/connector.sock` and
+  `D/core/local.sock`. Windows uses named pipes instead, with no path (`sidevoice-platform`'s `ipc`);
 - the release root `R`: `D/install`, always inside `D`;
 - the home: `$HOME` (Windows: `%USERPROFILE%`);
 - the core's port: `$SIDEVOICE_CORE_PORT`, else 10829;

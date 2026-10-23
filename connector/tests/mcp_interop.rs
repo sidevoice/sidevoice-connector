@@ -134,12 +134,14 @@ fn a_health_check_gets_the_tools_and_starts_no_daemon() {
     let tools = mcp.request("tools/list", json!({}));
     assert!(names(&tools["tools"]).contains(&"voice_connect"), "{tools}");
     mcp.stop();
-    for file in ["connector.sock", "connector.lock"] {
-        assert!(
-            !profile.data().join(file).exists(),
-            "{file}: a health check started the daemon"
-        );
-    }
+    assert!(
+        !endpoint_exists(&profile.connector_endpoint()),
+        "a health check started the daemon"
+    );
+    assert!(
+        !profile.data().join("connector.lock").exists(),
+        "a health check started the daemon"
+    );
 }
 
 /// An agent newer than this server may send arguments and `_meta` keys it does not know (sidevoice/sidevoice-core#112):
