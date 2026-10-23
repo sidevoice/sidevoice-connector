@@ -121,50 +121,12 @@ pub fn core_processes(layout: &Layout) -> Vec<u32> {
 }
 
 /// Stop a core of this data directory and wait until it has gone: asked to leave, the grace period, then killed;
-/// each only while it is provably that core. The request is the OS's standard one (decision "Graceful stop",
-/// 2026-10-22): `stop`'s own where the OS has one (`SIGTERM`), else, in band, `POST /api/local/shutdown` on the
-/// endpoint the core's ready file names, while that file names this core.
+/// each only while it is provably that core ([`Process::stop`], the same on every OS).
 pub async fn terminate_core(layout: &Layout, pid: u32, grace: Duration) {
-    ask_core_in_band(layout, pid).await;
     if Processes::stop(pid, |found| is_our_core(layout, &found.command), grace).await {
         crate::logfile::log(&format!(
             "the core (pid {pid}) did not leave by itself: killed it"
         ));
-    }
-}
-
-/// Where the OS's own stop asks nothing ([`Process::asks_to_leave`] false: Windows), the core `pid` asked to leave in
-/// band: `POST /api/local/shutdown` on the endpoint the core's ready file names, while that file names this core.
-async fn ask_core_in_band(layout: &Layout, pid: u32) {
-    if Processes::asks_to_leave() {
-        return;
-    }
-    if let Some(ready) = read_ready(layout).filter(|ready| ready.pid == pid) {
-        if core_running(layout, pid) {
-            if let Err(error) = crate::core_ready::shutdown(&ready, Duration::from_secs(2)).await {
-                crate::logfile::log(&format!(
-                    "could not ask the core (pid {pid}) to leave: {error}"
-                ));
-            }
-        }
-    }
-}
-
-/// Before the service manager ends or restarts the core job: where that is a hard stop (Task Scheduler's `/End`, on
-/// the OS whose stop asks nothing, [`Process::asks_to_leave`] false), every core of this data directory is asked to
-/// leave in band and given the grace time to go; the manager's stop is then the fallback for what is still there.
-/// Nothing where the manager asks the job itself (launchd and systemd send `SIGTERM`, then wait).
-pub async fn let_core_leave_before_manager(layout: &Layout) {
-    if Processes::asks_to_leave() {
-        return;
-    }
-    let pids = core_processes(layout);
-    for &pid in &pids {
-        ask_core_in_band(layout, pid).await;
-    }
-    let deadline = Instant::now() + STOP_GRACE;
-    while pids.iter().any(|&pid| core_running(layout, pid)) && Instant::now() < deadline {
-        sleep(Duration::from_millis(100)).await;
     }
 }
 

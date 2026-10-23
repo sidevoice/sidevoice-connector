@@ -841,7 +841,8 @@ pub fn kill(pid: u64) -> bool {
     u32::try_from(pid).is_ok_and(|pid| Processes::kill(pid, |_| true))
 }
 
-/// Asks `pid` to leave (`SIGTERM` where the OS has it) and waits up to `grace` for it to go, then stops it at once.
+/// Asks `pid` to leave (`SIGTERM`, or its stop event on Windows) and waits up to `grace` for it to go, then stops it at
+/// once.
 pub fn stop(pid: u32, grace: Duration) {
     tokio::runtime::Builder::new_current_thread()
         .enable_time()

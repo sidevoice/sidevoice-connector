@@ -9,10 +9,6 @@ use tokio::process::Command;
 pub struct Os;
 
 impl super::Process for Os {
-    fn asks_to_leave() -> bool {
-        true
-    }
-
     fn executable_is_busy(error: &io::Error) -> bool {
         error.raw_os_error() == Some(libc::ETXTBSY)
     }

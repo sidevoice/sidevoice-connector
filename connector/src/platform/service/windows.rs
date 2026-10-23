@@ -12,14 +12,20 @@
 //! ([`Stored`]), which does both ([`Service::run_job`](super::Service::run_job)). Task Scheduler cannot tell a job's
 //! pid or count its restarts: a job runs when this user has a process running its program, and restarts are not
 //! reported. It also brings a task back only after a failure, so a connector that exits cleanly stays down until
-//! the next login or start. `/End` is a hard stop; the graceful request is the caller's, in band, first.
+//! the next login or start. `/End` is a hard stop, so a job's process is first asked to leave
+//! ([`Process::ask_to_leave`]: its stop event, which the core and the connector daemon listen on) and given
+//! [`STOP_GRACE`]; `/End` ends what is still there. A job that left by itself exited 0, so `RestartOnFailure` does
+//! not bring it back.
 
 use super::{command, write_file, Job, JobId, JobState, Output, Places, Refusal, Service, Stored};
 use crate::platform::fs::{Files, Fs};
-use crate::platform::process::{Process, Processes};
+use crate::platform::process::{Identity, Process, Processes};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::time::{sleep, Duration, Instant};
+
+/// How long a job asked to leave has before `/End` (the launcher gives a core as much).
+const STOP_GRACE: Duration = Duration::from_secs(15);
 
 /// Task Scheduler, for this user.
 pub struct Os {
@@ -79,6 +85,7 @@ impl Service for Os {
                     .map_err(|detail| Refusal::NotLoaded(format!("{task}: {detail}")))?;
             }
             if restart {
+                self.let_leave(job).await;
                 schtasks(&["/End", "/TN", &task]).await;
             }
             let ran = schtasks(&["/Run", "/TN", &task]).await;
@@ -94,6 +101,7 @@ impl Service for Os {
         if !registered(&task).await {
             return Ok(());
         }
+        self.let_leave(job).await;
         let ended = schtasks(&["/End", "/TN", &task]).await;
         let deadline = Instant::now() + Duration::from_secs(10);
         while self.status(job).await.running {
@@ -152,6 +160,26 @@ impl Service for Os {
 }
 
 impl Os {
+    /// Before `/End`, which is a hard stop: the job's processes asked to leave ([`Process::ask_to_leave`]), and those
+    /// that listen given [`STOP_GRACE`] to go. What does not listen, or is still there, `/End` ends.
+    async fn let_leave(&self, job: JobId) {
+        let Some(program) = self.program(job).await else {
+            return;
+        };
+        let command = program.join(" ");
+        let is_it = |found: &Identity| found.command == command;
+        let asked: Vec<u32> = Processes::find(|found| found == command)
+            .into_iter()
+            .filter(|&pid| Processes::ask_to_leave(pid, is_it))
+            .collect();
+        let deadline = Instant::now() + STOP_GRACE;
+        while asked.iter().any(|&pid| Processes::is_process(pid, is_it))
+            && Instant::now() < deadline
+        {
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     fn dir(&self) -> PathBuf {
         self.places.data.join("service")
     }

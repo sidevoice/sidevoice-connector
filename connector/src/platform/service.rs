@@ -16,8 +16,8 @@
 //! to mean a job is absent.
 //!
 //! Stopping is the manager's: launchd and systemd send `SIGTERM`, then kill after their grace; Task Scheduler ends a
-//! task with a hard stop. The graceful request on Windows (the core's in-band shutdown over the local channel) is the
-//! caller's to make first, and arrives with the local channel.
+//! task with a hard stop, so the Windows implementation first asks the job's process to leave the way
+//! [`Process::stop`](super::process::Process::stop) does (its stop event) and gives it a grace time.
 
 #[cfg(target_os = "macos")]
 #[path = "service/macos.rs"]
@@ -204,7 +204,10 @@ pub trait Service: Sized + Send + Sync {
     ) -> impl Future<Output = Result<(), Refusal>> + Send;
 
     /// The job stopped and kept from coming back until it is started or the next login; with `disable` (it is about
-    /// to be removed), not at the next login either. Stopped is what the manager says afterwards. Why not.
+    /// to be removed), not at the next login either. Stopped is what the manager says afterwards. Why not. Its process
+    /// is first asked to leave and given a grace time, as [`Process::stop`](crate::platform::process::Process::stop)
+    /// does: launchd and systemd do that themselves (`SIGTERM`, then wait); Task Scheduler's end is a hard stop, so
+    /// its implementation asks first. The same for a running job that `start` restarts.
     fn stop(&self, job: JobId, disable: bool) -> impl Future<Output = Result<(), String>> + Send;
 
     /// After the definitions are removed: the manager forgets the jobs.

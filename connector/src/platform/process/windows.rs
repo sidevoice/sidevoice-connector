@@ -14,10 +14,6 @@ use windows::Win32::System::Threading::{
 pub struct Os;
 
 impl super::Process for Os {
-    fn asks_to_leave() -> bool {
-        false
-    }
-
     fn executable_is_busy(error: &io::Error) -> bool {
         error.raw_os_error() == i32::try_from(ERROR_SHARING_VIOLATION).ok()
     }
