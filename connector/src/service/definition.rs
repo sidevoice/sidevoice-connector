@@ -173,64 +173,73 @@ mod tests {
         items.iter().map(|item| (*item).to_owned()).collect()
     }
 
+    /// An absolute path of this OS, as text (none of these is made).
+    fn absolute(name: &str) -> String {
+        std::env::temp_dir()
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// A layout whose home is `absolute("u")`, with `vars` as its other variables and `settings` as its settings.
+    fn home_layout(
+        vars: &[(&str, String)],
+        settings: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+        agent_vars: &[&'static str],
+    ) -> Layout {
+        let home = absolute("u");
+        Layout::from_vars(
+            |name| {
+                if name == Environment::HOME {
+                    return Some(home.clone().into());
+                }
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.into())
+            },
+            settings,
+            agent_vars,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn the_core_environment_drops_loader_variables_and_names_its_data() {
-        let layout = Layout::from_vars(
-            |name| match name {
-                "HOME" => Some("/home/u".into()),
-                "SIDEVOICE_DATA_DIR" => Some("/home/u/.sidevoice".into()),
-                _ => None,
-            },
-            Vec::new(),
-            &[],
-        )
-        .unwrap();
+        let data = absolute("data");
+        let layout = home_layout(&[("SIDEVOICE_DATA_DIR", data.clone())], Vec::new(), &[]);
         let base = BTreeMap::from([
             ("LD_PRELOAD".to_owned(), "/evil.so".to_owned()),
-            ("HOME".to_owned(), "/home/u".to_owned()),
+            (Environment::HOME.to_owned(), absolute("u")),
         ]);
         let core = core_environment(&layout, &base);
         assert!(!core.contains_key("LD_PRELOAD"));
-        assert_eq!(core["SIDEVOICE_CORE_DATA_DIR"], "/home/u/.sidevoice/core");
+        let core_data = Path::new(&data).join("core");
+        assert_eq!(core["SIDEVOICE_CORE_DATA_DIR"], core_data.to_string_lossy());
         let args = core_arguments(&layout, None, Some(0));
         assert_eq!(&args[args.len() - 2..], ["--idle-exit", "0"]);
+        let ready = core_data.join("core.json").to_string_lossy().into_owned();
         assert!(args
             .windows(2)
-            .any(|pair| pair == ["--ready-file", "/home/u/.sidevoice/core/core.json"]));
+            .any(|pair| pair == ["--ready-file", ready.as_str()]));
         assert!(args.windows(2).any(|pair| pair == ["--host", "0.0.0.0"]));
         assert!(!args.contains(&"--launch-id".to_owned()));
     }
 
     #[test]
     fn explicitly_configured_core_host_reaches_service_and_on_demand_launches() {
-        let layout = Layout::from_vars(
-            |name| (name == "HOME").then(|| "/home/u".into()),
-            [("SIDEVOICE_CORE_HOST".into(), "0.0.0.0".into())],
-            &[],
-        )
-        .unwrap();
+        let host =
+            |value: &str| home_layout(&[], vec![("SIDEVOICE_CORE_HOST".into(), value.into())], &[]);
+        let layout = host("0.0.0.0");
         for args in [
             core_arguments(&layout, None, Some(0)),
             core_arguments(&layout, Some("launch"), Some(600)),
         ] {
             assert!(args.windows(2).any(|pair| pair == ["--host", "0.0.0.0"]));
         }
-        let empty = Layout::from_vars(
-            |name| (name == "HOME").then(|| "/home/u".into()),
-            [("SIDEVOICE_CORE_HOST".into(), "".into())],
-            &[],
-        )
-        .unwrap();
-        assert!(core_arguments(&empty, None, Some(0))
+        assert!(core_arguments(&host(""), None, Some(0))
             .windows(2)
             .any(|pair| pair == ["--host", "0.0.0.0"]));
-        let loopback = Layout::from_vars(
-            |name| (name == "HOME").then(|| "/home/u".into()),
-            [("SIDEVOICE_CORE_HOST".into(), "127.0.0.1".into())],
-            &[],
-        )
-        .unwrap();
-        assert!(core_arguments(&loopback, None, Some(0))
+        assert!(core_arguments(&host("127.0.0.1"), None, Some(0))
             .windows(2)
             .any(|pair| pair == ["--host", "127.0.0.1"]));
     }
@@ -239,28 +248,19 @@ mod tests {
     /// carries: the agent then uses its own default there, as it does for the person.
     #[test]
     fn a_job_does_not_inherit_an_agent_home_its_profile_leaves_unset() {
-        let unset = Layout::from_vars(
-            |name| (name == "HOME").then(|| "/home/u".into()),
-            Vec::new(),
-            &["ALPHA_HOME", "BETA_HOME"],
-        )
-        .unwrap();
+        let unset = home_layout(&[], Vec::new(), &["ALPHA_HOME", "BETA_HOME"]);
         assert_eq!(unset.agent_dirs_unset(), ["ALPHA_HOME", "BETA_HOME"]);
         assert!(!environment(&unset).contains_key("ALPHA_HOME"));
         assert_eq!(environment(&unset)["SIDEVOICE_SERVICE"], Services::KIND);
 
-        let named = Layout::from_vars(
-            |name| match name {
-                "HOME" => Some("/home/u".into()),
-                "ALPHA_HOME" => Some("/home/u/.alpha".into()),
-                _ => None,
-            },
+        let alpha = absolute("u.alpha");
+        let named = home_layout(
+            &[("ALPHA_HOME", alpha.clone())],
             Vec::new(),
             &["ALPHA_HOME", "BETA_HOME"],
-        )
-        .unwrap();
+        );
         assert_eq!(named.agent_dirs_unset(), ["BETA_HOME"]);
-        assert_eq!(environment(&named)["ALPHA_HOME"], "/home/u/.alpha");
+        assert_eq!(environment(&named)["ALPHA_HOME"], alpha);
     }
 
     #[test]

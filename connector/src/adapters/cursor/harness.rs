@@ -603,6 +603,7 @@ pub(super) mod client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::env::{Env, Environment};
     use std::collections::{HashMap, VecDeque};
     use std::fs;
     use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -814,7 +815,7 @@ mod tests {
         set_followed(&conversation, chat.clone());
         let profile = Profile::from_vars(
             |key| match key {
-                "HOME" => Some(scratch.path().as_os_str().to_os_string()),
+                key if key == Environment::HOME => Some(scratch.path().as_os_str().to_os_string()),
                 "SIDEVOICE_DATA_DIR" => Some(scratch.path().join("data").into_os_string()),
                 _ => None,
             },

@@ -145,9 +145,13 @@ struct InstalledCommand {
 
 impl InstalledCommand {
     fn executable() -> Result<Self> {
+        // Compared canonical as the OS gives it (`\\?\…` on Windows, like every path `owns` canonicalizes), but written
+        // in its plain form (`dunce`), which agent configurations and the steps a person runs carry.
         let executable = std::env::current_exe()?.canonicalize()?;
         Ok(Self {
-            command: executable.to_string_lossy().into_owned(),
+            command: dunce::simplified(&executable)
+                .to_string_lossy()
+                .into_owned(),
             args: vec!["mcp".into()],
             version: crate::identity::VERSION.into(),
             ownership: Ownership::Executable { executable },
@@ -1158,6 +1162,8 @@ fn error_value(key: &str, params: Value) -> Value {
     json!({"error":{"key":key,"params":params,"message":message}})
 }
 
+/// `value` canonical as the OS gives it: every path [`InstalledCommand::owns`] compares is in this one form (`dunce`
+/// may simplify one path and not another, a long one, so plain forms do not compare).
 fn canonical(value: &str) -> Option<PathBuf> {
     Path::new(value).canonicalize().ok()
 }

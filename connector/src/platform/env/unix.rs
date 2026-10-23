@@ -53,4 +53,11 @@ impl super::Env for Os {
             args: vec!["-lc".into(), command],
         })
     }
+
+    #[cfg(test)]
+    fn hand_shell(line: &str) -> std::process::Command {
+        let mut command = std::process::Command::new("/bin/sh");
+        command.arg("-c").arg(line);
+        command
+    }
 }

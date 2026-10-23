@@ -374,12 +374,15 @@ mod tests {
         let home = scratch.path().join("home");
         fs::create_dir(&home).unwrap();
         assert!(roots(&home).validate().is_ok());
+        // `..` spelled from the home's plain form: below a `\\?\` path (Windows' canonical form) `join` resolves it
+        // instead of keeping it.
+        let plain = dunce::simplified(&home);
         for unsafe_path in [
             PathBuf::new(),
             PathBuf::from("relative"),
             PathBuf::from(std::path::MAIN_SEPARATOR_STR),
-            home.join(data_name()).join(".."),
-            home.join("elsewhere").join("..").join(data_name()),
+            plain.join(data_name()).join(".."),
+            plain.join("elsewhere").join("..").join(data_name()),
         ] {
             let layout = at(unsafe_path, &home.join(data_name()));
             assert!(layout.validate().is_err(), "{}", layout.data.display());
