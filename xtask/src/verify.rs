@@ -246,6 +246,7 @@ const WINDOWS_SYSTEM: [&str; 24] = [
     "ntdll.dll",
     "ole32.dll",
     "oleaut32.dll",
+    "pdh.dll",
     "powrprof.dll",
     "psapi.dll",
     "rpcrt4.dll",
@@ -303,6 +304,7 @@ mod tests {
     #[test]
     fn a_windows_binary_may_load_api_sets_and_system_dlls_but_not_the_visual_c_runtime() {
         assert!(is_windows_system_dll("KERNEL32.dll"));
+        assert!(is_windows_system_dll("pdh.dll"));
         assert!(is_windows_system_dll("api-ms-win-core-synch-l1-2-0.dll"));
         assert!(!is_windows_system_dll("vcruntime140.dll"));
         assert!(!is_windows_system_dll("MSVCP140.dll"));
