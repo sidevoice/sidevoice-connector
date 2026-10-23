@@ -22,6 +22,7 @@
 
 use crate::messages::Keyed;
 use crate::platform::fs::{Create, Fs};
+use crate::platform::target::{Host, Target as _};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -51,7 +52,9 @@ pub const LOADER_VARIABLES: &[&str] = &[
 const ARCHIVE_ROOT: &str = "sidevoice-core-rust";
 const CORE_INVENTORY: &str = "native-core.json";
 const CORE_KIND: &str = "rust-native-v2";
-const ENTRYPOINT: &str = "bin/sidevoice-core-rust";
+/// The core's program, as its archive names it: `bin/sidevoice-core-rust`, with `.exe` on Windows.
+static ENTRYPOINT: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("bin/{}", Host::exe_name("sidevoice-core-rust")));
 /// The top-level directories a core may have; its entrypoint is the one file it must.
 const TOP_LEVEL: &[&str] = &["bin", "notices"];
 
@@ -128,7 +131,7 @@ pub fn packaged_as(root: &Path, version: &str) -> Result<PackagedCore> {
     }
     let inventory: Value = serde_json::from_slice(&read_bounded(&path, MAX_INVENTORY)?)
         .map_err(|error| mismatch(format!("{INVENTORY}: {error}")))?;
-    let target = crate::identity::target().context("unsupported target")?;
+    let target = Host::name().context("unsupported target")?;
     if inventory["version"] != version || inventory["target"] != target {
         return Err(mismatch(format!(
             "{INVENTORY} is version {} for {}; this connector is {version} for {target}",
@@ -256,7 +259,7 @@ fn unpack(bytes: &[u8], into: &Path) -> Result<(Files, Vec<u8>)> {
         }
         let parent = path.parent().context("member parent")?;
         crate::platform::fs::Files::ensure_private_dir(parent)?;
-        let mut file = if relative == ENTRYPOINT {
+        let mut file = if relative == ENTRYPOINT.as_str() {
             crate::platform::fs::Files::open_private(&path, Create::NewProgram)?
         } else {
             crate::platform::fs::Files::open_private(&path, Create::New)?
@@ -292,7 +295,7 @@ fn check_inventory(core: &PackagedCore, inventory: &[u8], written: &Files) -> Re
         || inventory["kind"] != CORE_KIND
         || inventory["target"] != core.target.as_str()
         || inventory["source_sha"] != core.source_sha.as_str()
-        || inventory["entrypoint"] != ENTRYPOINT
+        || inventory["entrypoint"] != ENTRYPOINT.as_str()
     {
         return Err(mismatch(format!(
             "{CORE_INVENTORY} is not the {CORE_KIND} core {} for {}",
@@ -319,8 +322,8 @@ fn check_inventory(core: &PackagedCore, inventory: &[u8], written: &Files) -> Re
             return Err(mismatch(format!("{CORE_INVENTORY} lists {name} twice")));
         }
     }
-    if !listed.contains_key(ENTRYPOINT) {
-        return Err(mismatch(format!("the core has no {ENTRYPOINT}")));
+    if !listed.contains_key(ENTRYPOINT.as_str()) {
+        return Err(mismatch(format!("the core has no {}", *ENTRYPOINT)));
     }
     if &listed != written {
         let differ: Vec<&String> = listed
@@ -461,7 +464,7 @@ pub(crate) mod tests {
     /// A core: its program (a script) and a notice.
     pub(crate) fn core_files() -> Vec<(&'static str, Vec<u8>)> {
         vec![
-            (ENTRYPOINT, b"#!/bin/sh\nexit 0\n".to_vec()),
+            (ENTRYPOINT.as_str(), b"#!/bin/sh\nexit 0\n".to_vec()),
             ("notices/LICENSE", b"licence".to_vec()),
         ]
     }
@@ -474,9 +477,9 @@ pub(crate) mod tests {
             })
             .collect();
         records.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-        let target = crate::identity::target().unwrap();
+        let target = Host::name().unwrap();
         let inventory = json!({"schema": 1, "kind": CORE_KIND, "target": target, "source_sha": SOURCE,
-            "entrypoint": ENTRYPOINT, "files": records});
+            "entrypoint": ENTRYPOINT.as_str(), "files": records});
         let mut builder = tar::Builder::new(Vec::new());
         let mut add = |name: String, bytes: &[u8], mode: u32| {
             let mut header = tar::Header::new_ustar();
@@ -507,7 +510,7 @@ pub(crate) mod tests {
     /// A package holding `archive` as its core, with the inventory naming `listed` as its digest.
     fn package(scratch: &Path, archive: &[u8], listed: Option<String>) -> PathBuf {
         let root = scratch.join("package");
-        let target = crate::identity::target().unwrap();
+        let target = Host::name().unwrap();
         let name = format!("core/sidevoice-core-0.2.0-{target}.tar.zst");
         fs::create_dir_all(root.join("core")).unwrap();
         fs::write(root.join(&name), archive).unwrap();
@@ -536,7 +539,7 @@ pub(crate) mod tests {
         let installed = install(&root, &release).unwrap();
         assert_eq!(installed.path, release.join("core"));
         assert_eq!(installed.core.version, "0.2.0");
-        let program = release.join(crate::service::layout::CORE_ENTRYPOINT);
+        let program = release.join(crate::service::layout::core_entrypoint());
         crate::platform::fs::Files::check_private(
             &crate::platform::fs::Files::open_read(&program).unwrap(),
         )
@@ -633,7 +636,7 @@ pub(crate) mod tests {
         assert_eq!(key(&error), "core.package-missing", "{error}");
         fs::write(
             scratch.path().join(INVENTORY),
-            json!({"version": "0.0.1", "target": crate::identity::target()}).to_string(),
+            json!({"version": "0.0.1", "target": Host::name()}).to_string(),
         )
         .unwrap();
         assert_eq!(
@@ -642,8 +645,7 @@ pub(crate) mod tests {
         );
         fs::write(
             scratch.path().join(INVENTORY),
-            json!({"version": crate::identity::VERSION, "target": crate::identity::target()})
-                .to_string(),
+            json!({"version": crate::identity::VERSION, "target": Host::name()}).to_string(),
         )
         .unwrap();
         assert_eq!(
@@ -678,11 +680,11 @@ pub(crate) mod tests {
             );
         }
         let mut files = core_files();
-        files.retain(|(name, _)| *name != ENTRYPOINT);
+        files.retain(|(name, _)| *name != ENTRYPOINT.as_str());
         let scratch = crate::test_support::temp_dir("entrypoint");
         let root = package(scratch.path(), &core_archive(&files, &[]), None);
         let error = install(&root, &release(scratch.path())).unwrap_err();
-        assert!(error.to_string().contains(ENTRYPOINT), "{error}");
+        assert!(error.to_string().contains(ENTRYPOINT.as_str()), "{error}");
     }
 
     /// An honest archive of `files` whose inventory names `kind`.

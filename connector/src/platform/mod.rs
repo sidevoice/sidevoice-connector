@@ -13,6 +13,7 @@ pub mod fs;
 pub mod lifecycle;
 pub mod process;
 pub mod service;
+pub mod target;
 pub mod uninstall;
 
 // This user and the local channel, shared with the core: `sidevoice-platform`, from the core's repository at the tag

@@ -1545,7 +1545,7 @@ async fn the_installed_command_is_registered_and_owns_every_release_of_it() {
     let fixture = Fixture::new();
     let profile = &fixture.profile;
     let releases = crate::data_dir::releases_dir(&profile.data);
-    let binary = releases.join("releases/1.0.0/bin/sidevoice-connector");
+    let binary = releases.join(format!("releases/1.0.0/{}", crate::install::binary()));
     private_mkdir(binary.parent().unwrap());
     private_write(&binary, b"#!/bin/sh\n");
     Files::make_executable(&binary);
@@ -1563,7 +1563,7 @@ async fn the_installed_command_is_registered_and_owns_every_release_of_it() {
     assert_eq!(installed.args, ["mcp"]);
     let mcp = ["mcp".to_owned()];
     assert!(installed.owns(&stable.to_string_lossy(), &mcp));
-    let other = releases.join("releases/2.0.0/bin/sidevoice-connector");
+    let other = releases.join(format!("releases/2.0.0/{}", crate::install::binary()));
     private_mkdir(other.parent().unwrap());
     private_write(&other, b"#!/bin/sh\n");
     assert!(
@@ -1572,7 +1572,9 @@ async fn the_installed_command_is_registered_and_owns_every_release_of_it() {
     );
     assert!(!installed.owns(&stable.to_string_lossy(), &["connector".into()]));
     assert!(!installed.owns("/usr/local/bin/sidevoice-connector", &mcp));
-    let elsewhere = fixture.root.join("elsewhere/bin/sidevoice-connector");
+    let elsewhere = fixture
+        .root
+        .join(format!("elsewhere/{}", crate::install::binary()));
     private_mkdir(elsewhere.parent().unwrap());
     private_write(&elsewhere, b"#!/bin/sh\n");
     assert!(!installed.owns(&elsewhere.to_string_lossy(), &mcp));

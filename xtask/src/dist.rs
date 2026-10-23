@@ -10,10 +10,11 @@ use serde_json::json;
 
 use crate::archive::write_archive;
 use crate::glibc;
+use crate::host::chmod;
 use crate::notices::stage_notices;
 use crate::util::*;
 use crate::verify::verify;
-use crate::{core, Result, CORE_DIR, ENTRYPOINT, INVENTORY, KIND, PACKAGE, ROOT_NAME};
+use crate::{core, entrypoint, exe_suffix, Result, CORE_DIR, INVENTORY, KIND, PACKAGE, ROOT_NAME};
 
 /// Where `dist` leaves the archive.
 pub(crate) const DIST_DIR: &str = "target/dist";
@@ -80,8 +81,12 @@ pub(crate) fn dist() -> Result<()> {
     let stage = work.0.join(ROOT_NAME);
     mkdir(&stage.join("bin"))?;
     mkdir(&stage.join("notices"))?;
-    let binary = stage.join(ENTRYPOINT);
-    write(&binary, &read(&built.join(PACKAGE))?)?;
+    let entrypoint = entrypoint(target);
+    let binary = stage.join(&entrypoint);
+    write(
+        &binary,
+        &read(&built.join(format!("{PACKAGE}{}", exe_suffix(target))))?,
+    )?;
     chmod(&binary, 0o755)?;
     write(&stage.join("LICENSE"), &read(&repo.join("LICENSE"))?)?;
     stage_notices(&stage.join("notices"), &triple)?;
@@ -99,7 +104,7 @@ pub(crate) fn dist() -> Result<()> {
     }
     let count = files.len();
     let mut inventory = json!({"schema": 1, "kind": KIND, "version": version, "target": target,
-                               "source_sha": source_sha, "entrypoint": ENTRYPOINT, "files": files,
+                               "source_sha": source_sha, "entrypoint": entrypoint, "files": files,
                                "core": {"version": pinned.version, "archive": core_archive,
                                         "sha256": pinned.sha256, "size": pinned.size,
                                         "source_sha": pinned.source_sha}});
@@ -111,7 +116,7 @@ pub(crate) fn dist() -> Result<()> {
     let archive = repo
         .join(DIST_DIR)
         .join(format!("{ROOT_NAME}-{target}.tar.zst"));
-    write_archive(&work.0, ROOT_NAME, &[ENTRYPOINT], epoch, &archive)?;
+    write_archive(&work.0, ROOT_NAME, &[entrypoint.as_str()], epoch, &archive)?;
     let bytes = read(&archive)?;
     println!(
         "{}",

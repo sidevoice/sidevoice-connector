@@ -10,7 +10,7 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 
-use super::CONNECTOR;
+use super::{connector_program, CONNECTOR};
 
 /// The checked core archive and its record (`core.json`), or `None` when the test must be skipped.
 pub fn pinned_core() -> Option<(PathBuf, Value)> {
@@ -42,7 +42,7 @@ pub fn package(at: &Path, archive: &Path, record: &Value, sha256: &str) -> PathB
     let root = at.join("package");
     fs::create_dir_all(root.join("bin")).unwrap();
     fs::create_dir_all(root.join("core")).unwrap();
-    let binary = root.join("bin/sidevoice-connector");
+    let binary = root.join(connector_program());
     // A link, not a copy: a program just written can be "busy" while another test's fork holds it.
     if fs::hard_link(CONNECTOR, &binary).is_err() {
         fs::copy(CONNECTOR, &binary).unwrap();

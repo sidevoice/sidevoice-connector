@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
+use support::connector_program;
 use support::package::{package, pinned_core};
 
 fn scratch(label: &str) -> PathBuf {
@@ -31,7 +32,7 @@ fn release(at: &Path) -> PathBuf {
 }
 
 fn stage_core(package: &Path, release: &Path) -> (bool, Value) {
-    let output = Command::new(package.join("bin/sidevoice-connector"))
+    let output = Command::new(package.join(connector_program()))
         .arg("stage-core")
         .arg(release)
         .arg("--json")
@@ -63,7 +64,7 @@ fn the_packaged_core_is_staged_into_a_release() {
     // The executable bit is how Unix marks a program; Windows has none.
     #[cfg(unix)]
     {
-        let program = release.join("core/bin/sidevoice-core-rust");
+        let program = release.join(format!("core/{}", support::core_program()));
         use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(&program).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700, "{}", program.display());

@@ -15,6 +15,7 @@ use crate::data_dir;
 use crate::messages::message;
 use crate::platform::env::{Env, Environment, LoginPath};
 use crate::platform::fs::{Files, Fs};
+use crate::platform::target::{Host, Target as _};
 use crate::profile::Profile;
 use anyhow::Result;
 use serde::Serialize;
@@ -225,7 +226,7 @@ impl InstalledCommand {
                         .chars()
                         .all(|ch| ch.is_ascii_alphanumeric() || ".+-_".contains(ch))
                     && parts[1].as_os_str() == "bin"
-                    && parts[2].as_os_str() == "sidevoice-connector"
+                    && parts[2].as_os_str() == Host::exe_name("sidevoice-connector").as_str()
             }
             #[cfg(test)]
             Ownership::Selected {

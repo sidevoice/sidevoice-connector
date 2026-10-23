@@ -100,3 +100,7 @@ quick-xml = { version = "0.42", features = ["serialize"] }
 # macOS: the LaunchAgent (src/platform/service/macos.rs), written and read as a property list.
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = "1.10"
+
+[build-dependencies]
+# The Windows manifest of the binaries (build.rs): long paths. Used for Windows targets only; nothing is embedded elsewhere.
+embed-manifest = "1"

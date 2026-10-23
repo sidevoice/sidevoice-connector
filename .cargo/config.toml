@@ -2,3 +2,8 @@
 # Build tooling (release archives, their manifest, publishing, the core for the tests): `cargo xtask <command>`,
 # see xtask/src/main.rs.
 xtask = "run --quiet --locked --package xtask --bin xtask --"
+
+# Windows: the C runtime is linked statically, so the binary needs no Visual C++ Redistributable on the machine
+# (`cargo xtask verify` fails a release whose binary imports vcruntime*.dll, xtask/src/verify.rs).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

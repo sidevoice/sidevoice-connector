@@ -68,7 +68,8 @@ floor is pinned, the package as a whole needs the core's floor.
 
 - `sidevoice-connector-<version>-<target>.tar.zst` for `macos-aarch64`, `linux-x86_64` and `linux-aarch64` (on the
   nightly, `sidevoice-connector-nightly-<target>.tar.zst`, fixed names whose download URLs never change): the root
-  `sidevoice-connector/` holds `bin/sidevoice-connector`, `LICENSE`, the licence notices of every crate linked into
+  `sidevoice-connector/` holds `bin/sidevoice-connector` (`bin/sidevoice-connector.exe` on Windows; the inventory's
+  `entrypoint` names it), `LICENSE`, the licence notices of every crate linked into
   the binary (`notices/`), `core/sidevoice-core-<core version>-<target>.tar.zst`, the pinned core release's archive
   for the same target exactly as the core published it (its own licence notices are inside it), and
   `connector.json`, the inventory: version, target, source commit, on Linux the glibc floor, every file with its
@@ -172,6 +173,27 @@ Say Windows x64 or macOS x86_64:
    - the archive: `bin/sidevoice-connector` gets `.exe` on Windows, which the inventory's `entrypoint`, `verify`
      and the launcher (it reads `entrypoint` from `connector.json`) must follow;
    - the README's supported platforms and the launcher package's README (`xtask/src/npm.rs`).
+
+#### Windows x64: built and checked, not released
+
+`windows-x86_64` is a known target (`TARGETS`, `released: false`; runner `windows-2025`, built natively with MSVC and
+the C runtime linked statically, `.cargo/config.toml`): it can be built, packaged and verified by hand, and the
+connector's `.exe` names, its `win32-x64` npm package definition and the archive checks exist. It is **not
+released**: the manifest, the npm packages, the launcher's dependencies and the `release.yml` matrix list only the
+`released` targets, so a release or nightly publishes exactly the Linux and macOS archives, with no Windows job
+that could fail them. To enable it, all of these:
+
+- `core.pin` names a sidevoice-core release that publishes `sidevoice-core-<version>-windows-x86_64.tar.zst`
+  (`cargo xtask fixtures` and `dist` say so when it does not), whose program is `bin/sidevoice-core-rust.exe`;
+- the connector's tests pass on Windows (the `Test (windows-x86_64)` job of `ci.yml`, red on purpose until they do);
+- `@sidevoice/sidevoice-win32-x64` is reserved and its trusted publisher configured (steps 1 and 2 of
+  [npm](#npm-what-is-published-and-how-to-add-a-platform)), before the first `vX.Y.Z` release that includes it (a
+  nightly publishes nothing to npm);
+- then one change: `released: true` on the Windows target in `xtask/src/main.rs` and its line back in the
+  `release.yml` matrix (`{ target: windows-x86_64, runner: windows-2025 }`).
+
+Not decided, so not done: Authenticode signing and the installer format (the archive and the npm package are the
+only Windows distribution here).
 ## Which version comes next
 
 `fix:` → patch, `feat:` → minor. While the version is 0.x a breaking change (`feat!:` or a `BREAKING CHANGE:`

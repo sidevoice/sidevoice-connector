@@ -9,7 +9,7 @@ use serde_json::json;
 
 use crate::archive::unpack_checked;
 use crate::util::*;
-use crate::{target_names, Result, ENTRYPOINT, KIND, MANIFEST, ROOT_NAME};
+use crate::{entrypoint, released_names, Result, ENTRYPOINT_STEM, KIND, MANIFEST, ROOT_NAME};
 
 /// The name an archive is published under: the version for a release, `nightly` for the nightly (fixed names, so
 /// its download URLs never change). The commit is in the manifest and in every archive's inventory.
@@ -52,7 +52,7 @@ pub(crate) fn write_manifest(
         .unwrap_or("nightly");
     let mut bundles = serde_json::Map::new();
     let mut sums = Vec::new();
-    for target in target_names() {
+    for target in released_names() {
         let built = dir.join(format!("{ROOT_NAME}-{target}.tar.zst"));
         let name = published_name(label, target);
         if built.exists() {
@@ -71,10 +71,13 @@ pub(crate) fn write_manifest(
             "{}  {name}\n",
             record["sha256"].as_str().unwrap_or("")
         ));
+        // The bundle's own entrypoint: the one list's `entrypoint` below has no suffix, and Windows programs have one.
+        let mut record = record;
+        record["entrypoint"] = entrypoint(target).into();
         bundles.insert(target.into(), record);
     }
     let value = json!({"schema": 1, "kind": KIND, "version": version, "source_sha": source_sha,
-                       "cargo_lock_sha256": sha256(lock), "entrypoint": ENTRYPOINT, "bundles": bundles});
+                       "cargo_lock_sha256": sha256(lock), "entrypoint": ENTRYPOINT_STEM, "bundles": bundles});
     let bytes = canonical(&value);
     write(&dir.join(MANIFEST), &bytes)?;
     sums.push(format!("{}  {MANIFEST}\n", sha256(&bytes)));
@@ -87,6 +90,7 @@ pub(crate) fn write_manifest(
 mod tests {
     use super::*;
     use crate::archive::{test_core_record, test_tree, write_archive};
+    use crate::target_names;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -95,7 +99,14 @@ mod tests {
         let work = TempDir::new(&format!("xtask-manifest-stage-{target}-{version}")).unwrap();
         test_tree(&work.0, target, sha, version, test_core_record);
         let archive = dir.join(format!("{ROOT_NAME}-{target}.tar.zst"));
-        write_archive(&work.0, ROOT_NAME, &[ENTRYPOINT], 1, &archive).unwrap();
+        write_archive(
+            &work.0,
+            ROOT_NAME,
+            &[entrypoint(target).as_str()],
+            1,
+            &archive,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -111,15 +122,15 @@ mod tests {
     }
 
     #[test]
-    fn a_release_lists_every_target_under_its_version() {
+    fn a_release_lists_every_released_target_under_its_version() {
         let dir = TempDir::new("xtask-manifest-release").unwrap();
-        for target in target_names() {
+        for target in released_names() {
             built(&dir.0, target, SHA, "0.7.0");
         }
         let bytes = write_manifest(&dir.0, Some("v0.7.0"), SHA, "0.7.0", b"lock").unwrap();
         let manifest = parse_json(&bytes, "manifest").unwrap();
         assert_eq!(manifest["version"], "0.7.0");
-        for target in target_names() {
+        for target in released_names() {
             let name = published_name("0.7.0", target);
             assert_eq!(manifest["bundles"][target]["name"], name.as_str());
             assert!(dir.0.join(&name).is_file());
@@ -141,6 +152,19 @@ mod tests {
     }
 
     #[test]
+    fn windows_is_known_but_not_released_until_its_flag_says_so() {
+        assert!(target_names().any(|name| name == "windows-x86_64"));
+        assert!(!released_names().any(|name| name == "windows-x86_64"));
+        let dir = TempDir::new("xtask-manifest-no-windows").unwrap();
+        for target in released_names() {
+            built(&dir.0, target, SHA, "0.7.0");
+        }
+        let bytes = write_manifest(&dir.0, None, SHA, "0.7.0", b"lock").unwrap();
+        let manifest = parse_json(&bytes, "manifest").unwrap();
+        assert!(manifest["bundles"].get("windows-x86_64").is_none());
+    }
+
+    #[test]
     fn a_tag_other_than_the_crate_version_is_refused() {
         let dir = TempDir::new("xtask-manifest-tag").unwrap();
         let error = write_manifest(&dir.0, Some("v0.8.0"), SHA, "0.7.0", b"lock").unwrap_err();
@@ -150,7 +174,7 @@ mod tests {
     #[test]
     fn an_archive_of_another_commit_is_refused() {
         let dir = TempDir::new("xtask-manifest-commit").unwrap();
-        for target in target_names() {
+        for target in released_names() {
             built(&dir.0, target, SHA, "0.7.0");
         }
         let other = "1111111111111111111111111111111111111111";
