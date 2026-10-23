@@ -21,8 +21,8 @@ The tests are part of the build: an asset is only produced on a target where the
 besides the GitHub steps is code in `xtask/` (`cargo xtask fixtures | dist | verify | verify-floor | manifest |
 publish | npm | npm-smoke | npm-publish`):
 
-- `cargo xtask fixtures` fetches what the tests run against: the sidevoice-core release whose version is in
-  `core.pin` (one line, `X.Y.Z`), its archive for this machine checked against that release's `SHA256SUMS`,
+- `cargo xtask fixtures` fetches what the tests run against: the sidevoice-core release whose version is the
+  `sidevoice-platform` tag in `connector/Cargo.toml` (`vX.Y.Z`), its archive for this machine checked against that release's `SHA256SUMS`,
   `native-core-manifest.json` and `attestation.sigstore.json` (signed by the core's `release.yml` on `main`), into
   `target/sidevoice-core` (unpacked, with the checked archive beside it); and the pinned Codex CLI into
   `target/codex`. Without them the tests that need them are skipped locally and fail in CI.
@@ -60,7 +60,7 @@ Ubuntu 20.04, RHEL/AlmaLinux 8, Amazon Linux 2023 and every later release) and e
 
 Raising or lowering the floor is a change of `FLOOR` and `FLOOR_IMAGE` together, and of the requirements in the
 README. Only the connector binary is covered: the tests still run on the `ubuntu-24.04` runners because the
-sidevoice-core release they run against (`core.pin`) has its own floor. For the same reason `verify-floor` does not
+sidevoice-core release they run against (the `sidevoice-platform` tag) has its own floor. For the same reason `verify-floor` does not
 stage or run the core the archive carries; `verify` does, on the build machine. Until a core release with the same
 floor is pinned, the package as a whole needs the core's floor.
 
@@ -167,7 +167,7 @@ Say Windows x64 or macOS x86_64:
 5. **What is specific to the platform**, each a change of its own:
    - the connector's own target name (`connector/src/identity.rs`) and its service manager
      (`src/service/`: launchd and systemd today; Windows needs its own);
-   - a pinned sidevoice-core release built for that target (`core.pin`, `xtask/src/core.rs`);
+   - a pinned sidevoice-core release built for that target (the `sidevoice-platform` tag, `xtask/src/core.rs`);
    - linking: on Linux the glibc floor (`xtask/src/glibc.rs`, cargo-zigbuild in `.github/actions/setup`); on
      musl, a separate target with `libc: ["musl"]`; the libraries a binary may load (`xtask/src/verify.rs`);
    - the archive: `bin/sidevoice-connector` gets `.exe` on Windows, which the inventory's `entrypoint`, `verify`
@@ -183,7 +183,7 @@ released**: the manifest, the npm packages, the launcher's dependencies and the 
 `released` targets, so a release or nightly publishes exactly the Linux and macOS archives, with no Windows job
 that could fail them. To enable it, all of these:
 
-- `core.pin` names a sidevoice-core release that publishes `sidevoice-core-<version>-windows-x86_64.tar.zst`
+- The `sidevoice-platform` tag names a sidevoice-core release that publishes `sidevoice-core-<version>-windows-x86_64.tar.zst`
   (`cargo xtask fixtures` and `dist` say so when it does not), whose program is `bin/sidevoice-core-rust.exe`;
 - the connector's tests pass on Windows (the `Test (windows-x86_64)` job of `ci.yml`, red on purpose until they do);
 - `@sidevoice/sidevoice-win32-x64` is reserved and its trusted publisher configured (steps 1 and 2 of
@@ -233,7 +233,7 @@ Build artifacts on Actions runs are kept 7 days, for debugging only. Download fr
   publisher settings: the error names them) and re-run that job; packages already published with the same bytes are
   skipped. If the launcher is already staged, approve or reject it on npmjs.com instead.
 - A release run is never cancelled half-way; nightlies queue behind each other.
-- Moving to a new core release is a PR that changes `core.pin` (by hand or by a dependency bot); its CI is the
+- Moving to a new core release is a PR that changes the `sidevoice-platform` tag in `connector/Cargo.toml` (the one place the core version lives: it is the shared library's version and the release `cargo xtask` bundles); its CI is the
   connector's tests against that core.
 
 ## What this needs from the repository settings

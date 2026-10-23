@@ -1,7 +1,7 @@
 //! What the tests that run the connector against the real core share: a private profile, the core, the connector
 //! daemon, an MCP client, the core's local HTTP routes and a presentation (call) socket.
 //!
-//! The core is the sidevoice-core release pinned in `core.pin`, unpacked by `cargo xtask core` into
+//! The core is the sidevoice-core release pinned by the `sidevoice-platform` tag in `connector/Cargo.toml`, unpacked by `cargo xtask core` into
 //! `target/sidevoice-core` (or the directory `SIDEVOICE_TEST_CORE_DIR` names). Without it these tests are skipped
 //! locally and fail in CI (`CI` set), so a missing core never passes as green.
 // These black-box tests speak the connector's and the core's wire raw, as a client of another version would.
