@@ -52,7 +52,7 @@ pub(crate) fn dist() -> Result<()> {
         ("build", None, repo.join("target/release"))
     };
     let mut build = Command::new(cargo());
-    // Only the connector: the package's other binary, the test bench, is not released.
+    // Only the connector: the test bench (testbench/) is a package of its own and is not released.
     build.args([
         subcommand,
         "--locked",
