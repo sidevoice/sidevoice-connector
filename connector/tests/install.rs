@@ -50,6 +50,7 @@ fn cursor_installed(profile: &Profile) {
 
 /// `program args… --json` in the profile: its one JSON line and whether it succeeded.
 fn run(profile: &Profile, program: &Path, args: &[&str]) -> (bool, Value) {
+    let began = std::time::Instant::now();
     let output = profile
         .command(program)
         .envs(settings())
@@ -72,6 +73,11 @@ fn run(profile: &Profile, program: &Path, args: &[&str]) -> (bool, Value) {
         1,
         "{args:?} must print one JSON line and nothing else: {text:?} {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    eprintln!(
+        "[{:?}] {args:?} -> {}",
+        began.elapsed(),
+        text.chars().take(1500).collect::<String>()
     );
     let answer: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(output.status.success(), answer["ok"] == true, "{answer}");
