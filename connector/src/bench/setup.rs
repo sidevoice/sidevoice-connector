@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
+use sidevoice_connector::platform::env::{Env, Environment};
 
 /// Every directory the connector reads, below one private root.
 #[derive(Clone)]
@@ -65,13 +66,14 @@ fn checked_bench_path(path: String) -> Result<String> {
     Ok(path)
 }
 
-const DIRECTORIES: &[&str] = &[
-    "home",
-    "home/.sidevoice",
-    "home/.local/share",
-    "xdg/config",
-    "bench",
-];
+const DIRECTORIES: &[&str] = &["home", "home/.local/share", "xdg/config", "bench"];
+
+/// The data directory of the profile at `root`: the program's own directory (`Environment::DATA_NAME`) in the
+/// profile's home, the same rule as the tests' profiles. Every connector process of the profile is given it as
+/// `SIDEVOICE_DATA_DIR`.
+fn data_dir(root: &Path) -> PathBuf {
+    root.join("home").join(Environment::DATA_NAME)
+}
 
 /// Asks this build's connector about the agents its harnesses declare (`bench-agents`).
 fn bench_agents(request: Value) -> Result<Value> {
@@ -126,6 +128,7 @@ impl Profile {
         let homes = strings(&answer["homes"]);
         let directories = std::iter::once(root.clone())
             .chain(DIRECTORIES.iter().map(|directory| root.join(directory)))
+            .chain([data_dir(&root)])
             .chain(homes.values().map(PathBuf::from));
         for path in directories {
             fs::DirBuilder::new()
@@ -147,8 +150,10 @@ impl Profile {
         self.root.join(child).to_string_lossy().into_owned()
     }
 
+    /// The connector's data directory in this profile ([`data_dir`]): every read of the installation's files (its
+    /// record, discovery state, log, sockets) goes through it.
     pub fn data(&self) -> PathBuf {
-        self.root.join("home/.sidevoice")
+        data_dir(&self.root)
     }
 
     pub fn core_socket(&self) -> PathBuf {
@@ -161,7 +166,10 @@ impl Profile {
     pub fn mcp_env(&self) -> BTreeMap<String, String> {
         let mut env = BTreeMap::from([
             ("HOME".into(), self.path("home")),
-            ("SIDEVOICE_DATA_DIR".into(), self.path("home/.sidevoice")),
+            (
+                "SIDEVOICE_DATA_DIR".into(),
+                self.data().to_string_lossy().into_owned(),
+            ),
             ("XDG_CONFIG_HOME".into(), self.path("xdg/config")),
             ("XDG_DATA_HOME".into(), self.path("home/.local/share")),
             ("SIDEVOICE_SERVICE_MANAGER".into(), "none".into()),
