@@ -1,46 +1,55 @@
-//! Windows: a protected DACL set when a file or directory is created, read back from the handle; reparse points
-//! (links, junctions) refused.
+//! Windows: a protected DACL set when a file or directory is created (a record too: staged under that DACL, then
+//! renamed over the record), read back from the handle; reparse points (links, junctions, mount points) refused, at
+//! the path and on the way to it.
 //!
 //! "Private" is a protected DACL (it inherits nothing) granting full control to the owner (`OWNER RIGHTS`), SYSTEM
 //! and Administrators only, inherited by what is created inside. What others may do is read from the DACL of the
-//! handle that was opened (`GetSecurityInfo`): an allow entry for anybody but the file's owner, SYSTEM,
-//! Administrators or `OWNER RIGHTS` counts; who the owner is, is `platform::user`'s.
+//! handle that was opened (`GetSecurityInfo`): an allow entry for anybody but the file's owner, this user, SYSTEM,
+//! Administrators or `OWNER RIGHTS` counts; and, for whether it is private, so do a DACL that is not protected (it
+//! takes whatever its parent passes down) and an entry for others that only what is created inside inherits. Who the
+//! owner is, is `platform::user`'s. The rule is `sidevoice-platform`'s (its `fs/windows.rs`, sidevoice-core#170), so
+//! the two can be made one.
 //!
 //! Own `unsafe` over `windows-sys`: no maintained crate covers "create with this DACL" and "read what this handle's
 //! DACL grants" (`windows-acl` is unmaintained; `windows-permissions` is a thin binding with the same calls left to
-//! us), and the surface is a few calls. The link count (and the identity of a file system with no 128-bit ids) comes from `winapi-util`; a file's identity is `FileIdInfo`, one more call.
+//! us), and the surface is a few calls. This user's SID is read from the process token here because
+//! `sidevoice-platform`'s `user` does not offer comparing a SID with this user. The link count (and the identity of a
+//! file system with no 128-bit ids) comes from `winapi-util`; a file's identity is `FileIdInfo`, one more call. A
+//! record's staging file (a fresh name beside it, removed on failure, renamed over it) is `tempfile`'s.
 
 use super::{Create, FileId, Others};
 use crate::platform::user::{User, UserId};
 use anyhow::{bail, Context, Result};
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::Path;
 use std::ptr::null_mut;
 use std::sync::OnceLock;
 
 use windows_sys::Win32::Foundation::{
-    LocalFree, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_SUCCESS,
-    HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, LocalFree, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+    ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW, GetSecurityInfo,
-    SDDL_REVISION_1, SE_FILE_OBJECT,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    EqualSid, GetAce, ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID,
-    SECURITY_ATTRIBUTES,
+    EqualSid, GetAce, GetSecurityDescriptorControl, GetTokenInformation, TokenUser, ACL,
+    DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES,
+    SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FileIdInfo, GetFileInformationByHandleEx, CREATE_NEW,
-    FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_128,
-    FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_ALWAYS, READ_CONTROL,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_128, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS, READ_CONTROL,
 };
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// This OS's files.
 pub struct Os;
@@ -94,11 +103,20 @@ impl super::Fs for Os {
         )
     }
 
+    // `Change`: an entry for others that applies to the object itself. Anything else short of private is `Read`: an
+    // entry for others of any kind, including one only what is created inside inherits (inherit-only too), and a DACL
+    // that is not protected, which takes whatever its parent passes down, now or later.
+    // NTFS journals its metadata, and a directory can be flushed only through a handle opened for writing with
+    // `FILE_FLAG_BACKUP_SEMANTICS`, which `File::open` does not ask for (it fails): nothing to do.
+    fn sync_dir(_: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
     fn others_of(file: &File) -> io::Result<Others> {
         let judged = Judged::of(file)?;
-        Ok(if judged.grants_others(CHANGES) {
+        Ok(if judged.grants_others(CHANGES, false) {
             Others::Change
-        } else if judged.grants_others(u32::MAX) {
+        } else if !judged.protected()? || judged.grants_others(u32::MAX, true) {
             Others::Read
         } else {
             Others::Nothing
@@ -150,17 +168,28 @@ pub(super) fn link_count(file: &File) -> io::Result<u64> {
     Ok(winapi_util::file::information(file)?.number_of_links())
 }
 
-/// A directory on the way to something private: this user's or the system's, nobody else able to delete or rename
-/// what is in it, or to take it over. A reparse point on the way (a redirected known folder, a mounted volume) is
-/// followed: what is judged is the directory it leads to. Adding entries is not judged: there is no sticky bit, and
-/// `C:\` lets every user add folders.
+/// A directory on the way to something private (`sidevoice-platform`'s rule): this user's or the system's, nobody
+/// but this user and the system able to delete or rename what is in it, or to take it over. Entries only what is
+/// created inside inherits are not judged here (`C:\` passes Modify down to Authenticated Users): what is ours is
+/// created with its own DACL. A reparse point on the way (junction, symlink, mount point, a redirected folder) is
+/// refused, not followed: only the path as written is judged, and one leading into a directory others can change would
+/// hide it. A default profile has none on the way to its folders (`C:\Users\<name>\AppData\Local`): the legacy
+/// junctions (`Application Data`, `Local Settings`, `C:\Documents and Settings`) sit beside that path, not on it.
+/// Adding entries is not judged: there is no sticky bit, and `C:\` lets every user add folders.
 pub(super) fn check_ancestor(dir: &Path) -> Result<()> {
-    let file = open_for_security(dir).with_context(|| format!("missing {}", dir.display()))?;
+    let file = OpenOptions::new()
+        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(dir)
+        .with_context(|| format!("missing {}", dir.display()))?;
+    if is_link(&file)? {
+        bail!("unsafe directory {}: a link on the way", dir.display());
+    }
     let judged = Judged::of(&file)?;
     if !UserId::current().owns_file(&file)? && !judged.owner_is_system() {
         bail!("unsafe directory {}: owned by another user", dir.display());
     }
-    if judged.grants_others(REPLACES_ENTRIES) {
+    if judged.grants_others(REPLACES_ENTRIES, false) {
         bail!(
             "unsafe directory {}: others can replace what is in it",
             dir.display()
@@ -169,10 +198,22 @@ pub(super) fn check_ancestor(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// How a record is written whole. Nothing to set: what is created takes its directory's inheritable entries,
-/// private in a private directory; an existing file's DACL is not carried over to its replacement.
-pub(super) fn atomic(_keep_access: bool) -> atomic_write_file::OpenOptions {
-    atomic_write_file::OpenOptions::new()
+/// Writes `bytes` as `path` whole or not at all: staged in a new file beside it, created private
+/// ([`Fs::open_private`](super::Fs::open_private): its own protected DACL, nothing taken from the directory) before
+/// any byte is written, synced, then renamed over `path`. An existing file's DACL is not carried over to its
+/// replacement, which is private (`keep_access` is Unix's).
+pub(super) fn write_whole(path: &Path, bytes: &[u8], _keep_access: bool) -> io::Result<()> {
+    use super::Fs as _;
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut staged =
+        tempfile::Builder::new().make_in(dir, |temp| Os::open_private(temp, Create::New))?;
+    staged.write_all(bytes)?;
+    staged.as_file().sync_all()?;
+    staged.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 // Access rights (`winnt.h`), written out because they are the contract being checked.
@@ -223,23 +264,22 @@ fn wide(path: &Path) -> Vec<u16> {
         .collect()
 }
 
-/// Opens the directory `path` leads to, for reading its security descriptor.
-fn open_for_security(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-}
-
-/// Refuses a handle that turned out to be a link (the open did not follow it).
+/// Refuses a handle that turned out to be a link of any kind (the open did not follow it).
 fn not_a_link(file: File) -> io::Result<File> {
-    if file.metadata()?.is_symlink() {
+    if is_link(&file)? {
         return Err(io::Error::other("a link (reparse point)"));
     }
     Ok(file)
 }
 
-/// An owned SID, parsed from its string form.
+/// Whether a handle opened with `OPEN_REPARSE_POINT` is a reparse point of any kind: a symlink, a junction, a mount
+/// point.
+fn is_link(file: &File) -> io::Result<bool> {
+    let metadata = file.metadata()?;
+    Ok(metadata.is_symlink() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+}
+
+/// An owned SID, allocated by `ConvertStringSidToSidW`.
 struct Sid(PSID);
 
 // SAFETY: the SID is immutable once made and freed only on drop.
@@ -256,6 +296,59 @@ impl Sid {
         Sid(sid)
     }
 
+    /// This process's user: the token's `TokenUser`, copied through its string form.
+    fn user() -> io::Result<Sid> {
+        let mut token: HANDLE = null_mut();
+        // SAFETY: the pseudo-handle of the current process needs no closing; the token is closed below.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let sid = Self::token_user(token);
+        // SAFETY: the token opened above, closed once.
+        unsafe { CloseHandle(token) };
+        sid
+    }
+
+    fn token_user(token: HANDLE) -> io::Result<Sid> {
+        let mut needed = 0u32;
+        // SAFETY: a null buffer of length 0 asks only for the size (it fails with INSUFFICIENT_BUFFER).
+        unsafe { GetTokenInformation(token, TokenUser, null_mut(), 0, &mut needed) };
+        if needed == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // `u64` words: `TOKEN_USER` holds a pointer, so the buffer must be pointer-aligned.
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+        // SAFETY: the buffer is at least `needed` bytes.
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr() as *mut c_void,
+                needed,
+                &mut needed,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: on success the buffer starts with a `TOKEN_USER` whose SID points inside the buffer.
+        let user = unsafe { (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid };
+        let mut text: *mut u16 = null_mut();
+        // SAFETY: `user` is a valid SID while `buffer` lives; on success `text` is allocated with `LocalAlloc`.
+        if unsafe { ConvertSidToStringSidW(user, &mut text) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut sid: PSID = null_mut();
+        // SAFETY: `text` is the NUL-terminated string just made; on success `sid` is allocated with `LocalAlloc`.
+        let ok = unsafe { ConvertStringSidToSidW(text, &mut sid) };
+        // SAFETY: allocated by `ConvertSidToStringSidW` with `LocalAlloc`, freed once.
+        unsafe { LocalFree(text as *mut c_void) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Sid(sid))
+    }
+
     fn is(&self, other: PSID) -> bool {
         // SAFETY: both point at valid SIDs (null is refused first).
         !other.is_null() && unsafe { EqualSid(self.0, other) } != 0
@@ -269,8 +362,10 @@ impl Drop for Sid {
     }
 }
 
-/// SYSTEM, Administrators, `OWNER RIGHTS` and TrustedInstaller (which owns `C:\` and the system's folders).
+/// This user, SYSTEM, Administrators and `OWNER RIGHTS`: who may hold anything in what is ours besides its owner; and
+/// TrustedInstaller, which owns `C:\` and the system's folders.
 struct Principals {
+    user: Sid,
     system: Sid,
     administrators: Sid,
     owner_rights: Sid,
@@ -280,6 +375,7 @@ struct Principals {
 fn principals() -> &'static Principals {
     static PRINCIPALS: OnceLock<Principals> = OnceLock::new();
     PRINCIPALS.get_or_init(|| Principals {
+        user: Sid::user().expect("the process token is readable"),
         system: Sid::parse("SY"),
         administrators: Sid::parse("BA"),
         owner_rights: Sid::parse("OW"),
@@ -329,6 +425,19 @@ impl Judged {
         Ok(judged)
     }
 
+    /// Whether the DACL is protected: it takes nothing its parent passes down.
+    fn protected(&self) -> io::Result<bool> {
+        let (mut control, mut revision) = (0u16, 0u32);
+        // SAFETY: `descriptor` is the valid descriptor `GetSecurityInfo` returned, alive as long as `self`.
+        if unsafe { GetSecurityDescriptorControl(self.descriptor, &mut control, &mut revision) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(control & SE_DACL_PROTECTED != 0)
+    }
+
+    /// Whether the owner is the system: SYSTEM, Administrators or TrustedInstaller.
     fn owner_is_system(&self) -> bool {
         let p = principals();
         p.system.is(self.owner)
@@ -336,19 +445,23 @@ impl Judged {
             || p.trusted_installer.is(self.owner)
     }
 
-    /// Who may hold anything in what is ours: its owner, SYSTEM, Administrators and `OWNER RIGHTS`.
+    /// Who may hold anything in what is ours: its owner; this user, whoever the owner is (a profile folder owned by
+    /// Administrators or SYSTEM that grants its user full control is a default layout); SYSTEM, Administrators and
+    /// `OWNER RIGHTS`.
     fn trusted(&self, sid: PSID) -> bool {
         let p = principals();
         // SAFETY: both point at valid SIDs (null is refused first).
         (!self.owner.is_null() && !sid.is_null() && unsafe { EqualSid(self.owner, sid) } != 0)
+            || p.user.is(sid)
             || p.system.is(sid)
             || p.administrators.is(sid)
             || p.owner_rights.is(sid)
     }
 
-    /// Whether somebody untrusted is granted anything in `mask`. No DACL at all grants everything to everybody; an
-    /// allow entry of a layout not read here is taken to grant it.
-    fn grants_others(&self, mask: u32) -> bool {
+    /// Whether somebody untrusted is granted anything in `mask`, counting the entries only what is created inside
+    /// inherits when `inherit_only` says so. No DACL at all grants everything to everybody; an allow entry of a layout
+    /// not read here is taken to grant it.
+    fn grants_others(&self, mask: u32, inherit_only: bool) -> bool {
         if self.dacl.is_null() {
             return true;
         }
@@ -370,7 +483,7 @@ impl Judged {
                     *((ace as *const u8).add(4) as *const u32),
                 )
             };
-            if flags & INHERIT_ONLY_ACE != 0 || access & mask == 0 {
+            if (flags & INHERIT_ONLY_ACE != 0 && !inherit_only) || access & mask == 0 {
                 continue;
             }
             match kind {
@@ -455,14 +568,17 @@ impl super::TestFiles for Os {
         icacls(path, &["/grant", "*S-1-1-0:(F)"]);
     }
 
+    // Inheritance off first (what was inherited is kept as the file's own entries and the DACL protected), so a file a
+    // test wrote with `std` in a scratch directory ends up as private as one `open_private` makes.
     fn shut_others_out(path: &Path) {
+        icacls(path, &["/inheritance:d"]);
         icacls(path, &["/remove:g", "*S-1-1-0"]);
     }
 }
 
 /// `icacls <path> <args>` (tests), which must succeed. Everyone is `S-1-1-0`.
 #[cfg(any(test, feature = "test-support"))]
-fn icacls(path: &Path, args: &[&str]) {
+pub(super) fn icacls(path: &Path, args: &[&str]) {
     let status = std::process::Command::new("icacls")
         .arg(path)
         .args(args)
@@ -470,4 +586,17 @@ fn icacls(path: &Path, args: &[&str]) {
         .unwrap()
         .status;
     assert!(status.success(), "icacls {args:?}");
+}
+
+/// Makes `link` lead to the directory `target`: a junction, which needs no privilege (tests).
+#[cfg(test)]
+pub(super) fn link_dir(target: &Path, link: &Path) {
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .unwrap()
+        .status;
+    assert!(status.success(), "mklink /J");
 }

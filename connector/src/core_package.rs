@@ -380,7 +380,7 @@ pub fn stage(core: &PackagedCore, release: &Path) -> Result<PathBuf> {
         check_inventory(core, &inventory, &written)?;
         crate::platform::fs::Files::write_private(&partial.join(CORE_INVENTORY), &inventory)?;
         fs::rename(&partial, &destination)?;
-        fs::File::open(release)?.sync_all()?;
+        crate::platform::fs::Files::sync_dir(release)?;
         Ok(())
     })();
     if result.is_err() {

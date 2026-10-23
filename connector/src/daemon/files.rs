@@ -15,13 +15,14 @@ pub(super) const GUARD_BLOCK_RESUME: u8 = 1;
 pub(super) fn prepare_conversation_guard(path: &Path) -> Result<(u8, fs::File)> {
     match fs::symlink_metadata(path) {
         Ok(_) => {
-            Files::check_private(&Files::open_read(path)?)
+            // Judged and used on one handle, opened without following a link.
+            let mut file = Files::open_private(path, Create::ReadWrite)?;
+            Files::check_private(&file)
                 .with_context(|| format!("unsafe private file {}", path.display()))?;
-            let metadata = fs::metadata(path)?;
-            if metadata.len() != 16 || metadata.permissions().readonly() {
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.len() != 16 || metadata.permissions().readonly() {
                 bail!("invalid conversation state guard");
             }
-            let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
             let mut bytes = [0; 16];
             file.read_exact(&mut bytes)?;
             if &bytes[..8] != CONVERSATION_GUARD_MAGIC || bytes[9..].iter().any(|byte| *byte != 0) {
@@ -38,7 +39,7 @@ pub(super) fn prepare_conversation_guard(path: &Path) -> Result<(u8, fs::File)> 
             bytes[..8].copy_from_slice(CONVERSATION_GUARD_MAGIC);
             file.write_all(&bytes)?;
             file.sync_all()?;
-            fs::File::open(path.parent().context("conversation guard parent")?)?.sync_all()?;
+            Files::sync_dir(path.parent().context("conversation guard parent")?)?;
             file.seek(SeekFrom::Start(0))?;
             Ok((GUARD_CLEAR, file))
         }
@@ -56,15 +57,9 @@ pub(super) fn write_conversation_guard(file: &mut fs::File, state: u8) -> Result
 /// The speech waiting for the core, as this connector writes it: every row a speech of a conversation (its event,
 /// binding, conversation reference, utterance and text). A row of any other shape makes the outbox invalid.
 pub(super) fn read_outbox(path: &Path) -> Result<Vec<Value>> {
-    if !path.exists() {
+    let Some(bytes) = Files::read_private(path, 8 << 20)? else {
         return Ok(Vec::new());
-    }
-    Files::check_private(&Files::open_read(path)?)
-        .with_context(|| format!("unsafe private file {}", path.display()))?;
-    let bytes = fs::read(path)?;
-    if bytes.len() > 8 << 20 {
-        bail!("outbox too large");
-    }
+    };
     let rows = serde_json::from_slice::<Vec<Value>>(&bytes).context("invalid existing outbox")?;
     if !rows.iter().all(|row| {
         [
@@ -84,15 +79,7 @@ pub(super) fn read_outbox(path: &Path) -> Result<Vec<Value>> {
 
 /// The conversation state as this connector writes it: never above its size bound, which a larger file makes invalid.
 pub(super) fn read_conversation_state(path: &Path) -> Result<Option<Vec<u8>>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    Files::check_private(&Files::open_read(path)?)
-        .with_context(|| format!("unsafe private file {}", path.display()))?;
-    if fs::metadata(path)?.len() > CONVERSATION_STATE_MAX_BYTES as u64 {
-        bail!("conversation state too large");
-    }
-    Ok(Some(fs::read(path)?))
+    Files::read_private(path, CONVERSATION_STATE_MAX_BYTES as u64)
 }
 
 #[cfg(test)]
