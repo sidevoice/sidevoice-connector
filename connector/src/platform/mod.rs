@@ -9,13 +9,13 @@
 
 pub mod env;
 pub mod foreign;
-pub mod fs;
 pub mod lifecycle;
 pub mod process;
 pub mod service;
 pub mod target;
 pub mod uninstall;
 
-// This user and the local channel, shared with the core: `sidevoice-platform`, from the core's repository at the tag
-// of a core release. Re-exported so callers keep their paths (`crate::platform::ipc`, `crate::platform::user`).
-pub use sidevoice_platform::{data_dir, ipc, user};
+// This user, its private files, its data directory and the local channel, shared with the core: `sidevoice-platform`,
+// from the core's repository at the tag of a core release. Re-exported so callers keep their paths
+// (`crate::platform::fs`, `crate::platform::ipc`, `crate::platform::user`).
+pub use sidevoice_platform::{data_dir, fs, ipc, user};
