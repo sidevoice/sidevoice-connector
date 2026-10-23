@@ -43,8 +43,8 @@
 //! installation: `uninstall` answers that nothing is installed there and changes nothing at all.
 
 use crate::agents::HostAgents;
-use crate::data_dir;
 use crate::messages::Keyed;
+use crate::platform::data_dir;
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Create, Files, Fs};
 use crate::platform::process::{Process, Processes};
@@ -70,12 +70,14 @@ pub fn binary() -> String {
 }
 /// How long the pair has to answer after a restart.
 const VERIFY_LIMIT: Duration = Duration::from_secs(60);
-/// The lock files and the stop `uninstall` leaves in `D`.
+/// What `uninstall` leaves in `D`: the lock files, the stop, and `Models`, the downloaded models the engine shares
+/// with the other programs (on macOS `D` is their folder too): not this connector's to remove.
 const KEPT: &[&str] = &[
     "install.lock",
     "connector.lock",
     "agents.lock",
     "node-stopped.json",
+    "Models",
 ];
 
 /// The package being installed: its root (`bin/`, `connector.json`, `core/`), its binary and the version it is.
@@ -987,7 +989,7 @@ pub async fn uninstall(profile: &Profile, options: Options, runtime: &Runtime) -
 /// The two roots `uninstall` may remove, as this installation names them.
 fn removal_roots(layout: &Layout) -> Roots {
     Roots {
-        standard: crate::data_dir::standard(),
+        standard: data_dir::standard(),
         data: layout.data.clone(),
         releases: layout.releases.clone(),
         kept: KEPT,
@@ -1142,7 +1144,12 @@ pub(crate) mod tests {
                 |name| {
                     // Where an uninstall may remove: a directory of the OS's name below the home.
                     if name == data_dir::VARIABLE {
-                        Some(original.home.join(Environment::DATA_NAME).into_os_string())
+                        Some(
+                            original
+                                .home
+                                .join(data_dir::standard().unwrap().file_name().unwrap())
+                                .into_os_string(),
+                        )
                     } else {
                         variables
                             .iter()
@@ -1318,6 +1325,10 @@ pub(crate) mod tests {
         // Uninstall: the releases and the data go; the locks and the stop stay.
         Files::write_json(&layout.data.join("outbox.json"), &json!([])).unwrap();
         crate::lock::try_lock(&layout.data.join("agents.lock"), "test").unwrap();
+        // The shared models are another program's: they and what is in them survive.
+        let models = layout.data.join("Models/other-program");
+        fs::create_dir_all(&models).unwrap();
+        fs::write(models.join("sentinel"), "theirs").unwrap();
         let removed = uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
             .await
             .unwrap();
@@ -1336,6 +1347,11 @@ pub(crate) mod tests {
         );
         assert!(left.contains(&"node-stopped.json".to_owned()), "{left:?}");
         assert!(left.contains(&"install.lock".to_owned()), "{left:?}");
+        assert!(left.contains(&"Models".to_owned()), "{left:?}");
+        assert_eq!(
+            fs::read_to_string(models.join("sentinel")).unwrap(),
+            "theirs"
+        );
         assert!(!layout.installed());
 
         // And it installs again from nothing.

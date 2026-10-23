@@ -11,8 +11,8 @@ use crate::adapters::registration::{
     Launch, Manual, Registration,
 };
 use crate::adapters::Registry;
-use crate::data_dir;
 use crate::messages::message;
+use crate::platform::data_dir;
 use crate::platform::env::{Env, Environment, LoginPath};
 use crate::platform::fs::{Files, Fs};
 use crate::platform::target::{Host, Target as _};

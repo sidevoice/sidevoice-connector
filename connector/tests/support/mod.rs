@@ -24,7 +24,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use sidevoice_connector::platform::env::{Env as _, Environment};
+use sidevoice_connector::platform::data_dir;
 use sidevoice_connector::platform::fs::Fs as _;
 // What the tests do to files (links, programs, access): the platform's `TestFiles`, for `use support::*`.
 pub use sidevoice_connector::platform::fs::{Files, TestFiles};
@@ -184,7 +184,14 @@ impl Profile {
         ));
         let _ = fs::remove_dir_all(&base);
         private_dir(&base);
-        let data_core = format!("home/{}/core", Environment::DATA_NAME);
+        let data_core = format!(
+            "home/{}/core",
+            data_dir::standard()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+        );
         for child in [
             "home",
             "claude",
@@ -205,7 +212,9 @@ impl Profile {
     }
 
     pub fn data(&self) -> PathBuf {
-        self.root.join("home").join(Environment::DATA_NAME)
+        self.root
+            .join("home")
+            .join(data_dir::standard().unwrap().file_name().unwrap())
     }
 
     pub fn core_data(&self) -> PathBuf {

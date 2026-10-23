@@ -1,9 +1,9 @@
 //! Where everything is: this user's directories, read from the environment, and the connector's data directory
 //! layout.
 //!
-//! - `D`, the data directory: `$SIDEVOICE_DATA_DIR`, else the OS's standard place for a program's data (`data_dir`). Private (0700). The connector is the
+//! - `D`, the data directory: `$SIDEVOICE_DATA_DIR`, else the OS's standard place for a program's data (`sidevoice-platform`'s `data_dir`). Private (0700). The connector is the
 //!   one writer of its records there, each written whole (`platform/fs`); `D/core/` is the core's.
-//!   the connector's endpoint (`connector.sock` on Unix, in this user's runtime directory when there is one), `connector.lock`, `connector.log`, `agents.json`, `agents.lock`, `install.lock`,
+//!   the connector's endpoint (`connector.sock` on Unix, in this user's runtime directory when there is one) and `connector.json`, where it publishes it, `connector.lock`, `connector.log`, `agents.json`, `agents.lock`, `install.lock`,
 //!   `node-stopped.json` (a person's stop), `outbox.json`, `core/core.json`
 //!   and the core's endpoint, which its ready file names.
 //! - `R`, the release root: `D/install`, as `service/layout.rs` names it.
@@ -15,7 +15,7 @@
 //! Every path is absolute. The directories are checked again at each operation boundary, not trusted from startup:
 //! they are passed to agents' command lines and written into.
 
-use crate::data_dir::{self, data_dir};
+use crate::platform::data_dir;
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Files, Fs};
 use crate::platform::ipc::{Address, Endpoint};
@@ -70,6 +70,16 @@ pub struct Profile {
     pub core_ready: PathBuf,
 }
 
+/// The connector's ready record while it lives ([`Profile::publish_endpoint`]).
+#[derive(Debug)]
+pub struct PublishedEndpoint(PathBuf);
+
+impl Drop for PublishedEndpoint {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 impl Profile {
     /// This user's profile from the environment, with the agents' homes `homes` declares.
     pub fn from_env(homes: &[AgentHome]) -> Result<Self> {
@@ -84,7 +94,7 @@ impl Profile {
             bail!("{} must be absolute", Environment::HOME);
         }
         let or = |key: &str, fallback: PathBuf| var(key).map(PathBuf::from).unwrap_or(fallback);
-        let data = data_dir(&var)?;
+        let data = data_dir::resolve(&var)?;
         let xdg_config = or("XDG_CONFIG_HOME", home.join(".config"));
         if !xdg_config.is_absolute() {
             bail!("XDG_CONFIG_HOME must be absolute");
@@ -111,7 +121,7 @@ impl Profile {
                 set,
             });
         }
-        let core = data.join("core");
+        let core = data_dir::core_dir(&data);
         let profile = Self {
             home,
             endpoint: Endpoint::new(&data, "connector"),
@@ -293,6 +303,24 @@ impl Profile {
                 .map_or_else(String::new, |pid| format!(" (pid {pid})"));
             format!("another Sidevoice connector{pid} already serves this data directory")
         })
+    }
+
+    /// The connector's ready record, `D/connector.json`: where it listens, for whoever needs to reach it (the desktop
+    /// app), so nobody works a socket path out for themselves.
+    pub fn connector_record(&self) -> PathBuf {
+        self.data.join("connector.json")
+    }
+
+    /// Writes the ready record (`{"pid", "endpoint"}`, private, whole) once the connector listens; the record goes
+    /// away when the returned guard is dropped, which is any exit that gets to clean up. After a crash the record
+    /// stays, and `pid` tells a reader it is stale; the next connector rewrites it.
+    pub fn publish_endpoint(&self) -> Result<PublishedEndpoint> {
+        let record = self.connector_record();
+        Files::write_json(
+            &record,
+            &json!({"pid": std::process::id(), "endpoint": self.endpoint.to_string()}),
+        )?;
+        Ok(PublishedEndpoint(record))
     }
 
     /// A profile entirely inside `root`, with every directory made private: what unit tests run in.
@@ -542,6 +570,24 @@ mod tests {
         profile.try_connector_lock().unwrap();
     }
 
+    #[test]
+    fn the_connector_publishes_where_it_listens_and_withdraws_it_on_exit() {
+        let scratch = crate::test_support::temp_dir("published");
+        let profile = Profile::for_test(scratch.path(), &HOMES);
+        assert!(!profile.connector_record().exists());
+        let published = profile.publish_endpoint().unwrap();
+        let record: Value = serde_json::from_slice(
+            &Files::read_private(&profile.connector_record(), 4096)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["pid"], std::process::id());
+        let endpoint: Endpoint = record["endpoint"].as_str().unwrap().parse().unwrap();
+        assert_eq!(endpoint, profile.endpoint);
+        drop(published);
+        assert!(!profile.connector_record().exists());
+    }
     #[test]
     fn a_person_stop_marker_is_honoured_and_must_be_private() {
         let scratch = crate::test_support::temp_dir("stop");
