@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use sidevoice_connector::platform::env::{Env, Environment};
+use sidevoice_connector::platform::ipc::Endpoint;
 
 /// Every directory the connector reads, below one private root.
 #[derive(Clone)]
@@ -156,8 +157,9 @@ impl Profile {
         data_dir(&self.root)
     }
 
-    pub fn core_socket(&self) -> PathBuf {
-        self.data().join("core/local.sock")
+    /// Where the core listens, as it published it in its ready file; an error while it has not.
+    pub fn core_endpoint(&self) -> Result<Endpoint> {
+        Ok(sidevoice_connector::core_ready::read(&self.data().join("core/core.json"))?.endpoint)
     }
 
     /// What every connector process of this profile is given, beyond `PATH`: the profile's directories (a home of
