@@ -34,7 +34,10 @@ fn the_agent_keeps_its_own_xdg_directories() {
 
 #[test]
 fn bench_login_shell_exposes_captured_cli_path_without_binary_override() {
-    let root = std::env::temp_dir().join(format!("sidevoice-bench-shell-{}", uuid::Uuid::new_v4()));
+    let root = std::env::temp_dir().join(format!(
+        "sidevoice-testbench-shell-{}",
+        uuid::Uuid::new_v4()
+    ));
     let bin = root.join("person bin");
     fs::create_dir_all(root.join("bench")).unwrap();
     fs::create_dir_all(&bin).unwrap();
