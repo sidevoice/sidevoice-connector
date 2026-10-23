@@ -66,3 +66,17 @@ jobs:
       - uses: ./.github/actions/setup
       - run: cargo build --locked -p sidevoice-connector
       - run: cargo test --locked -p sidevoice-connector --lib --bins
+
+  # Windows packaging, on its own so its result shows while the Windows tests are red (W1, sidevoice-connector#116):
+  # the same fixtures, archive and npm steps as `test` (`dist` starts the archive's binary). Release.yml's Windows
+  # job runs fixtures and dist (it skips the tests meanwhile), so a failure here is what would block publication.
+  windows-package:
+    name: Package (windows-x86_64)
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup
+      - run: cargo xtask fixtures
+      - run: cargo xtask dist
+      - run: cargo xtask npm target/dist/sidevoice-connector-windows-x86_64.tar.zst
+      - run: cargo xtask npm-smoke
