@@ -1,12 +1,12 @@
 //! Where everything is: this user's directories, read from the environment, and the connector's data directory
 //! layout.
 //!
-//! - `D`, the data directory: `$SIDEVOICE_DATA_DIR`, else `~/.sidevoice`. Private (0700). The connector is the
+//! - `D`, the data directory: `$SIDEVOICE_DATA_DIR`, else the OS's standard place for a program's data (`data_dir`). Private (0700). The connector is the
 //!   one writer of its records there, each written whole (`platform/fs`); `D/core/` is the core's.
 //!   the connector's endpoint (`connector.sock` on Unix), `connector.lock`, `connector.log`, `agents.json`, `agents.lock`, `install.lock`,
 //!   `node-stopped.json` (a person's stop), `outbox.json`, `core/core.json`
 //!   and the core's endpoint, which its ready file names.
-//! - `R`, the release root: `$XDG_DATA_HOME/sidevoice` (else `~/.local/share/sidevoice`), as `service/layout.rs` names it.
+//! - `R`, the release root: `D/install`, as `service/layout.rs` names it.
 //! - The agents' homes, each named by a variable its harness declares ([`AgentHome`]): the variable's value, else
 //!   its default below `HOME` (or below another home of the same agent). A home that is not always passed on reaches
 //!   a child only when the person's environment sets it, so the agent uses its own default there as it does for
@@ -15,8 +15,11 @@
 //! Every path is absolute. The directories are checked again at each operation boundary, not trusted from startup:
 //! they are passed to agents' command lines and written into.
 
+use crate::data_dir::{self, data_dir};
+use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Files, Fs};
 use crate::platform::ipc::{Address, Endpoint};
+use crate::platform::service::{Service, Services};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::ffi::OsString;
@@ -62,7 +65,6 @@ pub struct Profile {
     /// The agents' homes, as their harnesses declare them.
     pub agent_homes: Vec<ResolvedHome>,
     pub xdg_config: PathBuf,
-    pub xdg_data: PathBuf,
     /// The connector daemon's endpoint, for its clients.
     pub endpoint: Endpoint,
     pub core_ready: PathBuf,
@@ -75,22 +77,17 @@ impl Profile {
     }
 
     pub fn from_vars(var: impl Fn(&str) -> Option<OsString>, homes: &[AgentHome]) -> Result<Self> {
-        let home = PathBuf::from(var("HOME").context("HOME is not set")?);
+        let home = PathBuf::from(
+            var(Environment::HOME).with_context(|| format!("{} is not set", Environment::HOME))?,
+        );
         if !home.is_absolute() {
-            bail!("HOME must be absolute");
+            bail!("{} must be absolute", Environment::HOME);
         }
         let or = |key: &str, fallback: PathBuf| var(key).map(PathBuf::from).unwrap_or(fallback);
-        let data = or("SIDEVOICE_DATA_DIR", home.join(".sidevoice"));
+        let data = data_dir(&var)?;
         let xdg_config = or("XDG_CONFIG_HOME", home.join(".config"));
-        let xdg_data = or("XDG_DATA_HOME", home.join(".local/share"));
-        for (name, path) in [
-            ("SIDEVOICE_DATA_DIR", &data),
-            ("XDG_CONFIG_HOME", &xdg_config),
-            ("XDG_DATA_HOME", &xdg_data),
-        ] {
-            if !path.is_absolute() {
-                bail!("{name} must be absolute");
-            }
+        if !xdg_config.is_absolute() {
+            bail!("XDG_CONFIG_HOME must be absolute");
         }
         let mut agent_homes: Vec<ResolvedHome> = Vec::new();
         for spec in homes {
@@ -122,7 +119,6 @@ impl Profile {
             data,
             agent_homes,
             xdg_config,
-            xdg_data,
         };
         profile.validate_existing_private()?;
         Ok(profile)
@@ -177,7 +173,7 @@ impl Profile {
     /// The variables a child is given: every directory, except an agent's home its harness passes on only when the
     /// environment sets it, and it does not (the agent then uses its own default, as it does for the person).
     pub fn variables(&self) -> Vec<(&'static str, &Path)> {
-        let mut variables = vec![("HOME", self.home.as_path())];
+        let mut variables = vec![(Environment::HOME, self.home.as_path())];
         variables.extend(
             self.agent_homes
                 .iter()
@@ -186,8 +182,7 @@ impl Profile {
         );
         variables.extend([
             ("XDG_CONFIG_HOME", self.xdg_config.as_path()),
-            ("XDG_DATA_HOME", self.xdg_data.as_path()),
-            ("SIDEVOICE_DATA_DIR", self.data.as_path()),
+            (data_dir::VARIABLE, self.data.as_path()),
         ]);
         variables
     }
@@ -197,14 +192,12 @@ impl Profile {
     pub fn validate_service_environment(&self) -> Result<()> {
         let service = std::env::var("SIDEVOICE_SERVICE")
             .context("the service manager is not identified (SIDEVOICE_SERVICE)")?;
-        if !matches!(service.as_str(), "launchd" | "systemd") {
+        if service != Services::KIND {
             bail!("unsupported service manager {service:?}");
         }
         for (key, expected) in self.variables() {
-            let required = matches!(
-                key,
-                "HOME" | "XDG_CONFIG_HOME" | "XDG_DATA_HOME" | "SIDEVOICE_DATA_DIR"
-            );
+            let required =
+                key == Environment::HOME || key == "XDG_CONFIG_HOME" || key == data_dir::VARIABLE;
             let supplied = match std::env::var_os(key) {
                 Some(supplied) => supplied,
                 None if required => bail!("the service environment does not name {key}"),
@@ -257,7 +250,6 @@ impl Profile {
         paths.extend([
             self.xdg_config.parent().context("XDG config parent")?,
             &self.xdg_config,
-            &self.xdg_data,
         ]);
         for path in paths {
             match fs::symlink_metadata(path) {
@@ -309,7 +301,6 @@ impl Profile {
         let mut children = vec![
             "home".to_owned(),
             "xdg/config".into(),
-            "xdg/data".into(),
             "sidevoice/core".into(),
         ];
         children.extend(
@@ -323,9 +314,8 @@ impl Profile {
         let root = root.canonicalize().unwrap();
         let path = |child: &str| -> OsString { root.join(child).into_os_string() };
         let mut variables = vec![
-            ("HOME".to_owned(), path("home")),
+            (Environment::HOME.to_owned(), path("home")),
             ("XDG_CONFIG_HOME".into(), path("xdg/config")),
-            ("XDG_DATA_HOME".into(), path("xdg/data")),
             ("SIDEVOICE_DATA_DIR".into(), path("sidevoice")),
         ];
         variables.extend(homes.iter().map(|home| {
@@ -391,19 +381,19 @@ mod tests {
     ];
 
     #[test]
-    fn the_layout_derives_from_home_unless_each_place_is_named() {
+    fn the_agent_homes_derive_from_home_unless_each_place_is_named() {
         let scratch = crate::test_support::temp_dir("layout");
         let home = scratch.path().to_string_lossy().into_owned();
-        let profile = Profile::from_vars(vars(&[("HOME", &home)]), &HOMES).unwrap();
-        assert_eq!(profile.data, scratch.path().join(".sidevoice"));
-        assert_eq!(
-            profile.endpoint,
-            Endpoint::new(&scratch.path().join(".sidevoice"), "connector")
-        );
-        assert_eq!(
-            profile.core_ready,
-            scratch.path().join(".sidevoice/core/core.json")
-        );
+        let standard = scratch.path().join("data");
+        let data = standard.to_str().unwrap();
+        let profile = Profile::from_vars(
+            vars(&[(Environment::HOME, &home), ("SIDEVOICE_DATA_DIR", data)]),
+            &HOMES,
+        )
+        .unwrap();
+        assert_eq!(profile.data, standard);
+        assert_eq!(profile.endpoint, Endpoint::new(&standard, "connector"));
+        assert_eq!(profile.core_ready, standard.join("core/core.json"));
         assert_eq!(
             profile.agent_home("ALPHA_HOME"),
             scratch.path().join(".alpha")
@@ -422,9 +412,8 @@ mod tests {
         let beta = scratch.path().join("beta");
         let named = Profile::from_vars(
             vars(&[
-                ("HOME", &home),
+                (Environment::HOME, &home),
                 ("SIDEVOICE_DATA_DIR", data.to_str().unwrap()),
-                ("XDG_DATA_HOME", "/xdg-data"),
                 ("BETA_HOME", beta.to_str().unwrap()),
             ]),
             &HOMES,
@@ -450,7 +439,13 @@ mod tests {
                 .map(|(_, value)| value.map(|value| value.to_owned()))
         };
 
-        let unset = Profile::from_vars(vars(&[("HOME", &home)]), &HOMES).unwrap();
+        let data = scratch.path().join("data");
+        let data = data.to_str().unwrap();
+        let unset = Profile::from_vars(
+            vars(&[(Environment::HOME, &home), ("SIDEVOICE_DATA_DIR", data)]),
+            &HOMES,
+        )
+        .unwrap();
         assert!(!unset.variables().iter().any(|(key, _)| *key == "BETA_HOME"));
         assert_eq!(
             passed(&unset, "BETA_HOME"),
@@ -469,7 +464,11 @@ mod tests {
         fs::create_dir(&named).unwrap();
         fs::set_permissions(&named, fs::Permissions::from_mode(0o700)).unwrap();
         let set = Profile::from_vars(
-            vars(&[("HOME", &home), ("BETA_HOME", named.to_str().unwrap())]),
+            vars(&[
+                (Environment::HOME, &home),
+                ("SIDEVOICE_DATA_DIR", data),
+                ("BETA_HOME", named.to_str().unwrap()),
+            ]),
             &HOMES,
         )
         .unwrap();
@@ -484,15 +483,17 @@ mod tests {
     #[test]
     fn relative_or_missing_places_are_refused() {
         assert!(Profile::from_vars(vars(&[]), &HOMES).is_err());
-        assert!(Profile::from_vars(vars(&[("HOME", "relative")]), &HOMES).is_err());
+        assert!(Profile::from_vars(vars(&[(Environment::HOME, "relative")]), &HOMES).is_err());
         assert!(Profile::from_vars(
-            vars(&[("HOME", "/tmp"), ("SIDEVOICE_DATA_DIR", "data")]),
+            vars(&[(Environment::HOME, "/tmp"), ("SIDEVOICE_DATA_DIR", "data")]),
             &HOMES
         )
         .is_err());
-        assert!(
-            Profile::from_vars(vars(&[("HOME", "/tmp"), ("ALPHA_HOME", "alpha")]), &HOMES).is_err()
-        );
+        assert!(Profile::from_vars(
+            vars(&[(Environment::HOME, "/tmp"), ("ALPHA_HOME", "alpha")]),
+            &HOMES
+        )
+        .is_err());
     }
 
     #[test]
@@ -526,7 +527,13 @@ mod tests {
     fn missing_directories_are_not_unsafe_and_one_connector_holds_the_data_directory() {
         let scratch = crate::test_support::temp_dir("fresh");
         let home = scratch.path().to_string_lossy().into_owned();
-        let profile = Profile::from_vars(vars(&[("HOME", &home)]), &HOMES).unwrap();
+        let data = scratch.path().join("data");
+        let data = data.to_str().unwrap();
+        let profile = Profile::from_vars(
+            vars(&[(Environment::HOME, &home), ("SIDEVOICE_DATA_DIR", data)]),
+            &HOMES,
+        )
+        .unwrap();
         assert!(!profile.data.exists());
         Files::ensure_private_dir(&profile.data).unwrap();
         let held = profile.try_connector_lock().unwrap();

@@ -211,7 +211,6 @@ fn evaluate(macos: bool, evidence: Option<BridgeEvidence>) -> ReadinessCheck {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::os::unix::fs::symlink;
 
     #[test]
     fn cursor_fallback_messages_are_plain_and_private() {
@@ -265,7 +264,7 @@ mod tests {
         assert_eq!(inventory(&bridge), BridgeFiles::Stale);
         fs::write(&socket, b"").unwrap();
         fs::remove_file(&descriptor).unwrap();
-        symlink(&socket, &descriptor).unwrap();
+        crate::test_support::symlink(&socket, &descriptor);
         assert_eq!(inventory(&bridge), BridgeFiles::Stale);
         fs::remove_dir_all(root).unwrap();
     }

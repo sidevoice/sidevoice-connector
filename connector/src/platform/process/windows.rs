@@ -1,7 +1,7 @@
 //! Windows: no console and a group of its own for what is detached, a Job Object for a tree (`process-wrap`).
-//! Nothing in the standard API lists another process's open handles.
 
 use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject};
+use std::io;
 use std::path::PathBuf;
 use tokio::process::Command;
 // `windows`, not `windows-sys`: `CreationFlags` takes its flags type.
@@ -29,7 +29,10 @@ impl super::Process for Os {
         wrap
     }
 
-    fn open_files(_: u32) -> Option<Vec<PathBuf>> {
-        None
+    fn open_files(_: u32) -> io::Result<Vec<PathBuf>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows does not list the files another process has open",
+        ))
     }
 }

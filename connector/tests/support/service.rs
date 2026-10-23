@@ -1,7 +1,7 @@
 //! What the service tests share: an installation staged inside a private profile (the real core, this connector),
 //! the service commands run against it, and this user's real service manager.
 //!
-//! The installation is what an installer leaves: `R/current -> R/releases/r1` (`R` is `$XDG_DATA_HOME/sidevoice`)
+//! The installation is what an installer leaves: `R/current.json` naming `R/releases/r1` (`R` is `D/install`)
 //! with the core at `core/bin/sidevoice-core-rust` (here a wrapper that runs the real one with no STUN and no
 //! browser keepalive) and its models at `core/models`, and `D/install.json` naming the command that runs this
 //! connector.
@@ -19,10 +19,10 @@ use super::{alive, private_dir, until, Profile, CONNECTOR};
 
 /// `R`.
 pub fn releases(profile: &Profile) -> PathBuf {
-    profile.root.join("home/.local/share/sidevoice")
+    profile.data().join("install")
 }
 
-/// Stage the release and the installation record; returns `R/current`.
+/// Stage the release and the installation record; returns `R/current.json`.
 pub fn stage_installation(profile: &Profile, core: &Path) -> PathBuf {
     let releases = releases(profile);
     let release = releases.join("releases/r1");
@@ -35,11 +35,20 @@ pub fn stage_installation(profile: &Profile, core: &Path) -> PathBuf {
     fs::write(&program, wrapper).unwrap();
     fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
     symlink(core.join("models"), release.join("core/models")).unwrap();
-    symlink("releases/r1", releases.join("current")).unwrap();
+    fs::write(
+        releases.join("current.json"),
+        json!({"release": "r1"}).to_string(),
+    )
+    .unwrap();
+    fs::set_permissions(
+        releases.join("current.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
     let record = profile.data().join("install.json");
     fs::write(&record, json!({"command": [CONNECTOR]}).to_string()).unwrap();
     fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
-    releases.join("current")
+    releases.join("current.json")
 }
 
 /// The environment of this profile's commands, plus `extra` (a manager's bus, a manager override).

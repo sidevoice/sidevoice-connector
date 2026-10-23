@@ -14,14 +14,19 @@ path = "src/main.rs"
 name = "sidevoice-bench"
 path = "src/bench/main.rs"
 
+# The MCP server check (src/adapters/health.rs) against a fake server that is this test's own binary, on every OS. Not
+# libtest: it writes its own lines to stdout, where the fake server's protocol goes.
+[[test]]
+name = "health"
+harness = false
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
 futures-util = "0.3"
-gethostname = "1"
+# The login name for the Windows task scheduler (src/platform/service).
 whoami = "2"
 hex = "0.4"
-interprocess = { version = "2.4", features = ["tokio"] }
 libc = "0.2"
 qrcodegen = "1.8"
 rmcp = { version = "3.5.1", features = ["server", "transport-io", "schemars"] }
@@ -38,35 +43,52 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 which = "=8.0.6"
+# This user's standard data directory per OS (src/data_dir.rs): `~/Library/Application Support`, `$XDG_DATA_HOME`,
+# `%LOCALAPPDATA%`.
+dirs = "7"
 zstd = "0.13"
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
+# This user and the local channel (src/platform: `user`, `ipc`), shared with the core: its `sidevoice-platform`, at the
+# tag of the core release `core.pin` names (the two ship together; move both in one PR).
+sidevoice-platform = { git = "https://github.com/sidevoice/sidevoice-core", tag = "v0.7.0" }
 # Records written whole (src/platform/fs): a temporary file beside the record, synced, renamed over it.
 atomic-write-file = "0.3"
+# Canonical paths without the `\\?\` prefix Windows gives `canonicalize` (src/platform/uninstall).
+dunce = "1"
 # Processes (src/platform/process): what every OS reads the same (owner, start, command line, parent) and the stop,
 # through `sysinfo`; spawning a detached process or a stoppable tree (process group, Job Object) through `process-wrap`.
 process-wrap = { version = "10", features = ["tokio1", "process-group", "job-object", "creation-flags", "kill-on-drop"] }
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+# Third parties' endpoints (src/platform/foreign): the same transport as the local channel, a Unix socket or a named pipe.
+interprocess = { version = "2.4", features = ["tokio"] }
 
 [dev-dependencies]
 # Scratch directories in unit tests (src/test_support.rs).
 tempfile = "3"
 
-# Unix: the effective uid (src/platform/user), with no `unsafe` of ours.
+# Unix: the effective uid (src/platform/service/macos: the launchd domain), with no `unsafe` of ours.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
 
-# Windows: this process's user and file owners (src/platform/user); the pipe's security descriptor (src/platform/ipc). Minimal features; the version the lock already has.
+# Windows: file owners and access (src/platform/fs). Minimal features; the version the lock already has.
 # `windows`: only for the type `process-wrap`'s `CreationFlags` takes (src/platform/process); it is `process-wrap`'s
 # own dependency, at its version, so it adds nothing to the build.
 [target.'cfg(windows)'.dependencies]
-widestring = "1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
-    "Win32_System_Threading",
 ] }
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
-# How many names a file has (src/platform/fs), from a handle: `winapi-util` (walkdir, ripgrep), no `unsafe` of ours.
+# The user and machine `Path` a Windows login has instead of a login shell's (src/platform/env/windows.rs).
+winreg = "0.55"
+# How many names a file has, and which file a handle is (src/platform/fs): `winapi-util` (walkdir, ripgrep), no `unsafe`
+# of ours.
 winapi-util = "0.1"
+# The Task Scheduler task's XML (src/platform/service/windows.rs), written and read through serde.
+quick-xml = { version = "0.42", features = ["serialize"] }
+
+# macOS: the LaunchAgent (src/platform/service/macos.rs), written and read as a property list.
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1.10"

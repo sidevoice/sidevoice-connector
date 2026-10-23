@@ -1,6 +1,7 @@
 //! The model selection of one Cursor chat. Only chat-local records may identify its engine.
 
 use super::{safe_chat_id, state_db, BridgeInstance};
+use crate::platform::env::{Env, Environment};
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
@@ -75,7 +76,13 @@ fn selected_engine(model: &str, configuration: Option<&Value>) -> Option<Value> 
 /// The Cursor CLI session's last model is in its own store.db metadata. It may itself contain
 /// an `effort=` override. A global CLI model selection does not establish this chat's effort.
 pub async fn engine(chat_id: &str) -> Option<Value> {
-    let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    engine_in_roots(chat_id, &config_roots()).await
+}
+
+/// Where Cursor's CLI keeps its configuration and its chats (`<root>/chats/<workspace>/<chat>/store.db`), first
+/// match first.
+pub(super) fn config_roots() -> Vec<PathBuf> {
+    let home = home();
     let mut roots = Vec::new();
     if let Some(path) = env::var_os("CURSOR_CONFIG_DIR") {
         roots.push(PathBuf::from(path));
@@ -84,7 +91,14 @@ pub async fn engine(chat_id: &str) -> Option<Value> {
         roots.push(PathBuf::from(path).join("cursor"));
     }
     roots.extend([home.join(".config/cursor"), home.join(".cursor")]);
-    engine_in_roots(chat_id, &roots).await
+    roots
+}
+
+/// This user's home, as the profile names it (`HOME`, `USERPROFILE`); empty when unset.
+pub(super) fn home() -> PathBuf {
+    env::var_os(Environment::HOME)
+        .map(PathBuf::from)
+        .unwrap_or_default()
 }
 
 async fn engine_in_roots(chat_id: &str, roots: &[PathBuf]) -> Option<Value> {

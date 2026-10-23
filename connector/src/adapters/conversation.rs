@@ -114,6 +114,34 @@ pub trait Reporter: Send + Sync {
     fn conversations(&self) -> BoxFuture<'_, Vec<Arc<Conversation>>>;
 }
 
+/// How many times in a row a tailer may fail to tell which file it has open before it gives up on the transcript.
+const IDENTITY_ATTEMPTS: u32 = 10;
+
+/// Counts a tailer's consecutive failures to tell which file it has open ([`Fs::identity`](crate::platform::fs::Fs)):
+/// a refusal that never goes away must not be retried in silence for ever.
+#[derive(Default)]
+pub struct IdentityFailures(u32);
+
+impl IdentityFailures {
+    /// The identity was read.
+    pub fn read(&mut self) {
+        self.0 = 0;
+    }
+
+    /// The identity could not be read. After [`IDENTITY_ATTEMPTS`] in a row the transcript is reported unreadable,
+    /// in the connector's log (what `voice_diagnose` shows), and this returns `true`: the tailer stops.
+    pub fn failed(&mut self, error: &std::io::Error) -> bool {
+        self.0 += 1;
+        if self.0 < IDENTITY_ATTEMPTS {
+            return false;
+        }
+        crate::logfile::log(&format!(
+            "Transcript unreadable: cannot tell which file is open after {IDENTITY_ATTEMPTS} attempts ({error}); not following it"
+        ));
+        true
+    }
+}
+
 /// Working state without a turn id.
 pub async fn report_working(reporter: &dyn Reporter, conversation: &Conversation, working: bool) {
     reporter

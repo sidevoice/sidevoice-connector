@@ -1,10 +1,10 @@
 //! Following a conversation's JSONL transcript as the harness appends it, and what the harness reads in each line.
 
-use super::conversation::{report_working, Conversation, Reporter};
+use super::conversation::{report_working, Conversation, IdentityFailures, Reporter};
+use crate::platform::fs::{FileId, Files, Fs};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -70,7 +70,7 @@ async fn follow_file<R: TranscriptReader>(
     path: PathBuf,
     mut reader: R,
 ) {
-    let mut file_id: Option<(u64, u64)> = None;
+    let mut file_id: Option<FileId> = None;
     let mut offset = 0u64;
     let mut partial = Vec::new();
     let mut tail = Vec::new();
@@ -79,6 +79,7 @@ async fn follow_file<R: TranscriptReader>(
     let mut announced_initial = false;
     let mut oversized = false;
     let rewritten_in_place = reader.rewritten_in_place();
+    let mut identity_failures = IdentityFailures::default();
     loop {
         if conversation.stopped.load(Ordering::Relaxed) {
             break;
@@ -105,8 +106,22 @@ async fn follow_file<R: TranscriptReader>(
         let Ok(meta) = input.metadata() else {
             continue;
         };
-        let current = (meta.dev(), meta.ino());
-        if file_id != Some(current) || meta.len() < offset {
+        // Which file was opened, from the handle read below: a different one after a rotation or a replacement. When
+        // the OS cannot tell, nothing is read this round, and after a few in a row the transcript is given up.
+        let current = match Files::identity(&input) {
+            Ok(current) => {
+                identity_failures.read();
+                current
+            }
+            Err(error) => {
+                if identity_failures.failed(&error) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                continue;
+            }
+        };
+        if file_id.as_ref() != Some(&current) || meta.len() < offset {
             file_id = Some(current);
             offset = 0;
             partial.clear();

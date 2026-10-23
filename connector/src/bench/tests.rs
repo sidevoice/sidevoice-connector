@@ -19,7 +19,10 @@ fn the_agent_keeps_its_own_xdg_directories() {
         login_path: "/usr/bin".into(),
     };
     let mcp = profile.mcp_env();
-    assert_eq!(mcp["SIDEVOICE_DATA_DIR"], "/p/home/.sidevoice");
+    assert_eq!(
+        Path::new(&mcp["SIDEVOICE_DATA_DIR"]),
+        Path::new("/p/home").join(Environment::DATA_NAME)
+    );
     assert_eq!(mcp["XDG_DATA_HOME"], "/p/home/.local/share");
     assert_eq!(mcp["SIDEVOICE_SERVICE_MANAGER"], "none");
     assert_eq!(mcp["SHELL"], "/p/bench/login-shell");

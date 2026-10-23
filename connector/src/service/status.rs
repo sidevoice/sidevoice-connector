@@ -2,13 +2,14 @@
 //! health, the same answer for `service status --json` and for a connector's `node.status`.
 
 use super::definition;
+use super::jobs::{self, Job, Kind};
 use super::layout::Layout;
-use super::manager::{self, Job, JobState};
 use crate::core_ready::Ready;
 use crate::messages::message;
 use crate::platform::fs::{Files, Fs};
 use crate::platform::ipc::Endpoint;
 use crate::platform::process::{Process, Processes};
+use crate::platform::service::{JobState, Service, Services};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -244,28 +245,22 @@ pub fn stopped(layout: &Layout) -> bool {
 
 /// Everything `derive` needs, read fresh. `connector_running`: the connector answering this (itself), else asked.
 pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observation {
-    let installed = manager::installed(layout).await;
+    let installed = jobs::installed(layout).await;
     let kind = match &installed {
-        Some(installed) => installed.kind,
-        None => manager::kind().await,
+        Some(_) => Kind::Manager,
+        None => jobs::kind().await,
     };
-    let defined_core = installed.as_ref().is_some_and(|found| found.core.is_some());
-    let defined_connector = installed
-        .as_ref()
-        .is_some_and(|found| found.connector.is_some());
-    let core_job = if defined_core {
-        Some(manager::state(kind, Job::Core).await)
+    let service = jobs::manager(layout);
+    let defined_core = installed.as_ref().is_some_and(|found| found.core);
+    let defined_connector = installed.as_ref().is_some_and(|found| found.connector);
+    let (core_job, program) = if defined_core {
+        let program = service.program(Job::Core.id()).await;
+        (
+            Some(service.status(Job::Core.id()).await),
+            definition::program_problem(program.as_deref()),
+        )
     } else {
-        None
-    };
-    let program = match installed.as_ref().and_then(|found| found.core.clone()) {
-        Some(file) => definition::program_problem(
-            fs::read_to_string(file)
-                .ok()
-                .and_then(|text| definition::definition_program(kind, &text))
-                .as_deref(),
-        ),
-        None => None,
+        (None, None)
     };
     let ready = read_ready(layout);
     let health = match ready.as_ref().map(|ready| &ready.endpoint) {
@@ -282,7 +277,7 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
         None => None,
     };
     let start_at_login = match &installed {
-        Some(found) => manager::start_at_login(found).await,
+        Some(found) => jobs::start_at_login(&service, found).await,
         None => None,
     };
     let connector_running = match connector_running {
@@ -297,7 +292,10 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
         defined_core,
         defined_connector,
         core_job,
-        limit: manager::limit(kind),
+        limit: match kind {
+            Kind::Manager => Services::START_LIMIT,
+            Kind::None => None,
+        },
         stopped: stopped(layout),
         health,
         ready,

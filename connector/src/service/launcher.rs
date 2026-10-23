@@ -16,13 +16,14 @@
 //! `flock`).
 
 use super::definition::core_arguments;
+use super::jobs;
 use super::layout::Layout;
-use super::manager;
 use super::status::{self, read_ready, serving};
 use super::{Failure, Result};
 use crate::core_ready::Ready;
 use crate::frame;
 use crate::messages::message;
+use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Create, Files, Fs};
 use crate::platform::ipc::{Channel, Channels};
 use crate::platform::process::{Identity, Process, Processes};
@@ -42,9 +43,6 @@ const STOP_GRACE: Duration = Duration::from_secs(15);
 const SERVICE_WAIT: Duration = Duration::from_secs(10);
 /// The idle exit of a core started on demand.
 const ON_DEMAND_IDLE_EXIT: u32 = 600;
-/// What an on-demand child's `PATH` is.
-const PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-
 /// One request to the connector on its socket: its `result`, or none when nothing answers within `limit`.
 pub async fn ask_connector(
     layout: &Layout,
@@ -206,7 +204,9 @@ pub async fn ensure_core(layout: &Layout) -> Result<Ready> {
     }
     private_data_dir(&layout.data)?;
     private_data_dir(&layout.core_data())?;
-    let program = layout.core_program();
+    let program = layout
+        .core_program()
+        .ok_or_else(|| Failure::keyed("service.no-installation", json!({})))?;
     let launch_id = uuid::Uuid::new_v4().to_string();
     let output =
         Files::open_private(&layout.core_output(), Create::Append).map_err(Failure::plain)?;
@@ -278,9 +278,9 @@ pub async fn ensure_core(layout: &Layout) -> Result<Ready> {
 pub async fn owns_core(layout: &Layout) -> bool {
     layout.installed()
         && !status::stopped(layout)
-        && manager::installed(layout)
+        && jobs::installed(layout)
             .await
-            .is_none_or(|found| found.core.is_none())
+            .is_none_or(|found| !found.core)
 }
 
 /// The connector's identity on its socket: `{pid, executable, managed}`.
@@ -443,9 +443,9 @@ where
     if status::stopped(layout) {
         return Err(Failure::keyed("node.stopped", json!({})));
     }
-    if manager::installed(layout)
+    if jobs::installed(layout)
         .await
-        .is_some_and(|found| found.connector.is_some())
+        .is_some_and(|found| found.connector)
     {
         let deadline = Instant::now() + SERVICE_WAIT;
         while Instant::now() < deadline {
@@ -481,7 +481,7 @@ where
     command
         .args(&argv[1..])
         .env_clear()
-        .env("PATH", PATH)
+        .envs(Environment::base())
         .envs(environment)
         .envs(layout.settings.clone())
         .envs(
@@ -558,14 +558,18 @@ mod tests {
     #[test]
     fn a_core_is_ours_only_with_this_data_directory_as_a_whole_argument() {
         let layout = Layout::from_vars(
-            |name| (name == "HOME").then(|| "/h".into()),
+            |name| match name {
+                "HOME" => Some("/h".into()),
+                "SIDEVOICE_DATA_DIR" => Some("/h/.sidevoice".into()),
+                _ => None,
+            },
             Vec::new(),
             &[],
         )
         .unwrap();
         assert!(is_our_core(
             &layout,
-            "/r/core --data-dir /h/.sidevoice/core --socket /x"
+            "/r/core --data-dir /h/.sidevoice/core --port 7000"
         ));
         assert!(is_our_core(
             &layout,
@@ -573,7 +577,7 @@ mod tests {
         ));
         assert!(!is_our_core(
             &layout,
-            "/r/core --data-dir /h/.sidevoice/core2 --socket /x"
+            "/r/core --data-dir /h/.sidevoice/core2 --port 7000"
         ));
         assert!(!is_our_core(&layout, "/r/core --data-dir /other/core"));
     }

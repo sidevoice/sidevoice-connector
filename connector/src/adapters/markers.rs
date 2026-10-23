@@ -29,7 +29,8 @@ impl Roots {
     pub fn process(home: &Path) -> Self {
         Self {
             home: home.to_path_buf(),
-            local_app_data: std::env::var_os("LOCALAPPDATA").map(PathBuf::from),
+            // Windows's known folder `%LOCALAPPDATA%`; only Windows markers name this root.
+            local_app_data: dirs::data_local_dir(),
             program_files: std::env::var_os("ProgramFiles").map(PathBuf::from),
         }
     }
@@ -68,7 +69,6 @@ pub fn matching_kinds(markers: &[Marker], os: &str, roots: &Roots) -> Vec<&'stat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn path_markers_check_metadata_without_starting_the_target() {
@@ -82,7 +82,6 @@ mod tests {
             format!("#!/bin/sh\ntouch '{}'\n", launched.display()),
         )
         .unwrap();
-        fs::set_permissions(&marker_file, fs::Permissions::from_mode(0o700)).unwrap();
         let markers = [Marker {
             os: "macos",
             kind: "app_bundle",

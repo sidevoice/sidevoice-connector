@@ -3,8 +3,8 @@
 
 use super::Claude;
 use crate::adapters::registration::{
-    run_required, shell_command_in, strings, AgentError, AgentHost, BenchSetup, Entry, Launch,
-    Manual, ManualStep, Registration,
+    cli_step, run_required, strings, AgentError, AgentHost, BenchSetup, Entry, Launch, Manual,
+    Registration,
 };
 use crate::profile::Profile;
 use futures_util::future::BoxFuture;
@@ -283,11 +283,7 @@ impl Registration for Claude {
         // `claude mcp` writes Claude Code's user configuration: the file each step changes. A step names
         // `CLAUDE_CONFIG_DIR` only when the person's environment sets it, as the connector runs the CLI.
         let file = super::user_config(profile);
-        let step = |args: &[String]| ManualStep {
-            command: Some(shell_command_in(profile, super::HOME.var, cli, args)),
-            snippet: None,
-            file: Some(file.to_string_lossy().into_owned()),
-        };
+        let step = |args: &[String]| cli_step(profile, super::HOME.var, cli, args, &file);
         // Ours is always in the user scope. Another entry may be in any scope, a project's or a local one relative to
         // the directory the person runs it in: without `--scope`, Claude Code removes it from the scope it is in.
         Manual::by_cli(
@@ -339,8 +335,8 @@ fn inbound_warning(profile: &Profile) -> Option<String> {
 mod tests {
     use super::*;
     use crate::adapters::registration::{CliError, CliOutput};
+    use crate::platform::fs::{Files, Fs};
     use serde_json::json;
-    use std::os::unix::fs::PermissionsExt;
 
     /// A host with no CLI to run: a state judged here never needs one.
     struct Host(Profile);
@@ -391,8 +387,7 @@ mod tests {
         }
         home.set = set;
         if exists {
-            fs::create_dir_all(&home.path).unwrap();
-            fs::set_permissions(&home.path, fs::Permissions::from_mode(0o700)).unwrap();
+            Files::ensure_private_dir(&home.path).unwrap();
         } else if set {
             // Its parent stays, so the file can be there without the home.
             fs::create_dir_all(home.path.parent().unwrap()).unwrap();
@@ -412,8 +407,7 @@ mod tests {
                 }
                 let scratch = crate::test_support::temp_dir("claude-unparsable");
                 let (profile, file) = profile(&scratch, set, exists);
-                fs::write(&file, b"{\"mcpServers\": {").unwrap();
-                fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+                write(&file, b"{\"mcpServers\": {");
                 assert_eq!(
                     state(&Host(profile), None).await,
                     "invalid",
@@ -424,7 +418,9 @@ mod tests {
         }
     }
 
-    /// A FIFO where the user configuration belongs is refused at once, never waited on.
+    /// A FIFO where the user configuration belongs is refused at once, never waited on. Unix only: a FIFO is a file
+    /// there; a Windows pipe has no place among files.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_fifo_for_the_user_configuration_is_refused_without_waiting() {
         let scratch = crate::test_support::temp_dir("claude-fifo");
@@ -447,15 +443,15 @@ mod tests {
     /// Links `file` to `name` in a dotfiles directory (outside Claude's and the home's), and returns where it leads.
     fn linked(scratch: &tempfile::TempDir, file: &Path, name: &str) -> PathBuf {
         let dotfiles = scratch.path().join("dotfiles");
-        fs::create_dir_all(&dotfiles).unwrap();
+        Files::ensure_private_dir(&dotfiles).unwrap();
         let target = dotfiles.join(name);
-        std::os::unix::fs::symlink(&target, file).unwrap();
+        crate::test_support::symlink(&target, file);
         target
     }
 
-    fn write(path: &Path, bytes: &[u8], mode: u32) {
-        fs::write(path, bytes).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    /// `bytes` as the whole of a file of the person's, open to nobody else.
+    fn write(path: &Path, bytes: &[u8]) {
+        Files::write_private(path, bytes).unwrap();
     }
 
     /// Dotfiles managers link `~/.claude.json` from their own directory: the link is followed, and what it leads to
@@ -465,17 +461,18 @@ mod tests {
         let scratch = crate::test_support::temp_dir("claude-linked");
         let (profile, file) = profile(&scratch, false, true);
         let target = linked(&scratch, &file, "claude.json");
-        write(&target, b"{\"mcpServers\": {}}", 0o600);
+        write(&target, b"{\"mcpServers\": {}}");
         assert_eq!(
             super::super::read_user_config(&profile),
             Ok(Some(json!({"mcpServers": {}})))
         );
-        write(&target, b"{\"mcpServers\": {", 0o600);
+        write(&target, b"{\"mcpServers\": {");
         assert_eq!(state(&Host(profile), None).await, "invalid");
         assert_eq!(fs::read(&target).unwrap(), b"{\"mcpServers\": {");
     }
 
-    /// A link to a FIFO is refused at once, never waited on.
+    /// A link to a FIFO is refused at once, never waited on. Unix only, as above.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_link_to_a_fifo_is_refused_without_waiting() {
         let scratch = crate::test_support::temp_dir("claude-linked-fifo");
@@ -497,20 +494,30 @@ mod tests {
     }
 
     /// What a link leads to is judged as the file itself: one others may write is refused (one another user owns is
-    /// refused by the same check of the opened file, which a test cannot make without root), and a link that leads
-    /// nowhere is unreadable, so the CLI is not run over it.
+    /// refused by the same check of the opened file, which a test cannot make without root). Unix only: the file is
+    /// opened to others with mode bits, which the interface does not offer (Windows access is a DACL).
+    #[cfg(unix)]
     #[tokio::test]
-    async fn a_link_to_a_file_others_may_write_or_to_nothing_is_refused() {
+    async fn a_link_to_a_file_others_may_write_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
         let scratch = crate::test_support::temp_dir("claude-linked-mode");
         let (profile, file) = profile(&scratch, false, true);
         let target = linked(&scratch, &file, "claude.json");
-        write(&target, b"{}", 0o622);
+        write(&target, b"{}");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o622)).unwrap();
         assert_eq!(
             super::super::read_user_config(&profile),
             Err(super::super::Unreadable)
         );
-        assert_eq!(state(&Host(profile.clone()), None).await, "invalid");
-        fs::remove_file(&target).unwrap();
+        assert_eq!(state(&Host(profile), None).await, "invalid");
+    }
+
+    /// A link that leads nowhere is unreadable, so the CLI is not run over it.
+    #[tokio::test]
+    async fn a_link_to_nothing_is_refused() {
+        let scratch = crate::test_support::temp_dir("claude-linked-nothing");
+        let (profile, file) = profile(&scratch, false, true);
+        linked(&scratch, &file, "claude.json");
         assert_eq!(
             super::super::read_user_config(&profile),
             Err(super::super::Unreadable)
@@ -529,7 +536,7 @@ mod tests {
         for (env, expected) in [(json!({}), "connected"), (json!({"OLD": "1"}), "owned-old")] {
             let config = json!({"mcpServers": {"sidevoice": {"type": "stdio",
                 "command": "/nowhere/sidevoice", "args": [], "env": env}}});
-            write(&target, config.to_string().as_bytes(), 0o600);
+            write(&target, config.to_string().as_bytes());
             assert_eq!(state(&host, Some("/nowhere/claude")).await, expected);
         }
     }

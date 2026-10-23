@@ -15,7 +15,7 @@ disallowed-methods = [
 ]
 
 # Local sockets: `platform::ipc` is the only place that opens one (a Unix socket, a named pipe on Windows).
-# The third-party sockets of `adapters/` stay until that block moves (they carry an `#[allow]`).
+# The third-party sockets of `adapters/` go through `platform::foreign`.
 disallowed-types = [
     { path = "tokio::net::UnixListener", reason = "use platform::ipc" },
     { path = "tokio::net::UnixStream", reason = "use platform::ipc" },

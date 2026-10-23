@@ -813,7 +813,11 @@ mod tests {
         let chat = "chat-model".to_owned();
         set_followed(&conversation, chat.clone());
         let profile = Profile::from_vars(
-            |key| (key == "HOME").then(|| scratch.path().as_os_str().to_os_string()),
+            |key| match key {
+                "HOME" => Some(scratch.path().as_os_str().to_os_string()),
+                "SIDEVOICE_DATA_DIR" => Some(scratch.path().join("data").into_os_string()),
+                _ => None,
+            },
             &[],
         )
         .unwrap();
