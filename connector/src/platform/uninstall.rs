@@ -83,6 +83,28 @@ const RELEASE_PREFIX: &str = "release-";
 /// What a claimed entry of `D` is called inside [`CLAIM`], before its unique suffix.
 const DATA_PREFIX: &str = "data-";
 
+/// `path` as the OS resolves it: its longest existing ancestor canonicalized, the components that do not exist yet
+/// appended as written.
+fn resolved(path: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(existing) {
+            return missing
+                .iter()
+                .rev()
+                .fold(real, |real, part| real.join(part));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name);
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 /// The roots one uninstall may remove, and what stays in the data directory.
 pub struct Roots {
     /// `D`, the data directory (`data_dir`).
@@ -194,13 +216,9 @@ impl Roots {
         if overlaps(&models, &self.data) {
             return Err(REFUSED);
         }
-        if let (Ok(models), Ok(data)) = (
-            std::fs::canonicalize(&models),
-            std::fs::canonicalize(&self.data),
-        ) {
-            if overlaps(&models, &data) {
-                return Err(REFUSED);
-            }
+        // As the OS resolves them, whether or not the store exists yet (another instance may create it later).
+        if overlaps(&resolved(&models), &resolved(&self.data)) {
+            return Err(REFUSED);
         }
         Ok(())
     }
@@ -505,6 +523,24 @@ mod tests {
         let removal = Remover::new(layout).unwrap();
         assert_eq!(removal.ownership().unwrap(), Ownership::Ours);
         assert_eq!(removal.remove_data_contents(&|_| {}).unwrap(), ["entry"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_standard_place_reaching_into_the_data_directory_through_a_link_is_refused_before_the_store_exists(
+    ) {
+        let scratch = temp_dir("uninstall-models-alias");
+        let home = scratch.path().join("home");
+        let data = home.join("data");
+        Files::ensure_private_dir(&data).unwrap();
+        fs::create_dir_all(data.join("nested/sidevoice")).unwrap();
+        let alias = home.join("xdg-alias");
+        Files::symlink(data.join("nested"), &alias);
+        // `Models` does not exist yet: another instance creates it later, inside `D`.
+        let mut layout = at(data, &alias.join("sidevoice"));
+        layout.home = Some(home);
+        let refused = layout.validate().unwrap_err();
+        assert!(refused.contains("shared models folder"), "{refused}");
     }
 
     #[test]
