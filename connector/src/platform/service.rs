@@ -140,6 +140,54 @@ pub struct JobState {
     pub restarting: bool,
     /// Why the manager does not run it: `not-loaded`, `start-limit`.
     pub reason: Option<&'static str>,
+    /// What the manager itself calls the job's state, in its own words and fields (systemd's `ActiveState`, launchd's
+    /// `state`, Task Scheduler's `Status`), for a person to read; never parsed.
+    pub state: Option<String>,
+}
+
+/// A job as its manager reports it now, named: what a person needs to see why it does not run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Diagnosis {
+    /// The manager ([`Service::KIND`]).
+    pub manager: &'static str,
+    /// What the manager calls the job ([`Service::name`]).
+    pub name: String,
+    pub job: JobState,
+}
+
+impl std::fmt::Display for Diagnosis {
+    /// `systemd job sidevoice-core: loaded, not running, state ActiveState=failed, last exit 2`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let job = &self.job;
+        write!(f, "{} job {}: ", self.manager, self.name)?;
+        if !job.loaded {
+            f.write_str("not loaded")?;
+        } else if let (true, Some(pid)) = (job.running, job.pid) {
+            write!(f, "loaded, running (pid {pid})")?;
+        } else if job.running {
+            f.write_str("loaded, running")?;
+        } else if job.restarting {
+            f.write_str("loaded, not running, the manager will start it again")?;
+        } else {
+            f.write_str("loaded, not running")?;
+        }
+        if let Some(state) = &job.state {
+            write!(f, ", state {state}")?;
+        }
+        if let Some(signal) = &job.signal {
+            write!(f, ", last signal {signal}")?;
+        }
+        if let Some(exit) = job.exit {
+            write!(f, ", last exit {exit}")?;
+        }
+        if let Some(runs) = job.runs {
+            write!(f, ", {runs} restarts")?;
+        }
+        if let Some(reason) = job.reason {
+            write!(f, ", {reason}")?;
+        }
+        Ok(())
+    }
 }
 
 /// Linux: whether this user's services run without a session, and the command that would make them.
@@ -215,6 +263,18 @@ pub trait Service: Sized + Send + Sync {
 
     /// The job as the manager reports it now.
     fn status(&self, job: JobId) -> impl Future<Output = JobState> + Send;
+
+    /// The job as the manager reports it now, named as a person reads it ([`Diagnosis`]'s `Display`): the one account
+    /// of a job that does not run, for `status`, `voice_diagnose` and an install that did not start.
+    fn diagnose(&self, job: JobId) -> impl Future<Output = Diagnosis> + Send {
+        async move {
+            Diagnosis {
+                manager: Self::KIND,
+                name: Self::name(job),
+                job: self.status(job).await,
+            }
+        }
+    }
 
     /// Whether the job starts at the next login, as the manager answers now; `None` when it cannot tell.
     fn login(&self, job: JobId) -> impl Future<Output = Option<bool>> + Send;
@@ -463,6 +523,39 @@ fn write_definition(file: &Path, text: &str) -> Result<bool, Refusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_diagnosis_reads_as_the_job_its_manager_and_how_it_last_ended() {
+        let said = |job: JobState| {
+            Diagnosis {
+                manager: "task-scheduler",
+                name: "sidevoice-core-a".into(),
+                job,
+            }
+            .to_string()
+        };
+        assert_eq!(
+            said(JobState::default()),
+            "task-scheduler job sidevoice-core-a: not loaded"
+        );
+        assert_eq!(
+            said(JobState {
+                loaded: true,
+                state: Some("Ready".into()),
+                exit: Some(2),
+                ..JobState::default()
+            }),
+            "task-scheduler job sidevoice-core-a: loaded, not running, state Ready, last exit 2"
+        );
+        assert_eq!(
+            said(JobState {
+                loaded: true,
+                running: true,
+                pid: Some(7),
+                ..JobState::default()
+            }),
+            "task-scheduler job sidevoice-core-a: loaded, running (pid 7)"
+        );
+    }
 
     fn job(program: &[&str], environment: &[(&str, &str)]) -> Job {
         Job {

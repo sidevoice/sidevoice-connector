@@ -282,6 +282,14 @@ pub fn human(answer: &Value) -> String {
             });
         out.push_str(&format!(" ({reason})"));
     }
+    if state != "running" {
+        if let Some(job) = answer.get("job").and_then(Value::as_str) {
+            out.push_str(&format!("\n{job}"));
+            if let Some(log) = answer.get("output_log").and_then(Value::as_str) {
+                out.push_str(&format!("\nThe core's output: {log}"));
+            }
+        }
+    }
     if let Some(login) = answer.get("start_at_login") {
         let key = match login.as_bool() {
             Some(true) => "service.login.on",

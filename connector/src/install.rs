@@ -48,10 +48,11 @@ use crate::platform::data_dir;
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Create, Files, Fs};
 use crate::platform::process::{Process, Processes};
+use crate::platform::service::Service;
 use crate::platform::target::{Host, Target as _};
 use crate::platform::uninstall::{Ownership, Removal, Remover, Roots};
 use crate::profile::Profile;
-use crate::service::jobs::Kind;
+use crate::service::jobs::{Job, Kind};
 use crate::service::layout::Layout;
 use crate::service::{launcher, status};
 use anyhow::{Context, Result};
@@ -62,7 +63,7 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::time::{sleep, timeout, Duration, Instant};
+use tokio::time::{sleep, timeout, timeout_at, Duration, Instant};
 
 /// The connector's program inside a package and inside a release (`bin/sidevoice-connector`, `.exe` on Windows).
 pub fn binary() -> String {
@@ -70,6 +71,87 @@ pub fn binary() -> String {
 }
 /// How long the pair has to answer after a restart.
 const VERIFY_LIMIT: Duration = Duration::from_secs(60);
+/// How long to wait between looks at the pair.
+const POLL_PAUSE: Duration = Duration::from_millis(250);
+
+/// What one look at the pair found.
+enum Poll {
+    /// The pair answers.
+    Ready,
+    /// A failure that waiting will not change.
+    Failed(Value),
+    /// Not yet, with the node's state as it was seen.
+    Waiting(Value),
+}
+
+/// How a wait ended without the pair answering.
+enum Wait {
+    Failed(Value),
+    /// The limit passed; the last state seen, if any.
+    TimedOut(Option<Value>),
+}
+
+/// `poll` until it is ready or fails, for at most `limit` in all: a look that is itself slow (a manager command has a
+/// 30 s deadline of its own) is cut off at the limit too, so the wait never outlasts it.
+async fn wait_until<F, Fut>(limit: Duration, pause: Duration, mut poll: F) -> Result<(), Wait>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Poll>,
+{
+    let deadline = Instant::now() + limit;
+    let mut last = None;
+    loop {
+        match timeout_at(deadline, poll()).await {
+            Ok(Poll::Ready) => return Ok(()),
+            Ok(Poll::Failed(failure)) => return Err(Wait::Failed(failure)),
+            Ok(Poll::Waiting(state)) => last = Some(state),
+            Err(_) => return Err(Wait::TimedOut(last)),
+        }
+        if Instant::now() >= deadline {
+            return Err(Wait::TimedOut(last));
+        }
+        sleep(pause).await;
+    }
+}
+
+/// What the install waited for, and where to look when it did not come.
+struct Waited {
+    /// The core's ready file.
+    ready: PathBuf,
+    /// Where the service appends the core's output.
+    output: PathBuf,
+    /// The last lines of that output, if there are any.
+    tail: Vec<String>,
+}
+
+/// The failure of a wait that reached `limit`: what was awaited, the service's own account of the job
+/// (`Diagnosis`), where the core's output is with its last lines, and what to run next.
+fn timeout_failure(limit: Duration, waited: &Waited, service: &str, last: Option<&Value>) -> Value {
+    let tail = if waited.tail.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nIts last lines:\n{}",
+            waited
+                .tail
+                .iter()
+                .map(|line| format!("    {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let seen = last
+        .and_then(|state| state.pointer("/failure/message"))
+        .and_then(Value::as_str)
+        .map(|message| format!(" Last seen: {message}"))
+        .unwrap_or_default();
+    json!({"key": "ready.timeout", "step": "ready",
+        "message": crate::messages::message("install.not-ready", &json!({
+            "seconds": limit.as_secs(), "ready": waited.ready, "service": service,
+            "seen": seen, "output": waited.output, "tail": tail})),
+        "service": service, "output_log": waited.output, "log_tail": waited.tail})
+}
+
 /// What `uninstall` leaves in `D`: the lock files, the stop, and `Models` (named by `sidevoice-platform`). The shared models
 /// are the engine's, never this connector's to remove; they live in the OS standard place (`data_dir::models_dir`), which
 /// is `D` itself when `D` is not overridden, so they are kept here so that an un-overridden `D` never loses them (when `D`
@@ -427,15 +509,17 @@ impl Runtime {
                     .await
                     .map_err(|failure| failure_value(&failure))?;
                 }
-                let deadline = Instant::now() + VERIFY_LIMIT;
-                loop {
+                let layout_ref = layout;
+                let binary_ref = &binary;
+                let before_ref = before.as_ref();
+                let poll = || async move {
                     if let Some((ready, _)) =
-                        status::serving(layout, Duration::from_millis(1500)).await
+                        status::serving(layout_ref, Duration::from_millis(1500)).await
                     {
-                        if Some(&ready.launch_id) != before.as_ref()
-                            && runs_release(layout, &binary).await
+                        if Some(&ready.launch_id) != before_ref
+                            && runs_release(layout_ref, binary_ref).await
                             && launcher::ask_connector(
-                                layout,
+                                layout_ref,
                                 "node.status",
                                 json!({}),
                                 Duration::from_secs(5),
@@ -443,37 +527,54 @@ impl Runtime {
                             .await
                             .is_some()
                         {
-                            return Ok(());
+                            return Poll::Ready;
                         }
                     }
                     let now = if kind == Kind::None {
                         // No job: what the core said about a failed start is the state.
-                        match status::read_failure(layout, &crate::logfile::timestamp()) {
+                        match status::read_failure(layout_ref, &crate::logfile::timestamp()) {
                             Some(failure) => json!({"state": "failed", "failure": failure}),
                             None => json!({"state": "starting"}),
                         }
                     } else {
-                        status::status(layout, None).await
+                        status::status(layout_ref, None).await
                     };
                     let state = now.get("state").and_then(Value::as_str).unwrap_or("");
                     if matches!(state, "failed" | "service-failed") && status::settled(&now) {
-                        return Err(now
-                            .get("failure")
-                            .cloned()
-                            .filter(Value::is_object)
-                            .unwrap_or_else(|| json!({"key": state})));
+                        return Poll::Failed(
+                            now.get("failure")
+                                .cloned()
+                                .filter(Value::is_object)
+                                .unwrap_or_else(|| json!({"key": state})),
+                        );
                     }
-                    if Instant::now() >= deadline {
-                        return Err(now
-                            .get("failure")
-                            .cloned()
-                            .filter(Value::is_object)
-                            .unwrap_or_else(|| {
-                                json!({"key": "ready.timeout",
-                                    "message": crate::messages::message("ready.timeout", &Value::Null)})
-                            }));
+                    Poll::Waiting(now)
+                };
+                match wait_until(VERIFY_LIMIT, POLL_PAUSE, poll).await {
+                    Ok(()) => Ok(()),
+                    Err(Wait::Failed(failure)) => Err(failure),
+                    Err(Wait::TimedOut(last)) => {
+                        let service = match kind {
+                            Kind::Manager => crate::service::jobs::manager(layout)
+                                .diagnose(Job::Core.id())
+                                .await
+                                .to_string(),
+                            Kind::None => {
+                                "No service manager runs it here: it is started on demand"
+                                    .to_owned()
+                            }
+                        };
+                        Err(timeout_failure(
+                            VERIFY_LIMIT,
+                            &Waited {
+                                ready: layout.core_ready(),
+                                output: layout.core_output(),
+                                tail: status::output_tail(layout, 5),
+                            },
+                            &service,
+                            last.as_ref(),
+                        ))
                     }
-                    sleep(Duration::from_millis(250)).await;
                 }
             }
             #[cfg(test)]
@@ -1363,6 +1464,84 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(fixture.releases(), ["3.0.0"]);
+    }
+
+    #[tokio::test]
+    async fn a_pair_that_never_answers_ends_the_wait_at_its_limit_with_the_last_state_seen() {
+        let started = Instant::now();
+        let ended = wait_until(
+            Duration::from_millis(80),
+            Duration::from_millis(5),
+            || async { Poll::Waiting(json!({"state": "backoff"})) },
+        )
+        .await;
+        let Err(Wait::TimedOut(Some(last))) = ended else {
+            panic!("the wait must time out with a state seen");
+        };
+        assert_eq!(last["state"], "backoff");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_look_that_itself_never_returns_is_cut_off_at_the_limit() {
+        let ended = wait_until(Duration::from_millis(50), Duration::from_millis(5), || {
+            std::future::pending::<Poll>()
+        })
+        .await;
+        assert!(matches!(ended, Err(Wait::TimedOut(None))));
+    }
+
+    #[tokio::test]
+    async fn a_wait_ends_at_once_when_the_pair_answers_or_fails_for_good() {
+        let ready = wait_until(Duration::from_secs(5), Duration::from_millis(5), || async {
+            Poll::Ready
+        })
+        .await;
+        assert!(ready.is_ok());
+        let failed = wait_until(Duration::from_secs(5), Duration::from_millis(5), || async {
+            Poll::Failed(json!({"key": "bind.port-in-use"}))
+        })
+        .await;
+        assert!(matches!(failed, Err(Wait::Failed(f)) if f["key"] == "bind.port-in-use"));
+    }
+
+    #[test]
+    fn a_timeout_names_what_was_awaited_the_service_the_output_and_the_next_command() {
+        let waited = Waited {
+            ready: PathBuf::from("/d/core/core.json"),
+            output: PathBuf::from("/d/core.stderr.log"),
+            tail: vec!["error: bad job".into(), "exit".into()],
+        };
+        let last = json!({"state": "failed", "failure": {"message": "The core exited (2)."}});
+        let failure = timeout_failure(
+            Duration::from_secs(60),
+            &waited,
+            "task-scheduler job sidevoice-core-a: loaded, not running, state Ready, last exit 2",
+            Some(&last),
+        );
+        assert_eq!(failure["key"], "ready.timeout");
+        let text = failure["message"].as_str().unwrap();
+        for part in [
+            "within 60 s",
+            "/d/core/core.json",
+            "Last seen: The core exited (2).",
+            "task-scheduler job sidevoice-core-a: loaded, not running, state Ready, last exit 2",
+            "/d/core.stderr.log",
+            "    error: bad job\n    exit",
+            "Next: run `npx sidevoice service status`.",
+        ] {
+            assert!(text.contains(part), "{part} missing in {text}");
+        }
+        let bare = timeout_failure(
+            Duration::from_secs(60),
+            &Waited {
+                tail: vec![],
+                ..waited
+            },
+            "x",
+            None,
+        );
+        assert!(!bare["message"].as_str().unwrap().contains("last lines"));
     }
 
     #[tokio::test]

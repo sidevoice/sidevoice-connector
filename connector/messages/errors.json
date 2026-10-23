@@ -56,6 +56,7 @@
   "connector.service-down": "The Sidevoice connector is not answering ({detail}); its service manager runs it. See `npx sidevoice service status`, or retry with `npx sidevoice service restart`.",
   "launch.exited": "The core exited ({detail}).",
   "ready.timeout": "The core did not become ready in time.",
+  "install.not-ready": "The core did not become ready within {seconds} s: it did not write its ready file ({ready}) and answer a health check on it.{seen} Service: {service}. The core's output is in {output}.{tail}\nNext: run `npx sidevoice service status`.",
   "hang": "The core stopped answering.",
   "identity.unreadable": "The core could not read this machine's identity.",
   "bind.port-in-use": "The core's port is taken by another program.",

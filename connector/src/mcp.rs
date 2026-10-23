@@ -316,7 +316,7 @@ fn diagnosis(
             "core_protocol":status.pointer("/core/protocol")},
         "connector":{"reachable":status.get("error").is_none(),"error":status.get("error"),
             "conversations":status.get("bindings").and_then(Value::as_array).map(Vec::len)},
-        "core":{"state":node.get("state"),"service":node.get("service"),"linked":status.get("connected"),
+        "core":{"state":node.get("state"),"service":node.get("service"),"job":node.get("job"),"linked":status.get("connected"),
             "failure":only(node.get("failure"), &["key","step","at","message"])},
         "resume":{"blocked":status.get("resume_blocked"),"reason":status.get("resume_block_reason")},
         "conversation":conversation,
@@ -689,7 +689,7 @@ impl Facade {
                 Ok(diagnosis(
                     &Facts {
                         connector_version: self.profile.connector_version(),
-                        logs: json!({"connector":layout.connector_log(),"core":layout.core_log()}),
+                        logs: json!({"connector":layout.connector_log(),"core":layout.core_log(),"core_output":layout.core_output()}),
                         several_chats: chosen.is_none() && self.several_chats(),
                     },
                     &status,
@@ -1472,7 +1472,7 @@ mod tests {
             "deliveries":[{"message_id":"m1","channel":"voice","at":"t","result":"unconfirmed","read":false,"text":"SECRET-TEXT"}]});
         let status = json!({"version":"1.0.0","connected":true,"core":{"protocol":3,"token":"SECRET-TOKEN"},
             "bindings":[listed.clone()]});
-        let node = json!({"state":"failed","core":{"version":"0.4.5","api":1},
+        let node = json!({"state":"failed","job":"systemd job sidevoice-core: loaded, not running, last exit 2","core":{"version":"0.4.5","api":1},
             "failure":{"key":"hang","step":"health","log_tail":"auth SECRET-TOKEN","detail":"SECRET-KEY"}});
         let facts = Facts {
             connector_version: "1.0.0",
@@ -1506,5 +1506,9 @@ mod tests {
         assert_eq!(report["conversation"]["deliveries"][0]["read"], false);
         assert_eq!(report["versions"]["core"], "0.4.5");
         assert_eq!(report["core"]["failure"]["key"], "hang");
+        assert_eq!(
+            report["core"]["job"],
+            "systemd job sidevoice-core: loaded, not running, last exit 2"
+        );
     }
 }
