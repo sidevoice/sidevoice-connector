@@ -25,6 +25,9 @@
 //!   `npx sidevoice --version --json` from there.
 //! - `npm-publish TAG`: the npm packages of the GitHub release TAG's checked assets, published by trusted publishing:
 //!   the platform packages, then the launcher as a staged version a maintainer approves.
+//! - `e2e ARCHIVE`: on a disposable machine (a CI runner), the archive installed end to end as a person installs it:
+//!   this user's real service manager and the real Claude Code and Codex CLIs; `install`, `pair-device`,
+//!   `agents connect`, `uninstall`, and what each must leave (xtask/src/e2e.rs).
 //! - `fixtures`: `core` and `codex`, into their default directories: what `cargo test` runs against.
 //! - `testbench [ARGS...]` (or `bench`): the test bench (testbench/README.md): the pinned core (fetched when
 //!   missing), this build, and `sidevoice-testbench ARGS` run on them.
@@ -33,6 +36,7 @@ mod archive;
 mod codex;
 mod core;
 mod dist;
+mod e2e;
 mod glibc;
 mod host;
 mod manifest;
@@ -148,7 +152,7 @@ pub(crate) const MANIFEST: &str = "sidevoice-connector-manifest.json";
 pub(crate) const KIND: &str = "sidevoice-connector-v1";
 
 const USAGE: &str =
-    "usage: cargo xtask dist | verify ARCHIVE | verify-floor ARCHIVE | manifest DIR [--tag vX.Y.Z] | publish DIR TAG | npm ARCHIVE... | npm-smoke | npm-publish TAG | fixtures | core [DIR] | codex [DIR] | testbench [ARGS...]";
+    "usage: cargo xtask dist | verify ARCHIVE | verify-floor ARCHIVE | manifest DIR [--tag vX.Y.Z] | publish DIR TAG | npm ARCHIVE... | npm-smoke | npm-publish TAG | e2e ARCHIVE | fixtures | core [DIR] | codex [DIR] | testbench [ARGS...]";
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -171,6 +175,7 @@ fn main() {
             npm::npm_packages(&archives)
         }
         ["npm-smoke"] => npm::smoke(),
+        ["e2e", archive] => e2e::e2e(Path::new(archive)),
         ["npm-publish", tag] => npm::publish(tag),
         ["testbench" | "bench", args @ ..] => testbench::testbench(args),
         _ => Err(USAGE.into()),

@@ -12,8 +12,8 @@ The earlier Node package, `@sidevoice/uplink` on npm, is deprecated and no longe
 
 | Act | Who | What happens |
 |---|---|---|
-| Open / update a PR | anyone | `ci`: format and Clippy (Linux and macOS), then on every target the tests, the release packaging (`cargo xtask dist`) and its npm packages, installed and run (`cargo xtask npm`, `npm-smoke`), publishing nothing. **PR title is a conventional commit**. |
-| Squash-merge into `main` | reviewer | The PR title becomes the commit. `release` runs: per target it runs the tests, builds and packages the connector; then it attests the assets, attaches them to the `nightly` pre-release, reads them back, verifies them and publishes. release-please opens or updates the **release PR** ("chore(main): release X.Y.Z"). |
+| Open / update a PR | anyone | `ci`: format and Clippy (Linux and macOS), then on every target the tests, the release packaging (`cargo xtask dist`) and its npm packages, installed and run (`cargo xtask npm`, `npm-smoke`); then each archive installed [end to end](#end-to-end) on a fresh runner of its OS; publishing nothing. **PR title is a conventional commit**. |
+| Squash-merge into `main` | reviewer | The PR title becomes the commit. `release` runs: per target it runs the tests, builds and packages the connector, and installs that archive [end to end](#end-to-end); only then it attests the assets, attaches them to the `nightly` pre-release, reads them back, verifies them and publishes. release-please opens or updates the **release PR** ("chore(main): release X.Y.Z"). |
 | Merge the release PR | a maintainer | **This is the release.** release-please tags `vX.Y.Z` and creates a draft GitHub Release whose notes are that version's changelog; `release` runs from the tag, attaches and verifies the assets, and publishes the Release; then it publishes the platform packages to npm and **stages** the launcher `sidevoice`. |
 | Approve the staged `sidevoice` on npmjs.com | a maintainer (2FA) | The version reaches people: `npx sidevoice` installs it (dist-tag `latest`, or `next` for a candidate). |
 
@@ -43,6 +43,29 @@ publish | npm | npm-smoke | npm-publish`):
   person installs them, and runs `npx sidevoice --version --json`: it must be that package's build. It also checks
   the exit status passes through and that another platform gets a clear refusal. CI runs both after `dist` on every
   target. See [npm](#npm-what-is-published-and-how-to-add-a-platform).
+- `cargo xtask e2e <archive>` installs that archive end to end, as a person installs it: see
+  [End to end](#end-to-end).
+
+## End to end
+
+Every archive a run builds is installed for real before that run can publish it (`e2e.yml`, called by `ci.yml` on
+every pull request and by `release.yml` between `dist` and `publish`): on a fresh runner of each target, from the
+`dist-<target>` artifact of the same run, never a published release. `cargo xtask e2e` (`xtask/src/e2e.rs`) installs
+the real Claude Code and Codex CLIs with npm (pinned: `CLAUDE_CODE_VERSION` there, `codex::VERSION`), with no login,
+then checks `install` (both jobs defined and running in this user's service manager, `core.json`, the core's health
+and port, both agents found and left unconnected), `pair-device` (a code), `agents` and `agents connect` for both
+(the registration in each agent's own configuration, naming the installation's command, and working), and
+`uninstall` (no job, definition, process, release or registration left; in the data directory only the locks and the
+stop it keeps on purpose). It changes the machine for real, so it runs only where `CI` is set or `SIDEVOICE_E2E=1`.
+
+What the runners need, and why:
+
+- **Windows** (Task Scheduler): the tasks run as the user with their interactive token, so only while that user is
+  logged on. The hosted runner's user is (the job prints its logon sessions first).
+- **Linux** (the systemd user manager): a runner's user has no login session, so no user manager. The job enables
+  lingering for it and sets the `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` a login session gives; without them
+  the connector falls back to running on demand, which the test refuses (it requires `service: systemd`).
+- **macOS** (launchd): the runner's user is logged in to the GUI, so its `gui/<uid>` domain exists; nothing to do.
 
 ## Linux: the glibc floor
 

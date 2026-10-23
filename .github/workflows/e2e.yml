@@ -1,0 +1,70 @@
+name: e2e
+
+# The archive this very run built (the `dist-<target>` artifact of the calling workflow's packaging job), installed end
+# to end on a fresh runner of each OS as a person installs it: this user's real service manager, the standard data
+# directory, the real Claude Code and Codex CLIs from npm with no login; `install`, `pair-device`, `agents connect`
+# and `uninstall`, and what each must leave (`cargo xtask e2e`, xtask/src/e2e.rs). Called by ci.yml on every pull
+# request and by release.yml before anything is published. RELEASING.md, "End to end".
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit or tag the calling run builds (its xtask runs the test).
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: Install end to end (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: windows-x86_64, runner: windows-2025 }
+          - { target: linux-x86_64, runner: ubuntu-24.04 }
+          - { target: linux-aarch64, runner: ubuntu-24.04-arm }
+          - { target: macos-aarch64, runner: macos-15 }
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: ./.github/actions/setup
+      # The agents' CLIs are installed with this npm, into its global prefix (on the login PATH the connector reads).
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist
+      # A runner's user has no login session, so no systemd user manager: what logging in gives a person
+      # (pam_systemd) is lingering for the user and the session's runtime directory and bus. Nothing else of the
+      # runner is changed; the connector itself only finds the manager there.
+      - name: The user's systemd manager, as a login session has it (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$USER"
+          runtime="/run/user/$(id -u)"
+          for _ in $(seq 1 120); do
+            [ -S "$runtime/bus" ] && break
+            sleep 0.5
+          done
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime/bus" >> "$GITHUB_ENV"
+          XDG_RUNTIME_DIR="$runtime" systemctl --user is-system-running || true
+      # Who runs this job, and in what kind of logon: Task Scheduler runs a task with the user's interactive token
+      # only while that user is logged on (connector/src/platform/service/windows.rs).
+      - name: The runner's logon (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          whoami
+          query user 2>&1 | Out-String | Write-Output
+          Get-CimInstance Win32_LogonSession | Where-Object LogonType -in 2,10,11 | Select-Object LogonId, LogonType, StartTime | Format-Table | Out-String | Write-Output
+      - run: cargo xtask e2e dist/sidevoice-connector-${{ matrix.target }}.tar.zst

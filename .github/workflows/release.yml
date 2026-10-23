@@ -3,7 +3,8 @@ name: release
 # Merging is publishing. Every push to main replaces the `nightly` pre-release; release-please.yml calls this with
 # the vX.Y.Z tag it created. Per target: the tests (against `cargo xtask fixtures`: the pinned core release, Codex), then
 # `cargo xtask dist` (release binary, archive, verified by running the connector from it; on Linux
-# `cargo xtask verify-floor` runs it again on the oldest distribution it supports). Then
+# `cargo xtask verify-floor` runs it again on the oldest distribution it supports), and that archive installed end to
+# end on a fresh runner of its OS (e2e.yml: `cargo xtask e2e`). Then
 # `cargo xtask manifest`, one attestation over every asset, and `cargo xtask publish` (attach, read back, verify,
 # publish); for a vX.Y.Z release, `cargo xtask npm-publish` then puts it on npm. RELEASING.md.
 on:
@@ -60,9 +61,17 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
+  # Each archive installed end to end on a fresh runner of its OS (e2e.yml) before anything is published.
+  e2e:
+    name: e2e
+    needs: dist
+    uses: ./.github/workflows/e2e.yml
+    with:
+      ref: ${{ inputs.tag || github.sha }}
+
   publish:
     name: Manifest, attest, publish
-    needs: dist
+    needs: [dist, e2e]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
