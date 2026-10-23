@@ -210,7 +210,7 @@ fn the_login_service_runs_recovers_stops_and_leaves_nothing_behind() {
         service(&profile, &extra, "status")["state"],
         "stopped-by-person"
     );
-    assert!(!profile.connector_socket().exists());
+    assert!(!endpoint_exists(&profile.connector_endpoint()));
     wait_gone(
         restarted["core"]["pid"].as_u64().unwrap(),
         "the stopped core exited",
@@ -327,7 +327,7 @@ fn the_login_service_runs_recovers_stops_and_leaves_nothing_behind() {
         (Some("stopped-by-person"), Some(false), Some(true)),
         "{still}"
     );
-    assert!(!profile.connector_socket().exists());
+    assert!(!endpoint_exists(&profile.connector_endpoint()));
     ok(&profile, &extra, "start");
     wait_state(&profile, &extra, "running again with login on", |status| {
         status["state"] == "running" && status["start_at_login"] == true
@@ -342,7 +342,7 @@ fn the_login_service_runs_recovers_stops_and_leaves_nothing_behind() {
     for file in &files {
         assert!(!file.exists(), "{} survived uninstall", file.display());
     }
-    assert!(!profile.connector_socket().exists());
+    assert!(!endpoint_exists(&profile.connector_endpoint()));
     // Uninstalling the service removes its jobs, not the installation: the state names that.
     let unserviced = service(&profile, &extra, "status");
     assert_eq!(

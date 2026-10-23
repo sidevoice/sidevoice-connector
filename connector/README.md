@@ -302,7 +302,7 @@ binding ID, it is retained and reported rather than assigned to another conversa
 ## Test bench
 
 `cargo xtask bench` drives this build and the pinned core from a page on loopback, without the desktop app, so that a real Claude Code or Codex session can be talked to by typing. It is a developer tool
-(`src/bench/`, the package's second binary, `sidevoice-bench`), never part of a release.
+(`src/bench/`, the package's second binary, `sidevoice-bench`), never part of a release. It runs on macOS and Linux only (it stands in for a person's login shell with a script, which Windows does not read).
 
 When it starts, the bench:
 

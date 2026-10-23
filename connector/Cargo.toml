@@ -48,9 +48,10 @@ which = "=8.0.6"
 dirs = "7"
 zstd = "0.13"
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
-# This user and the local channel (src/platform: `user`, `ipc`), shared with the core: its `sidevoice-platform`, at the
-# tag of the core release `core.pin` names (the two ship together; move both in one PR).
-sidevoice-platform = { git = "https://github.com/sidevoice/sidevoice-core", tag = "v0.7.0" }
+# This user, the local channel and the stop request (src/platform: `user`, `ipc`; `process`, `lifecycle`), shared
+# with the core: its `sidevoice-platform`, at the tag of the core release `core.pin` names (the two ship together;
+# move both in one PR).
+sidevoice-platform = { git = "https://github.com/sidevoice/sidevoice-core", tag = "v0.8.0" }
 # Records written whole (src/platform/fs): a temporary file beside the record, synced, renamed over it.
 atomic-write-file = "0.3"
 # Canonical paths without the `\\?\` prefix Windows gives `canonicalize` (src/platform/uninstall).
@@ -62,9 +63,16 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 # Third parties' endpoints (src/platform/foreign): the same transport as the local channel, a Unix socket or a named pipe.
 interprocess = { version = "2.4", features = ["tokio"] }
 
+[features]
+# What the integration tests do to files and the program never does (src/platform/fs: `TestFiles`). Enabled for them
+# by the dev-dependency on this crate below; never in a release build.
+test-support = []
+
 [dev-dependencies]
 # Scratch directories in unit tests (src/test_support.rs).
 tempfile = "3"
+# This crate with `test-support`, for the integration tests (tests/).
+sidevoice-connector = { path = ".", features = ["test-support"] }
 
 # Unix: the effective uid (src/platform/service/macos: the launchd domain), with no `unsafe` of ours.
 [target.'cfg(unix)'.dependencies]

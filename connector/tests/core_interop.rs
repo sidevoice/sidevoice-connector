@@ -7,6 +7,7 @@ mod support;
 
 use serde_json::json;
 use serde_json::Value;
+use sidevoice_connector::platform::fs::{Files, Fs};
 use std::time::Duration;
 use support::*;
 
@@ -227,7 +228,6 @@ fn a_conversation_talks_to_the_real_core_through_the_connector() {
 /// user's alone (another user can neither enter the directories nor connect to the sockets).
 #[test]
 fn the_connector_and_core_sockets_are_this_users_alone() {
-    use std::os::unix::fs::PermissionsExt;
     let Some(core) = core_dir() else { return };
     let profile = Profile::new("modes");
     let _core = profile.start_core(&core, "modes-1");
@@ -236,17 +236,21 @@ fn the_connector_and_core_sockets_are_this_users_alone() {
     for path in [
         profile.data(),
         profile.core_data(),
-        profile.connector_socket(),
-        std::path::PathBuf::from(profile.core_endpoint().to_string()),
         profile.data().join("connector.lock"),
     ] {
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(
-            mode & 0o077,
-            0,
-            "{} is open to others: {mode:o}",
-            path.display()
-        );
+        let file = Files::open_read(&path).unwrap();
+        Files::check_private(&file).unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
+    }
+    // A socket is private by its mode, a Unix mechanism; a pipe's access is set when it is made, and the channel's
+    // own tests check it.
+    #[cfg(unix)]
+    for endpoint in [profile.connector_endpoint(), profile.core_endpoint()] {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(endpoint.to_string())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "{endpoint} is open to others: {mode:o}");
     }
 }
 
@@ -607,9 +611,7 @@ fn t07_recovered_attempt_allows_a_new_context_to_play_with_real_core() {
         mcp.stop();
         connector.stop();
         let outbox = profile.data().join("outbox.json");
-        std::fs::write(&outbox, serde_json::to_vec(&json!([original])).unwrap()).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&outbox, std::fs::Permissions::from_mode(0o600)).unwrap();
+        Files::write_private(&outbox, &serde_json::to_vec(&json!([original])).unwrap()).unwrap();
         let _connector = profile.start_connector();
         profile.wait_linked(label);
         let mut command = profile.connector(&["mcp"]);
@@ -1765,7 +1767,6 @@ fn t16_failed_injection_and_pull_expose_identical_real_notice_fields() {
 
 #[test]
 fn t02c_t02d_backlogged_other_conversation_cannot_hide_real_core_refusal() {
-    use std::os::unix::fs::PermissionsExt;
     let Some(core) = core_dir() else { return };
     for (suffix, words) in [("words", Some("New request")), ("empty", None)] {
         let label = format!("backlog-{suffix}");
@@ -1775,8 +1776,7 @@ fn t02c_t02d_backlogged_other_conversation_cannot_hide_real_core_refusal() {
             "event_id":"old-event","utterance_id":"old-utterance","session_id":"old-session",
             "revision":0,"epoch":0,"text":"uncertain earlier work","history_only":false,"attempted":true}]);
         let outbox_path = profile.data().join("outbox.json");
-        std::fs::write(&outbox_path, held.to_string()).unwrap();
-        std::fs::set_permissions(&outbox_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        Files::write_private(&outbox_path, held.to_string().as_bytes()).unwrap();
         let _connector = profile.start_connector();
         profile.wait_linked(&label);
         let call = Presentation::open(&profile.core_endpoint());
@@ -1950,20 +1950,17 @@ fn t02a_late_receipt_follows_real_words_with_related_message_id_in_both_modes() 
 #[allow(clippy::disallowed_types)]
 #[test]
 fn t07_t16_detachable_pull_claim_reaches_the_next_real_ipc_owner() {
+    use sidevoice_connector::platform::ipc::Endpoint;
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
-    use std::path::Path;
 
     struct Ipc {
-        reader: BufReader<UnixStream>,
+        reader: BufReader<LocalStream>,
         serial: u64,
     }
     impl Ipc {
-        fn open(path: &Path) -> Self {
-            let stream = UnixStream::connect(path).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(15)))
-                .unwrap();
+        fn open(endpoint: &Endpoint) -> Self {
+            let mut stream = LocalStream::connect(endpoint).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(15)));
             Self {
                 reader: BufReader::new(stream),
                 serial: 0,
@@ -2000,7 +1997,7 @@ fn t07_t16_detachable_pull_claim_reaches_the_next_real_ipc_owner() {
         "title":"Detached fetch","harness":"http","delivery":{"kind":"none"},
         "capabilities":{"deliver":"unsupported"},
         "detachable":true});
-    let mut first = Ipc::open(&profile.connector_socket());
+    let mut first = Ipc::open(&profile.connector_endpoint());
     let joined = first.call("register", registration.clone());
     assert!(joined["binding_id"].is_string(), "{joined}");
     let selected = core_json(
@@ -2029,7 +2026,7 @@ fn t07_t16_detachable_pull_claim_reaches_the_next_real_ipc_owner() {
     let first_page = first.call("get_messages", json!({"client_ref":"detachable-ref"}));
     assert_eq!(first_page["messages"][0]["message_id"], id, "{first_page}");
     drop(first);
-    let mut next = Ipc::open(&profile.connector_socket());
+    let mut next = Ipc::open(&profile.connector_endpoint());
     let reclaimed = until("detached owner released", 5, || {
         let answer = next.try_call("register", registration.clone());
         (answer["ok"] == true).then(|| answer["result"].clone())

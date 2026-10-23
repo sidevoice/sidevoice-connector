@@ -378,7 +378,9 @@ impl HostAgents {
         }
     }
 
-    pub async fn shutdown(&self) {
+    /// Every operation cancelled at once (each kills its child tree), then waited for until `deadline`; one still
+    /// running then is aborted, which drops its child and with it the tree (`Processes::spawn_tree` kills on drop).
+    pub async fn shutdown_until(&self, deadline: Instant) {
         self.stopping.store(true, Ordering::SeqCst);
         let operations = {
             let mut active = self.operations.lock().await;
@@ -387,9 +389,22 @@ impl HostAgents {
         for operation in &operations {
             operation.cancel.cancel();
         }
-        for operation in operations {
-            let _ = operation.task.await;
+        for mut operation in operations {
+            if tokio::time::timeout_at(deadline, &mut operation.task)
+                .await
+                .is_err()
+            {
+                operation.task.abort();
+                let _ = operation.task.await;
+            }
         }
+    }
+
+    /// [`Self::shutdown_until`] with no deadline worth the name, for tests that wait for every operation to end.
+    #[cfg(test)]
+    pub async fn shutdown(&self) {
+        self.shutdown_until(Instant::now() + StdDuration::from_secs(3600))
+            .await;
     }
 
     async fn run_request(

@@ -6,7 +6,6 @@
 mod support;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Output;
 
 use serde_json::Value;
@@ -104,18 +103,14 @@ fn agents_lists_in_english_or_as_json_and_failures_carry_a_stable_key() {
 #[test]
 fn the_connector_refuses_a_data_directory_others_can_enter() {
     let profile = Profile::new("unsafe");
-    fs::set_permissions(profile.data(), fs::Permissions::from_mode(0o755)).unwrap();
+    Files::let_others_read(&profile.data());
     let output = profile.connector(&["connector"]).output().unwrap();
     assert!(!output.status.success());
     let said = String::from_utf8_lossy(&output.stderr);
     assert!(said.starts_with("sidevoice: "), "{said}");
     assert!(said.contains("unsafe private directory"), "{said}");
-    assert!(!profile.connector_socket().exists());
-    assert_eq!(
-        fs::metadata(profile.data()).unwrap().permissions().mode() & 0o777,
-        0o755,
-        "refused, not repaired"
-    );
+    assert!(!endpoint_exists(&profile.connector_endpoint()));
+    assert!(!is_private(&profile.data()), "refused, not repaired");
     let json = profile
         .connector(&["connector", "--json"])
         .output()
@@ -145,8 +140,8 @@ fn one_connector_serves_a_data_directory_and_its_log_is_private() {
             .filter(|text| text.contains("[sidevoice] Core link: "))
     });
     assert!(!text.contains("rust proof"), "{text}");
-    assert_eq!(fs::metadata(&log).unwrap().permissions().mode() & 0o077, 0);
-    let status = connector_ipc(&profile.connector_socket(), "status").expect("status");
+    assert!(is_private(&log));
+    let status = connector_ipc(&profile.connector_endpoint(), "status").expect("status");
     assert_eq!(status["connected"], false, "{status}");
     assert_eq!(status["core"], Value::Null, "{status}");
 }

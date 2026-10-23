@@ -1,4 +1,5 @@
-//! What the crate's unit tests share.
+//! What the crate's unit tests share. What they do to files (links, programs, access) is the platform's:
+//! `crate::platform::fs::TestFiles`.
 
 /// A scratch directory for one test, removed when dropped (`tempfile`). Under the temporary directory's canonical
 /// path (macOS: `/private/var/...`, not the `/var` link), so paths built from it equal what the code canonicalizes.
@@ -8,17 +9,4 @@ pub(crate) fn temp_dir(label: &str) -> tempfile::TempDir {
         .prefix(&format!("sv-{label}-"))
         .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
         .unwrap()
-}
-
-/// A symbolic link at `link` to `target` (a directory or a file), for tests of what must never be followed. The one
-/// place a test names the OS for it: a link is made differently on each.
-pub(crate) fn symlink(target: &std::path::Path, link: &std::path::Path) {
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(target, link).unwrap();
-    #[cfg(windows)]
-    if target.is_dir() {
-        std::os::windows::fs::symlink_dir(target, link).unwrap();
-    } else {
-        std::os::windows::fs::symlink_file(target, link).unwrap();
-    }
 }

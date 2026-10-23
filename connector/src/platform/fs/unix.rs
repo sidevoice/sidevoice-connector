@@ -98,10 +98,34 @@ fn others(mode: u32) -> Others {
     }
 }
 
-/// Lets group and others change `path` (tests).
-#[cfg(test)]
-pub(super) fn let_others_change(path: &Path) {
+#[cfg(any(test, feature = "test-support"))]
+impl super::TestFiles for Os {
+    fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) {
+        let (target, link) = (target.as_ref(), link.as_ref());
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    fn make_executable(path: &Path) {
+        set_mode(path, |mode| mode | 0o700);
+    }
+
+    fn let_others_read(path: &Path) {
+        set_mode(path, |mode| mode | 0o055);
+    }
+
+    fn let_others_change(path: &Path) {
+        set_mode(path, |mode| mode | 0o077);
+    }
+
+    fn shut_others_out(path: &Path) {
+        set_mode(path, |mode| mode & !0o077);
+    }
+}
+
+/// `path`'s permission bits changed by `change` (tests).
+#[cfg(any(test, feature = "test-support"))]
+fn set_mode(path: &Path, change: impl Fn(u32) -> u32) {
     use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(path).unwrap().mode() | 0o077;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    let mode = fs::metadata(path).unwrap().mode() & 0o7777;
+    fs::set_permissions(path, fs::Permissions::from_mode(change(mode))).unwrap();
 }

@@ -308,7 +308,8 @@ pub trait Removal: Sized {
 mod tests {
     use super::*;
     use crate::platform::env::{Env, Environment};
-    use crate::test_support::{symlink, temp_dir};
+    use crate::platform::fs::{Files, TestFiles};
+    use crate::test_support::temp_dir;
     use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -373,7 +374,7 @@ mod tests {
             "D is where the OS puts it, however deep"
         );
         let layout = roots(&home);
-        symlink(&home, &layout.data);
+        Files::symlink(&home, &layout.data);
         assert!(layout.validate().is_err(), "a root that is a link");
     }
 
@@ -542,8 +543,8 @@ mod tests {
         let (_scratch, layout, removal) = installed("uninstall-links-home");
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("keep"), "untouched").unwrap();
-        symlink(&outside, &layout.data.join("external"));
-        symlink(&outside, &layout.releases.join("current"));
+        Files::symlink(&outside, layout.data.join("external"));
+        Files::symlink(&outside, layout.releases.join("current"));
         fs::write(layout.data.join("remove"), "gone").unwrap();
 
         assert!(removal.preflight().unwrap());
@@ -597,7 +598,7 @@ mod tests {
         assert!(layout.data.join("install.lock").is_file());
         let outside = scratch.path().join("outside");
         fs::write(&outside, "sentinel").unwrap();
-        symlink(&outside, &layout.data.join("agents.lock"));
+        Files::symlink(&outside, layout.data.join("agents.lock"));
         assert!(removal.lock_file("agents.lock").is_err());
         assert_eq!(fs::read(&outside).unwrap(), b"sentinel");
     }
@@ -613,7 +614,7 @@ mod tests {
         let swapped = AtomicBool::new(false);
         let hook = |_: &OsStr| {
             if !swapped.swap(true, Ordering::SeqCst) && fs::rename(&victim, &moved).is_ok() {
-                symlink(&moved, &victim);
+                Files::symlink(&moved, &victim);
             }
         };
         let _ = removal.remove_data_contents(&hook);
@@ -633,7 +634,7 @@ mod tests {
         fs::write(layout.data.join("keep"), "untouched").unwrap();
         let removal = Remover::new(roots(&home)).unwrap();
         fs::rename(&home, &moved).unwrap();
-        symlink(&moved, &home);
+        Files::symlink(&moved, &home);
         assert!(removal.remove_data_contents(&|_| {}).is_err());
         assert_eq!(
             fs::read_to_string(moved.join(DATA).join("keep")).unwrap(),
@@ -664,7 +665,7 @@ mod tests {
             let done = AtomicBool::new(false);
             let hook = |_: &OsStr| {
                 if !done.swap(true, Ordering::SeqCst) && fs::rename(&victim, &moved).is_ok() {
-                    symlink(&target, &victim);
+                    Files::symlink(&target, &victim);
                 }
             };
             let first = removal.remove_data_contents(&hook);

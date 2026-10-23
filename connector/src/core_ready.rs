@@ -52,21 +52,30 @@ pub fn read(path: &Path) -> Result<Ready> {
     Ok(ready)
 }
 
-/// `GET /api/local/health` on the core's local endpoint, within `limit`: the body of its 200.
-pub async fn health(endpoint: &Endpoint, limit: Duration) -> Result<Value> {
+/// One HTTP/1.1 request on the core's local endpoint, within `limit`: the whole response.
+async fn request(endpoint: &Endpoint, text: String, limit: Duration) -> Result<String> {
     let ask = async {
         let mut stream = Channels::connect(endpoint).await?;
-        stream
-            .write_all(
-                b"GET /api/local/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-            )
-            .await?;
+        stream.write_all(text.as_bytes()).await?;
         let mut body = Vec::new();
         stream.take(65536).read_to_end(&mut body).await?;
         anyhow::Ok(body)
     };
-    let response = String::from_utf8(timeout(limit, ask).await??)?;
-    if !response.starts_with("HTTP/1.1 200 ") && !response.starts_with("HTTP/1.0 200 ") {
+    Ok(String::from_utf8(timeout(limit, ask).await??)?)
+}
+
+/// Whether `response` is a `status` answer.
+fn answered(response: &str, status: u16) -> bool {
+    ["HTTP/1.1", "HTTP/1.0"]
+        .iter()
+        .any(|version| response.starts_with(&format!("{version} {status} ")))
+}
+
+/// `GET /api/local/health` on the core's local endpoint, within `limit`: the body of its 200.
+pub async fn health(endpoint: &Endpoint, limit: Duration) -> Result<Value> {
+    let get = "GET /api/local/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let response = request(endpoint, get.to_owned(), limit).await?;
+    if !answered(&response, 200) {
         bail!("Core health refused");
     }
     let (_, payload) = response
@@ -121,20 +130,21 @@ impl Profile {
 #[cfg(test)]
 mod tests {
     use super::{read, require_v3};
+    use crate::platform::fs::{Files, Fs};
     use crate::platform::ipc::{Address, Endpoint};
-    use std::os::unix::fs::PermissionsExt;
 
     /// A newer core's ready file: fields this connector does not know, at the top and nested, and a protocol
     /// number it has never heard of. It is read for what it knows, and v3 is still found among the protocols.
     #[test]
     fn a_ready_file_with_fields_and_protocols_this_connector_does_not_know_is_read() {
         let scratch = crate::test_support::temp_dir("ready");
-        let endpoint = Endpoint::new(scratch.path(), "local").to_string();
-        let path = scratch.path().join("core.json");
+        let dir = scratch.path().join("core");
+        Files::create_private_dir(&dir).unwrap();
+        let endpoint = Endpoint::new(&dir, "local").to_string();
+        let path = dir.join("core.json");
         let ready = serde_json::json!({"pid":42,"launch_id":"launch-1","endpoint":endpoint,"connector_id":"c-1",
             "token":"t","connector_protocols":[3, 4, 1000],"future_field":{"nested":[1, 2]},"listen":"x"});
-        std::fs::write(&path, serde_json::to_vec(&ready).unwrap()).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        Files::write_json(&path, &ready).unwrap();
         let read = read(&path).unwrap();
         assert_eq!((read.pid, read.launch_id.as_str()), (42, "launch-1"));
         assert_eq!(read.connector_protocols, Some(vec![3, 4, 1000]));

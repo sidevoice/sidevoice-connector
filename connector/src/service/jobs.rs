@@ -182,7 +182,7 @@ pub async fn start(
 }
 
 /// The defined jobs stopped, the connector first ([`Service::stop`]); with `disable`, not at the next login either.
-/// The first refusal, or none.
+/// Each manager lets a job leave by itself before it ends it. The first refusal, or none.
 pub async fn unload(
     manager: &impl Service,
     installed: &Installed,

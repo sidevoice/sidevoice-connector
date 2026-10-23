@@ -1,31 +1,27 @@
 //! The IPC over `connector.sock` as a façade of another version speaks it, against the daemon with its real harnesses
 //! (sidevoice/sidevoice-core#112): a route kind this daemon does not know joins the conversation with no route in,
 //! instead of refusing it, and an optional field sent as `null` reads as absent.
-// A façade of another version speaks the wire raw, so it opens the Unix socket itself.
+// A façade of another version speaks the wire raw, so it opens the local endpoint itself.
 #![allow(clippy::disallowed_types)]
 
 mod support;
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use support::*;
 
 /// One façade's connection to the daemon.
 struct Ipc {
-    stream: UnixStream,
-    reader: BufReader<UnixStream>,
+    reader: BufReader<LocalStream>,
     serial: u64,
 }
 
 impl Ipc {
     fn open(profile: &Profile) -> Self {
         let stream =
-            UnixStream::connect(profile.connector_socket()).expect("the connector's socket");
-        let reader = BufReader::new(stream.try_clone().unwrap());
+            LocalStream::connect(&profile.connector_endpoint()).expect("the connector's endpoint");
         Self {
-            stream,
-            reader,
+            reader: BufReader::new(stream),
             serial: 0,
         }
     }
@@ -34,7 +30,7 @@ impl Ipc {
     fn ask(&mut self, method: &str, params: Value) -> Value {
         self.serial += 1;
         let request = json!({"id": self.serial, "method": method, "params": params});
-        writeln!(self.stream, "{request}").unwrap();
+        writeln!(self.reader.get_mut(), "{request}").unwrap();
         let mut line = String::new();
         self.reader.read_line(&mut line).unwrap();
         let answer: Value =

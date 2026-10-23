@@ -15,8 +15,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,7 +24,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use sidevoice_connector::platform::env::{Env as _, Environment};
-use sidevoice_connector::platform::ipc::{Channel, Channels, Endpoint};
+use sidevoice_connector::platform::fs::Fs as _;
+// What the tests do to files (links, programs, access): the platform's `TestFiles`, for `use support::*`.
+pub use sidevoice_connector::platform::fs::{Files, TestFiles};
+use sidevoice_connector::platform::ipc::{Address as _, Channel as _, Channels, Endpoint};
 use sidevoice_connector::platform::process::{Process as _, Processes};
 
 pub const CONNECTOR: &str = env!("CARGO_BIN_EXE_sidevoice-connector");
@@ -69,12 +70,86 @@ pub fn until<T>(what: &str, seconds: u64, mut probe: impl FnMut() -> Option<T>) 
 }
 
 pub fn private_dir(path: &Path) {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
-        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    Files::ensure_private_dir(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+}
+
+/// Where a test profile lives. Unix: `/tmp`, short and canonical (a Unix socket path has a 104-byte limit on macOS,
+/// and the connector compares canonical paths). Elsewhere the temporary directory (a pipe name has no such limit).
+pub fn short_temp_dir() -> PathBuf {
+    let base = if cfg!(unix) {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    base.canonicalize().unwrap()
+}
+
+/// Whether `path` is private to this user, as the connector judges it.
+pub fn is_private(path: &Path) -> bool {
+    Files::open_read(path)
+        .map_err(Into::into)
+        .and_then(|file| Files::check_private(&file))
+        .is_ok()
+}
+
+/// Whether the endpoint exists as the OS shows it: its record is the path of the socket (Unix) or the name of the
+/// pipe (Windows), and a path can be asked about.
+pub fn endpoint_exists(endpoint: &Endpoint) -> bool {
+    Path::new(&endpoint.to_string()).exists()
+}
+
+/// A blocking connection to a local endpoint, for tests that speak a wire raw and line by line: the channel is
+/// async, so it is driven by a runtime of its own.
+pub struct LocalStream {
+    runtime: tokio::runtime::Runtime,
+    stream: sidevoice_connector::platform::ipc::Stream,
+    timeout: Option<Duration>,
+}
+
+impl LocalStream {
+    pub fn connect(endpoint: &Endpoint) -> std::io::Result<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let stream = runtime.block_on(Channels::connect(endpoint))?;
+        Ok(Self {
+            runtime,
+            stream,
+            timeout: None,
+        })
+    }
+
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.timeout = timeout;
+    }
+}
+
+impl Read for LocalStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        use tokio::io::AsyncReadExt;
+        let timeout = self.timeout;
+        let stream = &mut self.stream;
+        self.runtime.block_on(async {
+            match timeout {
+                Some(limit) => tokio::time::timeout(limit, stream.read(buffer))
+                    .await
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?,
+                None => stream.read(buffer).await,
+            }
+        })
+    }
+}
+
+impl Write for LocalStream {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use tokio::io::AsyncWriteExt;
+        self.runtime.block_on(self.stream.write(bytes))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        self.runtime.block_on(self.stream.flush())
+    }
 }
 
 pub fn read_json(path: &Path) -> Option<Value> {
@@ -93,7 +168,7 @@ pub struct Profile {
 impl Profile {
     pub fn new(label: &str) -> Self {
         static SERIAL: AtomicU64 = AtomicU64::new(0);
-        let base = Path::new("/tmp").canonicalize().unwrap().join(format!(
+        let base = short_temp_dir().join(format!(
             "sv{label}-{}-{}",
             std::process::id(),
             SERIAL.fetch_add(1, Ordering::Relaxed)
@@ -136,8 +211,8 @@ impl Profile {
         .endpoint
     }
 
-    pub fn connector_socket(&self) -> PathBuf {
-        self.data().join("connector.sock")
+    pub fn connector_endpoint(&self) -> Endpoint {
+        Endpoint::new(&self.data(), "connector")
     }
 
     /// The environment a process of this profile gets: nothing inherited but `PATH`, so neither the developer's
@@ -213,7 +288,7 @@ impl Profile {
             .expect("start the connector");
         let process = Process(child);
         until("the connector's socket", 30, || {
-            self.connector_socket().exists().then_some(())
+            endpoint_exists(&self.connector_endpoint()).then_some(())
         });
         process
     }
@@ -225,7 +300,7 @@ impl Profile {
             &format!("the connector linked to core {launch_id}"),
             60,
             || {
-                connector_ipc(&self.connector_socket(), "status")
+                connector_ipc(&self.connector_endpoint(), "status")
                     .map(|status| status["core"].clone())
                     .filter(|core| core["launch_id"] == launch_id)
             },
@@ -287,9 +362,9 @@ impl Drop for Process {
 
 /// One request to the connector over its socket (JSON lines `{id, method, params}`): its result, or `None` when the
 /// connector is not there or refused.
-pub fn connector_ipc(socket: &Path, method: &str) -> Option<Value> {
-    let mut stream = UnixStream::connect(socket).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+pub fn connector_ipc(endpoint: &Endpoint, method: &str) -> Option<Value> {
+    let mut stream = LocalStream::connect(endpoint).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)));
     writeln!(
         stream,
         "{}",
@@ -304,7 +379,7 @@ pub fn connector_ipc(socket: &Path, method: &str) -> Option<Value> {
 
 /// One HTTP/1.0 request over the core's local endpoint; returns the status and the JSON body.
 pub fn core_http(
-    socket: &Endpoint,
+    endpoint: &Endpoint,
     method: &str,
     path: &str,
     body: Option<&Value>,
@@ -330,7 +405,7 @@ pub fn core_http(
         .block_on(async {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             tokio::time::timeout(Duration::from_secs(15), async {
-                let mut stream = Channels::connect(socket).await.expect("core endpoint");
+                let mut stream = Channels::connect(endpoint).await.expect("core endpoint");
                 stream.write_all(request.as_bytes()).await.unwrap();
                 let mut response = Vec::new();
                 stream.read_to_end(&mut response).await.unwrap();
@@ -355,13 +430,13 @@ pub fn core_http(
 }
 
 pub fn core_json(
-    socket: &Endpoint,
+    endpoint: &Endpoint,
     method: &str,
     path: &str,
     body: Option<&Value>,
     token: Option<&str>,
 ) -> Value {
-    let (status, value) = core_http(socket, method, path, body, token);
+    let (status, value) = core_http(endpoint, method, path, body, token);
     assert!(status < 400, "{method} {path}: HTTP {status} {value}");
     value
 }
@@ -526,7 +601,7 @@ pub fn http_receiver_with_status(status: u16) -> HttpReceiver {
 pub struct Presentation {
     pub token: String,
     pub session: String,
-    socket: Endpoint,
+    endpoint: Endpoint,
     send: tokio::sync::mpsc::UnboundedSender<Value>,
     frames: Receiver<Value>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -534,9 +609,9 @@ pub struct Presentation {
 }
 
 impl Presentation {
-    pub fn open(socket: &Endpoint) -> Self {
+    pub fn open(endpoint: &Endpoint) -> Self {
         let token = core_json(
-            socket,
+            endpoint,
             "POST",
             "/api/device/local/pair",
             Some(&json!({"name": "connector-test"})),
@@ -545,16 +620,16 @@ impl Presentation {
             .as_str()
             .expect("device token")
             .to_string();
-        Self::open_with_token(socket, token)
+        Self::open_with_token(endpoint, token)
     }
 
-    pub fn open_with_token(socket: &Endpoint, token: String) -> Self {
+    pub fn open_with_token(endpoint: &Endpoint, token: String) -> Self {
         let (session_tx, session_rx) = channel();
         let (frame_tx, frames) = channel();
         let (send, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let socket = socket.clone();
-        let held_socket = socket.clone();
+        let endpoint = endpoint.clone();
+        let held_endpoint = endpoint.clone();
         let protocol_token = token.clone();
         let thread = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -573,7 +648,7 @@ impl Presentation {
                         .parse()
                         .unwrap(),
                 );
-                let stream = Channels::connect(&socket).await.unwrap();
+                let stream = Channels::connect(&endpoint).await.unwrap();
                 let (mut ws, _) = tokio_tungstenite::client_async(request, stream)
                     .await
                     .expect("presentation socket");
@@ -608,7 +683,7 @@ impl Presentation {
         Self {
             token,
             session,
-            socket: held_socket,
+            endpoint: held_endpoint,
             send,
             frames,
             stop: Some(stop),
@@ -642,7 +717,7 @@ impl Presentation {
             "phase":phase,"turn_id":turn_id});
         if phase == "started" {
             let state = core_json(
-                &self.socket,
+                &self.endpoint,
                 "GET",
                 &format!("/api/presentation?session_id={}", self.session),
                 None,
@@ -766,7 +841,8 @@ pub fn kill(pid: u64) -> bool {
     u32::try_from(pid).is_ok_and(|pid| Processes::kill(pid, |_| true))
 }
 
-/// Asks `pid` to leave (`SIGTERM` where the OS has it) and waits up to `grace` for it to go, then stops it at once.
+/// Asks `pid` to leave (`SIGTERM`, or its stop event on Windows) and waits up to `grace` for it to go, then stops it at
+/// once.
 pub fn stop(pid: u32, grace: Duration) {
     tokio::runtime::Builder::new_current_thread()
         .enable_time()

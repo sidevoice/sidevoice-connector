@@ -2,6 +2,8 @@
 //! into a private profile (no service manager), opens a call; a conversation joins through the installation's MCP
 //! server (with an HTTP receiver as its harness); what is typed on the bench is delivered to it; its `voice_say`
 //! reply and the input's receipt show on the bench.
+// The bench runs on macOS and Linux only (src/bench/main.rs).
+#![cfg(unix)]
 
 mod support;
 

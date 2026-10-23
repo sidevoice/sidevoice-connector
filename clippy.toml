@@ -12,6 +12,12 @@ disallowed-methods = [
     { path = "tokio::process::Command::process_group", reason = "use platform::process" },
     { path = "std::os::unix::process::CommandExt::process_group", reason = "use platform::process" },
     { path = "std::os::unix::process::ExitStatusExt::signal", reason = "use platform::process" },
+    { path = "tokio::signal::ctrl_c", reason = "use platform::lifecycle" },
+    { path = "tokio::signal::unix::signal", reason = "use platform::lifecycle", allow-invalid = true },
+    { path = "tokio::signal::windows::ctrl_c", reason = "use platform::lifecycle", allow-invalid = true },
+    { path = "tokio::signal::windows::ctrl_close", reason = "use platform::lifecycle", allow-invalid = true },
+    { path = "tokio::signal::windows::ctrl_logoff", reason = "use platform::lifecycle", allow-invalid = true },
+    { path = "tokio::signal::windows::ctrl_shutdown", reason = "use platform::lifecycle", allow-invalid = true },
 ]
 
 # Local sockets: `platform::ipc` is the only place that opens one (a Unix socket, a named pipe on Windows).

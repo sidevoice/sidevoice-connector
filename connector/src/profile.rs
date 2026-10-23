@@ -340,7 +340,7 @@ impl Profile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use crate::platform::fs::TestFiles;
 
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let pairs: Vec<(String, OsString)> = pairs
@@ -462,7 +462,7 @@ mod tests {
 
         let named = scratch.path().join("beta-home");
         fs::create_dir(&named).unwrap();
-        fs::set_permissions(&named, fs::Permissions::from_mode(0o700)).unwrap();
+        Files::shut_others_out(&named);
         let set = Profile::from_vars(
             vars(&[
                 (Environment::HOME, &home),
@@ -508,18 +508,18 @@ mod tests {
             .collect::<Vec<_>>();
         let (first, second) = (&config[0], &config[1]);
         profile.validate_existing_private().unwrap();
-        fs::set_permissions(&profile.data, fs::Permissions::from_mode(0o750)).unwrap();
+        Files::let_others_change(&profile.data);
         assert!(profile.validate_existing_private().is_err());
-        fs::set_permissions(&profile.data, fs::Permissions::from_mode(0o700)).unwrap();
+        Files::shut_others_out(&profile.data);
 
-        fs::set_permissions(second, fs::Permissions::from_mode(0o777)).unwrap();
+        Files::let_others_change(second);
         assert!(profile.validate_for_agent(second).is_err());
-        fs::set_permissions(second, fs::Permissions::from_mode(0o700)).unwrap();
+        Files::shut_others_out(second);
         profile.validate_for_agent(second).unwrap();
         assert!(profile.validate_for_agent(&profile.home).is_err());
 
         fs::remove_dir(first).unwrap();
-        std::os::unix::fs::symlink(second, first).unwrap();
+        Files::symlink(second, first);
         assert!(profile.validate_existing_private().is_err());
     }
 
@@ -550,7 +550,7 @@ mod tests {
         let marker = profile.data.join("node-stopped.json");
         Files::write_json(&marker, &json!({"at":"now"})).unwrap();
         assert!(profile.service_stopped().unwrap());
-        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
+        Files::let_others_change(&marker);
         assert!(profile.service_stopped().is_err());
     }
 }

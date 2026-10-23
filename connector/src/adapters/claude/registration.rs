@@ -335,6 +335,7 @@ fn inbound_warning(profile: &Profile) -> Option<String> {
 mod tests {
     use super::*;
     use crate::adapters::registration::{CliError, CliOutput};
+    use crate::platform::fs::TestFiles;
     use crate::platform::fs::{Files, Fs};
     use serde_json::json;
 
@@ -445,7 +446,7 @@ mod tests {
         let dotfiles = scratch.path().join("dotfiles");
         Files::ensure_private_dir(&dotfiles).unwrap();
         let target = dotfiles.join(name);
-        crate::test_support::symlink(&target, file);
+        Files::symlink(&target, file);
         target
     }
 
