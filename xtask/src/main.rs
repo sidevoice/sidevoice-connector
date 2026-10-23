@@ -101,10 +101,9 @@ pub(crate) const TARGETS: &[Target] = &[
         npm_os: "win32",
         npm_cpu: "x64",
         exe_suffix: ".exe",
-        // Not released until the pinned core publishes a windows-x86_64 archive (the `sidevoice-platform` tag): with it, `dist` and the
-        // manifest would fail and stop every platform's publication. To enable: set this to `true` and add the
-        // target to the `release.yml` matrix (RELEASING.md, "Windows x64").
-        released: false,
+        // Released since the pinned core (the `sidevoice-platform` tag) publishes a windows-x86_64 archive. Its line
+        // in the `release.yml` matrix goes with this flag (RELEASING.md, "Windows x64").
+        released: true,
     },
 ];
 
