@@ -10,7 +10,7 @@ pub(super) struct Mount {
 }
 
 pub(super) fn mount(fd: RawFd) -> Result<Mount, &'static str> {
-    let stat = super::stat_fd(fd)?;
+    let stat = super::imp::stat_fd(fd)?;
     let mut fs_stat: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstatfs(fd, &mut fs_stat) } != 0 {
         return Err("cannot inspect uninstall mount");

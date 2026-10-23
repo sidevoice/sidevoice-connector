@@ -10,7 +10,7 @@ pub(super) struct Mount {
 }
 
 pub(super) fn mount(fd: RawFd) -> Result<Mount, &'static str> {
-    let stat = super::stat_fd(fd)?;
+    let stat = super::imp::stat_fd(fd)?;
     let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
         .map_err(|_| "cannot inspect uninstall mount")?;
     let id = info

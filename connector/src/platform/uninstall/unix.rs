@@ -15,16 +15,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
-#[cfg(target_os = "linux")]
-#[path = "unix/linux.rs"]
-mod linux;
-#[cfg(target_os = "macos")]
-#[path = "unix/macos.rs"]
-mod macos;
-#[cfg(target_os = "linux")]
-use linux::{mount, open_entry, Mount};
-#[cfg(target_os = "macos")]
-use macos::{mount, open_entry, Mount};
+use super::os::{mount, open_entry, Mount};
 
 /// Whether this user owns what `fd` is (`platform::user`).
 fn ours(fd: RawFd) -> Result<bool, &'static str> {
@@ -37,7 +28,7 @@ fn ours(fd: RawFd) -> Result<bool, &'static str> {
         .map_err(|_| "cannot read uninstall owner")
 }
 
-fn stat_fd(fd: RawFd) -> Result<libc::stat, &'static str> {
+pub(super) fn stat_fd(fd: RawFd) -> Result<libc::stat, &'static str> {
     let mut stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut stat) } == 0 {
         Ok(stat)

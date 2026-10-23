@@ -47,6 +47,14 @@ mod imp;
 #[cfg(windows)]
 #[path = "uninstall/windows.rs"]
 mod imp;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+use linux as os;
+#[cfg(target_os = "macos")]
+use macos as os;
 
 pub use imp::Os as Remover;
 
