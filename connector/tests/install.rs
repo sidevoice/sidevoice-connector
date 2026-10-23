@@ -93,6 +93,7 @@ impl Drop for Teardown<'_> {
         // The uninstall below removes the logs the failure needs.
         if std::thread::panicking() {
             eprintln!("{}", self.0.log_tail());
+            eprintln!("{}", tree(&self.0.data(), 4));
         }
         let _ = self
             .0
@@ -236,4 +237,18 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
     }
     assert!(left.contains(&"node-stopped.json".to_owned()), "{left:?}");
     fs::remove_dir_all(&at).unwrap();
+}
+
+/// Every file below `dir` with its size, for a failure's message.
+fn tree(dir: &Path, depth: usize) -> String {
+    let mut out = String::new();
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+        out.push_str(&format!("{} ({size})\n", path.display()));
+        if depth > 0 && path.is_dir() {
+            out.push_str(&tree(&path, depth - 1));
+        }
+    }
+    out
 }

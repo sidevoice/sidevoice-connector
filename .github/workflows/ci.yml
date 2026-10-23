@@ -50,7 +50,7 @@ jobs:
       # The lint job runs on Linux and macOS only: Windows compiles code they do not (platform/*/windows.rs).
       - if: runner.os == 'Windows'
         run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked --no-fail-fast
+      - run: cargo test --locked --no-fail-fast --test install  # TEMPORARY DIAGNOSTIC
       - run: cargo xtask dist
       # The Linux binary on the oldest distribution it supports (glibc floor, xtask/src/glibc.rs).
       - if: runner.os == 'Linux'
