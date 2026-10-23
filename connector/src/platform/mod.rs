@@ -10,6 +10,7 @@
 pub mod env;
 pub mod foreign;
 pub mod fs;
+pub mod lifecycle;
 pub mod process;
 pub mod service;
 pub mod uninstall;

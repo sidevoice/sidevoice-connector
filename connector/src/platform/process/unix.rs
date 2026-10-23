@@ -9,6 +9,10 @@ use tokio::process::Command;
 pub struct Os;
 
 impl super::Process for Os {
+    fn asks_to_leave() -> bool {
+        true
+    }
+
     // A group of its own is also what detaches it: a ^C or a hangup aimed at the caller's group misses it.
     fn detached(command: Command) -> CommandWrap {
         Self::tree(command)

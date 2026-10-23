@@ -5,6 +5,7 @@ use crate::adapters::Registry;
 use crate::link::Link;
 use crate::platform::fs::{Files, Fs};
 use crate::platform::ipc::{Channel, Channels};
+use crate::platform::lifecycle::{Lifecycle, Lifecycles};
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -94,7 +95,8 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     );
     idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut link_exited = false;
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let stop_requested = Lifecycles::stop_requests()?;
+    tokio::pin!(stop_requested);
     loop {
         tokio::select! {
             Some(result) = replay_tasks.join_next(), if !replay_tasks.is_empty() => {
@@ -182,8 +184,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
                     }
                 });
             }
-            _ = tokio::signal::ctrl_c() => { break; }
-            _ = terminate.recv() => { break; }
+            () = &mut stop_requested => { break; }
             _ = shutdown_rx.changed() => { break; }
             _ = idle_check.tick(), if !managed => {
                 let activity = daemon.activity_generation.load(Ordering::Relaxed);

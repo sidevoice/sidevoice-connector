@@ -121,11 +121,23 @@ pub fn core_processes(layout: &Layout) -> Vec<u32> {
 }
 
 /// Stop a core of this data directory and wait until it has gone: asked to leave, the grace period, then killed;
-/// each only while it is provably that core.
+/// each only while it is provably that core. The request is the OS's standard one (decision "Graceful stop",
+/// 2026-10-22): `stop`'s own where the OS has one (`SIGTERM`), else, in band, `POST /api/local/shutdown` on the
+/// endpoint the core's ready file names, while that file names this core.
 pub async fn terminate_core(layout: &Layout, pid: u32, grace: Duration) {
-    // TODO(sidevoice/sidevoice-core#165): ask the core to leave in band first, over its endpoint, once the core has
-    // that shutdown method. On Windows it is the only request there is (decision "Graceful stop", 2026-10-22):
-    // until then `stop` there waits the grace and kills. Its method and fields are core#165's to define.
+    if !Processes::asks_to_leave() {
+        if let Some(ready) = read_ready(layout).filter(|ready| ready.pid == pid) {
+            if core_running(layout, pid) {
+                if let Err(error) =
+                    crate::core_ready::shutdown(&ready, Duration::from_secs(2)).await
+                {
+                    crate::logfile::log(&format!(
+                        "could not ask the core (pid {pid}) to leave: {error}"
+                    ));
+                }
+            }
+        }
+    }
     if Processes::stop(pid, |found| is_our_core(layout, &found.command), grace).await {
         crate::logfile::log(&format!(
             "the core (pid {pid}) did not leave by itself: killed it"

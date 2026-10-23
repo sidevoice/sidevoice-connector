@@ -16,9 +16,9 @@
 //!
 //! Stopping is one operation, [`Process::stop`]: ask the process to leave, give it the grace time, then kill it.
 //! The request is the OS's standard one (decision "Graceful stop", 2026-10-22): `SIGTERM` on Unix; on Windows a
-//! shutdown request over the local channel, which arrives with that channel (connector#222, core#165) and is the
-//! caller's to make, in band, before `stop`. So on Windows this layer sends nothing: it waits the grace time, then
-//! kills.
+//! shutdown request over the local channel, which is the caller's to make, in band, before `stop` (for the core,
+//! `core_ready::shutdown`). [`Process::asks_to_leave`] says which of the two this OS is: where it is false, this
+//! layer sends nothing, it waits the grace time (for the request the caller made), then kills.
 
 #[cfg(unix)]
 #[path = "process/unix.rs"]
@@ -39,7 +39,7 @@ use std::time::Duration;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, Uid, UpdateKind};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 
-/// What every OS implements ([`Processes`], in `process/unix.rs` and `process/windows.rs`): the three required
+/// What every OS implements ([`Processes`], in `process/unix.rs` and `process/windows.rs`): the four required
 /// methods. The rest is one body for every OS; an OS overrides it only if it must.
 pub trait Process {
     /// `command` set to outlive its caller: its own process group (Unix), no console and its own group
@@ -55,6 +55,11 @@ pub trait Process {
     /// chat lookup waits for its agent's chat roots to be measured); another error when the OS shows nothing (no
     /// `/proc` and no `lsof`).
     fn open_files(pid: u32) -> io::Result<Vec<PathBuf>>;
+
+    /// Whether [`Process::stop`] itself asks a process to leave: `true` on Unix (`SIGTERM`), `false` on Windows, which
+    /// has no request to send a process that has no console. Where it is `false` a caller that wants the process to
+    /// leave by itself asks in band, over the process's local channel, before `stop`.
+    fn asks_to_leave() -> bool;
 
     /// Starts `command` so that it outlives this process and its terminal. The caller owns stdio and the
     /// environment.
@@ -82,8 +87,8 @@ pub trait Process {
         with_verified(pid, is_it, |_| true)
     }
 
-    /// Stops `pid`, only while it is this user's and `is_it` recognises it: asks it to leave (`SIGTERM`; Windows has
-    /// no request at this layer, see the module), waits up to `grace` for it to go (also for a request the caller
+    /// Stops `pid`, only while it is this user's and `is_it` recognises it: asks it to leave (`SIGTERM`; nothing where
+    /// [`Process::asks_to_leave`] is false, see the module), waits up to `grace` for it to go (also for a request the caller
     /// already made in band), then kills it and waits up to 5 s more. Returns whether it had to be killed.
     fn stop(
         pid: u32,

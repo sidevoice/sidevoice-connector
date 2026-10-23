@@ -13,6 +13,10 @@ use windows::Win32::System::Threading::{
 pub struct Os;
 
 impl super::Process for Os {
+    fn asks_to_leave() -> bool {
+        false
+    }
+
     // Not `CREATE_BREAKAWAY_FROM_JOB`: it is refused (access denied) when the caller's job does not allow breakaway.
     fn detached(command: Command) -> CommandWrap {
         let mut wrap = CommandWrap::from(command);
