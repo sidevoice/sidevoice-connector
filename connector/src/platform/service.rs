@@ -415,16 +415,31 @@ async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> Vec<u8>
     kept
 }
 
-/// Runs a manager's own command, with no shell; never fails, never outlives its deadline.
+/// How long the output of a manager's command is awaited once the command itself has exited: a descendant that
+/// keeps the pipes open does not hold the caller.
+const PIPE_GRACE: Duration = Duration::from_secs(2);
+
+/// Aborts its tasks when dropped, so a cancelled call leaves no reader behind.
+struct Readers(Vec<tokio::task::AbortHandle>);
+
+impl Drop for Readers {
+    fn drop(&mut self) {
+        for reader in &self.0 {
+            reader.abort();
+        }
+    }
+}
+
+/// Runs a manager's own command, with no shell; never fails, never outlives its deadline (the command, its output and
+/// everything it started: the tree is killed with it, also when the call is dropped).
 async fn command(program: &str, args: &[&str]) -> Output {
-    let spawned = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn();
-    let mut child = match spawned {
+        .stderr(Stdio::piped());
+    let mut child = match Processes::spawn_tree(command).await {
         Ok(child) => child,
         Err(error) => {
             return Output {
@@ -434,19 +449,21 @@ async fn command(program: &str, args: &[&str]) -> Output {
             }
         }
     };
-    let stdout = tokio::spawn(read_bounded(child.stdout.take().expect("piped stdout")));
-    let stderr = tokio::spawn(read_bounded(child.stderr.take().expect("piped stderr")));
+    let stdout = tokio::spawn(read_bounded(child.stdout().expect("piped stdout")));
+    let stderr = tokio::spawn(read_bounded(child.stderr().expect("piped stderr")));
+    let _readers = Readers(vec![stdout.abort_handle(), stderr.abort_handle()]);
     let status = match timeout(MANAGER_LIMIT, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
+            child.kill_tree().await;
             return Output {
                 ok: false,
                 code: None,
                 output: format!("{program}: {error}"),
-            }
+            };
         }
         Err(_) => {
-            let _ = child.kill().await;
+            child.kill_tree().await;
             return Output {
                 ok: false,
                 code: None,
@@ -454,8 +471,21 @@ async fn command(program: &str, args: &[&str]) -> Output {
             };
         }
     };
-    let mut output = stdout.await.unwrap_or_default();
-    output.extend(stderr.await.unwrap_or_default());
+    let collected = timeout(PIPE_GRACE, async {
+        let mut output = stdout.await.unwrap_or_default();
+        output.extend(stderr.await.unwrap_or_default());
+        output
+    })
+    .await;
+    // Whatever the command left running goes with it.
+    child.kill_tree().await;
+    let Ok(output) = collected else {
+        return Output {
+            ok: status.success(),
+            code: status.code(),
+            output: format!("{program}: its output did not end"),
+        };
+    };
     Output {
         ok: status.success(),
         code: status.code(),
@@ -523,6 +553,17 @@ fn write_definition(file: &Path, text: &str) -> Result<bool, Refusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A manager command that exits while a descendant keeps its pipes open is answered within the grace, not when
+    /// the descendant ends. (Unix only: it needs a shell to leave a descendant behind.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_whose_descendant_holds_its_pipes_is_not_waited_for() {
+        let started = tokio::time::Instant::now();
+        let out = command("sh", &["-c", "sleep 30 & exit 0"]).await;
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(out.ok);
+    }
+
     #[test]
     fn a_diagnosis_reads_as_the_job_its_manager_and_how_it_last_ended() {
         let said = |job: JobState| {

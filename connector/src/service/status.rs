@@ -192,16 +192,7 @@ pub async fn serving(layout: &Layout, limit: Duration) -> Option<(Ready, Value)>
 
 /// The last lines of the core's log, for a failure a person reads.
 pub fn log_tail(layout: &Layout, lines: usize) -> Vec<String> {
-    tail_of(&layout.core_log(), lines)
-}
-
-/// The last lines of what the service appends of the core's stdout and stderr.
-pub fn output_tail(layout: &Layout, lines: usize) -> Vec<String> {
-    tail_of(&layout.core_output(), lines)
-}
-
-fn tail_of(path: &std::path::Path, lines: usize) -> Vec<String> {
-    let Ok(mut file) = fs::File::open(path) else {
+    let Ok(mut file) = fs::File::open(layout.core_log()) else {
         return Vec::new();
     };
     let length = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);

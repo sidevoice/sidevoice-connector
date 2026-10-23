@@ -73,6 +73,8 @@ pub fn binary() -> String {
 const VERIFY_LIMIT: Duration = Duration::from_secs(60);
 /// How long to wait between looks at the pair.
 const POLL_PAUSE: Duration = Duration::from_millis(250);
+/// How long the service's own account of the job may take once the wait is over.
+const DIAGNOSIS_LIMIT: Duration = Duration::from_secs(10);
 
 /// What one look at the pair found.
 enum Poll {
@@ -118,38 +120,33 @@ where
 struct Waited {
     /// The core's ready file.
     ready: PathBuf,
-    /// Where the service appends the core's output.
+    /// Where the service appends the core's output. Its lines are never copied into an error: they may hold
+    /// credentials, so the error names the file.
     output: PathBuf,
-    /// The last lines of that output, if there are any.
-    tail: Vec<String>,
 }
 
-/// The failure of a wait that reached `limit`: what was awaited, the service's own account of the job
-/// (`Diagnosis`), where the core's output is with its last lines, and what to run next.
+/// The failure of a wait that reached `limit`: what was awaited, the last state seen and which component was still
+/// not ready, the service's own account of the job (`Diagnosis`), where the core's output is, and what to run next.
 fn timeout_failure(limit: Duration, waited: &Waited, service: &str, last: Option<&Value>) -> Value {
-    let tail = if waited.tail.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\nIts last lines:\n{}",
-            waited
-                .tail
-                .iter()
-                .map(|line| format!("    {line}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
+    let seen = match last {
+        None => " No look at the service finished.".to_owned(),
+        Some(last) => {
+            let text = |pointer: &str| last.pointer(pointer).and_then(Value::as_str);
+            format!(
+                " Last seen: state {}{}; still waiting for {}.",
+                text("/state").unwrap_or("unknown"),
+                text("/failure/message")
+                    .map(|message| format!(" ({message})"))
+                    .unwrap_or_default(),
+                text("/waiting_for").unwrap_or("the pair"),
+            )
+        }
     };
-    let seen = last
-        .and_then(|state| state.pointer("/failure/message"))
-        .and_then(Value::as_str)
-        .map(|message| format!(" Last seen: {message}"))
-        .unwrap_or_default();
     json!({"key": "ready.timeout", "step": "ready",
         "message": crate::messages::message("install.not-ready", &json!({
             "seconds": limit.as_secs(), "ready": waited.ready, "service": service,
-            "seen": seen, "output": waited.output, "tail": tail})),
-        "service": service, "output_log": waited.output, "log_tail": waited.tail})
+            "seen": seen, "output": waited.output})),
+        "service": service, "output_log": waited.output})
 }
 
 /// What `uninstall` leaves in `D`: the lock files, the stop, and `Models` (named by `sidevoice-platform`). The shared models
@@ -513,24 +510,29 @@ impl Runtime {
                 let binary_ref = &binary;
                 let before_ref = before.as_ref();
                 let poll = || async move {
+                    let mut waiting = "the core (no ready file with a health answer)";
                     if let Some((ready, _)) =
                         status::serving(layout_ref, Duration::from_millis(1500)).await
                     {
-                        if Some(&ready.launch_id) != before_ref
-                            && runs_release(layout_ref, binary_ref).await
-                            && launcher::ask_connector(
-                                layout_ref,
-                                "node.status",
-                                json!({}),
-                                Duration::from_secs(5),
-                            )
-                            .await
-                            .is_some()
+                        if Some(&ready.launch_id) == before_ref {
+                            waiting = "a new core launch (the previous one still answers)";
+                        } else if !runs_release(layout_ref, binary_ref).await {
+                            waiting = "the connector (not answering as this release)";
+                        } else if launcher::ask_connector(
+                            layout_ref,
+                            "node.status",
+                            json!({}),
+                            Duration::from_secs(5),
+                        )
+                        .await
+                        .is_none()
                         {
+                            waiting = "the connector (node.status unanswered)";
+                        } else {
                             return Poll::Ready;
                         }
                     }
-                    let now = if kind == Kind::None {
+                    let mut now = if kind == Kind::None {
                         // No job: what the core said about a failed start is the state.
                         match status::read_failure(layout_ref, &crate::logfile::timestamp()) {
                             Some(failure) => json!({"state": "failed", "failure": failure}),
@@ -548,17 +550,22 @@ impl Runtime {
                                 .unwrap_or_else(|| json!({"key": state})),
                         );
                     }
+                    now["waiting_for"] = json!(waiting);
                     Poll::Waiting(now)
                 };
                 match wait_until(VERIFY_LIMIT, POLL_PAUSE, poll).await {
                     Ok(()) => Ok(()),
                     Err(Wait::Failed(failure)) => Err(failure),
                     Err(Wait::TimedOut(last)) => {
+                        // The diagnosis is bounded on its own: the error and the rollback come whatever it does.
                         let service = match kind {
-                            Kind::Manager => crate::service::jobs::manager(layout)
-                                .diagnose(Job::Core.id())
-                                .await
-                                .to_string(),
+                            Kind::Manager => timeout(
+                                DIAGNOSIS_LIMIT,
+                                crate::service::jobs::manager(layout).diagnose(Job::Core.id()),
+                            )
+                            .await
+                            .map(|diagnosis| diagnosis.to_string())
+                            .unwrap_or_else(|_| "diagnosis unavailable (timed out)".to_owned()),
                             Kind::None => {
                                 "No service manager runs it here: it is started on demand"
                                     .to_owned()
@@ -569,7 +576,6 @@ impl Runtime {
                             &Waited {
                                 ready: layout.core_ready(),
                                 output: layout.core_output(),
-                                tail: status::output_tail(layout, 5),
                             },
                             &service,
                             last.as_ref(),
@@ -1510,9 +1516,9 @@ pub(crate) mod tests {
         let waited = Waited {
             ready: PathBuf::from("/d/core/core.json"),
             output: PathBuf::from("/d/core.stderr.log"),
-            tail: vec!["error: bad job".into(), "exit".into()],
         };
-        let last = json!({"state": "failed", "failure": {"message": "The core exited (2)."}});
+        let last = json!({"state": "failed", "waiting_for": "the connector (node.status unanswered)",
+            "failure": {"message": "The core exited (2)."}});
         let failure = timeout_failure(
             Duration::from_secs(60),
             &waited,
@@ -1524,24 +1530,29 @@ pub(crate) mod tests {
         for part in [
             "within 60 s",
             "/d/core/core.json",
-            "Last seen: The core exited (2).",
+            "Last seen: state failed (The core exited (2).); still waiting for the connector (node.status unanswered).",
             "task-scheduler job sidevoice-core-a: loaded, not running, state Ready, last exit 2",
             "/d/core.stderr.log",
-            "    error: bad job\n    exit",
             "Next: run `npx sidevoice service status`.",
         ] {
             assert!(text.contains(part), "{part} missing in {text}");
         }
-        let bare = timeout_failure(
-            Duration::from_secs(60),
-            &Waited {
-                tail: vec![],
-                ..waited
-            },
-            "x",
-            None,
+        // A state with no failure still says what was seen; no look at all says that.
+        let starting = json!({"state": "starting", "waiting_for": "the core (no ready file with a health answer)"});
+        let text = timeout_failure(Duration::from_secs(60), &waited, "x", Some(&starting))
+            ["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            text.contains("state starting; still waiting for the core"),
+            "{text}"
         );
-        assert!(!bare["message"].as_str().unwrap().contains("last lines"));
+        let text = timeout_failure(Duration::from_secs(60), &waited, "x", None)["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(text.contains("No look at the service finished."), "{text}");
     }
 
     #[tokio::test]
