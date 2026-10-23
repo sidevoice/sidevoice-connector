@@ -273,6 +273,12 @@ mod tests {
         let stopped = Environment::in_sequence(&[&line("fails"), &line("marks")]);
         Environment::hand_shell(&stopped).status().unwrap();
         assert!(!marker.exists(), "{stopped}");
+        let middle = Environment::in_sequence(&[&line("ok"), &line("fails"), &line("marks")]);
+        Environment::hand_shell(&middle).status().unwrap();
+        assert!(
+            !marker.exists(),
+            "a failure in the middle stops the rest: {middle}"
+        );
 
         let ran = Environment::in_sequence(&[&line("ok"), &line("ok"), &line("marks")]);
         assert!(
