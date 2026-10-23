@@ -22,13 +22,20 @@ use windows::Win32::System::Threading::{
 /// affected. Nothing maintained covers it (`std`'s handle list is unstable): own `unsafe`, three calls.
 fn keep_own_stdio_out() {
     for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-        // SAFETY: `GetStdHandle` returns this process's handle or none; only the inherit flag of that handle changes,
-        // and a failure (a console, no handle) is the same as having nothing to close.
-        unsafe {
+        // SAFETY: `GetStdHandle` returns this process's handle or none (skipped: nothing to close); only the inherit flag
+        // of that handle changes.
+        let failed = unsafe {
             let handle = GetStdHandle(which);
-            if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
-                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
-            }
+            !handle.is_null()
+                && handle != INVALID_HANDLE_VALUE
+                && SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) == 0
+        };
+        // The spawn goes on (the process must start), but the pipe may then be held open: said in the log, not hidden.
+        if failed {
+            crate::logfile::log(&format!(
+                "could not make a standard handle non-inheritable; a detached process may hold it open: {}",
+                io::Error::last_os_error()
+            ));
         }
     }
 }

@@ -92,8 +92,9 @@ pub struct Roots {
     pub standard: Option<PathBuf>,
     /// The names in `D` that an uninstall leaves (its permanent lock files and the stop).
     pub kept: &'static [&'static str],
-    /// This user's home directory; `None` when it is not known, and then nothing is removed.
-    pub home: Option<PathBuf>,
+    /// Every home directory the code knows: the profile's (`HOME`, `USERPROFILE`) and the OS's, which differ on Windows
+    /// (the Known Folder). `D` may be none of them nor a directory one is in; none known, and nothing is removed.
+    pub homes: Vec<PathBuf>,
 }
 
 /// What `D` is to a removal, as [`Removal::ownership`] finds it. Anything that is not ours is refused instead.
@@ -152,19 +153,20 @@ impl Roots {
     fn check_below_home(&self) -> Result<(), &'static str> {
         const REFUSED: &str =
             "uninstall refused: the data directory is the home directory or a directory it is in";
-        let home = self
-            .home
-            .as_deref()
-            .ok_or("uninstall refused: this user's home directory is not known")?;
-        if dunce::simplified(home).starts_with(dunce::simplified(&self.data)) {
-            return Err(REFUSED);
+        if self.homes.is_empty() {
+            return Err("uninstall refused: this user's home directory is not known");
         }
-        if let (Ok(home), Ok(data)) = (
-            std::fs::canonicalize(home),
-            std::fs::canonicalize(&self.data),
-        ) {
-            if dunce::simplified(&home).starts_with(dunce::simplified(&data)) {
+        for home in &self.homes {
+            if dunce::simplified(home).starts_with(dunce::simplified(&self.data)) {
                 return Err(REFUSED);
+            }
+            if let (Ok(home), Ok(data)) = (
+                std::fs::canonicalize(home),
+                std::fs::canonicalize(&self.data),
+            ) {
+                if dunce::simplified(&home).starts_with(dunce::simplified(&data)) {
+                    return Err(REFUSED);
+                }
             }
         }
         Ok(())
@@ -347,7 +349,11 @@ mod tests {
             data,
             standard: Some(standard.to_path_buf()),
             kept: KEPT,
-            home: standard.parent().map(Path::to_path_buf),
+            homes: standard
+                .parent()
+                .map(Path::to_path_buf)
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -500,11 +506,23 @@ mod tests {
             assert!(Remover::new(layout).is_err(), "{}", data.display());
         }
         let mut unknown = at(home.join("custom"), &standard);
-        unknown.home = None;
+        unknown.homes.clear();
         assert!(Remover::new(unknown).is_err(), "an unknown home");
         let mut spelled = at(home.clone(), &standard);
-        spelled.home = Some(fs::canonicalize(&home).unwrap().join("."));
+        spelled.homes = vec![fs::canonicalize(&home).unwrap().join(".")];
         assert!(Remover::new(spelled).is_err(), "the home written otherwise");
+        // The profile's home and the OS's are two places on Windows: either one is protected, whichever the data
+        // directory is compared with.
+        let elsewhere = scratch.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        for homes in [
+            vec![home.clone(), elsewhere.clone()],
+            vec![elsewhere.clone(), home.clone()],
+        ] {
+            let mut mismatch = at(home.clone(), &standard);
+            mismatch.homes = homes;
+            assert!(Remover::new(mismatch).is_err(), "one of two homes");
+        }
         assert_eq!(fs::read_to_string(home.join("entry")).unwrap(), "theirs");
     }
 

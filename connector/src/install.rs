@@ -994,7 +994,10 @@ fn removal_roots(layout: &Layout) -> Roots {
         data: layout.data.clone(),
         releases: layout.releases.clone(),
         kept: KEPT,
-        home: dirs::home_dir(),
+        // The profile's home and the OS's: the same on Unix, two places on Windows (`USERPROFILE`, the Known Folder).
+        homes: std::iter::once(layout.home.clone())
+            .chain(dirs::home_dir())
+            .collect(),
     }
 }
 
