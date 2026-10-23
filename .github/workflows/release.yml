@@ -48,11 +48,7 @@ jobs:
           ref: ${{ inputs.tag || github.sha }}
       - uses: ./.github/actions/setup
       - run: cargo xtask fixtures
-      # TEMPORARY (sidevoice-connector#116, block W1): the unit tests do not pass on Windows yet, so the Windows job
-      # does not run them; it still builds, packages and verifies the archive below (which starts the real binary).
-      # The `Test (windows-x86_64)` job of ci.yml keeps running them. Remove this condition when W1 is green.
-      - if: matrix.target != 'windows-x86_64'
-        run: cargo test --locked
+      - run: cargo test --locked
       - run: cargo xtask dist
       # The Linux binary on the oldest distribution it supports (glibc floor, xtask/src/glibc.rs).
       - if: runner.os == 'Linux'
