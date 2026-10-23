@@ -372,7 +372,7 @@ mod tests {
     fn a_program_outside_path_is_trusted_only_when_nobody_else_can_change_it_or_the_way_to_it() {
         let scratch = crate::test_support::temp_dir("env-trust");
         let root = scratch.path();
-        let program = program_under(root, "a/b/tool");
+        let program = program_under(root, &format!("a/b/tool{}", std::env::consts::EXE_SUFFIX));
         assert_eq!(
             Environment::trusted_program(&program, root),
             Ok(program.clone())
@@ -385,7 +385,10 @@ mod tests {
         let other = crate::test_support::temp_dir("env-trust-other");
         assert!(Environment::trusted_program(&program, other.path()).is_err());
         assert!(Environment::trusted_program(&root.join("none"), root).is_err());
-        let outside = program_under(other.path(), "x/tool");
+        let outside = program_under(
+            other.path(),
+            &format!("x/tool{}", std::env::consts::EXE_SUFFIX),
+        );
         let escape = root.join("escape");
         Files::symlink(&outside, &escape);
         assert!(

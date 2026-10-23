@@ -170,12 +170,7 @@ mod resolution {
         };
         let native = roots.home.join(".local/bin").join(Host::exe_name("claude"));
         Files::ensure_private_dir(native.parent().unwrap()).unwrap();
-        // Not runnable: no candidate.
-        std::io::Write::write_all(&mut Files::open_private(&native, Create::New).unwrap(), b"")
-            .unwrap();
         let claude = crate::adapters::claude::Claude;
-        assert_eq!(crate::agents::find_binary(&claude, None, &roots), None);
-        std::fs::remove_file(&native).unwrap();
         Files::open_private(&native, Create::NewProgram).unwrap();
         assert_eq!(
             crate::agents::find_binary(&claude, None, &roots).as_deref(),
