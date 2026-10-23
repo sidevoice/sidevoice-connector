@@ -17,7 +17,7 @@ async fn command_output_limit_reports_truncation_instead_of_parsing_prefix() {
 }
 
 #[tokio::test]
-async fn failed_watched_capture_hides_all_agents_and_recovery_reconciles_all() {
+async fn failed_watched_capture_keeps_the_last_scan_and_recovery_reconciles_all() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
     let _no_cursor_override = EnvGuard::set("SIDEVOICE_CURSOR_BIN", std::ffi::OsStr::new(""));
@@ -47,23 +47,107 @@ async fn failed_watched_capture_hides_all_agents_and_recovery_reconciles_all() {
     assert!(listed_ids(&first).contains(&"cursor".into()), "{first}");
     private_write(&shell, b"#!/bin/sh\nexit 1\n");
     let failed = host.handle("agents.list", json!({"watch":"cursor"})).await;
-    assert!(listed_ids(&failed).is_empty(), "{failed}");
+    assert_eq!(failed["scan_failed"], true, "{failed}");
+    assert_eq!(listed_ids(&failed), listed_ids(&first), "{failed}");
     let cached = host.handle("agents.list", json!({})).await;
-    assert!(listed_ids(&cached).is_empty(), "{cached}");
+    assert_eq!(cached["scan_failed"], true, "{cached}");
+    assert!(cached["scanned_at"].is_string(), "{cached}");
+    assert_eq!(listed_ids(&cached), listed_ids(&first), "{cached}");
     private_write(
         &shell,
         format!("#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' '{}'\n", bin.display()).as_bytes(),
     );
     Files::make_executable(&shell);
+    // What is installed changed while the capture was failing: recovery must look at every agent again.
+    fs::remove_file(bin.join("claude")).unwrap();
     let recovered = host.handle("agents.list", json!({"watch":"cursor"})).await;
     assert!(
-        listed_ids(&recovered).contains(&"claude".into()),
+        !listed_ids(&recovered).contains(&"claude".into()),
         "{recovered}"
     );
     assert!(
         listed_ids(&recovered).contains(&"cursor".into()),
         "{recovered}"
     );
+    assert_eq!(recovered["scan_failed"], false, "{recovered}");
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn actions_refuse_while_the_last_scan_failed_instead_of_trusting_the_cache() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let bin = fixture.root.join("bin");
+    private_mkdir(&bin);
+    let cursor = bin.join("cursor");
+    private_write(&cursor, b"#!/bin/sh\necho 'Cursor 3.22.12'\n");
+    Files::make_executable(&cursor);
+    let _cursor_bin = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cursor.as_os_str());
+    write_json(
+        &fixture.profile.data.join("agents.json"),
+        &json!({
+            "version":1,"scanned_at":null,"login_path":bin,"binaries":{},"seen":{},"dismissed":{}
+        }),
+    );
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let first = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_eq!(first["scan_failed"], false, "{first}");
+    let broken = fixture.root.join("broken-login-shell");
+    private_write(&broken, b"#!/bin/sh\nexit 1\n");
+    Files::make_executable(&broken);
+    let _shell = EnvGuard::set("SHELL", broken.as_os_str());
+    for action in ["agents.connect", "agents.disconnect"] {
+        let refused = host.handle(action, json!({"id":"cursor"})).await;
+        assert_eq!(
+            refused.pointer("/error/key"),
+            Some(&json!("agents.scan-failed")),
+            "{refused}"
+        );
+    }
+    host.shutdown().await;
+}
+
+#[tokio::test]
+async fn only_a_scan_of_every_agent_clears_a_recorded_failure() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    write_json(
+        &fixture.profile.data.join("agents.json"),
+        &json!({
+            "version":1,"scanned_at":"old","login_path":"/usr/bin","scan_failed":true,
+            "binaries":{},"seen":{},"dismissed":{}
+        }),
+    );
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    let base = json!({
+        "version":1,"scanned_at":"old","login_path":"/usr/bin","scan_failed":false,
+        "binaries":{},"seen":{},"dismissed":{}
+    });
+    let deadline = Instant::now() + StdDuration::from_secs(5);
+    let watched = host
+        .merge_scan(
+            base.clone(),
+            Vec::new(),
+            Some("/usr/bin".into()),
+            false,
+            &Cancellation::new(),
+            deadline,
+        )
+        .await
+        .unwrap();
+    assert_eq!(watched["scan_failed"], true, "{watched}");
+    let full = host
+        .merge_scan(
+            base,
+            Vec::new(),
+            Some("/usr/bin".into()),
+            true,
+            &Cancellation::new(),
+            deadline,
+        )
+        .await
+        .unwrap();
+    assert_eq!(full["scan_failed"], false, "{full}");
     host.shutdown().await;
 }
 
@@ -854,10 +938,11 @@ async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn()
     fs::remove_dir_all(fixture.profile.agent_home("CODEX_HOME")).unwrap();
     Files::symlink(&external, fixture.profile.agent_home("CODEX_HOME"));
 
+    // A symlinked agent home also stops the login-shell capture, so the scan fails and the action is refused.
     let answer = host.handle("agents.connect", json!({"id":"codex"})).await;
     assert_eq!(
         answer.pointer("/error/key"),
-        Some(&json!("agents.not-present"))
+        Some(&json!("agents.scan-failed"))
     );
     assert!(
         !marker.exists(),
@@ -2633,4 +2718,19 @@ async fn codex_delivery_queues_when_the_steer_is_refused() {
         "same message, same id"
     );
     daemon.await.unwrap();
+}
+
+#[test]
+fn a_scan_that_fails_after_an_action_says_the_change_was_applied() {
+    let failed = json!({"scan_failed":true});
+    let key = |result: std::result::Result<(), Failure>| match result {
+        Err(Failure::Key(key, _)) => key,
+        _ => "",
+    };
+    assert_eq!(key(require_scanned(&failed, "codex")), "agents.scan-failed");
+    assert_eq!(
+        key(require_verified(&failed, "codex")),
+        "agents.scan-failed-after"
+    );
+    assert!(require_verified(&json!({"scan_failed":false}), "codex").is_ok());
 }
