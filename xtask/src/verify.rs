@@ -230,7 +230,7 @@ fn linked_libraries(binary: &str, target: &str) -> Result<Vec<String>> {
 /// <https://learn.microsoft.com/en-us/windows/win32/api/> (the header's "Library" row names the DLL).
 /// A binary that imports another DLL fails `verify` on purpose: add it here once it is known to be on every
 /// supported Windows.
-const WINDOWS_SYSTEM: [&str; 24] = [
+const WINDOWS_SYSTEM: [&str; 25] = [
     "advapi32.dll",
     "bcrypt.dll",
     "bcryptprimitives.dll",
