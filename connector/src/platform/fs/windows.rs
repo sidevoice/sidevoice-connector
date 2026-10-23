@@ -8,7 +8,7 @@
 //!
 //! Own `unsafe` over `windows-sys`: no maintained crate covers "create with this DACL" and "read what this handle's
 //! DACL grants" (`windows-acl` is unmaintained; `windows-permissions` is a thin binding with the same calls left to
-//! us), and the surface is a few calls. The link count and a file's identity come from `winapi-util`.
+//! us), and the surface is a few calls. The link count (and the identity of a file system with no 128-bit ids) comes from `winapi-util`; a file's identity is `FileIdInfo`, one more call.
 
 use super::{Create, FileId, Others};
 use crate::platform::user::{User, UserId};
@@ -23,7 +23,10 @@ use std::path::Path;
 use std::ptr::null_mut;
 use std::sync::OnceLock;
 
-use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    LocalFree, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_SUCCESS,
+    HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW, GetSecurityInfo,
     SDDL_REVISION_1, SE_FILE_OBJECT,
@@ -33,9 +36,10 @@ use windows_sys::Win32::Security::{
     SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_ALWAYS, READ_CONTROL,
+    CreateDirectoryW, CreateFileW, FileIdInfo, GetFileInformationByHandleEx, CREATE_NEW,
+    FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_128,
+    FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_ALWAYS, READ_CONTROL,
 };
 
 /// This OS's files.
@@ -101,12 +105,42 @@ impl super::Fs for Os {
         })
     }
 
-    // `GetFileInformationByHandle` through `winapi-util`.
+    // The 128-bit file id (`FileIdInfo`): a 64-bit index is not unique on ReFS. A file system that has no such id
+    // (the call is refused as unsupported) is told by `GetFileInformationByHandle`'s 64-bit index, through
+    // `winapi-util`.
     fn identity(file: &File) -> io::Result<FileId> {
+        let mut info = FILE_ID_INFO {
+            VolumeSerialNumber: 0,
+            FileId: FILE_ID_128 {
+                Identifier: [0; 16],
+            },
+        };
+        // SAFETY: the handle is open for the call; `info` is a `FILE_ID_INFO` of the size passed.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle() as HANDLE,
+                FileIdInfo,
+                &mut info as *mut FILE_ID_INFO as *mut c_void,
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        };
+        if ok != 0 {
+            return Ok(FileId {
+                volume: info.VolumeSerialNumber,
+                index: u128::from_le_bytes(info.FileId.Identifier),
+            });
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error().map(|code| code as u32),
+            Some(ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED | ERROR_INVALID_FUNCTION)
+        ) {
+            return Err(error);
+        }
         let information = winapi_util::file::information(file)?;
         Ok(FileId {
             volume: information.volume_serial_number(),
-            index: information.file_index(),
+            index: u128::from(information.file_index()),
         })
     }
 }

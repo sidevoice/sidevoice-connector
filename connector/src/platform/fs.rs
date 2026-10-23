@@ -57,7 +57,7 @@ pub enum Create {
 #[derive(PartialEq)]
 pub struct FileId {
     volume: u64,
-    index: u64,
+    index: u128,
 }
 
 /// What every OS implements ([`Files`], in `fs/unix.rs` and `fs/windows.rs`): the required methods. The rest is one
@@ -76,7 +76,7 @@ pub trait Fs {
     /// What others may do with the file or directory behind an open handle.
     fn others_of(file: &File) -> io::Result<Others>;
 
-    /// Which file is behind an open handle (Unix: device and inode; Windows: volume serial number and file index),
+    /// Which file is behind an open handle (Unix: device and inode; Windows: volume serial number and the 128-bit file id, ReFS needing all of it; the 64-bit file index where the file system has no such id),
     /// read from the handle itself: the file being read, not whatever its path names a moment later.
     fn identity(file: &File) -> io::Result<FileId>;
 

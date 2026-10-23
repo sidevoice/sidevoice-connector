@@ -50,7 +50,7 @@ impl super::Fs for Os {
         let metadata = file.metadata()?;
         Ok(FileId {
             volume: metadata.dev(),
-            index: metadata.ino(),
+            index: metadata.ino().into(),
         })
     }
 }
