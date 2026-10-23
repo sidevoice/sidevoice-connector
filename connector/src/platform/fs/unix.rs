@@ -100,8 +100,16 @@ fn others(mode: u32) -> Others {
 
 /// Lets group and others change `path` (tests).
 #[cfg(test)]
-pub(super) fn let_others_change(path: &Path) {
+pub(crate) fn let_others_change(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let mode = fs::metadata(path).unwrap().mode() | 0o077;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Takes group and others' access to `path` away again (tests).
+#[cfg(test)]
+pub(crate) fn shut_others_out(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(path).unwrap().mode() & !0o077;
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }

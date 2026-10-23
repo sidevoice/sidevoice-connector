@@ -5,7 +5,6 @@
 mod support;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -109,7 +108,7 @@ fn the_connector_registers_with_the_real_codex_cli_and_leaves_foreign_entries_al
         "#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' \"$SIDEVOICE_TEST_LOGIN_PATH\"\n",
     )
     .unwrap();
-    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    executable(&shell);
     let fixture = Fixture { profile, codex };
     let config = fixture.profile.root.join("codex/config.toml");
 
@@ -146,7 +145,7 @@ fn the_connector_registers_with_the_real_codex_cli_and_leaves_foreign_entries_al
     // A configuration Codex itself cannot parse: refused, untouched.
     let invalid = b"[mcp_servers.sidevoice\ncommand = [broken\n";
     fs::write(&config, invalid).unwrap();
-    fs::set_permissions(&config, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+    private(&config);
     let refused = fixture.connector("connect", false);
     assert_eq!(refused["error"]["key"], "agents.invalid", "{refused}");
     assert_eq!(fs::read(&config).unwrap(), invalid);

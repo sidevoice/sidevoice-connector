@@ -435,10 +435,22 @@ impl Drop for PrivateAttributes {
 
 /// Lets everybody change `path` (tests).
 #[cfg(test)]
-pub(super) fn let_others_change(path: &Path) {
+pub(crate) fn let_others_change(path: &Path) {
     let status = std::process::Command::new("icacls")
         .arg(path)
         .args(["/grant", "*S-1-1-0:(F)"])
+        .output()
+        .unwrap()
+        .status;
+    assert!(status.success(), "icacls");
+}
+
+/// Takes everybody else's access to `path` away again (tests): the grant `let_others_change` made.
+#[cfg(test)]
+pub(crate) fn shut_others_out(path: &Path) {
+    let status = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/remove:g", "*S-1-1-0"])
         .output()
         .unwrap()
         .status;

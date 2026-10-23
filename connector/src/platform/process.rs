@@ -39,7 +39,7 @@ use std::time::Duration;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, Uid, UpdateKind};
 use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 
-/// What every OS implements ([`Processes`], in `process/unix.rs` and `process/windows.rs`): the four required
+/// What every OS implements ([`Processes`], in `process/unix.rs` and `process/windows.rs`): the five required
 /// methods. The rest is one body for every OS; an OS overrides it only if it must.
 pub trait Process {
     /// `command` set to outlive its caller: its own process group (Unix), no console and its own group
@@ -60,6 +60,10 @@ pub trait Process {
     /// has no request to send a process that has no console. Where it is `false` a caller that wants the process to
     /// leave by itself asks in band, over the process's local channel, before `stop`.
     fn asks_to_leave() -> bool;
+
+    /// Whether starting a program failed only because something still has it open for writing (one just written):
+    /// worth trying again in a moment. Unix: `ETXTBSY`. Windows: a sharing violation.
+    fn executable_is_busy(error: &io::Error) -> bool;
 
     /// Starts `command` so that it outlives this process and its terminal. The caller owns stdio and the
     /// environment.

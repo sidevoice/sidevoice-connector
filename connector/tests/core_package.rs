@@ -8,8 +8,8 @@
 
 mod support;
 
+use sidevoice_connector::platform::fs::{Files, Fs as _};
 use std::fs;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -26,7 +26,7 @@ fn scratch(label: &str) -> PathBuf {
 
 fn release(at: &Path) -> PathBuf {
     let release = at.join("release");
-    fs::DirBuilder::new().mode(0o700).create(&release).unwrap();
+    Files::create_private_dir(&release).unwrap();
     release
 }
 
@@ -60,9 +60,14 @@ fn the_packaged_core_is_staged_into_a_release() {
     assert!(ok, "{answer}");
     assert_eq!(answer["core"]["version"], record["version"], "{answer}");
     assert_eq!(answer["core"]["sha256"], record["sha256"], "{answer}");
-    let program = release.join("core/bin/sidevoice-core-rust");
-    let mode = fs::metadata(&program).unwrap().permissions().mode();
-    assert_eq!(mode & 0o777, 0o700, "{}", program.display());
+    // The executable bit is how Unix marks a program; Windows has none.
+    #[cfg(unix)]
+    {
+        let program = release.join("core/bin/sidevoice-core-rust");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&program).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "{}", program.display());
+    }
     assert!(release.join("core/notices").is_dir());
     assert!(!release.join("core/models").exists());
 

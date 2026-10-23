@@ -4,14 +4,13 @@ mod support;
 
 use serde_json::Value;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use support::{Profile, CONNECTOR};
+use support::{executable, Profile, CONNECTOR};
 
 fn program(path: &Path, contents: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, contents).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    executable(path);
 }
 
 fn listed(profile: &Profile, shell: Option<&Path>, override_bin: Option<&Path>) -> Value {

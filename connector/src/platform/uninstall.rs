@@ -542,8 +542,8 @@ mod tests {
         let (_scratch, layout, removal) = installed("uninstall-links-home");
         fs::create_dir(&outside).unwrap();
         fs::write(outside.join("keep"), "untouched").unwrap();
-        symlink(&outside, &layout.data.join("external"));
-        symlink(&outside, &layout.releases.join("current"));
+        symlink(&outside, layout.data.join("external"));
+        symlink(&outside, layout.releases.join("current"));
         fs::write(layout.data.join("remove"), "gone").unwrap();
 
         assert!(removal.preflight().unwrap());
@@ -597,7 +597,7 @@ mod tests {
         assert!(layout.data.join("install.lock").is_file());
         let outside = scratch.path().join("outside");
         fs::write(&outside, "sentinel").unwrap();
-        symlink(&outside, &layout.data.join("agents.lock"));
+        symlink(&outside, layout.data.join("agents.lock"));
         assert!(removal.lock_file("agents.lock").is_err());
         assert_eq!(fs::read(&outside).unwrap(), b"sentinel");
     }

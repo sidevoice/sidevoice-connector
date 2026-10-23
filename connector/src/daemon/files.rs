@@ -99,14 +99,13 @@ pub(super) fn read_conversation_state(path: &Path) -> Result<Option<Vec<u8>>> {
 mod tests {
     #[test]
     fn an_outbox_or_a_state_of_another_shape_is_invalid() {
-        use std::os::unix::fs::PermissionsExt;
         let dir =
             std::env::temp_dir().join(format!("sidevoice-daemon-state-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let write = |name: &str, bytes: &[u8]| {
             let path = dir.join(name);
             std::fs::write(&path, bytes).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            crate::test_support::private(&path);
             path
         };
         let speech = serde_json::json!({"event_id":"e","binding_id":"b","client_ref":"c","session_id":"s",

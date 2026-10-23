@@ -160,7 +160,6 @@ fn format_utc(seconds: i64, millis: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::MetadataExt;
 
     #[test]
     fn a_log_past_its_limit_is_copied_aside_and_truncated_in_place() {
@@ -170,7 +169,8 @@ mod tests {
         Files::check_private(&Files::open_read(&file).unwrap()).unwrap();
         // A writer holding the file open, as a service manager does.
         let mut held = OpenOptions::new().append(true).open(&file).unwrap();
-        let inode = fs::metadata(&file).unwrap().ino();
+        let identity = || Files::identity(&Files::open_read(&file).unwrap()).unwrap();
+        let inode = identity();
         assert!(!rotate(&file, 1024), "under the limit");
         fs::write(&file, vec![b'a'; 64]).unwrap();
         assert!(rotate(&file, 32));
@@ -181,7 +181,7 @@ mod tests {
             64
         );
         assert_eq!(fs::metadata(&file).unwrap().len(), 0);
-        assert_eq!(fs::metadata(&file).unwrap().ino(), inode, "never renamed");
+        assert!(identity() == inode, "never renamed");
         held.write_all(b"after\n").unwrap();
         assert_eq!(
             fs::read(&file).unwrap(),

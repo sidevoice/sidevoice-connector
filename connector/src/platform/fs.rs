@@ -20,6 +20,10 @@ mod imp;
 
 pub use imp::Os as Files;
 
+// How a test widens or narrows the access to a path: the interface only makes private things and checks them.
+#[cfg(test)]
+pub(crate) use imp::{let_others_change, shut_others_out};
+
 use super::user::{User, UserId};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;

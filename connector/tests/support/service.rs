@@ -8,14 +8,16 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::{alive, private_dir, until, Profile, CONNECTOR};
+use sidevoice_connector::platform::fs::{Files, Fs as _};
+
+use super::{alive, executable, private_dir, symlink, until, Profile, CONNECTOR};
 
 /// `R`.
 pub fn releases(profile: &Profile) -> PathBuf {
@@ -33,21 +35,19 @@ pub fn stage_installation(profile: &Profile, core: &Path) -> PathBuf {
     );
     let program = release.join("core/bin/sidevoice-core-rust");
     fs::write(&program, wrapper).unwrap();
-    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
-    symlink(core.join("models"), release.join("core/models")).unwrap();
-    fs::write(
-        releases.join("current.json"),
-        json!({"release": "r1"}).to_string(),
-    )
-    .unwrap();
-    fs::set_permissions(
-        releases.join("current.json"),
-        fs::Permissions::from_mode(0o600),
+    executable(&program);
+    symlink(core.join("models"), release.join("core/models"));
+    Files::write_private(
+        &releases.join("current.json"),
+        json!({"release": "r1"}).to_string().as_bytes(),
     )
     .unwrap();
     let record = profile.data().join("install.json");
-    fs::write(&record, json!({"command": [CONNECTOR]}).to_string()).unwrap();
-    fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
+    Files::write_private(
+        &record,
+        json!({"command": [CONNECTOR]}).to_string().as_bytes(),
+    )
+    .unwrap();
     releases.join("current.json")
 }
 
@@ -112,6 +112,8 @@ pub fn wait_gone(pid: u64, what: &str) {
     until(what, 30, || (!alive(pid)).then_some(()));
 }
 
+// systemd is Linux's (`getuid` names the user's bus); there is no such manager to ask elsewhere.
+#[cfg(unix)]
 /// This user's systemd user manager, reachable: the variables `systemctl --user` needs. On a CI runner with no
 /// session, lingering is enabled for this user first (the runner's own account, on a disposable machine).
 pub fn systemd_user_manager() -> Option<BTreeMap<String, String>> {

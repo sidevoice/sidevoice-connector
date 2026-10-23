@@ -15,8 +15,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,6 +24,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use sidevoice_connector::platform::env::{Env as _, Environment};
+use sidevoice_connector::platform::fs::{Files, Fs as _};
+use sidevoice_connector::platform::ipc::{Address as _, Channel as _, Channels, Endpoint};
 use sidevoice_connector::platform::process::{Process as _, Processes};
 
 pub const CONNECTOR: &str = env!("CARGO_BIN_EXE_sidevoice-connector");
@@ -68,12 +68,146 @@ pub fn until<T>(what: &str, seconds: u64, mut probe: impl FnMut() -> Option<T>) 
 }
 
 pub fn private_dir(path: &Path) {
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
-        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    Files::ensure_private_dir(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+}
+
+/// Where a test profile lives. Unix: `/tmp`, short and canonical (a Unix socket path has a 104-byte limit on macOS,
+/// and the connector compares canonical paths). Elsewhere the temporary directory (a pipe name has no such limit).
+pub fn short_temp_dir() -> PathBuf {
+    let base = if cfg!(unix) {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    base.canonicalize().unwrap()
+}
+
+/// Makes `path` something a test may run (a script standing in for an agent): executable by its owner on Unix.
+/// Windows has no executable bit, the extension decides, so there is nothing to do there.
+pub fn executable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(windows)]
+    let _ = path;
+}
+
+/// A symbolic link at `link` to `target` (a directory or a file). Made differently on each OS.
+pub fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) {
+    let (target, link) = (target.as_ref(), link.as_ref());
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link).unwrap();
+    } else {
+        std::os::windows::fs::symlink_file(target, link).unwrap();
+    }
+}
+
+/// Narrows `path`, made in a test's scratch directory, to its owner. Unix gives a new file or directory the umask's
+/// access, so it is narrowed; on Windows a new one inherits the scratch directory's access, which is already the
+/// owner's (and SYSTEM's and the administrators'), so there is nothing to do there.
+pub fn private(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if path.is_dir() { 0o700 } else { 0o600 };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    #[cfg(windows)]
+    let _ = path;
+}
+
+/// Lets everybody else read (and enter) `path`, as a directory made with a loose mask is: `0o755` on Unix, a read
+/// grant to Everyone on Windows.
+pub fn open_to_others(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(windows)]
+    assert!(
+        Command::new("icacls")
+            .arg(path)
+            .args(["/grant", "*S-1-1-0:(RX)"])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "icacls"
+    );
+}
+
+/// Whether `path` is private to this user, as the connector judges it.
+pub fn is_private(path: &Path) -> bool {
+    Files::open_read(path)
+        .map_err(Into::into)
+        .and_then(|file| Files::check_private(&file))
+        .is_ok()
+}
+
+/// Whether the endpoint exists as the OS shows it: its record is the path of the socket (Unix) or the name of the
+/// pipe (Windows), and a path can be asked about.
+pub fn endpoint_exists(endpoint: &Endpoint) -> bool {
+    Path::new(&endpoint.to_string()).exists()
+}
+
+/// A blocking connection to a local endpoint, for tests that speak a wire raw and line by line: the channel is
+/// async, so it is driven by a runtime of its own.
+pub struct LocalStream {
+    runtime: tokio::runtime::Runtime,
+    stream: sidevoice_connector::platform::ipc::Stream,
+    timeout: Option<Duration>,
+}
+
+impl LocalStream {
+    pub fn connect(endpoint: &Endpoint) -> std::io::Result<Self> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let stream = runtime.block_on(Channels::connect(endpoint))?;
+        Ok(Self {
+            runtime,
+            stream,
+            timeout: None,
+        })
+    }
+
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.timeout = timeout;
+    }
+}
+
+impl Read for LocalStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        use tokio::io::AsyncReadExt;
+        let timeout = self.timeout;
+        let stream = &mut self.stream;
+        self.runtime.block_on(async {
+            match timeout {
+                Some(limit) => tokio::time::timeout(limit, stream.read(buffer))
+                    .await
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?,
+                None => stream.read(buffer).await,
+            }
+        })
+    }
+}
+
+impl Write for LocalStream {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use tokio::io::AsyncWriteExt;
+        self.runtime.block_on(self.stream.write(bytes))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        self.runtime.block_on(self.stream.flush())
+    }
 }
 
 pub fn read_json(path: &Path) -> Option<Value> {
@@ -92,7 +226,7 @@ pub struct Profile {
 impl Profile {
     pub fn new(label: &str) -> Self {
         static SERIAL: AtomicU64 = AtomicU64::new(0);
-        let base = Path::new("/tmp").canonicalize().unwrap().join(format!(
+        let base = short_temp_dir().join(format!(
             "sv{label}-{}-{}",
             std::process::id(),
             SERIAL.fetch_add(1, Ordering::Relaxed)
@@ -127,12 +261,12 @@ impl Profile {
         self.data().join("core")
     }
 
-    pub fn core_socket(&self) -> PathBuf {
-        self.core_data().join("local.sock")
+    pub fn core_endpoint(&self) -> Endpoint {
+        Endpoint::new(&self.core_data(), "local")
     }
 
-    pub fn connector_socket(&self) -> PathBuf {
-        self.data().join("connector.sock")
+    pub fn connector_endpoint(&self) -> Endpoint {
+        Endpoint::new(&self.data(), "connector")
     }
 
     /// The environment a process of this profile gets: nothing inherited but `PATH`, so neither the developer's
@@ -208,7 +342,7 @@ impl Profile {
             .expect("start the connector");
         let process = Process(child);
         until("the connector's socket", 30, || {
-            self.connector_socket().exists().then_some(())
+            endpoint_exists(&self.connector_endpoint()).then_some(())
         });
         process
     }
@@ -220,7 +354,7 @@ impl Profile {
             &format!("the connector linked to core {launch_id}"),
             60,
             || {
-                connector_ipc(&self.connector_socket(), "status")
+                connector_ipc(&self.connector_endpoint(), "status")
                     .map(|status| status["core"].clone())
                     .filter(|core| core["launch_id"] == launch_id)
             },
@@ -282,9 +416,9 @@ impl Drop for Process {
 
 /// One request to the connector over its socket (JSON lines `{id, method, params}`): its result, or `None` when the
 /// connector is not there or refused.
-pub fn connector_ipc(socket: &Path, method: &str) -> Option<Value> {
-    let mut stream = UnixStream::connect(socket).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+pub fn connector_ipc(endpoint: &Endpoint, method: &str) -> Option<Value> {
+    let mut stream = LocalStream::connect(endpoint).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)));
     writeln!(
         stream,
         "{}",
@@ -297,18 +431,16 @@ pub fn connector_ipc(socket: &Path, method: &str) -> Option<Value> {
     (answer["ok"] == true).then(|| answer["result"].clone())
 }
 
-/// One HTTP/1.0 request over the core's Unix socket; returns the status and the JSON body.
+/// One HTTP/1.0 request over the core's local endpoint; returns the status and the JSON body.
 pub fn core_http(
-    socket: &Path,
+    endpoint: &Endpoint,
     method: &str,
     path: &str,
     body: Option<&Value>,
     token: Option<&str>,
 ) -> (u16, Value) {
-    let mut stream = UnixStream::connect(socket).expect("core socket");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(15)))
-        .unwrap();
+    let mut stream = LocalStream::connect(endpoint).expect("core endpoint");
+    stream.set_read_timeout(Some(Duration::from_secs(15)));
     let body = body.map(Value::to_string).unwrap_or_default();
     let mut request = format!("{method} {path} HTTP/1.0\r\nHost: localhost\r\n");
     if let Some(token) = token {
@@ -341,13 +473,13 @@ pub fn core_http(
 }
 
 pub fn core_json(
-    socket: &Path,
+    endpoint: &Endpoint,
     method: &str,
     path: &str,
     body: Option<&Value>,
     token: Option<&str>,
 ) -> Value {
-    let (status, value) = core_http(socket, method, path, body, token);
+    let (status, value) = core_http(endpoint, method, path, body, token);
     assert!(status < 400, "{method} {path}: HTTP {status} {value}");
     value
 }
@@ -512,7 +644,7 @@ pub fn http_receiver_with_status(status: u16) -> HttpReceiver {
 pub struct Presentation {
     pub token: String,
     pub session: String,
-    socket: PathBuf,
+    endpoint: Endpoint,
     send: tokio::sync::mpsc::UnboundedSender<Value>,
     frames: Receiver<Value>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -520,9 +652,9 @@ pub struct Presentation {
 }
 
 impl Presentation {
-    pub fn open(socket: &Path) -> Self {
+    pub fn open(endpoint: &Endpoint) -> Self {
         let token = core_json(
-            socket,
+            endpoint,
             "POST",
             "/api/device/local/pair",
             Some(&json!({"name": "connector-test"})),
@@ -531,16 +663,16 @@ impl Presentation {
             .as_str()
             .expect("device token")
             .to_string();
-        Self::open_with_token(socket, token)
+        Self::open_with_token(endpoint, token)
     }
 
-    pub fn open_with_token(socket: &Path, token: String) -> Self {
+    pub fn open_with_token(endpoint: &Endpoint, token: String) -> Self {
         let (session_tx, session_rx) = channel();
         let (frame_tx, frames) = channel();
         let (send, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let socket = socket.to_path_buf();
-        let held_socket = socket.clone();
+        let endpoint = endpoint.clone();
+        let held_endpoint = endpoint.clone();
         let protocol_token = token.clone();
         let thread = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -559,7 +691,7 @@ impl Presentation {
                         .parse()
                         .unwrap(),
                 );
-                let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+                let stream = Channels::connect(&endpoint).await.unwrap();
                 let (mut ws, _) = tokio_tungstenite::client_async(request, stream)
                     .await
                     .expect("presentation socket");
@@ -594,7 +726,7 @@ impl Presentation {
         Self {
             token,
             session,
-            socket: held_socket,
+            endpoint: held_endpoint,
             send,
             frames,
             stop: Some(stop),
@@ -611,14 +743,14 @@ impl Presentation {
         let code: Value = serde_json::from_slice(&output.stdout).unwrap();
         let secret = code["payload"]["secret"].as_str().expect("pairing secret");
         let paired = core_json(
-            &profile.core_socket(),
+            &profile.core_endpoint(),
             "POST",
             "/api/device/pair",
             Some(&json!({"secret":secret,"name":"second test device"})),
             None,
         );
         Self::open_with_token(
-            &profile.core_socket(),
+            &profile.core_endpoint(),
             paired["token"].as_str().unwrap().to_owned(),
         )
     }
@@ -628,7 +760,7 @@ impl Presentation {
             "phase":phase,"turn_id":turn_id});
         if phase == "started" {
             let state = core_json(
-                &self.socket,
+                &self.endpoint,
                 "GET",
                 &format!("/api/presentation?session_id={}", self.session),
                 None,

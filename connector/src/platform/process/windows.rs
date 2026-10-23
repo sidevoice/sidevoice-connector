@@ -4,6 +4,7 @@ use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject};
 use std::io;
 use std::path::PathBuf;
 use tokio::process::Command;
+use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 // `windows`, not `windows-sys`: `CreationFlags` takes its flags type.
 use windows::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS,
@@ -15,6 +16,10 @@ pub struct Os;
 impl super::Process for Os {
     fn asks_to_leave() -> bool {
         false
+    }
+
+    fn executable_is_busy(error: &io::Error) -> bool {
+        error.raw_os_error() == i32::try_from(ERROR_SHARING_VIOLATION).ok()
     }
 
     // Not `CREATE_BREAKAWAY_FROM_JOB`: it is refused (access denied) when the caller's job does not allow breakaway.

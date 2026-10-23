@@ -47,6 +47,7 @@ use crate::data_dir;
 use crate::messages::Keyed;
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Create, Files, Fs};
+use crate::platform::process::{Process, Processes};
 use crate::platform::uninstall::{Ownership, Removal, Remover, Roots};
 use crate::profile::Profile;
 use crate::service::jobs::Kind;
@@ -267,7 +268,7 @@ async fn check_binary(binary: &Path, version: &str) -> Result<()> {
         match timeout(Duration::from_secs(30), command.output()).await {
             Err(_) => return Err(failed("the connector did not say its version within 30 s")),
             // A program just written can be "busy" while another thread's fork still holds it open.
-            Ok(Err(error)) if error.raw_os_error() == Some(libc::ETXTBSY) && attempts < 20 => {
+            Ok(Err(error)) if Processes::executable_is_busy(&error) && attempts < 20 => {
                 attempts += 1;
                 sleep(Duration::from_millis(50)).await;
             }
@@ -495,13 +496,8 @@ impl Runtime {
             #[cfg(test)]
             Runtime::Fake(fake) => {
                 fake.lock().unwrap().unloaded = true;
-                std::fs::write(layout.stop_marker(), b"{}")
+                Files::write_private(&layout.stop_marker(), b"{}")
                     .map_err(crate::service::Failure::plain)?;
-                fs::set_permissions(
-                    layout.stop_marker(),
-                    std::os::unix::fs::PermissionsExt::from_mode(0o600),
-                )
-                .map_err(crate::service::Failure::plain)?;
                 Ok(json!({"ok": true, "state": "absent", "service": "none"}))
             }
         }
@@ -1111,7 +1107,6 @@ pub(crate) mod tests {
     use crate::core_package::tests::{core_archive, core_files};
     use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1185,7 +1180,7 @@ pub(crate) mod tests {
                 format!("#!/bin/sh\n# {build}\necho '{{\"ok\":true,\"version\":\"{version}\"}}'\n"),
             )
             .unwrap();
-            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::executable(&binary);
             let archive = core_archive(&core_files(), &[]);
             let target = crate::identity::target().unwrap();
             let name = format!("core/sidevoice-core-0.2.0-{target}.tar.zst");
@@ -1250,11 +1245,16 @@ pub(crate) mod tests {
             Some(vec![stable.to_string_lossy().into_owned()])
         );
         assert!(layout.installed());
-        let mode = fs::metadata(release.join(BINARY))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o700);
+        // The executable bit is how Unix marks a program; Windows has none.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(release.join(BINARY))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
 
         // The same build again: nothing staged, the selection restarted and verified (the recovery).
         let staged_at = fs::metadata(release.join(BINARY))
@@ -1380,8 +1380,8 @@ pub(crate) mod tests {
         let fixture = Fixture::new("leftovers");
         let layout = fixture.layout();
         fs::create_dir_all(layout.releases_dir().join(".1.0.0.partial-x/core")).unwrap();
-        fs::set_permissions(&layout.releases, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::set_permissions(layout.releases_dir(), fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::private(&layout.releases);
+        crate::test_support::private(&layout.releases_dir());
         fs::write(layout.releases.join(".current.json.x"), b"{}").unwrap();
         fixture
             .install(&fixture.package("1.0.0", "a"))
@@ -1449,7 +1449,7 @@ pub(crate) mod tests {
         let id = agent_without_cli();
         let program = fixture.scratch.path().join("agent-program");
         fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::executable(&program);
         let _installed = crate::agents::tests::EnvGuard::set(
             &format!("SIDEVOICE_{}_BIN", id.to_ascii_uppercase()),
             program.as_os_str(),
@@ -1624,7 +1624,7 @@ pub(crate) mod tests {
         .unwrap();
         let lock = layout.install_lock();
         fs::write(&lock, b"sentinel lock contents").unwrap();
-        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+        crate::test_support::private(&lock);
         let error = uninstall_with_hooks(
             &fixture.profile,
             NO_AGENTS,
@@ -1646,7 +1646,7 @@ pub(crate) mod tests {
         let fixture = Fixture::new("hard-linked-uninstall-lock");
         let outside = fixture.scratch.path().join("outside-sentinel");
         fs::write(&outside, b"outside contents").unwrap();
-        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+        crate::test_support::private(&outside);
         fs::hard_link(&outside, fixture.layout().install_lock()).unwrap();
         assert!(uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
             .await
@@ -1659,7 +1659,7 @@ pub(crate) mod tests {
         let fixture = Fixture::new("hard-linked-uninstall-agents-lock");
         let outside = fixture.scratch.path().join("outside-agents-sentinel");
         fs::write(&outside, b"outside contents").unwrap();
-        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+        crate::test_support::private(&outside);
         fs::hard_link(&outside, fixture.layout().data.join("agents.lock")).unwrap();
         assert!(uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
             .await

@@ -8,17 +8,28 @@
 //! agent's `voice_say` replies and the call's events (working state among them). What is typed there is voice input,
 //! exactly as if it had been spoken. How to point an agent at it: connector/README.md, "Test bench".
 
+// macOS and Linux only: the bench stands in for a person's login shell with a `/bin/sh` script, which is how the connector
+// finds an agent's `PATH` there; on Windows it reads the registry's instead, and the bench has no way yet to give it its
+// own. Porting it needs that way (a decision for the connector, not for the bench).
+#[cfg(unix)]
 mod call;
+#[cfg(unix)]
 mod page;
+#[cfg(unix)]
 mod setup;
 
+#[cfg(unix)]
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::Arc;
 
+#[cfg(unix)]
 use anyhow::Result;
+#[cfg(unix)]
 use clap::Parser;
 
 /// Drive the connector and the pinned core from a local page, without the desktop app.
+#[cfg(unix)]
 #[derive(Parser)]
 #[command(name = "sidevoice-bench", version)]
 struct Args {
@@ -42,10 +53,12 @@ struct Args {
     uninstall: bool,
 }
 
+#[cfg(unix)]
 fn default_profile() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".sidevoice-bench")
 }
 
+#[cfg(unix)]
 #[tokio::main]
 async fn main() {
     if let Err(error) = run(Args::parse()).await {
@@ -54,6 +67,7 @@ async fn main() {
     }
 }
 
+#[cfg(unix)]
 async fn run(args: Args) -> Result<()> {
     let profile = setup::Profile::new(&args.profile)?;
     if args.reset || args.uninstall {
@@ -83,4 +97,10 @@ async fn run(args: Args) -> Result<()> {
     let mut hosts = vec![format!("127.0.0.1:{port}"), format!("localhost:{port}")];
     hosts.extend(args.allow_hosts);
     page::serve(listener, hosts, call).await
+}
+
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("sidevoice-bench: runs on macOS and Linux only");
+    std::process::exit(2);
 }

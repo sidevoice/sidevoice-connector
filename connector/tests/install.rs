@@ -11,7 +11,6 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -39,14 +38,14 @@ fn cursor_installed(profile: &Profile) {
     let program = cursor_program(profile);
     fs::create_dir_all(program.parent().unwrap()).unwrap();
     fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
-    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    executable(&program);
     let shell = profile.root.join("login-shell");
     fs::write(
         &shell,
         "#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' \"$SIDEVOICE_TEST_LOGIN_PATH\"\n",
     )
     .unwrap();
-    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    executable(&shell);
 }
 
 /// `program args… --json` in the profile: its one JSON line and whether it succeeded.
@@ -148,7 +147,7 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
         .canonicalize()
         .unwrap();
     until("the release's connector answers", 30, || {
-        connector_ipc(&profile.connector_socket(), "identity").filter(|identity| {
+        connector_ipc(&profile.connector_endpoint(), "identity").filter(|identity| {
             identity["executable"].as_str().map(Path::new) == Some(binary.as_path())
         })
     });
@@ -207,7 +206,7 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
         "the core exited at uninstall",
     );
     assert!(!releases.exists(), "{} is left", releases.display());
-    assert!(!profile.connector_socket().exists());
+    assert!(!endpoint_exists(&profile.connector_endpoint()));
     let config = read_json(&cursor).unwrap();
     assert!(config["mcpServers"].get("sidevoice").is_none(), "{config}");
     let mut left: Vec<String> = fs::read_dir(profile.data())

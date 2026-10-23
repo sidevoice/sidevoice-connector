@@ -428,7 +428,7 @@ mod tests {
         let (_scratch, layout) = with_releases(&["1.0.0"]);
         let outside = layout.releases.join("outside.json");
         Files::write_json(&outside, &serde_json::json!({"release": "1.0.0"})).unwrap();
-        crate::test_support::symlink(&outside, &layout.current_record());
+        crate::test_support::symlink(&outside, layout.current_record());
         assert_eq!(layout.selected_id(), None);
     }
 }

@@ -134,7 +134,7 @@ fn with_no_manager_a_conversation_starts_the_connector_and_the_connector_the_cor
         "the stopped core exited",
     );
     assert!(
-        !profile.connector_socket().exists(),
+        !endpoint_exists(&profile.connector_endpoint()),
         "the connector left its socket"
     );
     mcp.stop();

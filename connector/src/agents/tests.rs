@@ -1,7 +1,7 @@
 use super::*;
 use crate::adapters::registration::{aggregate_readiness, ReadinessCheck};
 use crate::platform::fs::{Create, Files, Fs};
-use std::os::unix::fs::{symlink, PermissionsExt};
+use crate::test_support::symlink;
 
 #[tokio::test]
 async fn command_output_limit_reports_truncation_instead_of_parsing_prefix() {
@@ -26,11 +26,11 @@ async fn failed_watched_capture_hides_all_agents_and_recovery_reconciles_all() {
     for name in ["claude", "cursor-agent"] {
         let program = bin.join(name);
         private_write(&program, b"#!/bin/sh\nexit 0\n");
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::executable(&program);
     }
     let shell = fixture.root.join("login-shell");
     private_write(&shell, format!("#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' '{}'\n", bin.display()).as_bytes());
-    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::executable(&shell);
     let _shell = EnvGuard::set("SHELL", shell.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     assert_eq!(
@@ -54,7 +54,7 @@ async fn failed_watched_capture_hides_all_agents_and_recovery_reconciles_all() {
         &shell,
         format!("#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' '{}'\n", bin.display()).as_bytes(),
     );
-    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::executable(&shell);
     let recovered = host.handle("agents.list", json!({"watch":"cursor"})).await;
     assert!(
         listed_ids(&recovered).contains(&"claude".into()),
@@ -183,11 +183,11 @@ impl Fixture {
         let cursor = root.join("cursor-bin/cursor-agent");
         private_mkdir(cursor.parent().unwrap());
         private_write(&cursor, b"#!/bin/sh\nexit 0\n");
-        fs::set_permissions(&cursor, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::executable(&cursor);
         let _cursor = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cursor.as_os_str());
         let shell = root.join("fixture-login-shell");
         private_write(&shell, b"#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' /usr/bin\n");
-        fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::executable(&shell);
         let _shell = EnvGuard::set("SHELL", shell.as_os_str());
         Self {
             root,
@@ -221,12 +221,12 @@ impl Drop for Fixture {
 
 fn private_mkdir(path: &Path) {
     fs::create_dir_all(path).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::private(path);
 }
 
 fn private_write(path: &Path, bytes: &[u8]) {
     fs::write(path, bytes).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    crate::test_support::private(path);
 }
 
 fn write_json(path: &Path, value: &Value) {
@@ -264,7 +264,7 @@ async fn cursor_agent_row_exposes_readiness_codes_and_fallbacks_without_private_
     private_mkdir(&bin);
     let cursor = bin.join("cursor");
     private_write(&cursor, b"#!/bin/sh\necho 'Cursor 3.22.12'\n");
-    fs::set_permissions(&cursor, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::executable(&cursor);
     let _cursor_bin = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cursor.as_os_str());
     write_json(
         &fixture.profile.data.join("agents.json"),
@@ -332,7 +332,7 @@ async fn cursor_readiness_distinguishes_cli_only_from_editor() {
     let _path = EnvGuard::set("PATH", bin.as_os_str());
     let cli = bin.join("cursor-agent");
     private_write(&cli, b"#!/bin/sh\necho 'cursor-agent 1.0.0'\n");
-    fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::executable(&cli);
     write_json(
         &fixture.profile.data.join("agents.json"),
         &json!({
@@ -654,7 +654,7 @@ async fn cursor_actions_preserve_js_state_and_refuse_foreign_invalid_and_escaped
     ));
     private_write(&escaped, br#"{"must":"stay"}"#);
     fs::remove_file(&config_path).unwrap();
-    symlink(&escaped, &config_path).unwrap();
+    symlink(&escaped, &config_path);
     let escaped_before = fs::read(&escaped).unwrap();
     let escaped_result = host.handle("agents.connect", json!({"id":"cursor"})).await;
     assert_eq!(
@@ -786,7 +786,7 @@ async fn uninstalled_and_reinstalled_agent_gets_a_new_generation() {
             .unwrap();
     assert_eq!(state["seen"]["cursor"]["present"], false);
     private_write(&fixture.cursor(), &program);
-    fs::set_permissions(fixture.cursor(), fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::executable(&fixture.cursor());
     let returned = host
         .handle("agents.list", json!({"watch":"cursor","rescan":true}))
         .await;
@@ -816,7 +816,7 @@ async fn replacing_cursor_profile_with_symlink_refuses_connect_without_touching_
     );
     let before = fs::read(&config).unwrap();
     fs::remove_dir_all(fixture.profile.agent_home("CURSOR_CONFIG_DIR")).unwrap();
-    symlink(&external, fixture.profile.agent_home("CURSOR_CONFIG_DIR")).unwrap();
+    symlink(&external, fixture.profile.agent_home("CURSOR_CONFIG_DIR"));
 
     let answer = host.handle("agents.connect", json!({"id":"cursor"})).await;
     assert_eq!(answer.pointer("/error/key"), Some(&json!("agents.invalid")));
@@ -836,7 +836,7 @@ async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn()
         &executable,
         format!("#!/bin/sh\nprintf started > '{}'\n", marker.display()).as_bytes(),
     );
-    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::executable(&executable);
     let _binary = EnvGuard::set("SIDEVOICE_CODEX_BIN", executable.as_os_str());
     let mut state = empty_state();
     state["binaries"]["codex"] = json!(executable);
@@ -852,7 +852,7 @@ async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn()
     private_write(&config, b"[mcp_servers.other]\ncommand = 'keep-me'\n");
     let before = fs::read(&config).unwrap();
     fs::remove_dir_all(fixture.profile.agent_home("CODEX_HOME")).unwrap();
-    symlink(&external, fixture.profile.agent_home("CODEX_HOME")).unwrap();
+    symlink(&external, fixture.profile.agent_home("CODEX_HOME"));
 
     let answer = host.handle("agents.connect", json!({"id":"codex"})).await;
     assert_eq!(
@@ -895,8 +895,7 @@ async fn dangling_codex_config_symlink_is_invalid_not_absent() {
     symlink(
         missing,
         fixture.profile.agent_home("CODEX_HOME").join("config.toml"),
-    )
-    .unwrap();
+    );
     let answer = host.handle("agents.connect", json!({"id":"codex"})).await;
     assert_eq!(answer.pointer("/error/key"), Some(&json!("agents.invalid")));
     host.shutdown().await;
@@ -919,7 +918,7 @@ async fn a_linked_codex_config_is_judged_where_the_link_leads() {
     private_mkdir(&dotfiles);
     let target = dotfiles.join("config.toml");
     fs::rename(&config, &target).unwrap();
-    symlink(&target, &config).unwrap();
+    symlink(&target, &config);
     // A scan that must answer, never wait on what the link leads to.
     let list = |host: std::sync::Arc<HostAgents>| async move {
         let scan =
@@ -959,7 +958,7 @@ async fn a_linked_codex_config_is_judged_where_the_link_leads() {
     assert_eq!(fs::read(&target).unwrap(), malformed);
 
     fs::write(&target, b"").unwrap();
-    fs::set_permissions(&target, fs::Permissions::from_mode(0o620)).unwrap();
+    crate::platform::fs::let_others_change(&target);
     let listed = list(host.clone()).await;
     assert_eq!(
         row(&listed, "codex")["registration"],
@@ -967,15 +966,19 @@ async fn a_linked_codex_config_is_judged_where_the_link_leads() {
         "group-writable: {listed}"
     );
 
-    fs::remove_file(&target).unwrap();
-    let fifo = std::ffi::CString::new(target.to_string_lossy().into_owned()).unwrap();
-    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-    let listed = list(host.clone()).await;
-    assert_eq!(
-        row(&listed, "codex")["registration"],
-        "invalid",
-        "FIFO: {listed}"
-    );
+    // A FIFO is a Unix file type: Windows has none to refuse.
+    #[cfg(unix)]
+    {
+        fs::remove_file(&target).unwrap();
+        let fifo = std::ffi::CString::new(target.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let listed = list(host.clone()).await;
+        assert_eq!(
+            row(&listed, "codex")["registration"],
+            "invalid",
+            "FIFO: {listed}"
+        );
+    }
     host.shutdown().await;
 }
 
@@ -1241,7 +1244,7 @@ echo 'unsupported fixture command' >&2
 exit 2
 "##,
     );
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::executable(&binary);
     let _codex_override = EnvGuard::set("SIDEVOICE_CODEX_BIN", binary.as_os_str());
     let mut initial = empty_state();
     initial["login_path"] = json!("/usr/bin");
@@ -1460,7 +1463,7 @@ async fn the_installed_command_is_registered_and_owns_every_release_of_it() {
     let binary = releases.join("releases/1.0.0/bin/sidevoice-connector");
     private_mkdir(binary.parent().unwrap());
     private_write(&binary, b"#!/bin/sh\n");
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::executable(&binary);
     let stable = binary.clone();
     assert!(
         InstalledCommand::installed(profile).is_none(),
@@ -1559,11 +1562,11 @@ async fn codex_delivery_runs_the_scanned_codex_with_the_login_path() {
         )
         .as_bytes(),
     );
-    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::executable(&codex);
     let login = format!("{}:/usr/bin:/bin", bin.display());
     let shell = fixture.root.join("bench-login-shell");
     private_write(&shell, format!("#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' '{login}'\n").as_bytes());
-    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::executable(&shell);
     let _shell = EnvGuard::set("SHELL", shell.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let discovered = host.handle("agents.list", json!({"rescan":true})).await;
@@ -1631,7 +1634,7 @@ echo 'unsupported fixture command' >&2
 exit 2
 "##,
     );
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::executable(&binary);
     binary
 }
 
@@ -1776,7 +1779,7 @@ echo 'unsupported fixture command' >&2
 exit 2
 "##,
     );
-    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::executable(&binary);
     binary
 }
 
@@ -1852,7 +1855,7 @@ async fn a_foreign_claude_entry_is_never_started() {
         &foreign,
         format!("#!/bin/sh\ntouch '{}'\n", ran.display()).as_bytes(),
     );
-    fs::set_permissions(&foreign, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::executable(&foreign);
     write_json(
         &fixture
             .profile
@@ -1969,7 +1972,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}'
 sleep 30
 "##,
     );
-    fs::set_permissions(&server, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::executable(&server);
 }
 
 #[tokio::test]
@@ -2475,7 +2478,7 @@ async fn capture_with_rc_only_path(shell_name: &str, real_shell: &str, rc: &str)
         &shell,
         format!("#!/bin/sh\nexec {real_shell} \"$@\"\n").as_bytes(),
     );
-    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::executable(&shell);
     let _shell = EnvGuard::set("SHELL", shell.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let path = host
@@ -2520,7 +2523,7 @@ fn steer_fixture(version: &str) -> (Fixture, PathBuf) {
         )
         .as_bytes(),
     );
-    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_support::executable(&codex);
     let mut state = empty_state();
     state["login_path"] = json!(format!("{}:/usr/bin:/bin", bin.display()));
     write_json(&fixture.profile.data.join("agents.json"), &state);
@@ -2531,6 +2534,7 @@ fn voice_event(id: &str) -> Value {
     json!({"channel":"voice","session_id":"s","revision":1,"epoch":1,"message_id":id,"text":"hola"})
 }
 
+#[cfg(unix)]
 fn running_turn_answers(steer: Value) -> Vec<Value> {
     vec![
         json!({"userAgent":"x"}),
