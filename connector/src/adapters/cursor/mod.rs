@@ -1439,7 +1439,8 @@ mod bridge_tests {
     #[cfg(unix)]
     #[allow(clippy::disallowed_types)]
     async fn bridge_response_finishes_at_content_length_without_waiting_for_socket_close() {
-        let scratch = crate::test_support::temp_dir("cursor-bridge-response-length");
+        // Short label: its socket must fit macOS's 104-byte SUN_LEN (the temp dir alone is ~59 bytes there).
+        let scratch = crate::test_support::temp_dir("bridge-length");
         let socket = scratch.path().join("bridge.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let instance = BridgeInstance {
@@ -1481,7 +1482,8 @@ mod bridge_tests {
     #[cfg(unix)]
     #[allow(clippy::disallowed_types)]
     async fn queued_bridge_submission_has_no_editor_consumption_receipt() {
-        let scratch = crate::test_support::temp_dir("cursor-bridge-delivery");
+        // Short label, for the same SUN_LEN reason.
+        let scratch = crate::test_support::temp_dir("bridge-delivery");
         let descriptors = scratch.path().join("desktop-bridge");
         fs::create_dir(&descriptors).unwrap();
         let user_data = scratch.path().join("Cursor");
