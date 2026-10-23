@@ -4,11 +4,10 @@
 //! Callers import both: `use crate::platform::lifecycle::{Lifecycle, Lifecycles};` then
 //! `let stop = Lifecycles::stop_requests()?;`.
 //!
-//! The request is the OS's standard one: `SIGTERM` (what launchd and systemd send to stop a service) and `SIGINT`
-//! (^C) on Unix; on Windows ^C, the console closing, the machine shutting down and the user logging off. A Task
-//! Scheduler task is ended with a hard stop that no process sees: for that, and for another process that has no
-//! console to signal, the request is made in band, over the local channel (the daemon's `shutdown` method, the core's
-//! `POST /api/local/shutdown`), and is not this module's.
+//! On every OS, another process's request that this one leave, as `sidevoice-platform`'s `stop` hears it (what
+//! [`Process::stop`](super::process::Process::stop) sends): `SIGTERM` on Unix (also what launchd and systemd send),
+//! this process's stop event on Windows, which reaches a Task Scheduler task too. Besides it, the console's: `SIGINT`
+//! (^C) on Unix; on Windows ^C, the console closing, the machine shutting down and the user logging off.
 
 #[cfg(unix)]
 #[path = "lifecycle/unix.rs"]
@@ -58,25 +57,21 @@ mod tests {
     }
 
     /// What the test above runs. Nobody has asked: the future waits, and listening does not by itself stop anything.
-    /// Then `SIGTERM`, the one request that can be raised without a console or a session; the Windows requests (a
-    /// console event) need a real console and are checked on a Windows runner. Asking is the only OS-specific part:
-    /// nothing in the interface can send a request.
+    /// Then another process's request, as `Process::stop` sends it (`SIGTERM`, or the stop event), here sent by this
+    /// process to itself; the console events need a real console and are checked on a Windows runner.
     #[tokio::test]
     #[ignore = "a child of the test above, not a test"]
     async fn listening_child() {
+        use sidevoice_platform::stop::{StopRequest, StopRequests};
         assert!(std::env::var_os("SIDEVOICE_TEST_LIFECYCLE_CHILD").is_some());
         let stop = Lifecycles::stop_requests().unwrap();
         tokio::pin!(stop);
         assert!(tokio::time::timeout(Duration::from_millis(100), &mut stop)
             .await
             .is_err());
-        #[cfg(unix)]
-        {
-            use rustix::process::{getpid, kill_process, Signal};
-            kill_process(getpid(), Signal::TERM).unwrap();
-            tokio::time::timeout(Duration::from_secs(5), stop)
-                .await
-                .expect("the request was lost");
-        }
+        assert!(StopRequests::ask(std::process::id()).unwrap());
+        tokio::time::timeout(Duration::from_secs(5), stop)
+            .await
+            .expect("the request was lost");
     }
 }
