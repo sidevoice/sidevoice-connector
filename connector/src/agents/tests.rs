@@ -3,6 +3,10 @@ use crate::adapters::registration::{aggregate_readiness, ReadinessCheck};
 use crate::platform::data_dir;
 use crate::platform::fs::TestFiles;
 use crate::platform::fs::{Create, Files, Fs};
+use crate::platform::target::Host;
+use crate::test_support::stand_in::Script;
+
+mod stand_ins;
 
 #[tokio::test]
 async fn command_output_limit_reports_truncation_instead_of_parsing_prefix() {
@@ -18,6 +22,10 @@ async fn command_output_limit_reports_truncation_instead_of_parsing_prefix() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "the login PATH is asked of a login shell (`$SHELL`) on Unix; Windows reads it from the registry, so no shell can fail or change it"
+)]
 async fn failed_watched_capture_keeps_the_last_scan_and_recovery_reconciles_all() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
@@ -25,13 +33,10 @@ async fn failed_watched_capture_keeps_the_last_scan_and_recovery_reconciles_all(
     let bin = fixture.root.join("login-bin");
     private_mkdir(&bin);
     for name in ["claude", "cursor-agent"] {
-        let program = bin.join(name);
-        private_write(&program, b"#!/bin/sh\nexit 0\n");
-        Files::make_executable(&program);
+        Script::default().make(&bin.join(Host::exe_name(name)));
     }
-    let shell = fixture.root.join("login-shell");
-    private_write(&shell, format!("#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' '{}'\n", bin.display()).as_bytes());
-    Files::make_executable(&shell);
+    let shell = fixture.root.join(Host::exe_name("login-shell"));
+    login_shell(&shell, &bin.to_string_lossy());
     let _shell = EnvGuard::set("SHELL", shell.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     assert_eq!(
@@ -46,7 +51,7 @@ async fn failed_watched_capture_keeps_the_last_scan_and_recovery_reconciles_all(
     let first = host.handle("agents.list", json!({"rescan":true})).await;
     assert!(listed_ids(&first).contains(&"claude".into()), "{first}");
     assert!(listed_ids(&first).contains(&"cursor".into()), "{first}");
-    private_write(&shell, b"#!/bin/sh\nexit 1\n");
+    failing(&shell);
     let failed = host.handle("agents.list", json!({"watch":"cursor"})).await;
     assert_eq!(failed["scan_failed"], true, "{failed}");
     assert_eq!(listed_ids(&failed), listed_ids(&first), "{failed}");
@@ -54,13 +59,9 @@ async fn failed_watched_capture_keeps_the_last_scan_and_recovery_reconciles_all(
     assert_eq!(cached["scan_failed"], true, "{cached}");
     assert!(cached["scanned_at"].is_string(), "{cached}");
     assert_eq!(listed_ids(&cached), listed_ids(&first), "{cached}");
-    private_write(
-        &shell,
-        format!("#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' '{}'\n", bin.display()).as_bytes(),
-    );
-    Files::make_executable(&shell);
+    login_shell(&shell, &bin.to_string_lossy());
     // What is installed changed while the capture was failing: recovery must look at every agent again.
-    fs::remove_file(bin.join("claude")).unwrap();
+    fs::remove_file(bin.join(Host::exe_name("claude"))).unwrap();
     let recovered = host.handle("agents.list", json!({"watch":"cursor"})).await;
     assert!(
         !listed_ids(&recovered).contains(&"claude".into()),
@@ -75,14 +76,17 @@ async fn failed_watched_capture_keeps_the_last_scan_and_recovery_reconciles_all(
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "the login PATH is asked of a login shell (`$SHELL`) on Unix; Windows reads it from the registry, so no shell can fail or change it"
+)]
 async fn actions_refuse_while_the_last_scan_failed_instead_of_trusting_the_cache() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
     let bin = fixture.root.join("bin");
     private_mkdir(&bin);
-    let cursor = bin.join("cursor");
-    private_write(&cursor, b"#!/bin/sh\necho 'Cursor 3.22.12'\n");
-    Files::make_executable(&cursor);
+    let cursor = bin.join(Host::exe_name("cursor"));
+    prints(&cursor, "Cursor 3.22.12\n");
     let _cursor_bin = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cursor.as_os_str());
     write_json(
         &fixture.profile.data.join("agents.json"),
@@ -93,9 +97,8 @@ async fn actions_refuse_while_the_last_scan_failed_instead_of_trusting_the_cache
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let first = host.handle("agents.list", json!({"rescan":true})).await;
     assert_eq!(first["scan_failed"], false, "{first}");
-    let broken = fixture.root.join("broken-login-shell");
-    private_write(&broken, b"#!/bin/sh\nexit 1\n");
-    Files::make_executable(&broken);
+    let broken = fixture.root.join(Host::exe_name("broken-login-shell"));
+    failing(&broken);
     let _shell = EnvGuard::set("SHELL", broken.as_os_str());
     for action in ["agents.connect", "agents.disconnect"] {
         let refused = host.handle(action, json!({"id":"cursor"})).await;
@@ -272,14 +275,12 @@ impl Fixture {
             &crate::adapters::Registry::standard().homes(),
         )
         .unwrap();
-        let cursor = root.join("cursor-bin/cursor-agent");
+        let cursor = root.join("cursor-bin").join(Host::exe_name("cursor-agent"));
         private_mkdir(cursor.parent().unwrap());
-        private_write(&cursor, b"#!/bin/sh\nexit 0\n");
-        Files::make_executable(&cursor);
+        Script::default().make(&cursor);
         let _cursor = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cursor.as_os_str());
-        let shell = root.join("fixture-login-shell");
-        private_write(&shell, b"#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' /usr/bin\n");
-        Files::make_executable(&shell);
+        let shell = root.join(Host::exe_name("fixture-login-shell"));
+        login_shell(&shell, "/usr/bin");
         let _shell = EnvGuard::set("SHELL", shell.as_os_str());
         Self {
             root,
@@ -290,7 +291,9 @@ impl Fixture {
     }
 
     fn cursor(&self) -> PathBuf {
-        self.root.join("cursor-bin/cursor-agent")
+        self.root
+            .join("cursor-bin")
+            .join(Host::exe_name("cursor-agent"))
     }
 
     fn selected(&self) -> InstalledCommand {
@@ -325,6 +328,42 @@ fn write_json(path: &Path, value: &Value) {
     private_write(path, &serde_json::to_vec_pretty(value).unwrap());
 }
 
+/// A program that prints `text` and succeeds.
+fn prints(program: &Path, text: &str) {
+    Script {
+        print: text.into(),
+        ..Script::default()
+    }
+    .make(program);
+}
+
+/// A program that fails.
+fn failing(program: &Path) {
+    Script {
+        exit: 1,
+        ..Script::default()
+    }
+    .make(program);
+}
+
+/// A login shell (`$SHELL`, where the login `PATH` is asked of one) that says `path` is its `PATH`.
+fn login_shell(program: &Path, path: &str) {
+    prints(
+        program,
+        &format!("{}{path}{}", LoginPath::START, LoginPath::END),
+    );
+}
+
+/// Runs `command`, a line a person pastes in this OS's shell, with `home` as their home and no agent home named.
+fn run_by_hand(command: &str, home: &Path) -> std::process::ExitStatus {
+    Environment::hand_shell(command)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env(Environment::HOME, home)
+        .status()
+        .unwrap()
+}
+
 /// Points the agent home `var` at `path`, as if the person's environment set it (`set`) or left it to its default.
 fn set_agent_home(profile: &mut Profile, var: &str, path: &Path, set: bool) {
     let home = profile
@@ -354,9 +393,8 @@ async fn cursor_agent_row_exposes_readiness_codes_and_fallbacks_without_private_
     let fixture = Fixture::new();
     let bin = fixture.root.join("bin");
     private_mkdir(&bin);
-    let cursor = bin.join("cursor");
-    private_write(&cursor, b"#!/bin/sh\necho 'Cursor 3.22.12'\n");
-    Files::make_executable(&cursor);
+    let cursor = bin.join(Host::exe_name("cursor"));
+    prints(&cursor, "Cursor 3.22.12\n");
     let _cursor_bin = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cursor.as_os_str());
     write_json(
         &fixture.profile.data.join("agents.json"),
@@ -422,9 +460,8 @@ async fn cursor_readiness_distinguishes_cli_only_from_editor() {
     let bin = fixture.root.join("bin");
     private_mkdir(&bin);
     let _path = EnvGuard::set("PATH", bin.as_os_str());
-    let cli = bin.join("cursor-agent");
-    private_write(&cli, b"#!/bin/sh\necho 'cursor-agent 1.0.0'\n");
-    Files::make_executable(&cli);
+    let cli = bin.join(Host::exe_name("cursor-agent"));
+    prints(&cli, "cursor-agent 1.0.0\n");
     write_json(
         &fixture.profile.data.join("agents.json"),
         &json!({
@@ -921,14 +958,14 @@ async fn replacing_cursor_profile_with_symlink_refuses_connect_without_touching_
 async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
-    let executable = fixture.root.join("bin/codex");
+    let executable = fixture.root.join("bin").join(Host::exe_name("codex"));
     private_mkdir(executable.parent().unwrap());
     let marker = fixture.root.join("codex-was-started");
-    private_write(
-        &executable,
-        format!("#!/bin/sh\nprintf started > '{}'\n", marker.display()).as_bytes(),
-    );
-    Files::make_executable(&executable);
+    Script {
+        write: Some((marker.clone(), "started".into())),
+        ..Script::default()
+    }
+    .make(&executable);
     let _binary = EnvGuard::set("SIDEVOICE_CODEX_BIN", executable.as_os_str());
     let mut state = empty_state();
     state["binaries"]["codex"] = json!(executable);
@@ -946,12 +983,14 @@ async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn()
     fs::remove_dir_all(fixture.profile.agent_home("CODEX_HOME")).unwrap();
     Files::symlink(&external, fixture.profile.agent_home("CODEX_HOME"));
 
-    // A symlinked agent home also stops the login-shell capture, so the scan fails and the action is refused.
+    // Where the login PATH is asked of a login shell run with the profile, a symlinked agent home also stops that
+    // capture, so the scan fails; elsewhere the connect itself refuses the profile. Either way the action is refused.
     let answer = host.handle("agents.connect", json!({"id":"codex"})).await;
-    assert_eq!(
-        answer.pointer("/error/key"),
-        Some(&json!("agents.scan-failed"))
-    );
+    let refusal = match Environment::login_path() {
+        Some(LoginPath::Run { .. }) => "agents.scan-failed",
+        _ => "agents.invalid",
+    };
+    assert_eq!(answer.pointer("/error/key"), Some(&json!(refusal)));
     assert!(
         !marker.exists(),
         "Codex CLI ran with a replaced private profile"
@@ -1258,86 +1297,9 @@ async fn unparsable_claude_settings_are_left_alone_without_its_data_directory() 
 async fn complete_request_gate_orders_scans_mutations_and_external_dismissals() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
-    let binary = fixture.root.join("bin/codex");
+    let binary = fixture.root.join("bin").join(Host::exe_name("codex"));
     private_mkdir(binary.parent().unwrap());
-    private_write(
-        &binary,
-        br##"#!/bin/sh
-home="$CODEX_HOME"
-state_file="$home/fake-entry.json"
-config_file="$home/config.toml"
-quote() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
-if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
-    echo 'codex fixture 1'
-    exit 0
-fi
-if [ "$1 $2 $3" = "mcp get sidevoice" ]; then
-    if [ -e "$home/timeout-next-get" ]; then
-        rm -f "$home/timeout-next-get"
-        sleep 4
-    fi
-    if [ -e "$home/slow-next-get" ]; then
-        rm -f "$home/slow-next-get"
-        printf '%s' "$$" > "$home/slow-get-started"
-        sleep 0.8
-    fi
-    if [ ! -e "$state_file" ]; then
-        echo 'No such server: sidevoice' >&2
-        exit 1
-    fi
-    cat "$state_file"
-    exit 0
-fi
-if [ "$1 $2 $3" = "mcp remove sidevoice" ]; then
-    rm -f "$state_file" "$config_file"
-    if [ -e "$home/timeout-after-remove" ]; then
-        rm -f "$home/timeout-after-remove"
-        printf '1' > "$home/timeout-next-get"
-    fi
-    exit 0
-fi
-if [ "$1 $2 $3" = "mcp add sidevoice" ]; then
-    shift 3
-    env=""
-    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
-        if [ "$1" = "--env" ]; then
-            shift
-            if [ -n "$env" ]; then env="$env, "; fi
-            env="$env$(quote "${1%%=*}"): $(quote "${1#*=}")"
-        fi
-        shift
-    done
-    if [ "$#" -lt 2 ]; then
-        echo 'unsupported fixture command' >&2
-        exit 2
-    fi
-    shift
-    command="$1"
-    shift
-    args=""
-    for arg in "$@"; do
-        if [ -n "$args" ]; then args="$args, "; fi
-        args="$args$(quote "$arg")"
-    done
-    if [ -e "$home/leave-unregistered-after-add" ]; then
-        rm -f "$home/leave-unregistered-after-add"
-        exit 0
-    fi
-    if [ -e "$home/slow-next-add" ]; then
-        rm -f "$home/slow-next-add"
-        printf '%s' "$$" > "$home/slow-add-started"
-        sleep 0.8
-    fi
-    printf '{"name": "sidevoice", "transport": {"type": "stdio", "command": %s, "args": [%s], "env": {%s}}, "enabled": true}' \
-        "$(quote "$command")" "$args" "$env" > "$state_file"
-    printf '[mcp_servers.sidevoice]\ncommand = %s\nargs = [%s]\n' "$(quote "$command")" "$args" > "$config_file"
-    exit 0
-fi
-echo 'unsupported fixture command' >&2
-exit 2
-"##,
-    );
-    Files::make_executable(&binary);
+    stand_ins::make(&binary, "codex-gate");
     let _codex_override = EnvGuard::set("SIDEVOICE_CODEX_BIN", binary.as_os_str());
     let mut initial = empty_state();
     initial["login_path"] = json!("/usr/bin");
@@ -1642,26 +1604,26 @@ async fn codex_delivery_does_not_use_a_cached_binary_without_login_path() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "the test puts Codex on the login PATH through a login shell (`$SHELL`); Windows reads that PATH from the registry"
+)]
 async fn codex_delivery_runs_the_scanned_codex_with_the_login_path() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
     let bin = fixture.root.join("login-bin");
     private_mkdir(&bin);
     let marker = fixture.root.join("queued");
-    let codex = bin.join("codex");
-    private_write(
-        &codex,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$PATH\" \"$@\" > '{}'\n",
-            marker.display()
-        )
-        .as_bytes(),
-    );
-    Files::make_executable(&codex);
-    let login = format!("{}:/usr/bin:/bin", bin.display());
-    let shell = fixture.root.join("bench-login-shell");
-    private_write(&shell, format!("#!/bin/sh\nprintf '\\036SIDEVOICE_PATH_BEGIN\\036%s\\036SIDEVOICE_PATH_END\\036' '{login}'\n").as_bytes());
-    Files::make_executable(&shell);
+    let codex = bin.join(Host::exe_name("codex"));
+    Script {
+        record: Some(marker.clone()),
+        record_path: true,
+        ..Script::default()
+    }
+    .make(&codex);
+    let login = login_path(&bin);
+    let shell = fixture.root.join(Host::exe_name("bench-login-shell"));
+    login_shell(&shell, &login);
     let _shell = EnvGuard::set("SHELL", shell.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let discovered = host.handle("agents.list", json!({"rescan":true})).await;
@@ -1692,44 +1654,9 @@ async fn codex_delivery_runs_the_scanned_codex_with_the_login_path() {
 /// A Codex CLI that keeps one `sidevoice` entry in `$CODEX_HOME` as the real one shows it (`mcp get --json`, with
 /// `transport.env`), and logs every call.
 fn fake_codex(fixture: &Fixture) -> PathBuf {
-    let binary = fixture.root.join("bin/codex");
+    let binary = fixture.root.join("bin").join(Host::exe_name("codex"));
     private_mkdir(binary.parent().unwrap());
-    private_write(
-        &binary,
-        br##"#!/bin/sh
-home="${CODEX_HOME:-$HOME/.codex}"
-entry="$home/fake-entry.json"
-printf '%s\n' "$*" >> "$home/calls"
-quote() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
-case "$1 $2 $3" in
-"mcp get sidevoice")
-    if [ ! -e "$entry" ]; then echo 'No such server: sidevoice' >&2; exit 1; fi
-    cat "$entry"; exit 0 ;;
-"mcp remove sidevoice")
-    rm -f "$entry" "$home/config.toml"; exit 0 ;;
-"mcp add sidevoice")
-    shift 3
-    env=""
-    while [ "$1" != "--" ]; do
-        if [ "$1" = "--env" ]; then
-            shift
-            if [ -n "$env" ]; then env="$env, "; fi
-            env="$env$(quote "${1%%=*}"): $(quote "${1#*=}")"
-        fi
-        shift
-    done
-    shift
-    command="$1"; shift
-    printf '{"name":"sidevoice","enabled":true,"transport":{"type":"stdio","command":%s,"args":["%s"],"env":{%s}}}' \
-        "$(quote "$command")" "$*" "$env" > "$entry"
-    printf '[mcp_servers.sidevoice]\ncommand = %s\nargs = ["%s"]\n' "$(quote "$command")" "$*" > "$home/config.toml"
-    exit 0 ;;
-esac
-echo 'unsupported fixture command' >&2
-exit 2
-"##,
-    );
-    Files::make_executable(&binary);
+    stand_ins::make(&binary, "codex");
     binary
 }
 
@@ -1832,49 +1759,9 @@ async fn codex_disconnect_removes_a_disabled_or_outdated_entry_of_ours() {
 /// else `~/.claude`). Like the real one, `mcp get` starts the server the entry names (its command is kept in the data
 /// directory) to report whether it connects.
 fn fake_claude(fixture: &Fixture) -> PathBuf {
-    let binary = fixture.root.join("bin/claude");
+    let binary = fixture.root.join("bin").join(Host::exe_name("claude"));
     private_mkdir(binary.parent().unwrap());
-    private_write(
-        &binary,
-        br##"#!/bin/sh
-home="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-settings="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
-printf '%s\n' "$*" >> "$home/calls"
-quote() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
-case "$1 $2" in
-"mcp get")
-    if [ -e "$home/fake-command" ]; then "$(cat "$home/fake-command")" </dev/null >/dev/null 2>&1; fi
-    if [ ! -e "$settings" ]; then echo 'No MCP server named "sidevoice" found.' >&2; exit 1; fi
-    cat "$settings"; exit 0 ;;
-"mcp remove")
-    rm -f "$home/fake-command"
-    printf '{"mcpServers":{}}\n' > "$settings"; exit 0 ;;
-"mcp add")
-    if grep -q '"sidevoice"' "$settings" 2>/dev/null; then echo 'MCP server sidevoice already exists in user config' >&2; exit 1; fi
-    if [ -e "$home/fail-add" ]; then echo 'add failed' >&2; exit 1; fi
-    shift 5
-    env=""
-    while [ "$1" != "--" ]; do
-        if [ "$1" = "-e" ]; then
-            shift
-            if [ -n "$env" ]; then env="$env, "; fi
-            env="$env$(quote "${1%%=*}"): $(quote "${1#*=}")"
-        fi
-        shift
-    done
-    shift
-    command="$1"; shift
-    printf '%s' "$command" > "$home/fake-command"
-    printf '{"numStartups":3,"mcpServers":{"sidevoice":{"type":"stdio","command":%s,"args":["%s"],"env":{%s}}}}\n' \
-        "$(quote "$command")" "$*" "$env" > "$settings"
-    chmod 600 "$settings"
-    exit 0 ;;
-esac
-echo 'unsupported fixture command' >&2
-exit 2
-"##,
-    );
-    Files::make_executable(&binary);
+    stand_ins::make(&binary, "claude");
     binary
 }
 
@@ -1945,12 +1832,12 @@ async fn a_foreign_claude_entry_is_never_started() {
     let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", binary.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let ran = fixture.root.join("foreign-ran");
-    let foreign = fixture.root.join("bin/foreign");
-    private_write(
-        &foreign,
-        format!("#!/bin/sh\ntouch '{}'\n", ran.display()).as_bytes(),
-    );
-    Files::make_executable(&foreign);
+    let foreign = fixture.root.join("bin").join(Host::exe_name("foreign"));
+    Script {
+        write: Some((ran.clone(), String::new())),
+        ..Script::default()
+    }
+    .make(&foreign);
     write_json(
         &fixture
             .profile
@@ -2055,19 +1942,7 @@ async fn the_claude_entry_is_read_where_claude_code_reads_it() {
 fn fake_server(fixture: &Fixture) {
     let server = fixture.root.join("selected/current/dist/sidevoice");
     private_mkdir(server.parent().unwrap());
-    private_write(
-        &server,
-        br##"#!/bin/sh
-read -r initialize
-printf '%s\n' "$SIDEVOICE_HEALTH_CHECK $*" >> "$SIDEVOICE_DATA_DIR/health-calls"
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}}'
-read -r initialized
-read -r list
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}'
-sleep 30
-"##,
-    );
-    Files::make_executable(&server);
+    stand_ins::make(&server, "mcp-server");
 }
 
 #[tokio::test]
@@ -2334,14 +2209,7 @@ async fn the_manual_steps_run_by_hand_update_an_older_entry_in_the_agents_own_ho
             // Run by hand from a shell that names no agent home: the steps name it themselves.
             for step in steps {
                 let command = step["command"].as_str().unwrap();
-                let status = std::process::Command::new("/bin/sh")
-                    .arg("-c")
-                    .arg(command)
-                    .env_remove("CLAUDE_CONFIG_DIR")
-                    .env_remove("CODEX_HOME")
-                    .env("HOME", fixture.root.join("elsewhere"))
-                    .status()
-                    .unwrap();
+                let status = run_by_hand(command, &fixture.root.join("elsewhere"));
                 assert!(status.success(), "{kind}: {command}");
             }
         }
@@ -2392,7 +2260,11 @@ async fn steps_name_an_agents_home_only_when_the_person_sets_it() {
                 assert_eq!(step["file"], json!(file.to_string_lossy()), "{step}");
                 let command = step["command"].as_str().unwrap();
                 assert!(
-                    command.starts_with(&format!("'{}' ", cli.display())),
+                    command.starts_with(&format!(
+                        "{}{} ",
+                        Environment::CALL,
+                        Environment::quote(&cli.to_string_lossy())
+                    )),
                     "{command}"
                 );
             }
@@ -2400,14 +2272,7 @@ async fn steps_name_an_agents_home_only_when_the_person_sets_it() {
         // The person's shell: their HOME, no agent home named.
         for step in manual["connect"].as_array().unwrap() {
             let command = step["command"].as_str().unwrap();
-            let status = std::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(command)
-                .env_remove("CLAUDE_CONFIG_DIR")
-                .env_remove("CODEX_HOME")
-                .env("HOME", &home)
-                .status()
-                .unwrap();
+            let status = run_by_hand(command, &home);
             assert!(status.success(), "{command}");
         }
     }
@@ -2588,11 +2453,19 @@ async fn capture_with_rc_only_path(shell_name: &str, real_shell: &str, rc: &str)
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "the login PATH is asked of a login shell (`$SHELL`) on Unix; Windows reads it from the registry, so no shell can fail or change it"
+)]
 async fn login_path_comes_from_a_bashrc_only_path() {
     capture_with_rc_only_path("bash", "/bin/bash", ".bashrc").await;
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "the login PATH is asked of a login shell (`$SHELL`) on Unix; Windows reads it from the registry, so no shell can fail or change it"
+)]
 async fn login_path_comes_from_a_zshrc_only_path() {
     if let Some(zsh) = ["/bin/zsh", "/usr/bin/zsh"]
         .into_iter()
@@ -2609,20 +2482,25 @@ fn steer_fixture(version: &str) -> (Fixture, PathBuf) {
     let bin = fixture.root.join("login-bin");
     private_mkdir(&bin);
     let calls = fixture.root.join("calls");
-    let codex = bin.join("codex");
-    private_write(
-        &codex,
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli {version}'; exit 0; fi\nprintf '%s\\n' \"$@\" >> '{}'\n",
-            calls.display()
-        )
-        .as_bytes(),
-    );
-    Files::make_executable(&codex);
+    Script {
+        version: Some(format!("codex-cli {version}")),
+        record: Some(calls.clone()),
+        append: true,
+        ..Script::default()
+    }
+    .make(&bin.join(Host::exe_name("codex")));
     let mut state = empty_state();
-    state["login_path"] = json!(format!("{}:/usr/bin:/bin", bin.display()));
+    state["login_path"] = json!(login_path(&bin));
     write_json(&fixture.profile.data.join("agents.json"), &state);
     (fixture, calls)
+}
+
+/// A login `PATH` with `bin` first, then the system's directories, as this OS writes a list.
+fn login_path(bin: &Path) -> String {
+    std::env::join_paths([bin, Path::new("/usr/bin"), Path::new("/bin")])
+        .unwrap()
+        .into_string()
+        .unwrap()
 }
 
 fn voice_event(id: &str) -> Value {

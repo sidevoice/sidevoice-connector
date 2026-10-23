@@ -201,6 +201,13 @@ impl super::Env for Os {
         };
         LoginPath::clean(registry.path().as_ref()).map(LoginPath::Known)
     }
+
+    #[cfg(test)]
+    fn hand_shell(line: &str) -> std::process::Command {
+        let mut command = std::process::Command::new("pwsh");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", line]);
+        command
+    }
 }
 
 /// Unit tests here, not against the interface in `env.rs`: `%NAME%` expansion is how the Windows registry writes a

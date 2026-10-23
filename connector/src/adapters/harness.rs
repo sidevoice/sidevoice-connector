@@ -256,7 +256,7 @@ mod tests {
     }
 
     /// Only the adapters name a harness: every other source reaches one through the registry by id. Test files
-    /// (`tests.rs`) may name them, as fixtures.
+    /// (`tests.rs`, and the files of a `tests` module's directory) may name them, as fixtures.
     #[test]
     fn no_harness_is_named_outside_the_adapters() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -273,6 +273,11 @@ mod tests {
             if file.starts_with(&adapters)
                 || file == src.join("adapters.rs")
                 || file.file_name().is_some_and(|name| name == "tests.rs")
+                || file
+                    .strip_prefix(&src)
+                    .unwrap()
+                    .components()
+                    .any(|part| part.as_os_str() == "tests")
             {
                 continue;
             }

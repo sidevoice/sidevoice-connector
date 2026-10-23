@@ -113,6 +113,11 @@ pub trait Env {
     /// How this user's login `PATH` is asked for; `None` when this process has no way to know it.
     fn login_path() -> Option<LoginPath>;
 
+    /// Tests: what runs `line`, written for this OS's shell as [`Env::quote`] and [`Env::set`] write one, the way a
+    /// person who pastes it runs it: `sh -c` on Unix, PowerShell 7 (`pwsh -Command`) on Windows.
+    #[cfg(test)]
+    fn hand_shell(line: &str) -> std::process::Command;
+
     /// What a child started with its environment cleared is given: [`Env::base_path`] and [`Env::SYSTEM`].
     fn base() -> Vec<(OsString, OsString)> {
         let mut base = vec![(OsString::from("PATH"), Self::base_path())];

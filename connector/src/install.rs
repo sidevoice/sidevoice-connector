@@ -1187,12 +1187,12 @@ pub(crate) mod tests {
             fs::create_dir_all(root.join("bin")).unwrap();
             fs::create_dir_all(root.join("core")).unwrap();
             let binary = root.join(binary());
-            fs::write(
+            // `build` is part of the stand-in, so two builds are two files.
+            crate::test_support::stand_in::make(
                 &binary,
-                format!("#!/bin/sh\n# {build}\necho '{{\"ok\":true,\"version\":\"{version}\"}}'\n"),
-            )
-            .unwrap();
-            Files::make_executable(&binary);
+                &json!({"play": "script", "build": build,
+                    "print": format!("{}\n", json!({"ok": true, "version": version}))}),
+            );
             let archive = core_archive(&core_files(), &[]);
             let target = Host::name().unwrap();
             let name = format!("core/sidevoice-core-0.2.0-{target}.tar.zst");
@@ -1468,9 +1468,8 @@ pub(crate) mod tests {
         let fixture = Fixture::new("agents");
         let profile = &fixture.profile;
         let id = agent_without_cli();
-        let program = fixture.scratch.path().join("agent-program");
-        fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
-        Files::make_executable(&program);
+        let program = fixture.scratch.path().join(Host::exe_name("agent-program"));
+        crate::test_support::stand_in::Script::default().make(&program);
         let _installed = crate::agents::tests::EnvGuard::set(
             &format!("SIDEVOICE_{}_BIN", id.to_ascii_uppercase()),
             program.as_os_str(),
