@@ -207,15 +207,15 @@ pub struct Manual {
 }
 
 impl Manual {
-    /// `steps` as the one step the older fields (`instructions`, `removal`) hold: commands joined with `&&`, each run
-    /// once the one before succeeded, else the last step that gives a snippet (the one that adds), with its file.
+    /// `steps` as the one step the older fields (`instructions`, `removal`) hold: commands joined as this OS's shell
+    /// runs each once the one before succeeded ([`Env::in_sequence`]), else the last step that gives a snippet (the one that adds), with its file.
     pub fn as_one(steps: &[ManualStep]) -> Option<ManualStep> {
         if !steps.is_empty() && steps.iter().all(|step| step.command.is_some()) {
-            let command = steps
+            let commands: Vec<&str> = steps
                 .iter()
                 .filter_map(|step| step.command.as_deref())
-                .collect::<Vec<_>>()
-                .join(" && ");
+                .collect();
+            let command = Environment::in_sequence(&commands);
             return Some(ManualStep {
                 command: Some(command),
                 snippet: None,
@@ -559,7 +559,7 @@ mod tests {
         assert_eq!(
             Manual::as_one(&[command("remove"), command("add")]),
             Some(ManualStep {
-                command: Some("remove && add".into()),
+                command: Some(Environment::in_sequence(&["remove", "add"])),
                 snippet: None,
                 file: Some("/f".into()),
             })

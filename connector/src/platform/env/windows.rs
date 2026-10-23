@@ -202,6 +202,18 @@ impl super::Env for Os {
         LoginPath::clean(registry.path().as_ref()).map(LoginPath::Known)
     }
 
+    fn in_sequence(commands: &[&str]) -> String {
+        let mut line = String::new();
+        for (index, command) in commands.iter().enumerate() {
+            if index == 0 {
+                line.push_str(command);
+            } else {
+                line.push_str(&format!("; if ($?) {{ {command} }}"));
+            }
+        }
+        line
+    }
+
     #[cfg(test)]
     fn hand_shell(line: &str) -> std::process::Command {
         // Windows PowerShell 5.1: the shell every Windows has (PowerShell 7 is installed apart), so what a person
