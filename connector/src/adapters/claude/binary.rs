@@ -17,18 +17,20 @@ pub(super) fn fallbacks(roots: &Roots) -> Vec<(PathBuf, PathBuf)> {
     let home = |relative: &str| (roots.home.clone(), roots.home.join(relative).join(&exe));
     let mut found = vec![home(".local/bin"), home(".claude/local")];
     if let Some(local) = &roots.local_app_data {
-        let bundle =
-            Environment::store_packages(local).and_then(|packages| desktop_bundle(&packages, &exe));
-        found.extend(bundle.map(|program| (local.clone(), program)));
+        let bundles = Environment::store_packages(local)
+            .map(|packages| desktop_bundles(&packages, &exe))
+            .unwrap_or_default();
+        found.extend(bundles.into_iter().map(|program| (local.clone(), program)));
     }
     found
 }
 
 /// The desktop app is an MSIX package (`Claude_<publisher id>`) and keeps its Claude Code under
 /// `<packages>\Claude_*\LocalCache\Roaming\Claude\claude-code\<version>\<hash>\claude.exe`. The highest version wins
-/// (by version precedence, not text); among several builds of it, the newest.
-fn desktop_bundle(packages: &Path, exe: &str) -> Option<PathBuf> {
-    let mut best: Option<(Version, SystemTime, PathBuf)> = None;
+/// (by version precedence, not text); among several builds of it, the newest. All are returned, best first: the
+/// caller takes the first that it trusts, so a newer one that fails does not hide an older one that passes.
+fn desktop_bundles(packages: &Path, exe: &str) -> Vec<PathBuf> {
+    let mut found: Vec<(Version, SystemTime, PathBuf)> = Vec::new();
     for package in subdirs(packages) {
         let named = package
             .file_name()
@@ -53,19 +55,12 @@ fn desktop_bundle(packages: &Path, exe: &str) -> Option<PathBuf> {
                 else {
                     continue;
                 };
-                let better = best.as_ref().is_none_or(|(top, time, _)| {
-                    version
-                        .cmp_precedence(top)
-                        .then_with(|| modified.cmp(time))
-                        .is_gt()
-                });
-                if better {
-                    best = Some((version.clone(), modified, program));
-                }
+                found.push((version.clone(), modified, program));
             }
         }
     }
-    best.map(|(_, _, program)| program)
+    found.sort_by(|a, b| b.0.cmp_precedence(&a.0).then_with(|| b.1.cmp(&a.1)));
+    found.into_iter().map(|(_, _, program)| program).collect()
 }
 
 fn subdirs(dir: &Path) -> Vec<PathBuf> {
@@ -129,8 +124,14 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(desktop_bundle(packages, &exe), Some(newest));
-        assert_eq!(desktop_bundle(&packages.join("none"), &exe), None);
+        let ranked = desktop_bundles(packages, &exe);
+        assert_eq!(ranked.len(), 4, "every build of a version, not the others");
+        assert_eq!(ranked[0], newest);
+        assert!(
+            ranked[3].to_string_lossy().contains("2.1.9"),
+            "the lowest version is last"
+        );
+        assert!(desktop_bundles(&packages.join("none"), &exe).is_empty());
     }
 
     #[test]
@@ -179,6 +180,24 @@ mod resolution {
         // Somebody else can change it: ignored.
         Files::let_others_change(&native);
         assert_eq!(crate::agents::find_binary(&claude, None, &roots), None);
+        Files::shut_others_out(&native);
+        // A better candidate that is refused does not hide the next one that passes.
+        let ranked = vec![
+            (roots.home.clone(), roots.home.join("missing")),
+            (roots.home.clone(), native.clone()),
+        ];
+        Files::let_others_change(&native);
+        assert_eq!(crate::agents::first_trusted(ranked.clone()), None);
+        let second = roots
+            .home
+            .join(".local/bin/second")
+            .with_extension(std::env::consts::EXE_EXTENSION);
+        Files::open_private(&second, Create::NewProgram).unwrap();
+        let ranked = [ranked, vec![(roots.home.clone(), second.clone())]].concat();
+        assert_eq!(
+            crate::agents::first_trusted(ranked).as_deref(),
+            second.to_str()
+        );
         Files::shut_others_out(&native);
         // PATH comes first.
         let bin = dir.path().join("bin");

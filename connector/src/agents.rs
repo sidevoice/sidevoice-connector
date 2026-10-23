@@ -1226,22 +1226,25 @@ pub(crate) fn find_binary(
     path: Option<&str>,
     roots: &Roots,
 ) -> Option<String> {
-    find_in_path(agent.binary_names(), path).or_else(|| {
-        agent
-            .fallback_binaries(roots)
-            .into_iter()
-            .find_map(
-                |(root, program)| match Environment::trusted_program(&program, &root) {
-                    Ok(program) => program.into_os_string().into_string().ok(),
-                    Err(why) => {
-                        // The reason only: a path stays local.
-                        crate::logfile::log(&format!(
-                            "ignored a program of an agent outside PATH: {why}"
-                        ));
-                        None
-                    }
-                },
-            )
+    find_in_path(agent.binary_names(), path)
+        .or_else(|| first_trusted(agent.fallback_binaries(roots)))
+}
+
+/// The first of the (root, program) candidates, best first, that passes `Env::trusted_program`; a refused one is
+/// logged by the rule that refused it, never by path, and the next is tried.
+pub(crate) fn first_trusted(candidates: Vec<(PathBuf, PathBuf)>) -> Option<String> {
+    candidates.into_iter().find_map(|(root, program)| {
+        // Nothing there is the usual case, and no news.
+        fs::symlink_metadata(&program).ok()?;
+        match Environment::trusted_program(&program, &root) {
+            Ok(program) => program.into_os_string().into_string().ok(),
+            Err(why) => {
+                crate::logfile::log(&format!(
+                    "ignored a program of an agent outside PATH: {why}"
+                ));
+                None
+            }
+        }
     })
 }
 

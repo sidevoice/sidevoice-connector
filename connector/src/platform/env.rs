@@ -172,18 +172,21 @@ pub trait Env {
                     break;
                 }
                 if !dir.starts_with(base) || Files::check_user_directory(dir).is_err() {
-                    return Err("a directory on the way is not safe");
+                    return Err("a directory on the way is not this user's, or can be changed by another principal");
                 }
             }
         }
         let file = Files::open_read(&target).map_err(|_| "it cannot be opened")?;
         let regular = file.metadata().is_ok_and(|meta| meta.is_file());
         let ours = UserId::current().owns_file(&file).unwrap_or(false);
-        if !regular
-            || !ours
-            || Files::others_of(&file).map_or(true, |others| others == Others::Change)
-        {
-            return Err("it is not a regular file of this user's that nobody else can change");
+        if !regular {
+            return Err("it is not a regular file");
+        }
+        if !ours {
+            return Err("its owner is not this user");
+        }
+        if Files::others_of(&file).map_or(true, |others| others == Others::Change) {
+            return Err("it can be changed by another principal (the platform does not say which)");
         }
         which::which(&target).map_err(|_| "it cannot be run")?;
         Ok(program.to_path_buf())
