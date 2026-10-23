@@ -274,7 +274,7 @@ pub async fn stop(layout: &Layout) -> Result<Value> {
     write_stop(layout)?;
     let installed = jobs::installed(layout).await;
     if let Some(found) = &installed {
-        if let Some(refused) = jobs::unload(layout, &jobs::manager(layout), found, false).await {
+        if let Some(refused) = jobs::unload(&jobs::manager(layout), found, false).await {
             return Err(Failure::keyed(
                 "service.unload-failed",
                 json!({"detail": refused}),
@@ -331,7 +331,7 @@ pub async fn uninstall_held(layout: &Layout, keep_stopped: bool) -> Result<Value
     let installed = jobs::installed(layout).await;
     let kind = installed.as_ref().map_or(Kind::None, |_| Kind::Manager);
     if let Some(found) = &installed {
-        if let Some(refused) = jobs::unload(layout, &jobs::manager(layout), found, true).await {
+        if let Some(refused) = jobs::unload(&jobs::manager(layout), found, true).await {
             return Err(Failure::keyed(
                 "service.unload-failed",
                 json!({"detail": refused}),
