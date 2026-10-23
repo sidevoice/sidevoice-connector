@@ -86,7 +86,8 @@ const DATA_PREFIX: &str = "data-";
 const MODELS_UNRESOLVED: &str =
     "uninstall refused: cannot tell where the shared models folder is relative to the data directory";
 /// `path` as the OS resolves it: its longest existing ancestor canonicalized, the components that do not exist yet
-/// appended as written. Fails closed: only "not found" walks up to the parent; any other error (permission, a link
+/// appended as written. Fails closed: only an entry that is not there walks up to the parent (a link whose target is
+/// missing is refused); any other error (permission, a link
 /// loop...) or a tail that cannot be placed without the OS (`..`) is an error, never a guess.
 fn resolved(path: &Path, unresolved: &'static str) -> Result<PathBuf, &'static str> {
     let mut missing = Vec::new();
@@ -99,7 +100,14 @@ fn resolved(path: &Path, unresolved: &'static str) -> Result<PathBuf, &'static s
                     .rev()
                     .fold(real, |real, part| real.join(part)));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Not found is also what a link whose target is missing says: only an entry that is truly not there is
+                // walked past; a dangling link (symlink, junction) cannot be placed, so it refuses.
+                match std::fs::symlink_metadata(existing) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => return Err(unresolved),
+                }
+            }
             Err(_) => return Err(unresolved),
         }
         match (existing.parent(), existing.file_name()) {
@@ -664,6 +672,12 @@ mod tests {
         future.homes = vec![alias.join("future")];
         let refused = Remover::new(future)
             .err()
+        // The same through a link whose target is missing: it cannot be placed, so it refuses.
+        let dangling = scratch.path().join("dangling");
+        Files::symlink(home.join("missing"), &dangling);
+        let mut gone = at(home.clone(), &standard);
+        gone.homes = vec![dangling.join("future")];
+        assert!(Remover::new(gone).is_err(), "a home below a dangling link");
             .expect("a home below a link into D");
         assert!(
             refused.contains("the home directory or a directory it is in"),
