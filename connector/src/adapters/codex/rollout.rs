@@ -1,7 +1,7 @@
 //! Following a Codex thread's rollout: its engine, its turns (working) and the messages it read.
 
 use super::{default_effort, rollout_engine};
-use crate::adapters::conversation::{Conversation, Reporter};
+use crate::adapters::conversation::{Conversation, IdentityFailures, Reporter};
 use crate::platform::fs::{FileId, Files, Fs};
 use serde_json::{json, Value};
 use std::fs;
@@ -18,6 +18,7 @@ pub fn follow(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
         let mut path: Option<PathBuf> = None;
         let mut offset = 0u64;
         let mut file_id: Option<FileId> = None;
+        let mut identity_failures = IdentityFailures::default();
         let mut partial = Vec::new();
         let mut oversized = false;
         let mut turn: Option<String> = None;
@@ -47,10 +48,19 @@ pub fn follow(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
                         continue;
                     };
                     // Which file was opened, from the handle read below. When the OS cannot tell, nothing is read
-                    // this round.
-                    let Ok(current) = Files::identity(&input) else {
-                        tokio::time::sleep(Duration::from_millis(400)).await;
-                        continue;
+                    // this round, and after a few in a row the rollout is given up.
+                    let current = match Files::identity(&input) {
+                        Ok(current) => {
+                            identity_failures.read();
+                            current
+                        }
+                        Err(error) => {
+                            if identity_failures.failed(&error) {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                            continue;
+                        }
                     };
                     if file_id.as_ref() != Some(&current) || meta.len() < offset {
                         offset = 0;

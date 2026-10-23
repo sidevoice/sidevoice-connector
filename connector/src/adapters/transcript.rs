@@ -1,6 +1,6 @@
 //! Following a conversation's JSONL transcript as the harness appends it, and what the harness reads in each line.
 
-use super::conversation::{report_working, Conversation, Reporter};
+use super::conversation::{report_working, Conversation, IdentityFailures, Reporter};
 use crate::platform::fs::{FileId, Files, Fs};
 use serde_json::{json, Value};
 use std::fs;
@@ -79,6 +79,7 @@ async fn follow_file<R: TranscriptReader>(
     let mut announced_initial = false;
     let mut oversized = false;
     let rewritten_in_place = reader.rewritten_in_place();
+    let mut identity_failures = IdentityFailures::default();
     loop {
         if conversation.stopped.load(Ordering::Relaxed) {
             break;
@@ -106,10 +107,19 @@ async fn follow_file<R: TranscriptReader>(
             continue;
         };
         // Which file was opened, from the handle read below: a different one after a rotation or a replacement. When
-        // the OS cannot tell, nothing is read this round.
-        let Ok(current) = Files::identity(&input) else {
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            continue;
+        // the OS cannot tell, nothing is read this round, and after a few in a row the transcript is given up.
+        let current = match Files::identity(&input) {
+            Ok(current) => {
+                identity_failures.read();
+                current
+            }
+            Err(error) => {
+                if identity_failures.failed(&error) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                continue;
+            }
         };
         if file_id.as_ref() != Some(&current) || meta.len() < offset {
             file_id = Some(current);
