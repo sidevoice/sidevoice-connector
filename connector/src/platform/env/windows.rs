@@ -11,6 +11,7 @@
 use super::LoginPath;
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use winreg::enums::{RegType, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 use winreg::types::FromRegValue;
 use winreg::{RegKey, HKEY};
@@ -175,6 +176,11 @@ impl super::Env for Os {
 
     fn set(variable: &str, quoted_value: &str) -> String {
         format!("$env:{variable} = {quoted_value}; ")
+    }
+
+    // MSIX packages (a Store app) keep their files under `%LOCALAPPDATA%\Packages`.
+    fn store_packages(local_app_data: &Path) -> Option<PathBuf> {
+        Some(local_app_data.join("Packages"))
     }
 
     // The registry's, or this process's own when the registry gives nothing usable.

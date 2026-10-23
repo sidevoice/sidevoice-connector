@@ -224,7 +224,7 @@ impl Registration for Claude {
     fn fallback_binaries(
         &self,
         roots: &crate::adapters::markers::Roots,
-    ) -> Vec<std::path::PathBuf> {
+    ) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
         super::binary::fallbacks(roots)
     }
 

@@ -1230,16 +1230,29 @@ pub(crate) fn find_binary(
         agent
             .fallback_binaries(roots)
             .into_iter()
-            .find_map(|candidate| which::which(candidate).ok())
-            .map(|found| found.to_string_lossy().into_owned())
+            .find_map(
+                |(root, program)| match Environment::trusted_program(&program, &root) {
+                    Ok(program) => program.into_os_string().into_string().ok(),
+                    Err(why) => {
+                        // The reason only: a path stays local.
+                        crate::logfile::log(&format!(
+                            "ignored a program of an agent outside PATH: {why}"
+                        ));
+                        None
+                    }
+                },
+            )
     })
 }
 
 pub(crate) fn find_in_path(names: &[&str], path: Option<&str>) -> Option<String> {
     let path = path?;
     names.iter().find_map(|name| {
-        Environment::find_program(name, OsStr::new(path))
-            .map(|found| found.to_string_lossy().into_owned())
+        // A path that is not text cannot be reported or passed on as it is: not found.
+        Environment::find_program(name, OsStr::new(path))?
+            .into_os_string()
+            .into_string()
+            .ok()
     })
 }
 
