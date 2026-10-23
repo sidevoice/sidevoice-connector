@@ -70,12 +70,14 @@ pub fn binary() -> String {
 }
 /// How long the pair has to answer after a restart.
 const VERIFY_LIMIT: Duration = Duration::from_secs(60);
-/// The lock files and the stop `uninstall` leaves in `D`.
+/// What `uninstall` leaves in `D`: the lock files, the stop, and `Models`, the downloaded models the engine shares
+/// with the other programs (on macOS `D` is their folder too): not this connector's to remove.
 const KEPT: &[&str] = &[
     "install.lock",
     "connector.lock",
     "agents.lock",
     "node-stopped.json",
+    "Models",
 ];
 
 /// The package being installed: its root (`bin/`, `connector.json`, `core/`), its binary and the version it is.
@@ -1324,6 +1326,10 @@ pub(crate) mod tests {
         // Uninstall: the releases and the data go; the locks and the stop stay.
         Files::write_json(&layout.data.join("outbox.json"), &json!([])).unwrap();
         crate::lock::try_lock(&layout.data.join("agents.lock"), "test").unwrap();
+        // The shared models are another program's: they and what is in them survive.
+        let models = layout.data.join("Models/other-program");
+        fs::create_dir_all(&models).unwrap();
+        fs::write(models.join("sentinel"), "theirs").unwrap();
         let removed = uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
             .await
             .unwrap();
@@ -1342,6 +1348,11 @@ pub(crate) mod tests {
         );
         assert!(left.contains(&"node-stopped.json".to_owned()), "{left:?}");
         assert!(left.contains(&"install.lock".to_owned()), "{left:?}");
+        assert!(left.contains(&"Models".to_owned()), "{left:?}");
+        assert_eq!(
+            fs::read_to_string(models.join("sentinel")).unwrap(),
+            "theirs"
+        );
         assert!(!layout.installed());
 
         // And it installs again from nothing.
