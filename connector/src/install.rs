@@ -1250,7 +1250,7 @@ pub(crate) mod tests {
         let release = layout.releases_dir().join("1.0.0");
         assert!(complete(&release));
         assert!(release.join("core/native-core.json").is_file());
-        let stable = release.join("bin/sidevoice-connector");
+        let stable = release.join(binary());
         assert_eq!(answer["command"], json!([stable]));
         assert_eq!(
             layout.connector_command(),
