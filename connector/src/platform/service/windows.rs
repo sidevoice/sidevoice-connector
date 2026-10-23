@@ -198,7 +198,7 @@ impl Os {
             .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))?;
         let user = whoami::account().map_err(|error| error.to_string())?;
         let xml_file = self.xml_file(job);
-        write_file(&xml_file, &utf16(&task_xml(&stored, &user, on)?))
+        write_file(&xml_file, &utf16(&task_xml(&stored, &file, &user, on)?))
             .map_err(|refusal| format!("{refusal:?}"))?;
         let created = schtasks(&[
             "/Create",
@@ -395,26 +395,35 @@ struct RestartOnFailure {
 struct Actions<'a> {
     #[serde(rename = "@Context")]
     context: &'a str,
-    exec: Exec<'a>,
+    exec: Exec,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
-struct Exec<'a> {
-    command: &'a str,
+struct Exec {
+    command: String,
     arguments: String,
 }
 
 /// The task: at this user's logon (`login`: its trigger enabled), as this user with their interactive token and
 /// least privilege, one instance at a time, no time limit, not stopped on battery, restarted once a minute after a
-/// failure; its action runs the job's runner on the job's definition. Task Scheduler expands `%NAME%` in an action,
-/// so a word with `%` is refused.
-fn task_xml(job: &Stored, user: &str, login: bool) -> Result<String, String> {
+/// failure; its action runs the job's runner on the job's definition, the file `definition` (the runner names no
+/// definition of its own). Task Scheduler expands `%NAME%` in an action, so a word with `%` is refused.
+fn task_xml(job: &Stored, definition: &Path, user: &str, login: bool) -> Result<String, String> {
     let (command, runner_args) = job.runner.split_first().ok_or("no runner")?;
+    let definition = definition
+        .to_str()
+        .ok_or("the definition's path is not Unicode")?;
     if !Path::new(command).is_absolute() {
         return Err(format!("{command} is not an absolute path"));
     }
-    if job.runner.iter().any(|word| word.contains('%')) {
+    if job
+        .runner
+        .iter()
+        .map(String::as_str)
+        .chain([definition])
+        .any(|word| word.contains('%'))
+    {
         return Err("a runner word contains %, which Task Scheduler would expand".into());
     }
     let task = Task {
@@ -463,10 +472,13 @@ fn task_xml(job: &Stored, user: &str, login: bool) -> Result<String, String> {
         actions: Actions {
             context: "Author",
             exec: Exec {
-                command,
+                // One separator: an archive path joined with `/` (`bin/sidevoice-connector.exe`) reads back the same.
+                command: command.replace('/', "\\"),
                 arguments: runner_args
                     .iter()
-                    .map(|word| quote(word))
+                    .map(String::as_str)
+                    .chain([definition])
+                    .map(quote)
                     .collect::<Vec<_>>()
                     .join(" "),
             },
@@ -508,11 +520,11 @@ mod tests {
     #[test]
     fn a_task_runs_the_runner_at_this_users_logon_and_restarts_after_a_failure() {
         let job = stored(&[
-            "C:\\Program Files\\Sidevoice\\sidevoice-connector.exe",
+            "C:\\Program Files\\Sidevoice/sidevoice-connector.exe",
             "run-job",
-            "C:\\Users\\A B\\data\\service\\sidevoice-core.json",
         ]);
-        let text = task_xml(&job, "alice@example.com", true).unwrap();
+        let definition = Path::new("C:\\Users\\A B\\data\\service\\sidevoice-core.json");
+        let text = task_xml(&job, definition, "alice@example.com", true).unwrap();
         assert!(text.starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"), "{text}");
         assert!(text
             .contains("<Command>C:\\Program Files\\Sidevoice\\sidevoice-connector.exe</Command>"));
@@ -537,7 +549,7 @@ mod tests {
             assert!(text.contains(element), "{element}: {text}");
         }
         assert_eq!(parse_login(&text), Some(true));
-        let off = task_xml(&job, "alice", false).unwrap();
+        let off = task_xml(&job, definition, "alice", false).unwrap();
         assert_eq!(parse_login(&off), Some(false));
         let utf16_text: String = String::from_utf16_lossy(
             &utf16(&off)[2..]
@@ -550,9 +562,17 @@ mod tests {
 
     #[test]
     fn a_relative_runner_or_one_task_scheduler_would_expand_is_refused() {
-        assert!(task_xml(&stored(&["sidevoice-connector.exe"]), "a", true).is_err());
-        assert!(task_xml(&stored(&["C:\\x.exe", "%PATH%"]), "a", true).is_err());
-        assert!(task_xml(&stored(&[]), "a", true).is_err());
+        let definition = Path::new("C:\\d\\service\\job.json");
+        assert!(task_xml(&stored(&["sidevoice-connector.exe"]), definition, "a", true).is_err());
+        assert!(task_xml(&stored(&["C:\\x.exe", "%PATH%"]), definition, "a", true).is_err());
+        assert!(task_xml(&stored(&[]), definition, "a", true).is_err());
+        assert!(task_xml(
+            &stored(&["C:\\x.exe"]),
+            Path::new("C:\\%TEMP%\\job.json"),
+            "a",
+            true
+        )
+        .is_err());
     }
 
     #[test]
