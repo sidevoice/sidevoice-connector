@@ -157,7 +157,10 @@ pub trait Env {
     fn trusted_program(program: &Path, root: &Path) -> Result<PathBuf, &'static str> {
         use crate::platform::fs::{Fs, Others};
         use crate::platform::user::{User, UserId};
-        let root_found = Files::check_user_directory(root).map_err(|_| "its root is not safe")?;
+        // The same form `target` has: `check_user_directory` gives the `\\?\` form on Windows.
+        let root_found = Files::check_user_directory(root)
+            .and_then(dunce::canonicalize)
+            .map_err(|_| "its root is not safe")?;
         let target = dunce::canonicalize(program).map_err(|_| "it cannot be resolved")?;
         if !target.starts_with(&root_found) {
             return Err("it leads out of its root");
