@@ -198,14 +198,19 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
         (status["reachable"] == true).then_some(status)
     });
 
-    // Uninstall: both stopped, the registration, the releases and the data gone; the locks and the stop stay.
-    let (ok, removed) = run(&profile, &stable, &["uninstall"]);
+    // Uninstall: both stopped, the registration, the releases and the data gone; the locks and the stop stay. Windows
+    // cannot delete a running program, so `uninstall` refuses to run from inside what it removes: the package's
+    // copy, outside the Sidevoice folders, runs it there.
+    let uninstaller = if cfg!(windows) { &program } else { &stable };
+    let (ok, removed) = run(&profile, uninstaller, &["uninstall"]);
     assert!(ok, "{removed}");
     assert_eq!(removed["state"], "absent", "{removed}");
-    assert_eq!(
-        removed["agents"]["cursor"]["outcome"], "removed",
-        "{removed}"
-    );
+    if cfg!(unix) {
+        assert_eq!(
+            removed["agents"]["cursor"]["outcome"], "removed",
+            "{removed}"
+        );
+    }
     wait_gone(
         restarted["core"]["pid"].as_u64().unwrap(),
         "the core exited at uninstall",
