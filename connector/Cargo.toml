@@ -65,6 +65,7 @@ test-support = ["sidevoice-platform/test-support"]
 tempfile = "3"
 # This crate with `test-support`, for the unit and the integration tests (tests/).
 sidevoice-connector = { path = ".", features = ["test-support"] }
+ctor = "1"
 
 # Unix: the effective uid (src/platform/service/macos: the launchd domain), with no `unsafe` of ours.
 [target.'cfg(unix)'.dependencies]

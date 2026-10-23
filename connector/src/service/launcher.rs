@@ -554,35 +554,47 @@ mod tests {
 
     #[test]
     fn a_core_is_ours_only_with_this_data_directory_as_a_whole_argument() {
+        let root = std::env::temp_dir();
+        let (home, data) = (root.join("h"), root.join("h").join(".sidevoice"));
         let layout = Layout::from_vars(
-            |name| match name {
-                "HOME" => Some("/h".into()),
-                "SIDEVOICE_DATA_DIR" => Some("/h/.sidevoice".into()),
-                _ => None,
+            |name| {
+                if name == Environment::HOME {
+                    Some(home.clone().into())
+                } else if name == "SIDEVOICE_DATA_DIR" {
+                    Some(data.clone().into())
+                } else {
+                    None
+                }
             },
             Vec::new(),
             &[],
         )
         .unwrap();
+        let core = data.join("core");
+        let core = core.display();
+        let other = root.join("other").join("core");
         assert!(is_our_core(
             &layout,
-            "/r/core --data-dir /h/.sidevoice/core --port 7000"
+            &format!("/r/core --data-dir {core} --port 7000")
         ));
-        assert!(is_our_core(
+        assert!(is_our_core(&layout, &format!("/r/core --data-dir {core}")));
+        assert!(!is_our_core(
             &layout,
-            "/r/core --data-dir /h/.sidevoice/core"
+            &format!("/r/core --data-dir {core}2 --port 7000")
         ));
         assert!(!is_our_core(
             &layout,
-            "/r/core --data-dir /h/.sidevoice/core2 --port 7000"
+            &format!("/r/core --data-dir {}", other.display())
         ));
-        assert!(!is_our_core(&layout, "/r/core --data-dir /other/core"));
     }
 
     #[test]
     fn the_on_demand_connector_runs_the_selected_command_else_this_program() {
         let layout = Layout::from_vars(
-            |name| (name == "HOME").then(|| "/nonexistent-home".into()),
+            |name| {
+                (name == Environment::HOME)
+                    .then(|| std::env::temp_dir().join("nonexistent-home").into())
+            },
             Vec::new(),
             &[],
         )

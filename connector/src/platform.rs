@@ -12,6 +12,8 @@ pub mod foreign;
 pub mod lifecycle;
 pub mod process;
 pub mod service;
+#[cfg(test)]
+pub(crate) mod stand_in;
 pub mod target;
 pub mod uninstall;
 

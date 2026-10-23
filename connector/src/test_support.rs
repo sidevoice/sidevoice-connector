@@ -10,3 +10,5 @@ pub(crate) fn temp_dir(label: &str) -> tempfile::TempDir {
         .tempdir_in(std::env::temp_dir().canonicalize().unwrap())
         .unwrap()
 }
+
+pub(crate) mod stand_in;
