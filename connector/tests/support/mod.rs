@@ -237,7 +237,7 @@ impl Profile {
     /// home nor an agent session the tests run inside can leak in.
     pub fn env(&self) -> BTreeMap<String, String> {
         let path = |child: &str| self.root.join(child).to_string_lossy().into_owned();
-        BTreeMap::from([
+        let mut env = BTreeMap::from([
             ("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()),
             ("HOME".into(), path("home")),
             ("CLAUDE_CONFIG_DIR".into(), path("claude")),
@@ -249,7 +249,16 @@ impl Profile {
                 "SIDEVOICE_DATA_DIR".into(),
                 self.data().to_string_lossy().into_owned(),
             ),
-        ])
+        ]);
+        // The sockets are in the runtime directory (`$XDG_RUNTIME_DIR` here), which `connector_endpoint` reads from
+        // this process: the connector must see the same one, or it listens where the test does not look.
+        if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+            env.insert(
+                "XDG_RUNTIME_DIR".into(),
+                runtime.to_string_lossy().into_owned(),
+            );
+        }
+        env
     }
 
     pub fn command(&self, program: impl AsRef<Path>) -> Command {
