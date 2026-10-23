@@ -17,7 +17,7 @@
 //!    purpose (its locks and the stop: connector/README.md, "uninstall").
 //!
 //! It changes this user's service manager, agents and data for real, so it runs only on a disposable machine: a CI
-//! runner (`CI`), or where `SIDEVOICE_E2E=1` says so. On failure it prints what the jobs and logs say. The runner's
+//! runner (`CI=true`), or where `SIDEVOICE_E2E=1` says so. On failure it prints what the jobs and logs say. The runner's
 //! preparation (Linux: lingering and the user bus a login session would give) is the workflow's
 //! (`.github/workflows/e2e.yml`).
 //!
@@ -165,24 +165,37 @@ impl Machine {
         }
     }
 
-    /// What the manager says of a job, `None` when it has no such job: Task Scheduler's state and last result,
-    /// systemd's active and sub state, launchd's state.
+    /// What the manager says of a job, `None` when it says it has no such job: Task Scheduler's state and last
+    /// result, systemd's load, active and sub state, launchd's state. A query that fails for any other reason is an
+    /// error, never read as "no job".
     fn job_state(&self, job: &str) -> Result<Option<String>> {
         let name = self.job(job);
-        let said = match self.os {
+        match self.os {
             Os::Windows => {
+                // Not found is the one failure that means absent (CIM's ObjectNotFound); any other stops the script.
                 let script = format!(
-                    "$t = Get-ScheduledTask -TaskName '{name}' -ErrorAction SilentlyContinue; \
-                     if ($t) {{ $i = $t | Get-ScheduledTaskInfo; \"$($t.State) LastTaskResult=$($i.LastTaskResult)\" }}"
+                    "$ErrorActionPreference = 'Stop'; \
+                     try {{ $t = Get-ScheduledTask -TaskName '{name}' }} \
+                     catch {{ if ($_.CategoryInfo.Category -eq 'ObjectNotFound') {{ 'ABSENT'; exit 0 }} throw }}; \
+                     $i = $t | Get-ScheduledTaskInfo; \
+                     \"$($t.State) LastTaskResult=$($i.LastTaskResult)\""
                 );
-                run(
+                let said = run(
                     "powershell",
                     &["-NoProfile", "-NonInteractive", "-Command", &script],
                     LIMIT,
-                )?
-                .stdout
+                )?;
+                let text = said.stdout.trim();
+                if !said.ok || text.is_empty() {
+                    return Err(format!(
+                        "Get-ScheduledTask {name} failed ({:?}): {text} {}",
+                        said.code, said.stderr
+                    ));
+                }
+                Ok((text != "ABSENT").then(|| text.to_owned()))
             }
             Os::Linux => {
+                // `show` answers for a unit it has never heard of too: `LoadState=not-found`.
                 let shown = run(
                     "systemctl",
                     &[
@@ -194,15 +207,22 @@ impl Machine {
                     ],
                     LIMIT,
                 )?;
-                if !shown.ok || shown.stdout.contains("LoadState=not-found") {
-                    String::new()
-                } else {
+                if !shown.ok || !shown.stdout.contains("LoadState=") {
+                    return Err(format!(
+                        "systemctl --user show {name} failed ({:?}): {}{}",
+                        shown.code, shown.stdout, shown.stderr
+                    ));
+                }
+                if shown.stdout.contains("LoadState=not-found") {
+                    return Ok(None);
+                }
+                Ok(Some(
                     shown
                         .stdout
                         .split_whitespace()
                         .collect::<Vec<_>>()
-                        .join(" ")
-                }
+                        .join(" "),
+                ))
             }
             Os::Macos => {
                 let printed = run(
@@ -210,20 +230,26 @@ impl Machine {
                     &["print", &format!("gui/{}/{name}", self.uid)],
                     LIMIT,
                 )?;
-                if !printed.ok {
-                    String::new()
-                } else {
-                    printed
+                if printed.ok {
+                    let state = printed
                         .stdout
                         .lines()
                         .find_map(|line| line.trim().strip_prefix("state = "))
                         .map(|state| format!("state={state}"))
-                        .unwrap_or_else(|| "state=unknown".into())
+                        .unwrap_or_else(|| "state=unknown".into());
+                    return Ok(Some(state));
                 }
+                // launchctl's answer for a service the domain does not have: exit 113, "Could not find service".
+                let said = format!("{}{}", printed.stdout, printed.stderr);
+                if printed.code == Some(113) && said.contains("Could not find service") {
+                    return Ok(None);
+                }
+                Err(format!(
+                    "launchctl print gui/{}/{name} failed ({:?}): {said}",
+                    self.uid, printed.code
+                ))
             }
-        };
-        let said = said.trim().to_owned();
-        Ok((!said.is_empty()).then_some(said))
+        }
     }
 
     fn job_running(state: &str, os: Os) -> bool {
@@ -251,6 +277,12 @@ impl Machine {
             _ => run("ps", &["-A", "-o", "pid=,command="], LIMIT)?,
         };
         let wanted = data.to_lowercase();
+        if !listed.ok || listed.stdout.trim().is_empty() {
+            return Err(format!(
+                "listing the processes failed ({:?}): {}",
+                listed.code, listed.stderr
+            ));
+        }
         Ok(listed
             .stdout
             .lines()
@@ -265,16 +297,28 @@ impl Machine {
             .collect())
     }
 
-    /// Claude Code's user configuration (`CLAUDE_CONFIG_DIR` unset: `~/.claude.json`).
-    fn claude_config(&self) -> Option<Value> {
-        let bytes = fs::read(self.home.join(".claude.json")).ok()?;
-        serde_json::from_slice(&bytes).ok()
+    /// Claude Code's user configuration (`CLAUDE_CONFIG_DIR` unset: `~/.claude.json`): `None` only when there is no
+    /// such file; one that cannot be read or parsed is an error.
+    fn claude_config(&self) -> Result<Option<Value>> {
+        let file = self.home.join(".claude.json");
+        let Some(bytes) = read_if_there(&file)? else {
+            return Ok(None);
+        };
+        parse_json(&bytes, &file.display().to_string()).map(Some)
     }
 
-    /// Codex's configuration (`CODEX_HOME` unset: `~/.codex/config.toml`).
-    fn codex_config(&self) -> Option<toml::Value> {
-        let text = fs::read_to_string(self.home.join(".codex/config.toml")).ok()?;
-        text.parse().ok()
+    /// Codex's configuration (`CODEX_HOME` unset: `~/.codex/config.toml`): `None` only when there is no such file;
+    /// one that cannot be read or parsed is an error.
+    fn codex_config(&self) -> Result<Option<toml::Value>> {
+        let file = self.home.join(".codex/config.toml");
+        let Some(bytes) = read_if_there(&file)? else {
+            return Ok(None);
+        };
+        let text =
+            String::from_utf8(bytes).map_err(|_| format!("{}: not UTF-8", file.display()))?;
+        text.parse()
+            .map(Some)
+            .map_err(|error| format!("{}: {error}", file.display()))
     }
 
     /// On failure: what the manager says of each job and the end of every log in `D`.
@@ -338,6 +382,7 @@ const LIMIT: Duration = Duration::from_secs(60);
 
 struct Ran {
     ok: bool,
+    code: Option<i32>,
     stdout: String,
     stderr: String,
 }
@@ -399,6 +444,7 @@ fn run_path(program: &Path, args: &[&str], limit: Duration) -> Result<Ran> {
     };
     Ok(Ran {
         ok: status.success(),
+        code: status.code(),
         stdout: join(out),
         stderr: join(err),
     })
@@ -473,9 +519,9 @@ fn step(name: &str) {
 }
 
 pub(crate) fn e2e(archive: &Path) -> Result<()> {
-    if env::var_os("CI").is_none() && env::var("SIDEVOICE_E2E").as_deref() != Ok("1") {
+    if env::var("CI").as_deref() != Ok("true") && env::var("SIDEVOICE_E2E").as_deref() != Ok("1") {
         return Err("e2e installs Sidevoice into this user's real service manager, data directory and agents: it \
-                    runs only on a CI runner (CI set) or with SIDEVOICE_E2E=1"
+                    runs only on a CI runner (CI=true) or with SIDEVOICE_E2E=1"
             .into());
     }
     let machine = Machine::new()?;
@@ -501,6 +547,11 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
             format!("{} is already defined: {state:?}", machine.job(job))
         })?;
     }
+    // The core listens on all IPv4 interfaces at its default port: something else there would make the install
+    // fail for a reason that is not ours, or answer the port checks below in the core's place.
+    std::net::TcpListener::bind(("0.0.0.0", CORE_PORT)).map_err(|error| {
+        format!("port {CORE_PORT}, the core's, is not free on this machine ({error}): not a fresh machine")
+    })?;
 
     step("the agents' CLIs, installed with npm and no login");
     run_ok(
@@ -666,16 +717,27 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
             )
         };
         let answer = connect()?;
-        // TODO(sidevoice/sidevoice-connector#266): an agent installed but never started has no home directory yet,
-        // and `agents connect` refuses to run its CLI then (`agents.action-failed`). Until that is fixed, exactly
-        // that case is let through: the home made by hand, as the agent's first start would, and connected again.
-        // Any other failure fails the test; once #266 is fixed the first attempt succeeds and this goes.
-        let answer = if answer["ok"] != true
-            && fresh
-            && answer["error"]["key"] == "agents.action-failed"
-        {
+        // TODO(sidevoice/sidevoice-connector#266, fixed by #268): Claude Code installed but never started has no
+        // `~/.claude` yet, and `agents connect claude` refuses to run its CLI then. Until the fix lands, exactly
+        // that case is let through, and only Claude Code's. The answer carries no detail beyond the generic
+        // `agents.action-failed` and nothing is logged, so the cause is shown by difference: the same connect fails
+        // again while the home is still missing, then succeeds once only the home was made (by hand, private, as
+        // Claude Code's first start makes it). Anything else fails the test; once #268 lands the first attempt
+        // succeeds and this goes, in whichever of #265 and #268 lands second.
+        let known_bug = |answer: &Value| {
+            agent == "claude"
+                && fresh
+                && !home.exists()
+                && answer["ok"] != true
+                && answer["error"]["key"] == "agents.action-failed"
+        };
+        let answer = if known_bug(&answer) {
+            let again = connect()?;
+            check(known_bug(&again), || {
+                format!("agents connect claude failed differently the second time: {again}")
+            })?;
             println!(
-                "KNOWN BUG sidevoice/sidevoice-connector#266: agents connect {agent} failed with no {}; \
+                "KNOWN BUG sidevoice/sidevoice-connector#266: agents connect claude failed twice with no {}; \
                  made by hand, connecting again",
                 home.display()
             );
@@ -693,7 +755,7 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
         format!("claude mcp list does not list sidevoice: {claude_listed}")
     })?;
     let claude = machine
-        .claude_config()
+        .claude_config()?
         .ok_or("no ~/.claude.json after connecting Claude Code")?;
     let entry = &claude["mcpServers"]["sidevoice"];
     check(entry["command"] == command.as_str(), || {
@@ -702,7 +764,7 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
     let codex_entry = run_ok("codex", &["mcp", "get", "sidevoice", "--json"], LIMIT)?;
     println!("codex mcp get sidevoice: {}", codex_entry.trim());
     let codex = machine
-        .codex_config()
+        .codex_config()?
         .ok_or("no ~/.codex/config.toml after connecting Codex")?;
     let entry = codex
         .get("mcp_servers")
@@ -783,12 +845,12 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
     check(!claude_listed.contains("sidevoice:"), || {
         format!("claude mcp list still lists sidevoice: {claude_listed}")
     })?;
-    if let Some(claude) = machine.claude_config() {
+    if let Some(claude) = machine.claude_config()? {
         check(claude["mcpServers"].get("sidevoice").is_none(), || {
             "~/.claude.json still has the sidevoice entry".into()
         })?;
     }
-    if let Some(codex) = machine.codex_config() {
+    if let Some(codex) = machine.codex_config()? {
         let entry = codex
             .get("mcp_servers")
             .and_then(|servers| servers.get("sidevoice"));
@@ -796,6 +858,18 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
             "~/.codex/config.toml still has [mcp_servers.sidevoice]".into()
         })?;
     }
+    // Codex's own word, as for Claude Code above: it must fail, saying there is no such server (the wording the
+    // connector itself reads as absent, `adapters::registration::looks_absent`).
+    let codex_entry = run("codex", &["mcp", "get", "sidevoice", "--json"], LIMIT)?;
+    let said = format!("{}{}", codex_entry.stdout, codex_entry.stderr).to_ascii_lowercase();
+    println!("codex mcp get sidevoice after uninstall: {}", said.trim());
+    check(
+        !codex_entry.ok
+            && ["no mcp server", "no such", "not found", "does not exist"]
+                .iter()
+                .any(|absent| said.contains(absent)),
+        || format!("codex mcp get sidevoice does not say it is gone: {said}"),
+    )?;
     let port = run(
         "curl",
         &[
@@ -831,4 +905,13 @@ fn agent_row<'a>(listed: &'a Value, id: &str) -> Result<&'a Value> {
         .as_array()
         .and_then(|rows| rows.iter().find(|row| row["id"] == id))
         .ok_or_else(|| format!("agents lists no {id}: {listed}"))
+}
+
+/// A file's bytes, `None` when it does not exist; any other failure to read it is an error.
+fn read_if_there(file: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(file) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{}: {error}", file.display())),
+    }
 }
