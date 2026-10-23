@@ -46,20 +46,30 @@ pub(super) fn fallbacks(roots: &Roots) -> Vec<(PathBuf, PathBuf)> {
     found
 }
 
-/// `<cache>\<hash>\codex.exe` for every hash directory that has one, the most recently written first.
+/// The smallest a finished copy of the app's `codex.exe` can be. The cache has no completion marker and its hash
+/// directory names have no pattern we know, so a copy cut short by a failed relocation (openai/codex#40700) is
+/// recognised by size: the real program is tens of megabytes. A heuristic, not a guarantee.
+const LEAST_PROGRAM_BYTES: u64 = 4 * 1024 * 1024;
+
+/// `<cache>\<hash>\codex.exe` for every finished cache entry, the most recently written directory first. Skipped:
+/// a directory the app is still filling or gave up on (a name starting with `.`, or containing `staging`:
+/// `.staging-<id>`), and a program too small to be whole ([`LEAST_PROGRAM_BYTES`]).
 fn cached_copies(cache: &Path, exe: &str) -> Vec<PathBuf> {
     let mut found: Vec<(SystemTime, PathBuf)> = fs::read_dir(cache)
         .into_iter()
         .flatten()
         .flatten()
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            !name.starts_with('.') && !name.contains("staging")
+        })
         .filter_map(|entry| {
             let program = entry.path().join(exe);
-            let modified = fs::metadata(&program)
+            fs::metadata(&program)
                 .ok()
-                .filter(fs::Metadata::is_file)?
-                .modified()
-                .ok()?;
+                .filter(|meta| meta.is_file() && meta.len() >= LEAST_PROGRAM_BYTES)?;
+            let modified = entry.metadata().ok()?.modified().ok()?;
             Some((modified, program))
         })
         .collect();
@@ -73,28 +83,36 @@ mod tests {
     use crate::platform::fs::{Create, Files, Fs};
     use std::time::Duration;
 
+    /// A program of a whole size at `path`; `age` is its own mtime, which the order must not follow.
     fn program(path: &Path, age: u64) {
         Files::ensure_private_dir(path.parent().unwrap()).unwrap();
         Files::open_private(path, Create::NewProgram).unwrap();
-        fs::File::options()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + age))
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_len(LEAST_PROGRAM_BYTES).unwrap();
+        file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + age))
             .unwrap();
     }
 
     #[test]
-    fn cached_copies_are_listed_newest_first_and_only_where_there_is_a_program() {
+    fn cached_copies_are_listed_by_the_directory_written_last_and_only_when_finished() {
         let dir = crate::test_support::temp_dir("codex-cache");
         let exe = Host::exe_name("codex");
         let cache = dir.path().join("bin");
-        let (old, new) = (cache.join("aaa").join(&exe), cache.join("bbb").join(&exe));
-        program(&old, 1);
-        program(&new, 9);
+        let at = |name: &str| cache.join(name).join(&exe);
+        // The directory written last comes first, whatever the program inside says about its own age.
+        program(&at("aaa"), 99);
+        std::thread::sleep(Duration::from_millis(50));
+        program(&at("bbb"), 1);
+        // Not finished: a staging directory (whatever its age), a hidden one, a program cut short, no program.
+        std::thread::sleep(Duration::from_millis(50));
+        program(&at(".staging-1f"), 99);
+        program(&at("copy-staging"), 99);
+        program(&at(".hidden"), 99);
+        Files::ensure_private_dir(cache.join("short").as_path()).unwrap();
+        fs::write(at("short"), vec![0u8; 1024]).unwrap();
         fs::create_dir_all(cache.join("empty")).unwrap();
         fs::write(cache.join("stray"), "").unwrap();
-        assert_eq!(cached_copies(&cache, &exe), vec![new, old]);
+        assert_eq!(cached_copies(&cache, &exe), vec![at("bbb"), at("aaa")]);
         assert!(cached_copies(&cache.join("none"), &exe).is_empty());
     }
 
