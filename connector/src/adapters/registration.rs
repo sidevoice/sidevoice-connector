@@ -207,15 +207,15 @@ pub struct Manual {
 }
 
 impl Manual {
-    /// `steps` as the one step the older fields (`instructions`, `removal`) hold: commands joined with `&&`, each run
-    /// once the one before succeeded, else the last step that gives a snippet (the one that adds), with its file.
+    /// `steps` as the one step the older fields (`instructions`, `removal`) hold: commands joined as this OS's shell
+    /// runs each once the one before succeeded ([`Env::in_sequence`]), else the last step that gives a snippet (the one that adds), with its file.
     pub fn as_one(steps: &[ManualStep]) -> Option<ManualStep> {
         if !steps.is_empty() && steps.iter().all(|step| step.command.is_some()) {
-            let command = steps
+            let commands: Vec<&str> = steps
                 .iter()
                 .filter_map(|step| step.command.as_deref())
-                .collect::<Vec<_>>()
-                .join(" && ");
+                .collect();
+            let command = Environment::in_sequence(&commands);
             return Some(ManualStep {
                 command: Some(command),
                 snippet: None,
@@ -286,6 +286,21 @@ pub struct BenchSetup<'a> {
     pub server: &'a str,
     /// The environment the server runs with.
     pub env: &'a BTreeMap<String, String>,
+}
+
+impl BenchSetup<'_> {
+    /// One line that sources [`Self::env_script`] (`. 'script'`, read alike by a POSIX shell and PowerShell), then
+    /// runs `command args`, then `tail` (shell text as given, e.g. [`Self::server`]) after it: in sequence
+    /// ([`Env::in_sequence`]), the command only once the script was read.
+    pub fn line(&self, command: &str, args: &[String], tail: Option<&str>) -> String {
+        let source = format!(". {}", Environment::quote(self.env_script));
+        let mut run = shell_command(command, args);
+        if let Some(tail) = tail {
+            run.push(' ');
+            run.push_str(tail);
+        }
+        Environment::in_sequence(&[&source, &run])
+    }
 }
 
 /// Runs the agent's CLI and requires it to succeed.
@@ -502,6 +517,49 @@ pub fn bench_agents(request: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bench's lines source its script, then run the agent, in sequence as this OS's shell reads them.
+    #[test]
+    fn bench_steps_source_the_profile_then_run_the_agent_in_sequence() {
+        let answer = bench_agents(
+            &json!({"setup": {"env_script": "/b/env.sh", "mcp_config": "/b/mcp.json",
+            "server": "'/r/sidevoice' mcp", "env": {"SIDEVOICE_DATA_DIR": "/d"}}}),
+        );
+        let steps: Vec<&str> = answer["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step.as_str().unwrap())
+            .collect();
+        let source = format!(". {}", Environment::quote("/b/env.sh"));
+        let line = |run: String| Environment::in_sequence(&[&source, &run]);
+        let claude = line(shell_command(
+            "claude",
+            &strings(&["--mcp-config", "/b/mcp.json", "--strict-mcp-config"]),
+        ));
+        let codex_add = line(format!(
+            "{} '/r/sidevoice' mcp",
+            shell_command(
+                "codex",
+                &strings(&[
+                    "mcp",
+                    "add",
+                    "sidevoice",
+                    "--env",
+                    "SIDEVOICE_DATA_DIR=/d",
+                    "--"
+                ])
+            )
+        ));
+        for expected in [claude, codex_add, line(shell_command("codex", &[]))] {
+            assert!(
+                steps
+                    .iter()
+                    .any(|step| step.lines().any(|text| text.trim() == expected)),
+                "{expected} in {steps:?}"
+            );
+        }
+    }
     /// The shell reads each word as given, except where a batch shim would be re-parsed by `cmd.exe`: there no line
     /// is made when any word has `& | < > ^ % !` or `"`.
     #[test]
@@ -559,7 +617,7 @@ mod tests {
         assert_eq!(
             Manual::as_one(&[command("remove"), command("add")]),
             Some(ManualStep {
-                command: Some("remove && add".into()),
+                command: Some(Environment::in_sequence(&["remove", "add"])),
                 snippet: None,
                 file: Some("/f".into()),
             })

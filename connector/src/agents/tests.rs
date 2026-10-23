@@ -2199,10 +2199,6 @@ async fn the_manual_steps_run_by_hand_update_an_older_entry_in_the_agents_own_ho
 
 /// The older `instructions` (connecting as one step) rewrite an older entry too.
 #[tokio::test]
-#[cfg_attr(
-    windows,
-    ignore = "the joined `instructions` line is not valid PowerShell on Windows (`&&` then a `$env:` assignment): decision pending"
-)]
 async fn the_joined_instructions_run_by_hand_update_an_older_entry() {
     manual_steps_by_hand(&["instructions"]).await;
 }
@@ -2234,7 +2230,17 @@ async fn manual_steps_by_hand(kinds: &[&str]) {
             assert_eq!(agent["owned"], true, "{agent}");
             let steps = if *kind == "instructions" {
                 let command = agent["instructions"]["command"].as_str().unwrap();
-                assert!(command.contains(" && "), "removes, then adds: {agent}");
+                let update: Vec<&str> = agent["manual"]["update"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|step| step["command"].as_str().unwrap())
+                    .collect();
+                assert_eq!(
+                    command,
+                    Environment::in_sequence(&update),
+                    "removes, then adds: {agent}"
+                );
                 vec![agent["instructions"].clone()]
             } else {
                 let steps = agent["manual"][kind].as_array().unwrap().clone();

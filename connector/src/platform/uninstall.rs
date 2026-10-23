@@ -58,6 +58,7 @@ use macos as os;
 
 pub use imp::Os as Remover;
 
+use super::data_dir;
 use super::fs::{Files, Fs};
 use super::target::{Host, Target as _};
 use serde_json::{json, Value};
@@ -81,6 +82,35 @@ const RECORD_LIMIT: u64 = 64 * 1024;
 const RELEASE_PREFIX: &str = "release-";
 /// What a claimed entry of `D` is called inside [`CLAIM`], before its unique suffix.
 const DATA_PREFIX: &str = "data-";
+
+/// `path` as the OS resolves it: its longest existing ancestor canonicalized, the components that do not exist yet
+/// appended as written. Fails closed: only "not found" walks up to the parent; any other error (permission, a link
+/// loop...) or a tail that cannot be placed without the OS (`..`) is an error, never a guess.
+fn resolved(path: &Path) -> Result<PathBuf, &'static str> {
+    const UNRESOLVED: &str =
+        "uninstall refused: cannot tell where the shared models folder is relative to the data directory";
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(real) => {
+                return Ok(missing
+                    .iter()
+                    .rev()
+                    .fold(real, |real, part| real.join(part)));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(UNRESOLVED),
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name);
+                existing = parent;
+            }
+            _ => return Err(UNRESOLVED),
+        }
+    }
+}
 
 /// The roots one uninstall may remove, and what stays in the data directory.
 pub struct Roots {
@@ -130,6 +160,7 @@ impl Roots {
             return Err("uninstall path is outside known Sidevoice roots");
         }
         self.check_below_home()?;
+        self.check_models_outside()?;
         if !canonical(&self.anchor()?) {
             return Err("unsafe uninstall anchor");
         }
@@ -168,6 +199,35 @@ impl Roots {
                     return Err(REFUSED);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// That the shared models folder (`Models` in the standard place: `standard/Models`, wherever `D` is) is not inside `D`
+    /// deeper than `D/Models` itself, nor holds `D`: `D/Models` is kept by name, but a store further down (an overridden `D`
+    /// above the standard place) would be deleted with its parent. Refused before anything is touched, rather than
+    /// emptying around it: the least surprising, since the person chose a `D` that contains another program's data.
+    fn check_models_outside(&self) -> Result<(), &'static str> {
+        const REFUSED: &str = "uninstall refused: the shared models folder is inside the data directory (or holds it); \
+                               choose a data directory that does not contain it";
+        let Some(models) = self
+            .standard
+            .as_ref()
+            .map(|standard| standard.join(data_dir::MODELS))
+        else {
+            return Ok(());
+        };
+        let overlaps = |models: &Path, data: &Path| {
+            let (models, data) = (dunce::simplified(models), dunce::simplified(data));
+            data.starts_with(models)
+                || (models.starts_with(data) && models != data.join(data_dir::MODELS))
+        };
+        if overlaps(&models, &self.data) {
+            return Err(REFUSED);
+        }
+        // As the OS resolves them, whether or not the store exists yet (another instance may create it later).
+        if overlaps(&resolved(&models)?, &resolved(&self.data)?) {
+            return Err(REFUSED);
         }
         Ok(())
     }
@@ -479,6 +539,86 @@ mod tests {
         let removal = Remover::new(layout).unwrap();
         assert_eq!(removal.ownership().unwrap(), Ownership::Ours);
         assert_eq!(removal.remove_data_contents(&|_| {}).unwrap(), ["entry"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_standard_place_reaching_into_the_data_directory_through_a_link_is_refused_before_the_store_exists(
+    ) {
+        let scratch = temp_dir("uninstall-models-alias");
+        let home = scratch.path().join("home");
+        let data = home.join("data");
+        Files::ensure_private_dir(&data).unwrap();
+        fs::create_dir_all(data.join("nested/sidevoice")).unwrap();
+        let alias = home.join("xdg-alias");
+        Files::symlink(data.join("nested"), &alias);
+        // `Models` does not exist yet: another instance creates it later, inside `D`.
+        let mut layout = at(data, &alias.join("sidevoice"));
+        layout.home = Some(home);
+        let refused = layout.validate().unwrap_err();
+        assert!(refused.contains("shared models folder"), "{refused}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_standard_place_that_cannot_be_resolved_is_refused() {
+        let scratch = temp_dir("uninstall-models-unresolved");
+        let home = scratch.path().join("home");
+        let data = home.join("data");
+        Files::ensure_private_dir(&data).unwrap();
+        fs::create_dir_all(data.join("nested")).unwrap();
+        let alias = home.join("xdg-alias");
+        Files::symlink(data.join("nested"), &alias);
+        let looped = home.join("loop");
+        Files::symlink(looped.clone(), &looped);
+        // A missing tail with `..` leads back into `D` through the alias; a link loop cannot be resolved at all.
+        for standard in [
+            alias.join("missing").join("..").join("sidevoice"),
+            alias.join("missing").join(".."),
+            looped.join("sidevoice"),
+        ] {
+            let mut layout = at(data.clone(), &standard);
+            layout.home = Some(home.clone());
+            let refused = layout.validate().unwrap_err();
+            assert!(
+                refused.contains("shared models folder"),
+                "{}: {refused}",
+                standard.display()
+            );
+        }
+    }
+
+    #[test]
+    fn an_overridden_data_directory_that_contains_the_shared_models_is_refused_untouched() {
+        let scratch = temp_dir("uninstall-models");
+        let home = scratch.path().join("home");
+        let share = home.join(".local").join("share");
+        let standard = share.join(data_name());
+        Files::ensure_private_dir(&share).unwrap();
+        let models = standard.join(data_dir::MODELS);
+        Files::ensure_private_dir(&standard).unwrap();
+        fs::create_dir_all(models.join("profile")).unwrap();
+        fs::create_dir_all(models.join("other-program")).unwrap();
+        fs::write(models.join("other-program").join("sentinel"), "theirs").unwrap();
+        // `D` above the standard place holds the store two levels down; `D` inside the store holds `D`.
+        for data in [share.clone(), models.join("profile")] {
+            let mut layout = at(data.clone(), &standard);
+            layout.home = Some(home.clone());
+            let refused = layout.validate().unwrap_err();
+            assert!(
+                refused.contains("shared models folder"),
+                "{}: {refused}",
+                data.display()
+            );
+        }
+        // `D` as the standard place itself keeps `Models` by name: accepted.
+        let mut layout = at(standard.clone(), &standard);
+        layout.home = Some(home);
+        assert!(layout.validate().is_ok());
+        assert_eq!(
+            fs::read_to_string(models.join("other-program").join("sentinel")).unwrap(),
+            "theirs"
+        );
     }
 
     #[test]

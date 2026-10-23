@@ -110,6 +110,11 @@ pub trait Env {
     /// that follows: `NAME='v' ` in a POSIX shell, `$env:NAME = 'v'; ` in PowerShell.
     fn set(variable: &str, quoted_value: &str) -> String;
 
+    /// `commands` (lines for this OS's shell) as one line that runs each once the one before succeeded, and stops at
+    /// the first that fails: `a && b` in a POSIX shell; `a; if ($?) { b }` in PowerShell, which 5.1 (the one every
+    /// Windows has) reads too, where `&&` does not exist and, in 7, may not be followed by an assignment (`$env:X = …`).
+    fn in_sequence(commands: &[&str]) -> String;
+
     /// How this user's login `PATH` is asked for; `None` when this process has no way to know it.
     fn login_path() -> Option<LoginPath>;
 
@@ -236,6 +241,51 @@ mod tests {
             assert_eq!(Environment::quote(value), quoted, "{value:?}");
         }
         assert_eq!(Environment::set("NAME", &Environment::quote("a b")), set);
+    }
+
+    /// Commands in sequence, run as a person pastes the line: each once the one before succeeded, none after a failure.
+    #[test]
+    fn commands_in_sequence_stop_at_the_first_that_fails() {
+        use crate::platform::target::{Host, Target};
+        use crate::test_support::stand_in::Script;
+        let scratch = crate::test_support::temp_dir("env-sequence");
+        let line = |name: &str| {
+            format!(
+                "{}{}",
+                Environment::CALL,
+                Environment::quote(&scratch.path().join(Host::exe_name(name)).to_string_lossy())
+            )
+        };
+        let marker = scratch.path().join("ran");
+        Script::default().make(&scratch.path().join(Host::exe_name("ok")));
+        Script {
+            exit: 1,
+            ..Script::default()
+        }
+        .make(&scratch.path().join(Host::exe_name("fails")));
+        Script {
+            write: Some((marker.clone(), String::new())),
+            ..Script::default()
+        }
+        .make(&scratch.path().join(Host::exe_name("marks")));
+        assert_eq!(Environment::in_sequence(&["one"]), "one");
+
+        let stopped = Environment::in_sequence(&[&line("fails"), &line("marks")]);
+        Environment::hand_shell(&stopped).status().unwrap();
+        assert!(!marker.exists(), "{stopped}");
+        let middle = Environment::in_sequence(&[&line("ok"), &line("fails"), &line("marks")]);
+        Environment::hand_shell(&middle).status().unwrap();
+        assert!(
+            !marker.exists(),
+            "a failure in the middle stops the rest: {middle}"
+        );
+
+        let ran = Environment::in_sequence(&[&line("ok"), &line("ok"), &line("marks")]);
+        assert!(
+            Environment::hand_shell(&ran).status().unwrap().success(),
+            "{ran}"
+        );
+        assert!(marker.exists(), "{ran}");
     }
 
     #[test]
