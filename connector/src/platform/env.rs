@@ -79,7 +79,8 @@ pub trait Env {
     const DATA_NAME: &'static str;
 
     /// Variables a child cannot run without, passed on from this process when it has them (Windows: `SystemRoot`
-    /// and its like; a child without them cannot use the network or the system's crypto). None on Unix.
+    /// and its like; a child without them cannot use the network or the system's crypto; Unix: `XDG_RUNTIME_DIR`, where the
+    /// sockets are, which the child and whoever talks to it must both resolve to the same directory).
     const SYSTEM: &'static [&'static str];
 
     /// What starts a command line that runs a quoted program name: nothing in a POSIX shell, the call operator `& `
