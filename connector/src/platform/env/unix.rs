@@ -19,7 +19,8 @@ impl super::Env for Os {
     } else {
         "sidevoice"
     };
-    const SYSTEM: &'static [&'static str] = &[];
+    // The sockets are in the runtime directory (`sidevoice-platform`'s `ipc`): a child must look in the same one.
+    const SYSTEM: &'static [&'static str] = &["XDG_RUNTIME_DIR"];
     const CALL: &'static str = "";
 
     fn base_path() -> OsString {
