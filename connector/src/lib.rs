@@ -5,7 +5,7 @@
 pub mod adapters;
 pub mod agents;
 pub mod core_package;
-mod core_ready;
+pub mod core_ready;
 pub mod daemon;
 pub mod data_dir;
 mod frame;

@@ -2,19 +2,19 @@
 //! text is voice input (`/api/presentation/select` + `/api/presentation/text`, as the app sends what was said) and
 //! the call's events (receipts, working state, replies) are seen. When the core is not there, the installation's
 //! connector is started, which starts its core, as an agent's MCP server would.
-// The bench is a Unix-only developer binary that does not link the connector's modules; it speaks the core's socket raw.
+// The bench is a Unix-only developer binary; it speaks the core's local endpoint raw.
 #![allow(clippy::disallowed_types)]
 
 use std::collections::VecDeque;
-use std::path::Path;
+
 use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use sidevoice_connector::platform::ipc::{Channel, Channels, Endpoint};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
 use crate::setup::Profile;
@@ -64,15 +64,12 @@ impl Call {
     }
 
     async fn core_answers(&self) -> bool {
-        http(
-            &self.profile.core_socket(),
-            "GET",
-            "/api/local/health",
-            None,
-            None,
-        )
-        .await
-        .is_ok_and(|(status, _)| status == 200)
+        let Ok(endpoint) = self.profile.core_endpoint() else {
+            return false;
+        };
+        http(&endpoint, "GET", "/api/local/health", None, None)
+            .await
+            .is_ok_and(|(status, _)| status == 200)
     }
 
     /// The installation's connector, detached, as an MCP server starts it on demand; it starts the core.
@@ -100,7 +97,7 @@ impl Call {
 
     /// Pairs a local device and holds its call socket until it closes.
     async fn open(&self) -> Result<()> {
-        let socket = self.profile.core_socket();
+        let socket = self.profile.core_endpoint()?;
         let paired = expect(
             http(
                 &socket,
@@ -121,7 +118,7 @@ impl Call {
             "Sec-WebSocket-Protocol",
             format!("sidevoice, sidevoice.token.{token}").parse()?,
         );
-        let stream = UnixStream::connect(&socket).await?;
+        let stream = Channels::connect(&socket).await?;
         let (mut ws, _) = tokio_tungstenite::client_async(request, stream).await?;
         let ready = json!({"label": "rtvi-ai", "type": "client-ready", "id": "sidevoice-testbench",
                            "data": {"settings": {"turn_end_mode": "timer"}}});
@@ -193,15 +190,11 @@ impl Call {
         let Ok((token, session)) = self.device() else {
             return json!({"call": false, "events": events});
         };
-        let listing = http(
-            &self.profile.core_socket(),
-            "GET",
-            "/api/connectors",
-            None,
-            Some(&token),
-        )
+        let listing = async {
+            let endpoint = self.profile.core_endpoint()?;
+            expect(http(&endpoint, "GET", "/api/connectors", None, Some(&token)).await?)
+        }
         .await
-        .and_then(expect)
         .unwrap_or_else(|error| json!({"error": format!("{error:#}")}));
         json!({"call": true, "session": session, "connectors": listing["connectors"],
                "bindings": listing["bindings"], "events": events})
@@ -213,7 +206,7 @@ impl Call {
         let path = format!("/api/presentation/history?thread_id={}", encode(thread));
         expect(
             http(
-                &self.profile.core_socket(),
+                &self.profile.core_endpoint()?,
                 "GET",
                 &path,
                 None,
@@ -226,7 +219,7 @@ impl Call {
     /// Says `text` into the conversation `thread`, as the app sends what the person said in the call.
     pub async fn say(&self, thread: &str, text: &str) -> Result<Value> {
         let (token, session) = self.device()?;
-        let socket = self.profile.core_socket();
+        let socket = self.profile.core_endpoint()?;
         let selected = expect(
             http(
                 &socket,
@@ -255,16 +248,16 @@ fn expect((status, body): (u16, Value)) -> Result<Value> {
     Ok(body)
 }
 
-/// One HTTP/1.0 request over the core's Unix socket: its status and JSON body.
+/// One HTTP/1.0 request over the core's local endpoint: its status and JSON body.
 async fn http(
-    socket: &Path,
+    socket: &Endpoint,
     method: &str,
     path: &str,
     body: Option<&Value>,
     token: Option<&str>,
 ) -> Result<(u16, Value)> {
     let exchange = async {
-        let mut stream = UnixStream::connect(socket).await?;
+        let mut stream = Channels::connect(socket).await?;
         let body = body.map(Value::to_string).unwrap_or_default();
         let mut request = format!("{method} {path} HTTP/1.0\r\nHost: localhost\r\n");
         if let Some(token) = token {

@@ -172,10 +172,6 @@ pub async fn start(
         // A core about to start again: its last failure report is about a start that is over.
         let _ = std::fs::remove_file(layout.core_failure());
     }
-    if restart && jobs.contains(&Job::Core) {
-        // A restart ends the running core first: asked in band where the manager's end is a hard stop.
-        super::launcher::let_core_leave_before_manager(layout).await;
-    }
     match manager
         .start(&ids(jobs), &ids(changed), restart, login)
         .await
@@ -186,11 +182,8 @@ pub async fn start(
 }
 
 /// The defined jobs stopped, the connector first ([`Service::stop`]); with `disable`, not at the next login either.
-/// The core is first let leave by itself where the manager's stop is a hard one
-/// ([`launcher::let_core_leave_before_manager`](super::launcher::let_core_leave_before_manager)). The first refusal,
-/// or none.
+/// Each manager lets a job leave by itself before it ends it. The first refusal, or none.
 pub async fn unload(
-    layout: &Layout,
     manager: &impl Service,
     installed: &Installed,
     disable: bool,
@@ -198,9 +191,6 @@ pub async fn unload(
     for job in Job::ALL.iter().rev().copied() {
         if !installed.has(job) {
             continue;
-        }
-        if job == Job::Core {
-            super::launcher::let_core_leave_before_manager(layout).await;
         }
         if let Err(refused) = manager.stop(job.id(), disable).await {
             return Some(refused);
@@ -297,7 +287,6 @@ pub async fn linger(manager: &impl Service) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::env::{Env, Environment};
     use crate::platform::service::{Job as Definition, JobState, Places};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -495,27 +484,14 @@ mod tests {
 
     #[tokio::test]
     async fn the_connector_is_stopped_before_the_core_and_only_what_is_defined() {
-        let nowhere = std::env::temp_dir().join("sidevoice-unload-test");
-        let layout = Layout::from_vars(
-            |name| {
-                (name == Environment::HOME || name == crate::data_dir::VARIABLE)
-                    .then(|| nowhere.clone().into_os_string())
-            },
-            [],
-            &[],
-        )
-        .unwrap();
         let fake = Fake::default();
-        assert_eq!(
-            unload(&layout, &fake, &service(true, true), false).await,
-            None
-        );
+        assert_eq!(unload(&fake, &service(true, true), false).await, None);
         assert_eq!(
             *fake.calls.lock().unwrap(),
             vec!["stop sidevoice-connector", "stop sidevoice-core"]
         );
         let fake = Fake::default();
-        unload(&layout, &fake, &service(true, false), true).await;
+        unload(&fake, &service(true, false), true).await;
         assert_eq!(*fake.calls.lock().unwrap(), vec!["stop sidevoice-core"]);
     }
 
