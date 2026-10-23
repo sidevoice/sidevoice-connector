@@ -240,7 +240,7 @@ then held by Cursor and runs after the current turn. The `force` field is undocu
 unverified (it may interrupt the running turn), so it is not used. A reply that is neither accepted nor an explicit
 refusal stays `unknown` and is not retried blindly; `status: "error"` or a 4xx is a failed send. The working
 state comes from the chat's transcript, so it stays right while a message waits in Cursor's queue. The decision is
-`classify_send_reply` in `adapters/cursor/mod.rs`, with unit tests over mock bridge replies.
+`classify_send_reply` in `adapters/cursor.rs`, with unit tests over mock bridge replies.
 
 `uninstall` unloads both jobs and stops what runs on demand (a refusal stops it there, with nothing deleted), removes
 the agents' registrations Sidevoice wrote (current or not), then the owned data and releases. It keeps lock files and

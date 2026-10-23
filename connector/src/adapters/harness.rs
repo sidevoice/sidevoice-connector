@@ -271,6 +271,7 @@ mod tests {
         let mut leaks = Vec::new();
         for file in files {
             if file.starts_with(&adapters)
+                || file == src.join("adapters.rs")
                 || file.file_name().is_some_and(|name| name == "tests.rs")
             {
                 continue;
