@@ -61,7 +61,9 @@ const CLAIM: &str = ".uninstall-claim";
 /// The private directory in `D` holding the copy of the program that finishes an interrupted uninstall.
 const RECOVERY: &str = ".uninstall-recovery";
 /// The program inside [`RECOVERY`].
-const RECOVERY_PROGRAM: &str = "sidevoice-connector";
+fn recovery_program() -> String {
+    crate::identity::exe_name("sidevoice-connector")
+}
 /// `D`'s record of the installation, which names the recovery program until the very end.
 const RECORD: &str = "install.json";
 /// The largest [`RECORD`] read.
@@ -248,7 +250,7 @@ fn recovery_record(roots: &Roots) -> Result<Value, &'static str> {
             .ok_or("unsafe uninstall install record")?,
         Err(_) => return Err("unsafe uninstall install record"),
     };
-    record["command"] = json!([roots.data.join(RECOVERY).join(RECOVERY_PROGRAM)]);
+    record["command"] = json!([roots.data.join(RECOVERY).join(recovery_program())]);
     record["releases"] = json!(roots.releases);
     Ok(record)
 }
@@ -571,7 +573,7 @@ mod tests {
         removal.stage_recovery().unwrap();
         let record: Value =
             serde_json::from_slice(&fs::read(layout.data.join("install.json")).unwrap()).unwrap();
-        let program = layout.data.join(RECOVERY).join(RECOVERY_PROGRAM);
+        let program = layout.data.join(RECOVERY).join(recovery_program());
         assert_eq!(record["command"], json!([program]));
         assert_eq!(record["releases"], json!(layout.releases));
         assert!(program.is_file(), "a copy of this program");

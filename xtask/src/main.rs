@@ -82,6 +82,13 @@ pub(crate) const TARGETS: &[Target] = &[
         npm_os: "darwin",
         npm_cpu: "arm64",
     },
+    Target {
+        name: "windows-x86_64",
+        os: "windows",
+        arch: "x86_64",
+        npm_os: "win32",
+        npm_cpu: "x64",
+    },
 ];
 
 /// The names of [`TARGETS`], in order.
@@ -92,7 +99,23 @@ pub(crate) fn target_names() -> impl Iterator<Item = &'static str> {
 pub(crate) const PACKAGE: &str = "sidevoice-connector";
 /// The archive's single root directory.
 pub(crate) const ROOT_NAME: &str = "sidevoice-connector";
-pub(crate) const ENTRYPOINT: &str = "bin/sidevoice-connector";
+/// The connector's program inside the archive, without the suffix a target gives programs (`entrypoint`).
+pub(crate) const ENTRYPOINT_STEM: &str = "bin/sidevoice-connector";
+
+/// The suffix of a program's file name on `target` (the target's, not the host's: `dist` builds for the host, but
+/// `manifest`, `npm` and the archive checks read every target's archive from any machine).
+pub(crate) fn exe_suffix(target: &str) -> &'static str {
+    if target.starts_with("windows-") {
+        ".exe"
+    } else {
+        ""
+    }
+}
+
+/// The connector's program inside the archive of `target`: the `entrypoint` its inventory names.
+pub(crate) fn entrypoint(target: &str) -> String {
+    format!("{ENTRYPOINT_STEM}{}", exe_suffix(target))
+}
 /// Where the archive carries the pinned core release archive, as the core published it.
 pub(crate) const CORE_DIR: &str = "core";
 /// The inventory every archive carries at its root.

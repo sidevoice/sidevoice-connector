@@ -19,8 +19,8 @@
 //! No `unsafe` here: `std`'s `OpenOptionsExt` sets the sharing and the flags, `winapi-util` reads the file id.
 
 use super::{
-    recovery_record, Removal, Roots, CLAIM, DATA_PREFIX, RECORD, RECORD_LIMIT, RECOVERY,
-    RECOVERY_PROGRAM, RELEASE_PREFIX,
+    recovery_program, recovery_record, Removal, Roots, CLAIM, DATA_PREFIX, RECORD, RECORD_LIMIT,
+    RECOVERY, RELEASE_PREFIX,
 };
 use crate::platform::fs::{Create, Files, Fs};
 use std::ffi::{OsStr, OsString};
@@ -321,7 +321,7 @@ impl Removal for Os {
 
     fn stage_recovery(&self) -> Result<(), &'static str> {
         let (_held, recovery) = self.private_child(RECOVERY)?;
-        let program = recovery.join(RECOVERY_PROGRAM);
+        let program = recovery.join(recovery_program());
         match Files::open_read(&program) {
             Ok(file) => {
                 Files::check_private(&file).map_err(|_| "unsafe uninstall recovery executable")?
@@ -429,10 +429,10 @@ impl Removal for Os {
         if exists(&recovery)? {
             {
                 let _recovery = hold(&recovery)?;
-                if names(&recovery)? != [OsStr::new(RECOVERY_PROGRAM)] {
+                if names(&recovery)? != [OsStr::new(&recovery_program())] {
                     return Err("uninstall recovery directory changed");
                 }
-                fs::remove_file(recovery.join(RECOVERY_PROGRAM))
+                fs::remove_file(recovery.join(recovery_program()))
                     .map_err(|_| "cannot remove recovery executable")?;
             }
             fs::remove_dir(&recovery).map_err(|_| "cannot remove recovery directory")?;

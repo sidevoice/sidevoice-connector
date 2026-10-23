@@ -12,8 +12,9 @@ pub const VERSION: &str = env!("SIDEVOICE_CONNECTOR_VERSION");
 /// `--version --json` advertises this only for the guarded, recoverable uninstall contract.
 pub const SAFE_UNINSTALL: u8 = 1;
 
-/// The release target this binary was compiled for (`linux-x86_64`, `linux-aarch64`, `macos-aarch64`), or `None`
-/// on a platform no release is made for.
+/// The release target this binary was compiled for (`linux-x86_64`, `linux-aarch64`, `macos-aarch64`,
+/// `windows-x86_64`), or `None` on a platform no release is made for. The names are those of the release archives
+/// and, with npm's `os` and `cpu`, of the npm platform packages (`xtask/src/main.rs`, `TARGETS`).
 pub fn target() -> Option<&'static str> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
@@ -27,8 +28,18 @@ pub fn target() -> Option<&'static str> {
     {
         return Some("linux-aarch64");
     }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        return Some("windows-x86_64");
+    }
     #[allow(unreachable_code)]
     None
+}
+
+/// The file name of a program on this operating system: `stem` and, on Windows, `.exe`. Every program the
+/// connector names by file (its own binary, the core's, the copy that finishes an uninstall) goes through here.
+pub fn exe_name(stem: &str) -> String {
+    format!("{stem}{}", std::env::consts::EXE_SUFFIX)
 }
 
 /// The host name, as the operating system reports it. `SIDEVOICE_HOST_ID` overrides it (tests, several profiles on
@@ -87,6 +98,27 @@ pub fn machine(profile: &Profile) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_program_is_named_the_way_this_system_names_programs() {
+        assert_eq!(
+            exe_name("sidevoice-connector"),
+            format!("sidevoice-connector{}", std::env::consts::EXE_SUFFIX)
+        );
+        assert_eq!(exe_name("x").ends_with(".exe"), cfg!(windows));
+    }
+
+    #[test]
+    fn this_build_names_its_release_target() {
+        let expected = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("macos", "aarch64") => Some("macos-aarch64"),
+            ("linux", "x86_64") => Some("linux-x86_64"),
+            ("linux", "aarch64") => Some("linux-aarch64"),
+            ("windows", "x86_64") => Some("windows-x86_64"),
+            _ => None,
+        };
+        assert_eq!(target(), expected);
+    }
 
     #[test]
     fn platforms_are_named_for_people() {

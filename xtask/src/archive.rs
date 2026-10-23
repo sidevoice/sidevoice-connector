@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::glibc;
 use crate::util::*;
-use crate::{target_names, Result, CORE_DIR, ENTRYPOINT, INVENTORY, KIND, ROOT_NAME};
+use crate::{entrypoint, target_names, Result, CORE_DIR, INVENTORY, KIND, ROOT_NAME};
 
 const MAX_COMPRESSED: u64 = 250_000_000;
 const MAX_TOTAL: u64 = 1_000_000_000;
@@ -182,7 +182,7 @@ pub(crate) fn unpack_checked(archive: &Path, destination: &Path) -> Result<(Path
     }
     if inventory["schema"] != 1
         || inventory["kind"] != KIND
-        || inventory["entrypoint"] != ENTRYPOINT
+        || inventory["entrypoint"] != entrypoint(target).as_str()
     {
         return Err("wrong kind or entrypoint".into());
     }
@@ -216,7 +216,7 @@ pub(crate) fn unpack_checked(archive: &Path, destination: &Path) -> Result<(Path
             present.symmetric_difference(&listed)
         ));
     }
-    if !names.contains(&ENTRYPOINT) {
+    if !names.contains(&entrypoint(target).as_str()) {
         return Err("the inventory does not list the entrypoint".into());
     }
     for record in records {
@@ -275,13 +275,14 @@ pub(crate) fn test_tree(
 ) -> PathBuf {
     let root = work.join(ROOT_NAME);
     let core_archive = format!("{CORE_DIR}/{}", crate::core::archive_name("0.2.0", target));
+    let entrypoint = entrypoint(target);
     mkdir(&root.join("bin")).unwrap();
     mkdir(&root.join(CORE_DIR)).unwrap();
-    write(&root.join(ENTRYPOINT), target.as_bytes()).unwrap();
+    write(&root.join(&entrypoint), target.as_bytes()).unwrap();
     write(&root.join("LICENSE"), b"licence").unwrap();
     write(&root.join(&core_archive), b"the core").unwrap();
     let mut files = vec![
-        file_record(&root.join(ENTRYPOINT), ENTRYPOINT).unwrap(),
+        file_record(&root.join(&entrypoint), &entrypoint).unwrap(),
         file_record(&root.join("LICENSE"), "LICENSE").unwrap(),
         file_record(&root.join(&core_archive), &core_archive).unwrap(),
     ];
@@ -291,7 +292,7 @@ pub(crate) fn test_tree(
         .find(|record| record["name"] == core_archive.as_str())
         .unwrap();
     let mut inventory = serde_json::json!({"schema": 1, "kind": KIND, "version": version, "target": target,
-        "source_sha": sha, "entrypoint": ENTRYPOINT, "core": core(record), "files": files});
+        "source_sha": sha, "entrypoint": entrypoint, "core": core(record), "files": files});
     if target.starts_with("linux-") {
         inventory["glibc"] = "2.28".into();
     }
@@ -310,6 +311,8 @@ pub(crate) fn test_core_record(record: &Value) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
     fn stage_with(work: &Path, core: impl Fn(&Value) -> Value) -> PathBuf {
         test_tree(
@@ -344,7 +347,14 @@ mod tests {
                 core
             });
             let archive = work.0.join("a.tar.zst");
-            write_archive(&work.0, ROOT_NAME, &[ENTRYPOINT], 1, &archive).unwrap();
+            write_archive(
+                &work.0,
+                ROOT_NAME,
+                &[entrypoint("linux-x86_64").as_str()],
+                1,
+                &archive,
+            )
+            .unwrap();
             let out = TempDir::new("xtask-archive-core-out").unwrap();
             let error = unpack_checked(&archive, &out.0).unwrap_err();
             assert!(error.contains("core record"), "{label}: {error}");
@@ -357,18 +367,65 @@ mod tests {
         stage(&work.0);
         let first = work.0.join("first.tar.zst");
         let second = work.0.join("second.tar.zst");
-        write_archive(&work.0, ROOT_NAME, &[ENTRYPOINT], 1, &first).unwrap();
-        write_archive(&work.0, ROOT_NAME, &[ENTRYPOINT], 1, &second).unwrap();
+        write_archive(
+            &work.0,
+            ROOT_NAME,
+            &[entrypoint("linux-x86_64").as_str()],
+            1,
+            &first,
+        )
+        .unwrap();
+        write_archive(
+            &work.0,
+            ROOT_NAME,
+            &[entrypoint("linux-x86_64").as_str()],
+            1,
+            &second,
+        )
+        .unwrap();
         assert_eq!(read(&first).unwrap(), read(&second).unwrap());
 
         let out = TempDir::new("xtask-archive-test-out").unwrap();
-        let (root, inventory) = unpack_checked(&first, &out.0).unwrap();
+        let (_, inventory) = unpack_checked(&first, &out.0).unwrap();
         assert_eq!(inventory["version"], "1.2.3");
-        let mode = fs::metadata(root.join(ENTRYPOINT)).unwrap().permissions();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_entrypoint_unpacks_as_a_program() {
+        let work = TempDir::new("xtask-archive-mode").unwrap();
+        stage(&work.0);
+        let archive = work.0.join("a.tar.zst");
+        let program = entrypoint("linux-x86_64");
+        write_archive(&work.0, ROOT_NAME, &[program.as_str()], 1, &archive).unwrap();
+        let out = TempDir::new("xtask-archive-mode-out").unwrap();
+        let (root, _) = unpack_checked(&archive, &out.0).unwrap();
+        let mode = fs::metadata(root.join(program)).unwrap().permissions();
         assert_eq!(
             std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
             0o755
         );
+    }
+
+    #[test]
+    fn a_windows_archive_names_its_program_with_the_suffix() {
+        let work = TempDir::new("xtask-archive-windows").unwrap();
+        let root = test_tree(&work.0, "windows-x86_64", SHA, "1.2.3", test_core_record);
+        assert!(root.join("bin/sidevoice-connector.exe").is_file());
+        let archive = work.0.join("a.tar.zst");
+        write_archive(
+            &work.0,
+            ROOT_NAME,
+            &["bin/sidevoice-connector.exe"],
+            1,
+            &archive,
+        )
+        .unwrap();
+        let out = TempDir::new("xtask-archive-windows-out").unwrap();
+        let (_, inventory) = unpack_checked(&archive, &out.0).unwrap();
+        assert_eq!(inventory["entrypoint"], "bin/sidevoice-connector.exe");
+        assert_eq!(inventory["target"], "windows-x86_64");
+        assert!(inventory.get("glibc").is_none());
     }
 
     #[test]
@@ -377,7 +434,14 @@ mod tests {
         let root = stage(&work.0);
         write(&root.join("stowaway"), b"x").unwrap();
         let archive = work.0.join("a.tar.zst");
-        write_archive(&work.0, ROOT_NAME, &[ENTRYPOINT], 1, &archive).unwrap();
+        write_archive(
+            &work.0,
+            ROOT_NAME,
+            &[entrypoint("linux-x86_64").as_str()],
+            1,
+            &archive,
+        )
+        .unwrap();
         let out = TempDir::new("xtask-archive-extra-out").unwrap();
         let error = unpack_checked(&archive, &out.0).unwrap_err();
         assert!(error.contains("stowaway"), "{error}");
@@ -389,7 +453,14 @@ mod tests {
         let root = stage(&work.0);
         write(&root.join("LICENSE"), b"another licence").unwrap();
         let archive = work.0.join("a.tar.zst");
-        write_archive(&work.0, ROOT_NAME, &[ENTRYPOINT], 1, &archive).unwrap();
+        write_archive(
+            &work.0,
+            ROOT_NAME,
+            &[entrypoint("linux-x86_64").as_str()],
+            1,
+            &archive,
+        )
+        .unwrap();
         let out = TempDir::new("xtask-archive-changed-out").unwrap();
         let error = unpack_checked(&archive, &out.0).unwrap_err();
         assert!(error.contains("inventory mismatch: LICENSE"), "{error}");
@@ -407,7 +478,14 @@ mod tests {
             }
             write(&root.join(INVENTORY), &canonical(&inventory)).unwrap();
             let archive = work.0.join("a.tar.zst");
-            write_archive(&work.0, ROOT_NAME, &[ENTRYPOINT], 1, &archive).unwrap();
+            write_archive(
+                &work.0,
+                ROOT_NAME,
+                &[entrypoint("linux-x86_64").as_str()],
+                1,
+                &archive,
+            )
+            .unwrap();
             let out = TempDir::new("xtask-archive-floor-out").unwrap();
             let error = unpack_checked(&archive, &out.0).unwrap_err();
             assert!(

@@ -225,7 +225,8 @@ impl InstalledCommand {
                         .chars()
                         .all(|ch| ch.is_ascii_alphanumeric() || ".+-_".contains(ch))
                     && parts[1].as_os_str() == "bin"
-                    && parts[2].as_os_str() == "sidevoice-connector"
+                    && parts[2].as_os_str()
+                        == crate::identity::exe_name("sidevoice-connector").as_str()
             }
             #[cfg(test)]
             Ownership::Selected {

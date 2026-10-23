@@ -63,8 +63,10 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::time::{sleep, timeout, Duration, Instant};
 
-/// The connector's program inside a package and inside a release.
-pub const BINARY: &str = "bin/sidevoice-connector";
+/// The connector's program inside a package and inside a release (`bin/sidevoice-connector`, `.exe` on Windows).
+pub fn binary() -> String {
+    format!("bin/{}", crate::identity::exe_name("sidevoice-connector"))
+}
 /// How long the pair has to answer after a restart.
 const VERIFY_LIMIT: Duration = Duration::from_secs(60);
 /// The lock files and the stop `uninstall` leaves in `D`.
@@ -129,7 +131,7 @@ fn cause_text(failure: &Value) -> String {
 /// `R/releases/<id>/bin/sidevoice-connector`: the installation's command while `id` is selected. It names the
 /// release itself, so `select` writes it again at each switch, into `install.json` and so into the service jobs.
 fn release_command(layout: &Layout, id: &str) -> PathBuf {
-    layout.releases_dir().join(id).join(BINARY)
+    layout.releases_dir().join(id).join(binary())
 }
 
 /// `R/current.json` names release `id`, written whole (`platform::fs`), then `D/install.json` names its command.
@@ -173,9 +175,9 @@ fn valid_version(version: &str) -> bool {
 
 /// A release that is all there: its binary and its core's program.
 fn complete(release: &Path) -> bool {
-    release.join(BINARY).is_file()
+    release.join(binary()).is_file()
         && release
-            .join(crate::service::layout::CORE_ENTRYPOINT)
+            .join(crate::service::layout::core_entrypoint())
             .is_file()
 }
 
@@ -207,7 +209,7 @@ fn release_id(layout: &Layout, package: &Package, digest: &str) -> Result<(Strin
         format!("{}+{}", package.version, &digest[..12]),
     ];
     let same = |id: &str| {
-        digest_file(&layout.releases_dir().join(id).join(BINARY))
+        digest_file(&layout.releases_dir().join(id).join(binary()))
             .ok()
             .as_deref()
             == Some(digest)
@@ -294,7 +296,7 @@ async fn stage(layout: &Layout, package: &Package, id: &str, digest: &str) -> Re
     Files::create_private_dir(&partial)?;
     let result = async {
         Files::create_private_dir(&partial.join("bin"))?;
-        let binary = partial.join(BINARY);
+        let binary = partial.join(binary());
         copy_executable(&package.binary, &binary)?;
         Files::check_private(&Files::open_read(&binary)?)
             .with_context(|| format!("unsafe private file {}", binary.display()))?;
@@ -407,7 +409,7 @@ impl Runtime {
     ) -> std::result::Result<(), Value> {
         match self {
             Runtime::Machine => {
-                let binary = release.join(BINARY);
+                let binary = release.join(binary());
                 if kind == Kind::None {
                     let fallback = vec![binary.to_string_lossy().into_owned()];
                     launcher::ensure_connector(
@@ -1175,7 +1177,7 @@ pub(crate) mod tests {
             ));
             fs::create_dir_all(root.join("bin")).unwrap();
             fs::create_dir_all(root.join("core")).unwrap();
-            let binary = root.join(BINARY);
+            let binary = root.join(binary());
             fs::write(
                 &binary,
                 format!("#!/bin/sh\n# {build}\necho '{{\"ok\":true,\"version\":\"{version}\"}}'\n"),
@@ -1250,7 +1252,7 @@ pub(crate) mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(release.join(BINARY))
+            let mode = fs::metadata(release.join(binary()))
                 .unwrap()
                 .permissions()
                 .mode();
@@ -1258,7 +1260,7 @@ pub(crate) mod tests {
         }
 
         // The same build again: nothing staged, the selection restarted and verified (the recovery).
-        let staged_at = fs::metadata(release.join(BINARY))
+        let staged_at = fs::metadata(release.join(binary()))
             .unwrap()
             .modified()
             .unwrap();
@@ -1268,7 +1270,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(again["action"], "reinstalled", "{again}");
         assert_eq!(
-            fs::metadata(release.join(BINARY))
+            fs::metadata(release.join(binary()))
                 .unwrap()
                 .modified()
                 .unwrap(),

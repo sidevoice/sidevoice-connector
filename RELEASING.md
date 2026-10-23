@@ -66,9 +66,10 @@ floor is pinned, the package as a whole needs the core's floor.
 
 ## Assets
 
-- `sidevoice-connector-<version>-<target>.tar.zst` for `macos-aarch64`, `linux-x86_64` and `linux-aarch64` (on the
+- `sidevoice-connector-<version>-<target>.tar.zst` for `macos-aarch64`, `linux-x86_64`, `linux-aarch64` and `windows-x86_64` (on the
   nightly, `sidevoice-connector-nightly-<target>.tar.zst`, fixed names whose download URLs never change): the root
-  `sidevoice-connector/` holds `bin/sidevoice-connector`, `LICENSE`, the licence notices of every crate linked into
+  `sidevoice-connector/` holds `bin/sidevoice-connector` (`bin/sidevoice-connector.exe` on Windows; the inventory's
+  `entrypoint` names it), `LICENSE`, the licence notices of every crate linked into
   the binary (`notices/`), `core/sidevoice-core-<core version>-<target>.tar.zst`, the pinned core release's archive
   for the same target exactly as the core published it (its own licence notices are inside it), and
   `connector.json`, the inventory: version, target, source commit, on Linux the glibc floor, every file with its
@@ -99,13 +100,13 @@ Release itself.
 
 ### What is published
 
-Every `vX.Y.Z` release (never the nightly) is also published to npm, as four packages of the same version
+Every `vX.Y.Z` release (never the nightly) is also published to npm, as five packages of the same version
 (`xtask/src/npm.rs`, the pattern esbuild and Biome use):
 
 | Package | What it carries | dist-tag | How it is published |
 |---|---|---|---|
-| `@sidevoice/sidevoice-darwin-arm64`, `@sidevoice/sidevoice-linux-x64`, `@sidevoice/sidevoice-linux-arm64` | That target's release archive unpacked as it is (`bin/sidevoice-connector`, `connector.json`, the core archive under `core/`, `LICENSE`, `notices/`), a `package.json` with `os`, `cpu` and on Linux `libc: ["glibc"]`, and a README. **No `bin`**: the binary just lives in the package. | `platform` | directly, with provenance |
-| `sidevoice` | `optionalDependencies` on the three at **exactly** its own version (no ranges), and one script, `bin/sidevoice.js` (`xtask/npm/sidevoice.js`, plain JavaScript, no dependencies): it runs the installed platform package's binary with the same arguments, standard streams and exit status, and says clearly when the platform is unsupported or its package is missing. The only package with a `bin`: `sidevoice`. | `latest` for `X.Y.Z`, `next` for `X.Y.Z-rc.N` | **staged**, with provenance; a maintainer approves it |
+| `@sidevoice/sidevoice-darwin-arm64`, `@sidevoice/sidevoice-linux-x64`, `@sidevoice/sidevoice-linux-arm64`, `@sidevoice/sidevoice-win32-x64` | That target's release archive unpacked as it is (`bin/sidevoice-connector`, `connector.json`, the core archive under `core/`, `LICENSE`, `notices/`), a `package.json` with `os`, `cpu` and on Linux `libc: ["glibc"]` (on Windows the program inside is `bin/sidevoice-connector.exe`), and a README. **No `bin`**: the binary just lives in the package. | `platform` | directly, with provenance |
+| `sidevoice` | `optionalDependencies` on the four at **exactly** its own version (no ranges), and one script, `bin/sidevoice.js` (`xtask/npm/sidevoice.js`, plain JavaScript, no dependencies): it runs the installed platform package's binary with the same arguments, standard streams and exit status, and says clearly when the platform is unsupported or its package is missing. The only package with a `bin`: `sidevoice`. | `latest` for `X.Y.Z`, `next` for `X.Y.Z-rc.N` | **staged**, with provenance; a maintainer approves it |
 
 npm installs, of the launcher's optional dependencies, only the one matching the machine. The connector finds its
 package by its own path (the directory above its `bin/`), so it runs from `node_modules` exactly as from the archive.
@@ -123,7 +124,7 @@ published, for versioned releases only, as one step, `cargo xtask npm-publish vX
 3. It checks that trusted publishing accepts this run for **every** package (the same OIDC exchange `npm publish`
    makes) before publishing any. If one is not configured the job fails, naming the packages and what to set, and
    nothing is published. There is no token to fall back to.
-4. It publishes the three platform packages directly, under the dist-tag `platform`, with `--provenance`; then
+4. It publishes the four platform packages directly, under the dist-tag `platform`, with `--provenance`; then
    **stages** `sidevoice` (`npm stage publish`, `--provenance`, dist-tag `latest` or `next`). A version already
    published with the same bytes is skipped, so a re-run carries on; with other bytes it fails.
 
@@ -172,6 +173,20 @@ Say Windows x64 or macOS x86_64:
    - the archive: `bin/sidevoice-connector` gets `.exe` on Windows, which the inventory's `entrypoint`, `verify`
      and the launcher (it reads `entrypoint` from `connector.json`) must follow;
    - the README's supported platforms and the launcher package's README (`xtask/src/npm.rs`).
+
+#### Windows x64: what is in place and what is not
+
+`windows-x86_64` is in `TARGETS`, in the `release.yml` matrix (`windows-2025`, built natively with MSVC and the C
+runtime linked statically, `.cargo/config.toml`) and in the npm packages (`win32-x64`). Until these hold, a release
+or nightly cannot complete, because the manifest lists every target:
+
+- `core.pin` names a sidevoice-core release that publishes `sidevoice-core-<version>-windows-x86_64.tar.zst`
+  (`cargo xtask fixtures` and `dist` say so when it does not), whose program is `bin/sidevoice-core-rust.exe`;
+- `@sidevoice/sidevoice-win32-x64` is reserved and its trusted publisher configured (steps 1 and 2 above);
+- the connector's tests pass on Windows (the `Test (windows-x86_64)` job of `ci.yml`, red on purpose until they do).
+
+Not decided, so not done: Authenticode signing and the installer format (the archive and the npm package are the
+only Windows distribution here).
 ## Which version comes next
 
 `fix:` → patch, `feat:` → minor. While the version is 0.x a breaking change (`feat!:` or a `BREAKING CHANGE:`

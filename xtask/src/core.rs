@@ -17,7 +17,12 @@ pub(crate) const PIN: &str = "core.pin";
 const REPOSITORY: &str = "sidevoice/sidevoice-core";
 /// The archive's root directory and its entrypoint below it.
 const ROOT: &str = "sidevoice-core-rust";
-const ENTRYPOINT: &str = "bin/sidevoice-core-rust";
+const ENTRYPOINT_STEM: &str = "bin/sidevoice-core-rust";
+
+/// The core's program inside its archive for `target`: `bin/sidevoice-core-rust`, `.exe` on Windows.
+fn entrypoint(target: &str) -> String {
+    format!("{ENTRYPOINT_STEM}{}", crate::exe_suffix(target))
+}
 const MANIFEST: &str = "native-core-manifest.json";
 const ATTESTATION: &str = "attestation.sigstore.json";
 
@@ -85,7 +90,20 @@ pub(crate) fn fetch(target: &str) -> Result<PinnedCore> {
     let version = pinned_version()?;
     let name = archive_name(&version, target);
     let downloaded = TempDir::new("sidevoice-core-download")?;
-    for asset in [name.as_str(), "SHA256SUMS", MANIFEST, ATTESTATION] {
+    // The checksums first: a core release made before a target existed does not list its archive, and that is
+    // said as such, not as a failed download.
+    let sums_path = downloaded.0.join("SHA256SUMS");
+    write(&sums_path, &download(&asset_url(&version, "SHA256SUMS"))?)?;
+    if !parse_sums(&read(&sums_path)?)?
+        .iter()
+        .any(|(_, listed)| *listed == name)
+    {
+        return Err(format!(
+            "sidevoice-core {version} publishes no {target} archive ({name} is not in its SHA256SUMS): \
+             {PIN} must name a core release built for {target}"
+        ));
+    }
+    for asset in [name.as_str(), MANIFEST, ATTESTATION] {
         write(
             &downloaded.0.join(asset),
             &download(&asset_url(&version, asset))?,
@@ -144,13 +162,14 @@ pub(crate) fn core(dir: &Path) -> Result<()> {
     }
     mkdir(dir)?;
     let root = unpack(&pinned.archive(), dir, ROOT)?;
-    if !root.join(ENTRYPOINT).is_file() {
-        return Err(format!("{} has no {ENTRYPOINT}", pinned.name));
+    let entrypoint = entrypoint(&pinned.target);
+    if !root.join(&entrypoint).is_file() {
+        return Err(format!("{} has no {entrypoint}", pinned.name));
     }
     write(&dir.join(&pinned.name), &read(&pinned.archive())?)?;
     let record = json!({"version": pinned.version, "target": pinned.target, "archive": pinned.name,
                         "sha256": pinned.sha256, "size": pinned.size, "source_sha": pinned.source_sha,
-                        "entrypoint": root.join(ENTRYPOINT)});
+                        "entrypoint": root.join(&entrypoint)});
     write(&dir.join("core.json"), &canonical(&record))?;
     print!("{}", String::from_utf8_lossy(&canonical(&record)));
     Ok(())
@@ -170,6 +189,13 @@ mod tests {
             signer(),
             "https://github.com/sidevoice/sidevoice-core/.github/workflows/release.yml@refs/heads/main"
         );
+    }
+
+    #[test]
+    fn the_core_program_has_the_suffix_of_its_target() {
+        assert_eq!(entrypoint("linux-x86_64"), "bin/sidevoice-core-rust");
+        assert_eq!(entrypoint("macos-aarch64"), "bin/sidevoice-core-rust");
+        assert_eq!(entrypoint("windows-x86_64"), "bin/sidevoice-core-rust.exe");
     }
 
     #[test]

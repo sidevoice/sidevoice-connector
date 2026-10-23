@@ -1,7 +1,7 @@
 //! `cargo xtask verify ARCHIVE`: unpack it elsewhere and run the connector from there, and the core it carries.
 //! `cargo xtask verify-floor ARCHIVE`: the same, running the connector on the oldest Linux it supports.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::json;
@@ -9,7 +9,7 @@ use serde_json::json;
 use crate::archive::unpack_checked;
 use crate::glibc;
 use crate::util::*;
-use crate::{Result, ENTRYPOINT, PACKAGE};
+use crate::{entrypoint, Result, PACKAGE};
 
 /// The libraries a Linux binary may load: the C library and its own parts, present on every distribution.
 const LINUX_SYSTEM: [&str; 9] = [
@@ -37,11 +37,12 @@ const CONTAINER_ROOT: &str = "/opt/sidevoice-connector";
 /// there: the floor is the connector binary's, and the pinned core release has its own (newer, until the core's
 /// floor change is released), so its checks stay with the plain `verify` on the build machine.
 pub(crate) fn verify(archive: &Path, image: Option<&str>) -> Result<()> {
-    let work = TempDir::new_in(Path::new("/tmp"), "sidevoice connector relocated")?;
+    let work = TempDir::new_in(&scratch_base(), "sidevoice connector relocated")?;
     let (root, inventory) = unpack_checked(archive, &work.0)?;
-    let binary = root.join(ENTRYPOINT);
-    let binary_str = path_str(&binary)?;
     let target = inventory["target"].as_str().unwrap_or("");
+    let entrypoint = entrypoint(target);
+    let binary = root.join(&entrypoint);
+    let binary_str = path_str(&binary)?;
     if target != host_target()? {
         return Err(format!(
             "the archive is for {target}, this machine is {}",
@@ -93,22 +94,18 @@ pub(crate) fn verify(archive: &Path, image: Option<&str>) -> Result<()> {
     let run = |args: &[&str]| -> Result<String> {
         let result = match image {
             Some(image) => {
-                let entrypoint = format!("{CONTAINER_ROOT}/{ENTRYPOINT}");
-                let mut full = vec![entrypoint.as_str()];
+                let inside = format!("{CONTAINER_ROOT}/{entrypoint}");
+                let mut full = vec![inside.as_str()];
                 full.extend(args);
                 in_container(image, &root, &full)?.output()
             }
-            None => Command::new(&binary)
-                .args(args)
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .output(),
+            None => clean_environment(Command::new(&binary).args(args)).output(),
         };
         let result = result.map_err(|error| format!("{binary_str} {}: {error}", args.join(" ")))?;
         if !result.status.success() {
             return Err(format!(
                 "{} {}: {}{}",
-                ENTRYPOINT,
+                entrypoint,
                 args.join(" "),
                 String::from_utf8_lossy(&result.stderr),
                 String::from_utf8_lossy(&result.stdout)
@@ -189,8 +186,49 @@ fn in_container(image: &str, root: &Path, args: &[&str]) -> Result<Command> {
     Ok(command)
 }
 
+/// Where `verify` unpacks: a path with a space, away from the checkout (`/tmp`; Windows has no such place, so the
+/// user's temporary directory).
+fn scratch_base() -> PathBuf {
+    if cfg!(windows) {
+        std::env::temp_dir()
+    } else {
+        PathBuf::from("/tmp")
+    }
+}
+
+/// A clean environment: nothing the build or the runner set may stand in for what the binary carries. Windows
+/// programs need `SystemRoot` to start at all (Winsock, the loader), and look their DLLs up in System32.
+fn clean_environment(command: &mut Command) -> &mut Command {
+    command.env_clear();
+    if cfg!(windows) {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        command
+            .env("PATH", format!(r"{root}\System32"))
+            .env("SystemRoot", root)
+    } else {
+        command.env("PATH", "/usr/bin:/bin")
+    }
+}
+
+/// The DLLs a PE file imports (the import table; delay-loaded ones included).
+fn imported_dlls(binary: &str) -> Result<Vec<String>> {
+    let data = read(Path::new(binary))?;
+    let file = object::read::pe::PeFile64::parse(data.as_slice())
+        .map_err(|error| format!("{binary}: {error}"))?;
+    let mut names = Vec::new();
+    for import in object::Object::imports(&file).map_err(|error| format!("{binary}: {error}"))? {
+        let import = import.map_err(|error| format!("{binary}: {error}"))?;
+        names.push(String::from_utf8_lossy(import.library()).to_ascii_lowercase());
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
 fn linked_libraries(binary: &str, target: &str) -> Result<Vec<String>> {
-    if target.starts_with("linux-") {
+    if target.starts_with("windows-") {
+        imported_dlls(binary)
+    } else if target.starts_with("linux-") {
         let listing = output("ldd", &[binary], None)?;
         Ok(listing
             .lines()
@@ -208,8 +246,24 @@ fn linked_libraries(binary: &str, target: &str) -> Result<Vec<String>> {
     }
 }
 
+/// Whether a Windows DLL is on every machine: an API set (resolved by the loader) or a file in System32, and not
+/// the Visual C++ runtime, which only some machines have (the binary links it statically, `+crt-static`).
+fn is_windows_system_dll(library: &str, system32: &Path) -> bool {
+    let library = library.to_ascii_lowercase();
+    const RUNTIME: [&str; 5] = ["vcruntime", "msvcp", "concrt", "vccorlib", "vcomp"];
+    if RUNTIME.iter().any(|prefix| library.starts_with(prefix)) {
+        return false;
+    }
+    library.starts_with("api-ms-win-")
+        || library.starts_with("ext-ms-win-")
+        || system32.join(&library).is_file()
+}
+
 fn is_system_library(library: &str, target: &str) -> bool {
-    if target.starts_with("linux-") {
+    if target.starts_with("windows-") {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        is_windows_system_dll(library, &Path::new(&root).join("System32"))
+    } else if target.starts_with("linux-") {
         LINUX_SYSTEM.contains(&library)
     } else {
         library.starts_with("/usr/lib/") || library.starts_with("/System/Library/")
@@ -236,5 +290,20 @@ mod tests {
             "/opt/homebrew/lib/libzstd.1.dylib",
             "macos-aarch64"
         ));
+    }
+
+    #[test]
+    fn a_windows_binary_may_load_api_sets_and_system_dlls_but_not_the_visual_c_runtime() {
+        let system32 = TempDir::new("xtask-system32").unwrap();
+        write(&system32.0.join("kernel32.dll"), b"").unwrap();
+        write(&system32.0.join("vcruntime140.dll"), b"").unwrap();
+        assert!(is_windows_system_dll("KERNEL32.dll", &system32.0));
+        assert!(is_windows_system_dll(
+            "api-ms-win-core-synch-l1-2-0.dll",
+            &system32.0
+        ));
+        assert!(!is_windows_system_dll("vcruntime140.dll", &system32.0));
+        assert!(!is_windows_system_dll("MSVCP140.dll", &system32.0));
+        assert!(!is_windows_system_dll("libzstd.dll", &system32.0));
     }
 }

@@ -13,7 +13,7 @@
 //! | `D/<lock>.holder` | who holds that lock (`lock.rs`) |
 //! | `D/node-stopped.json` | a person's stop |
 //!
-//! The release layout below `R/releases/<id>` is the installer's; it is named here once (`CORE_ENTRYPOINT`).
+//! The release layout below `R/releases/<id>` is the installer's; it is named here once (`core_entrypoint`, `install::binary`).
 
 use crate::data_dir::{data_dir, releases_dir};
 use crate::platform::env::{Env, Environment};
@@ -25,8 +25,14 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-/// The core's program inside a release, and the directory its models are in (`core/models`).
-pub const CORE_ENTRYPOINT: &str = "core/bin/sidevoice-core-rust";
+/// The core's program inside a release (`core/bin/sidevoice-core-rust`, `.exe` on Windows), and the directory its
+/// models are in (`core/models`).
+pub fn core_entrypoint() -> String {
+    format!(
+        "core/bin/{}",
+        crate::identity::exe_name("sidevoice-core-rust")
+    )
+}
 pub const CORE_DIRECTORY: &str = "core";
 
 /// The core's port when `SIDEVOICE_CORE_PORT` does not name one.
@@ -205,7 +211,7 @@ impl Layout {
 
     /// The core's program in the selected release.
     pub fn core_program(&self) -> Option<PathBuf> {
-        Some(self.selected()?.join(CORE_ENTRYPOINT))
+        Some(self.selected()?.join(core_entrypoint()))
     }
 
     pub fn core_data(&self) -> PathBuf {
@@ -394,7 +400,7 @@ mod tests {
         assert_eq!(layout.selected(), Some(layout.releases_dir().join("1.0.0")));
         assert_eq!(
             layout.core_program(),
-            Some(layout.releases_dir().join("1.0.0").join(CORE_ENTRYPOINT))
+            Some(layout.releases_dir().join("1.0.0").join(core_entrypoint()))
         );
         assert!(layout.installed());
         Files::write_json(

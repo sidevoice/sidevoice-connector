@@ -192,6 +192,7 @@ fn launcher_readme(version: &str) -> Result<String> {
                 target.npm_cpu,
                 crate::glibc::FLOOR
             ),
+            "win32" => format!("- Windows on {} (`win32-{}`)", target.npm_cpu, target.npm_cpu),
             os => format!("- {os} on {}", target.npm_cpu),
         })
         .collect();
@@ -514,7 +515,7 @@ pub(crate) fn smoke() -> Result<()> {
     let preload = prefix.0.join("other-platform.js");
     write(
         &preload,
-        b"Object.defineProperty(process, 'platform', {value: 'win32'});\n\
+        b"Object.defineProperty(process, 'platform', {value: 'freebsd'});\n\
           Object.defineProperty(process, 'arch', {value: 'x64'});\n",
     )?;
     let refused = Command::new("node")
@@ -526,7 +527,7 @@ pub(crate) fn smoke() -> Result<()> {
         .map_err(|error| format!("node: {error}"))?;
     let message = String::from_utf8_lossy(&refused.stderr);
     if refused.status.code() != Some(1)
-        || !message.contains("win32-x64 is not supported")
+        || !message.contains("freebsd-x64 is not supported")
         || !message.contains("darwin-arm64")
     {
         return Err(format!(
@@ -838,7 +839,11 @@ mod tests {
             platform_package("macos-aarch64").unwrap(),
             "@sidevoice/sidevoice-darwin-arm64"
         );
-        assert!(platform_package("windows-x86_64").is_err());
+        assert_eq!(
+            platform_package("windows-x86_64").unwrap(),
+            "@sidevoice/sidevoice-win32-x64"
+        );
+        assert!(platform_package("windows-aarch64").is_err());
     }
 
     #[test]
@@ -852,7 +857,13 @@ mod tests {
         assert_eq!(mac["os"], json!(["darwin"]));
         assert!(mac.get("libc").is_none());
         // Only the launcher exposes a command, and only it is ever `latest` or `next`.
-        assert!(linux.get("bin").is_none() && mac.get("bin").is_none());
+        let windows = platform_manifest("windows-x86_64", "0.7.0").unwrap();
+        assert_eq!(windows["os"], json!(["win32"]));
+        assert_eq!(windows["cpu"], json!(["x64"]));
+        assert!(windows.get("libc").is_none());
+        assert!(
+            linux.get("bin").is_none() && mac.get("bin").is_none() && windows.get("bin").is_none()
+        );
         assert!(!["latest", "next"].contains(&PLATFORM_DIST_TAG));
         assert_eq!(
             mac["repository"]["url"],
@@ -869,7 +880,8 @@ mod tests {
             manifest["optionalDependencies"],
             json!({"@sidevoice/sidevoice-darwin-arm64": "0.7.0-rc.1",
                    "@sidevoice/sidevoice-linux-arm64": "0.7.0-rc.1",
-                   "@sidevoice/sidevoice-linux-x64": "0.7.0-rc.1"})
+                   "@sidevoice/sidevoice-linux-x64": "0.7.0-rc.1",
+                   "@sidevoice/sidevoice-win32-x64": "0.7.0-rc.1"})
         );
         assert!(manifest.get("dependencies").is_none());
     }
@@ -943,6 +955,7 @@ mod tests {
             "macOS on Apple silicon (`darwin-arm64`)",
             "Linux on x64 (`linux-x64`) with glibc 2.28 or newer",
             "Linux on arm64 (`linux-arm64`)",
+            "Windows on x64 (`win32-x64`)",
             "(0.7.0)",
             "https://github.com/sidevoice/sidevoice-connector",
         ] {

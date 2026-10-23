@@ -2,7 +2,6 @@
 
 use std::env;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,9 +32,17 @@ pub(crate) fn mkdir(path: &Path) -> Result<()> {
     fs::create_dir_all(path).map_err(|error| format!("{}: {error}", path.display()))
 }
 
+/// Sets the Unix permission bits. Windows has none (a program is one by its `.exe` name): nothing to do.
+#[cfg(unix)]
 pub(crate) fn chmod(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
         .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn chmod(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
 }
 
 pub(crate) fn path_str(path: &Path) -> Result<&str> {

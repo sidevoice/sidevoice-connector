@@ -8,7 +8,22 @@ fn build_value(name: &str, fallback: &str) -> String {
     }
 }
 
+/// The manifest Windows reads from the binaries: they handle paths longer than `MAX_PATH` (260 characters), which a
+/// release tree under `%LOCALAPPDATA%` can reach. Takes effect where the system allows it (`LongPathsEnabled`, on by
+/// default on current Windows 11); Rust's own file functions already use the `\\?\` form that needs no manifest.
+fn embed_windows_manifest() {
+    use embed_manifest::manifest::Setting;
+    embed_manifest::embed_manifest(
+        embed_manifest::new_manifest("Sidevoice.Connector").long_path_aware(Setting::Enabled),
+    )
+    .expect("cannot embed the Windows manifest");
+    println!("cargo:rerun-if-changed=build.rs");
+}
+
 fn main() {
+    if env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "windows") {
+        embed_windows_manifest();
+    }
     for name in [
         "SIDEVOICE_CONNECTOR_BUILD_SHA",
         "SIDEVOICE_CONNECTOR_TARGET",

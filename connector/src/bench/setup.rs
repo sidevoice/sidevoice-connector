@@ -217,7 +217,7 @@ impl Profile {
         let _ = fs::remove_dir_all(&package);
         fs::create_dir_all(package.join("bin"))?;
         fs::create_dir_all(package.join("core"))?;
-        let binary = package.join("bin/sidevoice-connector");
+        let binary = package.join(sidevoice_connector::install::binary());
         fs::copy(connector_binary()?, &binary)?;
         let packaged = format!("core/{name}");
         if fs::hard_link(&archive, package.join(&packaged)).is_err() {
@@ -356,7 +356,9 @@ fn write_bench_login_shell(root: &Path, login_path: &str) -> Result<()> {
 
 /// The connector binary of this build: beside the bench's own.
 fn connector_binary() -> Result<PathBuf> {
-    let binary = std::env::current_exe()?.with_file_name("sidevoice-connector");
+    let binary = std::env::current_exe()?.with_file_name(sidevoice_connector::identity::exe_name(
+        "sidevoice-connector",
+    ));
     if !binary.is_file() {
         bail!(
             "no connector beside the bench at {}: build both (`cargo build`)",

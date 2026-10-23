@@ -108,7 +108,7 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
     };
     let at = scratch("pair");
     let root = package(&at, &archive, &record, record["sha256"].as_str().unwrap());
-    let program = root.join("bin/sidevoice-connector");
+    let program = root.join(connector_program());
     let profile = Profile::new("install");
     cursor_installed(&profile);
     let _teardown = Teardown(&profile, program.clone());
@@ -120,13 +120,13 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
     assert_eq!(installed["service"], "none", "{installed}");
     let releases = releases(&profile);
     let release = releases.join("releases").join(&version);
-    let stable = release.join("bin/sidevoice-connector");
+    let stable = release.join(connector_program());
     assert_eq!(installed["command"][0], stable.to_string_lossy().as_ref());
     assert_eq!(
         read_json(&releases.join("current.json")).unwrap(),
         json!({"release": version})
     );
-    assert!(release.join("core/bin/sidevoice-core-rust").is_file());
+    assert!(release.join(format!("core/{}", core_program())).is_file());
     let record_file = read_json(&profile.data().join("install.json")).unwrap();
     assert_eq!(
         record_file["command"], installed["command"],
@@ -142,10 +142,7 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
     conversation.envs(settings()).arg("mcp");
     let mut mcp = Mcp::start(conversation);
     mcp.initialize("install");
-    let binary = release
-        .join("bin/sidevoice-connector")
-        .canonicalize()
-        .unwrap();
+    let binary = release.join(connector_program()).canonicalize().unwrap();
     until("the release's connector answers", 30, || {
         connector_ipc(&profile.connector_endpoint(), "identity").filter(|identity| {
             identity["executable"].as_str().map(Path::new) == Some(binary.as_path())

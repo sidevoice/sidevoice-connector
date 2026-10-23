@@ -3,8 +3,8 @@
 //! anchor's (the device and the mount id on Linux, the device and where it is mounted on macOS).
 
 use super::{
-    clean_absolute, recovery_record, Removal, Roots, CLAIM, DATA_PREFIX, RECORD, RECORD_LIMIT,
-    RECOVERY, RECOVERY_PROGRAM, RELEASE_PREFIX,
+    clean_absolute, recovery_program, recovery_record, Removal, Roots, CLAIM, DATA_PREFIX, RECORD,
+    RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
 };
 use crate::platform::user::{User, UserId};
 use serde_json::Value;
@@ -646,7 +646,8 @@ impl Removal for Os {
             .ok_or("uninstall data root disappeared")?;
         self.verify_dir(&self.data_rel, data.as_raw_fd())?;
         let recovery = self.private_child(data.as_raw_fd(), RECOVERY)?;
-        let executable = OsStr::new(RECOVERY_PROGRAM);
+        let program = recovery_program();
+        let executable = OsStr::new(&program);
         let executable_name = name(executable)?;
         if exists_at(recovery.as_raw_fd(), executable)? {
             let fd = unsafe {
@@ -857,7 +858,7 @@ impl Removal for Os {
                 .open_relative(recovery_path)?
                 .ok_or("uninstall recovery disappeared")?;
             let names = entries(recovery.as_raw_fd())?;
-            if names.len() != 1 || names[0] != OsStr::new(RECOVERY_PROGRAM) {
+            if names.len() != 1 || names[0] != OsStr::new(&recovery_program()) {
                 return Err("uninstall recovery directory changed");
             }
             self.verify_dir(recovery_path, recovery.as_raw_fd())?;

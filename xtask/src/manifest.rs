@@ -9,7 +9,7 @@ use serde_json::json;
 
 use crate::archive::unpack_checked;
 use crate::util::*;
-use crate::{target_names, Result, ENTRYPOINT, KIND, MANIFEST, ROOT_NAME};
+use crate::{entrypoint, target_names, Result, ENTRYPOINT_STEM, KIND, MANIFEST, ROOT_NAME};
 
 /// The name an archive is published under: the version for a release, `nightly` for the nightly (fixed names, so
 /// its download URLs never change). The commit is in the manifest and in every archive's inventory.
@@ -71,10 +71,13 @@ pub(crate) fn write_manifest(
             "{}  {name}\n",
             record["sha256"].as_str().unwrap_or("")
         ));
+        // The bundle's own entrypoint: the one list's `entrypoint` below has no suffix, and Windows programs have one.
+        let mut record = record;
+        record["entrypoint"] = entrypoint(target).into();
         bundles.insert(target.into(), record);
     }
     let value = json!({"schema": 1, "kind": KIND, "version": version, "source_sha": source_sha,
-                       "cargo_lock_sha256": sha256(lock), "entrypoint": ENTRYPOINT, "bundles": bundles});
+                       "cargo_lock_sha256": sha256(lock), "entrypoint": ENTRYPOINT_STEM, "bundles": bundles});
     let bytes = canonical(&value);
     write(&dir.join(MANIFEST), &bytes)?;
     sums.push(format!("{}  {MANIFEST}\n", sha256(&bytes)));
@@ -95,7 +98,14 @@ mod tests {
         let work = TempDir::new(&format!("xtask-manifest-stage-{target}-{version}")).unwrap();
         test_tree(&work.0, target, sha, version, test_core_record);
         let archive = dir.join(format!("{ROOT_NAME}-{target}.tar.zst"));
-        write_archive(&work.0, ROOT_NAME, &[ENTRYPOINT], 1, &archive).unwrap();
+        write_archive(
+            &work.0,
+            ROOT_NAME,
+            &[entrypoint(target).as_str()],
+            1,
+            &archive,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -132,6 +142,7 @@ mod tests {
                 "sidevoice-connector-0.7.0-linux-aarch64.tar.zst",
                 "sidevoice-connector-0.7.0-linux-x86_64.tar.zst",
                 "sidevoice-connector-0.7.0-macos-aarch64.tar.zst",
+                "sidevoice-connector-0.7.0-windows-x86_64.tar.zst",
                 MANIFEST,
             ]
         );

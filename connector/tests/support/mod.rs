@@ -32,6 +32,20 @@ use sidevoice_connector::platform::process::{Process as _, Processes};
 
 pub const CONNECTOR: &str = env!("CARGO_BIN_EXE_sidevoice-connector");
 
+/// The connector's and the core's programs inside a package, a release or an unpacked core (`.exe` on Windows).
+pub fn connector_program() -> String {
+    format!(
+        "bin/{}",
+        sidevoice_connector::identity::exe_name("sidevoice-connector")
+    )
+}
+pub fn core_program() -> String {
+    format!(
+        "bin/{}",
+        sidevoice_connector::identity::exe_name("sidevoice-core-rust")
+    )
+}
+
 /// The unpacked core (`<dir>/bin/sidevoice-core-rust`, `<dir>/models`), or `None` when the test must be skipped.
 pub fn core_dir() -> Option<PathBuf> {
     let dir = std::env::var_os("SIDEVOICE_TEST_CORE_DIR")
@@ -40,7 +54,7 @@ pub fn core_dir() -> Option<PathBuf> {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../target/sidevoice-core/sidevoice-core-rust")
         });
-    if dir.join("bin/sidevoice-core-rust").is_file() {
+    if dir.join(core_program()).is_file() {
         return Some(dir.canonicalize().expect("core directory"));
     }
     if std::env::var_os("CI").is_some() {
@@ -255,7 +269,7 @@ impl Profile {
         let ready = self.core_data().join("core.json");
         let log = fs::File::create(self.root.join(format!("core-{launch_id}.log"))).unwrap();
         let child = self
-            .command(core.join("bin/sidevoice-core-rust"))
+            .command(core.join(core_program()))
             .envs(self.core_env())
             .arg("--data-dir")
             .arg(self.core_data())
