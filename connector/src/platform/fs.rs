@@ -5,10 +5,12 @@
 //!
 //! The interface is the [`Fs`] trait; [`Files`] is the one OS implementation compiled in, chosen below. What differs
 //! per OS is only how access is set and read: Unix mode bits and `O_NOFOLLOW`; on Windows a protected DACL set when a
-//! file or directory is created, read back from the handle, and reparse points (links, junctions) refused. Who owns
-//! something is [`platform::user`](super::user)'s ([`UserId::current`]`.owns_path/owns_file`). Everything else has
-//! one body for every OS, the trait's default methods. Records are written whole by `atomic-write-file` (a temporary
-//! file beside the record, synced, renamed over it). Callers import both:
+//! file or directory is created, read back from the handle (one that is not protected, or that passes access down to
+//! others, is not private), and reparse points (links, junctions, mount points) refused, at the path and on the way to
+//! it. Who owns something is [`platform::user`](super::user)'s ([`UserId::current`]`.owns_path/owns_file`).
+//! Everything else has one body for every OS, the trait's default methods. Records are written whole: a temporary file
+//! beside the record, private from its creation, synced, renamed over it (`atomic-write-file` on Unix; on Windows a
+//! file `open_private` creates, staged by `tempfile`). Callers import both:
 //! `use crate::platform::fs::{Files, Fs};` then `Files::ensure_private_dir(..)`, `Files::read_trusted(..)`.
 
 #[cfg(unix)]
@@ -24,15 +26,16 @@ use super::user::{User, UserId};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::fs::{self, File};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 /// What somebody other than a file's owner (and the system: root, SYSTEM, Administrators) may do with it.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Others {
-    /// Nothing at all: the file is private.
+    /// Nothing at all, now or through what is created in it: the file is private.
     Nothing,
-    /// Read it, never change it.
+    /// Read it, never change it; or (Windows) nothing yet, but its DACL is not protected (it takes what its parent
+    /// passes down), or a directory passes access down to what is created in it.
     Read,
     /// Change it, or (a directory) replace what is in it.
     Change,
@@ -159,12 +162,38 @@ pub trait Fs {
         Ok(Some(bytes))
     }
 
-    /// Writes `bytes` as `path`, private, whole or not at all, in a directory that must already be private.
+    /// The bytes of a private file of ours, judged on the handle that was opened (no link followed) and read from
+    /// that same handle: [`Fs::check_private`] (a regular file with one name, this user's, open to nobody else), at
+    /// most `limit` bytes. `None` when it does not exist; refused otherwise.
+    fn read_private(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
+        let file = match Self::open_read(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("unsafe private file {}", path.display()))
+            }
+        };
+        Self::check_private(&file)
+            .with_context(|| format!("unsafe private file {}", path.display()))?;
+        if !file.metadata()?.is_file() {
+            bail!("unsafe private file {}: not a file", path.display());
+        }
+        let mut bytes = Vec::new();
+        file.take(limit + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            bail!("{} is too large: over {limit} bytes", path.display());
+        }
+        Ok(Some(bytes))
+    }
+
+    /// Writes `bytes` as `path`, private, whole or not at all, in a directory that must already be private. The
+    /// temporary file it is written to is private from its creation, before any byte is in it.
     fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         let parent = path.parent().context("file parent")?;
         Self::check_private(&Self::open_read(parent)?)
             .with_context(|| format!("unsafe private directory {}", parent.display()))?;
-        write_whole(imp::atomic(false), path, bytes).map_err(Into::into)
+        imp::write_whole(path, bytes, false).map_err(Into::into)
     }
 
     /// [`Fs::write_private`] of `value` as JSON.
@@ -173,9 +202,9 @@ pub trait Fs {
     }
 
     /// Writes `bytes` as `path` whole or not at all, in a directory the caller has vouched for: an existing file
-    /// keeps its access (Unix), a new one is private.
+    /// keeps its access (Unix), a new one is private (Windows: the replacement always is, private from its creation).
     fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
-        write_whole(imp::atomic(true), path, bytes)
+        imp::write_whole(path, bytes, true)
     }
 }
 
@@ -194,16 +223,6 @@ fn create_all<F: Fs + ?Sized>(path: &Path) -> io::Result<()> {
         Err(error) if error.kind() == ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
         other => other,
     }
-}
-
-fn write_whole(
-    options: atomic_write_file::OpenOptions,
-    path: &Path,
-    bytes: &[u8],
-) -> io::Result<()> {
-    let mut file = options.open(path)?;
-    file.write_all(bytes)?;
-    file.commit()
 }
 
 /// What tests do to files and the interface above never does: make a link, mark a program, widen and narrow the
@@ -226,9 +245,9 @@ pub trait TestFiles {
     /// Lets everybody else change `path`: group and others' bits on Unix, a full-control grant to Everyone on Windows.
     fn let_others_change(path: &Path);
 
-    /// Narrows `path` to its owner: group and others' bits cleared on Unix (also what the umask gave a new file),
-    /// the grants above to Everyone removed on Windows (where a new file in a test's scratch directory inherits the
-    /// owner's access, SYSTEM's and the administrators', and nobody else's).
+    /// Narrows `path` to its owner: group and others' bits cleared on Unix (also what the umask gave a new file); on
+    /// Windows its DACL protected, what it inherited kept as its own (in a test's scratch directory the owner's
+    /// access, SYSTEM's and the administrators', and nobody else's), and the grants above to Everyone removed.
     fn shut_others_out(path: &Path);
 }
 
@@ -236,6 +255,7 @@ pub trait TestFiles {
 mod tests {
     use super::*;
     use crate::test_support::temp_dir;
+    use std::io::Write;
 
     /// Whether what `path` names is private, judged on a handle opened without following a link.
     fn private(path: &Path) -> bool {
@@ -402,5 +422,122 @@ mod tests {
             "not a directory"
         );
         assert!(Files::check_user_directory(&scratch.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn a_new_private_file_is_private_before_anything_is_written_to_it() {
+        let scratch = temp_dir("before");
+        let new = scratch.path().join("new");
+        let _held = Files::open_private(&new, Create::New).unwrap();
+        assert!(private(&new), "empty, still being written");
+        let shared = scratch.path().join("shared");
+        Files::create_private_dir(&shared).unwrap();
+        Files::let_others_read(&shared);
+        let file = shared.join("config.json");
+        Files::replace(&file, b"{}").unwrap();
+        assert!(private(&file), "not what its directory lets others do");
+    }
+
+    #[test]
+    fn a_private_file_is_read_from_the_handle_that_was_judged() {
+        let scratch = temp_dir("read-private");
+        let dir = scratch.path().join("private");
+        Files::create_private_dir(&dir).unwrap();
+        let file = dir.join("record.json");
+        assert!(Files::read_private(&file, 1024).unwrap().is_none());
+        Files::write_private(&file, b"[1]").unwrap();
+        assert_eq!(Files::read_private(&file, 1024).unwrap().unwrap(), b"[1]");
+        assert!(Files::read_private(&file, 2).is_err(), "oversized");
+        assert!(Files::read_private(&dir, 1024).is_err(), "not a file");
+        let link = dir.join("link.json");
+        Files::symlink(&file, &link);
+        assert!(Files::read_private(&link, 1024).is_err(), "a link");
+        Files::let_others_read(&file);
+        assert!(
+            Files::read_private(&file, 1024).is_err(),
+            "others can read it"
+        );
+        assert!(
+            Files::read_trusted(&file, 1024).unwrap().is_some(),
+            "still a file nobody else can change"
+        );
+    }
+
+    // Windows only: an entry only what is created inside inherits, and a DACL that takes its parent's, have no Unix
+    // counterpart (a directory's mode is not passed down).
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_that_passes_access_down_to_others_is_not_private() {
+        let scratch = temp_dir("inherit-only");
+        let dir = scratch.path().join("files-readable");
+        Files::create_private_dir(&dir).unwrap();
+        imp::icacls(&dir, &["/grant", "*S-1-1-0:(OI)(IO)(R)"]);
+        assert_eq!(others(&dir), Others::Read);
+        assert!(
+            !private(&dir),
+            "what is created in it would be readable by everybody"
+        );
+        assert!(Files::ensure_private_dir(&dir).is_err(), "refused");
+        assert!(Files::write_private(&dir.join("x.json"), b"{}").is_err());
+        let file = dir.join("config.json");
+        Files::replace(&file, b"{}").unwrap();
+        assert!(
+            private(&file),
+            "created with its own DACL, nothing inherited"
+        );
+    }
+
+    // Windows only, as above.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_whose_dacl_is_not_protected_is_not_private() {
+        let scratch = temp_dir("unprotected");
+        let dir = scratch.path().join("inheriting");
+        Files::create_private_dir(&dir).unwrap();
+        imp::icacls(&dir, &["/inheritance:e"]);
+        assert_ne!(others(&dir), Others::Nothing);
+        assert!(!private(&dir), "it takes whatever its parent passes down");
+        assert!(Files::ensure_private_dir(&dir).is_err(), "refused");
+        assert!(
+            Files::check_user_directory(&dir).is_ok(),
+            "still a directory nobody else can change"
+        );
+    }
+
+    // Windows only: a profile folder owned by Administrators (or SYSTEM) granting its user full control has no Unix
+    // counterpart, where a directory has one owner and mode bits; `/setowner` to Administrators needs the elevated
+    // token the CI runner has.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_on_the_way_owned_by_administrators_granting_this_user_is_trusted() {
+        let scratch = temp_dir("profile");
+        let profile = scratch.path().join("profile");
+        fs::create_dir(&profile).unwrap();
+        let user = UserId::name().unwrap();
+        imp::icacls(&profile, &["/grant", &format!("{user}:(OI)(CI)(F)")]);
+        imp::icacls(&profile, &["/setowner", "*S-1-5-32-544"]);
+        let dir = profile.join("AppData").join("Local").join("data");
+        Files::ensure_private_dir(&dir).unwrap();
+    }
+
+    // Windows only: Unix keeps its rule for links on the way (a link of this user's is judged as itself on macOS).
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_on_the_way_to_a_private_directory_is_refused() {
+        let scratch = temp_dir("junction");
+        let shared = scratch.path().join("shared");
+        let dir = shared.join("private");
+        Files::ensure_private_dir(&dir).unwrap();
+        Files::let_others_change(&shared);
+        let link = scratch.path().join("link");
+        imp::link_dir(&dir, &link);
+        assert!(
+            Files::ensure_private_dir(&dir).is_err(),
+            "others can replace it"
+        );
+        assert!(
+            Files::ensure_private_dir(&link.join("inside")).is_err(),
+            "a link on the way is refused, not followed"
+        );
     }
 }

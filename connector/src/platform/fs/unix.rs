@@ -77,15 +77,19 @@ pub(super) fn check_ancestor(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// How a record is written whole: a new file `0600`, an existing one's mode kept when `keep_access`.
-pub(super) fn atomic(keep_access: bool) -> atomic_write_file::OpenOptions {
+/// Writes `bytes` as `path` whole or not at all, by `atomic-write-file` (a temporary file beside it, created `0600`,
+/// synced, renamed over it): a new file `0600`, an existing one's mode kept when `keep_access`.
+pub(super) fn write_whole(path: &Path, bytes: &[u8], keep_access: bool) -> io::Result<()> {
     use atomic_write_file::unix::OpenOptionsExt as _;
+    use std::io::Write as _;
     let mut options = atomic_write_file::OpenOptions::new();
     options
         .mode(0o600)
         .preserve_mode(keep_access)
         .preserve_owner(false);
-    options
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.commit()
 }
 
 fn others(mode: u32) -> Others {

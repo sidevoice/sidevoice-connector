@@ -7,7 +7,6 @@ use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
-use std::fs;
 use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{timeout, Duration};
@@ -39,12 +38,8 @@ fn endpoint<'de, D: serde::Deserializer<'de>>(
 
 /// The ready file at `path`, when it is this user's private file naming a launch and an endpoint.
 pub fn read(path: &Path) -> Result<Ready> {
-    Files::check_private(&Files::open_read(path)?)
-        .with_context(|| format!("unsafe private file {}", path.display()))?;
-    let bytes = fs::read(path)?;
-    if bytes.len() > 65536 {
-        bail!("Core ready file too large");
-    }
+    let bytes = Files::read_private(path, 65536)?
+        .with_context(|| format!("missing core ready file {}", path.display()))?;
     let ready: Ready = serde_json::from_slice(&bytes)?;
     if ready.launch_id.is_empty() || ready.pid == 0 {
         bail!("Core ready identity mismatch");
