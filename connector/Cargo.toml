@@ -8,12 +8,6 @@ publish = false
 name = "sidevoice-connector"
 path = "src/main.rs"
 
-# A developer tool (src/bench/main.rs, README "Test bench"): the connector and the pinned core driven from a local page.
-# Not part of the release archive, which carries only the connector.
-[[bin]]
-name = "sidevoice-bench"
-path = "src/bench/main.rs"
-
 # The MCP server check (src/adapters/health.rs) against a fake server that is this test's own binary, on every OS. Not
 # libtest: it writes its own lines to stdout, where the fake server's protocol goes.
 [[test]]

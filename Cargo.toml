@@ -27,6 +27,6 @@ zstd = "0.13"
 
 [workspace]
 resolver = "2"
-members = ["connector"]
-# `cargo test`, `cargo clippy` and `cargo fmt` at the root cover the connector and the tooling.
-default-members = [".", "connector"]
+members = ["connector", "testbench"]
+# `cargo test`, `cargo clippy` and `cargo fmt` at the root cover the connector, the test bench and the tooling.
+default-members = [".", "connector", "testbench"]
