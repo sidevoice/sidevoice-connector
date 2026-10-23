@@ -44,7 +44,7 @@
 
 use crate::agents::HostAgents;
 use crate::messages::Keyed;
-use crate::platform::data_dir::{self, DataDir, DataDirs};
+use crate::platform::data_dir;
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Create, Files, Fs};
 use crate::platform::process::{Process, Processes};
@@ -987,7 +987,7 @@ pub async fn uninstall(profile: &Profile, options: Options, runtime: &Runtime) -
 /// The two roots `uninstall` may remove, as this installation names them.
 fn removal_roots(layout: &Layout) -> Roots {
     Roots {
-        standard: DataDirs::standard(),
+        standard: data_dir::standard(),
         data: layout.data.clone(),
         releases: layout.releases.clone(),
         kept: KEPT,
@@ -1142,7 +1142,12 @@ pub(crate) mod tests {
                 |name| {
                     // Where an uninstall may remove: a directory of the OS's name below the home.
                     if name == data_dir::VARIABLE {
-                        Some(original.home.join(DataDirs::NAME).into_os_string())
+                        Some(
+                            original
+                                .home
+                                .join(data_dir::standard().unwrap().file_name().unwrap())
+                                .into_os_string(),
+                        )
                     } else {
                         variables
                             .iter()

@@ -310,7 +310,7 @@ pub trait Removal: Sized {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::data_dir::{DataDir, DataDirs};
+    use crate::platform::data_dir;
     use crate::platform::fs::{Files, TestFiles};
     use crate::test_support::temp_dir;
     use std::fs;
@@ -318,7 +318,18 @@ mod tests {
 
     const KEPT: &[&str] = &["install.lock", "agents.lock", "node-stopped.json"];
 
-    const DATA: &str = DataDirs::NAME;
+    /// The program's own directory name inside the standard place (what the shared rule picks for this OS).
+    fn data_name() -> &'static str {
+        static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        NAME.get_or_init(|| {
+            data_dir::standard()
+                .and_then(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .expect("a standard data directory")
+        })
+    }
 
     /// `D` at `data`, `R` inside it, `standard` as the OS's place for this user and the directory it is in as the
     /// home.
@@ -334,7 +345,7 @@ mod tests {
 
     /// The standard place in a scratch home.
     fn roots(home: &Path) -> Roots {
-        at(home.join(DATA), &home.join(DATA))
+        at(home.join(data_name()), &home.join(data_name()))
     }
 
     /// A home with both roots made, and a removal over it.
@@ -359,10 +370,10 @@ mod tests {
             PathBuf::new(),
             PathBuf::from("relative"),
             PathBuf::from(std::path::MAIN_SEPARATOR_STR),
-            home.join(DATA).join(".."),
-            home.join("elsewhere").join("..").join(DATA),
+            home.join(data_name()).join(".."),
+            home.join("elsewhere").join("..").join(data_name()),
         ] {
-            let layout = at(unsafe_path, &home.join(DATA));
+            let layout = at(unsafe_path, &home.join(data_name()));
             assert!(layout.validate().is_err(), "{}", layout.data.display());
         }
         let mut layout = roots(&home);
@@ -371,7 +382,7 @@ mod tests {
         let mut layout = roots(&home);
         layout.releases = home.join("install");
         assert!(layout.validate().is_err(), "R is inside D");
-        let deep = home.join(".local").join("share").join(DATA);
+        let deep = home.join(".local").join("share").join(data_name());
         assert!(
             at(deep.clone(), &deep).validate().is_ok(),
             "D is where the OS puts it, however deep"
@@ -391,8 +402,8 @@ mod tests {
     fn a_folder_that_only_has_the_programs_name_is_never_emptied() {
         let scratch = temp_dir("uninstall-unrelated");
         let home = scratch.path().join("home");
-        let standard = home.join(".local").join("share").join(DATA);
-        let unrelated = home.join("Documents").join(DATA);
+        let standard = home.join(".local").join("share").join(data_name());
+        let unrelated = home.join("Documents").join(data_name());
         with_entry(&unrelated);
         assert!(Remover::new(at(unrelated.clone(), &standard)).is_err());
         Files::write_json(
@@ -413,7 +424,11 @@ mod tests {
     #[test]
     fn the_standard_place_is_accepted_wherever_the_os_puts_it() {
         let scratch = temp_dir("uninstall-standard");
-        let elsewhere = scratch.path().join("mnt").join("user-data").join(DATA);
+        let elsewhere = scratch
+            .path()
+            .join("mnt")
+            .join("user-data")
+            .join(data_name());
         with_entry(&elsewhere);
         let removal = Remover::new(at(elsewhere.clone(), &elsewhere)).unwrap();
         assert_eq!(removal.remove_data_contents(&|_| {}).unwrap(), ["entry"]);
@@ -422,7 +437,7 @@ mod tests {
     #[test]
     fn another_directory_is_ours_only_with_an_installation_of_ours_in_it() {
         let scratch = temp_dir("uninstall-custom");
-        let standard = scratch.path().join("home").join(DATA);
+        let standard = scratch.path().join("home").join(data_name());
         let custom = scratch.path().join("custom").join("profile");
         let ownership = |removal: Remover| removal.ownership().unwrap();
         assert_eq!(
@@ -454,7 +469,7 @@ mod tests {
         let scratch = temp_dir("uninstall-home");
         let outer = scratch.path().join("outer");
         let home = outer.join("home");
-        let standard = home.join(".local").join("share").join(DATA);
+        let standard = home.join(".local").join("share").join(data_name());
         Files::ensure_private_dir(&home).unwrap();
         fs::write(home.join("entry"), "theirs").unwrap();
         let root = home
@@ -640,7 +655,7 @@ mod tests {
         Files::symlink(&moved, &home);
         assert!(removal.remove_data_contents(&|_| {}).is_err());
         assert_eq!(
-            fs::read_to_string(moved.join(DATA).join("keep")).unwrap(),
+            fs::read_to_string(moved.join(data_name()).join("keep")).unwrap(),
             "untouched"
         );
     }
@@ -650,11 +665,11 @@ mod tests {
     /// and stops, nothing outside is removed.
     #[test]
     fn a_root_or_the_directory_above_it_swapped_for_a_link_mid_removal_never_reaches_outside() {
-        for swapped in [DATA, ""] {
+        for swapped in [data_name(), ""] {
             let (scratch, layout, removal) = installed("uninstall-ancestor-swap");
             fs::write(layout.data.join("entry"), "ours").unwrap();
             let outside = scratch.path().join("outside");
-            for root in [DATA.to_owned(), format!("{DATA}/install")] {
+            for root in [data_name().to_owned(), format!("{}/install", data_name())] {
                 fs::create_dir_all(outside.join(&root)).unwrap();
                 fs::write(outside.join(&root).join("keep"), "outside").unwrap();
             }
@@ -662,7 +677,7 @@ mod tests {
             let (victim, target) = if swapped.is_empty() {
                 (scratch.path().join("home"), outside.clone())
             } else {
-                (layout.data.clone(), outside.join(DATA))
+                (layout.data.clone(), outside.join(data_name()))
             };
             let moved = scratch.path().join("moved");
             let done = AtomicBool::new(false);
@@ -691,8 +706,8 @@ mod tests {
             let _ = removal.finish_claim();
             for kept in [
                 "keep".to_owned(),
-                format!("{DATA}/keep"),
-                format!("{DATA}/install/keep"),
+                format!("{}/keep", data_name()),
+                format!("{}/install/keep", data_name()),
             ] {
                 assert_eq!(
                     fs::read_to_string(outside.join(&kept)).unwrap(),
@@ -711,7 +726,7 @@ mod tests {
         let resolved = fs::canonicalize(&home).unwrap();
         assert!(roots(&resolved).validate().is_ok());
         let mut mixed = roots(&home);
-        mixed.data = resolved.join(DATA);
+        mixed.data = resolved.join(data_name());
         assert!(mixed.validate().is_ok(), "either form, compared as one");
     }
 }
