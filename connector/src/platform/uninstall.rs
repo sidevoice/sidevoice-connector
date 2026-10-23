@@ -554,7 +554,7 @@ mod tests {
         Files::symlink(data.join("nested"), &alias);
         // `Models` does not exist yet: another instance creates it later, inside `D`.
         let mut layout = at(data, &alias.join("sidevoice"));
-        layout.home = Some(home);
+        layout.homes = vec![home];
         let refused = layout.validate().unwrap_err();
         assert!(refused.contains("shared models folder"), "{refused}");
     }
@@ -578,7 +578,7 @@ mod tests {
             looped.join("sidevoice"),
         ] {
             let mut layout = at(data.clone(), &standard);
-            layout.home = Some(home.clone());
+            layout.homes = vec![home.clone()];
             let refused = layout.validate().unwrap_err();
             assert!(
                 refused.contains("shared models folder"),
@@ -603,7 +603,7 @@ mod tests {
         // `D` above the standard place holds the store two levels down; `D` inside the store holds `D`.
         for data in [share.clone(), models.join("profile")] {
             let mut layout = at(data.clone(), &standard);
-            layout.home = Some(home.clone());
+            layout.homes = vec![home.clone()];
             let refused = layout.validate().unwrap_err();
             assert!(
                 refused.contains("shared models folder"),
@@ -613,7 +613,7 @@ mod tests {
         }
         // `D` as the standard place itself keeps `Models` by name: accepted.
         let mut layout = at(standard.clone(), &standard);
-        layout.home = Some(home);
+        layout.homes = vec![home];
         assert!(layout.validate().is_ok());
         assert_eq!(
             fs::read_to_string(models.join("other-program").join("sentinel")).unwrap(),
