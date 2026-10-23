@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use support::package::{package, pinned_core};
@@ -123,7 +124,38 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
     cursor_installed(&profile);
     let _teardown = Teardown(&profile, program.clone());
 
-    let (ok, installed) = run(&profile, &program, &["install"]);
+    let (ok, installed) = std::thread::scope(|scope| {
+        // TEMPORARY diagnostic: what the connector sees of its core while `install` waits for it.
+        let watcher = scope.spawn(|| {
+            let ready = profile.core_data().join("core.json");
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            for _ in 0..8 {
+                std::thread::sleep(Duration::from_secs(4));
+                let raw = fs::read_to_string(&ready)
+                    .map(|text| text.chars().take(700).collect::<String>());
+                let read = sidevoice_connector::core_ready::read(&ready)
+                    .map(|ready| ready.endpoint.to_string());
+                let health = read.as_ref().ok().and_then(|_| {
+                    let ready = sidevoice_connector::core_ready::read(&ready).ok()?;
+                    Some(
+                        runtime
+                            .block_on(sidevoice_connector::core_ready::health(
+                                &ready.endpoint,
+                                Duration::from_secs(2),
+                            ))
+                            .map(|v| v.to_string()),
+                    )
+                });
+                eprintln!("[watch] raw={raw:?}\n[watch] read={read:#?}\n[watch] health={health:?}");
+            }
+        });
+        let answer = run(&profile, &program, &["install"]);
+        let _ = watcher.join();
+        answer
+    });
     assert!(ok, "{installed}");
     let version = installed["version"].as_str().unwrap().to_owned();
     assert_eq!(installed["action"], "installed", "{installed}");
