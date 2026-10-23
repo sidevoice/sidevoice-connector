@@ -114,7 +114,8 @@ pub trait Env {
     fn login_path() -> Option<LoginPath>;
 
     /// Tests: what runs `line`, written for this OS's shell as [`Env::quote`] and [`Env::set`] write one, the way a
-    /// person who pastes it runs it: `sh -c` on Unix, PowerShell 7 (`pwsh -Command`) on Windows.
+    /// person who pastes it runs it: `sh -c` on Unix, Windows PowerShell 5.1 (`powershell -Command`, the one every
+    /// Windows has) on Windows.
     #[cfg(test)]
     fn hand_shell(line: &str) -> std::process::Command;
 

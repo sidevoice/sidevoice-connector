@@ -145,7 +145,9 @@ struct InstalledCommand {
 
 impl InstalledCommand {
     fn executable() -> Result<Self> {
-        let executable = std::env::current_exe()?.canonicalize()?;
+        // Canonical in its plain form (`dunce`): on Windows without the `\\?\` prefix `canonicalize` gives, which agent
+        // configurations and the steps a person runs would otherwise carry.
+        let executable = dunce::canonicalize(std::env::current_exe()?)?;
         Ok(Self {
             command: executable.to_string_lossy().into_owned(),
             args: vec!["mcp".into()],
@@ -168,9 +170,7 @@ impl InstalledCommand {
             version: profile.connector_version().into(),
             ownership: Ownership::Installed {
                 releases: layout.releases.join("releases"),
-                executable: std::env::current_exe()
-                    .and_then(|path| path.canonicalize())
-                    .ok(),
+                executable: std::env::current_exe().and_then(dunce::canonicalize).ok(),
             },
         })
     }
@@ -1158,8 +1158,9 @@ fn error_value(key: &str, params: Value) -> Value {
     json!({"error":{"key":key,"params":params,"message":message}})
 }
 
+/// `value` canonical in its plain form, as [`InstalledCommand`] records its executable (`dunce`).
 fn canonical(value: &str) -> Option<PathBuf> {
-    Path::new(value).canonicalize().ok()
+    dunce::canonicalize(value).ok()
 }
 
 #[cfg(test)]

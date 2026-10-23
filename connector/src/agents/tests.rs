@@ -612,6 +612,26 @@ fn agent_refusals_labels_and_manual_text_use_the_shared_english_bundle() {
     );
 }
 
+/// This program is registered by its plain canonical path, never Windows' `\\?\` form (which agent configurations
+/// and the steps a person runs would carry), and an entry naming either spelling is still ours.
+#[test]
+fn this_program_is_registered_by_its_plain_canonical_path() {
+    let own = InstalledCommand::executable().unwrap();
+    let path = Path::new(&own.command);
+    assert!(path.is_absolute(), "{}", own.command);
+    assert!(!own.command.starts_with(r"\\?\"), "{}", own.command);
+    assert_eq!(
+        path,
+        std::env::current_exe()
+            .unwrap()
+            .canonicalize()
+            .map(|p| dunce::simplified(&p).to_path_buf())
+            .unwrap()
+    );
+    let verbatim = std::env::current_exe().unwrap().canonicalize().unwrap();
+    assert!(own.owns(&verbatim.to_string_lossy(), &own.args));
+}
+
 #[test]
 fn ownership_is_exact_and_js_release_fixtures_stay_narrow() {
     let _turn = agent_env_blocking();

@@ -204,7 +204,9 @@ impl super::Env for Os {
 
     #[cfg(test)]
     fn hand_shell(line: &str) -> std::process::Command {
-        let mut command = std::process::Command::new("pwsh");
+        // Windows PowerShell 5.1: the shell every Windows has (PowerShell 7 is installed apart), so what a person
+        // most likely pastes into.
+        let mut command = std::process::Command::new("powershell");
         command.args(["-NoProfile", "-NonInteractive", "-Command", line]);
         command
     }
