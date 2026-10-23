@@ -212,8 +212,12 @@ impl Profile {
         self.data().join("core")
     }
 
+    /// Where the core listens, as it published it in its ready file (it picks its own endpoint).
     pub fn core_endpoint(&self) -> Endpoint {
-        Endpoint::new(&self.core_data(), "local")
+        until("the core's ready file", 60, || {
+            sidevoice_connector::core_ready::read(&self.core_data().join("core.json")).ok()
+        })
+        .endpoint
     }
 
     pub fn connector_endpoint(&self) -> Endpoint {
@@ -390,8 +394,6 @@ pub fn core_http(
     body: Option<&Value>,
     token: Option<&str>,
 ) -> (u16, Value) {
-    let mut stream = LocalStream::connect(endpoint).expect("core endpoint");
-    stream.set_read_timeout(Some(Duration::from_secs(15)));
     let body = body.map(Value::to_string).unwrap_or_default();
     let mut request = format!("{method} {path} HTTP/1.0\r\nHost: localhost\r\n");
     if let Some(token) = token {
@@ -405,9 +407,22 @@ pub fn core_http(
     }
     request.push_str("\r\n");
     request.push_str(&body);
-    stream.write_all(request.as_bytes()).unwrap();
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response).unwrap();
+    let response = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            tokio::time::timeout(Duration::from_secs(15), async {
+                let mut stream = Channels::connect(endpoint).await.expect("core endpoint");
+                stream.write_all(request.as_bytes()).await.unwrap();
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).await.unwrap();
+                response
+            })
+            .await
+            .expect("the core answers within 15 s")
+        });
     let response = String::from_utf8_lossy(&response).into_owned();
     let (head, payload) = response
         .split_once("\r\n\r\n")
