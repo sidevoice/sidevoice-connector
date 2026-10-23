@@ -65,6 +65,7 @@ jobs:
         shell: pwsh
         run: |
           whoami
-          query user 2>&1 | Out-String | Write-Output
+          query user 2>&1 | Out-String | Write-Output  # exits 1 when nobody is logged on
           Get-CimInstance Win32_LogonSession | Where-Object LogonType -in 2,10,11 | Select-Object LogonId, LogonType, StartTime | Format-Table | Out-String | Write-Output
+          $global:LASTEXITCODE = 0
       - run: cargo xtask e2e dist/sidevoice-connector-${{ matrix.target }}.tar.zst
