@@ -67,9 +67,12 @@ fn cli_detection_uses_only_fresh_login_path_not_overrides_fixed_paths_or_cache()
     assert!(!launched.exists(), "discovery launched the candidate CLI");
     fs::write(&shell, "#!/bin/sh\nexit 1\n").unwrap();
     let failed = listed(&profile, Some(&shell), Some(&bin));
+    // A failed capture says nothing about what is installed: the last scan is kept and the failure reported, and
+    // neither the override nor a fixed path is used in its place.
+    assert_eq!(failed["scan_failed"], true, "{failed}");
     assert!(
-        !has(&failed, "claude"),
-        "stale cache or fallback was used: {failed}"
+        has(&failed, "claude"),
+        "the last scan was dropped: {failed}"
     );
 }
 
@@ -125,8 +128,12 @@ fn startup_output_is_not_mistaken_for_the_login_path() {
     );
     fs::write(&shell, "#!/bin/sh\necho 'Welcome to your shell'\n").unwrap();
     let refused = listed(&profile, Some(&shell), None);
-    assert!(
-        !has(&refused, "claude"),
+    assert_eq!(
+        refused["scan_failed"], true,
         "banner-only output passed as PATH: {refused}"
+    );
+    assert!(
+        has(&refused, "claude"),
+        "the last scan was dropped: {refused}"
     );
 }
