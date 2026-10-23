@@ -199,14 +199,14 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
         };
         let homes = adapters::Registry::standard().homes();
         let agent_vars: Vec<&'static str> = homes.iter().map(|home| home.var).collect();
-        let answer = service::run(action, &agent_vars).await;
+        let answer = service::commands::run(action, &agent_vars).await;
         let ok = answer.get("ok") == Some(&Value::Bool(true));
         if json {
             println!("{answer}");
         } else if ok {
-            println!("{}", service::human(&answer));
+            println!("{}", service::commands::human(&answer));
         } else {
-            eprintln!("sidevoice: {}", service::human(&answer));
+            eprintln!("sidevoice: {}", service::commands::human(&answer));
         }
         return Ok(if ok {
             ExitCode::SUCCESS
