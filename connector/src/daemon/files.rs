@@ -39,7 +39,7 @@ pub(super) fn prepare_conversation_guard(path: &Path) -> Result<(u8, fs::File)> 
             bytes[..8].copy_from_slice(CONVERSATION_GUARD_MAGIC);
             file.write_all(&bytes)?;
             file.sync_all()?;
-            fs::File::open(path.parent().context("conversation guard parent")?)?.sync_all()?;
+            Files::sync_dir(path.parent().context("conversation guard parent")?)?;
             file.seek(SeekFrom::Start(0))?;
             Ok((GUARD_CLEAR, file))
         }

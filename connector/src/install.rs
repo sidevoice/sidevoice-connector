@@ -317,7 +317,7 @@ async fn stage(layout: &Layout, package: &Package, id: &str, digest: &str) -> Re
         .await
         .map_err(failed)??;
         fs::rename(&partial, releases.join(id))?;
-        File::open(&releases)?.sync_all()?;
+        Files::sync_dir(&releases)?;
         Ok(())
     }
     .await;

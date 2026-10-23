@@ -42,6 +42,10 @@ impl super::Fs for Os {
             .open(path)
     }
 
+    fn sync_dir(dir: &Path) -> io::Result<()> {
+        File::open(dir)?.sync_all()
+    }
+
     fn others_of(file: &File) -> io::Result<Others> {
         Ok(others(file.metadata()?.mode()))
     }

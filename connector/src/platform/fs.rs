@@ -76,6 +76,11 @@ pub trait Fs {
     /// waited on (a FIFO or a device put in a file's place).
     fn open_read(path: &Path) -> io::Result<File>;
 
+    /// Makes what was just created, renamed or removed in the directory `dir` durable, where the OS has a way: Unix
+    /// opens the directory and syncs it; Windows does nothing (NTFS journals its metadata, and flushing a directory
+    /// there means opening it for writing with `FILE_FLAG_BACKUP_SEMANTICS`, which `File::open` does not do).
+    fn sync_dir(dir: &Path) -> io::Result<()>;
+
     /// What others may do with the file or directory behind an open handle.
     fn others_of(file: &File) -> io::Result<Others>;
 
@@ -320,6 +325,45 @@ mod tests {
             Files::write_private(&open.join("other.json"), b"x").is_err(),
             "never written where others can enter"
         );
+    }
+
+    #[test]
+    fn a_directory_can_be_synced() {
+        let scratch = temp_dir("sync-dir");
+        Files::sync_dir(scratch.path()).unwrap();
+    }
+
+    #[test]
+    fn a_write_over_a_file_others_can_read_leaves_a_private_one() {
+        let scratch = temp_dir("over-readable");
+        let dir = scratch.path().join("private");
+        Files::create_private_dir(&dir).unwrap();
+        let file = dir.join("state.json");
+        fs::write(&file, b"old").unwrap();
+        Files::let_others_read(&file);
+        assert!(!private(&file));
+        Files::write_private(&file, b"new").unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"new");
+        assert!(private(&file), "the replacement is private");
+    }
+
+    // Windows only: on Unix `atomic-write-file` leaves its named temporary file behind when the final rename fails (it
+    // marks the file finished before renaming), so the same test would not hold there.
+    #[cfg(windows)]
+    #[test]
+    fn a_write_that_cannot_replace_the_record_leaves_no_temporary_file() {
+        let scratch = temp_dir("failed-persist");
+        let dir = scratch.path().join("private");
+        Files::create_private_dir(&dir).unwrap();
+        let file = dir.join("state.json");
+        fs::create_dir(&file).unwrap();
+        fs::write(file.join("inside"), b"x").unwrap();
+        assert!(Files::write_private(&file, b"new").is_err());
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["state.json"]);
     }
 
     #[test]

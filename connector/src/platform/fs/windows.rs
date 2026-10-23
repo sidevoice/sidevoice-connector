@@ -106,6 +106,12 @@ impl super::Fs for Os {
     // `Change`: an entry for others that applies to the object itself. Anything else short of private is `Read`: an
     // entry for others of any kind, including one only what is created inside inherits (inherit-only too), and a DACL
     // that is not protected, which takes whatever its parent passes down, now or later.
+    // NTFS journals its metadata, and a directory can be flushed only through a handle opened for writing with
+    // `FILE_FLAG_BACKUP_SEMANTICS`, which `File::open` does not ask for (it fails): nothing to do.
+    fn sync_dir(_: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
     fn others_of(file: &File) -> io::Result<Others> {
         let judged = Judged::of(file)?;
         Ok(if judged.grants_others(CHANGES, false) {
