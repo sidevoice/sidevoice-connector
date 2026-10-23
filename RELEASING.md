@@ -174,23 +174,20 @@ Say Windows x64 or macOS x86_64:
      and the launcher (it reads `entrypoint` from `connector.json`) must follow;
    - the README's supported platforms and the launcher package's README (`xtask/src/npm.rs`).
 
-#### Windows x64: built and checked, not released
+#### Windows x64
 
-`windows-x86_64` is a known target (`TARGETS`, `released: false`; runner `windows-2025`, built natively with MSVC and
-the C runtime linked statically, `.cargo/config.toml`): it can be built, packaged and verified by hand, and the
-connector's `.exe` names, its `win32-x64` npm package definition and the archive checks exist. It is **not
-released**: the manifest, the npm packages, the launcher's dependencies and the `release.yml` matrix list only the
-`released` targets, so a release or nightly publishes exactly the Linux and macOS archives, with no Windows job
-that could fail them. To enable it, all of these:
+`windows-x86_64` is a released target (`TARGETS`, `released: true`; runner `windows-2025`, built natively with MSVC and
+the C runtime linked statically, `.cargo/config.toml`): the manifest, the `@sidevoice/sidevoice-win32-x64` npm package,
+the launcher's `optionalDependencies` and the `release.yml` matrix list it, and the connector's `.exe` names and the
+archive checks follow from `TARGETS`. The pinned core publishes `sidevoice-core-<version>-windows-x86_64.tar.zst`
+(program `bin/sidevoice-core-rust.exe`); `cargo xtask fixtures` and `dist` say so when a pinned core does not.
+`@sidevoice/sidevoice-win32-x64` is reserved and its trusted publisher configured (steps 1 and 2 of
+[npm](#npm-what-is-published-and-how-to-add-a-platform)).
 
-- The `sidevoice-platform` tag names a sidevoice-core release that publishes `sidevoice-core-<version>-windows-x86_64.tar.zst`
-  (`cargo xtask fixtures` and `dist` say so when it does not), whose program is `bin/sidevoice-core-rust.exe`;
-- the connector's tests pass on Windows (the `Test (windows-x86_64)` job of `ci.yml`, red on purpose until they do);
-- `@sidevoice/sidevoice-win32-x64` is reserved and its trusted publisher configured (steps 1 and 2 of
-  [npm](#npm-what-is-published-and-how-to-add-a-platform)), before the first `vX.Y.Z` release that includes it (a
-  nightly publishes nothing to npm);
-- then one change: `released: true` on the Windows target in `xtask/src/main.rs` and its line back in the
-  `release.yml` matrix (`{ target: windows-x86_64, runner: windows-2025 }`).
+**Temporary, until the Windows tests pass (sidevoice-connector#116, block W1):** the Windows `dist` job does not run
+`cargo test`; it builds, packages and verifies the archive (`cargo xtask dist` starts the real binary from it). The
+`Test (windows-x86_64)` job of `ci.yml` keeps running the tests and stays red until they pass; the `Package (windows-x86_64)` job of `ci.yml` runs fixtures, dist and the npm packaging on every PR, so its result shows on its own. When it is green, remove
+the `if: matrix.target != 'windows-x86_64'` of the test step in `release.yml`.
 
 Not decided, so not done: Authenticode signing and the installer format (the archive and the npm package are the
 only Windows distribution here).

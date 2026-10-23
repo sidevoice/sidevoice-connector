@@ -399,12 +399,21 @@ pub fn staged_intact(core: &PackagedCore, staged: &Path) -> Result<()> {
     check_inventory(core, &inventory, &files)
 }
 
+/// `relative` as the inventory spells a path: components joined by `/` on every OS (a Windows path has `\`).
+fn inventory_path(relative: &Path) -> String {
+    relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Every plain file below `dir` but the inventory, by its path below `root`, with its size and digest.
 fn staged_files(root: &Path, dir: &Path, files: &mut Files) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        let relative = path.strip_prefix(root)?.to_string_lossy().into_owned();
+        let relative = inventory_path(path.strip_prefix(root)?);
         let kind = entry.file_type()?;
         if kind.is_dir() {
             staged_files(root, &path, files)?;
@@ -458,6 +467,13 @@ impl Installed {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn a_staged_path_is_spelled_with_slashes_on_every_os() {
+        let relative: PathBuf = ["bin", "sidevoice-core-rust.exe"].iter().collect();
+        assert_eq!(inventory_path(&relative), "bin/sidevoice-core-rust.exe");
+        assert_eq!(inventory_path(Path::new("notices")), "notices");
+    }
 
     const SOURCE: &str = "0123456789abcdef0123456789abcdef01234567";
 

@@ -90,7 +90,6 @@ pub(crate) fn write_manifest(
 mod tests {
     use super::*;
     use crate::archive::{test_core_record, test_tree, write_archive};
-    use crate::target_names;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -143,6 +142,7 @@ mod tests {
                 "sidevoice-connector-0.7.0-linux-aarch64.tar.zst",
                 "sidevoice-connector-0.7.0-linux-x86_64.tar.zst",
                 "sidevoice-connector-0.7.0-macos-aarch64.tar.zst",
+                "sidevoice-connector-0.7.0-windows-x86_64.tar.zst",
                 MANIFEST,
             ]
         );
@@ -152,16 +152,15 @@ mod tests {
     }
 
     #[test]
-    fn windows_is_known_but_not_released_until_its_flag_says_so() {
-        assert!(target_names().any(|name| name == "windows-x86_64"));
-        assert!(!released_names().any(|name| name == "windows-x86_64"));
-        let dir = TempDir::new("xtask-manifest-no-windows").unwrap();
+    fn windows_is_in_the_manifest_with_the_other_released_targets() {
+        assert!(released_names().any(|name| name == "windows-x86_64"));
+        let dir = TempDir::new("xtask-manifest-windows").unwrap();
         for target in released_names() {
             built(&dir.0, target, SHA, "0.7.0");
         }
         let bytes = write_manifest(&dir.0, None, SHA, "0.7.0", b"lock").unwrap();
         let manifest = parse_json(&bytes, "manifest").unwrap();
-        assert!(manifest["bundles"].get("windows-x86_64").is_none());
+        assert!(manifest["bundles"].get("windows-x86_64").is_some());
     }
 
     #[test]

@@ -882,7 +882,8 @@ mod tests {
             manifest["optionalDependencies"],
             json!({"@sidevoice/sidevoice-darwin-arm64": "0.7.0-rc.1",
                    "@sidevoice/sidevoice-linux-arm64": "0.7.0-rc.1",
-                   "@sidevoice/sidevoice-linux-x64": "0.7.0-rc.1"})
+                   "@sidevoice/sidevoice-linux-x64": "0.7.0-rc.1",
+                   "@sidevoice/sidevoice-win32-x64": "0.7.0-rc.1"})
         );
         assert!(manifest.get("dependencies").is_none());
     }
@@ -961,7 +962,7 @@ mod tests {
         ] {
             assert!(readme.contains(wanted), "{wanted}: {readme}");
         }
-        assert!(!readme.contains("Windows"), "{readme}");
+        assert!(readme.contains("Windows on x64 (`win32-x64`)"), "{readme}");
     }
 
     #[test]
