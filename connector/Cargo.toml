@@ -8,12 +8,6 @@ publish = false
 name = "sidevoice-connector"
 path = "src/main.rs"
 
-# A developer tool (src/bench/main.rs, README "Test bench"): the connector and the pinned core driven from a local page.
-# Not part of the release archive, which carries only the connector.
-[[bin]]
-name = "sidevoice-bench"
-path = "src/bench/main.rs"
-
 # The MCP server check (src/adapters/health.rs) against a fake server that is this test's own binary, on every OS. Not
 # libtest: it writes its own lines to stdout, where the fake server's protocol goes.
 [[test]]
@@ -74,7 +68,7 @@ sidevoice-connector = { path = ".", features = ["test-support"] }
 
 # Unix: the effective uid (src/platform/service/macos: the launchd domain), with no `unsafe` of ours.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "fs"] }
 # Records written whole (src/platform/fs/unix.rs): a temporary file beside the record, created 0600, synced, renamed
 # over it.
 atomic-write-file = "0.3"

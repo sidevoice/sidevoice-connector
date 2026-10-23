@@ -1,8 +1,9 @@
-//! The test bench (`sidevoice-bench`, src/bench/) against the real pinned core: it installs this build with the core
+//! The test bench (`sidevoice-testbench`) against the real pinned core: it installs this build with the core
 //! into a private profile (no service manager), opens a call; a conversation joins through the installation's MCP
 //! server (with an HTTP receiver as its harness); what is typed on the bench is delivered to it; its `voice_say`
 //! reply and the input's receipt show on the bench.
-// The bench runs on macOS and Linux only (src/bench/main.rs).
+// The test bench runs on macOS and Linux only (src/main.rs). It installs the connector built beside it, which this
+// package's tests do not build: run them with `cargo test` at the root (every member) or build the connector first.
 #![cfg(unix)]
 
 mod support;
@@ -15,10 +16,10 @@ use std::sync::mpsc::channel;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use support::package::pinned_core;
+use support::pinned_core;
 use support::*;
 
-const BENCH: &str = env!("CARGO_BIN_EXE_sidevoice-bench");
+const TESTBENCH: &str = env!("CARGO_BIN_EXE_sidevoice-testbench");
 
 /// One request to the bench's page server: status and JSON body.
 fn bench_http(address: &str, method: &str, path: &str, body: Option<&Value>) -> (u16, Value) {
@@ -46,7 +47,7 @@ struct Uninstall<'a>(&'a Profile);
 
 impl Drop for Uninstall<'_> {
     fn drop(&mut self) {
-        let _ = Command::new(BENCH)
+        let _ = Command::new(TESTBENCH)
             .arg("--profile")
             .arg(&self.0.root)
             .arg("--uninstall")
@@ -84,7 +85,7 @@ fn what_is_typed_on_the_bench_reaches_a_conversation_and_its_reply_shows() {
     .unwrap();
     std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
     let _uninstall = Uninstall(&profile);
-    let mut child = Command::new(BENCH)
+    let mut child = Command::new(TESTBENCH)
         .arg("--profile")
         .arg(&profile.root)
         .args(["--port", "0"])
@@ -108,7 +109,7 @@ fn what_is_typed_on_the_bench_reaches_a_conversation_and_its_reply_shows() {
         let line = lines
             .recv_timeout(Duration::from_secs(180))
             .expect("the bench never said it was ready");
-        if let Some(url) = line.strip_prefix("Bench ready: http://") {
+        if let Some(url) = line.strip_prefix("Test bench ready: http://") {
             break url.trim_end_matches('/').to_owned();
         }
     };
