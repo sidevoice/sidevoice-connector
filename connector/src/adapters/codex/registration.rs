@@ -282,6 +282,13 @@ impl Registration for Codex {
         &["codex"]
     }
 
+    fn fallback_binaries(
+        &self,
+        roots: &crate::adapters::markers::Roots,
+    ) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
+        super::binary::fallbacks(roots)
+    }
+
     // npm and Homebrew select their own installation prefix; neither is a stable Codex marker.
     fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
         &[]
