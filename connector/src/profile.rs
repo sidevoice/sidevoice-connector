@@ -273,8 +273,13 @@ impl Profile {
         Ok(())
     }
 
-    /// Before an agent's configuration is read or changed: it is a configuration home this profile names, and a
-    /// directory of the person's.
+    /// Before an agent's configuration is read or changed: it is a configuration home this profile names, and, when
+    /// it exists, a directory of the person's that nobody else can change. A home not there yet (an agent installed
+    /// but never started) is not unsafe, as [`Self::validate_existing_private`] holds for every home: what is checked
+    /// there is whatever could have been replaced, and the directory it would be made in (the home, or the parent
+    /// of a home checked through it) is checked by that call; the agent's own CLI makes it there, as on its first
+    /// start (sidevoice/sidevoice-connector#266). Anything at the path, a dangling link included, is checked.
+    /// Whoever reads or writes inside the home itself still needs it to exist ([`Self::agent_root`]).
     pub fn validate_for_agent(&self, config_root: &Path) -> Result<()> {
         self.validate_existing_private()?;
         if !self
@@ -284,7 +289,12 @@ impl Profile {
         {
             bail!("unknown agent configuration directory");
         }
-        Files::check_user_directory(config_root)?;
+        match fs::symlink_metadata(config_root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => {
+                Files::check_user_directory(config_root)?;
+            }
+        }
         Ok(())
     }
 
@@ -549,6 +559,27 @@ mod tests {
         fs::remove_dir(first).unwrap();
         Files::symlink(second, first);
         assert!(profile.validate_existing_private().is_err());
+    }
+
+    /// sidevoice/sidevoice-connector#266: an agent installed but never started has no home yet; that is not unsafe
+    /// (its CLI makes it), but a link left where it would be is still judged, and nothing reads inside a home that
+    /// is not there.
+    #[test]
+    fn a_missing_agent_home_is_not_unsafe_but_a_dangling_link_there_is_refused() {
+        let scratch = crate::test_support::temp_dir("missing-home");
+        let profile = Profile::for_test(scratch.path(), &HOMES);
+        let home = profile
+            .agent_homes
+            .iter()
+            .find(|home| home.spec.config)
+            .map(|home| home.path.clone())
+            .unwrap();
+        fs::remove_dir(&home).unwrap();
+        profile.validate_for_agent(&home).unwrap();
+        assert!(profile.agent_root(&home).is_err());
+
+        Files::symlink(scratch.path().join("nowhere"), &home);
+        assert!(profile.validate_for_agent(&home).is_err());
     }
 
     #[test]

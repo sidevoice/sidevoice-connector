@@ -199,6 +199,8 @@ fn codex_gate(args: &[String]) -> i32 {
 /// directory, `fake-command`) to report whether it connects.
 fn claude(args: &[String]) -> i32 {
     let home = dir_or_home("CLAUDE_CONFIG_DIR", ".claude");
+    // Like the real one, which makes its home on any start (a first `mcp add` included).
+    std::fs::create_dir_all(&home).unwrap();
     let settings = std::env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
