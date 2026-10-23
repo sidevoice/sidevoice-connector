@@ -83,12 +83,12 @@ const RELEASE_PREFIX: &str = "release-";
 /// What a claimed entry of `D` is called inside [`CLAIM`], before its unique suffix.
 const DATA_PREFIX: &str = "data-";
 
+const MODELS_UNRESOLVED: &str =
+    "uninstall refused: cannot tell where the shared models folder is relative to the data directory";
 /// `path` as the OS resolves it: its longest existing ancestor canonicalized, the components that do not exist yet
 /// appended as written. Fails closed: only "not found" walks up to the parent; any other error (permission, a link
 /// loop...) or a tail that cannot be placed without the OS (`..`) is an error, never a guess.
-fn resolved(path: &Path) -> Result<PathBuf, &'static str> {
-    const UNRESOLVED: &str =
-        "uninstall refused: cannot tell where the shared models folder is relative to the data directory";
+fn resolved(path: &Path, unresolved: &'static str) -> Result<PathBuf, &'static str> {
     let mut missing = Vec::new();
     let mut existing = path;
     loop {
@@ -100,14 +100,14 @@ fn resolved(path: &Path) -> Result<PathBuf, &'static str> {
                     .fold(real, |real, part| real.join(part)));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(UNRESOLVED),
+            Err(_) => return Err(unresolved),
         }
         match (existing.parent(), existing.file_name()) {
             (Some(parent), Some(name)) => {
                 missing.push(name);
                 existing = parent;
             }
-            _ => return Err(UNRESOLVED),
+            _ => return Err(unresolved),
         }
     }
 }
@@ -178,12 +178,14 @@ impl Roots {
         Ok(())
     }
 
-    /// That `D` is not the home nor a directory the home is in: compared as written and, when both are there, as
+    /// That `D` is not the home nor a directory the home is in: compared as written and as
     /// the OS resolves them (so another spelling of the same directory, through a link or in another case, is seen
     /// too). Refused when the home is not known.
     fn check_below_home(&self) -> Result<(), &'static str> {
         const REFUSED: &str =
             "uninstall refused: the data directory is the home directory or a directory it is in";
+        const UNRESOLVED_HOME: &str =
+            "uninstall refused: cannot tell where the home directory is relative to the data directory";
         if self.homes.is_empty() {
             return Err("uninstall refused: this user's home directory is not known");
         }
@@ -191,13 +193,12 @@ impl Roots {
             if dunce::simplified(home).starts_with(dunce::simplified(&self.data)) {
                 return Err(REFUSED);
             }
-            if let (Ok(home), Ok(data)) = (
-                std::fs::canonicalize(home),
-                std::fs::canonicalize(&self.data),
-            ) {
-                if dunce::simplified(&home).starts_with(dunce::simplified(&data)) {
-                    return Err(REFUSED);
-                }
+            // As the OS resolves them: a home that does not exist yet is placed by its longest existing ancestor (it may
+            // be a link into `D`), and a path that cannot be resolved refuses.
+            let home = resolved(home, UNRESOLVED_HOME)?;
+            let data = resolved(&self.data, UNRESOLVED_HOME)?;
+            if dunce::simplified(&home).starts_with(dunce::simplified(&data)) {
+                return Err(REFUSED);
             }
         }
         Ok(())
@@ -226,7 +227,10 @@ impl Roots {
             return Err(REFUSED);
         }
         // As the OS resolves them, whether or not the store exists yet (another instance may create it later).
-        if overlaps(&resolved(&models)?, &resolved(&self.data)?) {
+        if overlaps(
+            &resolved(&models, MODELS_UNRESOLVED)?,
+            &resolved(&self.data, MODELS_UNRESOLVED)?,
+        ) {
             return Err(REFUSED);
         }
         Ok(())
@@ -651,6 +655,20 @@ mod tests {
         let mut spelled = at(home.clone(), &standard);
         spelled.homes = vec![fs::canonicalize(&home).unwrap().join(".")];
         assert!(Remover::new(spelled).is_err(), "the home written otherwise");
+        // A home that does not exist yet, below a link into `D`: placed by its longest existing ancestor, so it is `D`'s.
+        let inside = home.join("sub");
+        fs::create_dir_all(&inside).unwrap();
+        let alias = scratch.path().join("alias");
+        Files::symlink(&inside, &alias);
+        let mut future = at(home.clone(), &standard);
+        future.homes = vec![alias.join("future")];
+        let refused = Remover::new(future)
+            .err()
+            .expect("a home below a link into D");
+        assert!(
+            refused.contains("the home directory or a directory it is in"),
+            "{refused}"
+        );
         // The profile's home and the OS's are two places on Windows: either one is protected, whichever the data
         // directory is compared with.
         let elsewhere = scratch.path().join("elsewhere");
