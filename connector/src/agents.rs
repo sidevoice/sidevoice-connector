@@ -1118,7 +1118,13 @@ pub fn agent_command(profile: &Profile, agent: &str) -> AgentCommand {
     let registry = Registry::standard();
     let program = id
         .and_then(|id| registry.agent(id).map(|(_, registration)| registration))
-        .and_then(|registration| find_in_path(registration.binary_names(), path.as_deref()));
+        .and_then(|registration| {
+            find_binary(
+                registration,
+                path.as_deref(),
+                &Roots::process(&profile.home),
+            )
+        });
     AgentCommand { program, path }
 }
 
@@ -1212,6 +1218,21 @@ pub(crate) fn executable(value: &str) -> bool {
         return false;
     }
     which::which(path).is_ok()
+}
+
+/// The agent's CLI: on `path` first, then where the agent is known to keep it outside `PATH`.
+pub(crate) fn find_binary(
+    agent: &dyn Registration,
+    path: Option<&str>,
+    roots: &Roots,
+) -> Option<String> {
+    find_in_path(agent.binary_names(), path).or_else(|| {
+        agent
+            .fallback_binaries(roots)
+            .into_iter()
+            .find_map(|candidate| which::which(candidate).ok())
+            .map(|found| found.to_string_lossy().into_owned())
+    })
 }
 
 pub(crate) fn find_in_path(names: &[&str], path: Option<&str>) -> Option<String> {
@@ -1499,7 +1520,7 @@ impl HostAgents {
             return Some(path);
         }
         let _ = id;
-        find_in_path(agent.binary_names(), login_path)
+        find_binary(agent, login_path, &Roots::process(&self.profile.home))
     }
 
     async fn capture_login_path(

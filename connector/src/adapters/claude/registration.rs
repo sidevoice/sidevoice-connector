@@ -221,6 +221,13 @@ impl Registration for Claude {
         &["claude"]
     }
 
+    fn fallback_binaries(
+        &self,
+        roots: &crate::adapters::markers::Roots,
+    ) -> Vec<std::path::PathBuf> {
+        super::binary::fallbacks(roots)
+    }
+
     fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
         use crate::adapters::markers::{Marker, Root};
         &[

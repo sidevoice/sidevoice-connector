@@ -141,6 +141,14 @@ pub trait Registration: Send + Sync {
     fn config_root<'a>(&self, profile: &'a Profile) -> &'a Path;
     /// Its CLI's names, as found on PATH.
     fn binary_names(&self) -> &'static [&'static str];
+    /// Where its CLI may be when it is not on `PATH`, most preferred first. Looked at only after `PATH`, by file
+    /// metadata; the first that can be run is the one used.
+    fn fallback_binaries(
+        &self,
+        _roots: &crate::adapters::markers::Roots,
+    ) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
     /// Fixed, passive filesystem markers for this agent. CLI names above use the captured login PATH.
     fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
         &[]
