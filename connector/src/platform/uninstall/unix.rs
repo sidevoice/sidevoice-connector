@@ -882,7 +882,7 @@ mod tests {
             data,
             releases,
             kept: KEPT,
-            home: Some(home.to_path_buf()),
+            homes: vec![home.to_path_buf()],
         })
         .unwrap()
     }

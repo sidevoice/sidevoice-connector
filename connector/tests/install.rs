@@ -79,8 +79,7 @@ fn run(profile: &Profile, program: &Path, args: &[&str]) -> (bool, Value) {
 }
 
 fn scratch(label: &str) -> PathBuf {
-    let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("install-{label}-{}", std::process::id()));
+    let path = support::short_temp_dir().join(format!("install-{label}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&path);
     fs::create_dir_all(&path).unwrap();
     path
@@ -91,6 +90,10 @@ struct Teardown<'a>(&'a Profile, PathBuf);
 
 impl Drop for Teardown<'_> {
     fn drop(&mut self) {
+        // The uninstall below removes the logs the failure needs.
+        if std::thread::panicking() {
+            eprintln!("{}", self.0.log_tail());
+        }
         let _ = self
             .0
             .command(&self.1)
@@ -151,38 +154,43 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
     mcp.stop();
 
     // Cursor (its CLI is installed) is found and left without Sidevoice, with the command that
-    // connects it; connected with it, it runs the installation's command.
-    assert_eq!(
-        installed["agents"]["cursor"]["outcome"], "not-connected",
-        "{installed}"
-    );
-    assert_eq!(
-        installed["agents"]["cursor"]["command"], "npx sidevoice agents connect cursor",
-        "{installed}"
-    );
+    // connects it; connected with it, it runs the installation's command. Windows reads the login PATH from the
+    // registry, so a stand-in shell cannot put Cursor's CLI on it: nothing of Cursor is checked there.
     let cursor = profile.root.join("cursor/config/mcp.json");
-    assert!(
-        read_json(&cursor).is_none_or(|config| config["mcpServers"].get("sidevoice").is_none()),
-        "installing connected Cursor"
-    );
-    let (ok, connected) = run(&profile, &stable, &["agents", "connect", "cursor"]);
-    assert!(ok, "{connected}");
-    let config = read_json(&cursor).unwrap();
-    assert_eq!(
-        config["mcpServers"]["sidevoice"]["command"],
-        stable.to_string_lossy().as_ref(),
-        "{config}"
-    );
-    assert_eq!(config["mcpServers"]["sidevoice"]["args"][0], "mcp");
+    if cfg!(unix) {
+        assert_eq!(
+            installed["agents"]["cursor"]["outcome"], "not-connected",
+            "{installed}"
+        );
+        assert_eq!(
+            installed["agents"]["cursor"]["command"], "npx sidevoice agents connect cursor",
+            "{installed}"
+        );
+        assert!(
+            read_json(&cursor).is_none_or(|config| config["mcpServers"].get("sidevoice").is_none()),
+            "installing connected Cursor"
+        );
+        let (ok, connected) = run(&profile, &stable, &["agents", "connect", "cursor"]);
+        assert!(ok, "{connected}");
+        let config = read_json(&cursor).unwrap();
+        assert_eq!(
+            config["mcpServers"]["sidevoice"]["command"],
+            stable.to_string_lossy().as_ref(),
+            "{config}"
+        );
+        assert_eq!(config["mcpServers"]["sidevoice"]["args"][0], "mcp");
+    }
 
     // Again: the same release, restarted and verified (a new core).
     let (ok, again) = run(&profile, &program, &["install"]);
     assert!(ok, "{again}");
     assert_eq!(again["action"], "reinstalled", "{again}");
-    assert_eq!(
-        again["agents"]["cursor"]["outcome"], "registered",
-        "{again}"
-    );
+    if cfg!(unix) {
+        assert_eq!(
+            again["agents"]["cursor"]["outcome"], "registered",
+            "{again}"
+        );
+    }
     let first_core = status["core"]["pid"].as_u64().unwrap();
     wait_gone(first_core, "the core before the reinstall exited");
     let restarted = until("the pair answers again", 60, || {
@@ -190,22 +198,29 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
         (status["reachable"] == true).then_some(status)
     });
 
-    // Uninstall: both stopped, the registration, the releases and the data gone; the locks and the stop stay.
-    let (ok, removed) = run(&profile, &stable, &["uninstall"]);
+    // Uninstall: both stopped, the registration, the releases and the data gone; the locks and the stop stay. Windows
+    // cannot delete a running program, so `uninstall` refuses to run from inside what it removes: the package's
+    // copy, outside the Sidevoice folders, runs it there.
+    let uninstaller = if cfg!(windows) { &program } else { &stable };
+    let (ok, removed) = run(&profile, uninstaller, &["uninstall"]);
     assert!(ok, "{removed}");
     assert_eq!(removed["state"], "absent", "{removed}");
-    assert_eq!(
-        removed["agents"]["cursor"]["outcome"], "removed",
-        "{removed}"
-    );
+    if cfg!(unix) {
+        assert_eq!(
+            removed["agents"]["cursor"]["outcome"], "removed",
+            "{removed}"
+        );
+    }
     wait_gone(
         restarted["core"]["pid"].as_u64().unwrap(),
         "the core exited at uninstall",
     );
     assert!(!releases.exists(), "{} is left", releases.display());
     assert!(!endpoint_exists(&profile.connector_endpoint()));
-    let config = read_json(&cursor).unwrap();
-    assert!(config["mcpServers"].get("sidevoice").is_none(), "{config}");
+    if cfg!(unix) {
+        let config = read_json(&cursor).unwrap();
+        assert!(config["mcpServers"].get("sidevoice").is_none(), "{config}");
+    }
     let mut left: Vec<String> = fs::read_dir(profile.data())
         .unwrap()
         .flatten()

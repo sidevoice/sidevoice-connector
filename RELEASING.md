@@ -184,13 +184,9 @@ archive checks follow from `TARGETS`. The pinned core publishes `sidevoice-core-
 `@sidevoice/sidevoice-win32-x64` is reserved and its trusted publisher configured (steps 1 and 2 of
 [npm](#npm-what-is-published-and-how-to-add-a-platform)).
 
-**Temporary, until the Windows tests pass (sidevoice-connector#116, block W1):** the Windows `dist` job does not run
-`cargo test`; it builds, packages and verifies the archive (`cargo xtask dist` starts the real binary from it). The
-`Test (windows-x86_64)` job of `ci.yml` keeps running the tests and stays red until they pass; the `Package (windows-x86_64)` job of `ci.yml` runs fixtures, dist and the npm packaging on every PR, so its result shows on its own. When it is green, remove
-the `if: matrix.target != 'windows-x86_64'` of the test step in `release.yml`.
-
 Not decided, so not done: Authenticode signing and the installer format (the archive and the npm package are the
 only Windows distribution here).
+
 ## Which version comes next
 
 `fix:` → patch, `feat:` → minor. While the version is 0.x a breaking change (`feat!:` or a `BREAKING CHANGE:`

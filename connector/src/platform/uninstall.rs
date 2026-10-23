@@ -83,12 +83,13 @@ const RELEASE_PREFIX: &str = "release-";
 /// What a claimed entry of `D` is called inside [`CLAIM`], before its unique suffix.
 const DATA_PREFIX: &str = "data-";
 
+const MODELS_UNRESOLVED: &str =
+    "uninstall refused: cannot tell where the shared models folder is relative to the data directory";
 /// `path` as the OS resolves it: its longest existing ancestor canonicalized, the components that do not exist yet
-/// appended as written. Fails closed: only "not found" walks up to the parent; any other error (permission, a link
+/// appended as written. Fails closed: only an entry that is not there walks up to the parent (a link whose target is
+/// missing is refused); any other error (permission, a link
 /// loop...) or a tail that cannot be placed without the OS (`..`) is an error, never a guess.
-fn resolved(path: &Path) -> Result<PathBuf, &'static str> {
-    const UNRESOLVED: &str =
-        "uninstall refused: cannot tell where the shared models folder is relative to the data directory";
+fn resolved(path: &Path, unresolved: &'static str) -> Result<PathBuf, &'static str> {
     let mut missing = Vec::new();
     let mut existing = path;
     loop {
@@ -99,15 +100,22 @@ fn resolved(path: &Path) -> Result<PathBuf, &'static str> {
                     .rev()
                     .fold(real, |real, part| real.join(part)));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(UNRESOLVED),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Not found is also what a link whose target is missing says: only an entry that is truly not there is
+                // walked past; a dangling link (symlink, junction) cannot be placed, so it refuses.
+                match std::fs::symlink_metadata(existing) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => return Err(unresolved),
+                }
+            }
+            Err(_) => return Err(unresolved),
         }
         match (existing.parent(), existing.file_name()) {
             (Some(parent), Some(name)) => {
                 missing.push(name);
                 existing = parent;
             }
-            _ => return Err(UNRESOLVED),
+            _ => return Err(unresolved),
         }
     }
 }
@@ -122,8 +130,9 @@ pub struct Roots {
     pub standard: Option<PathBuf>,
     /// The names in `D` that an uninstall leaves (its permanent lock files and the stop).
     pub kept: &'static [&'static str],
-    /// This user's home directory; `None` when it is not known, and then nothing is removed.
-    pub home: Option<PathBuf>,
+    /// Every home directory the code knows: the profile's (`HOME`, `USERPROFILE`) and the OS's, which differ on Windows
+    /// (the Known Folder). `D` may be none of them nor a directory one is in; none known, and nothing is removed.
+    pub homes: Vec<PathBuf>,
 }
 
 /// What `D` is to a removal, as [`Removal::ownership`] finds it. Anything that is not ours is refused instead.
@@ -177,23 +186,25 @@ impl Roots {
         Ok(())
     }
 
-    /// That `D` is not the home nor a directory the home is in: compared as written and, when both are there, as
+    /// That `D` is not the home nor a directory the home is in: compared as written and as
     /// the OS resolves them (so another spelling of the same directory, through a link or in another case, is seen
     /// too). Refused when the home is not known.
     fn check_below_home(&self) -> Result<(), &'static str> {
         const REFUSED: &str =
             "uninstall refused: the data directory is the home directory or a directory it is in";
-        let home = self
-            .home
-            .as_deref()
-            .ok_or("uninstall refused: this user's home directory is not known")?;
-        if dunce::simplified(home).starts_with(dunce::simplified(&self.data)) {
-            return Err(REFUSED);
+        const UNRESOLVED_HOME: &str =
+            "uninstall refused: cannot tell where the home directory is relative to the data directory";
+        if self.homes.is_empty() {
+            return Err("uninstall refused: this user's home directory is not known");
         }
-        if let (Ok(home), Ok(data)) = (
-            std::fs::canonicalize(home),
-            std::fs::canonicalize(&self.data),
-        ) {
+        for home in &self.homes {
+            if dunce::simplified(home).starts_with(dunce::simplified(&self.data)) {
+                return Err(REFUSED);
+            }
+            // As the OS resolves them: a home that does not exist yet is placed by its longest existing ancestor (it may
+            // be a link into `D`), and a path that cannot be resolved refuses.
+            let home = resolved(home, UNRESOLVED_HOME)?;
+            let data = resolved(&self.data, UNRESOLVED_HOME)?;
             if dunce::simplified(&home).starts_with(dunce::simplified(&data)) {
                 return Err(REFUSED);
             }
@@ -224,7 +235,10 @@ impl Roots {
             return Err(REFUSED);
         }
         // As the OS resolves them, whether or not the store exists yet (another instance may create it later).
-        if overlaps(&resolved(&models)?, &resolved(&self.data)?) {
+        if overlaps(
+            &resolved(&models, MODELS_UNRESOLVED)?,
+            &resolved(&self.data, MODELS_UNRESOLVED)?,
+        ) {
             return Err(REFUSED);
         }
         Ok(())
@@ -407,7 +421,11 @@ mod tests {
             data,
             standard: Some(standard.to_path_buf()),
             kept: KEPT,
-            home: standard.parent().map(Path::to_path_buf),
+            homes: standard
+                .parent()
+                .map(Path::to_path_buf)
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -548,7 +566,7 @@ mod tests {
         Files::symlink(data.join("nested"), &alias);
         // `Models` does not exist yet: another instance creates it later, inside `D`.
         let mut layout = at(data, &alias.join("sidevoice"));
-        layout.home = Some(home);
+        layout.homes = vec![home];
         let refused = layout.validate().unwrap_err();
         assert!(refused.contains("shared models folder"), "{refused}");
     }
@@ -572,7 +590,7 @@ mod tests {
             looped.join("sidevoice"),
         ] {
             let mut layout = at(data.clone(), &standard);
-            layout.home = Some(home.clone());
+            layout.homes = vec![home.clone()];
             let refused = layout.validate().unwrap_err();
             assert!(
                 refused.contains("shared models folder"),
@@ -597,7 +615,7 @@ mod tests {
         // `D` above the standard place holds the store two levels down; `D` inside the store holds `D`.
         for data in [share.clone(), models.join("profile")] {
             let mut layout = at(data.clone(), &standard);
-            layout.home = Some(home.clone());
+            layout.homes = vec![home.clone()];
             let refused = layout.validate().unwrap_err();
             assert!(
                 refused.contains("shared models folder"),
@@ -607,7 +625,7 @@ mod tests {
         }
         // `D` as the standard place itself keeps `Models` by name: accepted.
         let mut layout = at(standard.clone(), &standard);
-        layout.home = Some(home);
+        layout.homes = vec![home];
         assert!(layout.validate().is_ok());
         assert_eq!(
             fs::read_to_string(models.join("other-program").join("sentinel")).unwrap(),
@@ -640,11 +658,43 @@ mod tests {
             assert!(Remover::new(layout).is_err(), "{}", data.display());
         }
         let mut unknown = at(home.join("custom"), &standard);
-        unknown.home = None;
+        unknown.homes.clear();
         assert!(Remover::new(unknown).is_err(), "an unknown home");
         let mut spelled = at(home.clone(), &standard);
-        spelled.home = Some(fs::canonicalize(&home).unwrap().join("."));
+        spelled.homes = vec![fs::canonicalize(&home).unwrap().join(".")];
         assert!(Remover::new(spelled).is_err(), "the home written otherwise");
+        // A home that does not exist yet, below a link into `D`: placed by its longest existing ancestor, so it is `D`'s.
+        let inside = home.join("sub");
+        fs::create_dir_all(&inside).unwrap();
+        let alias = scratch.path().join("alias");
+        Files::symlink(&inside, &alias);
+        let mut future = at(home.clone(), &standard);
+        future.homes = vec![alias.join("future")];
+        let refused = Remover::new(future)
+            .err()
+            .expect("a home below a link into D");
+        assert!(
+            refused.contains("the home directory or a directory it is in"),
+            "{refused}"
+        );
+        // The same through a link whose target is missing: it cannot be placed, so it refuses.
+        let dangling = scratch.path().join("dangling");
+        Files::symlink(home.join("missing"), &dangling);
+        let mut gone = at(home.clone(), &standard);
+        gone.homes = vec![dangling.join("future")];
+        assert!(Remover::new(gone).is_err(), "a home below a dangling link");
+        // The profile's home and the OS's are two places on Windows: either one is protected, whichever the data
+        // directory is compared with.
+        let elsewhere = scratch.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        for homes in [
+            vec![home.clone(), elsewhere.clone()],
+            vec![elsewhere.clone(), home.clone()],
+        ] {
+            let mut mismatch = at(home.clone(), &standard);
+            mismatch.homes = homes;
+            assert!(Remover::new(mismatch).is_err(), "one of two homes");
+        }
         assert_eq!(fs::read_to_string(home.join("entry")).unwrap(), "theirs");
     }
 

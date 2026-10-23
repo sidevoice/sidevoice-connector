@@ -4,14 +4,14 @@ use serde_json::Value;
 use sidevoice_connector::platform::data_dir;
 mod support;
 
+use sidevoice_connector::platform::env::{Env as _, Environment};
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use support::TestFiles;
 
 fn temp_home() -> std::path::PathBuf {
-    let home = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("uninstall-unsafe-{}", uuid::Uuid::new_v4()));
+    let home = support::short_temp_dir().join(format!("uninstall-unsafe-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&home).unwrap();
     support::Files::shut_others_out(&home);
     home
@@ -21,7 +21,8 @@ fn uninstall(home: &Path, data: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_sidevoice-connector"))
         .args(["uninstall", "--json"])
         .env_clear()
-        .env("HOME", home)
+        .envs(Environment::base())
+        .env(Environment::HOME, home)
         .env("SIDEVOICE_DATA_DIR", data)
         .env("SIDEVOICE_SERVICE_MANAGER", "none")
         .stdin(Stdio::null())

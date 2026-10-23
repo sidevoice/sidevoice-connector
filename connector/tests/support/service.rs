@@ -2,7 +2,7 @@
 //! the service commands run against it, and this user's real service manager.
 //!
 //! The installation is what an installer leaves: `R/current.json` naming `R/releases/r1` (`R` is `D/install`)
-//! with the core at `core/bin/sidevoice-core-rust` (here a wrapper that runs the real one with no STUN and no
+//! with the core at `core/bin/sidevoice-core-rust` (a copy of the real one; the profile's environment gives it no STUN and no
 //! browser keepalive) and its models at `core/models`, and `D/install.json` naming the command that runs this
 //! connector.
 
@@ -29,12 +29,8 @@ pub fn stage_installation(profile: &Profile, core: &Path) -> PathBuf {
     let releases = releases(profile);
     let release = releases.join("releases/r1");
     private_dir(&release.join("core/bin"));
-    let wrapper = format!(
-        "#!/bin/sh\nSIDEVOICE_STUN_URLS= VOICE_BROWSER_HEARTBEAT_SECONDS=0 exec '{}' \"$@\"\n",
-        core.join(core_program()).display()
-    );
     let program = release.join(format!("core/{}", core_program()));
-    fs::write(&program, wrapper).unwrap();
+    fs::copy(core.join(core_program()), &program).unwrap();
     Files::make_executable(&program);
     Files::symlink(core.join("models"), release.join("core/models"));
     Files::write_private(

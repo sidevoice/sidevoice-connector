@@ -18,8 +18,8 @@ use support::connector_program;
 use support::package::{package, pinned_core};
 
 fn scratch(label: &str) -> PathBuf {
-    let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("core-package-{label}-{}", std::process::id()));
+    let path =
+        support::short_temp_dir().join(format!("core-package-{label}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&path);
     fs::create_dir_all(&path).unwrap();
     path

@@ -1,7 +1,7 @@
 name: release
 
 # Merging is publishing. Every push to main replaces the `nightly` pre-release; release-please.yml calls this with
-# the vX.Y.Z tag it created. Per target: the tests (Windows excepted for now, see its step; against `cargo xtask fixtures`: the pinned core release, Codex), then
+# the vX.Y.Z tag it created. Per target: the tests (against `cargo xtask fixtures`: the pinned core release, Codex), then
 # `cargo xtask dist` (release binary, archive, verified by running the connector from it; on Linux
 # `cargo xtask verify-floor` runs it again on the oldest distribution it supports). Then
 # `cargo xtask manifest`, one attestation over every asset, and `cargo xtask publish` (attach, read back, verify,
@@ -48,11 +48,7 @@ jobs:
           ref: ${{ inputs.tag || github.sha }}
       - uses: ./.github/actions/setup
       - run: cargo xtask fixtures
-      # TEMPORARY (sidevoice-connector#116, block W1): the unit tests do not pass on Windows yet, so the Windows job
-      # does not run them; it still builds, packages and verifies the archive below (which starts the real binary).
-      # The `Test (windows-x86_64)` job of ci.yml keeps running them. Remove this condition when W1 is green.
-      - if: matrix.target != 'windows-x86_64'
-        run: cargo test --locked
+      - run: cargo test --locked
       - run: cargo xtask dist
       # The Linux binary on the oldest distribution it supports (glibc floor, xtask/src/glibc.rs).
       - if: runner.os == 'Linux'
