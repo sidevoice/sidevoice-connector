@@ -894,7 +894,7 @@ impl Removal for Os {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::env::{Env, Environment};
+    use crate::platform::data_dir::{DataDir, DataDirs};
     use crate::platform::fs::TestFiles;
     use crate::platform::fs::{Files, Fs};
     use crate::test_support::temp_dir;
@@ -905,7 +905,7 @@ mod tests {
 
     /// `D` below the anchor (the scratch home it is made in).
     fn data_rel() -> &'static Path {
-        Path::new(Environment::DATA_NAME)
+        Path::new(DataDirs::NAME)
     }
 
     /// The preflight walk of `D`, with the mount probe made to report a different mount for `D` itself.

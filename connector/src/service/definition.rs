@@ -14,7 +14,7 @@
 use super::jobs::Job;
 use super::layout::Layout;
 use super::{Failure, Result};
-use crate::data_dir;
+use crate::platform::data_dir;
 use crate::platform::env::{Env, Environment};
 use crate::platform::service::{Job as Definition, Refusal, Restart, Service, Services};
 use serde_json::json;

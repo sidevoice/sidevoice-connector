@@ -1,7 +1,7 @@
 //! The desktop consumes the command's existing one-object JSON failure contract.
 
 use serde_json::Value;
-use sidevoice_connector::platform::env::{Env as _, Environment};
+use sidevoice_connector::platform::data_dir::{DataDir as _, DataDirs};
 mod support;
 
 use std::fs;
@@ -48,7 +48,7 @@ fn unsafe_root_refusal_is_a_nonzero_json_failure() {
 fn absent_installation_can_be_uninstalled_twice() {
     let home = temp_home();
     for _ in 0..2 {
-        let output = uninstall(&home, &home.join(Environment::DATA_NAME));
+        let output = uninstall(&home, &home.join(DataDirs::NAME));
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(output.status.success(), "{stdout}");
         assert_eq!(stdout.lines().count(), 1, "{stdout:?}");

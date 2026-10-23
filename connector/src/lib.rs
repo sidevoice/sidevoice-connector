@@ -7,7 +7,6 @@ pub mod agents;
 pub mod core_package;
 pub mod core_ready;
 pub mod daemon;
-pub mod data_dir;
 mod frame;
 pub mod identity;
 pub mod install;

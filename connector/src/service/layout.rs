@@ -16,7 +16,7 @@
 //!
 //! The release layout below `R/releases/<id>` is the installer's; it is named here once (`core_entrypoint`, `install::binary`).
 
-use crate::data_dir::{data_dir, releases_dir};
+use crate::platform::data_dir::{DataDir, DataDirs};
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Files, Fs};
 use crate::platform::ipc::{Address, Endpoint};
@@ -103,7 +103,7 @@ impl Layout {
         agent_vars: &[&'static str],
     ) -> anyhow::Result<Self> {
         let home = absolute(Environment::HOME, var(Environment::HOME), PathBuf::new)?;
-        let data = data_dir(&var)?;
+        let data = DataDirs::resolve(&var)?;
         let config_home = absolute("XDG_CONFIG_HOME", var("XDG_CONFIG_HOME"), || {
             home.join(".config")
         })?;
@@ -124,7 +124,7 @@ impl Layout {
             })
             .collect();
         Ok(Self {
-            releases: releases_dir(&data),
+            releases: DataDirs::releases_dir(&data),
             home,
             data,
             config_home,
@@ -214,7 +214,7 @@ impl Layout {
     }
 
     pub fn core_data(&self) -> PathBuf {
-        self.data.join("core")
+        DataDirs::core_dir(&self.data)
     }
 
     pub fn core_ready(&self) -> PathBuf {

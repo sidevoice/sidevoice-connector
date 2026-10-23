@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
-use sidevoice_connector::platform::env::{Env, Environment};
+use sidevoice_connector::platform::data_dir::{DataDir, DataDirs};
 use sidevoice_connector::platform::ipc::Endpoint;
 
 /// Every directory the connector reads, below one private root.
@@ -70,11 +70,11 @@ fn checked_bench_path(path: String) -> Result<String> {
 
 const DIRECTORIES: &[&str] = &["home", "home/.local/share", "xdg/config", "bench"];
 
-/// The data directory of the profile at `root`: the program's own directory (`Environment::DATA_NAME`) in the
+/// The data directory of the profile at `root`: the program's own directory (`DataDirs::NAME`) in the
 /// profile's home, the same rule as the tests' profiles. Every connector process of the profile is given it as
 /// `SIDEVOICE_DATA_DIR`.
 fn data_dir(root: &Path) -> PathBuf {
-    root.join("home").join(Environment::DATA_NAME)
+    root.join("home").join(DataDirs::NAME)
 }
 
 /// Asks this build's connector about the agents its harnesses declare (`bench-agents`).

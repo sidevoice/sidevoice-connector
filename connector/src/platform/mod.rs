@@ -18,4 +18,4 @@ pub mod uninstall;
 
 // This user and the local channel, shared with the core: `sidevoice-platform`, from the core's repository at the tag
 // of a core release. Re-exported so callers keep their paths (`crate::platform::ipc`, `crate::platform::user`).
-pub use sidevoice_platform::{ipc, user};
+pub use sidevoice_platform::{data_dir, ipc, user};

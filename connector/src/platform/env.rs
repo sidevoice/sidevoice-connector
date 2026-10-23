@@ -67,16 +67,11 @@ impl LoginPath {
     }
 }
 
-/// What every OS implements ([`Environment`], in `env/unix.rs` and `env/windows.rs`): the three constants and the
+/// What every OS implements ([`Environment`], in `env/unix.rs` and `env/windows.rs`): the constants and the
 /// two methods that differ. The rest is one body for every OS; an OS overrides it only if it must.
 pub trait Env {
     /// The variable that names this user's home directory: `HOME`, `USERPROFILE`.
     const HOME: &'static str;
-
-    /// The name of the connector's own directory inside the OS's standard place for a program's data, which is
-    /// where its data directory is (`data_dir`): `Sidevoice` (macOS, Windows), `sidevoice` (Linux, by the XDG
-    /// convention).
-    const DATA_NAME: &'static str;
 
     /// Variables a child cannot run without, passed on from this process when it has them (Windows: `SystemRoot`
     /// and its like; a child without them cannot use the network or the system's crypto). None on Unix.

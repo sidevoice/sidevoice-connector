@@ -13,12 +13,6 @@ pub struct Os;
 
 impl super::Env for Os {
     const HOME: &'static str = "HOME";
-    // The XDG convention (Linux) is lower case; Apple's (and Windows') is the product's name.
-    const DATA_NAME: &'static str = if cfg!(target_os = "macos") {
-        "Sidevoice"
-    } else {
-        "sidevoice"
-    };
     const SYSTEM: &'static [&'static str] = &[];
     const CALL: &'static str = "";
 

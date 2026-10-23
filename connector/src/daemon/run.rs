@@ -70,6 +70,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     // Accept MCP before Core is ready. The link task retries the private Core socket until the
     // separately manager-owned Core job becomes healthy.
     let listener = Channels::listen(&profile.endpoint)?;
+    let published = profile.publish_endpoint()?;
     let (ready_tx, ready_rx) = oneshot::channel();
     let supervisor = Arc::new(crate::service::core_supervisor(&profile));
     let link_task = tokio::spawn(link.run(profile.clone(), incoming_tx, ready_tx, supervisor));
@@ -239,6 +240,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     })
     .await;
     drop(listener);
+    drop(published);
     drop(lock);
     if link_exited {
         bail!("Core authentication was refused or its link task exited");

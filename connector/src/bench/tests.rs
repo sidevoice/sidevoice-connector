@@ -21,7 +21,7 @@ fn the_agent_keeps_its_own_xdg_directories() {
     let mcp = profile.mcp_env();
     assert_eq!(
         Path::new(&mcp["SIDEVOICE_DATA_DIR"]),
-        Path::new("/p/home").join(Environment::DATA_NAME)
+        Path::new("/p/home").join(DataDirs::NAME)
     );
     assert_eq!(mcp["XDG_DATA_HOME"], "/p/home/.local/share");
     assert_eq!(mcp["SIDEVOICE_SERVICE_MANAGER"], "none");

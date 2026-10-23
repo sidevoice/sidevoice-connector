@@ -120,7 +120,6 @@ impl Registry<'_> {
 
 impl super::Env for Os {
     const HOME: &'static str = "USERPROFILE";
-    const DATA_NAME: &'static str = "Sidevoice";
     // What programs started with an empty environment fail without (`SystemRoot`: sockets and the system's crypto;
     // `PATHEXT`: how a `.cmd` is found; the per-user folders and the temporary directory most programs write to).
     const SYSTEM: &'static [&'static str] = &[

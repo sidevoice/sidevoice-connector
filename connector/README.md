@@ -33,13 +33,19 @@ English (`messages/errors.json`, compiled in). Without `--json` a failure is one
 
 Every place comes from the environment, so a disposable profile is just a set of variables (the tests use one):
 
-- the data directory `D`: `$SIDEVOICE_DATA_DIR`, else the OS's standard place for a program's data: macOS
-  `~/Library/Application Support/Sidevoice`, Linux `$XDG_DATA_HOME/sidevoice` (else `~/.local/share/sidevoice`),
-  Windows `%LOCALAPPDATA%\Sidevoice` (`src/data_dir.rs`). Private (0700), created by the daemon when
+- the data directory `D`: one rule for every Sidevoice program on the machine (core, connector, the desktop app),
+  owned by `sidevoice-platform`'s `data_dir`: `$SIDEVOICE_DATA_DIR`, else the OS's standard place for a program's
+  data: macOS `~/Library/Application Support/Sidevoice`, Linux `$XDG_DATA_HOME/sidevoice` (else
+  `~/.local/share/sidevoice`), Windows `%LOCALAPPDATA%\Sidevoice`. Private (0700), created by the daemon when
   missing and refused, never repaired, when someone else could enter it or any directory above it could have its
-  entries replaced. It holds `connector.lock`, `connector.log`, `agents.json`, `agents.lock`,
+  entries replaced. It holds `connector.lock`, `connector.log`, `connector.json`, `agents.json`, `agents.lock`,
   `node-stopped.json` (a person's stop), the speech outbox, and `core/`
   (the core's own: `core.json`, which names the core's endpoint);
+- where each program listens is published, not worked out: `D/connector.json` (`{"pid", "endpoint"}`, private,
+  written once the connector listens and removed when it exits cleanly; after a crash it stays and `pid` tells it is
+  stale) and the core's `D/core/core.json` (`endpoint`). `endpoint` is the record `sidevoice-platform`'s `ipc`
+  writes and reads: a Unix socket path, or a named pipe on Windows. Whoever needs to reach either (the desktop app)
+  reads it there;
 - the local sockets (`connector.sock`, the core's `local.sock`): in this user's runtime directory, each in a private
   `sidevoice-<hash of its data directory>` directory (`D` for the connector, `D/core` for the core), so their paths
   stay within the OS limit: Linux `$XDG_RUNTIME_DIR` (`/run/user/<uid>`), macOS the per-user `$TMPDIR`

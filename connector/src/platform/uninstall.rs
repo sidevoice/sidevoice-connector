@@ -310,7 +310,7 @@ pub trait Removal: Sized {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::env::{Env, Environment};
+    use crate::platform::data_dir::{DataDir, DataDirs};
     use crate::platform::fs::{Files, TestFiles};
     use crate::test_support::temp_dir;
     use std::fs;
@@ -318,7 +318,7 @@ mod tests {
 
     const KEPT: &[&str] = &["install.lock", "agents.lock", "node-stopped.json"];
 
-    const DATA: &str = Environment::DATA_NAME;
+    const DATA: &str = DataDirs::NAME;
 
     /// `D` at `data`, `R` inside it, `standard` as the OS's place for this user and the directory it is in as the
     /// home.
