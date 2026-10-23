@@ -2,8 +2,8 @@
 
 use super::Codex;
 use crate::adapters::registration::{
-    looks_absent, read_profile_file, run_required, shell_command, shell_command_in, strings,
-    AgentError, AgentHost, BenchSetup, CliError, Entry, Launch, Manual, ManualStep, Registration,
+    cli_step, looks_absent, read_profile_file, run_required, shell_command, strings, AgentError,
+    AgentHost, BenchSetup, CliError, Entry, Launch, Manual, Registration,
 };
 use crate::profile::Profile;
 use anyhow::Result;
@@ -318,11 +318,7 @@ impl Registration for Codex {
         // `codex mcp` writes `config.toml` in Codex's home: the file each step changes. A step names `CODEX_HOME` only
         // when the person's environment sets it; without it, Codex's default is the same home.
         let file = profile.agent_home(super::HOME.var).join("config.toml");
-        let step = |args: &[String]| ManualStep {
-            command: Some(shell_command_in(profile, super::HOME.var, cli, args)),
-            snippet: None,
-            file: Some(file.to_string_lossy().into_owned()),
-        };
+        let step = |args: &[String]| cli_step(profile, super::HOME.var, cli, args, &file);
         let remove = step(&strings(&REMOVE));
         Manual::by_cli(registration, step(&add_args(host)), remove.clone(), remove)
     }

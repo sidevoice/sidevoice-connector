@@ -338,26 +338,55 @@ pub fn shell_command(command: &str, args: &[String]) -> String {
     format!("{}{words}", Environment::CALL)
 }
 
-/// `command args` for that shell, run with the agent's home `variable` as the connector runs its CLI: named when the
-/// person's environment sets it, else left to the agent's own default, as in the person's shell. A step done by hand
-/// then changes the same configuration as the connector would.
-pub fn shell_command_in(
+/// [`shell_command`], or `None` when this OS's shell cannot be trusted to read it as written ([`Env::hand_safe`]:
+/// on Windows, a batch shim or an unknown target with `& | < > ^ % !` or `"` in the program or an argument).
+pub fn hand_command(command: &str, args: &[String]) -> Option<String> {
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    Environment::hand_safe(command, &words).then(|| shell_command(command, args))
+}
+
+/// [`hand_command`] run with the agent's home `variable` as the connector runs its CLI: named when the person's
+/// environment sets it, else left to the agent's own default, as in the person's shell. A step done by hand then
+/// changes the same configuration as the connector would.
+pub fn hand_command_in(
     profile: &Profile,
     variable: &str,
     command: &str,
     args: &[String],
-) -> String {
+) -> Option<String> {
+    let line = hand_command(command, args)?;
     if !profile.agent_home_set(variable) {
-        return shell_command(command, args);
+        return Some(line);
     }
-    format!(
-        "{}{}",
-        Environment::set(
-            variable,
-            &Environment::quote(&profile.agent_home(variable).to_string_lossy())
-        ),
-        shell_command(command, args)
-    )
+    let home = Environment::quote(&profile.agent_home(variable).to_string_lossy());
+    Some(format!("{}{line}", Environment::set(variable, &home)))
+}
+
+/// The step that runs `command args` by hand ([`hand_command_in`]) and changes `file`; when no line can be made
+/// safely, a note saying so in place of the command.
+pub fn cli_step(
+    profile: &Profile,
+    variable: &str,
+    command: &str,
+    args: &[String],
+    file: &Path,
+) -> ManualStep {
+    let file = Some(file.to_string_lossy().into_owned());
+    match hand_command_in(profile, variable, command, args) {
+        Some(line) => ManualStep {
+            command: Some(line),
+            snippet: None,
+            file,
+        },
+        None => ManualStep {
+            command: None,
+            snippet: Some(message(
+                "agents.manual.unsafe-command",
+                &json!({"program": command}),
+            )),
+            file,
+        },
+    }
 }
 
 #[derive(Serialize)]
@@ -473,6 +502,51 @@ pub fn bench_agents(request: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The shell reads each word as given, except where a batch shim would be re-parsed by `cmd.exe`: there no line
+    /// is made when any word has `& | < > ^ % !` or `"`.
+    #[test]
+    fn a_line_to_paste_is_made_only_where_the_shell_reads_it_as_written() {
+        let args = |words: &[&str]| strings(words);
+        let quoted = if cfg!(windows) {
+            "& 'claude' 'mcp' 'add'"
+        } else {
+            "'claude' 'mcp' 'add'"
+        };
+        assert_eq!(
+            hand_command("claude", &args(&["mcp", "add"])).as_deref(),
+            Some(quoted)
+        );
+        for metacharacter in ["&", "|", "<", ">", "^", "%", "!", "\""] {
+            let path = format!("C:\\R{metacharacter}D\\sidevoice");
+            // A batch shim, or a name that may be one: refused on Windows.
+            let expected = |line: String| (!cfg!(windows)).then_some(line);
+            assert_eq!(
+                hand_command("claude.cmd", &args(&["--", &path])),
+                expected(shell_command("claude.cmd", &args(&["--", &path]))),
+                "{metacharacter} in an argument of a .cmd"
+            );
+            assert_eq!(
+                hand_command(&format!("C:\\R{metacharacter}D\\claude.bat"), &[]),
+                expected(shell_command(
+                    &format!("C:\\R{metacharacter}D\\claude.bat"),
+                    &[]
+                )),
+                "{metacharacter} in the path of a .bat"
+            );
+            assert_eq!(
+                hand_command("claude", &args(&[&path])),
+                expected(shell_command("claude", &args(&[&path]))),
+                "{metacharacter} in an argument of an unknown target"
+            );
+            // An executable is started directly: PowerShell's quoting is enough (but for `"`, see `Env::quote`).
+            if metacharacter != "\"" {
+                assert!(hand_command("C:\\bin\\claude.exe", &args(&[&path])).is_some());
+            }
+        }
+        // Spaces and quotes of the typographic kind are not cmd.exe syntax.
+        assert!(hand_command("claude.cmd", &args(&["C:\\Program Files\\x", "it's"])).is_some());
+    }
+
     /// The older single-step fields: commands run in order, each once the one before succeeded; file steps keep the
     /// snippet that adds.
     #[test]

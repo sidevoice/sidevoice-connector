@@ -96,10 +96,19 @@ pub trait Env {
     /// to pass. PowerShell 7.3 and later (`$PSNativeCommandArgumentPassing` `Windows`, the default, or `Standard`)
     /// passes an `.exe` every argument as given, an empty one and one with `"` in it included. Windows PowerShell
     /// 5.1, and 7.3+ for `.cmd`/`.bat` targets (their `Legacy` rules), drop an empty argument and mangle an embedded
-    /// `"`; a line with neither is passed right by every version. That is the supported contract: no empty argument
-    /// and no `"` in one, which holds for the lines built with this (paths, flags, `NAME=value` with a path), and has
-    /// to, as an agent's CLI installed by npm is a `.cmd` shim on Windows.
+    /// `"`. A `.cmd`/`.bat` is also re-parsed by `cmd.exe`, to which `& | < > ^ % !` and `"` are syntax whatever
+    /// PowerShell quoted. So quoting is only half the contract: whoever builds a line to run by hand asks
+    /// [`Env::hand_safe`] first, and passes no empty argument.
     fn quote(value: &str) -> String;
+
+    /// Whether `program` with `args` can be written as one line to paste in this OS's shell and be read as the
+    /// words given (see [`Env::quote`]). Always on Unix. On Windows a line is safe when the program is an `.exe` or
+    /// `.com` (started directly), or when no word, the program included, has `&`, `|`, `<`, `>`, `^`, `%`, `!` or `"`:
+    /// any other target (a `.cmd`/`.bat` shim, or a name with no extension that may resolve to one) is re-parsed by
+    /// `cmd.exe`, which quoting for PowerShell does not protect against. When it is not safe, no line is made.
+    fn hand_safe(_program: &str, _args: &[&str]) -> bool {
+        true
+    }
 
     /// The start of a command line that sets `variable` to `quoted_value` (already [`Env::quote`]d) for the command
     /// that follows: `NAME='v' ` in a POSIX shell, `$env:NAME = 'v'; ` in PowerShell.

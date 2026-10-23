@@ -161,6 +161,19 @@ impl super::Env for Os {
         quoted
     }
 
+    fn hand_safe(program: &str, args: &[&str]) -> bool {
+        let direct = std::path::Path::new(program)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("com")
+            });
+        direct
+            || !std::iter::once(program)
+                .chain(args.iter().copied())
+                .any(|word| word.contains(['&', '|', '<', '>', '^', '%', '!', '"']))
+    }
+
     fn set(variable: &str, quoted_value: &str) -> String {
         format!("$env:{variable} = {quoted_value}; ")
     }

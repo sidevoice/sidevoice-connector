@@ -3,8 +3,8 @@
 
 use super::Claude;
 use crate::adapters::registration::{
-    run_required, shell_command_in, strings, AgentError, AgentHost, BenchSetup, Entry, Launch,
-    Manual, ManualStep, Registration,
+    cli_step, run_required, strings, AgentError, AgentHost, BenchSetup, Entry, Launch, Manual,
+    Registration,
 };
 use crate::profile::Profile;
 use futures_util::future::BoxFuture;
@@ -283,11 +283,7 @@ impl Registration for Claude {
         // `claude mcp` writes Claude Code's user configuration: the file each step changes. A step names
         // `CLAUDE_CONFIG_DIR` only when the person's environment sets it, as the connector runs the CLI.
         let file = super::user_config(profile);
-        let step = |args: &[String]| ManualStep {
-            command: Some(shell_command_in(profile, super::HOME.var, cli, args)),
-            snippet: None,
-            file: Some(file.to_string_lossy().into_owned()),
-        };
+        let step = |args: &[String]| cli_step(profile, super::HOME.var, cli, args, &file);
         // Ours is always in the user scope. Another entry may be in any scope, a project's or a local one relative to
         // the directory the person runs it in: without `--scope`, Claude Code removes it from the scope it is in.
         Manual::by_cli(
