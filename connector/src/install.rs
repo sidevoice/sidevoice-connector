@@ -70,8 +70,10 @@ pub fn binary() -> String {
 }
 /// How long the pair has to answer after a restart.
 const VERIFY_LIMIT: Duration = Duration::from_secs(60);
-/// What `uninstall` leaves in `D`: the lock files, the stop, and `Models`, the downloaded models the engine shares
-/// with the other programs (on macOS `D` is their folder too): not this connector's to remove.
+/// What `uninstall` leaves in `D`: the lock files, the stop, and `Models` (named by `sidevoice-platform`). The shared models
+/// are the engine's, never this connector's to remove; they live in the OS standard place (`data_dir::models_dir`), which
+/// is `D` itself when `D` is not overridden, so they are kept here so that an un-overridden `D` never loses them (when `D`
+/// is overridden they are not under it and this entry matches nothing).
 const KEPT: &[&str] = &[
     "install.lock",
     "connector.lock",
@@ -1326,8 +1328,8 @@ pub(crate) mod tests {
         // Uninstall: the releases and the data go; the locks and the stop stay.
         Files::write_json(&layout.data.join("outbox.json"), &json!([])).unwrap();
         crate::lock::try_lock(&layout.data.join("agents.lock"), "test").unwrap();
-        // The shared models are another program's: they and what is in them survive.
-        let models = data_dir::models_dir(&layout.data).join("other-program");
+        // The shared models are another program's: if they are in `D` (un-overridden), they and what is in them survive.
+        let models = layout.data.join(data_dir::MODELS).join("other-program");
         fs::create_dir_all(&models).unwrap();
         fs::write(models.join("sentinel"), "theirs").unwrap();
         let removed = uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
