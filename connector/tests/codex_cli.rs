@@ -15,7 +15,11 @@ fn codex_cli() -> Option<PathBuf> {
     let path = std::env::var_os("SIDEVOICE_TEST_CODEX")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/codex/node_modules/.bin/codex")
+            let bin =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/codex/node_modules/.bin");
+            // npm's shim, found the way the OS runs it: `codex.cmd` on Windows (the extensionless one beside it cannot
+            // run there), `codex` elsewhere.
+            which::which_in("codex", Some(&bin), &bin).unwrap_or_else(|_| bin.join("codex"))
         });
     if path.is_file() {
         // Keep npm's `.bin/codex` entry: canonicalizing it can turn the path into

@@ -32,19 +32,6 @@ pub(crate) fn mkdir(path: &Path) -> Result<()> {
     fs::create_dir_all(path).map_err(|error| format!("{}: {error}", path.display()))
 }
 
-/// Sets the Unix permission bits. Windows has none (a program is one by its `.exe` name): nothing to do.
-#[cfg(unix)]
-pub(crate) fn chmod(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .map_err(|error| format!("{}: {error}", path.display()))
-}
-
-#[cfg(not(unix))]
-pub(crate) fn chmod(_path: &Path, _mode: u32) -> Result<()> {
-    Ok(())
-}
-
 pub(crate) fn path_str(path: &Path) -> Result<&str> {
     path.to_str()
         .ok_or_else(|| format!("{}: not UTF-8", path.display()))
@@ -79,8 +66,15 @@ pub(crate) fn parse_json(bytes: &[u8], what: &str) -> Result<Value> {
 }
 
 /// Runs a program to completion and returns its standard output; a failure is an error with its standard error.
+/// `program` as the OS would find it on `PATH`, `PATHEXT` included: on Windows `npm` is `npm.cmd`, which `Command::new("npm")`
+/// does not resolve. A path that is not found is left as it is, so running it reports the error.
+pub(crate) fn resolve(program: &str) -> PathBuf {
+    which::which(program).unwrap_or_else(|_| PathBuf::from(program))
+}
+
 pub(crate) fn output(program: &str, args: &[&str], dir: Option<&Path>) -> Result<String> {
-    let mut command = Command::new(program);
+    // Rust runs a `.cmd` or `.bat` through `cmd.exe` with its own escaping (since 1.77), given its resolved path.
+    let mut command = Command::new(resolve(program));
     command.args(args);
     if let Some(dir) = dir {
         command.current_dir(dir);
@@ -174,16 +168,22 @@ pub(crate) fn file_record(path: &Path, name: &str) -> Result<Value> {
     Ok(json!({"name": name, "size": bytes.len(), "sha256": sha256(&bytes)}))
 }
 
+/// A path relative to an archive root as the archive, the inventory and the checks spell it: components joined by `/`
+/// on every host (a Windows `bin\sidevoice` is `bin/sidevoice`).
+pub(crate) fn archive_name(relative: &Path) -> String {
+    relative
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Every entry below `root`, as paths relative to it with whether each is a directory, sorted.
 pub(crate) fn walk(root: &Path) -> Result<Vec<(String, bool)>> {
     fn visit(root: &Path, dir: &Path, found: &mut Vec<(String, bool)>) -> Result<()> {
         for entry in fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))? {
             let path = entry.map_err(|error| error.to_string())?.path();
-            let relative = path
-                .strip_prefix(root)
-                .expect("below root")
-                .to_string_lossy()
-                .into_owned();
+            let relative = archive_name(path.strip_prefix(root).expect("below root"));
             let is_dir = path.is_dir();
             found.push((relative, is_dir));
             if is_dir {
@@ -241,6 +241,28 @@ mod tests {
     fn canonical_json_sorts_keys_and_ends_in_a_newline() {
         let value = json!({"b": 1, "a": {"d": 2, "c": 3}});
         assert_eq!(canonical(&value), b"{\"a\":{\"c\":3,\"d\":2},\"b\":1}\n");
+    }
+
+    #[test]
+    fn archive_names_join_components_with_a_slash_whatever_the_host() {
+        let relative: PathBuf = ["bin", "tools", "sidevoice"].iter().collect();
+        assert_eq!(archive_name(&relative), "bin/tools/sidevoice");
+        assert_eq!(archive_name(Path::new("connector.json")), "connector.json");
+    }
+
+    #[test]
+    fn a_walk_lists_nested_entries_with_slashes() {
+        let dir = TempDir::new("xtask-walk").unwrap();
+        mkdir(&dir.0.join("bin").join("deep")).unwrap();
+        write(&dir.0.join("bin").join("deep").join("tool"), b"").unwrap();
+        assert_eq!(
+            walk(&dir.0).unwrap(),
+            vec![
+                ("bin".to_string(), true),
+                ("bin/deep".to_string(), true),
+                ("bin/deep/tool".to_string(), false),
+            ]
+        );
     }
 
     #[test]

@@ -1,13 +1,15 @@
 //! `cargo xtask verify ARCHIVE`: unpack it elsewhere and run the connector from there, and the core it carries.
 //! `cargo xtask verify-floor ARCHIVE`: the same, running the connector on the oldest Linux it supports.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use serde_json::json;
 
 use crate::archive::unpack_checked;
 use crate::glibc;
+use crate::host::chmod;
+use crate::host::{clean_environment, scratch_base};
 use crate::util::*;
 use crate::{entrypoint, Result, PACKAGE};
 
@@ -186,30 +188,6 @@ fn in_container(image: &str, root: &Path, args: &[&str]) -> Result<Command> {
     Ok(command)
 }
 
-/// Where `verify` unpacks: a path with a space, away from the checkout (`/tmp`; Windows has no such place, so the
-/// user's temporary directory).
-fn scratch_base() -> PathBuf {
-    if cfg!(windows) {
-        std::env::temp_dir()
-    } else {
-        PathBuf::from("/tmp")
-    }
-}
-
-/// A clean environment: nothing the build or the runner set may stand in for what the binary carries. Windows
-/// programs need `SystemRoot` to start at all (Winsock, the loader), and look their DLLs up in System32.
-fn clean_environment(command: &mut Command) -> &mut Command {
-    command.env_clear();
-    if cfg!(windows) {
-        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-        command
-            .env("PATH", format!(r"{root}\System32"))
-            .env("SystemRoot", root)
-    } else {
-        command.env("PATH", "/usr/bin:/bin")
-    }
-}
-
 /// The DLLs a PE file imports (the import table; delay-loaded ones included).
 fn imported_dlls(binary: &str) -> Result<Vec<String>> {
     let data = read(Path::new(binary))?;
@@ -246,23 +224,53 @@ fn linked_libraries(binary: &str, target: &str) -> Result<Vec<String>> {
     }
 }
 
-/// Whether a Windows DLL is on every machine: an API set (resolved by the loader) or a file in System32, and not
-/// the Visual C++ runtime, which only some machines have (the binary links it statically, `+crt-static`).
-fn is_windows_system_dll(library: &str, system32: &Path) -> bool {
+/// The Windows system DLLs a binary may import, by name (lower case). A fixed baseline, not whatever the build runner's
+/// `System32` happens to hold: a newer runner image could carry a DLL that a supported older Windows does not. Every
+/// one is part of the Windows 10 and later system itself and documented as a Win32 API library on
+/// <https://learn.microsoft.com/en-us/windows/win32/api/> (the header's "Library" row names the DLL).
+/// A binary that imports another DLL fails `verify` on purpose: add it here once it is known to be on every
+/// supported Windows.
+const WINDOWS_SYSTEM: [&str; 24] = [
+    "advapi32.dll",
+    "bcrypt.dll",
+    "bcryptprimitives.dll",
+    "combase.dll",
+    "crypt32.dll",
+    "gdi32.dll",
+    "iphlpapi.dll",
+    "kernel32.dll",
+    "kernelbase.dll",
+    "mswsock.dll",
+    "ncrypt.dll",
+    "netapi32.dll",
+    "ntdll.dll",
+    "ole32.dll",
+    "oleaut32.dll",
+    "powrprof.dll",
+    "psapi.dll",
+    "rpcrt4.dll",
+    "secur32.dll",
+    "shell32.dll",
+    "user32.dll",
+    "userenv.dll",
+    "winmm.dll",
+    "ws2_32.dll",
+];
+
+/// Whether a Windows DLL is on every machine: one of [`WINDOWS_SYSTEM`], or an API set (`api-ms-win-*`,
+/// `ext-ms-win-*`: virtual names the loader resolves on the machine itself,
+/// <https://learn.microsoft.com/en-us/windows/win32/apiindex/windows-apisets>). Never the Visual C++ runtime, which
+/// only some machines have (the binary links it statically, `+crt-static`).
+fn is_windows_system_dll(library: &str) -> bool {
     let library = library.to_ascii_lowercase();
-    const RUNTIME: [&str; 5] = ["vcruntime", "msvcp", "concrt", "vccorlib", "vcomp"];
-    if RUNTIME.iter().any(|prefix| library.starts_with(prefix)) {
-        return false;
-    }
     library.starts_with("api-ms-win-")
         || library.starts_with("ext-ms-win-")
-        || system32.join(&library).is_file()
+        || WINDOWS_SYSTEM.contains(&library.as_str())
 }
 
 fn is_system_library(library: &str, target: &str) -> bool {
     if target.starts_with("windows-") {
-        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-        is_windows_system_dll(library, &Path::new(&root).join("System32"))
+        is_windows_system_dll(library)
     } else if target.starts_with("linux-") {
         LINUX_SYSTEM.contains(&library)
     } else {
@@ -294,16 +302,10 @@ mod tests {
 
     #[test]
     fn a_windows_binary_may_load_api_sets_and_system_dlls_but_not_the_visual_c_runtime() {
-        let system32 = TempDir::new("xtask-system32").unwrap();
-        write(&system32.0.join("kernel32.dll"), b"").unwrap();
-        write(&system32.0.join("vcruntime140.dll"), b"").unwrap();
-        assert!(is_windows_system_dll("KERNEL32.dll", &system32.0));
-        assert!(is_windows_system_dll(
-            "api-ms-win-core-synch-l1-2-0.dll",
-            &system32.0
-        ));
-        assert!(!is_windows_system_dll("vcruntime140.dll", &system32.0));
-        assert!(!is_windows_system_dll("MSVCP140.dll", &system32.0));
-        assert!(!is_windows_system_dll("libzstd.dll", &system32.0));
+        assert!(is_windows_system_dll("KERNEL32.dll"));
+        assert!(is_windows_system_dll("api-ms-win-core-synch-l1-2-0.dll"));
+        assert!(!is_windows_system_dll("vcruntime140.dll"));
+        assert!(!is_windows_system_dll("MSVCP140.dll"));
+        assert!(!is_windows_system_dll("libzstd.dll"));
     }
 }

@@ -10,6 +10,7 @@ use serde_json::json;
 
 use crate::archive::write_archive;
 use crate::glibc;
+use crate::host::chmod;
 use crate::notices::stage_notices;
 use crate::util::*;
 use crate::verify::verify;

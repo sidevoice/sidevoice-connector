@@ -39,9 +39,9 @@ jobs:
           - { target: macos-aarch64, runner: macos-15 }
           - { target: linux-x86_64, runner: ubuntu-24.04 }
           - { target: linux-aarch64, runner: ubuntu-24.04-arm }
-          # Native on its own runner, like the others: MSVC, C runtime linked statically (.cargo/config.toml). Its core
-          # must be a release that publishes a windows-x86_64 archive (core.pin): `cargo xtask fixtures` says so when not.
-          - { target: windows-x86_64, runner: windows-2025 }
+          # windows-x86_64 (runner: windows-2025, native, C runtime linked statically in .cargo/config.toml) is not
+          # here until the pinned core publishes a windows-x86_64 archive (core.pin) and `released` is set in
+          # xtask/src/main.rs: RELEASING.md, "Windows x64".
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -92,7 +92,7 @@ jobs:
       - run: cargo xtask publish dist "$TAG"
 
   # Versioned releases only, never the nightly: the npm packages of the assets the Release just published (read back
-  # and checked against SHA256SUMS and the attestation), by trusted publishing (OIDC; no token exists): the four
+  # and checked against SHA256SUMS and the attestation), by trusted publishing (OIDC; no token exists): the three
   # platform packages, then the launcher `sidevoice` staged for a maintainer's approval on npmjs.com. RELEASING.md.
   npm:
     name: Publish to npm

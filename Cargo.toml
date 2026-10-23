@@ -19,6 +19,8 @@ object = { version = "0.40", default-features = false, features = ["read_core", 
 serde_json = "1"
 sha2 = "0.10"
 tar = "0.4"
+# Programs are found the way the OS finds them, `PATHEXT` included (`npm` is `npm.cmd` on Windows): xtask/src/util.rs.
+which = "=8.0.6"
 zstd = "0.13"
 
 [workspace]

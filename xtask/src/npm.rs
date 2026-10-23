@@ -28,10 +28,11 @@ use std::process::{Command, Stdio};
 use serde_json::{json, Value};
 
 use crate::archive::unpack_checked;
+use crate::host::chmod;
 use crate::manifest::published_name;
 use crate::publish::{gh, signer, verify_attestation};
 use crate::util::*;
-use crate::{target_names, Result, INVENTORY, TARGETS};
+use crate::{released_names, Result, INVENTORY, TARGETS};
 
 /// Where `cargo xtask npm` leaves the packed packages (emptied first).
 pub(crate) const OUT_DIR: &str = "target/npm";
@@ -149,7 +150,7 @@ pub(crate) fn launcher_manifest(version: &str) -> Result<Value> {
          call. Run `npx sidevoice install` on the machine where your agents run.",
     );
     let mut dependencies = serde_json::Map::new();
-    for target in target_names() {
+    for target in released_names() {
         dependencies.insert(platform_package(target)?, version.into());
     }
     manifest["keywords"] = json!([
@@ -183,6 +184,7 @@ fn platform_readme(target: &str, version: &str) -> Result<String> {
 fn launcher_readme(version: &str) -> Result<String> {
     let platforms: Vec<String> = TARGETS
         .iter()
+        .filter(|target| target.released)
         .map(|target| match target.npm_os {
             "darwin" => format!("- macOS on {} (`darwin-{}`)", mac_cpu(target.npm_cpu), target.npm_cpu),
             "linux" => format!(
@@ -719,7 +721,7 @@ pub(crate) fn publish(tag: &str) -> Result<()> {
     ])?;
     let sums = parse_sums(&read(&assets.0.join("SHA256SUMS"))?)?;
     let mut archives = Vec::new();
-    for target in target_names() {
+    for target in released_names() {
         let name = published_name(version, target);
         let path = assets.0.join(&name);
         let listed = sums
@@ -880,8 +882,7 @@ mod tests {
             manifest["optionalDependencies"],
             json!({"@sidevoice/sidevoice-darwin-arm64": "0.7.0-rc.1",
                    "@sidevoice/sidevoice-linux-arm64": "0.7.0-rc.1",
-                   "@sidevoice/sidevoice-linux-x64": "0.7.0-rc.1",
-                   "@sidevoice/sidevoice-win32-x64": "0.7.0-rc.1"})
+                   "@sidevoice/sidevoice-linux-x64": "0.7.0-rc.1"})
         );
         assert!(manifest.get("dependencies").is_none());
     }
@@ -955,12 +956,12 @@ mod tests {
             "macOS on Apple silicon (`darwin-arm64`)",
             "Linux on x64 (`linux-x64`) with glibc 2.28 or newer",
             "Linux on arm64 (`linux-arm64`)",
-            "Windows on x64 (`win32-x64`)",
             "(0.7.0)",
             "https://github.com/sidevoice/sidevoice-connector",
         ] {
             assert!(readme.contains(wanted), "{wanted}: {readme}");
         }
+        assert!(!readme.contains("Windows"), "{readme}");
     }
 
     #[test]

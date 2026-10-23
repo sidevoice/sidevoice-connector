@@ -25,7 +25,10 @@ pub(crate) fn codex(dir: &Path) -> Result<()> {
         ],
         None,
     )?;
-    let binary = dir.join("node_modules/.bin/codex");
+    // npm's shim: `codex` on Unix, `codex.cmd` on Windows (beside an extensionless one that cannot run there).
+    let bin = dir.join("node_modules/.bin");
+    let binary = which::which_in("codex", Some(&bin), dir)
+        .map_err(|error| format!("no codex in {}: {error}", bin.display()))?;
     let version = output(path_str(&binary)?, &["--version"], None)?;
     if !version.contains(VERSION) {
         return Err(format!(

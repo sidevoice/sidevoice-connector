@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::glibc;
+use crate::host::chmod;
 use crate::util::*;
 use crate::{entrypoint, target_names, Result, CORE_DIR, INVENTORY, KIND, ROOT_NAME};
 
