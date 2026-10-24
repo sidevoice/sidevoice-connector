@@ -273,13 +273,14 @@ impl Profile {
         Ok(())
     }
 
-    /// Before an agent's configuration is read or changed: it is a configuration home this profile names, and, when
-    /// it exists, a directory of the person's that nobody else can change. A home not there yet (an agent installed
-    /// but never started) is not unsafe, as [`Self::validate_existing_private`] holds for every home: what is checked
-    /// there is whatever could have been replaced, and the directory it would be made in (the home, or the parent
-    /// of a home checked through it) is checked by that call; the agent's own CLI makes it there, as on its first
-    /// start (sidevoice/sidevoice-connector#266). Anything at the path, a dangling link included, is checked.
-    /// Whoever reads or writes inside the home itself still needs it to exist ([`Self::agent_root`]).
+    /// Before an agent's configuration is read or changed: it is a configuration home this profile names, and a
+    /// directory of the person's that nobody else can change. A home not there yet (an agent installed but never
+    /// started, sidevoice/sidevoice-connector#266) is let through for the agent's own CLI to make, as its first start
+    /// would, only where nobody else could plant something there first: the nearest directory that exists above it
+    /// must pass the same check (the one an existing home, or the parent of a home checked through it, gets), and so
+    /// must every directory from there up to the person's home when it is inside it. Anything at the path, a
+    /// dangling link included, is checked as a home. Whoever reads or writes inside the home itself still needs it to
+    /// exist ([`Self::agent_root`]).
     pub fn validate_for_agent(&self, config_root: &Path) -> Result<()> {
         self.validate_existing_private()?;
         if !self
@@ -290,12 +291,32 @@ impl Profile {
             bail!("unknown agent configuration directory");
         }
         match fs::symlink_metadata(config_root) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.check_where_missing_home_is_made(config_root)
+            }
             _ => {
                 Files::check_user_directory(config_root)?;
+                Ok(())
             }
         }
-        Ok(())
+    }
+
+    /// For a home that does not exist: the nearest existing directory above it, and each one from there up to the
+    /// person's home when it is inside it, is a directory of the person's that nobody else can change.
+    fn check_where_missing_home_is_made(&self, config_root: &Path) -> Result<()> {
+        for dir in config_root.ancestors().skip(1) {
+            match fs::symlink_metadata(dir) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+                Ok(_) => {}
+            }
+            Files::check_user_directory(dir)
+                .with_context(|| format!("where {} would be made", config_root.display()))?;
+            if dir == self.home || !dir.starts_with(&self.home) {
+                return Ok(());
+            }
+        }
+        bail!("no directory exists above {}", config_root.display())
     }
 
     /// The directory an agent's configuration files must stay inside: its own, canonical.
@@ -580,6 +601,52 @@ mod tests {
 
         Files::symlink(scratch.path().join("nowhere"), &home);
         assert!(profile.validate_for_agent(&home).is_err());
+    }
+
+    /// A missing home is let through only where nobody else could plant something first: its default under a home of
+    /// the person's passes, the same home named below a directory others can change, at any depth, is refused.
+    #[test]
+    fn a_missing_agent_home_where_others_could_make_it_first_is_refused() {
+        let scratch = crate::test_support::temp_dir("missing-home-parent");
+        let home = scratch.path().join("home");
+        Files::ensure_private_dir(&home).unwrap();
+        let shared = scratch.path().join("shared");
+        Files::ensure_private_dir(&shared).unwrap();
+        Files::let_others_change(&shared);
+        let data = scratch.path().join("data");
+        let profile_with = |alpha: Option<&Path>| {
+            let mut pairs = vec![
+                (Environment::HOME, home.to_str().unwrap()),
+                ("SIDEVOICE_DATA_DIR", data.to_str().unwrap()),
+            ];
+            if let Some(alpha) = alpha {
+                pairs.push(("ALPHA_HOME", alpha.to_str().unwrap()));
+            }
+            Profile::from_vars(vars(&pairs), &HOMES).unwrap()
+        };
+        let alpha = |profile: &Profile| profile.agent_home("ALPHA_HOME").to_path_buf();
+
+        let default = profile_with(None);
+        assert_eq!(alpha(&default), home.join(".alpha"));
+        default.validate_for_agent(&alpha(&default)).unwrap();
+
+        for named in [shared.join("alpha"), shared.join("deeper/still/alpha")] {
+            let custom = profile_with(Some(&named));
+            assert!(
+                custom.validate_for_agent(&alpha(&custom)).is_err(),
+                "{} was let through",
+                named.display()
+            );
+        }
+        // Inside the home, every directory up to it is judged, not only the nearest.
+        let inner = home.join("open");
+        Files::ensure_private_dir(&inner.join("private")).unwrap();
+        Files::let_others_change(&inner);
+        let nested = profile_with(Some(&inner.join("private/alpha")));
+        assert!(nested.validate_for_agent(&alpha(&nested)).is_err());
+        Files::shut_others_out(&shared);
+        let custom = profile_with(Some(&shared.join("alpha")));
+        custom.validate_for_agent(&alpha(&custom)).unwrap();
     }
 
     #[test]
