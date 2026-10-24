@@ -154,8 +154,8 @@ async fn replacement_with_same_size_and_mtime_is_probed_again() {
     let program = fixture.program(fixture.dir.path(), "0.157.0");
     fixture.deliver().await.unwrap();
     let before = fs::metadata(&program).unwrap();
-    // Keep both files alive before replacement, guaranteeing a distinct inode/creation time.
-    std::thread::sleep(Duration::from_millis(30));
+    // Keep both files alive before replacement so the inode/file index cannot be reused.
+    // Windows may preserve the old creation time when the replacement is renamed.
     let replacement = fixture.program(&fixture.dir.path().join("staging"), "0.158.0");
     fs::File::options()
         .write(true)

@@ -15,7 +15,7 @@ pub use imp::Os as FileIdentity;
 /// The identity/change fields the host adds to a file's portable metadata.
 pub trait FileIdentities {
     /// Returns host identity or change-time fields to supplement size and mtime.
-    fn change(metadata: &fs::Metadata) -> [u64; 4];
+    fn change(path: &Path, metadata: &fs::Metadata) -> io::Result<[u64; 4]>;
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -31,11 +31,12 @@ impl Stamp {
     pub fn read(path: &Path) -> io::Result<Self> {
         let path = fs::canonicalize(path)?;
         let metadata = fs::metadata(&path)?;
+        let change = FileIdentity::change(&path, &metadata)?;
         Ok(Self {
             path,
             len: metadata.len(),
             modified: metadata.modified()?,
-            change: FileIdentity::change(&metadata),
+            change,
         })
     }
 }
