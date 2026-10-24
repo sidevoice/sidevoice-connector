@@ -1,6 +1,6 @@
 //! Where Codex's CLI is when it is not on `PATH` because it lives inside the ChatGPT desktop app. `PATH` is looked
-//! at first (`agents::find_binary`); these are the fallbacks, each paired with the directory of this user's it must
-//! be under, judged by `Env::trusted_program` before one is used. Nothing here starts a program.
+//! at first (`agents::find_binary`); these are the fallbacks, taken as a program found on `PATH` is: the first that
+//! exists and can be run is used (`agents::first_runnable`). Nothing here starts a program.
 
 use crate::adapters::markers::Roots;
 use crate::platform::env::{Env, Environment};
@@ -9,14 +9,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// The candidates as (root, program), in the order they are tried.
+/// The candidates, in the order they are tried.
 ///
 /// - Windows: the copy the app makes of its bundled `codex.exe` for the user, `<app programs>\OpenAI\Codex\bin\
 ///   <hash>\codex.exe`, newest first (that "newest" is an assumption). The Store package's own copy is not a
 ///   candidate: it is reported as not runnable by the user.
 /// - macOS: the CLI inside the app bundle, in `/Applications` and in `~/Applications`, in the layout of the current
 ///   app and in the older one.
-pub(super) fn fallbacks(roots: &Roots) -> Vec<(PathBuf, PathBuf)> {
+pub(super) fn fallbacks(roots: &Roots) -> Vec<PathBuf> {
     let exe = Host::exe_name("codex");
     let mut found = Vec::new();
     if let Some(programs) = roots
@@ -24,24 +24,18 @@ pub(super) fn fallbacks(roots: &Roots) -> Vec<(PathBuf, PathBuf)> {
         .as_deref()
         .and_then(Environment::per_user_app_programs)
     {
-        let cache = programs.join("OpenAI").join("Codex").join("bin");
-        found.extend(
-            cached_copies(&cache, &exe)
-                .into_iter()
-                .map(|program| (programs.clone(), program)),
-        );
+        found.extend(cached_copies(
+            &programs.join("OpenAI").join("Codex").join("bin"),
+            &exe,
+        ));
     }
-    let home_apps = roots.home.join("Applications");
-    for (root, apps) in [
-        (
-            PathBuf::from("/Applications"),
-            PathBuf::from("/Applications"),
-        ),
-        (roots.home.clone(), home_apps),
+    for apps in [
+        PathBuf::from("/Applications"),
+        roots.home.join("Applications"),
     ] {
         let resources = apps.join("ChatGPT.app/Contents/Resources");
-        found.push((root.clone(), resources.join("codex-cli/bin").join(&exe)));
-        found.push((root, resources.join(&exe)));
+        found.push(resources.join("codex-cli/bin").join(&exe));
+        found.push(resources.join(&exe));
     }
     found
 }
@@ -126,42 +120,17 @@ mod tests {
             program_files: None,
         };
         let exe = Host::exe_name("codex");
-        let found = fallbacks(&roots);
         let resources = "ChatGPT.app/Contents/Resources";
-        assert_eq!(found.len(), 4);
-        assert_eq!(found[0].0, Path::new("/Applications"));
+        let system = Path::new("/Applications").join(resources);
+        let home = roots.home.join("Applications").join(resources);
         assert_eq!(
-            found[0].1,
-            Path::new("/Applications")
-                .join(resources)
-                .join("codex-cli/bin")
-                .join(&exe)
-        );
-        assert_eq!(found[2].0, roots.home);
-        assert_eq!(
-            found[3].1,
-            roots.home.join("Applications").join(resources).join(&exe)
-        );
-    }
-
-    #[test]
-    fn a_trusted_cached_copy_is_used_when_the_better_one_is_refused() {
-        let dir = crate::test_support::temp_dir("codex-resolve");
-        let exe = Host::exe_name("codex");
-        let programs = dir.path().to_path_buf();
-        let cache = programs.join("OpenAI/Codex/bin");
-        let (old, new) = (cache.join("aaa").join(&exe), cache.join("bbb").join(&exe));
-        program(&old, 1);
-        program(&new, 9);
-        use crate::platform::fs::TestFiles;
-        Files::let_others_change(&new);
-        let candidates = cached_copies(&cache, &exe)
-            .into_iter()
-            .map(|program| (programs.clone(), program))
-            .collect();
-        assert_eq!(
-            crate::agents::first_trusted(candidates).as_deref(),
-            old.to_str()
+            fallbacks(&roots),
+            vec![
+                system.join("codex-cli/bin").join(&exe),
+                system.join(&exe),
+                home.join("codex-cli/bin").join(&exe),
+                home.join(&exe),
+            ]
         );
     }
 }
