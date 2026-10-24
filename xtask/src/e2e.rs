@@ -11,6 +11,9 @@
 //! 4. `agents` finds both agents; `agents connect` registers Sidevoice with each, which lands in the agent's own
 //!    configuration (`claude mcp list` and `~/.claude.json`; `codex mcp get` and `~/.codex/config.toml`) naming the
 //!    installation's command, and the agents' rows say connected with a working registration.
+//!    Then the agents are moved to where their desktop apps keep them (nothing of them left on `PATH`, except Codex on
+//!    Linux, which has no app there) and the same is asserted again: found, working, disconnected and connected
+//!    through the fallback (`connector/src/adapters/{claude,codex}/binary.rs`).
 //! 5. `uninstall` from the unpacked archive (Windows cannot delete a running program, so never from the release):
 //!    no job left in the manager and no definition, no process of the installation, no release, the agents'
 //!    registrations gone from their configuration, and nothing in the data directory but what uninstall keeps on
@@ -566,6 +569,9 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
         ],
         Duration::from_secs(300),
     )?;
+    // The CLIs the rest of the test runs: the ones on PATH, until they are moved to the apps' places.
+    let mut claude_cli = resolve("claude");
+    let mut codex_cli = resolve("codex");
     for (cli, version) in [("claude", CLAUDE_CODE_VERSION), ("codex", codex::VERSION)] {
         let found = which::which(cli)
             .map_err(|error| format!("{cli} is not on PATH after npm install: {error}"))?;
@@ -732,44 +738,67 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
             format!("{} is not there after connecting {agent}", home.display())
         })?;
     }
-    let claude_listed = run_ok("claude", &["mcp", "list"], Duration::from_secs(120))?;
-    println!("claude mcp list:\n{claude_listed}");
-    check(claude_listed.contains("sidevoice:"), || {
-        format!("claude mcp list does not list sidevoice: {claude_listed}")
-    })?;
-    let claude = machine
-        .claude_config()?
-        .ok_or("no ~/.claude.json after connecting Claude Code")?;
-    let entry = &claude["mcpServers"]["sidevoice"];
-    check(entry["command"] == command.as_str(), || {
-        format!("~/.claude.json's sidevoice entry does not run {command}: {entry}")
-    })?;
-    let codex_entry = run_ok("codex", &["mcp", "get", "sidevoice", "--json"], LIMIT)?;
-    println!("codex mcp get sidevoice: {}", codex_entry.trim());
-    let codex = machine
-        .codex_config()?
-        .ok_or("no ~/.codex/config.toml after connecting Codex")?;
-    let entry = codex
-        .get("mcp_servers")
-        .and_then(|servers| servers.get("sidevoice"))
-        .ok_or("~/.codex/config.toml has no [mcp_servers.sidevoice]")?;
-    check(
-        entry.get("command").and_then(toml::Value::as_str) == Some(command.as_str()),
-        || format!("~/.codex/config.toml's sidevoice entry does not run {command}: {entry}"),
-    )?;
+    registered(machine, &stable, &command, &claude_cli, &codex_cli)?;
+
+    step("agents in the desktop apps' places: moved off PATH, found, still working, disconnected and connected");
+    let (claude_app, codex_app) = move_to_apps(machine, &mut claude_cli, &mut codex_cli)?;
+    println!("claude at {}", claude_app.display());
+    match &codex_app {
+        Some(path) => println!("codex at {}", path.display()),
+        None => println!(
+            "codex stays on PATH: no desktop app keeps it on {}",
+            env::consts::OS
+        ),
+    }
     let listed = ok(
         sidevoice(&stable, &["agents"], Duration::from_secs(120))?,
         "agents",
     )?;
     for agent in ["claude", "codex"] {
         let row = agent_row(&listed, agent)?;
+        check(row["present"] == true, || {
+            format!("{agent} is not found at the app's place: {row}")
+        })?;
         check(row["registration"] == "connected", || {
-            format!("{agent} is not connected: {row}")
+            format!("{agent} is not connected, read through the app's copy: {row}")
         })?;
         check(row["health"]["state"] == "working", || {
-            format!("{agent}'s registration does not work: {}", row["health"])
+            format!(
+                "{agent}'s registration does not work, read through the app's copy: {}",
+                row["health"]
+            )
         })?;
     }
+    for agent in ["claude", "codex"] {
+        ok(
+            sidevoice(
+                &stable,
+                &["agents", "disconnect", agent],
+                Duration::from_secs(120),
+            )?,
+            &format!("agents disconnect {agent}"),
+        )?;
+    }
+    let listed = ok(
+        sidevoice(&stable, &["agents"], Duration::from_secs(120))?,
+        "agents",
+    )?;
+    for agent in ["claude", "codex"] {
+        let row = agent_row(&listed, agent)?;
+        check(
+            row["present"] == true && row["registration"] == "not-connected",
+            || format!("{agent} is not found and unconnected after disconnecting: {row}"),
+        )?;
+        ok(
+            sidevoice(
+                &stable,
+                &["agents", "connect", agent],
+                Duration::from_secs(120),
+            )?,
+            &format!("agents connect {agent} through the app's copy"),
+        )?;
+    }
+    registered(machine, &stable, &command, &claude_cli, &codex_cli)?;
 
     step("uninstall, from the package");
     let removed = ok(
@@ -824,7 +853,7 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
             format!("left in {}: {extra:?}", machine.data.display())
         })?;
     }
-    let claude_listed = run_ok("claude", &["mcp", "list"], Duration::from_secs(120))?;
+    let claude_listed = run_ok_path(&claude_cli, &["mcp", "list"], Duration::from_secs(120))?;
     check(!claude_listed.contains("sidevoice:"), || {
         format!("claude mcp list still lists sidevoice: {claude_listed}")
     })?;
@@ -843,7 +872,7 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
     }
     // Codex's own word, as for Claude Code above: it must fail, saying there is no such server (the wording the
     // connector itself reads as absent, `adapters::registration::looks_absent`).
-    let codex_entry = run("codex", &["mcp", "get", "sidevoice", "--json"], LIMIT)?;
+    let codex_entry = run_path(&codex_cli, &["mcp", "get", "sidevoice", "--json"], LIMIT)?;
     let said = format!("{}{}", codex_entry.stdout, codex_entry.stderr).to_ascii_lowercase();
     println!("codex mcp get sidevoice after uninstall: {}", said.trim());
     check(
@@ -868,6 +897,190 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
     })?;
     println!("\ne2e: install, pair-device, agents connect and uninstall all as promised");
     Ok(())
+}
+
+/// Sidevoice is registered with both agents, in each one's own configuration and by its own CLI, and the connector's
+/// rows say connected and working.
+fn registered(
+    machine: &Machine,
+    stable: &Path,
+    command: &str,
+    claude_cli: &Path,
+    codex_cli: &Path,
+) -> Result<()> {
+    let claude_listed = run_ok_path(claude_cli, &["mcp", "list"], Duration::from_secs(120))?;
+    println!("claude mcp list:\n{claude_listed}");
+    check(claude_listed.contains("sidevoice:"), || {
+        format!("claude mcp list does not list sidevoice: {claude_listed}")
+    })?;
+    let claude = machine
+        .claude_config()?
+        .ok_or("no ~/.claude.json after connecting Claude Code")?;
+    let entry = &claude["mcpServers"]["sidevoice"];
+    check(entry["command"] == command, || {
+        format!("~/.claude.json's sidevoice entry does not run {command}: {entry}")
+    })?;
+    let codex_entry = run_ok_path(codex_cli, &["mcp", "get", "sidevoice", "--json"], LIMIT)?;
+    println!("codex mcp get sidevoice: {}", codex_entry.trim());
+    let codex = machine
+        .codex_config()?
+        .ok_or("no ~/.codex/config.toml after connecting Codex")?;
+    let entry = codex
+        .get("mcp_servers")
+        .and_then(|servers| servers.get("sidevoice"))
+        .ok_or("~/.codex/config.toml has no [mcp_servers.sidevoice]")?;
+    check(
+        entry.get("command").and_then(toml::Value::as_str) == Some(command),
+        || format!("~/.codex/config.toml's sidevoice entry does not run {command}: {entry}"),
+    )?;
+    let listed = ok(
+        sidevoice(stable, &["agents"], Duration::from_secs(120))?,
+        "agents",
+    )?;
+    for agent in ["claude", "codex"] {
+        let row = agent_row(&listed, agent)?;
+        check(row["registration"] == "connected", || {
+            format!("{agent} is not connected: {row}")
+        })?;
+        check(row["health"]["state"] == "working", || {
+            format!("{agent}'s registration does not work: {}", row["health"])
+        })?;
+    }
+    Ok(())
+}
+
+/// The program called `exe` (the native one, not npm's script shim) inside `package`: the largest file of that name
+/// of at least `least` bytes. The shim and any wrapper are far smaller.
+fn native_program(package: &Path, exe: &str, least: u64) -> Option<PathBuf> {
+    let mut best: Option<(u64, PathBuf)> = None;
+    let mut pending = vec![package.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                pending.push(path);
+            } else if meta.len() >= least
+                && path.file_name().is_some_and(|name| name == exe)
+                && best.as_ref().is_none_or(|(size, _)| meta.len() > *size)
+            {
+                best = Some((meta.len(), path));
+            }
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// Copies `from` to `to` (making its folders) as the app would have put it there.
+fn place(from: &Path, to: &Path) -> Result<()> {
+    let parent = to.parent().ok_or("no parent")?;
+    fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+    fs::copy(from, to)
+        .map_err(|error| format!("{} to {}: {error}", from.display(), to.display()))?;
+    println!("placed {} at {}", from.display(), to.display());
+    Ok(())
+}
+
+/// Moves the npm-installed CLIs to where the desktop apps keep theirs, exactly where the connector looks
+/// (`connector/src/adapters/{claude,codex}/binary.rs`), and removes them from npm so nothing is left on `PATH`.
+/// Claude Code: Windows, the Claude MSIX package's `claude-code\<version>\<hash>`; elsewhere `~/.claude/local` (a
+/// fallback place on no `PATH`; `~/.claude` exists by now). Codex: Windows, the ChatGPT app's cache
+/// `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>`; macOS, `~/Applications/ChatGPT.app`'s bundle; Linux has no app, so it
+/// stays where npm put it. Returns where each now is (`None`: still on `PATH`) and sets the two CLI paths to use.
+fn move_to_apps(
+    machine: &Machine,
+    claude_cli: &mut PathBuf,
+    codex_cli: &mut PathBuf,
+) -> Result<(PathBuf, Option<PathBuf>)> {
+    let root = PathBuf::from(run_ok("npm", &["root", "--global"], LIMIT)?.trim());
+    let windows = machine.os == Os::Windows;
+    let claude_exe = if windows { "claude.exe" } else { "claude" };
+    let codex_exe = if windows { "codex.exe" } else { "codex" };
+    // Real programs are tens of megabytes; the Codex detector itself skips a copy under 4 MiB.
+    let least = 4 * 1024 * 1024;
+    let claude_from = native_program(&root.join("@anthropic-ai"), claude_exe, least)
+        .ok_or_else(|| format!("no native {claude_exe} under {}", root.display()))?;
+    let codex_from = native_program(&root.join("@openai"), codex_exe, least)
+        .ok_or_else(|| format!("no native {codex_exe} under {}", root.display()))?;
+    let local = || var("LOCALAPPDATA").map(PathBuf::from);
+    let claude_to = match machine.os {
+        Os::Windows => local()?
+            .join("Packages/Claude_e2e0000000000/LocalCache/Roaming/Claude/claude-code")
+            .join(CLAUDE_CODE_VERSION)
+            .join("e2e")
+            .join(claude_exe),
+        _ => machine.home.join(".claude/local").join(claude_exe),
+    };
+    let codex_to = match machine.os {
+        Os::Windows => Some(local()?.join("OpenAI/Codex/bin/e2e").join(codex_exe)),
+        Os::Macos => Some(
+            machine
+                .home
+                .join("Applications/ChatGPT.app/Contents/Resources/codex-cli/bin")
+                .join(codex_exe),
+        ),
+        Os::Linux => None,
+    };
+    place(&claude_from, &claude_to)?;
+    if let Some(to) = &codex_to {
+        place(&codex_from, to)?;
+    }
+    let mut args = vec![
+        "uninstall",
+        "--global",
+        "--no-audit",
+        "--no-fund",
+        "@anthropic-ai/claude-code",
+    ];
+    if codex_to.is_some() {
+        args.push("@openai/codex");
+    }
+    run_ok("npm", &args, Duration::from_secs(300))?;
+    check(which::which("claude").is_err(), || {
+        format!("claude is still on PATH: {:?}", which::which("claude"))
+    })?;
+    if codex_to.is_some() {
+        check(which::which("codex").is_err(), || {
+            format!("codex is still on PATH: {:?}", which::which("codex"))
+        })?;
+    }
+    for (cli, version, path) in [
+        ("claude", CLAUDE_CODE_VERSION, Some(&claude_to)),
+        ("codex", codex::VERSION, codex_to.as_ref()),
+    ] {
+        if let Some(path) = path {
+            let said = run_path(path, &["--version"], LIMIT)?;
+            check(said.ok && said.stdout.contains(version), || {
+                format!(
+                    "{cli} at {} says {:?} {:?}",
+                    path.display(),
+                    said.stdout,
+                    said.stderr
+                )
+            })?;
+        }
+    }
+    *claude_cli = claude_to.clone();
+    if let Some(to) = &codex_to {
+        *codex_cli = to.clone();
+    }
+    Ok((claude_to, codex_to))
+}
+
+fn run_ok_path(program: &Path, args: &[&str], limit: Duration) -> Result<String> {
+    let ran = run_path(program, args, limit)?;
+    if !ran.ok {
+        return Err(format!(
+            "{} {}: {}{}",
+            program.display(),
+            args.join(" "),
+            ran.stderr,
+            ran.stdout
+        ));
+    }
+    Ok(ran.stdout)
 }
 
 fn run_ok(program: &str, args: &[&str], limit: Duration) -> Result<String> {
