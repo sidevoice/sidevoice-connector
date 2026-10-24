@@ -45,6 +45,43 @@ pub fn socket_path(home: &Path) -> PathBuf {
     home.join(SOCKET)
 }
 
+/// Log-safe reasons. Never retain daemon error messages/data or transport error text here.
+#[derive(Debug)]
+pub enum Failure {
+    NoSocket(PathBuf),
+    VersionTooOld,
+    VersionUnknown,
+    Rpc {
+        method: &'static str,
+        code: Option<i64>,
+    },
+    Timeout,
+    NoRunningTurn,
+    InvalidReply,
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSocket(path) => write!(out, "reason=no-socket socket={path:?}"),
+            Self::VersionTooOld => out.write_str("reason=version-too-old"),
+            Self::VersionUnknown => out.write_str("reason=version-unparseable"),
+            Self::Rpc { method, code } => {
+                write!(out, "reason=rpc-error method={method}")?;
+                if let Some(code) = code {
+                    write!(out, " code={code}")?;
+                }
+                Ok(())
+            }
+            Self::Timeout => out.write_str("reason=timeout"),
+            Self::NoRunningTurn => out.write_str("reason=no-running-turn"),
+            Self::InvalidReply => out.write_str("reason=invalid-reply"),
+        }
+    }
+}
+
+impl std::error::Error for Failure {}
+
 type Socket = tokio_tungstenite::WebSocketStream<ForeignStream>;
 
 /// Steers the active turn of `thread` with `text`, naming the message `message_id` (Codex's `clientUserMessageId`,
@@ -72,7 +109,7 @@ pub async fn steer(socket: &Path, thread: &str, message_id: &str, text: &str) ->
             json!({"threadId":thread,"limit":1,"sortDirection":"desc","itemsView":"notLoaded"}),
         )
         .await?;
-        let turn = active_turn(&turns).context("no running turn to steer")?;
+        let turn = active_turn(&turns).context(Failure::NoRunningTurn)?;
         let answer = request(
             &mut ws,
             3,
@@ -86,10 +123,10 @@ pub async fn steer(socket: &Path, thread: &str, message_id: &str, text: &str) ->
             .get("turnId")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .context("steer answer without a turn id")
+            .context(Failure::InvalidReply)
     })
     .await
-    .map_err(|_| anyhow!("Codex steer timed out"))?
+    .map_err(|_| anyhow!(Failure::Timeout))?
 }
 
 /// The id of the newest turn when it is still running.
@@ -107,7 +144,7 @@ async fn notify(ws: &mut Socket, method: &str) -> Result<()> {
 }
 
 /// One request and its answer; notifications and requests the server sends meanwhile are not ours.
-async fn request(ws: &mut Socket, id: u64, method: &str, params: Value) -> Result<Value> {
+async fn request(ws: &mut Socket, id: u64, method: &'static str, params: Value) -> Result<Value> {
     ws.send(Message::text(
         json!({"id":id,"method":method,"params":params}).to_string(),
     ))
@@ -123,12 +160,12 @@ async fn request(ws: &mut Socket, id: u64, method: &str, params: Value) -> Resul
             continue;
         }
         if let Some(error) = frame.get("error") {
-            bail!("Codex {method} refused: {error}");
+            bail!(Failure::Rpc {
+                method,
+                code: error.get("code").and_then(Value::as_i64),
+            });
         }
-        return frame
-            .get("result")
-            .cloned()
-            .context("answer without result");
+        return frame.get("result").cloned().context(Failure::InvalidReply);
     }
     bail!("Codex daemon closed the connection")
 }
@@ -270,11 +307,19 @@ mod tests {
         let (path, _daemon) = daemon(vec![
             json!({"userAgent":"x"}),
             json!({"data":[{"id":"turn-9","status":"inProgress"}]}),
-            json!({"code":-32600,"message":"expected turn mismatch"}),
+            json!({"code":-32600,"message":"private voice input echoed", "data":{"input":"private voice input echoed"}}),
         ])
         .await;
-        let error = steer(&path, "thread-1", "m-1", "hola").await.unwrap_err();
-        assert!(error.to_string().contains("refused"), "{error}");
+        let error = steer(&path, "thread-1", "m-1", "private voice input echoed")
+            .await
+            .unwrap_err();
+        let line = super::super::steer_fallback_log("thread-1", "m-1", &error);
+        assert!(
+            line.contains("reason=rpc-error method=turn/steer code=-32600"),
+            "{line}"
+        );
+        assert!(!line.contains("private voice input echoed"), "{line}");
+        assert!(!line.contains("data"), "{line}");
     }
 
     #[tokio::test]
