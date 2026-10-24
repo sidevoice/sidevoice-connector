@@ -73,9 +73,9 @@ fn login_path_of(database: Option<String>, environment: Option<String>) -> Optio
     })
 }
 
-/// `pw_shell` of the current uid; none when the database has no entry or an empty shell. The tests have `$SHELL` stand
+/// `pw_shell` of the current uid; none when the database has no entry or an empty shell. The tests (and `test-support` builds, which the integration tests start) have `$SHELL` stand
 /// for the person's shell, so they never consult the machine's database.
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn database_shell() -> Option<String> {
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::current()).ok()??;
     user.shell
@@ -85,7 +85,7 @@ fn database_shell() -> Option<String> {
         .filter(|shell| !shell.is_empty())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn database_shell() -> Option<String> {
     None
 }
