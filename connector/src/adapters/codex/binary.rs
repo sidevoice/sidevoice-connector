@@ -94,6 +94,15 @@ pub(super) fn npm_native(launcher: &Path) -> Option<PathBuf> {
     } else {
         dir.join("node_modules")
     };
+    // npm's name for this machine's architecture (the platform package's suffix); the target directory starts with
+    // Rust's. A package for another architecture installed too is not this machine's program.
+    let arch = std::env::consts::ARCH;
+    let package_suffix = match arch {
+        "x86_64" => "-x64",
+        "aarch64" => "-arm64",
+        _ => return None,
+    };
+    let target_prefix = format!("{arch}-");
     let scope = modules.join("@openai");
     let codex = scope.join("codex");
     let mut packages = vec![codex.clone()];
@@ -102,7 +111,10 @@ pub(super) fn npm_native(launcher: &Path) -> Option<PathBuf> {
             .into_iter()
             .flatten()
             .flatten()
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with("codex-"))
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with("codex-") && name.ends_with(package_suffix)
+            })
             .map(|entry| entry.path())
             .collect();
         found.sort();
@@ -113,6 +125,12 @@ pub(super) fn npm_native(launcher: &Path) -> Option<PathBuf> {
             .into_iter()
             .flatten()
             .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&target_prefix)
+            })
             .map(|entry| entry.path().join("bin").join(&exe))
             .filter(|program| program.is_file())
             .collect();
@@ -188,8 +206,17 @@ mod tests {
     fn an_npm_launcher_stands_for_the_native_program_of_its_package() {
         let dir = crate::test_support::temp_dir("codex-npm");
         let exe = Host::exe_name("codex");
+        let arch = std::env::consts::ARCH;
+        let (here, there) = if arch == "aarch64" {
+            ("arm64", "x64")
+        } else {
+            ("x64", "arm64")
+        };
         let launcher = |root: &Path| root.join("codex.cmd");
-        let native = |package: &Path| package.join("vendor/some-target/bin").join(&exe);
+        // A program in `package`, under a target directory named as Rust names this machine's (or another's).
+        let native = |package: &Path, target: &str| {
+            package.join(format!("vendor/{target}-test/bin")).join(&exe)
+        };
         let make = |path: &Path| {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, b"").unwrap();
@@ -197,19 +224,39 @@ mod tests {
 
         // A global install: the platform package inside `@openai/codex`, as npm nests it.
         let global = dir.path().join("global");
-        let inner = global.join("node_modules/@openai/codex/node_modules/@openai/codex-win32-x64");
+        let inner = global.join(format!(
+            "node_modules/@openai/codex/node_modules/@openai/codex-test-{here}"
+        ));
         assert_eq!(npm_native(&launcher(&global)), None, "nothing installed");
-        make(&native(&inner));
-        assert_eq!(npm_native(&launcher(&global)), Some(native(&inner)));
+        make(&native(&inner, arch));
+        assert_eq!(npm_native(&launcher(&global)), Some(native(&inner, arch)));
 
         // Hoisted beside it, and a local install (`node_modules/.bin/codex.cmd`).
         let local = dir.path().join("local/node_modules");
-        let beside = local.join("@openai/codex-win32-x64");
-        make(&native(&beside));
+        let beside = local.join(format!("@openai/codex-test-{here}"));
+        make(&native(&beside, arch));
         assert_eq!(
             npm_native(&local.join(".bin/codex.cmd")),
-            Some(native(&beside))
+            Some(native(&beside, arch))
         );
+
+        // Both architectures' packages installed (and the other's sorting first, or its target in this machine's
+        // package): only this machine's program is taken.
+        let mixed = dir.path().join("mixed/node_modules/@openai");
+        make(&native(&mixed.join(format!("codex-test-{there}")), arch));
+        make(&native(&mixed.join(format!("codex-test-{there}")), there));
+        make(&native(&mixed.join(format!("codex-test-{here}")), there));
+        make(&native(&mixed.join(format!("codex-test-{here}")), arch));
+        assert_eq!(
+            npm_native(&dir.path().join("mixed/codex.cmd")),
+            Some(native(&mixed.join(format!("codex-test-{here}")), arch))
+        );
+        let only_other = dir.path().join("other/node_modules/@openai");
+        make(&native(
+            &only_other.join(format!("codex-test-{there}")),
+            there,
+        ));
+        assert_eq!(npm_native(&dir.path().join("other/codex.cmd")), None);
 
         // The program itself, or a manager whose layout is not npm's, is left as found.
         assert_eq!(npm_native(&global.join(&exe)), None);
