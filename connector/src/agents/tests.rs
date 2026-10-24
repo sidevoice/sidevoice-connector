@@ -407,7 +407,7 @@ async fn cursor_readiness_settles(host: &Arc<HostAgents>, state: &str) -> Value 
 
 #[tokio::test]
 async fn cursor_agent_row_exposes_readiness_codes_and_fallbacks_without_private_data() {
-    use crate::platform::ipc::{Address, Endpoint};
+    use crate::platform::ipc::{Address, Channel, Channels, Endpoint};
     let _turn = agent_env().await;
     let fixture = Fixture::new();
     let bin = fixture.root.join("bin");
@@ -438,7 +438,9 @@ async fn cursor_agent_row_exposes_readiness_codes_and_fallbacks_without_private_
     private_mkdir(&fixture.profile.home.join(".cursor"));
     private_mkdir(&dir);
     // The route this OS publishes for the bridge (a Unix socket path, a `\\.\pipe\…` name).
-    let socket = Endpoint::new(&fixture.root, "bridge").to_string();
+    let endpoint = Endpoint::new(&fixture.root, "bridge");
+    let _listener = Channels::listen(&endpoint).unwrap();
+    let socket = endpoint.to_string();
     write_json(
         &dir.join("one.json"),
         &json!({
@@ -476,8 +478,9 @@ async fn cursor_readiness_distinguishes_cli_only_from_editor() {
         json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
     );
 
-    // The editor installed under the home directory (where this OS has such a place) makes the missing bridge
-    // something to fix. Windows installs under %LOCALAPPDATA%, which a test cannot move.
+    // A home-root install makes the missing bridge something to fix. Windows uses
+    // SHGetKnownFolderPath via dirs::data_local_dir(), which ignores LOCALAPPDATA overrides.
+    // Its installed-editor case is covered with injected Roots in bridge_setup's probe tests.
     let Some(marker) = crate::adapters::cursor::Cursor
         .install_markers()
         .iter()

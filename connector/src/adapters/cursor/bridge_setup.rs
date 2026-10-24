@@ -108,7 +108,7 @@ fn bridge_dir(profile: &Profile) -> PathBuf {
         .unwrap_or_else(|| profile.home.join(".cursor/desktop-bridge"))
 }
 
-fn inventory(dir: &Path) -> BridgeFiles {
+async fn inventory(dir: &Path) -> BridgeFiles {
     let Ok(entries) = fs::read_dir(dir) else {
         return BridgeFiles::Missing;
     };
@@ -155,6 +155,9 @@ fn inventory(dir: &Path) -> BridgeFiles {
             && pid > 0
             && pid <= i32::MAX as u64
             && super::process_alive(pid)
+            && tokio::time::timeout(Duration::from_millis(250), Foreigners::connect(&socket))
+                .await
+                .is_ok_and(|result| result.is_ok())
         {
             return BridgeFiles::Live;
         }
@@ -169,11 +172,13 @@ fn inventory(dir: &Path) -> BridgeFiles {
 pub fn check(profile: &Profile) -> ReadinessCheck {
     let dir = bridge_dir(profile);
     let roots = Roots::process(&profile.home);
-    check_with(dir.clone(), &CACHE, move || probe(&dir, &roots))
+    check_with(dir.clone(), &CACHE, move || {
+        tokio::runtime::Handle::current().block_on(probe(&dir, &roots))
+    })
 }
 
-fn probe(dir: &Path, roots: &Roots) -> BridgeEvidence {
-    let files = inventory(dir);
+async fn probe(dir: &Path, roots: &Roots) -> BridgeEvidence {
+    let files = inventory(dir).await;
     BridgeEvidence {
         files,
         editor_app: files == BridgeFiles::Live
@@ -205,13 +210,12 @@ mod tests {
     use super::*;
     use crate::adapters::markers::Root;
     use crate::platform::fs::{Files, TestFiles};
-    use crate::platform::ipc::{Address, Endpoint};
+    use crate::platform::ipc::{Address, Channel, Channels, Endpoint};
     use serde_json::json;
 
-    /// The route this OS publishes for a bridge (a Unix socket path, a `\\.\pipe\…` name). Nothing listens at it:
-    /// readiness judges the route's shape and the process, never connects.
+    /// The route this OS publishes for a bridge.
     fn route(root: &Path) -> PathBuf {
-        PathBuf::from(Endpoint::new(root, "bridge").to_string())
+        PathBuf::from(Endpoint::new(&root.join("private"), "bridge").to_string())
     }
 
     /// Roots under `root`, with this OS's Cursor install marker made there, as the app's installer would.
@@ -260,13 +264,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn temporary_bridge_descriptors_cover_missing_empty_live_and_stale() {
+    #[tokio::test]
+    async fn temporary_bridge_descriptors_cover_missing_empty_live_and_stale() {
         let root = crate::test_support::temp_dir("cursor-bridge");
         let bridge = root.path().join("desktop-bridge");
-        assert_eq!(inventory(&bridge), BridgeFiles::Missing);
+        assert_eq!(inventory(&bridge).await, BridgeFiles::Missing);
         fs::create_dir_all(&bridge).unwrap();
-        assert_eq!(inventory(&bridge), BridgeFiles::Missing);
+        assert_eq!(inventory(&bridge).await, BridgeFiles::Missing);
         let descriptor = bridge.join("one.json");
         let write = |socket: &Path, pid: u32| {
             let payload = json!({
@@ -279,19 +283,31 @@ mod tests {
             fs::write(&descriptor, serde_json::to_vec(&payload).unwrap()).unwrap();
         };
         write(&route(root.path()), std::process::id());
-        assert_eq!(inventory(&bridge), BridgeFiles::Live);
+        assert_eq!(inventory(&bridge).await, BridgeFiles::Stale);
+        let listener =
+            Channels::listen(&Endpoint::new(&root.path().join("private"), "bridge")).unwrap();
+        assert_eq!(inventory(&bridge).await, BridgeFiles::Live);
+        // Readiness connects and closes without writing any request or bearer token.
+        use tokio::io::AsyncReadExt;
+        let mut stream = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+        drop(stream);
+        drop(listener);
+        assert_eq!(inventory(&bridge).await, BridgeFiles::Stale);
         // A route this OS cannot name is no bridge.
         write(Path::new("relative/bridge"), std::process::id());
-        assert_eq!(inventory(&bridge), BridgeFiles::Stale);
+        assert_eq!(inventory(&bridge).await, BridgeFiles::Stale);
         // A process that is gone is no bridge.
         write(&route(root.path()), u32::MAX);
-        assert_eq!(inventory(&bridge), BridgeFiles::Stale);
+        assert_eq!(inventory(&bridge).await, BridgeFiles::Stale);
         // A descriptor that is a link is not read.
         write(&route(root.path()), std::process::id());
         let target = root.path().join("target.json");
         fs::rename(&descriptor, &target).unwrap();
         Files::symlink(&target, &descriptor);
-        assert_eq!(inventory(&bridge), BridgeFiles::Stale);
+        assert_eq!(inventory(&bridge).await, BridgeFiles::Stale);
     }
 
     #[test]
@@ -325,15 +341,22 @@ mod tests {
         let root = crate::test_support::temp_dir("cursor-user-app");
         let roots = installed_roots(root.path());
         let bridge = root.path().join("desktop-bridge");
+        // Injected roots exercise the real installed-editor readiness on Windows too.
+        assert_eq!(
+            evaluate(Some(probe(&bridge, &roots).await)),
+            BRIDGE_NOT_RUNNING
+        );
         fs::create_dir_all(&bridge).unwrap();
         let descriptor = bridge.join("one.json");
+        let _listener =
+            Channels::listen(&Endpoint::new(&root.path().join("private"), "bridge")).unwrap();
         fs::write(&descriptor, serde_json::to_vec(&json!({
             "protocolVersion":1,"pid":std::process::id(),"socketPath":route(root.path()),"token":"fixture-secret"
         })).unwrap()).unwrap();
         let cache = InventoryCache::default();
         let (probe_bridge, probe_roots) = (bridge.clone(), roots);
         let first = check_with(bridge.clone(), &cache, move || {
-            probe(&probe_bridge, &probe_roots)
+            tokio::runtime::Handle::current().block_on(probe(&probe_bridge, &probe_roots))
         });
         assert_eq!(first, BRIDGE_NOT_RUNNING);
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -350,7 +373,7 @@ mod tests {
         .unwrap();
         // The bridge goes away; the installed app stays: not running, still supported.
         fs::remove_file(&descriptor).unwrap();
-        let stopped = probe(&bridge, &installed_roots(root.path()));
+        let stopped = probe(&bridge, &installed_roots(root.path())).await;
         assert_eq!(stopped.files, BridgeFiles::Missing);
         assert_eq!(evaluate(Some(stopped)), BRIDGE_NOT_RUNNING);
     }
