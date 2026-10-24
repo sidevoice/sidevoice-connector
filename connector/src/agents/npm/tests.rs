@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::adapters::registration::Registration;
+use crate::platform::fs::{Files, TestFiles};
 use std::sync::LazyLock;
 static CODEX: LazyLock<NativePackage> =
     LazyLock::new(|| crate::adapters::codex::Codex.npm_package().unwrap());
@@ -86,9 +87,6 @@ fn yarn_classic_global_shim_uses_its_entry_not_a_guessed_prefix() {
     );
 }
 
-// Symlinks need Developer Mode/privilege on Windows. Unix exercises pnpm's real linked store; the remaining
-// fixture trees and Windows batch syntax are tested on every host.
-#[cfg(unix)]
 #[test]
 fn pnpm_follows_package_symlink_and_resolves_optional_dependency_in_store() {
     let dir = tempfile::tempdir().unwrap();
@@ -100,8 +98,8 @@ fn pnpm_follows_package_symlink_and_resolves_optional_dependency_in_store() {
         modules.join(".pnpm/@openai+codex-win32-x64@1.0.0/node_modules/@openai/codex-win32-x64");
     let expected = native(&native_root, &CODEX);
     fs::create_dir_all(modules.join("@openai")).unwrap();
-    std::os::unix::fs::symlink(&root, modules.join(CODEX.package)).unwrap();
-    std::os::unix::fs::symlink(&native_root, store.join("@openai/codex-win32-x64")).unwrap();
+    Files::symlink(&root, modules.join(CODEX.package));
+    Files::symlink(&native_root, store.join("@openai/codex-win32-x64"));
     // A stale hoisted copy must not hide the package's own dependency.
     native(&modules.join("@openai/codex-win32-x64"), &CODEX);
     let shim = modules.join(".bin/codex.cmd");
