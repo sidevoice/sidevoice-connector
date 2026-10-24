@@ -26,7 +26,7 @@ use crate::messages::message;
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Create, Files, Fs};
 use crate::platform::ipc::{Channel, Channels};
-use crate::platform::process::{Identity, Process, Processes};
+use crate::platform::process::{ChildProcess, Identity, Process, Processes};
 use serde_json::{json, Value};
 use std::fs;
 use std::io;

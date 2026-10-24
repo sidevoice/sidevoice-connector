@@ -1,7 +1,7 @@
 use super::conversation::Conversation;
 use super::harness::{no_route, Harness, Route};
 use super::Identity;
-use crate::platform::process::{Process, Processes};
+use crate::platform::process::{ChildProcess, Processes};
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use futures_util::future::BoxFuture;
@@ -219,7 +219,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_that_outlasts_its_limit_is_stopped() {
-        use crate::platform::process::Process as _;
         use crate::platform::target::{Host, Target as _};
         use crate::test_support::stand_in::Script;
         let dir = crate::test_support::temp_dir("http-send-late");

@@ -17,7 +17,7 @@ pub const HOME: crate::profile::AgentHome = crate::profile::AgentHome {
 };
 
 use super::{envelope, Identity};
-use crate::platform::process::{Process, Processes};
+use crate::platform::process::{ChildProcess, Processes};
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};

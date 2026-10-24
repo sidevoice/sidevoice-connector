@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 pub(crate) mod tests;
-use crate::platform::process::{Child, Process, Processes};
+use crate::platform::process::{Child, ChildProcess, Processes};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

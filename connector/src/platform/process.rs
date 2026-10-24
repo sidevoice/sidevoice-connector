@@ -1,23 +1,6 @@
-//! Processes: starting them detached or as a tree, telling who a pid is before anything is done to it, finding and
-//! stopping them.
-//!
-//! The interface is the [`Process`] trait; [`Processes`] is the one OS implementation compiled in, chosen below.
-//! What differs per OS is how a child is made to outlive its caller or to lead a tree (`process-wrap`: a process
-//! group on Unix; no console, a group of its own, a Job Object on Windows) and a harness adapter's open-files
-//! heuristic. Everything else has one body, the trait's default methods, over `sysinfo`, which reads the same things
-//! on every OS (owner, start time, command line, parent, state) and sends the stop; there is no `/proc` or `ps` of
-//! ours. Callers import both: `use crate::platform::process::{Process, Processes};` then
-//! `Processes::spawn_tree(command)`, `Processes::stop(pid, |found| .., grace)`.
-//!
-//! A pid read from a file is only a hint: pids are reused, and a stale lock or ready file can name somebody
-//! else's work. Nothing is stopped on a pid alone: [`Process::is_process`], [`Process::stop`] and
-//! [`Process::kill`] act only on a process that is this user's and that the caller's check recognises (its start
-//! time, its command line). A zombie (dead, not yet reaped) is no process: it will never do anything again.
-//!
-//! Stopping is one operation, [`Process::stop`], the same on every OS for its caller: ask the process to leave
-//! ([`Process::ask_to_leave`]), give it the grace time, then kill it. The request is the one `sidevoice-platform`'s
-//! `stop` sends and the core and this daemon listen for (decision "Graceful stop", option C, 2026-10-23): `SIGTERM` on
-//! Unix; on Windows the process's named stop event. A process that does not listen is killed after the grace.
+//! Connector process policy: verified PID actions, scanners and open-file heuristics.
+//! Child execution and unverified identity observations belong to `sidevoice-platform`.
+//! Recorded PIDs require this user's process and the caller's identity check before any stop or kill.
 
 #[cfg(unix)]
 #[path = "process/unix.rs"]
@@ -26,30 +9,20 @@ mod imp;
 #[path = "process/windows.rs"]
 mod imp;
 
-pub use imp::Os as Processes;
+pub use sidevoice_platform::process::{Child, Identity, Process as ChildProcess, Processes};
 
-use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 use sidevoice_platform::stop::{StopRequest, StopRequests};
 use std::future::Future;
 use std::io;
 use std::path::PathBuf;
-use std::process::ExitStatus;
 use std::sync::OnceLock;
 use std::time::Duration;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, Uid, UpdateKind};
-use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
+#[cfg(test)]
+use tokio::process::Command;
 
-/// What every OS implements ([`Processes`], in `process/unix.rs` and `process/windows.rs`): the four required
-/// methods. The rest is one body for every OS; an OS overrides it only if it must.
+/// Connector-owned process inspection and verified stop policy.
 pub trait Process {
-    /// `command` set to outlive its caller: its own process group (Unix), no console and its own group
-    /// (Windows), so closing the terminal or pressing ^C in it does not reach it. Nothing kills it on drop.
-    fn detached(command: Command) -> CommandWrap;
-
-    /// `command` set to lead a tree that can be stopped as a whole: a process group (Unix) or a Job Object
-    /// (Windows) that holds everything it starts.
-    fn tree(command: Command) -> CommandWrap;
-
     /// The files `pid` has open, as far as the OS shows them to this user: `/proc/<pid>/fd`, else `lsof`, on Unix.
     /// `Unsupported` on Windows, where nothing in the standard API lists another process's handles (a Windows
     /// chat lookup waits for its agent's chat roots to be measured); another error when the OS shows nothing (no
@@ -59,26 +32,6 @@ pub trait Process {
     /// Whether starting a program failed only because something still has it open for writing (one just written):
     /// worth trying again in a moment. Unix: `ETXTBSY`. Windows: a sharing violation.
     fn executable_is_busy(error: &io::Error) -> bool;
-
-    /// Starts `command` so that it outlives this process and its terminal. The caller owns stdio and the
-    /// environment.
-    fn spawn_detached(command: Command) -> impl Future<Output = io::Result<Child>> + Send {
-        spawn(Self::detached(command), false)
-    }
-
-    /// Starts `command` as the leader of a tree that [`Child::kill_tree`] stops whole, and that goes with the
-    /// [`Child`] when it is dropped.
-    fn spawn_tree(command: Command) -> impl Future<Output = io::Result<Child>> + Send {
-        let mut wrap = Self::tree(command);
-        wrap.wrap(KillOnDrop);
-        spawn(wrap, true)
-    }
-
-    /// Who `pid` is now, whoever owns it; `None` when there is no such process (or a zombie).
-    fn identity(pid: u32) -> Option<Identity> {
-        let pid = valid(pid)?;
-        identity_of(read(ProcessesToUpdate::Some(&[pid])).process(pid)?)
-    }
 
     /// Whether `pid` is, now, this user's process and `is_it` recognises it. False when it is gone, somebody
     /// else's, another process now, or cannot be told.
@@ -151,90 +104,6 @@ pub trait Process {
                 .parent()?
                 .as_u32(),
         )
-    }
-}
-
-/// A process this module started.
-///
-/// Not `process-wrap`'s own child: its `wait` on a group or a job waits for every process the leader left behind,
-/// and a leader's exit is what callers ask about. [`Child::wait`] reports the leader's exit; the tree is stopped
-/// with [`Child::kill_tree`]. A tree ([`Processes::spawn_tree`]) is killed whole when its `Child` is dropped: its group
-/// (Unix; `KillOnDrop` alone kills only the leader) or its Job Object. A descendant that leaves the group (`setsid`)
-/// or the job is not contained.
-pub struct Child(Box<dyn ChildWrapper>, bool);
-
-impl Drop for Child {
-    fn drop(&mut self) {
-        if self.1 {
-            let _ = self.0.start_kill();
-        }
-    }
-}
-
-impl Child {
-    pub fn id(&self) -> Option<u32> {
-        self.0.id()
-    }
-
-    /// Takes the leader's stdin (when it was piped).
-    pub fn stdin(&mut self) -> Option<ChildStdin> {
-        self.0.stdin().take()
-    }
-
-    /// Takes the leader's stdout (when it was piped).
-    pub fn stdout(&mut self) -> Option<ChildStdout> {
-        self.0.stdout().take()
-    }
-
-    /// Takes the leader's stderr (when it was piped).
-    pub fn stderr(&mut self) -> Option<ChildStderr> {
-        self.0.stderr().take()
-    }
-
-    // The leader alone, beneath the tree's wrapper.
-    fn leader(&mut self) -> &mut dyn ChildWrapper {
-        self.0.inner_mut()
-    }
-
-    /// The leader's exit, when it has exited.
-    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.leader().try_wait()
-    }
-
-    /// Waits for the leader to exit.
-    pub async fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.leader().wait().await
-    }
-
-    /// Kills the leader and everything it started (its whole group or job, also after the leader has exited) and
-    /// reaps the leader, within 2 s.
-    pub async fn kill_tree(&mut self) {
-        let _ = self.0.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(2), self.leader().wait()).await;
-    }
-}
-
-/// Who a process is: what a recorded pid is checked against.
-pub struct Identity {
-    /// Opaque start time: comparable only with another reading on the same machine.
-    pub start: String,
-    /// The program and its arguments, joined by spaces.
-    pub command: String,
-}
-
-// A busy executable (open for writing somewhere: being replaced, or just written while a sibling process forked; std
-// names it the same on every OS) runs a moment later: five tries 50 ms apart.
-async fn spawn(mut wrap: CommandWrap, tree: bool) -> io::Result<Child> {
-    let mut attempt = 0;
-    loop {
-        match wrap.spawn() {
-            Ok(child) => return Ok(Child(child, tree)),
-            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy && attempt < 5 => {
-                attempt += 1;
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(error) => return Err(error),
-        }
     }
 }
 
