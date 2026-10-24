@@ -33,6 +33,8 @@ use sidevoice_connector::platform::ipc::{Address as _, Channel as _, Channels, E
 use sidevoice_connector::platform::process::{Process as _, Processes};
 
 pub const CONNECTOR: &str = env!("CARGO_BIN_EXE_sidevoice-connector");
+/// The windowless launcher of the Windows service jobs (built on every OS; only a package for Windows carries it).
+pub const BACKGROUND: &str = env!("CARGO_BIN_EXE_sidevoice-background");
 
 /// The connector's and the core's programs inside a package, a release or an unpacked core (`.exe` on Windows).
 pub fn connector_program() -> String {
