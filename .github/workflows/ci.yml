@@ -3,7 +3,8 @@ name: ci
 # Every pull request: lint, then on every target the tests (against what `cargo xtask fixtures` fetches: the
 # sidevoice-core release pinned by the sidevoice-platform tag in connector/Cargo.toml and the pinned Codex CLI) and the release packaging, exactly as a
 # release builds it (on Linux also run on the oldest distribution it supports), publishing nothing. What passes here
-# is what merging publishes (release.yml), npm packages included. RELEASING.md.
+# is what merging publishes (release.yml), npm packages included; then each archive is installed end to end on a fresh
+# runner of its OS (e2e.yml). RELEASING.md.
 on:
   pull_request:
     branches: [main]
@@ -59,3 +60,19 @@ jobs:
       # them: `npx sidevoice --version --json` must run this build (xtask/src/npm.rs).
       - run: cargo xtask npm target/dist/sidevoice-connector-${{ matrix.target }}.tar.zst
       - run: cargo xtask npm-smoke
+      # The archive the e2e jobs install (below); kept briefly, it is never published.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: target/dist/*.tar.zst
+          retention-days: 3
+          if-no-files-found: error
+
+  # That archive installed end to end on a fresh runner of each OS (e2e.yml): what merging would publish has to
+  # install, pair, connect the real agents and uninstall cleanly.
+  e2e:
+    name: e2e
+    needs: test
+    uses: ./.github/workflows/e2e.yml
+    with:
+      ref: ${{ github.sha }}

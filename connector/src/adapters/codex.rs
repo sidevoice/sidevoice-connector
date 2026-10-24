@@ -1,3 +1,4 @@
+mod binary;
 mod harness;
 mod registration;
 mod rollout;
