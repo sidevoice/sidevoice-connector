@@ -3,8 +3,8 @@
 //! anchor's (the device and the mount id on Linux, the device and where it is mounted on macOS).
 
 use super::{
-    clean_absolute, recovery_program, recovery_record, Removal, Roots, CLAIM, DATA_PREFIX, RECORD,
-    RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
+    clean_absolute, foreign, recovery_program, recovery_record, DataDir, Removal, Roots, CLAIM,
+    DATA_PREFIX, RECORD, RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
 };
 use crate::platform::user::{User, UserId};
 use serde_json::Value;
@@ -837,6 +837,78 @@ impl Removal for Os {
             }
         }
         Ok(())
+    }
+
+    fn remove_data_dir(&self, before_remove: &dyn Fn(&OsStr)) -> Result<DataDir, &'static str> {
+        let Some(data) = self.open_relative(&self.data_rel)? else {
+            return Ok(DataDir {
+                removed: true,
+                ..DataDir::default()
+            });
+        };
+        let mut found = entries(data.as_raw_fd())?;
+        found.sort_by_key(|entry| entry == "install.lock");
+        let kept = foreign(&self.roots, &found);
+        if !kept.is_empty() {
+            return Ok(DataDir {
+                kept,
+                ..DataDir::default()
+            });
+        }
+        self.verify_dir(&self.data_rel, data.as_raw_fd())?;
+        let mut held = Vec::new();
+        for entry in found {
+            if entry == "node-stopped.json" {
+                continue;
+            }
+            before_remove(&entry);
+            // `unlinkat` removes a link itself and refuses a directory.
+            if unsafe { libc::unlinkat(data.as_raw_fd(), name(&entry)?.as_ptr(), 0) } != 0 {
+                held.push(entry.to_string_lossy().into_owned());
+            }
+        }
+        let (Some(parent), Some(leaf)) = (self.data_rel.parent(), self.data_rel.file_name()) else {
+            return Err("unsafe uninstall path");
+        };
+        let parent = self
+            .open_below(parent, false)?
+            .ok_or("uninstall path disappeared")?;
+        let mut now = entries(data.as_raw_fd())?;
+        let stop = now.iter().any(|entry| entry == "node-stopped.json");
+        now.retain(|entry| entry != "node-stopped.json");
+        if stop && now.is_empty() && held.is_empty() {
+            return Ok(DataDir {
+                kept: vec!["node-stopped.json".into()],
+                ..DataDir::default()
+            });
+        }
+        if !held.is_empty() || !now.is_empty() {
+            held.extend(now.iter().map(|entry| entry.to_string_lossy().into_owned()));
+            held.sort();
+            held.dedup();
+            return Ok(DataDir {
+                held,
+                kept: if stop {
+                    vec!["node-stopped.json".into()]
+                } else {
+                    Vec::new()
+                },
+                ..DataDir::default()
+            });
+        }
+        // Empty directories only: `AT_REMOVEDIR` never removes a directory with content.
+        let gone =
+            unsafe { libc::unlinkat(parent.as_raw_fd(), name(leaf)?.as_ptr(), libc::AT_REMOVEDIR) }
+                == 0;
+        Ok(DataDir {
+            removed: gone,
+            held: if gone {
+                Vec::new()
+            } else {
+                vec![leaf.to_string_lossy().into_owned()]
+            },
+            ..DataDir::default()
+        })
     }
 }
 

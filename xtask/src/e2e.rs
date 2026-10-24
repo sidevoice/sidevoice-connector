@@ -18,8 +18,8 @@
 //! 5. `uninstall` through npx from the local tarballs (Windows cannot delete a running program, so never from
 //!    the release):
 //!    no job left in the manager and no definition, no process of the installation, no release, the agents'
-//!    registrations gone from their configuration, and nothing in the data directory but what uninstall keeps on
-//!    purpose (its locks and the stop: connector/README.md, "uninstall").
+//!    registrations gone from their configuration, and the data directory gone (it holds only its own locks and the stop, which go
+//!    with it; connector/README.md, "uninstall").
 //!
 //! It changes this user's service manager, agents and data for real, so it runs only on a disposable machine: a CI
 //! runner (`CI=true`), or where `SIDEVOICE_E2E=1` says so. On failure it prints what the jobs and logs say. The runner's
@@ -37,7 +37,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::util::*;
 use crate::{codex, Result};
@@ -56,13 +56,6 @@ fn agent_version(name: &str, pinned: &str) -> String {
 const CORE_PORT: u16 = 10829;
 /// The core and connector jobs, by their base name (`service/jobs.rs`).
 const JOBS: [&str; 2] = ["sidevoice-core", "sidevoice-connector"];
-/// What uninstall leaves in the data directory on purpose: the locks and a person's stop.
-const KEPT: [&str; 4] = [
-    "install.lock",
-    "connector.lock",
-    "agents.lock",
-    "node-stopped.json",
-];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Os {
@@ -977,20 +970,43 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
     check(!releases.exists(), || {
         format!("{} is left", releases.display())
     })?;
+    // The stop survives cleanup. Models keep every remaining file beside them.
     if machine.data.exists() {
-        let mut names: Vec<String> = fs::read_dir(&machine.data)
+        let names: Vec<String> = fs::read_dir(&machine.data)
             .map_err(|error| format!("{}: {error}", machine.data.display()))?
             .flatten()
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
-        names.sort();
         println!("{} holds {names:?}", machine.data.display());
-        let extra: Vec<&String> = names
-            .iter()
-            .filter(|name| !KEPT.contains(&name.as_str()))
-            .collect();
-        check(extra.is_empty(), || {
-            format!("left in {}: {extra:?}", machine.data.display())
+        let mut expected = if names.iter().any(|name| name == "Models") {
+            vec![
+                "Models",
+                "agents.lock",
+                "connector.lock",
+                "install.lock",
+                "node-stopped.json",
+            ]
+        } else {
+            vec!["node-stopped.json"]
+        };
+        expected.sort();
+        let mut names = names;
+        names.sort();
+        check(names == expected, || {
+            format!("left in {}: {names:?}", machine.data.display())
+        })?;
+        check(
+            removed["data_dir"]["kept"]
+                == if names.iter().any(|name| name == "Models") {
+                    json!(["Models"])
+                } else {
+                    json!(["node-stopped.json"])
+                },
+            || format!("uninstall did not say what it kept: {removed}"),
+        )?;
+    } else {
+        check(removed["data_dir"]["removed"] == true, || {
+            format!("uninstall did not say it removed the data directory: {removed}")
         })?;
     }
     let claude_listed = run_ok_path(&claude_cli, &["mcp", "list"], Duration::from_secs(120))?;

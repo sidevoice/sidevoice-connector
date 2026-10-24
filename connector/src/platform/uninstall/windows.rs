@@ -19,8 +19,8 @@
 //! No `unsafe` here: `std`'s `OpenOptionsExt` sets the sharing and the flags, `winapi-util` reads the file id.
 
 use super::{
-    recovery_program, recovery_record, Removal, Roots, CLAIM, DATA_PREFIX, RECORD, RECORD_LIMIT,
-    RECOVERY, RELEASE_PREFIX,
+    foreign, recovery_program, recovery_record, DataDir, Removal, Roots, CLAIM, DATA_PREFIX,
+    RECORD, RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
 };
 use crate::platform::fs::{Create, Files, Fs};
 use std::ffi::{OsStr, OsString};
@@ -32,6 +32,22 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
+
+/// Access denied alone can also mean ACLs or attributes; only call it held when
+/// an exclusive attribute handle confirms another open handle conflicts.
+fn in_use(error: &io::Error, path: &Path) -> bool {
+    match error.raw_os_error() {
+        Some(32 | 33) => true,
+        Some(5) => OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .err()
+            .is_some_and(|error| matches!(error.raw_os_error(), Some(32 | 33))),
+        _ => false,
+    }
+}
 
 /// What a file or directory is, whatever it is called: its volume and its file id.
 #[derive(PartialEq)]
@@ -442,5 +458,69 @@ impl Removal for Os {
             fs::remove_file(record).map_err(|_| "cannot remove uninstall record")?;
         }
         Ok(())
+    }
+
+    fn remove_data_dir(&self, before_remove: &dyn Fn(&OsStr)) -> Result<DataDir, &'static str> {
+        let data = &self.roots.data;
+        let mut held = Vec::new();
+        {
+            // `D` held while its files go: nobody can swap it. A file open elsewhere (a process holds it without
+            // sharing delete: a sharing violation) stays, and is reported.
+            let Some(_held) = self.data()? else {
+                return Ok(DataDir {
+                    removed: true,
+                    ..DataDir::default()
+                });
+            };
+            let mut found = names(data)?;
+            found.sort_by_key(|entry| entry == "install.lock");
+            let kept = foreign(&self.roots, &found);
+            if !kept.is_empty() {
+                return Ok(DataDir {
+                    kept,
+                    ..DataDir::default()
+                });
+            }
+            for entry in found {
+                if entry == "node-stopped.json" {
+                    continue;
+                }
+                before_remove(&entry);
+                // A link is removed itself; a directory of that name is not entered.
+                let path = data.join(&entry);
+                if let Err(error) = fs::remove_file(&path) {
+                    if in_use(&error, &path) && !path.is_dir() {
+                        held.push(entry.to_string_lossy().into_owned());
+                    } else {
+                        return Err("cannot remove uninstall file");
+                    }
+                }
+            }
+        }
+        if data.join("node-stopped.json").exists() {
+            return Ok(DataDir {
+                kept: vec!["node-stopped.json".into()],
+                held,
+                ..DataDir::default()
+            });
+        }
+        if held.is_empty() {
+            // `D` itself cannot be deleted while held, so its parent is held instead. Only an empty directory goes.
+            let _parent = self.hold_down_to(data.parent().ok_or("unsafe uninstall path")?)?;
+            if let Err(error) = fs::remove_dir(data) {
+                if !in_use(&error, data) {
+                    return Err("cannot remove uninstall directory");
+                }
+                held.push(
+                    data.file_name()
+                        .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+                );
+            }
+        }
+        Ok(DataDir {
+            removed: held.is_empty(),
+            held,
+            ..DataDir::default()
+        })
     }
 }
