@@ -55,11 +55,6 @@ impl Claude {
                 "invalid"
             }));
         };
-        // Registering goes through its CLI: without one, an entry the file holds cannot be acted on (uninstall says
-        // it was left behind). With no entry there is nothing to act on, with or without a CLI.
-        if binary.is_none() {
-            return Ok(Entry::bare("unknown"));
-        }
         // Another transport (`http`, `sse`) or no command: not an entry Sidevoice writes.
         let stdio = entry
             .get("type")
@@ -87,6 +82,9 @@ impl Claude {
             .unwrap_or_default();
         let state = if !host.owns(&command, &args) {
             "foreign"
+        } else if binary.is_none() {
+            // Only our entry can be left behind when the CLI needed to remove it is absent.
+            "unknown"
         } else if command == host.command() && args == host.args() && env == host.mcp_env() {
             "connected"
         } else {
@@ -444,6 +442,22 @@ mod tests {
         assert_eq!(state(&Host(profile.clone()), None).await, "unknown");
         write(&file, br#"{"mcpServers":{"other":{"command":"x"}}}"#);
         assert_eq!(state(&Host(profile), None).await, "absent");
+    }
+
+    #[tokio::test]
+    async fn foreign_entries_stay_foreign_without_a_cli() {
+        let scratch = crate::test_support::temp_dir("claude-foreign-no-cli");
+        let (profile, file) = profile(&scratch, false, true);
+        for entry in [
+            json!({"type": "http", "url": "https://example.com"}),
+            json!({"command": "/someone/elses/server", "args": []}),
+        ] {
+            let config = json!({"mcpServers": {"sidevoice": entry}});
+            let bytes = serde_json::to_vec(&config).unwrap();
+            write(&file, &bytes);
+            assert_eq!(state(&Host(profile.clone()), None).await, "foreign");
+            assert_eq!(fs::read(&file).unwrap(), bytes);
+        }
     }
 
     /// A FIFO where the user configuration belongs is refused at once, never waited on. Unix only: a FIFO is a file

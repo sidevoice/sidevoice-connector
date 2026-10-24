@@ -898,6 +898,28 @@ fn removal(row: &Value) -> Option<bool> {
     }
 }
 
+/// Diagnose an entry uninstall cannot remove without advising deletion of an invalid or unclassified entry.
+fn unremoved(row: &Value, label: &str) -> (&'static str, String) {
+    match row["registration"].as_str() {
+            Some("foreign") => (
+                "foreign",
+                format!("{label} has a Sidevoice entry that Sidevoice did not create; it was left unchanged."),
+            ),
+            Some("invalid") => (
+                "invalid",
+                crate::messages::message("agents.invalid", &json!({"agent": label})),
+            ),
+            Some("unknown") if row.pointer("/can/disconnect") == Some(&Value::Bool(false)) => (
+                "unknown",
+                crate::messages::message("agents.left-behind", &json!({"agent": label})),
+            ),
+            _ => (
+                "unknown",
+                crate::messages::message("agents.registration-unknown", &json!({"agent": label})),
+            ),
+    }
+}
+
 /// Every registration of ours removed: per agent, `{outcome, message}`.
 async fn unregister(profile: &Profile) -> Value {
     let agents = match HostAgents::for_installer(profile.clone()) {
@@ -921,14 +943,7 @@ async fn unregister(profile: &Profile) -> Value {
                     Some((_, message)) => ("failed", message),
                 }
             }
-            Some("foreign") => (
-                "foreign",
-                format!("{label} has a Sidevoice entry that Sidevoice did not create; it was left unchanged."),
-            ),
-            _ => (
-                "unknown",
-                crate::messages::message("agents.left-behind", &json!({"agent": label})),
-            ),
+            _ => unremoved(&row, &label),
         };
         outcomes.insert(id, json!({"outcome": outcome, "message": message}));
     }
@@ -1674,6 +1689,29 @@ pub(crate) mod tests {
         assert_eq!(removal(&row("foreign", false)), Some(false));
         assert_eq!(removal(&row("invalid", false)), Some(false));
         assert_eq!(removal(&row("unknown", false)), Some(false));
+    }
+
+    #[test]
+    fn uninstall_preserves_the_invalid_config_diagnosis() {
+        for disconnect in [false, true] {
+            let row = json!({"registration": "invalid", "can": {"disconnect": disconnect}});
+            let (outcome, message) = unremoved(&row, "Agent");
+            assert_eq!(outcome, "invalid");
+            assert_eq!(
+                message,
+                crate::messages::message("agents.invalid", &json!({"agent": "Agent"}))
+            );
+        }
+        let row =
+            |disconnect| json!({"registration": "unknown", "can": {"disconnect": disconnect}});
+        assert_eq!(
+            unremoved(&row(false), "Agent").1,
+            crate::messages::message("agents.left-behind", &json!({"agent": "Agent"}))
+        );
+        assert_eq!(
+            unremoved(&row(true), "Agent").1,
+            crate::messages::message("agents.registration-unknown", &json!({"agent": "Agent"}))
+        );
     }
 
     /// An agent of the registry the connector connects by itself, without its CLI: connected in any profile of the tests
