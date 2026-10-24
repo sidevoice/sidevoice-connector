@@ -147,8 +147,14 @@ pub async fn deliver(delivery: &Value, event: &Value, profile: &Profile) -> Resu
         .get("message_id")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if let Ok(turn) = try_steer(command(), profile, thread, message_id, &envelope).await {
-        return Ok(json!({"status":"accepted","detail":format!("codex steered turn {turn}")}));
+    match try_steer(command(), profile, thread, message_id, &envelope).await {
+        Ok(turn) => {
+            crate::logfile::log(&format!(
+                "codex delivery path=steered thread={thread:?} message_id={message_id:?}"
+            ));
+            return Ok(json!({"status":"accepted","detail":format!("codex steered turn {turn}")}));
+        }
+        Err(error) => crate::logfile::log(&steer_fallback_log(thread, message_id, &error)),
     }
     let mut queue = command();
     queue
@@ -156,10 +162,29 @@ pub async fn deliver(delivery: &Value, event: &Value, profile: &Profile) -> Resu
         .arg(envelope);
     match run(queue, false, Duration::from_secs(30)).await {
         Ok((status, _)) if status.success() => {
+            crate::logfile::log(&format!(
+                "codex delivery path=queued thread={thread:?} message_id={message_id:?}"
+            ));
             Ok(json!({"status":"accepted","detail":"codex queue confirmed the thread"}))
         }
-        _ => bail!("Codex queue failed"),
+        _ => {
+            crate::logfile::log(&format!(
+                "codex delivery path=queue-failed thread={thread:?} message_id={message_id:?}"
+            ));
+            bail!("Codex queue failed")
+        }
     }
+}
+
+/// Only typed, allowlisted diagnostics reach the log; arbitrary error chains may contain voice input.
+fn steer_fallback_log(thread: &str, message_id: &str, error: &anyhow::Error) -> String {
+    let reason = error
+        .downcast_ref::<steer::Failure>()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "reason=steer-unavailable".to_owned());
+    format!(
+        "codex delivery path=queue-fallback thread={thread:?} message_id={message_id:?} {reason}"
+    )
 }
 
 /// Runs `command` (a Codex CLI call) to its end within `limit`, giving its exit status and, when `capture`, its
@@ -198,7 +223,7 @@ async fn run(
         Ok(done) => Ok(done?),
         Err(_) => {
             child.kill_tree().await;
-            bail!("Codex did not answer in time")
+            bail!(steer::Failure::Timeout)
         }
     }
 }
@@ -214,12 +239,16 @@ async fn try_steer(
 ) -> Result<String> {
     let socket = steer::socket_path(profile.agent_home(HOME.var));
     if !socket.exists() {
-        bail!("no Codex daemon socket");
+        bail!(steer::Failure::NoSocket(socket));
     }
     version.arg("--version");
     let (_, stdout) = run(version, true, Duration::from_secs(10)).await?;
-    if !steer::supports_steer(steer::parse_version(&String::from_utf8_lossy(&stdout))) {
-        bail!("installed Codex cannot be steered from outside");
+    let installed = steer::parse_version(&String::from_utf8_lossy(&stdout));
+    if !steer::supports_steer(installed) {
+        match installed {
+            Some(_) => bail!(steer::Failure::VersionTooOld),
+            None => bail!(steer::Failure::VersionUnknown),
+        }
     }
     steer::steer(&socket, thread, message_id, text).await
 }
@@ -227,6 +256,15 @@ async fn try_steer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_log_does_not_format_unclassified_error_chains() {
+        let error = anyhow::anyhow!("private voice input echoed")
+            .context("transport returned private voice input echoed");
+        let line = steer_fallback_log("thread-1", "message-1", &error);
+        assert!(line.contains("reason=steer-unavailable"));
+        assert!(!line.contains("private voice input echoed"));
+    }
 
     #[test]
     fn rollout_engine_reads_model_and_effort() {
