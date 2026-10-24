@@ -147,8 +147,17 @@ pub async fn deliver(delivery: &Value, event: &Value, profile: &Profile) -> Resu
         .get("message_id")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if let Ok(turn) = try_steer(command(), profile, thread, message_id, &envelope).await {
-        return Ok(json!({"status":"accepted","detail":format!("codex steered turn {turn}")}));
+    match try_steer(command(), profile, thread, message_id, &envelope).await {
+        Ok(turn) => {
+            crate::logfile::log(&format!(
+                "codex delivery path=steered thread={thread:?} message_id={message_id:?} turn={turn:?}"
+            ));
+            return Ok(json!({"status":"accepted","detail":format!("codex steered turn {turn}")}));
+        }
+        Err(error) => crate::logfile::log(&format!(
+            "codex delivery path=queue-fallback thread={thread:?} message_id={message_id:?} reason={:?}",
+            format!("{error:#}")
+        )),
     }
     let mut queue = command();
     queue
@@ -156,9 +165,17 @@ pub async fn deliver(delivery: &Value, event: &Value, profile: &Profile) -> Resu
         .arg(envelope);
     match run(queue, false, Duration::from_secs(30)).await {
         Ok((status, _)) if status.success() => {
+            crate::logfile::log(&format!(
+                "codex delivery path=queued thread={thread:?} message_id={message_id:?}"
+            ));
             Ok(json!({"status":"accepted","detail":"codex queue confirmed the thread"}))
         }
-        _ => bail!("Codex queue failed"),
+        _ => {
+            crate::logfile::log(&format!(
+                "codex delivery path=queue-failed thread={thread:?} message_id={message_id:?}"
+            ));
+            bail!("Codex queue failed")
+        }
     }
 }
 
@@ -214,12 +231,19 @@ async fn try_steer(
 ) -> Result<String> {
     let socket = steer::socket_path(profile.agent_home(HOME.var));
     if !socket.exists() {
-        bail!("no Codex daemon socket");
+        bail!("no Codex daemon socket at {}", socket.display());
     }
     version.arg("--version");
     let (_, stdout) = run(version, true, Duration::from_secs(10)).await?;
-    if !steer::supports_steer(steer::parse_version(&String::from_utf8_lossy(&stdout))) {
-        bail!("installed Codex cannot be steered from outside");
+    let installed = steer::parse_version(&String::from_utf8_lossy(&stdout));
+    if !steer::supports_steer(installed) {
+        let (major, minor, patch) = steer::MIN_VERSION;
+        match installed {
+            Some((a, b, c)) => bail!(
+                "installed Codex version {a}.{b}.{c} is too old to steer; requires {major}.{minor}.{patch}"
+            ),
+            None => bail!("could not parse installed Codex version; steering requires {major}.{minor}.{patch}"),
+        }
     }
     steer::steer(&socket, thread, message_id, text).await
 }
