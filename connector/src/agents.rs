@@ -1266,25 +1266,16 @@ pub(crate) fn find_binary(
     roots: &Roots,
 ) -> Option<String> {
     find_in_path(agent.binary_names(), path)
-        .or_else(|| first_trusted(agent.fallback_binaries(roots)))
+        .or_else(|| first_runnable(agent.fallback_binaries(roots)))
 }
 
-/// The first of the (root, program) candidates, best first, that passes `Env::trusted_program`; a refused one is
-/// logged by the rule that refused it, never by path, and the next is tried.
-pub(crate) fn first_trusted(candidates: Vec<(PathBuf, PathBuf)>) -> Option<String> {
-    candidates.into_iter().find_map(|(root, program)| {
-        // Nothing there is the usual case, and no news.
-        fs::symlink_metadata(&program).ok()?;
-        match Environment::trusted_program(&program, &root) {
-            Ok(program) => program.into_os_string().into_string().ok(),
-            Err(why) => {
-                crate::logfile::log(&format!(
-                    "ignored a program of an agent outside PATH: {why}"
-                ));
-                None
-            }
-        }
-    })
+/// The first of the candidates, best first, that is a program this OS can run (`Env::runnable`), taken as a program
+/// found on `PATH` is. A path that is not text cannot be reported or passed on as it is: the next one is tried.
+pub(crate) fn first_runnable(candidates: Vec<PathBuf>) -> Option<String> {
+    candidates
+        .into_iter()
+        .filter(|program| Environment::runnable(program))
+        .find_map(|program| program.into_os_string().into_string().ok())
 }
 
 pub(crate) fn find_in_path(names: &[&str], path: Option<&str>) -> Option<String> {

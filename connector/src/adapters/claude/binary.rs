@@ -1,6 +1,6 @@
 //! Where Claude Code's CLI is when it is not on `PATH`. `PATH` is looked at first (`agents::find_binary`); these are
-//! the fallbacks, each paired with the directory of this user's it must be under. They are only candidates: the
-//! caller judges them (`Env::trusted_program`) before one is used. Nothing here starts a program.
+//! the fallbacks, taken as a program found on `PATH` is: the first that exists and can be run is used
+//! (`agents::first_runnable`). Nothing here starts a program.
 
 use crate::adapters::markers::Roots;
 use crate::platform::env::{Env, Environment};
@@ -10,17 +10,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// The candidates as (root, program), in the order they are tried: the native installer's (`~/.local/bin/claude`),
-/// the older local install (`~/.claude/local/claude`), then the copy the Claude desktop app bundles.
-pub(super) fn fallbacks(roots: &Roots) -> Vec<(PathBuf, PathBuf)> {
+/// The candidates, in the order they are tried: the native installer's (`~/.local/bin/claude`), the older local
+/// install (`~/.claude/local/claude`), then the copy the Claude desktop app bundles.
+pub(super) fn fallbacks(roots: &Roots) -> Vec<PathBuf> {
     let exe = Host::exe_name("claude");
-    let home = |relative: &str| (roots.home.clone(), roots.home.join(relative).join(&exe));
+    let home = |relative: &str| roots.home.join(relative).join(&exe);
     let mut found = vec![home(".local/bin"), home(".claude/local")];
     if let Some(local) = &roots.local_app_data {
         let bundles = Environment::store_packages(local)
             .map(|packages| desktop_bundles(&packages, &exe))
             .unwrap_or_default();
-        found.extend(bundles.into_iter().map(|program| (local.clone(), program)));
+        found.extend(bundles);
     }
     found
 }
@@ -28,7 +28,7 @@ pub(super) fn fallbacks(roots: &Roots) -> Vec<(PathBuf, PathBuf)> {
 /// The desktop app is an MSIX package (`Claude_<publisher id>`) and keeps its Claude Code under
 /// `<packages>\Claude_*\LocalCache\Roaming\Claude\claude-code\<version>\<hash>\claude.exe`. The highest version wins
 /// (by version precedence, not text); among several builds of it, the newest. All are returned, best first: the
-/// caller takes the first that it trusts, so a newer one that fails does not hide an older one that passes.
+/// caller takes the first that can be run, so a newer one that cannot does not hide an older one that can.
 fn desktop_bundles(packages: &Path, exe: &str) -> Vec<PathBuf> {
     let mut found: Vec<(Version, SystemTime, PathBuf)> = Vec::new();
     for package in subdirs(packages) {
@@ -135,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn the_native_and_local_installs_come_first_each_under_the_home() {
+    fn the_native_and_local_installs_come_first() {
         let dir = tempfile::tempdir().unwrap();
         let roots = Roots {
             home: dir.path().join("home"),
@@ -146,11 +146,8 @@ mod tests {
         assert_eq!(
             fallbacks(&roots),
             vec![
-                (roots.home.clone(), roots.home.join(".local/bin").join(&exe)),
-                (
-                    roots.home.clone(),
-                    roots.home.join(".claude/local").join(&exe)
-                ),
+                roots.home.join(".local/bin").join(&exe),
+                roots.home.join(".claude/local").join(&exe),
             ]
         );
     }
@@ -162,7 +159,7 @@ mod resolution {
     use crate::platform::fs::{Create, Files, Fs, TestFiles};
 
     #[test]
-    fn path_wins_and_a_trusted_fallback_is_used_when_path_has_none() {
+    fn path_wins_and_a_fallback_that_can_be_run_is_used_when_path_has_none() {
         let dir = crate::test_support::temp_dir("claude-binary");
         let roots = Roots {
             home: dir.path().join("home"),
@@ -172,33 +169,28 @@ mod resolution {
         let native = roots.home.join(".local/bin").join(Host::exe_name("claude"));
         Files::ensure_private_dir(native.parent().unwrap()).unwrap();
         let claude = crate::adapters::claude::Claude;
+        assert_eq!(crate::agents::find_binary(&claude, None, &roots), None);
         Files::open_private(&native, Create::NewProgram).unwrap();
         assert_eq!(
             crate::agents::find_binary(&claude, None, &roots).as_deref(),
             native.to_str()
         );
-        // Somebody else can change it: ignored.
+        // Used as one on PATH would be, whoever else can change it.
         Files::let_others_change(&native);
-        assert_eq!(crate::agents::find_binary(&claude, None, &roots), None);
-        Files::shut_others_out(&native);
-        // A better candidate that is refused does not hide the next one that passes.
-        let ranked = vec![
-            (roots.home.clone(), roots.home.join("missing")),
-            (roots.home.clone(), native.clone()),
-        ];
-        Files::let_others_change(&native);
-        assert_eq!(crate::agents::first_trusted(ranked.clone()), None);
-        let second = roots
-            .home
-            .join(".local/bin/second")
-            .with_extension(std::env::consts::EXE_EXTENSION);
-        Files::open_private(&second, Create::NewProgram).unwrap();
-        let ranked = [ranked, vec![(roots.home.clone(), second.clone())]].concat();
         assert_eq!(
-            crate::agents::first_trusted(ranked).as_deref(),
-            second.to_str()
+            crate::agents::find_binary(&claude, None, &roots).as_deref(),
+            native.to_str()
         );
-        Files::shut_others_out(&native);
+        // A better candidate that is missing, or a directory, does not hide the next one.
+        let ranked = vec![
+            roots.home.join("missing"),
+            roots.home.clone(),
+            native.clone(),
+        ];
+        assert_eq!(
+            crate::agents::first_runnable(ranked).as_deref(),
+            native.to_str()
+        );
         // PATH comes first.
         let bin = dir.path().join("bin");
         let first = bin.join(Host::exe_name("claude"));

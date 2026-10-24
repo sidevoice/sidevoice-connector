@@ -17,7 +17,6 @@ mod imp;
 
 pub use imp::Os as Environment;
 
-use crate::platform::fs::Files;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
@@ -156,54 +155,17 @@ pub trait Env {
         None
     }
 
-    /// A program the connector found outside `PATH` (somewhere it chose to look), judged before it is used: it and
-    /// everything on the way to it from `root` (a directory of this user's, which the program must be under) belong
-    /// to this user and cannot be changed by anybody else, and it is a regular file this OS can run. A link is
-    /// resolved and what it leads to is judged, and must also be under `root`. Returns the program as `program`
-    /// names it, or why it is refused (no path in it).
-    fn trusted_program(program: &Path, root: &Path) -> Result<PathBuf, &'static str> {
-        use crate::platform::fs::{Fs, Others};
-        use crate::platform::user::{User, UserId};
-        // The same form `target` has: `check_user_directory` gives the `\\?\` form on Windows.
-        let root_found = Files::check_user_directory(root)
-            .and_then(dunce::canonicalize)
-            .map_err(|_| "its root is not safe")?;
-        let target = dunce::canonicalize(program).map_err(|_| "it cannot be resolved")?;
-        if !target.starts_with(&root_found) {
-            return Err("it leads out of its root");
-        }
-        for path in [program, target.as_path()] {
-            let base = if path == program { root } else { &root_found };
-            for dir in path.ancestors().skip(1) {
-                if dir == base {
-                    break;
-                }
-                if !dir.starts_with(base) || Files::check_user_directory(dir).is_err() {
-                    return Err("a directory on the way is not this user's, or can be changed by another principal");
-                }
-            }
-        }
-        let file = Files::open_read(&target).map_err(|_| "it cannot be opened")?;
-        let regular = file.metadata().is_ok_and(|meta| meta.is_file());
-        let ours = UserId::current().owns_file(&file).unwrap_or(false);
-        if !regular {
-            return Err("it is not a regular file");
-        }
-        if !ours {
-            return Err("its owner is not this user");
-        }
-        if Files::others_of(&file).map_or(true, |others| others == Others::Change) {
-            return Err("it can be changed by another principal (the platform does not say which)");
-        }
-        which::which(&target).map_err(|_| "it cannot be run")?;
-        Ok(program.to_path_buf())
+    /// Whether `program` (an absolute path) is a program this OS can run: a regular file (a link is followed, as a
+    /// `PATH` lookup follows one) that is executable (Unix) or has a runnable extension (Windows).
+    fn runnable(program: &Path) -> bool {
+        program.is_file() && which::which(program).is_ok()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::fs::{Create, Files, Fs, TestFiles};
+    use crate::platform::fs::{Create, Files, Fs};
 
     /// Two absolute directories of this OS, as a list in its own form.
     fn absolute() -> (PathBuf, PathBuf, String) {
@@ -366,51 +328,15 @@ mod tests {
         );
     }
 
-    /// A program of this user's as the platform makes one, in a private directory under `root`.
-    fn program_under(root: &Path, relative: &str) -> PathBuf {
-        let program = root.join(relative);
-        Files::ensure_private_dir(program.parent().unwrap()).unwrap();
-        std::io::Write::write_all(
-            &mut Files::open_private(&program, Create::NewProgram).unwrap(),
-            b"#!/bin/sh\n",
-        )
-        .unwrap();
-        program
-    }
-
     #[test]
-    fn a_program_outside_path_is_trusted_only_when_nobody_else_can_change_it_or_the_way_to_it() {
-        let scratch = crate::test_support::temp_dir("env-trust");
-        let root = scratch.path();
-        let program = program_under(root, &format!("a/b/tool{}", std::env::consts::EXE_SUFFIX));
-        assert_eq!(
-            Environment::trusted_program(&program, root),
-            Ok(program.clone())
-        );
-        // A link is judged by what it leads to.
-        let link = root.join("link");
-        Files::symlink(&program, &link);
-        assert_eq!(Environment::trusted_program(&link, root), Ok(link.clone()));
-        // Not under the root it is said to be under, or not there at all.
-        let other = crate::test_support::temp_dir("env-trust-other");
-        assert!(Environment::trusted_program(&program, other.path()).is_err());
-        assert!(Environment::trusted_program(&root.join("none"), root).is_err());
-        let outside = program_under(
-            other.path(),
-            &format!("x/tool{}", std::env::consts::EXE_SUFFIX),
-        );
-        let escape = root.join("escape");
-        Files::symlink(&outside, &escape);
-        assert!(
-            Environment::trusted_program(&escape, root).is_err(),
-            "a link out of the root"
-        );
-        // Somebody else can change the directory on the way, or the program.
-        Files::let_others_change(program.parent().unwrap());
-        assert!(Environment::trusted_program(&program, root).is_err());
-        Files::shut_others_out(program.parent().unwrap());
-        assert!(Environment::trusted_program(&program, root).is_ok());
-        Files::let_others_change(&program);
-        assert!(Environment::trusted_program(&program, root).is_err());
+    fn a_program_is_runnable_and_a_directory_or_nothing_is_not() {
+        let scratch = crate::test_support::temp_dir("env-runnable");
+        let program = scratch
+            .path()
+            .join(format!("sv-tool{}", std::env::consts::EXE_SUFFIX));
+        Files::open_private(&program, Create::NewProgram).unwrap();
+        assert!(Environment::runnable(&program));
+        assert!(!Environment::runnable(scratch.path()));
+        assert!(!Environment::runnable(&scratch.path().join("none")));
     }
 }
