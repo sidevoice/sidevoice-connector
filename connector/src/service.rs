@@ -16,6 +16,7 @@
 //! What the node is doing is never stored (`status`): read fresh from the manager, the core's failure report and
 //! its health, the same answer for `service status --json` and for a connector's `node.status`.
 
+pub mod background;
 pub mod commands;
 pub mod definition;
 pub mod jobs;

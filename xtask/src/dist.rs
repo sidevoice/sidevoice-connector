@@ -14,7 +14,10 @@ use crate::host::chmod;
 use crate::notices::stage_notices;
 use crate::util::*;
 use crate::verify::verify;
-use crate::{core, entrypoint, exe_suffix, Result, CORE_DIR, INVENTORY, KIND, PACKAGE, ROOT_NAME};
+use crate::{
+    background, core, entrypoint, exe_suffix, Result, BACKGROUND_BIN, CORE_DIR, INVENTORY, KIND,
+    PACKAGE, ROOT_NAME,
+};
 
 /// Where `dist` leaves the archive.
 pub(crate) const DIST_DIR: &str = "target/dist";
@@ -52,7 +55,8 @@ pub(crate) fn dist() -> Result<()> {
         ("build", None, repo.join("target/release"))
     };
     let mut build = Command::new(cargo());
-    // Only the connector: the test bench (testbench/) is a package of its own and is not released.
+    // Only the connector (and on Windows its windowless launcher): the test bench (testbench/) is a package of its own
+    // and is not released.
     build.args([
         subcommand,
         "--locked",
@@ -62,6 +66,9 @@ pub(crate) fn dist() -> Result<()> {
         "--bin",
         PACKAGE,
     ]);
+    if background(target).is_some() {
+        build.args(["--bin", BACKGROUND_BIN]);
+    }
     if let Some(build_target) = &build_target {
         build.args(["--target", build_target]);
     }
@@ -88,6 +95,16 @@ pub(crate) fn dist() -> Result<()> {
         &read(&built.join(format!("{PACKAGE}{}", exe_suffix(target))))?,
     )?;
     chmod(&binary, 0o755)?;
+    let mut executables = vec![entrypoint.clone()];
+    if let Some(launcher) = background(target) {
+        let staged = stage.join(&launcher);
+        write(
+            &staged,
+            &read(&built.join(format!("{BACKGROUND_BIN}{}", exe_suffix(target))))?,
+        )?;
+        chmod(&staged, 0o755)?;
+        executables.push(launcher);
+    }
     write(&stage.join("LICENSE"), &read(&repo.join("LICENSE"))?)?;
     stage_notices(&stage.join("notices"), &triple)?;
     // The core travels inside: the pinned release's archive for this target, checked against its attestation.
@@ -116,7 +133,8 @@ pub(crate) fn dist() -> Result<()> {
     let archive = repo
         .join(DIST_DIR)
         .join(format!("{ROOT_NAME}-{target}.tar.zst"));
-    write_archive(&work.0, ROOT_NAME, &[entrypoint.as_str()], epoch, &archive)?;
+    let executables: Vec<&str> = executables.iter().map(String::as_str).collect();
+    write_archive(&work.0, ROOT_NAME, &executables, epoch, &archive)?;
     let bytes = read(&archive)?;
     println!(
         "{}",

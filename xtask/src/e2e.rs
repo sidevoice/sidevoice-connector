@@ -255,6 +255,29 @@ impl Machine {
         }
     }
 
+    /// The program a Windows task runs (its action's `Execute`), as Task Scheduler reports it.
+    fn task_program(&self, job: &str) -> Result<String> {
+        let script = format!(
+            "$ErrorActionPreference = 'Stop'; (Get-ScheduledTask -TaskName '{}').Actions[0].Execute",
+            self.job(job)
+        );
+        let said = run(
+            "powershell",
+            &["-NoProfile", "-NonInteractive", "-Command", &script],
+            LIMIT,
+        )?;
+        let program = said.stdout.trim().to_owned();
+        if !said.ok || program.is_empty() {
+            return Err(format!(
+                "the action of {} could not be read ({:?}): {program} {}",
+                self.job(job),
+                said.code,
+                said.stderr
+            ));
+        }
+        Ok(program)
+    }
+
     fn job_running(state: &str, os: Os) -> bool {
         match os {
             Os::Windows => state.starts_with("Running "),
@@ -649,6 +672,38 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
             check(definition.is_file(), || {
                 format!("no definition at {}", definition.display())
             })?;
+        }
+    }
+
+    if machine.os == Os::Windows {
+        step("the tasks run the windowless launcher beside the connector");
+        let launcher = stable.with_file_name("sidevoice-background.exe");
+        check(launcher.is_file(), || {
+            format!("the release has no launcher at {}", launcher.display())
+        })?;
+        let running = machine.processes()?;
+        for job in JOBS {
+            let program = machine.task_program(job)?;
+            println!("{}: runs {program}", machine.job(job));
+            check(
+                program
+                    .trim_matches('"')
+                    .eq_ignore_ascii_case(path_str(&launcher)?),
+                || {
+                    format!(
+                        "the task of {job} runs {program}, not {}",
+                        launcher.display()
+                    )
+                },
+            )?;
+            let definition = format!("{job}.json").to_lowercase();
+            check(
+                running.iter().any(|line| {
+                    let line = line.to_lowercase();
+                    line.contains("sidevoice-background.exe") && line.contains(&definition)
+                }),
+                || format!("no launcher process is running the job {job}: {running:#?}"),
+            )?;
         }
     }
 

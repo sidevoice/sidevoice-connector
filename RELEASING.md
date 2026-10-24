@@ -94,7 +94,7 @@ floor is pinned, the package as a whole needs the core's floor.
 
 - `sidevoice-connector-<version>-<target>.tar.zst` for `macos-aarch64`, `linux-x86_64` and `linux-aarch64` (on the
   nightly, `sidevoice-connector-nightly-<target>.tar.zst`, fixed names whose download URLs never change): the root
-  `sidevoice-connector/` holds `bin/sidevoice-connector` (`bin/sidevoice-connector.exe` on Windows; the inventory's
+  `sidevoice-connector/` holds `bin/sidevoice-connector` (`bin/sidevoice-connector.exe` on Windows, where `bin/sidevoice-background.exe` sits beside it: the windowless program the service tasks run; the inventory's
   `entrypoint` names it), `LICENSE`, the licence notices of every crate linked into
   the binary (`notices/`), `core/sidevoice-core-<core version>-<target>.tar.zst`, the pinned core release's archive
   for the same target exactly as the core published it (its own licence notices are inside it), and

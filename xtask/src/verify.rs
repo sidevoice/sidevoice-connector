@@ -138,6 +138,35 @@ pub(crate) fn verify(archive: &Path, image: Option<&str>) -> Result<()> {
             ));
         }
     }
+    // The windowless launcher of the Windows service tasks: loads only system DLLs, hands its arguments to the connector
+    // beside it and exits with the connector's code (a flag the connector refuses makes it fail).
+    if let Some(launcher) = crate::background(target) {
+        let launcher = root.join(launcher);
+        let launcher_str = path_str(&launcher)?;
+        let foreign: Vec<String> = linked_libraries(launcher_str, target)?
+            .into_iter()
+            .filter(|library| !is_system_library(library, target))
+            .collect();
+        if !foreign.is_empty() {
+            return Err(format!(
+                "{launcher_str} loads libraries a machine may not have: {foreign:?}"
+            ));
+        }
+        let ran = |args: &[&str]| -> Result<bool> {
+            clean_environment(Command::new(&launcher).args(args))
+                .status()
+                .map(|status| status.success())
+                .map_err(|error| format!("{launcher_str} {}: {error}", args.join(" ")))
+        };
+        if !ran(&["--version"])? {
+            return Err(format!("{launcher_str} --version failed"));
+        }
+        if ran(&["--no-such-option"])? {
+            return Err(format!(
+                "{launcher_str} hid the connector's refusal of an unknown option"
+            ));
+        }
+    }
     // The core inside: staged into a release by the connector itself, as an install does it. Not in
     // the floor's container (read-only, and the core's own glibc floor is not the connector's yet).
     let staged = match image {

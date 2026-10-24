@@ -107,9 +107,11 @@ pub fn core_environment(
 /// Both jobs' definitions for the selected installation, every value checked.
 pub fn definitions(layout: &Layout) -> Result<Vec<(Job, Definition)>> {
     let programs = programs(layout)?;
-    let mut runner = layout
-        .connector_command()
-        .ok_or_else(|| Failure::keyed("service.no-installation", json!({})))?;
+    let mut runner = Services::runner(
+        &layout
+            .connector_command()
+            .ok_or_else(|| Failure::keyed("service.no-installation", json!({})))?,
+    );
     runner.push(RUN_JOB.into());
     let environment = environment(layout);
     let definitions = vec![

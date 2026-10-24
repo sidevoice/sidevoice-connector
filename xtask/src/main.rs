@@ -144,6 +144,18 @@ pub(crate) fn exe_suffix(target: &str) -> &'static str {
 pub(crate) fn entrypoint(target: &str) -> String {
     format!("{ENTRYPOINT_STEM}{}", exe_suffix(target))
 }
+/// The windowless launcher of the Windows service tasks (connector/src/background.rs), beside the connector in the
+/// Windows archive only; the connector's `Service::BACKGROUND`. Its stem, with no suffix.
+pub(crate) const BACKGROUND_STEM: &str = "bin/sidevoice-background";
+/// The crate binary that is it.
+pub(crate) const BACKGROUND_BIN: &str = "sidevoice-background";
+
+/// The launcher inside the archive of `target`, when that target has one.
+pub(crate) fn background(target: &str) -> Option<String> {
+    target
+        .starts_with("windows-")
+        .then(|| format!("{BACKGROUND_STEM}{}", exe_suffix(target)))
+}
 /// Where the archive carries the pinned core release archive, as the core published it.
 pub(crate) const CORE_DIR: &str = "core";
 /// The inventory every archive carries at its root.

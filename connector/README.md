@@ -112,7 +112,7 @@ stable keys: `core.package-missing`, `core.package-mismatch`. The core never run
 laid out as above) and makes the installation every other part runs (sidevoice/sidevoice-connector#66, decisions 1
 and 3):
 
-- `R/releases/<version>/`: one directory per version, with a copy of the binary (`bin/sidevoice-connector`) and the
+- `R/releases/<version>/`: one directory per version, with a copy of the binary (`bin/sidevoice-connector`; on Windows also `bin/sidevoice-background.exe`, which the service tasks run so no console window opens) and the
   core staged in it (above). Another build of a version already there (a nightly, a local build) is
   `<version>+<the first 12 hex digits of its binary's digest>`.
 - `R/current`: a link to the selected release, switched by renaming a new link over it.

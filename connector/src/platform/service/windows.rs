@@ -8,13 +8,16 @@
 //! deleted (`/Delete`).
 //!
 //! A task cannot set its program's environment or send its output to a file, so its action runs the job's runner
-//! ([`Job::runner`], the connector's `run-job`) on the job's definition, `<data>/service/<name>.json`
+//! ([`Job::runner`]: the connector's `run-job`, started through `sidevoice-background.exe` beside it, a GUI program
+//! that starts the connector without a window, since Task Scheduler gives a console program a console of its own and
+//! closing it would end the job; [`Service::BACKGROUND`]) on the job's definition, `<data>/service/<name>.json`
 //! ([`Stored`]), which does both ([`Service::run_job`](super::Service::run_job)). Task Scheduler cannot tell a job's
 //! pid or count its restarts: a job runs when this user has a process running its program, and restarts are not
 //! reported. It also brings a task back only after a failure, so a connector that exits cleanly stays down until
 //! the next login or start. `/End` is a hard stop, so a job's process is first asked to leave
 //! ([`Process::ask_to_leave`]: its stop event, which the core and the connector daemon listen on) and given
-//! [`STOP_GRACE`]; `/End` ends what is still there. A job that left by itself exited 0, so `RestartOnFailure` does
+//! [`STOP_GRACE`]; `/End` ends what is still there, and the background program's Job Object (kill on close) ends the connector's tree
+//! with it. A job that left by itself exited 0, so `RestartOnFailure` does
 //! not bring it back.
 
 use super::{command, write_file, Job, JobId, JobState, Output, Places, Refusal, Service, Stored};
@@ -34,6 +37,7 @@ pub struct Os {
 
 impl Service for Os {
     const KIND: &'static str = "task-scheduler";
+    const BACKGROUND: Option<&'static str> = Some(crate::service::background::PROGRAM);
 
     fn new(places: Places) -> Os {
         Os { places }
@@ -595,6 +599,19 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         assert_eq!(utf16_text, off);
+    }
+
+    #[test]
+    fn a_task_runs_the_background_program_beside_the_connector_with_the_connectors_arguments() {
+        let mut runner = Os::runner(&["C:\\r\\bin\\sidevoice-connector.exe".to_owned()]);
+        runner.push("run-job".into());
+        let job = stored(&runner.iter().map(String::as_str).collect::<Vec<_>>());
+        let text = task_xml(&job, Path::new("C:\\d\\service\\job.json"), "alice", true).unwrap();
+        assert!(
+            text.contains("<Command>C:\\r\\bin\\sidevoice-background.exe</Command>"),
+            "{text}"
+        );
+        assert!(text.contains("<Arguments>run-job C:\\d\\service\\job.json</Arguments>"));
     }
 
     #[test]
