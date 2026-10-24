@@ -265,3 +265,19 @@ Build artifacts on Actions runs are kept 7 days, for debugging only. Download fr
 - The `npm` environment is not used: publishing to npm runs in no environment, and its approval is the staged
   launcher's (see [npm](#npm-what-is-published-and-how-to-add-a-platform)). Delete it.
 - On npmjs.com, a trusted publisher for each npm package ([Trusted publishing](#who-publishes-and-how)).
+
+## Daily latest-agent compatibility
+
+`e2e-latest.yml` runs once daily at 07:23 UTC and supports **Actions → Latest agent compatibility → Run workflow**
+(or `gh workflow run e2e-latest.yml`). It is informational, never a required check, and does not run on PRs or gate
+releases. Do not add its checks to branch protection. It resolves both npm `latest` versions once and calls the same
+`e2e.yml` and `cargo xtask e2e`, against the published nightly connector archives, avoiding daily release builds.
+Windows x64 and both existing Linux architectures run; macOS is omitted to reduce private Actions costs.
+Failures open one issue, or comment on the existing open issue, with the concrete CLI versions and run link. A version
+lookup failure is reported as unresolved. Deduplication depends on the exact title
+`Latest agent compatibility e2e failed`; do not rename an open compatibility issue. The next successful run
+comments "passing again" and closes it. Reports include the nightly commit, archive update timestamps, and pinned
+versions from that commit alongside the latest versions. The e2e checkout uses that same nightly commit.
+
+PR and release e2e retain their pinned defaults. For a disposable local runner, concrete overrides are
+`SIDEVOICE_E2E_CLAUDE_VERSION` and `SIDEVOICE_E2E_CODEX_VERSION`; both installation and version assertions use them.

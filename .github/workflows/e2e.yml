@@ -13,6 +13,20 @@ on:
         type: string
         required: true
 
+      claude-version:
+        type: string
+        default: ''
+      codex-version:
+        type: string
+        default: ''
+      release-tag:
+        description: Download published archives instead of this run's build artifacts.
+        type: string
+        default: ''
+      skip-macos:
+        type: boolean
+        default: false
+
 permissions:
   contents: read
 
@@ -23,24 +37,35 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { target: windows-x86_64, runner: windows-2025 }
-          - { target: linux-x86_64, runner: ubuntu-24.04 }
-          - { target: linux-aarch64, runner: ubuntu-24.04-arm }
-          - { target: macos-aarch64, runner: macos-15 }
+        include: ${{ fromJSON(inputs.skip-macos && '[{"target":"windows-x86_64","runner":"windows-2025"},{"target":"linux-x86_64","runner":"ubuntu-24.04"},{"target":"linux-aarch64","runner":"ubuntu-24.04-arm"}]' || '[{"target":"windows-x86_64","runner":"windows-2025"},{"target":"linux-x86_64","runner":"ubuntu-24.04"},{"target":"linux-aarch64","runner":"ubuntu-24.04-arm"},{"target":"macos-aarch64","runner":"macos-15"}]') }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
       - uses: ./.github/actions/setup
       # The agents' CLIs are installed with this npm, into its global prefix (on the login PATH the connector reads).
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      - if: inputs.release-tag == ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dist-${{ matrix.target }}
           path: dist
+      - name: Download the published archive
+        if: inputs.release-tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$RELEASE_TAG" --pattern "sidevoice-connector-*-$TARGET.tar.zst" --dir dist
+          mv dist/sidevoice-connector-*-"$TARGET".tar.zst "dist/sidevoice-connector-$TARGET.tar.zst"
       # A runner's user has no login session, so no systemd user manager: what logging in gives a person
       # (pam_systemd) is lingering for the user and the session's runtime directory and bus. Nothing else of the
       # runner is changed; the connector itself only finds the manager there.
@@ -69,3 +94,6 @@ jobs:
           Get-CimInstance Win32_LogonSession | Where-Object LogonType -in 2,10,11 | Select-Object LogonId, LogonType, StartTime | Format-Table | Out-String | Write-Output
           $global:LASTEXITCODE = 0
       - run: cargo xtask e2e dist/sidevoice-connector-${{ matrix.target }}.tar.zst
+        env:
+          SIDEVOICE_E2E_CLAUDE_VERSION: ${{ inputs.claude-version }}
+          SIDEVOICE_E2E_CODEX_VERSION: ${{ inputs.codex-version }}

@@ -42,6 +42,14 @@ use crate::{codex, Result};
 
 /// The Claude Code CLI release installed, from npm (`@anthropic-ai/claude-code`). Bumped by hand, like any pin.
 pub(crate) const CLAUDE_CODE_VERSION: &str = "2.1.308";
+/// CI can exercise concrete newer releases without moving the reproducible defaults.
+fn agent_version(name: &str, pinned: &str) -> String {
+    env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| pinned.to_owned())
+}
+
 /// The core's default HTTP port (connector/README.md, "Where things are").
 const CORE_PORT: u16 = 10829;
 /// The core and connector jobs, by their base name (`service/jobs.rs`).
@@ -579,6 +587,8 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
         format!("port {CORE_PORT}, the core's, is not free on this machine ({error}): not a fresh machine")
     })?;
 
+    let claude_version = agent_version("SIDEVOICE_E2E_CLAUDE_VERSION", CLAUDE_CODE_VERSION);
+    let codex_version = agent_version("SIDEVOICE_E2E_CODEX_VERSION", codex::VERSION);
     step("the agents' CLIs, installed with npm and no login");
     run_ok(
         "npm",
@@ -587,15 +597,18 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
             "--global",
             "--no-audit",
             "--no-fund",
-            &format!("@anthropic-ai/claude-code@{CLAUDE_CODE_VERSION}"),
-            &format!("@openai/codex@{}", codex::VERSION),
+            &format!("@anthropic-ai/claude-code@{claude_version}"),
+            &format!("@openai/codex@{codex_version}"),
         ],
         Duration::from_secs(300),
     )?;
     // The CLIs the rest of the test runs: the ones on PATH, until they are moved to the apps' places.
     let mut claude_cli = resolve("claude");
     let mut codex_cli = resolve("codex");
-    for (cli, version) in [("claude", CLAUDE_CODE_VERSION), ("codex", codex::VERSION)] {
+    for (cli, version) in [
+        ("claude", claude_version.as_str()),
+        ("codex", codex_version.as_str()),
+    ] {
         let found = which::which(cli)
             .map_err(|error| format!("{cli} is not on PATH after npm install: {error}"))?;
         let said = run_path(&found, &["--version"], LIMIT)?;
@@ -1064,6 +1077,8 @@ fn move_to_apps(
     claude_cli: &mut PathBuf,
     codex_cli: &mut PathBuf,
 ) -> Result<(PathBuf, Option<PathBuf>)> {
+    let claude_version = agent_version("SIDEVOICE_E2E_CLAUDE_VERSION", CLAUDE_CODE_VERSION);
+    let codex_version = agent_version("SIDEVOICE_E2E_CODEX_VERSION", codex::VERSION);
     let root = PathBuf::from(run_ok("npm", &["root", "--global"], LIMIT)?.trim());
     let windows = machine.os == Os::Windows;
     let claude_exe = if windows { "claude.exe" } else { "claude" };
@@ -1078,7 +1093,7 @@ fn move_to_apps(
     let claude_to = match machine.os {
         Os::Windows => local()?
             .join("Claude-Data/claude_e2e0000000000/claude-code")
-            .join(CLAUDE_CODE_VERSION)
+            .join(&claude_version)
             .join("e2e")
             .join(claude_exe),
         _ => machine.home.join(".claude/local").join(claude_exe),
@@ -1124,8 +1139,8 @@ fn move_to_apps(
         })?;
     }
     for (cli, version, path) in [
-        ("claude", CLAUDE_CODE_VERSION, Some(&claude_to)),
-        ("codex", codex::VERSION, codex_to.as_ref()),
+        ("claude", claude_version.as_str(), Some(&claude_to)),
+        ("codex", codex_version.as_str(), codex_to.as_ref()),
     ] {
         if let Some(path) = path {
             let said = run_path(path, &["--version"], LIMIT)?;
