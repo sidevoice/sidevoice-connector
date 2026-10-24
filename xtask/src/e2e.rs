@@ -1054,7 +1054,8 @@ fn place(from: &Path, to: &Path) -> Result<()> {
 
 /// Moves the npm-installed CLIs to where the desktop apps keep theirs, exactly where the connector looks
 /// (`connector/src/adapters/{claude,codex}/binary.rs`), and removes them from npm so nothing is left on `PATH`.
-/// Claude Code: Windows, the Claude MSIX package's `claude-code\<version>\<hash>`; elsewhere `~/.claude/local` (a
+/// Claude Code: Windows, the desktop app's `%LOCALAPPDATA%\Claude-Data\claude_<id>\claude-code\<version>\<hash>` (and a
+/// lower version in the older MSIX package layout, which must lose); elsewhere `~/.claude/local` (a
 /// fallback place on no `PATH`; `~/.claude` exists by now). Codex: Windows, the ChatGPT app's cache
 /// `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>`; macOS, `~/Applications/ChatGPT.app`'s bundle; Linux has no app, so it
 /// stays where npm put it. Returns where each now is (`None`: still on `PATH`) and sets the two CLI paths to use.
@@ -1076,7 +1077,7 @@ fn move_to_apps(
     let local = || var("LOCALAPPDATA").map(PathBuf::from);
     let claude_to = match machine.os {
         Os::Windows => local()?
-            .join("Packages/Claude_e2e0000000000/LocalCache/Roaming/Claude/claude-code")
+            .join("Claude-Data/claude_e2e0000000000/claude-code")
             .join(CLAUDE_CODE_VERSION)
             .join("e2e")
             .join(claude_exe),
@@ -1093,6 +1094,13 @@ fn move_to_apps(
         Os::Linux => None,
     };
     place(&claude_from, &claude_to)?;
+    if machine.os == Os::Windows {
+        // The older MSIX layout holds a copy too, of a lower version: the connector must still pick the Claude-Data one.
+        let older = local()?
+            .join("Packages/Claude_e2e0000000000/LocalCache/Roaming/Claude/claude-code/0.0.1/e2e")
+            .join(claude_exe);
+        place(&claude_from, &older)?;
+    }
     if let Some(to) = &codex_to {
         place(&codex_from, to)?;
     }

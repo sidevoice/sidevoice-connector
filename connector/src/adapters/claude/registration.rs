@@ -36,10 +36,6 @@ impl Claude {
             Err(_) => return Ok(Entry::bare("invalid")),
             Ok(_) => {}
         }
-        // Registering goes through its CLI: without one, what the file says cannot be acted on.
-        if binary.is_none() {
-            return Ok(Entry::bare("unknown"));
-        }
         let Some(config) = config else {
             return Ok(Entry::bare("absent"));
         };
@@ -59,6 +55,11 @@ impl Claude {
                 "invalid"
             }));
         };
+        // Registering goes through its CLI: without one, an entry the file holds cannot be acted on (uninstall says
+        // it was left behind). With no entry there is nothing to act on, with or without a CLI.
+        if binary.is_none() {
+            return Ok(Entry::bare("unknown"));
+        }
         // Another transport (`http`, `sse`) or no command: not an entry Sidevoice writes.
         let stdio = entry
             .get("type")
@@ -428,6 +429,21 @@ mod tests {
                 assert_eq!(fs::read(&file).unwrap(), b"{\"mcpServers\": {");
             }
         }
+    }
+
+    /// With no CLI found, an entry of ours in the configuration is `unknown` (uninstall reports it left behind); no
+    /// entry is `absent`, so uninstall has nothing to report.
+    #[tokio::test]
+    async fn without_a_cli_only_an_entry_that_is_there_is_unknown() {
+        let scratch = crate::test_support::temp_dir("claude-no-cli");
+        let (profile, file) = profile(&scratch, false, true);
+        write(
+            &file,
+            br#"{"mcpServers":{"sidevoice":{"command":"/nowhere/sidevoice","args":[]}},"other":1}"#,
+        );
+        assert_eq!(state(&Host(profile.clone()), None).await, "unknown");
+        write(&file, br#"{"mcpServers":{"other":{"command":"x"}}}"#);
+        assert_eq!(state(&Host(profile), None).await, "absent");
     }
 
     /// A FIFO where the user configuration belongs is refused at once, never waited on. Unix only: a FIFO is a file

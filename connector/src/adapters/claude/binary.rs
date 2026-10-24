@@ -17,29 +17,56 @@ pub(super) fn fallbacks(roots: &Roots) -> Vec<PathBuf> {
     let home = |relative: &str| roots.home.join(relative).join(&exe);
     let mut found = vec![home(".local/bin"), home(".claude/local")];
     if let Some(local) = &roots.local_app_data {
-        let bundles = Environment::store_packages(local)
-            .map(|packages| desktop_bundles(&packages, &exe))
-            .unwrap_or_default();
-        found.extend(bundles);
+        let roots = version_roots(
+            Environment::store_packages(local),
+            Environment::per_user_app_programs(local),
+        );
+        found.extend(desktop_bundles(&roots, &exe));
     }
     found
 }
 
-/// The desktop app is an MSIX package (`Claude_<publisher id>`) and keeps its Claude Code under
-/// `<packages>\Claude_*\LocalCache\Roaming\Claude\claude-code\<version>\<hash>\claude.exe`. The highest version wins
-/// (by version precedence, not text); among several builds of it, the newest. All are returned, best first: the
-/// caller takes the first that can be run, so a newer one that cannot does not hide an older one that can.
-fn desktop_bundles(packages: &Path, exe: &str) -> Vec<PathBuf> {
+/// The directories holding the desktop app's `<version>\<hash>\claude.exe` builds, from the two places the app has
+/// kept them: the MSIX package, `<packages>\Claude_*\LocalCache\Roaming\Claude\claude-code` (older), and the
+/// per-user data folder, `<app programs>\Claude-Data\claude_*\claude-code` (current).
+fn version_roots(packages: Option<PathBuf>, programs: Option<PathBuf>) -> Vec<PathBuf> {
+    let named = |dir: &Path| -> Vec<PathBuf> {
+        subdirs(dir)
+            .into_iter()
+            .filter(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .to_ascii_lowercase()
+                        .starts_with("claude_")
+                })
+            })
+            .collect()
+    };
+    let mut roots = Vec::new();
+    if let Some(packages) = packages {
+        roots.extend(
+            named(&packages)
+                .into_iter()
+                .map(|package| package.join("LocalCache/Roaming/Claude/claude-code")),
+        );
+    }
+    if let Some(programs) = programs {
+        roots.extend(
+            named(&programs.join("Claude-Data"))
+                .into_iter()
+                .map(|data| data.join("claude-code")),
+        );
+    }
+    roots
+}
+
+/// Every `<root>\<version>\<hash>\claude.exe` under the [`version_roots`]. The highest version wins (by version
+/// precedence, not text); among several builds of it, the newest. All are returned, best first: the caller takes the
+/// first that can be run, so a newer one that cannot does not hide an older one that can.
+fn desktop_bundles(roots: &[PathBuf], exe: &str) -> Vec<PathBuf> {
     let mut found: Vec<(Version, SystemTime, PathBuf)> = Vec::new();
-    for package in subdirs(packages) {
-        let named = package
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with("Claude_"));
-        if !named {
-            continue;
-        }
-        let root = package.join("LocalCache/Roaming/Claude/claude-code");
-        for version_dir in subdirs(&root) {
+    for root in roots {
+        for version_dir in subdirs(root) {
             let Some(version) = version_dir
                 .file_name()
                 .and_then(|name| Version::parse(&name.to_string_lossy()).ok())
@@ -124,16 +151,46 @@ mod tests {
             )
             .unwrap();
         }
-        let ranked = desktop_bundles(packages, &exe);
+        let ranked = desktop_bundles(&version_roots(Some(packages.to_path_buf()), None), &exe);
         assert_eq!(ranked.len(), 4, "every build of a version, not the others");
         assert_eq!(ranked[0], newest);
         assert!(
             ranked[3].to_string_lossy().contains("2.1.9"),
             "the lowest version is last"
         );
-        assert!(desktop_bundles(&packages.join("none"), &exe).is_empty());
+        assert!(
+            desktop_bundles(&version_roots(Some(packages.join("none")), None), &exe).is_empty()
+        );
     }
 
+    #[test]
+    fn the_claude_data_folder_is_searched_with_the_package_and_the_newest_version_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = Host::exe_name("claude");
+        let packages = dir.path().join("Packages");
+        let programs = dir.path().to_path_buf();
+        program(
+            &bundle(&packages, "Claude_pzs8sxrjxfjjc", "2.1.200", "old"),
+            0,
+        );
+        let current = programs
+            .join("Claude-Data/claude_pzs8sxrjxfjjc/claude-code/2.1.308/c17a819afb40")
+            .join(&exe);
+        program(&current, 0);
+        program(
+            &programs
+                .join("Claude-Data/other_abc/claude-code/9.9.9/x")
+                .join(&exe),
+            0,
+        );
+        let roots = version_roots(Some(packages.clone()), Some(programs.clone()));
+        let ranked = desktop_bundles(&roots, &exe);
+        assert_eq!(ranked.len(), 2, "both layouts, not the unrelated folder");
+        assert_eq!(ranked[0], current);
+        // Either layout alone is found.
+        let only = version_roots(None, Some(programs));
+        assert_eq!(desktop_bundles(&only, &exe), vec![current]);
+    }
     #[test]
     fn the_native_and_local_installs_come_first() {
         let dir = tempfile::tempdir().unwrap();

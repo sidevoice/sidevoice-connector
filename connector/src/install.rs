@@ -927,7 +927,7 @@ async fn unregister(profile: &Profile) -> Value {
             ),
             _ => (
                 "unknown",
-                crate::messages::message("agents.registration-unknown", &json!({"agent": label})),
+                crate::messages::message("agents.left-behind", &json!({"agent": label})),
             ),
         };
         outcomes.insert(id, json!({"outcome": outcome, "message": message}));
