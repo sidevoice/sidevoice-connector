@@ -16,14 +16,16 @@ pub const HOME: crate::profile::AgentHome = crate::profile::AgentHome {
 };
 
 use super::{envelope, Identity};
+use crate::platform::process::{Process, Processes};
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 
 /// Codex's model catalogue in its home: the models the account can use, each with its default reasoning level.
 const MODEL_CATALOGUE: &str = "models_cache.json";
@@ -148,22 +150,56 @@ pub async fn deliver(delivery: &Value, event: &Value, profile: &Profile) -> Resu
     if let Ok(turn) = try_steer(command(), profile, thread, message_id, &envelope).await {
         return Ok(json!({"status":"accepted","detail":format!("codex steered turn {turn}")}));
     }
-    let result = tokio::time::timeout(
-        Duration::from_secs(30),
-        command()
-            .args(["queue", "--thread", thread, "--message"])
-            .arg(envelope)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .status(),
-    )
-    .await;
-    match result {
-        Ok(Ok(status)) if status.success() => {
+    let mut queue = command();
+    queue
+        .args(["queue", "--thread", thread, "--message"])
+        .arg(envelope);
+    match run(queue, false, Duration::from_secs(30)).await {
+        Ok((status, _)) if status.success() => {
             Ok(json!({"status":"accepted","detail":"codex queue confirmed the thread"}))
         }
         _ => bail!("Codex queue failed"),
+    }
+}
+
+/// Runs `command` (a Codex CLI call) to its end within `limit`, giving its exit status and, when `capture`, its
+/// output. Started through [`Processes::spawn_detached`], so that on Windows it has no console window of its own (the
+/// daemon has none, and a console program started without one opens a visible window); the program is stopped when
+/// this is dropped or `limit` passes.
+async fn run(
+    mut command: tokio::process::Command,
+    capture: bool,
+    limit: Duration,
+) -> Result<(ExitStatus, Vec<u8>)> {
+    command
+        .stdin(Stdio::null())
+        .stdout(if capture {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = Processes::spawn_detached(command).await?;
+    let mut stdout = child.stdout();
+    let finished = tokio::time::timeout(limit, async {
+        let read = async {
+            let mut output = Vec::new();
+            if let Some(stdout) = stdout.as_mut() {
+                stdout.read_to_end(&mut output).await?;
+            }
+            std::io::Result::Ok(output)
+        };
+        let (status, output) = tokio::join!(child.wait(), read);
+        Ok::<_, std::io::Error>((status?, output?))
+    })
+    .await;
+    match finished {
+        Ok(done) => Ok(done?),
+        Err(_) => {
+            child.kill_tree().await;
+            bail!("Codex did not answer in time")
+        }
     }
 }
 
@@ -180,19 +216,9 @@ async fn try_steer(
     if !socket.exists() {
         bail!("no Codex daemon socket");
     }
-    let output = tokio::time::timeout(
-        Duration::from_secs(10),
-        version
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await??;
-    if !steer::supports_steer(steer::parse_version(&String::from_utf8_lossy(
-        &output.stdout,
-    ))) {
+    version.arg("--version");
+    let (_, stdout) = run(version, true, Duration::from_secs(10)).await?;
+    if !steer::supports_steer(steer::parse_version(&String::from_utf8_lossy(&stdout))) {
         bail!("installed Codex cannot be steered from outside");
     }
     steer::steer(&socket, thread, message_id, text).await
@@ -280,5 +306,36 @@ mod tests {
         fs::write(home.join(MODEL_CATALOGUE), catalogue().to_string()).unwrap();
         assert_eq!(default_effort(&home, "gpt-6-luna"), Some("high".to_owned()));
         fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_codex_call_gives_its_status_and_output_and_is_stopped_at_its_limit() {
+        use crate::platform::stand_in::{StandIn, StandIns as _};
+        use crate::platform::target::{Host, Target as _};
+        let dir = crate::test_support::temp_dir("codex-run");
+        let program = dir.path().join(Host::exe_name("codex"));
+        StandIn::make(
+            &program,
+            r#"{"play":"script","print":"codex-cli 0.157.0\n","exit":3}"#,
+        );
+        let (status, stdout) = run(
+            tokio::process::Command::new(&program),
+            true,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(String::from_utf8_lossy(&stdout), "codex-cli 0.157.0\n");
+        let (_, nothing) = run(
+            tokio::process::Command::new(&program),
+            false,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert!(nothing.is_empty());
+        let late = run(tokio::process::Command::new(&program), true, Duration::ZERO).await;
+        assert!(late.is_err(), "no time to answer");
     }
 }
