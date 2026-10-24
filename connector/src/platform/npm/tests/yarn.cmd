@@ -1,11 +1,7 @@
-@SETLOCAL
-
 @IF EXIST "%~dp0\node.exe" (
-  @SET "_prog=%~dp0\node.exe"
+  "%~dp0\node.exe"  "%~dp0\..\Data\global\node_modules\@example\agent\bin\agent.js" %*
 ) ELSE (
-  @SET "_prog=node"
+  @SETLOCAL
   @SET PATHEXT=%PATHEXT:;.JS;=;%
+  node  "%~dp0\..\Data\global\node_modules\@example\agent\bin\agent.js" %*
 )
-
-"%_prog%"  "%~dp0\..\Data\global\node_modules\@example\agent\bin\agent.js" %*
-@ENDLOCAL
