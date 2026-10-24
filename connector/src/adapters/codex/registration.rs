@@ -289,6 +289,10 @@ impl Registration for Codex {
         super::binary::fallbacks(roots)
     }
 
+    fn native_program(&self, launcher: &Path) -> Option<PathBuf> {
+        super::binary::npm_native(launcher)
+    }
+
     // npm and Homebrew select their own installation prefix; neither is a stable Codex marker.
     fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
         &[]

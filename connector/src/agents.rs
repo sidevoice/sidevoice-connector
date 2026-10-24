@@ -1266,6 +1266,7 @@ pub(crate) fn find_binary(
     roots: &Roots,
 ) -> Option<String> {
     find_in_path(agent.binary_names(), path)
+        .map(|found| native_program(agent, found))
         .or_else(|| first_runnable(agent.fallback_binaries(roots)))
 }
 
@@ -1276,6 +1277,15 @@ pub(crate) fn first_runnable(candidates: Vec<PathBuf>) -> Option<String> {
         .into_iter()
         .filter(|program| Environment::runnable(program))
         .find_map(|program| program.into_os_string().into_string().ok())
+}
+
+/// What `found` (on `PATH`) stands for: the real program when it is only a launcher script of the agent, else itself.
+fn native_program(agent: &dyn Registration, found: String) -> String {
+    agent
+        .native_program(Path::new(&found))
+        .filter(|program| Environment::runnable(program))
+        .and_then(|program| program.into_os_string().into_string().ok())
+        .unwrap_or(found)
 }
 
 pub(crate) fn find_in_path(names: &[&str], path: Option<&str>) -> Option<String> {
