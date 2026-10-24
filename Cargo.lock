@@ -1416,8 +1416,8 @@ dependencies = [
 
 [[package]]
 name = "sidevoice-platform"
-version = "0.11.0"
-source = "git+https://github.com/sidevoice/sidevoice-core?tag=v0.11.0#db588cf97f4fdd21d86c060b3f860d23075459d2"
+version = "0.11.1"
+source = "git+https://github.com/sidevoice/sidevoice-core?tag=v0.11.1#b2f094574a6583d84f137e56d667a9833e557d5f"
 dependencies = [
  "dirs",
  "gethostname",
