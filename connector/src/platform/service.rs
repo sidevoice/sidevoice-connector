@@ -242,14 +242,15 @@ pub trait Service: Sized + Send + Sync {
     fn definition(job: &Job) -> String;
 
     /// The command a manager runs to run a job (then [`Job::runner`]'s `run-job` and the definition file): the
-    /// installation's `command`, its program replaced by [`Service::BACKGROUND`] beside it where there is one.
+    /// installation's `command`, its program replaced by [`Service::BACKGROUND`] beside it where there is one and the
+    /// release has it: a release from before the launcher (a rollback to it) keeps the plain command.
     fn runner(command: &[String]) -> Vec<String> {
         let mut runner = command.to_vec();
         if let (Some(stem), Some(program)) = (Self::BACKGROUND, runner.first_mut()) {
-            *program = Path::new(program.as_str())
-                .with_file_name(Host::exe_name(stem))
-                .to_string_lossy()
-                .into_owned();
+            let launcher = Path::new(program.as_str()).with_file_name(Host::exe_name(stem));
+            if launcher.is_file() {
+                *program = launcher.to_string_lossy().into_owned();
+            }
         }
         runner
     }
@@ -638,8 +639,15 @@ mod tests {
     #[test]
     fn the_runner_is_the_installations_command_with_the_background_program_where_the_manager_has_one(
     ) {
-        let bin = Path::new("/r/current/bin");
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path();
         let connector = bin.join(Host::exe_name("sidevoice-connector"));
+        // A release from before the launcher has none beside its connector: its command is kept.
+        let command = vec![connector.to_string_lossy().into_owned(), "x".into()];
+        assert_eq!(Services::runner(&command), command);
+        if let Some(stem) = Services::BACKGROUND {
+            std::fs::write(bin.join(Host::exe_name(stem)), b"launcher").unwrap();
+        }
         let command = vec![connector.to_string_lossy().into_owned(), "x".into()];
         let runner = Services::runner(&command);
         let expected = match Services::BACKGROUND {

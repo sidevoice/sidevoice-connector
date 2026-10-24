@@ -603,12 +603,18 @@ mod tests {
 
     #[test]
     fn a_task_runs_the_background_program_beside_the_connector_with_the_connectors_arguments() {
-        let mut runner = Os::runner(&["C:\\r\\bin\\sidevoice-connector.exe".to_owned()]);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sidevoice-background.exe"), b"launcher").unwrap();
+        let connector = dir.path().join("sidevoice-connector.exe");
+        let mut runner = Os::runner(&[connector.to_string_lossy().into_owned()]);
         runner.push("run-job".into());
         let job = stored(&runner.iter().map(String::as_str).collect::<Vec<_>>());
         let text = task_xml(&job, Path::new("C:\\d\\service\\job.json"), "alice", true).unwrap();
         assert!(
-            text.contains("<Command>C:\\r\\bin\\sidevoice-background.exe</Command>"),
+            text.contains(&format!(
+                "<Command>{}</Command>",
+                dir.path().join("sidevoice-background.exe").display()
+            )),
             "{text}"
         );
         assert!(text.contains("<Arguments>run-job C:\\d\\service\\job.json</Arguments>"));
