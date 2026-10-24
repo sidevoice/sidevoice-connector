@@ -2694,6 +2694,35 @@ async fn claude_never_started_is_connected_and_its_cli_makes_its_home() {
     host.shutdown().await;
 }
 
+/// Claude Code on the login PATH `$SHELL` says (`login-bin`), and that shell overtaken by another scan of the same data
+/// directory the first `times` times it runs: the other scan records its own login PATH, where nothing is found.
+fn overtaken_scans(fixture: &Fixture, times: u64) -> PathBuf {
+    let bin = fixture.root.join("login-bin");
+    private_mkdir(&bin);
+    Script::default().make(&bin.join(Host::exe_name("claude")));
+    let shell = fixture.root.join(Host::exe_name("login-shell"));
+    crate::test_support::stand_in::make(
+        &shell,
+        &json!({
+            "play": "overtaken-login-shell",
+            "path": bin.to_string_lossy(),
+            "times": times,
+            "marker": fixture.root.join("overtaken"),
+            "file": fixture.profile.data.join("agents.json"),
+            "state": {
+                "version": 1,
+                "login_path": fixture.root.join("service-bin").to_string_lossy(),
+                "scanned_at": "2026-10-24T00:14:52.000Z",
+                "scan_failed": false,
+                "binaries": {},
+                "seen": {"claude": {"present": false}},
+                "dismissed": {},
+            },
+        }),
+    );
+    shell
+}
+
 /// Two scans of one data directory overlap with different login PATHs (the daemon's at its start, from the service's
 /// environment, while `install` scans from the person's): the one overtaken scans again from what the other recorded,
 /// so it answers with what it found, never with the other's listing or with nothing.
@@ -2706,29 +2735,7 @@ async fn a_scan_overtaken_by_another_scans_again_and_answers_what_it_found() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
     let _no_cursor_override = EnvGuard::set("SIDEVOICE_CURSOR_BIN", std::ffi::OsStr::new(""));
-    let bin = fixture.root.join("login-bin");
-    private_mkdir(&bin);
-    Script::default().make(&bin.join(Host::exe_name("claude")));
-    let shell = fixture.root.join(Host::exe_name("login-shell"));
-    let other = fixture.root.join("service-bin");
-    crate::test_support::stand_in::make(
-        &shell,
-        &json!({
-            "play": "overtaken-login-shell",
-            "path": bin.to_string_lossy(),
-            "marker": fixture.root.join("overtaken"),
-            "file": fixture.profile.data.join("agents.json"),
-            "state": {
-                "version": 1,
-                "login_path": other.to_string_lossy(),
-                "scanned_at": "2026-10-24T00:14:52.000Z",
-                "scan_failed": false,
-                "binaries": {},
-                "seen": {"claude": {"present": false}},
-                "dismissed": {},
-            },
-        }),
-    );
+    let shell = overtaken_scans(&fixture, 1);
     let _shell = EnvGuard::set("SHELL", shell.as_os_str());
     let host = HostAgents::for_installer(fixture.profile.clone()).unwrap();
 
@@ -2740,5 +2747,68 @@ async fn a_scan_overtaken_by_another_scans_again_and_answers_what_it_found() {
     assert!(listed.get("error").is_none(), "{listed}");
     assert_eq!(listed["scan_failed"], false, "{listed}");
     assert!(listed_ids(&listed).contains(&"claude".into()), "{listed}");
+    host.shutdown().await;
+}
+
+/// Overtaken on every attempt, a scan says it failed rather than answer with the other scan's listing as its own; what
+/// the other scan recorded is left as it recorded it.
+#[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "the login PATH is asked of a login shell (`$SHELL`) on Unix; Windows reads it from the registry, so no shell can be overtaken"
+)]
+async fn a_scan_overtaken_on_every_attempt_says_it_failed() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let _no_cursor_override = EnvGuard::set("SIDEVOICE_CURSOR_BIN", std::ffi::OsStr::new(""));
+    let shell = overtaken_scans(&fixture, SCAN_ATTEMPTS as u64);
+    let _shell = EnvGuard::set("SHELL", shell.as_os_str());
+    let host = HostAgents::for_installer(fixture.profile.clone()).unwrap();
+
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert_eq!(listed["scan_failed"], true, "{listed}");
+    let runs = fs::read_to_string(fixture.root.join("overtaken")).unwrap();
+    assert_eq!(
+        runs.trim(),
+        SCAN_ATTEMPTS.to_string(),
+        "one capture per attempt"
+    );
+    let recorded: Value =
+        serde_json::from_slice(&fs::read(fixture.profile.data.join("agents.json")).unwrap())
+            .unwrap();
+    assert_eq!(recorded["scan_failed"], false, "{recorded}");
+    host.shutdown().await;
+}
+
+/// The reverse order: a scan from the person's environment found Claude Code; a later one from the service's, whose
+/// login PATH does not have it (the daemon's start or its six-hourly rescan), records it absent, and a cached listing
+/// then drops it. Which source wins is a decision for the operator (sidevoice/sidevoice-connector#269, "Decision for
+/// the operator"): kept here as what the chosen design must make pass.
+#[tokio::test]
+#[ignore = "TODO(sidevoice/sidevoice-connector#269): presence across scan sources is undecided (operator decision)"]
+async fn a_scan_from_the_service_environment_does_not_drop_what_the_persons_found() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let _no_cursor_override = EnvGuard::set("SIDEVOICE_CURSOR_BIN", std::ffi::OsStr::new(""));
+    let shell = overtaken_scans(&fixture, 0);
+    let host = HostAgents::for_installer(fixture.profile.clone()).unwrap();
+    {
+        let _shell = EnvGuard::set("SHELL", shell.as_os_str());
+        let found = host.handle("agents.list", json!({"rescan":true})).await;
+        assert!(listed_ids(&found).contains(&"claude".into()), "{found}");
+    }
+    let service = fixture.root.join(Host::exe_name("service-shell"));
+    login_shell(
+        &service,
+        &fixture.root.join("service-bin").to_string_lossy(),
+    );
+    {
+        let _shell = EnvGuard::set("SHELL", service.as_os_str());
+        let daemon = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+        daemon.handle("agents.list", json!({"rescan":true})).await;
+        daemon.shutdown().await;
+    }
+    let cached = host.handle("agents.list", json!({})).await;
+    assert!(listed_ids(&cached).contains(&"claude".into()), "{cached}");
     host.shutdown().await;
 }

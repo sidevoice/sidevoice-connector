@@ -280,14 +280,21 @@ fn mcp_server(args: &[String]) -> i32 {
     0
 }
 
-/// A login shell (`$SHELL`) that says `path` is its `PATH` and, the first time it runs (`marker` is then made),
-/// writes `state` as `file` first: what another scan of the same data directory, with another login PATH, records
-/// while this one runs (the daemon's at its start while an install scans).
+/// A login shell (`$SHELL`) that says `path` is its `PATH` and, the first `times` times it runs (default once; the
+/// runs are counted in `marker`), writes `state` as `file` first, its `login_path` made different each time: what
+/// another scan of the same data directory, with another login PATH, records while this one runs (the daemon's at its
+/// start while an install scans).
 fn overtaken_login_shell(part: &Value) -> i32 {
     let marker = PathBuf::from(part["marker"].as_str().unwrap());
-    if !marker.exists() {
-        std::fs::write(&marker, "").unwrap();
-        Files::write_json(Path::new(part["file"].as_str().unwrap()), &part["state"]).unwrap();
+    let runs: u64 = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0);
+    std::fs::write(&marker, (runs + 1).to_string()).unwrap();
+    if runs < part["times"].as_u64().unwrap_or(1) {
+        let mut state = part["state"].clone();
+        state["login_path"] = format!("{}{runs}", state["login_path"].as_str().unwrap()).into();
+        Files::write_json(Path::new(part["file"].as_str().unwrap()), &state).unwrap();
     }
     print!(
         "{}{}{}",

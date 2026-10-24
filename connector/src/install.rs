@@ -734,14 +734,14 @@ fn agent_rows(listed: &Value) -> Vec<(String, String, Value)> {
         .collect()
 }
 
-/// What `install` says for the agents instead of one entry each: the listing's failure, or, when it lists nothing
-/// because the scan could look at nothing (the login PATH was not captured, and no earlier scan is kept), that
-/// failure said as such rather than as an empty list.
+/// What `install` says for the agents instead of one entry each: the listing's failure, or a scan of its own that did
+/// not happen (the login PATH was not captured, or other scans kept overtaking it), said as such: never an empty list,
+/// nor what an earlier or another scan recorded, as if this install had found it.
 fn listing_error(listed: &Value) -> Option<Value> {
     if let Some((key, message)) = error_message(listed) {
         return Some(json!({"error": {"key": key, "message": message}}));
     }
-    if listed["scan_failed"] == true && agent_rows(listed).is_empty() {
+    if listed["scan_failed"] == true {
         let key = "agents.scan-failed";
         let message = crate::messages::message(key, &json!({"agent": "your agents"}));
         return Some(json!({"error": {"key": key, "message": message}}));
@@ -1244,8 +1244,8 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
-    /// An install that could look at no agent says so, by key, instead of listing none; an earlier scan it kept is
-    /// still listed, and a listing that worked is no error.
+    /// An install whose own scan did not happen says so, by key, whether the listing is empty or holds what an earlier or
+    /// another scan recorded; a listing that worked is no error.
     #[test]
     fn an_agent_scan_that_looked_at_nothing_is_said_not_listed_as_empty() {
         let failed = listing_error(&json!({"agents": [], "scan_failed": true})).unwrap();
@@ -1255,7 +1255,10 @@ pub(crate) mod tests {
             .is_some_and(|text| !text.is_empty()));
         let kept =
             json!({"agents": [{"id": "some-agent", "label": "Some agent"}], "scan_failed": true});
-        assert!(listing_error(&kept).is_none());
+        assert_eq!(
+            listing_error(&kept).unwrap()["error"]["key"],
+            "agents.scan-failed"
+        );
         assert!(listing_error(&json!({"agents": [], "scan_failed": false})).is_none());
     }
 

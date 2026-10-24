@@ -630,7 +630,9 @@ impl HostAgents {
 
     /// A scan, recorded. Scans of one data directory can overlap (the daemon's at its start, an install's, a
     /// person's), each with its own login PATH; one that finds another wrote meanwhile keeps what that one wrote and
-    /// scans again from it, a few times, so that what it answers is its own scan rather than another's, or nothing.
+    /// scans again from it, up to [`SCAN_ATTEMPTS`] times, so that what it answers is its own scan. When even the last
+    /// attempt was overtaken, the answer says the scan failed (`scan_failed`, in the answer only: what the other scan
+    /// recorded stays as it is), never another scan's listing as if it were this one's.
     async fn scan(
         &self,
         mut state: Value,
@@ -639,19 +641,21 @@ impl HostAgents {
         cancel: &Cancellation,
         deadline: Instant,
     ) -> std::result::Result<Value, Failure> {
-        for _ in 1..SCAN_ATTEMPTS {
-            let (scanned, recorded) = self
+        let mut attempt = 1;
+        loop {
+            let (mut scanned, recorded) = self
                 .scan_once(state, watch, check, cancel, deadline)
                 .await?;
             if recorded {
                 return Ok(scanned);
             }
+            if attempt >= SCAN_ATTEMPTS {
+                scanned["scan_failed"] = json!(true);
+                return Ok(scanned);
+            }
+            attempt += 1;
             state = scanned;
         }
-        Ok(self
-            .scan_once(state, watch, check, cancel, deadline)
-            .await?
-            .0)
     }
 
     async fn scan_once(
