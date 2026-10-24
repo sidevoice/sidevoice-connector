@@ -9,6 +9,7 @@
 
 pub mod architecture;
 pub mod env;
+pub mod file_stamp;
 pub mod foreign;
 pub mod lifecycle;
 pub mod process;

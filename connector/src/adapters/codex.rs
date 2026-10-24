@@ -122,6 +122,15 @@ pub fn identity(meta: &Value) -> Result<Option<Identity>> {
 /// (`steer`), else — and on any steer error — queued behind it with `codex queue`. Both carry the same envelope, so a
 /// message that arrives twice is the same message (same `message_id`).
 pub async fn deliver(delivery: &Value, event: &Value, profile: &Profile) -> Result<Value> {
+    deliver_with_cache(delivery, event, profile, &cache::CACHE).await
+}
+
+async fn deliver_with_cache(
+    delivery: &Value,
+    event: &Value,
+    profile: &Profile,
+    cache: &cache::Cache,
+) -> Result<Value> {
     if delivery.get("kind").and_then(Value::as_str) != Some("codex-queue") {
         bail!("Unsupported Codex delivery route");
     }
@@ -130,27 +139,44 @@ pub async fn deliver(delivery: &Value, event: &Value, profile: &Profile) -> Resu
         .and_then(Value::as_str)
         .context("Codex thread missing")?;
     let envelope = envelope(event)?;
-    let codex = cache::CACHE
-        .lock()
-        .await
-        .prepare(
-            profile,
-            steer::socket_path(profile.agent_home(HOME.var)).exists(),
-        )
-        .await?;
-    let command = || codex.command(profile);
+    let codex = crate::agents::agent_command(profile, "codex");
+    let program = codex
+        .program
+        .context("Codex not on the captured login PATH")?;
+    let key = cache::Key::read(Path::new(&program), profile);
+    let command = || {
+        let mut command = tokio::process::Command::new(&program);
+        if let Some(path) = &codex.path {
+            command.env("PATH", path);
+        }
+        command.env(HOME.var, profile.agent_home(HOME.var));
+        command
+    };
     let message_id = event
         .get("message_id")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    match try_steer(codex.version, profile, thread, message_id, &envelope).await {
+    match try_steer(
+        command(),
+        cache,
+        &key,
+        profile,
+        thread,
+        message_id,
+        &envelope,
+    )
+    .await
+    {
         Ok(turn) => {
             crate::logfile::log(&format!(
                 "codex delivery path=steered thread={thread:?} message_id={message_id:?}"
             ));
             return Ok(json!({"status":"accepted","detail":format!("codex steered turn {turn}")}));
         }
-        Err(error) => crate::logfile::log(&steer_fallback_log(thread, message_id, &error)),
+        Err(error) => {
+            cache.steer_failed(&key, &error);
+            crate::logfile::log(&steer_fallback_log(thread, message_id, &error));
+        }
     }
     let mut queue = command();
     queue
@@ -167,7 +193,7 @@ pub async fn deliver(delivery: &Value, event: &Value, profile: &Profile) -> Resu
             crate::logfile::log(&format!(
                 "codex delivery path=queue-failed thread={thread:?} message_id={message_id:?}"
             ));
-            cache::CACHE.lock().await.invalidate();
+            cache.invalidate(&key);
             bail!("Codex queue failed")
         }
     }
@@ -228,7 +254,9 @@ async fn run(
 /// Steers the thread's running turn: only when the Codex daemon's socket is there and the installed Codex is at
 /// least [`steer::MIN_VERSION`]. Any error means: queue instead.
 async fn try_steer(
-    installed: Option<(u64, u64, u64)>,
+    version: tokio::process::Command,
+    cache: &cache::Cache,
+    key: &Option<cache::Key>,
     profile: &Profile,
     thread: &str,
     message_id: &str,
@@ -238,11 +266,9 @@ async fn try_steer(
     if !socket.exists() {
         bail!(steer::Failure::NoSocket(socket));
     }
-    if !steer::supports_steer(installed) {
-        match installed {
-            Some(_) => bail!(steer::Failure::VersionTooOld),
-            None => bail!(steer::Failure::VersionUnknown),
-        }
+    let installed = cache.version(key, version).await?;
+    if !steer::supports_steer(Some(installed)) {
+        bail!(steer::Failure::VersionTooOld);
     }
     steer::steer(&socket, thread, message_id, text).await
 }
