@@ -1,4 +1,5 @@
 mod binary;
+mod cache;
 mod harness;
 mod registration;
 mod rollout;
@@ -129,25 +130,20 @@ pub async fn deliver(delivery: &Value, event: &Value, profile: &Profile) -> Resu
         .and_then(Value::as_str)
         .context("Codex thread missing")?;
     let envelope = envelope(event)?;
-    // The Codex CLI the agent scan found, not whatever `codex` a service manager's PATH reaches
-    // (`agents::agent_command`).
-    let codex = crate::agents::agent_command(profile, "codex");
-    let program = codex
-        .program
-        .context("Codex not on the captured login PATH")?;
-    let command = || {
-        let mut command = tokio::process::Command::new(&program);
-        if let Some(path) = &codex.path {
-            command.env("PATH", path);
-        }
-        command.env(HOME.var, profile.agent_home(HOME.var));
-        command
-    };
+    let codex = cache::CACHE
+        .lock()
+        .await
+        .prepare(
+            profile,
+            steer::socket_path(profile.agent_home(HOME.var)).exists(),
+        )
+        .await?;
+    let command = || codex.command(profile);
     let message_id = event
         .get("message_id")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    match try_steer(command(), profile, thread, message_id, &envelope).await {
+    match try_steer(codex.version, profile, thread, message_id, &envelope).await {
         Ok(turn) => {
             crate::logfile::log(&format!(
                 "codex delivery path=steered thread={thread:?} message_id={message_id:?}"
@@ -171,6 +167,7 @@ pub async fn deliver(delivery: &Value, event: &Value, profile: &Profile) -> Resu
             crate::logfile::log(&format!(
                 "codex delivery path=queue-failed thread={thread:?} message_id={message_id:?}"
             ));
+            cache::CACHE.lock().await.invalidate();
             bail!("Codex queue failed")
         }
     }
@@ -231,7 +228,7 @@ async fn run(
 /// Steers the thread's running turn: only when the Codex daemon's socket is there and the installed Codex is at
 /// least [`steer::MIN_VERSION`]. Any error means: queue instead.
 async fn try_steer(
-    mut version: tokio::process::Command,
+    installed: Option<(u64, u64, u64)>,
     profile: &Profile,
     thread: &str,
     message_id: &str,
@@ -241,9 +238,6 @@ async fn try_steer(
     if !socket.exists() {
         bail!(steer::Failure::NoSocket(socket));
     }
-    version.arg("--version");
-    let (_, stdout) = run(version, true, Duration::from_secs(10)).await?;
-    let installed = steer::parse_version(&String::from_utf8_lossy(&stdout));
     if !steer::supports_steer(installed) {
         match installed {
             Some(_) => bail!(steer::Failure::VersionTooOld),
