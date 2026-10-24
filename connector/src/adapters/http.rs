@@ -199,7 +199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_request_gives_its_status_and_output_and_is_stopped_at_its_limit() {
+    async fn a_request_gives_its_status_and_output() {
         use crate::platform::stand_in::{StandIn, StandIns as _};
         use crate::platform::target::{Host, Target as _};
         let dir = crate::test_support::temp_dir("http-send");
@@ -215,7 +215,42 @@ mod tests {
         .unwrap();
         assert_eq!(status.code(), Some(3));
         assert_eq!(String::from_utf8_lossy(&stdout), "ok\n201");
-        let late = send(tokio::process::Command::new(&program), b"", Duration::ZERO).await;
-        assert!(late.is_err(), "no time to answer");
+    }
+
+    #[tokio::test]
+    async fn a_request_that_outlasts_its_limit_is_stopped() {
+        use crate::platform::process::Process as _;
+        use crate::platform::target::{Host, Target as _};
+        use crate::test_support::stand_in::Script;
+        let dir = crate::test_support::temp_dir("http-send-late");
+        let program = dir.path().join(Host::exe_name("curl"));
+        let pid_file = dir.path().join("pid");
+        // Stays up a minute, far past the limit.
+        Script {
+            pid: Some(pid_file.clone()),
+            sleep_ms: 60_000,
+            ..Script::default()
+        }
+        .make(&program);
+        let started = std::time::Instant::now();
+        let late = send(
+            tokio::process::Command::new(&program),
+            b"",
+            Duration::from_millis(1500),
+        )
+        .await;
+        assert!(late.is_err(), "no answer in time");
+        assert!(started.elapsed() < Duration::from_secs(30), "waited for it");
+        // Where the program had not yet started to write its id, there is nothing left to be alive.
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.parse::<u32>().ok())
+        {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while Processes::identity(pid).is_some() {
+                assert!(std::time::Instant::now() < deadline, "it was left running");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
     }
 }
