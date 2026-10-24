@@ -754,6 +754,13 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
         sidevoice(&stable, &["agents"], Duration::from_secs(120))?,
         "agents",
     )?;
+    resolved_to(
+        machine,
+        &[
+            ("claude", &claude_app),
+            ("codex", codex_app.as_ref().unwrap_or(&codex_cli)),
+        ],
+    )?;
     for agent in ["claude", "codex"] {
         let row = agent_row(&listed, agent)?;
         check(row["present"] == true, || {
@@ -799,6 +806,13 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
         )?;
     }
     registered(machine, &stable, &command, &claude_cli, &codex_cli)?;
+    resolved_to(
+        machine,
+        &[
+            ("claude", &claude_app),
+            ("codex", codex_app.as_ref().unwrap_or(&codex_cli)),
+        ],
+    )?;
 
     step("uninstall, from the package");
     let removed = ok(
@@ -1067,6 +1081,32 @@ fn move_to_apps(
         *codex_cli = to.clone();
     }
     Ok((claude_to, codex_to))
+}
+
+/// The binary the connector itself resolved for each agent (`binaries` in `D/agents.json`, written by the scan the
+/// last `agents` ran) is exactly the placed one. `which` on this process's PATH cannot say it: the connector reads
+/// the login PATH (Unix) or the registry's (Windows).
+fn resolved_to(machine: &Machine, expected: &[(&str, &PathBuf)]) -> Result<()> {
+    let file = machine.data.join("agents.json");
+    let bytes = read_if_there(&file)?.ok_or_else(|| format!("{} is not there", file.display()))?;
+    let state = parse_json(&bytes, &file.display().to_string())?;
+    for (agent, placed) in expected {
+        let resolved = state["binaries"][agent]
+            .as_str()
+            .ok_or_else(|| format!("{} names no binary for {agent}: {state}", file.display()))?;
+        println!("{agent}: the connector resolved {resolved}");
+        let same = |a: &Path, b: &Path| match (fs::canonicalize(a), fs::canonicalize(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        };
+        check(same(Path::new(resolved), placed), || {
+            format!(
+                "the connector resolved {agent} to {resolved}, not the placed {}",
+                placed.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn run_ok_path(program: &Path, args: &[&str], limit: Duration) -> Result<String> {
