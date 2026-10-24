@@ -29,6 +29,10 @@ The command line is English only and is not translated. With `--json` a command 
 failure is `{"ok":false,"error":{"key","params","message"}}` and exit status 1, the key stable and the message
 English (`messages/errors.json`, compiled in). Without `--json` a failure is one English line on stderr.
 
+On Windows, Codex and Claude Code installed through npm, pnpm or yarn classic use their native platform binary
+when the installed package provides one. Yarn Plug'n'Play agent installs are unsupported: use Yarn's
+`nodeLinker: node-modules` or install the agent with npm/pnpm. Native installers keep their own executable.
+
 ## Where things are
 
 Every place comes from the environment, so a disposable profile is just a set of variables (the tests use one):

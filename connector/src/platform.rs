@@ -21,3 +21,5 @@ pub mod uninstall;
 // from the core's repository at the tag of a core release. Re-exported so callers keep their paths
 // (`crate::platform::fs`, `crate::platform::ipc`, `crate::platform::user`).
 pub use sidevoice_platform::{data_dir, fs, ipc, user};
+
+pub mod npm;

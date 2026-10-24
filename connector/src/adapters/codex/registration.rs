@@ -289,8 +289,13 @@ impl Registration for Codex {
         super::binary::fallbacks(roots)
     }
 
-    fn native_program(&self, launcher: &Path) -> Option<PathBuf> {
-        super::binary::npm_native(launcher)
+    fn npm_package(&self) -> Option<crate::platform::npm::NativePackage> {
+        Some(crate::platform::npm::NativePackage {
+            package: "@openai/codex",
+            platform_prefix: "@openai/codex-",
+            program: "vendor/{target}/bin/codex{exe}",
+            bundled: true,
+        })
     }
 
     // npm and Homebrew select their own installation prefix; neither is a stable Codex marker.
