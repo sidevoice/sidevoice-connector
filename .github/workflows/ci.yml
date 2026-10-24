@@ -57,11 +57,18 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
-          $version = ($metadata.packages | Where-Object name -eq 'sidevoice-connector').version
+          $identity = & target/release/sidevoice-connector.exe --version --json | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Cannot read connector version" }
+          $version = $identity.version
+          $numbers = ($version -split '[-+]')[0] -split '\.'
           $resource = (Get-Item target/release/sidevoice-background.exe).VersionInfo
           if ($resource.FileVersion -ne $version -or $resource.ProductVersion -ne $version) {
-            throw "Launcher resource version does not match connector package $version"
+            throw "Launcher resource version does not match connector $version"
+          }
+          if ($resource.FileMajorPart -ne [int]$numbers[0] -or
+              $resource.FileMinorPart -ne [int]$numbers[1] -or
+              $resource.FileBuildPart -ne [int]$numbers[2]) {
+            throw "Launcher numeric resource version does not match connector $version"
           }
           if ($resource.FileDescription -ne 'Sidevoice Background') {
             throw "Launcher description changed"

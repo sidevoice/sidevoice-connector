@@ -1,5 +1,5 @@
-// The version resource of sidevoice-background.exe (build.rs): what Task Manager shows for the program. Numbers are
-// spelled out instead of including winver.h, which the resource compiler may not find.
+// The version resource of sidevoice-background.exe: build.rs substitutes the version the CLI reports.
+// Resource constants are literals instead of including winver.h, which the resource compiler may not find.
 1 VERSIONINFO
 FILEVERSION @VERSION_NUMBERS@
 PRODUCTVERSION @VERSION_NUMBERS@
