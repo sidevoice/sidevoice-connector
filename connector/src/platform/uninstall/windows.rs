@@ -460,7 +460,7 @@ impl Removal for Os {
         Ok(())
     }
 
-    fn remove_data_dir(&self) -> Result<DataDir, &'static str> {
+    fn remove_data_dir(&self, before_remove: &dyn Fn(&OsStr)) -> Result<DataDir, &'static str> {
         let data = &self.roots.data;
         let mut held = Vec::new();
         {
@@ -472,7 +472,8 @@ impl Removal for Os {
                     ..DataDir::default()
                 });
             };
-            let found = names(data)?;
+            let mut found = names(data)?;
+            found.sort_by_key(|entry| entry == "install.lock");
             let kept = foreign(&self.roots, &found);
             if !kept.is_empty() {
                 return Ok(DataDir {
@@ -484,6 +485,7 @@ impl Removal for Os {
                 if entry == "node-stopped.json" {
                     continue;
                 }
+                before_remove(&entry);
                 // A link is removed itself; a directory of that name is not entered.
                 let path = data.join(&entry);
                 if let Err(error) = fs::remove_file(&path) {

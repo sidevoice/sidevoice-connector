@@ -80,15 +80,25 @@ fn names_file(file: &File, path: &Path) -> Result<bool> {
     let locked = same_file::Handle::from_file(file.try_clone()?)?;
     match same_file::Handle::from_path(path) {
         Ok(current) => Ok(locked == current),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Ok(false)
+        }
         Err(error) => Err(error.into()),
     }
 }
 
 /// Tries once: the lock, or `None` when another holder has it.
 pub fn try_lock(path: &Path, kind: &str) -> Result<Option<Lock>> {
-    let file = Files::open_private(path, Create::ReadWrite)
-        .with_context(|| format!("open lock {}", path.display()))?;
+    let file = match Files::open_private(path, Create::ReadWrite) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("open lock {}", path.display())),
+    };
     if !take(&file, path)? {
         return Ok(None);
     }
@@ -136,11 +146,31 @@ pub async fn wait_lock(path: &Path, kind: &str, limit: Duration) -> Result<Optio
 /// the data directory it pinned, so a link added after its checks cannot be used; no record is written, nothing is
 /// added to a directory about to be removed.
 pub async fn wait_lock_file(file: File, path: &Path, limit: Duration) -> Result<Option<Lock>> {
+    reacquire(file, path, limit, || {
+        Files::open_private(path, Create::ReadWrite)
+    })
+    .await
+}
+
+// A delete-pending path can deny reopening until the retired handle closes.
+// Drop each failed candidate before the existing bounded polling backoff.
+async fn reacquire(
+    file: File,
+    path: &Path,
+    limit: Duration,
+    mut open: impl FnMut() -> std::io::Result<File>,
+) -> Result<Option<Lock>> {
     let mut file = Some(file);
     poll(limit, || {
         let opened = match file.take() {
             Some(file) => file,
-            None => Files::open_private(path, Create::ReadWrite)?,
+            None => match open() {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return Ok(None)
+                }
+                Err(error) => return Err(error.into()),
+            },
         };
         Ok(take(&opened, path)?.then_some(Lock {
             file: opened,
@@ -180,11 +210,9 @@ mod tests {
         let retrying_waiter = Files::open_private(&path, Create::ReadWrite).unwrap();
         // Where the OS allows unlinking a held file, reproduce uninstall retiring it
         // while an installer already has that inode open.
-        if std::fs::remove_file(&path).is_err() {
-            return;
-        }
-        let third = try_lock(&path, "install").unwrap().unwrap();
+        std::fs::remove_file(&path).expect("unlink a held lock must be exercised");
         drop(first);
+        let third = try_lock(&path, "install").unwrap().unwrap();
         assert!(
             !take(&waiter, &path).unwrap(),
             "retired inode cannot grant the lock"
@@ -202,6 +230,48 @@ mod tests {
         assert!(try_lock(&path, "install").unwrap().is_none());
         drop(held);
         assert!(try_lock(&path, "install").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_pending_reacquire_closes_the_retired_handle_and_backs_off() {
+        let (_tmp, dir) = private_dir("delete-pending");
+        let path = dir.join("install.lock");
+        let retired = Files::open_private(&path, Create::ReadWrite).unwrap();
+        let observer = Files::open_private(&path, Create::ReadWrite).unwrap();
+        retired.try_lock().unwrap();
+        std::fs::rename(&path, dir.join("retired.lock")).expect("retire an open lock");
+        let mut attempts = 0;
+        let started = tokio::time::Instant::now();
+        let held = reacquire(retired, &path, Duration::from_secs(1), || {
+            attempts += 1;
+            // The failed old candidate was unlocked and dropped before reopening.
+            observer
+                .try_lock()
+                .expect("retired candidate must release its lock");
+            observer.unlock().unwrap();
+            if attempts == 1 {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            } else {
+                Files::open_private(&path, Create::ReadWrite)
+            }
+        })
+        .await
+        .unwrap()
+        .expect("delete-pending is retried");
+        assert_eq!(attempts, 2);
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert!(try_lock(&path, "another").unwrap().is_none());
+        drop(held);
+        let retired = Files::open_private(&dir.join("retired.lock"), Create::ReadWrite).unwrap();
+        assert!(
+            reacquire(retired, &path, Duration::from_millis(40), || {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            })
+            .await
+            .unwrap()
+            .is_none(),
+            "persistent denial respects the timeout"
+        );
     }
 
     #[test]

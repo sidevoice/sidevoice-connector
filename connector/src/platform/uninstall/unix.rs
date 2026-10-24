@@ -839,14 +839,15 @@ impl Removal for Os {
         Ok(())
     }
 
-    fn remove_data_dir(&self) -> Result<DataDir, &'static str> {
+    fn remove_data_dir(&self, before_remove: &dyn Fn(&OsStr)) -> Result<DataDir, &'static str> {
         let Some(data) = self.open_relative(&self.data_rel)? else {
             return Ok(DataDir {
                 removed: true,
                 ..DataDir::default()
             });
         };
-        let found = entries(data.as_raw_fd())?;
+        let mut found = entries(data.as_raw_fd())?;
+        found.sort_by_key(|entry| entry == "install.lock");
         let kept = foreign(&self.roots, &found);
         if !kept.is_empty() {
             return Ok(DataDir {
@@ -860,6 +861,7 @@ impl Removal for Os {
             if entry == "node-stopped.json" {
                 continue;
             }
+            before_remove(&entry);
             // `unlinkat` removes a link itself and refuses a directory.
             if unsafe { libc::unlinkat(data.as_raw_fd(), name(&entry)?.as_ptr(), 0) } != 0 {
                 held.push(entry.to_string_lossy().into_owned());

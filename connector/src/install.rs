@@ -1215,7 +1215,7 @@ async fn uninstall_with_hooks(
     guard.remove_releases().map_err(failed)?;
     guard.finish_claim().map_err(failed)?;
     guard.finish_recovery().map_err(failed)?;
-    let data_dir = match guard.remove_data_dir() {
+    let data_dir = match guard.remove_data_dir(&|_| {}) {
         Ok(left) => json!({"removed": left.removed, "kept": left.kept, "held": left.held}),
         // Everything else is already gone: this is said, and is not a failure of the uninstall.
         Err(reason) => json!({"removed": false, "kept": [], "held": [], "error": reason}),

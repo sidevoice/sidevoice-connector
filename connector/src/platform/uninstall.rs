@@ -420,11 +420,12 @@ pub trait Removal: Sized {
     fn finish_recovery(&self) -> Result<(), &'static str>;
 
     /// The very last step, once [`Removal::finish_recovery`] is done while the install lock is still held:
-    /// when `D` holds only files of ours ([`Roots::is_own`]: its locks) they are removed, preserving the stop marker;
+    /// `before_remove` runs before each unlink, for deterministic interleaving checks. The install lock is unlinked last.
+    /// When `D` holds only files of ours ([`Roots::is_own`]: its locks) they are removed, preserving the stop marker;
     /// when it holds anything else, nothing is removed and the other names are reported as kept. Nothing is
     /// followed: a link among them is removed as a link, a directory of that name is never entered. A file that
     /// in use is reported as held; other cleanup errors are non-fatal to uninstall; nothing outside `D` is touched.
-    fn remove_data_dir(&self) -> Result<DataDir, &'static str>;
+    fn remove_data_dir(&self, before_remove: &dyn Fn(&OsStr)) -> Result<DataDir, &'static str>;
 }
 
 #[cfg(test)]
@@ -436,7 +437,12 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    const KEPT: &[&str] = &["install.lock", "agents.lock", "node-stopped.json"];
+    const KEPT: &[&str] = &[
+        "install.lock",
+        "connector.lock",
+        "agents.lock",
+        "node-stopped.json",
+    ];
 
     /// The program's own directory name inside the standard place (what the shared rule picks for this OS).
     fn data_name() -> &'static str {
@@ -856,6 +862,53 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_retires_the_install_lock_after_every_other_lock() {
+        use crate::lock::try_lock;
+        let (_home, layout, removal) = installed("uninstall-lock-order");
+        fs::write(layout.data.join("node-stopped.json"), "{}").unwrap();
+        let install = layout.data.join("install.lock");
+        let connector = layout.data.join("connector.lock");
+        let agents = layout.data.join("agents.lock");
+        let install_held = try_lock(&install, "uninstall").unwrap().unwrap();
+        let connector_held = try_lock(&connector, "connector").unwrap().unwrap();
+        let agents_held = try_lock(&agents, "agents").unwrap().unwrap();
+        for path in [&install, &connector, &agents] {
+            assert!(
+                try_lock(path, "replacement").unwrap().is_none(),
+                "original still holds {}",
+                path.display()
+            );
+        }
+        // The service is stopped before cleanup; installers must take install.lock
+        // before they can start a replacement daemon or agents operation.
+        drop(connector_held);
+        emptied(&removal);
+        let order = std::cell::RefCell::new(Vec::new());
+        removal
+            .remove_data_dir(&|name| {
+                assert!(try_lock(&install, "replacement-install").unwrap().is_none());
+                if name == "install.lock" {
+                    assert!(
+                        !connector.exists(),
+                        "daemon lock retired before installs can resume"
+                    );
+                    assert!(
+                        !agents.exists(),
+                        "agents lock retired before installs can resume"
+                    );
+                }
+                order.borrow_mut().push(name.to_os_string());
+            })
+            .unwrap();
+        assert_eq!(order.borrow().last().unwrap(), "install.lock");
+        drop(agents_held);
+        drop(install_held);
+        let _replacement_install = try_lock(&install, "install").unwrap().unwrap();
+        let _replacement_connector = try_lock(&connector, "connector").unwrap().unwrap();
+        assert!(try_lock(&connector, "second-connector").unwrap().is_none());
+    }
+
+    #[test]
     fn cleanup_preserves_the_stop_and_removes_a_link_only_as_a_link() {
         let scratch = temp_dir("uninstall-own");
         let (_home, layout, removal) = installed("uninstall-own-home");
@@ -866,7 +919,7 @@ mod tests {
         Files::symlink(&outside, layout.data.join("agents.lock"));
         emptied(&removal);
         assert_eq!(
-            removal.remove_data_dir().unwrap(),
+            removal.remove_data_dir(&|_| {}).unwrap(),
             DataDir {
                 kept: vec!["node-stopped.json".into()],
                 ..DataDir::default()
@@ -883,7 +936,7 @@ mod tests {
         fs::write(layout.data.join("install.lock"), "x").unwrap();
         emptied(&removal);
         fs::write(layout.data.join("stranger"), "theirs").unwrap();
-        let left = removal.remove_data_dir().unwrap();
+        let left = removal.remove_data_dir(&|_| {}).unwrap();
         assert_eq!(
             left,
             DataDir {
@@ -909,7 +962,7 @@ mod tests {
         fs::create_dir(layout.data.join("install.lock")).unwrap();
         fs::write(layout.data.join("install.lock").join("inside"), "x").unwrap();
         emptied(&removal);
-        if let Ok(left) = removal.remove_data_dir() {
+        if let Ok(left) = removal.remove_data_dir(&|_| {}) {
             assert_eq!(left.held, ["install.lock"]);
         }
         assert!(layout.data.is_dir());
