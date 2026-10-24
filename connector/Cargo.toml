@@ -43,8 +43,6 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 which = "=8.0.6"
-# Node package directories and symlinked optional dependencies (platform/npm.rs).
-oxc_resolver = "11.24.3"
 # The Claude desktop app's bundled Claude Code versions, compared as versions (src/adapters/claude/binary.rs).
 semver = "1"
 # This user's standard data directory per OS (src/data_dir.rs): `~/Library/Application Support`, `$XDG_DATA_HOME`,

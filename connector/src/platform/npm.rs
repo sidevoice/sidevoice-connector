@@ -2,10 +2,9 @@
 //!
 //! A shim names the actual package entry, rather than an assumed global prefix. Canonicalizing that entry's
 //! package directory is essential for pnpm: Node resolves optional dependencies beside the real `.pnpm` package.
-//! `oxc_resolver` owns Node's ancestor `node_modules` lookup and symlinks; exports/main are irrelevant when locating
-//! a package directory. Native installs and shims belonging to other packages are left alone.
+//! Only Node's package-directory lookup is needed: exports/main do not affect locating that directory.
+//! Native installs and shims belonging to other packages are left alone.
 
-use oxc_resolver::{ResolveOptions, Resolver};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -17,7 +16,7 @@ pub struct NativePackage {
     pub platform_prefix: &'static str,
     /// Path inside that dependency; `{target}` is the Rust target, `{exe}` the executable suffix.
     pub program: &'static str,
-    /// Older releases also carried this layout inside the main package (Codex's `vendor`).
+    /// Older releases also carried this layout inside the main package (a legacy `vendor` tree).
     pub bundled: bool,
 }
 
@@ -52,11 +51,6 @@ fn resolve_for(
     let dir = launcher
         .parent()
         .ok_or_else(|| io::Error::other("launcher has no directory"))?;
-    let resolver = Resolver::new(ResolveOptions {
-        resolve_to_context: true,
-        exports_fields: Vec::new(),
-        ..ResolveOptions::default()
-    });
     let Some(root) = package_root(&text, dir, package.package) else {
         if text.contains(".pnp.cjs") || text.contains(".pnp.js") || has_pnp(dir) {
             return Err(pnp_error());
@@ -68,8 +62,8 @@ fn resolve_for(
         .replace("{target}", target)
         .replace("{exe}", ".exe");
     let dependency = format!("{}{suffix}", package.platform_prefix);
-    if let Ok(resolved) = resolver.resolve(&root, &dependency) {
-        let program = resolved.path().join(&relative);
+    if let Some(resolved) = node_package(&root, &dependency) {
+        let program = resolved.join(&relative);
         if program.is_file() {
             return Ok(Some(program));
         }
@@ -80,7 +74,7 @@ fn resolve_for(
             return Ok(Some(program));
         }
     }
-    // Older pure-JavaScript releases (notably Claude Code) do not declare any native package.
+    // Older pure-JavaScript releases do not declare any native package.
     // Their CLI remains usable through the original launcher.
     if !package.bundled {
         let manifest: serde_json::Value =
@@ -102,6 +96,20 @@ fn resolve_for(
         io::ErrorKind::NotFound,
         format!("{} native program is missing ({dependency}); reinstall the agent with optional dependencies enabled", package.package),
     ))
+}
+
+/// Node's LOAD_NODE_MODULES directory search, from the real package path. A node_modules ancestor is itself a
+/// search root (never node_modules/node_modules). Resolve each candidate before returning so linked stores and
+/// Windows junctions behave as Node's default realpath lookup does. No main/exports or JavaScript evaluation.
+fn node_package(from: &Path, name: &str) -> Option<PathBuf> {
+    from.ancestors()
+        .filter(|parent| parent.file_name().is_none_or(|name| name != "node_modules"))
+        .map(|parent| parent.join("node_modules").join(name))
+        .find_map(|candidate| {
+            dunce::canonicalize(candidate)
+                .ok()
+                .filter(|path| path.is_dir())
+        })
 }
 
 /// npm/yarn use `%~dp0` or `%dp0%`; pnpm also emits `%~dp0\..\<package>`. Only quoted, existing entry paths
@@ -152,13 +160,18 @@ fn pnp_error() -> io::Error {
 mod tests {
     use super::*;
 
-    use crate::adapters::registration::Registration;
-    use std::sync::LazyLock;
-
-    static CODEX: LazyLock<NativePackage> =
-        LazyLock::new(|| crate::adapters::codex::Codex.npm_package().unwrap());
-    static CLAUDE: LazyLock<NativePackage> =
-        LazyLock::new(|| crate::adapters::claude::Claude.npm_package().unwrap());
+    const AGENT: NativePackage = NativePackage {
+        package: "@example/agent",
+        platform_prefix: "@example/agent-",
+        program: "vendor/{target}/bin/agent{exe}",
+        bundled: true,
+    };
+    const OTHER: NativePackage = NativePackage {
+        package: "@example/other",
+        platform_prefix: "@example/other-",
+        program: "other{exe}",
+        bundled: false,
+    };
     const TARGET: &str = "x86_64-pc-windows-msvc";
 
     fn write(path: &Path, text: &str) {
@@ -196,32 +209,30 @@ mod tests {
         for nested in [true, false] {
             let prefix = dir.path().join(if nested { "global" } else { "local" });
             let modules = prefix.join("node_modules");
-            let root = modules.join(CODEX.package);
-            package(&root, CODEX.package, "bin/codex.js");
+            let root = modules.join(AGENT.package);
+            package(&root, AGENT.package, "bin/agent.js");
             let dep = if nested {
                 root.join("node_modules")
             } else {
                 modules.clone()
             };
-            let expected = native(&dep.join("@openai/codex-win32-x64"), &CODEX);
+            let expected = native(&dep.join("@example/agent-win32-x64"), &AGENT);
             // An installed package for another OS/architecture must never win.
-            native(&dep.join("@openai/codex-darwin-x64"), &CODEX);
+            native(&dep.join("@example/agent-darwin-x64"), &AGENT);
             let shim = if nested {
-                prefix.join("codex.cmd")
+                prefix.join("agent.cmd")
             } else {
-                modules.join(".bin/codex.cmd")
+                modules.join(".bin/agent.cmd")
             };
-            let relative = if nested { "node_modules/" } else { "../" };
-            write(
-                &shim,
-                &format!(
-                    r#"@ECHO off
-"%dp0%\node.exe" "%dp0%\{relative}@openai/codex/bin/codex.js" %*
-"#
-                ),
-            );
+            let text = include_str!("npm/tests/npm.cmd");
+            let text = if nested {
+                text.to_owned()
+            } else {
+                text.replace(r"\node_modules\", r"\..\")
+            };
+            write(&shim, &text);
             assert_eq!(
-                resolved(&shim, &CODEX).unwrap(),
+                resolved(&shim, &AGENT).unwrap(),
                 Some(dunce::canonicalize(expected).unwrap())
             );
         }
@@ -231,15 +242,12 @@ mod tests {
     fn yarn_classic_global_shim_uses_its_entry_not_a_guessed_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let modules = dir.path().join("Data/global/node_modules");
-        package(&modules.join(CODEX.package), CODEX.package, "bin/codex.js");
-        let expected = native(&modules.join("@openai/codex-win32-x64"), &CODEX);
-        let shim = dir.path().join("bin/codex.cmd");
-        write(
-            &shim,
-            r#"@"%~dp0\..\Data\global\node_modules\@openai\codex\bin\codex.js" %*"#,
-        );
+        package(&modules.join(AGENT.package), AGENT.package, "bin/agent.js");
+        let expected = native(&modules.join("@example/agent-win32-x64"), &AGENT);
+        let shim = dir.path().join("bin/agent.cmd");
+        write(&shim, include_str!("npm/tests/yarn.cmd"));
         assert_eq!(
-            resolved(&shim, &CODEX).unwrap(),
+            resolved(&shim, &AGENT).unwrap(),
             Some(dunce::canonicalize(expected).unwrap())
         );
     }
@@ -251,79 +259,73 @@ mod tests {
     fn pnpm_follows_package_symlink_and_resolves_optional_dependency_in_store() {
         let dir = tempfile::tempdir().unwrap();
         let modules = dir.path().join("node_modules");
-        let store = modules.join(".pnpm/@openai+codex@1.0.0/node_modules");
-        let root = store.join(CODEX.package);
-        package(&root, CODEX.package, "bin/codex.js");
+        let store = modules.join(".pnpm/@example+agent@1.0.0/node_modules");
+        let root = store.join(AGENT.package);
+        package(&root, AGENT.package, "bin/agent.js");
         let native_root = modules
-            .join(".pnpm/@openai+codex-win32-x64@1.0.0/node_modules/@openai/codex-win32-x64");
-        let expected = native(&native_root, &CODEX);
-        fs::create_dir_all(modules.join("@openai")).unwrap();
-        std::os::unix::fs::symlink(&root, modules.join(CODEX.package)).unwrap();
-        std::os::unix::fs::symlink(&native_root, store.join("@openai/codex-win32-x64")).unwrap();
+            .join(".pnpm/@example+agent-win32-x64@1.0.0/node_modules/@example/agent-win32-x64");
+        let expected = native(&native_root, &AGENT);
+        fs::create_dir_all(modules.join("@example")).unwrap();
+        std::os::unix::fs::symlink(&root, modules.join(AGENT.package)).unwrap();
+        std::os::unix::fs::symlink(&native_root, store.join("@example/agent-win32-x64")).unwrap();
         // A stale hoisted copy must not hide the package's own dependency.
-        native(&modules.join("@openai/codex-win32-x64"), &CODEX);
-        let shim = modules.join(".bin/codex.cmd");
-        write(&shim, r#"@"%~dp0\..\@openai\codex\bin\codex.js" %*"#);
+        native(&modules.join("@example/agent-win32-x64"), &AGENT);
+        let shim = modules.join(".bin/agent.cmd");
+        write(&shim, include_str!("npm/tests/pnpm.cmd"));
         assert_eq!(
-            resolved(&shim, &CODEX).unwrap(),
+            resolved(&shim, &AGENT).unwrap(),
             Some(dunce::canonicalize(expected).unwrap())
         );
     }
 
     #[test]
-    fn claude_uses_its_native_platform_package_too() {
+    fn other_uses_its_native_platform_package_too() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("node_modules/@anthropic-ai/claude-code");
-        package(&root, CLAUDE.package, "bin/claude.exe");
-        let expected = native(
-            &root.join("node_modules/@anthropic-ai/claude-code-win32-x64"),
-            &CLAUDE,
-        );
-        let shim = dir.path().join("claude.cmd");
+        let root = dir.path().join("node_modules/@example/other");
+        package(&root, OTHER.package, "bin/other.exe");
+        let expected = native(&root.join("node_modules/@example/other-win32-x64"), &OTHER);
+        let shim = dir.path().join("other.cmd");
         write(
             &shim,
-            r#"@"%dp0%\node_modules\@anthropic-ai\claude-code\bin\claude.exe" %*"#,
+            r#"@"%dp0%\node_modules\@example\other\bin\other.exe" %*"#,
         );
         assert_eq!(
-            resolved(&shim, &CLAUDE).unwrap(),
+            resolved(&shim, &OTHER).unwrap(),
             Some(dunce::canonicalize(expected).unwrap())
         );
     }
 
     #[test]
-    fn older_pure_javascript_claude_remains_a_launcher() {
+    fn older_pure_javascript_other_remains_a_launcher() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("node_modules/@anthropic-ai/claude-code");
-        package(&root, CLAUDE.package, "cli.js");
-        write(
-            &root.join("package.json"),
-            r#"{"name":"@anthropic-ai/claude-code"}"#,
-        );
-        let shim = dir.path().join("claude.cmd");
-        write(
-            &shim,
-            r#"@"%dp0%\node_modules\@anthropic-ai\claude-code\cli.js" %*"#,
-        );
-        assert!(resolved(&shim, &CLAUDE).unwrap().is_none());
+        let root = dir.path().join("node_modules/@example/other");
+        package(&root, OTHER.package, "cli.js");
+        write(&root.join("package.json"), r#"{"name":"@example/other"}"#);
+        let shim = dir.path().join("other.cmd");
+        write(&shim, r#"@"%dp0%\node_modules\@example\other\cli.js" %*"#);
+        assert!(resolved(&shim, &OTHER).unwrap().is_none());
     }
 
     #[test]
-    fn bundled_codex_and_missing_or_wrong_platform_dependencies() {
+    fn bundled_agent_and_missing_or_wrong_platform_dependencies() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("node_modules/@openai/codex");
-        package(&root, CODEX.package, "bin/codex.js");
-        let shim = dir.path().join("codex.cmd");
+        let root = dir.path().join("node_modules/@example/agent");
+        package(&root, AGENT.package, "bin/agent.js");
+        let shim = dir.path().join("agent.cmd");
         write(
             &shim,
-            r#"@"%dp0%\node_modules\@openai\codex\bin\codex.js" %*"#,
+            r#"@"%dp0%\node_modules\@example\agent\bin\agent.js" %*"#,
         );
-        native(&root.join("node_modules/@openai/codex-win32-arm64"), &CODEX);
-        let error = resolved(&shim, &CODEX).unwrap_err();
+        native(
+            &root.join("node_modules/@example/agent-win32-arm64"),
+            &AGENT,
+        );
+        let error = resolved(&shim, &AGENT).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert!(error.to_string().contains("optional dependencies"));
-        let expected = native(&root, &CODEX);
+        let expected = native(&root, &AGENT);
         assert_eq!(
-            resolved(&shim, &CODEX).unwrap(),
+            resolved(&shim, &AGENT).unwrap(),
             Some(dunce::canonicalize(expected).unwrap())
         );
     }
@@ -331,16 +333,17 @@ mod tests {
     #[test]
     fn native_programs_unrelated_shims_and_pnp() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(resolve(&dir.path().join("codex.exe"), &CODEX)
-            .unwrap()
-            .is_none());
-        let shim = dir.path().join("codex.cmd");
+        // Bun installs executable launchers: leave their argument handling to the executable.
+        let executable = dir.path().join("agent.exe");
+        write(&executable, "MZ");
+        assert!(resolve(&executable, &AGENT).unwrap().is_none());
+        let shim = dir.path().join("agent.cmd");
         let other = dir.path().join("node_modules/other");
         package(&other, "other", "cli.js");
         write(&shim, r#"@"%dp0%\node_modules\other\cli.js" %*"#);
-        assert!(resolved(&shim, &CODEX).unwrap().is_none());
+        assert!(resolved(&shim, &AGENT).unwrap().is_none());
         write(&dir.path().join(".pnp.cjs"), "");
-        let error = resolved(&shim, &CODEX).unwrap_err();
+        let error = resolved(&shim, &AGENT).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         assert!(error.to_string().contains("nodeLinker: node-modules"));
     }
