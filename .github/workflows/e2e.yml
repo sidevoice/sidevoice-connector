@@ -1,7 +1,7 @@
 name: e2e
 
-# The archive this very run built (the `dist-<target>` artifact of the calling workflow's packaging job), installed end
-# to end on a fresh runner of each OS as a person installs it: this user's real service manager, the standard data
+# The npm tarballs packed from the archive this very run built (the `dist-<target>` artifact of the calling workflow's packaging job), installed end
+# through offline npx end to end on a fresh runner of each OS as a person installs it: this user's real service manager, the standard data
 # directory, the real Claude Code and Codex CLIs from npm with no login; `install`, `pair-device`, `agents connect`
 # and `uninstall`, and what each must leave (`cargo xtask e2e`, xtask/src/e2e.rs). Called by ci.yml on every pull
 # request and by release.yml before anything is published. RELEASING.md, "End to end".
@@ -93,7 +93,10 @@ jobs:
           query user 2>&1 | Out-String | Write-Output  # exits 1 when nobody is logged on
           Get-CimInstance Win32_LogonSession | Where-Object LogonType -in 2,10,11 | Select-Object LogonId, LogonType, StartTime | Format-Table | Out-String | Write-Output
           $global:LASTEXITCODE = 0
-      - run: cargo xtask e2e dist/sidevoice-connector-${{ matrix.target }}.tar.zst
+      # Reuse the release npm packer, then supply both local tarballs to offline npx with a fresh cache/prefix.
+      # The daily release-tag path uses the same test.
+      - name: Install through npx from local tarballs and check the full lifecycle
+        run: cargo xtask e2e dist/sidevoice-connector-${{ matrix.target }}.tar.zst
         env:
           SIDEVOICE_E2E_CLAUDE_VERSION: ${{ inputs.claude-version }}
           SIDEVOICE_E2E_CODEX_VERSION: ${{ inputs.codex-version }}
