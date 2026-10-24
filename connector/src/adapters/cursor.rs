@@ -710,7 +710,10 @@ fn bridge_instances_in(dir: &Path) -> Vec<BridgeInstance> {
                     .and_then(Value::as_str)
                     .unwrap_or(""),
             );
-            if token.is_empty() || !socket.exists() || !process_alive(pid) {
+            if token.is_empty()
+                || Foreigners::check(socket.as_os_str()).is_err()
+                || !process_alive(pid)
+            {
                 return None;
             }
             Some(BridgeInstance {
@@ -1332,10 +1335,20 @@ pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
 #[cfg(test)]
 mod bridge_tests {
     use super::*;
-    // The Desktop Bridge is Cursor's own socket, macOS-only by design: these tests stand one up, so they are Unix's.
-    #[cfg(unix)]
-    #[allow(clippy::disallowed_types)]
-    use tokio::net::UnixListener;
+    use crate::platform::fs::{Files, Fs};
+    use crate::platform::ipc::{Address, Channel, Channels, Endpoint, Listener};
+
+    /// A fake Desktop Bridge: a listener at the route this OS publishes for an endpoint (a Unix socket, a named pipe on
+    /// Windows), reached through the same `Foreigners` the adapter uses.
+    fn fake_bridge(scratch: &Path) -> (PathBuf, Listener) {
+        let dir = scratch.join("private");
+        Files::create_private_dir(&dir).unwrap();
+        let endpoint = Endpoint::new(&dir, "bridge");
+        (
+            PathBuf::from(endpoint.to_string()),
+            Channels::listen(&endpoint).unwrap(),
+        )
+    }
 
     #[test]
     fn send_reply_requires_explicit_confirmation() {
@@ -1436,13 +1449,10 @@ mod bridge_tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]
-    #[allow(clippy::disallowed_types)]
     async fn bridge_response_finishes_at_content_length_without_waiting_for_socket_close() {
         // Short label: its socket must fit macOS's 104-byte SUN_LEN (the temp dir alone is ~59 bytes there).
         let scratch = crate::test_support::temp_dir("bridge-length");
-        let socket = scratch.path().join("bridge.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let (socket, listener) = fake_bridge(scratch.path());
         let instance = BridgeInstance {
             socket,
             token: "fixture-secret".into(),
@@ -1450,7 +1460,7 @@ mod bridge_tests {
             created_at: 1,
         };
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut stream = listener.accept().await.unwrap();
             let mut request = [0; 8192];
             assert!(stream.read(&mut request).await.unwrap() > 0);
             let body = r#"{"outcome":"submitted"}"#;
@@ -1479,8 +1489,6 @@ mod bridge_tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]
-    #[allow(clippy::disallowed_types)]
     async fn queued_bridge_submission_has_no_editor_consumption_receipt() {
         // Short label, for the same SUN_LEN reason.
         let scratch = crate::test_support::temp_dir("bridge-delivery");
@@ -1500,8 +1508,7 @@ mod bridge_tests {
         );
         state_db::fixture(&database, &sql);
 
-        let socket = scratch.path().join("bridge.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let (socket, listener) = fake_bridge(scratch.path());
         fs::write(
             descriptors.join("one.json"),
             serde_json::to_vec(&json!({
@@ -1519,10 +1526,11 @@ mod bridge_tests {
         assert_eq!(chat.as_deref(), Some("chat-1"));
 
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut stream = listener.accept().await.unwrap();
             let mut request = vec![0; 8192];
             let count = stream.read(&mut request).await.unwrap();
             let request = String::from_utf8_lossy(&request[..count]);
+            assert!(request.contains("Authorization: Bearer fixture-secret"));
             assert!(request.contains("\"type\":\"sendMessage\""));
             assert!(request.contains("\"threadId\":\"chat-1\""));
             let response = r#"{"outcome":"queued"}"#;
