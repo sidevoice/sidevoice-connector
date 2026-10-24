@@ -1,5 +1,56 @@
 # Changelog
 
+## [0.16.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.15.0...v0.16.0) (2026-10-24)
+
+
+### Features
+
+* **agents:** find Claude Code outside PATH (desktop app bundle, native installer) ([#263](https://github.com/sidevoice/sidevoice-connector/issues/263)) ([c807475](https://github.com/sidevoice/sidevoice-connector/commit/c8074758d317a61990b507b62da75d81836049c2))
+* **agents:** find Codex inside the ChatGPT desktop app ([#267](https://github.com/sidevoice/sidevoice-connector/issues/267)) ([7df5c77](https://github.com/sidevoice/sidevoice-connector/commit/7df5c7701280afff98931fcdb06f0f51f21acacf))
+* **cursor:** editor voice on Windows and Linux through the desktop bridge ([#293](https://github.com/sidevoice/sidevoice-connector/issues/293)) ([c2e286e](https://github.com/sidevoice/sidevoice-connector/commit/c2e286e778b918cfbd68989530889ecf0f138f3b))
+* **install:** name the kept models folder from sidevoice-platform ([#252](https://github.com/sidevoice/sidevoice-connector/issues/252)) ([8912d02](https://github.com/sidevoice/sidevoice-connector/commit/8912d021e1993d737f386e1c907246d45050062f))
+* **packaging:** windows-x86_64 target, .exe program names, win32-x64 npm package ([#241](https://github.com/sidevoice/sidevoice-connector/issues/241)) ([d433e01](https://github.com/sidevoice/sidevoice-connector/commit/d433e010ac20680e3954aef2888d5e655c004b37))
+* **platform:** harness adapters on every OS ([#239](https://github.com/sidevoice/sidevoice-connector/issues/239)) ([1817a05](https://github.com/sidevoice/sidevoice-connector/commit/1817a052f8deb26fe8e3e70103bcdca714fa3f2d))
+* **platform:** install pointer record and Windows-safe removal ([#237](https://github.com/sidevoice/sidevoice-connector/issues/237)) ([d12fdf0](https://github.com/sidevoice/sidevoice-connector/commit/d12fdf0e5f76052aeb9d5858d7c82b9d910127cc)), closes [#116](https://github.com/sidevoice/sidevoice-connector/issues/116)
+* **platform:** lifecycle concern, one stop request on every OS, and a Windows-clean crate ([#240](https://github.com/sidevoice/sidevoice-connector/issues/240)) ([3d372c6](https://github.com/sidevoice/sidevoice-connector/commit/3d372c65f424dc3503db62d7088bf8da91f390ff))
+* **platform:** local channel over interprocess, peer check on every OS ([#222](https://github.com/sidevoice/sidevoice-connector/issues/222)) ([1e0d174](https://github.com/sidevoice/sidevoice-connector/commit/1e0d174ec6de8964b3268d0d35d6a55260b0e204))
+* **platform:** local sockets in the user's runtime directory ([#247](https://github.com/sidevoice/sidevoice-connector/issues/247)) ([ba1df18](https://github.com/sidevoice/sidevoice-connector/commit/ba1df186b697ac807ca3e713e7af9ab485b31492))
+* **platform:** one data directory per OS and the environment children get ([#238](https://github.com/sidevoice/sidevoice-connector/issues/238)) ([665394e](https://github.com/sidevoice/sidevoice-connector/commit/665394e2efe17fa889c757efb48557da02ac8dc4))
+* **platform:** processes behind one interface, on sysinfo and process-wrap ([#223](https://github.com/sidevoice/sidevoice-connector/issues/223)) ([4b57467](https://github.com/sidevoice/sidevoice-connector/commit/4b574675dc232451df3c28039ce60bec3034094e))
+* **platform:** service managers behind one trait, Task Scheduler on Windows ([#232](https://github.com/sidevoice/sidevoice-connector/issues/232)) ([0da72a2](https://github.com/sidevoice/sidevoice-connector/commit/0da72a24bf5bec26ca12f619ee3aef65f61960bb))
+* **platform:** shared data directory rule; the connector publishes its endpoint ([#248](https://github.com/sidevoice/sidevoice-connector/issues/248)) ([3e94748](https://github.com/sidevoice/sidevoice-connector/commit/3e947489e5d15983defa0ff7da759ece6b194911))
+* **platform:** this user on Windows (token SID) ([#219](https://github.com/sidevoice/sidevoice-connector/issues/219)) ([e64b9ab](https://github.com/sidevoice/sidevoice-connector/commit/e64b9ab51fa8e0d1de1ec136522e5562e1414345))
+* **release:** ship Windows x64 ([#253](https://github.com/sidevoice/sidevoice-connector/issues/253)) ([01e9372](https://github.com/sidevoice/sidevoice-connector/commit/01e9372e7786e46b238bea1f5f4d10648270764f))
+
+
+### Bug Fixes
+
+* **agents:** a scan overtaken by another scans again, and install says when it could look at no agent ([#269](https://github.com/sidevoice/sidevoice-connector/issues/269)) ([41ab38b](https://github.com/sidevoice/sidevoice-connector/commit/41ab38b54f13b744c72f501de4f1a6ac9406443f))
+* **agents:** connect an agent that was never started (its home is not there yet) ([#268](https://github.com/sidevoice/sidevoice-connector/issues/268)) ([4681c6a](https://github.com/sidevoice/sidevoice-connector/commit/4681c6a7b45ee3d0af06c86eff1ee2c4697623cd))
+* **agents:** find the Claude app CLI under Claude-Data; uninstall never skips our entry silently ([#288](https://github.com/sidevoice/sidevoice-connector/issues/288)) ([0369df9](https://github.com/sidevoice/sidevoice-connector/commit/0369df98b8c7c0bf19efaf94d50d0ff8fb5f759b))
+* **agents:** find the person's shell in the user database, not $SHELL ([#273](https://github.com/sidevoice/sidevoice-connector/issues/273)) ([35984cc](https://github.com/sidevoice/sidevoice-connector/commit/35984ccd057ec93e02edf6e9b2d6dae5d4d9cf8b))
+* **agents:** keep last scan when login PATH capture fails ([#236](https://github.com/sidevoice/sidevoice-connector/issues/236)) ([f6cc045](https://github.com/sidevoice/sidevoice-connector/commit/f6cc045663da1f6170856ef48d220b6a0b772964)), closes [#235](https://github.com/sidevoice/sidevoice-connector/issues/235)
+* **agents:** resolve npm-installed agents to their native binary under any package manager ([#294](https://github.com/sidevoice/sidevoice-connector/issues/294)) ([b71a997](https://github.com/sidevoice/sidevoice-connector/commit/b71a9971af958fb4f0fab74242f20db000cc621c)), closes [#284](https://github.com/sidevoice/sidevoice-connector/issues/284)
+* **background:** use real package version in Windows resource ([#287](https://github.com/sidevoice/sidevoice-connector/issues/287)) ([ce3d9b3](https://github.com/sidevoice/sidevoice-connector/commit/ce3d9b32cbc7f6174ddde79eb636b802531c06ce))
+* **codex:** log why a delivery was queued instead of steered ([#290](https://github.com/sidevoice/sidevoice-connector/issues/290)) ([db92152](https://github.com/sidevoice/sidevoice-connector/commit/db92152d047b36b7be432046d9fded5bda252183))
+* **codex:** run the native Codex of an npm install, and start it without a console window ([#277](https://github.com/sidevoice/sidevoice-connector/issues/277)) ([ca0f35e](https://github.com/sidevoice/sidevoice-connector/commit/ca0f35ec88a515284f51485ef15f119d7df66512))
+* **install:** a bounded wait for the service, with its diagnosis on timeout ([#264](https://github.com/sidevoice/sidevoice-connector/issues/264)) ([a9183ab](https://github.com/sidevoice/sidevoice-connector/commit/a9183abe6545ab863ff1904df2cf5c13c4809732))
+* **platform:** Windows private check refuses inherited grants and unprotected DACLs ([#242](https://github.com/sidevoice/sidevoice-connector/issues/242)) ([b089299](https://github.com/sidevoice/sidevoice-connector/commit/b089299e5adfa9cbaa215cc4122c2de352201e98))
+* **test:** keep test socket paths under the macOS limit ([#243](https://github.com/sidevoice/sidevoice-connector/issues/243)) ([91cd68d](https://github.com/sidevoice/sidevoice-connector/commit/91cd68ddbac7edec4cc74c26905a227ed94ae15a))
+* **uninstall:** do not refuse the pre-stop check when the running service changes an entry ([#262](https://github.com/sidevoice/sidevoice-connector/issues/262)) ([0104161](https://github.com/sidevoice/sidevoice-connector/commit/01041612079853b1447ce844f64d0ddddff30772))
+* **uninstall:** remove the data dir when only our own files are left ([#295](https://github.com/sidevoice/sidevoice-connector/issues/295)) ([40a5f42](https://github.com/sidevoice/sidevoice-connector/commit/40a5f42f6dd7947bff494c8487df3709be5ceda1))
+* **windows:** bench steps that PowerShell runs as one line ([#257](https://github.com/sidevoice/sidevoice-connector/issues/257)) ([d908106](https://github.com/sidevoice/sidevoice-connector/commit/d9081060bc0833829c4c9cba24b4114ffa00e3fd))
+* **windows:** manual steps that PowerShell runs as one line ([#256](https://github.com/sidevoice/sidevoice-connector/issues/256)) ([0e562ea](https://github.com/sidevoice/sidevoice-connector/commit/0e562eacfbcae858dd5607487660578d129871fc))
+* **windows:** run the service jobs through a windowless launcher, sidevoice-background.exe ([#280](https://github.com/sidevoice/sidevoice-connector/issues/280)) ([b1b4ed6](https://github.com/sidevoice/sidevoice-connector/commit/b1b4ed65c527049c095aac612822555c28e6964f))
+* **windows:** start the daemon's helper processes without a console window ([#278](https://github.com/sidevoice/sidevoice-connector/issues/278)) ([d143ed2](https://github.com/sidevoice/sidevoice-connector/commit/d143ed2fefeff786e53801fb61c0fd81a455b6e7))
+* **windows:** the service task runs its job definition ([#260](https://github.com/sidevoice/sidevoice-connector/issues/260)) ([494c289](https://github.com/sidevoice/sidevoice-connector/commit/494c289a16a0e0c4cfbee7464c8de2f416fbda51))
+* **windows:** the test suite passes on Windows ([#254](https://github.com/sidevoice/sidevoice-connector/issues/254)) ([59f8fe1](https://github.com/sidevoice/sidevoice-connector/commit/59f8fe1eb38014b0ca46cd1518eb10eb7f1f5724))
+
+
+### Performance Improvements
+
+* **codex:** cache parsed versions per process ([#296](https://github.com/sidevoice/sidevoice-connector/issues/296)) ([e20b615](https://github.com/sidevoice/sidevoice-connector/commit/e20b61528f8e6f3487ff766dafc24df87d48399f)), closes [#270](https://github.com/sidevoice/sidevoice-connector/issues/270)
+
 ## [0.15.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.14.1...v0.15.0) (2026-10-21)
 
 
