@@ -705,49 +705,32 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
     }
 
     step("agents connect: Sidevoice registered with both");
+    // Claude Code installed and never started has no home yet: connecting it must work all the same, its CLI making
+    // the home (sidevoice/sidevoice-connector#266).
     for (agent, home) in [("claude", ".claude"), ("codex", ".codex")] {
         let home = machine.home.join(home);
-        let fresh = !home.exists();
-        println!("{} exists before connecting: {}", home.display(), !fresh);
-        let connect = || {
+        println!(
+            "{} exists before connecting: {}",
+            home.display(),
+            home.exists()
+        );
+        check(agent != "claude" || !home.exists(), || {
+            format!(
+                "{} already exists: the never-started case is not exercised",
+                home.display()
+            )
+        })?;
+        ok(
             sidevoice(
                 &stable,
                 &["agents", "connect", agent],
                 Duration::from_secs(120),
-            )
-        };
-        let answer = connect()?;
-        // TODO(sidevoice/sidevoice-connector#266, fixed by #268): Claude Code installed but never started has no
-        // `~/.claude` yet, and `agents connect claude` refuses to run its CLI then. Until the fix lands, exactly
-        // that case is let through, and only Claude Code's. The answer carries no detail beyond the generic
-        // `agents.action-failed` and nothing is logged, so the cause is shown by difference: the same connect fails
-        // again while the home is still missing, then succeeds once only the home was made (by hand, private, as
-        // Claude Code's first start makes it). Anything else fails the test; once #268 lands the first attempt
-        // succeeds and this goes, in whichever of #265 and #268 lands second.
-        let known_bug = |answer: &Value| {
-            agent == "claude"
-                && fresh
-                && !home.exists()
-                && answer["ok"] != true
-                && answer["error"]["key"] == "agents.action-failed"
-        };
-        let answer = if known_bug(&answer) {
-            let again = connect()?;
-            check(known_bug(&again), || {
-                format!("agents connect claude failed differently the second time: {again}")
-            })?;
-            println!(
-                "KNOWN BUG sidevoice/sidevoice-connector#266: agents connect claude failed twice with no {}; \
-                 made by hand, connecting again",
-                home.display()
-            );
-            mkdir(&home)?;
-            crate::host::make_private_dir(&home)?;
-            connect()?
-        } else {
-            answer
-        };
-        ok(answer, &format!("agents connect {agent}"))?;
+            )?,
+            &format!("agents connect {agent}"),
+        )?;
+        check(home.is_dir(), || {
+            format!("{} is not there after connecting {agent}", home.display())
+        })?;
     }
     let claude_listed = run_ok("claude", &["mcp", "list"], Duration::from_secs(120))?;
     println!("claude mcp list:\n{claude_listed}");
