@@ -207,10 +207,10 @@ if any check is unsupported; otherwise `needs_attention` if any check needs atte
 For `cursor.unsupported`, the fallback is “Cursor editor voice is not supported on this computer.”
 
 Cursor currently has one check: a usable Desktop Bridge descriptor with a live process and socket
-is ready even when the selected CLI is `cursor-agent`. A detected Cursor editor in either
-`/Applications` or the user's `Applications` directory with a missing, empty, stale, or unusable
-bridge needs attention with `cursor.bridge_not_running`; non-macOS or no editor or live bridge is
-unsupported with `cursor.unsupported`. A first macOS scan reports provisional needs attention
+is ready even when the selected CLI is `cursor-agent`, on every OS (a Unix socket, or a named pipe on Windows). A detected
+Cursor editor (the install markers of the agent) with a missing, empty, stale, or unusable bridge needs
+attention with `cursor.bridge_not_running`; no editor and no live bridge is unsupported with
+`cursor.unsupported`. A first scan reports provisional needs attention
 until its background refresh finishes. Refreshed status uses a snapshot up to two seconds old;
 filesystem discovery runs off the request worker. Readiness is machine-wide and says nothing about a particular chat.
 Per-chat `voice_status.bridge.bridge_chat_known` remains the source for whether that chat is known.

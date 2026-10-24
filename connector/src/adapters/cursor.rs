@@ -710,7 +710,10 @@ fn bridge_instances_in(dir: &Path) -> Vec<BridgeInstance> {
                     .and_then(Value::as_str)
                     .unwrap_or(""),
             );
-            if token.is_empty() || !socket.exists() || !process_alive(pid) {
+            if token.is_empty()
+                || Foreigners::check(socket.as_os_str()).is_err()
+                || !process_alive(pid)
+            {
                 return None;
             }
             Some(BridgeInstance {
@@ -783,7 +786,7 @@ enum SendReply {
     Unconfirmed(String),
 }
 
-fn classify_send_reply(response: &BridgeResponse, sent: &str) -> SendReply {
+fn classify_send_reply(response: &BridgeResponse, sent: &str, token: &str) -> SendReply {
     let outcome = response
         .body
         .get("outcome")
@@ -791,11 +794,11 @@ fn classify_send_reply(response: &BridgeResponse, sent: &str) -> SendReply {
         .or_else(|| response.body.get("status").and_then(Value::as_str))
         .unwrap_or("");
     let plain_reason = || {
-        ["reason", "message", "error"]
+        let reason = ["reason", "message", "error"]
             .iter()
             .find_map(|key| response.body.get(*key).and_then(Value::as_str))
-            .unwrap_or(outcome)
-            .to_owned()
+            .unwrap_or(outcome);
+        sanitize_bridge_reason(reason, sent, token)
     };
     match confirmed_send_outcome(response) {
         Some("submitted") => return SendReply::Accepted("submitted"),
@@ -805,7 +808,7 @@ fn classify_send_reply(response: &BridgeResponse, sent: &str) -> SendReply {
     if matches!(outcome, "not-found" | "unknown-thread") {
         SendReply::UnknownThread
     } else if outcome == "error" {
-        SendReply::Error(bridge_error_reason(&response.body, sent))
+        SendReply::Error(bridge_error_reason(&response.body, sent, token))
     } else if (400..500).contains(&response.status) {
         SendReply::Refused(plain_reason())
     } else {
@@ -813,17 +816,26 @@ fn classify_send_reply(response: &BridgeResponse, sent: &str) -> SendReply {
     }
 }
 
-/// The bridge's own error text, short and on one line; withheld if it echoes the message that was sent.
-fn bridge_error_reason(body: &Value, sent: &str) -> String {
+/// The bridge's error text, bounded and on one line; withhold echoed input and bearer tokens.
+fn bridge_error_reason(body: &Value, sent: &str, token: &str) -> String {
     let reason = ["message", "error", "reason"]
         .iter()
         .find_map(|key| body.get(*key).and_then(Value::as_str))
         .unwrap_or("")
         .trim();
+    sanitize_bridge_reason(reason, sent, token)
+}
+
+fn sanitize_bridge_reason(reason: &str, sent: &str, token: &str) -> String {
+    let reason = reason.trim();
     if reason.is_empty() {
         return "no reason given".into();
     }
-    if reason.len() > 200 || sent.contains(reason) || reason.contains(sent.trim()) {
+    if reason.len() > 200
+        || sent.contains(reason)
+        || (!sent.trim().is_empty() && reason.contains(sent.trim()))
+        || (!token.is_empty() && reason.contains(token))
+    {
         return "[withheld]".into();
     }
     reason.replace(['\n', '\r'], " ")
@@ -1194,7 +1206,7 @@ async fn deliver_editor_to_instances(
                     json!({"status":"unknown","detail":format!("Cursor Desktop Bridge may have taken the message: {error}")}),
                 );
             }
-            Ok(response) => match classify_send_reply(&response, &text) {
+            Ok(response) => match classify_send_reply(&response, &text, &instance.token) {
                 SendReply::Accepted(outcome) => {
                     log_correlation(
                         "accepted",
@@ -1332,10 +1344,20 @@ pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
 #[cfg(test)]
 mod bridge_tests {
     use super::*;
-    // The Desktop Bridge is Cursor's own socket, macOS-only by design: these tests stand one up, so they are Unix's.
-    #[cfg(unix)]
-    #[allow(clippy::disallowed_types)]
-    use tokio::net::UnixListener;
+    use crate::platform::fs::{Files, Fs};
+    use crate::platform::ipc::{Address, Channel, Channels, Endpoint, Listener};
+
+    /// A fake Desktop Bridge: a listener at the route this OS publishes for an endpoint (a Unix socket, a named pipe on
+    /// Windows), reached through the same `Foreigners` the adapter uses.
+    fn fake_bridge(scratch: &Path) -> (PathBuf, Listener) {
+        let dir = scratch.join("private");
+        Files::create_private_dir(&dir).unwrap();
+        let endpoint = Endpoint::new(&dir, "bridge");
+        (
+            PathBuf::from(endpoint.to_string()),
+            Channels::listen(&endpoint).unwrap(),
+        )
+    }
 
     #[test]
     fn send_reply_requires_explicit_confirmation() {
@@ -1360,7 +1382,9 @@ mod bridge_tests {
 
     #[test]
     fn send_replies_are_classified_for_idle_and_busy_chats() {
-        let reply = |status, body| classify_send_reply(&BridgeResponse { status, body }, "hola");
+        let reply = |status, body| {
+            classify_send_reply(&BridgeResponse { status, body }, "hola", "fixture-secret")
+        };
         // Idle chat: a turn starts. Busy chat: held behind the running turn. Both are accepted.
         assert_eq!(
             reply(200, json!({"outcome":"submitted"})),
@@ -1399,7 +1423,7 @@ mod bridge_tests {
     #[test]
     fn bridge_error_reason_is_logged_unless_it_echoes_the_message() {
         let sent = "please summarise the diff";
-        let reason = |body: Value| bridge_error_reason(&body, sent);
+        let reason = |body: Value| bridge_error_reason(&body, sent, "fixture-secret");
         assert_eq!(
             reason(json!({"status":"error","message":"No composer for thread"})),
             "No composer for thread"
@@ -1419,6 +1443,76 @@ mod bridge_tests {
         );
     }
 
+    #[tokio::test]
+    async fn bridge_token_is_withheld_from_errors_refusals_and_unknown_replies() {
+        let scratch = crate::test_support::temp_dir("bridge-secret");
+        let token = "private-bearer-do-not-report";
+        for (status, outcome, field) in [
+            (200, "error", "message"),
+            (403, "refused", "reason"),
+            (500, "unexpected", "error"),
+        ] {
+            let iteration = scratch.path().join(status.to_string());
+            fs::create_dir(&iteration).unwrap();
+            let (socket, listener) = fake_bridge(&iteration);
+            let instance = BridgeInstance {
+                socket,
+                token: token.into(),
+                user_data: scratch.path().to_owned(),
+                created_at: 0,
+            };
+            let body = json!({"outcome":outcome,(field):format!("Invalid token: {token}")});
+            let diagnostic = diagnostic_reply_body(&body);
+            assert!(!diagnostic.contains(token));
+            let classified = classify_send_reply(
+                &BridgeResponse {
+                    status,
+                    body: body.clone(),
+                },
+                "private words",
+                token,
+            );
+            // These are exactly the reason and body strings used by the error log paths.
+            assert!(!format!("{classified:?} {diagnostic}").contains(token));
+            let server = tokio::spawn(async move {
+                let mut stream = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                let count = stream.read(&mut request).await.unwrap();
+                assert!(count > 0);
+                let response = body.to_string();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status} Reply\r\nContent-Length: {}\r\n\r\n{response}",
+                            response.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            });
+            let result = deliver_editor_to_instances(
+                &json!({"composer":"chat"}),
+                &json!({"channel":"voice","session_id":"s","revision":1,"epoch":0,"message_id":"m","text":"private words"}),
+                &[instance],
+            ).await.unwrap();
+            server.await.unwrap();
+            assert!(result["detail"].as_str().unwrap().contains("[withheld]"));
+            assert!(!result.to_string().contains(token));
+            assert!(correlation_lines()
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|line| !line.contains(token)));
+        }
+        for reason in ["x".repeat(201), "🦀".repeat(100)] {
+            assert_eq!(
+                sanitize_bridge_reason(&reason, "voice", token),
+                "[withheld]"
+            );
+        }
+    }
+
     #[test]
     fn unconfirmed_reply_diagnostic_keeps_shape_without_private_text() {
         let secret = "private voice message";
@@ -1436,13 +1530,10 @@ mod bridge_tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]
-    #[allow(clippy::disallowed_types)]
     async fn bridge_response_finishes_at_content_length_without_waiting_for_socket_close() {
         // Short label: its socket must fit macOS's 104-byte SUN_LEN (the temp dir alone is ~59 bytes there).
         let scratch = crate::test_support::temp_dir("bridge-length");
-        let socket = scratch.path().join("bridge.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let (socket, listener) = fake_bridge(scratch.path());
         let instance = BridgeInstance {
             socket,
             token: "fixture-secret".into(),
@@ -1450,7 +1541,7 @@ mod bridge_tests {
             created_at: 1,
         };
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut stream = listener.accept().await.unwrap();
             let mut request = [0; 8192];
             assert!(stream.read(&mut request).await.unwrap() > 0);
             let body = r#"{"outcome":"submitted"}"#;
@@ -1479,8 +1570,6 @@ mod bridge_tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]
-    #[allow(clippy::disallowed_types)]
     async fn queued_bridge_submission_has_no_editor_consumption_receipt() {
         // Short label, for the same SUN_LEN reason.
         let scratch = crate::test_support::temp_dir("bridge-delivery");
@@ -1500,8 +1589,7 @@ mod bridge_tests {
         );
         state_db::fixture(&database, &sql);
 
-        let socket = scratch.path().join("bridge.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let (socket, listener) = fake_bridge(scratch.path());
         fs::write(
             descriptors.join("one.json"),
             serde_json::to_vec(&json!({
@@ -1519,10 +1607,11 @@ mod bridge_tests {
         assert_eq!(chat.as_deref(), Some("chat-1"));
 
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut stream = listener.accept().await.unwrap();
             let mut request = vec![0; 8192];
             let count = stream.read(&mut request).await.unwrap();
             let request = String::from_utf8_lossy(&request[..count]);
+            assert!(request.contains("Authorization: Bearer fixture-secret"));
             assert!(request.contains("\"type\":\"sendMessage\""));
             assert!(request.contains("\"threadId\":\"chat-1\""));
             let response = r#"{"outcome":"queued"}"#;

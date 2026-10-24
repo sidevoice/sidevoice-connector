@@ -389,8 +389,25 @@ fn row<'a>(answer: &'a Value, id: &str) -> &'a Value {
 const BRIDGE_MESSAGE: &str = "Voice in the Cursor editor needs Cursor's Desktop Bridge: in Cursor, open Settings › Beta, enable “Allow CLI to access desktop agents”, then restart Cursor.";
 const UNSUPPORTED_MESSAGE: &str = "Cursor editor voice is not supported on this computer.";
 
+/// Asks for the Cursor row until its readiness is `state`: the bridge is looked for in the background, so the first
+/// answer is provisional.
+async fn cursor_readiness_settles(host: &Arc<HostAgents>, state: &str) -> Value {
+    tokio::time::timeout(StdDuration::from_secs(6), async {
+        loop {
+            let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
+            if row(&answer, "cursor")["readiness"]["state"] == state {
+                break row(&answer, "cursor")["readiness"].clone();
+            }
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn cursor_agent_row_exposes_readiness_codes_and_fallbacks_without_private_data() {
+    use crate::platform::ipc::{Address, Channel, Channels, Endpoint};
     let _turn = agent_env().await;
     let fixture = Fixture::new();
     let bin = fixture.root.join("bin");
@@ -405,22 +422,25 @@ async fn cursor_agent_row_exposes_readiness_codes_and_fallbacks_without_private_
         }),
     );
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+    // Until the first look at the bridge has finished, the answer is provisional.
     let missing = host.handle("agents.list", json!({"watch":"cursor"})).await;
-    let bridge = &row(&missing, "cursor")["readiness"];
-    let expected = if cfg!(target_os = "macos") {
-        json!({"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]})
-    } else {
+    assert_eq!(
+        &row(&missing, "cursor")["readiness"],
+        &json!({"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]})
+    );
+    // Neither the app nor a bridge: not supported here.
+    assert_eq!(
+        cursor_readiness_settles(&host, "unsupported").await,
         json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
-    };
-    assert_eq!(bridge, &expected);
-    let cached = host.handle("agents.list", json!({})).await;
-    assert_eq!(row(&cached, "cursor")["readiness"], *bridge);
+    );
 
     let dir = fixture.profile.home.join(".cursor/desktop-bridge");
     private_mkdir(&fixture.profile.home.join(".cursor"));
     private_mkdir(&dir);
-    let socket = fixture.root.join("bridge.sock");
-    private_write(&socket, b"");
+    // The route this OS publishes for the bridge (a Unix socket path, a `\\.\pipe\…` name).
+    let endpoint = Endpoint::new(&fixture.root, "bridge");
+    let _listener = Channels::listen(&endpoint).unwrap();
+    let socket = endpoint.to_string();
     write_json(
         &dir.join("one.json"),
         &json!({
@@ -428,28 +448,8 @@ async fn cursor_agent_row_exposes_readiness_codes_and_fallbacks_without_private_
             "token":"secret-token","userDataDir":fixture.root.join("private-cursor-data")
         }),
     );
-    let rescanned = if cfg!(target_os = "macos") {
-        tokio::time::timeout(StdDuration::from_secs(4), async {
-            loop {
-                let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
-                if row(&answer, "cursor")["readiness"]["state"] == "ready" {
-                    break answer;
-                }
-                tokio::time::sleep(StdDuration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap()
-    } else {
-        host.handle("agents.list", json!({"watch":"cursor"})).await
-    };
-    let bridge = &row(&rescanned, "cursor")["readiness"];
-    let expected = if cfg!(target_os = "macos") {
-        json!({"state":"ready","reasons":[]})
-    } else {
-        json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
-    };
-    assert_eq!(bridge, &expected);
+    let bridge = cursor_readiness_settles(&host, "ready").await;
+    assert_eq!(bridge, json!({"state":"ready","reasons":[]}));
     let serialized = bridge.to_string();
     assert!(!serialized.contains(&fixture.root.to_string_lossy().to_string()));
     assert!(!serialized.contains("secret-token"));
@@ -457,6 +457,8 @@ async fn cursor_agent_row_exposes_readiness_codes_and_fallbacks_without_private_
 
 #[tokio::test]
 async fn cursor_readiness_distinguishes_cli_only_from_editor() {
+    use crate::adapters::markers::Root;
+    use crate::adapters::registration::Registration;
     let _turn = agent_env().await;
     let fixture = Fixture::new();
     let bin = fixture.root.join("bin");
@@ -471,52 +473,26 @@ async fn cursor_readiness_distinguishes_cli_only_from_editor() {
         }),
     );
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
-    let answer = if cfg!(target_os = "macos") {
-        tokio::time::timeout(StdDuration::from_secs(4), async {
-            loop {
-                let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
-                if row(&answer, "cursor")["readiness"]["state"] == "unsupported" {
-                    break answer;
-                }
-                tokio::time::sleep(StdDuration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap()
-    } else {
-        host.handle("agents.list", json!({"watch":"cursor"})).await
-    };
-    let bridge = &row(&answer, "cursor")["readiness"];
     assert_eq!(
-        bridge,
-        &json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
+        cursor_readiness_settles(&host, "unsupported").await,
+        json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
     );
 
-    let app = fixture.profile.home.join("Applications/Cursor.app");
-    private_mkdir(&fixture.profile.home.join("Applications"));
-    private_mkdir(&app);
-    let answer = if cfg!(target_os = "macos") {
-        tokio::time::timeout(StdDuration::from_secs(4), async {
-            loop {
-                let answer = host.handle("agents.list", json!({"watch":"cursor"})).await;
-                if row(&answer, "cursor")["readiness"]["state"] == "needs_attention" {
-                    break answer;
-                }
-                tokio::time::sleep(StdDuration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap()
-    } else {
-        host.handle("agents.list", json!({"watch":"cursor"})).await
+    // A home-root install makes the missing bridge something to fix. Windows uses
+    // SHGetKnownFolderPath via dirs::data_local_dir(), which ignores LOCALAPPDATA overrides.
+    // Its installed-editor case is covered with injected Roots in bridge_setup's probe tests.
+    let Some(marker) = crate::adapters::cursor::Cursor
+        .install_markers()
+        .iter()
+        .find(|marker| marker.os == std::env::consts::OS && marker.root == Root::Home)
+    else {
+        return;
     };
-    let bridge = &row(&answer, "cursor")["readiness"];
-    let expected = if cfg!(target_os = "macos") {
+    std::fs::create_dir_all(fixture.profile.home.join(marker.path)).unwrap();
+    assert_eq!(
+        cursor_readiness_settles(&host, "needs_attention").await,
         json!({"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]})
-    } else {
-        json!({"state":"unsupported","reasons":[{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]})
-    };
-    assert_eq!(bridge, &expected);
+    );
 }
 
 #[test]

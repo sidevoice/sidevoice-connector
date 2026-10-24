@@ -1,6 +1,9 @@
 //! Read-only, local facts for the Cursor agent card. No bridge secret or home path enters the status row.
 
-use crate::adapters::registration::ReadinessCheck;
+use super::Cursor;
+use crate::adapters::markers::{matching_kinds, Roots};
+use crate::adapters::registration::{ReadinessCheck, Registration};
+use crate::platform::foreign::{Foreign, Foreigners};
 use crate::profile::Profile;
 use serde::Deserialize;
 use std::env;
@@ -105,7 +108,7 @@ fn bridge_dir(profile: &Profile) -> PathBuf {
         .unwrap_or_else(|| profile.home.join(".cursor/desktop-bridge"))
 }
 
-fn inventory(dir: &Path) -> BridgeFiles {
+async fn inventory(dir: &Path) -> BridgeFiles {
     let Ok(entries) = fs::read_dir(dir) else {
         return BridgeFiles::Missing;
     };
@@ -148,10 +151,13 @@ fn inventory(dir: &Path) -> BridgeFiles {
         };
         if value.protocol_version == Some(1)
             && value.token.is_some_and(|token| !token.is_empty())
-            && socket.exists()
+            && Foreigners::check(socket.as_os_str()).is_ok()
             && pid > 0
             && pid <= i32::MAX as u64
             && super::process_alive(pid)
+            && tokio::time::timeout(Duration::from_millis(250), Foreigners::connect(&socket))
+                .await
+                .is_ok_and(|result| result.is_ok())
         {
             return BridgeFiles::Live;
         }
@@ -164,40 +170,32 @@ fn inventory(dir: &Path) -> BridgeFiles {
 }
 
 pub fn check(profile: &Profile) -> ReadinessCheck {
-    if !cfg!(target_os = "macos") {
-        return CURSOR_UNSUPPORTED;
-    }
     let dir = bridge_dir(profile);
-    let home_app = profile.home.join("Applications/Cursor.app");
-    check_with(true, dir.clone(), &CACHE, move || {
-        probe(&dir, &home_app, Path::new("/Applications/Cursor.app"))
+    let roots = Roots::process(&profile.home);
+    check_with(dir.clone(), &CACHE, move || {
+        tokio::runtime::Handle::current().block_on(probe(&dir, &roots))
     })
 }
 
-fn probe(dir: &Path, home_app: &Path, system_app: &Path) -> BridgeEvidence {
-    let files = inventory(dir);
+async fn probe(dir: &Path, roots: &Roots) -> BridgeEvidence {
+    let files = inventory(dir).await;
     BridgeEvidence {
         files,
-        editor_app: files == BridgeFiles::Live || home_app.is_dir() || system_app.is_dir(),
+        editor_app: files == BridgeFiles::Live
+            || !matching_kinds(Cursor.install_markers(), std::env::consts::OS, roots).is_empty(),
     }
 }
 
 fn check_with(
-    macos: bool,
     path: PathBuf,
     cache: &InventoryCache,
     scan: impl FnOnce() -> BridgeEvidence + Send + 'static,
 ) -> ReadinessCheck {
-    if !macos {
-        return CURSOR_UNSUPPORTED;
-    }
-    evaluate(true, cache.snapshot_or_refresh(path, scan))
+    evaluate(cache.snapshot_or_refresh(path, scan))
 }
 
-fn evaluate(macos: bool, evidence: Option<BridgeEvidence>) -> ReadinessCheck {
-    if !macos {
-        CURSOR_UNSUPPORTED
-    } else if evidence.is_some_and(|evidence| evidence.files == BridgeFiles::Live) {
+fn evaluate(evidence: Option<BridgeEvidence>) -> ReadinessCheck {
+    if evidence.is_some_and(|evidence| evidence.files == BridgeFiles::Live) {
         ReadinessCheck::Ok
     } else if evidence.is_none_or(|evidence| evidence.editor_app) {
         // An unscanned bridge stays provisional until the background refresh completes.
@@ -210,8 +208,36 @@ fn evaluate(macos: bool, evidence: Option<BridgeEvidence>) -> ReadinessCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::markers::Root;
     use crate::platform::fs::{Files, TestFiles};
+    use crate::platform::ipc::{Address, Channel, Channels, Endpoint};
     use serde_json::json;
+
+    /// The route this OS publishes for a bridge.
+    fn route(root: &Path) -> PathBuf {
+        PathBuf::from(Endpoint::new(&root.join("private"), "bridge").to_string())
+    }
+
+    /// Roots under `root`, with this OS's Cursor install marker made there, as the app's installer would.
+    fn installed_roots(root: &Path) -> Roots {
+        let roots = Roots {
+            home: root.join("home"),
+            local_app_data: Some(root.join("local")),
+            program_files: None,
+        };
+        for marker in Cursor.install_markers() {
+            if marker.os != std::env::consts::OS {
+                continue;
+            }
+            let base = match marker.root {
+                Root::Home => &roots.home,
+                Root::LocalAppData => roots.local_app_data.as_ref().unwrap(),
+                _ => continue,
+            };
+            fs::create_dir_all(base.join(marker.path)).unwrap();
+        }
+        roots
+    }
 
     #[test]
     fn cursor_fallback_messages_are_plain_and_private() {
@@ -238,36 +264,50 @@ mod tests {
         }
     }
 
-    #[test]
-    fn temporary_bridge_descriptors_cover_missing_empty_live_and_stale() {
-        let root = env::temp_dir().join(format!(
-            "sidevoice-cursor-bridge-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let bridge = root.join("desktop-bridge");
-        assert_eq!(inventory(&bridge), BridgeFiles::Missing);
+    #[tokio::test]
+    async fn temporary_bridge_descriptors_cover_missing_empty_live_and_stale() {
+        let root = crate::test_support::temp_dir("cursor-bridge");
+        let bridge = root.path().join("desktop-bridge");
+        assert_eq!(inventory(&bridge).await, BridgeFiles::Missing);
         fs::create_dir_all(&bridge).unwrap();
-        assert_eq!(inventory(&bridge), BridgeFiles::Missing);
-        let socket = root.join("socket");
-        fs::write(&socket, b"").unwrap();
+        assert_eq!(inventory(&bridge).await, BridgeFiles::Missing);
         let descriptor = bridge.join("one.json");
-        let payload = json!({
-            "protocolVersion":1,
-            "pid":std::process::id(),
-            "socketPath":socket,
-            "token":"private-do-not-report",
-            "userDataDir":"/private/also-do-not-report",
-        });
-        fs::write(&descriptor, serde_json::to_vec(&payload).unwrap()).unwrap();
-        assert_eq!(inventory(&bridge), BridgeFiles::Live);
-        fs::remove_file(&socket).unwrap();
-        assert_eq!(inventory(&bridge), BridgeFiles::Stale);
-        fs::write(&socket, b"").unwrap();
-        fs::remove_file(&descriptor).unwrap();
-        Files::symlink(&socket, &descriptor);
-        assert_eq!(inventory(&bridge), BridgeFiles::Stale);
-        fs::remove_dir_all(root).unwrap();
+        let write = |socket: &Path, pid: u32| {
+            let payload = json!({
+                "protocolVersion":1,
+                "pid":pid,
+                "socketPath":socket,
+                "token":"private-do-not-report",
+                "userDataDir":"/private/also-do-not-report",
+            });
+            fs::write(&descriptor, serde_json::to_vec(&payload).unwrap()).unwrap();
+        };
+        write(&route(root.path()), std::process::id());
+        assert_eq!(inventory(&bridge).await, BridgeFiles::Stale);
+        let listener =
+            Channels::listen(&Endpoint::new(&root.path().join("private"), "bridge")).unwrap();
+        assert_eq!(inventory(&bridge).await, BridgeFiles::Live);
+        // Readiness connects and closes without writing any request or bearer token.
+        use tokio::io::AsyncReadExt;
+        let mut stream = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).await.unwrap();
+        assert!(bytes.is_empty());
+        drop(stream);
+        drop(listener);
+        assert_eq!(inventory(&bridge).await, BridgeFiles::Stale);
+        // A route this OS cannot name is no bridge.
+        write(Path::new("relative/bridge"), std::process::id());
+        assert_eq!(inventory(&bridge).await, BridgeFiles::Stale);
+        // A process that is gone is no bridge.
+        write(&route(root.path()), u32::MAX);
+        assert_eq!(inventory(&bridge).await, BridgeFiles::Stale);
+        // A descriptor that is a link is not read.
+        write(&route(root.path()), std::process::id());
+        let target = root.path().join("target.json");
+        fs::rename(&descriptor, &target).unwrap();
+        Files::symlink(&target, &descriptor);
+        assert_eq!(inventory(&bridge).await, BridgeFiles::Stale);
     }
 
     #[test]
@@ -276,67 +316,53 @@ mod tests {
             files: BridgeFiles::Live,
             editor_app: false,
         });
-        assert_eq!(evaluate(true, live), ReadinessCheck::Ok);
+        assert_eq!(evaluate(live), ReadinessCheck::Ok);
         for bridge in [BridgeFiles::Missing, BridgeFiles::Stale] {
             assert_eq!(
-                evaluate(
-                    true,
-                    Some(BridgeEvidence {
-                        files: bridge,
-                        editor_app: true
-                    })
-                ),
+                evaluate(Some(BridgeEvidence {
+                    files: bridge,
+                    editor_app: true
+                })),
                 BRIDGE_NOT_RUNNING
             );
         }
-        assert_eq!(evaluate(false, live), CURSOR_UNSUPPORTED);
         assert_eq!(
-            evaluate(
-                true,
-                Some(BridgeEvidence {
-                    files: BridgeFiles::Missing,
-                    editor_app: false
-                })
-            ),
+            evaluate(Some(BridgeEvidence {
+                files: BridgeFiles::Missing,
+                editor_app: false
+            })),
             CURSOR_UNSUPPORTED
         );
-        assert_eq!(evaluate(true, None), BRIDGE_NOT_RUNNING);
+        assert_eq!(evaluate(None), BRIDGE_NOT_RUNNING);
     }
 
     #[tokio::test]
-    async fn user_local_app_and_live_bridge_override_selected_cli_only_evidence() {
-        let root = env::temp_dir().join(format!(
-            "sidevoice-cursor-user-app-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let home_app = root.join("Applications/Cursor.app");
-        let bridge = root.join(".cursor/desktop-bridge");
-        fs::create_dir_all(&home_app).unwrap();
-        fs::create_dir_all(&bridge).unwrap();
-        let _selected_cli = root.join("bin/cursor-agent");
-        let socket = root.join("bridge.sock");
-        fs::write(&socket, b"").unwrap();
-        fs::write(bridge.join("one.json"), serde_json::to_vec(&json!({
-            "protocolVersion":1,"pid":std::process::id(),"socketPath":socket,"token":"fixture-secret"
-        })).unwrap()).unwrap();
-        let system_app = root.join("no-system-app");
-        let cache = InventoryCache::default();
-        let probe_bridge = bridge.clone();
-        let probe_app = home_app.clone();
-        let probe_system = system_app.clone();
+    async fn installed_app_and_live_bridge_override_selected_cli_only_evidence() {
+        let root = crate::test_support::temp_dir("cursor-user-app");
+        let roots = installed_roots(root.path());
+        let bridge = root.path().join("desktop-bridge");
+        // Injected roots exercise the real installed-editor readiness on Windows too.
         assert_eq!(
-            check_with(true, bridge.clone(), &cache, move || probe(
-                &probe_bridge,
-                &probe_app,
-                &probe_system
-            )),
+            evaluate(Some(probe(&bridge, &roots).await)),
             BRIDGE_NOT_RUNNING
         );
+        fs::create_dir_all(&bridge).unwrap();
+        let descriptor = bridge.join("one.json");
+        let _listener =
+            Channels::listen(&Endpoint::new(&root.path().join("private"), "bridge")).unwrap();
+        fs::write(&descriptor, serde_json::to_vec(&json!({
+            "protocolVersion":1,"pid":std::process::id(),"socketPath":route(root.path()),"token":"fixture-secret"
+        })).unwrap()).unwrap();
+        let cache = InventoryCache::default();
+        let (probe_bridge, probe_roots) = (bridge.clone(), roots);
+        let first = check_with(bridge.clone(), &cache, move || {
+            tokio::runtime::Handle::current().block_on(probe(&probe_bridge, &probe_roots))
+        });
+        assert_eq!(first, BRIDGE_NOT_RUNNING);
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if check_with(true, bridge.clone(), &cache, || {
-                    panic!("fresh cache rescanned")
-                }) == ReadinessCheck::Ok
+                if check_with(bridge.clone(), &cache, || panic!("fresh cache rescanned"))
+                    == ReadinessCheck::Ok
                 {
                     break;
                 }
@@ -345,28 +371,22 @@ mod tests {
         })
         .await
         .unwrap();
-        fs::remove_file(&socket).unwrap();
-        let stopped = probe(&bridge, &home_app, &system_app);
-        assert_eq!(stopped.files, BridgeFiles::Stale);
-        assert_eq!(evaluate(true, Some(stopped)), BRIDGE_NOT_RUNNING);
-        fs::remove_dir_all(root).unwrap();
+        // The bridge goes away; the installed app stays: not running, still supported.
+        fs::remove_file(&descriptor).unwrap();
+        let stopped = probe(&bridge, &installed_roots(root.path())).await;
+        assert_eq!(stopped.files, BridgeFiles::Missing);
+        assert_eq!(evaluate(Some(stopped)), BRIDGE_NOT_RUNNING);
     }
 
     #[tokio::test]
-    async fn slow_refresh_never_blocks_runtime_deadline_or_cancellation_and_non_mac_does_not_scan()
-    {
+    async fn slow_refresh_never_blocks_runtime_deadline_or_cancellation() {
         use std::sync::mpsc;
         let cache = InventoryCache::default();
         let path = PathBuf::from("/unused-fixture-key");
-        assert_eq!(
-            check_with(false, path.clone(), &cache, || panic!("non-Mac scanned")),
-            CURSOR_UNSUPPORTED
-        );
-        assert!(cache.0.lock().unwrap().path.is_none());
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let pending = tokio::time::timeout(Duration::from_millis(50), async {
-            check_with(true, path.clone(), &cache, move || {
+            check_with(path.clone(), &cache, move || {
                 let _ = started_tx.send(());
                 release_rx.recv().unwrap();
                 BridgeEvidence {
@@ -380,7 +400,7 @@ mod tests {
         assert_eq!(pending, BRIDGE_NOT_RUNNING);
         started_rx.await.unwrap();
         assert_eq!(
-            check_with(true, path.clone(), &cache, || panic!("duplicate refresh")),
+            check_with(path.clone(), &cache, || panic!("duplicate refresh")),
             pending
         );
         let heartbeat = tokio::spawn(async {
@@ -411,9 +431,8 @@ mod tests {
         release_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if check_with(true, path.clone(), &cache, || {
-                    panic!("fresh cache rescanned")
-                }) == ReadinessCheck::Ok
+                if check_with(path.clone(), &cache, || panic!("fresh cache rescanned"))
+                    == ReadinessCheck::Ok
                 {
                     break;
                 }
