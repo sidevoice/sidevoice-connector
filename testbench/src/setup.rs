@@ -2,7 +2,7 @@
 //! archive lays it out, installed by its own `install` with no service manager (Sidevoice on demand), and the files
 //! and commands that point an agent at it.
 
-use sidevoice_connector::platform::target::{Host, Target as _};
+use sidevoice_connector::platform::target;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -364,7 +364,7 @@ fn write_bench_login_shell(root: &Path, login_path: &str) -> Result<()> {
 
 /// The connector binary of this build: beside the bench's own.
 fn connector_binary() -> Result<PathBuf> {
-    let binary = std::env::current_exe()?.with_file_name(Host::exe_name("sidevoice-connector"));
+    let binary = std::env::current_exe()?.with_file_name(target::exe_name("sidevoice-connector"));
     if !binary.is_file() {
         bail!(
             "no connector beside the bench at {}: build both (`cargo build`)",

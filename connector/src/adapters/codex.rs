@@ -369,9 +369,9 @@ mod tests {
     #[tokio::test]
     async fn a_codex_call_gives_its_status_and_output_and_is_stopped_at_its_limit() {
         use crate::platform::stand_in::{StandIn, StandIns as _};
-        use crate::platform::target::{Host, Target as _};
+        use crate::platform::target;
         let dir = crate::test_support::temp_dir("codex-run");
-        let program = dir.path().join(Host::exe_name("codex"));
+        let program = dir.path().join(target::exe_name("codex"));
         StandIn::make(
             &program,
             r#"{"play":"script","print":"codex-cli 0.157.0\n","exit":3}"#,

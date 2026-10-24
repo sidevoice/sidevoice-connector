@@ -201,9 +201,9 @@ mod tests {
     #[tokio::test]
     async fn a_request_gives_its_status_and_output() {
         use crate::platform::stand_in::{StandIn, StandIns as _};
-        use crate::platform::target::{Host, Target as _};
+        use crate::platform::target;
         let dir = crate::test_support::temp_dir("http-send");
-        let program = dir.path().join(Host::exe_name("curl"));
+        let program = dir.path().join(target::exe_name("curl"));
         StandIn::make(&program, r#"{"play":"script","print":"ok\n201","exit":3}"#);
         // No payload: a stand-in that ends without reading its input would make writing a real one fail.
         let (status, stdout) = send(
@@ -220,10 +220,10 @@ mod tests {
     #[tokio::test]
     async fn a_request_that_outlasts_its_limit_is_stopped() {
         use crate::platform::process::Process as _;
-        use crate::platform::target::{Host, Target as _};
+        use crate::platform::target;
         use crate::test_support::stand_in::Script;
         let dir = crate::test_support::temp_dir("http-send-late");
-        let program = dir.path().join(Host::exe_name("curl"));
+        let program = dir.path().join(target::exe_name("curl"));
         let pid_file = dir.path().join("pid");
         // Stays up a minute, far past the limit.
         Script {

@@ -14,12 +14,13 @@ path = "xtask/src/main.rs"
 test = true
 
 [dependencies]
+sidevoice-platform = { workspace = true }
 # The DLLs a Windows binary imports (xtask/src/verify.rs), read from its PE file.
 object = { version = "0.40", default-features = false, features = ["read_core", "pe", "std"] }
 serde_json = "1"
 sha2 = "0.10"
 tar = "0.4"
-# The core version is the `sidevoice-platform` tag in connector/Cargo.toml (xtask/src/core.rs).
+# The core version is the workspace `sidevoice-platform` tag (xtask/src/core.rs).
 toml = "0.8"
 # Programs are found the way the OS finds them, `PATHEXT` included (`npm` is `npm.cmd` on Windows): xtask/src/util.rs.
 which = "=8.0.6"
@@ -30,3 +31,7 @@ resolver = "2"
 members = ["connector", "testbench"]
 # `cargo test`, `cargo clippy` and `cargo fmt` at the root cover the connector, the test bench and the tooling.
 default-members = [".", "connector", "testbench"]
+
+[workspace.dependencies]
+# Shared platform API and the core release bundled by xtask: one pin for both consumers.
+sidevoice-platform = { git = "https://github.com/sidevoice/sidevoice-core", tag = "v0.11.0" }

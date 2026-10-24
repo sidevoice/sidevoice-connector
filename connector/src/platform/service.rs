@@ -33,7 +33,7 @@ pub use imp::Os as Services;
 
 use super::fs::{Create, Files, Fs};
 use super::process::{Process, Processes};
-use super::target::{Host, Target as _};
+use super::target;
 use super::user::{User, UserId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -224,7 +224,7 @@ pub trait Service: Sized + Send + Sync {
     const KIND: &'static str;
     /// How many starts it allows before it gives up (systemd's start limit); none where it has none to report.
     const START_LIMIT: Option<u64> = None;
-    /// The program, beside the connector, that runs the jobs' runner without a window (a stem: [`Host::exe_name`] names it),
+    /// The program, beside the connector, that runs the jobs' runner without a window (a stem: [`target::exe_name`] names it),
     /// where the manager starts a console program in a window of its own (Task Scheduler). It travels in the package,
     /// is staged in each release beside the connector, and replaces the connector in [`Service::runner`].
     const BACKGROUND: Option<&'static str> = None;
@@ -247,7 +247,7 @@ pub trait Service: Sized + Send + Sync {
     fn runner(command: &[String]) -> Vec<String> {
         let mut runner = command.to_vec();
         if let (Some(stem), Some(program)) = (Self::BACKGROUND, runner.first_mut()) {
-            let launcher = Path::new(program.as_str()).with_file_name(Host::exe_name(stem));
+            let launcher = Path::new(program.as_str()).with_file_name(target::exe_name(stem));
             if launcher.is_file() {
                 *program = launcher.to_string_lossy().into_owned();
             }
@@ -641,17 +641,17 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path();
-        let connector = bin.join(Host::exe_name("sidevoice-connector"));
+        let connector = bin.join(target::exe_name("sidevoice-connector"));
         // A release from before the launcher has none beside its connector: its command is kept.
         let command = vec![connector.to_string_lossy().into_owned(), "x".into()];
         assert_eq!(Services::runner(&command), command);
         if let Some(stem) = Services::BACKGROUND {
-            std::fs::write(bin.join(Host::exe_name(stem)), b"launcher").unwrap();
+            std::fs::write(bin.join(target::exe_name(stem)), b"launcher").unwrap();
         }
         let command = vec![connector.to_string_lossy().into_owned(), "x".into()];
         let runner = Services::runner(&command);
         let expected = match Services::BACKGROUND {
-            Some(stem) => bin.join(Host::exe_name(stem)),
+            Some(stem) => bin.join(target::exe_name(stem)),
             None => connector,
         };
         assert_eq!(Path::new(&runner[0]), expected);

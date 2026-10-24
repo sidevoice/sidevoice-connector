@@ -4,7 +4,7 @@
 
 use crate::adapters::markers::Roots;
 use crate::platform::env::{Env, Environment};
-use crate::platform::target::{Host, Target as _};
+use crate::platform::target;
 use semver::Version;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ use std::time::SystemTime;
 /// The candidates, in the order they are tried: the native installer's (`~/.local/bin/claude`), the older local
 /// install (`~/.claude/local/claude`), then the copy the Claude desktop app bundles.
 pub(super) fn fallbacks(roots: &Roots) -> Vec<PathBuf> {
-    let exe = Host::exe_name("claude");
+    let exe = target::exe_name("claude");
     let home = |relative: &str| roots.home.join(relative).join(&exe);
     let mut found = vec![home(".local/bin"), home(".claude/local")];
     if let Some(local) = &roots.local_app_data {
@@ -119,14 +119,14 @@ mod tests {
             .join("LocalCache/Roaming/Claude/claude-code")
             .join(version)
             .join(hash)
-            .join(Host::exe_name("claude"))
+            .join(target::exe_name("claude"))
     }
 
     #[test]
     fn the_desktop_bundle_is_the_highest_version_then_the_newest_build() {
         let dir = tempfile::tempdir().unwrap();
         let packages = dir.path();
-        let exe = Host::exe_name("claude");
+        let exe = target::exe_name("claude");
         program(
             &bundle(packages, "Claude_pzs8sxrjxfjjc", "2.1.9", "aaa"),
             50,
@@ -166,7 +166,7 @@ mod tests {
     #[test]
     fn the_claude_data_folder_is_searched_with_the_package_and_the_newest_version_wins() {
         let dir = tempfile::tempdir().unwrap();
-        let exe = Host::exe_name("claude");
+        let exe = target::exe_name("claude");
         let packages = dir.path().join("Packages");
         let programs = dir.path().to_path_buf();
         program(
@@ -199,7 +199,7 @@ mod tests {
             local_app_data: None,
             program_files: None,
         };
-        let exe = Host::exe_name("claude");
+        let exe = target::exe_name("claude");
         assert_eq!(
             fallbacks(&roots),
             vec![
@@ -223,7 +223,10 @@ mod resolution {
             local_app_data: None,
             program_files: None,
         };
-        let native = roots.home.join(".local/bin").join(Host::exe_name("claude"));
+        let native = roots
+            .home
+            .join(".local/bin")
+            .join(target::exe_name("claude"));
         Files::ensure_private_dir(native.parent().unwrap()).unwrap();
         let claude = crate::adapters::claude::Claude;
         assert_eq!(crate::agents::find_binary(&claude, None, &roots), None);
@@ -250,7 +253,7 @@ mod resolution {
         );
         // PATH comes first.
         let bin = dir.path().join("bin");
-        let first = bin.join(Host::exe_name("claude"));
+        let first = bin.join(target::exe_name("claude"));
         Files::ensure_private_dir(&bin).unwrap();
         Files::open_private(&first, Create::NewProgram).unwrap();
         assert_eq!(
