@@ -43,6 +43,8 @@ use uuid::Uuid;
 
 const REQUEST_LIMIT: StdDuration = StdDuration::from_secs(18);
 const CHILD_LIMIT: StdDuration = StdDuration::from_millis(2500);
+/// How many times a scan another one overtook is made, the last one answering with what is recorded then.
+const SCAN_ATTEMPTS: usize = 3;
 const OUTPUT_LIMIT: usize = 64 * 1024;
 const STATE_LIMIT: u64 = 4 * 1024 * 1024;
 /// The longest a health check of one agent takes.
@@ -626,14 +628,40 @@ impl HostAgents {
         }))
     }
 
+    /// A scan, recorded. Scans of one data directory can overlap (the daemon's at its start, an install's, a
+    /// person's), each with its own login PATH; one that finds another wrote meanwhile keeps what that one wrote and
+    /// scans again from it, a few times, so that what it answers is its own scan rather than another's, or nothing.
     async fn scan(
+        &self,
+        mut state: Value,
+        watch: Option<AgentId>,
+        check: bool,
+        cancel: &Cancellation,
+        deadline: Instant,
+    ) -> std::result::Result<Value, Failure> {
+        for _ in 1..SCAN_ATTEMPTS {
+            let (scanned, recorded) = self
+                .scan_once(state, watch, check, cancel, deadline)
+                .await?;
+            if recorded {
+                return Ok(scanned);
+            }
+            state = scanned;
+        }
+        Ok(self
+            .scan_once(state, watch, check, cancel, deadline)
+            .await?
+            .0)
+    }
+
+    async fn scan_once(
         &self,
         state: Value,
         watch: Option<AgentId>,
         check: bool,
         cancel: &Cancellation,
         deadline: Instant,
-    ) -> std::result::Result<Value, Failure> {
+    ) -> std::result::Result<(Value, bool), Failure> {
         if self.stopped()? {
             return Err(Failure::Cancelled);
         }
@@ -649,7 +677,8 @@ impl HostAgents {
                         latest["scanned_at"] = json!(iso_now());
                     }
                 })
-                .await;
+                .await
+                .map(|state| (state, true));
         }
         // After a failed scan every agent is looked at again, not only the watched one.
         let ids: Vec<_> = (if base.get("login_path") != Some(&json!(login_path))
@@ -755,6 +784,8 @@ impl HostAgents {
         environment
     }
 
+    /// The scan written into the state, and whether all of it was: what another scan wrote since this one started
+    /// (another login PATH, another binary for an agent) is kept, and this scan's observations of it are dropped.
     async fn merge_scan(
         &self,
         base: Value,
@@ -763,76 +794,80 @@ impl HostAgents {
         full: bool,
         cancel: &Cancellation,
         deadline: Instant,
-    ) -> std::result::Result<Value, Failure> {
-        self.update_state(cancel, deadline, true, move |latest| {
-            if captured_path.is_none() {
-                return;
-            }
-            let path_unchanged = latest.get("login_path") == base.get("login_path");
-            if path_unchanged {
-                latest["login_path"] = json!(captured_path);
-            }
-            for (id, observation) in observations {
-                if !path_unchanged
-                    || latest.pointer(&format!("/binaries/{}", id))
-                        != base.pointer(&format!("/binaries/{}", id))
-                {
-                    continue;
+    ) -> std::result::Result<(Value, bool), Failure> {
+        let mut recorded = true;
+        let state = self
+            .update_state(cancel, deadline, true, |latest| {
+                if captured_path.is_none() {
+                    return;
                 }
-                if let Some(binary) = &observation.binary {
-                    latest["binaries"][id] = json!(binary);
-                } else if let Some(binaries) =
-                    latest.get_mut("binaries").and_then(Value::as_object_mut)
-                {
-                    binaries.remove(id);
+                let path_unchanged = latest.get("login_path") == base.get("login_path");
+                if path_unchanged {
+                    latest["login_path"] = json!(captured_path);
                 }
-                let signature = observation.signature;
-                let previous = latest.pointer(&format!("/seen/{}", id)).cloned();
-                let same = previous.as_ref().is_some_and(|seen| {
-                    seen.get("present") == Some(&Value::Bool(true))
-                        && seen.get("signature").and_then(Value::as_str) == signature.as_deref()
-                });
-                let generation = if observation.present {
-                    if same {
+                for (id, observation) in observations {
+                    if !path_unchanged
+                        || latest.pointer(&format!("/binaries/{}", id))
+                            != base.pointer(&format!("/binaries/{}", id))
+                    {
+                        recorded = false;
+                        continue;
+                    }
+                    if let Some(binary) = &observation.binary {
+                        latest["binaries"][id] = json!(binary);
+                    } else if let Some(binaries) =
+                        latest.get_mut("binaries").and_then(Value::as_object_mut)
+                    {
+                        binaries.remove(id);
+                    }
+                    let signature = observation.signature;
+                    let previous = latest.pointer(&format!("/seen/{}", id)).cloned();
+                    let same = previous.as_ref().is_some_and(|seen| {
+                        seen.get("present") == Some(&Value::Bool(true))
+                            && seen.get("signature").and_then(Value::as_str) == signature.as_deref()
+                    });
+                    let generation = if observation.present {
+                        if same {
+                            previous
+                                .as_ref()
+                                .and_then(|seen| seen.get("generation"))
+                                .cloned()
+                                .unwrap_or_else(|| json!(Uuid::new_v4().to_string()))
+                        } else {
+                            json!(Uuid::new_v4().to_string())
+                        }
+                    } else {
                         previous
                             .as_ref()
                             .and_then(|seen| seen.get("generation"))
                             .cloned()
-                            .unwrap_or_else(|| json!(Uuid::new_v4().to_string()))
+                            .unwrap_or(Value::Null)
+                    };
+                    let detected_at = if observation.present && !same {
+                        json!(iso_now())
                     } else {
-                        json!(Uuid::new_v4().to_string())
-                    }
-                } else {
-                    previous
-                        .as_ref()
-                        .and_then(|seen| seen.get("generation"))
-                        .cloned()
-                        .unwrap_or(Value::Null)
-                };
-                let detected_at = if observation.present && !same {
-                    json!(iso_now())
-                } else {
-                    previous
-                        .as_ref()
-                        .and_then(|seen| seen.get("detected_at"))
-                        .cloned()
-                        .unwrap_or(Value::Null)
-                };
-                latest["seen"][id] = json!({
-                    "present":observation.present,
-                    "signature":signature,
-                    "generation":generation,
-                    "detected_at":detected_at,
-                    "agent":observation.row,
-                });
-            }
-            latest["scanned_at"] = json!(iso_now());
-            // Only a scan of every agent, on the path it started from, recovers from a failed one.
-            if full && path_unchanged {
-                latest["scan_failed"] = json!(false);
-            }
-        })
-        .await
+                        previous
+                            .as_ref()
+                            .and_then(|seen| seen.get("detected_at"))
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    };
+                    latest["seen"][id] = json!({
+                        "present":observation.present,
+                        "signature":signature,
+                        "generation":generation,
+                        "detected_at":detected_at,
+                        "agent":observation.row,
+                    });
+                }
+                latest["scanned_at"] = json!(iso_now());
+                // Only a scan of every agent, on the path it started from, recovers from a failed one.
+                if full && path_unchanged {
+                    latest["scan_failed"] = json!(false);
+                }
+            })
+            .await?;
+        Ok((state, recorded))
     }
 
     async fn load_state(

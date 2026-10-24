@@ -2,7 +2,7 @@
 //! (`crate::test_support::stand_in`): the same parts on every OS.
 
 use crate::platform::env::{Env, Environment};
-use crate::platform::fs::{Files, TestFiles};
+use crate::platform::fs::{Files, Fs, TestFiles};
 use crate::test_support::stand_in;
 use serde_json::{json, Map, Value};
 use std::io::{BufRead, Write};
@@ -16,11 +16,12 @@ pub(super) fn make(program: &Path, play: &str) {
 
 #[ctor::ctor(unsafe)]
 fn play_agents() {
-    stand_in::serve(|name, _, args| match name {
+    stand_in::serve(|name, part, args| match name {
         "codex" => Some(codex(args)),
         "codex-gate" => Some(codex_gate(args)),
         "claude" => Some(claude(args)),
         "mcp-server" => Some(mcp_server(args)),
+        "overtaken-login-shell" => Some(overtaken_login_shell(part)),
         _ => None,
     });
 }
@@ -276,5 +277,23 @@ fn mcp_server(args: &[String]) -> i32 {
     println!(r#"{{"jsonrpc":"2.0","id":2,"result":{{"tools":[]}}}}"#);
     std::io::stdout().flush().unwrap();
     std::thread::sleep(Duration::from_secs(30));
+    0
+}
+
+/// A login shell (`$SHELL`) that says `path` is its `PATH` and, the first time it runs (`marker` is then made),
+/// writes `state` as `file` first: what another scan of the same data directory, with another login PATH, records
+/// while this one runs (the daemon's at its start while an install scans).
+fn overtaken_login_shell(part: &Value) -> i32 {
+    let marker = PathBuf::from(part["marker"].as_str().unwrap());
+    if !marker.exists() {
+        std::fs::write(&marker, "").unwrap();
+        Files::write_json(Path::new(part["file"].as_str().unwrap()), &part["state"]).unwrap();
+    }
+    print!(
+        "{}{}{}",
+        crate::platform::env::LoginPath::START,
+        part["path"].as_str().unwrap(),
+        crate::platform::env::LoginPath::END
+    );
     0
 }

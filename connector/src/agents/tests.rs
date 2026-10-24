@@ -138,7 +138,8 @@ async fn only_a_scan_of_every_agent_clears_a_recorded_failure() {
             deadline,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(watched["scan_failed"], true, "{watched}");
     let full = host
         .merge_scan(
@@ -150,7 +151,8 @@ async fn only_a_scan_of_every_agent_clears_a_recorded_failure() {
             deadline,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(full["scan_failed"], false, "{full}");
     host.shutdown().await;
 }
@@ -2689,5 +2691,54 @@ async fn claude_never_started_is_connected_and_its_cli_makes_its_home() {
         "{connected}"
     );
     assert!(home.is_dir(), "the CLI did not make {}", home.display());
+    host.shutdown().await;
+}
+
+/// Two scans of one data directory overlap with different login PATHs (the daemon's at its start, from the service's
+/// environment, while `install` scans from the person's): the one overtaken scans again from what the other recorded,
+/// so it answers with what it found, never with the other's listing or with nothing.
+#[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "the login PATH is asked of a login shell (`$SHELL`) on Unix; Windows reads it from the registry, so no shell can be overtaken"
+)]
+async fn a_scan_overtaken_by_another_scans_again_and_answers_what_it_found() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let _no_cursor_override = EnvGuard::set("SIDEVOICE_CURSOR_BIN", std::ffi::OsStr::new(""));
+    let bin = fixture.root.join("login-bin");
+    private_mkdir(&bin);
+    Script::default().make(&bin.join(Host::exe_name("claude")));
+    let shell = fixture.root.join(Host::exe_name("login-shell"));
+    let other = fixture.root.join("service-bin");
+    crate::test_support::stand_in::make(
+        &shell,
+        &json!({
+            "play": "overtaken-login-shell",
+            "path": bin.to_string_lossy(),
+            "marker": fixture.root.join("overtaken"),
+            "file": fixture.profile.data.join("agents.json"),
+            "state": {
+                "version": 1,
+                "login_path": other.to_string_lossy(),
+                "scanned_at": "2026-10-24T00:14:52.000Z",
+                "scan_failed": false,
+                "binaries": {},
+                "seen": {"claude": {"present": false}},
+                "dismissed": {},
+            },
+        }),
+    );
+    let _shell = EnvGuard::set("SHELL", shell.as_os_str());
+    let host = HostAgents::for_installer(fixture.profile.clone()).unwrap();
+
+    let listed = host.handle("agents.list", json!({"rescan":true})).await;
+    assert!(
+        fixture.root.join("overtaken").exists(),
+        "the other scan never wrote"
+    );
+    assert!(listed.get("error").is_none(), "{listed}");
+    assert_eq!(listed["scan_failed"], false, "{listed}");
+    assert!(listed_ids(&listed).contains(&"claude".into()), "{listed}");
     host.shutdown().await;
 }
