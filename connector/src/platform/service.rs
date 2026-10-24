@@ -33,6 +33,7 @@ pub use imp::Os as Services;
 
 use super::fs::{Create, Files, Fs};
 use super::process::{Process, Processes};
+use super::target::{Host, Target as _};
 use super::user::{User, UserId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -223,6 +224,10 @@ pub trait Service: Sized + Send + Sync {
     const KIND: &'static str;
     /// How many starts it allows before it gives up (systemd's start limit); none where it has none to report.
     const START_LIMIT: Option<u64> = None;
+    /// The program, beside the connector, that runs the jobs' runner without a window (a stem: [`Host::exe_name`] names it),
+    /// where the manager starts a console program in a window of its own (Task Scheduler). It travels in the package,
+    /// is staged in each release beside the connector, and replaces the connector in [`Service::runner`].
+    const BACKGROUND: Option<&'static str> = None;
 
     /// This user's manager, its definitions kept under `places`. Nothing is asked of it yet.
     fn new(places: Places) -> Self;
@@ -235,6 +240,20 @@ pub trait Service: Sized + Send + Sync {
 
     /// The text of the job's definition. The values are checked ([`Job::check`]) before it is made.
     fn definition(job: &Job) -> String;
+
+    /// The command a manager runs to run a job (then [`Job::runner`]'s `run-job` and the definition file): the
+    /// installation's `command`, its program replaced by [`Service::BACKGROUND`] beside it where there is one and the
+    /// release has it: a release from before the launcher (a rollback to it) keeps the plain command.
+    fn runner(command: &[String]) -> Vec<String> {
+        let mut runner = command.to_vec();
+        if let (Some(stem), Some(program)) = (Self::BACKGROUND, runner.first_mut()) {
+            let launcher = Path::new(program.as_str()).with_file_name(Host::exe_name(stem));
+            if launcher.is_file() {
+                *program = launcher.to_string_lossy().into_owned();
+            }
+        }
+        runner
+    }
 
     /// The program a definition runs, read back from its text.
     fn program_of(text: &str) -> Option<Vec<String>>;
@@ -615,6 +634,29 @@ mod tests {
             log: PathBuf::from("/d/test.log"),
             runner: vec!["/r/current/sidevoice-connector".into(), "run-job".into()],
         }
+    }
+
+    #[test]
+    fn the_runner_is_the_installations_command_with_the_background_program_where_the_manager_has_one(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path();
+        let connector = bin.join(Host::exe_name("sidevoice-connector"));
+        // A release from before the launcher has none beside its connector: its command is kept.
+        let command = vec![connector.to_string_lossy().into_owned(), "x".into()];
+        assert_eq!(Services::runner(&command), command);
+        if let Some(stem) = Services::BACKGROUND {
+            std::fs::write(bin.join(Host::exe_name(stem)), b"launcher").unwrap();
+        }
+        let command = vec![connector.to_string_lossy().into_owned(), "x".into()];
+        let runner = Services::runner(&command);
+        let expected = match Services::BACKGROUND {
+            Some(stem) => bin.join(Host::exe_name(stem)),
+            None => connector,
+        };
+        assert_eq!(Path::new(&runner[0]), expected);
+        assert_eq!(runner[1..], command[1..]);
+        assert!(Services::runner(&[]).is_empty());
     }
 
     #[test]

@@ -10,7 +10,10 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 
-use super::{connector_program, CONNECTOR};
+use sidevoice_connector::platform::service::{Service as _, Services};
+use sidevoice_connector::platform::target::{Host, Target as _};
+
+use super::{connector_program, BACKGROUND, CONNECTOR};
 
 /// The checked core archive and its record (`core.json`), or `None` when the test must be skipped.
 pub fn pinned_core() -> Option<(PathBuf, Value)> {
@@ -46,6 +49,13 @@ pub fn package(at: &Path, archive: &Path, record: &Value, sha256: &str) -> PathB
     // A link, not a copy: a program just written can be "busy" while another test's fork holds it.
     if fs::hard_link(CONNECTOR, &binary).is_err() {
         fs::copy(CONNECTOR, &binary).unwrap();
+    }
+    // Where the OS runs its service jobs through a windowless launcher, the package carries it beside the connector.
+    if let Some(stem) = Services::BACKGROUND {
+        let launcher = root.join("bin").join(Host::exe_name(stem));
+        if fs::hard_link(BACKGROUND, &launcher).is_err() {
+            fs::copy(BACKGROUND, &launcher).unwrap();
+        }
     }
     let name = format!("core/{}", record["archive"].as_str().unwrap());
     fs::copy(archive, root.join(&name)).unwrap();

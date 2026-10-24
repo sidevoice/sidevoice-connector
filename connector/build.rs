@@ -20,9 +20,23 @@ fn embed_windows_manifest() {
     println!("cargo:rerun-if-changed=build.rs");
 }
 
+/// The version resource of the windowless launcher (`sidevoice-background`) alone: Task Manager shows its description,
+/// "Sidevoice Background", for the process. The connector, a console program a person runs, gets none.
+fn embed_background_resource() {
+    embed_resource::compile_for(
+        "background.rc",
+        ["sidevoice-background"],
+        embed_resource::NONE,
+    )
+    .manifest_required()
+    .expect("cannot embed the launcher's version resource");
+    println!("cargo:rerun-if-changed=background.rc");
+}
+
 fn main() {
     if env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "windows") {
         embed_windows_manifest();
+        embed_background_resource();
     }
     for name in [
         "SIDEVOICE_CONNECTOR_BUILD_SHA",

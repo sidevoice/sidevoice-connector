@@ -4,7 +4,7 @@
 //!
 //! | What | Where |
 //! |---|---|
-//! | `R/releases/<id>/` | one release per version: `bin/sidevoice-connector`, a copy of the installing binary, and `core/`, the core the package carries, staged and checked against its inventory (`core_package.rs`) |
+//! | `R/releases/<id>/` | one release per version: `bin/sidevoice-connector`, a copy of the installing binary (on Windows also `bin/sidevoice-background.exe`, the windowless program the service tasks run), and `core/`, the core the package carries, staged and checked against its inventory (`core_package.rs`) |
 //! | `R/current.json` | the pointer record `{"release": "<id>"}`, written whole over the old one: the selected release |
 //! | `D/install.json` | `command`: `[R/releases/<id>/bin/sidevoice-connector]` of the selected release, rewritten at each switch, what the service jobs, the desktop app and every agent registration run, never the package's own path (npm's cache is not stable); `releases`: `R` |
 //!
@@ -48,7 +48,7 @@ use crate::platform::data_dir;
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Create, Files, Fs};
 use crate::platform::process::{Process, Processes};
-use crate::platform::service::Service;
+use crate::platform::service::{Service, Services};
 use crate::platform::target::{Host, Target as _};
 use crate::platform::uninstall::{Ownership, Removal, Remover, Roots};
 use crate::profile::Profile;
@@ -258,9 +258,16 @@ fn valid_version(version: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ".+-_".contains(ch))
 }
 
-/// A release that is all there: its binary and its core's program.
+/// The program beside the connector that runs the service jobs without a window (`bin/sidevoice-background.exe`),
+/// where the OS's service manager needs one (`Service::BACKGROUND`).
+fn background() -> Option<String> {
+    Services::BACKGROUND.map(|stem| format!("bin/{}", Host::exe_name(stem)))
+}
+
+/// A release that is all there: its binary, its background program where there is one, and its core's program.
 fn complete(release: &Path) -> bool {
     release.join(binary()).is_file()
+        && background().is_none_or(|program| release.join(program).is_file())
         && release
             .join(crate::service::layout::core_entrypoint())
             .is_file()
@@ -390,6 +397,16 @@ async fn stage(layout: &Layout, package: &Package, id: &str, digest: &str) -> Re
             return Err(failed("the connector changed while it was being copied"));
         }
         check_binary(&binary, &package.version).await?;
+        if let Some(program) = background() {
+            // Beside the connector it was started from, as the package carries them.
+            let from = package
+                .binary
+                .with_file_name(Path::new(&program).file_name().unwrap_or_default());
+            let staged = partial.join(&program);
+            copy_executable(&from, &staged)?;
+            Files::check_private(&Files::open_read(&staged)?)
+                .with_context(|| format!("unsafe private file {}", staged.display()))?;
+        }
         let (root, release, version) = (
             package.root.clone(),
             partial.clone(),
@@ -1338,6 +1355,9 @@ pub(crate) mod tests {
                 &json!({"play": "script", "build": build,
                     "print": format!("{}\n", json!({"ok": true, "version": version}))}),
             );
+            if let Some(program) = background() {
+                fs::write(root.join(program), b"background").unwrap();
+            }
             let archive = core_archive(&core_files(), &[]);
             let target = Host::name().unwrap();
             let name = format!("core/sidevoice-core-0.2.0-{target}.tar.zst");

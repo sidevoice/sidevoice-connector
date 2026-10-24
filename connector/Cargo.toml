@@ -8,6 +8,12 @@ publish = false
 name = "sidevoice-connector"
 path = "src/main.rs"
 
+# The windowless launcher of the Windows service jobs (src/background.rs, src/service/background.rs). Built on every OS so
+# the workspace stays one build; only the Windows archive ships it (xtask/src/dist.rs).
+[[bin]]
+name = "sidevoice-background"
+path = "src/background.rs"
+
 # The MCP server check (src/adapters/health.rs) against a fake server that is this test's own binary, on every OS. Not
 # libtest: it writes its own lines to stdout, where the fake server's protocol goes.
 [[test]]
@@ -101,3 +107,6 @@ plist = "1.10"
 [build-dependencies]
 # The Windows manifest of the binaries (build.rs): long paths. Used for Windows targets only; nothing is embedded elsewhere.
 embed-manifest = "1"
+# The launcher's version resource (build.rs): its file description. Windows targets only; needs the Windows SDK's resource
+# compiler, which a Rust MSVC toolchain's machine has.
+embed-resource = "3"
