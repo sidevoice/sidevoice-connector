@@ -250,7 +250,8 @@ state comes from the chat's transcript, so it stays right while a message waits 
 
 `uninstall` unloads both jobs and stops what runs on demand (a refusal stops it there, with nothing deleted), removes
 the agents' registrations Sidevoice wrote (current or not), then the owned data and releases. At the very end it looks at
-`D`: when only the connector's own files are left in it (its lock files and the stop) they and `D` are removed; when
+`D`: when only the connector's own files remain, its locks are removed. The stop (`node-stopped.json`) stays,
+keeping an already open conversation from starting Sidevoice again; `data_dir.kept` names it. When
 anything else is there (the shared `Models`, in the standard place) `D` stays and the answer's `data_dir.kept` names it.
 A file something still holds (on Windows, a sharing violation) is not an error: `data_dir.held` names it and `D` is left;
 the human output says so too.

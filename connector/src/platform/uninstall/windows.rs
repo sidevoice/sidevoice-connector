@@ -33,6 +33,22 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 
+/// Access denied alone can also mean ACLs or attributes; only call it held when
+/// an exclusive attribute handle confirms another open handle conflicts.
+fn in_use(error: &io::Error, path: &Path) -> bool {
+    match error.raw_os_error() {
+        Some(32 | 33) => true,
+        Some(5) => OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .err()
+            .is_some_and(|error| matches!(error.raw_os_error(), Some(32 | 33))),
+        _ => false,
+    }
+}
+
 /// What a file or directory is, whatever it is called: its volume and its file id.
 #[derive(PartialEq)]
 struct Identity(u64, u64);
@@ -465,20 +481,34 @@ impl Removal for Os {
                 });
             }
             for entry in found {
+                if entry == "node-stopped.json" {
+                    continue;
+                }
                 // A link is removed itself; a directory of that name is not entered.
                 let path = data.join(&entry);
-                if fs::remove_file(&path)
-                    .or_else(|_| fs::remove_dir(&path))
-                    .is_err()
-                {
-                    held.push(entry.to_string_lossy().into_owned());
+                if let Err(error) = fs::remove_file(&path) {
+                    if in_use(&error, &path) && !path.is_dir() {
+                        held.push(entry.to_string_lossy().into_owned());
+                    } else {
+                        return Err("cannot remove uninstall file");
+                    }
                 }
             }
+        }
+        if data.join("node-stopped.json").exists() {
+            return Ok(DataDir {
+                kept: vec!["node-stopped.json".into()],
+                held,
+                ..DataDir::default()
+            });
         }
         if held.is_empty() {
             // `D` itself cannot be deleted while held, so its parent is held instead. Only an empty directory goes.
             let _parent = self.hold_down_to(data.parent().ok_or("unsafe uninstall path")?)?;
-            if fs::remove_dir(data).is_err() {
+            if let Err(error) = fs::remove_dir(data) {
+                if !in_use(&error, data) {
+                    return Err("cannot remove uninstall directory");
+                }
                 held.push(
                     data.file_name()
                         .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),

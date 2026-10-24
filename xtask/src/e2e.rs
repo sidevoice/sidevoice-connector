@@ -899,8 +899,7 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
     check(!releases.exists(), || {
         format!("{} is left", releases.display())
     })?;
-    // Only its own files were left in the data directory, so it goes too; anything else (the shared models, in the
-    // standard place) is not ours and keeps it.
+    // The stop survives cleanup. Models keep every remaining file beside them.
     if machine.data.exists() {
         let names: Vec<String> = fs::read_dir(&machine.data)
             .map_err(|error| format!("{}: {error}", machine.data.display()))?
@@ -908,12 +907,32 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         println!("{} holds {names:?}", machine.data.display());
-        check(names == ["Models"], || {
+        let mut expected = if names.iter().any(|name| name == "Models") {
+            vec![
+                "Models",
+                "agents.lock",
+                "connector.lock",
+                "install.lock",
+                "node-stopped.json",
+            ]
+        } else {
+            vec!["node-stopped.json"]
+        };
+        expected.sort();
+        let mut names = names;
+        names.sort();
+        check(names == expected, || {
             format!("left in {}: {names:?}", machine.data.display())
         })?;
-        check(removed["data_dir"]["kept"] == json!(["Models"]), || {
-            format!("uninstall did not say what it kept: {removed}")
-        })?;
+        check(
+            removed["data_dir"]["kept"]
+                == if names.iter().any(|name| name == "Models") {
+                    json!(["Models"])
+                } else {
+                    json!(["node-stopped.json"])
+                },
+            || format!("uninstall did not say what it kept: {removed}"),
+        )?;
     } else {
         check(removed["data_dir"]["removed"] == true, || {
             format!("uninstall did not say it removed the data directory: {removed}")

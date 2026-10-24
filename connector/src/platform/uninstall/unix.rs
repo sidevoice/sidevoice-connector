@@ -857,6 +857,9 @@ impl Removal for Os {
         self.verify_dir(&self.data_rel, data.as_raw_fd())?;
         let mut held = Vec::new();
         for entry in found {
+            if entry == "node-stopped.json" {
+                continue;
+            }
             // `unlinkat` removes a link itself and refuses a directory.
             if unsafe { libc::unlinkat(data.as_raw_fd(), name(&entry)?.as_ptr(), 0) } != 0 {
                 held.push(entry.to_string_lossy().into_owned());
@@ -868,13 +871,26 @@ impl Removal for Os {
         let parent = self
             .open_below(parent, false)?
             .ok_or("uninstall path disappeared")?;
-        let now = entries(data.as_raw_fd())?;
+        let mut now = entries(data.as_raw_fd())?;
+        let stop = now.iter().any(|entry| entry == "node-stopped.json");
+        now.retain(|entry| entry != "node-stopped.json");
+        if stop && now.is_empty() && held.is_empty() {
+            return Ok(DataDir {
+                kept: vec!["node-stopped.json".into()],
+                ..DataDir::default()
+            });
+        }
         if !held.is_empty() || !now.is_empty() {
             held.extend(now.iter().map(|entry| entry.to_string_lossy().into_owned()));
             held.sort();
             held.dedup();
             return Ok(DataDir {
                 held,
+                kept: if stop {
+                    vec!["node-stopped.json".into()]
+                } else {
+                    Vec::new()
+                },
                 ..DataDir::default()
             });
         }

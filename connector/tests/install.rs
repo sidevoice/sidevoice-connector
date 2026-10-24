@@ -221,12 +221,11 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
         let config = read_json(&cursor).unwrap();
         assert!(config["mcpServers"].get("sidevoice").is_none(), "{config}");
     }
-    // Only its own files were left, so the directory goes too.
-    assert!(
-        !profile.data().exists(),
-        "{} is left",
-        profile.data().display()
+    assert!(profile.data().join("node-stopped.json").exists());
+    assert_eq!(
+        removed["data_dir"]["kept"],
+        json!(["node-stopped.json"]),
+        "{removed}"
     );
-    assert_eq!(removed["data_dir"]["removed"], true, "{removed}");
     fs::remove_dir_all(&at).unwrap();
 }

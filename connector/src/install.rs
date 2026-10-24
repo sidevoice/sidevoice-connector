@@ -150,7 +150,7 @@ fn timeout_failure(limit: Duration, waited: &Waited, service: &str, last: Option
 }
 
 /// What `uninstall` leaves in `D` while it runs: the lock files, the stop, and `Models` (named by `sidevoice-platform`); the
-/// files of ours among them go last, with `D`, when nothing else is left (`Removal::remove_data_dir`). The shared models
+/// lock files go last when nothing else is left, preserving the stop (`Removal::remove_data_dir`). The shared models
 /// are the engine's, never this connector's to remove; they live in the OS standard place (`data_dir::models_dir`), which
 /// is `D` itself when `D` is not overridden, so they are kept here so that an un-overridden `D` never loses them (when `D`
 /// is overridden they are not under it and this entry matches nothing).
@@ -1177,11 +1177,14 @@ async fn uninstall_with_hooks(
     let had_releases = preflight(&guard).map_err(failed)?;
     guard.preflight().map_err(failed)?;
     let install_lock = guard.lock_file("install.lock").map_err(failed)?;
-    let install_held =
-        crate::lock::wait_lock_file(install_lock, "install.lock", Duration::from_secs(30))
-            .await
-            .map_err(failed)?
-            .ok_or_else(|| failed("another install or service command holds install.lock"))?;
+    let install_held = crate::lock::wait_lock_file(
+        install_lock,
+        &layout.data.join("install.lock"),
+        Duration::from_secs(30),
+    )
+    .await
+    .map_err(failed)?
+    .ok_or_else(|| failed("another install or service command holds install.lock"))?;
     // What `D` holds may have changed while the lock was awaited: still ours, or (missing at the start) only the
     // lock this uninstall just made there.
     match (found, guard.ownership().map_err(failed)?) {
@@ -1200,23 +1203,25 @@ async fn uninstall_with_hooks(
         json!({})
     };
     let agents_lock = guard.lock_file("agents.lock").map_err(failed)?;
-    let agents_held =
-        crate::lock::wait_lock_file(agents_lock, "agents.lock", Duration::from_secs(30))
-            .await?
-            .ok_or_else(|| failed("another agents request holds agents.lock"))?;
+    let agents_held = crate::lock::wait_lock_file(
+        agents_lock,
+        &layout.data.join("agents.lock"),
+        Duration::from_secs(30),
+    )
+    .await?
+    .ok_or_else(|| failed("another agents request holds agents.lock"))?;
     guard.stage_recovery().map_err(failed)?;
     let removed = guard.remove_data_contents(&before_claim).map_err(failed)?;
     guard.remove_releases().map_err(failed)?;
     guard.finish_claim().map_err(failed)?;
     guard.finish_recovery().map_err(failed)?;
-    // Nothing else holds a file of ours now: the locks are let go before the directory is looked at.
-    drop(agents_held);
-    drop(install_held);
     let data_dir = match guard.remove_data_dir() {
         Ok(left) => json!({"removed": left.removed, "kept": left.kept, "held": left.held}),
         // Everything else is already gone: this is said, and is not a failure of the uninstall.
         Err(reason) => json!({"removed": false, "kept": [], "held": [], "error": reason}),
     };
+    drop(agents_held);
+    drop(install_held);
     let advice =
         vec!["Conversations already open keep their Sidevoice server until they end.".to_owned()];
     Ok(
@@ -1542,7 +1547,7 @@ pub(crate) mod tests {
             ["4.0.0".to_owned(), "3.0.0".to_owned()]
         );
 
-        // Uninstall: the releases and the data go, and the locks and the stop with them.
+        // Uninstall removes releases and owned data, preserving the stop.
         Files::write_json(&layout.data.join("outbox.json"), &json!([])).unwrap();
         crate::lock::try_lock(&layout.data.join("agents.lock"), "test").unwrap();
         // The shared models are another program's: if they are in `D` (un-overridden), they and what is in them survive.

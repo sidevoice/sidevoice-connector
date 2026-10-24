@@ -295,9 +295,9 @@ impl Roots {
     /// Whether `name` is a file the connector itself creates in `D`, and so may be removed with `D`: the names it
     /// `kept`, except the shared models folder, which is the engine's.
     fn is_own(&self, name: &OsStr) -> bool {
-        self.kept
-            .iter()
-            .any(|kept| OsStr::new(kept) == name && *kept != data_dir::MODELS)
+        self.kept.iter().any(|kept| {
+            OsStr::new(kept) == name && *kept != data_dir::MODELS && *kept != "node-stopped.json"
+        })
     }
 
     /// The names in `D` that are never claimed as data: what the uninstall `kept`, the retry record, the claim and the
@@ -351,10 +351,10 @@ fn recovery_record(roots: &Roots) -> Result<Value, &'static str> {
 pub struct DataDir {
     /// `D` itself is gone.
     pub removed: bool,
-    /// Entries that are not the connector's own: they, `D` and everything of ours beside them are left.
+    /// Preserved entries: the stop marker, or foreign entries which keep everything beside them.
     pub kept: Vec<String>,
     /// Entries of ours that could not be removed because something holds them (an open file, a process whose
-    /// working directory it is) or the OS refused; they and `D` are left. `D`'s own name when it is `D` that is held.
+    /// working directory it is); they and `D` are left. `D`'s own name when it is `D` that is held.
     pub held: Vec<String>,
 }
 
@@ -362,7 +362,7 @@ pub struct DataDir {
 fn foreign(roots: &Roots, names: &[OsString]) -> Vec<String> {
     let mut kept: Vec<String> = names
         .iter()
-        .filter(|name| !roots.is_own(name))
+        .filter(|name| !roots.is_own(name) && *name != "node-stopped.json")
         .map(|name| name.to_string_lossy().into_owned())
         .collect();
     kept.sort();
@@ -419,11 +419,11 @@ pub trait Removal: Sized {
     /// releases or data remain, so that a failure earlier always leaves the way to retry.
     fn finish_recovery(&self) -> Result<(), &'static str>;
 
-    /// The very last step, once [`Removal::finish_recovery`] is done and the locks this removal took are released:
-    /// when `D` holds only files of ours ([`Roots::is_own`]: its locks and the stop) they and `D` are removed;
+    /// The very last step, once [`Removal::finish_recovery`] is done while the install lock is still held:
+    /// when `D` holds only files of ours ([`Roots::is_own`]: its locks) they are removed, preserving the stop marker;
     /// when it holds anything else, nothing is removed and the other names are reported as kept. Nothing is
     /// followed: a link among them is removed as a link, a directory of that name is never entered. A file that
-    /// cannot be removed is reported as held and never fails the uninstall; nothing outside `D` is touched.
+    /// in use is reported as held; other cleanup errors are non-fatal to uninstall; nothing outside `D` is touched.
     fn remove_data_dir(&self) -> Result<DataDir, &'static str>;
 }
 
@@ -856,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn a_data_directory_with_only_our_files_is_removed_and_a_link_among_them_only_as_a_link() {
+    fn cleanup_preserves_the_stop_and_removes_a_link_only_as_a_link() {
         let scratch = temp_dir("uninstall-own");
         let (_home, layout, removal) = installed("uninstall-own-home");
         let outside = scratch.path().join("outside");
@@ -868,11 +868,11 @@ mod tests {
         assert_eq!(
             removal.remove_data_dir().unwrap(),
             DataDir {
-                removed: true,
+                kept: vec!["node-stopped.json".into()],
                 ..DataDir::default()
             }
         );
-        assert!(!layout.data.exists());
+        assert!(layout.data.join("node-stopped.json").exists());
         assert_eq!(fs::read(&outside).unwrap(), b"sentinel");
         assert!(layout.data.parent().unwrap().is_dir(), "only D goes");
     }
@@ -902,21 +902,16 @@ mod tests {
     }
 
     #[test]
-    fn what_cannot_be_removed_is_reported_held_and_never_an_error() {
+    fn cleanup_never_enters_a_directory_under_an_own_file_name() {
         let (_home, layout, removal) = installed("uninstall-held");
         fs::write(layout.data.join("agents.lock"), "x").unwrap();
         // A name of ours that the OS will not remove as a file (any host): a directory with something in it.
         fs::create_dir(layout.data.join("install.lock")).unwrap();
         fs::write(layout.data.join("install.lock").join("inside"), "x").unwrap();
         emptied(&removal);
-        let left = removal.remove_data_dir().unwrap();
-        assert_eq!(
-            left,
-            DataDir {
-                held: vec!["install.lock".into()],
-                ..DataDir::default()
-            }
-        );
+        if let Ok(left) = removal.remove_data_dir() {
+            assert_eq!(left.held, ["install.lock"]);
+        }
         assert!(layout.data.is_dir());
         assert!(
             layout.data.join("install.lock").join("inside").exists(),

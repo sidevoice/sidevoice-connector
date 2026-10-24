@@ -3,8 +3,8 @@
 //! the same on every OS. Nothing is ever stale, so nothing is ever reclaimed, and no process judges another gone and
 //! takes its place.
 //!
-//! Lock files are permanent: created once, never replaced, never deleted (a holder of a deleted file and a newcomer
-//! on its replacement would both hold "the" lock). The lock belongs to the open handle, so a second open of the same
+//! Uninstall may unlink a lock while holding it. Acquirers verify the path still names the locked file,
+//! so a waiter on the retired file cannot proceed alongside a holder of its replacement. The lock belongs to the open handle, so a second open of the same
 //! file, even in this process, does not get it while the first is held. A lock file must be private, this user's,
 //! with no other name (`platform::fs`), checked before and after the lock is taken.
 //!
@@ -60,23 +60,40 @@ fn record_path(path: &Path) -> PathBuf {
 
 /// Takes the lock on `file` if nobody holds it. The file is checked before and after, so a name added meanwhile is
 /// refused as well.
-fn take(file: &File, label: &str) -> Result<bool> {
+fn take(file: &File, path: &Path) -> Result<bool> {
+    let label = path.display();
     let check = || Files::check_private(file).with_context(|| format!("unsafe lock file {label}"));
+    if !names_file(file, path)? {
+        return Ok(false);
+    }
     check()?;
     match file.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => return Ok(false),
         Err(TryLockError::Error(error)) => return Err(error).context(format!("lock {label}")),
     }
+    if !names_file(file, path)? {
+        file.unlock()?;
+        return Ok(false);
+    }
     check()?;
     Ok(true)
+}
+
+fn names_file(file: &File, path: &Path) -> Result<bool> {
+    let locked = same_file::Handle::from_file(file.try_clone()?)?;
+    match same_file::Handle::from_path(path) {
+        Ok(current) => Ok(locked == current),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Tries once: the lock, or `None` when another holder has it.
 pub fn try_lock(path: &Path, kind: &str) -> Result<Option<Lock>> {
     let file = Files::open_private(path, Create::ReadWrite)
         .with_context(|| format!("open lock {}", path.display()))?;
-    if !take(&file, &path.display().to_string())? {
+    if !take(&file, path)? {
         return Ok(None);
     }
     let pid = std::process::id();
@@ -122,9 +139,19 @@ pub async fn wait_lock(path: &Path, kind: &str, limit: Duration) -> Result<Optio
 /// The lock on a lock file the caller opened itself, waiting for it up to `limit`. For uninstall, which opens it in
 /// the data directory it pinned, so a link added after its checks cannot be used; no record is written, nothing is
 /// added to a directory about to be removed.
-pub async fn wait_lock_file(file: File, label: &str, limit: Duration) -> Result<Option<Lock>> {
-    let held = poll(limit, || Ok(take(&file, label)?.then_some(()))).await?;
-    Ok(held.map(|()| Lock { file, record: None }))
+pub async fn wait_lock_file(file: File, path: &Path, limit: Duration) -> Result<Option<Lock>> {
+    let mut file = Some(file);
+    poll(limit, || {
+        let opened = match file.take() {
+            Some(file) => file,
+            None => Files::open_private(path, Create::ReadWrite)?,
+        };
+        Ok(take(&opened, path)?.then_some(Lock {
+            file: opened,
+            record: None,
+        }))
+    })
+    .await
 }
 
 /// The holder's record, when there is a holder that wrote one: information only.
@@ -146,6 +173,32 @@ mod tests {
         let dir = tmp.path().join("data");
         Files::create_private_dir(&dir).unwrap();
         (tmp, dir)
+    }
+
+    #[tokio::test]
+    async fn a_waiter_on_a_retired_file_retries_the_current_lock() {
+        let (_tmp, dir) = private_dir("retired-lock");
+        let path = dir.join("install.lock");
+        let first = try_lock(&path, "uninstall").unwrap().unwrap();
+        let waiter = Files::open_private(&path, Create::ReadWrite).unwrap();
+        // Where the OS allows unlinking a held file, reproduce uninstall retiring it
+        // while an installer already has that inode open.
+        if std::fs::remove_file(&path).is_err() {
+            return;
+        }
+        let third = try_lock(&path, "install").unwrap().unwrap();
+        drop(first);
+        assert!(
+            !take(&waiter, &path).unwrap(),
+            "retired inode cannot grant the lock"
+        );
+        assert!(wait_lock_file(waiter, &path, Duration::ZERO)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(try_lock(&path, "install").unwrap().is_none());
+        drop(third);
+        assert!(try_lock(&path, "install").unwrap().is_some());
     }
 
     #[test]
@@ -192,12 +245,12 @@ mod tests {
         let (_tmp, dir) = private_dir("file");
         let path = dir.join("install.lock");
         let open = || Files::open_private(&path, Create::ReadWrite).unwrap();
-        let held = wait_lock_file(open(), "install.lock", Duration::ZERO)
+        let held = wait_lock_file(open(), &path, Duration::ZERO)
             .await
             .unwrap()
             .expect("free");
         assert!(try_lock(&path, "install").unwrap().is_none());
-        assert!(wait_lock_file(open(), "install.lock", Duration::ZERO)
+        assert!(wait_lock_file(open(), &path, Duration::ZERO)
             .await
             .unwrap()
             .is_none());
