@@ -2665,3 +2665,29 @@ fn a_scan_that_fails_after_an_action_says_the_change_was_applied() {
     );
     assert!(require_verified(&json!({"scan_failed":false}), "codex").is_ok());
 }
+
+/// sidevoice/sidevoice-connector#266: Claude Code installed but never started has no home yet. Connecting it runs its
+/// CLI, which makes the home as its first start would, instead of refusing for a directory that is not there.
+#[tokio::test]
+async fn claude_never_started_is_connected_and_its_cli_makes_its_home() {
+    let _turn = agent_env().await;
+    let fixture = Fixture::new();
+    let binary = fake_claude(&fixture);
+    let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", binary.as_os_str());
+    let home = fixture
+        .profile
+        .agent_home("CLAUDE_CONFIG_DIR")
+        .to_path_buf();
+    fs::remove_dir_all(&home).unwrap();
+    let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
+
+    let connected = host.handle("agents.connect", json!({"id":"claude"})).await;
+    assert!(connected.get("error").is_none(), "{connected}");
+    assert_eq!(
+        row(&connected, "claude")["registration"],
+        "connected",
+        "{connected}"
+    );
+    assert!(home.is_dir(), "the CLI did not make {}", home.display());
+    host.shutdown().await;
+}
