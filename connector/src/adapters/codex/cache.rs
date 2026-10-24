@@ -254,7 +254,7 @@ mod delivery_tests {
         Files::ensure_private_dir(&profile.data).unwrap();
         Files::write_json(
             &profile.data.join("agents.json"),
-            &json!({"login_path":dir.path()}),
+            &json!({"version":1,"login_path":dir.path()}),
         )
         .unwrap();
         let socket = steer::socket_path(profile.agent_home(HOME.var));
