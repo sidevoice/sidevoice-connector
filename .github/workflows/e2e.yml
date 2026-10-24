@@ -1,10 +1,11 @@
 name: e2e
 
-# The npm tarballs packed from the archive this very run built (the `dist-<target>` artifact of the calling workflow's packaging job), installed end
-# through offline npx end to end on a fresh runner of each OS as a person installs it: this user's real service manager, the standard data
-# directory, the real Claude Code and Codex CLIs from npm with no login; `install`, `pair-device`, `agents connect`
-# and `uninstall`, and what each must leave (`cargo xtask e2e`, xtask/src/e2e.rs). Called by ci.yml on every pull
-# request and by release.yml before anything is published. RELEASING.md, "End to end".
+# Pack this run's dist-<target> archive into local launcher and platform npm tarballs, then install through
+# offline npx on a fresh runner. Both packages are explicit root inputs, so this does not test resolution through
+# optionalDependencies or npm's os/cpu filtering. npm is pinned to 11.21.0; this is not Node 18 compatibility coverage.
+# Check the real service manager, standard data directory and agent CLIs through the full lifecycle
+# (xtask/src/e2e.rs). Called by ci.yml and release.yml; e2e-latest.yml uses published release archives.
+# RELEASING.md, "End to end".
 on:
   workflow_call:
     inputs:

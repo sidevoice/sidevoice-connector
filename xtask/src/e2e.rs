@@ -1,6 +1,6 @@
 //! `cargo xtask e2e ARCHIVE`: this build packed for npm and installed through npx end to end on this machine,
-//! as a person installs it, with
-//! nothing standing in: this user's real service manager (Task Scheduler, the systemd user manager, launchd), the
+//! using explicit local launcher and platform tarballs with pinned npm (not optional-dependency resolution).
+//! It checks this user's real service manager (Task Scheduler, the systemd user manager, launchd), the
 //! standard data directory, and the real Claude Code and Codex CLIs ([`CLAUDE_CODE_VERSION`], [`codex::VERSION`])
 //! installed with npm into its global prefix, with no login. Step by step:
 //!
@@ -683,10 +683,11 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
         sidevoice_command(package.command()?, &["--version"], LIMIT)?,
         "npx --version",
     )?;
-    check(
-        identity["target"] == host_target()? && identity["version"] == package.packages[0].version,
-        || format!("npx runs another build: {identity}"),
-    )?;
+    let (_, inventory) = crate::archive::unpack_checked(archive, &scratch.join("identity"))?;
+    check(inventory["target"] == host_target()?, || {
+        format!("archive is for another machine: {}", inventory["target"])
+    })?;
+    check_identity(&identity, &inventory)?;
     let started = Instant::now();
     let installed = ok(
         sidevoice_command(
@@ -1284,5 +1285,38 @@ fn read_if_there(file: &Path) -> Result<Option<Vec<u8>>> {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("{}: {error}", file.display())),
+    }
+}
+
+fn check_identity(identity: &Value, inventory: &Value) -> Result<()> {
+    for field in ["version", "target", "source_sha"] {
+        check(identity[field] == inventory[field], || {
+            format!(
+                "npx runs another build: {field} is {}, archive carries {}",
+                identity[field], inventory[field]
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn npx_must_run_the_archives_build_even_when_the_version_matches() {
+        let inventory = json!({
+            "version": "0.15.0",
+            "target": "linux-x86_64",
+            "source_sha": "a".repeat(40),
+        });
+        assert!(check_identity(&inventory, &inventory).is_ok());
+        for field in ["version", "target", "source_sha"] {
+            let mut other = inventory.clone();
+            other[field] = "another build".into();
+            assert!(check_identity(&other, &inventory).is_err(), "{field}");
+        }
     }
 }
