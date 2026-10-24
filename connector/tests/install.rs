@@ -198,7 +198,7 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
         (status["reachable"] == true).then_some(status)
     });
 
-    // Uninstall: both stopped, the registration, the releases and the data gone; the locks and the stop stay. Windows
+    // Uninstall: both stopped, the registration, the releases and the data gone, the directory too. Windows
     // cannot delete a running program, so `uninstall` refuses to run from inside what it removes: the package's
     // copy, outside the Sidevoice folders, runs it there.
     let uninstaller = if cfg!(windows) { &program } else { &stable };
@@ -221,24 +221,12 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
         let config = read_json(&cursor).unwrap();
         assert!(config["mcpServers"].get("sidevoice").is_none(), "{config}");
     }
-    let mut left: Vec<String> = fs::read_dir(profile.data())
-        .unwrap()
-        .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect();
-    left.sort();
-    for name in &left {
-        assert!(
-            [
-                "install.lock",
-                "connector.lock",
-                "agents.lock",
-                "node-stopped.json"
-            ]
-            .contains(&name.as_str()),
-            "{name} is left in the data directory: {left:?}"
-        );
-    }
-    assert!(left.contains(&"node-stopped.json".to_owned()), "{left:?}");
+    // Only its own files were left, so the directory goes too.
+    assert!(
+        !profile.data().exists(),
+        "{} is left",
+        profile.data().display()
+    );
+    assert_eq!(removed["data_dir"]["removed"], true, "{removed}");
     fs::remove_dir_all(&at).unwrap();
 }

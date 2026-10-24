@@ -249,8 +249,11 @@ state comes from the chat's transcript, so it stays right while a message waits 
 `classify_send_reply` in `adapters/cursor.rs`, with unit tests over mock bridge replies.
 
 `uninstall` unloads both jobs and stops what runs on demand (a refusal stops it there, with nothing deleted), removes
-the agents' registrations Sidevoice wrote (current or not), then the owned data and releases. It keeps lock files and
-the stop, so that a launcher on its way finds the stop and starts nothing.
+the agents' registrations Sidevoice wrote (current or not), then the owned data and releases. At the very end it looks at
+`D`: when only the connector's own files are left in it (its lock files and the stop) they and `D` are removed; when
+anything else is there (the shared `Models`, in the standard place) `D` stays and the answer's `data_dir.kept` names it.
+A file something still holds (on Windows, a sharing violation) is not an error: `data_dir.held` names it and `D` is left;
+the human output says so too.
 
 Before unloading, uninstall checks that `R` is `D/install` and that `D` is ours: never the home directory, a directory
 the home is in, or a file-system or volume root, whatever it holds; and either exactly the OS's standard place above

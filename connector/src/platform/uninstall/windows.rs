@@ -19,8 +19,8 @@
 //! No `unsafe` here: `std`'s `OpenOptionsExt` sets the sharing and the flags, `winapi-util` reads the file id.
 
 use super::{
-    recovery_program, recovery_record, Removal, Roots, CLAIM, DATA_PREFIX, RECORD, RECORD_LIMIT,
-    RECOVERY, RELEASE_PREFIX,
+    foreign, recovery_program, recovery_record, DataDir, Removal, Roots, CLAIM, DATA_PREFIX,
+    RECORD, RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
 };
 use crate::platform::fs::{Create, Files, Fs};
 use std::ffi::{OsStr, OsString};
@@ -442,5 +442,53 @@ impl Removal for Os {
             fs::remove_file(record).map_err(|_| "cannot remove uninstall record")?;
         }
         Ok(())
+    }
+
+    fn remove_data_dir(&self) -> Result<DataDir, &'static str> {
+        let data = &self.roots.data;
+        let mut held = Vec::new();
+        {
+            // `D` held while its files go: nobody can swap it. A file open elsewhere (a process holds it without
+            // sharing delete: a sharing violation) stays, and is reported.
+            let Some(_held) = self.data()? else {
+                return Ok(DataDir {
+                    removed: true,
+                    ..DataDir::default()
+                });
+            };
+            let found = names(data)?;
+            let kept = foreign(&self.roots, &found);
+            if !kept.is_empty() {
+                return Ok(DataDir {
+                    kept,
+                    ..DataDir::default()
+                });
+            }
+            for entry in found {
+                // A link is removed itself; a directory of that name is not entered.
+                let path = data.join(&entry);
+                if fs::remove_file(&path)
+                    .or_else(|_| fs::remove_dir(&path))
+                    .is_err()
+                {
+                    held.push(entry.to_string_lossy().into_owned());
+                }
+            }
+        }
+        if held.is_empty() {
+            // `D` itself cannot be deleted while held, so its parent is held instead. Only an empty directory goes.
+            let _parent = self.hold_down_to(data.parent().ok_or("unsafe uninstall path")?)?;
+            if fs::remove_dir(data).is_err() {
+                held.push(
+                    data.file_name()
+                        .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+                );
+            }
+        }
+        Ok(DataDir {
+            removed: held.is_empty(),
+            held,
+            ..DataDir::default()
+        })
     }
 }

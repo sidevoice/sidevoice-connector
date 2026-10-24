@@ -149,7 +149,8 @@ fn timeout_failure(limit: Duration, waited: &Waited, service: &str, last: Option
         "service": service, "output_log": waited.output})
 }
 
-/// What `uninstall` leaves in `D`: the lock files, the stop, and `Models` (named by `sidevoice-platform`). The shared models
+/// What `uninstall` leaves in `D` while it runs: the lock files, the stop, and `Models` (named by `sidevoice-platform`); the
+/// files of ours among them go last, with `D`, when nothing else is left (`Removal::remove_data_dir`). The shared models
 /// are the engine's, never this connector's to remove; they live in the OS standard place (`data_dir::models_dir`), which
 /// is `D` itself when `D` is not overridden, so they are kept here so that an un-overridden `D` never loses them (when `D`
 /// is overridden they are not under it and this entry matches nothing).
@@ -1176,10 +1177,11 @@ async fn uninstall_with_hooks(
     let had_releases = preflight(&guard).map_err(failed)?;
     guard.preflight().map_err(failed)?;
     let install_lock = guard.lock_file("install.lock").map_err(failed)?;
-    let _lock = crate::lock::wait_lock_file(install_lock, "install.lock", Duration::from_secs(30))
-        .await
-        .map_err(failed)?
-        .ok_or_else(|| failed("another install or service command holds install.lock"))?;
+    let install_held =
+        crate::lock::wait_lock_file(install_lock, "install.lock", Duration::from_secs(30))
+            .await
+            .map_err(failed)?
+            .ok_or_else(|| failed("another install or service command holds install.lock"))?;
     // What `D` holds may have changed while the lock was awaited: still ours, or (missing at the start) only the
     // lock this uninstall just made there.
     match (found, guard.ownership().map_err(failed)?) {
@@ -1198,7 +1200,7 @@ async fn uninstall_with_hooks(
         json!({})
     };
     let agents_lock = guard.lock_file("agents.lock").map_err(failed)?;
-    let _agents_lock =
+    let agents_held =
         crate::lock::wait_lock_file(agents_lock, "agents.lock", Duration::from_secs(30))
             .await?
             .ok_or_else(|| failed("another agents request holds agents.lock"))?;
@@ -1207,15 +1209,52 @@ async fn uninstall_with_hooks(
     guard.remove_releases().map_err(failed)?;
     guard.finish_claim().map_err(failed)?;
     guard.finish_recovery().map_err(failed)?;
+    // Nothing else holds a file of ours now: the locks are let go before the directory is looked at.
+    drop(agents_held);
+    drop(install_held);
+    let data_dir = match guard.remove_data_dir() {
+        Ok(left) => json!({"removed": left.removed, "kept": left.kept, "held": left.held}),
+        // Everything else is already gone: this is said, and is not a failure of the uninstall.
+        Err(reason) => json!({"removed": false, "kept": [], "held": [], "error": reason}),
+    };
     let advice =
         vec!["Conversations already open keep their Sidevoice server until they end.".to_owned()];
     Ok(
         json!({"ok": true, "state": "absent", "safe_uninstall": crate::identity::SAFE_UNINSTALL,
         "service": service.get("service").cloned().unwrap_or(Value::Null),
         "note": service.get("note").cloned().unwrap_or(Value::Null), "agents": agents,
-        "releases": had_releases.then(|| layout.releases.clone()), "data": layout.data, "removed": removed,
+        "releases": had_releases.then(|| layout.releases.clone()), "data": layout.data, "removed": removed, "data_dir": data_dir,
         "advice": advice}),
     )
+}
+
+/// What became of the data directory itself, as a person reads it.
+fn data_dir_line(answer: &Value) -> String {
+    let path = answer["data"].as_str().unwrap_or("?");
+    let names = |key: &str| -> String {
+        answer["data_dir"][key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if answer["data_dir"]["removed"] == true {
+        format!("Removed {path}.")
+    } else if let Some(error) = answer["data_dir"]["error"].as_str() {
+        format!("{path} was left as it is: {error}.")
+    } else if !names("held").is_empty() {
+        format!(
+            "{path} was left: something still holds {}. Close what uses it and remove the folder.",
+            names("held")
+        )
+    } else {
+        format!(
+            "{path} was left because it also holds {}, which is not Sidevoice's to remove.",
+            names("kept")
+        )
+    }
 }
 
 /// `uninstall` as a person reads it.
@@ -1248,11 +1287,11 @@ pub fn human_uninstall(answer: &Value) -> String {
         .is_some_and(|removed| !removed.is_empty())
     {
         done.push(format!(
-            "Removed what was in {} (credential, socket, outbox, logs, the core's data); its lock files and the stop \
-             stay.",
+            "Removed what was in {} (credential, socket, outbox, logs, the core's data).",
             answer["data"].as_str().unwrap_or("?")
         ));
     }
+    done.push(data_dir_line(answer));
     let mut out = done
         .iter()
         .map(|line| format!("· {line}"))
@@ -1503,7 +1542,7 @@ pub(crate) mod tests {
             ["4.0.0".to_owned(), "3.0.0".to_owned()]
         );
 
-        // Uninstall: the releases and the data go; the locks and the stop stay.
+        // Uninstall: the releases and the data go, and the locks and the stop with them.
         Files::write_json(&layout.data.join("outbox.json"), &json!([])).unwrap();
         crate::lock::try_lock(&layout.data.join("agents.lock"), "test").unwrap();
         // The shared models are another program's: if they are in `D` (un-overridden), they and what is in them survive.
@@ -1522,13 +1561,23 @@ pub(crate) mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .collect();
         left.sort();
-        assert!(
-            left.iter().all(|name| KEPT.contains(&name.as_str())),
+        // The models are not ours, so they and `D` stay (and our files beside them), and it is said.
+        assert_eq!(
+            left,
+            [
+                data_dir::MODELS,
+                "agents.lock",
+                "install.lock",
+                "node-stopped.json"
+            ],
             "{left:?}"
         );
-        assert!(left.contains(&"node-stopped.json".to_owned()), "{left:?}");
-        assert!(left.contains(&"install.lock".to_owned()), "{left:?}");
-        assert!(left.contains(&data_dir::MODELS.to_owned()), "{left:?}");
+        assert_eq!(
+            removed["data_dir"],
+            json!({"removed": false, "kept": [data_dir::MODELS], "held": []}),
+            "{removed}"
+        );
+        assert!(human_uninstall(&removed).contains(data_dir::MODELS));
         assert_eq!(
             fs::read_to_string(models.join("sentinel")).unwrap(),
             "theirs"
