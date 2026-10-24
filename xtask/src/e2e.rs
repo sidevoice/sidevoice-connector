@@ -1,10 +1,11 @@
-//! `cargo xtask e2e ARCHIVE`: the release archive installed end to end on this machine, as a person installs it, with
-//! nothing standing in: this user's real service manager (Task Scheduler, the systemd user manager, launchd), the
+//! `cargo xtask e2e ARCHIVE`: this build packed for npm and installed through npx end to end on this machine,
+//! using explicit local launcher and platform tarballs with pinned npm (not optional-dependency resolution).
+//! It checks this user's real service manager (Task Scheduler, the systemd user manager, launchd), the
 //! standard data directory, and the real Claude Code and Codex CLIs ([`CLAUDE_CODE_VERSION`], [`codex::VERSION`])
 //! installed with npm into its global prefix, with no login. Step by step:
 //!
 //! 1. Nothing of Sidevoice is here yet; the two agents' CLIs are installed and answer `--version`.
-//! 2. `install` from the unpacked archive: both jobs defined and running under the manager, `D/core/core.json`
+//! 2. `install` through npx from the local tarballs: both jobs defined and running under the manager, `D/core/core.json`
 //!    there, `service status` running (the core's health on its local channel), the core's HTTP port answering
 //!    `/api/rendezvous`, and both agents found and left unconnected.
 //! 3. `pair-device` gives a code.
@@ -14,7 +15,8 @@
 //!    Then the agents are moved to where their desktop apps keep them (nothing of them left on `PATH`, except Codex on
 //!    Linux, which has no app there) and the same is asserted again: found, working, disconnected and connected
 //!    through the fallback (`connector/src/adapters/{claude,codex}/binary.rs`).
-//! 5. `uninstall` from the unpacked archive (Windows cannot delete a running program, so never from the release):
+//! 5. `uninstall` through npx from the local tarballs (Windows cannot delete a running program, so never from
+//!    the release):
 //!    no job left in the manager and no definition, no process of the installation, no release, the agents'
 //!    registrations gone from their configuration, and nothing in the data directory but what uninstall keeps on
 //!    purpose (its locks and the stop: connector/README.md, "uninstall").
@@ -428,9 +430,14 @@ fn run(program: &str, args: &[&str], limit: Duration) -> Result<Ran> {
 }
 
 fn run_path(program: &Path, args: &[&str], limit: Duration) -> Result<Ran> {
-    let what = format!("{} {}", program.display(), args.join(" "));
-    let mut child = Command::new(program)
-        .args(args)
+    let mut command = Command::new(program);
+    command.args(args);
+    run_command(command, limit)
+}
+
+fn run_command(mut command: Command, limit: Duration) -> Result<Ran> {
+    let what = format!("{command:?}");
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -486,10 +493,15 @@ fn run_path(program: &Path, args: &[&str], limit: Duration) -> Result<Ran> {
 
 /// The connector at `program`: `args… --json`, its one JSON object, whose `ok` must match the exit status.
 fn sidevoice(program: &Path, args: &[&str], limit: Duration) -> Result<Value> {
+    sidevoice_command(Command::new(program), args, limit)
+}
+
+fn sidevoice_command(mut command: Command, args: &[&str], limit: Duration) -> Result<Value> {
     let mut all = args.to_vec();
     all.push("--json");
     println!("$ sidevoice-connector {}", all.join(" "));
-    let ran = run_path(program, &all, limit)?;
+    command.args(&all);
+    let ran = run_command(command, limit)?;
     let lines: Vec<&str> = ran
         .stdout
         .lines()
@@ -550,6 +562,48 @@ fn until<T>(what: &str, seconds: u64, mut probe: impl FnMut() -> Result<Option<T
 
 fn step(name: &str) {
     println!("\n== {name}");
+}
+
+/// Both packages are explicit local inputs: no Sidevoice build may come from the registry.
+/// Keep npm's config, prefix and cache separate from the agents' online global installation.
+struct Npx {
+    scratch: PathBuf,
+    packages: Vec<crate::npm::Packed>,
+}
+
+impl Npx {
+    fn new(archive: &Path, scratch: &Path) -> Result<Self> {
+        let out = scratch.join("tarballs");
+        mkdir(&out)?;
+        let started = Instant::now();
+        let packages = crate::npm::build(&[archive], &out)?;
+        println!("npm packing took {:.1} s", started.elapsed().as_secs_f64());
+        for config in ["user-npmrc", "global-npmrc"] {
+            write(&scratch.join(config), b"")?;
+        }
+        Ok(Self {
+            scratch: scratch.to_owned(),
+            packages,
+        })
+    }
+
+    fn command(&self) -> Result<Command> {
+        let mut command = crate::npm::npm_command("npx-cli.js")?;
+        command
+            .current_dir(&self.scratch)
+            .env("npm_config_userconfig", self.scratch.join("user-npmrc"))
+            .env("npm_config_globalconfig", self.scratch.join("global-npmrc"))
+            .env("npm_config_cache", self.scratch.join("cache"))
+            .env("npm_config_prefix", self.scratch.join("prefix"))
+            .env("npm_config_offline", "true")
+            .env("npm_config_registry", "http://127.0.0.1:9")
+            .args(["--yes", "--offline"]);
+        for package in &self.packages {
+            command.arg("--package").arg(&package.tarball);
+        }
+        command.args(["--", "sidevoice"]);
+        Ok(command)
+    }
 }
 
 pub(crate) fn e2e(archive: &Path) -> Result<()> {
@@ -623,23 +677,27 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
         })?;
     }
 
-    step("the archive, unpacked as a person unpacks it");
-    let (root, inventory) = crate::archive::unpack_checked(archive, scratch)?;
-    let target = inventory["target"].as_str().unwrap_or_default();
-    check(target == host_target()?, || {
-        format!("{} is for {target}, not this machine", archive.display())
+    step("this archive's npm tarballs, installed through npx offline");
+    let package = Npx::new(archive, scratch)?;
+    let identity = ok(
+        sidevoice_command(package.command()?, &["--version"], LIMIT)?,
+        "npx --version",
+    )?;
+    let (_, inventory) = crate::archive::unpack_checked(archive, &scratch.join("identity"))?;
+    check(inventory["target"] == host_target()?, || {
+        format!("archive is for another machine: {}", inventory["target"])
     })?;
-    let package = root.join(crate::entrypoint(target));
-
-    step("install");
+    check_identity(&identity, &inventory)?;
+    let started = Instant::now();
     let installed = ok(
-        sidevoice(
-            &package,
+        sidevoice_command(
+            package.command()?,
             &["install", "--no-prompt"],
             Duration::from_secs(300),
         )?,
-        "install",
+        "npx install",
     )?;
+    println!("npx install took {:.1} s", started.elapsed().as_secs_f64());
     check(installed["action"] == "installed", || {
         format!("not a first installation: {installed}")
     })?;
@@ -884,7 +942,7 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
 
     step("uninstall, from the package");
     let removed = ok(
-        sidevoice(&package, &["uninstall"], Duration::from_secs(300))?,
+        sidevoice_command(package.command()?, &["uninstall"], Duration::from_secs(300))?,
         "uninstall",
     )?;
     check(removed["state"] == "absent", || {
@@ -1227,5 +1285,38 @@ fn read_if_there(file: &Path) -> Result<Option<Vec<u8>>> {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("{}: {error}", file.display())),
+    }
+}
+
+fn check_identity(identity: &Value, inventory: &Value) -> Result<()> {
+    for field in ["version", "target", "source_sha"] {
+        check(identity[field] == inventory[field], || {
+            format!(
+                "npx runs another build: {field} is {}, archive carries {}",
+                identity[field], inventory[field]
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn npx_must_run_the_archives_build_even_when_the_version_matches() {
+        let inventory = json!({
+            "version": "0.15.0",
+            "target": "linux-x86_64",
+            "source_sha": "a".repeat(40),
+        });
+        assert!(check_identity(&inventory, &inventory).is_ok());
+        for field in ["version", "target", "source_sha"] {
+            let mut other = inventory.clone();
+            other[field] = "another build".into();
+            assert!(check_identity(&other, &inventory).is_err(), "{field}");
+        }
     }
 }

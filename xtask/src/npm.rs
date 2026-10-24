@@ -232,7 +232,7 @@ pub(crate) struct Packed {
 
 /// The pinned npm, run with a configuration of its own (empty user and global config, its own cache) and none of
 /// the environment's npm settings or tokens.
-fn npm_command(cli: &str) -> Result<Command> {
+pub(crate) fn npm_command(cli: &str) -> Result<Command> {
     let dir = repo().join(NPM_DIR);
     let script = dir.join("node_modules/npm/bin").join(cli);
     let (user, global) = (dir.join("user-npmrc"), dir.join("global-npmrc"));

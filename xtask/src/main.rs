@@ -25,7 +25,7 @@
 //!   `npx sidevoice --version --json` from there.
 //! - `npm-publish TAG`: the npm packages of the GitHub release TAG's checked assets, published by trusted publishing:
 //!   the platform packages, then the launcher as a staged version a maintainer approves.
-//! - `e2e ARCHIVE`: on a disposable machine (a CI runner), the archive installed end to end as a person installs it:
+//! - `e2e ARCHIVE`: on a disposable machine (a CI runner), the archive packed into local npm tarballs and installed through offline npx:
 //!   this user's real service manager and the real Claude Code and Codex CLIs; `install`, `pair-device`,
 //!   `agents connect`, `uninstall`, and what each must leave (xtask/src/e2e.rs).
 //! - `fixtures`: `core` and `codex`, into their default directories: what `cargo test` runs against.

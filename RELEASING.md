@@ -52,8 +52,19 @@ Every archive a run builds is installed for real before that run can publish it 
 every pull request and by `release.yml` between `dist` and `publish`): on a fresh runner of each target, from the
 `dist-<target>` artifact of the same run, never a published release. `cargo xtask e2e` (`xtask/src/e2e.rs`) installs
 the real Claude Code and Codex CLIs with npm (pinned: `CLAUDE_CODE_VERSION` there, `codex::VERSION`), with no login,
-then checks `install` (both jobs defined and running in this user's service manager, `core.json`, the core's health
-and port, both agents found and left unconnected), `pair-device` (a code), `agents` and `agents connect` for both
+then packs that archive with the release npm builder and supplies both local tarballs to
+`npx --offline --package <platform.tgz> --package <launcher.tgz> -- sidevoice install`, with an isolated cache
+and prefix and an invalid registry. No registry Sidevoice package can take part. The same npx invocation runs
+`uninstall`; intermediate commands use the installed stable binary, as agent registrations do. This replaces
+the duplicate archive installation pass; packing and npx install durations are logged.
+
+This differs from a normal `npx sidevoice install`: the platform package is supplied as an explicit root package,
+rather than resolved through the launcher's `optionalDependencies` and npm's `os`/`cpu` filtering. The test uses
+npm 11.21.0 on Node 24; it does not verify the README's Node 18+ promise.
+
+The test compares the launcher's version, target and source SHA with the archive inventory, then checks
+`install` (both jobs defined and running in this user's service manager, `core.json`, the core's health and port,
+both agents found and left unconnected), `pair-device` (a code), `agents` and `agents connect` for both
 (the registration in each agent's own configuration, naming the installation's command, and working), and
 `uninstall` (no job, definition, process, release or registration left; in the data directory only the locks and the
 stop it keeps on purpose). It changes the machine for real, so it runs only where `CI` is set or `SIDEVOICE_E2E=1`.
