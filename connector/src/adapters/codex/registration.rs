@@ -289,8 +289,8 @@ impl Registration for Codex {
         super::binary::fallbacks(roots)
     }
 
-    fn npm_package(&self) -> Option<crate::platform::npm::NativePackage> {
-        Some(crate::platform::npm::NativePackage {
+    fn npm_package(&self) -> Option<crate::agents::npm::NativePackage> {
+        Some(crate::agents::npm::NativePackage {
             package: "@openai/codex",
             platform_prefix: "@openai/codex-",
             program: "vendor/{target}/bin/codex{exe}",

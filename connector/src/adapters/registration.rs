@@ -151,7 +151,7 @@ pub trait Registration: Send + Sync {
     }
     /// The npm package and native program layout, when this harness publishes one.
     /// Shared resolution reads package-manager shims and follows Node dependency lookup.
-    fn npm_package(&self) -> Option<crate::platform::npm::NativePackage> {
+    fn npm_package(&self) -> Option<crate::agents::npm::NativePackage> {
         None
     }
     /// Fixed, passive filesystem markers for this agent. CLI names above use the captured login PATH.

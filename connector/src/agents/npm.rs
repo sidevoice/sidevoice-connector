@@ -5,7 +5,7 @@
 //! Only Node's package-directory lookup is needed: exports/main do not affect locating that directory.
 //! Native installs and shims belonging to other packages are left alone.
 
-use super::architecture::{Architecture, Cpu, Native};
+use crate::platform::architecture::{Architecture, Cpu, Native};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -23,9 +23,6 @@ pub struct NativePackage {
 /// Missing dependencies and Yarn PnP return diagnostics; callers keep the original launcher on resolution failure.
 pub fn resolve(launcher: &Path, package: &NativePackage) -> io::Result<Option<PathBuf>> {
     if !is_cmd(launcher) {
-        return Ok(None);
-    }
-    if std::env::consts::OS != "windows" {
         return Ok(None);
     }
     resolve_for(launcher, package, windows_targets(Native::native()?))
@@ -90,7 +87,7 @@ fn resolve_for(
             return Ok(None);
         }
     }
-    if has_pnp(&root) || has_pnp(dir) {
+    if has_pnp(dir) {
         return Err(pnp_error());
     }
     Err(io::Error::new(

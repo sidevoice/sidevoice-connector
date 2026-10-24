@@ -10,4 +10,4 @@ or Node process is needed to run the Rust tests. Bun's executable shims are left
 behavior has not been verified here.
 
 The fixtures use the production harness declarations and real native paths. The shared tests live in `tests.rs` so
-the repository's architecture check can still forbid harness names in production platform code.
+the repository's architecture check can still forbid harness names in production agents code.

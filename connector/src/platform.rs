@@ -11,7 +11,6 @@ pub mod architecture;
 pub mod env;
 pub mod foreign;
 pub mod lifecycle;
-pub mod npm;
 pub mod process;
 pub mod service;
 #[cfg(test)]

@@ -4,6 +4,8 @@
 //! One gate owns a complete request. CLI children belong to its worker task so a vanished link reply can
 //! cancel the work without releasing the gate before the child has exited.
 
+pub mod npm;
+
 use crate::adapters::health::{self, Health};
 use crate::adapters::markers::{self, Roots};
 use crate::adapters::registration::{
@@ -1282,7 +1284,7 @@ pub(crate) fn first_runnable(candidates: Vec<PathBuf>) -> Option<String> {
 /// What `found` (on `PATH`) stands for: the real program when it is only a launcher script of the agent, else itself.
 fn native_program(agent: &dyn Registration, found: String) -> Option<String> {
     let resolved = match agent.npm_package() {
-        Some(package) => crate::platform::npm::resolve(Path::new(&found), &package),
+        Some(package) => npm::resolve(Path::new(&found), &package),
         None => Ok(None),
     };
     resolved_program(found, resolved)
