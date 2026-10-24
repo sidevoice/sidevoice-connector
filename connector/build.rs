@@ -23,13 +23,23 @@ fn embed_windows_manifest() {
 /// The version resource of the windowless launcher (`sidevoice-background`) alone: Task Manager shows its description,
 /// "Sidevoice Background", for the process. The connector, a console program a person runs, gets none.
 fn embed_background_resource() {
-    embed_resource::compile_for(
-        "background.rc",
-        ["sidevoice-background"],
-        embed_resource::NONE,
-    )
-    .manifest_required()
-    .expect("cannot embed the launcher's version resource");
+    let version = env!("CARGO_PKG_VERSION");
+    let numbers = format!(
+        "{},{},{},0",
+        env!("CARGO_PKG_VERSION_MAJOR"),
+        env!("CARGO_PKG_VERSION_MINOR"),
+        env!("CARGO_PKG_VERSION_PATCH"),
+    );
+    let resource = std::fs::read_to_string("background.rc")
+        .expect("cannot read the launcher's version resource")
+        .replace("@VERSION_NUMBERS@", &numbers)
+        .replace("@VERSION@", version);
+    let path = std::path::PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"))
+        .join("background.rc");
+    std::fs::write(&path, resource).expect("cannot write the launcher's version resource");
+    embed_resource::compile_for(&path, ["sidevoice-background"], embed_resource::NONE)
+        .manifest_required()
+        .expect("cannot embed the launcher's version resource");
     println!("cargo:rerun-if-changed=background.rc");
 }
 
