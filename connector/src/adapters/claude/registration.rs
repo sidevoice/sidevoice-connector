@@ -216,6 +216,14 @@ impl Registration for Claude {
         profile.agent_home(super::HOME.var)
     }
 
+    fn npm_package(&self) -> Option<crate::agents::npm::NativePackage> {
+        Some(crate::agents::npm::NativePackage {
+            package: "@anthropic-ai/claude-code",
+            platform_prefix: "@anthropic-ai/claude-code-",
+            program: "claude{exe}",
+        })
+    }
+
     fn binary_names(&self) -> &'static [&'static str] {
         &["claude"]
     }

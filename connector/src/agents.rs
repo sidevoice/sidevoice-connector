@@ -4,6 +4,8 @@
 //! One gate owns a complete request. CLI children belong to its worker task so a vanished link reply can
 //! cancel the work without releasing the gate before the child has exited.
 
+pub mod npm;
+
 use crate::adapters::health::{self, Health};
 use crate::adapters::markers::{self, Roots};
 use crate::adapters::registration::{
@@ -1266,7 +1268,7 @@ pub(crate) fn find_binary(
     roots: &Roots,
 ) -> Option<String> {
     find_in_path(agent.binary_names(), path)
-        .map(|found| native_program(agent, found))
+        .and_then(|found| native_program(agent, found))
         .or_else(|| first_runnable(agent.fallback_binaries(roots)))
 }
 
@@ -1280,12 +1282,35 @@ pub(crate) fn first_runnable(candidates: Vec<PathBuf>) -> Option<String> {
 }
 
 /// What `found` (on `PATH`) stands for: the real program when it is only a launcher script of the agent, else itself.
-fn native_program(agent: &dyn Registration, found: String) -> String {
-    agent
-        .native_program(Path::new(&found))
-        .filter(|program| Environment::runnable(program))
-        .and_then(|program| program.into_os_string().into_string().ok())
-        .unwrap_or(found)
+fn native_program(agent: &dyn Registration, found: String) -> Option<String> {
+    let resolved = match agent.npm_package() {
+        Some(package) => npm::resolve(Path::new(&found), &package),
+        None => Ok(None),
+    };
+    resolved_program(found, resolved)
+}
+
+/// Prefer a runnable native program, then the original launcher. A failed resolution is diagnostic only; if the
+/// launcher also disappeared or cannot run, the caller can still try the harness's usual fallback executables.
+fn resolved_program(found: String, resolved: std::io::Result<Option<PathBuf>>) -> Option<String> {
+    match resolved {
+        Ok(Some(program)) => {
+            if let Some(native) = first_runnable(vec![program.clone()]) {
+                return Some(native);
+            }
+            crate::logfile::log(&format!(
+                "agent native program is not runnable: {}; keeping launcher {found}",
+                program.display()
+            ));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            crate::logfile::log(&format!(
+                "cannot resolve agent launcher {found}: {error}; keeping its launcher"
+            ));
+        }
+    }
+    first_runnable(vec![PathBuf::from(found)])
 }
 
 pub(crate) fn find_in_path(names: &[&str], path: Option<&str>) -> Option<String> {
