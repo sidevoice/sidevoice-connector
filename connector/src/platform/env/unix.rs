@@ -50,12 +50,19 @@ impl super::Env for Os {
 }
 
 /// The shell to ask: the user database's entry for this uid (a service started by `systemd --user` or `launchd` may have
-/// no `$SHELL`), else `$SHELL`; either must be an absolute path.
+/// no `$SHELL`), else `$SHELL`; either must be an absolute path and not a `nologin` / `false` stand-in (an account with no shell).
 fn login_path_of(database: Option<String>, environment: Option<String>) -> Option<LoginPath> {
     let shell = [database, environment]
         .into_iter()
         .flatten()
-        .find(|value| Path::new(value).is_absolute())?;
+        .find(|value| {
+            let path = Path::new(value);
+            path.is_absolute()
+                && !matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some("nologin" | "false")
+                )
+        })?;
     let name = Path::new(&shell)
         .file_name()
         .and_then(|name| name.to_str())
@@ -115,6 +122,16 @@ mod tests {
         assert_eq!(program(both).as_deref(), Some("/bin/zsh"));
         let only_env = login_path_of(None, Some("/bin/bash".into()));
         assert_eq!(program(only_env).as_deref(), Some("/bin/bash"));
+        for refusing in [
+            "/usr/sbin/nologin",
+            "/sbin/nologin",
+            "/bin/false",
+            "/usr/bin/false",
+        ] {
+            let refused = login_path_of(Some(refusing.into()), Some("/bin/bash".into()));
+            assert_eq!(program(refused).as_deref(), Some("/bin/bash"));
+        }
+        assert!(login_path_of(Some("/usr/sbin/nologin".into()), None).is_none());
         assert!(login_path_of(None, None).is_none());
         assert!(login_path_of(Some("zsh".into()), Some("bash".into())).is_none());
     }
