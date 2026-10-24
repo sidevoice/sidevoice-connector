@@ -36,10 +36,6 @@ impl Claude {
             Err(_) => return Ok(Entry::bare("invalid")),
             Ok(_) => {}
         }
-        // Registering goes through its CLI: without one, what the file says cannot be acted on.
-        if binary.is_none() {
-            return Ok(Entry::bare("unknown"));
-        }
         let Some(config) = config else {
             return Ok(Entry::bare("absent"));
         };
@@ -86,6 +82,9 @@ impl Claude {
             .unwrap_or_default();
         let state = if !host.owns(&command, &args) {
             "foreign"
+        } else if binary.is_none() {
+            // Only our entry can be left behind when the CLI needed to remove it is absent.
+            "unknown"
         } else if command == host.command() && args == host.args() && env == host.mcp_env() {
             "connected"
         } else {
@@ -427,6 +426,37 @@ mod tests {
                 );
                 assert_eq!(fs::read(&file).unwrap(), b"{\"mcpServers\": {");
             }
+        }
+    }
+
+    /// With no CLI found, an entry of ours in the configuration is `unknown` (uninstall reports it left behind); no
+    /// entry is `absent`, so uninstall has nothing to report.
+    #[tokio::test]
+    async fn without_a_cli_only_an_entry_that_is_there_is_unknown() {
+        let scratch = crate::test_support::temp_dir("claude-no-cli");
+        let (profile, file) = profile(&scratch, false, true);
+        write(
+            &file,
+            br#"{"mcpServers":{"sidevoice":{"command":"/nowhere/sidevoice","args":[]}},"other":1}"#,
+        );
+        assert_eq!(state(&Host(profile.clone()), None).await, "unknown");
+        write(&file, br#"{"mcpServers":{"other":{"command":"x"}}}"#);
+        assert_eq!(state(&Host(profile), None).await, "absent");
+    }
+
+    #[tokio::test]
+    async fn foreign_entries_stay_foreign_without_a_cli() {
+        let scratch = crate::test_support::temp_dir("claude-foreign-no-cli");
+        let (profile, file) = profile(&scratch, false, true);
+        for entry in [
+            json!({"type": "http", "url": "https://example.com"}),
+            json!({"command": "/someone/elses/server", "args": []}),
+        ] {
+            let config = json!({"mcpServers": {"sidevoice": entry}});
+            let bytes = serde_json::to_vec(&config).unwrap();
+            write(&file, &bytes);
+            assert_eq!(state(&Host(profile.clone()), None).await, "foreign");
+            assert_eq!(fs::read(&file).unwrap(), bytes);
         }
     }
 
