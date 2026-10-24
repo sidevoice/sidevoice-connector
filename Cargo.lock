@@ -1341,6 +1341,7 @@ dependencies = [
  "hex",
  "interprocess",
  "libc",
+ "nix",
  "plist",
  "process-wrap",
  "qrcodegen",

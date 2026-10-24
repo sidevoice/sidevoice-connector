@@ -72,6 +72,9 @@ ctor = "1"
 # Unix: the effective uid (src/platform/service/macos: the launchd domain), with no `unsafe` of ours.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
+# The login shell from the user database (src/platform/env/unix): `getpwuid_r`, no `unsafe` of ours. Already in the lock;
+# `user` adds no dependency.
+nix = { version = "0.31", default-features = false, features = ["user"] }
 
 # Windows: reparse points and sharing (src/platform/uninstall, src/platform/process). Minimal features; the version the
 # lock already has.
