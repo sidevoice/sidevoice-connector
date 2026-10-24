@@ -53,6 +53,26 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo xtask dist
+      - name: Check the Windows launcher version resource
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $identity = & target/release/sidevoice-connector.exe --version --json | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Cannot read connector version" }
+          $version = $identity.version
+          $numbers = ($version -split '[-+]')[0] -split '\.'
+          $resource = (Get-Item target/release/sidevoice-background.exe).VersionInfo
+          if ($resource.FileVersion -ne $version -or $resource.ProductVersion -ne $version) {
+            throw "Launcher resource version does not match connector $version"
+          }
+          if ($resource.FileMajorPart -ne [int]$numbers[0] -or
+              $resource.FileMinorPart -ne [int]$numbers[1] -or
+              $resource.FileBuildPart -ne [int]$numbers[2]) {
+            throw "Launcher numeric resource version does not match connector $version"
+          }
+          if ($resource.FileDescription -ne 'Sidevoice Background') {
+            throw "Launcher description changed"
+          }
       # The Linux binary on the oldest distribution it supports (glibc floor, xtask/src/glibc.rs).
       - if: runner.os == 'Linux'
         run: cargo xtask verify-floor target/dist/sidevoice-connector-${{ matrix.target }}.tar.zst
