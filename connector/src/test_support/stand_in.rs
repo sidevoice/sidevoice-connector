@@ -51,6 +51,10 @@ pub(crate) struct Script {
     pub write: Option<(PathBuf, String)>,
     /// What it prints on stdout.
     pub print: String,
+    /// A file its process id is written to, before anything else.
+    pub pid: Option<PathBuf>,
+    /// How long it stays up (milliseconds) before it does the rest.
+    pub sleep_ms: u64,
     /// Its exit code.
     pub exit: i32,
 }
@@ -64,6 +68,10 @@ impl Script {
     }
 
     fn play(&self, args: &[String]) -> i32 {
+        if let Some(file) = &self.pid {
+            std::fs::write(file, std::process::id().to_string()).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(self.sleep_ms));
         if let Some(version) = self.version.as_ref().filter(|_| args == ["--version"]) {
             println!("{version}");
             return 0;
