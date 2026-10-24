@@ -1,0 +1,115 @@
+name: Latest agent compatibility
+
+# Informational only: never called by CI or release and never triggered by a PR.
+on:
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize manual and scheduled runs, including issue lookup/create.
+concurrency:
+  group: e2e-latest
+  cancel-in-progress: false
+
+jobs:
+  versions:
+    runs-on: ubuntu-24.04
+    outputs:
+      claude: ${{ steps.versions.outputs.claude }}
+      codex: ${{ steps.versions.outputs.codex }}
+      release: ${{ steps.versions.outputs.release }}
+      sha: ${{ steps.versions.outputs.sha }}
+      assets: ${{ steps.versions.outputs.assets }}
+      pinned-claude: ${{ steps.versions.outputs.pinned-claude }}
+      pinned-codex: ${{ steps.versions.outputs.pinned-codex }}
+    steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+      - id: versions
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "claude=$(npm view @anthropic-ai/claude-code@latest version)" >> "$GITHUB_OUTPUT"
+          echo "codex=$(npm view @openai/codex@latest version)" >> "$GITHUB_OUTPUT"
+          release=$(gh api "repos/$GH_REPO/releases/tags/nightly")
+          sha=$(gh api "repos/$GH_REPO/commits/nightly" --jq .sha)
+          echo "release=$(jq -r .tag_name <<< "$release")" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "assets=$(jq -r '[.assets[] | select(.name | test("^sidevoice-connector-.*-(windows-x86_64|linux-x86_64|linux-aarch64)\\.tar\\.zst$")) | "\(.name): \(.updated_at)"] | join("; ")' <<< "$release")" >> "$GITHUB_OUTPUT"
+          for entry in 'e2e.rs:CLAUDE_CODE_VERSION:pinned-claude' 'codex.rs:VERSION:pinned-codex'; do
+            IFS=: read -r file constant output <<< "$entry"
+            source=$(gh api "repos/$GH_REPO/contents/xtask/src/$file?ref=$sha" -H 'Accept: application/vnd.github.raw+json')
+            pinned=$(sed -n "s/^pub(crate) const $constant: &str = \"\([^\"]*\)\";.*/\1/p" <<< "$source")
+            test -n "$pinned"
+            echo "$output=$pinned" >> "$GITHUB_OUTPUT"
+          done
+
+  e2e:
+    needs: versions
+    uses: ./.github/workflows/e2e.yml
+    with:
+      ref: ${{ needs.versions.outputs.sha }}
+      claude-version: ${{ needs.versions.outputs.claude }}
+      codex-version: ${{ needs.versions.outputs.codex }}
+      release-tag: ${{ needs.versions.outputs.release }}
+      skip-macos: true
+
+  report:
+    if: always() && (needs.versions.result == 'failure' || needs.e2e.result == 'failure' || needs.e2e.result == 'success')
+    needs: [versions, e2e]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or update the compatibility issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CLAUDE_VERSION: ${{ needs.versions.outputs.claude }}
+          CODEX_VERSION: ${{ needs.versions.outputs.codex }}
+          CONNECTOR_RELEASE: ${{ needs.versions.outputs.release }}
+          NIGHTLY_SHA: ${{ needs.versions.outputs.sha }}
+          ASSETS: ${{ needs.versions.outputs.assets }}
+          PINNED_CLAUDE: ${{ needs.versions.outputs.pinned-claude }}
+          PINNED_CODEX: ${{ needs.versions.outputs.pinned-codex }}
+          PASSED: ${{ needs.versions.result == 'success' && needs.e2e.result == 'success' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title='Latest agent compatibility e2e failed'
+          # Exact title is the deduplication key; documented in RELEASING.md.
+          issue=$(gh api --paginate "repos/$GH_REPO/issues?state=open&per_page=100" \
+            --jq '.[] | select(.pull_request == null and .title == "Latest agent compatibility e2e failed") | .number' | head -n 1)
+          if [ "$PASSED" = true ]; then
+            if [ -n "$issue" ]; then
+              gh issue close "$issue" --comment "passing again: $RUN_URL"
+            fi
+            exit 0
+          fi
+          body="$RUNNER_TEMP/compatibility-issue.md"
+          cat > "$body" <<BODY
+          Daily compatibility check failed.
+
+          Claude Code latest: ${CLAUDE_VERSION:-unresolved (version lookup failed)}; pinned: ${PINNED_CLAUDE:-unresolved}
+          Codex latest: ${CODEX_VERSION:-unresolved (version lookup failed)}; pinned: ${PINNED_CODEX:-unresolved}
+          Connector release: ${CONNECTOR_RELEASE:-unresolved}
+          Nightly commit: ${NIGHTLY_SHA:-unresolved}
+          Archive updated_at: ${ASSETS:-unresolved}
+          Platforms: Windows x64, Linux x64 and ARM64 (macOS omitted to reduce cost).
+
+          Run: $RUN_URL (attempt $GITHUB_RUN_ATTEMPT)
+          BODY
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body-file "$body"
+          else
+            gh issue create --title "$title" --body-file "$body"
+          fi
