@@ -7,9 +7,11 @@
 //! `<concern>/unix.rs` and `<concern>/windows.rs` only implement it, behind a private `imp`. A side that lacks an
 //! operation does not compile; a host that has nothing to do implements it as a no-op, so the gap is a decision.
 
+pub mod architecture;
 pub mod env;
 pub mod foreign;
 pub mod lifecycle;
+pub mod npm;
 pub mod process;
 pub mod service;
 #[cfg(test)]
@@ -22,4 +24,3 @@ pub mod uninstall;
 // (`crate::platform::fs`, `crate::platform::ipc`, `crate::platform::user`).
 pub use sidevoice_platform::{data_dir, fs, ipc, user};
 
-pub mod npm;

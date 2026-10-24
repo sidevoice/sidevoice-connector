@@ -294,7 +294,6 @@ impl Registration for Codex {
             package: "@openai/codex",
             platform_prefix: "@openai/codex-",
             program: "vendor/{target}/bin/codex{exe}",
-            bundled: true,
         })
     }
 

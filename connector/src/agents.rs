@@ -1265,10 +1265,9 @@ pub(crate) fn find_binary(
     path: Option<&str>,
     roots: &Roots,
 ) -> Option<String> {
-    if let Some(found) = find_in_path(agent.binary_names(), path) {
-        return native_program(agent, found);
-    }
-    first_runnable(agent.fallback_binaries(roots))
+    find_in_path(agent.binary_names(), path)
+        .and_then(|found| native_program(agent, found))
+        .or_else(|| first_runnable(agent.fallback_binaries(roots)))
 }
 
 /// The first of the candidates, best first, that is a program this OS can run (`Env::runnable`), taken as a program
@@ -1282,27 +1281,34 @@ pub(crate) fn first_runnable(candidates: Vec<PathBuf>) -> Option<String> {
 
 /// What `found` (on `PATH`) stands for: the real program when it is only a launcher script of the agent, else itself.
 fn native_program(agent: &dyn Registration, found: String) -> Option<String> {
-    let Some(package) = agent.npm_package() else {
-        return Some(found);
+    let resolved = match agent.npm_package() {
+        Some(package) => crate::platform::npm::resolve(Path::new(&found), &package),
+        None => Ok(None),
     };
-    match crate::platform::npm::resolve(Path::new(&found), &package) {
+    resolved_program(found, resolved)
+}
+
+/// Prefer a runnable native program, then the original launcher. A failed resolution is diagnostic only; if the
+/// launcher also disappeared or cannot run, the caller can still try the harness's usual fallback executables.
+fn resolved_program(found: String, resolved: std::io::Result<Option<PathBuf>>) -> Option<String> {
+    match resolved {
         Ok(Some(program)) => {
-            if Environment::runnable(&program) {
-                program.into_os_string().into_string().ok()
-            } else {
-                crate::logfile::log(&format!(
-                    "agent native program is not runnable: {}",
-                    program.display()
-                ));
-                None
+            if let Some(native) = first_runnable(vec![program.clone()]) {
+                return Some(native);
             }
+            crate::logfile::log(&format!(
+                "agent native program is not runnable: {}; keeping launcher {found}",
+                program.display()
+            ));
         }
-        Ok(None) => Some(found),
+        Ok(None) => {}
         Err(error) => {
-            crate::logfile::log(&format!("cannot resolve agent launcher {found}: {error}"));
-            None
+            crate::logfile::log(&format!(
+                "cannot resolve agent launcher {found}: {error}; keeping its launcher"
+            ));
         }
     }
+    first_runnable(vec![PathBuf::from(found)])
 }
 
 pub(crate) fn find_in_path(names: &[&str], path: Option<&str>) -> Option<String> {

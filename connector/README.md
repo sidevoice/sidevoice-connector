@@ -30,8 +30,10 @@ failure is `{"ok":false,"error":{"key","params","message"}}` and exit status 1, 
 English (`messages/errors.json`, compiled in). Without `--json` a failure is one English line on stderr.
 
 On Windows, Codex and Claude Code installed through npm, pnpm or yarn classic use their native platform binary
-when the installed package provides one. Yarn Plug'n'Play agent installs are unsupported: use Yarn's
-`nodeLinker: node-modules` or install the agent with npm/pnpm. Native installers keep their own executable.
+when the installed package provides one. On ARM64 Windows, native ARM64 packages are preferred, with x64 packages
+as an emulated fallback. If native resolution fails, the original launcher remains available and the reason is logged.
+Yarn Plug'n'Play native resolution is unsupported: use Yarn's `nodeLinker: node-modules` or npm/pnpm to resolve the
+native program directly. Native installers keep their own executable.
 
 ## Where things are
 

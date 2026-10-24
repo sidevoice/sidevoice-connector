@@ -2812,3 +2812,25 @@ async fn a_scan_from_the_service_environment_does_not_drop_what_the_persons_foun
     assert!(listed_ids(&cached).contains(&"claude".into()), "{cached}");
     host.shutdown().await;
 }
+
+#[test]
+fn native_resolution_errors_and_unrunnable_results_keep_the_launcher() {
+    let dir = crate::test_support::temp_dir("agent-resolver-fallback");
+    let launcher = dir.path().join(Host::exe_name("launcher"));
+    Files::open_private(&launcher, Create::NewProgram).unwrap();
+    let found = launcher.to_str().unwrap().to_owned();
+    assert_eq!(
+        resolved_program(found.clone(), Err(std::io::Error::other("resolver failed"))),
+        Some(found.clone())
+    );
+    assert_eq!(
+        resolved_program(found.clone(), Ok(Some(dir.path().join("missing-native")))),
+        Some(found.clone())
+    );
+    // If the launcher disappears too, resolution returns None so find_binary can try fallback_binaries.
+    std::fs::remove_file(&launcher).unwrap();
+    assert_eq!(
+        resolved_program(found, Err(std::io::Error::other("resolver failed"))),
+        None
+    );
+}

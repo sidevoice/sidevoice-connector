@@ -221,7 +221,6 @@ impl Registration for Claude {
             package: "@anthropic-ai/claude-code",
             platform_prefix: "@anthropic-ai/claude-code-",
             program: "claude{exe}",
-            bundled: false,
         })
     }
 
