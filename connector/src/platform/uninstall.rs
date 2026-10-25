@@ -60,7 +60,7 @@ pub use imp::Os as Remover;
 
 use super::data_dir;
 use super::fs::{Files, Fs};
-use super::target::{Host, Target as _};
+use super::target;
 use serde_json::{json, Value};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -72,7 +72,7 @@ const CLAIM: &str = ".uninstall-claim";
 const RECOVERY: &str = ".uninstall-recovery";
 /// The program inside [`RECOVERY`].
 fn recovery_program() -> String {
-    Host::exe_name("sidevoice-connector")
+    target::exe_name("sidevoice-connector")
 }
 /// `D`'s record of the installation, which names the recovery program until the very end.
 const RECORD: &str = "install.json";

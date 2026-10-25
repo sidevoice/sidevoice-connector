@@ -123,7 +123,7 @@ The connector is one Rust binary, the crate in [`connector/`](connector); the bu
 ([`xtask/`](xtask)). You need the Rust toolchain pinned in [`.github/actions/setup`](.github/actions/setup/action.yml).
 
 ```sh
-cargo xtask fixtures   # what the tests run against: the sidevoice-core release pinned by the `sidevoice-platform` tag in connector/Cargo.toml, the pinned Codex CLI
+cargo xtask fixtures   # what the tests run against: the sidevoice-core release pinned by the `sidevoice-platform` workspace tag in Cargo.toml, the pinned Codex CLI
 cargo test --locked    # unit tests, and the connector against the real core, Codex and the service managers
 cargo xtask dist       # this machine's release archive, built and verified as a release builds it
                        # (Linux: needs zig and cargo-zigbuild, to link against glibc 2.28; RELEASING.md)

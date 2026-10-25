@@ -4,7 +4,7 @@
 
 use crate::adapters::markers::Roots;
 use crate::platform::env::{Env, Environment};
-use crate::platform::target::{Host, Target as _};
+use crate::platform::target;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -17,7 +17,7 @@ use std::time::SystemTime;
 /// - macOS: the CLI inside the app bundle, in `/Applications` and in `~/Applications`, in the layout of the current
 ///   app and in the older one.
 pub(super) fn fallbacks(roots: &Roots) -> Vec<PathBuf> {
-    let exe = Host::exe_name("codex");
+    let exe = target::exe_name("codex");
     let mut found = Vec::new();
     if let Some(programs) = roots
         .local_app_data
@@ -90,7 +90,7 @@ mod tests {
     #[test]
     fn cached_copies_are_listed_by_the_directory_written_last_and_only_when_finished() {
         let dir = crate::test_support::temp_dir("codex-cache");
-        let exe = Host::exe_name("codex");
+        let exe = target::exe_name("codex");
         let cache = dir.path().join("bin");
         let at = |name: &str| cache.join(name).join(&exe);
         // The directory written last comes first, whatever the program inside says about its own age.
@@ -119,7 +119,7 @@ mod tests {
             local_app_data: None,
             program_files: None,
         };
-        let exe = Host::exe_name("codex");
+        let exe = target::exe_name("codex");
         let resources = "ChatGPT.app/Contents/Resources";
         let system = Path::new("/Applications").join(resources);
         let home = roots.home.join("Applications").join(resources);

@@ -1,7 +1,7 @@
 name: ci
 
 # Every pull request: lint, then on every target the tests (against what `cargo xtask fixtures` fetches: the
-# sidevoice-core release pinned by the sidevoice-platform tag in connector/Cargo.toml and the pinned Codex CLI) and the release packaging, exactly as a
+# sidevoice-core release pinned by the workspace sidevoice-platform tag in Cargo.toml and the pinned Codex CLI) and the release packaging, exactly as a
 # release builds it (on Linux also run on the oldest distribution it supports), publishing nothing. What passes here
 # is what merging publishes (release.yml), npm packages included; then each archive is installed end to end on a fresh
 # runner of its OS (e2e.yml). RELEASING.md.

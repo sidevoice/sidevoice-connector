@@ -22,7 +22,7 @@ besides the GitHub steps is code in `xtask/` (`cargo xtask fixtures | dist | ver
 publish | npm | npm-smoke | npm-publish`):
 
 - `cargo xtask fixtures` fetches what the tests run against: the sidevoice-core release whose version is the
-  `sidevoice-platform` tag in `connector/Cargo.toml` (`vX.Y.Z`), its archive for this machine checked against that release's `SHA256SUMS`,
+  workspace `sidevoice-platform` tag in `Cargo.toml` (`vX.Y.Z`), its archive for this machine checked against that release's `SHA256SUMS`,
   `native-core-manifest.json` and `attestation.sigstore.json` (signed by the core's `release.yml` on `main`), into
   `target/sidevoice-core` (unpacked, with the checked archive beside it); and the pinned Codex CLI into
   `target/codex`. Without them the tests that need them are skipped locally and fail in CI.
@@ -196,7 +196,7 @@ Say Windows x64 or macOS x86_64:
 2. **Configure its trusted publisher** as above: `sidevoice` / `sidevoice-connector` / the workflow filename npm
    checks (see above), no environment, "Allow npm publish" checked; in its access settings, require 2FA and
    disallow tokens.
-3. **Add the target to `TARGETS` in `xtask/src/main.rs`**, the one list the tooling reads: its name (as in archive
+3. **Add the target to `sidevoice-platform::target::TARGETS` in core and pin its release**, the one list the tooling reads: its name (as in archive
    names, `<os>-<arch>`), the Rust `std::env::consts` OS and ARCH of the machine that builds it, and npm's `os` and
    `cpu`. The manifest, the npm packages and the launcher's `optionalDependencies` follow from it.
 4. **Add its runner** to the matrices of `ci.yml` (`test`) and `release.yml` (`dist`), and to `lint` in `ci.yml` if
@@ -213,7 +213,7 @@ Say Windows x64 or macOS x86_64:
 
 #### Windows x64
 
-`windows-x86_64` is a released target (`TARGETS`, `released: true`; runner `windows-2025`, built natively with MSVC and
+`windows-x86_64` is a released target (shared `TARGETS`; runner `windows-2025`, built natively with MSVC and
 the C runtime linked statically, `.cargo/config.toml`): the manifest, the `@sidevoice/sidevoice-win32-x64` npm package,
 the launcher's `optionalDependencies` and the `release.yml` matrix list it, and the connector's `.exe` names and the
 archive checks follow from `TARGETS`. The pinned core publishes `sidevoice-core-<version>-windows-x86_64.tar.zst`
@@ -263,7 +263,7 @@ Build artifacts on Actions runs are kept 7 days, for debugging only. Download fr
   publisher settings: the error names them) and re-run that job; packages already published with the same bytes are
   skipped. If the launcher is already staged, approve or reject it on npmjs.com instead.
 - A release run is never cancelled half-way; nightlies queue behind each other.
-- Moving to a new core release is a PR that changes the `sidevoice-platform` tag in `connector/Cargo.toml` (the one place the core version lives: it is the shared library's version and the release `cargo xtask` bundles); its CI is the
+- Moving to a new core release is a PR that changes the workspace `sidevoice-platform` tag in `Cargo.toml` (the one place the core version lives: it is the shared library's version and the release `cargo xtask` bundles); its CI is the
   connector's tests against that core.
 
 ## What this needs from the repository settings

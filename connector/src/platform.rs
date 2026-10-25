@@ -16,10 +16,11 @@ pub mod process;
 pub mod service;
 #[cfg(test)]
 pub(crate) mod stand_in;
-pub mod target;
+#[cfg(test)]
+mod target_tests;
 pub mod uninstall;
 
 // This user, its private files, its data directory and the local channel, shared with the core: `sidevoice-platform`,
 // from the core's repository at the tag of a core release. Re-exported so callers keep their paths
 // (`crate::platform::fs`, `crate::platform::ipc`, `crate::platform::user`).
-pub use sidevoice_platform::{data_dir, fs, ipc, user};
+pub use sidevoice_platform::{data_dir, fs, ipc, target, user};

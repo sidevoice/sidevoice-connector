@@ -32,7 +32,7 @@ use crate::host::chmod;
 use crate::manifest::published_name;
 use crate::publish::{gh, signer, verify_attestation};
 use crate::util::*;
-use crate::{released_names, Result, INVENTORY, TARGETS};
+use crate::{Result, INVENTORY, TARGETS};
 
 /// Where `cargo xtask npm` leaves the packed packages (emptied first).
 pub(crate) const OUT_DIR: &str = "target/npm";
@@ -47,7 +47,6 @@ const LAUNCHER: &str = "sidevoice";
 /// The dist-tag of every platform package: never `latest` or `next`, so installing one by name resolves nothing new;
 /// only the launcher, which pins its exact version, brings it.
 pub(crate) const PLATFORM_DIST_TAG: &str = "platform";
-const PLATFORM_PREFIX: &str = "@sidevoice/sidevoice-";
 const LAUNCHER_JS: &str = include_str!("../npm/sidevoice.js");
 const LAUNCHER_BIN: &str = "bin/sidevoice.js";
 const REPOSITORY: &str = "sidevoice/sidevoice-connector";
@@ -55,17 +54,16 @@ const REGISTRY: &str = "https://registry.npmjs.org";
 
 /// A release target's npm `os` and `cpu` ([`crate::TARGETS`]).
 pub(crate) fn platform(target: &str) -> Result<(&'static str, &'static str)> {
-    TARGETS
-        .iter()
-        .find(|known| known.name == target)
+    sidevoice_platform::target::by_name(target)
         .map(|known| (known.npm_os, known.npm_cpu))
         .ok_or_else(|| format!("no npm platform for {target}"))
 }
 
 /// The platform package of a release target, `@sidevoice/sidevoice-<os>-<cpu>`.
 pub(crate) fn platform_package(target: &str) -> Result<String> {
-    let (os, cpu) = platform(target)?;
-    Ok(format!("{PLATFORM_PREFIX}{os}-{cpu}"))
+    sidevoice_platform::target::by_name(target)
+        .map(|target| target.npm_package())
+        .ok_or_else(|| format!("no npm platform for {target}"))
 }
 
 /// The file `npm pack` writes for a package.
@@ -150,7 +148,7 @@ pub(crate) fn launcher_manifest(version: &str) -> Result<Value> {
          call. Run `npx sidevoice install` on the machine where your agents run.",
     );
     let mut dependencies = serde_json::Map::new();
-    for target in released_names() {
+    for target in TARGETS.iter().map(|target| target.name) {
         dependencies.insert(platform_package(target)?, version.into());
     }
     manifest["keywords"] = json!([
@@ -184,7 +182,6 @@ fn platform_readme(target: &str, version: &str) -> Result<String> {
 fn launcher_readme(version: &str) -> Result<String> {
     let platforms: Vec<String> = TARGETS
         .iter()
-        .filter(|target| target.released)
         .map(|target| match target.npm_os {
             "darwin" => format!("- macOS on {} (`darwin-{}`)", mac_cpu(target.npm_cpu), target.npm_cpu),
             "linux" => format!(
@@ -721,7 +718,7 @@ pub(crate) fn publish(tag: &str) -> Result<()> {
     ])?;
     let sums = parse_sums(&read(&assets.0.join("SHA256SUMS"))?)?;
     let mut archives = Vec::new();
-    for target in released_names() {
+    for target in TARGETS.iter().map(|target| target.name) {
         let name = published_name(version, target);
         let path = assets.0.join(&name);
         let listed = sums
@@ -891,7 +888,17 @@ mod tests {
     #[test]
     fn the_launcher_script_names_the_platform_packages_as_xtask_does() {
         assert!(LAUNCHER_JS.starts_with("#!/usr/bin/env node\n"));
-        assert!(LAUNCHER_JS.contains(&format!("const PREFIX = \"{PLATFORM_PREFIX}\";")));
+        let prefix = LAUNCHER_JS
+            .lines()
+            .find_map(|line| line.strip_prefix("const PREFIX = \""))
+            .and_then(|line| line.strip_suffix("\";"))
+            .expect("launcher package prefix");
+        for target in TARGETS {
+            assert_eq!(
+                format!("{prefix}{}-{}", target.npm_os, target.npm_cpu),
+                target.npm_package()
+            );
+        }
     }
 
     #[test]
