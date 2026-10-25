@@ -15,7 +15,9 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
-use super::os::{mount, open_entry, Mount};
+use super::os::{mount, Mount};
+use sidevoice_platform::fs::{Access, Directory, HeldDirectory};
+use sidevoice_platform::removal::Removal as _;
 
 /// Whether this user owns what `fd` is (`platform::user`).
 fn ours(fd: RawFd) -> Result<bool, &'static str> {
@@ -33,8 +35,6 @@ fn ours(fd: RawFd) -> Result<bool, &'static str> {
 const CHANGED: &str = "uninstall entry changed during removal";
 const REPLACED: &str = "uninstall entry replaced";
 const MOVED: &str = "uninstall directory changed or is a link";
-/// How many times a check looks at an entry a running service keeps changing before it refuses.
-const CHECK_ATTEMPTS: usize = 5;
 
 pub(super) fn stat_fd(fd: RawFd) -> Result<libc::stat, &'static str> {
     let mut stat = unsafe { std::mem::zeroed() };
@@ -316,148 +316,33 @@ impl Os {
         Ok(())
     }
 
-    fn walk(
-        &self,
-        fd: RawFd,
-        relative: &Path,
-        remove: bool,
-        kept: &[&str],
-        depth: usize,
-        probe: &impl Fn(RawFd, &Path) -> Result<Mount, &'static str>,
-    ) -> Result<Vec<String>, &'static str> {
-        if depth > 64 {
-            return Err("uninstall tree is too deep");
-        }
+    /// Bridge the claim's descriptor identity to the shared held-root capability. Recheck our
+    /// anchor and root after opening it; the capability rechecks its own ancestry on every use.
+    fn held_directory(&self, relative: &Path, fd: RawFd) -> Result<HeldDirectory, &'static str> {
         self.verify_dir(relative, fd)?;
-        if probe(fd, relative)? != self.expected {
-            return Err("uninstall mount or device boundary");
-        }
-        let mut removed = Vec::new();
-        for entry in entries(fd)? {
-            if depth == 0 && kept.iter().any(|item| OsStr::new(item) == entry) {
-                continue;
-            }
-            self.verify_dir(relative, fd)?;
-            // A check (`remove` false) runs before the service is stopped, so the service may be writing in the
-            // tree: an entry it replaced or removed between the listing and the check is looked at again, and one
-            // that is gone is nothing to check. Every entry still there is checked as strictly as ever, and the
-            // removal itself (after the stop) never retries: there a change is a real one.
-            let mut attempts = 0;
-            loop {
-                match self.visit(fd, relative, &entry, remove, depth, probe) {
-                    Ok(()) => break,
-                    Err(refused @ (CHANGED | REPLACED | MOVED)) if !remove => {
-                        if !exists_at(fd, &entry)? {
-                            break;
-                        }
-                        attempts += 1;
-                        if attempts >= CHECK_ATTEMPTS {
-                            return Err(refused);
-                        }
-                    }
-                    Err(refused) => return Err(refused),
-                }
-            }
-            if depth == 0 && remove {
-                removed.push(entry.to_string_lossy().into_owned());
-            }
-        }
-        Ok(removed)
+        let held = HeldDirectory::open(
+            &self.anchor_path.join(relative),
+            Access::NotWritableByOthers,
+        )
+        .map_err(|_| "unsafe uninstall removal directory")?;
+        self.verify_dir(relative, fd)?;
+        Ok(held)
     }
 
-    /// One entry of the directory `fd` (at `relative`): checked, and removed when `remove`.
-    fn visit(
-        &self,
-        fd: RawFd,
-        relative: &Path,
-        entry: &OsStr,
-        remove: bool,
-        depth: usize,
-        probe: &impl Fn(RawFd, &Path) -> Result<Mount, &'static str>,
-    ) -> Result<(), &'static str> {
-        let child_path = relative.join(entry);
-        let child_name = name(entry)?;
-        let before = stat_at(fd, &child_name)?;
-        if before.st_dev != self.expected.device {
-            return Err("uninstall device boundary");
-        }
-        if before.st_mode & libc::S_IFMT == libc::S_IFDIR {
-            let child = open_dir(fd, entry)?;
-            self.check_mount(child.as_raw_fd())?;
-            if !same(&before, &stat_fd(child.as_raw_fd())?) {
-                return Err(REPLACED);
-            }
-            self.walk(
-                child.as_raw_fd(),
-                &child_path,
-                remove,
-                &[],
-                depth + 1,
-                probe,
-            )?;
-            if remove {
-                self.verify_dir(relative, fd)?;
-                if !same(&before, &stat_at(fd, &child_name)?) {
-                    return Err(REPLACED);
-                }
-                self.check_mount(child.as_raw_fd())?;
-                if unsafe { libc::unlinkat(fd, child_name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
-                    return Err("cannot remove uninstall directory");
-                }
-            }
-        } else {
-            if let Some(child) = open_entry(fd, &child_name, &before)? {
-                if !same(&before, &stat_fd(child.as_raw_fd())?) {
-                    return Err(REPLACED);
-                }
-                self.check_mount(child.as_raw_fd())?;
-            }
-            if remove {
-                self.verify_dir(relative, fd)?;
-                if !same(&before, &stat_at(fd, &child_name)?) {
-                    return Err(REPLACED);
-                }
-                if unsafe { libc::unlinkat(fd, child_name.as_ptr(), 0) } != 0 {
-                    return Err("cannot remove uninstall entry");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn tree(
-        &self,
-        relative: &Path,
-        remove_root: bool,
-        kept: &[&str],
-        remove: bool,
-        probe: &impl Fn(RawFd, &Path) -> Result<Mount, &'static str>,
-    ) -> Result<bool, &'static str> {
+    fn check_tree(&self, relative: &Path, kept: &[&str]) -> Result<bool, &'static str> {
         let Some(root) = self.open_relative(relative)? else {
             return Ok(false);
         };
-        self.walk(root.as_raw_fd(), relative, remove, kept, 0, probe)?;
-        if remove && remove_root {
-            let parent = relative.parent().ok_or("unsafe uninstall root")?;
-            let root_name = relative.file_name().ok_or("unsafe uninstall root")?;
-            let parent_fd = self
-                .open_relative(parent)?
-                .ok_or("uninstall root parent disappeared")?;
-            self.verify_dir(parent, parent_fd.as_raw_fd())?;
-            let name = name(root_name)?;
-            if !same(
-                &stat_fd(root.as_raw_fd())?,
-                &stat_at(parent_fd.as_raw_fd(), &name)?,
-            ) {
-                return Err("uninstall root replaced");
-            }
-            self.check_mount(root.as_raw_fd())?;
-            if unsafe { libc::unlinkat(parent_fd.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) }
-                != 0
-            {
-                return Err("cannot remove uninstall root");
-            }
-        }
+        let held = self.held_directory(relative, root.as_raw_fd())?;
+        super::check_live_contents(|| {
+            let selected = entries(root.as_raw_fd()).map_err(io::Error::other)?;
+            let allowed: Vec<_> = selected
+                .iter()
+                .filter(|name| !kept.iter().any(|kept| *name == OsStr::new(kept)))
+                .map(OsString::as_os_str)
+                .collect();
+            held.check_contents(&allowed)
+        })?;
         Ok(true)
     }
 
@@ -656,9 +541,8 @@ impl Removal for Os {
     }
 
     fn preflight(&self) -> Result<bool, &'static str> {
-        let probe = |fd, _: &Path| mount(fd);
-        let releases = self.tree(&self.releases_rel, false, &[], false, &probe)?;
-        self.tree(&self.data_rel, false, self.roots.kept, false, &probe)?;
+        let releases = self.check_tree(&self.releases_rel, &[])?;
+        self.check_tree(&self.data_rel, self.roots.kept)?;
         let claimed_releases = if let Some(claim) = self.open_relative(&self.claim_rel)? {
             entries(claim.as_raw_fd())?
                 .iter()
@@ -691,31 +575,13 @@ impl Removal for Os {
                 )?;
             }
         }
-        for entry in entries(claim.as_raw_fd())? {
-            if !entry.as_bytes().starts_with(RELEASE_PREFIX.as_bytes()) {
-                continue;
-            }
-            self.verify_dir(&self.claim_rel, claim.as_raw_fd())?;
-            let entry_name = name(&entry)?;
-            let before = stat_at(claim.as_raw_fd(), &entry_name)?;
-            if before.st_mode & libc::S_IFMT == libc::S_IFDIR {
-                self.tree(&self.claim_rel.join(&entry), true, &[], true, &|fd, _| {
-                    mount(fd)
-                })?;
-            } else {
-                // A raced replacement may have been claimed as a link. Its
-                // external target is untouched; retry can discard the link.
-                if before.st_dev != self.expected.device {
-                    return Err("uninstall device boundary");
-                }
-                if !same(&before, &stat_at(claim.as_raw_fd(), &entry_name)?) {
-                    return Err(REPLACED);
-                }
-                if unsafe { libc::unlinkat(claim.as_raw_fd(), entry_name.as_ptr(), 0) } != 0 {
-                    return Err("cannot remove claimed release link");
-                }
-            }
-        }
+        let selected: Vec<_> = entries(claim.as_raw_fd())?
+            .into_iter()
+            .filter(|name| name.as_bytes().starts_with(RELEASE_PREFIX.as_bytes()))
+            .collect();
+        let held = self.held_directory(&self.claim_rel, claim.as_raw_fd())?;
+        held.remove_contents(&selected.iter().map(OsString::as_os_str).collect::<Vec<_>>())
+            .map_err(|_| "cannot remove claimed releases")?;
         Ok(())
     }
 
@@ -742,20 +608,13 @@ impl Removal for Os {
             )?;
             removed.push(entry.to_string_lossy().into_owned());
         }
-        let release_names: Vec<String> = entries(claim.as_raw_fd())?
+        let selected: Vec<_> = entries(claim.as_raw_fd())?
             .into_iter()
-            .filter(|name| name.as_bytes().starts_with(RELEASE_PREFIX.as_bytes()))
-            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.as_bytes().starts_with(RELEASE_PREFIX.as_bytes()))
             .collect();
-        let kept: Vec<&str> = release_names.iter().map(String::as_str).collect();
-        self.walk(
-            claim.as_raw_fd(),
-            &self.claim_rel,
-            true,
-            &kept,
-            0,
-            &|fd, _| mount(fd),
-        )?;
+        let held = self.held_directory(&self.claim_rel, claim.as_raw_fd())?;
+        held.remove_contents(&selected.iter().map(OsString::as_os_str).collect::<Vec<_>>())
+            .map_err(|_| "cannot remove claimed data")?;
         Ok(removed)
     }
 
@@ -912,7 +771,7 @@ impl Removal for Os {
     }
 }
 
-/// What only the descriptor-based removal can be asked: its mount probe and the exact refusals. The rest of its
+/// Unix claim-boundary races and mount checks. The shared crate owns recursive-walk tests. The rest of its
 /// behaviour is tested against the interface, in `uninstall.rs`.
 #[cfg(test)]
 mod tests {
@@ -930,19 +789,6 @@ mod tests {
     fn data_rel() -> &'static Path {
         static REL: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         REL.get_or_init(|| PathBuf::from(data_dir::standard().unwrap().file_name().unwrap()))
-    }
-
-    /// The preflight walk of `D`, with the mount probe made to report a different mount for `D` itself.
-    fn preflight_with_simulated_data_mount(guard: &Os) -> Result<bool, &'static str> {
-        let probe = |fd, path: &Path| {
-            let mut observed = mount(fd)?;
-            if path == data_rel() {
-                observed.device ^= 1;
-            }
-            Ok(observed)
-        };
-        guard.tree(data_rel(), false, KEPT, false, &probe)?;
-        Ok(false)
     }
 
     fn removal(home: &Path) -> Os {
@@ -963,31 +809,23 @@ mod tests {
     fn injected_mount_boundary_refuses_before_deleting() {
         let scratch = temp_dir("uninstall-mount");
         let home = scratch.path().join("home");
-        let guard = removal(&home);
+        let mut guard = removal(&home);
         let nested = home.join(data_rel()).join("mounted");
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("keep"), "untouched").unwrap();
-        let probe = |fd: RawFd, path: &Path| {
-            let mut observed = mount(fd)?;
-            if path == data_rel().join("mounted") {
-                observed.device ^= 1;
-            }
-            Ok(observed)
-        };
+        // Recursive mount checking belongs to the shared primitive. The connector must still
+        // refuse a different mount at its claim boundary, before handing anything to it.
+        guard.expected.device ^= 1;
+        assert_eq!(guard.preflight(), Err("uninstall mount or device boundary"));
         assert_eq!(
-            guard.tree(data_rel(), false, &[], false, &probe),
+            guard.remove_data_contents(&|_| {}),
             Err("uninstall mount or device boundary")
         );
         assert!(nested.join("keep").exists());
-        assert_eq!(
-            preflight_with_simulated_data_mount(&guard),
-            Err("uninstall mount or device boundary")
-        );
     }
 
-    /// Three directories in `D`; the first one the walk enters removes the other two (the service writing in `D`
-    /// while it is checked), after the listing and before the walk reaches them.
-    fn walk_with_siblings_vanishing(remove: bool) -> Result<bool, &'static str> {
+    #[test]
+    fn check_ignores_entries_a_running_service_removed_but_claim_refuses_them() {
         let scratch = temp_dir("uninstall-vanish");
         let home = scratch.path().join("home");
         let guard = removal(&home);
@@ -996,30 +834,28 @@ mod tests {
             fs::create_dir_all(data.join(child)).unwrap();
             fs::write(data.join(child).join("file"), "x").unwrap();
         }
-        let first = std::sync::Mutex::new(None::<String>);
-        let probe = |fd: RawFd, path: &Path| {
-            if path.parent() == Some(data_rel()) {
-                let me = path.file_name().unwrap().to_string_lossy().into_owned();
-                let mut first = first.lock().unwrap();
-                if first.is_none() {
-                    for other in ["a", "b", "c"].into_iter().filter(|other| *other != me) {
-                        fs::remove_dir_all(data.join(other)).unwrap();
-                    }
-                    *first = Some(me);
-                }
-            }
-            mount(fd)
-        };
-        guard.tree(data_rel(), false, &[], remove, &probe)
-    }
-
-    #[test]
-    fn check_ignores_entries_a_running_service_removed_but_removal_refuses_them() {
-        assert_eq!(walk_with_siblings_vanishing(false), Ok(true));
-        assert_eq!(
-            walk_with_siblings_vanishing(true),
-            Err("uninstall entry changed during removal")
-        );
+        let held = guard
+            .held_directory(
+                data_rel(),
+                guard
+                    .open_relative(data_rel())
+                    .unwrap()
+                    .unwrap()
+                    .as_raw_fd(),
+            )
+            .unwrap();
+        fs::remove_dir_all(data.join("b")).unwrap();
+        fs::remove_dir_all(data.join("c")).unwrap();
+        // The shared API intentionally accepts absent selected entries on retry.
+        held.check_contents(&[OsStr::new("a"), OsStr::new("b"), OsStr::new("c")])
+            .unwrap();
+        assert!(guard.preflight().is_ok());
+        // After writers have stopped, disappearing at the connector's claim is still an error.
+        assert!(guard
+            .remove_data_contents(&|name| {
+                fs::remove_dir_all(data.join(name)).unwrap();
+            })
+            .is_err());
     }
 
     #[test]
@@ -1028,21 +864,21 @@ mod tests {
         let home = scratch.path().join("home");
         let guard = removal(&home);
         let victim = home.join(data_rel()).join("victim");
-        let moved = home.join(data_rel()).join("moved");
+        let moved = scratch.path().join("moved");
         let outside = scratch.path().join("outside");
         fs::create_dir_all(&victim).unwrap();
         fs::create_dir(&outside).unwrap();
         fs::write(victim.join("inside"), "inside").unwrap();
         fs::write(outside.join("keep"), "outside").unwrap();
         let swapped = AtomicBool::new(false);
-        let probe = |fd: RawFd, path: &Path| {
-            if path == data_rel().join("victim") && !swapped.swap(true, Ordering::SeqCst) {
-                fs::rename(&victim, &moved).unwrap();
-                Files::symlink(&outside, &victim);
-            }
-            mount(fd)
-        };
-        assert!(guard.tree(data_rel(), false, &[], true, &probe).is_err());
+        assert!(guard
+            .remove_data_contents(&|_| {
+                if !swapped.swap(true, Ordering::SeqCst) {
+                    fs::rename(&victim, &moved).unwrap();
+                    Files::symlink(&outside, &victim);
+                }
+            })
+            .is_err());
         assert_eq!(fs::read_to_string(outside.join("keep")).unwrap(), "outside");
         assert_eq!(fs::read_to_string(moved.join("inside")).unwrap(), "inside");
     }

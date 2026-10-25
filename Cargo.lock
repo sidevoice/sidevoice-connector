@@ -1419,13 +1419,15 @@ dependencies = [
 
 [[package]]
 name = "sidevoice-platform"
-version = "0.10.1"
-source = "git+https://github.com/sidevoice/sidevoice-core?tag=v0.10.1#d9298816955d679237aa5480d2ae23a6433c6f23"
+version = "0.12.0"
+source = "git+https://github.com/sidevoice/sidevoice-core?tag=v0.12.0#2c7af54b54f3ffb39091fff6929248fea761ee74"
 dependencies = [
  "dirs",
  "gethostname",
  "hex",
  "interprocess",
+ "libc",
+ "process-wrap",
  "rustix",
  "serde",
  "serde_json",
@@ -1436,6 +1438,7 @@ dependencies = [
  "whoami",
  "widestring",
  "winapi-util",
+ "windows",
  "windows-sys 0.61.2",
 ]
 
