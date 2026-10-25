@@ -415,8 +415,17 @@ mod tests {
         let dir = crate::test_support::temp_dir("codex-cancel");
         let program = dir.path().join(Host::exe_name("delivery"));
         let pid_file = dir.path().join("pid");
+        let descendant = dir.path().join(Host::exe_name("descendant"));
+        let descendant_pid = dir.path().join("descendant-pid");
+        Script {
+            pid: Some(descendant_pid.clone()),
+            sleep_ms: 60_000,
+            ..Script::default()
+        }
+        .make(&descendant);
         Script {
             pid: Some(pid_file.clone()),
+            spawn: Some(descendant),
             sleep_ms: 60_000,
             ..Script::default()
         }
@@ -429,7 +438,11 @@ mod tests {
             )
             .await
         });
-        crate::test_support::assert_cancellation_stops_child(task, &pid_file).await;
+        crate::test_support::assert_cancellation_stops_children(
+            task,
+            &[pid_file.as_path(), descendant_pid.as_path()],
+        )
+        .await;
     }
 
     #[tokio::test]
