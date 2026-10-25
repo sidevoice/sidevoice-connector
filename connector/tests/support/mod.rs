@@ -30,7 +30,7 @@ use sidevoice_connector::platform::fs::Fs as _;
 // What the tests do to files (links, programs, access): the platform's `TestFiles`, for `use support::*`.
 pub use sidevoice_connector::platform::fs::{Files, TestFiles};
 use sidevoice_connector::platform::ipc::{Address as _, Channel as _, Channels, Endpoint};
-use sidevoice_connector::platform::process::{Process as _, Processes};
+use sidevoice_connector::platform::process::{ChildProcess, Process as _, Processes};
 
 pub const CONNECTOR: &str = env!("CARGO_BIN_EXE_sidevoice-connector");
 /// The windowless launcher of the Windows service jobs (built on every OS; only a package for Windows carries it).

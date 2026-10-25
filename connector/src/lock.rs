@@ -15,7 +15,7 @@
 //! holder replaces it, so a reader trusts the lock first and the record second.
 
 use crate::platform::fs::{Create, Files, Fs};
-use crate::platform::process::{Process, Processes};
+use crate::platform::process::{ChildProcess, Processes};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, TryLockError};

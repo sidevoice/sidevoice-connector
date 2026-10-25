@@ -8,7 +8,7 @@
 //! connector's `run-job`. Stopping the job is not this program's: the job's own process is asked to leave
 //! (`platform::service`), the connector's `run-job` then exits, and so does this program.
 
-use crate::platform::process::{Process, Processes};
+use crate::platform::process::{ChildProcess, Processes};
 use crate::platform::target;
 use std::ffi::OsString;
 use std::io;

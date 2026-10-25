@@ -986,7 +986,6 @@ dependencies = [
  "indexmap",
  "nix",
  "tokio",
- "tracing",
  "windows",
 ]
 
@@ -1385,7 +1384,6 @@ dependencies = [
  "libc",
  "nix",
  "plist",
- "process-wrap",
  "qrcodegen",
  "quick-xml",
  "rmcp",
@@ -1411,7 +1409,6 @@ dependencies = [
  "which",
  "whoami",
  "winapi-util",
- "windows",
  "windows-sys 0.61.2",
  "winreg 0.55.0",
  "zstd",
