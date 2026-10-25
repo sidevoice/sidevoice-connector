@@ -11,7 +11,7 @@ use std::process::Command;
 use serde_json::{json, Value};
 
 use sidevoice_connector::platform::service::{Service as _, Services};
-use sidevoice_connector::platform::target::{Host, Target as _};
+use sidevoice_connector::platform::target;
 
 use super::{connector_program, BACKGROUND, CONNECTOR};
 
@@ -52,7 +52,7 @@ pub fn package(at: &Path, archive: &Path, record: &Value, sha256: &str) -> PathB
     }
     // Where the OS runs its service jobs through a windowless launcher, the package carries it beside the connector.
     if let Some(stem) = Services::BACKGROUND {
-        let launcher = root.join("bin").join(Host::exe_name(stem));
+        let launcher = root.join("bin").join(target::exe_name(stem));
         if fs::hard_link(BACKGROUND, &launcher).is_err() {
             fs::copy(BACKGROUND, &launcher).unwrap();
         }

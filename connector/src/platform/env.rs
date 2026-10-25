@@ -265,28 +265,33 @@ mod tests {
     /// Commands in sequence, run as a person pastes the line: each once the one before succeeded, none after a failure.
     #[test]
     fn commands_in_sequence_stop_at_the_first_that_fails() {
-        use crate::platform::target::{Host, Target};
+        use crate::platform::target;
         use crate::test_support::stand_in::Script;
         let scratch = crate::test_support::temp_dir("env-sequence");
         let line = |name: &str| {
             format!(
                 "{}{}",
                 Environment::CALL,
-                Environment::quote(&scratch.path().join(Host::exe_name(name)).to_string_lossy())
+                Environment::quote(
+                    &scratch
+                        .path()
+                        .join(target::exe_name(name))
+                        .to_string_lossy()
+                )
             )
         };
         let marker = scratch.path().join("ran");
-        Script::default().make(&scratch.path().join(Host::exe_name("ok")));
+        Script::default().make(&scratch.path().join(target::exe_name("ok")));
         Script {
             exit: 1,
             ..Script::default()
         }
-        .make(&scratch.path().join(Host::exe_name("fails")));
+        .make(&scratch.path().join(target::exe_name("fails")));
         Script {
             write: Some((marker.clone(), String::new())),
             ..Script::default()
         }
-        .make(&scratch.path().join(Host::exe_name("marks")));
+        .make(&scratch.path().join(target::exe_name("marks")));
         assert_eq!(Environment::in_sequence(&["one"]), "one");
 
         let stopped = Environment::in_sequence(&[&line("fails"), &line("marks")]);

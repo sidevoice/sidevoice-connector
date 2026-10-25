@@ -33,7 +33,7 @@ pub fn config_home(profile: &crate::profile::Profile) -> &std::path::Path {
 use super::{envelope, Identity};
 use crate::platform::env::{Env, Environment};
 use crate::platform::foreign::{Foreign, Foreigners};
-use crate::platform::process::{Process, Processes};
+use crate::platform::process::{ChildProcess, Process, Processes};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};

@@ -4,7 +4,7 @@
 //! binary.
 
 use super::registration::Launch;
-use crate::platform::process::{Child, Process, Processes};
+use crate::platform::process::{Child, ChildProcess, Processes};
 use futures_util::StreamExt;
 use rmcp::model::{InitializeResult, ListToolsResult, ProtocolVersion};
 use serde_json::{json, Value};

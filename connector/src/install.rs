@@ -49,7 +49,7 @@ use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Create, Files, Fs};
 use crate::platform::process::{Process, Processes};
 use crate::platform::service::{Service, Services};
-use crate::platform::target::{Host, Target as _};
+use crate::platform::target;
 use crate::platform::uninstall::{Ownership, Removal, Remover, Roots};
 use crate::profile::Profile;
 use crate::service::jobs::{Job, Kind};
@@ -67,7 +67,7 @@ use tokio::time::{sleep, timeout, timeout_at, Duration, Instant};
 
 /// The connector's program inside a package and inside a release (`bin/sidevoice-connector`, `.exe` on Windows).
 pub fn binary() -> String {
-    format!("bin/{}", Host::exe_name("sidevoice-connector"))
+    format!("bin/{}", target::exe_name("sidevoice-connector"))
 }
 /// How long the pair has to answer after a restart.
 const VERIFY_LIMIT: Duration = Duration::from_secs(60);
@@ -262,7 +262,7 @@ fn valid_version(version: &str) -> bool {
 /// The program beside the connector that runs the service jobs without a window (`bin/sidevoice-background.exe`),
 /// where the OS's service manager needs one (`Service::BACKGROUND`).
 fn background() -> Option<String> {
-    Services::BACKGROUND.map(|stem| format!("bin/{}", Host::exe_name(stem)))
+    Services::BACKGROUND.map(|stem| format!("bin/{}", target::exe_name(stem)))
 }
 
 /// A release that is all there: its binary, its background program where there is one, and its core's program.
@@ -1418,7 +1418,7 @@ pub(crate) mod tests {
                 fs::write(root.join(program), b"background").unwrap();
             }
             let archive = core_archive(&core_files(), &[]);
-            let target = Host::name().unwrap();
+            let target = target::build_target().map(|target| target.name).unwrap();
             let name = format!("core/sidevoice-core-0.2.0-{target}.tar.zst");
             fs::write(root.join(&name), &archive).unwrap();
             let inventory = json!({"version": version, "target": target,
@@ -1808,7 +1808,10 @@ pub(crate) mod tests {
         let fixture = Fixture::new("agents");
         let profile = &fixture.profile;
         let id = agent_without_cli();
-        let program = fixture.scratch.path().join(Host::exe_name("agent-program"));
+        let program = fixture
+            .scratch
+            .path()
+            .join(target::exe_name("agent-program"));
         crate::test_support::stand_in::Script::default().make(&program);
         let _installed = crate::agents::tests::EnvGuard::set(
             &format!("SIDEVOICE_{}_BIN", id.to_ascii_uppercase()),

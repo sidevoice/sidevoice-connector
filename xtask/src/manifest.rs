@@ -9,12 +9,14 @@ use serde_json::json;
 
 use crate::archive::unpack_checked;
 use crate::util::*;
-use crate::{entrypoint, released_names, Result, ENTRYPOINT_STEM, KIND, MANIFEST, ROOT_NAME};
+use crate::{entrypoint, Result, ENTRYPOINT_STEM, KIND, MANIFEST, ROOT_NAME, TARGETS};
 
 /// The name an archive is published under: the version for a release, `nightly` for the nightly (fixed names, so
 /// its download URLs never change). The commit is in the manifest and in every archive's inventory.
 pub(crate) fn published_name(label: &str, target: &str) -> String {
-    format!("{ROOT_NAME}-{label}-{target}.tar.zst")
+    sidevoice_platform::target::by_name(target)
+        .expect("validated release target")
+        .archive_name(ROOT_NAME, Some(label))
 }
 
 pub(crate) fn manifest(dir: &Path, tag: Option<&str>) -> Result<()> {
@@ -52,8 +54,9 @@ pub(crate) fn write_manifest(
         .unwrap_or("nightly");
     let mut bundles = serde_json::Map::new();
     let mut sums = Vec::new();
-    for target in released_names() {
-        let built = dir.join(format!("{ROOT_NAME}-{target}.tar.zst"));
+    for release_target in TARGETS {
+        let target = release_target.name;
+        let built = dir.join(release_target.archive_name(ROOT_NAME, None));
         let name = published_name(label, target);
         if built.exists() {
             fs::rename(&built, dir.join(&name)).map_err(|error| format!("{name}: {error}"))?;
@@ -123,13 +126,13 @@ mod tests {
     #[test]
     fn a_release_lists_every_released_target_under_its_version() {
         let dir = TempDir::new("xtask-manifest-release").unwrap();
-        for target in released_names() {
+        for target in TARGETS.iter().map(|target| target.name) {
             built(&dir.0, target, SHA, "0.7.0");
         }
         let bytes = write_manifest(&dir.0, Some("v0.7.0"), SHA, "0.7.0", b"lock").unwrap();
         let manifest = parse_json(&bytes, "manifest").unwrap();
         assert_eq!(manifest["version"], "0.7.0");
-        for target in released_names() {
+        for target in TARGETS.iter().map(|target| target.name) {
             let name = published_name("0.7.0", target);
             assert_eq!(manifest["bundles"][target]["name"], name.as_str());
             assert!(dir.0.join(&name).is_file());
@@ -153,9 +156,12 @@ mod tests {
 
     #[test]
     fn windows_is_in_the_manifest_with_the_other_released_targets() {
-        assert!(released_names().any(|name| name == "windows-x86_64"));
+        assert!(TARGETS
+            .iter()
+            .map(|target| target.name)
+            .any(|name| name == "windows-x86_64"));
         let dir = TempDir::new("xtask-manifest-windows").unwrap();
-        for target in released_names() {
+        for target in TARGETS.iter().map(|target| target.name) {
             built(&dir.0, target, SHA, "0.7.0");
         }
         let bytes = write_manifest(&dir.0, None, SHA, "0.7.0", b"lock").unwrap();
@@ -173,7 +179,7 @@ mod tests {
     #[test]
     fn an_archive_of_another_commit_is_refused() {
         let dir = TempDir::new("xtask-manifest-commit").unwrap();
-        for target in released_names() {
+        for target in TARGETS.iter().map(|target| target.name) {
             built(&dir.0, target, SHA, "0.7.0");
         }
         let other = "1111111111111111111111111111111111111111";

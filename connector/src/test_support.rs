@@ -12,3 +12,44 @@ pub(crate) fn temp_dir(label: &str) -> tempfile::TempDir {
 }
 
 pub(crate) mod stand_in;
+
+/// Cancel only after the leader and descendants are running, then prove none survived.
+pub(crate) async fn assert_cancellation_stops_children<T>(
+    task: tokio::task::JoinHandle<T>,
+    pid_files: &[&std::path::Path],
+) {
+    use crate::platform::process::{ChildProcess, Processes};
+    use std::time::Duration;
+    use tokio::time::{sleep, Instant};
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut pids = Vec::new();
+    for pid_file in pid_files {
+        let pid = loop {
+            if let Some(pid) = std::fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|text| text.parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child never reported its pid: {}",
+                pid_file.display()
+            );
+            sleep(Duration::from_millis(20)).await;
+        };
+        pids.push(pid);
+    }
+    task.abort();
+    assert!(task.await.err().is_some_and(|error| error.is_cancelled()));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for pid in pids {
+        while Processes::identity(pid).is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "cancelled delivery left pid {pid} running"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+}

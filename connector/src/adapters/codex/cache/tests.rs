@@ -2,7 +2,7 @@ use super::*;
 use crate::adapters::codex::{deliver_with_cache, HOME};
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Files, Fs};
-use crate::platform::target::{Host, Target};
+use crate::platform::target;
 use serde_json::json;
 use std::fs;
 
@@ -79,7 +79,7 @@ impl Fixture {
 
     fn program(&self, dir: &Path, version: &str) -> PathBuf {
         fs::create_dir_all(dir).unwrap();
-        let program = dir.join(Host::exe_name("codex"));
+        let program = dir.join(target::exe_name("codex"));
         crate::test_support::stand_in::make(
             &program,
             &json!({

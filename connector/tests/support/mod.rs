@@ -1,7 +1,7 @@
 //! What the tests that run the connector against the real core share: a private profile, the core, the connector
 //! daemon, an MCP client, the core's local HTTP routes and a presentation (call) socket.
 //!
-//! The core is the sidevoice-core release pinned by the `sidevoice-platform` tag in `connector/Cargo.toml`, unpacked by `cargo xtask core` into
+//! The core is the sidevoice-core release pinned by the `sidevoice-platform` workspace tag in `Cargo.toml`, unpacked by `cargo xtask core` into
 //! `target/sidevoice-core` (or the directory `SIDEVOICE_TEST_CORE_DIR` names). Without it these tests are skipped
 //! locally and fail in CI (`CI` set), so a missing core never passes as green.
 // These black-box tests speak the connector's and the core's wire raw, as a client of another version would.
@@ -11,7 +11,7 @@
 pub mod package;
 pub mod service;
 
-use sidevoice_connector::platform::target::{Host, Target as _};
+use sidevoice_connector::platform::target;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -30,7 +30,7 @@ use sidevoice_connector::platform::fs::Fs as _;
 // What the tests do to files (links, programs, access): the platform's `TestFiles`, for `use support::*`.
 pub use sidevoice_connector::platform::fs::{Files, TestFiles};
 use sidevoice_connector::platform::ipc::{Address as _, Channel as _, Channels, Endpoint};
-use sidevoice_connector::platform::process::{Process as _, Processes};
+use sidevoice_connector::platform::process::{ChildProcess, Process as _, Processes};
 
 pub const CONNECTOR: &str = env!("CARGO_BIN_EXE_sidevoice-connector");
 /// The windowless launcher of the Windows service jobs (built on every OS; only a package for Windows carries it).
@@ -38,10 +38,10 @@ pub const BACKGROUND: &str = env!("CARGO_BIN_EXE_sidevoice-background");
 
 /// The connector's and the core's programs inside a package, a release or an unpacked core (`.exe` on Windows).
 pub fn connector_program() -> String {
-    format!("bin/{}", Host::exe_name("sidevoice-connector"))
+    format!("bin/{}", target::exe_name("sidevoice-connector"))
 }
 pub fn core_program() -> String {
-    format!("bin/{}", Host::exe_name("sidevoice-core-rust"))
+    format!("bin/{}", target::exe_name("sidevoice-core-rust"))
 }
 
 /// The unpacked core (`<dir>/bin/sidevoice-core-rust`, `<dir>/models`), or `None` when the test must be skipped.

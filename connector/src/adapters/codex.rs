@@ -17,7 +17,7 @@ pub const HOME: crate::profile::AgentHome = crate::profile::AgentHome {
 };
 
 use super::{envelope, Identity};
-use crate::platform::process::{Process, Processes};
+use crate::platform::process::{ChildProcess, Processes};
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -182,21 +182,32 @@ async fn deliver_with_cache(
     queue
         .args(["queue", "--thread", thread, "--message"])
         .arg(envelope);
-    match run(queue, false, Duration::from_secs(30)).await {
-        Ok((status, _)) if status.success() => {
+    match queue_call(queue).await {
+        Ok(()) => {
             crate::logfile::log(&format!(
                 "codex delivery path=queued thread={thread:?} message_id={message_id:?}"
             ));
             Ok(json!({"status":"accepted","detail":"codex queue confirmed the thread"}))
         }
-        _ => {
+        Err(error) => {
             crate::logfile::log(&format!(
                 "codex delivery path=queue-failed thread={thread:?} message_id={message_id:?}"
             ));
             cache.invalidate(&key);
-            bail!("Codex queue failed")
+            Err(error)
         }
     }
+}
+
+/// Reports command setup/IO failures without including queue arguments (which contain voice input).
+async fn queue_call(command: tokio::process::Command) -> Result<()> {
+    let (status, _) = run(command, false, Duration::from_secs(30))
+        .await
+        .map_err(|error| anyhow::anyhow!("Codex queue failed: {error:#}"))?;
+    if !status.success() {
+        bail!("Codex queue failed ({status})");
+    }
+    Ok(())
 }
 
 /// Only typed, allowlisted diagnostics reach the log; arbitrary error chains may contain voice input.
@@ -211,7 +222,7 @@ fn steer_fallback_log(thread: &str, message_id: &str, error: &anyhow::Error) -> 
 }
 
 /// Runs `command` (a Codex CLI call) to its end within `limit`, giving its exit status and, when `capture`, its
-/// output. Started through [`Processes::spawn_detached`], so that on Windows it has no console window of its own (the
+/// output. Started through [`Processes::spawn_tree`], so that on Windows it has no console window of its own (the
 /// daemon has none, and a console program started without one opens a visible window); the program is stopped when
 /// this is dropped or `limit` passes.
 async fn run(
@@ -226,9 +237,10 @@ async fn run(
         } else {
             Stdio::null()
         })
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let mut child = Processes::spawn_detached(command).await?;
+        .stderr(Stdio::null());
+    let mut child = Processes::spawn_tree(command)
+        .await
+        .map_err(|error| anyhow::anyhow!("could not start Codex command: {error}"))?;
     let mut stdout = child.stdout();
     let finished = tokio::time::timeout(limit, async {
         let read = async {
@@ -369,9 +381,9 @@ mod tests {
     #[tokio::test]
     async fn a_codex_call_gives_its_status_and_output_and_is_stopped_at_its_limit() {
         use crate::platform::stand_in::{StandIn, StandIns as _};
-        use crate::platform::target::{Host, Target as _};
+        use crate::platform::target;
         let dir = crate::test_support::temp_dir("codex-run");
-        let program = dir.path().join(Host::exe_name("codex"));
+        let program = dir.path().join(target::exe_name("codex"));
         StandIn::make(
             &program,
             r#"{"play":"script","print":"codex-cli 0.157.0\n","exit":3}"#,
@@ -395,5 +407,57 @@ mod tests {
         assert!(nothing.is_empty());
         let late = run(tokio::process::Command::new(&program), true, Duration::ZERO).await;
         assert!(late.is_err(), "no time to answer");
+    }
+    #[tokio::test]
+    async fn cancelling_a_codex_delivery_stops_its_child() {
+        use crate::platform::target;
+        use crate::test_support::stand_in::Script;
+        let dir = crate::test_support::temp_dir("codex-cancel");
+        let program = dir.path().join(target::exe_name("delivery"));
+        let pid_file = dir.path().join("pid");
+        let descendant = dir.path().join(target::exe_name("descendant"));
+        let descendant_pid = dir.path().join("descendant-pid");
+        Script {
+            pid: Some(descendant_pid.clone()),
+            sleep_ms: 60_000,
+            ..Script::default()
+        }
+        .make(&descendant);
+        Script {
+            pid: Some(pid_file.clone()),
+            spawn: Some(descendant),
+            sleep_ms: 60_000,
+            ..Script::default()
+        }
+        .make(&program);
+        let task = tokio::spawn(async move {
+            run(
+                tokio::process::Command::new(program),
+                true,
+                Duration::from_secs(120),
+            )
+            .await
+        });
+        crate::test_support::assert_cancellation_stops_children(
+            task,
+            &[pid_file.as_path(), descendant_pid.as_path()],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_queue_setup_failure_keeps_the_operation_and_os_error() {
+        let dir = crate::test_support::temp_dir("codex-missing");
+        let program = dir.path().join("missing-codex");
+        let os_error = std::process::Command::new(&program).spawn().unwrap_err();
+        let error = queue_call(tokio::process::Command::new(&program))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("Codex queue failed: could not start Codex command"),
+            "{error}"
+        );
+        assert!(error.contains(&os_error.to_string()), "{error}");
     }
 }

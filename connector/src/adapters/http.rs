@@ -1,7 +1,7 @@
 use super::conversation::Conversation;
 use super::harness::{no_route, Harness, Route};
 use super::Identity;
-use crate::platform::process::{Process, Processes};
+use crate::platform::process::{ChildProcess, Processes};
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use futures_util::future::BoxFuture;
@@ -103,7 +103,7 @@ pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
 }
 
 /// Runs `curl` with `payload` on its stdin and gives its exit status and output, within `limit` after the payload is
-/// written (then the program is stopped). Started through [`Processes::spawn_detached`], so that on Windows it has no
+/// written (then the program is stopped). Started through [`Processes::spawn_tree`], so that on Windows it has no
 /// console window of its own: the daemon has none, and a console program started without one opens a visible window
 /// for every message.
 async fn send(
@@ -113,9 +113,10 @@ async fn send(
 ) -> Result<(ExitStatus, Vec<u8>)> {
     curl.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let mut child = Processes::spawn_detached(curl).await?;
+        .stderr(Stdio::null());
+    let mut child = Processes::spawn_tree(curl)
+        .await
+        .map_err(|error| anyhow::anyhow!("could not start HTTP sender: {error}"))?;
     child
         .stdin()
         .context("HTTP sender stdin unavailable")?
@@ -201,9 +202,9 @@ mod tests {
     #[tokio::test]
     async fn a_request_gives_its_status_and_output() {
         use crate::platform::stand_in::{StandIn, StandIns as _};
-        use crate::platform::target::{Host, Target as _};
+        use crate::platform::target;
         let dir = crate::test_support::temp_dir("http-send");
-        let program = dir.path().join(Host::exe_name("curl"));
+        let program = dir.path().join(target::exe_name("curl"));
         StandIn::make(&program, r#"{"play":"script","print":"ok\n201","exit":3}"#);
         // No payload: a stand-in that ends without reading its input would make writing a real one fail.
         let (status, stdout) = send(
@@ -219,11 +220,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_that_outlasts_its_limit_is_stopped() {
-        use crate::platform::process::Process as _;
-        use crate::platform::target::{Host, Target as _};
+        use crate::platform::target;
         use crate::test_support::stand_in::Script;
         let dir = crate::test_support::temp_dir("http-send-late");
-        let program = dir.path().join(Host::exe_name("curl"));
+        let program = dir.path().join(target::exe_name("curl"));
         let pid_file = dir.path().join("pid");
         // Stays up a minute, far past the limit.
         Script {
@@ -252,5 +252,58 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
+    }
+    #[tokio::test]
+    async fn cancelling_a_http_delivery_stops_its_child() {
+        use crate::platform::target;
+        use crate::test_support::stand_in::Script;
+        let dir = crate::test_support::temp_dir("http-cancel");
+        let program = dir.path().join(target::exe_name("delivery"));
+        let pid_file = dir.path().join("pid");
+        let descendant = dir.path().join(target::exe_name("descendant"));
+        let descendant_pid = dir.path().join("descendant-pid");
+        Script {
+            pid: Some(descendant_pid.clone()),
+            sleep_ms: 60_000,
+            ..Script::default()
+        }
+        .make(&descendant);
+        Script {
+            pid: Some(pid_file.clone()),
+            spawn: Some(descendant),
+            sleep_ms: 60_000,
+            ..Script::default()
+        }
+        .make(&program);
+        let task = tokio::spawn(async move {
+            send(
+                tokio::process::Command::new(program),
+                b"",
+                Duration::from_secs(120),
+            )
+            .await
+        });
+        crate::test_support::assert_cancellation_stops_children(
+            task,
+            &[pid_file.as_path(), descendant_pid.as_path()],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_sender_setup_failure_keeps_the_operation_and_os_error() {
+        let dir = crate::test_support::temp_dir("http-missing");
+        let program = dir.path().join("missing-curl");
+        let os_error = std::process::Command::new(&program).spawn().unwrap_err();
+        let error = send(
+            tokio::process::Command::new(&program),
+            b"",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("could not start HTTP sender"), "{error}");
+        assert!(error.contains(&os_error.to_string()), "{error}");
     }
 }

@@ -32,8 +32,8 @@ mod imp;
 pub use imp::Os as Services;
 
 use super::fs::{Create, Files, Fs};
-use super::process::{Process, Processes};
-use super::target::{Host, Target as _};
+use super::process::{ChildProcess, Processes};
+use super::target;
 use super::user::{User, UserId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -41,9 +41,8 @@ use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 
 const MANAGER_LIMIT: Duration = Duration::from_secs(30);
 const OUTPUT_LIMIT: usize = 64 * 1024;
@@ -224,7 +223,7 @@ pub trait Service: Sized + Send + Sync {
     const KIND: &'static str;
     /// How many starts it allows before it gives up (systemd's start limit); none where it has none to report.
     const START_LIMIT: Option<u64> = None;
-    /// The program, beside the connector, that runs the jobs' runner without a window (a stem: [`Host::exe_name`] names it),
+    /// The program, beside the connector, that runs the jobs' runner without a window (a stem: [`target::exe_name`] names it),
     /// where the manager starts a console program in a window of its own (Task Scheduler). It travels in the package,
     /// is staged in each release beside the connector, and replaces the connector in [`Service::runner`].
     const BACKGROUND: Option<&'static str> = None;
@@ -247,7 +246,7 @@ pub trait Service: Sized + Send + Sync {
     fn runner(command: &[String]) -> Vec<String> {
         let mut runner = command.to_vec();
         if let (Some(stem), Some(program)) = (Self::BACKGROUND, runner.first_mut()) {
-            let launcher = Path::new(program.as_str()).with_file_name(Host::exe_name(stem));
+            let launcher = Path::new(program.as_str()).with_file_name(target::exe_name(stem));
             if launcher.is_file() {
                 *program = launcher.to_string_lossy().into_owned();
             }
@@ -421,33 +420,9 @@ impl Output {
     }
 }
 
-async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(mut reader: R) -> Vec<u8> {
-    let mut kept = Vec::new();
-    let mut scratch = [0u8; 4096];
-    while let Ok(count) = reader.read(&mut scratch).await {
-        if count == 0 {
-            break;
-        }
-        let room = OUTPUT_LIMIT.saturating_sub(kept.len());
-        kept.extend_from_slice(&scratch[..count.min(room)]);
-    }
-    kept
-}
-
 /// How long the output of a manager's command is awaited once the command itself has exited: a descendant that
 /// keeps the pipes open does not hold the caller.
 const PIPE_GRACE: Duration = Duration::from_secs(2);
-
-/// Aborts its tasks when dropped, so a cancelled call leaves no reader behind.
-struct Readers(Vec<tokio::task::AbortHandle>);
-
-impl Drop for Readers {
-    fn drop(&mut self) {
-        for reader in &self.0 {
-            reader.abort();
-        }
-    }
-}
 
 /// Runs a manager's own command, with no shell; never fails, never outlives its deadline (the command, its output and
 /// what it started in its group or job: the tree is killed with it, also when the call is dropped).
@@ -458,7 +433,7 @@ async fn command(program: &str, args: &[&str]) -> Output {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = match Processes::spawn_tree(command).await {
+    let child = match Processes::spawn_tree(command).await {
         Ok(child) => child,
         Err(error) => {
             return Output {
@@ -468,47 +443,32 @@ async fn command(program: &str, args: &[&str]) -> Output {
             }
         }
     };
-    let stdout = tokio::spawn(read_bounded(child.stdout().expect("piped stdout")));
-    let stderr = tokio::spawn(read_bounded(child.stderr().expect("piped stderr")));
-    let _readers = Readers(vec![stdout.abort_handle(), stderr.abort_handle()]);
-    let status = match timeout(MANAGER_LIMIT, child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(error)) => {
-            child.kill_tree().await;
-            return Output {
-                ok: false,
-                code: None,
-                output: format!("{program}: {error}"),
+    // The shared collector owns its pipe buffers. Keep that future off the stack: service operations nest
+    // several manager commands, and their combined future can overflow the Windows CLI's main-thread stack.
+    match Box::pin(child.output(MANAGER_LIMIT, PIPE_GRACE, OUTPUT_LIMIT)).await {
+        Ok(mut captured) => {
+            // Truncation keeps the bounded prefix; leader success remains independent of pipe EOF.
+            let output = if captured.complete {
+                captured.stdout.extend(captured.stderr);
+                String::from_utf8_lossy(&captured.stdout).into_owned()
+            } else {
+                format!("{program}: its output did not end")
             };
+            Output {
+                ok: captured.status.success(),
+                code: captured.status.code(),
+                output,
+            }
         }
-        Err(_) => {
-            child.kill_tree().await;
-            return Output {
-                ok: false,
-                code: None,
-                output: format!("{program} {} timed out", args.join(" ")),
-            };
-        }
-    };
-    let collected = timeout(PIPE_GRACE, async {
-        let mut output = stdout.await.unwrap_or_default();
-        output.extend(stderr.await.unwrap_or_default());
-        output
-    })
-    .await;
-    // Whatever the command left running goes with it.
-    child.kill_tree().await;
-    let Ok(output) = collected else {
-        return Output {
-            ok: status.success(),
-            code: status.code(),
-            output: format!("{program}: its output did not end"),
-        };
-    };
-    Output {
-        ok: status.success(),
-        code: status.code(),
-        output: String::from_utf8_lossy(&output).into_owned(),
+        Err(error) => Output {
+            ok: false,
+            code: None,
+            output: if error.kind() == io::ErrorKind::TimedOut {
+                format!("{program} {} timed out", args.join(" "))
+            } else {
+                format!("{program}: {error}")
+            },
+        },
     }
 }
 
@@ -572,6 +532,32 @@ fn write_definition(file: &Path, text: &str) -> Result<bool, Refusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_manager_command_future_fits_nested_service_operations() {
+        let future = command("unused", &[]);
+        let bytes = std::mem::size_of_val(&future);
+        assert!(
+            bytes < 8 * 1024,
+            "manager command embeds {bytes} bytes in every caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_manager_command_keeps_its_exit_code_and_bounded_output_prefix() {
+        let scratch = crate::test_support::temp_dir("manager-output");
+        let program = scratch.path().join(target::exe_name("manager"));
+        crate::test_support::stand_in::Script {
+            print: "x".repeat(OUTPUT_LIMIT + 100),
+            exit: 7,
+            ..Default::default()
+        }
+        .make(&program);
+        let out = command(program.to_str().unwrap(), &[]).await;
+        assert!(!out.ok);
+        assert_eq!(out.code, Some(7));
+        assert_eq!(out.output, "x".repeat(OUTPUT_LIMIT));
+    }
+
     /// A manager command that exits while a descendant keeps its pipes open is answered within the grace, not when
     /// the descendant ends. (Unix only: it needs a shell to leave a descendant behind.)
     #[cfg(unix)]
@@ -581,6 +567,8 @@ mod tests {
         let out = command("sh", &["-c", "sleep 30 & exit 0"]).await;
         assert!(started.elapsed() < Duration::from_secs(10));
         assert!(out.ok);
+        assert_eq!(out.code, Some(0));
+        assert_eq!(out.output, "sh: its output did not end");
     }
 
     #[test]
@@ -641,17 +629,17 @@ mod tests {
     ) {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path();
-        let connector = bin.join(Host::exe_name("sidevoice-connector"));
+        let connector = bin.join(target::exe_name("sidevoice-connector"));
         // A release from before the launcher has none beside its connector: its command is kept.
         let command = vec![connector.to_string_lossy().into_owned(), "x".into()];
         assert_eq!(Services::runner(&command), command);
         if let Some(stem) = Services::BACKGROUND {
-            std::fs::write(bin.join(Host::exe_name(stem)), b"launcher").unwrap();
+            std::fs::write(bin.join(target::exe_name(stem)), b"launcher").unwrap();
         }
         let command = vec![connector.to_string_lossy().into_owned(), "x".into()];
         let runner = Services::runner(&command);
         let expected = match Services::BACKGROUND {
-            Some(stem) => bin.join(Host::exe_name(stem)),
+            Some(stem) => bin.join(target::exe_name(stem)),
             None => connector,
         };
         assert_eq!(Path::new(&runner[0]), expected);

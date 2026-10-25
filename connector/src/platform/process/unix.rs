@@ -1,27 +1,11 @@
-//! Unix: a process group per tree (`process-wrap`) and the Linux and BSD ways of listing open files.
+//! Unix open-file inspection and retryable executable errors.
 
-use process_wrap::tokio::{CommandWrap, ProcessGroup};
 use std::io;
 use std::path::PathBuf;
-use tokio::process::Command;
 
-/// This OS's processes.
-pub struct Os;
-
-impl super::Process for Os {
+impl super::Process for super::Processes {
     fn executable_is_busy(error: &io::Error) -> bool {
         error.raw_os_error() == Some(libc::ETXTBSY)
-    }
-
-    // A group of its own is also what detaches it: a ^C or a hangup aimed at the caller's group misses it.
-    fn detached(command: Command) -> CommandWrap {
-        Self::tree(command)
-    }
-
-    fn tree(command: Command) -> CommandWrap {
-        let mut wrap = CommandWrap::from(command);
-        wrap.wrap(ProcessGroup::leader());
-        wrap
     }
 
     // `/proc/<pid>/fd` where there is one, else `lsof`. Both name a file by where it really is.

@@ -15,22 +15,12 @@ use crate::notices::stage_notices;
 use crate::util::*;
 use crate::verify::verify;
 use crate::{
-    background, core, entrypoint, exe_suffix, Result, BACKGROUND_BIN, CORE_DIR, INVENTORY, KIND,
-    PACKAGE, ROOT_NAME,
+    background, core, entrypoint, Result, BACKGROUND_BIN, CORE_DIR, INVENTORY, KIND, PACKAGE,
+    ROOT_NAME,
 };
 
 /// Where `dist` leaves the archive.
 pub(crate) const DIST_DIR: &str = "target/dist";
-
-/// The Rust target triple this host builds for.
-fn host_triple() -> Result<String> {
-    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-    output(&rustc, &["-vV"], None)?
-        .lines()
-        .find_map(|line| line.strip_prefix("host: "))
-        .map(str::to_string)
-        .ok_or_else(|| "rustc -vV names no host".into())
-}
 
 pub(crate) fn dist() -> Result<()> {
     let repo = repo();
@@ -40,12 +30,14 @@ pub(crate) fn dist() -> Result<()> {
         .parse()
         .map_err(|_| "commit time")?;
     let version = connector_version()?;
-    let triple = host_triple()?;
-    let linux = target.starts_with("linux-");
+    let release_target =
+        sidevoice_platform::target::by_name(target).expect("validated build target");
+    let triple = release_target.triple;
+    let linux = release_target.os == "linux";
     // On Linux, cargo-zigbuild's `<triple>.<glibc>` target links against that glibc release; the binary lands in
     // target/<triple>/release.
     let (subcommand, build_target, built) = if linux {
-        let built = repo.join("target").join(&triple).join("release");
+        let built = repo.join("target").join(triple).join("release");
         (
             "zigbuild",
             Some(format!("{triple}.{}", glibc::FLOOR)),
@@ -92,7 +84,7 @@ pub(crate) fn dist() -> Result<()> {
     let binary = stage.join(&entrypoint);
     write(
         &binary,
-        &read(&built.join(format!("{PACKAGE}{}", exe_suffix(target))))?,
+        &read(&built.join(release_target.exe_name(PACKAGE)))?,
     )?;
     chmod(&binary, 0o755)?;
     let mut executables = vec![entrypoint.clone()];
@@ -100,13 +92,13 @@ pub(crate) fn dist() -> Result<()> {
         let staged = stage.join(&launcher);
         write(
             &staged,
-            &read(&built.join(format!("{BACKGROUND_BIN}{}", exe_suffix(target))))?,
+            &read(&built.join(release_target.exe_name(BACKGROUND_BIN)))?,
         )?;
         chmod(&staged, 0o755)?;
         executables.push(launcher);
     }
     write(&stage.join("LICENSE"), &read(&repo.join("LICENSE"))?)?;
-    stage_notices(&stage.join("notices"), &triple)?;
+    stage_notices(&stage.join("notices"), triple)?;
     // The core travels inside: the pinned release's archive for this target, checked against its attestation.
     let pinned = core::fetch(target)?;
     let core_archive = format!("{CORE_DIR}/{}", pinned.name);
@@ -132,7 +124,7 @@ pub(crate) fn dist() -> Result<()> {
 
     let archive = repo
         .join(DIST_DIR)
-        .join(format!("{ROOT_NAME}-{target}.tar.zst"));
+        .join(release_target.archive_name(ROOT_NAME, None));
     let executables: Vec<&str> = executables.iter().map(String::as_str).collect();
     write_archive(&work.0, ROOT_NAME, &executables, epoch, &archive)?;
     let bytes = read(&archive)?;

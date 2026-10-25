@@ -190,7 +190,7 @@ fn what_is_typed_on_the_bench_reaches_a_conversation_and_its_reply_shows() {
                "text": "A reply for the bench"}),
     );
     assert_eq!(said["text_saved"], true, "{said}");
-    let history = until("the reply on the bench", 30, || {
+    let history = until("the reply and input receipt on the bench", 30, || {
         let (_, history) = bench_http(
             &address,
             "GET",
@@ -198,9 +198,17 @@ fn what_is_typed_on_the_bench_reaches_a_conversation_and_its_reply_shows() {
             None,
         );
         let rows = history["messages"].as_array()?.clone();
-        rows.iter()
-            .any(|row| row["role"] != "user" && row["text"] == "A reply for the bench")
-            .then_some(rows)
+        let replied = rows
+            .iter()
+            .any(|row| row["role"] != "user" && row["text"] == "A reply for the bench");
+        // Reply publication and the delivery receipt are independent events. Seeing the reply does not
+        // imply the receipt has already replaced the input's transient "sending" state.
+        let received = rows.iter().any(|row| {
+            row["role"] == "user"
+                && ["delivered", "unconfirmed", "read"]
+                    .contains(&row["status"].as_str().unwrap_or(""))
+        });
+        (replied && received).then_some(rows)
     });
     let input = history
         .iter()
@@ -210,14 +218,13 @@ fn what_is_typed_on_the_bench_reaches_a_conversation_and_its_reply_shows() {
         ["delivered", "unconfirmed", "read"].contains(&input["status"].as_str().unwrap_or("")),
         "{input}"
     );
-    let (_, state) = bench_http(&address, "GET", "/api/state", None);
-    assert!(
+    until("the input receipt event on the bench", 30, || {
+        let (_, state) = bench_http(&address, "GET", "/api/state", None);
         state["events"]
-            .as_array()
-            .unwrap()
+            .as_array()?
             .iter()
-            .any(|event| event["event"]["type"] == "voice-input-receipt"),
-        "{state}"
-    );
+            .any(|event| event["event"]["type"] == "voice-input-receipt")
+            .then_some(())
+    });
     mcp.stop();
 }

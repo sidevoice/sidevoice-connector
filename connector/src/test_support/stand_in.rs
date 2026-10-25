@@ -51,7 +51,9 @@ pub(crate) struct Script {
     pub write: Option<(PathBuf, String)>,
     /// What it prints on stdout.
     pub print: String,
-    /// A file its process id is written to, before anything else.
+    /// A child program started before this script reports its pid or sleeps.
+    pub spawn: Option<PathBuf>,
+    /// A file its process id is written to, before sleeping or producing output.
     pub pid: Option<PathBuf>,
     /// How long it stays up (milliseconds) before it does the rest.
     pub sleep_ms: u64,
@@ -68,6 +70,11 @@ impl Script {
     }
 
     fn play(&self, args: &[String]) -> i32 {
+        // Dropping std::process::Child does not kill it: the delivery's owned tree must clean it up.
+        let _child = self
+            .spawn
+            .as_ref()
+            .map(|program| std::process::Command::new(program).spawn().unwrap());
         if let Some(file) = &self.pid {
             std::fs::write(file, std::process::id().to_string()).unwrap();
         }
