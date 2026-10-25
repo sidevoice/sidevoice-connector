@@ -118,9 +118,7 @@ pub(crate) fn download(url: &str) -> Result<Vec<u8>> {
 /// This machine as a release target name.
 pub(crate) fn host_target() -> Result<&'static str> {
     let (os, arch) = (env::consts::OS, env::consts::ARCH);
-    crate::TARGETS
-        .iter()
-        .find(|target| target.os == os && target.arch == arch)
+    sidevoice_platform::target::build_target()
         .map(|target| target.name)
         .ok_or_else(|| format!("unsupported build host {os}-{arch}"))
 }

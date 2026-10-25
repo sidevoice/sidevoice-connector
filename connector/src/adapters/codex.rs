@@ -381,9 +381,9 @@ mod tests {
     #[tokio::test]
     async fn a_codex_call_gives_its_status_and_output_and_is_stopped_at_its_limit() {
         use crate::platform::stand_in::{StandIn, StandIns as _};
-        use crate::platform::target::{Host, Target as _};
+        use crate::platform::target;
         let dir = crate::test_support::temp_dir("codex-run");
-        let program = dir.path().join(Host::exe_name("codex"));
+        let program = dir.path().join(target::exe_name("codex"));
         StandIn::make(
             &program,
             r#"{"play":"script","print":"codex-cli 0.157.0\n","exit":3}"#,
@@ -410,12 +410,12 @@ mod tests {
     }
     #[tokio::test]
     async fn cancelling_a_codex_delivery_stops_its_child() {
-        use crate::platform::target::{Host, Target as _};
+        use crate::platform::target;
         use crate::test_support::stand_in::Script;
         let dir = crate::test_support::temp_dir("codex-cancel");
-        let program = dir.path().join(Host::exe_name("delivery"));
+        let program = dir.path().join(target::exe_name("delivery"));
         let pid_file = dir.path().join("pid");
-        let descendant = dir.path().join(Host::exe_name("descendant"));
+        let descendant = dir.path().join(target::exe_name("descendant"));
         let descendant_pid = dir.path().join("descendant-pid");
         Script {
             pid: Some(descendant_pid.clone()),

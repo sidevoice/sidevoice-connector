@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::glibc;
 use crate::host::chmod;
 use crate::util::*;
-use crate::{entrypoint, target_names, Result, CORE_DIR, INVENTORY, KIND, ROOT_NAME};
+use crate::{entrypoint, Result, CORE_DIR, INVENTORY, KIND, ROOT_NAME, TARGETS};
 
 const MAX_COMPRESSED: u64 = 250_000_000;
 const MAX_TOTAL: u64 = 1_000_000_000;
@@ -181,17 +181,20 @@ pub(crate) fn unpack_checked(archive: &Path, destination: &Path) -> Result<(Path
     if fields != expected {
         return Err("wrong inventory fields".into());
     }
+    if !TARGETS
+        .iter()
+        .map(|target| target.name)
+        .any(|name| name == target)
+        || !is_commit(inventory["source_sha"].as_str().unwrap_or(""))
+        || inventory["version"].as_str().unwrap_or("").is_empty()
+    {
+        return Err("wrong target, source commit or version".into());
+    }
     if inventory["schema"] != 1
         || inventory["kind"] != KIND
         || inventory["entrypoint"] != entrypoint(target).as_str()
     {
         return Err("wrong kind or entrypoint".into());
-    }
-    if !target_names().any(|name| name == target)
-        || !is_commit(inventory["source_sha"].as_str().unwrap_or(""))
-        || inventory["version"].as_str().unwrap_or("").is_empty()
-    {
-        return Err("wrong target, source commit or version".into());
     }
     let records = inventory["files"].as_array().ok_or("inventory files")?;
     let names: Vec<&str> = records
@@ -331,6 +334,27 @@ mod tests {
 
     fn stage(work: &Path) -> PathBuf {
         stage_with(work, core_record)
+    }
+
+    #[test]
+    fn an_unknown_archive_target_is_refused_without_panicking() {
+        let work = TempDir::new("xtask-archive-unknown-target").unwrap();
+        let root = test_tree(&work.0, "windows-x86_64", SHA, "1.2.3", core_record);
+        let mut inventory = parse_json(&read(&root.join(INVENTORY)).unwrap(), "").unwrap();
+        inventory["target"] = "windows-aarch64".into();
+        write(&root.join(INVENTORY), &canonical(&inventory)).unwrap();
+        let archive = work.0.join("a.tar.zst");
+        write_archive(
+            &work.0,
+            ROOT_NAME,
+            &[entrypoint("windows-x86_64").as_str()],
+            1,
+            &archive,
+        )
+        .unwrap();
+        let out = TempDir::new("xtask-archive-unknown-target-out").unwrap();
+        let error = unpack_checked(&archive, &out.0).unwrap_err();
+        assert!(error.contains("wrong target"), "{error}");
     }
 
     #[test]

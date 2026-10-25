@@ -293,12 +293,12 @@ With `--json` both print one JSON object and nothing else.
 
 Each binding attempts injection when its harness supports it. `get_messages` is available for every conversation and reads only journal input that has not been injected or acknowledged. Its `get` operation returns full messages and their agent envelope, with stable `message_id` and cursor. An unacknowledged claim is returned again; pass `ack_ids` only after processing the messages. `check` reports pending counts without claiming. A claim prevents later injection. Sidevoice only notes have `channel: "note"` and empty user text; `reply_not_heard`, empty turn, return, and `reply_heard` correction notices remain in the ordinary queue. Core evidence uses only confirmed `partial` or `not_heard` fates, with full reply text and a Unicode-scalar extent. The agent envelope tells the agent to revisit what still matters, identifies each reply by its opening words, and shows only the tail of the confirmed heard prefix; the full reply remains in its `voice_say` context. A note with no person words asks the agent to tell them now what still matters. Physical playback causes stay in app diagnostics.
 
-Candidate integration tests can set `SIDEVOICE_TEST_CORE_DIR` to an unpacked source build of the matching core PR head. The `sidevoice-platform` tag in `connector/Cargo.toml` remains a numbered published release gate for distribution and CI packaging.
+Candidate integration tests can set `SIDEVOICE_TEST_CORE_DIR` to an unpacked source build of the matching core PR head. The `sidevoice-platform` workspace tag in `Cargo.toml` remains a numbered published release gate for distribution and CI packaging.
 
 ## Tests
 
 `cargo test` runs the unit tests and, in `tests/`, this binary against the sidevoice-core release named by
-the `sidevoice-platform` tag in `connector/Cargo.toml` (a conversation joins through MCP, input from a call is delivered, a reply is
+the `sidevoice-platform` workspace tag in `Cargo.toml` (a conversation joins through MCP, input from a call is delivered, a reply is
 saved, the core restarts and the link comes back), against the real Codex CLI in a disposable profile, as a
 login service under the real launchd (macOS) and the real systemd user manager (Linux; on a CI runner the test
 enables lingering for the runner's user), with no service manager at all; and the

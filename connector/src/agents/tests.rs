@@ -3,7 +3,7 @@ use crate::adapters::registration::{aggregate_readiness, ReadinessCheck};
 use crate::platform::data_dir;
 use crate::platform::fs::TestFiles;
 use crate::platform::fs::{Create, Files, Fs};
-use crate::platform::target::Host;
+use crate::platform::target;
 use crate::test_support::stand_in::Script;
 
 mod stand_ins;
@@ -33,9 +33,9 @@ async fn failed_watched_capture_keeps_the_last_scan_and_recovery_reconciles_all(
     let bin = fixture.root.join("login-bin");
     private_mkdir(&bin);
     for name in ["claude", "cursor-agent"] {
-        Script::default().make(&bin.join(Host::exe_name(name)));
+        Script::default().make(&bin.join(target::exe_name(name)));
     }
-    let shell = fixture.root.join(Host::exe_name("login-shell"));
+    let shell = fixture.root.join(target::exe_name("login-shell"));
     login_shell(&shell, &bin.to_string_lossy());
     let _shell = EnvGuard::set("SHELL", shell.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
@@ -61,7 +61,7 @@ async fn failed_watched_capture_keeps_the_last_scan_and_recovery_reconciles_all(
     assert_eq!(listed_ids(&cached), listed_ids(&first), "{cached}");
     login_shell(&shell, &bin.to_string_lossy());
     // What is installed changed while the capture was failing: recovery must look at every agent again.
-    fs::remove_file(bin.join(Host::exe_name("claude"))).unwrap();
+    fs::remove_file(bin.join(target::exe_name("claude"))).unwrap();
     let recovered = host.handle("agents.list", json!({"watch":"cursor"})).await;
     assert!(
         !listed_ids(&recovered).contains(&"claude".into()),
@@ -85,7 +85,7 @@ async fn actions_refuse_while_the_last_scan_failed_instead_of_trusting_the_cache
     let fixture = Fixture::new();
     let bin = fixture.root.join("bin");
     private_mkdir(&bin);
-    let cursor = bin.join(Host::exe_name("cursor"));
+    let cursor = bin.join(target::exe_name("cursor"));
     prints(&cursor, "Cursor 3.22.12\n");
     let _cursor_bin = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cursor.as_os_str());
     write_json(
@@ -97,7 +97,7 @@ async fn actions_refuse_while_the_last_scan_failed_instead_of_trusting_the_cache
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let first = host.handle("agents.list", json!({"rescan":true})).await;
     assert_eq!(first["scan_failed"], false, "{first}");
-    let broken = fixture.root.join(Host::exe_name("broken-login-shell"));
+    let broken = fixture.root.join(target::exe_name("broken-login-shell"));
     failing(&broken);
     let _shell = EnvGuard::set("SHELL", broken.as_os_str());
     for action in ["agents.connect", "agents.disconnect"] {
@@ -277,11 +277,13 @@ impl Fixture {
             &crate::adapters::Registry::standard().homes(),
         )
         .unwrap();
-        let cursor = root.join("cursor-bin").join(Host::exe_name("cursor-agent"));
+        let cursor = root
+            .join("cursor-bin")
+            .join(target::exe_name("cursor-agent"));
         private_mkdir(cursor.parent().unwrap());
         Script::default().make(&cursor);
         let _cursor = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cursor.as_os_str());
-        let shell = root.join(Host::exe_name("fixture-login-shell"));
+        let shell = root.join(target::exe_name("fixture-login-shell"));
         login_shell(&shell, "/usr/bin");
         let _shell = EnvGuard::set("SHELL", shell.as_os_str());
         Self {
@@ -295,7 +297,7 @@ impl Fixture {
     fn cursor(&self) -> PathBuf {
         self.root
             .join("cursor-bin")
-            .join(Host::exe_name("cursor-agent"))
+            .join(target::exe_name("cursor-agent"))
     }
 
     fn selected(&self) -> InstalledCommand {
@@ -412,7 +414,7 @@ async fn cursor_agent_row_exposes_readiness_codes_and_fallbacks_without_private_
     let fixture = Fixture::new();
     let bin = fixture.root.join("bin");
     private_mkdir(&bin);
-    let cursor = bin.join(Host::exe_name("cursor"));
+    let cursor = bin.join(target::exe_name("cursor"));
     prints(&cursor, "Cursor 3.22.12\n");
     let _cursor_bin = EnvGuard::set("SIDEVOICE_CURSOR_BIN", cursor.as_os_str());
     write_json(
@@ -464,7 +466,7 @@ async fn cursor_readiness_distinguishes_cli_only_from_editor() {
     let bin = fixture.root.join("bin");
     private_mkdir(&bin);
     let _path = EnvGuard::set("PATH", bin.as_os_str());
-    let cli = bin.join(Host::exe_name("cursor-agent"));
+    let cli = bin.join(target::exe_name("cursor-agent"));
     prints(&cli, "cursor-agent 1.0.0\n");
     write_json(
         &fixture.profile.data.join("agents.json"),
@@ -947,7 +949,7 @@ async fn replacing_cursor_profile_with_symlink_refuses_connect_without_touching_
 async fn replacing_codex_profile_with_symlink_refuses_connect_before_cli_spawn() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
-    let executable = fixture.root.join("bin").join(Host::exe_name("codex"));
+    let executable = fixture.root.join("bin").join(target::exe_name("codex"));
     private_mkdir(executable.parent().unwrap());
     let marker = fixture.root.join("codex-was-started");
     Script {
@@ -1286,7 +1288,7 @@ async fn unparsable_claude_settings_are_left_alone_without_its_data_directory() 
 async fn complete_request_gate_orders_scans_mutations_and_external_dismissals() {
     let _turn = agent_env().await;
     let fixture = Fixture::new();
-    let binary = fixture.root.join("bin").join(Host::exe_name("codex"));
+    let binary = fixture.root.join("bin").join(target::exe_name("codex"));
     private_mkdir(binary.parent().unwrap());
     stand_ins::make(&binary, "codex-gate");
     let _codex_override = EnvGuard::set("SIDEVOICE_CODEX_BIN", binary.as_os_str());
@@ -1615,7 +1617,7 @@ async fn codex_delivery_runs_the_scanned_codex_with_the_login_path() {
     let bin = fixture.root.join("login-bin");
     private_mkdir(&bin);
     let marker = fixture.root.join("queued");
-    let codex = bin.join(Host::exe_name("codex"));
+    let codex = bin.join(target::exe_name("codex"));
     Script {
         record: Some(marker.clone()),
         record_path: true,
@@ -1623,7 +1625,7 @@ async fn codex_delivery_runs_the_scanned_codex_with_the_login_path() {
     }
     .make(&codex);
     let login = login_path(&bin);
-    let shell = fixture.root.join(Host::exe_name("bench-login-shell"));
+    let shell = fixture.root.join(target::exe_name("bench-login-shell"));
     login_shell(&shell, &login);
     let _shell = EnvGuard::set("SHELL", shell.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
@@ -1655,7 +1657,7 @@ async fn codex_delivery_runs_the_scanned_codex_with_the_login_path() {
 /// A Codex CLI that keeps one `sidevoice` entry in `$CODEX_HOME` as the real one shows it (`mcp get --json`, with
 /// `transport.env`), and logs every call.
 fn fake_codex(fixture: &Fixture) -> PathBuf {
-    let binary = fixture.root.join("bin").join(Host::exe_name("codex"));
+    let binary = fixture.root.join("bin").join(target::exe_name("codex"));
     private_mkdir(binary.parent().unwrap());
     stand_ins::make(&binary, "codex");
     binary
@@ -1760,7 +1762,7 @@ async fn codex_disconnect_removes_a_disabled_or_outdated_entry_of_ours() {
 /// else `~/.claude`). Like the real one, `mcp get` starts the server the entry names (its command is kept in the data
 /// directory) to report whether it connects.
 fn fake_claude(fixture: &Fixture) -> PathBuf {
-    let binary = fixture.root.join("bin").join(Host::exe_name("claude"));
+    let binary = fixture.root.join("bin").join(target::exe_name("claude"));
     private_mkdir(binary.parent().unwrap());
     stand_ins::make(&binary, "claude");
     binary
@@ -1833,7 +1835,7 @@ async fn a_foreign_claude_entry_is_never_started() {
     let _claude = EnvGuard::set("SIDEVOICE_CLAUDE_BIN", binary.as_os_str());
     let host = HostAgents::with_selected(fixture.profile.clone(), fixture.selected());
     let ran = fixture.root.join("foreign-ran");
-    let foreign = fixture.root.join("bin").join(Host::exe_name("foreign"));
+    let foreign = fixture.root.join("bin").join(target::exe_name("foreign"));
     Script {
         write: Some((ran.clone(), String::new())),
         ..Script::default()
@@ -2511,7 +2513,7 @@ fn steer_fixture(version: &str) -> (Fixture, PathBuf) {
         append: true,
         ..Script::default()
     }
-    .make(&bin.join(Host::exe_name("codex")));
+    .make(&bin.join(target::exe_name("codex")));
     let mut state = empty_state();
     state["login_path"] = json!(login_path(&bin));
     write_json(&fixture.profile.data.join("agents.json"), &state);
@@ -2675,8 +2677,8 @@ async fn claude_never_started_is_connected_and_its_cli_makes_its_home() {
 fn overtaken_scans(fixture: &Fixture, times: u64) -> PathBuf {
     let bin = fixture.root.join("login-bin");
     private_mkdir(&bin);
-    Script::default().make(&bin.join(Host::exe_name("claude")));
-    let shell = fixture.root.join(Host::exe_name("login-shell"));
+    Script::default().make(&bin.join(target::exe_name("claude")));
+    let shell = fixture.root.join(target::exe_name("login-shell"));
     crate::test_support::stand_in::make(
         &shell,
         &json!({
@@ -2773,7 +2775,7 @@ async fn a_scan_from_the_service_environment_does_not_drop_what_the_persons_foun
         let found = host.handle("agents.list", json!({"rescan":true})).await;
         assert!(listed_ids(&found).contains(&"claude".into()), "{found}");
     }
-    let service = fixture.root.join(Host::exe_name("service-shell"));
+    let service = fixture.root.join(target::exe_name("service-shell"));
     login_shell(
         &service,
         &fixture.root.join("service-bin").to_string_lossy(),
@@ -2792,7 +2794,7 @@ async fn a_scan_from_the_service_environment_does_not_drop_what_the_persons_foun
 #[test]
 fn native_resolution_errors_and_unrunnable_results_keep_the_launcher() {
     let dir = crate::test_support::temp_dir("agent-resolver-fallback");
-    let launcher = dir.path().join(Host::exe_name("launcher"));
+    let launcher = dir.path().join(target::exe_name("launcher"));
     Files::open_private(&launcher, Create::NewProgram).unwrap();
     let found = launcher.to_str().unwrap().to_owned();
     assert_eq!(

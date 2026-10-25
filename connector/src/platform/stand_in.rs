@@ -21,7 +21,7 @@ use std::path::Path;
 
 /// What every OS implements ([`StandIn`]).
 pub trait StandIns {
-    /// Makes `program` (named as this OS names a program: `Host::exe_name`) this test binary playing `part`, a
+    /// Makes `program` (named as this OS names a program: `target::exe_name`) this test binary playing `part`, a
     /// line of JSON: executable, and private as `Files::shut_others_out` leaves a file. Two calls with another
     /// `part` give two different files.
     fn make(program: &Path, part: &str);
@@ -37,9 +37,9 @@ mod tests {
     /// A stand-in made here is found, and plays its part, whatever the OS: run, it says the part back.
     #[test]
     fn a_stand_in_runs_and_plays_its_part() {
-        use crate::platform::target::{Host, Target};
+        use crate::platform::target;
         let scratch = crate::test_support::temp_dir("stand-in");
-        let program = scratch.path().join(Host::exe_name("echo-part"));
+        let program = scratch.path().join(target::exe_name("echo-part"));
         StandIn::make(
             &program,
             r#"{"play":"script","print":"it's \"me\"\n","exit":3}"#,

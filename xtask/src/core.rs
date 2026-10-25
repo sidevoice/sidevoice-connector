@@ -1,5 +1,5 @@
 //! `cargo xtask core [DIR]`: the real core the connector's tests run against — the sidevoice-core release pinned in
-//! `sidevoice-platform` tag in `connector/Cargo.toml`, for this host, checked before it is unpacked.
+//! `sidevoice-platform` tag in `Cargo.toml`, for this host, checked before it is unpacked.
 
 use std::fs;
 use std::path::Path;
@@ -13,7 +13,7 @@ use crate::Result;
 
 pub(crate) const DEFAULT_DIR: &str = "target/sidevoice-core";
 /// The manifest whose `sidevoice-platform` dependency names the core release: the one place the core version lives.
-const MANIFEST_PATH: &str = "connector/Cargo.toml";
+const MANIFEST_PATH: &str = "Cargo.toml";
 const PLATFORM_CRATE: &str = "sidevoice-platform";
 const REPOSITORY: &str = "sidevoice/sidevoice-core";
 /// The archive's root directory and its entrypoint below it.
@@ -22,7 +22,9 @@ const ENTRYPOINT_STEM: &str = "bin/sidevoice-core-rust";
 
 /// The core's program inside its archive for `target`: `bin/sidevoice-core-rust`, `.exe` on Windows.
 fn entrypoint(target: &str) -> String {
-    format!("{ENTRYPOINT_STEM}{}", crate::exe_suffix(target))
+    sidevoice_platform::target::by_name(target)
+        .expect("validated release target")
+        .exe_name(ENTRYPOINT_STEM)
 }
 const MANIFEST: &str = "native-core-manifest.json";
 const ATTESTATION: &str = "attestation.sigstore.json";
@@ -49,7 +51,7 @@ pub(crate) fn parse_version(text: &str) -> Result<String> {
     Ok(version.to_string())
 }
 
-/// The core version a connector manifest names: the `tag` (`vX.Y.Z`) of its `sidevoice-platform` git dependency on
+/// The core version the workspace manifest names: the `tag` (`vX.Y.Z`) of its `sidevoice-platform` git dependency on
 /// the core's repository. Anything else (a path, a registry version, a branch, a rev, another tag shape) is an error.
 pub(crate) fn core_version_from_manifest(text: &str) -> Result<String> {
     let manifest: toml::Table = text
@@ -57,12 +59,13 @@ pub(crate) fn core_version_from_manifest(text: &str) -> Result<String> {
         .map_err(|error| format!("{MANIFEST_PATH} is not valid TOML: {error}"))?;
     let fail = |why: &str| {
         format!(
-            "{MANIFEST_PATH}: [dependencies] {PLATFORM_CRATE} {why}; it must be \
+            "{MANIFEST_PATH}: [workspace.dependencies] {PLATFORM_CRATE} {why}; it must be \
              {{ git = \"https://github.com/{REPOSITORY}\", tag = \"vX.Y.Z\" }}, the core release the connector bundles"
         )
     };
     let table = manifest
-        .get("dependencies")
+        .get("workspace")
+        .and_then(|workspace| workspace.get("dependencies"))
         .and_then(|dependencies| dependencies.get(PLATFORM_CRATE))
         .ok_or_else(|| fail("is missing"))?
         .as_table()
@@ -101,7 +104,9 @@ fn asset_url(version: &str, name: &str) -> String {
 }
 
 pub(crate) fn archive_name(version: &str, target: &str) -> String {
-    format!("sidevoice-core-{version}-{target}.tar.zst")
+    sidevoice_platform::target::by_name(target)
+        .expect("validated release target")
+        .archive_name("sidevoice-core", Some(version))
 }
 
 /// The pinned core release's archive for a target, downloaded and checked: listed in the release's `SHA256SUMS`
@@ -240,7 +245,7 @@ mod tests {
     }
 
     fn manifest(dependency: &str) -> String {
-        format!("[package]\nname = \"connector\"\n\n[dependencies]\nserde = \"1\"\n{dependency}\n")
+        format!("[package]\nname = \"connector\"\n\n[workspace.dependencies]\nserde = \"1\"\n{dependency}\n")
     }
 
     #[test]

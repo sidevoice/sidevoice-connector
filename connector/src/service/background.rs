@@ -9,7 +9,7 @@
 //! (`platform::service`), the connector's `run-job` then exits, and so does this program.
 
 use crate::platform::process::{ChildProcess, Processes};
-use crate::platform::target::{Host, Target as _};
+use crate::platform::target;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ pub const PROGRAM: &str = "sidevoice-background";
 
 /// The connector beside the running program.
 pub fn connector() -> io::Result<PathBuf> {
-    Ok(std::env::current_exe()?.with_file_name(Host::exe_name("sidevoice-connector")))
+    Ok(std::env::current_exe()?.with_file_name(target::exe_name("sidevoice-connector")))
 }
 
 /// `program` run with `args` and no window, waited for: its exit code (1 when it has none).

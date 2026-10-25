@@ -14,7 +14,7 @@
 //!   `sidevoice-connector-manifest.json` and `SHA256SUMS`; with a tag, the crate version must be that release.
 //! - `publish DIR TAG`: attach every file in DIR to the release TAG (for `nightly`, move the tag here first and drop
 //!   older assets), download them back, check them against `SHA256SUMS` and the attestation, and publish.
-//! - `core [DIR]`: download the sidevoice-core release pinned by the `sidevoice-platform` tag in `connector/Cargo.toml` for this host, check it against that
+//! - `core [DIR]`: download the sidevoice-core release pinned by the workspace `sidevoice-platform` tag in `Cargo.toml` for this host, check it against that
 //!   release's `SHA256SUMS`, manifest and attestation, and unpack it into DIR (default `target/sidevoice-core`),
 //!   with the checked archive beside it: where the connector's tests find the real core.
 //! - `codex [DIR]`: install the pinned Codex CLI from npm into DIR (default `target/codex`), where the registration
@@ -52,78 +52,8 @@ use std::path::Path;
 
 pub(crate) type Result<T> = std::result::Result<T, String>;
 
-/// A release target: its name in archive names and inventories, the `std::env::consts::OS` and `ARCH` of the machine
-/// that builds it (each target is built on its own runner), and npm's `os` and `cpu` for its package.
-pub(crate) struct Target {
-    pub(crate) name: &'static str,
-    pub(crate) os: &'static str,
-    pub(crate) arch: &'static str,
-    pub(crate) npm_os: &'static str,
-    pub(crate) npm_cpu: &'static str,
-    /// The suffix of a program's file name on it (`.exe` on Windows).
-    pub(crate) exe_suffix: &'static str,
-    /// Whether releases and nightlies ship it: in the manifest, the npm packages and the `release.yml` matrix. A
-    /// target that is known but not released can still be built, packaged and checked by hand.
-    pub(crate) released: bool,
-}
+use sidevoice_platform::target::{self, TARGETS};
 
-/// Every target the tooling knows: the one list the tooling reads (archives, manifest, npm packages, the launcher's
-/// dependencies). Adding a target is a line here and its runner in the `ci.yml` and `release.yml` matrices
-/// (RELEASING.md, "npm: what is published and how to add a platform").
-pub(crate) const TARGETS: &[Target] = &[
-    Target {
-        name: "linux-aarch64",
-        os: "linux",
-        arch: "aarch64",
-        npm_os: "linux",
-        npm_cpu: "arm64",
-        exe_suffix: "",
-        released: true,
-    },
-    Target {
-        name: "linux-x86_64",
-        os: "linux",
-        arch: "x86_64",
-        npm_os: "linux",
-        npm_cpu: "x64",
-        exe_suffix: "",
-        released: true,
-    },
-    Target {
-        name: "macos-aarch64",
-        os: "macos",
-        arch: "aarch64",
-        npm_os: "darwin",
-        npm_cpu: "arm64",
-        exe_suffix: "",
-        released: true,
-    },
-    Target {
-        name: "windows-x86_64",
-        os: "windows",
-        arch: "x86_64",
-        npm_os: "win32",
-        npm_cpu: "x64",
-        exe_suffix: ".exe",
-        // Released since the pinned core (the `sidevoice-platform` tag) publishes a windows-x86_64 archive. Its line
-        // in the `release.yml` matrix goes with this flag (RELEASING.md, "Windows x64").
-        released: true,
-    },
-];
-
-/// The names of [`TARGETS`], in order: every target the tooling knows.
-pub(crate) fn target_names() -> impl Iterator<Item = &'static str> {
-    TARGETS.iter().map(|target| target.name)
-}
-
-/// The names of the targets that are `released`, in order: the manifest, the npm packages and the launcher's
-/// dependencies list exactly these.
-pub(crate) fn released_names() -> impl Iterator<Item = &'static str> {
-    TARGETS
-        .iter()
-        .filter(|target| target.released)
-        .map(|target| target.name)
-}
 /// The crate whose binary is released.
 pub(crate) const PACKAGE: &str = "sidevoice-connector";
 /// The archive's single root directory.
@@ -131,18 +61,11 @@ pub(crate) const ROOT_NAME: &str = "sidevoice-connector";
 /// The connector's program inside the archive, without the suffix a target gives programs (`entrypoint`).
 pub(crate) const ENTRYPOINT_STEM: &str = "bin/sidevoice-connector";
 
-/// The suffix of a program's file name on `target` (the target's, not the host's: `dist` builds for the host, but
-/// `manifest`, `npm` and the archive checks read every target's archive from any machine).
-pub(crate) fn exe_suffix(target: &str) -> &'static str {
-    TARGETS
-        .iter()
-        .find(|known| known.name == target)
-        .map_or("", |known| known.exe_suffix)
-}
-
 /// The connector's program inside the archive of `target`: the `entrypoint` its inventory names.
 pub(crate) fn entrypoint(target: &str) -> String {
-    format!("{ENTRYPOINT_STEM}{}", exe_suffix(target))
+    target::by_name(target)
+        .expect("validated release target")
+        .exe_name(ENTRYPOINT_STEM)
 }
 /// The windowless launcher of the Windows service tasks (connector/src/background.rs), beside the connector in the
 /// Windows archive only; the connector's `Service::BACKGROUND`. Its stem, with no suffix.
@@ -152,9 +75,9 @@ pub(crate) const BACKGROUND_BIN: &str = "sidevoice-background";
 
 /// The launcher inside the archive of `target`, when that target has one.
 pub(crate) fn background(target: &str) -> Option<String> {
-    target
-        .starts_with("windows-")
-        .then(|| format!("{BACKGROUND_STEM}{}", exe_suffix(target)))
+    target::by_name(target)
+        .filter(|target| target.os == "windows")
+        .map(|target| target.exe_name(BACKGROUND_STEM))
 }
 /// Where the archive carries the pinned core release archive, as the core published it.
 pub(crate) const CORE_DIR: &str = "core";

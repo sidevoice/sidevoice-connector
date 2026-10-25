@@ -51,10 +51,8 @@ semver = "1"
 dirs = "7"
 zstd = "0.13"
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
-# This user, its private files, the local channel and the stop request (src/platform: `user`, `fs`, `ipc`; `process`,
-# `lifecycle`), shared with the core: its `sidevoice-platform`, at the tag of the core release it bundles. This tag is the
-# one place the core version lives: `cargo xtask` reads it to download, verify and bundle that same release.
-sidevoice-platform = { git = "https://github.com/sidevoice/sidevoice-core", tag = "v0.11.1" }
+# Shared platform API, pinned with the bundled core release in the workspace manifest.
+sidevoice-platform = { workspace = true }
 # Canonical paths without the `\\?\` prefix Windows gives `canonicalize` (src/platform/uninstall).
 dunce = "1"
 # Processes (src/platform/process): what every OS reads the same (owner, start, command line, parent) and the stop,
