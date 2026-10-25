@@ -4,14 +4,9 @@
 //! delete it or put a link in its place: the paths the step then uses can only lead through those directories. The
 //! anchor (the nearest directory above `D` there at the start) is compared (volume and file id, `winapi-util`) with
 //! the one seen when the removal started, and `D` with the one recorded when it was checked or made; an entry is
-//! claimed by renaming it into the private claim directory and
-//! compared before and after; the standard library's
-//! handle-based `remove_dir_all` deletes what was claimed (it removes a link or junction itself and never follows one,
-//! so it never leaves the volume). `D` and the claim directory are checked private with
-//! [`platform::fs`](crate::platform::fs).
-//!
-//! What Unix has and this does not: no recursive preflight walk (nothing is entered before it is claimed) and no
-//! mount compare (a volume mounted inside a root is a reparse point, removed as one, never entered).
+//! claimed by renaming it into the private claim directory and compared before and after. The shared
+//! `HeldDirectory` removal preflights and deletes only the selected claimed entries, retaining the root.
+//! Reparse points are never traversed. Claim publication, recovery and final lock/root cleanup remain here.
 //!
 //! A running program cannot be deleted on Windows: an uninstall run from inside what it removes (a release, or the
 //! recovery copy on a retry) is refused by [`Removal::preflight`] before anything is touched, with what to do instead.
@@ -22,7 +17,8 @@ use super::{
     foreign, recovery_program, recovery_record, DataDir, Removal, Roots, CLAIM, DATA_PREFIX,
     RECORD, RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
 };
-use crate::platform::fs::{Create, Files, Fs};
+use crate::platform::fs::{Access, Create, Directory, Files, Fs, HeldDirectory};
+use sidevoice_platform::removal::Removal as _;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -115,21 +111,6 @@ fn names(dir: &Path) -> Result<Vec<OsString>, &'static str> {
 /// Whether `name` is a claimed release.
 fn is_release(name: &OsStr) -> bool {
     name.to_string_lossy().starts_with(RELEASE_PREFIX)
-}
-
-/// `path` deleted: a link is removed itself, a directory with all it holds, a file.
-fn remove_entry(path: &Path) -> Result<(), &'static str> {
-    let kind = fs::symlink_metadata(path)
-        .map_err(|_| "uninstall entry changed during removal")?
-        .file_type();
-    let done = if kind.is_symlink() {
-        fs::remove_file(path).or_else(|_| fs::remove_dir(path))
-    } else if kind.is_dir() {
-        fs::remove_dir_all(path)
-    } else {
-        fs::remove_file(path)
-    };
-    done.map_err(|_| "cannot remove uninstall entry")
 }
 
 /// Renames `source` to `target` (in a held directory), refused when what arrived is not what was there just before.
@@ -319,6 +300,19 @@ impl Removal for Os {
         if present {
             self.hold_down_to(releases)?;
         }
+        if data.is_some() {
+            let held = HeldDirectory::open(&self.roots.data, Access::Private)
+                .map_err(|_| "unsafe uninstall data root")?;
+            super::check_live_contents(|| {
+                let selected = names(&self.roots.data).map_err(io::Error::other)?;
+                let allowed: Vec<_> = selected
+                    .iter()
+                    .filter(|name| !self.roots.kept.iter().any(|kept| *name == OsStr::new(kept)))
+                    .map(OsString::as_os_str)
+                    .collect();
+                held.check_contents(&allowed)
+            })?;
+        }
         let claim = self.roots.data.join(CLAIM);
         let claimed =
             data.is_some() && exists(&claim)? && names(&claim)?.iter().any(|name| is_release(name));
@@ -380,11 +374,14 @@ impl Removal for Os {
             claim_entry(&data.join(&entry), &claimed, &entry, before_claim)?;
             removed.push(entry.to_string_lossy().into_owned());
         }
-        for entry in names(&claim)? {
-            if !is_release(&entry) {
-                remove_entry(&claim.join(entry))?;
-            }
-        }
+        let selected: Vec<_> = names(&claim)?
+            .into_iter()
+            .filter(|entry| !is_release(entry))
+            .collect();
+        let held = HeldDirectory::open(&claim, Access::Private)
+            .map_err(|_| "unsafe uninstall claim directory")?;
+        held.remove_contents(&selected.iter().map(OsString::as_os_str).collect::<Vec<_>>())
+            .map_err(|_| "cannot remove claimed data")?;
         Ok(removed)
     }
 
@@ -402,11 +399,14 @@ impl Removal for Os {
                 &|_| {},
             )?;
         }
-        for entry in names(&claim)? {
-            if is_release(&entry) {
-                remove_entry(&claim.join(entry))?;
-            }
-        }
+        let selected: Vec<_> = names(&claim)?
+            .into_iter()
+            .filter(|entry| is_release(entry))
+            .collect();
+        let held = HeldDirectory::open(&claim, Access::Private)
+            .map_err(|_| "unsafe uninstall claim directory")?;
+        held.remove_contents(&selected.iter().map(OsString::as_os_str).collect::<Vec<_>>())
+            .map_err(|_| "cannot remove claimed releases")?;
         Ok(())
     }
 

@@ -29,17 +29,10 @@
 //! Every step starts from the anchor: the nearest directory above `D` that exists when the removal starts (the
 //! directory `D` is in, unless that is still to be made), compared with the one seen at the start before each use.
 //!
-//! How they are met differs. On Unix every step is relative to directory descriptors held open from the anchor down
-//! (`openat` with `O_NOFOLLOW`), each checked against the path again before it is used, with the mount compared at
-//! every directory, walked in full by [`Removal::preflight`] before anything is removed. On Windows each step holds
-//! every directory from the volume root down to the one it works in, each opened as itself (a link or junction there
-//! is refused) and without letting anybody rename or delete it while held, so the paths the step uses reach those
-//! directories and nothing else, a claimed entry is compared
-//! before and after its rename, and the standard library's handle-based `remove_dir_all` (which removes a link or
-//! junction itself, never what it leads to, so it never leaves the volume) does the deleting. Windows has no
-//! recursive preflight and no mount compare: it never enters a reparse point, which is how another volume is mounted
-//! there. Everything that does not touch the OS is one body here: the roots, whether `D` is ours, and the retry
-//! record.
+//! Claim publication and final empty-root/lock cleanup remain OS-specific here. Recursive preflight and
+//! payload deletion have one owner: `sidevoice_platform::removal::Removal` on `HeldDirectory`. It verifies
+//! held ancestry, refuses unsafe directories and mount boundaries, and never traverses links/reparse points.
+//! The connector selects claim names and retains recovery until every payload has been removed.
 
 #[cfg(unix)]
 #[path = "uninstall/unix.rs"]
@@ -118,6 +111,17 @@ fn resolved(path: &Path, unresolved: &'static str) -> Result<PathBuf, &'static s
             _ => return Err(unresolved),
         }
     }
+}
+
+/// A live service may replace entries during preflight. Retry the read-only shared check at most five
+/// times, always rerunning every safety check. No deletion or claim is retried by this helper.
+fn check_live_contents(mut check: impl FnMut() -> std::io::Result<()>) -> Result<(), &'static str> {
+    for _ in 0..5 {
+        if check().is_ok() {
+            return Ok(());
+        }
+    }
+    Err("cannot preflight uninstall contents")
 }
 
 /// The roots one uninstall may remove, and what stays in the data directory.
@@ -799,6 +803,28 @@ mod tests {
         }
     }
 
+    // A backslash is an ordinary filename character on Unix, but a separator on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn unix_backslashes_in_existing_data_names_are_removed() {
+        for directory in [false, true] {
+            let (_home, layout, removal) = installed("uninstall-backslash");
+            let entry = layout.data.join(r"session\backup");
+            if directory {
+                fs::create_dir(&entry).unwrap();
+                fs::write(entry.join("payload"), "session data").unwrap();
+            } else {
+                fs::write(&entry, "session data").unwrap();
+            }
+
+            assert!(removal.preflight().unwrap());
+            emptied(&removal);
+            assert!(!entry.exists());
+            assert!(removal.remove_data_dir(&|_| {}).unwrap().removed);
+            assert!(!layout.data.exists());
+        }
+    }
+
     #[test]
     fn links_inside_owned_roots_never_delete_their_targets() {
         let scratch = temp_dir("uninstall-links");
@@ -850,6 +876,122 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, ["agents.lock", "install.lock", "node-stopped.json"]);
+    }
+
+    #[test]
+    fn live_preflight_retries_but_remains_bounded() {
+        let mut attempts = 0;
+        check_live_contents(|| {
+            attempts += 1;
+            if attempts < 5 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "service replaced an entry",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, 5);
+        attempts = 0;
+        assert!(check_live_contents(|| {
+            attempts += 1;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "unsafe directory",
+            ))
+        })
+        .is_err());
+        assert_eq!(attempts, 5);
+    }
+
+    #[test]
+    fn claimed_data_retry_preserves_releases_recovery_models_and_locks() {
+        let (_home, layout, _) = installed("uninstall-shared-retry");
+        let mut selected = at(layout.data.clone(), &layout.data);
+        selected.kept = &[
+            "install.lock",
+            "connector.lock",
+            "agents.lock",
+            "node-stopped.json",
+            data_dir::MODELS,
+        ];
+        let removal = Remover::new(selected).unwrap();
+        fs::create_dir(layout.data.join(data_dir::MODELS)).unwrap();
+        fs::write(layout.data.join(data_dir::MODELS).join("model"), "keep").unwrap();
+        fs::write(layout.data.join("install.lock"), "keep").unwrap();
+        removal.stage_recovery().unwrap();
+        Files::ensure_private_dir(&layout.data.join(CLAIM)).unwrap();
+        let release = layout.data.join(CLAIM).join("release-interrupted");
+        fs::create_dir(&release).unwrap();
+        fs::write(release.join("payload"), "release").unwrap();
+        let data = layout.data.join(CLAIM).join("data-interrupted");
+        fs::create_dir(&data).unwrap();
+        fs::write(data.join("payload"), "data").unwrap();
+        removal.remove_data_contents(&|_| {}).unwrap();
+        assert!(!data.exists());
+        assert!(release.join("payload").exists());
+        assert!(layout.data.join(RECOVERY).join(recovery_program()).exists());
+        assert!(layout.data.join(RECORD).exists());
+        assert!(layout.data.join(data_dir::MODELS).join("model").exists());
+        assert!(layout.data.join("install.lock").exists());
+        removal.remove_releases().unwrap();
+        removal.finish_claim().unwrap();
+        removal.finish_recovery().unwrap();
+        assert!(layout.data.join(data_dir::MODELS).join("model").exists());
+    }
+
+    // These fixtures require Windows sharing modes; the assertions use the removal interface.
+    #[cfg(windows)]
+    #[test]
+    fn busy_claimed_payload_keeps_recovery_and_retries_after_handle_closes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        let (_home, layout, removal) = installed("uninstall-busy-payload");
+        removal.stage_recovery().unwrap();
+        Files::ensure_private_dir(&layout.data.join(CLAIM)).unwrap();
+        let claimed = layout.data.join(CLAIM).join("data-interrupted");
+        fs::create_dir(&claimed).unwrap();
+        let busy = claimed.join("busy");
+        fs::write(&busy, "payload").unwrap();
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&busy)
+            .unwrap();
+        assert!(removal.remove_data_contents(&|_| {}).is_err());
+        assert!(removal.finish_claim().is_err());
+        assert!(removal.finish_recovery().is_err());
+        assert!(layout.data.join(RECOVERY).join(recovery_program()).exists());
+        assert!(layout.data.join(RECORD).exists());
+        drop(handle);
+        removal.remove_data_contents(&|_| {}).unwrap();
+        removal.remove_releases().unwrap();
+        removal.finish_claim().unwrap();
+        removal.finish_recovery().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn final_cleanup_reports_a_lock_held_without_delete_sharing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        let (_home, layout, removal) = installed("uninstall-busy-lock");
+        let busy = layout.data.join("connector.lock");
+        fs::write(&busy, "held").unwrap();
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&busy)
+            .unwrap();
+        emptied(&removal);
+        assert_eq!(
+            removal.remove_data_dir(&|_| {}).unwrap().held,
+            ["connector.lock"]
+        );
+        drop(handle);
+        assert!(removal.remove_data_dir(&|_| {}).unwrap().held.is_empty());
     }
 
     /// `D` emptied the way an uninstall does, up to the last step.

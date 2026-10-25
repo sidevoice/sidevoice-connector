@@ -1,7 +1,6 @@
-//! Linux: the mount is the device and the mount id from `/proc/self/fdinfo`; any entry can be opened with `O_PATH`.
+//! Linux: the mount is the device and the mount id from `/proc/self/fdinfo`.
 
-use std::ffi::CStr;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::RawFd;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Mount {
@@ -22,23 +21,4 @@ pub(super) fn mount(fd: RawFd) -> Result<Mount, &'static str> {
         device: stat.st_dev,
         id,
     })
-}
-
-/// `name` in `fd`, opened to be checked against `before`: any kind of entry, by `O_PATH`.
-pub(super) fn open_entry(
-    fd: RawFd,
-    name: &CStr,
-    _before: &libc::stat,
-) -> Result<Option<OwnedFd>, &'static str> {
-    let child = unsafe {
-        libc::openat(
-            fd,
-            name.as_ptr(),
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if child < 0 {
-        return Err("uninstall entry replaced");
-    }
-    Ok(Some(unsafe { OwnedFd::from_raw_fd(child) }))
 }
