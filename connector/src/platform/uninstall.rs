@@ -803,6 +803,28 @@ mod tests {
         }
     }
 
+    // A backslash is an ordinary filename character on Unix, but a separator on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn unix_backslashes_in_existing_data_names_are_removed() {
+        for directory in [false, true] {
+            let (_home, layout, removal) = installed("uninstall-backslash");
+            let entry = layout.data.join(r"session\backup");
+            if directory {
+                fs::create_dir(&entry).unwrap();
+                fs::write(entry.join("payload"), "session data").unwrap();
+            } else {
+                fs::write(&entry, "session data").unwrap();
+            }
+
+            assert!(removal.preflight().unwrap());
+            emptied(&removal);
+            assert!(!entry.exists());
+            assert!(removal.remove_data_dir(&|_| {}).unwrap().removed);
+            assert!(!layout.data.exists());
+        }
+    }
+
     #[test]
     fn links_inside_owned_roots_never_delete_their_targets() {
         let scratch = temp_dir("uninstall-links");
