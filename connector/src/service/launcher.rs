@@ -154,7 +154,7 @@ fn failure_cause(
         return describe(key, "ready", Value::Null);
     }
     match exit {
-        Some(Err(error)) => describe("launch.exited", "spawn", json!(error.to_string())),
+        Some(Err(error)) => describe("launch.spawn-failed", "spawn", json!(error.to_string())),
         Some(Ok(code)) => describe(
             "launch.exited",
             "run",
@@ -171,11 +171,18 @@ fn spawn_failure(layout: &Layout, program: &Path, error: &io::Error) -> Value {
     let key = match error.kind() {
         io::ErrorKind::NotFound => "launch.missing-executable",
         io::ErrorKind::PermissionDenied => "launch.permission",
-        _ => "launch.exited",
+        _ => "launch.spawn-failed",
     };
-    let detail = json!(program.to_string_lossy());
+    let detail = json!(format!("{}: {error}", program.display()));
     json!({"key": key, "step": "spawn", "detail": detail, "at": crate::logfile::timestamp(),
         "message": message(key, &status::detail_params(Some(&detail))), "log_tail": status::log_tail(layout, 10)})
+}
+
+fn connector_spawn_failure(error: &io::Error) -> Failure {
+    Failure::keyed(
+        "connector.spawn-failed",
+        json!({"detail": error.to_string()}),
+    )
 }
 
 /// A core failure as an error: its key, and the failure itself for whoever reports it.
@@ -488,12 +495,9 @@ where
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut child = Processes::spawn_detached(command).await.map_err(|error| {
-        Failure::keyed(
-            "connector.not-started",
-            json!({"detail": error.to_string()}),
-        )
-    })?;
+    let mut child = Processes::spawn_detached(command)
+        .await
+        .map_err(|error| connector_spawn_failure(&error))?;
     let deadline = Instant::now() + SERVICE_WAIT;
     while Instant::now() < deadline {
         sleep(Duration::from_millis(100)).await;
@@ -551,6 +555,47 @@ impl CoreSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_failures_keep_the_setup_detail_in_json_and_english() {
+        let dir = crate::test_support::temp_dir("spawn-errors");
+        let layout = Layout::from_vars(
+            |name| (name == Environment::HOME).then(|| dir.path().to_path_buf().into()),
+            Vec::new(),
+            &[],
+        )
+        .unwrap();
+        let program = dir.path().join("core");
+        let detail = format!(
+            "SetHandleInformation(stdout): {}",
+            io::Error::from_raw_os_error(5)
+        );
+        let error = io::Error::other(detail.clone());
+        let failure = spawn_failure(&layout, &program, &error);
+        assert_eq!(failure["key"], "launch.spawn-failed");
+        assert_eq!(failure["step"], "spawn");
+        for field in ["detail", "message"] {
+            let text = failure[field].as_str().unwrap();
+            assert!(text.contains(&detail), "{failure}");
+            assert!(
+                text.contains(&program.to_string_lossy().to_string()),
+                "{failure}"
+            );
+            assert!(!text.contains("core exited"), "{failure}");
+        }
+        let connector = connector_spawn_failure(&error);
+        assert_eq!(connector.key, "connector.spawn-failed");
+        assert_eq!(connector.params["detail"], detail);
+        assert!(connector.to_string().contains(&detail));
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::PermissionDenied] {
+            let error = io::Error::new(kind, detail.clone());
+            let failure = spawn_failure(&layout, &program, &error);
+            assert!(
+                failure["message"].as_str().unwrap().contains(&detail),
+                "{failure}"
+            );
+        }
+    }
 
     #[test]
     fn a_core_is_ours_only_with_this_data_directory_as_a_whole_argument() {
