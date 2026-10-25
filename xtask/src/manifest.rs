@@ -54,8 +54,9 @@ pub(crate) fn write_manifest(
         .unwrap_or("nightly");
     let mut bundles = serde_json::Map::new();
     let mut sums = Vec::new();
-    for target in TARGETS.iter().map(|target| target.name) {
-        let built = dir.join(format!("{ROOT_NAME}-{target}.tar.zst"));
+    for release_target in TARGETS {
+        let target = release_target.name;
+        let built = dir.join(release_target.archive_name(ROOT_NAME, None));
         let name = published_name(label, target);
         if built.exists() {
             fs::rename(&built, dir.join(&name)).map_err(|error| format!("{name}: {error}"))?;
