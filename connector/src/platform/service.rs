@@ -443,7 +443,9 @@ async fn command(program: &str, args: &[&str]) -> Output {
             }
         }
     };
-    match child.output(MANAGER_LIMIT, PIPE_GRACE, OUTPUT_LIMIT).await {
+    // The shared collector owns its pipe buffers. Keep that future off the stack: service operations nest
+    // several manager commands, and their combined future can overflow the Windows CLI's main-thread stack.
+    match Box::pin(child.output(MANAGER_LIMIT, PIPE_GRACE, OUTPUT_LIMIT)).await {
         Ok(mut captured) => {
             // Truncation keeps the bounded prefix; leader success remains independent of pipe EOF.
             let output = if captured.complete {
@@ -530,6 +532,16 @@ fn write_definition(file: &Path, text: &str) -> Result<bool, Refusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_manager_command_future_fits_nested_service_operations() {
+        let future = command("unused", &[]);
+        let bytes = std::mem::size_of_val(&future);
+        assert!(
+            bytes < 8 * 1024,
+            "manager command embeds {bytes} bytes in every caller"
+        );
+    }
+
     #[tokio::test]
     async fn a_manager_command_keeps_its_exit_code_and_bounded_output_prefix() {
         let scratch = crate::test_support::temp_dir("manager-output");
