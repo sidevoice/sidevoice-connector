@@ -80,12 +80,14 @@ rustix = { version = "1", features = ["process"] }
 # `user` adds no dependency.
 nix = { version = "0.31", default-features = false, features = ["user"] }
 
-# Windows: reparse points and sharing (src/platform/uninstall, src/platform/process). Minimal features; the version the
+# Windows: reparse points and sharing (src/platform/uninstall, src/platform/process) and the Restart Manager
+# (src/platform/holders). Minimal features; the version the
 # lock already has.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    "Win32_System_RestartManager",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }

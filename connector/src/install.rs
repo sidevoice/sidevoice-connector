@@ -47,6 +47,7 @@ use crate::messages::Keyed;
 use crate::platform::data_dir;
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Create, Files, Fs};
+use crate::platform::holders::{Holder, Holders, Holding};
 use crate::platform::process::{Process, Processes};
 use crate::platform::service::{Service, Services};
 use crate::platform::target;
@@ -199,6 +200,46 @@ fn failed(detail: impl std::fmt::Display) -> anyhow::Error {
     keyed("install.failed", json!({"detail": detail.to_string()}))
 }
 
+/// `failure` (what the removal said), or, when processes hold the installed programs open, a failure that names each
+/// one and says what to do: on Windows a running program cannot be deleted, and it runs for as long as the agent
+/// or editor that started its MCP server. `own` is this process, which is not asked to close.
+fn in_use_error(
+    what: &'static str,
+    failure: anyhow::Error,
+    reason: &str,
+    holders: &[Holder],
+    own: u32,
+) -> anyhow::Error {
+    let named = holders
+        .iter()
+        .filter(|holder| holder.pid != own)
+        .map(|holder| format!("{} (PID {})", holder.name, holder.pid))
+        .collect::<Vec<_>>();
+    if named.is_empty() {
+        return failure;
+    }
+    keyed(
+        "install.files-in-use",
+        json!({"what": what, "reason": reason, "holders": named.join(", ")}),
+    )
+}
+
+/// [`in_use_error`] for the programs under `root`, asked of the OS now.
+fn explain_in_use(
+    what: &'static str,
+    root: &Path,
+    failure: anyhow::Error,
+    reason: &str,
+) -> anyhow::Error {
+    in_use_error(
+        what,
+        failure,
+        reason,
+        &Holders::of(root),
+        std::process::id(),
+    )
+}
+
 /// A failure as `{key, message, …}`: what a refusal carries about why the pair did not answer.
 fn failure_value(failure: &crate::service::Failure) -> Value {
     failure.value()["error"].clone()
@@ -325,7 +366,10 @@ fn release_id(layout: &Layout, package: &Package, digest: &str) -> Result<(Strin
         }
         if same || !selected {
             // Ours but incomplete, or another build that is not selected: staged again.
-            fs::remove_dir_all(&release)?;
+            fs::remove_dir_all(&release).map_err(|error| {
+                let reason = error.to_string();
+                explain_in_use("Install", &release, error.into(), &reason)
+            })?;
             return Ok((id, true));
         }
     }
@@ -1211,8 +1255,12 @@ async fn uninstall_with_hooks(
     .await?
     .ok_or_else(|| failed("another agents request holds agents.lock"))?;
     guard.stage_recovery().map_err(failed)?;
-    let removed = guard.remove_data_contents(&before_claim).map_err(failed)?;
-    guard.remove_releases().map_err(failed)?;
+    let removed = guard
+        .remove_data_contents(&before_claim)
+        .map_err(|reason| explain_in_use("Uninstall", &layout.data, failed(reason), reason))?;
+    guard
+        .remove_releases()
+        .map_err(|reason| explain_in_use("Uninstall", &layout.data, failed(reason), reason))?;
     guard.finish_claim().map_err(failed)?;
     guard.finish_recovery().map_err(failed)?;
     let data_dir = match guard.remove_data_dir(&|_| {}) {
@@ -1319,6 +1367,64 @@ pub(crate) mod tests {
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn programs_holding_the_installed_files_are_named_with_what_to_do() {
+        let holders = [
+            Holder {
+                pid: 4242,
+                name: "Claude".into(),
+            },
+            Holder {
+                pid: 77,
+                name: "sidevoice-connector.exe".into(),
+            },
+            Holder {
+                pid: 9,
+                name: "this installer".into(),
+            },
+        ];
+        let error = in_use_error(
+            "Uninstall",
+            failed("cannot claim uninstall entry"),
+            "cannot claim uninstall entry",
+            &holders,
+            9,
+        );
+        let said = crate::messages::keyed(&error);
+        assert_eq!(said.key, "install.files-in-use");
+        let text = said.message();
+        assert!(
+            text.contains("Claude (PID 4242), sidevoice-connector.exe (PID 77)"),
+            "{text}"
+        );
+        assert!(
+            text.starts_with("Uninstall failed (cannot claim uninstall entry)"),
+            "{text}"
+        );
+        assert!(text.contains("Close the agent app or editor"), "{text}");
+        assert!(!text.contains("PID 9)"), "{text}");
+    }
+
+    #[test]
+    fn a_failure_with_no_holder_is_said_as_it_was() {
+        for holders in [
+            &[][..],
+            &[Holder {
+                pid: 9,
+                name: "this installer".into(),
+            }][..],
+        ] {
+            let error = in_use_error(
+                "Uninstall",
+                failed("cannot claim"),
+                "cannot claim",
+                holders,
+                9,
+            );
+            assert_eq!(crate::messages::keyed(&error).key, "install.failed");
+        }
+    }
 
     /// An install whose own scan did not happen says so, by key, whether the listing is empty or holds what an earlier or
     /// another scan recorded; a listing that worked is no error.
