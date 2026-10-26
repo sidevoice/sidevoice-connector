@@ -34,4 +34,4 @@ default-members = [".", "connector", "testbench"]
 
 [workspace.dependencies]
 # Shared platform API and the core release bundled by xtask: one pin for both consumers.
-sidevoice-platform = { git = "https://github.com/sidevoice/sidevoice-core", tag = "v0.12.3" }
+sidevoice-platform = { git = "https://github.com/sidevoice/sidevoice-core", tag = "v0.12.4" }
