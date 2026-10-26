@@ -35,3 +35,27 @@ pub trait Holding {
     /// is no holder.
     fn of(root: &Path) -> Vec<Holder>;
 }
+
+/// Whether `root` may be walked: neither it nor any directory above it is a link or junction, as `is_link` says. A
+/// path the remover refused for that reason must never be enumerated, or its target would be searched for holders.
+/// Not being able to tell is a link.
+#[cfg(any(windows, test))]
+fn walkable(root: &Path, is_link: impl Fn(&Path) -> Option<bool>) -> bool {
+    root.ancestors().all(|path| is_link(path) == Some(false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_linked_root_or_a_linked_ancestor_is_never_walked() {
+        let linked = PathBuf::from("/data/link");
+        let looks = |path: &Path| Some(path == linked);
+        assert!(walkable(Path::new("/data/real/install"), looks));
+        assert!(!walkable(&linked, looks));
+        assert!(!walkable(&linked.join("deeper/install"), looks));
+        assert!(!walkable(Path::new("/data/unknown"), |_| None));
+    }
+}

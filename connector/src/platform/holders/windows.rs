@@ -5,6 +5,7 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 use windows_sys::Win32::System::RestartManager::{
     RmEndSession, RmGetList, RmRegisterResources, RmStartSession, CCH_RM_SESSION_KEY,
     RM_PROCESS_INFO,
@@ -33,6 +34,13 @@ fn files(root: &Path) -> Vec<PathBuf> {
         }
     }
     found
+}
+
+/// Whether `path` is a link, junction or other reparse point; `None` when it cannot be read.
+fn is_link(path: &Path) -> Option<bool> {
+    use std::os::windows::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    Some(meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
 }
 
 /// A Restart Manager session, ended when dropped.
@@ -126,6 +134,9 @@ fn holding(files: &[PathBuf]) -> Option<Vec<Holder>> {
 
 impl Holding for Os {
     fn of(root: &Path) -> Vec<Holder> {
+        if !super::walkable(root, is_link) {
+            return Vec::new();
+        }
         let mut holders: Vec<Holder> = files(root)
             .chunks(BATCH)
             .flat_map(|batch| holding(batch).unwrap_or_default())

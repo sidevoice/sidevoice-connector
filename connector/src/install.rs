@@ -225,6 +225,14 @@ fn in_use_error(
     )
 }
 
+/// Whether a removal refused the path itself (a link, a junction, an unsafe or replaced root), not a sharing failure:
+/// nothing is looked up for it, so a refused path is never searched.
+fn path_refusal(reason: &str) -> bool {
+    ["link", "junction", "unsafe", "replaced", "changed during"]
+        .iter()
+        .any(|word| reason.contains(word))
+}
+
 /// [`in_use_error`] for the files under `root`, asked of the OS now.
 fn explain_in_use(
     what: &'static str,
@@ -232,6 +240,9 @@ fn explain_in_use(
     failure: anyhow::Error,
     reason: &str,
 ) -> anyhow::Error {
+    if path_refusal(reason) {
+        return failure;
+    }
     in_use_error(
         what,
         failure,
@@ -1406,6 +1417,19 @@ pub(crate) mod tests {
         assert!(text.contains("If that is why, close them"), "{text}");
         assert!(text.contains("virus scanner"), "{text}");
         assert!(!text.contains("PID 9)"), "{text}");
+    }
+
+    #[test]
+    fn a_refused_path_is_never_searched_for_holders() {
+        for reason in [
+            "uninstall directory is a link or junction",
+            "unsafe uninstall data root",
+            "uninstall entry replaced during claim",
+        ] {
+            assert!(path_refusal(reason), "{reason}");
+        }
+        assert!(!path_refusal("cannot claim uninstall entry"));
+        assert!(!path_refusal("uninstall directory missing or in use"));
     }
 
     #[test]
