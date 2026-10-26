@@ -1374,7 +1374,7 @@ pub(crate) mod tests {
         let holders = [
             Holder {
                 pid: 4242,
-                name: "Claude".into(),
+                name: "editor.exe".into(),
             },
             Holder {
                 pid: 77,
@@ -1396,7 +1396,7 @@ pub(crate) mod tests {
         assert_eq!(said.key, "install.files-in-use");
         let text = said.message();
         assert!(
-            text.contains("Claude (PID 4242), sidevoice-connector.exe (PID 77)"),
+            text.contains("editor.exe (PID 4242), sidevoice-connector.exe (PID 77)"),
             "{text}"
         );
         assert!(
