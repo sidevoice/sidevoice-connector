@@ -200,9 +200,10 @@ fn failed(detail: impl std::fmt::Display) -> anyhow::Error {
     keyed("install.failed", json!({"detail": detail.to_string()}))
 }
 
-/// `failure` (what the removal said), or, when processes hold the installed programs open, a failure that names each
-/// one and says what to do: on Windows a running program cannot be deleted, and it runs for as long as the agent
-/// or editor that started its MCP server. `own` is this process, which is not asked to close.
+/// `failure` (what the removal said), or, when processes are seen holding installed files open, the same failure with
+/// each of them named and what to try. A holder seen in the tree is not proof that it caused this failure (a scanner,
+/// an agent's server, anything): the wording says so, keeps the original `reason` and does not blame an agent app
+/// alone. `own` is this process, which is not asked to close.
 fn in_use_error(
     what: &'static str,
     failure: anyhow::Error,
@@ -224,7 +225,7 @@ fn in_use_error(
     )
 }
 
-/// [`in_use_error`] for the programs under `root`, asked of the OS now.
+/// [`in_use_error`] for the files under `root`, asked of the OS now.
 fn explain_in_use(
     what: &'static str,
     root: &Path,
@@ -1210,17 +1211,21 @@ async fn uninstall_with_hooks(
     before_claim: impl Fn(&OsStr),
 ) -> Result<Value> {
     let layout = Layout::from_profile(profile);
-    let guard = Remover::new(removal_roots(&layout)).map_err(failed)?;
-    let found = guard.ownership().map_err(failed)?;
+    // A failure that touches the installation may come from a process that has its files open: the holders are looked
+    // up and named beside the original failure (`explain_in_use`); no check is relaxed.
+    let explain =
+        |reason: &'static str| explain_in_use("Uninstall", &layout.data, failed(reason), reason);
+    let guard = Remover::new(removal_roots(&layout)).map_err(explain)?;
+    let found = guard.ownership().map_err(explain)?;
     if found == Ownership::Leftovers {
         // Nothing proves an installation of ours there: nothing is written, stopped or deleted.
         return Ok(json!({"ok": true, "state": "absent", "installed": false,
             "safe_uninstall": crate::identity::SAFE_UNINSTALL, "data": layout.data, "removed": [],
             "advice": []}));
     }
-    let had_releases = preflight(&guard).map_err(failed)?;
-    guard.preflight().map_err(failed)?;
-    let install_lock = guard.lock_file("install.lock").map_err(failed)?;
+    let had_releases = preflight(&guard).map_err(explain)?;
+    guard.preflight().map_err(explain)?;
+    let install_lock = guard.lock_file("install.lock").map_err(explain)?;
     let install_held = crate::lock::wait_lock_file(
         install_lock,
         &layout.data.join("install.lock"),
@@ -1231,7 +1236,7 @@ async fn uninstall_with_hooks(
     .ok_or_else(|| failed("another install or service command holds install.lock"))?;
     // What `D` holds may have changed while the lock was awaited: still ours, or (missing at the start) only the
     // lock this uninstall just made there.
-    match (found, guard.ownership().map_err(failed)?) {
+    match (found, guard.ownership().map_err(explain)?) {
         (_, Ownership::Ours) | (Ownership::Absent, Ownership::Leftovers) => {}
         _ => {
             return Err(failed(
@@ -1239,14 +1244,14 @@ async fn uninstall_with_hooks(
             ))
         }
     }
-    guard.preflight().map_err(failed)?;
+    guard.preflight().map_err(explain)?;
     let service = runtime.unload(&layout).await?;
     let agents = if options.agents {
         unregister(profile).await
     } else {
         json!({})
     };
-    let agents_lock = guard.lock_file("agents.lock").map_err(failed)?;
+    let agents_lock = guard.lock_file("agents.lock").map_err(explain)?;
     let agents_held = crate::lock::wait_lock_file(
         agents_lock,
         &layout.data.join("agents.lock"),
@@ -1254,15 +1259,11 @@ async fn uninstall_with_hooks(
     )
     .await?
     .ok_or_else(|| failed("another agents request holds agents.lock"))?;
-    guard.stage_recovery().map_err(failed)?;
-    let removed = guard
-        .remove_data_contents(&before_claim)
-        .map_err(|reason| explain_in_use("Uninstall", &layout.data, failed(reason), reason))?;
-    guard
-        .remove_releases()
-        .map_err(|reason| explain_in_use("Uninstall", &layout.data, failed(reason), reason))?;
-    guard.finish_claim().map_err(failed)?;
-    guard.finish_recovery().map_err(failed)?;
+    guard.stage_recovery().map_err(explain)?;
+    let removed = guard.remove_data_contents(&before_claim).map_err(explain)?;
+    guard.remove_releases().map_err(explain)?;
+    guard.finish_claim().map_err(explain)?;
+    guard.finish_recovery().map_err(explain)?;
     let data_dir = match guard.remove_data_dir(&|_| {}) {
         Ok(left) => json!({"removed": left.removed, "kept": left.kept, "held": left.held}),
         // Everything else is already gone: this is said, and is not a failure of the uninstall.
@@ -1369,7 +1370,7 @@ pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
-    fn programs_holding_the_installed_files_are_named_with_what_to_do() {
+    fn programs_seen_holding_installed_files_are_named_beside_the_original_failure() {
         let holders = [
             Holder {
                 pid: 4242,
@@ -1399,10 +1400,11 @@ pub(crate) mod tests {
             "{text}"
         );
         assert!(
-            text.starts_with("Uninstall failed (cannot claim uninstall entry)"),
+            text.starts_with("Uninstall failed: cannot claim uninstall entry."),
             "{text}"
         );
-        assert!(text.contains("Close the agent app or editor"), "{text}");
+        assert!(text.contains("If that is why, close them"), "{text}");
+        assert!(text.contains("virus scanner"), "{text}");
         assert!(!text.contains("PID 9)"), "{text}");
     }
 

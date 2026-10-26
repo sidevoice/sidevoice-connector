@@ -1,4 +1,4 @@
-//! Windows: the Restart Manager's account of which processes use the programs under a directory.
+//! Windows: the Restart Manager's account of which processes use the files under a path, registered in batches.
 
 use super::{Holder, Holding};
 use std::ffi::OsStr;
@@ -10,30 +10,25 @@ use windows_sys::Win32::System::RestartManager::{
     RM_PROCESS_INFO,
 };
 
-/// How many programs are registered with the Restart Manager at most: a release holds a handful.
-const PROGRAM_LIMIT: usize = 1000;
+/// How many files are registered with the Restart Manager in one session.
+const BATCH: usize = 256;
 
 pub struct Os;
 
-/// The programs (`.exe`, `.dll`) under `root`; links are listed as themselves, never entered.
-fn programs(root: &Path) -> Vec<PathBuf> {
+/// The regular files under `root` (`root` itself when it is one); links are never followed and directories are not
+/// listed: the Restart Manager refuses them.
+fn files(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
+    if std::fs::symlink_metadata(root).is_ok_and(|meta| meta.is_file()) {
+        found.push(root.to_path_buf());
+    }
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
         for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            let path = entry.path();
-            if kind.is_dir() {
-                pending.push(path);
-            } else if kind.is_file()
-                && path.extension().is_some_and(|extension| {
-                    extension.eq_ignore_ascii_case("exe") || extension.eq_ignore_ascii_case("dll")
-                })
-                && found.len() < PROGRAM_LIMIT
-            {
-                found.push(path);
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => pending.push(entry.path()),
+                Ok(kind) if kind.is_file() => found.push(entry.path()),
+                _ => {}
             }
         }
     }
@@ -131,11 +126,10 @@ fn holding(files: &[PathBuf]) -> Option<Vec<Holder>> {
 
 impl Holding for Os {
     fn of(root: &Path) -> Vec<Holder> {
-        let files = programs(root);
-        if files.is_empty() {
-            return Vec::new();
-        }
-        let mut holders = holding(&files).unwrap_or_default();
+        let mut holders: Vec<Holder> = files(root)
+            .chunks(BATCH)
+            .flat_map(|batch| holding(batch).unwrap_or_default())
+            .collect();
         holders.sort_by_key(|holder| holder.pid);
         holders.dedup_by_key(|holder| holder.pid);
         holders
