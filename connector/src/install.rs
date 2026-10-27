@@ -47,6 +47,7 @@ use crate::messages::Keyed;
 use crate::platform::data_dir;
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Create, Files, Fs};
+use crate::platform::holders::{Holder, Holders, Holding};
 use crate::platform::process::{Process, Processes};
 use crate::platform::service::{Service, Services};
 use crate::platform::target;
@@ -199,6 +200,47 @@ fn failed(detail: impl std::fmt::Display) -> anyhow::Error {
     keyed("install.failed", json!({"detail": detail.to_string()}))
 }
 
+/// `failure` (what the removal said), or, when processes are seen holding installed files open, the same failure with
+/// each of them named and what to try. A holder seen in the tree is not proof that it caused this failure (a scanner,
+/// an agent's server, anything): the wording says so, keeps the original `reason` and does not blame an agent app
+/// alone. `own` is this process, which is not asked to close.
+fn in_use_error(
+    what: &'static str,
+    failure: anyhow::Error,
+    reason: &str,
+    holders: &[Holder],
+    own: u32,
+) -> anyhow::Error {
+    let named = holders
+        .iter()
+        .filter(|holder| holder.pid != own)
+        .map(|holder| format!("{} (PID {})", holder.name, holder.pid))
+        .collect::<Vec<_>>();
+    if named.is_empty() {
+        return failure;
+    }
+    keyed(
+        "install.files-in-use",
+        json!({"what": what, "reason": reason, "holders": named.join(", ")}),
+    )
+}
+
+/// [`in_use_error`] for the files under `root`, asked of the OS now.
+fn explain_in_use(
+    what: &'static str,
+    root: &Path,
+    failure: anyhow::Error,
+    reason: &str,
+) -> anyhow::Error {
+    in_use_error(
+        what,
+        failure,
+        reason,
+        &Holders::of(root),
+        std::process::id(),
+    )
+}
+
 /// A failure as `{key, message, …}`: what a refusal carries about why the pair did not answer.
 fn failure_value(failure: &crate::service::Failure) -> Value {
     failure.value()["error"].clone()
@@ -325,7 +367,10 @@ fn release_id(layout: &Layout, package: &Package, digest: &str) -> Result<(Strin
         }
         if same || !selected {
             // Ours but incomplete, or another build that is not selected: staged again.
-            fs::remove_dir_all(&release)?;
+            fs::remove_dir_all(&release).map_err(|error| {
+                let reason = error.to_string();
+                explain_in_use("Install", &release, error.into(), &reason)
+            })?;
             return Ok((id, true));
         }
     }
@@ -1166,17 +1211,21 @@ async fn uninstall_with_hooks(
     before_claim: impl Fn(&OsStr),
 ) -> Result<Value> {
     let layout = Layout::from_profile(profile);
-    let guard = Remover::new(removal_roots(&layout)).map_err(failed)?;
-    let found = guard.ownership().map_err(failed)?;
+    // A failure that touches the installation may come from a process that has its files open: the holders are looked
+    // up and named beside the original failure (`explain_in_use`); no check is relaxed.
+    let explain =
+        |reason: &'static str| explain_in_use("Uninstall", &layout.data, failed(reason), reason);
+    let guard = Remover::new(removal_roots(&layout)).map_err(explain)?;
+    let found = guard.ownership().map_err(explain)?;
     if found == Ownership::Leftovers {
         // Nothing proves an installation of ours there: nothing is written, stopped or deleted.
         return Ok(json!({"ok": true, "state": "absent", "installed": false,
             "safe_uninstall": crate::identity::SAFE_UNINSTALL, "data": layout.data, "removed": [],
             "advice": []}));
     }
-    let had_releases = preflight(&guard).map_err(failed)?;
-    guard.preflight().map_err(failed)?;
-    let install_lock = guard.lock_file("install.lock").map_err(failed)?;
+    let had_releases = preflight(&guard).map_err(explain)?;
+    guard.preflight().map_err(explain)?;
+    let install_lock = guard.lock_file("install.lock").map_err(explain)?;
     let install_held = crate::lock::wait_lock_file(
         install_lock,
         &layout.data.join("install.lock"),
@@ -1187,7 +1236,7 @@ async fn uninstall_with_hooks(
     .ok_or_else(|| failed("another install or service command holds install.lock"))?;
     // What `D` holds may have changed while the lock was awaited: still ours, or (missing at the start) only the
     // lock this uninstall just made there.
-    match (found, guard.ownership().map_err(failed)?) {
+    match (found, guard.ownership().map_err(explain)?) {
         (_, Ownership::Ours) | (Ownership::Absent, Ownership::Leftovers) => {}
         _ => {
             return Err(failed(
@@ -1195,14 +1244,14 @@ async fn uninstall_with_hooks(
             ))
         }
     }
-    guard.preflight().map_err(failed)?;
+    guard.preflight().map_err(explain)?;
     let service = runtime.unload(&layout).await?;
     let agents = if options.agents {
         unregister(profile).await
     } else {
         json!({})
     };
-    let agents_lock = guard.lock_file("agents.lock").map_err(failed)?;
+    let agents_lock = guard.lock_file("agents.lock").map_err(explain)?;
     let agents_held = crate::lock::wait_lock_file(
         agents_lock,
         &layout.data.join("agents.lock"),
@@ -1210,11 +1259,11 @@ async fn uninstall_with_hooks(
     )
     .await?
     .ok_or_else(|| failed("another agents request holds agents.lock"))?;
-    guard.stage_recovery().map_err(failed)?;
-    let removed = guard.remove_data_contents(&before_claim).map_err(failed)?;
-    guard.remove_releases().map_err(failed)?;
-    guard.finish_claim().map_err(failed)?;
-    guard.finish_recovery().map_err(failed)?;
+    guard.stage_recovery().map_err(explain)?;
+    let removed = guard.remove_data_contents(&before_claim).map_err(explain)?;
+    guard.remove_releases().map_err(explain)?;
+    guard.finish_claim().map_err(explain)?;
+    guard.finish_recovery().map_err(explain)?;
     let data_dir = match guard.remove_data_dir(&|_| {}) {
         Ok(left) => json!({"removed": left.removed, "kept": left.kept, "held": left.held}),
         // Everything else is already gone: this is said, and is not a failure of the uninstall.
@@ -1319,6 +1368,65 @@ pub(crate) mod tests {
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn programs_seen_holding_installed_files_are_named_beside_the_original_failure() {
+        let holders = [
+            Holder {
+                pid: 4242,
+                name: "editor.exe".into(),
+            },
+            Holder {
+                pid: 77,
+                name: "sidevoice-connector.exe".into(),
+            },
+            Holder {
+                pid: 9,
+                name: "this installer".into(),
+            },
+        ];
+        let error = in_use_error(
+            "Uninstall",
+            failed("cannot claim uninstall entry"),
+            "cannot claim uninstall entry",
+            &holders,
+            9,
+        );
+        let said = crate::messages::keyed(&error);
+        assert_eq!(said.key, "install.files-in-use");
+        let text = said.message();
+        assert!(
+            text.contains("editor.exe (PID 4242), sidevoice-connector.exe (PID 77)"),
+            "{text}"
+        );
+        assert!(
+            text.starts_with("Uninstall failed: cannot claim uninstall entry."),
+            "{text}"
+        );
+        assert!(text.contains("If that is why, close them"), "{text}");
+        assert!(text.contains("virus scanner"), "{text}");
+        assert!(!text.contains("PID 9)"), "{text}");
+    }
+
+    #[test]
+    fn a_failure_with_no_holder_is_said_as_it_was() {
+        for holders in [
+            &[][..],
+            &[Holder {
+                pid: 9,
+                name: "this installer".into(),
+            }][..],
+        ] {
+            let error = in_use_error(
+                "Uninstall",
+                failed("cannot claim"),
+                "cannot claim",
+                holders,
+                9,
+            );
+            assert_eq!(crate::messages::keyed(&error).key, "install.failed");
+        }
+    }
 
     /// An install whose own scan did not happen says so, by key, whether the listing is empty or holds what an earlier or
     /// another scan recorded; a listing that worked is no error.

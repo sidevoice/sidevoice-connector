@@ -74,6 +74,7 @@
   "core.package-missing": "This Sidevoice package does not carry a core for this computer ({detail}). Install Sidevoice again.",
   "core.package-mismatch": "The core in this Sidevoice package is not the one the package lists ({detail}); nothing was installed. Install Sidevoice again.",
   "install.failed": "Sidevoice could not be installed: {detail}",
+  "install.files-in-use": "{what} failed: {reason}. These programs have Sidevoice files open: {holders}. If that is why, close them (an agent app or editor that runs Sidevoice, a virus scanner, a file viewer), then run the command again.",
   "install.verify-failed": "Sidevoice {version} is installed but did not start ({cause}). See `npx sidevoice service status`, or run the install again.",
   "install.rolled-back": "Sidevoice {version} did not start ({cause}), so this computer is back on {previous}, which is running. Nothing of {version} was kept.",
   "install.rollback-failed": "Sidevoice {version} did not start ({cause}), and {previous}, put back in its place, did not start either ({back}). See `npx sidevoice service status`."
