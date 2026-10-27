@@ -11,9 +11,10 @@
 //!    it by its lock.
 //!
 //! The core without a job: one connector starts it, detached, and leaves it running (a call may be going on); it
-//! exits on its own when nothing has used it for a while. The handshake is the ready file `D/core/core.json`; a core
-//! that died before serving says why in `D/core/core-failure.json`, and one data directory has one core (its
-//! `flock`).
+//! exits on its own when nothing has used it for a while. Only where a detached core outlives whoever asked for it
+//! ([`Service::DETACHED_OUTLIVES_CALLER`]): elsewhere (Windows) the core runs only as its job, and with none it is
+//! not started ([`core_starter`]). The handshake is the ready file `D/core/core.json`; a core that died before
+//! serving says why in `D/core/core-failure.json`, and one data directory has one core (its `flock`).
 
 use super::definition::core_arguments;
 use super::jobs;
@@ -27,6 +28,7 @@ use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Create, Files, Fs};
 use crate::platform::ipc::{Channel, Channels};
 use crate::platform::process::{ChildProcess, Identity, Process, Processes};
+use crate::platform::service::{Service, Services};
 use serde_json::{json, Value};
 use std::fs;
 use std::io;
@@ -199,12 +201,62 @@ fn private_data_dir(path: &Path) -> Result<()> {
     Files::ensure_private_dir(path).map_err(Failure::plain)
 }
 
+/// Who starts this machine's core when it does not run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreStarter {
+    /// Its job's manager.
+    Manager,
+    /// The connector, on demand, detached.
+    Connector,
+    /// Nobody: there is no core job, and a detached core would not outlive whoever asked for it.
+    Nobody,
+}
+
+/// Who starts the core: the manager of a core job (`core_job`); else the connector where a detached core outlives its
+/// caller (`detached_outlives_caller`, [`Service::DETACHED_OUTLIVES_CALLER`]); else nobody, and a start is refused
+/// ([`core_needs_service`]).
+pub fn core_starter(core_job: bool, detached_outlives_caller: bool) -> CoreStarter {
+    if core_job {
+        CoreStarter::Manager
+    } else if detached_outlives_caller {
+        CoreStarter::Connector
+    } else {
+        CoreStarter::Nobody
+    }
+}
+
+/// The refusal for a core [`CoreStarter::Nobody`] starts: `service install` gives it a job.
+pub fn core_needs_service() -> Failure {
+    Failure::keyed("service.core-needs-service", json!({}))
+}
+
+/// Who starts this machine's core, from the jobs defined here.
+async fn starter(layout: &Layout) -> CoreStarter {
+    let core_job = jobs::installed(layout)
+        .await
+        .is_some_and(|found| found.core);
+    core_starter(core_job, Services::DETACHED_OUTLIVES_CALLER)
+}
+
+/// Why this machine's core cannot be had, said before anything is spawned: an installation, not stopped by the
+/// person, whose core nobody would start ([`core_starter`]). `None` otherwise.
+pub async fn core_refusal(layout: &Layout) -> Option<Failure> {
+    if !layout.installed() || status::stopped(layout) {
+        return None;
+    }
+    (starter(layout).await == CoreStarter::Nobody).then(core_needs_service)
+}
+
 /// The core serving this data directory without a service manager: the one already serving, or one started here,
-/// detached, from the selected release. Another core still starting holds the directory (`bind.core-running`):
+/// detached, from the selected release; refused where a detached core would not outlive its caller
+/// ([`Service::DETACHED_OUTLIVES_CALLER`]). Another core still starting holds the directory (`bind.core-running`):
 /// that one is waited for instead. Nothing here unlinks a socket: only the core holding the directory replaces it.
 pub async fn ensure_core(layout: &Layout) -> Result<Ready> {
     if let Some((ready, _)) = serving(layout, Duration::from_secs(2)).await {
         return Ok(ready);
+    }
+    if !Services::DETACHED_OUTLIVES_CALLER {
+        return Err(core_needs_service());
     }
     private_data_dir(&layout.data)?;
     private_data_dir(&layout.core_data())?;
@@ -278,13 +330,12 @@ pub async fn ensure_core(layout: &Layout) -> Result<Ready> {
     Err(core_failure(failure))
 }
 
-/// Whether this machine's core is the connector's to start: no core job, an installation selected, no stop.
+/// Whether this machine's core is the connector's to start: an installation selected, no stop, and the connector
+/// its [`core_starter`] (no core job, and a detached core outlives its caller).
 pub async fn owns_core(layout: &Layout) -> bool {
     layout.installed()
         && !status::stopped(layout)
-        && jobs::installed(layout)
-            .await
-            .is_none_or(|found| !found.core)
+        && starter(layout).await == CoreStarter::Connector
 }
 
 /// The connector's identity on its socket: `{pid, executable, managed}`.
@@ -595,6 +646,31 @@ mod tests {
                 "{failure}"
             );
         }
+    }
+
+    #[test]
+    fn the_core_is_its_jobs_else_on_demand_where_it_outlives_its_caller_else_refused() {
+        for detached_outlives_caller in [true, false] {
+            assert_eq!(
+                core_starter(true, detached_outlives_caller),
+                CoreStarter::Manager,
+                "a core job is the manager's, whatever the OS"
+            );
+        }
+        assert_eq!(core_starter(false, true), CoreStarter::Connector);
+        assert_eq!(
+            core_starter(false, false),
+            CoreStarter::Nobody,
+            "no job, and a detached core would end with its caller: nothing is spawned"
+        );
+        let refusal = core_needs_service();
+        assert_eq!(refusal.key, "service.core-needs-service");
+        assert!(
+            refusal
+                .message()
+                .contains("`npx sidevoice service install`"),
+            "{refusal}"
+        );
     }
 
     #[test]

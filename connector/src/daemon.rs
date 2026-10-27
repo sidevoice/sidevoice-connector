@@ -1469,6 +1469,12 @@ impl Daemon {
                 // A connector started a moment ago (on demand, or with its core) links within seconds: the code
                 // waits for that link, up to a bound, instead of failing while it comes.
                 let deadline = Instant::now() + PAIR_DEVICE_LINK_WAIT;
+                if !self.link.connected().await {
+                    let layout = crate::service::layout::Layout::from_profile(&self.profile);
+                    if let Some(refusal) = crate::service::launcher::core_refusal(&layout).await {
+                        bail!("{refusal}");
+                    }
+                }
                 while !self.link.connected().await {
                     if Instant::now() >= deadline {
                         bail!("this machine's core did not come up in time; ask again in a moment");

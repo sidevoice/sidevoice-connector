@@ -2,7 +2,8 @@
 //! a user bus), with the real core and an installation staged in a private profile: a conversation's MCP server
 //! starts the connector, the connector starts the core and links to it; a core that dies is started again; the
 //! person's retry ends the core and a new one comes; a person's stop ends both and holds, so a conversation is told
-//! instead of starting anything, until `service start`.
+//! instead of starting anything, until `service start`. Where the core cannot run on demand (Windows: it would end
+//! with its caller's Job Object), starting it with no core job is refused instead.
 
 mod support;
 
@@ -12,6 +13,7 @@ use std::net::{Ipv4Addr, TcpStream, UdpSocket};
 use std::process::Stdio;
 
 use serde_json::json;
+use sidevoice_connector::platform::service::{Service, Services};
 use support::service::*;
 use support::*;
 
@@ -44,6 +46,39 @@ fn with_no_manager_a_conversation_starts_the_connector_and_the_connector_the_cor
     assert!(idle["start_at_login"].is_null(), "{idle}");
     let refused = service(&profile, &extra, "login off");
     assert_eq!(refused["error"]["key"], "service.no-manager", "{refused}");
+
+    if !Services::DETACHED_OUTLIVES_CALLER {
+        // Here a core started detached would end with whoever asked for it (on Windows, its Job Object), so with no
+        // core job nothing starts one: each way of asking is refused before anything runs, with the remedy.
+        for verb in ["start", "restart"] {
+            let refused = service(&profile, &extra, verb);
+            assert_eq!(
+                refused["error"]["key"], "service.core-needs-service",
+                "{verb}: {refused}"
+            );
+        }
+        let output = command(&profile, &extra, &["pair-device", "--json"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let paired: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(!output.status.success(), "{paired}");
+        assert_eq!(
+            paired["error"]["key"], "service.core-needs-service",
+            "{paired}"
+        );
+        let after = service(&profile, &extra, "status");
+        assert_eq!(
+            (after["state"].as_str(), after["reachable"].as_bool()),
+            (Some("not-installed"), Some(false)),
+            "{after}"
+        );
+        assert!(
+            !endpoint_exists(&profile.connector_endpoint()),
+            "pair-device started a connector"
+        );
+        return;
+    }
 
     // A conversation's MCP server is what gets Sidevoice started; joining keeps its connector busy.
     let receiver = http_receiver();

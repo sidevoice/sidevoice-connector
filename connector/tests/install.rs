@@ -5,6 +5,8 @@
 //! recovers the same release and keeps that registration; uninstalling stops both, removes the registration, the
 //! releases and the data, and leaves the locks and the stop.
 //!
+//! Where the core runs only as a job of its manager (Windows), installing with no manager is refused instead.
+//!
 //! Upgrades, rollback and pruning are the unit tests' (`src/install.rs`): this binary is one version.
 
 mod support;
@@ -15,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use serde_json::{json, Value};
+use sidevoice_connector::platform::service::{Service, Services};
 use support::package::{package, pinned_core};
 use support::service::{releases, wait_gone};
 use support::*;
@@ -117,6 +120,22 @@ fn install_runs_the_pair_connects_no_agent_and_uninstall_leaves_only_the_locks()
     let _teardown = Teardown(&profile, program.clone());
 
     let (ok, installed) = run(&profile, &program, &["install"]);
+    if !Services::DETACHED_OUTLIVES_CALLER {
+        // With no manager there is no core job, and here the core runs only as one (on Windows a detached core would
+        // end with its caller's Job Object): the release is staged, and nothing starts its core.
+        assert!(!ok, "{installed}");
+        assert_eq!(
+            installed["error"]["key"], "install.verify-failed",
+            "{installed}"
+        );
+        assert_eq!(
+            installed["error"]["params"]["failure"]["key"], "service.core-needs-service",
+            "{installed}"
+        );
+        drop(_teardown);
+        let _ = fs::remove_dir_all(&at);
+        return;
+    }
     assert!(ok, "{installed}");
     let version = installed["version"].as_str().unwrap().to_owned();
     assert_eq!(installed["action"], "installed", "{installed}");

@@ -486,6 +486,10 @@ impl Runtime {
                 let _ = fs::remove_file(layout.core_failure());
                 let kind = crate::service::jobs::kind().await;
                 if kind == Kind::None {
+                    // No manager, so no core job: the core runs on demand, where it can.
+                    if let Some(refusal) = launcher::core_refusal(layout).await {
+                        return Err(refusal);
+                    }
                     crate::service::stop_on_demand_or_fail(layout).await?;
                 } else {
                     crate::service::define_and_start(layout, true).await?;

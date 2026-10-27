@@ -22,6 +22,7 @@
   "service.busy": "Another Sidevoice install or service command is under way ({detail}); nothing was changed. Try again when it has finished.",
   "service.no-installation": "Sidevoice is not installed on this computer: run `npx sidevoice install` first.",
   "service.no-manager": "This computer has no service manager for your user (launchd, or systemd --user), so Sidevoice cannot start at login here; it starts on demand when a conversation needs it.",
+  "service.core-needs-service": "On this computer the Sidevoice core runs only as a job of its login service, and that job is not installed, so nothing was started. Install it with `npx sidevoice service install`.",
   "service.unsafe-value": "A value for the service definition ({what}) contains a control character; nothing was written.",
   "service.definition-unsafe": "A Sidevoice service definition or its directory is unsafe ({detail}); nothing was changed.",
   "service.not-enabled": "The service manager did not take the Sidevoice service for your next login ({detail}); it was not installed. Run `npx sidevoice service install` again once the manager can.",

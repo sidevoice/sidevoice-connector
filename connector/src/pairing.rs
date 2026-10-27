@@ -130,9 +130,13 @@ pub fn device_answer(answer: Value) -> Result<Value> {
 }
 
 /// `pair-device`: a code from this machine's core, through its connector (started on demand when nothing runs it).
+/// Refused before anything is started when nothing would start the core (`launcher::core_refusal`).
 pub async fn device_code(profile: &Profile) -> Result<Value> {
-    crate::service::ensure_connector(profile).await?;
     let layout = crate::service::layout::Layout::from_profile(profile);
+    if let Some(refusal) = crate::service::launcher::core_refusal(&layout).await {
+        return Err(refusal.into());
+    }
+    crate::service::ensure_connector(profile).await?;
     let answer = crate::service::launcher::request_connector(
         &layout,
         "pair_device",

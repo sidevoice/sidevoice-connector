@@ -20,7 +20,7 @@ The core exposes this as a boolean fact, and the web waits three seconds before 
 | `connector [--service]` | The daemon: one per data directory. `--service` (or `SIDEVOICE_SERVICE=launchd\|systemd`) when a service manager runs it. |
 | `agents [--json]` | The agents on this computer and whether they use Sidevoice. |
 | `agents connect\|disconnect\|dismiss\|check <claude\|codex\|cursor> [--json]` | Registers Sidevoice with an agent, removes its registration, dismisses the new-agent notice, or checks that its registration works (below). Only an entry Sidevoice wrote is ever changed. |
-| `service <install\|start\|stop\|restart\|status\|uninstall> [--json]` | The login service: two jobs under launchd or the systemd user manager; with no manager, Sidevoice on demand (below). |
+| `service <install\|start\|stop\|restart\|status\|uninstall> [--json]` | The login service: two jobs under launchd, the systemd user manager or Task Scheduler; with no manager, Sidevoice on demand (below; on Windows the core runs only as its task). |
 | `service login <on\|off\|status> [--json]` | Whether the login service starts at the next login, and only that: turning it off stops nothing, turning it on starts nothing (below). |
 | `pair-device [--json]` | A one-time code from this machine's core (through the connector, started on demand) to pair a device such as the Sidevoice app: the code, its QR, its validity and where it works (`reach`: `direct` or `local-only`). `--json`: `{ok, code, expires_in, reach, payload}`. The MCP tool `voice_pair_device` says the same text. |
 | `--version [--json]` | The release version; with `--json`, also the target and the source commit. |
@@ -127,7 +127,8 @@ and 3):
 
 Under the install lock, `install` stages the release unless it is there, whole (its core as its inventory says), switches `current`, writes `install.json`, clears a person's stop, and restarts: with a service manager both
 jobs are defined (`service install`'s definitions) and restarted; without one, what runs on demand is stopped and the
-connector is started from the new release, which starts its core. The pair must then answer within 60 s: the core's
+connector is started from the new release, which starts its core (on Windows, where the core runs only as its task,
+an install with no manager fails with `service.core-needs-service`). The pair must then answer within 60 s: the core's
 health, for a launch after the restart, and the connector's identity (this release's binary) and its `node.status`.
 When it does not, `current` goes back to the release it named before, that one is restarted and verified, the failed
 release is deleted, and the install fails with `install.rolled-back` (or `install.rollback-failed`); a first
@@ -359,3 +360,14 @@ cannot be read, the start is refused (`service.login-unknown`) rather than risk 
 With no manager (`SIDEVOICE_SERVICE_MANAGER=none`, a container, an `su` shell, Linux without a user bus) or no jobs
 installed, an MCP server starts the connector from the selected installation, and the connector starts the core,
 detached, and again whenever its link to it fails.
+
+On Windows the core runs only as its Task Scheduler task, never detached: a detached process stays in its caller's
+Job Object and is ended with it, and a caller such as the desktop app runs the CLI in a job that allows no breakaway,
+so a core started on demand by `pair-device` would die as soon as the command answered. `service install` (or
+`install` with the manager) defines the task, and `service start`, `restart` and `install` run it (`schtasks /Run`),
+then wait up to their usual limits for the core to answer, as on the other systems; Task Scheduler starts it outside
+whoever asked. With no core task (`SIDEVOICE_SERVICE_MANAGER=none`, or the service uninstalled) nothing starts the
+core: `service start`, `service restart`, `pair-device` (and `voice_pair_device`) and `install` with no manager are
+refused with `service.core-needs-service`, before anything is started, and a connector does not try. The decision is
+`service::launcher::core_starter`, from whether a core job is defined and the manager's `DETACHED_OUTLIVES_CALLER`
+(`platform::service`).

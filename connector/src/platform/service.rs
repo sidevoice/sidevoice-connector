@@ -227,6 +227,11 @@ pub trait Service: Sized + Send + Sync {
     /// where the manager starts a console program in a window of its own (Task Scheduler). It travels in the package,
     /// is staged in each release beside the connector, and replaces the connector in [`Service::runner`].
     const BACKGROUND: Option<&'static str> = None;
+    /// Whether a core the connector starts outside the manager (on demand, detached) outlives whoever asked for it.
+    /// Not on Windows: a detached child stays in its caller's Job Object, which need not allow breakaway (the desktop
+    /// app runs the CLI in one that does not) and is ended with the caller; there the core runs only as the manager's
+    /// job, and a core with no job is not started.
+    const DETACHED_OUTLIVES_CALLER: bool = true;
 
     /// This user's manager, its definitions kept under `places`. Nothing is asked of it yet.
     fn new(places: Places) -> Self;
