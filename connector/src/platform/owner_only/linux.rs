@@ -3,8 +3,7 @@
 
 use std::fs::File;
 use std::io;
-use std::path::Path;
 
-pub(super) fn remove_extended(_path: &Path, _dir: &File) -> io::Result<()> {
+pub(super) fn remove_extended(_dir: &File) -> io::Result<()> {
     Ok(())
 }

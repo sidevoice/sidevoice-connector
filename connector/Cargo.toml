@@ -104,9 +104,6 @@ quick-xml = { version = "0.42", features = ["serialize"] }
 # macOS: the LaunchAgent (src/platform/service/macos.rs), written and read as a property list.
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = "1.10"
-# The extended ACL removed from a directory of ours left open (src/platform/owner_only/macos.rs); the version
-# `sidevoice-platform` reads them with.
-exacl = "0.13"
 
 [build-dependencies]
 # The Windows manifest of the binaries (build.rs): long paths. Used for Windows targets only; nothing is embedded elsewhere.
@@ -116,3 +113,8 @@ embed-manifest = "1"
 embed-resource = "3"
 # Parse the same semantic version the CLI reports for the Windows numeric resource fields.
 semver = "1"
+
+# macOS tests: an ACL given to a directory (src/platform/owner_only/macos.rs), the version `sidevoice-platform` reads
+# them with.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+exacl = "0.13"

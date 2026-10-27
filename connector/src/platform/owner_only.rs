@@ -5,8 +5,11 @@
 //!
 //! The interface is the [`OwnerOnly`] trait; [`Restrictor`] is the one OS implementation compiled in, chosen below.
 //! What it leaves is what `Fs::create_private_dir` makes: Unix mode `0700` and, on macOS, no extended ACL; Windows the
-//! protected DACL granting full control to the owner, SYSTEM and Administrators only.
+//! protected DACL granting full control to the owner, SYSTEM and Administrators only. Every change is made through
+//! the handle that was opened and judged, never through a name, so it reaches that directory and nothing else: not
+//! one put at its name meanwhile, and not what is inside it.
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::path::Path;
@@ -32,11 +35,12 @@ pub use imp::Os as Restrictor;
 
 /// What every OS implements.
 pub trait OwnerOnly {
-    /// Opens what is at `path` itself, able to change its access: a link there (Windows: any reparse point) is
-    /// refused, never followed.
-    fn open(path: &Path) -> io::Result<File>;
+    /// Opens the entry `name` (one ordinary component) of the directory at `parent`, able to change its access: the
+    /// entry itself, a link there (Windows: any reparse point) refused, never followed; `parent` itself not a link.
+    fn open(parent: &Path, name: &OsStr) -> io::Result<File>;
 
-    /// Leaves the directory behind `dir`, opened at `path` by [`OwnerOnly::open`], open to its owner only. Changes
-    /// access and nothing else: the owner, the contents and the directories above are untouched.
-    fn restrict(path: &Path, dir: &File) -> io::Result<()>;
+    /// Leaves the directory behind `dir`, opened by [`OwnerOnly::open`], open to its owner only, through that handle.
+    /// Changes its own access and nothing else: not the owner, not what is inside it (no inherited access is passed
+    /// down to it), not the directories above.
+    fn restrict(dir: &File) -> io::Result<()>;
 }
