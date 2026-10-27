@@ -163,10 +163,12 @@ impl TranscriptReader for Reader {
                 observed.push(Observed::Engine(engine));
             }
         }
-        if let Some(header) =
-            transcript::user_text(item, true).and_then(|text| transcript::voice_header(&text))
-        {
-            observed.push(Observed::Read(header));
+        if let Some(text) = transcript::user_text(item, true) {
+            observed.extend(
+                transcript::voice_headers(&text)
+                    .into_iter()
+                    .map(Observed::Read),
+            );
         }
         observed
     }

@@ -485,8 +485,12 @@ impl TranscriptReader for Reader {
         } else if item.get("role") == Some(&json!("user")) {
             observed.push(Observed::Working(true));
         }
-        if let Some(header) = text.as_deref().and_then(transcript::voice_header) {
-            observed.push(Observed::Read(header));
+        if let Some(text) = text.as_deref() {
+            observed.extend(
+                transcript::voice_headers(text)
+                    .into_iter()
+                    .map(Observed::Read),
+            );
         }
         observed
     }

@@ -287,12 +287,29 @@ pub fn user_text(item: &Value, claude: bool) -> Option<String> {
     (!texts.is_empty()).then(|| texts.join("\n"))
 }
 
-/// The header a delivered message starts with (`envelope`), when `text` carries a valid one.
-pub fn voice_header(text: &str) -> Option<Value> {
-    let start = text.find("{\"channel\":")?;
-    let tail = &text[start..];
-    let end = tail.find('}')?;
-    let header: Value = serde_json::from_str(&tail[..=end]).ok()?;
+/// Every header a delivered message starts with (`envelope`) in `text`, in order. A harness may coalesce several
+/// messages into one transcript entry, so one entry can carry many.
+pub fn voice_headers(text: &str) -> Vec<Value> {
+    let mut headers = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("{\"channel\":") {
+        let tail = &rest[start..];
+        let Some(end) = tail.find('}') else {
+            break;
+        };
+        match valid_header(&tail[..=end]) {
+            Some(header) => {
+                headers.push(header);
+                rest = &tail[end + 1..];
+            }
+            None => rest = &tail[1..],
+        }
+    }
+    headers
+}
+
+fn valid_header(text: &str) -> Option<Value> {
+    let header: Value = serde_json::from_str(text).ok()?;
     if !matches!(
         header.get("channel").and_then(Value::as_str),
         Some("voice" | "room-control" | "note")
@@ -316,7 +333,7 @@ pub fn voice_header(text: &str) -> Option<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::voice_header;
+    use super::voice_headers;
     use serde_json::json;
 
     #[test]
@@ -326,8 +343,36 @@ mod tests {
             "message_id":"note:1","text":"","unheard":{"count":1,"replies":[]}}),
         )
         .unwrap();
-        let header = voice_header(&note).unwrap();
-        assert_eq!(header["message_id"], "note:1");
-        assert_eq!(header["channel"], "note");
+        let headers = voice_headers(&note);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0]["message_id"], "note:1");
+        assert_eq!(headers[0]["channel"], "note");
+    }
+
+    #[test]
+    fn every_envelope_of_a_coalesced_entry_is_read_in_order() {
+        let envelope = |channel: &str, id: &str, words: &str| {
+            let header =
+                json!({"channel":channel,"session_id":"s","revision":1,"epoch":1,"message_id":id});
+            format!("{header}\n{words}\n[Sidevoice] trailer\n")
+        };
+        let text = [
+            envelope("voice", "m1", "one"),
+            envelope("room-control", "c1", ""),
+            envelope("voice", "m2", "two"),
+            envelope("voice", "m3", "three"),
+        ]
+        .concat();
+        let ids = voice_headers(&text)
+            .iter()
+            .map(|header| header["message_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["m1", "c1", "m2", "m3"]);
+    }
+
+    #[test]
+    fn an_invalid_header_does_not_hide_the_next_one() {
+        let text = "{\"channel\":\"voice\"} words {\"channel\":\"voice\",\"session_id\":\"s\",\"revision\":0,\"message_id\":\"m\"}";
+        assert_eq!(voice_headers(text).len(), 1);
     }
 }
