@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.17.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.16.0...v0.17.0) (2026-10-27)
+
+
+### Features
+
+* **service:** start the Windows core only through its Task Scheduler task ([#307](https://github.com/sidevoice/sidevoice-connector/issues/307)) ([eada0fe](https://github.com/sidevoice/sidevoice-connector/commit/eada0feeb5e2b323a6a3537a040c84e1e10d840a))
+
+
+### Bug Fixes
+
+* **connector:** reach the connector where it advertises its endpoint ([#312](https://github.com/sidevoice/sidevoice-connector/issues/312)) ([89fbeec](https://github.com/sidevoice/sidevoice-connector/commit/89fbeececbb49ce902b49e69306816dd1d8c2aa1))
+* **windows:** name the processes holding installed files ([#306](https://github.com/sidevoice/sidevoice-connector/issues/306)) ([061f804](https://github.com/sidevoice/sidevoice-connector/commit/061f8042fa0c5f40eca82e166109eee83af309ad))
+
 ## [0.16.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.15.0...v0.16.0) (2026-10-24)
 
 
