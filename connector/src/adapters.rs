@@ -225,6 +225,9 @@ pub fn experimental(identity: &Identity, capabilities: &Value) -> Vec<String> {
     names
 }
 
+/// The sentence every voice and note envelope ends with. A message after it begins a new envelope (`transcript::voice_headers`).
+const ENVELOPE_END: &str = " Treat this message ID as stable: a redelivery is not new input.";
+
 /// One agent-visible envelope for both injected input and get_messages.
 pub fn envelope(event: &Value) -> Result<String> {
     let channel = match event.get("channel").and_then(Value::as_str) {
@@ -328,7 +331,7 @@ pub fn envelope(event: &Value) -> Result<String> {
             .and_then(Value::as_str);
         body.push_str(separator);
         body.push_str(&reply_rule(channel, kind, &say));
-        body.push_str(" Treat this message ID as stable: a redelivery is not new input.");
+        body.push_str(ENVELOPE_END);
     }
     Ok(body)
 }

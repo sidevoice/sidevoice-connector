@@ -2,6 +2,7 @@
 
 use super::{default_effort, rollout_engine};
 use crate::adapters::conversation::{Conversation, IdentityFailures, Reporter};
+use crate::adapters::transcript;
 use crate::platform::fs::{FileId, Files, Fs};
 use serde_json::{json, Value};
 use std::fs;
@@ -203,33 +204,9 @@ async fn observe(
             }
         }
     }
-    if item.get("type") == Some(&json!("response_item"))
-        && item.pointer("/payload/type") == Some(&json!("message"))
-        && item.pointer("/payload/role") == Some(&json!("user"))
-    {
-        let text = item
-            .pointer("/payload/content")
-            .and_then(Value::as_array)
-            .map(|parts| {
-                parts
-                    .iter()
-                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("input_text"))
-                    .filter_map(|p| p.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        let Some(start) = text.find("{\"channel\":") else {
-            return;
-        };
-        let Some(end) = text[start..].find('}') else {
-            return;
-        };
-        let Ok(header) = serde_json::from_str::<Value>(&text[start..=start + end]) else {
-            return;
-        };
+    for header in user_headers(item) {
         let Some(message_id) = header.get("message_id").and_then(Value::as_str) else {
-            return;
+            continue;
         };
         reporter
             .read(
@@ -241,6 +218,29 @@ async fn observe(
             )
             .await;
     }
+}
+
+/// The envelope headers a user message of the rollout carries, in order: one response item can hold several.
+fn user_headers(item: &Value) -> Vec<Value> {
+    if item.get("type") != Some(&json!("response_item"))
+        || item.pointer("/payload/type") != Some(&json!("message"))
+        || item.pointer("/payload/role") != Some(&json!("user"))
+    {
+        return Vec::new();
+    }
+    let text = item
+        .pointer("/payload/content")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("input_text"))
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    transcript::voice_headers(&text)
 }
 
 /// The rollout of `thread` below `home/sessions/<year>/<month>/<day>/`, newest first.
@@ -289,6 +289,26 @@ fn rollout_path(home: &Path, thread: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_envelope_of_a_user_item_is_read() {
+        let envelope = |id: &str| {
+            crate::adapters::envelope(&json!({"channel":"voice","session_id":"s","revision":1,
+                "epoch":1,"message_id":id,"text":"words"}))
+            .unwrap()
+        };
+        let item = json!({"type":"response_item","payload":{"type":"message","role":"user",
+            "content":[{"type":"input_text","text":format!("{}\n\n{}", envelope("m1"), envelope("m2"))},
+            {"type":"input_text","text":envelope("m3")}]}});
+        let ids = user_headers(&item)
+            .iter()
+            .map(|header| header["message_id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["m1", "m2", "m3"]);
+        let assistant = json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+            "content":[{"type":"input_text","text":envelope("m4")}]}});
+        assert!(user_headers(&assistant).is_empty());
+    }
 
     fn home_with(catalogue: &Value) -> PathBuf {
         let home = std::env::temp_dir().join(format!("sv-codex-rollout-{}", uuid::Uuid::new_v4()));

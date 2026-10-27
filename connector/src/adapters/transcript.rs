@@ -287,25 +287,81 @@ pub fn user_text(item: &Value, claude: bool) -> Option<String> {
     (!texts.is_empty()).then(|| texts.join("\n"))
 }
 
+/// The longest a header can be. A real one is a handful of short fields; a candidate with no closing brace inside
+/// this window is not one, so malformed input is scanned in time proportional to its length.
+const HEADER_LIMIT: usize = 1024;
+
+const HEADER_START: &str = "{\"channel\":";
+
 /// Every header a delivered message starts with (`envelope`) in `text`, in order. A harness may coalesce several
 /// messages into one transcript entry, so one entry can carry many.
+///
+/// The first header is the first valid one anywhere in the text. Each later one is accepted only where an envelope
+/// can begin: straight after the previous envelope's closing sentence (`ENVELOPE_END`) or, when that one is a
+/// room-control message (which has no closing sentence), straight after its blank line. A header quoted in a
+/// message body, or in the unheard replies an envelope carries, is not a delivery and never reads one.
 pub fn voice_headers(text: &str) -> Vec<Value> {
     let mut headers = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find("{\"channel\":") {
-        let tail = &rest[start..];
-        let Some(end) = tail.find('}') else {
-            break;
-        };
-        match valid_header(&tail[..=end]) {
-            Some(header) => {
-                headers.push(header);
-                rest = &tail[end + 1..];
-            }
-            None => rest = &tail[1..],
-        }
+    let Some((first, mut position)) = first_header(text) else {
+        return headers;
+    };
+    let mut room_control = is_room_control(&first);
+    headers.push(first);
+    while let Some((header, end)) = next_header(text, position, room_control) {
+        room_control = is_room_control(&header);
+        headers.push(header);
+        position = end;
     }
     headers
+}
+
+fn is_room_control(header: &Value) -> bool {
+    header.get("channel").and_then(Value::as_str) == Some("room-control")
+}
+
+/// The first valid header anywhere in `text`, and where it ends.
+fn first_header(text: &str) -> Option<(Value, usize)> {
+    let mut from = 0;
+    while let Some(at) = text[from..].find(HEADER_START) {
+        let start = from + at;
+        if let Some((header, length)) = header_at(&text[start..]) {
+            return Some((header, start + length));
+        }
+        from = start + 1;
+    }
+    None
+}
+
+/// The header of the envelope that follows the one ending at `from`, and where it ends.
+fn next_header(text: &str, mut from: usize, room_control: bool) -> Option<(Value, usize)> {
+    let boundary = if room_control {
+        "\n\n"
+    } else {
+        super::ENVELOPE_END
+    };
+    loop {
+        from += text[from..].find(boundary)? + boundary.len();
+        let after = text[from..].trim_start_matches(['\r', '\n']);
+        if let Some((header, length)) = header_at(after) {
+            return Some((header, text.len() - after.len() + length));
+        }
+        if room_control {
+            return None;
+        }
+    }
+}
+
+/// The header `text` starts with, and its length in bytes.
+fn header_at(text: &str) -> Option<(Value, usize)> {
+    if !text.starts_with(HEADER_START) {
+        return None;
+    }
+    let mut window = text.len().min(HEADER_LIMIT);
+    while !text.is_char_boundary(window) {
+        window -= 1;
+    }
+    let end = text[..window].find('}')?;
+    Some((valid_header(&text[..=end])?, end + 1))
 }
 
 fn valid_header(text: &str) -> Option<Value> {
@@ -349,30 +405,78 @@ mod tests {
         assert_eq!(headers[0]["channel"], "note");
     }
 
+    fn envelope(channel: &str, id: &str, words: &str) -> String {
+        crate::adapters::envelope(
+            &json!({"channel":channel,"session_id":"s","revision":1,"epoch":1,
+            "message_id":id,"text":words}),
+        )
+        .unwrap()
+    }
+
+    fn ids(text: &str) -> Vec<String> {
+        voice_headers(text)
+            .iter()
+            .map(|header| header["message_id"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
     #[test]
     fn every_envelope_of_a_coalesced_entry_is_read_in_order() {
-        let envelope = |channel: &str, id: &str, words: &str| {
-            let header =
-                json!({"channel":channel,"session_id":"s","revision":1,"epoch":1,"message_id":id});
-            format!("{header}\n{words}\n[Sidevoice] trailer\n")
-        };
         let text = [
             envelope("voice", "m1", "one"),
             envelope("room-control", "c1", ""),
             envelope("voice", "m2", "two"),
             envelope("voice", "m3", "three"),
         ]
-        .concat();
-        let ids = voice_headers(&text)
-            .iter()
-            .map(|header| header["message_id"].as_str().unwrap().to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(ids, ["m1", "c1", "m2", "m3"]);
+        .join("\n\n");
+        assert_eq!(ids(&text), ["m1", "c1", "m2", "m3"]);
     }
 
     #[test]
     fn an_invalid_header_does_not_hide_the_next_one() {
-        let text = "{\"channel\":\"voice\"} words {\"channel\":\"voice\",\"session_id\":\"s\",\"revision\":0,\"message_id\":\"m\"}";
-        assert_eq!(voice_headers(text).len(), 1);
+        let text = format!(
+            "{{\"channel\":\"voice\"}} words {}",
+            envelope("voice", "m", "x")
+        );
+        assert_eq!(ids(&text), ["m"]);
+    }
+
+    #[test]
+    fn a_header_quoted_in_a_body_is_not_a_delivery() {
+        let quoted =
+            r#"{"channel":"voice","session_id":"s","revision":1,"epoch":1,"message_id":"pending"}"#;
+        let text = [
+            envelope(
+                "voice",
+                "m1",
+                &format!("look at this:\n\n{quoted}\n\nthanks"),
+            ),
+            envelope("voice", "m2", &format!("again {quoted}")),
+        ]
+        .join("\n\n");
+        assert_eq!(ids(&text), ["m1", "m2"]);
+    }
+
+    #[test]
+    fn a_header_quoted_in_an_unheard_reply_is_not_a_delivery() {
+        let quoted =
+            r#"{"channel":"voice","session_id":"s","revision":1,"epoch":1,"message_id":"pending"}"#;
+        let with_reply = crate::adapters::envelope(&json!({"channel":"voice","session_id":"s",
+            "revision":1,"epoch":1,"message_id":"m1","text":"hi",
+            "unheard":{"count":1,"replies":[{"text":format!("I wrote\n\n{quoted}\n\nand more"),
+                "heard_chars":0}]}}))
+        .unwrap();
+        let text = [with_reply, envelope("voice", "m2", "next")].join("\n\n");
+        assert_eq!(ids(&text), ["m1", "m2"]);
+    }
+
+    #[test]
+    fn a_run_of_malformed_candidates_is_scanned_in_linear_time() {
+        let text = format!("{}}}", "{\"channel\":".repeat(80_000));
+        let start = std::time::Instant::now();
+        assert!(voice_headers(&text).is_empty());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        let spaced = format!("{}{}", text, envelope("voice", "m", "x"));
+        assert_eq!(ids(&spaced), ["m"]);
     }
 }
