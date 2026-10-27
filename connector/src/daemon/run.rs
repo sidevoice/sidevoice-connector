@@ -3,7 +3,6 @@
 use super::Daemon;
 use crate::adapters::Registry;
 use crate::link::Link;
-use crate::platform::fs::{Files, Fs};
 use crate::platform::ipc::{Channel, Channels};
 use crate::platform::lifecycle::{Lifecycle, Lifecycles};
 use crate::profile::Profile;
@@ -24,8 +23,8 @@ pub(super) fn prune_binding_order(order: &mut HashMap<String, oneshot::Receiver<
 }
 
 pub async fn run(profile: Profile, managed: bool) -> Result<()> {
-    // Refused, not repaired: a data directory others can write into is not one to serve from.
-    Files::ensure_private_dir(&profile.data)?;
+    // Ours and private, made private again if it was only left open; refused otherwise (`crate::private_dir`).
+    crate::private_dir::ensure(&profile.data)?;
     crate::logfile::init(profile.data.join("connector.log"), managed);
     profile.validate_existing_private()?;
     if managed {
@@ -42,7 +41,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
         ));
         return Ok(());
     }
-    Files::check_private(&Files::open_read(&profile.data)?)
+    crate::private_dir::check_existing(&profile.data)
         .with_context(|| format!("unsafe private directory {}", profile.data.display()))?;
     let lock = profile.try_connector_lock()?;
     if profile.service_stopped()? {

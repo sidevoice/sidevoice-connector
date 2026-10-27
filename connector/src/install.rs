@@ -264,7 +264,7 @@ fn release_command(layout: &Layout, id: &str) -> PathBuf {
 /// `R/current.json` names release `id`, written whole (`platform::fs`), then `D/install.json` names its command.
 /// `D` is made first, so that failing to make it never leaves the pointer switched and the command not.
 fn select(layout: &Layout, id: &str) -> Result<()> {
-    Files::ensure_private_dir(&layout.data)?;
+    crate::private_dir::ensure(&layout.data)?;
     Files::write_json(&layout.current_record(), &json!({"release": id}))?;
     Files::write_json(
         &layout.install_file(),
@@ -429,7 +429,7 @@ async fn check_binary(binary: &Path, version: &str) -> Result<()> {
 /// or not at all.
 async fn stage(layout: &Layout, package: &Package, id: &str, digest: &str) -> Result<()> {
     let releases = layout.releases_dir();
-    Files::ensure_private_dir(&releases)?;
+    crate::private_dir::ensure(&releases)?;
     let partial = releases.join(format!(".{id}.partial-{}", uuid::Uuid::new_v4().simple()));
     Files::create_private_dir(&partial)?;
     let result = async {
@@ -720,7 +720,7 @@ pub async fn install(
 ) -> Result<Value> {
     let layout = Layout::from_profile(profile);
     let lock = crate::service::install_lock(&layout).await?;
-    Files::ensure_private_dir(&layout.releases)?;
+    crate::private_dir::ensure(&layout.releases)?;
     remove_leftovers(&layout);
     let previous = layout.selected_id();
     let digest = digest_file(&package.binary)?;

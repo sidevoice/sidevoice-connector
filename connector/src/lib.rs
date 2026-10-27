@@ -17,6 +17,7 @@ pub mod mcp;
 pub mod messages;
 pub mod pairing;
 pub mod platform;
+pub mod private_dir;
 pub mod profile;
 pub mod service;
 #[cfg(test)]

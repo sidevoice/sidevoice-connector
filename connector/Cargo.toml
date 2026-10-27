@@ -73,19 +73,22 @@ tempfile = "3"
 sidevoice-connector = { path = ".", features = ["test-support"] }
 ctor = "1"
 
-# Unix: the effective uid (src/platform/service/macos: the launchd domain), with no `unsafe` of ours.
+# Unix: the effective uid (src/platform/service/macos: the launchd domain) and the mode of a directory of ours left open
+# (src/platform/owner_only/unix.rs: `fchmod`), with no `unsafe` of ours.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "fs"] }
 # The login shell from the user database (src/platform/env/unix): `getpwuid_r`, no `unsafe` of ours. Already in the lock;
 # `user` adds no dependency.
 nix = { version = "0.31", default-features = false, features = ["user"] }
 
 # Windows: reparse points and sharing (src/platform/uninstall, src/platform/process) and the Restart Manager
-# (src/platform/holders). Minimal features; the version the
-# lock already has.
+# (src/platform/holders), and the private DACL put back on a directory of ours left open (src/platform/owner_only).
+# Minimal features; the version the lock already has.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_RestartManager",
     "Win32_System_SystemInformation",
@@ -101,6 +104,9 @@ quick-xml = { version = "0.42", features = ["serialize"] }
 # macOS: the LaunchAgent (src/platform/service/macos.rs), written and read as a property list.
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = "1.10"
+# The extended ACL removed from a directory of ours left open (src/platform/owner_only/macos.rs); the version
+# `sidevoice-platform` reads them with.
+exacl = "0.13"
 
 [build-dependencies]
 # The Windows manifest of the binaries (build.rs): long paths. Used for Windows targets only; nothing is embedded elsewhere.

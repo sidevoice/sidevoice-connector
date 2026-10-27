@@ -1390,6 +1390,7 @@ dependencies = [
  "dunce",
  "embed-manifest",
  "embed-resource",
+ "exacl",
  "futures-util",
  "hex",
  "interprocess",

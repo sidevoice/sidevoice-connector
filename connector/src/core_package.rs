@@ -351,7 +351,7 @@ pub fn stage(core: &PackagedCore, release: &Path) -> Result<PathBuf> {
     if !release.is_absolute() {
         bail!("{} is not an absolute path", release.display());
     }
-    crate::platform::fs::Files::check_private(&crate::platform::fs::Files::open_read(release)?)
+    crate::private_dir::check_existing(release)
         .with_context(|| format!("unsafe private directory {}", release.display()))?;
     let destination = release.join(crate::service::layout::CORE_DIRECTORY);
     if fs::symlink_metadata(&destination).is_ok() {
