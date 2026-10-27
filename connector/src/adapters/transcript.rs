@@ -287,10 +287,6 @@ pub fn user_text(item: &Value, claude: bool) -> Option<String> {
     (!texts.is_empty()).then(|| texts.join("\n"))
 }
 
-/// The longest a header can be. A real one is a handful of short fields; a candidate with no closing brace inside
-/// this window is not one, so malformed input is scanned in time proportional to its length.
-const HEADER_LIMIT: usize = 1024;
-
 const HEADER_START: &str = "{\"channel\":";
 
 /// Every header a delivered message starts with (`envelope`) in `text`, in order. A harness may coalesce several
@@ -299,7 +295,8 @@ const HEADER_START: &str = "{\"channel\":";
 /// The first header is the first valid one anywhere in the text. Each later one is accepted only where an envelope
 /// can begin: straight after the previous envelope's closing sentence (`ENVELOPE_END`) or, when that one is a
 /// room-control message (which has no closing sentence), straight after its blank line. A header quoted in a
-/// message body, or in the unheard replies an envelope carries, is not a delivery and never reads one.
+/// message body or in the unheard replies an envelope carries is not a delivery. Text that copies the closing
+/// sentence itself is not told apart: that needs a marker in the envelope (see the PR's decision section).
 pub fn voice_headers(text: &str) -> Vec<Value> {
     let mut headers = Vec::new();
     let Some((first, mut position)) = first_header(text) else {
@@ -351,21 +348,22 @@ fn next_header(text: &str, mut from: usize, room_control: bool) -> Option<(Value
     }
 }
 
-/// The header `text` starts with, and its length in bytes.
+/// The header `text` starts with, and its length in bytes. Only the text up to the next header candidate is
+/// parsed: a real header is flat JSON whose strings escape their quotes, so it never contains the start of another,
+/// and a malformed candidate costs no more than the distance to the next one. No length is imposed on its fields.
 fn header_at(text: &str) -> Option<(Value, usize)> {
     if !text.starts_with(HEADER_START) {
         return None;
     }
-    let mut window = text.len().min(HEADER_LIMIT);
-    while !text.is_char_boundary(window) {
-        window -= 1;
-    }
-    let end = text[..window].find('}')?;
-    Some((valid_header(&text[..=end])?, end + 1))
+    let window = text[1..]
+        .find(HEADER_START)
+        .map_or(text.len(), |next| next + 1);
+    let mut values = serde_json::Deserializer::from_str(&text[..window]).into_iter::<Value>();
+    let header = valid_header(values.next()?.ok()?)?;
+    Some((header, values.byte_offset()))
 }
 
-fn valid_header(text: &str) -> Option<Value> {
-    let header: Value = serde_json::from_str(text).ok()?;
+fn valid_header(header: Value) -> Option<Value> {
     if !matches!(
         header.get("channel").and_then(Value::as_str),
         Some("voice" | "room-control" | "note")
@@ -468,6 +466,26 @@ mod tests {
         .unwrap();
         let text = [with_reply, envelope("voice", "m2", "next")].join("\n\n");
         assert_eq!(ids(&text), ["m1", "m2"]);
+    }
+
+    #[test]
+    fn a_header_with_long_fields_is_still_a_header() {
+        let long = |session: &str, id: &str| {
+            crate::adapters::envelope(&json!({"channel":"voice","session_id":session,"revision":1,
+                "epoch":1,"message_id":id,"text":"one"}))
+            .unwrap()
+        };
+        let text = [
+            envelope("voice", "m1", "x"),
+            long(&"s".repeat(5_000), "long"),
+            long("s", &format!("id}}{}", "i".repeat(5_000))),
+            envelope("voice", "m2", "y"),
+        ]
+        .join("\n\n");
+        let found = ids(&text);
+        assert_eq!(found.len(), 4);
+        assert_eq!(found[1], "long");
+        assert!(found[2].starts_with("id}"));
     }
 
     #[test]
