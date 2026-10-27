@@ -7,6 +7,11 @@
 //! shell; the task is defined from XML (`/Create /XML`), started (`/Run`), ended (`/End`), read (`/Query /XML`) and
 //! deleted (`/Delete`).
 //!
+//! The core runs only as its task: a core started detached would stay in its caller's Job Object and end with it
+//! (the desktop app runs the CLI in one that allows no breakaway), so with no core task nothing starts it on demand
+//! ([`Service::DETACHED_OUTLIVES_CALLER`]); `service start`, `restart` and `install` run the task, which Task
+//! Scheduler starts outside whoever asked.
+//!
 //! A task cannot set its program's environment or send its output to a file, so its action runs the job's runner
 //! ([`Job::runner`]: the connector's `run-job`, started through `sidevoice-background.exe` beside it, a GUI program
 //! that starts the connector without a window, since Task Scheduler gives a console program a console of its own and
@@ -38,6 +43,9 @@ pub struct Os {
 impl Service for Os {
     const KIND: &'static str = "task-scheduler";
     const BACKGROUND: Option<&'static str> = Some(crate::service::background::PROGRAM);
+    // `sidevoice-platform`'s detached spawn does not leave an enclosing Job Object, and asking to break away is
+    // refused by a job that does not allow it: the core is started through its task (`/Run`) only.
+    const DETACHED_OUTLIVES_CALLER: bool = false;
 
     fn new(places: Places) -> Os {
         Os { places }

@@ -9,7 +9,7 @@ use super::{
     Action, Failure, Result,
 };
 use crate::platform::fs::{Files, Fs};
-use crate::platform::service::Service;
+use crate::platform::service::{Service, Services};
 use serde_json::{json, Value};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -83,10 +83,25 @@ fn killed_note(result: &mut Value, down: &launcher::Teardown) {
     }
 }
 
+/// Refused, before anything changes, where nothing would start the core afterwards: an installation whose core has
+/// no job, where it cannot run on demand ([`launcher::core_starter`]).
+fn core_startable(layout: &Layout, installed: Option<&jobs::Installed>) -> Result<()> {
+    let core_job = installed.is_some_and(|found| found.core);
+    if layout.installed()
+        && launcher::core_starter(core_job, Services::DETACHED_OUTLIVES_CALLER)
+            == launcher::CoreStarter::Nobody
+    {
+        return Err(launcher::core_needs_service());
+    }
+    Ok(())
+}
+
 /// `service start`: a stop no longer holds; the manager starts both jobs. With no jobs, nothing is started here:
-/// the next conversation starts Sidevoice on demand.
+/// the next conversation starts Sidevoice on demand, where the core can run on demand; elsewhere the start is refused
+/// with the stop left as it is ([`core_startable`]).
 pub async fn start(layout: &Layout) -> Result<Value> {
     let installed = jobs::installed(layout).await;
+    core_startable(layout, installed.as_ref())?;
     {
         let _lock = install_lock(layout).await?;
         clear_stop(layout)?;
@@ -126,12 +141,14 @@ pub async fn stop(layout: &Layout) -> Result<Value> {
 }
 
 /// `service restart`, the person's retry: the core job restarted (its start limit cleared first); stopped, it is a
-/// start. With no jobs, the core running on demand is ended, and the connector starts it again when it needs it.
+/// start. With no jobs, the core running on demand is ended, and the connector starts it again when it needs it;
+/// refused, as `start` is, where the core cannot run on demand.
 pub async fn restart(layout: &Layout) -> Result<Value> {
     if status::stopped(layout) {
         return start(layout).await;
     }
     let installed = jobs::installed(layout).await;
+    core_startable(layout, installed.as_ref())?;
     {
         let _lock = install_lock(layout).await?;
         match &installed {

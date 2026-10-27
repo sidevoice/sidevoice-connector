@@ -1469,6 +1469,12 @@ impl Daemon {
                 // A connector started a moment ago (on demand, or with its core) links within seconds: the code
                 // waits for that link, up to a bound, instead of failing while it comes.
                 let deadline = Instant::now() + PAIR_DEVICE_LINK_WAIT;
+                if !self.link.connected().await {
+                    let layout = crate::service::layout::Layout::from_profile(&self.profile);
+                    if let Some(refusal) = crate::service::launcher::core_refusal(&layout).await {
+                        return Err(refusal.into());
+                    }
+                }
                 while !self.link.connected().await {
                     if Instant::now() >= deadline {
                         bail!("this machine's core did not come up in time; ask again in a moment");
@@ -1629,10 +1635,7 @@ impl Daemon {
                         active = true;
                     }
                 }
-                let answer = match self.command(owner, method, params).await {
-                    Ok(result) => json!({"id":id,"ok":true,"result":result}),
-                    Err(error) => json!({"id":id,"ok":false,"error":error.to_string()}),
-                };
+                let answer = answer(id, self.command(owner, method, params).await);
                 let shutdown_after_reply =
                     method == "shutdown" && answer.get("ok") == Some(&json!(true));
                 frame::write(&mut connection, &answer).await?;
@@ -1707,13 +1710,62 @@ impl Reporter for Daemon {
     }
 }
 
+/// The answer to one command on the socket. A failure says `error`, its English text, as every version reads it; a
+/// keyed one (a [`crate::messages::Keyed`] or a [`crate::service::Failure`]) also says `keyed_error`,
+/// `{key, params, message}`, for a client that acts or translates by key.
+fn answer(id: Value, outcome: Result<Value>) -> Value {
+    match outcome {
+        Ok(result) => json!({"id":id,"ok":true,"result":result}),
+        Err(error) => {
+            let mut answer = json!({"id":id,"ok":false,"error":error.to_string()});
+            let keyed = match error.downcast_ref::<crate::service::Failure>() {
+                Some(failure) => Some(failure.value()),
+                None => error
+                    .downcast_ref::<crate::messages::Keyed>()
+                    .map(crate::messages::Keyed::value),
+            };
+            if let Some(keyed) = keyed {
+                answer["keyed_error"] = keyed["error"].clone();
+            }
+            answer
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::run::prune_binding_order;
-    use super::Daemon;
+    use super::{answer, Daemon};
     use serde_json::json;
     use std::collections::HashMap;
     use tokio::sync::oneshot;
+
+    #[test]
+    fn a_keyed_failure_keeps_its_text_and_adds_its_key() {
+        let refusal = crate::service::launcher::core_needs_service();
+        let message = refusal.message();
+        let refused = answer(json!(7), Err(refusal.into()));
+        assert_eq!(refused["ok"], false);
+        assert_eq!(refused["error"], message, "the text every version reads");
+        assert_eq!(
+            refused["keyed_error"],
+            json!({"key": "service.core-needs-service", "params": {}, "message": message})
+        );
+        let keyed = crate::messages::Keyed::new("pair-device.failed", json!({"detail": "x"}));
+        let refused = answer(json!(8), Err(keyed.clone().into()));
+        assert_eq!(refused["keyed_error"]["key"], "pair-device.failed");
+        assert_eq!(refused["keyed_error"]["params"], json!({"detail": "x"}));
+        assert_eq!(refused["error"], keyed.message());
+        let plain = answer(json!(9), Err(anyhow::anyhow!("unknown IPC method")));
+        assert_eq!(
+            plain,
+            json!({"id": 9, "ok": false, "error": "unknown IPC method"})
+        );
+        assert_eq!(
+            answer(json!(1), Ok(json!({"a": 1}))),
+            json!({"id": 1, "ok": true, "result": {"a": 1}})
+        );
+    }
 
     #[test]
     fn completed_binding_tails_do_not_accumulate() {
