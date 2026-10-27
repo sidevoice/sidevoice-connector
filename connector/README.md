@@ -52,8 +52,12 @@ Every place comes from the environment, so a disposable profile is just a set of
 - where each program listens is published, not worked out: `D/connector.json` (`{"pid", "endpoint"}`, private,
   written once the connector listens and removed when it exits cleanly; after a crash it stays and `pid` tells it is
   stale) and the core's `D/core/core.json` (`endpoint`). `endpoint` is the record `sidevoice-platform`'s `ipc`
-  writes and reads: a Unix socket path, or a named pipe on Windows. Whoever needs to reach either (the desktop app)
-  reads it there;
+  writes and reads: a Unix socket path, or a named pipe on Windows. Whoever needs to reach either (the desktop app,
+  and every client of the connector: an agent's `sidevoice mcp`, the `service` commands, `pair-device`) reads it
+  there. A client tries the connector's advertised endpoint first, once judged (`platform::advertised`: on Unix
+  `connector.sock` in `D` or in the private `sidevoice-<hash of D>` directory right below a temporary or runtime
+  directory of this user's, not a link; on Windows only the pipe the client computes itself), then the one it works
+  out from its own environment, which differs when its `$TMPDIR` is not the connector's;
 - the local sockets (`connector.sock`, the core's `local.sock`): in this user's runtime directory, each in a private
   `sidevoice-<hash of its data directory>` directory (`D` for the connector, `D/core` for the core), so their paths
   stay within the OS limit: Linux `$XDG_RUNTIME_DIR` (`/run/user/<uid>`), macOS the per-user `$TMPDIR`

@@ -55,6 +55,7 @@
   "permission-denied": "The core's job cannot run its program: permission denied.",
   "node.stopped": "Sidevoice is stopped on this computer: start it from the app or with `npx sidevoice service start`.",
   "connector.spawn-failed": "The Sidevoice connector could not be started: {detail}.",
+  "connector.unreachable": "The Sidevoice connector ({state}) does not answer at {advertised}, the endpoint it advertises, nor at {computed}, where this process would look for it ({detail}). See `npx sidevoice service status`.",
   "connector.not-started": "The Sidevoice connector did not start.",
   "connector.service-down": "The Sidevoice connector is not answering ({detail}); its service manager runs it. See `npx sidevoice service status`, or retry with `npx sidevoice service restart`.",
   "launch.spawn-failed": "The core's program could not be started ({detail}).",
