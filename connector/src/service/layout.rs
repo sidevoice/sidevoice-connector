@@ -9,6 +9,7 @@
 //! | `R/current.json` | the pointer record `{"release": "<id>"}`: the selected release, `R/releases/<id>`, with its core at `core/bin/sidevoice-core-rust` and `core/models` |
 //! | `D/core` | the core's data: `core.json` (ready, naming the core's endpoint), `core-failure.json` |
 //! | `D/connector.lock` | the connector daemon's lock |
+//! | `D/connector.json` | the running connector's endpoint, which its clients reach first (`connector_endpoints`) |
 //! | the endpoints | `Endpoint::new(D, "connector")` and the core's `Endpoint::new(D/core, "local")`: on Unix a socket in this user's runtime directory (`sidevoice-<hash of the data directory>/<name>.sock`), else in that data directory; on Windows a named pipe |
 //! | `D/install.lock`, `D/agents.lock` | the install/service lock and the agents lock |
 //! | `D/<lock>.holder` | who holds that lock (`lock.rs`) |
@@ -16,11 +17,13 @@
 //!
 //! The release layout below `R/releases/<id>` is the installer's; it is named here once (`core_entrypoint`, `install::binary`).
 
+use crate::platform::advertised::{Advertised, AdvertisedEndpoint};
 use crate::platform::data_dir;
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Files, Fs};
 use crate::platform::ipc::{Address, Endpoint};
 use crate::platform::target;
+use crate::profile::CONNECTOR_RECORD;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -238,8 +241,15 @@ impl Layout {
         self.data.join("connector.log")
     }
 
+    /// The connector's endpoint as this process works it out from its own environment.
     pub fn connector_endpoint(&self) -> Endpoint {
         Endpoint::new(&self.data, "connector")
+    }
+
+    /// Where to reach the connector: the endpoint it advertises in `D/connector.json`, when there is one, then the
+    /// one this process works out ([`ConnectorEndpoints`]).
+    pub fn connector_endpoints(&self) -> ConnectorEndpoints {
+        ConnectorEndpoints::read(&self.data, self.connector_endpoint())
     }
 
     pub fn connector_lock(&self) -> PathBuf {
@@ -290,6 +300,67 @@ impl Layout {
             .collect::<Option<_>>()?;
         let program = command.first()?;
         Path::new(program).is_absolute().then_some(command)
+    }
+}
+
+/// Where a client may reach the connector of a data directory: the endpoint the connector advertises in
+/// `D/connector.json` once it listens, and the one the client works out from its own environment. The two differ when
+/// their environments do (macOS: launchd's `$TMPDIR` and an agent app's), and then only the advertised one answers.
+#[derive(Clone, Debug)]
+pub struct ConnectorEndpoints {
+    /// What this process works out ([`Layout::connector_endpoint`]).
+    pub computed: Endpoint,
+    /// What the connector advertises, as written, and whether it may be connected to: the endpoint, or why not
+    /// ([`Advertised::trust`]). `None` without a record.
+    pub advertised: Option<(String, std::result::Result<Endpoint, String>)>,
+}
+
+impl ConnectorEndpoints {
+    /// The record in `data`, judged: only this user's private file is read, and what it names only if trusted.
+    pub fn read(data: &Path, computed: Endpoint) -> Self {
+        let advertised = match Files::read_private(&data.join(CONNECTOR_RECORD), 4096) {
+            Ok(None) => None,
+            Err(error) => Some((
+                data.join(CONNECTOR_RECORD).display().to_string(),
+                Err(error.to_string()),
+            )),
+            Ok(Some(bytes)) => serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .and_then(|record| record.get("endpoint")?.as_str().map(str::to_owned))
+                .map(|record| {
+                    let trusted = record
+                        .parse::<Endpoint>()
+                        .and_then(|endpoint| {
+                            Advertised::trust(&endpoint, data, "connector").map(|()| endpoint)
+                        })
+                        .map_err(|error| error.to_string());
+                    (record, trusted)
+                }),
+        };
+        Self {
+            computed,
+            advertised,
+        }
+    }
+
+    /// The endpoints to try, in order: the advertised one when trusted, then the computed one when it is another.
+    pub fn to_try(&self) -> Vec<&Endpoint> {
+        let mut endpoints = Vec::new();
+        if let Some((_, Ok(advertised))) = &self.advertised {
+            endpoints.push(advertised);
+        }
+        if endpoints.first() != Some(&&self.computed) {
+            endpoints.push(&self.computed);
+        }
+        endpoints
+    }
+
+    /// The advertised endpoint, as written, when it is not the computed one.
+    pub fn other_advertised(&self) -> Option<&str> {
+        self.advertised
+            .as_ref()
+            .filter(|(record, _)| *record != self.computed.to_string())
+            .map(|(record, _)| record.as_str())
     }
 }
 

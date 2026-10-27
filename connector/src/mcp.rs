@@ -1,6 +1,5 @@
 use crate::adapters::{self, Identity, Registry};
 use crate::frame;
-use crate::platform::ipc::{Channel, Channels};
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
@@ -79,11 +78,14 @@ impl Ipc {
         if self.tx.lock().await.is_some() {
             return Ok(());
         }
+        let endpoints =
+            crate::service::layout::Layout::from_profile(&self.profile).connector_endpoints();
         let stream = timeout(
             Duration::from_secs(2),
-            Channels::connect(&self.profile.endpoint),
+            crate::service::launcher::connect_connector(&endpoints),
         )
-        .await??;
+        .await?
+        .map_err(anyhow::Error::msg)?;
         let (mut writer, mut reader) = frame::connection(stream).split();
         let (tx, mut rx) = mpsc::channel::<Value>(64);
         *self.tx.lock().await = Some(tx);

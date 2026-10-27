@@ -57,6 +57,9 @@ pub struct ResolvedHome {
     pub set: bool,
 }
 
+/// The connector's ready record in `D`, naming where it listens ([`Profile::publish_endpoint`]).
+pub const CONNECTOR_RECORD: &str = "connector.json";
+
 #[derive(Clone, Debug)]
 pub struct Profile {
     pub home: PathBuf,
@@ -339,7 +342,7 @@ impl Profile {
     /// The connector's ready record, `D/connector.json`: where it listens, for whoever needs to reach it (the desktop
     /// app), so nobody works a socket path out for themselves.
     pub fn connector_record(&self) -> PathBuf {
-        self.data.join("connector.json")
+        self.data.join(CONNECTOR_RECORD)
     }
 
     /// Writes the ready record (`{"pid", "endpoint"}`, private, whole) once the connector listens; the record goes

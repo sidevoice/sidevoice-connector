@@ -145,3 +145,54 @@ fn one_connector_serves_a_data_directory_and_its_log_is_private() {
     assert_eq!(status["connected"], false, "{status}");
     assert_eq!(status["core"], Value::Null, "{status}");
 }
+
+/// A client whose temporary and runtime directories are not the connector's (macOS: an agent app started from a shell
+/// with its own `$TMPDIR`, the connector run by launchd with another) works out another endpoint than the one the
+/// connector listens on, and reaches it where the connector advertises it, `D/connector.json`.
+#[cfg(unix)]
+#[test]
+fn a_client_with_another_temporary_directory_reaches_the_connector_where_it_advertises() {
+    let profile = Profile::new("advertised");
+    // The connector's runtime and temporary directory is `/tmp`; the client's, one of its own.
+    let log = fs::File::create(profile.data().join("advertised-connector.log")).unwrap();
+    let mut connector = Process(
+        profile
+            .connector(&["connector"])
+            .env("TMPDIR", "/tmp")
+            .env("XDG_RUNTIME_DIR", "/tmp")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(log)
+            .spawn()
+            .expect("start the connector"),
+    );
+    let record = profile.data().join("connector.json");
+    let advertised = until("the connector's advertised endpoint", 30, || {
+        read_json(&record).and_then(|record| record["endpoint"].as_str().map(str::to_owned))
+    });
+    assert!(advertised.starts_with("/tmp/sidevoice-"), "{advertised}");
+    let client_runtime = short_temp_dir().join(format!("sv-client-{}", std::process::id()));
+    private_dir(&client_runtime);
+    let status = profile
+        .connector(&["service", "status", "--json"])
+        .env("SIDEVOICE_SERVICE_MANAGER", "none")
+        .env("TMPDIR", &client_runtime)
+        .env("XDG_RUNTIME_DIR", &client_runtime)
+        .output()
+        .unwrap();
+    let value = json_line(&status);
+    assert_eq!(value["connector"]["running"], true, "{value}");
+    // Without the record the same client looks only where it works the endpoint out, and finds nothing there.
+    fs::remove_file(&record).unwrap();
+    let unaware = profile
+        .connector(&["service", "status", "--json"])
+        .env("SIDEVOICE_SERVICE_MANAGER", "none")
+        .env("TMPDIR", &client_runtime)
+        .env("XDG_RUNTIME_DIR", &client_runtime)
+        .output()
+        .unwrap();
+    assert_eq!(json_line(&unaware)["connector"]["running"], false);
+    connector.stop();
+    let _ = fs::remove_dir(std::path::Path::new(&advertised).parent().unwrap());
+    let _ = fs::remove_dir_all(&client_runtime);
+}

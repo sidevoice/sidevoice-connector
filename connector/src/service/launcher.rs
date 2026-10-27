@@ -18,7 +18,7 @@
 
 use super::definition::core_arguments;
 use super::jobs;
-use super::layout::Layout;
+use super::layout::{ConnectorEndpoints, Layout};
 use super::status::{self, read_ready, serving};
 use super::{Failure, Result};
 use crate::core_ready::Ready;
@@ -26,7 +26,7 @@ use crate::frame;
 use crate::messages::message;
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Create, Files, Fs};
-use crate::platform::ipc::{Channel, Channels};
+use crate::platform::ipc::{Channel, Channels, Stream};
 use crate::platform::process::{ChildProcess, Identity, Process, Processes};
 use crate::platform::service::{Service, Services};
 use serde_json::{json, Value};
@@ -63,13 +63,9 @@ pub async fn request_connector(
     params: Value,
     limit: Duration,
 ) -> std::result::Result<Value, String> {
-    let endpoint = layout.connector_endpoint();
+    let endpoints = layout.connector_endpoints();
     let ask = async {
-        let mut connection = frame::connection(
-            Channels::connect(&endpoint)
-                .await
-                .map_err(|error| error.to_string())?,
-        );
+        let mut connection = frame::connection(connect_connector(&endpoints).await?);
         frame::write(
             &mut connection,
             &json!({"id": 1, "method": method, "params": params}),
@@ -86,6 +82,38 @@ pub async fn request_connector(
     timeout(limit, ask)
         .await
         .unwrap_or_else(|_| Err(format!("no answer within {} s", limit.as_secs())))
+}
+
+/// A connection to the connector: at the endpoint it advertises when that one is trusted and answers, else at the
+/// one this process works out. Each is refused unless its server is this user ([`Channel::connect`]). No timeout:
+/// callers bound it. The error says what each endpoint answered, both named when they differ.
+pub async fn connect_connector(
+    endpoints: &ConnectorEndpoints,
+) -> std::result::Result<Stream, String> {
+    let mut failures = Vec::new();
+    if let Some((record, Err(refusal))) = &endpoints.advertised {
+        failures.push(format!("{record}: {refusal}"));
+    }
+    for endpoint in endpoints.to_try() {
+        match Channels::connect(endpoint).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => failures.push(format!("{endpoint}: {error}")),
+        }
+    }
+    Err(failures.join("; "))
+}
+
+/// Why the connector its manager runs does not answer here, when it advertises another endpoint than the one this
+/// process works out: both named, with what each answered. `None` when it advertises none, or the same one.
+async fn unreachable(layout: &Layout, state: &str) -> Option<Failure> {
+    let endpoints = layout.connector_endpoints();
+    let advertised = endpoints.other_advertised()?.to_owned();
+    let detail = connect_connector(&endpoints).await.err()?;
+    Some(Failure::keyed(
+        "connector.unreachable",
+        json!({"advertised": advertised, "computed": endpoints.computed.to_string(),
+            "detail": detail, "state": state}),
+    ))
 }
 
 /// Whether some process holds the connector's lock (one this process can take has no holder).
@@ -526,6 +554,9 @@ where
                 ));
             }
         }
+        if let Some(failure) = unreachable(layout, &state).await {
+            return Err(failure);
+        }
         return Err(Failure::keyed(
             "connector.service-down",
             json!({"detail": state, "state": state}),
@@ -606,6 +637,7 @@ impl CoreSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::ipc::{Address, Endpoint};
 
     #[test]
     fn spawn_failures_keep_the_setup_detail_in_json_and_english() {
@@ -723,6 +755,75 @@ mod tests {
         assert_eq!(
             connector_argv(&layout, vec!["/self".into()]),
             ["/self", "connector"]
+        );
+    }
+
+    /// A layout on a fresh private data directory, and the record the connector would write there advertising
+    /// `endpoint`.
+    fn advertising(label: &str, endpoint: &str) -> (tempfile::TempDir, Layout) {
+        let dir = crate::test_support::temp_dir(label);
+        let data = dir.path().join("data");
+        let layout = Layout::from_vars(
+            |name| match name {
+                Environment::HOME => Some(dir.path().to_path_buf().into()),
+                "SIDEVOICE_DATA_DIR" => Some(data.clone().into()),
+                _ => None,
+            },
+            Vec::new(),
+            &[],
+        )
+        .unwrap();
+        Files::ensure_private_dir(&layout.data).unwrap();
+        Files::write_json(
+            &layout.data.join(crate::profile::CONNECTOR_RECORD),
+            &json!({"pid": 1, "endpoint": endpoint}),
+        )
+        .unwrap();
+        (dir, layout)
+    }
+
+    #[test]
+    fn an_advertised_endpoint_of_another_data_directory_is_refused_and_the_computed_one_kept() {
+        let other = crate::test_support::temp_dir("elsewhere");
+        let foreign = Endpoint::new(other.path(), "connector").to_string();
+        let (_dir, layout) = advertising("tampered", &foreign);
+        let endpoints = layout.connector_endpoints();
+        assert!(
+            matches!(&endpoints.advertised, Some((record, Err(_))) if *record == foreign),
+            "{endpoints:?}"
+        );
+        assert_eq!(endpoints.to_try(), [&layout.connector_endpoint()]);
+        assert_eq!(endpoints.other_advertised(), Some(foreign.as_str()));
+    }
+
+    #[test]
+    fn without_a_record_the_computed_endpoint_is_the_one() {
+        let (_dir, layout) = advertising("unadvertised", "");
+        std::fs::remove_file(layout.data.join(crate::profile::CONNECTOR_RECORD)).unwrap();
+        let endpoints = layout.connector_endpoints();
+        assert!(endpoints.advertised.is_none());
+        assert_eq!(endpoints.to_try(), [&layout.connector_endpoint()]);
+        assert_eq!(endpoints.other_advertised(), None);
+    }
+
+    #[tokio::test]
+    async fn when_neither_endpoint_answers_the_failure_names_both() {
+        let other = crate::test_support::temp_dir("silent");
+        let advertised = Endpoint::new(other.path(), "connector").to_string();
+        let (_dir, layout) = advertising("unreachable", &advertised);
+        let computed = layout.connector_endpoint().to_string();
+        let failure = unreachable(&layout, "running").await.expect("a failure");
+        assert_eq!(failure.key, "connector.unreachable");
+        let message = failure.message();
+        assert!(message.contains(&advertised), "{message}");
+        assert!(message.contains(&computed), "{message}");
+        assert!(!message.contains('{'), "every parameter filled: {message}");
+        let said = request_connector(&layout, "status", json!({}), Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(
+            said.contains(&advertised) && said.contains(&computed),
+            "{said}"
         );
     }
 }
