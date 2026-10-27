@@ -77,6 +77,30 @@ fn with_no_manager_a_conversation_starts_the_connector_and_the_connector_the_cor
             !endpoint_exists(&profile.connector_endpoint()),
             "pair-device started a connector"
         );
+        // A connector already running (an agent's MCP server started it) refuses a pairing code on its socket with
+        // the same key, beside the text every version reads, instead of waiting for a core that will not come.
+        let connector = Process(
+            command(&profile, &extra, &["connector"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        until("the connector's socket", 30, || {
+            endpoint_exists(&profile.connector_endpoint()).then_some(())
+        });
+        let refused = connector_answer(&profile.connector_endpoint(), "pair_device").unwrap();
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(
+            refused["keyed_error"]["key"], "service.core-needs-service",
+            "{refused}"
+        );
+        assert_eq!(
+            refused["error"], refused["keyed_error"]["message"],
+            "{refused}"
+        );
+        drop(connector);
         return;
     }
 

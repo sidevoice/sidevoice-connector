@@ -27,7 +27,9 @@ The core exposes this as a boolean fact, and the web waits three seconds before 
 
 The command line is English only and is not translated. With `--json` a command prints one JSON object on stdout; a
 failure is `{"ok":false,"error":{"key","params","message"}}` and exit status 1, the key stable and the message
-English (`messages/errors.json`, compiled in). Without `--json` a failure is one English line on stderr.
+English (`messages/errors.json`, compiled in). Without `--json` a failure is one English line on stderr. On
+`connector.sock` a refused command answers `{"id","ok":false,"error":"<English text>"}`, as every version reads it, and
+a keyed refusal (`service.core-needs-service` from `pair_device`, …) adds `"keyed_error":{"key","params","message"}`.
 
 On Windows, Codex and Claude Code installed through npm, pnpm or yarn classic use their native platform binary
 when the installed package provides one. On ARM64 Windows, native ARM64 packages are preferred, with x64 packages

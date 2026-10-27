@@ -407,6 +407,12 @@ impl Drop for Process {
 /// One request to the connector over its socket (JSON lines `{id, method, params}`): its result, or `None` when the
 /// connector is not there or refused.
 pub fn connector_ipc(endpoint: &Endpoint, method: &str) -> Option<Value> {
+    let answer = connector_answer(endpoint, method)?;
+    (answer["ok"] == true).then(|| answer["result"].clone())
+}
+
+/// The connector's whole answer to one command with no parameters: `{id, ok, result}`, or `{id, ok: false, error, …}`.
+pub fn connector_answer(endpoint: &Endpoint, method: &str) -> Option<Value> {
     let mut stream = LocalStream::connect(endpoint).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(5)));
     writeln!(
@@ -417,8 +423,7 @@ pub fn connector_ipc(endpoint: &Endpoint, method: &str) -> Option<Value> {
     .ok()?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).ok()?;
-    let answer: Value = serde_json::from_str(&line).ok()?;
-    (answer["ok"] == true).then(|| answer["result"].clone())
+    serde_json::from_str(&line).ok()
 }
 
 /// One HTTP/1.0 request over the core's local endpoint; returns the status and the JSON body.
