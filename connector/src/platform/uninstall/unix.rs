@@ -582,7 +582,6 @@ impl Removal for Os {
                 )?;
             }
         }
-        let recorded = self.roots.recorded_claims()?;
         let selected: Vec<_> = entries(claim.as_raw_fd())?
             .into_iter()
             .filter(|name| name.as_bytes().starts_with(RELEASE_PREFIX.as_bytes()))
@@ -618,6 +617,7 @@ impl Removal for Os {
             )?;
             removed.push(entry.to_string_lossy().into_owned());
         }
+        let recorded = self.roots.recorded_claims()?;
         let selected: Vec<_> = entries(claim.as_raw_fd())?
             .into_iter()
             .filter(|name| {
