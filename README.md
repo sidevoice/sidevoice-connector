@@ -114,7 +114,7 @@ Ask the agent to call the MCP tool `voice_diagnose` in the conversation concerne
 with the versions, whether the core runs and the connector is linked to it, this conversation's
 delivery route (and whether its socket exists), its last deliveries with how each ended and whether the agent has
 read it, the harness's capabilities and inbound check, the editor bridge state, and where the logs are
-(`connector.log` and `core.log` in the data directory: `~/Library/Application Support/Sidevoice` on macOS, `$XDG_DATA_HOME/sidevoice` on Linux, `%LOCALAPPDATA%\Sidevoice` on Windows; `SIDEVOICE_DATA_DIR` overrides it). It never includes message text, keys or tokens. A delivery that ends
+(`connector.log` and `core.log` in the data directory: `~/Library/Application Support/Sidevoice` on macOS, `$XDG_DATA_HOME/sidevoice` on Linux, `%LOCALAPPDATA%\Sidevoice\Data` on Windows; `SIDEVOICE_DATA_DIR` overrides it). It never includes message text, keys or tokens. A delivery that ends
 `unconfirmed` and is never read usually means the agent holds incoming messages (see its inbound check).
 
 ## Develop

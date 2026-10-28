@@ -44,7 +44,7 @@ Every place comes from the environment, so a disposable profile is just a set of
 - the data directory `D`: one rule for every Sidevoice program on the machine (core, connector, the desktop app),
   owned by `sidevoice-platform`'s `data_dir`: `$SIDEVOICE_DATA_DIR`, else the OS's standard place for a program's
   data: macOS `~/Library/Application Support/Sidevoice`, Linux `$XDG_DATA_HOME/sidevoice` (else
-  `~/.local/share/sidevoice`), Windows `%LOCALAPPDATA%\Sidevoice`. Private (0700), created by the daemon when
+  `~/.local/share/sidevoice`), Windows `%LOCALAPPDATA%\Sidevoice\Data` (the shared `Models` sit beside it, in `%LOCALAPPDATA%\Sidevoice\Models`). Private (0700), created by the daemon when
   missing. One that is this user's, a real directory and only left open (an older build's 0755, an ACL) is made
   private again, with one line in the log (`src/private_dir.rs`); it is refused, never repaired, when it belongs to
   someone else, is a link, or any directory above it could have its entries replaced. It holds `connector.lock`,

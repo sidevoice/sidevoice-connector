@@ -132,6 +132,9 @@ pub struct Roots {
     pub releases: PathBuf,
     /// `D` as the OS places it for this user with no override (`data_dir::standard`); `None` when there is none.
     pub standard: Option<PathBuf>,
+    /// The shared models folder as the core places it (`data_dir::models_dir`): beside `D` on Windows (`Sidevoice\Models`),
+    /// `D/Models` elsewhere. `None` when there is none.
+    pub models: Option<PathBuf>,
     /// The names in `D` that an uninstall leaves (its permanent lock files and the stop).
     pub kept: &'static [&'static str],
     /// Every home directory the code knows: the profile's (`HOME`, `USERPROFILE`) and the OS's, which differ on Windows
@@ -216,18 +219,14 @@ impl Roots {
         Ok(())
     }
 
-    /// That the shared models folder (`Models` in the standard place: `standard/Models`, wherever `D` is) is not inside `D`
+    /// That the shared models folder (`Roots::models`, wherever `D` is) is not inside `D`
     /// deeper than `D/Models` itself, nor holds `D`: `D/Models` is kept by name, but a store further down (an overridden `D`
     /// above the standard place) would be deleted with its parent. Refused before anything is touched, rather than
     /// emptying around it: the least surprising, since the person chose a `D` that contains another program's data.
     fn check_models_outside(&self) -> Result<(), &'static str> {
         const REFUSED: &str = "uninstall refused: the shared models folder is inside the data directory (or holds it); \
                                choose a data directory that does not contain it";
-        let Some(models) = self
-            .standard
-            .as_ref()
-            .map(|standard| standard.join(data_dir::MODELS))
-        else {
+        let Some(models) = self.models.clone() else {
             return Ok(());
         };
         let overlaps = |models: &Path, data: &Path| {
@@ -468,6 +467,7 @@ mod tests {
             releases: data.join("install"),
             data,
             standard: Some(standard.to_path_buf()),
+            models: Some(standard.join(data_dir::MODELS)),
             kept: KEPT,
             homes: standard
                 .parent()
@@ -679,6 +679,33 @@ mod tests {
             fs::read_to_string(models.join("other-program").join("sentinel")).unwrap(),
             "theirs"
         );
+    }
+
+    #[test]
+    fn a_data_directory_at_or_inside_models_that_sit_beside_the_standard_place_is_refused() {
+        let scratch = temp_dir("uninstall-models-beside");
+        let home = scratch.path().join("home");
+        let app = home.join(data_name());
+        let standard = app.join("Data");
+        let models = app.join(data_dir::MODELS);
+        fs::create_dir_all(models.join("profile")).unwrap();
+        Files::ensure_private_dir(&standard).unwrap();
+        for data in [models.clone(), models.join("profile")] {
+            let mut layout = at(data.clone(), &standard);
+            layout.models = Some(models.clone());
+            layout.homes = vec![home.clone()];
+            let refused = layout.validate().unwrap_err();
+            assert!(
+                refused.contains("shared models folder"),
+                "{}: {refused}",
+                data.display()
+            );
+        }
+        // The standard place itself, with `Models` beside it, is no overlap.
+        let mut layout = at(standard.clone(), &standard);
+        layout.models = Some(models);
+        layout.homes = vec![home];
+        assert!(layout.validate().is_ok());
     }
 
     #[test]
