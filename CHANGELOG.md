@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.17.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.17.0...v0.17.1) (2026-10-28)
+
+
+### Bug Fixes
+
+* **install:** repair a self-owned data directory that is too open ([#313](https://github.com/sidevoice/sidevoice-connector/issues/313)) ([1cef390](https://github.com/sidevoice/sidevoice-connector/commit/1cef390f62a0078ddfd18d6048319bab17f2f9ae)), closes [#310](https://github.com/sidevoice/sidevoice-connector/issues/310)
+* **read-receipts:** mark every voice message of a coalesced transcript entry as read ([#314](https://github.com/sidevoice/sidevoice-connector/issues/314)) ([199de51](https://github.com/sidevoice/sidevoice-connector/commit/199de51f931b195e047351023df35826ea0d3aa7))
+
 ## [0.17.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.16.0...v0.17.0) (2026-10-27)
 
 
