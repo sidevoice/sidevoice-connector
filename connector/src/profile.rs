@@ -238,12 +238,13 @@ impl Profile {
     }
 
     /// Refuses directories that were replaced or opened up after this process started: the data directory and the
-    /// core's are private when they exist (they are created private by whoever needs them first), and every
-    /// directory of the person's we read or write is theirs and writable by nobody else.
+    /// core's are private when they exist (they are created private by whoever needs them first; one of ours only
+    /// left open is made private again, `crate::private_dir`), and every directory of the person's we read or write
+    /// is theirs and writable by nobody else.
     pub fn validate_existing_private(&self) -> Result<()> {
         for dir in [&self.data, &self.data.join("core")] {
             match fs::symlink_metadata(dir) {
-                Ok(_) => Files::check_private(&Files::open_read(dir)?)
+                Ok(_) => crate::private_dir::check_existing(dir)
                     .with_context(|| format!("unsafe private directory {}", dir.display()))?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
@@ -559,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn a_data_directory_others_can_enter_or_a_replaced_agent_home_is_refused() {
+    fn an_open_data_directory_is_made_private_and_a_replaced_agent_home_is_refused() {
         let scratch = crate::test_support::temp_dir("trust");
         let profile = Profile::for_test(scratch.path(), &HOMES);
         let config = profile
@@ -571,8 +572,8 @@ mod tests {
         let (first, second) = (&config[0], &config[1]);
         profile.validate_existing_private().unwrap();
         Files::let_others_change(&profile.data);
-        assert!(profile.validate_existing_private().is_err());
-        Files::shut_others_out(&profile.data);
+        profile.validate_existing_private().unwrap();
+        Files::check_private(&Files::open_read(&profile.data).unwrap()).unwrap();
 
         Files::let_others_change(second);
         assert!(profile.validate_for_agent(second).is_err());

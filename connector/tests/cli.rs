@@ -1,7 +1,7 @@
 //! The command line as people and programs use it, with no core: `--version`, `agents`, and how a failure is said
 //! (English text on stderr; with `--json`, one object with a stable key on stdout). And the connector daemon's own
-//! guards: a data directory others can enter is refused, one connector serves a data directory, and its log is
-//! private.
+//! guards: a data directory of ours others can enter is made private again and one reached through a link is refused,
+//! one connector serves a data directory, and its log is private.
 
 mod support;
 
@@ -101,16 +101,32 @@ fn agents_lists_in_english_or_as_json_and_failures_carry_a_stable_key() {
 }
 
 #[test]
-fn the_connector_refuses_a_data_directory_others_can_enter() {
+fn a_data_directory_of_ours_others_can_enter_is_made_private_again() {
     let profile = Profile::new("unsafe");
     Files::let_others_read(&profile.data());
+    assert!(!is_private(&profile.data()));
+    let listed = profile.connector(&["agents", "--json"]).output().unwrap();
+    assert!(listed.status.success());
+    assert_eq!(json_line(&listed)["ok"], true);
+    let said = String::from_utf8_lossy(&listed.stderr);
+    assert!(said.contains("made it private again"), "{said}");
+    assert!(is_private(&profile.data()), "repaired");
+}
+
+#[test]
+fn the_connector_refuses_a_data_directory_that_is_a_link() {
+    let profile = Profile::new("unsafe-link");
+    let real = profile.data().with_extension("real");
+    fs::rename(profile.data(), &real).unwrap();
+    Files::let_others_read(&real);
+    Files::symlink(&real, profile.data());
     let output = profile.connector(&["connector"]).output().unwrap();
     assert!(!output.status.success());
     let said = String::from_utf8_lossy(&output.stderr);
     assert!(said.starts_with("sidevoice: "), "{said}");
     assert!(said.contains("unsafe private directory"), "{said}");
     assert!(!endpoint_exists(&profile.connector_endpoint()));
-    assert!(!is_private(&profile.data()), "refused, not repaired");
+    assert!(!is_private(&real), "refused, not repaired");
     let json = profile
         .connector(&["connector", "--json"])
         .output()

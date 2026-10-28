@@ -25,7 +25,6 @@ pub mod layout;
 pub mod status;
 
 use crate::lock::Lock;
-use crate::platform::fs::{Files, Fs};
 use crate::platform::service::Service;
 use crate::profile::Profile;
 use jobs::Job;
@@ -120,7 +119,7 @@ pub type Result<T> = std::result::Result<T, Failure>;
 
 /// `D`, created private when missing.
 fn data_dir(layout: &Layout) -> Result<()> {
-    Files::ensure_private_dir(&layout.data).map_err(Failure::plain)
+    crate::private_dir::ensure(&layout.data).map_err(Failure::plain)
 }
 
 /// The install lock, waited for up to 30 s.

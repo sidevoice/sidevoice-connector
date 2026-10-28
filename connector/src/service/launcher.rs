@@ -226,7 +226,7 @@ fn core_failure(failure: Value) -> Failure {
 }
 
 fn private_data_dir(path: &Path) -> Result<()> {
-    Files::ensure_private_dir(path).map_err(Failure::plain)
+    crate::private_dir::ensure(path).map_err(Failure::plain)
 }
 
 /// Who starts this machine's core when it does not run.
