@@ -935,6 +935,29 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
         ],
     )?;
 
+    // A connector of ours that outlives the service and ignores a request to leave (an MCP server an app keeps open):
+    // on Windows its program is held open, so uninstall must end it itself, and say so.
+    let mut survivor = if machine.os == Os::Windows {
+        step("a surviving connector is running from the releases");
+        let copy = stable.with_file_name("survivor.exe");
+        fs::copy(&stable, &copy).map_err(|error| format!("{}: {error}", copy.display()))?;
+        let mut child = Command::new(&copy)
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("{}: {error}", copy.display()))?;
+        thread::sleep(Duration::from_secs(3));
+        check(
+            child.try_wait().map_err(|e| e.to_string())?.is_none(),
+            || "the surviving connector exited by itself".to_owned(),
+        )?;
+        Some(child)
+    } else {
+        None
+    };
+
     step("uninstall, from the package");
     let removed = ok(
         sidevoice_command(package.command()?, &["uninstall"], Duration::from_secs(300))?,
@@ -943,6 +966,18 @@ fn steps(machine: &Machine, archive: &Path, scratch: &Path) -> Result<()> {
     check(removed["state"] == "absent", || {
         format!("uninstall: {removed}")
     })?;
+    if let Some(mut child) = survivor.take() {
+        check(
+            removed["terminated"]
+                .as_array()
+                .is_some_and(|pids| pids.iter().any(|pid| *pid == child.id())),
+            || format!("uninstall did not report ending the surviving connector: {removed}"),
+        )?;
+        check(
+            child.try_wait().map_err(|e| e.to_string())?.is_some(),
+            || "the surviving connector is still running after uninstall".to_owned(),
+        )?;
+    }
     for agent in ["claude", "codex"] {
         let outcome = &removed["agents"][agent]["outcome"];
         check(outcome == "removed", || {

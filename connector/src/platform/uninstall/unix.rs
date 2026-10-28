@@ -4,7 +4,7 @@
 
 use super::{
     clean_absolute, foreign, recovery_program, recovery_record, DataDir, Removal, Roots, CLAIM,
-    DATA_PREFIX, RECORD, RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
+    RECORD, RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
 };
 use crate::platform::user::{User, UserId};
 use serde_json::Value;
@@ -329,7 +329,11 @@ impl Os {
         Ok(held)
     }
 
-    fn check_tree(&self, relative: &Path, kept: &[&str]) -> Result<bool, &'static str> {
+    fn check_tree(
+        &self,
+        relative: &Path,
+        skip: impl Fn(&OsStr) -> bool,
+    ) -> Result<bool, &'static str> {
         let Some(root) = self.open_relative(relative)? else {
             return Ok(false);
         };
@@ -338,7 +342,7 @@ impl Os {
             let selected = entries(root.as_raw_fd()).map_err(io::Error::other)?;
             let allowed: Vec<_> = selected
                 .iter()
-                .filter(|name| !kept.iter().any(|kept| *name == OsStr::new(kept)))
+                .filter(|name| !skip(name))
                 .map(OsString::as_os_str)
                 .collect();
             held.check_contents(&allowed)
@@ -541,8 +545,11 @@ impl Removal for Os {
     }
 
     fn preflight(&self) -> Result<bool, &'static str> {
-        let releases = self.check_tree(&self.releases_rel, &[])?;
-        self.check_tree(&self.data_rel, self.roots.kept)?;
+        let releases = self.check_tree(&self.releases_rel, |_| false)?;
+        self.check_tree(&self.data_rel, |name| {
+            self.roots.is_foreign(name)
+                || self.roots.kept.iter().any(|kept| name == OsStr::new(kept))
+        })?;
         let claimed_releases = if let Some(claim) = self.open_relative(&self.claim_rel)? {
             entries(claim.as_raw_fd())?
                 .iter()
@@ -597,7 +604,9 @@ impl Removal for Os {
             if self.roots.is_kept(&entry) {
                 continue;
             }
-            let claimed_name = format!("{DATA_PREFIX}{}", uuid::Uuid::new_v4().simple());
+            let claimed_name = Roots::claimed_name(&entry);
+            let record = super::record_claim(&self.roots, &claimed_name)?;
+            self.write_install_record(root.as_raw_fd(), &record)?;
             self.claim_entry(
                 root.as_raw_fd(),
                 &self.data_rel,
@@ -608,9 +617,13 @@ impl Removal for Os {
             )?;
             removed.push(entry.to_string_lossy().into_owned());
         }
+        let recorded = self.roots.recorded_claims()?;
         let selected: Vec<_> = entries(claim.as_raw_fd())?
             .into_iter()
-            .filter(|name| !name.as_bytes().starts_with(RELEASE_PREFIX.as_bytes()))
+            .filter(|name| {
+                !name.as_bytes().starts_with(RELEASE_PREFIX.as_bytes())
+                    && self.roots.claim_is_ours(name, &recorded)
+            })
             .collect();
         let held = self.held_directory(&self.claim_rel, claim.as_raw_fd())?;
         held.remove_contents(&selected.iter().map(OsString::as_os_str).collect::<Vec<_>>())
@@ -627,8 +640,18 @@ impl Removal for Os {
         }
         let claim = open_dir(data.as_raw_fd(), OsStr::new(CLAIM))?;
         self.verify_dir(&self.claim_rel, claim.as_raw_fd())?;
-        if !entries(claim.as_raw_fd())?.is_empty() {
-            return Err("uninstall claim still contains data");
+        let recorded = self.roots.recorded_claims()?;
+        let left = entries(claim.as_raw_fd())?;
+        if !left.is_empty() {
+            // What should have been deleted is an error; what is not proven ours stays, and so does the claim
+            // (`remove_data_dir` lists it).
+            if left
+                .iter()
+                .any(|name| self.roots.claim_is_ours(name, &recorded))
+            {
+                return Err("uninstall claim still contains data");
+            }
+            return Ok(());
         }
         self.verify_dir(&self.data_rel, data.as_raw_fd())?;
         if unsafe {
@@ -658,9 +681,6 @@ impl Removal for Os {
             if !self.roots.is_kept(&entry) {
                 return Err("uninstall data remains");
             }
-        }
-        if exists_at(data.as_raw_fd(), OsStr::new(CLAIM))? {
-            return Err("uninstall claim remains");
         }
         if exists_at(data.as_raw_fd(), OsStr::new(RECOVERY))? {
             let recovery_path = &self.recovery_rel;
@@ -801,6 +821,7 @@ mod tests {
             data,
             releases,
             kept: KEPT,
+            owned: None,
             homes: vec![home.to_path_buf()],
         })
         .unwrap()

@@ -4,11 +4,18 @@ use super::{Holder, Holding};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_MORE_DATA, ERROR_SUCCESS, FILETIME, HANDLE, WAIT_OBJECT_0,
+};
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 use windows_sys::Win32::System::RestartManager::{
     RmEndSession, RmGetList, RmRegisterResources, RmStartSession, CCH_RM_SESSION_KEY,
     RM_PROCESS_INFO,
+};
+use windows_sys::Win32::System::Threading::{
+    GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+    WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
 /// How many files are registered with the Restart Manager in one session.
@@ -65,7 +72,13 @@ fn text(buffer: &[u16]) -> String {
     String::from_utf16_lossy(&buffer[..end])
 }
 
-fn holding(files: &[PathBuf]) -> Option<Vec<Holder>> {
+/// A FILETIME as one number.
+fn filetime(time: FILETIME) -> u64 {
+    (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+}
+
+/// Who holds `files`, each with the time its process started (as the Restart Manager saw it).
+fn holding(files: &[PathBuf]) -> Option<Vec<(Holder, u64)>> {
     let mut handle = 0;
     let mut key = [0u16; CCH_RM_SESSION_KEY as usize + 1];
     // SAFETY: `handle` and `key` are writable and `key` has the room the API documents.
@@ -118,9 +131,14 @@ fn holding(files: &[PathBuf]) -> Option<Vec<Holder>> {
                 list.truncate(count as usize);
                 return Some(
                     list.iter()
-                        .map(|info| Holder {
-                            pid: info.Process.dwProcessId,
-                            name: text(&info.strAppName),
+                        .map(|info| {
+                            (
+                                Holder {
+                                    pid: info.Process.dwProcessId,
+                                    name: text(&info.strAppName),
+                                },
+                                filetime(info.Process.ProcessStartTime),
+                            )
                         })
                         .collect(),
                 );
@@ -140,9 +158,120 @@ impl Holding for Os {
         let mut holders: Vec<Holder> = files(root)
             .chunks(BATCH)
             .flat_map(|batch| holding(batch).unwrap_or_default())
+            .map(|(holder, _)| holder)
             .collect();
         holders.sort_by_key(|holder| holder.pid);
         holders.dedup_by_key(|holder| holder.pid);
         holders
+    }
+
+    fn stop_running_from(roots: &[&Path], program_root: &Path) -> Vec<u32> {
+        Self::stop_running_from_impl(roots, program_root)
+    }
+}
+
+/// An open process handle, closed when dropped.
+struct Process(HANDLE);
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        // SAFETY: the handle was returned by `OpenProcess` and is closed once.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+impl Process {
+    /// `pid` opened for what is needed to check it and end it; `None` when it is gone or not this user's.
+    fn open(pid: u32) -> Option<Self> {
+        // SAFETY: plain call; a null handle is a failure.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        (!handle.is_null()).then_some(Self(handle))
+    }
+
+    /// When the process started.
+    fn started(&self) -> Option<u64> {
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            },
+            FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            },
+            FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            },
+            FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            },
+        );
+        // SAFETY: the four times are writable.
+        let read =
+            unsafe { GetProcessTimes(self.0, &mut created, &mut exited, &mut kernel, &mut user) };
+        (read != 0).then(|| filetime(created))
+    }
+
+    /// The full path of the process's program.
+    fn image(&self) -> Option<PathBuf> {
+        let mut buffer = vec![0u16; 32_768];
+        let mut size = u32::try_from(buffer.len()).ok()?;
+        // SAFETY: `buffer` has `size` units; the call writes at most that many and sets `size` to the length.
+        let read = unsafe {
+            QueryFullProcessImageNameW(self.0, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut size)
+        };
+        (read != 0).then(|| PathBuf::from(String::from_utf16_lossy(&buffer[..size as usize])))
+    }
+
+    /// Ends the process and waits a little for it to be gone.
+    fn end(&self) -> bool {
+        // SAFETY: the handle has the terminate right.
+        let ended = unsafe { TerminateProcess(self.0, 1) } != 0;
+        // SAFETY: the handle has the synchronize right.
+        ended && unsafe { WaitForSingleObject(self.0, 5_000) } == WAIT_OBJECT_0
+    }
+}
+
+impl Os {
+    fn stop_running_from_impl(roots: &[&Path], program_root: &Path) -> Vec<u32> {
+        let own = std::process::id();
+        let mut found: Vec<(u32, u64)> = Vec::new();
+        for root in roots {
+            if !super::walkable(root, is_link) {
+                continue;
+            }
+            for (holder, start) in files(root)
+                .chunks(BATCH)
+                .flat_map(|batch| holding(batch).unwrap_or_default())
+            {
+                if holder.pid != own && !found.iter().any(|(pid, _)| *pid == holder.pid) {
+                    found.push((holder.pid, start));
+                }
+            }
+        }
+        let mut ended = Vec::new();
+        for (pid, start) in found {
+            // One handle for the checks and the ending: a pid reused since the Restart Manager looked is another
+            // start time, and is left alone.
+            let Some(process) = Process::open(pid) else {
+                continue;
+            };
+            let ours = process.started() == Some(start)
+                && process
+                    .image()
+                    .is_some_and(|image| super::runs_from(&image, program_root));
+            if ours && process.end() {
+                ended.push(pid);
+            }
+        }
+        ended
     }
 }

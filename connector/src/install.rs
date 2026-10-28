@@ -163,6 +163,31 @@ const KEPT: &[&str] = &[
     data_dir::MODELS,
 ];
 
+/// The names in `D` that this connector, or the core it runs, creates: the only entries `uninstall` removes. `D` can be
+/// shared with a program that is not ours (the desktop app installs itself into the standard place), so anything else
+/// in it is left alone and reported.
+const OWNED: &[&str] = &[
+    "agents.json",
+    "agents.lock",
+    "connector.json",
+    "connector.lock",
+    "connector.log",
+    "connector.log.1",
+    "connector.log.2",
+    "connector.sock",
+    "conversation-state.guard",
+    "conversation-state.json",
+    "core",
+    "core.log",
+    "core.log.1",
+    "core.log.2",
+    "core.stderr.log",
+    "install.lock",
+    "node-stopped.json",
+    "outbox.json",
+    "service",
+];
+
 /// The package being installed: its root (`bin/`, `connector.json`, `core/`), its binary and the version it is.
 #[derive(Clone, Debug)]
 pub struct Package {
@@ -200,10 +225,16 @@ fn failed(detail: impl std::fmt::Display) -> anyhow::Error {
     keyed("install.failed", json!({"detail": detail.to_string()}))
 }
 
-/// `failure` (what the removal said), or, when processes are seen holding installed files open, the same failure with
-/// each of them named and what to try. A holder seen in the tree is not proof that it caused this failure (a scanner,
-/// an agent's server, anything): the wording says so, keeps the original `reason` and does not blame an agent app
-/// alone. `own` is this process, which is not asked to close.
+/// Whether `name` is the Sidevoice desktop app, as the OS names the process (its application name, else its program).
+fn is_desktop_app(name: &str) -> bool {
+    let name = name.trim().to_lowercase();
+    name.strip_suffix(".exe").unwrap_or(&name) == "sidevoice"
+}
+
+/// `failure` (what the removal said), or, when processes are seen holding installed files open, the same failure
+/// saying what to do: quit the desktop app when it is one of them (the one thing to do, so nothing else is listed),
+/// else close the others, each named with its PID. `own` is this process, which is not asked to close. `what` is
+/// `Install` or `Uninstall`: the command to run again.
 fn in_use_error(
     what: &'static str,
     failure: anyhow::Error,
@@ -211,17 +242,45 @@ fn in_use_error(
     holders: &[Holder],
     own: u32,
 ) -> anyhow::Error {
-    let named = holders
-        .iter()
-        .filter(|holder| holder.pid != own)
-        .map(|holder| format!("{} (PID {})", holder.name, holder.pid))
-        .collect::<Vec<_>>();
-    if named.is_empty() {
+    let others: Vec<&Holder> = holders.iter().filter(|holder| holder.pid != own).collect();
+    if others.is_empty() {
         return failure;
     }
+    let command = format!("npx sidevoice {}", what.to_lowercase());
+    if others.iter().any(|holder| is_desktop_app(&holder.name)) {
+        let app = others.iter().find(|holder| is_desktop_app(&holder.name));
+        let place = if cfg!(target_os = "macos") {
+            "click its icon in the menu bar, then choose Quit".to_owned()
+        } else if let (true, Some(app)) = (cfg!(windows), app) {
+            // No icon (hung, or its tray entry gone): the one way left to end it.
+            format!(
+                "right-click its icon in the system tray, then choose Quit; if there is no icon, run `taskkill /F /PID {}`",
+                app.pid
+            )
+        } else {
+            "right-click its icon in the system tray, then choose Quit".to_owned()
+        };
+        return keyed(
+            "install.files-in-use-app",
+            json!({"what": what, "reason": reason, "place": place, "command": command}),
+        );
+    }
+    let named = others
+        .iter()
+        .map(|holder| {
+            if cfg!(windows) {
+                format!(
+                    "{} (PID {}; close it with `taskkill /PID {}`)",
+                    holder.name, holder.pid, holder.pid
+                )
+            } else {
+                format!("{} (PID {})", holder.name, holder.pid)
+            }
+        })
+        .collect::<Vec<_>>();
     keyed(
         "install.files-in-use",
-        json!({"what": what, "reason": reason, "holders": named.join(", ")}),
+        json!({"what": what, "reason": reason, "holders": named.join(", "), "command": command}),
     )
 }
 
@@ -669,6 +728,25 @@ impl Runtime {
     /// The core's current launch, if one is ready.
     fn launch(&self, layout: &Layout) -> Option<String> {
         status::read_ready(layout).map(|ready| ready.launch_id)
+    }
+
+    /// The connector processes of this installation that outlive the service (a daemon, a server an app started from
+    /// the release) ended: they are ours, and on Windows they keep the files
+    /// open. Found by the path of their program (inside the releases), never by name. Never the desktop app.
+    async fn stop_own_connectors(&self, layout: &Layout) -> Vec<u32> {
+        match self {
+            Runtime::Machine => {
+                let (releases, data) = (layout.releases.clone(), layout.data.clone());
+                // Blocking OS calls: off the async threads.
+                tokio::task::spawn_blocking(move || {
+                    Holders::stop_running_from(&[releases.as_path(), data.as_path()], &releases)
+                })
+                .await
+                .unwrap_or_default()
+            }
+            #[cfg(test)]
+            Runtime::Fake(_) => Vec::new(),
+        }
     }
 
     /// Both jobs unloaded, what runs on demand stopped and both definitions deleted, the stop kept.
@@ -1201,6 +1279,7 @@ fn removal_roots(layout: &Layout) -> Roots {
         data: layout.data.clone(),
         releases: layout.releases.clone(),
         kept: KEPT,
+        owned: Some(OWNED),
         // The profile's home and the OS's: the same on Unix, two places on Windows (`USERPROFILE`, the Known Folder).
         homes: std::iter::once(layout.home.clone())
             .chain(dirs::home_dir())
@@ -1251,6 +1330,7 @@ async fn uninstall_with_hooks(
     }
     guard.preflight().map_err(explain)?;
     let service = runtime.unload(&layout).await?;
+    let terminated = runtime.stop_own_connectors(&layout).await;
     let agents = if options.agents {
         unregister(profile).await
     } else {
@@ -1281,7 +1361,7 @@ async fn uninstall_with_hooks(
     Ok(
         json!({"ok": true, "state": "absent", "safe_uninstall": crate::identity::SAFE_UNINSTALL,
         "service": service.get("service").cloned().unwrap_or(Value::Null),
-        "note": service.get("note").cloned().unwrap_or(Value::Null), "agents": agents,
+        "note": service.get("note").cloned().unwrap_or(Value::Null), "agents": agents, "terminated": terminated,
         "releases": had_releases.then(|| layout.releases.clone()), "data": layout.data, "removed": removed, "data_dir": data_dir,
         "advice": advice}),
     )
@@ -1400,17 +1480,36 @@ pub(crate) mod tests {
         let said = crate::messages::keyed(&error);
         assert_eq!(said.key, "install.files-in-use");
         let text = said.message();
-        assert!(
-            text.contains("editor.exe (PID 4242), sidevoice-connector.exe (PID 77)"),
-            "{text}"
-        );
+        assert!(text.contains("editor.exe (PID 4242"), "{text}");
+        assert!(text.contains("sidevoice-connector.exe (PID 77"), "{text}");
+        assert!(text.contains("`npx sidevoice uninstall`"), "{text}");
         assert!(
             text.starts_with("Uninstall failed: cannot claim uninstall entry."),
             "{text}"
         );
-        assert!(text.contains("If that is why, close them"), "{text}");
-        assert!(text.contains("virus scanner"), "{text}");
+        assert!(text.contains("Close them"), "{text}");
+        assert!(!text.contains("virus scanner"), "{text}");
         assert!(!text.contains("PID 9)"), "{text}");
+    }
+
+    #[test]
+    fn the_desktop_app_as_holder_is_told_to_quit_and_nothing_else_is_listed() {
+        let holders = [
+            Holder {
+                pid: 1,
+                name: "editor.exe".into(),
+            },
+            Holder {
+                pid: 2,
+                name: "Sidevoice".into(),
+            },
+        ];
+        let error = in_use_error("Uninstall", failed("x"), "x", &holders, 9);
+        let said = crate::messages::keyed(&error);
+        assert_eq!(said.key, "install.files-in-use-app");
+        let text = said.message();
+        assert!(text.contains("Quit it ("), "{text}");
+        assert!(!text.contains("editor"), "{text}");
     }
 
     #[test]
@@ -1667,6 +1766,8 @@ pub(crate) mod tests {
         let models = layout.data.join(data_dir::MODELS).join("other-program");
         fs::create_dir_all(&models).unwrap();
         fs::write(models.join("sentinel"), "theirs").unwrap();
+        // The desktop app lives in the same folder: what is not the connector's survives, and is said.
+        fs::write(layout.data.join("sidevoice-desktop.exe"), "app").unwrap();
         let removed = uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
             .await
             .unwrap();
@@ -1686,13 +1787,14 @@ pub(crate) mod tests {
                 data_dir::MODELS,
                 "agents.lock",
                 "install.lock",
-                "node-stopped.json"
+                "node-stopped.json",
+                "sidevoice-desktop.exe"
             ],
             "{left:?}"
         );
         assert_eq!(
             removed["data_dir"],
-            json!({"removed": false, "kept": [data_dir::MODELS], "held": []}),
+            json!({"removed": false, "kept": [data_dir::MODELS, "sidevoice-desktop.exe"], "held": []}),
             "{removed}"
         );
         assert!(human_uninstall(&removed).contains(data_dir::MODELS));
@@ -2143,19 +2245,55 @@ pub(crate) mod tests {
         assert_eq!(fs::read(&outside).unwrap(), b"outside contents");
     }
 
+    /// What an older version claimed is not known to be ours (its claim names do not say what they were): a retry
+    /// leaves it where it is, with the claim directory, and says so; what this version claimed by name is deleted.
+    #[tokio::test]
+    async fn a_retry_never_deletes_what_an_older_claim_cannot_prove_is_ours() {
+        let fixture = Fixture::new("uninstall-legacy-claim");
+        fixture
+            .install(&fixture.package("1.0.0", "a"))
+            .await
+            .unwrap();
+        let layout = fixture.layout();
+        let claim = layout.data.join(".uninstall-claim");
+        Files::ensure_private_dir(&claim).unwrap();
+        let legacy = claim.join(format!("data-{}", "a".repeat(32)));
+        fs::write(&legacy, "desktop file").unwrap();
+        // Named like a claim of ours, but this connector never recorded it: not proven, so it stays.
+        let crafted = claim.join(format!("data-{}~connector.log", "c".repeat(32)));
+        fs::write(&crafted, "somebody else's").unwrap();
+        // One it did record, for an owned name: deleted.
+        let named_name = format!("data-{}~outbox.json", "b".repeat(32));
+        let named = claim.join(&named_name);
+        fs::write(&named, "ours").unwrap();
+        let mut record = layout.install_record().unwrap();
+        record["claimed"] = json!([named_name]);
+        Files::write_json(&layout.install_file(), &record).unwrap();
+        let answer = uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
+            .await
+            .unwrap();
+        assert_eq!(fs::read(&legacy).unwrap(), b"desktop file", "{answer}");
+        assert_eq!(fs::read(&crafted).unwrap(), b"somebody else's", "{answer}");
+        assert!(!named.exists(), "{answer}");
+        let kept = answer["data_dir"]["kept"].to_string();
+        assert!(kept.contains(".uninstall-claim"), "{answer}");
+        assert!(!layout.releases.exists(), "{answer}");
+    }
     #[tokio::test]
     async fn failed_claim_keeps_recovery_cli_and_retry_clears_residual_owned_data() {
         let fixture = Fixture::new("uninstall-retry");
         let package = fixture.package("1.0.0", "a");
         fixture.install(&package).await.unwrap();
         let layout = fixture.layout();
-        let victim = layout.data.join("victim");
+        let victim = layout.data.join("conversation-state.json");
         let moved = fixture.scratch.path().join("outside-victim");
         fs::create_dir(&victim).unwrap();
         fs::write(victim.join("keep"), b"outside contents").unwrap();
         let swapped = AtomicBool::new(false);
         let hook = |name: &OsStr| {
-            if name == OsStr::new("victim") && !swapped.swap(true, Ordering::SeqCst) {
+            if name == OsStr::new("conversation-state.json")
+                && !swapped.swap(true, Ordering::SeqCst)
+            {
                 fs::rename(&victim, &moved).unwrap();
                 Files::symlink(&moved, &victim);
             }

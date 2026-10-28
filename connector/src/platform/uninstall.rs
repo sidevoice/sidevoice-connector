@@ -137,6 +137,10 @@ pub struct Roots {
     pub models: Option<PathBuf>,
     /// The names in `D` that an uninstall leaves (its permanent lock files and the stop).
     pub kept: &'static [&'static str],
+    /// The names in `D` that the connector (or the core it runs) creates, and so the only ones an uninstall removes:
+    /// `D` can be shared with a program that is not ours (the desktop app installs into the standard place), and what
+    /// is not listed is left where it is and reported. `None` removes every entry (a `D` known to be only ours).
+    pub owned: Option<&'static [&'static str]>,
     /// Every home directory the code knows: the profile's (`HOME`, `USERPROFILE`) and the OS's, which differ on Windows
     /// (the Known Folder). `D` may be none of them nor a directory one is in; none known, and nothing is removed.
     pub homes: Vec<PathBuf>,
@@ -303,13 +307,69 @@ impl Roots {
         })
     }
 
+    /// Whether `name` in `D` is not the connector's: not in [`Roots::owned`] (the retry record, the claim and recovery
+    /// directories and `R` are ours and never foreign).
+    fn is_foreign(&self, name: &OsStr) -> bool {
+        self.owned.is_some_and(|owned| {
+            !owned.iter().any(|own| OsStr::new(own) == name)
+                && ![RECORD, CLAIM, RECOVERY]
+                    .iter()
+                    .any(|own| OsStr::new(own) == name)
+                && self.releases.file_name() != Some(name)
+        })
+    }
+
+    /// What a claimed entry of `D` is called inside [`CLAIM`]: the prefix, a unique suffix and, after a `~`, the name
+    /// it had, so that a retry knows what it holds.
+    fn claimed_name(original: &OsStr) -> String {
+        format!(
+            "{DATA_PREFIX}{}~{}",
+            uuid::Uuid::new_v4().simple(),
+            original.to_string_lossy()
+        )
+    }
+
+    /// Whether the entry `claimed` of the claim directory is proven to be the connector's, so a retry may delete it: it
+    /// names an owned entry. One without its name (an older version's claim, which also claimed what was not ours)
+    /// is not proven, and is left where it is.
+    fn claim_is_ours(&self, claimed: &OsStr, recorded: &[String]) -> bool {
+        let claimed = claimed.to_string_lossy();
+        if self.owned.is_none() || claimed.starts_with(RELEASE_PREFIX) {
+            return true;
+        }
+        // Written to the record before the rename, so only a claim this connector made is in it; and what it claimed
+        // is named exactly on the list of what it creates (never a reserved name).
+        let original = claimed
+            .strip_prefix(DATA_PREFIX)
+            .and_then(|rest| rest.get(32..))
+            .and_then(|tail| tail.strip_prefix('~'));
+        recorded.iter().any(|name| *name == *claimed)
+            && original
+                .is_some_and(|original| self.owned.is_some_and(|owned| owned.contains(&original)))
+    }
+
+    /// The claim names the record lists: what this connector claimed.
+    fn recorded_claims(&self) -> Result<Vec<String>, &'static str> {
+        match Files::read_trusted(&self.data.join(RECORD), RECORD_LIMIT) {
+            Ok(None) => Ok(Vec::new()),
+            Ok(Some(bytes)) => Ok(serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .and_then(|record| record.get("claimed").cloned())
+                .and_then(|list| serde_json::from_value(list).ok())
+                .unwrap_or_default()),
+            Err(_) => Err("unsafe uninstall install record"),
+        }
+    }
+
     /// The names in `D` that are never claimed as data: what the uninstall `kept`, the retry record, the claim and the
     /// recovery directories, and `R` (removed as the releases, by itself).
     fn is_kept(&self, name: &OsStr) -> bool {
-        self.kept
-            .iter()
-            .chain(&[RECORD, CLAIM, RECOVERY])
-            .any(|kept| OsStr::new(kept) == name)
+        self.is_foreign(name)
+            || self
+                .kept
+                .iter()
+                .chain(&[RECORD, CLAIM, RECOVERY])
+                .any(|kept| OsStr::new(kept) == name)
             || self.releases.file_name() == Some(name)
     }
 }
@@ -346,6 +406,19 @@ fn recovery_record(roots: &Roots) -> Result<Value, &'static str> {
     };
     record["command"] = json!([roots.data.join(RECOVERY).join(recovery_program())]);
     record["releases"] = json!(roots.releases);
+    Ok(record)
+}
+
+/// The record with `claimed` (a claim name) added to what it lists, to be saved before the rename that makes the claim.
+fn record_claim(roots: &Roots, claimed: &str) -> Result<Value, &'static str> {
+    let mut record = recovery_record(roots)?;
+    let mut list: Vec<String> = record
+        .get("claimed")
+        .cloned()
+        .and_then(|list| serde_json::from_value(list).ok())
+        .unwrap_or_default();
+    list.push(claimed.to_owned());
+    record["claimed"] = json!(list);
     Ok(record)
 }
 
@@ -469,6 +542,7 @@ mod tests {
             standard: Some(standard.to_path_buf()),
             models: Some(standard.join(data_dir::MODELS)),
             kept: KEPT,
+            owned: None,
             homes: standard
                 .parent()
                 .map(Path::to_path_buf)

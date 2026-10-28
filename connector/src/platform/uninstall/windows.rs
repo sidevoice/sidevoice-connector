@@ -14,8 +14,8 @@
 //! No `unsafe` here: `std`'s `OpenOptionsExt` sets the sharing and the flags, `winapi-util` reads the file id.
 
 use super::{
-    foreign, recovery_program, recovery_record, DataDir, Removal, Roots, CLAIM, DATA_PREFIX,
-    RECORD, RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
+    foreign, recovery_program, recovery_record, DataDir, Removal, Roots, CLAIM, RECORD,
+    RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
 };
 use crate::platform::fs::{Access, Create, Directory, Files, Fs, HeldDirectory};
 use sidevoice_platform::removal::Removal as _;
@@ -307,7 +307,10 @@ impl Removal for Os {
                 let selected = names(&self.roots.data).map_err(io::Error::other)?;
                 let allowed: Vec<_> = selected
                     .iter()
-                    .filter(|name| !self.roots.kept.iter().any(|kept| *name == OsStr::new(kept)))
+                    .filter(|name| {
+                        !self.roots.is_foreign(name)
+                            && !self.roots.kept.iter().any(|kept| *name == OsStr::new(kept))
+                    })
                     .map(OsString::as_os_str)
                     .collect();
                 held.check_contents(&allowed)
@@ -370,13 +373,18 @@ impl Removal for Os {
             if self.roots.is_kept(&entry) {
                 continue;
             }
-            let claimed = claim.join(format!("{DATA_PREFIX}{}", uuid::Uuid::new_v4().simple()));
+            let claimed_name = Roots::claimed_name(&entry);
+            let record = super::record_claim(&self.roots, &claimed_name)?;
+            Files::write_json(&self.roots.data.join(RECORD), &record)
+                .map_err(|_| "cannot save uninstall record")?;
+            let claimed = claim.join(&claimed_name);
             claim_entry(&data.join(&entry), &claimed, &entry, before_claim)?;
             removed.push(entry.to_string_lossy().into_owned());
         }
+        let recorded = self.roots.recorded_claims()?;
         let selected: Vec<_> = names(&claim)?
             .into_iter()
-            .filter(|entry| !is_release(entry))
+            .filter(|entry| !is_release(entry) && self.roots.claim_is_ours(entry, &recorded))
             .collect();
         let held = HeldDirectory::open(&claim, Access::Private)
             .map_err(|_| "unsafe uninstall claim directory")?;
@@ -420,8 +428,18 @@ impl Removal for Os {
         }
         {
             let _claim = hold(&claim)?;
-            if !names(&claim)?.is_empty() {
-                return Err("uninstall claim still contains data");
+            let recorded = self.roots.recorded_claims()?;
+            let left = names(&claim)?;
+            if !left.is_empty() {
+                // What should have been deleted is an error; what is not proven ours stays, and so does the claim
+                // (`remove_data_dir` lists it).
+                if left
+                    .iter()
+                    .any(|name| self.roots.claim_is_ours(name, &recorded))
+                {
+                    return Err("uninstall claim still contains data");
+                }
+                return Ok(());
             }
         }
         fs::remove_dir(&claim).map_err(|_| "cannot finish uninstall claim")
@@ -437,9 +455,6 @@ impl Removal for Os {
         let data = &self.roots.data;
         if names(data)?.iter().any(|name| !self.roots.is_kept(name)) {
             return Err("uninstall data remains");
-        }
-        if exists(&data.join(CLAIM))? {
-            return Err("uninstall claim remains");
         }
         let recovery = data.join(RECOVERY);
         if exists(&recovery)? {

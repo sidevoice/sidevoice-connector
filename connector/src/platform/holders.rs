@@ -34,6 +34,22 @@ pub trait Holding {
     /// Empty when there are none, when `root` is not there, and when the OS cannot tell: an observation that fails
     /// is no holder.
     fn of(root: &Path) -> Vec<Holder>;
+
+    /// Kills every process that has a file open under one of `roots` and whose program is a file inside `program_root`
+    /// (its full path, links resolved: the name a process gives itself proves nothing). The process is opened once;
+    /// its start time (as the OS reported it holding the file) and its program are checked on that same handle, and it
+    /// is ended through it, so a pid reused meanwhile is never touched. Never this process. Returns the pids ended.
+    /// Unix reports no holders, so ends nothing.
+    fn stop_running_from(roots: &[&Path], program_root: &Path) -> Vec<u32>;
+}
+
+/// Whether the program at `image` is a file inside `root`, both as the file system resolves them.
+#[cfg(any(windows, test))]
+fn runs_from(image: &Path, root: &Path) -> bool {
+    match (std::fs::canonicalize(image), std::fs::canonicalize(root)) {
+        (Ok(image), Ok(root)) => dunce::simplified(&image).starts_with(dunce::simplified(&root)),
+        _ => false,
+    }
 }
 
 /// Whether `root` may be walked: neither it nor any directory above it is a link or junction, as `is_link` says. A
@@ -48,6 +64,21 @@ fn walkable(root: &Path, is_link: impl Fn(&Path) -> Option<bool>) -> bool {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn a_program_belongs_to_an_installation_by_its_path_not_its_name() {
+        let scratch = crate::test_support::temp_dir("holders-runs-from");
+        let root = scratch.path().join("install");
+        let other = scratch.path().join("install2");
+        for dir in [&root, &other] {
+            std::fs::create_dir_all(dir.join("bin")).unwrap();
+            std::fs::write(dir.join("bin/sidevoice-connector"), "").unwrap();
+        }
+        assert!(runs_from(&root.join("bin/sidevoice-connector"), &root));
+        // The same name from another installation, or from a folder that only shares the prefix, is not ours.
+        assert!(!runs_from(&other.join("bin/sidevoice-connector"), &root));
+        assert!(!runs_from(&root.join("missing"), &root));
+    }
 
     #[test]
     fn a_linked_root_or_a_linked_ancestor_is_never_walked() {
