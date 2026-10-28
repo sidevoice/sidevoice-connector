@@ -733,18 +733,19 @@ impl Runtime {
     /// The connector processes of this installation that outlive the service (a daemon, a server an app started from
     /// the release) ended: they are ours, and on Windows they keep the files
     /// open. Found by the path of their program (inside the releases), never by name. Never the desktop app.
-    async fn stop_own_connectors(&self, layout: &Layout) {
+    async fn stop_own_connectors(&self, layout: &Layout) -> Vec<u32> {
         match self {
             Runtime::Machine => {
                 let (releases, data) = (layout.releases.clone(), layout.data.clone());
                 // Blocking OS calls: off the async threads.
-                let _ = tokio::task::spawn_blocking(move || {
+                tokio::task::spawn_blocking(move || {
                     Holders::stop_running_from(&[releases.as_path(), data.as_path()], &releases)
                 })
-                .await;
+                .await
+                .unwrap_or_default()
             }
             #[cfg(test)]
-            Runtime::Fake(_) => {}
+            Runtime::Fake(_) => Vec::new(),
         }
     }
 
@@ -1329,7 +1330,7 @@ async fn uninstall_with_hooks(
     }
     guard.preflight().map_err(explain)?;
     let service = runtime.unload(&layout).await?;
-    runtime.stop_own_connectors(&layout).await;
+    let terminated = runtime.stop_own_connectors(&layout).await;
     let agents = if options.agents {
         unregister(profile).await
     } else {
@@ -1360,7 +1361,7 @@ async fn uninstall_with_hooks(
     Ok(
         json!({"ok": true, "state": "absent", "safe_uninstall": crate::identity::SAFE_UNINSTALL,
         "service": service.get("service").cloned().unwrap_or(Value::Null),
-        "note": service.get("note").cloned().unwrap_or(Value::Null), "agents": agents,
+        "note": service.get("note").cloned().unwrap_or(Value::Null), "agents": agents, "terminated": terminated,
         "releases": had_releases.then(|| layout.releases.clone()), "data": layout.data, "removed": removed, "data_dir": data_dir,
         "advice": advice}),
     )
@@ -2258,12 +2259,21 @@ pub(crate) mod tests {
         Files::ensure_private_dir(&claim).unwrap();
         let legacy = claim.join(format!("data-{}", "a".repeat(32)));
         fs::write(&legacy, "desktop file").unwrap();
-        let named = claim.join(format!("data-{}~outbox.json", "b".repeat(32)));
+        // Named like a claim of ours, but this connector never recorded it: not proven, so it stays.
+        let crafted = claim.join(format!("data-{}~connector.log", "c".repeat(32)));
+        fs::write(&crafted, "somebody else's").unwrap();
+        // One it did record, for an owned name: deleted.
+        let named_name = format!("data-{}~outbox.json", "b".repeat(32));
+        let named = claim.join(&named_name);
         fs::write(&named, "ours").unwrap();
+        let mut record = layout.install_record().unwrap();
+        record["claimed"] = json!([named_name]);
+        Files::write_json(&layout.install_file(), &record).unwrap();
         let answer = uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
             .await
             .unwrap();
         assert_eq!(fs::read(&legacy).unwrap(), b"desktop file", "{answer}");
+        assert_eq!(fs::read(&crafted).unwrap(), b"somebody else's", "{answer}");
         assert!(!named.exists(), "{answer}");
         let kept = answer["data_dir"]["kept"].to_string();
         assert!(kept.contains(".uninstall-claim"), "{answer}");

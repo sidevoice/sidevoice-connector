@@ -582,6 +582,7 @@ impl Removal for Os {
                 )?;
             }
         }
+        let recorded = self.roots.recorded_claims()?;
         let selected: Vec<_> = entries(claim.as_raw_fd())?
             .into_iter()
             .filter(|name| name.as_bytes().starts_with(RELEASE_PREFIX.as_bytes()))
@@ -605,6 +606,8 @@ impl Removal for Os {
                 continue;
             }
             let claimed_name = Roots::claimed_name(&entry);
+            let record = super::record_claim(&self.roots, &claimed_name)?;
+            self.write_install_record(root.as_raw_fd(), &record)?;
             self.claim_entry(
                 root.as_raw_fd(),
                 &self.data_rel,
@@ -619,7 +622,7 @@ impl Removal for Os {
             .into_iter()
             .filter(|name| {
                 !name.as_bytes().starts_with(RELEASE_PREFIX.as_bytes())
-                    && self.roots.claim_is_ours(name)
+                    && self.roots.claim_is_ours(name, &recorded)
             })
             .collect();
         let held = self.held_directory(&self.claim_rel, claim.as_raw_fd())?;
@@ -637,11 +640,15 @@ impl Removal for Os {
         }
         let claim = open_dir(data.as_raw_fd(), OsStr::new(CLAIM))?;
         self.verify_dir(&self.claim_rel, claim.as_raw_fd())?;
+        let recorded = self.roots.recorded_claims()?;
         let left = entries(claim.as_raw_fd())?;
         if !left.is_empty() {
             // What should have been deleted is an error; what is not proven ours stays, and so does the claim
             // (`remove_data_dir` lists it).
-            if left.iter().any(|name| self.roots.claim_is_ours(name)) {
+            if left
+                .iter()
+                .any(|name| self.roots.claim_is_ours(name, &recorded))
+            {
                 return Err("uninstall claim still contains data");
             }
             return Ok(());

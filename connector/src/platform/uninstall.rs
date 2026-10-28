@@ -332,17 +332,33 @@ impl Roots {
     /// Whether the entry `claimed` of the claim directory is proven to be the connector's, so a retry may delete it: it
     /// names an owned entry. One without its name (an older version's claim, which also claimed what was not ours)
     /// is not proven, and is left where it is.
-    fn claim_is_ours(&self, claimed: &OsStr) -> bool {
+    fn claim_is_ours(&self, claimed: &OsStr, recorded: &[String]) -> bool {
         let claimed = claimed.to_string_lossy();
         if self.owned.is_none() || claimed.starts_with(RELEASE_PREFIX) {
             return true;
         }
+        // Written to the record before the rename, so only a claim this connector made is in it; and what it claimed
+        // is named exactly on the list of what it creates (never a reserved name).
         let original = claimed
             .strip_prefix(DATA_PREFIX)
             .and_then(|rest| rest.get(32..))
             .and_then(|tail| tail.strip_prefix('~'));
-        original
-            .is_some_and(|original| !original.is_empty() && !self.is_foreign(OsStr::new(original)))
+        recorded.iter().any(|name| *name == *claimed)
+            && original
+                .is_some_and(|original| self.owned.is_some_and(|owned| owned.contains(&original)))
+    }
+
+    /// The claim names the record lists: what this connector claimed.
+    fn recorded_claims(&self) -> Result<Vec<String>, &'static str> {
+        match Files::read_trusted(&self.data.join(RECORD), RECORD_LIMIT) {
+            Ok(None) => Ok(Vec::new()),
+            Ok(Some(bytes)) => Ok(serde_json::from_slice::<Value>(&bytes)
+                .ok()
+                .and_then(|record| record.get("claimed").cloned())
+                .and_then(|list| serde_json::from_value(list).ok())
+                .unwrap_or_default()),
+            Err(_) => Err("unsafe uninstall install record"),
+        }
     }
 
     /// The names in `D` that are never claimed as data: what the uninstall `kept`, the retry record, the claim and the
@@ -390,6 +406,19 @@ fn recovery_record(roots: &Roots) -> Result<Value, &'static str> {
     };
     record["command"] = json!([roots.data.join(RECOVERY).join(recovery_program())]);
     record["releases"] = json!(roots.releases);
+    Ok(record)
+}
+
+/// The record with `claimed` (a claim name) added to what it lists, to be saved before the rename that makes the claim.
+fn record_claim(roots: &Roots, claimed: &str) -> Result<Value, &'static str> {
+    let mut record = recovery_record(roots)?;
+    let mut list: Vec<String> = record
+        .get("claimed")
+        .cloned()
+        .and_then(|list| serde_json::from_value(list).ok())
+        .unwrap_or_default();
+    list.push(claimed.to_owned());
+    record["claimed"] = json!(list);
     Ok(record)
 }
 
