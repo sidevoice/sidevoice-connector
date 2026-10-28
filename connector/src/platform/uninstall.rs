@@ -334,10 +334,10 @@ impl Roots {
     /// names an owned entry. One without its name (an older version's claim, which also claimed what was not ours)
     /// is not proven, and is left where it is.
     fn claim_is_ours(&self, claimed: &OsStr) -> bool {
-        if self.owned.is_none() {
+        let claimed = claimed.to_string_lossy();
+        if self.owned.is_none() || claimed.starts_with(RELEASE_PREFIX) {
             return true;
         }
-        let claimed = claimed.to_string_lossy();
         let original = claimed
             .strip_prefix(DATA_PREFIX)
             .and_then(|rest| rest.get(32..))
