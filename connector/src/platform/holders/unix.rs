@@ -9,4 +9,8 @@ impl Holding for Os {
     fn of(_: &Path) -> Vec<Holder> {
         Vec::new()
     }
+
+    fn stop_running_from(_: &[&Path], _: &Path) -> Vec<u32> {
+        Vec::new()
+    }
 }

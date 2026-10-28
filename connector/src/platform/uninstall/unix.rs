@@ -4,7 +4,7 @@
 
 use super::{
     clean_absolute, foreign, recovery_program, recovery_record, DataDir, Removal, Roots, CLAIM,
-    DATA_PREFIX, RECORD, RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
+    RECORD, RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
 };
 use crate::platform::user::{User, UserId};
 use serde_json::Value;
@@ -604,7 +604,7 @@ impl Removal for Os {
             if self.roots.is_kept(&entry) {
                 continue;
             }
-            let claimed_name = format!("{DATA_PREFIX}{}", uuid::Uuid::new_v4().simple());
+            let claimed_name = Roots::claimed_name(&entry);
             self.claim_entry(
                 root.as_raw_fd(),
                 &self.data_rel,
@@ -617,7 +617,7 @@ impl Removal for Os {
         }
         let selected: Vec<_> = entries(claim.as_raw_fd())?
             .into_iter()
-            .filter(|name| !name.as_bytes().starts_with(RELEASE_PREFIX.as_bytes()))
+            .filter(|name| !name.as_bytes().starts_with(RELEASE_PREFIX.as_bytes()) && self.roots.claim_is_ours(name))
             .collect();
         let held = self.held_directory(&self.claim_rel, claim.as_raw_fd())?;
         held.remove_contents(&selected.iter().map(OsString::as_os_str).collect::<Vec<_>>())
@@ -635,7 +635,8 @@ impl Removal for Os {
         let claim = open_dir(data.as_raw_fd(), OsStr::new(CLAIM))?;
         self.verify_dir(&self.claim_rel, claim.as_raw_fd())?;
         if !entries(claim.as_raw_fd())?.is_empty() {
-            return Err("uninstall claim still contains data");
+            // What is not proven ours stays, and so does the claim: `remove_data_dir` lists it.
+            return Ok(());
         }
         self.verify_dir(&self.data_rel, data.as_raw_fd())?;
         if unsafe {
@@ -665,9 +666,6 @@ impl Removal for Os {
             if !self.roots.is_kept(&entry) {
                 return Err("uninstall data remains");
             }
-        }
-        if exists_at(data.as_raw_fd(), OsStr::new(CLAIM))? {
-            return Err("uninstall claim remains");
         }
         if exists_at(data.as_raw_fd(), OsStr::new(RECOVERY))? {
             let recovery_path = &self.recovery_rel;

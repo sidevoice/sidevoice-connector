@@ -172,12 +172,15 @@ const OWNED: &[&str] = &[
     "connector.json",
     "connector.lock",
     "connector.log",
+    "connector.log.1",
+    "connector.log.2",
     "connector.sock",
     "conversation-state.guard",
     "conversation-state.json",
     "core",
     "core.log",
     "core.log.1",
+    "core.log.2",
     "core.stderr.log",
     "install.lock",
     "node-stopped.json",
@@ -728,15 +731,17 @@ impl Runtime {
     }
 
     /// The connector processes of this installation that outlive the service (a daemon, a server an app started from
-    /// the release) asked to leave and, after a short grace, killed: they are ours, and on Windows they keep the files
-    /// open. Never the desktop app, which is the person's to quit.
+    /// the release) ended: they are ours, and on Windows they keep the files
+    /// open. Found by the path of their program (inside the releases), never by name. Never the desktop app.
     async fn stop_own_connectors(&self, layout: &Layout) {
         match self {
             Runtime::Machine => {
-                for pid in own_connectors(layout) {
-                    // Found among our own files and programs: any live process of this user with that pid is ours.
-                    Processes::stop(pid, |_| true, CONNECTOR_GRACE).await;
-                }
+                let (releases, data) = (layout.releases.clone(), layout.data.clone());
+                // Blocking OS calls: off the async threads.
+                let _ = tokio::task::spawn_blocking(move || {
+                    Holders::stop_running_from(&[releases.as_path(), data.as_path()], &releases)
+                })
+                .await;
             }
             #[cfg(test)]
             Runtime::Fake(_) => {}
@@ -756,25 +761,6 @@ impl Runtime {
             }
         }
     }
-}
-
-/// How long a connector of ours is given to leave when asked, before it is killed.
-const CONNECTOR_GRACE: Duration = Duration::from_secs(3);
-
-/// The `sidevoice-connector` processes holding this installation's files open (on Windows a running program holds its
-/// own file, so this finds every connector running from it). Never this process.
-fn own_connectors(layout: &Layout) -> Vec<u32> {
-    let own = std::process::id();
-    let mut pids: Vec<u32> = [&layout.releases, &layout.data]
-        .into_iter()
-        .flat_map(|root| Holders::of(root))
-        .filter(|holder| holder.name.to_lowercase().contains("sidevoice-connector"))
-        .map(|holder| holder.pid)
-        .collect();
-    pids.retain(|pid| *pid != own);
-    pids.sort_unstable();
-    pids.dedup();
-    pids
 }
 
 /// The selection restarted and verified: `Ok(kind)`, or why the pair did not answer.
@@ -2257,6 +2243,32 @@ pub(crate) mod tests {
         assert_eq!(fs::read(&outside).unwrap(), b"outside contents");
     }
 
+
+    /// What an older version claimed is not known to be ours (its claim names do not say what they were): a retry
+    /// leaves it where it is, with the claim directory, and says so; what this version claimed by name is deleted.
+    #[tokio::test]
+    async fn a_retry_never_deletes_what_an_older_claim_cannot_prove_is_ours() {
+        let fixture = Fixture::new("uninstall-legacy-claim");
+        fixture
+            .install(&fixture.package("1.0.0", "a"))
+            .await
+            .unwrap();
+        let layout = fixture.layout();
+        let claim = layout.data.join(".uninstall-claim");
+        Files::ensure_private_dir(&claim).unwrap();
+        let legacy = claim.join(format!("data-{}", "a".repeat(32)));
+        fs::write(&legacy, "desktop file").unwrap();
+        let named = claim.join(format!("data-{}~outbox.json", "b".repeat(32)));
+        fs::write(&named, "ours").unwrap();
+        let answer = uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
+            .await
+            .unwrap();
+        assert_eq!(fs::read(&legacy).unwrap(), b"desktop file", "{answer}");
+        assert!(!named.exists(), "{answer}");
+        let kept = answer["data_dir"]["kept"].to_string();
+        assert!(kept.contains(".uninstall-claim"), "{answer}");
+        assert!(!layout.releases.exists(), "{answer}");
+    }
     #[tokio::test]
     async fn failed_claim_keeps_recovery_cli_and_retry_clears_residual_owned_data() {
         let fixture = Fixture::new("uninstall-retry");

@@ -14,7 +14,7 @@
 //! No `unsafe` here: `std`'s `OpenOptionsExt` sets the sharing and the flags, `winapi-util` reads the file id.
 
 use super::{
-    foreign, recovery_program, recovery_record, DataDir, Removal, Roots, CLAIM, DATA_PREFIX,
+    foreign, recovery_program, recovery_record, DataDir, Removal, Roots, CLAIM,
     RECORD, RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
 };
 use crate::platform::fs::{Access, Create, Directory, Files, Fs, HeldDirectory};
@@ -373,13 +373,13 @@ impl Removal for Os {
             if self.roots.is_kept(&entry) {
                 continue;
             }
-            let claimed = claim.join(format!("{DATA_PREFIX}{}", uuid::Uuid::new_v4().simple()));
+            let claimed = claim.join(Roots::claimed_name(&entry));
             claim_entry(&data.join(&entry), &claimed, &entry, before_claim)?;
             removed.push(entry.to_string_lossy().into_owned());
         }
         let selected: Vec<_> = names(&claim)?
             .into_iter()
-            .filter(|entry| !is_release(entry))
+            .filter(|entry| !is_release(entry) && self.roots.claim_is_ours(entry))
             .collect();
         let held = HeldDirectory::open(&claim, Access::Private)
             .map_err(|_| "unsafe uninstall claim directory")?;
@@ -424,7 +424,8 @@ impl Removal for Os {
         {
             let _claim = hold(&claim)?;
             if !names(&claim)?.is_empty() {
-                return Err("uninstall claim still contains data");
+                // What is not proven ours stays, and so does the claim: `remove_data_dir` lists it.
+                return Ok(());
             }
         }
         fs::remove_dir(&claim).map_err(|_| "cannot finish uninstall claim")
@@ -440,9 +441,6 @@ impl Removal for Os {
         let data = &self.roots.data;
         if names(data)?.iter().any(|name| !self.roots.is_kept(name)) {
             return Err("uninstall data remains");
-        }
-        if exists(&data.join(CLAIM))? {
-            return Err("uninstall claim remains");
         }
         let recovery = data.join(RECOVERY);
         if exists(&recovery)? {

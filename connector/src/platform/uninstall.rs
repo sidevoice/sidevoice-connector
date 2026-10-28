@@ -320,6 +320,33 @@ impl Roots {
         })
     }
 
+    /// What a claimed entry of `D` is called inside [`CLAIM`]: the prefix, a unique suffix and, after a `~`, the name
+    /// it had, so that a retry knows what it holds.
+    fn claimed_name(original: &OsStr) -> String {
+        format!(
+            "{DATA_PREFIX}{}~{}",
+            uuid::Uuid::new_v4().simple(),
+            original.to_string_lossy()
+        )
+    }
+
+    /// Whether the entry `claimed` of the claim directory is proven to be the connector's, so a retry may delete it: it
+    /// names an owned entry. One without its name (an older version's claim, which also claimed what was not ours)
+    /// is not proven, and is left where it is.
+    fn claim_is_ours(&self, claimed: &OsStr) -> bool {
+        if self.owned.is_none() {
+            return true;
+        }
+        let claimed = claimed.to_string_lossy();
+        let original = claimed
+            .strip_prefix(DATA_PREFIX)
+            .and_then(|rest| rest.get(32..))
+            .and_then(|tail| tail.strip_prefix('~'));
+        original.is_some_and(|original| {
+            !original.is_empty() && !self.is_foreign(OsStr::new(original))
+        })
+    }
+
     /// The names in `D` that are never claimed as data: what the uninstall `kept`, the retry record, the claim and the
     /// recovery directories, and `R` (removed as the releases, by itself).
     fn is_kept(&self, name: &OsStr) -> bool {
