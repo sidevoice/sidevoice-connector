@@ -200,10 +200,16 @@ fn failed(detail: impl std::fmt::Display) -> anyhow::Error {
     keyed("install.failed", json!({"detail": detail.to_string()}))
 }
 
-/// `failure` (what the removal said), or, when processes are seen holding installed files open, the same failure with
-/// each of them named and what to try. A holder seen in the tree is not proof that it caused this failure (a scanner,
-/// an agent's server, anything): the wording says so, keeps the original `reason` and does not blame an agent app
-/// alone. `own` is this process, which is not asked to close.
+/// Whether `name` is the Sidevoice desktop app, as the OS names the process (its application name, else its program).
+fn is_desktop_app(name: &str) -> bool {
+    let name = name.trim().to_lowercase();
+    name.strip_suffix(".exe").unwrap_or(&name) == "sidevoice"
+}
+
+/// `failure` (what the removal said), or, when processes are seen holding installed files open, the same failure
+/// saying what to do: quit the desktop app when it is one of them (the one thing to do, so nothing else is listed),
+/// else close the others, each named with its PID. `own` is this process, which is not asked to close. `what` is
+/// `Install` or `Uninstall`: the command to run again.
 fn in_use_error(
     what: &'static str,
     failure: anyhow::Error,
@@ -211,17 +217,45 @@ fn in_use_error(
     holders: &[Holder],
     own: u32,
 ) -> anyhow::Error {
-    let named = holders
-        .iter()
-        .filter(|holder| holder.pid != own)
-        .map(|holder| format!("{} (PID {})", holder.name, holder.pid))
-        .collect::<Vec<_>>();
-    if named.is_empty() {
+    let others: Vec<&Holder> = holders.iter().filter(|holder| holder.pid != own).collect();
+    if others.is_empty() {
         return failure;
     }
+    let command = format!("npx sidevoice {}", what.to_lowercase());
+    if others.iter().any(|holder| is_desktop_app(&holder.name)) {
+        let app = others.iter().find(|holder| is_desktop_app(&holder.name));
+        let place = if cfg!(target_os = "macos") {
+            "click its icon in the menu bar, then choose Quit".to_owned()
+        } else if let (true, Some(app)) = (cfg!(windows), app) {
+            // No icon (hung, or its tray entry gone): the one way left to end it.
+            format!(
+                "right-click its icon in the system tray, then choose Quit; if there is no icon, run `taskkill /F /PID {}`",
+                app.pid
+            )
+        } else {
+            "right-click its icon in the system tray, then choose Quit".to_owned()
+        };
+        return keyed(
+            "install.files-in-use-app",
+            json!({"what": what, "reason": reason, "place": place, "command": command}),
+        );
+    }
+    let named = others
+        .iter()
+        .map(|holder| {
+            if cfg!(windows) {
+                format!(
+                    "{} (PID {}; close it with `taskkill /PID {}`)",
+                    holder.name, holder.pid, holder.pid
+                )
+            } else {
+                format!("{} (PID {})", holder.name, holder.pid)
+            }
+        })
+        .collect::<Vec<_>>();
     keyed(
         "install.files-in-use",
-        json!({"what": what, "reason": reason, "holders": named.join(", ")}),
+        json!({"what": what, "reason": reason, "holders": named.join(", "), "command": command}),
     )
 }
 
@@ -671,6 +705,18 @@ impl Runtime {
         status::read_ready(layout).map(|ready| ready.launch_id)
     }
 
+    /// The connector processes of this installation that outlive the service (a daemon, a server an app started from
+    /// the release) asked to leave and, after a short grace, killed: they are ours, and on Windows they keep the files
+    /// open. Never the desktop app, which is the person's to quit.
+    async fn stop_own_connectors(&self, layout: &Layout) {
+        if let Runtime::Machine = self {
+            for pid in own_connectors(layout) {
+                // Found among our own files and programs: any live process of this user with that pid is ours.
+                Processes::stop(pid, |_| true, CONNECTOR_GRACE).await;
+            }
+        }
+    }
+
     /// Both jobs unloaded, what runs on demand stopped and both definitions deleted, the stop kept.
     async fn unload(&self, layout: &Layout) -> crate::service::Result<Value> {
         match self {
@@ -684,6 +730,29 @@ impl Runtime {
             }
         }
     }
+}
+
+/// How long a connector of ours is given to leave when asked, before it is killed.
+const CONNECTOR_GRACE: Duration = Duration::from_secs(3);
+
+/// The `sidevoice-connector` processes of this installation: those holding its files open, and those running a
+/// program from its releases. Never this process.
+fn own_connectors(layout: &Layout) -> Vec<u32> {
+    let own = std::process::id();
+    let releases = layout.releases.to_string_lossy().to_lowercase();
+    let mut pids: Vec<u32> = [&layout.releases, &layout.data]
+        .into_iter()
+        .flat_map(|root| Holders::of(root))
+        .filter(|holder| holder.name.to_lowercase().contains("sidevoice-connector"))
+        .map(|holder| holder.pid)
+        .collect();
+    pids.extend(Processes::find(|command| {
+        command.to_lowercase().contains(&releases)
+    }));
+    pids.retain(|pid| *pid != own);
+    pids.sort_unstable();
+    pids.dedup();
+    pids
 }
 
 /// The selection restarted and verified: `Ok(kind)`, or why the pair did not answer.
@@ -1250,6 +1319,7 @@ async fn uninstall_with_hooks(
     }
     guard.preflight().map_err(explain)?;
     let service = runtime.unload(&layout).await?;
+    runtime.stop_own_connectors(&layout).await;
     let agents = if options.agents {
         unregister(profile).await
     } else {
@@ -1399,17 +1469,36 @@ pub(crate) mod tests {
         let said = crate::messages::keyed(&error);
         assert_eq!(said.key, "install.files-in-use");
         let text = said.message();
-        assert!(
-            text.contains("editor.exe (PID 4242), sidevoice-connector.exe (PID 77)"),
-            "{text}"
-        );
+        assert!(text.contains("editor.exe (PID 4242"), "{text}");
+        assert!(text.contains("sidevoice-connector.exe (PID 77"), "{text}");
+        assert!(text.contains("`npx sidevoice uninstall`"), "{text}");
         assert!(
             text.starts_with("Uninstall failed: cannot claim uninstall entry."),
             "{text}"
         );
-        assert!(text.contains("If that is why, close them"), "{text}");
-        assert!(text.contains("virus scanner"), "{text}");
+        assert!(text.contains("Close them"), "{text}");
+        assert!(!text.contains("virus scanner"), "{text}");
         assert!(!text.contains("PID 9)"), "{text}");
+    }
+
+    #[test]
+    fn the_desktop_app_as_holder_is_told_to_quit_and_nothing_else_is_listed() {
+        let holders = [
+            Holder {
+                pid: 1,
+                name: "editor.exe".into(),
+            },
+            Holder {
+                pid: 2,
+                name: "Sidevoice".into(),
+            },
+        ];
+        let error = in_use_error("Uninstall", failed("x"), "x", &holders, 9);
+        let said = crate::messages::keyed(&error);
+        assert_eq!(said.key, "install.files-in-use-app");
+        let text = said.message();
+        assert!(text.contains("Quit it ("), "{text}");
+        assert!(!text.contains("editor"), "{text}");
     }
 
     #[test]
