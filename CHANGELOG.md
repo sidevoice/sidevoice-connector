@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.2](https://github.com/sidevoice/sidevoice-connector/compare/v0.17.1...v0.17.2) (2026-10-28)
+
+
+### Bug Fixes
+
+* **uninstall:** stop our own connectors and say what to quit ([#317](https://github.com/sidevoice/sidevoice-connector/issues/317)) ([04c82a3](https://github.com/sidevoice/sidevoice-connector/commit/04c82a3b95aaf615381c418927dc3c54224e0eea))
+
 ## [0.17.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.17.0...v0.17.1) (2026-10-28)
 
 
