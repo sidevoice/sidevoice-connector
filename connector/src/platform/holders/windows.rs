@@ -137,10 +137,7 @@ fn holding(files: &[PathBuf]) -> Option<Vec<(Holder, u64)>> {
                                     name: text(&info.strAppName),
                                 },
                                 filetime(info.Process.ProcessStartTime),
-                            )
-                        })|info| Holder {
-                            pid: info.Process.dwProcessId,
-                            name: text(&info.strAppName),
+                        })
                         })
                         .collect(),
                 );
