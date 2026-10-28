@@ -182,6 +182,7 @@ const OWNED: &[&str] = &[
     "install.lock",
     "node-stopped.json",
     "outbox.json",
+    "service",
 ];
 
 /// The package being installed: its root (`bin/`, `connector.json`, `core/`), its binary and the version it is.
