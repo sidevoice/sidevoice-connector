@@ -760,20 +760,16 @@ impl Runtime {
 /// How long a connector of ours is given to leave when asked, before it is killed.
 const CONNECTOR_GRACE: Duration = Duration::from_secs(3);
 
-/// The `sidevoice-connector` processes of this installation: those holding its files open, and those running a
-/// program from its releases. Never this process.
+/// The `sidevoice-connector` processes holding this installation's files open (on Windows a running program holds its
+/// own file, so this finds every connector running from it). Never this process.
 fn own_connectors(layout: &Layout) -> Vec<u32> {
     let own = std::process::id();
-    let releases = layout.releases.to_string_lossy().to_lowercase();
     let mut pids: Vec<u32> = [&layout.releases, &layout.data]
         .into_iter()
         .flat_map(|root| Holders::of(root))
         .filter(|holder| holder.name.to_lowercase().contains("sidevoice-connector"))
         .map(|holder| holder.pid)
         .collect();
-    pids.extend(Processes::find(|command| {
-        command.to_lowercase().contains(&releases)
-    }));
     pids.retain(|pid| *pid != own);
     pids.sort_unstable();
     pids.dedup();
