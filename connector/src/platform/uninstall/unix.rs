@@ -810,6 +810,7 @@ mod tests {
         let releases = data.join("install");
         Os::new(Roots {
             standard: Some(data.clone()),
+            models: Some(data.join(data_dir::MODELS)),
             data,
             releases,
             kept: KEPT,

@@ -1274,6 +1274,7 @@ pub async fn uninstall(profile: &Profile, options: Options, runtime: &Runtime) -
 fn removal_roots(layout: &Layout) -> Roots {
     Roots {
         standard: data_dir::standard(),
+        models: data_dir::models_dir(),
         data: layout.data.clone(),
         releases: layout.releases.clone(),
         kept: KEPT,

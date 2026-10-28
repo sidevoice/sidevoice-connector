@@ -109,7 +109,9 @@ impl Machine {
             "HOME"
         })?);
         let data = match os {
-            Os::Windows => PathBuf::from(var("LOCALAPPDATA")?).join("Sidevoice"),
+            Os::Windows => PathBuf::from(var("LOCALAPPDATA")?)
+                .join("Sidevoice")
+                .join("Data"),
             Os::Macos => home.join("Library/Application Support/Sidevoice"),
             Os::Linux => env::var("XDG_DATA_HOME")
                 .ok()
