@@ -8,13 +8,14 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_MORE_DATA, ERROR_SUCCESS, FILETIME, HANDLE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-use windows_sys::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
-    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-};
 use windows_sys::Win32::System::RestartManager::{
     RmEndSession, RmGetList, RmRegisterResources, RmStartSession, CCH_RM_SESSION_KEY,
     RM_PROCESS_INFO,
+};
+use windows_sys::Win32::System::Threading::{
+    GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+    WaitForSingleObject, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
 };
 
 /// How many files are registered with the Restart Manager in one session.
@@ -137,7 +138,7 @@ fn holding(files: &[PathBuf]) -> Option<Vec<(Holder, u64)>> {
                                     name: text(&info.strAppName),
                                 },
                                 filetime(info.Process.ProcessStartTime),
-                        })
+                            )
                         })
                         .collect(),
                 );
@@ -196,10 +197,22 @@ impl Process {
     /// When the process started.
     fn started(&self) -> Option<u64> {
         let (mut created, mut exited, mut kernel, mut user) = (
-            FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 },
-            FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 },
-            FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 },
-            FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 },
+            FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            },
+            FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            },
+            FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            },
+            FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            },
         );
         // SAFETY: the four times are writable.
         let read =

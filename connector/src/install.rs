@@ -2243,7 +2243,6 @@ pub(crate) mod tests {
         assert_eq!(fs::read(&outside).unwrap(), b"outside contents");
     }
 
-
     /// What an older version claimed is not known to be ours (its claim names do not say what they were): a retry
     /// leaves it where it is, with the claim directory, and says so; what this version claimed by name is deleted.
     #[tokio::test]

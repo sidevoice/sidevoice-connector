@@ -342,9 +342,8 @@ impl Roots {
             .strip_prefix(DATA_PREFIX)
             .and_then(|rest| rest.get(32..))
             .and_then(|tail| tail.strip_prefix('~'));
-        original.is_some_and(|original| {
-            !original.is_empty() && !self.is_foreign(OsStr::new(original))
-        })
+        original
+            .is_some_and(|original| !original.is_empty() && !self.is_foreign(OsStr::new(original)))
     }
 
     /// The names in `D` that are never claimed as data: what the uninstall `kept`, the retry record, the claim and the

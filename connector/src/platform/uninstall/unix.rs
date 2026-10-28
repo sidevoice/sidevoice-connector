@@ -617,7 +617,10 @@ impl Removal for Os {
         }
         let selected: Vec<_> = entries(claim.as_raw_fd())?
             .into_iter()
-            .filter(|name| !name.as_bytes().starts_with(RELEASE_PREFIX.as_bytes()) && self.roots.claim_is_ours(name))
+            .filter(|name| {
+                !name.as_bytes().starts_with(RELEASE_PREFIX.as_bytes())
+                    && self.roots.claim_is_ours(name)
+            })
             .collect();
         let held = self.held_directory(&self.claim_rel, claim.as_raw_fd())?;
         held.remove_contents(&selected.iter().map(OsString::as_os_str).collect::<Vec<_>>())

@@ -14,8 +14,8 @@
 //! No `unsafe` here: `std`'s `OpenOptionsExt` sets the sharing and the flags, `winapi-util` reads the file id.
 
 use super::{
-    foreign, recovery_program, recovery_record, DataDir, Removal, Roots, CLAIM,
-    RECORD, RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
+    foreign, recovery_program, recovery_record, DataDir, Removal, Roots, CLAIM, RECORD,
+    RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
 };
 use crate::platform::fs::{Access, Create, Directory, Files, Fs, HeldDirectory};
 use sidevoice_platform::removal::Removal as _;
