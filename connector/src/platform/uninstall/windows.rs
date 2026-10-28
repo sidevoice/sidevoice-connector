@@ -423,8 +423,13 @@ impl Removal for Os {
         }
         {
             let _claim = hold(&claim)?;
-            if !names(&claim)?.is_empty() {
-                // What is not proven ours stays, and so does the claim: `remove_data_dir` lists it.
+            let left = names(&claim)?;
+            if !left.is_empty() {
+                // What should have been deleted is an error; what is not proven ours stays, and so does the claim
+                // (`remove_data_dir` lists it).
+                if left.iter().any(|name| self.roots.claim_is_ours(name)) {
+                    return Err("uninstall claim still contains data");
+                }
                 return Ok(());
             }
         }

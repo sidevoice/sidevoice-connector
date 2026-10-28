@@ -637,8 +637,13 @@ impl Removal for Os {
         }
         let claim = open_dir(data.as_raw_fd(), OsStr::new(CLAIM))?;
         self.verify_dir(&self.claim_rel, claim.as_raw_fd())?;
-        if !entries(claim.as_raw_fd())?.is_empty() {
-            // What is not proven ours stays, and so does the claim: `remove_data_dir` lists it.
+        let left = entries(claim.as_raw_fd())?;
+        if !left.is_empty() {
+            // What should have been deleted is an error; what is not proven ours stays, and so does the claim
+            // (`remove_data_dir` lists it).
+            if left.iter().any(|name| self.roots.claim_is_ours(name)) {
+                return Err("uninstall claim still contains data");
+            }
             return Ok(());
         }
         self.verify_dir(&self.data_rel, data.as_raw_fd())?;
