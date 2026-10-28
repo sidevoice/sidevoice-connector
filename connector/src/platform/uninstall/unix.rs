@@ -329,7 +329,11 @@ impl Os {
         Ok(held)
     }
 
-    fn check_tree(&self, relative: &Path, kept: &[&str]) -> Result<bool, &'static str> {
+    fn check_tree(
+        &self,
+        relative: &Path,
+        skip: impl Fn(&OsStr) -> bool,
+    ) -> Result<bool, &'static str> {
         let Some(root) = self.open_relative(relative)? else {
             return Ok(false);
         };
@@ -338,7 +342,7 @@ impl Os {
             let selected = entries(root.as_raw_fd()).map_err(io::Error::other)?;
             let allowed: Vec<_> = selected
                 .iter()
-                .filter(|name| !kept.iter().any(|kept| *name == OsStr::new(kept)))
+                .filter(|name| !skip(name))
                 .map(OsString::as_os_str)
                 .collect();
             held.check_contents(&allowed)
@@ -541,8 +545,11 @@ impl Removal for Os {
     }
 
     fn preflight(&self) -> Result<bool, &'static str> {
-        let releases = self.check_tree(&self.releases_rel, &[])?;
-        self.check_tree(&self.data_rel, self.roots.kept)?;
+        let releases = self.check_tree(&self.releases_rel, |_| false)?;
+        self.check_tree(&self.data_rel, |name| {
+            self.roots.is_foreign(name)
+                || self.roots.kept.iter().any(|kept| name == OsStr::new(kept))
+        })?;
         let claimed_releases = if let Some(claim) = self.open_relative(&self.claim_rel)? {
             entries(claim.as_raw_fd())?
                 .iter()
@@ -800,6 +807,7 @@ mod tests {
             data,
             releases,
             kept: KEPT,
+            owned: None,
             homes: vec![home.to_path_buf()],
         })
         .unwrap()

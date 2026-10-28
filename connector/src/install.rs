@@ -163,6 +163,27 @@ const KEPT: &[&str] = &[
     data_dir::MODELS,
 ];
 
+/// The names in `D` that this connector, or the core it runs, creates: the only entries `uninstall` removes. `D` can be
+/// shared with a program that is not ours (the desktop app installs itself into the standard place), so anything else
+/// in it is left alone and reported.
+const OWNED: &[&str] = &[
+    "agents.json",
+    "agents.lock",
+    "connector.json",
+    "connector.lock",
+    "connector.log",
+    "connector.sock",
+    "conversation-state.guard",
+    "conversation-state.json",
+    "core",
+    "core.log",
+    "core.log.1",
+    "core.stderr.log",
+    "install.lock",
+    "node-stopped.json",
+    "outbox.json",
+];
+
 /// The package being installed: its root (`bin/`, `connector.json`, `core/`), its binary and the version it is.
 #[derive(Clone, Debug)]
 pub struct Package {
@@ -709,11 +730,15 @@ impl Runtime {
     /// the release) asked to leave and, after a short grace, killed: they are ours, and on Windows they keep the files
     /// open. Never the desktop app, which is the person's to quit.
     async fn stop_own_connectors(&self, layout: &Layout) {
-        if let Runtime::Machine = self {
-            for pid in own_connectors(layout) {
-                // Found among our own files and programs: any live process of this user with that pid is ours.
-                Processes::stop(pid, |_| true, CONNECTOR_GRACE).await;
+        match self {
+            Runtime::Machine => {
+                for pid in own_connectors(layout) {
+                    // Found among our own files and programs: any live process of this user with that pid is ours.
+                    Processes::stop(pid, |_| true, CONNECTOR_GRACE).await;
+                }
             }
+            #[cfg(test)]
+            Runtime::Fake(_) => {}
         }
     }
 
@@ -1269,6 +1294,7 @@ fn removal_roots(layout: &Layout) -> Roots {
         data: layout.data.clone(),
         releases: layout.releases.clone(),
         kept: KEPT,
+        owned: Some(OWNED),
         // The profile's home and the OS's: the same on Unix, two places on Windows (`USERPROFILE`, the Known Folder).
         homes: std::iter::once(layout.home.clone())
             .chain(dirs::home_dir())
@@ -1755,6 +1781,8 @@ pub(crate) mod tests {
         let models = layout.data.join(data_dir::MODELS).join("other-program");
         fs::create_dir_all(&models).unwrap();
         fs::write(models.join("sentinel"), "theirs").unwrap();
+        // The desktop app lives in the same folder: what is not the connector's survives, and is said.
+        fs::write(layout.data.join("sidevoice-desktop.exe"), "app").unwrap();
         let removed = uninstall(&fixture.profile, NO_AGENTS, &fixture.runtime())
             .await
             .unwrap();
@@ -1774,13 +1802,14 @@ pub(crate) mod tests {
                 data_dir::MODELS,
                 "agents.lock",
                 "install.lock",
-                "node-stopped.json"
+                "node-stopped.json",
+                "sidevoice-desktop.exe"
             ],
             "{left:?}"
         );
         assert_eq!(
             removed["data_dir"],
-            json!({"removed": false, "kept": [data_dir::MODELS], "held": []}),
+            json!({"removed": false, "kept": [data_dir::MODELS, "sidevoice-desktop.exe"], "held": []}),
             "{removed}"
         );
         assert!(human_uninstall(&removed).contains(data_dir::MODELS));
@@ -2237,13 +2266,15 @@ pub(crate) mod tests {
         let package = fixture.package("1.0.0", "a");
         fixture.install(&package).await.unwrap();
         let layout = fixture.layout();
-        let victim = layout.data.join("victim");
+        let victim = layout.data.join("conversation-state.json");
         let moved = fixture.scratch.path().join("outside-victim");
         fs::create_dir(&victim).unwrap();
         fs::write(victim.join("keep"), b"outside contents").unwrap();
         let swapped = AtomicBool::new(false);
         let hook = |name: &OsStr| {
-            if name == OsStr::new("victim") && !swapped.swap(true, Ordering::SeqCst) {
+            if name == OsStr::new("conversation-state.json")
+                && !swapped.swap(true, Ordering::SeqCst)
+            {
                 fs::rename(&victim, &moved).unwrap();
                 Files::symlink(&moved, &victim);
             }

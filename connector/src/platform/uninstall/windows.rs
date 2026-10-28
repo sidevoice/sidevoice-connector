@@ -307,7 +307,10 @@ impl Removal for Os {
                 let selected = names(&self.roots.data).map_err(io::Error::other)?;
                 let allowed: Vec<_> = selected
                     .iter()
-                    .filter(|name| !self.roots.kept.iter().any(|kept| *name == OsStr::new(kept)))
+                    .filter(|name| {
+                        !self.roots.is_foreign(name)
+                            && !self.roots.kept.iter().any(|kept| *name == OsStr::new(kept))
+                    })
                     .map(OsString::as_os_str)
                     .collect();
                 held.check_contents(&allowed)

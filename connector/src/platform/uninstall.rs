@@ -134,6 +134,10 @@ pub struct Roots {
     pub standard: Option<PathBuf>,
     /// The names in `D` that an uninstall leaves (its permanent lock files and the stop).
     pub kept: &'static [&'static str],
+    /// The names in `D` that the connector (or the core it runs) creates, and so the only ones an uninstall removes:
+    /// `D` can be shared with a program that is not ours (the desktop app installs into the standard place), and what
+    /// is not listed is left where it is and reported. `None` removes every entry (a `D` known to be only ours).
+    pub owned: Option<&'static [&'static str]>,
     /// Every home directory the code knows: the profile's (`HOME`, `USERPROFILE`) and the OS's, which differ on Windows
     /// (the Known Folder). `D` may be none of them nor a directory one is in; none known, and nothing is removed.
     pub homes: Vec<PathBuf>,
@@ -304,13 +308,27 @@ impl Roots {
         })
     }
 
+    /// Whether `name` in `D` is not the connector's: not in [`Roots::owned`] (the retry record, the claim and recovery
+    /// directories and `R` are ours and never foreign).
+    fn is_foreign(&self, name: &OsStr) -> bool {
+        self.owned.is_some_and(|owned| {
+            !owned.iter().any(|own| OsStr::new(own) == name)
+                && ![RECORD, CLAIM, RECOVERY]
+                    .iter()
+                    .any(|own| OsStr::new(own) == name)
+                && self.releases.file_name() != Some(name)
+        })
+    }
+
     /// The names in `D` that are never claimed as data: what the uninstall `kept`, the retry record, the claim and the
     /// recovery directories, and `R` (removed as the releases, by itself).
     fn is_kept(&self, name: &OsStr) -> bool {
-        self.kept
-            .iter()
-            .chain(&[RECORD, CLAIM, RECOVERY])
-            .any(|kept| OsStr::new(kept) == name)
+        self.is_foreign(name)
+            || self
+                .kept
+                .iter()
+                .chain(&[RECORD, CLAIM, RECOVERY])
+                .any(|kept| OsStr::new(kept) == name)
             || self.releases.file_name() == Some(name)
     }
 }
@@ -469,6 +487,7 @@ mod tests {
             data,
             standard: Some(standard.to_path_buf()),
             kept: KEPT,
+            owned: None,
             homes: standard
                 .parent()
                 .map(Path::to_path_buf)
