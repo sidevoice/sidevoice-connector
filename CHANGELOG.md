@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.18.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.17.2...v0.18.0) (2026-10-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* rename the core binary to sidevoice-core ([#320](https://github.com/sidevoice/sidevoice-connector/issues/320))
+
+### Bug Fixes
+
+* **cursor:** read reasoning_effort and report the base model id ([#321](https://github.com/sidevoice/sidevoice-connector/issues/321)) ([f017ecb](https://github.com/sidevoice/sidevoice-connector/commit/f017ecbcc8aee6fd76da375649d29da83e4e6d8a))
+
+
+### Code Refactoring
+
+* rename the core binary to sidevoice-core ([#320](https://github.com/sidevoice/sidevoice-connector/issues/320)) ([bab4d2f](https://github.com/sidevoice/sidevoice-connector/commit/bab4d2fce01fc549134a0865a6ba06abaf496b19))
+
 ## [0.17.2](https://github.com/sidevoice/sidevoice-connector/compare/v0.17.1...v0.17.2) (2026-10-28)
 
 
