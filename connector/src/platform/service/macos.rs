@@ -443,7 +443,7 @@ mod tests {
             id: JobId { label, name: "x" },
             description: "x",
             program: vec![
-                "/r/current/core/bin/sidevoice-core-rust".into(),
+                "/r/current/core/bin/sidevoice-core".into(),
                 "--data-dir".into(),
                 "/d/core & <x>".into(),
             ],

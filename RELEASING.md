@@ -217,7 +217,7 @@ Say Windows x64 or macOS x86_64:
 the C runtime linked statically, `.cargo/config.toml`): the manifest, the `@sidevoice/sidevoice-win32-x64` npm package,
 the launcher's `optionalDependencies` and the `release.yml` matrix list it, and the connector's `.exe` names and the
 archive checks follow from `TARGETS`. The pinned core publishes `sidevoice-core-<version>-windows-x86_64.tar.zst`
-(program `bin/sidevoice-core-rust.exe`); `cargo xtask fixtures` and `dist` say so when a pinned core does not.
+(program `bin/sidevoice-core.exe`); `cargo xtask fixtures` and `dist` say so when a pinned core does not.
 `@sidevoice/sidevoice-win32-x64` is reserved and its trusted publisher configured (steps 1 and 2 of
 [npm](#npm-what-is-published-and-how-to-add-a-platform)).
 

@@ -656,7 +656,7 @@ mod tests {
     fn a_definition_reads_back_the_program_it_runs() {
         for program in [
             &[
-                "/r/current/core/bin/sidevoice-core-rust",
+                "/r/current/core/bin/sidevoice-core",
                 "--data-dir",
                 "/d/core & <x>",
             ][..],

@@ -17,10 +17,10 @@ const MANIFEST_PATH: &str = "Cargo.toml";
 const PLATFORM_CRATE: &str = "sidevoice-platform";
 const REPOSITORY: &str = "sidevoice/sidevoice-core";
 /// The archive's root directory and its entrypoint below it.
-const ROOT: &str = "sidevoice-core-rust";
-const ENTRYPOINT_STEM: &str = "bin/sidevoice-core-rust";
+const ROOT: &str = "sidevoice-core";
+const ENTRYPOINT_STEM: &str = "bin/sidevoice-core";
 
-/// The core's program inside its archive for `target`: `bin/sidevoice-core-rust`, `.exe` on Windows.
+/// The core's program inside its archive for `target`: `bin/sidevoice-core`, `.exe` on Windows.
 fn entrypoint(target: &str) -> String {
     sidevoice_platform::target::by_name(target)
         .expect("validated release target")
@@ -199,7 +199,7 @@ pub(crate) fn fetch(target: &str) -> Result<PinnedCore> {
     })
 }
 
-/// Fetches the pinned core for this host ([`fetch`]) and unpacks it as `DIR/sidevoice-core-rust`, keeps the checked
+/// Fetches the pinned core for this host ([`fetch`]) and unpacks it as `DIR/sidevoice-core`, keeps the checked
 /// archive as `DIR/<name>`, and records what it is in `DIR/core.json`.
 pub(crate) fn core(dir: &Path) -> Result<()> {
     let pinned = fetch(host_target()?)?;
@@ -239,9 +239,9 @@ mod tests {
 
     #[test]
     fn the_core_program_has_the_suffix_of_its_target() {
-        assert_eq!(entrypoint("linux-x86_64"), "bin/sidevoice-core-rust");
-        assert_eq!(entrypoint("macos-aarch64"), "bin/sidevoice-core-rust");
-        assert_eq!(entrypoint("windows-x86_64"), "bin/sidevoice-core-rust.exe");
+        assert_eq!(entrypoint("linux-x86_64"), "bin/sidevoice-core");
+        assert_eq!(entrypoint("macos-aarch64"), "bin/sidevoice-core");
+        assert_eq!(entrypoint("windows-x86_64"), "bin/sidevoice-core.exe");
     }
 
     fn manifest(dependency: &str) -> String {

@@ -3,7 +3,7 @@
 //!
 //! | job | runs | restart | output |
 //! |---|---|---|---|
-//! | core `dev.sidevoice.core` / `sidevoice-core` | the selected release's `core/bin/sidevoice-core-rust` with fixed arguments and `idle-exit 0` | on failure | `D/core.stderr.log` |
+//! | core `dev.sidevoice.core` / `sidevoice-core` | the selected release's `core/bin/sidevoice-core` with fixed arguments and `idle-exit 0` | on failure | `D/core.stderr.log` |
 //! | connector `dev.sidevoice.connector` / `sidevoice-connector` | `install.json`'s `command` + `connector` | always | `D/connector.log` |
 //!
 //! Both name paths in the selected release, so a definition is rewritten when the selection changes. Neither job
