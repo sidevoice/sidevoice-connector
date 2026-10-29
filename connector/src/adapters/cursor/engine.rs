@@ -62,11 +62,6 @@ fn selected_engine(model: &str, configuration: Option<&Value>) -> Option<Value> 
         return None;
     }
     let (model, selector_effort) = model_selector(model);
-    // The first selected model's id is the base model; `modelName` may have the effort baked in
-    // (`grok-4.7-high`).
-    let model = configuration
-        .and_then(|config| text(config.get("selectedModels")?.get(0)?.get("modelId")))
-        .unwrap_or(model);
     let explicit = configuration.and_then(|config| {
         text(config.get("effort"))
             .or_else(|| effort_parameter(config.get("parameters")))
@@ -84,6 +79,13 @@ fn selected_engine(model: &str, configuration: Option<&Value>) -> Option<Value> 
             .or_else(|| parameter(config.get("defaultParameters"), "effort"))
     });
     let effort = explicit.or(selector_effort).or(default);
+    // With an effort parameter found, `modelName` may have it baked in (`grok-4.7-high`), so the
+    // first selected model's id is the base model. Without one, `modelName` is the only evidence.
+    let model = explicit
+        .and(configuration)
+        .and_then(|config| text(config.get("selectedModels")?.get(0)?.get("modelId")))
+        .filter(|id| !matches!(*id, "default" | "auto"))
+        .unwrap_or(model);
     Some(json!({"model":model,"effort":effort,"thinking":Value::Null}))
 }
 
@@ -267,6 +269,25 @@ mod tests {
         assert_eq!(
             selected_engine("composer-2.5", Some(&composer)).unwrap(),
             json!({"model":"composer-2.5","effort":null,"thinking":null})
+        );
+    }
+
+    #[test]
+    fn model_id_replaces_the_name_only_when_it_is_concrete_and_effort_was_found() {
+        let placeholder = json!({"selectedModels":[{"modelId":"default","parameters":[{"id":"reasoning_effort","value":"high"}]}]});
+        assert_eq!(
+            selected_engine("grok-4.7-high", Some(&placeholder)).unwrap(),
+            json!({"model":"grok-4.7-high","effort":"high","thinking":null})
+        );
+        let auto = json!({"selectedModels":[{"modelId":"auto","parameters":[{"id":"reasoning_effort","value":"high"}]}]});
+        assert_eq!(
+            selected_engine("grok-4.7-high", Some(&auto)).unwrap()["model"],
+            "grok-4.7-high"
+        );
+        let no_effort = json!({"selectedModels":[{"modelId":"grok-4.7"}]});
+        assert_eq!(
+            selected_engine("grok-4.7-high", Some(&no_effort)).unwrap(),
+            json!({"model":"grok-4.7-high","effort":null,"thinking":null})
         );
     }
 
