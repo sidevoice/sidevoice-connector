@@ -47,20 +47,34 @@ fn parameter<'a>(parameters: Option<&'a Value>, id: &str) -> Option<&'a str> {
     }
 }
 
+/// Cursor names the reasoning parameter `effort` for some models and `reasoning_effort` for others.
+const EFFORT_PARAMETERS: [&str; 2] = ["effort", "reasoning_effort"];
+
+fn effort_parameter(parameters: Option<&Value>) -> Option<&str> {
+    EFFORT_PARAMETERS
+        .iter()
+        .find_map(|id| parameter(parameters, id))
+}
+
 fn selected_engine(model: &str, configuration: Option<&Value>) -> Option<Value> {
     let model = model.trim();
     if model.is_empty() || model.len() > 160 || model == "default" {
         return None;
     }
     let (model, selector_effort) = model_selector(model);
+    // The first selected model's id is the base model; `modelName` may have the effort baked in
+    // (`grok-4.7-high`).
+    let model = configuration
+        .and_then(|config| text(config.get("selectedModels")?.get(0)?.get("modelId")))
+        .unwrap_or(model);
     let explicit = configuration.and_then(|config| {
         text(config.get("effort"))
-            .or_else(|| parameter(config.get("parameters"), "effort"))
-            .or_else(|| parameter(config.get("modelParams"), "effort"))
+            .or_else(|| effort_parameter(config.get("parameters")))
+            .or_else(|| effort_parameter(config.get("modelParams")))
             .or_else(|| {
                 // Current Cursor keeps the chat's picker parameters on its first selected model.
                 let first = config.get("selectedModels")?.get(0)?;
-                parameter(first.get("parameters"), "effort")
+                effort_parameter(first.get("parameters"))
             })
     });
     // Only a default stored with this chat's model configuration can fill an absent selection.
@@ -234,6 +248,25 @@ mod tests {
         assert_eq!(
             selected_engine("claude-opus", Some(&empty)).unwrap()["effort"],
             Value::Null
+        );
+    }
+
+    #[test]
+    fn real_cursor_samples_report_the_base_model_and_reasoning_effort() {
+        let grok_medium = json!({"modelName":"grok-4.7","maxMode":false,"selectedModels":[{"modelId":"grok-4.7","parameters":[{"id":"context","value":"256k"},{"id":"reasoning_effort","value":"medium"},{"id":"fast","value":"false"}]}]});
+        assert_eq!(
+            selected_engine("grok-4.7", Some(&grok_medium)).unwrap(),
+            json!({"model":"grok-4.7","effort":"medium","thinking":null})
+        );
+        let grok_high = json!({"modelName":"grok-4.7-high","maxMode":false,"selectedModels":[{"modelId":"grok-4.7","parameters":[{"id":"context","value":"256k"},{"id":"reasoning_effort","value":"high"},{"id":"fast","value":"false"}]}]});
+        assert_eq!(
+            selected_engine("grok-4.7-high", Some(&grok_high)).unwrap(),
+            json!({"model":"grok-4.7","effort":"high","thinking":null})
+        );
+        let composer = json!({"modelName":"composer-2.5","maxMode":false,"selectedModels":[{"modelId":"composer-2.5","parameters":[{"id":"fast","value":"false"}]}]});
+        assert_eq!(
+            selected_engine("composer-2.5", Some(&composer)).unwrap(),
+            json!({"model":"composer-2.5","effort":null,"thinking":null})
         );
     }
 
