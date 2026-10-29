@@ -6,7 +6,7 @@
 //! | `D`, the data directory | `$SIDEVOICE_DATA_DIR`, else the OS's standard place (`data_dir`) |
 //! | `D/install.json` | the installation record: `command` (the absolute argv prefix that runs this binary), `releases` |
 //! | `R`, the releases | `D/install` |
-//! | `R/current.json` | the pointer record `{"release": "<id>"}`: the selected release, `R/releases/<id>`, with its core at `core/bin/sidevoice-core-rust` and `core/models` |
+//! | `R/current.json` | the pointer record `{"release": "<id>"}`: the selected release, `R/releases/<id>`, with its core at `core/bin/sidevoice-core` and `core/models` |
 //! | `D/core` | the core's data: `core.json` (ready, naming the core's endpoint), `core-failure.json` |
 //! | `D/connector.lock` | the connector daemon's lock |
 //! | `D/connector.json` | the running connector's endpoint, which its clients reach first (`connector_endpoints`) |
@@ -30,10 +30,10 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-/// The core's program inside a release (`core/bin/sidevoice-core-rust`, `.exe` on Windows), and the directory its
+/// The core's program inside a release (`core/bin/sidevoice-core`, `.exe` on Windows), and the directory its
 /// models are in (`core/models`).
 pub fn core_entrypoint() -> String {
-    format!("core/bin/{}", target::exe_name("sidevoice-core-rust"))
+    format!("core/bin/{}", target::exe_name("sidevoice-core"))
 }
 pub const CORE_DIRECTORY: &str = "core";
 

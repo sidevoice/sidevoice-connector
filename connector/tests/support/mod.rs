@@ -41,16 +41,15 @@ pub fn connector_program() -> String {
     format!("bin/{}", target::exe_name("sidevoice-connector"))
 }
 pub fn core_program() -> String {
-    format!("bin/{}", target::exe_name("sidevoice-core-rust"))
+    format!("bin/{}", target::exe_name("sidevoice-core"))
 }
 
-/// The unpacked core (`<dir>/bin/sidevoice-core-rust`, `<dir>/models`), or `None` when the test must be skipped.
+/// The unpacked core (`<dir>/bin/sidevoice-core`, `<dir>/models`), or `None` when the test must be skipped.
 pub fn core_dir() -> Option<PathBuf> {
     let dir = std::env::var_os("SIDEVOICE_TEST_CORE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../target/sidevoice-core/sidevoice-core-rust")
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/sidevoice-core/sidevoice-core")
         });
     if dir.join(core_program()).is_file() {
         return Some(dir.canonicalize().expect("core directory"));

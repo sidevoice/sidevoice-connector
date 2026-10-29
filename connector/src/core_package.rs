@@ -49,12 +49,12 @@ pub const LOADER_VARIABLES: &[&str] = &[
 ];
 
 /// The core archive's single root directory, and what is below it.
-const ARCHIVE_ROOT: &str = "sidevoice-core-rust";
+const ARCHIVE_ROOT: &str = "sidevoice-core";
 const CORE_INVENTORY: &str = "native-core.json";
 const CORE_KIND: &str = "rust-native-v2";
-/// The core's program, as its archive names it: `bin/sidevoice-core-rust`, with `.exe` on Windows.
+/// The core's program, as its archive names it: `bin/sidevoice-core`, with `.exe` on Windows.
 static ENTRYPOINT: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| format!("bin/{}", target::exe_name("sidevoice-core-rust")));
+    std::sync::LazyLock::new(|| format!("bin/{}", target::exe_name("sidevoice-core")));
 /// The top-level directories a core may have; its entrypoint is the one file it must.
 const TOP_LEVEL: &[&str] = &["bin", "notices"];
 
@@ -474,8 +474,8 @@ pub(crate) mod tests {
 
     #[test]
     fn a_staged_path_is_spelled_with_slashes_on_every_os() {
-        let relative: PathBuf = ["bin", "sidevoice-core-rust.exe"].iter().collect();
-        assert_eq!(inventory_path(&relative), "bin/sidevoice-core-rust.exe");
+        let relative: PathBuf = ["bin", "sidevoice-core.exe"].iter().collect();
+        assert_eq!(inventory_path(&relative), "bin/sidevoice-core.exe");
         assert_eq!(inventory_path(Path::new("notices")), "notices");
     }
 
@@ -636,16 +636,16 @@ pub(crate) mod tests {
     #[test]
     fn a_path_outside_the_core_is_refused() {
         let scratch = crate::test_support::temp_dir("escape");
-        let archive = core_archive(&core_files(), &[("sidevoice-core-rust/../escape", b"x")]);
+        let archive = core_archive(&core_files(), &[("sidevoice-core/../escape", b"x")]);
         let root = package(scratch.path(), &archive, None);
         let release = release(scratch.path());
         let error = install(&root, &release).unwrap_err();
         assert_eq!(key(&error), "core.package-mismatch", "{error}");
         assert!(!scratch.path().join("escape").exists());
         assert_eq!(fs::read_dir(&release).unwrap().count(), 0, "nothing staged");
-        assert!(member("sidevoice-core-rust/bin/x").is_some());
-        assert!(member("sidevoice-core-rust/etc/x").is_none());
-        assert!(member("sidevoice-core-rust//x").is_none());
+        assert!(member("sidevoice-core/bin/x").is_some());
+        assert!(member("sidevoice-core/etc/x").is_none());
+        assert!(member("sidevoice-core//x").is_none());
         assert!(member("elsewhere/bin/x").is_none());
     }
 
@@ -696,7 +696,7 @@ pub(crate) mod tests {
         assert!(error.to_string().contains("rust-native-v2"), "{error}");
         for directory in ["models", "checks", "lib"] {
             assert!(
-                member(&format!("sidevoice-core-rust/{directory}/x")).is_none(),
+                member(&format!("sidevoice-core/{directory}/x")).is_none(),
                 "{directory}"
             );
         }
