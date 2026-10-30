@@ -1,6 +1,6 @@
 [package]
 name = "sidevoice-testbench"
-version = "0.17.2"
+version = "0.18.0"
 edition = "2021"
 publish = false
 description = "A developer tool: the connector and the pinned core driven from a local page, without the desktop app. Never part of a release."
