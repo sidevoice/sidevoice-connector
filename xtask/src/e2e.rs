@@ -147,7 +147,7 @@ impl Machine {
         match self.os {
             Os::Windows => format!("{job}-{}", self.user),
             Os::Linux => format!("{job}.service"),
-            Os::Macos => format!("dev.sidevoice.{}", job.trim_start_matches("sidevoice-")),
+            Os::Macos => format!("ai.sidevoice.{}", job.trim_start_matches("sidevoice-")),
         }
     }
 

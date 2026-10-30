@@ -5,7 +5,7 @@
 //! off through a crash, a stop, a start and a restart → on while stopped: nothing starts → uninstall: no job,
 //! definition or socket left, the installation still there (`not-installed`) and, once it is removed too, `absent`.
 //!
-//! The jobs carry the real names (`dev.sidevoice.core`, `sidevoice-core.service`, …), so outside CI it runs only
+//! The jobs carry the real names (`ai.sidevoice.core`, `sidevoice-core.service`, …), so outside CI it runs only
 //! when asked (`SIDEVOICE_TEST_SERVICE=1`) and never over jobs this user already has. On a Linux runner with no
 //! session, lingering is enabled for the runner's user so its user manager runs (`support::service`).
 #![cfg(any(target_os = "macos", target_os = "linux"))]
@@ -21,8 +21,8 @@ use support::service::*;
 use support::*;
 
 const JOBS: [(&str, &str); 2] = [
-    ("dev.sidevoice.core", "sidevoice-core.service"),
-    ("dev.sidevoice.connector", "sidevoice-connector.service"),
+    ("ai.sidevoice.core", "sidevoice-core.service"),
+    ("ai.sidevoice.connector", "sidevoice-connector.service"),
 ];
 
 /// Whether the manager has the job loaded.

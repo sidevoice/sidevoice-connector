@@ -447,11 +447,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     const CORE: JobId = JobId {
-        label: "dev.sidevoice.core",
+        label: "ai.sidevoice.core",
         name: "sidevoice-core",
     };
     const CONNECTOR: JobId = JobId {
-        label: "dev.sidevoice.connector",
+        label: "ai.sidevoice.connector",
         name: "sidevoice-connector",
     };
     const BOTH: [JobId; 2] = [CORE, CONNECTOR];
