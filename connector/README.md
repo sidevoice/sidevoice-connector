@@ -331,8 +331,8 @@ binding ID, it is retained and reported rather than assigned to another conversa
 ## Login service and Sidevoice on demand
 
 `service install|uninstall|start|stop|restart|status|login` (`src/service/`) runs two jobs of this user's service
-manager: the core (`dev.sidevoice.core` under launchd, `sidevoice-core.service` under the systemd user manager) and the
-connector daemon (`dev.sidevoice.connector`, `sidevoice-connector.service`). The core job runs
+manager: the core (`ai.sidevoice.core` under launchd, `sidevoice-core.service` under the systemd user manager) and the
+connector daemon (`ai.sidevoice.connector`, `sidevoice-connector.service`). The core job runs
 `R/current/core/bin/sidevoice-core` with `idle-exit 0`; the connector job runs `D/install.json`'s `command` +
 `connector`. Neither job starts or signals the other. Under systemd, each job must also be enabled for the next login
 (`enable`, checked with `is-enabled`; only as below once the person has a choice) and a changed definition read again (`daemon-reload`): a refusal of either fails

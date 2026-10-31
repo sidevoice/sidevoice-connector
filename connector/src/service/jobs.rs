@@ -39,11 +39,11 @@ impl Job {
     pub fn id(self) -> JobId {
         match self {
             Job::Core => JobId {
-                label: "dev.sidevoice.core",
+                label: "ai.sidevoice.core",
                 name: "sidevoice-core",
             },
             Job::Connector => JobId {
-                label: "dev.sidevoice.connector",
+                label: "ai.sidevoice.connector",
                 name: "sidevoice-connector",
             },
         }
@@ -519,8 +519,8 @@ mod tests {
 
     #[test]
     fn job_names_are_the_ones_the_app_and_older_installs_know() {
-        assert_eq!(Job::Core.id().label, "dev.sidevoice.core");
-        assert_eq!(Job::Connector.id().label, "dev.sidevoice.connector");
+        assert_eq!(Job::Core.id().label, "ai.sidevoice.core");
+        assert_eq!(Job::Connector.id().label, "ai.sidevoice.connector");
         assert_eq!(Job::Core.id().name, "sidevoice-core");
         assert_eq!(Job::Connector.id().name, "sidevoice-connector");
     }

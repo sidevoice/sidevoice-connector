@@ -353,11 +353,11 @@ mod tests {
         );
         let refused = Failure::keyed(
             "service.login-incomplete",
-            json!({"missing": "dev.sidevoice.connector"}),
+            json!({"missing": "ai.sidevoice.connector"}),
         );
         assert_eq!(
             human(&refused.value()),
-            "The Sidevoice login service is incomplete (dev.sidevoice.connector is missing), so whether it starts at login was not changed. Repair it with `npx sidevoice service install`, then try again."
+            "The Sidevoice login service is incomplete (ai.sidevoice.connector is missing), so whether it starts at login was not changed. Repair it with `npx sidevoice service install`, then try again."
         );
     }
 }

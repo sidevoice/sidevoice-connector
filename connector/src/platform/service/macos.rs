@@ -406,11 +406,11 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     const CORE: JobId = JobId {
-        label: "dev.sidevoice.core",
+        label: "ai.sidevoice.core",
         name: "sidevoice-core",
     };
     const CONNECTOR: JobId = JobId {
-        label: "dev.sidevoice.connector",
+        label: "ai.sidevoice.connector",
         name: "sidevoice-connector",
     };
 
@@ -435,8 +435,8 @@ mod tests {
         }
     }
 
-    const PRINT_DISABLED_OFF: &str = "disabled services = {\n\t\"com.apple.Siri.agent\" => enabled\n\t\"dev.sidevoice.core\" => disabled\n\t\"dev.sidevoice.connector\" => disabled\n}\n";
-    const PRINT_DISABLED_ON: &str = "disabled services = {\n\t\"dev.sidevoice.core\" => enabled\n\t\"dev.sidevoice.connector\" => enabled\n}\n";
+    const PRINT_DISABLED_OFF: &str = "disabled services = {\n\t\"com.apple.Siri.agent\" => enabled\n\t\"ai.sidevoice.core\" => disabled\n\t\"ai.sidevoice.connector\" => disabled\n}\n";
+    const PRINT_DISABLED_ON: &str = "disabled services = {\n\t\"ai.sidevoice.core\" => enabled\n\t\"ai.sidevoice.connector\" => enabled\n}\n";
 
     fn job(restart: Restart, label: &'static str) -> Job {
         Job {
@@ -460,13 +460,13 @@ mod tests {
         let read = |text: String| {
             plist::from_bytes::<plist::Dictionary>(text.as_bytes()).expect("a plist")
         };
-        let core = read(plist_text(&job(Restart::OnFailure, "dev.sidevoice.core")));
-        let connector = read(plist_text(&job(Restart::Always, "dev.sidevoice.connector")));
+        let core = read(plist_text(&job(Restart::OnFailure, "ai.sidevoice.core")));
+        let connector = read(plist_text(&job(Restart::Always, "ai.sidevoice.connector")));
         let keep_alive = core["KeepAlive"].as_dictionary().unwrap();
         assert_eq!(keep_alive["SuccessfulExit"].as_boolean(), Some(false));
         assert_eq!(keep_alive["Crashed"].as_boolean(), Some(true));
         assert_eq!(connector["KeepAlive"].as_boolean(), Some(true));
-        assert_eq!(core["Label"].as_string(), Some("dev.sidevoice.core"));
+        assert_eq!(core["Label"].as_string(), Some("ai.sidevoice.core"));
         assert_eq!(core["RunAtLoad"].as_boolean(), Some(true));
         assert_eq!(core["ThrottleInterval"].as_signed_integer(), Some(10));
         let arguments = core["ProgramArguments"].as_array().unwrap();
@@ -476,7 +476,7 @@ mod tests {
         for key in ["StandardOutPath", "StandardErrorPath"] {
             assert_eq!(core[key].as_string(), Some("/d/core.stderr.log"));
         }
-        let text = plist_text(&job(Restart::Always, "dev.sidevoice.connector"));
+        let text = plist_text(&job(Restart::Always, "ai.sidevoice.connector"));
         assert!(text.contains("&amp; &lt;x&gt;"), "{text}");
         assert_eq!(
             Os::program_of(&text).unwrap()[2],
@@ -498,9 +498,9 @@ mod tests {
         assert_eq!(
             *log.lock().unwrap(),
             vec![
-                format!("disable {domain}/dev.sidevoice.core"),
+                format!("disable {domain}/ai.sidevoice.core"),
                 format!("print-disabled {domain}"),
-                format!("disable {domain}/dev.sidevoice.connector"),
+                format!("disable {domain}/ai.sidevoice.connector"),
                 format!("print-disabled {domain}"),
             ],
             "no bootout: the loaded jobs stay loaded and running"
@@ -513,7 +513,7 @@ mod tests {
         assert_eq!(
             *log.lock().unwrap(),
             vec![
-                format!("enable {domain}/dev.sidevoice.core"),
+                format!("enable {domain}/ai.sidevoice.core"),
                 format!("print-disabled {domain}"),
             ],
             "no bootstrap or kickstart"
@@ -539,32 +539,29 @@ mod tests {
     #[test]
     fn login_answers_read_as_on_off_or_unknown() {
         assert_eq!(
-            parse_launchd_login(PRINT_DISABLED_OFF, "dev.sidevoice.core"),
+            parse_launchd_login(PRINT_DISABLED_OFF, "ai.sidevoice.core"),
             Some(false)
         );
         assert_eq!(
-            parse_launchd_login(PRINT_DISABLED_ON, "dev.sidevoice.core"),
+            parse_launchd_login(PRINT_DISABLED_ON, "ai.sidevoice.core"),
             Some(true)
         );
-        let older = "disabled services = {\n\t\"dev.sidevoice.core\" => true\n\t\"dev.sidevoice.connector\" => false\n}\n";
+        let older = "disabled services = {\n\t\"ai.sidevoice.core\" => true\n\t\"ai.sidevoice.connector\" => false\n}\n";
+        assert_eq!(parse_launchd_login(older, "ai.sidevoice.core"), Some(false));
         assert_eq!(
-            parse_launchd_login(older, "dev.sidevoice.core"),
-            Some(false)
-        );
-        assert_eq!(
-            parse_launchd_login(older, "dev.sidevoice.connector"),
+            parse_launchd_login(older, "ai.sidevoice.connector"),
             Some(true)
         );
         assert_eq!(
-            parse_launchd_login("disabled services = {\n}\n", "dev.sidevoice.core"),
+            parse_launchd_login("disabled services = {\n}\n", "ai.sidevoice.core"),
             Some(true),
             "no override: it loads with its plist"
         );
-        assert_eq!(parse_launchd_login("", "dev.sidevoice.core"), None);
+        assert_eq!(parse_launchd_login("", "ai.sidevoice.core"), None);
         assert_eq!(
             parse_launchd_login(
-                "disabled services = {\n\t\"dev.sidevoice.core\" => ???\n}",
-                "dev.sidevoice.core"
+                "disabled services = {\n\t\"ai.sidevoice.core\" => ???\n}",
+                "ai.sidevoice.core"
             ),
             None
         );
@@ -572,7 +569,7 @@ mod tests {
 
     #[test]
     fn reports_read_as_job_states() {
-        let running = "gui/501/dev.sidevoice.core = {\n\tstate = running\n\truns = 3\n\tpid = 4242\n\tlast exit code = 0\n}";
+        let running = "gui/501/ai.sidevoice.core = {\n\tstate = running\n\truns = 3\n\tpid = 4242\n\tlast exit code = 0\n}";
         let state = parse_launchd(true, running);
         assert_eq!(
             (state.loaded, state.running, state.pid, state.runs),
@@ -599,6 +596,6 @@ mod tests {
 
     #[test]
     fn jobs_are_named_by_their_labels() {
-        assert_eq!(Os::name(CORE), "dev.sidevoice.core");
+        assert_eq!(Os::name(CORE), "ai.sidevoice.core");
     }
 }

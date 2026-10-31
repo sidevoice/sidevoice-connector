@@ -56,7 +56,7 @@ pub struct Places {
     pub data: PathBuf,
 }
 
-/// A job's names, fixed: `label` reverse-DNS (`dev.sidevoice.core`), `name` short (`sidevoice-core`). Each manager
+/// A job's names, fixed: `label` reverse-DNS (`ai.sidevoice.core`), `name` short (`sidevoice-core`). Each manager
 /// derives what it calls the job from them ([`Service::name`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct JobId {
@@ -613,7 +613,7 @@ mod tests {
     fn job(program: &[&str], environment: &[(&str, &str)]) -> Job {
         Job {
             id: JobId {
-                label: "dev.sidevoice.test",
+                label: "ai.sidevoice.test",
                 name: "sidevoice-test",
             },
             description: "Sidevoice test",

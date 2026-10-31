@@ -3,8 +3,8 @@
 //!
 //! | job | runs | restart | output |
 //! |---|---|---|---|
-//! | core `dev.sidevoice.core` / `sidevoice-core` | the selected release's `core/bin/sidevoice-core` with fixed arguments and `idle-exit 0` | on failure | `D/core.stderr.log` |
-//! | connector `dev.sidevoice.connector` / `sidevoice-connector` | `install.json`'s `command` + `connector` | always | `D/connector.log` |
+//! | core `ai.sidevoice.core` / `sidevoice-core` | the selected release's `core/bin/sidevoice-core` with fixed arguments and `idle-exit 0` | on failure | `D/core.stderr.log` |
+//! | connector `ai.sidevoice.connector` / `sidevoice-connector` | `install.json`'s `command` + `connector` | always | `D/connector.log` |
 //!
 //! Both name paths in the selected release, so a definition is rewritten when the selection changes. Neither job
 //! starts, signals or adopts the other: the connector links to the core when it answers, and the core's exit status
