@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.19.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.18.0...v0.19.0) (2026-10-31)
+
+
+### ⚠ BREAKING CHANGES
+
+* **service:** job labels ai.sidevoice.core and ai.sidevoice.connector ([#324](https://github.com/sidevoice/sidevoice-connector/issues/324))
+
+### Miscellaneous Chores
+
+* **service:** job labels ai.sidevoice.core and ai.sidevoice.connector ([#324](https://github.com/sidevoice/sidevoice-connector/issues/324)) ([b872b12](https://github.com/sidevoice/sidevoice-connector/commit/b872b12e6181c1b92b431b88828a8ab0221ba00f))
+
 ## [0.18.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.17.2...v0.18.0) (2026-10-29)
 
 
