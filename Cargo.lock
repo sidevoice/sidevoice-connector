@@ -1381,7 +1381,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sidevoice-connector"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1456,7 +1456,7 @@ dependencies = [
 
 [[package]]
 name = "sidevoice-testbench"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2326,7 +2326,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "object",
  "serde_json",
