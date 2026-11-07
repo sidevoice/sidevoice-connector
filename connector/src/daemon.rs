@@ -33,6 +33,15 @@ pub use run::run;
 
 /// How long `pair_device` waits for the link to the core (the code itself has 10 s more).
 const PAIR_DEVICE_LINK_WAIT: Duration = Duration::from_secs(15);
+/// What was handed to the harnesses, kept across a restart (see `Daemon::delivered`).
+const DELIVERED_FILE: &str = "delivered.json";
+/// Most messages remembered per thread, and most threads.
+const DELIVERED_PER_THREAD: usize = 256;
+const DELIVERED_THREADS: usize = 1024;
+/// The longest message id remembered (the core's are far shorter); a longer one is handed over but not remembered.
+const DELIVERED_ID_MAX: usize = 128;
+/// How long an `unknown` answer waits for the transcript to show the message read before it is told as it is.
+const CONFIRM_WAIT_MS: u64 = 8000;
 const RESUME_REASON_NONE: u8 = 0;
 const RESUME_REASON_HISTORY: u8 = 1;
 const RESUME_REASON_STORAGE: u8 = 2;
@@ -47,6 +56,14 @@ pub struct Daemon {
     link: Arc<Link>,
     bindings: Mutex<HashMap<String, Arc<Conversation>>>,
     outbox: Mutex<Vec<Value>>,
+    /// Per thread, the messages already handed to its harness and what it answered (`accepted` or `unknown`), kept
+    /// across a restart: a message offered again (the core's answer was lost, or the core restarted holding it) is
+    /// answered from here and never typed into the agent a second time. The record is written after the hand-over, so
+    /// a crash between the two offers the message once more: a message is typed twice rather than never. Message ids
+    /// are the core's own (unique), so the thread and the id name a message.
+    delivered: Mutex<HashMap<String, VecDeque<(String, String)>>>,
+    /// How long a harness's `unknown` answer waits for the transcript to show the message read, in milliseconds.
+    confirm_wait_ms: AtomicU64,
     replay_tx: mpsc::Sender<()>,
     host_agents: Arc<HostAgents>,
     registry: Arc<Registry>,
@@ -75,6 +92,7 @@ impl Daemon {
         shutdown: watch::Sender<bool>,
     ) -> Result<Arc<Self>> {
         let outbox = read_outbox(&profile.data.join("outbox.json"))?;
+        let delivered = files::read_delivered(&profile.data.join(DELIVERED_FILE));
         let host_agents = HostAgents::new(profile.clone())?;
         let guard_path = profile.data.join("conversation-state.guard");
         let (guard_state, conversation_guard) = prepare_conversation_guard(&guard_path)?;
@@ -139,6 +157,8 @@ impl Daemon {
             link,
             bindings: Mutex::new(HashMap::new()),
             outbox: Mutex::new(outbox),
+            delivered: Mutex::new(delivered),
+            confirm_wait_ms: AtomicU64::new(CONFIRM_WAIT_MS),
             replay_tx,
             host_agents,
             registry: Arc::new(registry),
@@ -881,6 +901,66 @@ impl Daemon {
         crate::service::node_status(&self.profile).await
     }
 
+    async fn already_delivered(&self, thread: &str, message_id: &str) -> Option<String> {
+        let delivered = self.delivered.lock().await;
+        delivered
+            .get(thread)?
+            .iter()
+            .find(|(id, _)| id == message_id)
+            .map(|(_, status)| status.clone())
+    }
+
+    async fn remember_delivered(&self, thread: &str, message_id: &str, status: &str) {
+        if message_id.len() > DELIVERED_ID_MAX {
+            return;
+        }
+        let mut delivered = self.delivered.lock().await;
+        if !delivered.contains_key(thread) && delivered.len() >= DELIVERED_THREADS {
+            if let Some(oldest) = delivered.keys().next().cloned() {
+                delivered.remove(&oldest);
+            }
+        }
+        let rows = delivered.entry(thread.to_owned()).or_default();
+        rows.retain(|(id, _)| id != message_id);
+        rows.push_back((message_id.to_owned(), status.to_owned()));
+        while rows.len() > DELIVERED_PER_THREAD {
+            rows.pop_front();
+        }
+        let state: serde_json::Map<String, Value> = delivered
+            .iter()
+            .map(|(thread, rows)| (thread.clone(), json!(rows)))
+            .collect();
+        if let Err(error) = Files::write_json(
+            &self.profile.data.join(DELIVERED_FILE),
+            &Value::Object(state),
+        ) {
+            crate::logfile::log(&format!(
+                "delivery stage=daemon result=delivered_not_kept error={error}"
+            ));
+        }
+    }
+
+    /// Whether `message_id` was reported read within the confirm wait (it leaves the binding's pending list then).
+    async fn read_within_confirm_wait(&self, binding: &Conversation, message_id: &str) -> bool {
+        let until =
+            Instant::now() + Duration::from_millis(self.confirm_wait_ms.load(Ordering::Relaxed));
+        loop {
+            if !binding
+                .pending
+                .lock()
+                .await
+                .iter()
+                .any(|id| id == message_id)
+            {
+                return true;
+            }
+            if Instant::now() >= until {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     async fn deliver(&self, frame: &Value) -> Value {
         crate::logfile::log("delivery stage=daemon result=received");
         let id = frame
@@ -907,6 +987,15 @@ impl Daemon {
         if message_id.is_empty() || session_id.is_empty() || (text.is_empty() && !note) {
             crate::logfile::log("delivery stage=daemon result=invalid_input");
             return json!({"status":"failed","detail":"invalid input"});
+        }
+        // Offered again what the harness already has (the core's answer was lost, or it restarted holding the message):
+        // answered as before, never handed over twice.
+        if let Some(status) = self.already_delivered(&binding.thread, message_id).await {
+            crate::logfile::log("delivery stage=daemon result=already_delivered");
+            return json!({"status":status,"detail":"already handed to the agent"});
+        }
+        if binding.read.lock().await.iter().any(|id| id == message_id) {
+            return json!({"status":"accepted","detail":"already read by the agent"});
         }
         {
             let mut pending = binding.pending.lock().await;
@@ -942,6 +1031,24 @@ impl Daemon {
                 json!({"status":"failed","detail":error.to_string()})
             }
         };
+        // A harness that took the message without saying so (`unknown`) gets a moment for the transcript to show it
+        // read: the answer is then `accepted`, and the person's message is not marked uncertain for nothing. The
+        // binding's turn lock is held meanwhile, so nothing later is handed over before this one is settled.
+        let result = if result.get("status").and_then(Value::as_str) == Some("unknown")
+            && self.read_within_confirm_wait(&binding, message_id).await
+        {
+            json!({"status":"accepted","detail":"read by the agent"})
+        } else {
+            result
+        };
+        if matches!(
+            result.get("status").and_then(Value::as_str),
+            Some("accepted" | "unknown")
+        ) {
+            let status = result["status"].as_str().unwrap_or("accepted").to_owned();
+            self.remember_delivered(&binding.thread, message_id, &status)
+                .await;
+        }
         let status = match result.get("status").and_then(Value::as_str) {
             Some("accepted") => "accepted",
             Some("failed") => "failed",
@@ -1735,8 +1842,13 @@ fn answer(id: Value, outcome: Result<Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::run::prune_binding_order;
+    use super::*;
     use super::{answer, Daemon};
+    use crate::adapters::Conversation;
+    use anyhow::Result;
+    use futures_util::future::BoxFuture;
     use serde_json::json;
+    use serde_json::Value;
     use std::collections::HashMap;
     use tokio::sync::oneshot;
 
@@ -1957,6 +2069,233 @@ mod tests {
         assert_eq!(
             *calls.lock().unwrap(),
             ["deliver t-1 \"hola\"", "close t-1"]
+        );
+    }
+
+    /// A harness whose answers are scripted: what each handing over of a message answers, in turn.
+    struct Scripted {
+        handed: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        answers: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<&'static str>>>,
+    }
+
+    impl crate::adapters::Harness for Scripted {
+        fn id(&self) -> &'static str {
+            "scripted"
+        }
+        fn capabilities(&self) -> Value {
+            json!({"deliver":"supported","working":"unsupported"})
+        }
+        fn accepts(&self, delivery: &Value, thread: &str) -> crate::adapters::Route {
+            crate::adapters::Route::known(delivery["thread"] == thread)
+        }
+        fn prepare<'a>(&'a self, _: &'a Conversation) -> BoxFuture<'a, Result<Option<Value>>> {
+            Box::pin(async { Ok(Some(json!({"ready":true}))) })
+        }
+        fn deliver<'a>(
+            &'a self,
+            _: &'a Conversation,
+            frame: &'a Value,
+            _: &'a crate::profile::Profile,
+        ) -> BoxFuture<'a, Result<Value>> {
+            Box::pin(async move {
+                let answer = self
+                    .answers
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or("accepted");
+                if answer == "link_down" {
+                    anyhow::bail!("the harness is unreachable");
+                }
+                self.handed
+                    .lock()
+                    .unwrap()
+                    .push(frame["text"].as_str().unwrap_or("").to_owned());
+                Ok(json!({"status":answer}))
+            })
+        }
+        fn close<'a>(&'a self, _: &'a Conversation) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
+        }
+        fn status<'a>(
+            &'a self,
+            _: &'a Conversation,
+        ) -> BoxFuture<'a, Option<serde_json::Map<String, Value>>> {
+            Box::pin(async { None })
+        }
+        fn watch(&self, _: Arc<Conversation>, _: Arc<dyn crate::adapters::Reporter>) {}
+    }
+
+    async fn scripted_daemon(
+        scratch: &std::path::Path,
+        answers: &[&'static str],
+    ) -> (
+        Arc<Daemon>,
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let profile = crate::profile::Profile::for_test(
+            scratch,
+            &crate::adapters::Registry::standard().homes(),
+        );
+        let handed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let registry = Registry::new(vec![Arc::new(Scripted {
+            handed: handed.clone(),
+            answers: std::sync::Arc::new(std::sync::Mutex::new(answers.iter().copied().collect())),
+        })]);
+        let (replay_tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let daemon = Daemon::new(
+            profile,
+            crate::link::Link::new(),
+            replay_tx,
+            registry,
+            false,
+            shutdown,
+        )
+        .unwrap();
+        daemon.confirm_wait_ms.store(300, Ordering::Relaxed);
+        let joined = daemon
+            .command(
+                1,
+                "register",
+                json!({"client_ref":"s-1","thread":"t-1","title":"S","harness":"scripted",
+                "delivery":{"thread":"t-1"}}),
+            )
+            .await
+            .unwrap();
+        (
+            daemon,
+            joined["binding_id"].as_str().unwrap().to_owned(),
+            handed,
+        )
+    }
+
+    fn frame(binding: &str, id: &str, text: &str) -> Value {
+        json!({"binding_id":binding,"message_id":id,"session_id":"s","revision":1,"text":text})
+    }
+
+    /// The garage: the harness is unreachable for a while with several messages queued, and the core, which offers
+    /// the first one until it is taken and only then the next, gets each handed over once and in order; the
+    /// connector restarting in the middle does not hand over what the harness already has.
+    #[tokio::test]
+    async fn the_garage_messages_reach_the_harness_once_and_in_order_across_a_restart() {
+        let scratch = crate::test_support::temp_dir("garage");
+        let (daemon, binding, handed) = scripted_daemon(
+            scratch.path(),
+            &["link_down", "link_down", "link_down", "accepted"],
+        )
+        .await;
+        let mut offered = 0;
+        // The core's side: the first message is offered again until it is taken; the later ones wait behind it.
+        loop {
+            offered += 1;
+            let answer = daemon.deliver(&frame(&binding, "m-1", "one")).await;
+            if answer["status"] == "accepted" {
+                break;
+            }
+            assert_eq!(
+                answer["status"], "failed",
+                "an unreachable harness is a failure the core retries"
+            );
+            assert!(
+                handed.lock().unwrap().is_empty(),
+                "nothing later went ahead of it"
+            );
+        }
+        assert_eq!(offered, 4);
+        assert_eq!(
+            daemon.deliver(&frame(&binding, "m-2", "two")).await["status"],
+            "accepted"
+        );
+        // The core, restarted, holds all three again and offers them in order from the start.
+        drop(daemon);
+        let (daemon, binding, handed_after) = scripted_daemon(scratch.path(), &[]).await;
+        for (id, text) in [("m-1", "one"), ("m-2", "two"), ("m-3", "three")] {
+            assert_eq!(
+                daemon.deliver(&frame(&binding, id, text)).await["status"],
+                "accepted"
+            );
+        }
+        assert_eq!(
+            *handed.lock().unwrap(),
+            ["one", "two"],
+            "each was handed over once"
+        );
+        assert_eq!(
+            *handed_after.lock().unwrap(),
+            ["three"],
+            "what the harness had is not typed in again after a restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_answer_that_the_transcript_confirms_becomes_accepted_and_is_not_repeated() {
+        let scratch = crate::test_support::temp_dir("unknown-read");
+        let (daemon, binding, handed) =
+            scripted_daemon(scratch.path(), &["unknown", "unknown"]).await;
+        // Read within the wait: the message was reported read while the harness's answer was awaited.
+        let id = daemon
+            .bindings
+            .lock()
+            .await
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        let reader = {
+            let daemon = daemon.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                daemon
+                    .report_read(&id, "m-1", json!("s"), json!(1), Value::Null)
+                    .await;
+            })
+        };
+        assert_eq!(
+            daemon.deliver(&frame(&binding, "m-1", "one")).await["status"],
+            "accepted"
+        );
+        reader.await.unwrap();
+        // Never confirmed: told as unknown, and offered again it is not handed over a second time.
+        assert_eq!(
+            daemon.deliver(&frame(&binding, "m-2", "two")).await["status"],
+            "unknown"
+        );
+        assert_eq!(
+            daemon.deliver(&frame(&binding, "m-2", "two")).await["status"],
+            "unknown"
+        );
+        assert_eq!(*handed.lock().unwrap(), ["one", "two"]);
+    }
+
+    /// A record that says anything but "handed over" is not believed: a message it names `failed` is handed over.
+    #[tokio::test]
+    async fn only_a_handed_over_answer_in_the_record_is_believed() {
+        let scratch = crate::test_support::temp_dir("delivered-record");
+        std::fs::create_dir_all(scratch.path().join("data")).ok();
+        let (first, _, _) = scripted_daemon(scratch.path(), &[]).await;
+        let path = first.profile.data.join(DELIVERED_FILE);
+        drop(first);
+        Files::write_json(
+            &path,
+            &json!({"t-1":[["m-1","failed"],["m-2","accepted"],["","accepted"]]}),
+        )
+        .unwrap();
+        let (daemon, binding, handed) = scripted_daemon(scratch.path(), &[]).await;
+        assert_eq!(
+            daemon.deliver(&frame(&binding, "m-1", "one")).await["status"],
+            "accepted"
+        );
+        assert_eq!(
+            daemon.deliver(&frame(&binding, "m-2", "two")).await["status"],
+            "accepted"
+        );
+        assert_eq!(
+            *handed.lock().unwrap(),
+            ["one"],
+            "m-1 was handed over; m-2 was already"
         );
     }
 }
