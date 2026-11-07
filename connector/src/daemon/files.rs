@@ -56,6 +56,39 @@ pub(super) fn write_conversation_guard(file: &mut fs::File, state: u8) -> Result
 
 /// The speech waiting for the core, as this connector writes it: every row a speech of a conversation (its event,
 /// binding, conversation reference, utterance and text). A row of any other shape makes the outbox invalid.
+/// What was handed to each conversation's harness, by thread: the message and what the harness answered, oldest
+/// first. A record that does not parse is a record lost (a message may then be handed over once more), never a
+/// connector that cannot start.
+pub(super) fn read_delivered(
+    path: &Path,
+) -> std::collections::HashMap<String, std::collections::VecDeque<(String, String)>> {
+    let Ok(Some(bytes)) = Files::read_private(path, 8 << 20) else {
+        return Default::default();
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return Default::default();
+    };
+    value
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(thread, rows)| {
+            let rows = rows
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|row| {
+                    Some((
+                        row.get(0)?.as_str()?.to_owned(),
+                        row.get(1)?.as_str()?.to_owned(),
+                    ))
+                })
+                .collect();
+            (thread.clone(), rows)
+        })
+        .collect()
+}
+
 pub(super) fn read_outbox(path: &Path) -> Result<Vec<Value>> {
     let Some(bytes) = Files::read_private(path, 8 << 20)? else {
         return Ok(Vec::new());
