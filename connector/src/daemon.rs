@@ -37,7 +37,9 @@ const PAIR_DEVICE_LINK_WAIT: Duration = Duration::from_secs(15);
 const DELIVERED_FILE: &str = "delivered.json";
 /// Most messages remembered per thread, and most threads.
 const DELIVERED_PER_THREAD: usize = 256;
-const DELIVERED_THREADS: usize = 256;
+const DELIVERED_THREADS: usize = 1024;
+/// The longest message id remembered (the core's are far shorter); a longer one is handed over but not remembered.
+const DELIVERED_ID_MAX: usize = 128;
 /// How long an `unknown` answer waits for the transcript to show the message read before it is told as it is.
 const CONFIRM_WAIT_MS: u64 = 8000;
 const RESUME_REASON_NONE: u8 = 0;
@@ -56,7 +58,9 @@ pub struct Daemon {
     outbox: Mutex<Vec<Value>>,
     /// Per thread, the messages already handed to its harness and what it answered (`accepted` or `unknown`), kept
     /// across a restart: a message offered again (the core's answer was lost, or the core restarted holding it) is
-    /// answered from here and never typed into the agent a second time.
+    /// answered from here and never typed into the agent a second time. The record is written after the hand-over, so
+    /// a crash between the two offers the message once more: a message is typed twice rather than never. Message ids
+    /// are the core's own (unique), so the thread and the id name a message.
     delivered: Mutex<HashMap<String, VecDeque<(String, String)>>>,
     /// How long a harness's `unknown` answer waits for the transcript to show the message read, in milliseconds.
     confirm_wait_ms: AtomicU64,
@@ -907,6 +911,9 @@ impl Daemon {
     }
 
     async fn remember_delivered(&self, thread: &str, message_id: &str, status: &str) {
+        if message_id.len() > DELIVERED_ID_MAX {
+            return;
+        }
         let mut delivered = self.delivered.lock().await;
         if !delivered.contains_key(thread) && delivered.len() >= DELIVERED_THREADS {
             if let Some(oldest) = delivered.keys().next().cloned() {
@@ -2261,5 +2268,34 @@ mod tests {
             "unknown"
         );
         assert_eq!(*handed.lock().unwrap(), ["one", "two"]);
+    }
+
+    /// A record that says anything but "handed over" is not believed: a message it names `failed` is handed over.
+    #[tokio::test]
+    async fn only_a_handed_over_answer_in_the_record_is_believed() {
+        let scratch = crate::test_support::temp_dir("delivered-record");
+        std::fs::create_dir_all(scratch.path().join("data")).ok();
+        let (first, _, _) = scripted_daemon(scratch.path(), &[]).await;
+        let path = first.profile.data.join(DELIVERED_FILE);
+        drop(first);
+        Files::write_json(
+            &path,
+            &json!({"t-1":[["m-1","failed"],["m-2","accepted"],["","accepted"]]}),
+        )
+        .unwrap();
+        let (daemon, binding, handed) = scripted_daemon(scratch.path(), &[]).await;
+        assert_eq!(
+            daemon.deliver(&frame(&binding, "m-1", "one")).await["status"],
+            "accepted"
+        );
+        assert_eq!(
+            daemon.deliver(&frame(&binding, "m-2", "two")).await["status"],
+            "accepted"
+        );
+        assert_eq!(
+            *handed.lock().unwrap(),
+            ["one"],
+            "m-1 was handed over; m-2 was already"
+        );
     }
 }

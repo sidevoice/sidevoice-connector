@@ -68,22 +68,32 @@ pub(super) fn read_delivered(
     let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
         return Default::default();
     };
+    // Only what the connector itself writes is believed: a bounded id and an answer that means "handed over".
     value
         .as_object()
         .into_iter()
         .flatten()
+        .take(super::DELIVERED_THREADS)
         .map(|(thread, rows)| {
-            let rows = rows
+            let mut rows: std::collections::VecDeque<(String, String)> = rows
                 .as_array()
                 .into_iter()
                 .flatten()
                 .filter_map(|row| {
-                    Some((
-                        row.get(0)?.as_str()?.to_owned(),
-                        row.get(1)?.as_str()?.to_owned(),
-                    ))
+                    let id = row
+                        .get(0)?
+                        .as_str()
+                        .filter(|id| !id.is_empty() && id.len() <= super::DELIVERED_ID_MAX)?;
+                    let status = row
+                        .get(1)?
+                        .as_str()
+                        .filter(|status| matches!(*status, "accepted" | "unknown"))?;
+                    Some((id.to_owned(), status.to_owned()))
                 })
                 .collect();
+            while rows.len() > super::DELIVERED_PER_THREAD {
+                rows.pop_front();
+            }
             (thread.clone(), rows)
         })
         .collect()
