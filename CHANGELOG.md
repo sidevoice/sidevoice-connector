@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.19.0...v0.19.1) (2026-11-07)
+
+
+### Bug Fixes
+
+* **daemon:** a message already handed to the harness is not handed over again, across a restart ([#332](https://github.com/sidevoice/sidevoice-connector/issues/332)) ([beba06b](https://github.com/sidevoice/sidevoice-connector/commit/beba06bb6f703e7e297e69cc89a1e60449183cd7))
+
 ## [0.19.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.18.0...v0.19.0) (2026-10-31)
 
 
