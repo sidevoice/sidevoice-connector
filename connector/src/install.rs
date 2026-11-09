@@ -56,6 +56,7 @@ use crate::profile::Profile;
 use crate::service::jobs::{Job, Kind};
 use crate::service::layout::Layout;
 use crate::service::{launcher, status};
+use crate::step::{self, AtStep, Step};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -323,12 +324,15 @@ fn release_command(layout: &Layout, id: &str) -> PathBuf {
 /// `R/current.json` names release `id`, written whole (`platform::fs`), then `D/install.json` names its command.
 /// `D` is made first, so that failing to make it never leaves the pointer switched and the command not.
 fn select(layout: &Layout, id: &str) -> Result<()> {
-    crate::private_dir::ensure(&layout.data)?;
-    Files::write_json(&layout.current_record(), &json!({"release": id}))?;
+    crate::private_dir::ensure(&layout.data).at_step(Step::Select, &layout.data)?;
+    let current = layout.current_record();
+    Files::write_json(&current, &json!({"release": id})).at_step(Step::Select, &current)?;
+    let install = layout.install_file();
     Files::write_json(
-        &layout.install_file(),
+        &install,
         &json!({"command": [release_command(layout, id)], "releases": layout.releases}),
-    )?;
+    )
+    .at_step(Step::Select, &install)?;
     Ok(())
 }
 
@@ -425,10 +429,17 @@ fn release_id(layout: &Layout, package: &Package, digest: &str) -> Result<(Strin
             continue;
         }
         if same || !selected {
-            // Ours but incomplete, or another build that is not selected: staged again.
-            fs::remove_dir_all(&release).map_err(|error| {
-                let reason = error.to_string();
-                explain_in_use("Install", &release, error.into(), &reason)
+            // Ours but incomplete, or another build that is not selected: staged again. Still refused, it says the
+            // programs seen holding it, else the step and the path.
+            step::retried(Step::RemoveOldRelease, &release, || {
+                fs::remove_dir_all(&release)
+            })
+            .map_err(|failure| {
+                let reason = crate::messages::keyed(&failure).params["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                explain_in_use("Install", &release, failure, &reason)
             })?;
             return Ok((id, true));
         }
@@ -488,29 +499,38 @@ async fn check_binary(binary: &Path, version: &str) -> Result<()> {
 /// or not at all.
 async fn stage(layout: &Layout, package: &Package, id: &str, digest: &str) -> Result<()> {
     let releases = layout.releases_dir();
-    crate::private_dir::ensure(&releases)?;
+    crate::private_dir::ensure(&releases).at_step(Step::ReleasesDir, &releases)?;
     let partial = releases.join(format!(".{id}.partial-{}", uuid::Uuid::new_v4().simple()));
-    Files::create_private_dir(&partial)?;
+    Files::create_private_dir(&partial).at_step(Step::StageDir, &partial)?;
     let result = async {
-        Files::create_private_dir(&partial.join("bin"))?;
+        let bin = partial.join("bin");
+        Files::create_private_dir(&bin).at_step(Step::StageDir, &bin)?;
         let binary = partial.join(binary());
-        copy_executable(&package.binary, &binary)?;
-        Files::check_private(&Files::open_read(&binary)?)
-            .with_context(|| format!("unsafe private file {}", binary.display()))?;
-        which::which(&binary).context("the staged connector cannot be run")?;
-        if digest_file(&binary)? != digest {
+        copy_executable(&package.binary, &binary).at_step(Step::CopyConnector, &binary)?;
+        Files::open_read(&binary)
+            .and_then(|file| Files::check_private(&file))
+            .context("unsafe private file")
+            .at_step(Step::CheckConnector, &binary)?;
+        which::which(&binary)
+            .context("the staged connector cannot be run")
+            .at_step(Step::CheckConnector, &binary)?;
+        if digest_file(&binary).at_step(Step::CheckConnector, &binary)? != digest {
             return Err(failed("the connector changed while it was being copied"));
         }
-        check_binary(&binary, &package.version).await?;
+        check_binary(&binary, &package.version)
+            .await
+            .at_step(Step::CheckConnector, &binary)?;
         if let Some(program) = background() {
             // Beside the connector it was started from, as the package carries them.
             let from = package
                 .binary
                 .with_file_name(Path::new(&program).file_name().unwrap_or_default());
             let staged = partial.join(&program);
-            copy_executable(&from, &staged)?;
-            Files::check_private(&Files::open_read(&staged)?)
-                .with_context(|| format!("unsafe private file {}", staged.display()))?;
+            copy_executable(&from, &staged).at_step(Step::CopyBackground, &staged)?;
+            Files::open_read(&staged)
+                .and_then(|file| Files::check_private(&file))
+                .context("unsafe private file")
+                .at_step(Step::CopyBackground, &staged)?;
         }
         let (root, release, version) = (
             package.root.clone(),
@@ -522,13 +542,24 @@ async fn stage(layout: &Layout, package: &Package, id: &str, digest: &str) -> Re
         })
         .await
         .map_err(failed)??;
-        fs::rename(&partial, releases.join(id))?;
-        Files::sync_dir(&releases)?;
+        // Off the runtime's threads: on Windows it may wait for another program to let the new files go.
+        let (from, to) = (partial.clone(), releases.join(id));
+        tokio::task::spawn_blocking(move || {
+            step::retried(Step::PublishRelease, &from, || fs::rename(&from, &to))
+        })
+        .await
+        .map_err(failed)??;
+        Files::sync_dir(&releases).at_step(Step::PublishRelease, &releases)?;
         Ok(())
     }
     .await;
     if result.is_err() {
-        let _ = fs::remove_dir_all(&partial);
+        // What is left is removed by the next install ([`remove_leftovers`]) if it cannot be now.
+        let partial = partial.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            step::retried(Step::StageDir, &partial, || fs::remove_dir_all(&partial))
+        })
+        .await;
     }
     result
 }
@@ -798,10 +829,10 @@ pub async fn install(
 ) -> Result<Value> {
     let layout = Layout::from_profile(profile);
     let lock = crate::service::install_lock(&layout).await?;
-    crate::private_dir::ensure(&layout.releases)?;
+    crate::private_dir::ensure(&layout.releases).at_step(Step::InstallDir, &layout.releases)?;
     remove_leftovers(&layout);
     let previous = layout.selected_id();
-    let digest = digest_file(&package.binary)?;
+    let digest = digest_file(&package.binary).at_step(Step::ReadPackage, &package.binary)?;
     let (id, fresh) = release_id(&layout, package, &digest)?;
     if fresh {
         stage(&layout, package, &id, &digest).await?;
@@ -1926,6 +1957,40 @@ pub(crate) mod tests {
             .install(&fixture.package("bad/version", "a"))
             .await
             .is_err());
+    }
+
+    /// Whatever step of putting the release in place fails, the failure names the step and the path it failed at,
+    /// by key, never the bare OS error under `connector.failed`; nothing of the failed release is selected.
+    #[tokio::test]
+    async fn a_failure_at_any_step_of_installing_names_the_step_and_its_path() {
+        for step in Step::ALL {
+            if step == Step::CopyBackground && background().is_none() {
+                continue;
+            }
+            let fixture = Fixture::new(&format!("step-{}", step.id()));
+            let layout = fixture.layout();
+            if step == Step::RemoveOldRelease {
+                // A release of this name that is not whole: removed before staging.
+                Files::ensure_private_dir(&layout.releases_dir().join("1.0.0/bin")).unwrap();
+            }
+            let package = fixture.package("1.0.0", "a");
+            step::faults::fail_next(fixture.scratch.path(), step, 5);
+            let error = fixture.install(&package).await.unwrap_err();
+            let said = crate::messages::keyed(&error);
+            assert_eq!(said.key, "install.step-failed", "{step:?}: {error:#}");
+            assert_eq!(said.params["step"], step.id(), "{}", said.params);
+            assert_eq!(said.params["os_error"], 5, "{}", said.params);
+            let path = said.params["path"].as_str().unwrap();
+            assert!(
+                Path::new(path).starts_with(fixture.scratch.path()),
+                "{step:?}: {path}"
+            );
+            let text = said.message();
+            assert!(text.contains(path), "{text}");
+            assert!(text.contains(&step.action()), "{text}");
+            assert_eq!(said.value()["error"]["params"]["step"], step.id());
+            assert!(layout.selected_id().is_none(), "{step:?}");
+        }
     }
 
     #[tokio::test]

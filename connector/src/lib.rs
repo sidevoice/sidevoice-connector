@@ -20,5 +20,6 @@ pub mod platform;
 pub mod private_dir;
 pub mod profile;
 pub mod service;
+pub mod step;
 #[cfg(test)]
 mod test_support;
