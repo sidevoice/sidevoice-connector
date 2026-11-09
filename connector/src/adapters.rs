@@ -4,6 +4,7 @@ mod conversation;
 pub mod cursor;
 mod harness;
 pub mod health;
+pub mod herdr;
 mod http;
 pub(crate) mod markers;
 pub mod registration;
@@ -135,11 +136,15 @@ pub fn identify(
     if let Some(identity) = http::identity()? {
         return Ok(identity);
     }
+    if let Some(identity) = herdr::identity()? {
+        return Ok(identity);
+    }
     bail!("{}", unidentified(client))
 }
 
 /// The agents whose conversations Sidevoice joins.
-pub const SUPPORTED: &str = "Claude Code, Codex (the CLI and the desktop app) and Cursor";
+pub const SUPPORTED: &str =
+    "Claude Code, Codex (the CLI and the desktop app), Cursor and any agent in a herdr pane";
 
 /// Why a call could not be tied to a conversation, naming the agent that made it (from its MCP client info), and
 /// which agents Sidevoice joins.
@@ -211,11 +216,12 @@ pub fn conversation_capabilities(identity: &Identity) -> Value {
 
 pub fn experimental(identity: &Identity, capabilities: &Value) -> Vec<String> {
     let mut names = identity.experimental.clone();
-    if identity.harness == "cursor"
+    if (identity.harness == "cursor"
         && matches!(
             identity.delivery["kind"].as_str(),
             Some("cursor-tmux" | "cursor-bridge")
-        )
+        ))
+        || identity.delivery["kind"] == herdr::KIND
     {
         names.push("deliver".into());
     }
@@ -647,7 +653,7 @@ mod tests {
         );
         assert!(unidentified(None).contains("the agent did not say who it is"));
         for text in [codex, other] {
-            assert!(text.ends_with("Sidevoice joins conversations of Claude Code, Codex (the CLI and the desktop app) and Cursor."), "{text}");
+            assert!(text.ends_with("Sidevoice joins conversations of Claude Code, Codex (the CLI and the desktop app), Cursor and any agent in a herdr pane."), "{text}");
             assert!(!text.contains("SIDEVOICE_"), "{text}");
         }
     }

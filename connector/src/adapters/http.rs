@@ -1,4 +1,4 @@
-use super::conversation::Conversation;
+use super::conversation::{Conversation, Reporter};
 use super::harness::{no_route, Harness, Route};
 use super::Identity;
 use crate::platform::process::{ChildProcess, Processes};
@@ -8,6 +8,7 @@ use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
 use std::env;
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -154,7 +155,16 @@ pub fn accepts(delivery: &Value, thread: &str) -> Route {
     }
 }
 
-/// Any agent whose conversations take voice by HTTP (`SIDEVOICE_DELIVERY_URL`): the harness of an id no other claims.
+/// Whether `delivery` is a route the fallback serves for conversation `thread`: the HTTP route, or herdr's.
+fn fallback_accepts(delivery: &Value, thread: &str) -> Route {
+    match delivery.get("kind").and_then(Value::as_str) {
+        Some(super::herdr::KIND) => super::herdr::accepts(delivery, thread),
+        _ => accepts(delivery, thread),
+    }
+}
+
+/// Any agent whose conversations take voice by HTTP (`SIDEVOICE_DELIVERY_URL`) or sit in a herdr pane: the harness of
+/// an id no other claims.
 pub struct Http;
 
 impl Harness for Http {
@@ -167,7 +177,30 @@ impl Harness for Http {
     }
 
     fn accepts(&self, delivery: &Value, thread: &str) -> Route {
-        accepts(delivery, thread)
+        fallback_accepts(delivery, thread)
+    }
+
+    fn experimental_note(&self, capability: &str, identity: &Identity) -> Option<&'static str> {
+        (capability == "deliver" && identity.delivery["kind"] == super::herdr::KIND)
+            .then_some(super::herdr::EXPERIMENTAL_NOTE)
+    }
+
+    fn status<'a>(
+        &'a self,
+        conversation: &'a Conversation,
+    ) -> BoxFuture<'a, Option<serde_json::Map<String, Value>>> {
+        Box::pin(async move {
+            match conversation.route_kind() {
+                Some(super::herdr::KIND) => super::herdr::status(conversation).await,
+                _ => None,
+            }
+        })
+    }
+
+    fn watch(&self, conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
+        if conversation.route_kind() == Some(super::herdr::KIND) {
+            super::herdr::watch(conversation, reporter);
+        }
     }
 
     fn deliver<'a>(
@@ -179,6 +212,9 @@ impl Harness for Http {
         Box::pin(async move {
             match conversation.route_kind() {
                 Some("http") => deliver(&conversation.delivery, frame).await,
+                Some(super::herdr::KIND) => {
+                    super::herdr::deliver(&conversation.delivery, frame).await
+                }
                 _ => Ok(no_route(&conversation.thread)),
             }
         })

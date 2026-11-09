@@ -295,6 +295,31 @@ starting a destructive reset; the post-uninstall echo alone is too late to prote
 
 With `--json` both print one JSON object and nothing else.
 
+## Any agent in a herdr pane
+
+[herdr](https://github.com/herdrdev/herdr) is a terminal multiplexer for coding agents. It detects the agent in each
+pane (Claude Code, Codex, Gemini, OpenCode, Copilot, Qwen, Amp and about two dozen more), follows whether it is
+working, idle or blocked, and can submit a prompt to it. Every process in a pane inherits `HERDR_ENV=1`,
+`HERDR_PANE_ID`, `HERDR_BIN_PATH` and `HERDR_SOCKET_PATH`, so a `sidevoice mcp` an agent starts in a pane can join
+that agent's conversation without an adapter for it (`src/adapters/herdr.rs`).
+
+- **Identity.** `herdr agent get` for the pane. The harness id is herdr's agent kind (`gemini`), the conversation is
+  the agent's native session reference when herdr has one, else the pane's terminal id (never the pane id, which
+  changes when a pane moves). A pane with no detected agent is not joined. Claude Code, Codex and Cursor keep their
+  own adapters; they win where they apply.
+- **Delivery** (`delivery.kind: "herdr"`, experimental): `herdr agent prompt` types the message into the terminal and
+  sends Enter, so it can merge with a draft the person is typing. It always runs the `HERDR_BIN_PATH` of the pane
+  against its `HERDR_SOCKET_PATH` (never a `herdr` on `PATH`), after checking that the socket is served by this user,
+  and only while the pane still holds the same agent and conversation. If the agent is `blocked` (waiting for the
+  person's approval) herdr sends nothing: the delivery is `failed` and the message stays for `get_messages`. A
+  timeout or an unclear answer is `unknown`, never retried blindly: herdr says a timeout does not prove nothing was
+  sent.
+- **Working** follows herdr's status (`working` is working; `idle`, `done` and `blocked` are not; `unknown` reports
+  nothing) with `herdr agent wait`, which herdr serves from its events: nothing is polled while the state holds.
+- **Status.** `voice_status` shows the pane's `agent_status`, so `blocked` says the agent needs the person.
+- **Limits.** No end-of-turn and no inbound inspection. Sidevoice does not register itself in these agents: the
+  person adds `sidevoice mcp` to that agent's own MCP configuration.
+
 ## Conversation flow
 
 `voice_connect` returns the core's conversation `epoch` and `initial_reply_context`. After an incoming message, pass its `session_id`, `revision`, and `epoch` together to `voice_say`; for speech before the first message, pass `conversation` to use the returned initial context. Only a confirmed spoken turn advances the epoch. Typed context does not interrupt playback. A refused `voice_say` while a person is speaking is terminal: wait for that person's message; nothing is queued for later audio. A saved publication records admission, not proof of hearing.
