@@ -353,12 +353,32 @@ the command (`service.not-enabled`), even when the job would run now. A person's
 manager is asked and holds until `service start` or the next login; every change holds `D/install.lock`. On Linux,
 `service install` says whether the user lingers and prints `loginctl enable-linger <user>`; it never runs it.
 
+Before Sidevoice 0.19 the launchd jobs were labelled `dev.sidevoice.core` and `dev.sidevoice.connector`; a Mac updated
+from then kept them loaded, and the old core held the core's port. So `install`, `service install`, `service start`,
+`service restart` and `uninstall` first remove those legacy jobs (`service::jobs::Job::legacy_id`, the one place the
+old labels are named; `platform/service/launchd.rs`): each one whose definition in `~/Library/LaunchAgents` is this
+user's plain file, naming its label and a program inside `D` (or, with no definition left, a loaded job running such a
+program) is unloaded (`launchctl bootout gui/<uid>/<label>`) and its definition deleted, before any new job starts.
+Anything else under those labels is left alone. The answer's `legacy_jobs` (only when one was found) says what became
+of each: `{label, outcome: "removed"|"left", unloaded, plist, reason, key, params, message}`, and the human output
+prints its `message`. A job of ours that cannot be removed fails the command with `service.legacy-job-left`, naming
+it and the two commands that remove it by hand, and nothing is started (`install` switches nothing). systemd units and
+Task Scheduler tasks are named from the jobs' short names, which never changed: there is nothing to remove there.
+
 `service status --json`, and a daemon's `node.status`, is derived on every read from the manager, the core's
 `core-failure.json` and its health: `absent`, `not-installed`, `stopped-by-person`, `starting`, `backoff`,
 `running`, `failed` or `service-failed`, the states the desktop app reads. It also says `start_at_login`: `true`
 when the manager starts both jobs at the next login, `false` when it does not start one of them, and `null` when the
 manager cannot tell for either, or the service is not whole (no job, or one of the two definitions missing): never
 guessed.
+
+A core that could not listen reports `bind.port-in-use` (its message: "The requested port is already in use.").
+The connector keeps that key and adds what it can see (`service::status::explain_port`): `port` (the port the core
+names, else `$SIDEVOICE_CORE_PORT` or 10829), `holder` (`{pid, name}` of the process listening there, from `lsof` on
+macOS and on a Linux that has it; `null` when none can be seen, and always on Windows), `legacy_job` (the legacy
+label when that process is the core of a `dev.sidevoice.core` job) and `hint`, `{key, params, message}` with key
+`bind.port-in-use.legacy`, `.held` or `.unknown`, whose message becomes the failure's `message`. The same failure is
+explained in `service status`, `node.status`, an install that did not start and a core started on demand.
 
 `service login on|off` sets whether both jobs start at the next login, and nothing else: launchd `launchctl
 enable|disable gui/<uid>/<label>` (no `bootout`, no `bootstrap`), systemd `systemctl --user enable|disable <unit>`

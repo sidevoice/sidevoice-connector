@@ -7,6 +7,7 @@ use super::layout::Layout;
 use crate::core_ready::Ready;
 use crate::messages::message;
 use crate::platform::fs::{Files, Fs};
+use crate::platform::holders::{Holder, Holders, Holding};
 use crate::platform::ipc::Endpoint;
 use crate::platform::process::{Process, Processes};
 use crate::platform::service::{JobState, Service, Services};
@@ -236,11 +237,86 @@ pub fn read_failure(layout: &Layout, at: &str) -> Option<Value> {
         .filter(|detail| !detail.is_null());
     let message =
         text("message", 400).unwrap_or_else(|| message(&key, &detail_params(detail.as_ref())));
-    Some(
-        json!({"key": key, "step": text("step", 40), "message": message, "detail": detail,
+    let mut failure = json!({"key": key, "step": text("step", 40), "message": message, "detail": detail,
         "at": text("at", 40).unwrap_or_else(|| at.to_owned()), "launch_id": text("launch_id", 80),
-        "log_tail": log_tail(layout, 10)}),
-    )
+        "log_tail": log_tail(layout, 10)});
+    // A core that names the port it could not have (`bind.port-in-use`): kept for [`explain_port`].
+    if let Some(port) = report
+        .get("port")
+        .and_then(Value::as_u64)
+        .filter(|port| u16::try_from(*port).is_ok())
+    {
+        failure["port"] = json!(port);
+    }
+    Some(failure)
+}
+
+/// A core failure the core reported as `bind.port-in-use`, with what the connector can add ([`port_failure`]): the
+/// port (the report's `port` when it has one, else this installation's), the process listening on it where the OS
+/// shows it (`platform::holders`), and whether that process is the core of a legacy launchd job
+/// (`jobs::Job::legacy_id`). Any other failure is returned as it is.
+pub async fn explain_port(layout: &Layout, failure: Value) -> Value {
+    if failure.get("key").and_then(Value::as_str) != Some("bind.port-in-use") {
+        return failure;
+    }
+    let port = failure
+        .get("port")
+        .and_then(Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok())
+        .or_else(|| layout.core_port().parse().ok())
+        .unwrap_or_default();
+    // `lsof` blocks: off the async threads, and bounded by the platform.
+    let holder = tokio::task::spawn_blocking(move || Holders::listening(port))
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .next();
+    let legacy = match &holder {
+        Some(holder) => jobs::legacy_core_as(&jobs::manager(layout), holder.pid).await,
+        None => None,
+    };
+    port_failure(failure, port, holder.as_ref(), legacy)
+}
+
+/// `bind.port-in-use` said with its port and what holds it. Its `key` stays the core's; it gains `port`, `holder`
+/// (`{pid, name}`, or `null` when nothing could be seen), `legacy_job` (the legacy label whose core that is, or `null`)
+/// and `hint` (`{key, params, message}`: `bind.port-in-use.legacy`, `.held` or `.unknown`), whose message becomes the
+/// failure's `message`, which a person reads.
+pub fn port_failure(
+    mut failure: Value,
+    port: u16,
+    holder: Option<&Holder>,
+    legacy: Option<&str>,
+) -> Value {
+    if !failure.is_object() {
+        return failure;
+    }
+    let named = holder.map(|holder| {
+        let name = if holder.name.is_empty() {
+            "?"
+        } else {
+            holder.name.as_str()
+        };
+        json!({"pid": holder.pid, "name": name})
+    });
+    let (key, params) = match (&named, legacy) {
+        (Some(named), Some(label)) => (
+            "bind.port-in-use.legacy",
+            json!({"port": port, "pid": named["pid"], "name": named["name"], "label": label}),
+        ),
+        (Some(named), None) => (
+            "bind.port-in-use.held",
+            json!({"port": port, "pid": named["pid"], "name": named["name"]}),
+        ),
+        (None, _) => ("bind.port-in-use.unknown", json!({"port": port})),
+    };
+    let text = message(key, &params);
+    failure["port"] = json!(port);
+    failure["holder"] = named.unwrap_or(Value::Null);
+    failure["legacy_job"] = json!(legacy.filter(|_| holder.is_some()));
+    failure["hint"] = json!({"key": key, "params": params, "message": text});
+    failure["message"] = json!(text);
+    failure
 }
 
 /// Whether `D/node-stopped.json` is there.
@@ -293,6 +369,13 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
             .await
             .is_some(),
     };
+    // A failure is read only of a core job that does not run: what holds its port is looked up then.
+    let failure = match read_failure(layout, &at) {
+        Some(failure) if !core_job.as_ref().is_some_and(|job| job.running) => {
+            Some(explain_port(layout, failure).await)
+        }
+        failure => failure,
+    };
     Observation {
         service: kind.as_str(),
         installed: layout.installed(),
@@ -308,7 +391,7 @@ pub async fn observe(layout: &Layout, connector_running: Option<bool>) -> Observ
         stopped: stopped(layout),
         health,
         ready,
-        failure: read_failure(layout, &at),
+        failure,
         core_age,
         program,
         log_tail: log_tail(layout, 10),
@@ -531,5 +614,146 @@ mod tests {
         assert!(settled(
             &json!({"state": "failed", "failure": {"step": "bind"}})
         ));
+    }
+
+    #[test]
+    fn a_port_taken_names_the_port_and_its_holder_and_a_legacy_core() {
+        let reported = || {
+            json!({"key": "bind.port-in-use", "step": "bind", "message": "The requested port is already in use.",
+                "detail": null, "at": "t", "log_tail": []})
+        };
+        let holder = Holder {
+            pid: 4242,
+            name: "sidevoice-core".into(),
+        };
+
+        let legacy = port_failure(reported(), 10829, Some(&holder), Some("dev.sidevoice.core"));
+        assert_eq!(legacy["key"], "bind.port-in-use", "the core's key stays");
+        assert_eq!(legacy["step"], "bind");
+        assert_eq!(
+            (&legacy["port"], &legacy["holder"], &legacy["legacy_job"]),
+            (
+                &json!(10829),
+                &json!({"pid": 4242, "name": "sidevoice-core"}),
+                &json!("dev.sidevoice.core")
+            )
+        );
+        assert_eq!(legacy["hint"]["key"], "bind.port-in-use.legacy");
+        assert_eq!(
+            legacy["hint"]["params"],
+            json!({"port": 10829, "pid": 4242, "name": "sidevoice-core", "label": "dev.sidevoice.core"})
+        );
+        assert_eq!(
+            legacy["message"],
+            "The core's port 10829 is held by an older Sidevoice core (sidevoice-core, pid 4242) that launchd still \
+             runs as dev.sidevoice.core, a job from before Sidevoice 0.19. `npx sidevoice service restart` removes \
+             that job, then starts this core."
+        );
+        assert_eq!(legacy["message"], legacy["hint"]["message"]);
+
+        let held = port_failure(reported(), 10829, Some(&holder), None);
+        assert_eq!(held["hint"]["key"], "bind.port-in-use.held");
+        assert!(held["legacy_job"].is_null());
+        assert_eq!(
+            held["message"],
+            "The core's port 10829 is already in use by sidevoice-core (pid 4242). Quit that program, or give \
+             Sidevoice another port (SIDEVOICE_CORE_PORT) and install again."
+        );
+
+        let unseen = port_failure(reported(), 4000, None, Some("dev.sidevoice.core"));
+        assert_eq!(unseen["hint"]["key"], "bind.port-in-use.unknown");
+        assert!(unseen["holder"].is_null() && unseen["legacy_job"].is_null());
+        assert_eq!(unseen["port"], 4000);
+
+        // The human answer of `service status` says it.
+        let mut o = running();
+        o.health = None;
+        o.core_job = Some(JobState {
+            loaded: true,
+            exit: Some(0),
+            ..JobState::default()
+        });
+        o.failure = Some(legacy.clone());
+        let status = derive(&o);
+        assert_eq!(status["failure"]["hint"]["key"], "bind.port-in-use.legacy");
+        let said = super::super::commands::human(&json!({"ok": true, "state": status["state"],
+            "service": "launchd", "failure": status["failure"]}));
+        assert!(
+            said.contains("dev.sidevoice.core") && said.contains("10829"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn only_a_port_taken_is_explained() {
+        let other = json!({"key": "bind.core-running", "message": "x"});
+        assert_eq!(
+            port_failure(json!("not an object"), 1, None, None),
+            json!("not an object")
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let layout = Layout::from_vars(
+            |name| {
+                use crate::platform::env::{Env, Environment};
+                (name == Environment::HOME).then(|| std::env::temp_dir().join("u").into())
+            },
+            Vec::new(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            runtime.block_on(explain_port(&layout, other.clone())),
+            other
+        );
+    }
+
+    /// `core-failure.json` is written by the core, of whatever version: unknown fields, top level and nested, are
+    /// ignored, a `port` it names is kept, and a port taken is explained by its known part.
+    #[tokio::test]
+    async fn a_core_failure_report_with_unknown_fields_is_read_and_explained_for_what_it_knows() {
+        let scratch = tempfile::tempdir().unwrap();
+        let data = scratch.path().join("d");
+        let layout = Layout::from_vars(
+            |name| {
+                use crate::platform::env::{Env, Environment};
+                if name == Environment::HOME {
+                    Some(scratch.path().join("u").into())
+                } else if name == "SIDEVOICE_DATA_DIR" {
+                    Some(data.clone().into())
+                } else {
+                    None
+                }
+            },
+            Vec::new(),
+            &[],
+        )
+        .unwrap();
+        crate::private_dir::ensure(&layout.data).unwrap();
+        crate::private_dir::ensure(&layout.core_data()).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        Files::write_json(
+            &layout.core_failure(),
+            &json!({"key": "bind.port-in-use", "step": "bind", "message": "The requested port is already in use.",
+                "launch_id": "l", "port": port, "newer": {"nested": [1, 2]}, "severity": "something-new"}),
+        )
+        .unwrap();
+        let report = read_failure(&layout, "t").expect("a report");
+        assert_eq!(report["port"], port);
+        assert!(report.get("newer").is_none());
+        let explained = explain_port(&layout, report).await;
+        assert_eq!(explained["key"], "bind.port-in-use");
+        assert_eq!(explained["port"], port, "the port the core names");
+        match explained["hint"]["key"].as_str() {
+            Some("bind.port-in-use.held") => {
+                assert_eq!(explained["holder"]["pid"], std::process::id())
+            }
+            Some("bind.port-in-use.unknown") if !cfg!(target_os = "macos") => {}
+            other => panic!("{other:?}: {explained}"),
+        }
+        drop(listener);
     }
 }

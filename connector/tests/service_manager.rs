@@ -98,6 +98,66 @@ fn definitions(profile: &Profile, extra: &BTreeMap<String, String>) -> Vec<PathB
         .collect()
 }
 
+/// The job a Sidevoice before 0.19 defined for its core (`dev.sidevoice.core`), loaded: its definition in the
+/// profile's LaunchAgents naming a program inside the data directory, which only sleeps. Returns the definition.
+#[cfg(target_os = "macos")]
+fn plant_legacy_core(profile: &Profile) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let none = BTreeMap::new();
+    assert!(
+        !manager_has(&none, LEGACY_CORE),
+        "dev.sidevoice.core is already loaded: not touching this user's own service"
+    );
+    let bin = profile.data().join("install/releases/0.18.0/core/bin");
+    for dir in bin
+        .ancestors()
+        .take(5)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        private_dir(dir);
+    }
+    let program = bin.join("sidevoice-core");
+    std::fs::write(&program, "#!/bin/sh\nexec /bin/sleep 600\n").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let agents = profile.root.join("home/Library/LaunchAgents");
+    private_dir(&profile.root.join("home/Library"));
+    private_dir(&agents);
+    let plist = agents.join(format!("{}.plist", LEGACY_CORE.0));
+    std::fs::write(
+        &plist,
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+             \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\
+             <key>Label</key><string>{}</string>\
+             <key>ProgramArguments</key><array><string>{}</string></array>\
+             <key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n",
+            LEGACY_CORE.0,
+            program.display()
+        ),
+    )
+    .unwrap();
+    // An integration test is its own crate and cannot reach `platform`.
+    #[allow(clippy::disallowed_methods)]
+    let uid = unsafe { libc::getuid() };
+    let booted = Command::new("/bin/launchctl")
+        .args(["bootstrap", &format!("gui/{uid}"), plist.to_str().unwrap()])
+        .output()
+        .expect("launchctl bootstrap");
+    assert!(
+        booted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&booted.stderr)
+    );
+    assert!(manager_has(&none, LEGACY_CORE));
+    plist
+}
+
+/// The core job's label before Sidevoice 0.19 (launchd only).
+#[cfg(target_os = "macos")]
+const LEGACY_CORE: (&str, &str) = ("dev.sidevoice.core", "");
+
 struct Installed<'a> {
     profile: &'a Profile,
     extra: BTreeMap<String, String>,
@@ -157,8 +217,30 @@ fn the_login_service_runs_recovers_stops_and_leaves_nothing_behind() {
         extra: extra.clone(),
         active: true,
     };
+    // An upgrade from before 0.19: the old core job is still loaded. Installing removes it before its jobs start.
+    #[cfg(target_os = "macos")]
+    let legacy = plant_legacy_core(&profile);
     let answer = ok(&profile, &extra, "install");
     assert_eq!(answer["service"], kind, "{answer}");
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(
+            (
+                answer["legacy_jobs"][0]["label"].as_str(),
+                answer["legacy_jobs"][0]["outcome"].as_str(),
+                answer["legacy_jobs"][0]["unloaded"].as_bool()
+            ),
+            (Some(LEGACY_CORE.0), Some("removed"), Some(true)),
+            "{answer}"
+        );
+        assert!(
+            !manager_has(&extra, LEGACY_CORE),
+            "the legacy job stays loaded"
+        );
+        assert!(!legacy.exists(), "its definition stays");
+    }
+    #[cfg(not(target_os = "macos"))]
+    assert!(answer.get("legacy_jobs").is_none(), "{answer}");
     if kind == "systemd" {
         assert!(
             answer["linger"]["command"]

@@ -168,6 +168,11 @@ impl Holding for Os {
     fn stop_running_from(roots: &[&Path], program_root: &Path) -> Vec<u32> {
         Self::stop_running_from_impl(roots, program_root)
     }
+
+    // Not looked up: the core's port taken is said with the port alone.
+    fn listening(_: u16) -> Vec<Holder> {
+        Vec::new()
+    }
 }
 
 /// An open process handle, closed when dropped.

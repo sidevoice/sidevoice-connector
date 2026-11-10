@@ -20,6 +20,8 @@ pub struct Os {
     places: Places,
 }
 
+// `retire_legacy` and `legacy_pid` keep their defaults (nothing): a unit is named from the job's short name
+// (`sidevoice-core.service`), which never changed. Only launchd's labels were renamed, in Sidevoice 0.19.
 impl Service for Os {
     const KIND: &'static str = "systemd";
     const START_LIMIT: Option<u64> = Some(START_LIMIT);

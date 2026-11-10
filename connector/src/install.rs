@@ -761,7 +761,8 @@ impl Runtime {
                     let mut now = if kind == Kind::None {
                         // No job: what the core said about a failed start is the state.
                         match status::read_failure(layout_ref, &crate::logfile::timestamp()) {
-                            Some(failure) => json!({"state": "failed", "failure": failure}),
+                            Some(failure) => json!({"state": "failed",
+                                "failure": status::explain_port(layout_ref, failure).await}),
                             None => json!({"state": "starting"}),
                         }
                     } else {
@@ -849,6 +850,23 @@ impl Runtime {
         }
     }
 
+    /// The jobs a Sidevoice before 0.19 left under launchd, removed when they are ours (`jobs::retire_legacy`), before
+    /// anything is switched or started: what became of each one found.
+    async fn retire_legacy(&self, layout: &Layout) -> crate::service::Result<Vec<Value>> {
+        match self {
+            Runtime::Machine => {
+                crate::service::jobs::retire_legacy(layout, &crate::service::jobs::manager(layout))
+                    .await
+            }
+            #[cfg(test)]
+            Runtime::Fake(fake) => match fake.lock().unwrap().legacy.clone() {
+                Some(Err(key)) => Err(crate::service::Failure::keyed(key, json!({}))),
+                Some(Ok(entries)) => Ok(entries),
+                None => Ok(Vec::new()),
+            },
+        }
+    }
+
     /// Both jobs unloaded, what runs on demand stopped and both definitions deleted, the stop kept.
     async fn unload(&self, layout: &Layout) -> crate::service::Result<Value> {
         match self {
@@ -910,6 +928,8 @@ pub async fn install(
     if fresh {
         stage(&layout, package, &id, &digest).await?;
     }
+    // Before the switch: a legacy job of ours that cannot be removed leaves the selection as it was.
+    let legacy = runtime.retire_legacy(&layout).await?;
     select(&layout, &id)?;
     let kind = match start_and_verify(runtime, &layout, &id).await {
         Ok(kind) => kind,
@@ -969,6 +989,7 @@ pub async fn install(
         "command": [release_command(&layout, &id)], "releases": layout.releases, "pruned": pruned,
         "service": kind.as_str(), "state": state.get("state").cloned().unwrap_or(Value::Null),
         "agents": agents});
+    crate::service::commands::with_legacy(&mut answer, legacy);
     if kind == Kind::Manager {
         let service = crate::service::jobs::manager(&layout);
         if let Some(linger) = crate::service::jobs::linger(&service).await {
@@ -1354,6 +1375,7 @@ pub fn human_install(answer: &Value) -> String {
     if answer["service"] == "none" {
         done.push("With no service manager here, Sidevoice starts on demand when a conversation needs it.".into());
     }
+    done.extend(crate::service::commands::legacy_lines(answer));
     if let Some(agents) = answer["agents"].as_object() {
         for outcome in agents.values() {
             if let Some(message) = outcome["message"].as_str() {
@@ -1474,13 +1496,15 @@ async fn uninstall_with_hooks(
     drop(install_held);
     let advice =
         vec!["Conversations already open keep their Sidevoice server until they end.".to_owned()];
-    Ok(
-        json!({"ok": true, "state": "absent", "safe_uninstall": crate::identity::SAFE_UNINSTALL,
+    let mut answer = json!({"ok": true, "state": "absent", "safe_uninstall": crate::identity::SAFE_UNINSTALL,
         "service": service.get("service").cloned().unwrap_or(Value::Null),
         "note": service.get("note").cloned().unwrap_or(Value::Null), "agents": agents, "terminated": terminated,
         "releases": had_releases.then(|| layout.releases.clone()), "data": layout.data, "removed": removed, "data_dir": data_dir,
-        "advice": advice}),
-    )
+        "advice": advice});
+    if let Some(legacy) = service.get("legacy_jobs") {
+        answer["legacy_jobs"] = legacy.clone();
+    }
+    Ok(answer)
 }
 
 /// What became of the data directory itself, as a person reads it.
@@ -1527,6 +1551,7 @@ pub fn human_uninstall(answer: &Value) -> String {
     if let Some(note) = answer["note"].as_str() {
         done.push(note.to_owned());
     }
+    done.extend(crate::service::commands::legacy_lines(answer));
     if let Some(agents) = answer["agents"].as_object() {
         for outcome in agents.values() {
             if let Some(message) = outcome["message"].as_str() {
@@ -1673,6 +1698,8 @@ pub(crate) mod tests {
         /// The release `current` named at each restart.
         pub restarts: Vec<String>,
         pub unloaded: bool,
+        /// What removing the legacy jobs answers: their entries, or the key of its refusal (none: nothing found).
+        pub legacy: Option<std::result::Result<Vec<Value>, &'static str>>,
     }
 
     struct Fixture {
@@ -1933,6 +1960,57 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(fixture.releases(), ["3.0.0"]);
+    }
+
+    #[tokio::test]
+    async fn legacy_jobs_go_before_the_switch_and_one_left_in_place_switches_nothing() {
+        let fixture = Fixture::new("install-legacy");
+        let layout = fixture.layout();
+        fixture
+            .install(&fixture.package("1.0.0", "a"))
+            .await
+            .unwrap();
+        let update = fixture.package("2.0.0", "b");
+
+        fixture.fake.lock().unwrap().legacy = Some(Err("service.legacy-job-left"));
+        let refused = fixture.install(&update).await.unwrap_err();
+        assert_eq!(
+            refused
+                .downcast_ref::<crate::service::Failure>()
+                .map(|failure| failure.key.as_str()),
+            Some("service.legacy-job-left"),
+            "{refused}"
+        );
+        assert_eq!(
+            layout.selected_id().as_deref(),
+            Some("1.0.0"),
+            "not switched"
+        );
+        assert_eq!(
+            fixture.fake.lock().unwrap().restarts,
+            ["1.0.0"],
+            "nothing restarted"
+        );
+
+        let removed = json!({"label": "dev.sidevoice.core", "outcome": "removed", "unloaded": true,
+            "plist": "/h/Library/LaunchAgents/dev.sidevoice.core.plist", "key": "service.legacy.removed",
+            "message": "Removed dev.sidevoice.core, the service job of a Sidevoice before 0.19: unloaded it and deleted /h/Library/LaunchAgents/dev.sidevoice.core.plist."});
+        fixture.fake.lock().unwrap().legacy = Some(Ok(vec![removed.clone()]));
+        let answer = fixture.install(&update).await.unwrap();
+        assert_eq!(answer["legacy_jobs"], json!([removed]), "{answer}");
+        assert_eq!(layout.selected_id().as_deref(), Some("2.0.0"));
+        let said = human_install(&answer);
+        assert!(
+            said.contains(
+                "\n· Removed dev.sidevoice.core, the service job of a Sidevoice before 0.19"
+            ),
+            "{said}"
+        );
+
+        // Nothing found, nothing said.
+        fixture.fake.lock().unwrap().legacy = None;
+        let again = fixture.install(&update).await.unwrap();
+        assert!(again.get("legacy_jobs").is_none(), "{again}");
     }
 
     #[tokio::test]

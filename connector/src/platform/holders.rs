@@ -41,6 +41,39 @@ pub trait Holding {
     /// is ended through it, so a pid reused meanwhile is never touched. Never this process. Returns the pids ended.
     /// Unix reports no holders, so ends nothing.
     fn stop_running_from(roots: &[&Path], program_root: &Path) -> Vec<u32>;
+
+    /// The processes listening on TCP `port` here, as far as this user can see them, without repeats: what to name
+    /// when a program finds its port taken. Empty when none is seen and when the OS cannot tell; looking is bounded in
+    /// time. Unix asks `lsof` (macOS has it; a Linux without it sees nothing). Windows does not look.
+    fn listening(port: u16) -> Vec<Holder>;
+}
+
+/// `lsof -F pc` read: one holder per `p<pid>` line, named by the `c<command>` line after it, control characters
+/// dropped.
+#[cfg(any(unix, test))]
+fn lsof_listeners(output: &str) -> Vec<Holder> {
+    let mut found: Vec<Holder> = Vec::new();
+    for line in output.lines() {
+        if let Some(pid) = line.strip_prefix('p') {
+            if let Ok(pid) = pid.trim().parse::<u32>() {
+                if !found.iter().any(|holder| holder.pid == pid) {
+                    found.push(Holder {
+                        pid,
+                        name: String::new(),
+                    });
+                }
+            }
+        } else if let (Some(name), Some(last)) = (line.strip_prefix('c'), found.last_mut()) {
+            if last.name.is_empty() {
+                last.name = name
+                    .chars()
+                    .filter(|ch| !ch.is_control())
+                    .take(80)
+                    .collect();
+            }
+        }
+    }
+    found
 }
 
 /// Whether the program at `image` is a file inside `root`, both as the file system resolves them.
@@ -78,6 +111,44 @@ mod tests {
         // The same name from another installation, or from a folder that only shares the prefix, is not ours.
         assert!(!runs_from(&other.join("bin/sidevoice-connector"), &root));
         assert!(!runs_from(&root.join("missing"), &root));
+    }
+
+    #[test]
+    fn lsof_answers_read_as_the_listening_processes() {
+        let output = "p4242\ncsidevoice-core\nf7\np99\ncnode\x07\np4242\ncagain\n";
+        assert_eq!(
+            lsof_listeners(output),
+            vec![
+                Holder {
+                    pid: 4242,
+                    name: "sidevoice-core".into()
+                },
+                Holder {
+                    pid: 99,
+                    name: "node".into()
+                },
+            ]
+        );
+        assert!(lsof_listeners("").is_empty());
+        assert!(lsof_listeners("pnot-a-pid\ncx\n").is_empty());
+    }
+
+    /// A port this test listens on is seen held by this process, where the OS can tell (macOS always: `lsof` is part of
+    /// it; Linux when `lsof` is installed).
+    #[cfg(unix)]
+    #[test]
+    fn a_listening_port_is_held_by_its_process() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held = Holders::listening(port);
+        if held.is_empty() && cfg!(not(target_os = "macos")) {
+            eprintln!("skipped: no lsof here");
+            return;
+        }
+        assert!(
+            held.iter().any(|holder| holder.pid == std::process::id()),
+            "{held:?}"
+        );
     }
 
     #[test]

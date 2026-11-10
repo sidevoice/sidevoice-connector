@@ -355,7 +355,7 @@ pub async fn ensure_core(layout: &Layout) -> Result<Ready> {
         terminate_core(layout, pid, STOP_GRACE).await;
     }
     let _ = child.try_wait();
-    Err(core_failure(failure))
+    Err(core_failure(status::explain_port(layout, failure).await))
 }
 
 /// Whether this machine's core is the connector's to start: an installation selected, no stop, and the connector

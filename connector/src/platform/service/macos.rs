@@ -4,12 +4,15 @@
 //! starts; its output goes to the job's log. Whether it starts at login is launchd's override for its label
 //! (`enable` / `disable`), which a plist's RunAtLoad obeys.
 
-use super::{command, Job, JobId, JobState, Output, Places, Refusal, Restart, Service};
+use super::launchd::{self, Presence};
+use super::{
+    command, Job, JobId, JobState, Legacy, LegacyRefusal, Output, Places, Refusal, Restart, Service,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::PathBuf;
-use tokio::time::{sleep, Duration, Instant};
+use std::path::{Path, PathBuf};
+use tokio::time::{sleep, Duration};
 
 /// launchd, for this user.
 pub struct Os {
@@ -130,6 +133,20 @@ impl Service for Os {
     async fn set_login(&self, job: JobId, on: bool) -> Result<(), String> {
         set_login_with(&run, job, on).await
     }
+
+    // The labels before Sidevoice 0.19, in this user's GUI domain and LaunchAgents ([`launchd::retire_with`]).
+    async fn retire_legacy(
+        &self,
+        legacy: &[JobId],
+        roots: &[&Path],
+    ) -> Result<Vec<Legacy>, LegacyRefusal> {
+        let agents = self.places.home.join("Library/LaunchAgents");
+        launchd::retire_with(&run, &domain(), &agents, legacy, roots, BOOT_OUT_LIMIT).await
+    }
+
+    async fn legacy_pid(&self, legacy: JobId) -> Option<u32> {
+        self.status(legacy).await.pid
+    }
 }
 
 impl Os {
@@ -188,52 +205,17 @@ fn target(job: JobId) -> String {
     format!("{}/{}", domain(), job.label)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Presence {
-    Loaded,
-    Absent,
-    Unknown(String),
-}
+/// How long a `bootout` is waited out.
+const BOOT_OUT_LIMIT: Duration = Duration::from_secs(10);
 
-/// Whether launchd has a job, as it answers: absent only when it says so ("Could not find service", 113).
+/// Whether launchd has a job, as it answers ([`launchd::presence_of`]).
 async fn presence(job: JobId) -> Presence {
-    let printed = launchctl(&["print", &target(job)]).await;
-    if printed.ok {
-        return Presence::Loaded;
-    }
-    if printed.code == Some(113)
-        || printed
-            .output
-            .to_ascii_lowercase()
-            .contains("could not find service")
-    {
-        return Presence::Absent;
-    }
-    Presence::Unknown(if printed.trimmed().is_empty() {
-        format!("launchctl exited {:?}", printed.code)
-    } else {
-        printed.trimmed()
-    })
+    launchd::presence_with(&run, &target(job)).await
 }
 
-/// `launchctl bootout` returns before launchd has let the job go, and a `bootstrap` in that interval fails: the job
-/// is waited out, until launchd says it is gone (which a manager that cannot be asked never says).
+/// The job unloaded and waited out ([`launchd::boot_out_with`]).
 async fn boot_out(job: JobId) -> Result<(), String> {
-    let out = launchctl(&["bootout", &target(job)]).await;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match presence(job).await {
-            Presence::Absent => return Ok(()),
-            now if Instant::now() >= deadline => {
-                return Err(match now {
-                    Presence::Unknown(detail) => format!("not confirmed: {detail}"),
-                    _ if !out.trimmed().is_empty() => out.trimmed(),
-                    _ => "still loaded".into(),
-                })
-            }
-            _ => sleep(Duration::from_millis(100)).await,
-        }
-    }
+    launchd::boot_out_with(&run, &target(job), BOOT_OUT_LIMIT).await
 }
 
 /// How a job is bootstrapped, from whether this start enables it for login and, if not, whether it starts at login
