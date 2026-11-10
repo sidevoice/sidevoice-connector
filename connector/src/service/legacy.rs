@@ -7,7 +7,9 @@
 //! `D/core.stderr.log` or `D/connector.log`, and run the connector as `<program> connector`. `D` was `~/.sidevoice` up
 //! to 0.15.x and `~/Library/Application Support/Sidevoice` from 0.16.0, unless `SIDEVOICE_DATA_DIR` named another, which
 //! is recognised when it is this installation's. The core's arguments were always the full list of its release, in
-//! order, every value derived from `D` and the job's `SIDEVOICE_CORE_HOST` and `SIDEVOICE_CORE_PORT`.
+//! order, every value derived from `D` and the job's `SIDEVOICE_CORE_HOST` and `SIDEVOICE_CORE_PORT` (whose default was
+//! 8768 up to 0.8.1, 10829 from 0.9.0). Paths are compared with `.` and `..` worked out: those releases wrote
+//! `SIDEVOICE_DATA_DIR`, `XDG_DATA_HOME` and `install.json`'s `releases` as given, `..` included.
 
 use super::jobs::Job;
 use super::layout::Layout;
@@ -44,19 +46,31 @@ struct Writer {
     socket: bool,
     host: Host,
     credential: bool,
+    /// The core's port when the job's `SIDEVOICE_CORE_PORT` names none.
+    port: &'static str,
 }
 
 /// Every writer before 0.19, from the history of `service/definition.rs` and `service/layout.rs` (v0.7.0 to v0.18.0).
 /// The core ran `--data-dir D/core [--socket D/core/local.sock] --ready-file D/core/core.json --host H --port P
 /// --log-file D/core.log [--room-credential D/credentials.json] --idle-exit 0`.
-const WRITERS: [Writer; 5] = [
+const WRITERS: [Writer; 6] = [
     Writer {
-        releases: "0.7.0-0.10.2",
+        releases: "0.7.0-0.8.1",
         release: Release::Current,
         core: "sidevoice-core-rust",
         socket: true,
         host: Host::Loopback,
         credential: true,
+        port: "8768",
+    },
+    Writer {
+        releases: "0.9.0-0.10.2",
+        release: Release::Current,
+        core: "sidevoice-core-rust",
+        socket: true,
+        host: Host::Loopback,
+        credential: true,
+        port: "10829",
     },
     Writer {
         releases: "0.10.3-0.13.x",
@@ -65,6 +79,7 @@ const WRITERS: [Writer; 5] = [
         socket: true,
         host: Host::Setting,
         credential: true,
+        port: "10829",
     },
     Writer {
         releases: "0.14.0-0.15.x",
@@ -73,6 +88,7 @@ const WRITERS: [Writer; 5] = [
         socket: true,
         host: Host::Setting,
         credential: false,
+        port: "10829",
     },
     Writer {
         releases: "0.16.0-0.17.x",
@@ -81,6 +97,7 @@ const WRITERS: [Writer; 5] = [
         socket: false,
         host: Host::Setting,
         credential: false,
+        port: "10829",
     },
     Writer {
         releases: "0.18.x",
@@ -89,6 +106,7 @@ const WRITERS: [Writer; 5] = [
         socket: false,
         host: Host::Setting,
         credential: false,
+        port: "10829",
     },
 ];
 
@@ -110,7 +128,7 @@ pub fn recognise(job: Job, layout: &Layout, recorded: &Recorded) -> Result<(), S
     let data = environment
         .get("SIDEVOICE_DATA_DIR")
         .map(PathBuf::from)
-        .filter(|data| plain(data))
+        .filter(|data| data.is_absolute())
         .ok_or_else(|| "it names no data directory".to_owned())?;
     if ![layout.data.clone(), layout.home.join(".sidevoice")]
         .iter()
@@ -145,7 +163,7 @@ pub fn recognise(job: Job, layout: &Layout, recorded: &Recorded) -> Result<(), S
         if arguments != expected.as_slice() {
             continue;
         }
-        if let Some(found) = released_program(job, writer, layout, &data, program) {
+        if let Some(found) = released_program(job, writer, layout, &data, program, environment) {
             return found;
         }
     }
@@ -179,7 +197,7 @@ fn core_arguments(
         .get("SIDEVOICE_CORE_PORT")
         .filter(|port| port.parse::<u16>().is_ok())
         .cloned()
-        .unwrap_or_else(|| super::layout::DEFAULT_CORE_PORT.to_owned());
+        .unwrap_or_else(|| writer.port.to_owned());
     arguments.extend([
         "--ready-file".to_owned(),
         path(core.join("core.json")),
@@ -201,8 +219,13 @@ fn core_arguments(
 }
 
 /// Where `writer`'s releases were, for the data directory `data`: `D/install` (0.16.0 on); `install.json`'s
-/// `releases`, else `~/.local/share/sidevoice` (up to 0.15.x).
-fn release_roots(release: Release, layout: &Layout, data: &Path) -> Vec<PathBuf> {
+/// `releases`, else `$XDG_DATA_HOME/sidevoice` as the job recorded it, else `~/.local/share/sidevoice` (up to 0.15.x).
+fn release_roots(
+    release: Release,
+    layout: &Layout,
+    data: &Path,
+    environment: &BTreeMap<String, String>,
+) -> Vec<PathBuf> {
     match release {
         Release::Selected => vec![data.join("install")],
         Release::Current => {
@@ -211,9 +234,14 @@ fn release_roots(release: Release, layout: &Layout, data: &Path) -> Vec<PathBuf>
                 .flatten()
                 .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
                 .and_then(|record| record.get("releases")?.as_str().map(PathBuf::from))
-                .filter(|releases| plain(releases));
+                .filter(|releases| releases.is_absolute());
+            let data_home = environment
+                .get("XDG_DATA_HOME")
+                .map(|home| Path::new(home).join("sidevoice"))
+                .filter(|releases| releases.is_absolute());
             recorded
                 .into_iter()
+                .chain(data_home)
                 .chain([layout.home.join(".local/share/sidevoice")])
                 .collect()
         }
@@ -229,12 +257,14 @@ fn released_program(
     layout: &Layout,
     data: &Path,
     program: &Path,
+    environment: &BTreeMap<String, String>,
 ) -> Option<Result<(), String>> {
-    if !plain(program) {
-        return None;
-    }
-    for root in release_roots(writer.release, layout, data) {
-        let Ok(rest) = program.strip_prefix(&root) else {
+    // Compared as written, `.` and `..` worked out (old releases wrote such paths verbatim).
+    let written = normal(program)?;
+    for root in release_roots(writer.release, layout, data, environment) {
+        let Some(rest) =
+            normal(&root).and_then(|root| written.strip_prefix(root).ok().map(Path::to_path_buf))
+        else {
             continue;
         };
         let Some(parts) = rest
@@ -273,37 +303,50 @@ fn released_program(
     None
 }
 
-/// An absolute path with no `..`.
-fn plain(path: &Path) -> bool {
-    path.is_absolute()
-        && !path
-            .components()
-            .any(|part| matches!(part, Component::ParentDir))
-}
-
-/// `path` with every link resolved: its longest existing ancestor made canonical, the rest appended. None when it
-/// is not [`plain`] or nothing of it can be resolved.
-fn resolved(path: &Path) -> Option<PathBuf> {
-    if !plain(path) {
+/// `path` with `.` and `..` worked out as written, without the file system; none when it is not absolute.
+fn normal(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
         return None;
     }
-    let mut existing = path;
-    let mut rest = Vec::new();
-    loop {
-        if let Ok(mut found) = std::fs::canonicalize(existing) {
-            found.extend(rest.iter().rev());
-            return Some(found);
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
         }
-        rest.push(existing.file_name()?);
-        existing = existing.parent()?;
     }
+    Some(out)
 }
 
-/// Whether two paths are the same place: as written, or with their links resolved.
+/// `path` ([`normal`]) with every link resolved: its longest prefix the file system resolves made canonical, the rest
+/// appended. None when it is not absolute or nothing of it can be resolved.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    let path = normal(path)?;
+    let parts: Vec<Component> = path.components().collect();
+    for keep in (1..=parts.len()).rev() {
+        let prefix: PathBuf = parts[..keep].iter().collect();
+        if let Ok(mut found) = std::fs::canonicalize(&prefix) {
+            for part in &parts[keep..] {
+                if let Component::Normal(name) = part {
+                    found.push(name);
+                }
+            }
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Whether two absolute paths are the same place: as written with `.` and `..` worked out, or with their links
+/// resolved.
 fn same(one: &Path, other: &Path) -> bool {
-    plain(one)
-        && plain(other)
-        && (one == other || resolved(one).is_some_and(|one| Some(one) == resolved(other)))
+    let (Some(written), Some(other_written)) = (normal(one), normal(other)) else {
+        return false;
+    };
+    written == other_written || resolved(one).is_some_and(|one| Some(one) == resolved(other))
 }
 
 // Links and the paths of a Mac: Unix only.
@@ -426,6 +469,8 @@ mod tests {
             .collect()
     }
 
+    const ARGS_0_8: &str = "--data-dir {D}/core --socket {D}/core/local.sock --ready-file {D}/core/core.json \
+        --host 127.0.0.1 --port 8768 --log-file {D}/core.log --room-credential {D}/credentials.json --idle-exit 0";
     const ARGS_0_10_2: &str = "--data-dir {D}/core --socket {D}/core/local.sock --ready-file {D}/core/core.json \
         --host 127.0.0.1 --port 10829 --log-file {D}/core.log --room-credential {D}/credentials.json --idle-exit 0";
     const ARGS_0_13: &str = "--data-dir {D}/core --socket {D}/core/local.sock --ready-file {D}/core/core.json \
@@ -471,6 +516,7 @@ mod tests {
         let mac = Mac::new();
         let (data, core, connector) = mac.era_a("0.13.1");
         for (arguments, settings) in [
+            (ARGS_0_8, &[][..]),
             (ARGS_0_10_2, &[][..]),
             (ARGS_0_13, &[][..]),
             (
@@ -530,6 +576,33 @@ mod tests {
         assert_eq!(recognise(Job::Core, &mac.layout, &job), Ok(()));
     }
 
+    #[test]
+    fn data_and_release_directories_written_with_dots_are_recognised_as_this_installation() {
+        let mac = Mac::new();
+        let (_, _, _) = mac.era_a("0.15.0");
+        // `SIDEVOICE_DATA_DIR=~/state/../.sidevoice` and `XDG_DATA_HOME=~/./x/../.local/share`, written as given.
+        let data = mac.home.join("state/../.sidevoice");
+        let releases = mac.home.join("./x/../.local/share/sidevoice");
+        let core = releases.join("current/core/bin/sidevoice-core-rust");
+        let connector = releases.join("current/bin/sidevoice-connector");
+        let settings = [("XDG_DATA_HOME", path(&mac.home.join("./x/../.local/share")))];
+        let settings: Vec<(&str, &str)> = settings
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        let job = core_job(&core, &data, &words(ARGS_0_13, &data), &settings);
+        assert_eq!(recognise(Job::Core, &mac.layout, &job), Ok(()));
+        let mut connector_job = connector_job(&connector, &data);
+        connector_job.environment.extend(job.environment.clone());
+        assert_eq!(
+            recognise(Job::Connector, &mac.layout, &connector_job),
+            Ok(())
+        );
+        // Worked out, the data directory must still be this installation's, and the program inside its releases.
+        let elsewhere = mac.home.join(".sidevoice/../other");
+        let job = core_job(&core, &elsewhere, &words(ARGS_0_13, &elsewhere), &settings);
+        assert!(recognise(Job::Core, &mac.layout, &job).is_err());
+    }
     #[test]
     fn arguments_no_release_wrote_are_not_recognised() {
         let mac = Mac::new();
