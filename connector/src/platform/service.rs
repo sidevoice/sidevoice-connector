@@ -28,6 +28,12 @@ mod imp;
 #[cfg(windows)]
 #[path = "service/windows.rs"]
 mod imp;
+// launchd's steps that need no macOS API (launchctl's answers read, a job waited out, the legacy jobs removed), with
+// launchctl and the files passed in: built for macOS, and for the tests on every Unix.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[path = "service/launchd.rs"]
+mod launchd;
 
 pub use imp::Os as Services;
 
@@ -215,6 +221,50 @@ pub enum Refusal {
     NotStarted(JobId, String),
 }
 
+/// A job an earlier release recorded under a legacy label, as the manager has it: its program and arguments, its
+/// environment, and where its output went (none when that cannot be read). Read from its definition, or, with none
+/// left, from what the manager says the loaded job runs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Recorded {
+    pub program: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+    pub log: Option<PathBuf>,
+}
+
+/// Whether a [`Recorded`] job is one Sidevoice wrote: `Err` says why not, in a few English words.
+pub type Recognise<'a> = dyn Fn(&Recorded) -> Result<(), String> + Sync + 'a;
+
+/// A job to retire ([`Service::retire_legacy`]): its old names, how the release that wrote it restarted it, and the
+/// caller's judgement of what it ran.
+pub struct LegacyJob<'a> {
+    pub id: JobId,
+    pub restart: Restart,
+    pub ours: &'a Recognise<'a>,
+}
+
+/// A legacy job of ours that is gone ([`Service::retire_legacy`]): whether it was loaded (it is not any more), and
+/// its definition, deleted, when there was one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Legacy {
+    /// The old label.
+    pub label: &'static str,
+    pub unloaded: bool,
+    pub deleted: Option<PathBuf>,
+}
+
+/// A job under a legacy label that was left in place ([`Service::retire_legacy`]): which, where its definition is,
+/// why (`recognised`: one of ours that could not be removed; otherwise one that is not recognisably ours, so it was not
+/// touched), and the two commands that remove it by hand (unload it, delete its definition).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacyRefusal {
+    pub label: &'static str,
+    pub plist: PathBuf,
+    pub recognised: bool,
+    pub detail: String,
+    pub bootout: String,
+    pub remove: String,
+}
+
 /// What every manager implements ([`Services`], in `service/macos.rs` (launchd), `service/linux.rs` (systemd) and
 /// `service/windows.rs` (Task Scheduler)): the required methods. The rest is one body for every manager; one
 /// overrides it only if it must.
@@ -305,6 +355,32 @@ pub trait Service: Sized + Send + Sync {
     /// The job set to start at the next login (`on`) or not, and only that: nothing is loaded, started, stopped or
     /// unloaded. Not read back here. Why not.
     fn set_login(&self, job: JobId, on: bool) -> impl Future<Output = Result<(), String>> + Send;
+
+    /// The jobs an earlier release defined under labels this one no longer uses (`legacy`), removed, so that they never
+    /// run beside ours: called before any of ours is started. A job is removed only when what the manager has under
+    /// that label is exactly what such a release wrote: the manager's own part of the definition checked here, what
+    /// it runs judged by [`LegacyJob::ours`]. It is unloaded and its definition deleted. Anything else under a legacy
+    /// label is not touched, and refused with how to remove it by hand, as is a job of ours that cannot be removed:
+    /// the caller then starts nothing, so the two never compete in silence. Nothing there is nothing to do, so
+    /// running it again changes nothing.
+    ///
+    /// Only launchd ever renamed a job (`dev.sidevoice.*` to `ai.sidevoice.*`, in Sidevoice 0.19), so only it
+    /// overrides this. systemd's units and Task Scheduler's tasks are named from [`JobId::name`], which never
+    /// changed: there a legacy job is the current one, and this must remove nothing.
+    fn retire_legacy(
+        &self,
+        legacy: &[LegacyJob<'_>],
+    ) -> impl Future<Output = Result<Vec<Legacy>, LegacyRefusal>> + Send {
+        let _ = legacy;
+        async { Ok(Vec::new()) }
+    }
+
+    /// The pid of a legacy job ([`Service::retire_legacy`]) running now: none when it does not run, and wherever no
+    /// job was ever renamed (systemd, Task Scheduler).
+    fn legacy_pid(&self, legacy: JobId) -> impl Future<Output = Option<u32>> + Send {
+        let _ = legacy;
+        async { None }
+    }
 
     /// Whether this user's manager answers now.
     fn answers() -> impl Future<Output = bool> + Send {

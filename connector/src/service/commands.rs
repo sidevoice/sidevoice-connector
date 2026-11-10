@@ -47,7 +47,9 @@ fn answer(state: &Value, service: Kind) -> Value {
 }
 
 /// `service install`: both definitions written for the selected installation, anything running on demand stopped,
-/// both jobs started; answered with the core's state once it settles. Linux says what linger would add.
+/// both jobs started; answered with the core's state once it settles. Linux says what linger would add. Before anything
+/// changes, the jobs a Sidevoice before 0.19 left are removed (`jobs::retire_legacy`, said in `legacy_jobs`), as they
+/// are by `start`, `restart` and `uninstall`.
 pub async fn install(layout: &Layout) -> Result<Value> {
     let _lock = install_lock(layout).await?;
     if !layout.installed() {
@@ -58,14 +60,23 @@ pub async fn install(layout: &Layout) -> Result<Value> {
         return Err(Failure::keyed("service.no-manager", json!({})));
     }
     definition::definitions(layout)?;
+    let legacy = jobs::retire_legacy(layout, &jobs::manager(layout)).await?;
     clear_stop(layout)?;
     define_and_start(layout, false).await?;
     let now = settle(layout, INSTALL_SETTLE).await;
     let mut result = answer(&now, kind);
+    with_legacy(&mut result, legacy);
     if let Some(linger) = jobs::linger(&jobs::manager(layout)).await {
         result["linger"] = linger;
     }
     Ok(result)
+}
+
+/// The legacy jobs found and what became of them (`jobs::retire_legacy`), as `legacy_jobs`: only when there were any.
+pub fn with_legacy(result: &mut Value, legacy: Vec<Value>) {
+    if !legacy.is_empty() {
+        result["legacy_jobs"] = json!(legacy);
+    }
 }
 
 fn killed_note(result: &mut Value, down: &launcher::Teardown) {
@@ -102,20 +113,21 @@ fn core_startable(layout: &Layout, installed: Option<&jobs::Installed>) -> Resul
 pub async fn start(layout: &Layout) -> Result<Value> {
     let installed = jobs::installed(layout).await;
     core_startable(layout, installed.as_ref())?;
-    {
+    let legacy = {
         let _lock = install_lock(layout).await?;
+        let service = jobs::manager(layout);
+        let legacy = jobs::retire_legacy(layout, &service).await?;
         clear_stop(layout)?;
         if let Some(found) = &installed {
-            let service = jobs::manager(layout);
             let login = jobs::keeps_login(&service, Some(found)).await;
             jobs::start(layout, &service, &[], false, login, &Job::ALL).await?;
         }
-    }
+        legacy
+    };
     let now = settle(layout, SETTLE).await;
-    Ok(answer(
-        &now,
-        installed.map_or(Kind::None, |_| Kind::Manager),
-    ))
+    let mut result = answer(&now, installed.map_or(Kind::None, |_| Kind::Manager));
+    with_legacy(&mut result, legacy);
+    Ok(result)
 }
 
 /// `service stop`: the person's stop, written first so nothing starts Sidevoice again meanwhile; then the manager
@@ -149,11 +161,12 @@ pub async fn restart(layout: &Layout) -> Result<Value> {
     }
     let installed = jobs::installed(layout).await;
     core_startable(layout, installed.as_ref())?;
-    {
+    let legacy = {
         let _lock = install_lock(layout).await?;
+        let service = jobs::manager(layout);
+        let legacy = jobs::retire_legacy(layout, &service).await?;
         match &installed {
             Some(found) if found.core => {
-                let service = jobs::manager(layout);
                 let login = jobs::keeps_login(&service, Some(found)).await;
                 jobs::start(layout, &service, &[], true, login, &[Job::Core]).await?;
             }
@@ -163,17 +176,17 @@ pub async fn restart(layout: &Layout) -> Result<Value> {
                 }
             }
         }
-    }
+        legacy
+    };
     let now = settle(layout, SETTLE).await;
-    Ok(answer(
-        &now,
-        installed.map_or(Kind::None, |_| Kind::Manager),
-    ))
+    let mut result = answer(&now, installed.map_or(Kind::None, |_| Kind::Manager));
+    with_legacy(&mut result, legacy);
+    Ok(result)
 }
 
-/// `service uninstall`: the stop written, both jobs unloaded (any refusal stops here, with nothing deleted), what
-/// runs on demand stopped, both definitions deleted and the manager told. `keep_stopped`: the caller goes on
-/// taking the installation apart and clears the marker itself. Idempotent.
+/// `service uninstall`: the stop written, both jobs unloaded and the legacy ones removed (any refusal stops here, with
+/// nothing deleted), what runs on demand stopped, both definitions deleted and the manager told. `keep_stopped`: the
+/// caller goes on taking the installation apart and clears the marker itself. Idempotent.
 pub async fn uninstall(layout: &Layout, keep_stopped: bool) -> Result<Value> {
     let _lock = install_lock(layout).await?;
     uninstall_held(layout, keep_stopped).await
@@ -192,6 +205,8 @@ pub async fn uninstall_held(layout: &Layout, keep_stopped: bool) -> Result<Value
             ));
         }
     }
+    // The jobs a Sidevoice before 0.19 left go too; one that cannot be removed stops here, with nothing deleted.
+    let legacy = jobs::retire_legacy(layout, &jobs::manager(layout)).await?;
     let down = stop_on_demand_or_fail(layout).await?;
     if let Some(found) = &installed {
         let service = jobs::manager(layout);
@@ -208,6 +223,7 @@ pub async fn uninstall_held(layout: &Layout, keep_stopped: bool) -> Result<Value
     let mut result = json!({"ok": true, "state": if layout.installed() { "not-installed" } else { "absent" },
         "service": kind.as_str()});
     killed_note(&mut result, &down);
+    with_legacy(&mut result, legacy);
     Ok(result)
 }
 
@@ -270,6 +286,18 @@ pub async fn run(action: Action, agent_vars: &[&'static str]) -> Value {
     result.unwrap_or_else(|failure| failure.value())
 }
 
+/// What an answer says of the legacy jobs it found (`legacy_jobs`), one line each.
+pub fn legacy_lines(answer: &Value) -> Vec<String> {
+    answer
+        .get("legacy_jobs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("message").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// An answer as a person reads it: the state, its failure, and what to do about linger.
 pub fn human(answer: &Value) -> String {
     if answer.get("ok") != Some(&json!(true)) {
@@ -316,6 +344,10 @@ pub fn human(answer: &Value) -> String {
         out.push('\n');
         out.push_str(&crate::messages::message(key, &Value::Null));
     }
+    for line in legacy_lines(answer) {
+        out.push('\n');
+        out.push_str(&line);
+    }
     if let Some(note) = answer.get("note").and_then(Value::as_str) {
         out.push('\n');
         out.push_str(note);
@@ -350,6 +382,15 @@ mod tests {
             human(&unknown).ends_with("\nWhether Sidevoice starts at login is not known: it has no login service here, or the service manager cannot tell."),
             "{}",
             human(&unknown)
+        );
+        let migrated = json!({"ok": true, "state": "running", "service": "launchd", "legacy_jobs": [
+            {"label": "dev.sidevoice.core", "outcome": "removed", "message": "Removed dev.sidevoice.core."},
+            {"label": "dev.sidevoice.connector", "outcome": "something-newer", "message": "Left it."},
+            {"label": "no message"}]});
+        assert_eq!(
+            human(&migrated),
+            "Sidevoice is running (launchd).\nRemoved dev.sidevoice.core.\nLeft it.",
+            "an outcome it does not know is said by its message"
         );
         let refused = Failure::keyed(
             "service.login-incomplete",

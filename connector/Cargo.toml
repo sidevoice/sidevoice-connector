@@ -114,6 +114,10 @@ embed-resource = "3"
 # Parse the same semantic version the CLI reports for the Windows numeric resource fields.
 semver = "1"
 
+# Unix tests: launchd's legacy jobs (src/platform/service/launchd.rs) are read as property lists, and tested on every Unix.
+[target.'cfg(unix)'.dev-dependencies]
+plist = "1.10"
+
 # macOS tests: an ACL given to a directory (src/platform/owner_only/macos.rs), the version `sidevoice-platform` reads
 # them with.
 [target.'cfg(target_os = "macos")'.dev-dependencies]

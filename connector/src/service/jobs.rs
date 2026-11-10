@@ -4,8 +4,11 @@
 
 use super::definition;
 use super::layout::Layout;
+use super::legacy;
 use super::{Failure, Result};
-use crate::platform::service::{JobId, Linger, Refusal, Service, Services};
+use crate::platform::service::{
+    JobId, Legacy, LegacyJob, LegacyRefusal, Linger, Recorded, Refusal, Service, Services,
+};
 use serde_json::{json, Value};
 
 /// A manager runs the jobs, or none does (Sidevoice on demand).
@@ -44,6 +47,23 @@ impl Job {
             },
             Job::Connector => JobId {
                 label: "ai.sidevoice.connector",
+                name: "sidevoice-connector",
+            },
+        }
+    }
+
+    /// LEGACY, the only place these labels are named: the job as Sidevoice before 0.19 labelled it under launchd
+    /// (`dev.sidevoice.*`, renamed `ai.sidevoice.*` by sidevoice/sidevoice-connector#324). Read only to remove such a
+    /// job before ours start ([`retire_legacy`]) and to say when its core holds our port. The short name never
+    /// changed, so systemd and Task Scheduler have no legacy job (`Service::retire_legacy` does nothing there).
+    pub fn legacy_id(self) -> JobId {
+        match self {
+            Job::Core => JobId {
+                label: "dev.sidevoice.core",
+                name: "sidevoice-core",
+            },
+            Job::Connector => JobId {
+                label: "dev.sidevoice.connector",
                 name: "sidevoice-connector",
             },
         }
@@ -156,6 +176,67 @@ pub async fn failure(manager: &impl Service, refusal: Refusal) -> Failure {
         }
     };
     Failure::keyed(key, params)
+}
+
+/// The legacy jobs ([`Job::legacy_id`]) removed when they are ours, the connector's first, before any of ours starts
+/// ([`Service::retire_legacy`], what they ran recognised by [`legacy::recognise`]): an entry of `legacy_jobs` for each
+/// one removed ([`legacy_entry`]), none when nothing was there. A job under a legacy label that is not recognisably
+/// ours is `service.legacy-job-unrecognised`, one of ours that could not be removed `service.legacy-job-left`; both
+/// name it and the commands that remove it by hand, and the caller starts nothing. Nothing where no manager is used.
+pub async fn retire_legacy(layout: &Layout, manager: &impl Service) -> Result<Vec<Value>> {
+    if platform_kind() == Kind::None {
+        return Ok(Vec::new());
+    }
+    let core = |recorded: &Recorded| legacy::recognise(Job::Core, layout, recorded);
+    let connector = |recorded: &Recorded| legacy::recognise(Job::Connector, layout, recorded);
+    let jobs = [
+        LegacyJob {
+            id: Job::Connector.legacy_id(),
+            restart: legacy::restart(Job::Connector),
+            ours: &connector,
+        },
+        LegacyJob {
+            id: Job::Core.legacy_id(),
+            restart: legacy::restart(Job::Core),
+            ours: &core,
+        },
+    ];
+    match manager.retire_legacy(&jobs).await {
+        Ok(done) => Ok(done.iter().map(legacy_entry).collect()),
+        Err(refused) => Err(legacy_refusal(&refused)),
+    }
+}
+
+/// A job left under a legacy label, as the service says it.
+fn legacy_refusal(refused: &LegacyRefusal) -> Failure {
+    Failure::keyed(
+        if refused.recognised {
+            "service.legacy-job-left"
+        } else {
+            "service.legacy-job-unrecognised"
+        },
+        json!({"label": refused.label, "plist": refused.plist, "detail": refused.detail,
+            "bootout": refused.bootout, "remove": refused.remove}),
+    )
+}
+
+/// One legacy job removed, for `legacy_jobs`: `{label, outcome: "removed", unloaded, plist, key, params, message}`,
+/// `plist` the definition deleted or `null`. A reader that does not know an `outcome` shows its `message`.
+pub fn legacy_entry(legacy: &Legacy) -> Value {
+    let key = match (legacy.unloaded, &legacy.deleted) {
+        (true, Some(_)) => "service.legacy.removed",
+        (true, None) => "service.legacy.unloaded",
+        (false, _) => "service.legacy.deleted",
+    };
+    let params = json!({"label": legacy.label, "plist": legacy.deleted});
+    json!({"label": legacy.label, "outcome": "removed", "unloaded": legacy.unloaded, "plist": legacy.deleted,
+        "key": key, "message": crate::messages::message(key, &params), "params": params})
+}
+
+/// The legacy core job's label, when it is what runs as `pid` (`bind.port-in-use`: who holds the core's port).
+pub async fn legacy_core_as(manager: &impl Service, pid: u32) -> Option<&'static str> {
+    let legacy = Job::Core.legacy_id();
+    (manager.legacy_pid(legacy).await == Some(pid)).then_some(legacy.label)
 }
 
 /// Each of `jobs` started from its definition as it is now ([`Service::start`]): a changed one loaded again, with
@@ -300,6 +381,9 @@ mod tests {
         refuse: Vec<&'static str>,
         stuck: Vec<&'static str>,
         calls: Mutex<Vec<String>>,
+        /// What `retire_legacy` answers (nothing found when none), and the pid the legacy core runs as.
+        legacy: Option<std::result::Result<Vec<Legacy>, LegacyRefusal>>,
+        legacy_pid: Option<u32>,
     }
 
     impl Fake {
@@ -367,6 +451,29 @@ mod tests {
                 self.login.lock().unwrap().insert(job.name, Some(on));
             }
             Ok(())
+        }
+        async fn retire_legacy(
+            &self,
+            legacy: &[LegacyJob<'_>],
+        ) -> std::result::Result<Vec<Legacy>, LegacyRefusal> {
+            // Each job, how it restarted, and whether an empty record is taken for ours (never).
+            let jobs: Vec<String> = legacy
+                .iter()
+                .map(|job| {
+                    let empty = (job.ours)(&Recorded::default()).is_ok();
+                    format!("{}:{:?}:{empty}", job.id.label, job.restart)
+                })
+                .collect();
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("retire {}", jobs.join(" ")));
+            self.legacy.clone().unwrap_or(Ok(Vec::new()))
+        }
+        async fn legacy_pid(&self, legacy: JobId) -> Option<u32> {
+            (legacy.label == "dev.sidevoice.core")
+                .then_some(self.legacy_pid)
+                .flatten()
         }
     }
 
@@ -523,5 +630,153 @@ mod tests {
         assert_eq!(Job::Connector.id().label, "ai.sidevoice.connector");
         assert_eq!(Job::Core.id().name, "sidevoice-core");
         assert_eq!(Job::Connector.id().name, "sidevoice-connector");
+    }
+
+    #[test]
+    fn the_legacy_labels_are_launchds_before_0_19_with_the_same_short_names() {
+        for job in Job::ALL {
+            assert_eq!(job.legacy_id().name, job.id().name, "{job:?}");
+            assert_ne!(job.legacy_id().label, job.id().label, "{job:?}");
+        }
+        assert_eq!(Job::Core.legacy_id().label, "dev.sidevoice.core");
+        assert_eq!(Job::Connector.legacy_id().label, "dev.sidevoice.connector");
+    }
+
+    fn layout() -> Layout {
+        let root = std::env::temp_dir();
+        let (home, data) = (root.join("u"), root.join("d"));
+        Layout::from_vars(
+            |name| {
+                use crate::platform::env::{Env, Environment};
+                if name == Environment::HOME {
+                    Some(home.clone().into())
+                } else if name == "SIDEVOICE_DATA_DIR" {
+                    Some(data.clone().into())
+                } else {
+                    None
+                }
+            },
+            Vec::new(),
+            &[],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn legacy_jobs_are_retired_connector_first_and_each_one_removed_is_said() {
+        if platform_kind() == Kind::None {
+            return;
+        }
+        let plist = PathBuf::from("/h/Library/LaunchAgents/dev.sidevoice.core.plist");
+        let fake = Fake {
+            legacy: Some(Ok(vec![
+                Legacy {
+                    label: "dev.sidevoice.connector",
+                    unloaded: true,
+                    deleted: None,
+                },
+                Legacy {
+                    label: "dev.sidevoice.core",
+                    unloaded: true,
+                    deleted: Some(plist.clone()),
+                },
+            ])),
+            ..Fake::default()
+        };
+        let entries = retire_legacy(&layout(), &fake).await.unwrap();
+        assert_eq!(
+            *fake.calls.lock().unwrap(),
+            vec!["retire dev.sidevoice.connector:Always:false dev.sidevoice.core:OnFailure:false"],
+            "each with how its release kept it alive, what it ran judged by `legacy::recognise`"
+        );
+        assert_eq!(
+            (entries[0]["key"].as_str(), entries[0]["plist"].is_null()),
+            (Some("service.legacy.unloaded"), true)
+        );
+        assert_eq!(
+            entries[1],
+            json!({"label": "dev.sidevoice.core", "outcome": "removed", "unloaded": true, "plist": plist,
+                "key": "service.legacy.removed",
+                "params": {"label": "dev.sidevoice.core", "plist": plist},
+                "message": format!("Removed dev.sidevoice.core, the service job of a Sidevoice before 0.19: unloaded it and deleted {}.", plist.display())})
+        );
+        let deleted = legacy_entry(&Legacy {
+            label: "dev.sidevoice.core",
+            unloaded: false,
+            deleted: Some(plist.clone()),
+        });
+        assert_eq!(deleted["key"], "service.legacy.deleted");
+
+        assert_eq!(
+            retire_legacy(&layout(), &Fake::default()).await.unwrap(),
+            Vec::<Value>::new(),
+            "nothing there, nothing said"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_left_under_a_legacy_label_is_refused_naming_it_and_how_to_remove_it() {
+        if platform_kind() == Kind::None {
+            return;
+        }
+        let refusal = |recognised: bool, detail: &str| Fake {
+            legacy: Some(Err(LegacyRefusal {
+                label: "dev.sidevoice.core",
+                plist: PathBuf::from("/h/Library/LaunchAgents/dev.sidevoice.core.plist"),
+                recognised,
+                detail: detail.into(),
+                bootout: "launchctl bootout gui/501/dev.sidevoice.core".into(),
+                remove: "rm -f '/h/Library/LaunchAgents/dev.sidevoice.core.plist'".into(),
+            })),
+            ..Fake::default()
+        };
+        let stuck = refusal(true, "Boot-out failed: 5: Input/output error");
+        let refused = retire_legacy(&layout(), &stuck).await.unwrap_err().value();
+        assert_eq!(refused["error"]["key"], "service.legacy-job-left");
+        assert_eq!(refused["error"]["params"]["label"], "dev.sidevoice.core");
+        assert_eq!(
+            refused["error"]["message"],
+            "dev.sidevoice.core, a service job left by a Sidevoice before 0.19, could not be removed (Boot-out failed: 5: \
+             Input/output error), so nothing was started: it would compete with this Sidevoice for the core's port. \
+             Remove it by hand with `launchctl bootout gui/501/dev.sidevoice.core` and \
+             `rm -f '/h/Library/LaunchAgents/dev.sidevoice.core.plist'`, then run the command again."
+        );
+
+        let foreign = refusal(
+            false,
+            "it runs /Users/u/bin/x, not the program of a Sidevoice release",
+        );
+        let refused = retire_legacy(&layout(), &foreign)
+            .await
+            .unwrap_err()
+            .value();
+        assert_eq!(refused["error"]["key"], "service.legacy-job-unrecognised");
+        assert_eq!(
+            refused["error"]["params"]["plist"],
+            "/h/Library/LaunchAgents/dev.sidevoice.core.plist"
+        );
+        assert_eq!(
+            refused["error"]["message"],
+            "launchd has a job named dev.sidevoice.core (/h/Library/LaunchAgents/dev.sidevoice.core.plist), the name \
+             Sidevoice used before 0.19, but it does not match what Sidevoice wrote (it runs /Users/u/bin/x, not the \
+             program of a Sidevoice release), so it was not touched and nothing was started: it could compete with \
+             Sidevoice for the core's port. If it is an old Sidevoice job, remove it with \
+             `launchctl bootout gui/501/dev.sidevoice.core` and `rm -f '/h/Library/LaunchAgents/dev.sidevoice.core.plist'`; \
+             if it is yours, give it another label. Then run the command again."
+        );
+    }
+
+    #[tokio::test]
+    async fn the_legacy_core_is_named_only_when_it_runs_as_that_pid() {
+        let fake = Fake {
+            legacy_pid: Some(4242),
+            ..Fake::default()
+        };
+        assert_eq!(
+            legacy_core_as(&fake, 4242).await,
+            Some("dev.sidevoice.core")
+        );
+        assert_eq!(legacy_core_as(&fake, 7).await, None);
+        assert_eq!(legacy_core_as(&Fake::default(), 4242).await, None);
     }
 }
