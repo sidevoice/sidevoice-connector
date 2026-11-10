@@ -56,6 +56,7 @@ use crate::profile::Profile;
 use crate::service::jobs::{Job, Kind};
 use crate::service::layout::Layout;
 use crate::service::{launcher, status};
+use crate::step::{self, AtStep, Step};
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -323,12 +324,20 @@ fn release_command(layout: &Layout, id: &str) -> PathBuf {
 /// `R/current.json` names release `id`, written whole (`platform::fs`), then `D/install.json` names its command.
 /// `D` is made first, so that failing to make it never leaves the pointer switched and the command not.
 fn select(layout: &Layout, id: &str) -> Result<()> {
-    crate::private_dir::ensure(&layout.data)?;
-    Files::write_json(&layout.current_record(), &json!({"release": id}))?;
-    Files::write_json(
-        &layout.install_file(),
-        &json!({"command": [release_command(layout, id)], "releases": layout.releases}),
-    )?;
+    step::attempt(Step::Select, &layout.data, || {
+        crate::private_dir::ensure(&layout.data)
+    })?;
+    let current = layout.current_record();
+    step::attempt(Step::Select, &current, || {
+        Files::write_json(&current, &json!({"release": id}))
+    })?;
+    let install = layout.install_file();
+    step::attempt(Step::Select, &install, || {
+        Files::write_json(
+            &install,
+            &json!({"command": [release_command(layout, id)], "releases": layout.releases}),
+        )
+    })?;
     Ok(())
 }
 
@@ -425,10 +434,17 @@ fn release_id(layout: &Layout, package: &Package, digest: &str) -> Result<(Strin
             continue;
         }
         if same || !selected {
-            // Ours but incomplete, or another build that is not selected: staged again.
-            fs::remove_dir_all(&release).map_err(|error| {
-                let reason = error.to_string();
-                explain_in_use("Install", &release, error.into(), &reason)
+            // Ours but incomplete, or another build that is not selected: staged again. Still refused, it says the
+            // programs seen holding it, else the step and the path.
+            step::retried(Step::RemoveOldRelease, &release, || {
+                fs::remove_dir_all(&release)
+            })
+            .map_err(|failure| {
+                let reason = crate::messages::keyed(&failure).params["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                explain_in_use("Install", &release, failure, &reason)
             })?;
             return Ok((id, true));
         }
@@ -488,29 +504,48 @@ async fn check_binary(binary: &Path, version: &str) -> Result<()> {
 /// or not at all.
 async fn stage(layout: &Layout, package: &Package, id: &str, digest: &str) -> Result<()> {
     let releases = layout.releases_dir();
-    crate::private_dir::ensure(&releases)?;
+    step::attempt(Step::ReleasesDir, &releases, || {
+        crate::private_dir::ensure(&releases)
+    })?;
     let partial = releases.join(format!(".{id}.partial-{}", uuid::Uuid::new_v4().simple()));
-    Files::create_private_dir(&partial)?;
+    step::attempt(Step::StageDir, &partial, || {
+        Files::create_private_dir(&partial)
+    })?;
     let result = async {
-        Files::create_private_dir(&partial.join("bin"))?;
+        let bin = partial.join("bin");
+        step::attempt(Step::StageDir, &bin, || Files::create_private_dir(&bin))?;
         let binary = partial.join(binary());
-        copy_executable(&package.binary, &binary)?;
-        Files::check_private(&Files::open_read(&binary)?)
-            .with_context(|| format!("unsafe private file {}", binary.display()))?;
-        which::which(&binary).context("the staged connector cannot be run")?;
-        if digest_file(&binary)? != digest {
+        step::attempt(Step::CopyConnector, &binary, || {
+            copy_executable(&package.binary, &binary)
+        })?;
+        step::attempt(Step::CheckConnector, &binary, || {
+            Files::open_read(&binary)
+                .and_then(|file| Files::check_private(&file))
+                .context("unsafe private file")
+        })?;
+        step::attempt(Step::CheckConnector, &binary, || {
+            which::which(&binary).context("the staged connector cannot be run")
+        })?;
+        if step::attempt(Step::CheckConnector, &binary, || digest_file(&binary))? != digest {
             return Err(failed("the connector changed while it was being copied"));
         }
-        check_binary(&binary, &package.version).await?;
+        check_binary(&binary, &package.version)
+            .await
+            .at_step(Step::CheckConnector, &binary)?;
         if let Some(program) = background() {
             // Beside the connector it was started from, as the package carries them.
             let from = package
                 .binary
                 .with_file_name(Path::new(&program).file_name().unwrap_or_default());
             let staged = partial.join(&program);
-            copy_executable(&from, &staged)?;
-            Files::check_private(&Files::open_read(&staged)?)
-                .with_context(|| format!("unsafe private file {}", staged.display()))?;
+            step::attempt(Step::CopyBackground, &staged, || {
+                copy_executable(&from, &staged)
+            })?;
+            step::attempt(Step::CopyBackground, &staged, || {
+                Files::open_read(&staged)
+                    .and_then(|file| Files::check_private(&file))
+                    .context("unsafe private file")
+            })?;
         }
         let (root, release, version) = (
             package.root.clone(),
@@ -522,15 +557,80 @@ async fn stage(layout: &Layout, package: &Package, id: &str, digest: &str) -> Re
         })
         .await
         .map_err(failed)??;
-        fs::rename(&partial, releases.join(id))?;
-        Files::sync_dir(&releases)?;
+        // Off the runtime's threads: on Windows it may wait for another program to let the new files go.
+        let (from, to) = (partial.clone(), releases.join(id));
+        tokio::task::spawn_blocking(move || {
+            step::retried(Step::PublishRelease, &from, || fs::rename(&from, &to))
+        })
+        .await
+        .map_err(failed)??;
+        step::attempt(Step::PublishRelease, &releases, || {
+            Files::sync_dir(&releases)
+        })?;
         Ok(())
     }
     .await;
     if result.is_err() {
-        let _ = fs::remove_dir_all(&partial);
+        // What is left is removed by the next install ([`remove_leftovers`]) if it cannot be now.
+        let partial = partial.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            step::retried(Step::StageDir, &partial, || fs::remove_dir_all(&partial))
+        })
+        .await;
     }
     result
+}
+
+/// Removes release `id`, which did not start, once the one before it is back (on Windows tried again while another
+/// program holds it, as [`step::retried`] says): `None` when it is gone, else its path and why it stays, as the keyed
+/// failure's `{key, params, message}`.
+async fn remove_failed(layout: &Layout, id: &str) -> Option<(PathBuf, Value)> {
+    let release = layout.releases_dir().join(id);
+    let path = release.clone();
+    let removed = tokio::task::spawn_blocking(move || {
+        step::retried(Step::RemoveFailedRelease, &path, || {
+            fs::remove_dir_all(&path)
+        })
+    })
+    .await;
+    let error = match removed {
+        Ok(Ok(())) => return None,
+        Ok(Err(error)) => error,
+        Err(error) => failed(error),
+    };
+    let stat = fs::symlink_metadata(&release).map(|_| ());
+    left_behind(&release, error, stat)
+}
+
+/// What a removal that failed with `error` left at `release`, given what looking at it said (`stat`): only "not
+/// found" proves it gone. Any other answer leaves whether it is there unknown, so it is said to stay, with the look's
+/// failure.
+fn left_behind(
+    release: &Path,
+    error: anyhow::Error,
+    stat: io::Result<()>,
+) -> Option<(PathBuf, Value)> {
+    let failure = match stat {
+        Err(look) if look.kind() == io::ErrorKind::NotFound => return None,
+        Ok(()) => error,
+        Err(look) => {
+            let removal = crate::messages::keyed(&error).params["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            step::failure(
+                Step::RemoveFailedRelease,
+                release,
+                anyhow::Error::new(look).context(format!(
+                    "removing it said {removal:?}, and whether it is still there cannot be told"
+                )),
+            )
+        }
+    };
+    Some((
+        release.to_path_buf(),
+        crate::messages::keyed(&failure).value()["error"].clone(),
+    ))
 }
 
 /// Every release but `keep` deleted.
@@ -798,10 +898,14 @@ pub async fn install(
 ) -> Result<Value> {
     let layout = Layout::from_profile(profile);
     let lock = crate::service::install_lock(&layout).await?;
-    crate::private_dir::ensure(&layout.releases)?;
+    step::attempt(Step::InstallDir, &layout.releases, || {
+        crate::private_dir::ensure(&layout.releases)
+    })?;
     remove_leftovers(&layout);
     let previous = layout.selected_id();
-    let digest = digest_file(&package.binary)?;
+    let digest = step::attempt(Step::ReadPackage, &package.binary, || {
+        digest_file(&package.binary)
+    })?;
     let (id, fresh) = release_id(&layout, package, &digest)?;
     if fresh {
         stage(&layout, package, &id, &digest).await?;
@@ -818,18 +922,30 @@ pub async fn install(
             };
             select(&layout, &back)?;
             let again = start_and_verify(runtime, &layout, &back).await;
-            let _ = fs::remove_dir_all(layout.releases_dir().join(&id));
-            return Err(match again {
-                Ok(_) => keyed(
-                    "install.rolled-back",
-                    json!({"version": id, "previous": back, "cause": cause_text(&cause), "failure": cause}),
-                ),
-                Err(back_cause) => keyed(
-                    "install.rollback-failed",
-                    json!({"version": id, "previous": back, "cause": cause_text(&cause), "failure": cause,
-                        "back": cause_text(&back_cause)}),
-                ),
-            });
+            let left = remove_failed(&layout, &id).await;
+            // `install.rolled-back` and `install.rollback-failed` keep their meaning: the failed release is gone. When
+            // it stays, the `-left` keys say so, with `left`, its path, `left_failure`, the step's keyed failure
+            // (`install.files-busy` when still held), and `detail`, what that failure said.
+            let mut params = json!({"version": id, "previous": back, "cause": cause_text(&cause),
+                "failure": cause});
+            let key = match (again, &left) {
+                (Ok(_), None) => "install.rolled-back",
+                (Ok(_), Some(_)) => "install.rolled-back-left",
+                (Err(back_cause), left) => {
+                    params["back"] = json!(cause_text(&back_cause));
+                    if left.is_none() {
+                        "install.rollback-failed"
+                    } else {
+                        "install.rollback-failed-left"
+                    }
+                }
+            };
+            if let Some((path, refusal)) = left {
+                params["left"] = json!(path);
+                params["detail"] = refusal["params"]["detail"].clone();
+                params["left_failure"] = refusal;
+            }
+            return Err(keyed(key, params));
         }
     };
     let keep: Vec<&str> = [Some(id.as_str()), previous.as_deref()]
@@ -1751,6 +1867,13 @@ pub(crate) mod tests {
         assert_eq!(keyed.params["previous"], "3.0.0");
         assert_eq!(keyed.params["failure"]["key"], "launch.exited");
         assert!(error.to_string().contains("back on 3.0.0"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .ends_with("which is running. Nothing of 4.0.0 was kept."),
+            "{error}"
+        );
+        assert!(keyed.params.get("left").is_none(), "{}", keyed.params);
         assert_eq!(layout.selected_id().as_deref(), Some("3.0.0"));
         assert_eq!(fixture.releases(), ["2.0.0", "3.0.0"]);
         let restarts = fixture.fake.lock().unwrap().restarts.clone();
@@ -1926,6 +2049,205 @@ pub(crate) mod tests {
             .install(&fixture.package("bad/version", "a"))
             .await
             .is_err());
+    }
+
+    /// Whatever step of putting the release in place fails, the failure names the step and the path it failed at,
+    /// by key, never the bare OS error under `connector.failed`; nothing of the failed release is selected.
+    #[tokio::test]
+    async fn a_failure_at_any_step_of_installing_names_the_step_and_its_path() {
+        for step in Step::ALL {
+            // Removing a release that did not start comes after a rollback: its own test below.
+            if step == Step::RemoveFailedRelease
+                || (step == Step::CopyBackground && background().is_none())
+            {
+                continue;
+            }
+            let fixture = Fixture::new(&format!("step-{}", step.id()));
+            let layout = fixture.layout();
+            if step == Step::RemoveOldRelease {
+                // A release of this name that is not whole: removed before staging.
+                Files::ensure_private_dir(&layout.releases_dir().join("1.0.0/bin")).unwrap();
+            }
+            let package = fixture.package("1.0.0", "a");
+            // OS error 1 is not one Windows retries, so a retried step fails at once on every OS.
+            step::faults::fail_next(fixture.scratch.path(), step, 1);
+            let error = fixture.install(&package).await.unwrap_err();
+            let said = crate::messages::keyed(&error);
+            assert_eq!(said.key, "install.step-failed", "{step:?}: {error:#}");
+            assert_eq!(said.params["step"], step.id(), "{}", said.params);
+            assert_eq!(said.params["os_error"], 1, "{}", said.params);
+            let path = said.params["path"].as_str().unwrap();
+            assert!(
+                Path::new(path).starts_with(fixture.scratch.path()),
+                "{step:?}: {path}"
+            );
+            let text = said.message();
+            assert!(text.contains(path), "{text}");
+            assert!(text.contains(&step.action()), "{text}");
+            assert_eq!(said.value()["error"]["params"]["step"], step.id());
+            assert!(layout.selected_id().is_none(), "{step:?}");
+        }
+    }
+
+    /// The package's inventory or core archive refused (as an antivirus or an ACL refuses a read) is the
+    /// `read-package` step's, with the file; only a file that is not there says the package has no core.
+    #[tokio::test]
+    async fn a_package_file_that_cannot_be_read_is_not_said_to_be_missing() {
+        let fixture = Fixture::new("package-read");
+        let package = fixture.package("1.0.0", "a");
+        let inventory = package.root.join(crate::core_package::INVENTORY);
+        let archive = crate::core_package::packaged_as(&package.root, "1.0.0")
+            .unwrap()
+            .archive;
+        for (file, code, expected) in [
+            (&inventory, 5, "install.step-failed"),
+            (&archive, 32, "install.step-failed"),
+            (&inventory, 2, "core.package-missing"),
+            (&archive, 2, "core.package-missing"),
+        ] {
+            step::faults::fail_next(file, Step::ReadPackage, code);
+            let error = fixture.install(&package).await.unwrap_err();
+            let said = crate::messages::keyed(&error);
+            assert_eq!(said.key, expected, "{}: {error:#}", file.display());
+            if expected == "install.step-failed" {
+                assert_eq!(said.params["step"], "read-package");
+                assert_eq!(said.params["path"], file.display().to_string());
+                assert_eq!(said.params["os_error"], code);
+            }
+        }
+        assert!(fixture.layout().selected_id().is_none());
+        // Nothing injected: the same package installs.
+        fixture.install(&package).await.unwrap();
+    }
+
+    /// A real refusal to read (no permission on the inventory) takes the same path, through the OS.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_inventory_without_read_permission_is_a_read_package_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new("package-denied");
+        let package = fixture.package("1.0.0", "a");
+        let inventory = package.root.join(crate::core_package::INVENTORY);
+        fs::set_permissions(&inventory, fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(&inventory).is_ok() {
+            // Run with privileges that ignore permissions: nothing to prove here.
+            return;
+        }
+        let error = fixture.install(&package).await.unwrap_err();
+        let said = crate::messages::keyed(&error);
+        assert_eq!(said.key, "install.step-failed", "{error:#}");
+        assert_eq!(said.params["step"], "read-package");
+        assert_eq!(said.params["kind"], "PermissionDenied");
+        assert_eq!(said.params["path"], inventory.display().to_string());
+    }
+
+    /// A release that did not start and cannot be removed after the rollback (held, as a scanner holds it) is said
+    /// to stay, with its path and the step's failure; it is not said to be gone.
+    #[tokio::test]
+    async fn a_failed_release_that_cannot_be_removed_is_said_to_stay() {
+        let fixture = Fixture::new("rollback-left");
+        fixture
+            .install(&fixture.package("1.0.0", "a"))
+            .await
+            .unwrap();
+        fixture.fake.lock().unwrap().failing.insert("2.0.0".into());
+        let release = fixture.layout().releases_dir().join("2.0.0");
+        step::faults::fail_next(&release, Step::RemoveFailedRelease, 32);
+        let error = fixture
+            .install(&fixture.package("2.0.0", "a"))
+            .await
+            .unwrap_err();
+        let said = crate::messages::keyed(&error);
+        let text = said.message();
+        if cfg!(windows) {
+            // Held once (a sharing violation), then let go: the retry removes it, and the stable key says so.
+            assert_eq!(said.key, "install.rolled-back", "{error:#}");
+            assert!(said.params.get("left").is_none(), "{}", said.params);
+            assert!(text.ends_with("Nothing of 2.0.0 was kept."), "{text}");
+            assert!(!release.exists());
+        } else {
+            // Tried once off Windows: it stays, said by a key of its own, never by `install.rolled-back`.
+            assert_eq!(said.key, "install.rolled-back-left", "{error:#}");
+            assert_eq!(said.params["previous"], "1.0.0");
+            assert_eq!(said.params["left"], release.display().to_string());
+            let left = &said.params["left_failure"];
+            assert_eq!(left["key"], "install.step-failed", "{left}");
+            assert_eq!(left["params"]["step"], "remove-failed-release");
+            assert_eq!(left["params"]["os_error"], 32);
+            assert!(text.contains("back on 1.0.0"), "{text}");
+            assert!(text.contains("2.0.0 could not be removed"), "{text}");
+            assert!(text.contains(&release.display().to_string()), "{text}");
+            assert!(!text.contains("Nothing of"), "{text}");
+            assert!(release.is_dir());
+
+            // The one before it does not start either: `install.rollback-failed-left`.
+            fixture.fake.lock().unwrap().failing.insert("1.0.0".into());
+            let release = fixture.layout().releases_dir().join("3.0.0");
+            fixture.fake.lock().unwrap().failing.insert("3.0.0".into());
+            step::faults::fail_next(&release, Step::RemoveFailedRelease, 5);
+            let error = fixture
+                .install(&fixture.package("3.0.0", "a"))
+                .await
+                .unwrap_err();
+            let said = crate::messages::keyed(&error);
+            assert_eq!(said.key, "install.rollback-failed-left", "{error:#}");
+            assert_eq!(said.params["left"], release.display().to_string());
+            assert!(said.params["back"].is_string(), "{}", said.params);
+            let text = said.message();
+            assert!(text.contains("3.0.0 could not be removed"), "{text}");
+            assert!(text.contains(&release.display().to_string()), "{text}");
+        }
+        assert_eq!(fixture.layout().selected_id().as_deref(), Some("1.0.0"));
+    }
+
+    /// Only "not found" proves a release gone after its removal failed; a look that fails otherwise says it stays,
+    /// with that failure.
+    #[test]
+    fn a_release_is_gone_only_when_it_is_not_found() {
+        let release = Path::new("/r/releases/2.0.0");
+        let removal = || {
+            step::failure(
+                Step::RemoveFailedRelease,
+                release,
+                io::Error::from_raw_os_error(5).into(),
+            )
+        };
+        let gone = io::Error::new(io::ErrorKind::NotFound, "gone");
+        assert!(left_behind(release, removal(), Err(gone)).is_none());
+        let (path, failure) = left_behind(release, removal(), Ok(())).unwrap();
+        assert_eq!(path, release);
+        assert_eq!(failure["params"]["os_error"], 5);
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "no look");
+        let (path, failure) = left_behind(release, removal(), Err(denied)).unwrap();
+        assert_eq!(path, release);
+        assert_eq!(failure["key"], "install.step-failed");
+        assert_eq!(failure["params"]["step"], "remove-failed-release");
+        assert_eq!(failure["params"]["kind"], "PermissionDenied");
+        let detail = failure["params"]["detail"].as_str().unwrap();
+        assert!(detail.contains("cannot be told"), "{detail}");
+        assert!(detail.contains("os error 5"), "{detail}");
+    }
+
+    /// What older clients read keeps its meaning: `install.rolled-back` and `install.rollback-failed` say what they
+    /// said before (the failed release is gone), word for word; a release left behind has keys of its own.
+    #[test]
+    fn the_rollback_keys_keep_their_meaning_and_a_left_release_has_its_own() {
+        assert_eq!(
+            crate::messages::message("install.rolled-back", &json!({})),
+            "Sidevoice {version} did not start ({cause}), so this computer is back on {previous}, which is running. Nothing of {version} was kept."
+        );
+        assert_eq!(
+            crate::messages::message("install.rollback-failed", &json!({})),
+            "Sidevoice {version} did not start ({cause}), and {previous}, put back in its place, did not start either ({back}). See `npx sidevoice service status`."
+        );
+        for key in ["install.rolled-back-left", "install.rollback-failed-left"] {
+            let text = crate::messages::message(key, &json!({}));
+            assert!(
+                text.contains("{left}") && text.contains("{detail}"),
+                "{key}: {text}"
+            );
+            assert!(!text.contains("Nothing of"), "{key}: {text}");
+        }
     }
 
     #[tokio::test]

@@ -23,7 +23,8 @@
 use crate::messages::Keyed;
 use crate::platform::fs::{Create, Fs};
 use crate::platform::target;
-use anyhow::{bail, Context, Result};
+use crate::step::{self, AtStep, Step};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -106,6 +107,28 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// A file of the package at `path`, read whole up to `limit`: only a file that is not there is `core.package-missing`
+/// (`what` says which); any other failure to read it (refused by an antivirus or an ACL) is the `read-package` step's,
+/// with its path and OS error.
+fn read_package(path: &Path, limit: u64, what: impl FnOnce() -> String) -> Result<Vec<u8>> {
+    let read = match step::injected(Step::ReadPackage, path) {
+        Some(error) => Err(anyhow::Error::new(error)),
+        None => read_bounded(path, limit),
+    };
+    read.map_err(|error| {
+        let missing = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        });
+        if missing {
+            Keyed::new("core.package-missing", json!({"detail": what()})).into()
+        } else {
+            step::failure(Step::ReadPackage, path, error)
+        }
+    })
+}
+
 /// The package this binary is part of: the directory above its `bin/`.
 pub fn package_root() -> Result<PathBuf> {
     let executable = std::env::current_exe()?.canonicalize()?;
@@ -123,14 +146,10 @@ pub fn package_root() -> Result<PathBuf> {
 /// this target, and name a core archive inside it.
 pub fn packaged_as(root: &Path, version: &str) -> Result<PackagedCore> {
     let path = root.join(INVENTORY);
-    if !path.exists() {
-        bail!(Keyed::new(
-            "core.package-missing",
-            json!({"detail": format!("no {}", path.display())})
-        ));
-    }
-    let inventory: Value = serde_json::from_slice(&read_bounded(&path, MAX_INVENTORY)?)
-        .map_err(|error| mismatch(format!("{INVENTORY}: {error}")))?;
+    let inventory: Value = serde_json::from_slice(&read_package(&path, MAX_INVENTORY, || {
+        format!("no {}", path.display())
+    })?)
+    .map_err(|error| mismatch(format!("{INVENTORY}: {error}")))?;
     let release_target = target::build_target().context("unsupported target")?;
     let target = release_target.name;
     if inventory["version"] != version || inventory["target"] != target {
@@ -241,13 +260,15 @@ fn unpack(bytes: &[u8], into: &Path) -> Result<(Files, Vec<u8>)> {
         let relative = member(&name).ok_or_else(|| mismatch(format!("unsafe path {raw:?}")))?;
         let path = into.join(relative);
         if kind.is_dir() {
-            crate::platform::fs::Files::ensure_private_dir(&path)?;
+            step::attempt(Step::UnpackCore, &path, || {
+                crate::platform::fs::Files::ensure_private_dir(&path)
+            })?;
             continue;
         }
         if !kind.is_file() {
             return Err(mismatch(format!("{relative} is not a plain file")));
         }
-        let size = entry.header().size()?;
+        let size = entry.header().size().at_step(Step::UnpackCore, &path)?;
         total += size;
         if total > MAX_UNPACKED {
             return Err(mismatch("the core exceeds its unpacked size bound"));
@@ -257,34 +278,36 @@ fn unpack(bytes: &[u8], into: &Path) -> Result<(Files, Vec<u8>)> {
                 return Err(mismatch(format!("{CORE_INVENTORY} is too large")));
             }
             let mut bytes = Vec::new();
-            entry.read_to_end(&mut bytes)?;
+            entry
+                .read_to_end(&mut bytes)
+                .at_step(Step::UnpackCore, &path)?;
             inventory = Some(bytes);
             continue;
         }
-        let parent = path.parent().context("member parent")?;
-        crate::platform::fs::Files::ensure_private_dir(parent)?;
-        let mut file = if relative == ENTRYPOINT.as_str() {
-            crate::platform::fs::Files::open_private(&path, Create::NewProgram)?
-        } else {
-            crate::platform::fs::Files::open_private(&path, Create::New)?
-        };
-        let mut hasher = Sha256::new();
-        let mut block = [0u8; 65536];
-        let mut length = 0u64;
-        loop {
-            let read = entry.read(&mut block)?;
-            if read == 0 {
-                break;
+        let file = step::attempt(Step::UnpackCore, &path, || -> Result<(u64, String)> {
+            let parent = path.parent().context("member parent")?;
+            crate::platform::fs::Files::ensure_private_dir(parent)?;
+            let mut file = if relative == ENTRYPOINT.as_str() {
+                crate::platform::fs::Files::open_private(&path, Create::NewProgram)?
+            } else {
+                crate::platform::fs::Files::open_private(&path, Create::New)?
+            };
+            let mut hasher = Sha256::new();
+            let mut block = [0u8; 65536];
+            let mut length = 0u64;
+            loop {
+                let read = entry.read(&mut block)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&block[..read]);
+                file.write_all(&block[..read])?;
+                length += read as u64;
             }
-            hasher.update(&block[..read]);
-            file.write_all(&block[..read])?;
-            length += read as u64;
-        }
-        file.sync_all()?;
-        written.insert(
-            relative.to_owned(),
-            (length, hex::encode(hasher.finalize())),
-        );
+            file.sync_all()?;
+            Ok((length, hex::encode(hasher.finalize())))
+        })?;
+        written.insert(relative.to_owned(), file);
     }
     let inventory = inventory.ok_or_else(|| mismatch(format!("no {CORE_INVENTORY}")))?;
     Ok((written, inventory))
@@ -349,24 +372,27 @@ fn check_inventory(core: &PackagedCore, inventory: &[u8], written: &Files) -> Re
 /// is there whole or not at all. `release` must be a private directory with no core yet. Returns `<release>/core`.
 pub fn stage(core: &PackagedCore, release: &Path) -> Result<PathBuf> {
     if !release.is_absolute() {
-        bail!("{} is not an absolute path", release.display());
+        return Err(step::failure(
+            Step::StageDir,
+            release,
+            anyhow!("{} is not an absolute path", release.display()),
+        ));
     }
-    crate::private_dir::check_existing(release)
-        .with_context(|| format!("unsafe private directory {}", release.display()))?;
+    step::attempt(Step::StageDir, release, || {
+        crate::private_dir::check_existing(release)
+            .with_context(|| format!("unsafe private directory {}", release.display()))
+    })?;
     let destination = release.join(crate::service::layout::CORE_DIRECTORY);
     if fs::symlink_metadata(&destination).is_ok() {
-        bail!("{} already exists", destination.display());
+        return Err(step::failure(
+            Step::UnpackCore,
+            &destination,
+            anyhow!("{} already exists", destination.display()),
+        ));
     }
-    let bytes = match read_bounded(&core.archive, MAX_ARCHIVE) {
-        Ok(bytes) => bytes,
-        Err(error) if !core.archive.exists() => {
-            bail!(Keyed::new(
-                "core.package-missing",
-                json!({"detail": format!("{error}")})
-            ))
-        }
-        Err(error) => return Err(error),
-    };
+    let bytes = read_package(&core.archive, MAX_ARCHIVE, || {
+        format!("no {}", core.archive.display())
+    })?;
     let digest = hex::encode(Sha256::digest(&bytes));
     if bytes.len() as u64 != core.size || digest != core.sha256 {
         return Err(mismatch(format!(
@@ -378,17 +404,28 @@ pub fn stage(core: &PackagedCore, release: &Path) -> Result<PathBuf> {
         )));
     }
     let partial = release.join(format!(".core-{}.partial", uuid::Uuid::new_v4()));
-    crate::platform::fs::Files::create_private_dir(&partial)?;
+    step::attempt(Step::UnpackCore, &partial, || {
+        crate::platform::fs::Files::create_private_dir(&partial)
+    })?;
     let result = (|| -> Result<()> {
         let (written, inventory) = unpack(&bytes, &partial)?;
         check_inventory(core, &inventory, &written)?;
-        crate::platform::fs::Files::write_private(&partial.join(CORE_INVENTORY), &inventory)?;
-        fs::rename(&partial, &destination)?;
-        crate::platform::fs::Files::sync_dir(release)?;
+        let saved = partial.join(CORE_INVENTORY);
+        step::attempt(Step::UnpackCore, &saved, || {
+            crate::platform::fs::Files::write_private(&saved, &inventory)
+        })?;
+        // On Windows another program (an antivirus scanning the new core) may hold it for a moment: tried again.
+        step::retried(Step::PublishCore, &partial, || {
+            fs::rename(&partial, &destination)
+        })?;
+        step::attempt(Step::PublishCore, release, || {
+            crate::platform::fs::Files::sync_dir(release)
+        })?;
         Ok(())
     })();
     if result.is_err() {
-        let _ = fs::remove_dir_all(&partial);
+        // Best effort: the installer removes the staged release this is in.
+        let _ = step::retried(Step::UnpackCore, &partial, || fs::remove_dir_all(&partial));
     }
     result.map(|()| destination)
 }
