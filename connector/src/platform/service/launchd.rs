@@ -221,6 +221,20 @@ fn field(printed: &str, name: &str) -> Option<String> {
     })
 }
 
+/// What tells a file apart from another put at its path: device, inode, modification time and length; none when
+/// nothing is there.
+fn identity(path: &Path) -> Option<(u64, u64, i64, i64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let found = std::fs::symlink_metadata(path).ok()?;
+    Some((
+        found.dev(),
+        found.ino(),
+        found.mtime(),
+        found.mtime_nsec(),
+        found.len(),
+    ))
+}
+
 /// `path` as one word of a POSIX shell.
 fn quoted(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
@@ -258,6 +272,9 @@ where
         };
         let printed = run(vec!["print".into(), target.clone()]).await;
         let presence = presence_of(&printed);
+        // The definition is told apart from one put in its place meanwhile by its identity, taken before it is read and
+        // compared again before the unload and the delete ([`identity`]).
+        let before = identity(&plist);
         let defined = match existing(&plist) {
             Ok(false) => None,
             Ok(true) => Some(
@@ -273,16 +290,34 @@ where
         let recorded = match (defined, &presence) {
             (Some(recorded), _) => recorded,
             (None, Presence::Absent | Presence::Unknown(_)) => continue,
+            // A loaded job whose definition is gone is judged by what launchd says it runs alone, the exact program and
+            // arguments of a release before 0.19: launchd keeps no plist keys to check. Unloading it deletes no file, and
+            // the label is in our own reverse-DNS namespace (`dev.sidevoice`), so it is unloaded (a decision for the
+            // human in sidevoice/sidevoice-connector#337; refusing it instead is the alternative).
             (None, Presence::Loaded) => Ok(printed_job(&printed.output)),
         };
         if let Err(detail) = recorded.and_then(|recorded| (job.ours)(&recorded)) {
             return Err(refused(false, detail));
+        }
+        let changed = || {
+            refused(
+                false,
+                "its definition changed while Sidevoice was removing it".into(),
+            )
+        };
+        if identity(&plist) != before {
+            return Err(changed());
         }
         let unloaded = presence != Presence::Absent;
         if unloaded {
             boot_out_with(run, &target, limit)
                 .await
                 .map_err(|detail| refused(true, detail))?;
+        }
+        // Only a process of this same user could swap the file in between, and it can change LaunchAgents directly
+        // anyway: this narrows the window, it is not a boundary (a decision for the human in #337).
+        if identity(&plist) != before {
+            return Err(changed());
         }
         let deleted = match std::fs::remove_file(&plist) {
             Ok(()) => Some(plist.clone()),
@@ -339,6 +374,8 @@ mod tests {
         loaded: Arc<Mutex<BTreeSet<String>>>,
         program: String,
         stuck: bool,
+        /// A file written over by the `bootout` (another program replacing a definition meanwhile).
+        swap: Option<PathBuf>,
         calls: Arc<Mutex<Vec<String>>>,
     }
 
@@ -384,6 +421,9 @@ mod tests {
                         output: "Boot-out failed: 5: Input/output error".into(),
                     },
                     ("bootout", target) => {
+                        if let Some(swap) = &self.swap {
+                            std::fs::write(swap, "replaced").unwrap();
+                        }
                         loaded.remove(target);
                         Output {
                             ok: true,
@@ -701,6 +741,19 @@ mod tests {
         assert!(real.exists() && home.plist(CORE.label).exists());
     }
 
+    #[tokio::test]
+    async fn a_definition_replaced_while_it_is_removed_is_not_deleted() {
+        let home = Home::new();
+        let core = home.plant_core();
+        let launchd = Launchd {
+            swap: Some(core.clone()),
+            ..Launchd::with(&[CORE.label], CORE_PROGRAM)
+        };
+        let refused = home.retire(&launchd).await.unwrap_err();
+        assert!(!refused.recognised, "{refused:?}");
+        assert!(refused.detail.contains("changed"), "{refused:?}");
+        assert_eq!(std::fs::read_to_string(&core).unwrap(), "replaced");
+    }
     #[tokio::test]
     async fn a_legacy_job_of_ours_that_will_not_unload_is_refused_with_the_commands_that_remove_it()
     {

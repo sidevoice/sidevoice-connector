@@ -134,7 +134,7 @@ fn plant_legacy_core(profile: &Profile) -> PathBuf {
         word(data.join("core")),
         "<string>--ready-file</string>".into(),
         word(data.join("core/core.json")),
-        "<string>--host</string><string>127.0.0.1</string><string>--port</string><string>0</string>".into(),
+        "<string>--host</string><string>0.0.0.0</string><string>--port</string><string>10829</string>".into(),
         "<string>--log-file</string>".into(),
         word(data.join("core.log")),
         "<string>--idle-exit</string><string>0</string>".into(),

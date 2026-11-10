@@ -1,48 +1,95 @@
 //! What Sidevoice before 0.19 ran under its launchd jobs (`dev.sidevoice.*`, [`Job::legacy_id`]), recognised before
 //! such a job is removed ([`Service::retire_legacy`](crate::platform::service::Service::retire_legacy)): a job is
-//! Sidevoice's only when everything it records is what one of those releases wrote. The manager checks its own part
-//! of the definition (`platform/service/launchd.rs`); this checks what the job runs, from the releases' history:
+//! Sidevoice's only when what it runs is exactly what one of those releases wrote for it ([`WRITERS`]). The manager
+//! checks its own part of the definition (`platform/service/launchd.rs`).
 //!
-//! | releases | `D` (`SIDEVOICE_DATA_DIR` in the job) | releases `R` | core program | connector program |
-//! |---|---|---|---|---|
-//! | 0.7.0–0.15.x | `~/.sidevoice` | `install.json`'s `releases`, else `~/.local/share/sidevoice` | `R/current/core/bin/sidevoice-core-rust` | `R/current/bin/sidevoice-connector` |
-//! | 0.16.0–0.17.x | `~/Library/Application Support/Sidevoice` | `D/install` | `R/releases/<id>/core/bin/sidevoice-core-rust` | `R/releases/<id>/bin/sidevoice-connector` |
-//! | 0.18.x | the same | `D/install` | `R/releases/<id>/core/bin/sidevoice-core` | the same |
-//!
-//! Each with `SIDEVOICE_DATA_DIR` set to this installation's `D` instead, when it was. The core ran with `--data-dir
-//! D/core` first, then `--socket` (up to 0.15), `--ready-file`, `--host`, `--port`, `--log-file`,
-//! `--room-credential` (up to 0.13) and `--idle-exit 0` last; the connector with `connector` alone. Both had
-//! `SIDEVOICE_SERVICE=launchd` and wrote to `D/core.stderr.log` and `D/connector.log`. Either release layout, `current`
-//! or `releases/<id>`, is accepted for each, and the program, links resolved, must stay inside its releases.
+//! Every release had the job carry `SIDEVOICE_SERVICE=launchd` and `SIDEVOICE_DATA_DIR=D`, send its output to
+//! `D/core.stderr.log` or `D/connector.log`, and run the connector as `<program> connector`. `D` was `~/.sidevoice` up
+//! to 0.15.x and `~/Library/Application Support/Sidevoice` from 0.16.0, unless `SIDEVOICE_DATA_DIR` named another, which
+//! is recognised when it is this installation's. The core's arguments were always the full list of its release, in
+//! order, every value derived from `D` and the job's `SIDEVOICE_CORE_HOST` and `SIDEVOICE_CORE_PORT`.
 
 use super::jobs::Job;
 use super::layout::Layout;
 use crate::platform::fs::{Files, Fs};
 use crate::platform::service::{Recorded, Restart};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-/// The core's program: `sidevoice-core-rust` up to 0.17.x, `sidevoice-core` in 0.18.x.
-const CORE_PROGRAMS: [&str; 2] = ["sidevoice-core-rust", "sidevoice-core"];
-/// The flags the core job ran with, each once with its value.
-const CORE_FLAGS: [&str; 8] = [
-    "--data-dir",
-    "--socket",
-    "--ready-file",
-    "--host",
-    "--port",
-    "--log-file",
-    "--room-credential",
-    "--idle-exit",
-];
-/// The flags every release gave the core job.
-const CORE_REQUIRED: [&str; 5] = [
-    "--data-dir",
-    "--ready-file",
-    "--port",
-    "--log-file",
-    "--idle-exit",
+/// Where a release put the programs its jobs ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Release {
+    /// `R/current/…`, `R` being `install.json`'s `releases`, else `~/.local/share/sidevoice` (0.7.0–0.15.x).
+    Current,
+    /// `D/install/releases/<id>/…` (0.16.0 on).
+    Selected,
+}
+
+/// How a release chose the core's `--host`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Host {
+    /// Always `127.0.0.1`.
+    Loopback,
+    /// `SIDEVOICE_CORE_HOST` when set and not empty, else `0.0.0.0`.
+    Setting,
+}
+
+/// One historical writer of the jobs: the releases it covers, where their programs were, the core's program name and
+/// the arguments it gave the core.
+struct Writer {
+    releases: &'static str,
+    release: Release,
+    core: &'static str,
+    socket: bool,
+    host: Host,
+    credential: bool,
+}
+
+/// Every writer before 0.19, from the history of `service/definition.rs` and `service/layout.rs` (v0.7.0 to v0.18.0).
+/// The core ran `--data-dir D/core [--socket D/core/local.sock] --ready-file D/core/core.json --host H --port P
+/// --log-file D/core.log [--room-credential D/credentials.json] --idle-exit 0`.
+const WRITERS: [Writer; 5] = [
+    Writer {
+        releases: "0.7.0-0.10.2",
+        release: Release::Current,
+        core: "sidevoice-core-rust",
+        socket: true,
+        host: Host::Loopback,
+        credential: true,
+    },
+    Writer {
+        releases: "0.10.3-0.13.x",
+        release: Release::Current,
+        core: "sidevoice-core-rust",
+        socket: true,
+        host: Host::Setting,
+        credential: true,
+    },
+    Writer {
+        releases: "0.14.0-0.15.x",
+        release: Release::Current,
+        core: "sidevoice-core-rust",
+        socket: true,
+        host: Host::Setting,
+        credential: false,
+    },
+    Writer {
+        releases: "0.16.0-0.17.x",
+        release: Release::Selected,
+        core: "sidevoice-core-rust",
+        socket: false,
+        host: Host::Setting,
+        credential: false,
+    },
+    Writer {
+        releases: "0.18.x",
+        release: Release::Selected,
+        core: "sidevoice-core",
+        socket: false,
+        host: Host::Setting,
+        credential: false,
+    },
 ];
 
 /// How launchd kept the job alive, in every release: the core after a crash or a non-zero exit, the connector always.
@@ -53,8 +100,8 @@ pub fn restart(job: Job) -> Restart {
     }
 }
 
-/// Whether `recorded`, what launchd has under `job`'s legacy label, is what a Sidevoice before 0.19 wrote for this
-/// installation (the module's table); why not, in a few English words.
+/// Whether `recorded`, what launchd has under `job`'s legacy label, is exactly what one of the [`WRITERS`] wrote for
+/// this installation; why not, in a few English words.
 pub fn recognise(job: Job, layout: &Layout, recorded: &Recorded) -> Result<(), String> {
     let environment = &recorded.environment;
     if environment.get("SIDEVOICE_SERVICE").map(String::as_str) != Some("launchd") {
@@ -74,89 +121,119 @@ pub fn recognise(job: Job, layout: &Layout, recorded: &Recorded) -> Result<(), S
             data.display()
         ));
     }
-    let Some((program, arguments)) = recorded.program.split_first() else {
-        return Err("it runs nothing".into());
-    };
-    let log = match job {
-        Job::Core => {
-            core_arguments(arguments, &data)?;
-            "core.stderr.log"
-        }
-        Job::Connector => {
-            if arguments != ["connector"] {
-                return Err(format!(
-                    "it runs {} with {arguments:?}, not `connector`",
-                    program
-                ));
-            }
-            "connector.log"
-        }
-    };
+    let log = data.join(match job {
+        Job::Core => "core.stderr.log",
+        Job::Connector => "connector.log",
+    });
     if let Some(recorded) = &recorded.log {
-        if !same(recorded, &data.join(log)) {
+        if !same(recorded, &log) {
             return Err(format!(
                 "its output goes to {}, not where Sidevoice sent it",
                 recorded.display()
             ));
         }
     }
-    released_program(job, layout, &data, Path::new(program))
-}
-
-/// The core job's arguments as every release wrote them: flag and value pairs from [`CORE_FLAGS`], each once, all of
-/// [`CORE_REQUIRED`], `--data-dir D/core` first and `--idle-exit 0` last.
-fn core_arguments(arguments: &[String], data: &Path) -> Result<(), String> {
-    let refused = || {
-        Err(format!(
-            "it runs the core with {arguments:?}, not as Sidevoice did"
-        ))
+    let Some((program, arguments)) = recorded.program.split_first() else {
+        return Err("it runs nothing".into());
     };
-    if !arguments.len().is_multiple_of(2) {
-        return refused();
-    }
-    let mut seen = BTreeSet::new();
-    for pair in arguments.chunks(2) {
-        if !CORE_FLAGS.contains(&pair[0].as_str()) || !seen.insert(pair[0].as_str()) {
-            return refused();
+    let program = Path::new(program);
+    for writer in &WRITERS {
+        let expected = match job {
+            Job::Core => core_arguments(writer, &data, environment),
+            Job::Connector => vec!["connector".to_owned()],
+        };
+        if arguments != expected.as_slice() {
+            continue;
+        }
+        if let Some(found) = released_program(job, writer, layout, &data, program) {
+            return found;
         }
     }
-    let first = arguments.first().map(String::as_str) == Some("--data-dir")
-        && same(Path::new(&arguments[1]), &data.join("core"));
-    let last = arguments[arguments.len().saturating_sub(2)..] == ["--idle-exit", "0"];
-    if !first || !last || CORE_REQUIRED.iter().any(|flag| !seen.contains(flag)) {
-        return refused();
+    Err(format!(
+        "it runs {} {arguments:?}, which no Sidevoice release wrote",
+        program.display()
+    ))
+}
+
+/// The core job's arguments exactly as `writer` wrote them for the data directory `data` and the job's environment.
+fn core_arguments(
+    writer: &Writer,
+    data: &Path,
+    environment: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let path = |path: PathBuf| path.to_string_lossy().into_owned();
+    let core = data.join("core");
+    let mut arguments = vec!["--data-dir".to_owned(), path(core.clone())];
+    if writer.socket {
+        arguments.extend(["--socket".to_owned(), path(core.join("local.sock"))]);
     }
-    Ok(())
+    let host = match writer.host {
+        Host::Loopback => "127.0.0.1".to_owned(),
+        Host::Setting => environment
+            .get("SIDEVOICE_CORE_HOST")
+            .filter(|host| !host.is_empty())
+            .cloned()
+            .unwrap_or_else(|| "0.0.0.0".to_owned()),
+    };
+    let port = environment
+        .get("SIDEVOICE_CORE_PORT")
+        .filter(|port| port.parse::<u16>().is_ok())
+        .cloned()
+        .unwrap_or_else(|| super::layout::DEFAULT_CORE_PORT.to_owned());
+    arguments.extend([
+        "--ready-file".to_owned(),
+        path(core.join("core.json")),
+        "--host".to_owned(),
+        host,
+        "--port".to_owned(),
+        port,
+        "--log-file".to_owned(),
+        path(data.join("core.log")),
+    ]);
+    if writer.credential {
+        arguments.extend([
+            "--room-credential".to_owned(),
+            path(data.join("credentials.json")),
+        ]);
+    }
+    arguments.extend(["--idle-exit".to_owned(), "0".to_owned()]);
+    arguments
 }
 
-/// Where a release before 0.19 could have put its releases, for the data directory `data`: this installation's,
-/// `data/install` (0.16.0 on), and `install.json`'s `releases`, else `~/.local/share/sidevoice` (up to 0.15.x).
-fn release_roots(layout: &Layout, data: &Path) -> Vec<PathBuf> {
-    let mut roots = vec![
-        layout.releases.clone(),
-        data.join("install"),
-        layout.home.join(".local/share/sidevoice"),
-    ];
-    let recorded = Files::read_trusted(&data.join("install.json"), 64 * 1024)
-        .ok()
-        .flatten()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|record| record.get("releases")?.as_str().map(PathBuf::from))
-        .filter(|releases| plain(releases));
-    roots.extend(recorded);
-    roots
+/// Where `writer`'s releases were, for the data directory `data`: `D/install` (0.16.0 on); `install.json`'s
+/// `releases`, else `~/.local/share/sidevoice` (up to 0.15.x).
+fn release_roots(release: Release, layout: &Layout, data: &Path) -> Vec<PathBuf> {
+    match release {
+        Release::Selected => vec![data.join("install")],
+        Release::Current => {
+            let recorded = Files::read_trusted(&data.join("install.json"), 64 * 1024)
+                .ok()
+                .flatten()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|record| record.get("releases")?.as_str().map(PathBuf::from))
+                .filter(|releases| plain(releases));
+            recorded
+                .into_iter()
+                .chain([layout.home.join(".local/share/sidevoice")])
+                .collect()
+        }
+    }
 }
 
-/// Whether `program` is the job's program in a release: `<root>/current/<entry>` or `<root>/releases/<id>/<entry>`
-/// below one of the [`release_roots`], and, its links resolved, still inside that root.
-fn released_program(job: Job, layout: &Layout, data: &Path, program: &Path) -> Result<(), String> {
+/// Whether `program` is the job's program in one of `writer`'s releases: `<R>/current/<entry>` or
+/// `<R>/releases/<id>/<entry>`, as that writer laid them out, with the core named as it named it. None when it is not;
+/// otherwise whether, its links resolved, it stays inside that release root.
+fn released_program(
+    job: Job,
+    writer: &Writer,
+    layout: &Layout,
+    data: &Path,
+    program: &Path,
+) -> Option<Result<(), String>> {
     if !plain(program) {
-        return Err(format!(
-            "it runs {}, not an absolute plain path",
-            program.display()
-        ));
+        return None;
     }
-    for root in release_roots(layout, data) {
+    for root in release_roots(writer.release, layout, data) {
         let Ok(rest) = program.strip_prefix(&root) else {
             continue;
         };
@@ -170,32 +247,30 @@ fn released_program(job: Job, layout: &Layout, data: &Path, program: &Path) -> R
         else {
             continue;
         };
-        let entry = match parts.as_slice() {
-            ["current", entry @ ..] => entry,
-            ["releases", id, entry @ ..] if !id.starts_with('.') => entry,
+        let entry = match (writer.release, parts.as_slice()) {
+            (Release::Current, ["current", entry @ ..]) => entry,
+            (Release::Selected, ["releases", id, entry @ ..]) if !id.starts_with('.') => entry,
             _ => continue,
         };
         let shaped = match (job, entry) {
-            (Job::Core, ["core", "bin", name]) => CORE_PROGRAMS.contains(name),
+            (Job::Core, ["core", "bin", name]) => *name == writer.core,
             (Job::Connector, ["bin", "sidevoice-connector"]) => true,
             _ => false,
         };
         if !shaped {
             continue;
         }
-        return match (resolved(program), resolved(&root)) {
+        return Some(match (resolved(program), resolved(&root)) {
             (Some(program), Some(root)) if program.starts_with(&root) => Ok(()),
             _ => Err(format!(
-                "it runs {}, which leads outside {}",
+                "it runs {}, which leads outside {} (the releases of Sidevoice {})",
                 program.display(),
-                root.display()
+                root.display(),
+                writer.releases
             )),
-        };
+        });
     }
-    Err(format!(
-        "it runs {}, not the program of a Sidevoice release",
-        program.display()
-    ))
+    None
 }
 
 /// An absolute path with no `..`.
@@ -235,7 +310,6 @@ fn same(one: &Path, other: &Path) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     /// A home with this installation's standard data directory (as 0.16.0 on), and a layout naming it.
     struct Mac {
@@ -272,7 +346,7 @@ mod tests {
             }
         }
 
-        /// What release `id` with the core program `core` recorded: its program existing (or pruned) under `root`.
+        /// Release `id` under `root`, with the core program `core`, its programs there (or pruned).
         fn release(&self, root: &Path, id: &str, core: &str, keep: bool) -> (PathBuf, PathBuf) {
             let release = root.join("releases").join(id);
             let (core, connector) = (
@@ -287,34 +361,53 @@ mod tests {
             }
             (core, connector)
         }
+
+        /// The data directory of 0.7.0–0.15.x, `~/.sidevoice`, and its default releases with `current` linked to
+        /// release `id`. The core and connector programs through `current`.
+        fn era_a(&self, id: &str) -> (PathBuf, PathBuf, PathBuf) {
+            let data = self.home.join(".sidevoice");
+            Files::ensure_private_dir(&data).unwrap();
+            let releases = self.home.join(".local/share/sidevoice");
+            self.release(&releases, id, "sidevoice-core-rust", true);
+            let current = releases.join("current");
+            let _ = std::fs::remove_file(&current);
+            std::os::unix::fs::symlink(releases.join("releases").join(id), &current).unwrap();
+            (
+                data,
+                current.join("core/bin/sidevoice-core-rust"),
+                current.join("bin/sidevoice-connector"),
+            )
+        }
     }
 
     fn path(path: &Path) -> String {
         path.to_string_lossy().into_owned()
     }
 
-    /// The core job as `data`'s release wrote it, `extra` flags (with values) in its era's place.
-    fn core_job(program: &Path, data: &Path, extra: &[&str]) -> Recorded {
-        let mut words = vec![path(program), "--data-dir".into(), path(&data.join("core"))];
-        words.extend(extra.iter().map(|word| (*word).to_owned()));
-        words.extend(
-            [
-                "--ready-file",
-                &path(&data.join("core/core.json")),
-                "--host",
-                "127.0.0.1",
-                "--port",
-                "10829",
-                "--log-file",
-                &path(&data.join("core.log")),
-                "--idle-exit",
-                "0",
-            ]
-            .map(str::to_owned),
-        );
+    fn environment(data: &Path, settings: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let mut environment = BTreeMap::from([
+            ("HOME".into(), "/Users/u".into()),
+            ("SIDEVOICE_DATA_DIR".into(), path(data)),
+            ("SIDEVOICE_SERVICE".into(), "launchd".into()),
+        ]);
+        for (name, value) in settings {
+            environment.insert((*name).into(), (*value).into());
+        }
+        environment
+    }
+
+    /// The core job written out by hand, word for word, as a release of each era wrote it.
+    fn core_job(
+        program: &Path,
+        data: &Path,
+        arguments: &[String],
+        settings: &[(&str, &str)],
+    ) -> Recorded {
         Recorded {
-            program: words,
-            environment: environment(data),
+            program: std::iter::once(path(program))
+                .chain(arguments.iter().cloned())
+                .collect(),
+            environment: environment(data, settings),
             log: Some(data.join("core.stderr.log")),
         }
     }
@@ -322,18 +415,27 @@ mod tests {
     fn connector_job(program: &Path, data: &Path) -> Recorded {
         Recorded {
             program: vec![path(program), "connector".into()],
-            environment: environment(data),
+            environment: environment(data, &[]),
             log: Some(data.join("connector.log")),
         }
     }
 
-    fn environment(data: &Path) -> BTreeMap<String, String> {
-        BTreeMap::from([
-            ("HOME".into(), "/Users/u".into()),
-            ("SIDEVOICE_DATA_DIR".into(), path(data)),
-            ("SIDEVOICE_SERVICE".into(), "launchd".into()),
-        ])
+    fn words(text: &str, data: &Path) -> Vec<String> {
+        text.split(' ')
+            .map(|word| word.replace("{D}", &path(data)))
+            .collect()
     }
+
+    const ARGS_0_10_2: &str = "--data-dir {D}/core --socket {D}/core/local.sock --ready-file {D}/core/core.json \
+        --host 127.0.0.1 --port 10829 --log-file {D}/core.log --room-credential {D}/credentials.json --idle-exit 0";
+    const ARGS_0_13: &str = "--data-dir {D}/core --socket {D}/core/local.sock --ready-file {D}/core/core.json \
+        --host 0.0.0.0 --port 10829 --log-file {D}/core.log --room-credential {D}/credentials.json --idle-exit 0";
+    const ARGS_0_15: &str =
+        "--data-dir {D}/core --socket {D}/core/local.sock --ready-file {D}/core/core.json \
+        --host 192.168.1.7 --port 4000 --log-file {D}/core.log --idle-exit 0";
+    const ARGS_0_18: &str =
+        "--data-dir {D}/core --ready-file {D}/core/core.json --host 0.0.0.0 --port 10829 \
+        --log-file {D}/core.log --idle-exit 0";
 
     #[test]
     fn the_jobs_of_0_16_to_0_18_are_recognised_kept_or_pruned() {
@@ -345,11 +447,8 @@ mod tests {
             ("0.18.0", "sidevoice-core", true),
         ] {
             let (core, connector) = mac.release(&releases, id, core, keep);
-            assert_eq!(
-                recognise(Job::Core, &mac.layout, &core_job(&core, &data, &[])),
-                Ok(()),
-                "{id}"
-            );
+            let job = core_job(&core, &data, &words(ARGS_0_18, &data), &[]);
+            assert_eq!(recognise(Job::Core, &mac.layout, &job), Ok(()), "{id}");
             assert_eq!(
                 recognise(
                     Job::Connector,
@@ -362,34 +461,33 @@ mod tests {
         }
         // What `launchctl print` says has no output path when it cannot be read: the rest still decides.
         let (core, _) = mac.release(&releases, "0.18.0", "sidevoice-core", true);
-        let mut printed = core_job(&core, &data, &[]);
+        let mut printed = core_job(&core, &data, &words(ARGS_0_18, &data), &[]);
         printed.log = None;
         assert_eq!(recognise(Job::Core, &mac.layout, &printed), Ok(()));
     }
 
     #[test]
-    fn the_jobs_of_0_7_to_0_15_are_recognised_through_current_and_a_recorded_releases_dir() {
+    fn the_jobs_of_0_7_to_0_15_are_recognised_each_with_its_own_arguments() {
         let mac = Mac::new();
-        let data = mac.home.join(".sidevoice");
-        Files::ensure_private_dir(&data).unwrap();
-        // The default releases, `R/current` a link to the selected release, the core with `--socket` and (to 0.13)
-        // `--room-credential`.
-        let releases = mac.home.join(".local/share/sidevoice");
-        mac.release(&releases, "0.13.1", "sidevoice-core-rust", true);
-        std::os::unix::fs::symlink(releases.join("releases/0.13.1"), releases.join("current"))
-            .unwrap();
-        let extra = [
-            "--socket",
-            "/Users/u/.sidevoice/core/local.sock",
-            "--room-credential",
-            "/Users/u/.sidevoice/room.json",
-        ];
-        let core = releases.join("current/core/bin/sidevoice-core-rust");
-        let connector = releases.join("current/bin/sidevoice-connector");
-        assert_eq!(
-            recognise(Job::Core, &mac.layout, &core_job(&core, &data, &extra)),
-            Ok(())
-        );
+        let (data, core, connector) = mac.era_a("0.13.1");
+        for (arguments, settings) in [
+            (ARGS_0_10_2, &[][..]),
+            (ARGS_0_13, &[][..]),
+            (
+                ARGS_0_15,
+                &[
+                    ("SIDEVOICE_CORE_HOST", "192.168.1.7"),
+                    ("SIDEVOICE_CORE_PORT", "4000"),
+                ][..],
+            ),
+        ] {
+            let job = core_job(&core, &data, &words(arguments, &data), settings);
+            assert_eq!(
+                recognise(Job::Core, &mac.layout, &job),
+                Ok(()),
+                "{arguments}"
+            );
+        }
         assert_eq!(
             recognise(
                 Job::Connector,
@@ -398,10 +496,26 @@ mod tests {
             ),
             Ok(())
         );
-        // Releases put elsewhere, as `install.json` recorded (0.14 and 0.15: `--socket`, no credential).
+    }
+
+    #[test]
+    fn releases_put_elsewhere_are_recognised_where_install_json_recorded_them() {
+        let mac = Mac::new();
+        let (data, _, connector) = mac.era_a("0.15.0");
         let elsewhere = mac.home.join("opt/sidevoice");
-        let (core, _) = mac.release(&elsewhere, "0.15.0", "sidevoice-core-rust", true);
-        let job = core_job(&core, &data, &extra[..2]);
+        mac.release(&elsewhere, "0.15.0", "sidevoice-core-rust", true);
+        std::os::unix::fs::symlink(elsewhere.join("releases/0.15.0"), elsewhere.join("current"))
+            .unwrap();
+        let core = elsewhere.join("current/core/bin/sidevoice-core-rust");
+        let job = core_job(
+            &core,
+            &data,
+            &words(ARGS_0_15, &data),
+            &[
+                ("SIDEVOICE_CORE_HOST", "192.168.1.7"),
+                ("SIDEVOICE_CORE_PORT", "4000"),
+            ],
+        );
         assert!(
             recognise(Job::Core, &mac.layout, &job).is_err(),
             "not recorded yet"
@@ -417,17 +531,122 @@ mod tests {
     }
 
     #[test]
+    fn arguments_no_release_wrote_are_not_recognised() {
+        let mac = Mac::new();
+        let data = mac.layout.data.clone();
+        let (core, _) = mac.release(&mac.layout.releases, "0.18.0", "sidevoice-core", true);
+        let genuine = words(ARGS_0_18, &data);
+        let with = |from: &str, to: &str| -> Vec<String> {
+            genuine
+                .iter()
+                .map(|word| {
+                    if word == from {
+                        to.to_owned()
+                    } else {
+                        word.clone()
+                    }
+                })
+                .collect()
+        };
+        let ready = path(&data.join("core/core.json"));
+        let log = path(&data.join("core.log"));
+        let without_host: Vec<String> = genuine
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| ![4, 5].contains(index))
+            .map(|(_, word)| word.clone())
+            .collect();
+        let mut reordered = genuine.clone();
+        reordered.swap(2, 6);
+        reordered.swap(3, 7);
+        let mut extra = genuine.clone();
+        extra.splice(10..10, ["--verbose".to_owned(), "1".to_owned()]);
+        for (arguments, settings, why) in [
+            (with(&ready, "/tmp/x"), &[][..], "a foreign --ready-file"),
+            (with(&log, "/tmp/x"), &[][..], "a foreign --log-file"),
+            (without_host, &[][..], "no --host"),
+            (
+                with("0.0.0.0", "127.0.0.1"),
+                &[][..],
+                "the loopback host 0.18 never wrote",
+            ),
+            (
+                with("10829", "4000"),
+                &[][..],
+                "a port its environment does not name",
+            ),
+            (
+                genuine.clone(),
+                &[("SIDEVOICE_CORE_PORT", "4000")][..],
+                "the port its environment names, not used",
+            ),
+            (reordered, &[][..], "another order"),
+            (extra, &[][..], "an extra flag"),
+            (
+                words(ARGS_0_15, &data),
+                &[][..],
+                "the arguments of another era",
+            ),
+        ] {
+            let job = core_job(&core, &data, &arguments, settings);
+            assert!(
+                recognise(Job::Core, &mac.layout, &job).is_err(),
+                "{why}: {arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_layout_and_program_no_release_paired_are_not_recognised() {
+        let mac = Mac::new();
+        let data = mac.layout.data.clone();
+        // `sidevoice-core` was only ever run from `releases/<id>`, `sidevoice-core-rust` through `current` only with
+        // the 0.7–0.15 arguments, and a 0.18 release never ran `sidevoice-core-rust` with 0.15's.
+        let releases = mac.home.join(".local/share/sidevoice");
+        mac.release(&releases, "x", "sidevoice-core", true);
+        std::os::unix::fs::symlink(releases.join("releases/x"), releases.join("current")).unwrap();
+        let current_new = releases.join("current/core/bin/sidevoice-core");
+        let (selected_old, _) =
+            mac.release(&mac.layout.releases, "0.17.0", "sidevoice-core-rust", true);
+        let era_a = mac.home.join(".sidevoice");
+        Files::ensure_private_dir(&era_a).unwrap();
+        for (program, data, arguments, why) in [
+            (
+                current_new,
+                era_a.clone(),
+                words(ARGS_0_13, &era_a),
+                "`current` with sidevoice-core",
+            ),
+            (
+                selected_old.clone(),
+                data.clone(),
+                words(ARGS_0_13, &data),
+                "a 0.17 release with 0.13's arguments",
+            ),
+            (
+                data.join("install/current/core/bin/sidevoice-core-rust"),
+                data.clone(),
+                words(ARGS_0_13, &data),
+                "`current` under D/install",
+            ),
+        ] {
+            let job = core_job(&program, &data, &arguments, &[]);
+            assert!(recognise(Job::Core, &mac.layout, &job).is_err(), "{why}");
+        }
+    }
+
+    #[test]
     fn a_script_of_the_persons_own_under_the_data_directory_is_not_recognised() {
         let mac = Mac::new();
         let data = mac.layout.data.clone();
         let script = data.join("my-script");
         std::fs::write(&script, "#!/bin/sh\n").unwrap();
-        let other = mac.home.join("Library/Application Support/Other");
         let (core, connector) = mac.release(&mac.layout.releases, "0.18.0", "sidevoice-core", true);
+        let other = mac.home.join("Library/Application Support/Other");
+        let args = words(ARGS_0_18, &data);
         for (job, recorded) in [
-            (Job::Core, core_job(&script, &data, &[])),
+            (Job::Core, core_job(&script, &data, &args, &[])),
             (Job::Connector, connector_job(&script, &data)),
-            // Our program, run otherwise.
             (
                 Job::Connector,
                 Recorded {
@@ -435,22 +654,12 @@ mod tests {
                     ..connector_job(&connector, &data)
                 },
             ),
-            (
-                Job::Core,
-                Recorded {
-                    program: vec![path(&core), "--data-dir".into(), path(&data.join("core"))],
-                    ..core_job(&core, &data, &[])
-                },
-            ),
-            (Job::Core, core_job(&core, &data, &["--verbose", "1"])),
-            // Our program, under another job's label.
             (Job::Core, connector_job(&connector, &data)),
-            // Not written for launchd, another data directory, its output elsewhere.
             (
                 Job::Core,
                 Recorded {
                     environment: BTreeMap::new(),
-                    ..core_job(&core, &data, &[])
+                    ..core_job(&core, &data, &args, &[])
                 },
             ),
             (
@@ -458,6 +667,7 @@ mod tests {
                 core_job(
                     &other.join("install/releases/0.18.0/core/bin/sidevoice-core"),
                     &other,
+                    &words(ARGS_0_18, &other),
                     &[],
                 ),
             ),
@@ -465,15 +675,15 @@ mod tests {
                 Job::Core,
                 Recorded {
                     log: Some(data.join("elsewhere.log")),
-                    ..core_job(&core, &data, &[])
+                    ..core_job(&core, &data, &args, &[])
                 },
             ),
-            // A path that climbs out.
             (
                 Job::Core,
                 core_job(
                     &data.join("install/releases/0.18.0/../../../../../../bin/sh"),
                     &data,
+                    &args,
                     &[],
                 ),
             ),
@@ -500,7 +710,12 @@ mod tests {
             .layout
             .releases
             .join("releases/0.18.0/core/bin/sidevoice-core");
-        let refused = recognise(Job::Core, &mac.layout, &core_job(&core, &data, &[])).unwrap_err();
+        let refused = recognise(
+            Job::Core,
+            &mac.layout,
+            &core_job(&core, &data, &words(ARGS_0_18, &data), &[]),
+        )
+        .unwrap_err();
         assert!(refused.contains("leads outside"), "{refused}");
     }
 }
