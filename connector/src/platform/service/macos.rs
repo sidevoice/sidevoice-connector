@@ -6,12 +6,13 @@
 
 use super::launchd::{self, Presence};
 use super::{
-    command, Job, JobId, JobState, Legacy, LegacyRefusal, Output, Places, Refusal, Restart, Service,
+    command, Job, JobId, JobState, Legacy, LegacyJob, LegacyRefusal, Output, Places, Refusal,
+    Restart, Service,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tokio::time::{sleep, Duration};
 
 /// launchd, for this user.
@@ -135,13 +136,9 @@ impl Service for Os {
     }
 
     // The labels before Sidevoice 0.19, in this user's GUI domain and LaunchAgents ([`launchd::retire_with`]).
-    async fn retire_legacy(
-        &self,
-        legacy: &[JobId],
-        roots: &[&Path],
-    ) -> Result<Vec<Legacy>, LegacyRefusal> {
+    async fn retire_legacy(&self, legacy: &[LegacyJob<'_>]) -> Result<Vec<Legacy>, LegacyRefusal> {
         let agents = self.places.home.join("Library/LaunchAgents");
-        launchd::retire_with(&run, &domain(), &agents, legacy, roots, BOOT_OUT_LIMIT).await
+        launchd::retire_with(&run, &domain(), &agents, legacy, BOOT_OUT_LIMIT).await
     }
 
     async fn legacy_pid(&self, legacy: JobId) -> Option<u32> {

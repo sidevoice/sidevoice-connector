@@ -22,6 +22,7 @@ pub mod definition;
 pub mod jobs;
 pub mod launcher;
 pub mod layout;
+pub mod legacy;
 pub mod status;
 
 use crate::lock::Lock;

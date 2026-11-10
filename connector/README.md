@@ -356,14 +356,20 @@ manager is asked and holds until `service start` or the next login; every change
 Before Sidevoice 0.19 the launchd jobs were labelled `dev.sidevoice.core` and `dev.sidevoice.connector`; a Mac updated
 from then kept them loaded, and the old core held the core's port. So `install`, `service install`, `service start`,
 `service restart` and `uninstall` first remove those legacy jobs (`service::jobs::Job::legacy_id`, the one place the
-old labels are named; `platform/service/launchd.rs`): each one whose definition in `~/Library/LaunchAgents` is this
-user's plain file, naming its label and a program inside `D` (or, with no definition left, a loaded job running such a
-program) is unloaded (`launchctl bootout gui/<uid>/<label>`) and its definition deleted, before any new job starts.
-Anything else under those labels is left alone. The answer's `legacy_jobs` (only when one was found) says what became
-of each: `{label, outcome: "removed"|"left", unloaded, plist, reason, key, params, message}`, and the human output
-prints its `message`. A job of ours that cannot be removed fails the command with `service.legacy-job-left`, naming
-it and the two commands that remove it by hand, and nothing is started (`install` switches nothing). systemd units and
-Task Scheduler tasks are named from the jobs' short names, which never changed: there is nothing to remove there.
+old labels are named), before any new job starts. A legacy job is removed only when it is exactly what a release
+from 0.7.0 to 0.18.x wrote: its definition in `~/Library/LaunchAgents` is this user's plain file with exactly the keys
+Sidevoice wrote, started and kept alive as Sidevoice did (`platform/service/launchd.rs`), and what it runs is
+recognised (`service/legacy.rs`, which lists the layouts): `SIDEVOICE_SERVICE=launchd`, a Sidevoice data directory
+(this one, or `~/.sidevoice` up to 0.15), the job's own arguments and log, and the core or connector program of a
+release (`<R>/current/…` or `<R>/releases/<id>/…`), which must stay inside its releases once links are resolved. With
+no definition left, a loaded job is judged by what `launchctl print` says it runs. It is unloaded (`launchctl bootout
+gui/<uid>/<label>`) and its definition deleted. The answer's `legacy_jobs` (only when one was removed) says what
+became of each: `{label, outcome: "removed", unloaded, plist, key, params, message}`, and the human output prints its
+`message`. Anything else under a legacy label is not touched and fails the command with
+`service.legacy-job-unrecognised`, and a job of ours that cannot be removed with `service.legacy-job-left`. Both name
+the job, its definition and the two commands that remove it by hand, and nothing is started (`install` switches
+nothing). systemd units and Task Scheduler tasks are named from the jobs' short names, which never changed: there is
+nothing to remove there.
 
 `service status --json`, and a daemon's `node.status`, is derived on every read from the manager, the core's
 `core-failure.json` and its health: `absent`, `not-installed`, `stopped-by-person`, `starting`, `backoff`,

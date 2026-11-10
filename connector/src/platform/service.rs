@@ -221,30 +221,45 @@ pub enum Refusal {
     NotStarted(JobId, String),
 }
 
-/// What became of a job an earlier release defined under a label this one no longer uses ([`Service::retire_legacy`]).
+/// A job an earlier release recorded under a legacy label, as the manager has it: its program and arguments, its
+/// environment, and where its output went (none when that cannot be read). Read from its definition, or, with none
+/// left, from what the manager says the loaded job runs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Recorded {
+    pub program: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+    pub log: Option<PathBuf>,
+}
+
+/// Whether a [`Recorded`] job is one Sidevoice wrote: `Err` says why not, in a few English words.
+pub type Recognise<'a> = dyn Fn(&Recorded) -> Result<(), String> + Sync + 'a;
+
+/// A job to retire ([`Service::retire_legacy`]): its old names, how the release that wrote it restarted it, and the
+/// caller's judgement of what it ran.
+pub struct LegacyJob<'a> {
+    pub id: JobId,
+    pub restart: Restart,
+    pub ours: &'a Recognise<'a>,
+}
+
+/// A legacy job of ours that is gone ([`Service::retire_legacy`]): whether it was loaded (it is not any more), and
+/// its definition, deleted, when there was one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Legacy {
     /// The old label.
     pub label: &'static str,
-    pub outcome: LegacyOutcome,
+    pub unloaded: bool,
+    pub deleted: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LegacyOutcome {
-    /// Ours, and gone: whether it was loaded (it is not any more), and its definition, deleted, when there was one.
-    Removed {
-        unloaded: bool,
-        deleted: Option<PathBuf>,
-    },
-    /// A job or a definition under that label that is not ours: left as it is, with why, in a few English words.
-    Left { reason: String },
-}
-
-/// A legacy job of ours that could not be removed ([`Service::retire_legacy`]): which, why, and the two commands that
-/// remove it by hand (unload it, delete its definition).
+/// A job under a legacy label that was left in place ([`Service::retire_legacy`]): which, where its definition is,
+/// why (`recognised`: one of ours that could not be removed; otherwise one that is not recognisably ours, so it was not
+/// touched), and the two commands that remove it by hand (unload it, delete its definition).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LegacyRefusal {
     pub label: &'static str,
+    pub plist: PathBuf,
+    pub recognised: bool,
     pub detail: String,
     pub bootout: String,
     pub remove: String,
@@ -342,21 +357,21 @@ pub trait Service: Sized + Send + Sync {
     fn set_login(&self, job: JobId, on: bool) -> impl Future<Output = Result<(), String>> + Send;
 
     /// The jobs an earlier release defined under labels this one no longer uses (`legacy`), removed, so that they never
-    /// run beside ours: called before any of ours is started. Each one that is ours (its definition this user's plain
-    /// file, naming that label and a program inside one of `roots`; with no definition, a loaded job running such a
-    /// program) is unloaded and its definition deleted; anything else under that label is left as it is, and said.
-    /// Nothing there is nothing to do, so running it again changes nothing. A job of ours that cannot be removed is
-    /// refused, and the caller starts nothing.
+    /// run beside ours: called before any of ours is started. A job is removed only when what the manager has under
+    /// that label is exactly what such a release wrote: the manager's own part of the definition checked here, what
+    /// it runs judged by [`LegacyJob::ours`]. It is unloaded and its definition deleted. Anything else under a legacy
+    /// label is not touched, and refused with how to remove it by hand, as is a job of ours that cannot be removed:
+    /// the caller then starts nothing, so the two never compete in silence. Nothing there is nothing to do, so
+    /// running it again changes nothing.
     ///
     /// Only launchd ever renamed a job (`dev.sidevoice.*` to `ai.sidevoice.*`, in Sidevoice 0.19), so only it
     /// overrides this. systemd's units and Task Scheduler's tasks are named from [`JobId::name`], which never
     /// changed: there a legacy job is the current one, and this must remove nothing.
     fn retire_legacy(
         &self,
-        legacy: &[JobId],
-        roots: &[&Path],
+        legacy: &[LegacyJob<'_>],
     ) -> impl Future<Output = Result<Vec<Legacy>, LegacyRefusal>> + Send {
-        let _ = (legacy, roots);
+        let _ = legacy;
         async { Ok(Vec::new()) }
     }
 

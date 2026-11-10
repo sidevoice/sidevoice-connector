@@ -125,16 +125,38 @@ fn plant_legacy_core(profile: &Profile) -> PathBuf {
     private_dir(&profile.root.join("home/Library"));
     private_dir(&agents);
     let plist = agents.join(format!("{}.plist", LEGACY_CORE.0));
+    // Exactly what 0.18.0 wrote: its keys, its environment, the core's arguments and output.
+    let data = profile.data();
+    let word = |path: PathBuf| format!("<string>{}</string>", path.display());
+    let arguments = [
+        word(program.clone()),
+        "<string>--data-dir</string>".into(),
+        word(data.join("core")),
+        "<string>--ready-file</string>".into(),
+        word(data.join("core/core.json")),
+        "<string>--host</string><string>127.0.0.1</string><string>--port</string><string>0</string>".into(),
+        "<string>--log-file</string>".into(),
+        word(data.join("core.log")),
+        "<string>--idle-exit</string><string>0</string>".into(),
+    ]
+    .concat();
     std::fs::write(
         &plist,
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
              \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\
-             <key>Label</key><string>{}</string>\
-             <key>ProgramArguments</key><array><string>{}</string></array>\
-             <key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n",
-            LEGACY_CORE.0,
-            program.display()
+             <key>Label</key><string>{label}</string>\
+             <key>ProgramArguments</key><array>{arguments}</array>\
+             <key>EnvironmentVariables</key><dict><key>HOME</key>{home}\
+             <key>SIDEVOICE_DATA_DIR</key>{data}<key>SIDEVOICE_SERVICE</key><string>launchd</string></dict>\
+             <key>RunAtLoad</key><true/>\
+             <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/><key>Crashed</key><true/></dict>\
+             <key>ThrottleInterval</key><integer>10</integer>\
+             <key>StandardOutPath</key>{log}<key>StandardErrorPath</key>{log}</dict></plist>\n",
+            label = LEGACY_CORE.0,
+            home = word(profile.root.join("home")),
+            data = word(data.clone()),
+            log = word(data.join("core.stderr.log")),
         ),
     )
     .unwrap();
