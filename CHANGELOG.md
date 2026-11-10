@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.2](https://github.com/sidevoice/sidevoice-connector/compare/v0.19.1...v0.19.2) (2026-11-10)
+
+
+### Bug Fixes
+
+* **install:** name the step and path of a failed install, and retry Windows renames held by another program ([9cd15da](https://github.com/sidevoice/sidevoice-connector/commit/9cd15da4de4d4309da113f2088733500e252d302))
+
 ## [0.19.1](https://github.com/sidevoice/sidevoice-connector/compare/v0.19.0...v0.19.1) (2026-11-07)
 
 
