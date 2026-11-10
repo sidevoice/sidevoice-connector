@@ -218,8 +218,9 @@ fn core_arguments(
     arguments
 }
 
-/// Where `writer`'s releases were, for the data directory `data`: `D/install` (0.16.0 on); `install.json`'s
-/// `releases`, else `$XDG_DATA_HOME/sidevoice` as the job recorded it, else `~/.local/share/sidevoice` (up to 0.15.x).
+/// Where `writer`'s releases were, for the data directory `data`: `D/install` (0.16.0 on); up to 0.15.x exactly one,
+/// as they chose it: `install.json`'s `releases` when it is an absolute path ending in `sidevoice`, else
+/// `$XDG_DATA_HOME/sidevoice` as the job recorded it, else `~/.local/share/sidevoice`.
 fn release_roots(
     release: Release,
     layout: &Layout,
@@ -234,16 +235,25 @@ fn release_roots(
                 .flatten()
                 .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
                 .and_then(|record| record.get("releases")?.as_str().map(PathBuf::from))
-                .filter(|releases| releases.is_absolute());
-            let data_home = environment
-                .get("XDG_DATA_HOME")
-                .map(|home| Path::new(home).join("sidevoice"))
-                .filter(|releases| releases.is_absolute());
-            recorded
-                .into_iter()
-                .chain(data_home)
-                .chain([layout.home.join(".local/share/sidevoice")])
-                .collect()
+                .filter(|releases| {
+                    releases.is_absolute()
+                        && releases.file_name().is_some_and(|name| name == "sidevoice")
+                });
+            // Exactly one, in the order those releases chose it: the record, else `$XDG_DATA_HOME` (an empty one is
+            // unset; a relative one they refused, so no job of theirs has it), else the home's default.
+            let chosen = match (
+                recorded,
+                environment
+                    .get("XDG_DATA_HOME")
+                    .filter(|home| !home.is_empty()),
+            ) {
+                (Some(recorded), _) => Some(recorded),
+                (None, Some(home)) => {
+                    Some(Path::new(home).join("sidevoice")).filter(|root| root.is_absolute())
+                }
+                (None, None) => Some(layout.home.join(".local/share/sidevoice")),
+            };
+            chosen.into_iter().collect()
         }
     }
 }
@@ -579,17 +589,19 @@ mod tests {
     #[test]
     fn data_and_release_directories_written_with_dots_are_recognised_as_this_installation() {
         let mac = Mac::new();
-        let (_, _, _) = mac.era_a("0.15.0");
-        // `SIDEVOICE_DATA_DIR=~/state/../.sidevoice` and `XDG_DATA_HOME=~/./x/../.local/share`, written as given.
+        // `SIDEVOICE_DATA_DIR=~/state/../.sidevoice` and a non-default `XDG_DATA_HOME=~/./x/../xdg-data`, written as
+        // given; the releases in `$XDG_DATA_HOME/sidevoice`, `current` linked to one.
         let data = mac.home.join("state/../.sidevoice");
-        let releases = mac.home.join("./x/../.local/share/sidevoice");
+        Files::ensure_private_dir(&mac.home.join(".sidevoice")).unwrap();
+        let xdg = mac.home.join("./x/../xdg-data");
+        let real = mac.home.join("xdg-data/sidevoice");
+        mac.release(&real, "0.13.1", "sidevoice-core-rust", true);
+        std::os::unix::fs::symlink(real.join("releases/0.13.1"), real.join("current")).unwrap();
+        let releases = xdg.join("sidevoice");
         let core = releases.join("current/core/bin/sidevoice-core-rust");
         let connector = releases.join("current/bin/sidevoice-connector");
-        let settings = [("XDG_DATA_HOME", path(&mac.home.join("./x/../.local/share")))];
-        let settings: Vec<(&str, &str)> = settings
-            .iter()
-            .map(|(name, value)| (*name, value.as_str()))
-            .collect();
+        let xdg_text = path(&xdg);
+        let settings = [("XDG_DATA_HOME", xdg_text.as_str())];
         let job = core_job(&core, &data, &words(ARGS_0_13, &data), &settings);
         assert_eq!(recognise(Job::Core, &mac.layout, &job), Ok(()));
         let mut connector_job = connector_job(&connector, &data);
@@ -598,10 +610,54 @@ mod tests {
             recognise(Job::Connector, &mac.layout, &connector_job),
             Ok(())
         );
-        // Worked out, the data directory must still be this installation's, and the program inside its releases.
-        let elsewhere = mac.home.join(".sidevoice/../other");
-        let job = core_job(&core, &elsewhere, &words(ARGS_0_13, &elsewhere), &settings);
+
+        // The home's default is not where those releases looked once `XDG_DATA_HOME` named another place.
+        let (_, default_core, _) = mac.era_a("0.13.1");
+        let elsewhere_job = core_job(&default_core, &data, &words(ARGS_0_13, &data), &settings);
+        assert!(recognise(Job::Core, &mac.layout, &elsewhere_job).is_err());
+
+        // Worked out, the data directory must still be this installation's.
+        let other = mac.home.join(".sidevoice/../other");
+        let job = core_job(&core, &other, &words(ARGS_0_13, &other), &settings);
         assert!(recognise(Job::Core, &mac.layout, &job).is_err());
+    }
+
+    #[test]
+    fn xdg_data_home_is_not_where_releases_were_when_install_json_named_another_place() {
+        let mac = Mac::new();
+        let data = mac.home.join(".sidevoice");
+        Files::ensure_private_dir(&data).unwrap();
+        let xdg = mac.home.join("xdg-data");
+        let releases = xdg.join("sidevoice");
+        mac.release(&releases, "0.15.0", "sidevoice-core-rust", true);
+        std::os::unix::fs::symlink(releases.join("releases/0.15.0"), releases.join("current"))
+            .unwrap();
+        let core = releases.join("current/core/bin/sidevoice-core-rust");
+        let xdg_text = path(&xdg);
+        let settings = [("XDG_DATA_HOME", xdg_text.as_str())];
+        let job = core_job(&core, &data, &words(ARGS_0_13, &data), &settings);
+        assert_eq!(
+            recognise(Job::Core, &mac.layout, &job),
+            Ok(()),
+            "no record: XDG"
+        );
+        let record = |releases: &Path| {
+            Files::write_private(
+                &data.join("install.json"),
+                serde_json::json!({"releases": path(releases)})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        };
+        record(&mac.home.join("opt/sidevoice"));
+        assert!(
+            recognise(Job::Core, &mac.layout, &job).is_err(),
+            "the record names another root: only that one"
+        );
+        // A record those releases ignored (not ending in `sidevoice`) leaves XDG chosen.
+        record(&mac.home.join("opt/other"));
+        assert_eq!(recognise(Job::Core, &mac.layout, &job), Ok(()));
     }
     #[test]
     fn arguments_no_release_wrote_are_not_recognised() {
