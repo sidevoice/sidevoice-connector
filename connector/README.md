@@ -152,9 +152,10 @@ cannot be read is `read-package`, never `core.package-missing`. On Windows, wher
 (most often an antivirus scanning it) keeps its directory from being renamed or removed, the renames that publish the
 core and the release, and the removals of an older copy, of a release that did not start and of what a failed stage
 left, are tried again for about 19 s on `ERROR_ACCESS_DENIED` and `ERROR_SHARING_VIOLATION`; a rename still refused
-fails the install with `install.files-busy`, saying the attempts and the time waited. A release that did not start and
-cannot be removed after the rollback stays: `install.rolled-back` (or `install.rollback-failed`) says so with `left`,
-its path, and `left_failure`, the step's keyed failure.
+fails the install with `install.files-busy`, saying the attempts and the time waited. `install.rolled-back` and
+`install.rollback-failed` still mean the release that did not start was deleted. When it could not be (or whether it is
+still there cannot be told), the install fails with `install.rolled-back-left` or `install.rollback-failed-left`
+instead: the same params plus `left`, its path, `left_failure`, the step's keyed failure, and `detail`.
 
 Installing connects no agent. An agent gets Sidevoice only when the person connects it: Connect in the app (which
 calls `agents.connect`), `agents connect <id>`, or their answer to the offer below. Unless `--no-agents`, `install`

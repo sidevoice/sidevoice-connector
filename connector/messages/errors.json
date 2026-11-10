@@ -94,8 +94,8 @@
   "install.step.select": "switching to the new release",
   "install.step.remove-failed-release": "removing the release that did not start",
   "install.verify-failed": "Sidevoice {version} is installed but did not start ({cause}). See `npx sidevoice service status`, or run the install again.",
-  "install.rolled-back": "Sidevoice {version} did not start ({cause}), so this computer is back on {previous}, which is running. {kept}",
-  "install.rolled-back.removed": "Nothing of {version} was kept.",
-  "install.rolled-back.left": "{version} could not be removed ({detail}); it stays, unselected, at {left}, and a later install removes or reuses it.",
-  "install.rollback-failed": "Sidevoice {version} did not start ({cause}), and {previous}, put back in its place, did not start either ({back}). See `npx sidevoice service status`."
+  "install.rolled-back": "Sidevoice {version} did not start ({cause}), so this computer is back on {previous}, which is running. Nothing of {version} was kept.",
+  "install.rolled-back-left": "Sidevoice {version} did not start ({cause}), so this computer is back on {previous}, which is running. {version} could not be removed ({detail}); it stays, unselected, at {left}, and a later install removes or reuses it.",
+  "install.rollback-failed": "Sidevoice {version} did not start ({cause}), and {previous}, put back in its place, did not start either ({back}). See `npx sidevoice service status`.",
+  "install.rollback-failed-left": "Sidevoice {version} did not start ({cause}), and {previous}, put back in its place, did not start either ({back}). {version} could not be removed ({detail}); it stays at {left}. See `npx sidevoice service status`."
 }

@@ -598,12 +598,38 @@ async fn remove_failed(layout: &Layout, id: &str) -> Option<(PathBuf, Value)> {
         Ok(Err(error)) => error,
         Err(error) => failed(error),
     };
-    if fs::symlink_metadata(&release).is_err() {
-        return None;
-    }
+    let stat = fs::symlink_metadata(&release).map(|_| ());
+    left_behind(&release, error, stat)
+}
+
+/// What a removal that failed with `error` left at `release`, given what looking at it said (`stat`): only "not
+/// found" proves it gone. Any other answer leaves whether it is there unknown, so it is said to stay, with the look's
+/// failure.
+fn left_behind(
+    release: &Path,
+    error: anyhow::Error,
+    stat: io::Result<()>,
+) -> Option<(PathBuf, Value)> {
+    let failure = match stat {
+        Err(look) if look.kind() == io::ErrorKind::NotFound => return None,
+        Ok(()) => error,
+        Err(look) => {
+            let removal = crate::messages::keyed(&error).params["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            step::failure(
+                Step::RemoveFailedRelease,
+                release,
+                anyhow::Error::new(look).context(format!(
+                    "removing it said {removal:?}, and whether it is still there cannot be told"
+                )),
+            )
+        }
+    };
     Some((
-        release,
-        crate::messages::keyed(&error).value()["error"].clone(),
+        release.to_path_buf(),
+        crate::messages::keyed(&failure).value()["error"].clone(),
     ))
 }
 
@@ -897,32 +923,29 @@ pub async fn install(
             select(&layout, &back)?;
             let again = start_and_verify(runtime, &layout, &back).await;
             let left = remove_failed(&layout, &id).await;
-            let mut failure = match again {
-                Ok(_) => Keyed::new(
-                    "install.rolled-back",
-                    json!({"version": id, "previous": back, "cause": cause_text(&cause), "failure": cause}),
-                ),
-                Err(back_cause) => Keyed::new(
-                    "install.rollback-failed",
-                    json!({"version": id, "previous": back, "cause": cause_text(&cause), "failure": cause,
-                        "back": cause_text(&back_cause)}),
-                ),
+            // `install.rolled-back` and `install.rollback-failed` keep their meaning: the failed release is gone. When
+            // it stays, the `-left` keys say so, with `left`, its path, `left_failure`, the step's keyed failure
+            // (`install.files-busy` when still held), and `detail`, what that failure said.
+            let mut params = json!({"version": id, "previous": back, "cause": cause_text(&cause),
+                "failure": cause});
+            let key = match (again, &left) {
+                (Ok(_), None) => "install.rolled-back",
+                (Ok(_), Some(_)) => "install.rolled-back-left",
+                (Err(back_cause), left) => {
+                    params["back"] = json!(cause_text(&back_cause));
+                    if left.is_none() {
+                        "install.rollback-failed"
+                    } else {
+                        "install.rollback-failed-left"
+                    }
+                }
             };
-            // Whether the failed release went (`kept`, said by `install.rolled-back`), and where it stays when not:
-            // `left`, its path, and `left_failure`, the step's keyed failure (`install.files-busy` when still held).
-            failure.params["kept"] = json!(match &left {
-                None =>
-                    crate::messages::message("install.rolled-back.removed", &json!({"version": id})),
-                Some((path, refusal)) => crate::messages::message(
-                    "install.rolled-back.left",
-                    &json!({"version": id, "left": path, "detail": refusal["params"]["detail"]}),
-                ),
-            });
             if let Some((path, refusal)) = left {
-                failure.params["left"] = json!(path);
-                failure.params["left_failure"] = refusal;
+                params["left"] = json!(path);
+                params["detail"] = refusal["params"]["detail"].clone();
+                params["left_failure"] = refusal;
             }
-            return Err(failure.into());
+            return Err(keyed(key, params));
         }
     };
     let keep: Vec<&str> = [Some(id.as_str()), previous.as_deref()]
@@ -2046,12 +2069,13 @@ pub(crate) mod tests {
                 Files::ensure_private_dir(&layout.releases_dir().join("1.0.0/bin")).unwrap();
             }
             let package = fixture.package("1.0.0", "a");
-            step::faults::fail_next(fixture.scratch.path(), step, 5);
+            // OS error 1 is not one Windows retries, so a retried step fails at once on every OS.
+            step::faults::fail_next(fixture.scratch.path(), step, 1);
             let error = fixture.install(&package).await.unwrap_err();
             let said = crate::messages::keyed(&error);
             assert_eq!(said.key, "install.step-failed", "{step:?}: {error:#}");
             assert_eq!(said.params["step"], step.id(), "{}", said.params);
-            assert_eq!(said.params["os_error"], 5, "{}", said.params);
+            assert_eq!(said.params["os_error"], 1, "{}", said.params);
             let path = said.params["path"].as_str().unwrap();
             assert!(
                 Path::new(path).starts_with(fixture.scratch.path()),
@@ -2134,26 +2158,96 @@ pub(crate) mod tests {
             .await
             .unwrap_err();
         let said = crate::messages::keyed(&error);
-        assert_eq!(said.key, "install.rolled-back", "{error:#}");
         let text = said.message();
         if cfg!(windows) {
-            // Held once (a sharing violation), then let go: the retry removes it.
+            // Held once (a sharing violation), then let go: the retry removes it, and the stable key says so.
+            assert_eq!(said.key, "install.rolled-back", "{error:#}");
             assert!(said.params.get("left").is_none(), "{}", said.params);
             assert!(text.ends_with("Nothing of 2.0.0 was kept."), "{text}");
             assert!(!release.exists());
         } else {
-            // Tried once off Windows: it stays, and says so.
+            // Tried once off Windows: it stays, said by a key of its own, never by `install.rolled-back`.
+            assert_eq!(said.key, "install.rolled-back-left", "{error:#}");
+            assert_eq!(said.params["previous"], "1.0.0");
             assert_eq!(said.params["left"], release.display().to_string());
             let left = &said.params["left_failure"];
             assert_eq!(left["key"], "install.step-failed", "{left}");
             assert_eq!(left["params"]["step"], "remove-failed-release");
             assert_eq!(left["params"]["os_error"], 32);
+            assert!(text.contains("back on 1.0.0"), "{text}");
             assert!(text.contains("2.0.0 could not be removed"), "{text}");
             assert!(text.contains(&release.display().to_string()), "{text}");
             assert!(!text.contains("Nothing of"), "{text}");
             assert!(release.is_dir());
+
+            // The one before it does not start either: `install.rollback-failed-left`.
+            fixture.fake.lock().unwrap().failing.insert("1.0.0".into());
+            let release = fixture.layout().releases_dir().join("3.0.0");
+            fixture.fake.lock().unwrap().failing.insert("3.0.0".into());
+            step::faults::fail_next(&release, Step::RemoveFailedRelease, 5);
+            let error = fixture
+                .install(&fixture.package("3.0.0", "a"))
+                .await
+                .unwrap_err();
+            let said = crate::messages::keyed(&error);
+            assert_eq!(said.key, "install.rollback-failed-left", "{error:#}");
+            assert_eq!(said.params["left"], release.display().to_string());
+            assert!(said.params["back"].is_string(), "{}", said.params);
+            let text = said.message();
+            assert!(text.contains("3.0.0 could not be removed"), "{text}");
+            assert!(text.contains(&release.display().to_string()), "{text}");
         }
         assert_eq!(fixture.layout().selected_id().as_deref(), Some("1.0.0"));
+    }
+
+    /// Only "not found" proves a release gone after its removal failed; a look that fails otherwise says it stays,
+    /// with that failure.
+    #[test]
+    fn a_release_is_gone_only_when_it_is_not_found() {
+        let release = Path::new("/r/releases/2.0.0");
+        let removal = || {
+            step::failure(
+                Step::RemoveFailedRelease,
+                release,
+                io::Error::from_raw_os_error(5).into(),
+            )
+        };
+        let gone = io::Error::new(io::ErrorKind::NotFound, "gone");
+        assert!(left_behind(release, removal(), Err(gone)).is_none());
+        let (path, failure) = left_behind(release, removal(), Ok(())).unwrap();
+        assert_eq!(path, release);
+        assert_eq!(failure["params"]["os_error"], 5);
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "no look");
+        let (path, failure) = left_behind(release, removal(), Err(denied)).unwrap();
+        assert_eq!(path, release);
+        assert_eq!(failure["key"], "install.step-failed");
+        assert_eq!(failure["params"]["step"], "remove-failed-release");
+        assert_eq!(failure["params"]["kind"], "PermissionDenied");
+        let detail = failure["params"]["detail"].as_str().unwrap();
+        assert!(detail.contains("cannot be told"), "{detail}");
+        assert!(detail.contains("os error 5"), "{detail}");
+    }
+
+    /// What older clients read keeps its meaning: `install.rolled-back` and `install.rollback-failed` say what they
+    /// said before (the failed release is gone), word for word; a release left behind has keys of its own.
+    #[test]
+    fn the_rollback_keys_keep_their_meaning_and_a_left_release_has_its_own() {
+        assert_eq!(
+            crate::messages::message("install.rolled-back", &json!({})),
+            "Sidevoice {version} did not start ({cause}), so this computer is back on {previous}, which is running. Nothing of {version} was kept."
+        );
+        assert_eq!(
+            crate::messages::message("install.rollback-failed", &json!({})),
+            "Sidevoice {version} did not start ({cause}), and {previous}, put back in its place, did not start either ({back}). See `npx sidevoice service status`."
+        );
+        for key in ["install.rolled-back-left", "install.rollback-failed-left"] {
+            let text = crate::messages::message(key, &json!({}));
+            assert!(
+                text.contains("{left}") && text.contains("{detail}"),
+                "{key}: {text}"
+            );
+            assert!(!text.contains("Nothing of"), "{key}: {text}");
+        }
     }
 
     #[tokio::test]
