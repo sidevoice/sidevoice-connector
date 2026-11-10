@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.3](https://github.com/sidevoice/sidevoice-connector/compare/v0.19.2...v0.19.3) (2026-11-10)
+
+
+### Bug Fixes
+
+* **service:** remove the pre-0.19 launchd jobs before starting Sidevoice ([a4fd10c](https://github.com/sidevoice/sidevoice-connector/commit/a4fd10c5fe42882aa6d5824866fe756e7cb4641f))
+
 ## [0.19.2](https://github.com/sidevoice/sidevoice-connector/compare/v0.19.1...v0.19.2) (2026-11-10)
 
 
