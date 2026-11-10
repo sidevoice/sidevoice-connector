@@ -146,12 +146,15 @@ again.
 
 A file operation that fails while the release is put in place says which step and where (`src/step.rs`):
 `install.step-failed`, with `step` (`install-dir`, `read-package`, `remove-old-release`, `releases-dir`, `stage-dir`,
-`copy-connector`, `check-connector`, `copy-background`, `unpack-core`, `publish-core`, `publish-release`, `select`;
-the set only grows), `path`, `os_error`, `kind` and `detail`. On Windows, where a program that has a new file open
+`copy-connector`, `check-connector`, `copy-background`, `unpack-core`, `publish-core`, `publish-release`, `select`,
+`remove-failed-release`; the set only grows), `path`, `os_error`, `kind` and `detail`. A package file that is there but
+cannot be read is `read-package`, never `core.package-missing`. On Windows, where a program that has a new file open
 (most often an antivirus scanning it) keeps its directory from being renamed or removed, the renames that publish the
-core and the release, and the removals of an older copy and of what a failed stage left, are tried again for about
-19 s on `ERROR_ACCESS_DENIED` and `ERROR_SHARING_VIOLATION`; still refused, the install fails with
-`install.files-busy`, saying the attempts and the time waited.
+core and the release, and the removals of an older copy, of a release that did not start and of what a failed stage
+left, are tried again for about 19 s on `ERROR_ACCESS_DENIED` and `ERROR_SHARING_VIOLATION`; a rename still refused
+fails the install with `install.files-busy`, saying the attempts and the time waited. A release that did not start and
+cannot be removed after the rollback stays: `install.rolled-back` (or `install.rollback-failed`) says so with `left`,
+its path, and `left_failure`, the step's keyed failure.
 
 Installing connects no agent. An agent gets Sidevoice only when the person connects it: Connect in the app (which
 calls `agents.connect`), `agents connect <id>`, or their answer to the offer below. Unless `--no-agents`, `install`

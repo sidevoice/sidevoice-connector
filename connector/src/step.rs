@@ -47,10 +47,12 @@ pub enum Step {
     PublishRelease,
     /// Writing the records that select the release.
     Select,
+    /// Removing a release that did not start, once the one before it is back.
+    RemoveFailedRelease,
 }
 
 impl Step {
-    pub const ALL: [Step; 12] = [
+    pub const ALL: [Step; 13] = [
         Step::InstallDir,
         Step::ReadPackage,
         Step::RemoveOldRelease,
@@ -63,6 +65,7 @@ impl Step {
         Step::PublishCore,
         Step::PublishRelease,
         Step::Select,
+        Step::RemoveFailedRelease,
     ];
 
     /// The stable id a client reads (`params.step`).
@@ -80,6 +83,7 @@ impl Step {
             Step::PublishCore => "publish-core",
             Step::PublishRelease => "publish-release",
             Step::Select => "select",
+            Step::RemoveFailedRelease => "remove-failed-release",
         }
     }
 
@@ -238,17 +242,38 @@ fn refused(step: Step, path: &Path, refused: Refused) -> anyhow::Error {
     Keyed::new(key, params).into()
 }
 
-/// Says a failure as the step's: `result.at_step(Step::…, path)?`.
+/// Says a failure as the step's: `result.at_step(Step::…, path)?`. Where the operation is a closure, [`attempt`] is
+/// preferred: a test can make it fail there instead of running it.
 pub trait AtStep<T> {
     fn at_step(self, step: Step, path: &Path) -> Result<T>;
 }
 
 impl<T, E: Into<anyhow::Error>> AtStep<T> for std::result::Result<T, E> {
     fn at_step(self, step: Step, path: &Path) -> Result<T> {
-        let result = self.map_err(|error| failure(step, path, error.into()));
-        #[cfg(test)]
-        let result = faults::inject(step, path, result);
-        result
+        self.map_err(|error| failure(step, path, error.into()))
+    }
+}
+
+/// The failure a unit test asked for at `step` on `path`, instead of the operation; never one outside the tests.
+pub fn injected(step: Step, path: &Path) -> Option<io::Error> {
+    #[cfg(test)]
+    return faults::take(step, path);
+    #[cfg(not(test))]
+    {
+        let _ = (step, path);
+        None
+    }
+}
+
+/// `op` at `step` on `path`, its failure keyed: `step::attempt(Step::…, path, || …)?`.
+pub fn attempt<T, E: Into<anyhow::Error>>(
+    step: Step,
+    path: &Path,
+    op: impl FnOnce() -> std::result::Result<T, E>,
+) -> Result<T> {
+    match injected(step, path) {
+        Some(error) => Err(failure(step, path, error.into())),
+        None => op().at_step(step, path),
     }
 }
 
@@ -257,24 +282,28 @@ pub fn retried<T>(step: Step, path: &Path, op: impl FnMut() -> io::Result<T>) ->
     retried_with(&Retry::platform(), step, path, op, std::thread::sleep)
 }
 
-/// [`retried`], with the policy and the wait given.
+/// [`retried`], with the policy and the wait given. A failure a test asks for is met at an attempt, in place of the
+/// operation, and goes through the same policy.
 pub fn retried_with<T>(
     retry: &Retry,
     step: Step,
     path: &Path,
-    op: impl FnMut() -> io::Result<T>,
+    mut op: impl FnMut() -> io::Result<T>,
     pause: impl FnMut(Duration),
 ) -> Result<T> {
-    let result = retry
-        .run(op, pause)
-        .map_err(|refusal| refused(step, path, refusal));
-    #[cfg(test)]
-    let result = faults::inject(step, path, result);
-    result
+    retry
+        .run(
+            || match injected(step, path) {
+                Some(error) => Err(error),
+                None => op(),
+            },
+            pause,
+        )
+        .map_err(|refusal| refused(step, path, refusal))
 }
 
-/// Failures the unit tests make happen at a step, for paths below a root of their own (each test has its scratch
-/// directory, so tests running at once never meet another's).
+/// Failures the unit tests make happen at a step, in place of its operation, for paths below a root of their own
+/// (each test has its scratch directory, so tests running at once never meet another's).
 #[cfg(test)]
 pub(crate) mod faults {
     use super::*;
@@ -283,7 +312,7 @@ pub(crate) mod faults {
 
     static FAULTS: Mutex<Vec<(PathBuf, Step, i32)>> = Mutex::new(Vec::new());
 
-    /// The next time `step` is passed on a path below `root`, it fails with OS error `code`.
+    /// The next time `step` is attempted on `root` or a path below it, it fails with OS error `code` instead.
     pub fn fail_next(root: &Path, step: Step, code: i32) {
         FAULTS
             .lock()
@@ -291,20 +320,13 @@ pub(crate) mod faults {
             .push((root.to_path_buf(), step, code));
     }
 
-    pub(super) fn inject<T>(step: Step, path: &Path, result: Result<T>) -> Result<T> {
+    pub(super) fn take(step: Step, path: &Path) -> Option<io::Error> {
         let mut faults = FAULTS.lock().unwrap();
-        let Some(at) = faults
+        let at = faults
             .iter()
-            .position(|(root, at, _)| *at == step && path.starts_with(root))
-        else {
-            return result;
-        };
+            .position(|(root, at, _)| *at == step && path.starts_with(root))?;
         let (_, _, code) = faults.remove(at);
-        Err(failure(
-            step,
-            path,
-            io::Error::from_raw_os_error(code).into(),
-        ))
+        Some(io::Error::from_raw_os_error(code))
     }
 }
 
