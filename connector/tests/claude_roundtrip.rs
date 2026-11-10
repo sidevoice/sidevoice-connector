@@ -23,12 +23,28 @@
 //! ```
 //!
 //! Settings (environment):
-//! - `SIDEVOICE_TEST_CLAUDE_BIN`: the `claude` program (default: `claude` on `PATH`, else `~/.local/bin/claude`).
+//! - `SIDEVOICE_TEST_CLAUDE_BIN`: the `claude` program (default: `claude` / `claude.exe` on `PATH`, else
+//!   `~/.local/bin/claude`).
+//! - `SIDEVOICE_TEST_CLAUDE_MODEL`: the model to run (default `haiku`, the cheapest).
+//!
+//! Credentials, in order of preference. **Use a dedicated credential**: `CLAUDE_CODE_OAUTH_TOKEN` (from
+//! `claude setup-token`, a long-lived token that is never refreshed) or `ANTHROPIC_API_KEY`. Whichever is set is
+//! passed through to `claude` alone (never to the core, the connector or the MCP server), and nothing is copied.
+//!
+//! Otherwise the test falls back to copying a login:
 //! - `SIDEVOICE_TEST_CLAUDE_CONFIG_DIR`: a Claude Code configuration directory logged in to the test account
 //!   (default `$CLAUDE_CONFIG_DIR`, else `~/.claude`). Only its `.credentials.json` is copied into the test's private
 //!   profile; the real configuration, `~/.claude.json` and its MCP servers are never touched. Where Claude Code keeps
 //!   its login in the OS keychain (macOS) there is no such file: point this at a directory holding one.
-//! - `SIDEVOICE_TEST_CLAUDE_MODEL`: the model to run (default `haiku`, the cheapest).
+//!
+//! The risk of the copy: OAuth refresh tokens rotate. If Claude Code refreshed the access token inside the copy, the
+//! refresh token in the user's real `.credentials.json` would be dead and their real login would end. So the copy is
+//! refused (the test panics before starting) when its access token expires within two hours, which leaves no
+//! refresh during the test. The copy lives in the test's private profile under the temporary directory and is removed
+//! with it when the test ends. It cannot be deleted earlier: Claude Code reads the file again for later requests (the
+//! second turn failed to start when it was deleted after the first). A test process that is killed leaves it behind,
+//! so delete the profile directory (`svclaudert-*`, under the temporary directory) if so, or avoid the copy with
+//! `CLAUDE_CODE_OAUTH_TOKEN`.
 mod support;
 
 use serde_json::{json, Value};
@@ -36,7 +52,7 @@ use sidevoice_connector::platform::env::Env as _;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 use support::*;
 
@@ -52,11 +68,32 @@ fn claude_program() -> PathBuf {
         return program.into();
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
+    let name = format!("claude{}", std::env::consts::EXE_SUFFIX);
     std::env::split_paths(&path)
-        .map(|dir| dir.join("claude"))
-        .chain([home().join(".local/bin/claude")])
+        .map(|dir| dir.join(&name))
+        .chain([home().join(".local/bin").join(&name)])
         .find(|candidate| candidate.is_file())
         .expect("no `claude` on PATH: set SIDEVOICE_TEST_CLAUDE_BIN")
+}
+
+/// How the session authenticates.
+enum Login {
+    /// A dedicated credential from the environment: (variable, value), passed to `claude` alone.
+    Env(&'static str, std::ffi::OsString),
+    /// A copy of a logged-in `.credentials.json`.
+    Copy(PathBuf),
+}
+
+/// Two hours: a copied login must outlive the test by this much, so Claude Code never refreshes it.
+const MIN_LOGIN_LIFE_MS: u128 = 2 * 60 * 60 * 1000;
+
+fn login() -> Login {
+    for variable in ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"] {
+        if let Some(value) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
+            return Login::Env(variable, value);
+        }
+    }
+    Login::Copy(logged_in_config())
 }
 
 fn logged_in_config() -> PathBuf {
@@ -68,6 +105,28 @@ fn logged_in_config() -> PathBuf {
     assert!(
         credentials.is_file(),
         "no login at {}: log in with `claude auth login` or set SIDEVOICE_TEST_CLAUDE_CONFIG_DIR",
+        credentials.display()
+    );
+    let text = std::fs::read_to_string(&credentials).expect("read the login");
+    let parsed: Value = serde_json::from_str(&text).expect("the login is JSON");
+    let expires = parsed
+        .pointer("/claudeAiOauth/expiresAt")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| {
+            panic!(
+                "{} has no claudeAiOauth.expiresAt: set CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`) instead",
+                credentials.display()
+            )
+        }) as u128;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    assert!(
+        expires > now + MIN_LOGIN_LIFE_MS,
+        "the login at {} expires in under two hours: Claude Code would refresh it inside the copy and rotate the \
+         refresh token, ending your real login. Run `claude` once to refresh it, or set CLAUDE_CODE_OAUTH_TOKEN \
+         (`claude setup-token`) or ANTHROPIC_API_KEY instead",
         credentials.display()
     );
     credentials
@@ -85,9 +144,12 @@ struct Session {
 
 impl Session {
     fn start(profile: &Profile, model: &str) -> Self {
-        let credentials = logged_in_config();
         let config = profile.root.join("claude");
-        std::fs::copy(credentials, config.join(".credentials.json")).expect("copy the login");
+        let login = login();
+        let credentials = config.join(".credentials.json");
+        if let Login::Copy(source) = &login {
+            std::fs::copy(source, &credentials).expect("copy the login");
+        }
         std::fs::write(
             config.join(".claude.json"),
             r#"{"hasCompletedOnboarding":true,"theme":"dark"}"#,
@@ -107,8 +169,11 @@ impl Session {
         )
         .unwrap();
 
-        let mut child = profile
-            .command(claude_program())
+        let mut command = profile.command(claude_program());
+        if let Login::Env(variable, value) = &login {
+            command.env(variable, value);
+        }
+        let mut child = command
             .args([
                 "-p",
                 "--input-format",
@@ -158,10 +223,18 @@ impl Session {
     fn finish_turn(&mut self, seconds: u64) -> Value {
         let deadline = Instant::now() + Duration::from_secs(seconds);
         loop {
-            let value = self
+            let value = match self
                 .lines
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .expect("claude's turn did not end");
+            {
+                Ok(value) => value,
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!("claude's turn did not end in {seconds} s")
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("claude exited before its turn ended")
+                }
+            };
             if value["type"] == "system" && value["subtype"] == "init" {
                 self.id = value["session_id"].as_str().map(str::to_owned);
             }
@@ -218,7 +291,7 @@ fn a_message_through_the_core_reaches_a_real_claude_session_and_its_reply_comes_
     assert_eq!(joined["harness"], "claude", "{joined}");
     assert_eq!(joined["delivery"]["kind"], "claude-uds", "{joined}");
     // Settled: the turn above is over, so what follows is the working state of the delivered message alone.
-    until("the connector reports the session idle", 30, || {
+    until("the connector reports the session idle", 90, || {
         (binding(&profile, &thread)?["working"] == false).then_some(())
     });
 
@@ -246,7 +319,8 @@ fn a_message_through_the_core_reaches_a_real_claude_session_and_its_reply_comes_
     assert_eq!(accepted["accepted"], true, "{accepted}");
 
     // Working goes true, the token comes back through voice_say, and working goes false again.
-    let mut working = Vec::new();
+    // Seeded with the settled state; only samples taken after the injection are added.
+    let mut working = vec![false];
     let deadline = Instant::now() + Duration::from_secs(120);
     let (mut said, mut turn_over) = (None, false);
     while Instant::now() < deadline && !(said.is_some() && turn_over) {
@@ -267,7 +341,10 @@ fn a_message_through_the_core_reaches_a_real_claude_session_and_its_reply_comes_
     let said =
         said.unwrap_or_else(|| panic!("the token {token} never came back; working: {working:?}"));
     assert_eq!(said["thread"], thread.as_str(), "{said}");
-    assert!(working.ends_with(&[true, false]), "working was {working:?}");
+    assert!(
+        working.starts_with(&[false, true]) && working.ends_with(&[true, false]),
+        "working was {working:?}: the injected turn should take it from idle to working to idle"
+    );
 
     // The core confirmed the delivery: the connector read the message into the session.
     let delivered = history(&profile, &call, &thread)
@@ -279,7 +356,10 @@ fn a_message_through_the_core_reaches_a_real_claude_session_and_its_reply_comes_
     assert_eq!(delivered["status"], "read", "{delivered}");
 
     // The model the connector reports is the one Claude Code ran.
-    let engine = binding(&profile, &thread).unwrap()["engine"].clone();
+    let engine = until("the connector reports the model", 15, || {
+        let engine = binding(&profile, &thread)?["engine"].clone();
+        engine["model"].is_string().then_some(engine)
+    });
     let reported = engine["model"].as_str().unwrap_or_default();
     assert!(reported.starts_with("claude-"), "{engine}");
     session.finish_turn(60);
