@@ -28,7 +28,10 @@ publish | npm | npm-smoke | npm-publish`):
   `target/codex`. Without them the tests that need them are skipped locally and fail in CI.
 - `cargo test --locked` runs the unit tests and the integration tests in `connector/tests/`: the
   connector against the real core, registration with the real Codex CLI, and (macOS) the login service under the
-  real launchd.
+  real launchd. The real-Claude round trip (`claude_roundtrip.rs`) is `#[ignore]`d: it uses a real account, so it never
+  runs here; run it by name before a release or a change to the harness adapters (credentials and setup are in its
+  header):
+  `cargo test -p sidevoice-connector --test claude_roundtrip -- --ignored --nocapture`.
 - `cargo xtask dist` builds this machine's release binary and packages it exactly as the release does, with the
   pinned core release's archive for this machine (fetched and checked as `fixtures` checks it), then verifies the
   archive by unpacking it elsewhere and running the connector from there: its version and build identity, and
