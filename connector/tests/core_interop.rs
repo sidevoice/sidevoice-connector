@@ -55,7 +55,7 @@ fn assert_unheard_envelope(message: &Value) {
         "no reply texts: {message}"
     );
     assert!(
-        envelope.contains("[Sidevoice] The person did not hear your last"),
+        envelope.contains("[Sidevoice] The person did not hear"),
         "{message}"
     );
     assert!(

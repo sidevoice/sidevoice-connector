@@ -345,7 +345,10 @@ data directory keeps, per conversation, each id it handed over as `accepted` (th
 may have reached it) or `received` (the agent has it in the conversation, as its harness tells). A message offered
 again is answered from that record (`accepted`, with `received: true` when it is), and the core's question is
 answered from it too: `received` names the ids the agent has, `unknown` the ids never handed over, which the core
-offers again. The record survives a restart (at most 256 ids per conversation, 1024 conversations). `input.read` is
+offers again. The record survives a restart (at most 256 ids per conversation, and 1024 conversations, the one used
+least recently dropped first); a conversation closed from the room drops its record, and an id too long to keep is
+refused before it is handed over. A message the agent took while the connector was down is still seen: each harness
+follows its transcript or rollout from the start the first time it is asked about a conversation. `input.read` is
 still sent the moment the harness sees a message; it is not retried, since the core's next question recovers it.
 
 The local speech outbox is synced to disk. Core's `text_saved: true` acknowledges admission into its current-process
