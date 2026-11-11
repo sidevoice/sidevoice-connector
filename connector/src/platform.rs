@@ -9,6 +9,7 @@
 
 pub mod advertised;
 pub mod architecture;
+pub mod deferred;
 pub mod env;
 pub mod file_stamp;
 pub mod foreign;

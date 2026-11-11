@@ -14,8 +14,8 @@
 //! No `unsafe` here: `std`'s `OpenOptionsExt` sets the sharing and the flags, `winapi-util` reads the file id.
 
 use super::{
-    foreign, recovery_program, recovery_record, DataDir, Removal, Roots, CLAIM, RECORD,
-    RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
+    foreign, recovery_program, recovery_record, DataDir, ReleasesError, Removal, Roots, CLAIM,
+    RECORD, RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
 };
 use crate::platform::fs::{Access, Create, Directory, Files, Fs, HeldDirectory};
 use sidevoice_platform::removal::Removal as _;
@@ -393,9 +393,10 @@ impl Removal for Os {
         Ok(removed)
     }
 
-    fn remove_releases(&self) -> Result<(), &'static str> {
+    fn remove_releases(&self) -> Result<(), ReleasesError> {
         let (_held, claim) = self.private_child(CLAIM)?;
         let releases = &self.roots.releases;
+        let mut mine = None;
         if exists(releases)? {
             let parent = releases.parent().ok_or("unsafe uninstall root")?;
             let _parents = self.hold_down_to(parent)?;
@@ -406,6 +407,7 @@ impl Removal for Os {
                 releases.file_name().ok_or("unsafe uninstall root")?,
                 &|_| {},
             )?;
+            mine = Some(claimed);
         }
         let selected: Vec<_> = names(&claim)?
             .into_iter()
@@ -414,7 +416,7 @@ impl Removal for Os {
         let held = HeldDirectory::open(&claim, Access::Private)
             .map_err(|_| "unsafe uninstall claim directory")?;
         held.remove_contents(&selected.iter().map(OsString::as_os_str).collect::<Vec<_>>())
-            .map_err(|_| "cannot remove claimed releases")?;
+            .map_err(|_| ReleasesError::after_claim("cannot remove claimed releases", mine))?;
         Ok(())
     }
 
