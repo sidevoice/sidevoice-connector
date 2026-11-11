@@ -54,51 +54,19 @@ pub(super) fn write_conversation_guard(file: &mut fs::File, state: u8) -> Result
     Ok(())
 }
 
-/// The speech waiting for the core, as this connector writes it: every row a speech of a conversation (its event,
-/// binding, conversation reference, utterance and text). A row of any other shape makes the outbox invalid.
-/// What was handed to each conversation's harness, by thread: the message and what the harness answered, oldest
-/// first. A record that does not parse is a record lost (a message may then be handed over once more), never a
-/// connector that cannot start.
-pub(super) fn read_delivered(
-    path: &Path,
-) -> std::collections::HashMap<String, std::collections::VecDeque<(String, String)>> {
-    let Ok(Some(bytes)) = Files::read_private(path, 8 << 20) else {
-        return Default::default();
-    };
-    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
-        return Default::default();
-    };
-    // Only what the connector itself writes is believed: a bounded id and an answer that means "handed over".
-    value
-        .as_object()
-        .into_iter()
+/// The per-id record of what was handed to each conversation's harness (`record.rs`). A record that cannot be read or
+/// does not parse is a record lost (a message may then be handed over once more), never a connector that cannot start.
+pub(super) fn read_delivered(path: &Path) -> super::Record {
+    Files::read_private(path, 8 << 20)
+        .ok()
         .flatten()
-        .take(super::DELIVERED_THREADS)
-        .map(|(thread, rows)| {
-            let mut rows: std::collections::VecDeque<(String, String)> = rows
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|row| {
-                    let id = row
-                        .get(0)?
-                        .as_str()
-                        .filter(|id| !id.is_empty() && id.len() <= super::DELIVERED_ID_MAX)?;
-                    let status = row
-                        .get(1)?
-                        .as_str()
-                        .filter(|status| matches!(*status, "accepted" | "unknown"))?;
-                    Some((id.to_owned(), status.to_owned()))
-                })
-                .collect();
-            while rows.len() > super::DELIVERED_PER_THREAD {
-                rows.pop_front();
-            }
-            (thread.clone(), rows)
-        })
-        .collect()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .map(|value| super::Record::from_json(&value))
+        .unwrap_or_default()
 }
 
+/// The speech waiting for the core, as this connector writes it: every row a speech of a conversation (its event,
+/// binding, conversation reference, utterance and text). A row of any other shape makes the outbox invalid.
 pub(super) fn read_outbox(path: &Path) -> Result<Vec<Value>> {
     let Some(bytes) = Files::read_private(path, 8 << 20)? else {
         return Ok(Vec::new());

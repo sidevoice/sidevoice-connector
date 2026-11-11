@@ -471,7 +471,7 @@ async fn write(socket: &str, token: &str, event: &Value) -> Result<Sent> {
     socket.write_all(b"\n").await?;
     let mut peer = Vec::new();
     match tokio::time::timeout(Duration::from_millis(1500), socket.read_to_end(&mut peer)).await {
-        Err(_) => Ok(Sent::Unconfirmed),
+        Err(_) => Ok(Sent::Accepted),
         Ok(Ok(_)) => Ok(Sent::Refused(Limit::Failed(
             "Claude Code inbox closed before confirming delivery".into(),
         ))),

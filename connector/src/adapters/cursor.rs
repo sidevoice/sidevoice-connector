@@ -1173,7 +1173,7 @@ async fn type_into(chat: &str, event: &Value) -> Result<Sent> {
     if !entered.status.success() {
         bail!("tmux could not send the voice message");
     }
-    Ok(Sent::Unconfirmed)
+    Ok(Sent::Accepted)
 }
 
 #[cfg(test)]

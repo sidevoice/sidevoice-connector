@@ -341,6 +341,19 @@ Codex never passes the thread to an MCP server through its environment. Older Co
 those need `CODEX_THREAD_ID` in the registration's environment. A queued message can be accepted before Codex reads
 it; the connector sends `input.read` only after the same message appears in that thread's rollout.
 
+Delivery is at least once, and the core is the only side that retries: it offers a message (`input.deliver`) until
+the connector answers `accepted`, then asks in batch (`input.received {binding_id, message_ids}`) until the
+connector names it received. The connector never hands the agent the same message id twice: `delivered.json` in the
+data directory keeps, per conversation, each id it handed over as `accepted` (the agent's inbox took it, or a write
+may have reached it) or `received` (the agent has it in the conversation, as its harness tells). A message offered
+again is answered from that record (`accepted`, with `received: true` when it is), and the core's question is
+answered from it too: `received` names the ids the agent has, `unknown` the ids never handed over, which the core
+offers again. The record survives a restart (at most 256 ids per conversation, and 1024 conversations, the one used
+least recently dropped first); a conversation closed from the room drops its record, and an id too long to keep is
+refused before it is handed over. A message the agent took while the connector was down is still seen: each harness
+follows its transcript or rollout from the start the first time it is asked about a conversation. `input.read` is
+still sent the moment the harness sees a message; it is not retried, since the core's next question recovers it.
+
 The local speech outbox is synced to disk. Core's `text_saved: true` acknowledges admission into its current-process
 journal, which the core keeps in memory; the connector removes an outbox item on that acknowledgement, so a core
 crash immediately afterwards can lose that speech text ([Core issue #43](https://github.com/sidevoice/sidevoice-core/issues/43)).

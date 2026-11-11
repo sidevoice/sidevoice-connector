@@ -20,7 +20,7 @@ When it starts, it:
 The page lists the conversations that joined (harness, input mode, engine, live or closed). Pick one and type: the
 text goes into the call as voice input (`/api/presentation/select`, then `/api/presentation/text`, which is what the
 app sends for what was said), so the agent receives it with its voice header and `[Sidevoice]` line. Each message
-shows its receipt as the core records it (`pending`, `delivered`, `unconfirmed`, `read`, `not_sent`), the agent's
+shows its receipt as the core records it (`pending`, `delivered`, `read`, `not_sent`), the agent's
 `voice_say` replies appear under it, and the call's events (receipts, working state, speech) are listed beside.
 
 Pointing an agent at it (the paths are printed by the test bench; `P` is the profile). The agent runs with the profile's
