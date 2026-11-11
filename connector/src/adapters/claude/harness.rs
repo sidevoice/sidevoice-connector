@@ -1,11 +1,12 @@
-//! Claude Code as a harness: voice through its messaging socket, the transcript and session record followed.
+//! Claude Code as a harness: a session is found by the environment Claude Code starts its MCP server with (the session,
+//! where Claude Code keeps its state, its own process), reached through the inbox the process's session record names,
+//! and followed through that record and its transcript.
 
-use super::{assistant_engine, assistant_model, session_engine, transcript_path, working_state};
-use crate::adapters::conversation::{report_working, Conversation, Reporter};
-use crate::adapters::harness::{no_route, Harness, Route};
+use super::{agent_home, agent_process, assistant_engine, assistant_model, Session};
+use crate::adapters::harness::{Agent, CallContext, Conversation, Harness, Sent, State};
 use crate::adapters::registration::Registration;
 use crate::adapters::transcript::{self, Observed, TranscriptReader};
-use crate::profile::Profile;
+use crate::adapters::watch::{Watch, Watches};
 use anyhow::Result;
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
@@ -27,89 +28,114 @@ fn now_ms() -> u64 {
         .map_or(1, |d| d.as_millis() as u64)
 }
 
-pub struct Claude;
+/// When the last entry of a session's open turn was written, in epoch milliseconds; 0 when none is open.
+#[derive(Default)]
+pub struct OpenTurn(AtomicU64);
 
-impl Harness for Claude {
+/// Claude Code's sessions, as the connector follows them.
+#[derive(Default)]
+pub struct Sessions {
+    watches: Watches<OpenTurn>,
+}
+
+impl Sessions {
+    fn watch(&self, conversation: &Conversation) -> Arc<Watch<OpenTurn>> {
+        let session = Session::of(conversation);
+        self.watches.get(&conversation.id, |watch| {
+            if let Some(engine) = session.engine() {
+                watch.set_engine(engine);
+            }
+            follow(watch.clone(), session.clone());
+        })
+    }
+}
+
+impl Harness for Sessions {
     fn id(&self) -> &'static str {
         "claude"
     }
 
-    fn capabilities(&self) -> Value {
-        super::capabilities()
+    fn registration(&self) -> &dyn Registration {
+        &super::Claude
     }
 
-    fn homes(&self) -> &'static [crate::profile::AgentHome] {
-        std::slice::from_ref(&super::HOME)
+    /// Claude Code names the session, and that it has an inbox for messages, in its MCP server's environment.
+    fn identify(&self, call: &CallContext) -> Result<Option<Conversation>> {
+        let (Some(id), Some(_)) = (
+            call.var("CLAUDE_CODE_SESSION_ID"),
+            call.var("CLAUDE_CODE_MESSAGING_SOCKET"),
+        ) else {
+            return Ok(None);
+        };
+        let env = |name: &str| call.var(name);
+        let home = agent_home(env);
+        let pid = home.as_deref().and_then(|home| agent_process(home, env));
+        Ok(Some(Conversation {
+            harness: self.id().into(),
+            id,
+            agent: Agent { pid, home },
+        }))
     }
 
-    fn registration(&self) -> Option<&dyn Registration> {
-        Some(self)
-    }
-
-    fn accepts(&self, delivery: &Value, thread: &str) -> Route {
-        match delivery.get("kind").and_then(Value::as_str) {
-            Some("claude-uds") => {
-                Route::known(delivery.get("socket").and_then(Value::as_str).is_some())
-            }
-            _ => crate::adapters::http::accepts(delivery, thread),
-        }
-    }
-
-    fn deliver<'a>(
+    fn send<'a>(
         &'a self,
         conversation: &'a Conversation,
-        frame: &'a Value,
-        _profile: &'a Profile,
-    ) -> BoxFuture<'a, Result<Value>> {
+        message: &'a Value,
+    ) -> BoxFuture<'a, Sent> {
+        Box::pin(async move { super::send(&Session::of(conversation), message).await })
+    }
+
+    fn state<'a>(&'a self, conversation: &'a Conversation) -> BoxFuture<'a, State> {
         Box::pin(async move {
-            match conversation.route_kind() {
-                Some("claude-uds") => super::deliver(&conversation.delivery, frame).await,
-                Some("http") => crate::adapters::http::deliver(&conversation.delivery, frame).await,
-                _ => Ok(no_route(&conversation.thread)),
-            }
+            // Asked afresh each time: a session whose settings were fixed takes messages at once.
+            let watch = self.watch(conversation);
+            watch.set_inbound(Session::of(conversation).inbound());
+            watch.state()
         })
     }
 
-    fn watch(&self, conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
-        if conversation.route_kind() != Some("claude-uds") {
-            return;
-        }
-        let turn = Arc::new(AtomicU64::new(0));
-        transcript::follow(
-            conversation.clone(),
-            reporter.clone(),
-            Reader {
-                session: conversation.thread.clone(),
-                turn: turn.clone(),
-            },
-        );
-        watch_working(conversation, reporter, turn);
+    fn received<'a>(
+        &'a self,
+        conversation: &'a Conversation,
+        ids: &'a [String],
+    ) -> BoxFuture<'a, Vec<String>> {
+        Box::pin(async move { self.watch(conversation).received(ids) })
     }
 }
 
+/// Follows the session: its transcript, followed again when the process moves to another session (`/clear`), and its
+/// working state.
+///
 /// Working state: the session record says busy, or the transcript holds a turn open (a message in, no final answer
 /// yet) and was written to lately. The record alone reads idle between a message arriving and the turn starting, and
-/// between tool calls. Reported working at once, idle once it has held for [`IDLE_DEBOUNCE`].
-fn watch_working(
-    conversation: Arc<Conversation>,
-    reporter: Arc<dyn Reporter>,
-    turn: Arc<AtomicU64>,
-) {
+/// between tool calls. Working at once, idle once it has held for [`IDLE_DEBOUNCE`].
+fn follow(watch: Arc<Watch<OpenTurn>>, session: Session) {
     tokio::spawn(async move {
-        let mut reported = None;
         let mut idle_since = Instant::now();
-        while !conversation.stopped.load(Ordering::Relaxed) {
-            let open = turn.load(Ordering::Relaxed);
-            let working = working_state(&conversation.thread) == Some(true)
+        let mut followed: Option<String> = None;
+        while !watch.stopped() {
+            let current = session
+                .record()
+                .and_then(|record| record.session_id().map(str::to_owned))
+                .unwrap_or_else(|| session.id().to_owned());
+            if followed.as_deref() != Some(current.as_str()) {
+                transcript::follow(
+                    watch.clone(),
+                    Reader {
+                        session: session.clone(),
+                        followed: current.clone(),
+                        watch: watch.clone(),
+                    },
+                );
+                followed = Some(current);
+            }
+            let open = watch.extra.0.load(Ordering::Relaxed);
+            let working = session.working() == Some(true)
                 || (open > 0 && now_ms().saturating_sub(open) < OPEN_TURN_MS);
             if working {
                 idle_since = Instant::now();
             }
-            let state = working || idle_since.elapsed() < IDLE_DEBOUNCE;
-            if reported != Some(state) {
-                report_working(&*reporter, &conversation, state).await;
-                reported = Some(state);
-            }
+            watch.set_working(working || idle_since.elapsed() < IDLE_DEBOUNCE);
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
     });
@@ -138,27 +164,34 @@ fn turn_signal(item: &Value) -> Option<bool> {
     }
 }
 
-/// A session's transcript: the engine of each assistant entry, and the messages read.
+/// The transcript of the session the process runs (`followed`): the engine of each assistant entry, the open turn, and
+/// the messages read. Followed while the process runs that session.
 struct Reader {
-    session: String,
-    /// When the last entry of the open turn was written, in epoch milliseconds; 0 when none is open.
-    turn: Arc<AtomicU64>,
+    session: Session,
+    followed: String,
+    watch: Arc<Watch<OpenTurn>>,
 }
 
 impl TranscriptReader for Reader {
     fn path(&self) -> Option<PathBuf> {
-        transcript_path(&self.session)
+        self.session.transcript(&self.followed)
     }
 
-    fn item(&mut self, item: &Value, _authenticated: bool) -> Vec<Observed> {
+    fn current(&self) -> bool {
+        self.session
+            .record()
+            .is_none_or(|record| record.session_id().is_none_or(|id| id == self.followed))
+    }
+
+    fn item(&mut self, item: &Value) -> Vec<Observed> {
         let mut observed = Vec::new();
         match turn_signal(item) {
-            Some(true) => self.turn.store(now_ms(), Ordering::Relaxed),
-            Some(false) => self.turn.store(0, Ordering::Relaxed),
+            Some(true) => self.watch.extra.0.store(now_ms(), Ordering::Relaxed),
+            Some(false) => self.watch.extra.0.store(0, Ordering::Relaxed),
             None => {}
         }
         if assistant_model(item).is_some() {
-            let launch = session_engine(&self.session).unwrap_or_else(|| json!({}));
+            let launch = self.session.engine().unwrap_or_else(|| json!({}));
             if let Some(engine) = assistant_engine(item, &launch) {
                 observed.push(Observed::Engine(engine));
             }

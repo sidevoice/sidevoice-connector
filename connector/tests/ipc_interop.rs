@@ -1,6 +1,6 @@
 //! The IPC over `connector.sock` as a façade of another version speaks it, against the daemon with its real harnesses
-//! (sidevoice/sidevoice-core#112): a route kind this daemon does not know joins the conversation with no route in,
-//! instead of refusing it, and an optional field sent as `null` reads as absent.
+//! (sidevoice/sidevoice-core#112): fields this daemon does not know (an older façade's route and capabilities) are
+//! ignored, and an optional field sent as `null` reads as absent.
 // A façade of another version speaks the wire raw, so it opens the local endpoint itself.
 #![allow(clippy::disallowed_types)]
 
@@ -47,11 +47,10 @@ fn binding<'a>(status: &'a Value, client_ref: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("{client_ref} not listed: {status}"))
 }
 
-/// A newer façade names a route kind Claude Code's harness does not know: the conversation joins with no route in
-/// (deliver unsupported), so the core cannot push to it and its speech still goes out. A route kind the harness
-/// knows, naming another conversation, is still refused.
+/// A façade of another version sends a route, capabilities and experimental names: the daemon reads only the
+/// conversation (its harness and id), asks the harness how it is, and the speech still goes out.
 #[test]
-fn an_unknown_route_kind_joins_with_no_route_in_and_a_known_one_is_still_checked() {
+fn route_fields_of_another_version_are_ignored_and_the_conversation_joins_by_its_id() {
     let profile = Profile::new("ipcroute");
     let _connector = profile.start_connector();
     let mut ipc = Ipc::open(&profile);
@@ -67,9 +66,10 @@ fn an_unknown_route_kind_joins_with_no_route_in_and_a_known_one_is_still_checked
     let status = ipc.ask("status", json!({}));
     let listed = binding(&status, "t-1");
     assert_eq!(listed["harness"], "claude", "{listed}");
-    assert_eq!(listed["delivery"], json!({"kind":"none"}), "{listed}");
-    assert_eq!(listed["capabilities"]["deliver"], "unsupported", "{listed}");
-    assert_eq!(listed["experimental"], json!([]), "{listed}");
+    assert!(listed["inbound"]["ok"].is_boolean(), "{listed}");
+    for field in ["delivery", "route", "capabilities", "experimental"] {
+        assert!(listed.get(field).is_none(), "{field} is not read: {listed}");
+    }
 
     let said = ipc.ask(
         "publish",
@@ -77,29 +77,6 @@ fn an_unknown_route_kind_joins_with_no_route_in_and_a_known_one_is_still_checked
     );
     assert_eq!(said["ok"], true, "{said}");
     assert_eq!(said["result"]["status"], "queued", "{said}");
-
-    // Known kinds keep their identity checks: Codex's queue for another thread, Claude Code's socket missing.
-    for (harness, delivery) in [
-        (
-            "codex",
-            json!({"kind":"codex-queue","thread":"someone-else"}),
-        ),
-        ("claude", json!({"kind":"claude-uds"})),
-        (
-            "claude",
-            json!({"kind":"http","thread":"someone-else","url":"http://127.0.0.1:9"}),
-        ),
-    ] {
-        let refused = ipc.ask(
-            "register",
-            json!({"client_ref":"t-2","thread":"t-2","harness":harness,"delivery":delivery}),
-        );
-        assert_eq!(refused["ok"], false, "{refused}");
-        assert_eq!(
-            refused["error"], "harness identity does not match its delivery route",
-            "{refused}"
-        );
-    }
 }
 
 /// `"client_refs": null` is the same as no `client_refs`: the speech goes to the conversation named, not through turn
@@ -112,16 +89,15 @@ fn a_null_optional_field_reads_as_absent() {
     let joined = ipc.ask(
         "register",
         json!({"client_ref":"t-1","thread":"t-1","harness":"codex",
-            "delivery":{"kind":"codex-queue","thread":"t-1"},"capabilities":null,"experimental":null}),
+            "endpoint":null,"engine":null}),
     );
     assert_eq!(joined["ok"], true, "{joined}");
     let status = ipc.ask("status", json!({}));
     let listed = binding(&status, "t-1");
     assert!(
-        listed["capabilities"].is_object(),
-        "null capabilities read as absent: {listed}"
+        listed["inbound"].is_object(),
+        "a null endpoint reads as absent: {listed}"
     );
-    assert_eq!(listed["experimental"], json!([]), "{listed}");
 
     let absent = json!({"client_ref":"t-1","session_id":"binding:t-1","revision":0,"epoch":0,"text":"absent"});
     let mut null = absent.clone();

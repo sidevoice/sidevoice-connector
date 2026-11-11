@@ -1,4 +1,4 @@
-use crate::adapters::{self, Identity, Registry};
+use crate::adapters::{self, Agent, CallContext, Conversation, Registry};
 use crate::frame;
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
@@ -256,9 +256,9 @@ struct Joined {
     binding_id: String,
     initial_reply_context: Value,
     title: String,
-    identity: Identity,
-    capabilities: Value,
-    experimental: Vec<String>,
+    conversation: Conversation,
+    /// Whether messages get in, as the connector last said.
+    inbound: Value,
 }
 
 /// What `voice_diagnose` knows from this process rather than from the connector.
@@ -292,25 +292,16 @@ fn diagnosis(
     node: &Value,
     binding: Option<(&str, &Joined)>,
     listed: Option<&Value>,
-    bridge: Option<Value>,
 ) -> Value {
     let conversation = binding.map(|(name, joined)| {
-        let delivery = &joined.identity.delivery;
-        let mut route = json!({"kind":delivery.get("kind")});
-        if let Some(socket) = delivery.get("socket").and_then(Value::as_str) {
-            route["socket"] = json!(socket);
-            route["socket_exists"] = json!(std::path::Path::new(socket).exists());
-        }
-        json!({"conversation":name,"binding_id":joined.binding_id,"harness":joined.identity.harness,
-            "route":route,"capabilities":joined.capabilities,
-            "experimental":joined.experimental,"inbound":joined.identity.inbound,
+        json!({"conversation":name,"binding_id":joined.binding_id,"harness":joined.conversation.harness,
+            "inbound":only(Some(listed.and_then(|item| item.get("inbound")).unwrap_or(&joined.inbound)), &["ok","limit","reason","remedy"]),
             "known_to_connector":listed.is_some(),
             "working":listed.and_then(|item| item.get("working")),
             "engine":only(listed.and_then(|item| item.get("engine")), &["model","effort","thinking"]),
             "deliveries":listed.and_then(|item| item.get("deliveries")).and_then(Value::as_array)
                 .map(|items| items.iter().map(|item| only(Some(item), &["message_id","channel","at","result","read"])).collect::<Vec<_>>()),
-            "awaiting_read":listed.and_then(|item| item.get("awaiting_read")),
-            "bridge":bridge.or_else(|| listed.and_then(|item| item.get("delivery_state")).map(|state| only(Some(state), &["state","bridge_chat_known"])))})
+            "awaiting_read":listed.and_then(|item| item.get("awaiting_read"))})
     });
     let mut report = json!({
         "versions":{"connector":facts.connector_version,"connector_daemon":status.get("version"),
@@ -349,9 +340,9 @@ impl Facade {
         let joined = Arc::new(Mutex::new(HashMap::new()));
         Self {
             ipc: Ipc::new(profile.clone(), joined.clone()),
+            registry: Arc::new(Registry::standard(&profile)),
             profile,
             joined,
-            registry: Arc::new(Registry::standard()),
             several_chats: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -406,7 +397,17 @@ impl Facade {
     ) -> Result<Value> {
         match name {
             "voice_connect" => {
-                let mut identity = adapters::identify(&meta, Some(&client), &client_caps)?;
+                let env = |name: &str| std::env::var(name).ok();
+                let call = CallContext {
+                    env: &env,
+                    meta: &meta,
+                    client: &client,
+                    client_capabilities: &client_caps,
+                };
+                let conversation = self
+                    .registry
+                    .identify(&call)?
+                    .ok_or_else(|| anyhow::anyhow!("{}", adapters::unidentified(Some(&client))))?;
                 let explicit_title = args.get("title").and_then(Value::as_str).unwrap_or("");
                 let title = if !explicit_title.is_empty() {
                     explicit_title.to_owned()
@@ -434,34 +435,14 @@ impl Facade {
                     title
                 };
                 let title = title.chars().take(200).collect::<String>();
-                let given_title = explicit_title.trim().chars().take(200).collect::<String>();
-                let harness = self.registry.get(&identity.harness).clone();
-                harness.refine_identity(&mut identity, &given_title).await;
-                let inbound = adapters::inspect_inbound(&identity)?;
-                if inbound.as_ref().and_then(|value| value.get("ok")) == Some(&json!(false)) {
-                    let info = inbound.as_ref().unwrap();
-                    bail!(
-                        "This conversation cannot connect: {} {}",
-                        info["reason"]
-                            .as_str()
-                            .unwrap_or("incoming messages are refused"),
-                        info["remedy"]
-                            .as_str()
-                            .unwrap_or("change this session's settings")
-                    );
-                }
-                identity.inbound = inbound.clone();
-                let capabilities = adapters::conversation_capabilities(&identity);
-                let experimental = adapters::experimental(&identity, &capabilities);
-                if !identity.editor {
+                let several = self.several_chats();
+                if !several {
                     let old: Vec<_> = self
                         .joined
                         .lock()
                         .await
                         .iter()
-                        .filter(|(thread, joined)| {
-                            thread.as_str() != identity.thread && !joined.identity.editor
-                        })
+                        .filter(|(thread, _)| thread.as_str() != conversation.id)
                         .map(|(thread, joined)| (thread.clone(), joined.binding_id.clone()))
                         .collect();
                     for (thread, binding_id) in old {
@@ -475,21 +456,20 @@ impl Facade {
                         self.joined.lock().await.remove(&thread);
                     }
                 }
-                let mut params = json!({
-                    "client_ref":identity.thread,"harness":identity.harness,"thread":identity.thread,"title":title,
-                    "delivery":identity.delivery,"route":identity.route,"inbound":identity.inbound,
-                    "capabilities":capabilities,"experimental":experimental,"detachable":identity.detachable
+                let id = conversation.id.clone();
+                let params = json!({
+                    "client_ref":id,"harness":conversation.harness,"thread":id,"title":title,
+                    "endpoint":adapters::endpoint(&call),"detachable":several,
+                    "agent":conversation.agent.to_json()
                 });
-                if let Some(engine) = adapters::engine(&identity) {
-                    params["engine"] = engine;
-                }
                 let result = self.ipc.call("register", params).await?;
                 let binding_id = result
                     .get("binding_id")
                     .and_then(Value::as_str)
                     .context("connector omitted binding ID")?;
+                let inbound = result.get("inbound").cloned().unwrap_or(Value::Null);
                 self.joined.lock().await.insert(
-                    identity.thread.clone(),
+                    id.clone(),
                     Joined {
                         binding_id: binding_id.to_owned(),
                         initial_reply_context: result
@@ -497,12 +477,11 @@ impl Facade {
                             .cloned()
                             .unwrap_or(Value::Null),
                         title: title.clone(),
-                        identity: identity.clone(),
-                        capabilities: capabilities.clone(),
-                        experimental: experimental.clone(),
+                        conversation: conversation.clone(),
+                        inbound: inbound.clone(),
                     },
                 );
-                let pushed = capabilities["deliver"] == "supported";
+                let pushed = result.get("delivery") != Some(&json!("get_messages"));
                 let connector = self
                     .ipc
                     .call("status", json!({}))
@@ -510,33 +489,24 @@ impl Facade {
                     .unwrap_or_else(|_| json!({}));
                 let mut response = json!({
                     "status":if result.get("pending") == Some(&json!(true)) {"joining"} else {"joined"},
-                    "harness":identity.harness,"conversation":identity.thread,"binding_id":binding_id,
+                    "harness":conversation.harness,"conversation":id,"binding_id":binding_id,
                     "delivery":if pushed {"push"} else {"get_messages"},"reachable":result.get("connected"),
                     "epoch":result.get("epoch"),"initial_reply_context":result.get("initial_reply_context"),
-                    "capabilities":capabilities,"inbound":identity.inbound,
+                    "inbound":inbound,
                     "local_only":"This conversation is on this machine's core and can be reached by any device paired with this machine that can reach its address, including another computer on the same LAN. If the person asks for a device pairing code, call voice_pair_device and show it; the person enters it in their app.",
                     "version":self.profile.connector_version(),"connector_version":connector.get("version")
                 });
+                let reason = inbound.get("reason").and_then(Value::as_str);
                 if !pushed {
                     response["voice_in"] = json!({"supported":true,"via":"get_messages",
                         "speak_with":result.get("initial_reply_context"),
-                        "reason":format!("Voice cannot be put into this conversation by itself: {}", identity.deliver_note.as_deref().unwrap_or("this harness offers no way to put a message into it.")),
+                        "reason":format!("Voice cannot be put into this conversation by itself: {}", reason.unwrap_or("this harness offers no way to put a message into it.")),
                         "how":"Call get_messages to read what the person says, at the start of each turn and between steps, then acknowledge each message ID after processing it."});
+                } else if let Some(reason) = reason {
+                    response["voice_in"] = json!(format!("Voice reaches this conversation by itself, but not yet ({reason}): until then nothing is sent."));
                 }
-                if let Some(note) = &identity.watch_note {
-                    response["watch_note"] = json!(note);
-                }
-                if !experimental.is_empty() {
-                    response["experimental"] = json!(experimental);
-                    response["experimental_notes"] = json!(experimental
-                        .iter()
-                        .filter_map(|name| harness.experimental_note(name, &identity))
-                        .collect::<Vec<_>>());
-                }
-                if let Some(client_harness) = self.registry.client(&client) {
-                    for (key, value) in client_harness.joined_fields(&identity, &result) {
-                        response[key] = value;
-                    }
+                if several {
+                    response["speak_first"] = json!(format!("Other chats of this window can join too. Remember this chat's conversation id ({id}): voice_status, voice_disconnect and get_messages need it when several chats are joined. To speak before the person has said anything by voice, call voice_say with conversation \"{id}\" and no session_id. To answer a voice message, use its session_id and revision as usual."));
                 }
                 Ok(response)
             }
@@ -546,7 +516,7 @@ impl Facade {
                     .and_then(Value::as_str)
                     .filter(|name| !name.is_empty());
                 if let Some(name) = named {
-                    self.adopt_by_id(name, &client).await;
+                    self.adopt_by_id(name).await;
                 }
                 let status = self.ipc.call("status", json!({})).await?;
                 self.refresh_binding_ids(&status).await;
@@ -598,7 +568,7 @@ impl Facade {
                         "note":closed_note(status.pointer("/resume_block_reason").and_then(Value::as_str).unwrap_or("conversation_history_limit"))}));
                 }
                 if named.is_none() && self.several_chats() && !self.joined.lock().await.is_empty() {
-                    let conversations = self.joined.lock().await.values().map(|binding| json!({"title":binding.title,"harness":binding.identity.harness})).collect::<Vec<_>>();
+                    let conversations = self.joined.lock().await.values().map(|binding| json!({"title":binding.title,"harness":binding.conversation.harness})).collect::<Vec<_>>();
                     return Ok(
                         json!({"joined":Value::Null,"conversation":Value::Null,"reachable":status.get("connected"),"connector":status,
                         "conversations":conversations,"closed_by_client":closed_now.iter().filter_map(|item| item.as_str()).map(|name| json!({
@@ -625,17 +595,13 @@ impl Facade {
                                     == Some(name.as_str())
                             })
                         });
-                    let mut response = json!({"joined":true,"conversation":name,"binding_id":binding.binding_id,"harness":binding.identity.harness,
-                        "reachable":status.get("connected"),"connector":status,"capabilities":binding.capabilities,
-                        "experimental":binding.experimental,"inbound":binding.identity.inbound});
-                    if let Some(client_harness) = self.registry.client(&client) {
-                        for (key, value) in
-                            client_harness.status_fields(&binding.identity, daemon_binding)
-                        {
-                            response[key] = value;
-                        }
-                    }
-                    Ok(response)
+                    let inbound = daemon_binding
+                        .and_then(|item| item.get("inbound"))
+                        .unwrap_or(&binding.inbound);
+                    Ok(
+                        json!({"joined":true,"conversation":name,"binding_id":binding.binding_id,"harness":binding.conversation.harness,
+                        "reachable":status.get("connected"),"connector":status,"inbound":inbound}),
+                    )
                 } else {
                     Ok(
                         json!({"joined":false,"conversation":Value::Null,"reachable":status.get("connected"),"connector":status,
@@ -651,7 +617,7 @@ impl Facade {
                     .and_then(Value::as_str)
                     .filter(|name| !name.is_empty());
                 if let Some(name) = named {
-                    self.adopt_by_id(name, &client).await;
+                    self.adopt_by_id(name).await;
                 }
                 // Read-only: a connector that does not answer is itself a finding, not a failure of this tool.
                 let status = match self.ipc.call("status", json!({"deliveries":true})).await {
@@ -681,12 +647,6 @@ impl Facade {
                                 .find(|item| item["client_ref"].as_str() == Some(name))
                         })
                 });
-                let bridge = binding.as_ref().and_then(|binding| {
-                    self.registry
-                        .client(&client)
-                        .map(|harness| harness.status_fields(&binding.identity, listed))
-                        .and_then(|mut fields| fields.remove("bridge"))
-                });
                 let layout = crate::service::layout::Layout::from_profile(&self.profile);
                 Ok(diagnosis(
                     &Facts {
@@ -698,7 +658,6 @@ impl Facade {
                     &node,
                     chosen.as_deref().zip(binding.as_ref()),
                     listed,
-                    bridge,
                 ))
             }
             "get_messages" => {
@@ -707,7 +666,7 @@ impl Facade {
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty());
                 if let Some(name) = named {
-                    self.adopt_by_id(name, &client).await;
+                    self.adopt_by_id(name).await;
                 }
                 let chosen = self.pick(named).await?.context("not connected")?;
                 let joined = self
@@ -733,7 +692,7 @@ impl Facade {
                     .and_then(Value::as_str)
                     .filter(|name| !name.is_empty());
                 if let Some(name) = named {
-                    self.adopt_by_id(name, &client).await;
+                    self.adopt_by_id(name).await;
                 }
                 let status = self.ipc.call("status", json!({})).await?;
                 self.refresh_binding_ids(&status).await;
@@ -869,7 +828,7 @@ impl Facade {
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 if let Some(adopted) = &adopted {
-                    self.adopt_by_id(adopted, &client).await;
+                    self.adopt_by_id(adopted).await;
                 }
                 if result.get("text_saved") == Some(&json!(true)) {
                     Ok(json!({"status":"published","text_saved":true,"audio":result.get("status")}))
@@ -891,7 +850,7 @@ impl Facade {
                     .and_then(Value::as_str)
                     .filter(|name| !name.is_empty());
                 if let Some(name) = named {
-                    self.adopt_by_id(name, &client).await;
+                    self.adopt_by_id(name).await;
                 }
                 if self.several_chats() && named.is_none() {
                     bail!("Several chats of this window may be joined; pass the conversation id voice_connect returned in this chat.");
@@ -944,13 +903,10 @@ impl Facade {
         bail!("Several chats of this window are joined ({titles}); pass conversation: the id voice_connect returned in this chat.")
     }
 
-    /// A conversation another façade of this client left, taken over by its id: only one of a harness that draws
-    /// views and adopts it.
-    async fn adopt_by_id(&self, name: &str, client: &Value) {
-        let Some(harness) = self.registry.client(client).cloned() else {
-            return;
-        };
-        if !self.several_chats() || !harness.adopts(Some(name)) {
+    /// A conversation another façade of this client left, taken over by its id: only by a façade serving several chats,
+    /// whose conversations outlive it.
+    async fn adopt_by_id(&self, name: &str) {
+        if !self.several_chats() {
             return;
         }
         if self.joined.lock().await.contains_key(name) {
@@ -962,15 +918,21 @@ impl Facade {
         let Some(binding_id) = result.get("binding_id").and_then(Value::as_str) else {
             return;
         };
-        let Some((identity, title)) = harness.adopted_identity(name, &result) else {
+        let Some(harness) = result.get("harness").and_then(Value::as_str) else {
             return;
         };
-        let capabilities = identity.capabilities.clone();
-        let experimental = identity.experimental.clone();
-        let registration = json!({"client_ref":name,"harness":identity.harness,"thread":identity.thread,
-            "title":title,"delivery":identity.delivery,"route":identity.route,"inbound":identity.inbound,
-            "capabilities":capabilities,"experimental":experimental,"detachable":true,
-            "engine":result.get("engine").cloned().unwrap_or(Value::Null)});
+        let conversation = Conversation {
+            harness: harness.to_owned(),
+            id: name.to_owned(),
+            agent: Agent::from_json(result.get("agent")),
+        };
+        let title = result
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let registration = json!({"client_ref":name,"harness":conversation.harness,"thread":name,
+            "title":title,"detachable":true,"agent":conversation.agent.to_json()});
         self.ipc.remember_registration(registration).await;
         self.joined.lock().await.insert(
             name.to_owned(),
@@ -981,9 +943,8 @@ impl Facade {
                     .cloned()
                     .unwrap_or(Value::Null),
                 title,
-                identity,
-                capabilities,
-                experimental,
+                conversation,
+                inbound: result.get("inbound").cloned().unwrap_or(Value::Null),
             },
         );
     }
@@ -997,7 +958,7 @@ fn tools() -> Vec<Tool> {
         ("voice_disconnect", "Leave voice. The conversation and its work continue in writing.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
         ("voice_pair_device", "Generate a one-time code to pair the person's device (the desktop app or a browser) with this machine. When the person asks for a code or asks to pair their device, call this tool and show its code, QR, validity and address as returned. Do not ask the person to generate the device code. Never call it on your own initiative.", json!({}), vec![]),
         ("voice_status", "Whether voice can currently reach this conversation.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
-        ("voice_diagnose", "Read-only diagnostics for when something does not arrive or is not heard: versions, the core and its link, this conversation's delivery route, its last deliveries and whether each was read, harness capabilities and the inbound check, the editor bridge state, and where the logs are. Never message text, keys or tokens. Changes nothing.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
+        ("voice_diagnose", "Read-only diagnostics for when something does not arrive or is not heard: versions, the core and its link, this conversation's harness and whether messages get into it (and why not), its last deliveries and whether each was read, and where the logs are. Never message text, keys or tokens. Changes nothing.", json!({"conversation":{"type":"string","description":"Only when several chats of this window are joined: the conversation id voice_connect returned in this chat"}}), vec![]),
     ];
     // No `additionalProperties: false`: an argument this server does not know (an agent's own, or one a newer server
     // added) is ignored, never refused, by the server or by a client that checks calls against the schema.
@@ -1044,10 +1005,7 @@ impl ServerHandler for Facade {
     ) -> std::result::Result<InitializeResult, McpError> {
         let client = serde_json::to_value(&request.client_info).unwrap_or_else(|_| json!({}));
         let client_caps = serde_json::to_value(&request.capabilities).unwrap_or_else(|_| json!({}));
-        let several = self
-            .registry
-            .client(&client)
-            .is_some_and(|harness| harness.hosts_several_chats(&client_caps));
+        let several = Registry::hosts_several_chats(&client, &client_caps);
         self.several_chats.store(several, Ordering::Relaxed);
         context.peer.set_peer_info(request.clone());
         self.negotiate_initialize(&request)
@@ -1221,8 +1179,9 @@ fn call_meta(context: &impl serde::Serialize, params: Option<impl serde::Seriali
 
 #[cfg(test)]
 mod tests {
-    use super::{closed_note, diagnosis, ipc_limit, tools, Facts, Joined, INSTRUCTIONS};
-    use crate::adapters::Identity;
+    use super::{
+        closed_note, diagnosis, ipc_limit, tools, Agent, Conversation, Facts, Joined, INSTRUCTIONS,
+    };
     use rmcp::model::InitializeRequestParams;
     use serde_json::{json, Value};
     use std::time::Duration;
@@ -1446,30 +1405,19 @@ mod tests {
     /// line anywhere in what the connector or the core answered never reaches the agent.
     #[test]
     fn a_diagnosis_carries_no_text_tokens_or_log_lines() {
-        let identity = Identity {
-            harness: "a-harness".into(),
-            thread: "thread-1".into(),
-            delivery: json!({"kind":"socket-route","socket":"/nonexistent/sidevoice.sock","token":"SECRET-TOKEN"}),
-            capability_overrides: json!({}),
-            route: None,
-            capabilities: json!({"deliver":"supported"}),
-            experimental: vec![],
-            inbound: Some(json!({"ok":true})),
-            editor: false,
-            detachable: true,
-            chat_marker: None,
-            deliver_note: None,
-            watch_note: None,
-        };
         let joined = Joined {
             binding_id: "b1".into(),
             initial_reply_context: json!({"text":"SECRET-TEXT"}),
             title: "chat".into(),
-            identity,
-            capabilities: json!({"deliver":"supported"}),
-            experimental: vec![],
+            conversation: Conversation {
+                harness: "a-harness".into(),
+                id: "thread-1".into(),
+                agent: Agent::default(),
+            },
+            inbound: json!({"ok":true}),
         };
         let listed = json!({"client_ref":"thread-1","delivery":{"kind":"socket-route","token":"SECRET-TOKEN"},
+            "inbound":{"ok":false,"limit":"chat_not_found","reason":"waiting","route":{"token":"SECRET-TOKEN"}},
             "initial_reply_context":{"text":"SECRET-TEXT"},"working":false,"awaiting_read":1,
             "deliveries":[{"message_id":"m1","channel":"voice","at":"t","result":"unconfirmed","read":false,"text":"SECRET-TEXT"}]});
         let status = json!({"version":"1.0.0","connected":true,"core":{"protocol":3,"token":"SECRET-TOKEN"},
@@ -1487,7 +1435,6 @@ mod tests {
             &node,
             Some(("thread-1", &joined)),
             Some(&listed),
-            None,
         );
         let text = report.to_string();
         for secret in [
@@ -1499,8 +1446,8 @@ mod tests {
         ] {
             assert!(!text.contains(secret), "{secret} in {text}");
         }
-        assert_eq!(report["conversation"]["route"]["kind"], "socket-route");
-        assert_eq!(report["conversation"]["route"]["socket_exists"], false);
+        assert_eq!(report["conversation"]["harness"], "a-harness");
+        assert_eq!(report["conversation"]["inbound"]["limit"], "chat_not_found");
         assert_eq!(
             report["conversation"]["deliveries"][0]["result"],
             "unconfirmed"

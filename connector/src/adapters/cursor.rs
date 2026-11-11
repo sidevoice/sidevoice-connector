@@ -1,11 +1,23 @@
-pub mod bridge_setup;
+mod bridge_setup;
 mod engine;
 mod harness;
 mod registration;
+#[cfg(test)]
+pub(crate) use registration::MARKERS;
+#[cfg(feature = "testbench")]
+pub(crate) use registration::PROGRAMS;
 mod state_db;
 
 pub use engine::engine;
-pub use harness::Cursor;
+pub use harness::Chats;
+
+/// Cursor, as Sidevoice is installed in it (its [`Registration`](super::registration::Registration)).
+#[derive(Default)]
+pub struct Cursor;
+
+/// What an editor chat's conversation id starts with; the rest, a UUID of its own, is the marker the Desktop Bridge
+/// finds the chat by in Cursor's record of its join call, whose answer carries the id.
+pub const EDITOR_PREFIX: &str = "cursor-editor-";
 
 /// Cursor's configuration home (`mcp.json`), checked through its parent, and its data below it.
 pub const HOMES: [crate::profile::AgentHome; 2] = [
@@ -30,7 +42,8 @@ pub fn config_home(profile: &crate::profile::Profile) -> &std::path::Path {
     profile.agent_home(HOMES[0].var)
 }
 
-use super::{envelope, Identity};
+use super::envelope;
+use super::harness::{Limit, Sent};
 use crate::platform::env::{Env, Environment};
 use crate::platform::foreign::{Foreign, Foreigners};
 use crate::platform::process::{ChildProcess, Process, Processes};
@@ -51,10 +64,6 @@ const EDITOR_NOTE: &str = "Sidevoice cannot tell which Cursor chat this is: this
 /// databases named in advance, and where Cursor keeps them there is not measured yet: never guessed.
 const CLI_UNSUPPORTED: &str = "Sidevoice cannot tell which Cursor chat this is: this Cursor did not declare MCP Apps support (the io.modelcontextprotocol/ui extension) when it started this server, which is how the editor is told apart, and finding a Cursor CLI chat (cursor-agent) is not supported on this system yet, because it cannot see which chat cursor-agent has open";
 const NOT_PERSISTED: &str = "This chat is not running under cursor-agent persist, so nothing can put a message into it. To let Sidevoice talk to a Cursor CLI chat (experimental), start it with  cursor-agent persist  (it needs tmux).";
-
-pub fn capabilities() -> Value {
-    json!({"deliver":"supported","inspectInbound":"unsupported","working":"supported","endOfTurn":"supported","sessionIdentity":"supported"})
-}
 
 pub fn is_cursor_client(client: &Value) -> bool {
     client
@@ -84,58 +93,6 @@ pub fn is_editor(capabilities: &Value) -> bool {
                     .is_some_and(|name| name.to_ascii_lowercase().starts_with("text/html"))
             })
         })
-}
-
-pub fn identity(_client: &Value, capabilities: &Value) -> Result<Identity> {
-    if is_editor(capabilities) {
-        let thread = format!("cursor-editor-{}", uuid::Uuid::new_v4());
-        // Unique to this join: the join call's answer carries it, so the Desktop Bridge finds this chat by it in
-        // Cursor's own record of the call.
-        let marker = format!(
-            "{}{}",
-            uuid::Uuid::new_v4().simple(),
-            uuid::Uuid::new_v4().simple()
-        );
-        let route = "cursor-editor-bridge";
-        let delivery = json!({"kind":"cursor-bridge","thread":thread,"marker":marker,"route":route,"joined_at":unix_ms()});
-        let mut identity = Identity::new("cursor", thread.clone(), delivery);
-        identity.route = Some(route.into());
-        identity.editor = true;
-        identity.detachable = true;
-        identity.chat_marker = Some(marker);
-        identity.experimental.extend([
-            "sessionIdentity".into(),
-            "working".into(),
-            "endOfTurn".into(),
-        ]);
-        identity.watch_note = Some("Sidevoice learns that this chat took a voice message, and when it is working, from Cursor itself: from this chat's transcript, once the Desktop Bridge knows which chat it is.".into());
-        return Ok(identity);
-    }
-    let found = match find_chat() {
-        Ok(Some(found)) => found,
-        Ok(None) => bail!("{EDITOR_NOTE}"),
-        Err(error) => bail!("{CLI_UNSUPPORTED} ({error})."),
-    };
-    let persisted = persist_session(&found.chat)?;
-    if let Some((name, pane, in_mode, attached)) = persisted {
-        let mut identity = Identity::new(
-            "cursor",
-            found.chat.clone(),
-            json!({"kind":"cursor-tmux","chat":found.chat,"session":name,"pane":pane,"in_mode":in_mode,"attached":attached}),
-        );
-        identity.route = Some("cursor-cli-persist".into());
-        Ok(identity)
-    } else {
-        let mut identity = Identity::new(
-            "cursor",
-            found.chat.clone(),
-            json!({"kind":"none","chat":found.chat}),
-        );
-        identity.route = Some("cursor-cli".into());
-        identity.capability_overrides = json!({"deliver":"unsupported"});
-        identity.deliver_note = Some(NOT_PERSISTED.into());
-        Ok(identity)
-    }
 }
 
 struct Chat {
@@ -283,25 +240,13 @@ mod pinned_transcript_tests {
 /// Find the Cursor chat whose transcript records this join or one of its pending inputs.
 /// Editor conversation ids are ours; Cursor's own chat id is only available in the transcript
 /// or in the Desktop Bridge state database.
-pub fn editor_transcript_chat(
-    delivery: &Value,
-    expected_ids: &[String],
-    excluded: &HashSet<String>,
-) -> Option<(String, bool)> {
-    let title = delivery
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    let joined_at = delivery
-        .get("joined_at")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .saturating_sub(5_000);
+/// The one recent Cursor chat whose transcript holds a message delivered to this conversation (`expected_ids`).
+pub fn editor_transcript_chat(expected_ids: &[String]) -> Option<String> {
+    if expected_ids.is_empty() {
+        return None;
+    }
     let expected = expected_ids.iter().cloned().collect::<HashSet<_>>();
-    let mut expected_matches = Vec::new();
-    let mut title_matches = Vec::new();
-
+    let mut matches = Vec::new();
     for root in transcript_roots() {
         let Ok(projects) = fs::read_dir(root.join("projects")) else {
             continue;
@@ -321,55 +266,27 @@ pub fn editor_transcript_chat(
                 let Ok(metadata) = fs::metadata(&path) else {
                     continue;
                 };
-                let modified = modified_ms(&metadata);
-                if modified < unix_ms().saturating_sub(10 * 60_000) {
+                if modified_ms(&metadata) < unix_ms().saturating_sub(10 * 60_000) {
                     continue;
                 }
                 let Some(text) = transcript_tail(&path) else {
                     continue;
                 };
-                let mut holds_expected = false;
-                let mut records_join = false;
-                for line in text.lines() {
-                    let Ok(entry) = serde_json::from_str::<Value>(line) else {
-                        continue;
-                    };
-                    if entry.get("role") == Some(&json!("user"))
-                        && !expected.is_empty()
-                        && cursor_user_text(&entry)
-                            .and_then(|text| cursor_message_id(&text))
-                            .is_some_and(|id| expected.contains(&id))
-                    {
-                        holds_expected = true;
-                    }
-                    if modified >= joined_at
-                        && !title.is_empty()
-                        && !excluded.contains(&chat)
-                        && cursor_join_matches(&entry, title)
-                    {
-                        records_join = true;
-                    }
-                    if holds_expected && records_join {
-                        break;
-                    }
-                }
+                let holds_expected = text.lines().any(|line| {
+                    serde_json::from_str::<Value>(line).is_ok_and(|entry| {
+                        entry.get("role") == Some(&json!("user"))
+                            && cursor_user_text(&entry)
+                                .and_then(|text| cursor_message_id(&text))
+                                .is_some_and(|id| expected.contains(&id))
+                    })
+                });
                 if holds_expected {
-                    expected_matches.push(chat.clone());
-                }
-                if records_join {
-                    title_matches.push(chat);
+                    matches.push(chat);
                 }
             }
         }
     }
-
-    if expected_matches.len() == 1 {
-        return expected_matches.pop().map(|chat| (chat, true));
-    }
-    if title_matches.len() == 1 {
-        return title_matches.pop().map(|chat| (chat, false));
-    }
-    None
+    (matches.len() == 1).then(|| matches.remove(0))
 }
 
 fn transcript_roots() -> Vec<PathBuf> {
@@ -424,31 +341,6 @@ fn cursor_message_id(text: &str) -> Option<String> {
         .get("message_id")?
         .as_str()
         .map(str::to_owned)
-}
-
-fn cursor_join_matches(entry: &Value, title: &str) -> bool {
-    if entry.get("role") != Some(&json!("assistant")) {
-        return false;
-    }
-    entry
-        .pointer("/message/content")
-        .and_then(Value::as_array)
-        .is_some_and(|parts| {
-            parts.iter().any(|part| {
-                part.get("type").and_then(Value::as_str) == Some("tool_use")
-                    && part
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .is_some_and(|name| name.ends_with("voice_connect"))
-                    && (title.is_empty()
-                        || part
-                            .pointer("/input/title")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .trim()
-                            == title)
-            })
-        })
 }
 
 fn tmux_prefix() -> Vec<String> {
@@ -545,10 +437,10 @@ fn tmux_command(args: &[&str]) -> Result<std::process::Output> {
     Ok(output)
 }
 
-fn persist_session(chat: &str) -> Result<Option<(String, String, bool, bool)>> {
-    let Ok(output) = tmux_command(&["list-sessions", "-F", "#{session_name}\t#{@cursor_managed}\t#{@cursor_chat_id}\t#{session_attached}\t#{pane_id}\t#{pane_in_mode}"]) else {
-        return Ok(None);
-    };
+/// The tmux pane of the `cursor-agent persist` session running CLI chat `chat`, and whether it is in a mode (copy,
+/// scroll) that must be left before typing.
+fn persist_session(chat: &str) -> Option<(String, bool)> {
+    let output = tmux_command(&["list-sessions", "-F", "#{session_name}\t#{@cursor_managed}\t#{@cursor_chat_id}\t#{session_attached}\t#{pane_id}\t#{pane_in_mode}"]).ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     for line in text.lines() {
         let fields = line.split('\t').collect::<Vec<_>>();
@@ -561,28 +453,9 @@ fn persist_session(chat: &str) -> Result<Option<(String, String, bool, bool)>> {
         {
             continue;
         }
-        let in_mode = fields[5] == "1";
-        return Ok(Some((
-            fields[0].into(),
-            fields[4].into(),
-            in_mode,
-            fields[3] == "1",
-        )));
+        return Some((fields[4].into(), fields[5] == "1"));
     }
-    Ok(None)
-}
-
-pub async fn refine_identity(identity: &mut Identity, title: &str) {
-    if identity.delivery.get("kind").and_then(Value::as_str) != Some("cursor-bridge") {
-        return;
-    }
-    if !title.is_empty() {
-        identity.delivery["title"] = json!(title);
-    }
-    let instances = bridge_instances();
-    if let Some(candidate) = calling_thread(&instances).await {
-        identity.delivery["candidate"] = json!(candidate);
-    }
+    None
 }
 
 #[derive(Clone)]
@@ -1003,66 +876,37 @@ fn decode_chunks(mut input: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-async fn calling_thread(instances: &[BridgeInstance]) -> Option<String> {
-    let mut running = Vec::new();
-    for instance in instances {
-        let Ok(reply) = bridge_request(instance, &json!({"type":"listThreads"})).await else {
-            continue;
-        };
-        if reply.status != 200 {
-            continue;
-        }
-        if let Some(threads) = reply.body.get("threads").and_then(Value::as_array) {
-            running.extend(
-                threads
-                    .iter()
-                    .filter(|thread| {
-                        thread.get("status") == Some(&json!("running"))
-                            && thread.get("source") == Some(&json!("local"))
-                    })
-                    .filter_map(|thread| {
-                        thread.get("id").and_then(Value::as_str).map(str::to_owned)
-                    }),
-            );
-        }
-    }
-    (running.len() == 1).then(|| running.remove(0))
+/// The chat whose recorded join call carries `marker`, found through the Desktop Bridge's Cursor databases; quiet, for
+/// the watcher.
+pub async fn composer_holding(marker: &str) -> Option<String> {
+    composer_holding_in(marker, &bridge_instances(), false).await
 }
 
-pub async fn composer_holding(delivery: &Value) -> Option<String> {
-    composer_holding_in(delivery, &bridge_instances(), false).await
+/// [`composer_holding`], with every step logged, for a delivery.
+pub async fn composer_holding_for_delivery(marker: &str) -> Option<String> {
+    composer_holding_in(marker, &bridge_instances(), true).await
 }
 
-pub async fn composer_holding_for_delivery(delivery: &Value) -> Option<String> {
-    composer_holding_in(delivery, &bridge_instances(), true).await
+/// Whether `marker` is one this connector makes (a UUID, lowercase): only such a marker goes into a query.
+fn valid_marker(marker: &str) -> bool {
+    uuid::Uuid::try_parse(marker).is_ok_and(|parsed| parsed.hyphenated().to_string() == marker)
 }
 
 async fn composer_holding_in(
-    delivery: &Value,
+    marker: &str,
     instances: &[BridgeInstance],
     diagnostics: bool,
 ) -> Option<String> {
-    let marker = delivery.get("marker").and_then(Value::as_str)?;
-    if marker.len() != 64 || !marker.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !valid_marker(marker) {
         if diagnostics {
             log_bridge("lookup", "invalid_marker", None, None, None);
         }
         return None;
     }
-    let candidate = delivery.get("candidate").and_then(Value::as_str);
     if diagnostics && instances.is_empty() {
         log_bridge("lookup", "no_bridge_instance", Some(marker), None, None);
     }
-    if let Some(candidate) = candidate {
-        if safe_chat_id(candidate) {
-            if let Some(chat) =
-                query_bridge_chat(instances, marker, Some(candidate), diagnostics).await
-            {
-                return Some(chat);
-            }
-        }
-    }
-    query_bridge_chat(instances, marker, None, diagnostics).await
+    query_bridge_chat(instances, marker, diagnostics).await
 }
 
 fn safe_chat_id(value: &str) -> bool {
@@ -1076,7 +920,6 @@ fn safe_chat_id(value: &str) -> bool {
 async fn query_bridge_chat(
     instances: &[BridgeInstance],
     marker: &str,
-    candidate: Option<&str>,
     diagnostics: bool,
 ) -> Option<String> {
     for (index, instance) in instances.iter().enumerate() {
@@ -1099,11 +942,7 @@ async fn query_bridge_chat(
             }
             continue;
         }
-        let (from, to) = match candidate.filter(|value| safe_chat_id(value)) {
-            Some(chat) => (format!("bubbleId:{chat}:"), format!("bubbleId:{chat};")),
-            None => ("bubbleId:".into(), "bubbleId;".into()),
-        };
-        let sql = format!("SELECT DISTINCT substr(key, 10, instr(substr(key, 10), ':') - 1) AS chat FROM cursorDiskKV WHERE key >= '{from}' AND key < '{to}' AND instr(CAST(value AS TEXT), '{marker}') > 0 LIMIT 2;");
+        let sql = format!("SELECT DISTINCT substr(key, 10, instr(substr(key, 10), ':') - 1) AS chat FROM cursorDiskKV WHERE key >= 'bubbleId:' AND key < 'bubbleId;' AND instr(CAST(value AS TEXT), '{marker}') > 0 LIMIT 2;");
         let rows = match state_db::query(&database, &sql).await {
             Ok(rows) => rows,
             Err(error) => {
@@ -1127,17 +966,7 @@ async fn query_bridge_chat(
                 .and_then(Value::as_str)
                 .filter(|chat| safe_chat_id(chat))
             {
-                log_correlation(
-                    "mapping",
-                    if candidate.is_some() {
-                        "sqlite_candidate"
-                    } else {
-                        "sqlite_scan"
-                    },
-                    Some(marker),
-                    chat,
-                    Some(instance),
-                );
+                log_correlation("mapping", "sqlite_scan", Some(marker), chat, Some(instance));
                 if diagnostics {
                     log_bridge("lookup", "chat_found", Some(chat), Some(index), None);
                 }
@@ -1174,7 +1003,12 @@ async fn deliver_editor_to_instances(
     let composer = if let Some(composer) = delivery.get("composer").and_then(Value::as_str) {
         composer.to_owned()
     } else {
-        composer_holding_in(delivery, instances, true).await?
+        composer_holding_in(
+            delivery.get("marker").and_then(Value::as_str)?,
+            instances,
+            true,
+        )
+        .await?
     };
     let text = match envelope(event) {
         Ok(text) => text,
@@ -1285,15 +1119,18 @@ async fn deliver_editor_to_instances(
     None
 }
 
-pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
-    let chat = delivery
-        .get("chat")
-        .and_then(Value::as_str)
-        .context("Cursor chat missing")?;
-    let Some((session, pane, in_mode, attached)) = persist_session(chat)? else {
-        return Ok(
-            json!({"status":"unsupported","error":format!("Chat {chat} is no longer running in a cursor-agent persist session")}),
-        );
+/// Types `event` into the terminal of CLI chat `chat`, which runs under `cursor-agent persist` in tmux, and sends it
+/// with Enter. The terminal answers nothing: the transcript tells when the chat took it.
+pub async fn send_cli(chat: &str, event: &Value) -> Sent {
+    match type_into(chat, event).await {
+        Ok(sent) => sent,
+        Err(error) => Sent::Refused(Limit::Failed(error.to_string())),
+    }
+}
+
+async fn type_into(chat: &str, event: &Value) -> Result<Sent> {
+    let Some((pane, in_mode)) = persist_session(chat) else {
+        return Ok(Sent::Refused(Limit::NoRoute(NOT_PERSISTED.into())));
     };
     if in_mode {
         let _ = tmux_command(&["send-keys", "-t", &pane, "-X", "cancel"]);
@@ -1336,9 +1173,7 @@ pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
     if !entered.status.success() {
         bail!("tmux could not send the voice message");
     }
-    Ok(
-        json!({"status":"unknown","detail":format!("typed into persistent session {session}{}", if attached {" (someone is attached)"} else {""})}),
-    )
+    Ok(Sent::Unconfirmed)
 }
 
 #[cfg(test)]
@@ -1579,11 +1414,7 @@ mod bridge_tests {
         let storage = user_data.join("User/globalStorage");
         fs::create_dir_all(&storage).unwrap();
         let database = storage.join("state.vscdb");
-        let marker = format!(
-            "{}{}",
-            uuid::Uuid::new_v4().simple(),
-            uuid::Uuid::new_v4().simple()
-        );
+        let marker = uuid::Uuid::new_v4().to_string();
         let sql = format!(
             "CREATE TABLE cursorDiskKV(key TEXT, value TEXT); INSERT INTO cursorDiskKV VALUES ('bubbleId:chat-1:turn', 'join {marker}');"
         );
@@ -1603,7 +1434,7 @@ mod bridge_tests {
         assert_eq!(instances.len(), 1);
         // The background watcher uses this quiet lookup. Its successful mapping must still
         // carry enough provenance to correlate a later cached send with the accepting bridge.
-        let chat = composer_holding_in(&json!({"marker":marker}), &instances, false).await;
+        let chat = composer_holding_in(&marker, &instances, false).await;
         assert_eq!(chat.as_deref(), Some("chat-1"));
 
         let server = tokio::spawn(async move {

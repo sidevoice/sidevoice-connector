@@ -2,10 +2,17 @@ mod binary;
 mod cache;
 mod harness;
 mod registration;
+#[cfg(any(test, feature = "testbench"))]
+pub(crate) use registration::PROGRAMS;
 mod rollout;
 pub(crate) mod steer;
 
-pub use harness::Codex;
+pub use harness::Threads;
+#[cfg(test)]
+pub(crate) use rollout::follow as follow_rollout;
+
+/// Codex, as Sidevoice is installed in it (its [`Registration`](super::registration::Registration)).
+pub struct Codex;
 
 /// Codex's home (`config.toml`, sessions).
 pub const HOME: crate::profile::AgentHome = crate::profile::AgentHome {
@@ -16,12 +23,12 @@ pub const HOME: crate::profile::AgentHome = crate::profile::AgentHome {
     check_parent: false,
 };
 
-use super::{envelope, Identity};
+use super::envelope;
+use super::harness::{Limit, Sent};
 use crate::platform::process::{ChildProcess, Processes};
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
@@ -30,10 +37,6 @@ use tokio::io::AsyncReadExt;
 
 /// Codex's model catalogue in its home: the models the account can use, each with its default reasoning level.
 const MODEL_CATALOGUE: &str = "models_cache.json";
-
-pub fn capabilities() -> Value {
-    json!({"deliver":"supported","inspectInbound":"unsupported","working":"supported","endOfTurn":"supported","sessionIdentity":"supported"})
-}
 
 /// The engine a rollout's turn context or session header records: its model and reasoning effort. A turn context
 /// records the effort chosen for the session (`model_reasoning_effort`, a profile, `-c`, the app's picker), and none
@@ -74,72 +77,24 @@ fn catalogue_default_effort(catalogue: &Value, model: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-pub fn identity(meta: &Value) -> Result<Option<Identity>> {
-    let turn = meta.get("x-codex-turn-metadata").and_then(|value| {
-        if let Some(text) = value.as_str() {
-            serde_json::from_str::<Value>(text).ok()
-        } else {
-            Some(value.clone())
-        }
-    });
-    let thread = [
-        meta.get("openai/threadId"),
-        meta.get("openai/thread_id"),
-        meta.get("codexThreadId"),
-        meta.get("codex_thread_id"),
-        turn.as_ref().and_then(|value| value.get("thread_id")),
-        meta.get("session_id"),
-        meta.get("thread_id"),
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(|value| {
-        value
-            .as_str()
-            .filter(|text| !text.is_empty())
-            .map(str::to_owned)
-    })
-    .or_else(|| {
-        env::var("CODEX_THREAD_ID")
-            .ok()
-            .filter(|text| !text.is_empty())
-    });
-    let Some(thread) = thread else {
-        return Ok(None);
-    };
-    let delivery = if let Some(url) = env::var("SIDEVOICE_DELIVERY_URL")
-        .ok()
-        .filter(|url| !url.is_empty())
-    {
-        json!({"kind":"http","url":url,"thread":thread})
-    } else {
-        json!({"kind":"codex-queue","thread":thread})
-    };
-    Ok(Some(Identity::new("codex", thread, delivery)))
-}
-
 /// Delivers `event` to the thread: into the running turn when the installed Codex can be steered from outside
 /// (`steer`), else — and on any steer error — queued behind it with `codex queue`. Both carry the same envelope, so a
 /// message that arrives twice is the same message (same `message_id`).
-pub async fn deliver(delivery: &Value, event: &Value, profile: &Profile) -> Result<Value> {
-    deliver_with_cache(delivery, event, profile, &cache::CACHE).await
+pub async fn send(thread: &str, event: &Value, profile: &Profile) -> Sent {
+    match deliver_with_cache(thread, event, profile, &cache::CACHE).await {
+        Ok(()) => Sent::Accepted,
+        Err(error) => Sent::Refused(Limit::Failed(error.to_string())),
+    }
 }
 
 async fn deliver_with_cache(
-    delivery: &Value,
+    thread: &str,
     event: &Value,
     profile: &Profile,
     cache: &cache::Cache,
-) -> Result<Value> {
-    if delivery.get("kind").and_then(Value::as_str) != Some("codex-queue") {
-        bail!("Unsupported Codex delivery route");
-    }
-    let thread = delivery
-        .get("thread")
-        .and_then(Value::as_str)
-        .context("Codex thread missing")?;
+) -> Result<()> {
     let envelope = envelope(event)?;
-    let codex = crate::agents::agent_command(profile, "codex");
+    let codex = crate::agents::agent_command(profile, &registration::PROGRAMS);
     let program = codex
         .program
         .context("Codex not on the captured login PATH")?;
@@ -167,11 +122,11 @@ async fn deliver_with_cache(
     )
     .await
     {
-        Ok(turn) => {
+        Ok(_) => {
             crate::logfile::log(&format!(
                 "codex delivery path=steered thread={thread:?} message_id={message_id:?}"
             ));
-            return Ok(json!({"status":"accepted","detail":format!("codex steered turn {turn}")}));
+            return Ok(());
         }
         Err(error) => {
             cache.steer_failed(&key, &error);
@@ -187,7 +142,7 @@ async fn deliver_with_cache(
             crate::logfile::log(&format!(
                 "codex delivery path=queued thread={thread:?} message_id={message_id:?}"
             ));
-            Ok(json!({"status":"accepted","detail":"codex queue confirmed the thread"}))
+            Ok(())
         }
         Err(error) => {
             crate::logfile::log(&format!(

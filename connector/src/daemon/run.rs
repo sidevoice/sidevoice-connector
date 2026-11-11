@@ -54,7 +54,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
         profile.clone(),
         link.clone(),
         replay_tx,
-        Registry::standard(),
+        Registry::standard(&profile),
         managed,
         shutdown_tx,
     )?;

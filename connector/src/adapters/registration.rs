@@ -1,6 +1,7 @@
-//! Registering Sidevoice with an agent: the trait a harness implements, and what the host-agent coordinator lends
-//! it for one request.
+//! Registering Sidevoice with an agent: the trait each harness's registration implements, the state it reports, what
+//! the host-agent coordinator lends it for one request, and the plain helpers several harnesses share.
 
+use super::markers::{self, Marker, Roots};
 use crate::messages::message;
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Files, Fs};
@@ -34,7 +35,7 @@ pub enum CliError {
     Failed,
 }
 
-/// How the agent starts the server its entry .find_map(|name| Environment::find_program(name, &path))?s: the command, its arguments, the environment the entry gives it and
+/// How the agent starts the server its entry names: the command, its arguments, the environment the entry gives it and
 /// the working directory it names, if any.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Launch {
@@ -79,9 +80,15 @@ pub trait AgentHost: Send + Sync {
     fn owns(&self, command: &str, args: &[String]) -> bool;
     /// The environment a registration hands the server.
     fn mcp_env(&self) -> BTreeMap<String, String>;
-    /// Runs the agent's CLI with its home, under the request's cancellation and deadline.
+    /// The agent's CLI as the coordinator finds it now, from the agent's `programs`: on the person's login PATH, then
+    /// where the agent keeps it outside it.
+    fn find_program(&self, programs: &Programs) -> Option<String>;
+    /// The agent's CLI as the last look at its state found it: what connecting and disconnecting run.
+    fn program(&self) -> Option<&str>;
+    /// Runs the agent's CLI in `cwd` (its home), under the request's cancellation and deadline.
     fn run<'a>(
         &'a self,
+        cwd: &'a Path,
         binary: &'a str,
         args: Vec<String>,
     ) -> BoxFuture<'a, Result<CliOutput, CliError>>;
@@ -89,111 +96,163 @@ pub trait AgentHost: Send + Sync {
     fn live(&self) -> Result<(), AgentError>;
 }
 
-/// One agent-owned readiness check, with a stable code and English fallback when it is not OK.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReadinessCheck {
-    Ok,
-    NeedsAttention(&'static str, &'static str),
-    Unsupported(&'static str, &'static str),
+/// Where an agent's CLI is: its names on PATH, where it may be outside PATH (most preferred first, looked at only after
+/// PATH, the first that can be run taken), and the npm package whose launcher stands for a native program.
+pub struct Programs {
+    pub names: &'static [&'static str],
+    pub fallbacks: fn(&Roots) -> Vec<PathBuf>,
+    pub npm: Option<crate::agents::npm::NativePackage>,
 }
 
-pub fn aggregate_readiness(checks: &[ReadinessCheck]) -> Option<Value> {
-    if checks.is_empty() {
-        return None;
-    }
-    let state = if checks
-        .iter()
-        .any(|check| matches!(check, ReadinessCheck::Unsupported(_, _)))
-    {
-        "unsupported"
-    } else if checks
-        .iter()
-        .any(|check| matches!(check, ReadinessCheck::NeedsAttention(_, _)))
-    {
-        "needs_attention"
-    } else {
-        "ready"
-    };
-    let reasons = checks
-        .iter()
-        .filter_map(|check| match check {
-            ReadinessCheck::Ok => None,
-            ReadinessCheck::NeedsAttention(code, message)
-            | ReadinessCheck::Unsupported(code, message) => {
-                Some(json!({"code":code,"message":message}))
-            }
-        })
-        .collect::<Vec<_>>();
-    Some(json!({"state":state,"reasons":reasons}))
-}
-
-/// Attach only nonempty agent checks; an absent field means ready.
-pub fn with_readiness(mut row: Value, checks: Vec<ReadinessCheck>) -> Value {
-    if let Some(value) = aggregate_readiness(&checks) {
-        row["readiness"] = value;
-    }
-    row
+/// No places outside PATH.
+pub fn no_fallbacks(_: &Roots) -> Vec<PathBuf> {
+    Vec::new()
 }
 
 /// Registering Sidevoice with an agent, reading its state, and removing only an entry Sidevoice wrote.
 pub trait Registration: Send + Sync {
-    /// The agent's home.
-    fn config_root<'a>(&self, profile: &'a Profile) -> &'a Path;
-    /// Its CLI's names, as found on PATH.
-    fn binary_names(&self) -> &'static [&'static str];
-    /// Where its CLI may be when it is not on `PATH`, most preferred first. Looked at only after `PATH`, by file
-    /// metadata; the first that can be run is the one used, as one found on `PATH` would be.
-    fn fallback_binaries(
-        &self,
-        _roots: &crate::adapters::markers::Roots,
-    ) -> Vec<std::path::PathBuf> {
-        Vec::new()
-    }
-    /// The npm package and native program layout, when this harness publishes one.
-    /// Shared resolution reads package-manager shims and follows Node dependency lookup.
-    fn npm_package(&self) -> Option<crate::agents::npm::NativePackage> {
-        None
-    }
-    /// Fixed, passive filesystem markers for this agent. CLI names above use the captured login PATH.
-    fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
-        &[]
-    }
-    /// Checks specific to this agent; an empty list needs no readiness field.
-    fn readiness_checks(&self, _profile: &Profile) -> Vec<ReadinessCheck> {
-        Vec::new()
-    }
-    /// How to start this agent against the test bench's profile, when it can be: printed when the bench starts.
-    fn bench_steps(&self, _setup: &BenchSetup) -> Option<String> {
-        None
-    }
-
-    /// What is left for the person after an install that registered Sidevoice with this agent.
-    fn after_install(&self, _profile: &Profile) -> Vec<String> {
-        Vec::new()
-    }
-    /// Whether Sidevoice registers with it without its CLI.
-    fn connects_without_binary(&self) -> bool {
-        false
-    }
-    /// The registration's state: `connected`, `outdated` (ours, not current), `not-connected`, `foreign`, `invalid`
-    /// or `unknown`; with the entry's launch, as the agent would run it, whenever its configuration names one.
+    /// Registers Sidevoice with the agent: writes its entry, or writes again one an older Sidevoice wrote.
+    fn connect<'a>(&'a self, host: &'a dyn AgentHost) -> BoxFuture<'a, Result<(), AgentError>>;
+    /// Removes Sidevoice's entry, current or not; never one Sidevoice did not write.
+    fn disconnect<'a>(&'a self, host: &'a dyn AgentHost) -> BoxFuture<'a, Result<(), AgentError>>;
+    /// How a person does each operation by hand, as ordered steps, for the registration `registered` reports.
+    fn manual(&self, host: &dyn AgentHost, registered: Registered) -> Manual;
+    /// The agent on this machine: whether it is installed, whether Sidevoice is registered with it, and what needs
+    /// the person's attention.
     fn state<'a>(
         &'a self,
         host: &'a dyn AgentHost,
-        binary: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<Entry, AgentError>>;
-    fn connect<'a>(
-        &'a self,
-        host: &'a dyn AgentHost,
-        binary: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), AgentError>>;
-    fn disconnect<'a>(
-        &'a self,
-        host: &'a dyn AgentHost,
-        binary: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), AgentError>>;
-    /// How a person does each operation by hand, as ordered steps, for the registration `state` reported.
-    fn manual(&self, host: &dyn AgentHost, registration: &str, binary: Option<&str>) -> Manual;
+    ) -> BoxFuture<'a, Result<RegistrationState, AgentError>>;
+}
+
+/// An agent as Sidevoice finds it on this machine.
+#[derive(Clone, Debug)]
+pub struct RegistrationState {
+    /// How the agent was found installed (`cli`, or a marker of its own such as `app_bundle`); empty when it was not.
+    pub installed: Vec<&'static str>,
+    pub registered: Registered,
+    /// Whether Sidevoice registers with it by itself (its CLI was found, or it edits the agent's file); else only by
+    /// hand.
+    pub automatic: bool,
+    /// What the person should know or do; any but a note means not ready.
+    pub warnings: Vec<Warning>,
+    /// How the agent starts Sidevoice's entry, when its configuration names one: what a health check starts.
+    pub launch: Option<Launch>,
+    /// The agent's CLI, as found.
+    pub program: Option<String>,
+}
+
+impl RegistrationState {
+    /// Whether nothing stops it from working: no warning but notes.
+    pub fn ready(&self) -> bool {
+        self.warnings
+            .iter()
+            .all(|warning| warning.level == Level::Note)
+    }
+}
+
+/// Whether Sidevoice is registered with the agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Registered {
+    /// No entry of Sidevoice's.
+    Absent,
+    /// Sidevoice's entry, running this installation.
+    Registered,
+    /// An entry Sidevoice wrote that is not the current one (disabled, an older release, another environment).
+    Outdated,
+    /// Another "sidevoice" entry, not Sidevoice's.
+    Foreign,
+    /// The agent's configuration cannot be read as it should.
+    Invalid,
+    /// It could not be told.
+    Unknown,
+}
+
+impl Registered {
+    /// As the agent list names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "not-connected",
+            Self::Registered => "connected",
+            Self::Outdated => "outdated",
+            Self::Foreign => "foreign",
+            Self::Invalid => "invalid",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// From [`Registered::as_str`]; anything else is `Unknown`.
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "not-connected" => Self::Absent,
+            "connected" => Self::Registered,
+            "outdated" => Self::Outdated,
+            "foreign" => Self::Foreign,
+            "invalid" => Self::Invalid,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Something about an agent the person should know, with a stable code and English text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Warning {
+    pub level: Level,
+    pub code: &'static str,
+    pub message: String,
+}
+
+/// How much a [`Warning`] matters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Level {
+    /// To know; it works.
+    Note,
+    /// It needs the person's attention to work.
+    NeedsAttention,
+    /// It cannot work here.
+    Unsupported,
+}
+
+/// The agent list's `readiness` from `warnings`: none without any; else `ready`, `needs_attention` or `unsupported`,
+/// with each reason (notes are none).
+pub fn readiness(warnings: &[Warning]) -> Option<Value> {
+    if warnings.is_empty() {
+        return None;
+    }
+    let reasons: Vec<&Warning> = warnings
+        .iter()
+        .filter(|warning| warning.level != Level::Note)
+        .collect();
+    let state = if reasons.is_empty() {
+        "ready"
+    } else if reasons
+        .iter()
+        .any(|warning| warning.level == Level::Unsupported)
+    {
+        "unsupported"
+    } else {
+        "needs_attention"
+    };
+    Some(
+        json!({"state":state,"reasons":reasons.iter().map(|warning| json!({"code":warning.code,"message":warning.message})).collect::<Vec<_>>()}),
+    )
+}
+
+/// How the agent was found installed: `cli` when its CLI was found, then each of its `markers` present here.
+pub fn installed(
+    profile: &Profile,
+    program: Option<&str>,
+    markers: &'static [Marker],
+) -> Vec<&'static str> {
+    program
+        .map(|_| "cli")
+        .into_iter()
+        .chain(markers::matching_kinds(
+            markers,
+            std::env::consts::OS,
+            &Roots::process(&profile.home),
+        ))
+        .collect()
 }
 
 /// One step done by hand: a command to run, or a snippet for a file. `file` is the file the step changes, when
@@ -289,40 +348,14 @@ impl Manual {
     }
 }
 
-/// The test bench's profile, as an agent is pointed at it: what [`Registration::bench_steps`] writes its steps with.
-pub struct BenchSetup<'a> {
-    /// The script to source before starting the agent.
-    pub env_script: &'a str,
-    /// An `mcpServers` configuration file naming the installation.
-    pub mcp_config: &'a str,
-    /// The installation's MCP server command, quoted for a shell.
-    pub server: &'a str,
-    /// The environment the server runs with.
-    pub env: &'a BTreeMap<String, String>,
-}
-
-impl BenchSetup<'_> {
-    /// One line that sources [`Self::env_script`] (`. 'script'`, read alike by a POSIX shell and PowerShell), then
-    /// runs `command args`, then `tail` (shell text as given, e.g. [`Self::server`]) after it: in sequence
-    /// ([`Env::in_sequence`]), the command only once the script was read.
-    pub fn line(&self, command: &str, args: &[String], tail: Option<&str>) -> String {
-        let source = format!(". {}", Environment::quote(self.env_script));
-        let mut run = shell_command(command, args);
-        if let Some(tail) = tail {
-            run.push(' ');
-            run.push_str(tail);
-        }
-        Environment::in_sequence(&[&source, &run])
-    }
-}
-
 /// Runs the agent's CLI and requires it to succeed.
 pub async fn run_required(
     host: &dyn AgentHost,
+    cwd: &Path,
     binary: &str,
     args: &[String],
 ) -> Result<(), AgentError> {
-    let output = match host.run(binary, args.to_vec()).await {
+    let output = match host.run(cwd, binary, args.to_vec()).await {
         Ok(output) => output,
         Err(CliError::Cancelled) => return Err(AgentError::Cancelled),
         Err(CliError::Failed) => return Err(AgentError::Key("agents.action-failed")),
@@ -459,120 +492,10 @@ pub fn read_profile_file(path: &Path, limit: u64) -> anyhow::Result<String> {
     String::from_utf8(bytes).context("profile file is not UTF-8")
 }
 
-/// What the test bench asks the connector about the agents (`bench-agents`, a separate binary that cannot read the
-/// registry itself):
-/// - `{"root": R}`: each declared agent home, below `R/agents/`, and each agent's CLI as this `PATH` finds it
-///   (`SIDEVOICE_<ID>_BIN`), as `{"homes": {VAR: path}, "binaries": {VAR: path}}`;
-/// - `{"setup": {env_script, mcp_config, server, env}}`: how to start each agent against the bench, `{"steps": […]}`.
-pub fn bench_agents(request: &Value) -> Value {
-    let registry = super::Registry::standard();
-    if let Some(root) = request.get("root").and_then(Value::as_str) {
-        let homes: serde_json::Map<String, Value> = registry
-            .homes()
-            .iter()
-            .map(|home| {
-                let dir = Path::new(root)
-                    .join("agents")
-                    .join(home.var.to_ascii_lowercase());
-                (
-                    home.var.to_owned(),
-                    Value::from(dir.to_string_lossy().into_owned()),
-                )
-            })
-            .collect();
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let binaries: serde_json::Map<String, Value> = registry
-            .agents()
-            .filter_map(|(id, registration)| {
-                let found = registration
-                    .binary_names()
-                    .iter()
-                    .find_map(|name| Environment::find_program(name, &path))?;
-                Some((
-                    format!("SIDEVOICE_{}_BIN", id.to_ascii_uppercase()),
-                    Value::from(found.to_string_lossy().into_owned()),
-                ))
-            })
-            .collect();
-        return serde_json::json!({"homes": homes, "binaries": binaries});
-    }
-    let setup = request.get("setup").cloned().unwrap_or_default();
-    let text = |key: &str| {
-        setup
-            .get(key)
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned()
-    };
-    let env: BTreeMap<String, String> = setup
-        .get("env")
-        .and_then(Value::as_object)
-        .map(|env| {
-            env.iter()
-                .map(|(name, value)| (name.clone(), value.as_str().unwrap_or("").to_owned()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let (env_script, mcp_config, server) = (text("env_script"), text("mcp_config"), text("server"));
-    let bench = BenchSetup {
-        env_script: &env_script,
-        mcp_config: &mcp_config,
-        server: &server,
-        env: &env,
-    };
-    let steps: Vec<String> = registry
-        .agents()
-        .filter_map(|(_, registration)| registration.bench_steps(&bench))
-        .collect();
-    serde_json::json!({"steps": steps})
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The bench's lines source its script, then run the agent, in sequence as this OS's shell reads them.
-    #[test]
-    fn bench_steps_source_the_profile_then_run_the_agent_in_sequence() {
-        let answer = bench_agents(
-            &json!({"setup": {"env_script": "/b/env.sh", "mcp_config": "/b/mcp.json",
-            "server": "'/r/sidevoice' mcp", "env": {"SIDEVOICE_DATA_DIR": "/d"}}}),
-        );
-        let steps: Vec<&str> = answer["steps"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|step| step.as_str().unwrap())
-            .collect();
-        let source = format!(". {}", Environment::quote("/b/env.sh"));
-        let line = |run: String| Environment::in_sequence(&[&source, &run]);
-        let claude = line(shell_command(
-            "claude",
-            &strings(&["--mcp-config", "/b/mcp.json", "--strict-mcp-config"]),
-        ));
-        let codex_add = line(format!(
-            "{} '/r/sidevoice' mcp",
-            shell_command(
-                "codex",
-                &strings(&[
-                    "mcp",
-                    "add",
-                    "sidevoice",
-                    "--env",
-                    "SIDEVOICE_DATA_DIR=/d",
-                    "--"
-                ])
-            )
-        ));
-        for expected in [claude, codex_add, line(shell_command("codex", &[]))] {
-            assert!(
-                steps
-                    .iter()
-                    .any(|step| step.lines().any(|text| text.trim() == expected)),
-                "{expected} in {steps:?}"
-            );
-        }
-    }
     /// The shell reads each word as given, except where a batch shim would be re-parsed by `cmd.exe`: there no line
     /// is made when any word has `& | < > ^ % !` or `"`.
     #[test]

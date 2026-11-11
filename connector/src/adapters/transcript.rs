@@ -1,12 +1,11 @@
 //! Following a conversation's JSONL transcript as the harness appends it, and what the harness reads in each line.
 
-use super::conversation::{report_working, Conversation, IdentityFailures, Reporter};
+use super::watch::{IdentityFailures, Watch};
 use crate::platform::fs::{FileId, Files, Fs};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::time::Duration;
 
@@ -25,38 +24,30 @@ pub trait TranscriptReader: Send + 'static {
     /// Where the transcript is, once the harness has written it.
     fn path(&self) -> Option<PathBuf>;
     /// Whether this transcript is still the conversation's; following ends when it is not.
-    fn current(&self, _conversation: &Conversation) -> bool {
+    fn current(&self) -> bool {
         true
     }
-    /// Whether what it says of working and engine may be reported yet.
-    fn authenticated(&self, _conversation: &Conversation) -> bool {
+    /// Whether what it says of working may be told yet.
+    fn authenticated(&self) -> bool {
         true
     }
     /// Whether the harness may rewrite the file in place, so a changed tail means reading it again from the top.
     fn rewritten_in_place(&self) -> bool {
         false
     }
-    /// What to report before reading, each pass.
-    fn begin(&mut self, _authenticated: bool) -> Vec<Observed> {
-        Vec::new()
-    }
     /// What one line says.
-    fn item(&mut self, item: &Value, authenticated: bool) -> Vec<Observed>;
+    fn item(&mut self, item: &Value) -> Vec<Observed>;
 }
 
-/// Follows the conversation's transcript until it stops: waits for the file, then reads it as it grows.
-pub fn follow<R: TranscriptReader>(
-    conversation: Arc<Conversation>,
-    reporter: Arc<dyn Reporter>,
-    reader: R,
-) {
+/// Follows the conversation's transcript into `watch` until it stops: waits for the file, then reads it as it grows.
+pub fn follow<S: Send + Sync + 'static, R: TranscriptReader>(watch: Arc<Watch<S>>, reader: R) {
     tokio::spawn(async move {
-        while !conversation.stopped.load(Ordering::Relaxed) {
-            if !reader.current(&conversation) {
+        while !watch.stopped() {
+            if !reader.current() {
                 return;
             }
             if let Some(path) = reader.path() {
-                follow_file(&*reporter, &conversation, path, reader).await;
+                follow_file(&watch, path, reader).await;
                 return;
             }
             tokio::time::sleep(Duration::from_millis(400)).await;
@@ -64,12 +55,7 @@ pub fn follow<R: TranscriptReader>(
     });
 }
 
-async fn follow_file<R: TranscriptReader>(
-    reporter: &dyn Reporter,
-    conversation: &Conversation,
-    path: PathBuf,
-    mut reader: R,
-) {
+async fn follow_file<S, R: TranscriptReader>(watch: &Watch<S>, path: PathBuf, mut reader: R) {
     let mut file_id: Option<FileId> = None;
     let mut offset = 0u64;
     let mut partial = Vec::new();
@@ -81,24 +67,10 @@ async fn follow_file<R: TranscriptReader>(
     let rewritten_in_place = reader.rewritten_in_place();
     let mut identity_failures = IdentityFailures::default();
     loop {
-        if conversation.stopped.load(Ordering::Relaxed) {
+        if watch.stopped() || !reader.current() {
             break;
         }
-        if !reader.current(conversation) {
-            break;
-        }
-        let authenticated = reader.authenticated(conversation);
-        for observed in reader.begin(authenticated) {
-            report(
-                reporter,
-                conversation,
-                observed,
-                &mut working,
-                catching_up,
-                authenticated,
-            )
-            .await;
-        }
+        let authenticated = reader.authenticated();
         let Ok(mut input) = fs::File::open(&path) else {
             tokio::time::sleep(Duration::from_millis(400)).await;
             continue;
@@ -171,16 +143,14 @@ async fn follow_file<R: TranscriptReader>(
                     if segment.last() == Some(&b'\n') {
                         if !oversized {
                             if let Ok(item) = serde_json::from_slice::<Value>(&partial) {
-                                for observed in reader.item(&item, authenticated) {
+                                for observed in reader.item(&item) {
                                     report(
-                                        reporter,
-                                        conversation,
+                                        watch,
                                         observed,
                                         &mut working,
                                         catching_up,
                                         authenticated,
-                                    )
-                                    .await;
+                                    );
                                 }
                             }
                         }
@@ -195,7 +165,7 @@ async fn follow_file<R: TranscriptReader>(
         }
         if !catching_up && authenticated && !announced_initial {
             if let Some(state) = working {
-                report_working(reporter, conversation, state).await;
+                watch.set_working(state);
             }
             announced_initial = true;
         }
@@ -208,42 +178,27 @@ async fn follow_file<R: TranscriptReader>(
     }
 }
 
-/// Reports one observation. Working is only remembered while catching up or before the transcript is authenticated;
-/// the latest is announced once both are past.
-async fn report(
-    reporter: &dyn Reporter,
-    conversation: &Conversation,
+/// Tells one observation. Working is only remembered while catching up or before the transcript is authenticated;
+/// the latest is told once both are past.
+fn report<S>(
+    watch: &Watch<S>,
     observed: Observed,
     working: &mut Option<bool>,
     catching_up: bool,
     authenticated: bool,
 ) {
     match observed {
-        Observed::Engine(engine) => reporter.engine(conversation, engine).await,
+        Observed::Engine(engine) => watch.set_engine(engine),
         Observed::Working(state) => {
             *working = Some(state);
             if !catching_up && authenticated {
-                report_working(reporter, conversation, state).await;
+                watch.set_working(state);
             }
         }
         Observed::Read(header) => {
-            let Some(message_id) = header.get("message_id").and_then(Value::as_str) else {
-                return;
-            };
-            let session_id = header
-                .get("session_id")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let revision = header.get("revision").and_then(Value::as_i64).unwrap_or(0);
-            reporter
-                .read(
-                    conversation,
-                    message_id,
-                    json!(session_id),
-                    json!(revision),
-                    Value::Null,
-                )
-                .await;
+            if let Some(message_id) = header.get("message_id").and_then(Value::as_str) {
+                watch.read(message_id);
+            }
         }
     }
 }

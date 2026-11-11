@@ -1,12 +1,11 @@
 use super::*;
 
-use crate::adapters::registration::Registration;
 use crate::platform::fs::{Files, TestFiles};
 use std::sync::LazyLock;
 static CODEX: LazyLock<NativePackage> =
-    LazyLock::new(|| crate::adapters::codex::Codex.npm_package().unwrap());
+    LazyLock::new(|| crate::adapters::codex::PROGRAMS.npm.unwrap());
 static CLAUDE: LazyLock<NativePackage> =
-    LazyLock::new(|| crate::adapters::claude::Claude.npm_package().unwrap());
+    LazyLock::new(|| crate::adapters::claude::PROGRAMS.npm.unwrap());
 const TARGET: &str = "x86_64-pc-windows-msvc";
 
 fn write(path: &Path, text: &str) {

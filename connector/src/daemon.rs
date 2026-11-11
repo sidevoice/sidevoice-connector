@@ -1,4 +1,4 @@
-use crate::adapters::{Conversation, Registry, Reporter, Route};
+use crate::adapters::{Agent, Conversation, Inbound, Limit, Registry, Sent, State, Status};
 use crate::agents::HostAgents;
 use crate::frame;
 use crate::link::{Incoming, Link};
@@ -6,7 +6,6 @@ use crate::platform::fs::{Files, Fs};
 use crate::platform::ipc::Stream;
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
-use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -17,6 +16,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::Duration;
 use tokio::time::Instant;
 
+mod binding;
 #[cfg(test)]
 #[path = "daemon/tests.rs"]
 mod bridge_tests;
@@ -24,6 +24,8 @@ mod bridge_tests;
 mod contract_tests;
 mod files;
 mod run;
+
+use binding::Binding;
 
 use files::{
     prepare_conversation_guard, read_conversation_state, read_outbox, write_conversation_guard,
@@ -40,8 +42,10 @@ const DELIVERED_PER_THREAD: usize = 256;
 const DELIVERED_THREADS: usize = 1024;
 /// The longest message id remembered (the core's are far shorter); a longer one is handed over but not remembered.
 const DELIVERED_ID_MAX: usize = 128;
-/// How long an `unknown` answer waits for the transcript to show the message read before it is told as it is.
+/// How long a message the agent's inbox took without a word waits for the agent to have it before it is told as it is.
 const CONFIRM_WAIT_MS: u64 = 8000;
+/// How often each joined conversation's harness is asked how it is and what it has received.
+const POLL: Duration = Duration::from_millis(500);
 const RESUME_REASON_NONE: u8 = 0;
 const RESUME_REASON_HISTORY: u8 = 1;
 const RESUME_REASON_STORAGE: u8 = 2;
@@ -54,7 +58,7 @@ fn present<'a>(params: &'a Value, key: &str) -> Option<&'a Value> {
 pub struct Daemon {
     profile: Profile,
     link: Arc<Link>,
-    bindings: Mutex<HashMap<String, Arc<Conversation>>>,
+    bindings: Mutex<HashMap<String, Arc<Binding>>>,
     outbox: Mutex<Vec<Value>>,
     /// Per thread, the messages already handed to its harness and what it answered (`accepted` or `unknown`), kept
     /// across a restart: a message offered again (the core's answer was lost, or the core restarted holding it) is
@@ -62,7 +66,7 @@ pub struct Daemon {
     /// a crash between the two offers the message once more: a message is typed twice rather than never. Message ids
     /// are the core's own (unique), so the thread and the id name a message.
     delivered: Mutex<HashMap<String, VecDeque<(String, String)>>>,
-    /// How long a harness's `unknown` answer waits for the transcript to show the message read, in milliseconds.
+    /// How long a message handed over without a word waits for the agent to have it, in milliseconds.
     confirm_wait_ms: AtomicU64,
     replay_tx: mpsc::Sender<()>,
     host_agents: Arc<HostAgents>,
@@ -189,24 +193,76 @@ impl Daemon {
                 }
             }
         });
-        let reporter: Arc<dyn Reporter> = daemon.clone();
-        for harness in daemon.registry.all() {
-            harness.attach(&daemon.profile, Arc::downgrade(&reporter))?;
-        }
+        let poller = daemon.clone();
+        let mut stop = daemon.shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(POLL);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => poller.poll().await,
+                    changed = stop.changed() => {
+                        if changed.is_err() || *stop.borrow() { break; }
+                    }
+                }
+            }
+        });
         Ok(daemon)
     }
 
-    async fn register_core(&self, binding: &Arc<Conversation>) -> Result<Value> {
+    /// How each joined conversation is now, and which of the messages handed to it it has: what changed is told to
+    /// the core.
+    async fn poll(&self) {
+        let bindings: Vec<_> = self.bindings.lock().await.values().cloned().collect();
+        for binding in bindings {
+            let state = self
+                .state_of(&binding.conversation(), binding.endpoint.is_some())
+                .await;
+            let working = match state.status {
+                Status::Working => Some(true),
+                Status::Idle => Some(false),
+                Status::Unknown => None,
+            };
+            let told = *binding.working.lock().await;
+            if let Some(working) = working.filter(|working| told != Some(*working)) {
+                self.report_working(&binding, working).await;
+            }
+            if let Some(model) = &state.model {
+                self.report_engine(&binding, model.engine()).await;
+            }
+            *binding.state.lock().await = state;
+            let pending: Vec<String> = binding.pending.lock().await.iter().cloned().collect();
+            if binding.endpoint.is_none() && !pending.is_empty() {
+                let harness = self.registry.get(&binding.harness);
+                for id in harness.received(&binding.conversation(), &pending).await {
+                    self.report_read(&binding, &id).await;
+                }
+            }
+        }
+    }
+
+    /// How `conversation` is, from its harness; one whose agent named its own HTTP endpoint takes messages there.
+    async fn state_of(&self, conversation: &Conversation, endpoint: bool) -> State {
+        let mut state = self
+            .registry
+            .get(&conversation.harness)
+            .state(conversation)
+            .await;
+        if endpoint {
+            state.inbound = Inbound::Open;
+        }
+        state
+    }
+
+    async fn register_core(&self, binding: &Arc<Binding>) -> Result<Value> {
         let mut current = binding.id.lock().await;
         let engine = binding.engine.lock().await.clone().unwrap_or(Value::Null);
+        let (capabilities, inbound) = declaration(&*binding.state.lock().await);
         crate::logfile::log(&format!(
-            "delivery stage=register result=attempt inject={} route={}",
-            binding.capabilities["deliver"] == "supported",
-            binding.route_kind().unwrap_or("none")
+            "delivery stage=register result=attempt inject={}",
+            capabilities["deliver"] == "supported"
         ));
-        let mut frame = json!({"client_ref":binding.client_ref,"harness":binding.harness,"thread":binding.thread,"title":binding.title,"delivery":binding.delivery,
-            "inbound":binding.inbound,"capabilities":binding.capabilities,
-            "experimental":binding.experimental,"route":binding.route,"engine":engine,"focus":false});
+        let mut frame = json!({"client_ref":binding.client_ref,"harness":binding.harness,"thread":binding.thread,"title":binding.title,
+            "inbound":inbound,"capabilities":capabilities,"engine":engine,"focus":false});
         if !current.starts_with("local-") {
             frame["binding_id"] = json!(*current);
         }
@@ -310,11 +366,7 @@ impl Daemon {
         self.request_replay();
     }
 
-    async fn close_binding_from_client(
-        &self,
-        binding: &Arc<Conversation>,
-        reason: &str,
-    ) -> Result<()> {
+    async fn close_binding_from_client(&self, binding: &Arc<Binding>, reason: &str) -> Result<()> {
         let _state_transaction = self.conversation_state_serial.lock().await;
         if !self
             .bindings
@@ -330,7 +382,6 @@ impl Daemon {
             let _ = self.shutdown.send(true);
             return Err(error);
         }
-        binding.stopped.store(true, Ordering::Relaxed);
         self.bindings.lock().await.remove(&binding.client_ref);
         {
             let mut closed = self.closed_by_client.lock().await;
@@ -341,7 +392,6 @@ impl Daemon {
         if !self.persist_conversation_state().await {
             bail!("closed binding could not be saved");
         }
-        self.registry.get(&binding.harness).close(binding).await;
         Ok(())
     }
 
@@ -491,7 +541,7 @@ impl Daemon {
         }
     }
 
-    async fn send_working_event(&self, binding: &Conversation, mut event: Value) {
+    async fn send_working_event(&self, binding: &Binding, mut event: Value) {
         let current = binding.working.lock().await;
         if event.get("working").and_then(Value::as_bool) != *current {
             return;
@@ -504,19 +554,19 @@ impl Daemon {
         let _ = self.link.notify("input.working", event).await;
     }
 
-    async fn report_working_event(&self, binding: &Conversation, event: Value) {
+    async fn report_working_event(&self, binding: &Binding, event: Value) {
         if let Some(working) = event.get("working").and_then(Value::as_bool) {
             *binding.working.lock().await = Some(working);
             self.send_working_event(binding, event).await;
         }
     }
 
-    async fn report_working(&self, binding: &Conversation, working: bool) {
+    async fn report_working(&self, binding: &Binding, working: bool) {
         self.report_working_event(binding, json!({"working":working,"turn_id":Value::Null}))
             .await;
     }
 
-    async fn report_engine(&self, binding: &Conversation, engine: Value) {
+    async fn report_engine(&self, binding: &Binding, engine: Value) {
         if !engine
             .get("model")
             .and_then(Value::as_str)
@@ -842,7 +892,7 @@ impl Daemon {
         }
     }
 
-    async fn binding_for_id(&self, id: &str) -> Option<Arc<Conversation>> {
+    async fn binding_for_id(&self, id: &str) -> Option<Arc<Binding>> {
         let candidates: Vec<_> = self.bindings.lock().await.values().cloned().collect();
         for b in candidates {
             if *b.id.lock().await == id {
@@ -940,18 +990,21 @@ impl Daemon {
         }
     }
 
-    /// Whether `message_id` was reported read within the confirm wait (it leaves the binding's pending list then).
-    async fn read_within_confirm_wait(&self, binding: &Conversation, message_id: &str) -> bool {
+    /// Whether the agent has `message_id` within the confirm wait, asking its harness: told to the core as read then.
+    async fn received_within_confirm_wait(&self, binding: &Binding, message_id: &str) -> bool {
         let until =
             Instant::now() + Duration::from_millis(self.confirm_wait_ms.load(Ordering::Relaxed));
+        let conversation = binding.conversation();
+        let ids = [message_id.to_owned()];
         loop {
-            if !binding
-                .pending
-                .lock()
+            if !self
+                .registry
+                .get(&binding.harness)
+                .received(&conversation, &ids)
                 .await
-                .iter()
-                .any(|id| id == message_id)
+                .is_empty()
             {
+                self.report_read(binding, message_id).await;
                 return true;
             }
             if Instant::now() >= until {
@@ -1015,31 +1068,42 @@ impl Daemon {
             )
             .await;
         crate::logfile::log(&format!(
-            "delivery stage=adapter result=attempt route={}",
-            binding.route_kind().unwrap_or("none")
+            "delivery stage=adapter result=attempt endpoint={}",
+            binding.endpoint.is_some()
         ));
-        let result = match self
-            .registry
-            .get(&binding.harness)
-            .deliver(&binding, frame, &self.profile)
-            .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                binding.pending.lock().await.retain(|id| id != message_id);
-                binding.forget_input(message_id, session_id, revision).await;
-                json!({"status":"failed","detail":error.to_string()})
+        let sent = match &binding.endpoint {
+            Some(endpoint) => crate::adapters::post(endpoint, &binding.thread, frame).await,
+            None => {
+                self.registry
+                    .get(&binding.harness)
+                    .send(&binding.conversation(), frame)
+                    .await
             }
         };
-        // A harness that took the message without saying so (`unknown`) gets a moment for the transcript to show it
-        // read: the answer is then `accepted`, and the person's message is not marked uncertain for nothing. The
-        // binding's turn lock is held meanwhile, so nothing later is handed over before this one is settled.
-        let result = if result.get("status").and_then(Value::as_str) == Some("unknown")
-            && self.read_within_confirm_wait(&binding, message_id).await
-        {
-            json!({"status":"accepted","detail":"read by the agent"})
-        } else {
-            result
+        let result = match sent {
+            Sent::Accepted => json!({"status":"accepted"}),
+            // Taken without a word: a moment for the agent to show it has it, so the answer is `accepted` and the
+            // person's message is not marked uncertain for nothing. The binding's turn lock is held meanwhile, so
+            // nothing later is handed over before this one is settled.
+            Sent::Unconfirmed
+                if self
+                    .received_within_confirm_wait(&binding, message_id)
+                    .await =>
+            {
+                json!({"status":"accepted","detail":"read by the agent"})
+            }
+            Sent::Unconfirmed => {
+                json!({"status":"unknown","detail":"handed to the agent, which has not shown it yet"})
+            }
+            Sent::Refused(limit) => {
+                binding.pending.lock().await.retain(|id| id != message_id);
+                binding.forget_input(message_id, session_id, revision).await;
+                let status = match limit {
+                    Limit::NoRoute(_) => "unsupported",
+                    _ => "failed",
+                };
+                json!({"status":status,"detail":limit.detail()})
+            }
         };
         if matches!(
             result.get("status").and_then(Value::as_str),
@@ -1088,41 +1152,11 @@ impl Daemon {
                     .and_then(Value::as_str)
                     .context("harness required")?
                     .to_owned();
-                let harness_adapter = self.registry.get(&harness).clone();
-                let mut delivery = present(&params, "delivery")
-                    .cloned()
-                    .unwrap_or_else(|| json!({"kind":"none"}));
-                let mut capabilities = present(&params, "capabilities")
-                    .cloned()
-                    .unwrap_or_else(|| harness_adapter.capabilities());
-                let mut experimental = present(&params, "experimental")
-                    .cloned()
-                    .unwrap_or_else(|| json!([]));
-                let mut route = params
-                    .get("route")
+                // The agent's own HTTP endpoint for messages, when it names one: used whatever its harness.
+                let endpoint = present(&params, "endpoint")
                     .and_then(Value::as_str)
+                    .filter(|url| !url.is_empty())
                     .map(str::to_owned);
-                match harness_adapter.accepts(&delivery, &thread) {
-                    Route::Accepted => {}
-                    Route::Refused => bail!("harness identity does not match its delivery route"),
-                    // A route kind a newer façade knows and this daemon does not: the conversation joins with no
-                    // route in (the core cannot deliver to it), and its speech still goes out.
-                    Route::Unknown => {
-                        crate::logfile::log(&format!(
-                            "conversation {client_ref} joins with no route in: {harness} has no route {}",
-                            delivery.get("kind").unwrap_or(&Value::Null)
-                        ));
-                        delivery = json!({"kind":"none"});
-                        route = None;
-                        if let Some(capabilities) = capabilities.as_object_mut() {
-                            capabilities.insert("deliver".into(), json!("unsupported"));
-                        }
-                        if let Some(names) = experimental.as_array_mut() {
-                            names.retain(|name| name != "deliver");
-                        }
-                    }
-                }
-                let inbound = params.get("inbound").cloned().unwrap_or(Value::Null);
                 let detachable = params.get("detachable") == Some(&json!(true));
                 let _state_transaction = self.conversation_state_serial.lock().await;
                 self.check_registration_allowed(&client_ref, resume).await?;
@@ -1137,29 +1171,33 @@ impl Daemon {
                     let registered = self.register_core(&existing).await?;
                     let binding_id = existing.id.lock().await.clone();
                     drop(_state_transaction);
-                    return Ok(
-                        json!({"binding_id":binding_id,"thread":thread,"connected":self.link.connected().await,"prepared":null,
-                            "epoch":registered.get("epoch"),"initial_reply_context":registered.get("initial_reply_context")}),
-                    );
+                    let mut answer = json!({"binding_id":binding_id,"thread":thread,"connected":self.link.connected().await,
+                        "epoch":registered.get("epoch"),"initial_reply_context":registered.get("initial_reply_context")});
+                    joined_way_in(&mut answer, &existing.state.lock().await.inbound);
+                    return Ok(answer);
                 }
                 drop(_state_transaction);
-                let binding = Arc::new(Conversation {
-                    client_ref: client_ref.clone(),
+                let conversation = Conversation {
                     harness,
+                    id: thread.clone(),
+                    agent: Agent::from_json(present(&params, "agent")),
+                };
+                let state = self.state_of(&conversation, endpoint.is_some()).await;
+                if let Inbound::Blocked(Limit::InboundBlockedByPermissions { reason, remedy }) =
+                    &state.inbound
+                {
+                    bail!("This conversation cannot connect: {reason} {remedy}");
+                }
+                let binding = Arc::new(Binding {
+                    client_ref: client_ref.clone(),
+                    harness: conversation.harness,
                     thread: thread.clone(),
+                    agent: conversation.agent,
                     title,
-                    delivery: delivery.clone(),
+                    endpoint,
                     initial_reply_context: Mutex::new(Value::Null),
-                    engine: Mutex::new(
-                        params
-                            .get("engine")
-                            .filter(|value| !value.is_null())
-                            .cloned(),
-                    ),
-                    route,
-                    capabilities,
-                    experimental,
-                    inbound,
+                    engine: Mutex::new(state.model.as_ref().map(|model| model.engine())),
+                    state: Mutex::new(state),
                     detachable,
                     owner: AtomicU64::new(owner),
                     id: Mutex::new(format!("local-{}", uuid::Uuid::new_v4())),
@@ -1172,8 +1210,6 @@ impl Daemon {
                     read: Mutex::new(VecDeque::new()),
                     deliveries: Mutex::new(VecDeque::new()),
                     working: Mutex::new(None),
-                    stopped: AtomicBool::new(false),
-                    state: harness_adapter.conversation_state(),
                 });
                 let _state_transaction = self.conversation_state_serial.lock().await;
                 self.check_registration_allowed(&client_ref, resume).await?;
@@ -1187,11 +1223,12 @@ impl Daemon {
                     let registered = self.register_core(&existing).await?;
                     let binding_id = existing.id.lock().await.clone();
                     drop(_state_transaction);
-                    return Ok(json!({"binding_id":binding_id,"thread":thread,
-                        "connected":self.link.connected().await,"prepared":null,
-                        "epoch":registered.get("epoch"),"initial_reply_context":registered.get("initial_reply_context")}));
+                    let mut answer = json!({"binding_id":binding_id,"thread":thread,
+                        "connected":self.link.connected().await,
+                        "epoch":registered.get("epoch"),"initial_reply_context":registered.get("initial_reply_context")});
+                    joined_way_in(&mut answer, &existing.state.lock().await.inbound);
+                    return Ok(answer);
                 }
-                let prepared = harness_adapter.prepare(&binding).await?;
                 self.bindings
                     .lock()
                     .await
@@ -1225,22 +1262,19 @@ impl Daemon {
                             .await
                             .insert(binding.client_ref.clone(), leave);
                     }
-                    binding.stopped.store(true, Ordering::Relaxed);
-                    self.registry.get(&binding.harness).close(&binding).await;
                     bail!("explicit join could not be saved");
                 }
                 drop(_state_transaction);
-                self.clone().watch_binding(binding.clone());
                 let result = self.register_core(&binding).await;
                 let id = binding.id.lock().await.clone();
                 if result.is_ok() {
                     self.request_replay();
                 }
-                Ok(
-                    json!({"binding_id":id,"thread":thread,"connected":result.is_ok(),"pending":result.is_err(),"prepared":prepared,
-                        "epoch":result.as_ref().ok().and_then(|v| v.get("epoch")),
-                        "initial_reply_context":result.as_ref().ok().and_then(|v| v.get("initial_reply_context"))}),
-                )
+                let mut answer = json!({"binding_id":id,"thread":thread,"connected":result.is_ok(),"pending":result.is_err(),
+                    "epoch":result.as_ref().ok().and_then(|v| v.get("epoch")),
+                    "initial_reply_context":result.as_ref().ok().and_then(|v| v.get("initial_reply_context"))});
+                joined_way_in(&mut answer, &binding.state.lock().await.inbound);
+                Ok(answer)
             }
             "publish" => {
                 if let Some(client_ref) = params.get("client_ref").and_then(Value::as_str) {
@@ -1340,8 +1374,8 @@ impl Daemon {
                     });
                     if adopted {
                         result["adopted"] = json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,
-                            "harness":binding.harness,"title":binding.title,"delivery":binding.delivery,"route":binding.route,
-                            "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound});
+                            "harness":binding.harness,"title":binding.title,
+                            "inbound":binding.state.lock().await.inbound.view()});
                     }
                     return Ok(result);
                 }
@@ -1389,8 +1423,8 @@ impl Daemon {
                 };
                 if adopted {
                     result["adopted"] = json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,
-                        "harness":binding.harness,"title":binding.title,"delivery":binding.delivery,"route":binding.route,
-                        "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound});
+                        "harness":binding.harness,"title":binding.title,
+                        "inbound":binding.state.lock().await.inbound.view()});
                 }
                 Ok(result)
             }
@@ -1455,9 +1489,7 @@ impl Daemon {
                 if !self.persist_conversation_state().await {
                     bail!("agent leave could not be saved");
                 }
-                binding.stopped.store(true, Ordering::Relaxed);
                 self.bindings.lock().await.remove(&binding.client_ref);
-                self.registry.get(&binding.harness).close(&binding).await;
                 if self.link.connected().await {
                     if let Err(error) = self.confirm_agent_leave(&binding.client_ref, &leave).await
                     {
@@ -1505,9 +1537,7 @@ impl Daemon {
                     .get(client_ref)
                     .cloned()
                     .context("unknown editor conversation")?;
-                if !binding.detachable
-                    || !self.registry.get(&binding.harness).adopts(Some(client_ref))
-                {
+                if !binding.detachable {
                     bail!("conversation cannot be adopted");
                 }
                 let previous = binding.owner.load(Ordering::Relaxed);
@@ -1517,8 +1547,8 @@ impl Daemon {
                 binding.owner.store(owner, Ordering::Relaxed);
                 Ok(
                     json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,"thread":binding.thread,
-                    "harness":binding.harness,"title":binding.title,"delivery":binding.delivery,"route":binding.route,
-                    "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound,"detachable":binding.detachable,
+                    "harness":binding.harness,"title":binding.title,
+                    "inbound":binding.state.lock().await.inbound.view(),"detachable":binding.detachable,"agent":binding.agent.to_json(),
                     "engine":binding.engine.lock().await.clone(),
                     "initial_reply_context":*binding.initial_reply_context.lock().await}),
                 )
@@ -1530,8 +1560,8 @@ impl Daemon {
                     let engine = binding.engine.lock().await.clone();
                     let working = *binding.working.lock().await;
                     let mut item = json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,
-                        "harness":binding.harness,"thread":binding.thread,"title":binding.title,"delivery":binding.delivery,
-                        "capabilities":binding.capabilities,"experimental":binding.experimental,"inbound":binding.inbound,
+                        "harness":binding.harness,"thread":binding.thread,"title":binding.title,
+                        "inbound":binding.state.lock().await.inbound.view(),
                         "engine":engine,"working":working,
                         "initial_reply_context":*binding.initial_reply_context.lock().await});
                     if params.get("deliveries") == Some(&json!(true)) {
@@ -1551,12 +1581,6 @@ impl Daemon {
                             })
                             .collect();
                         item["awaiting_read"] = json!(pending.len());
-                    }
-                    if let Some(fields) = self.registry.get(&binding.harness).status(&binding).await
-                    {
-                        for (key, value) in fields {
-                            item[key] = value;
-                        }
                     }
                     listed.push(item);
                 }
@@ -1596,7 +1620,7 @@ impl Daemon {
         }
     }
 
-    async fn find_owned(&self, owner: u64, params: &Value) -> Result<Arc<Conversation>> {
+    async fn find_owned(&self, owner: u64, params: &Value) -> Result<Arc<Binding>> {
         let candidates: Vec<_> = self.bindings.lock().await.values().cloned().collect();
         for b in candidates {
             let id = b.id.lock().await.clone();
@@ -1616,7 +1640,7 @@ impl Daemon {
         params: &Value,
         session_id: &str,
         revision: i64,
-    ) -> Result<(Arc<Conversation>, bool)> {
+    ) -> Result<(Arc<Binding>, bool)> {
         let allowed = params
             .get("client_refs")
             .and_then(Value::as_array)
@@ -1635,10 +1659,7 @@ impl Daemon {
         for binding in candidates {
             let previous = binding.owner.load(Ordering::Relaxed);
             let is_allowed = allowed.contains(&binding.client_ref)
-                || (adopt_orphans
-                    && previous == 0
-                    && binding.detachable
-                    && self.registry.get(&binding.harness).adopts(None));
+                || (adopt_orphans && previous == 0 && binding.detachable);
             if !is_allowed
                 || binding
                     .turns
@@ -1653,11 +1674,7 @@ impl Daemon {
             }
             if previous == owner {
                 matches.push((binding, false));
-            } else if previous == 0
-                && adopt_orphans
-                && binding.detachable
-                && self.registry.get(&binding.harness).adopts(None)
-            {
+            } else if previous == 0 && adopt_orphans && binding.detachable {
                 matches.push((binding, true));
             }
         }
@@ -1679,20 +1696,8 @@ impl Daemon {
         bail!("AMBIGUOUS: several conversations received this voice message ({titles}); pass the session_id and revision from its header")
     }
 
-    fn watch_binding(self: Arc<Self>, binding: Arc<Conversation>) {
-        let harness = self.registry.get(&binding.harness).clone();
-        harness.watch(binding, self);
-    }
-
     /// That `message_id`, delivered to the conversation, was read: told to the core once, if it is still pending.
-    async fn report_read(
-        &self,
-        binding: &Conversation,
-        message_id: &str,
-        session_id: Value,
-        revision: Value,
-        turn_id: Value,
-    ) {
+    async fn report_read(&self, binding: &Binding, message_id: &str) {
         let mut pending = binding.pending.lock().await;
         if !pending.iter().any(|id| id == message_id) {
             return;
@@ -1708,12 +1713,19 @@ impl Daemon {
             read.pop_front();
         }
         drop(read);
+        let (session_id, revision) = binding
+            .input_context
+            .lock()
+            .await
+            .get(message_id)
+            .cloned()
+            .unzip();
         let _ = self
             .link
             .notify(
                 "input.read",
                 json!({"binding_id":*binding.id.lock().await,"message_id":message_id,
-            "session_id":session_id,"revision":revision,"turn_id":turn_id}),
+            "session_id":session_id,"revision":revision,"turn_id":Value::Null}),
             )
             .await;
     }
@@ -1767,7 +1779,6 @@ impl Daemon {
                 b.owner.store(0, Ordering::Relaxed);
                 continue;
             }
-            b.stopped.store(true, Ordering::Relaxed);
             self.bindings.lock().await.remove(&b.client_ref);
             let _ = self
                 .link
@@ -1788,33 +1799,30 @@ impl Daemon {
     }
 }
 
-impl Reporter for Daemon {
-    fn profile(&self) -> &Profile {
-        &self.profile
-    }
+/// What the core is told of a conversation's way in, as it reads it: `capabilities` (`deliver` unsupported when there is no
+/// route in, `working` unsupported when the harness cannot tell) and `inbound` (refused only when the agent's own
+/// settings hold messages back; any other limit passes, and a message is refused when it is offered).
+fn declaration(state: &State) -> (Value, Value) {
+    let supported = |yes: bool| if yes { "supported" } else { "unsupported" };
+    let capabilities = json!({
+        "deliver":supported(!matches!(state.inbound, Inbound::Blocked(Limit::NoRoute(_)))),
+        "working":supported(state.status != Status::Unknown),
+    });
+    let inbound = match &state.inbound {
+        Inbound::Blocked(Limit::InboundBlockedByPermissions { .. }) => state.inbound.view(),
+        _ => json!({"ok":true}),
+    };
+    (capabilities, inbound)
+}
 
-    fn engine<'a>(&'a self, conversation: &'a Conversation, engine: Value) -> BoxFuture<'a, ()> {
-        Box::pin(self.report_engine(conversation, engine))
-    }
-
-    fn working<'a>(&'a self, conversation: &'a Conversation, event: Value) -> BoxFuture<'a, ()> {
-        Box::pin(self.report_working_event(conversation, event))
-    }
-
-    fn read<'a>(
-        &'a self,
-        conversation: &'a Conversation,
-        message_id: &'a str,
-        session_id: Value,
-        revision: Value,
-        turn_id: Value,
-    ) -> BoxFuture<'a, ()> {
-        Box::pin(self.report_read(conversation, message_id, session_id, revision, turn_id))
-    }
-
-    fn conversations(&self) -> BoxFuture<'_, Vec<Arc<Conversation>>> {
-        Box::pin(async { self.bindings.lock().await.values().cloned().collect() })
-    }
+/// Adds to a join answer how a message reaches the conversation, for its façade: `inbound` as it is now, and `delivery`,
+/// by itself (`push`) or only through get_messages when there is no route in.
+fn joined_way_in(answer: &mut Value, inbound: &Inbound) {
+    answer["inbound"] = inbound.view();
+    answer["delivery"] = json!(match inbound {
+        Inbound::Blocked(Limit::NoRoute(_)) => "get_messages",
+        _ => "push",
+    });
 }
 
 /// The answer to one command on the socket. A failure says `error`, its English text, as every version reads it; a
@@ -1846,7 +1854,6 @@ mod tests {
     use super::{answer, Daemon};
     use crate::adapters::Conversation;
     use anyhow::Result;
-    use futures_util::future::BoxFuture;
     use serde_json::json;
     use serde_json::Value;
     use std::collections::HashMap;
@@ -1916,15 +1923,13 @@ mod tests {
         }
     }
 
-    /// A harness the daemon has never heard of, registered by its id: the daemon checks its route, prepares,
-    /// delivers to, follows, lists and closes its conversation only through the trait.
+    /// A harness the daemon has never heard of, registered by its id: the daemon delivers to, follows and lists its
+    /// conversation only through the trait; an id no harness claims is served by the fallback, with no way in.
     #[tokio::test]
     async fn a_harness_registered_by_id_is_driven_through_its_trait() {
-        use crate::adapters::{Conversation, Harness, Registry, Reporter};
+        use crate::adapters::{CallContext, Harness, Model, Registry};
         use crate::profile::Profile;
-        use anyhow::Result;
         use futures_util::future::BoxFuture;
-        use serde_json::{Map, Value};
         use std::sync::{Arc, Mutex};
 
         struct Fake {
@@ -1935,72 +1940,49 @@ mod tests {
             fn id(&self) -> &'static str {
                 "fake"
             }
-
-            fn capabilities(&self) -> Value {
-                json!({"deliver":"supported","working":"unsupported"})
+            fn registration(&self) -> &dyn crate::adapters::registration::Registration {
+                &crate::adapters::Unregistered
             }
-
-            fn accepts(&self, delivery: &Value, thread: &str) -> crate::adapters::Route {
-                match delivery["kind"].as_str() {
-                    Some("fake-route") => {
-                        crate::adapters::Route::known(delivery["thread"] == thread)
-                    }
-                    _ => crate::adapters::Route::Unknown,
-                }
+            fn identify(&self, _: &CallContext) -> Result<Option<Conversation>> {
+                Ok(None)
             }
-
-            fn prepare<'a>(&'a self, _: &'a Conversation) -> BoxFuture<'a, Result<Option<Value>>> {
-                Box::pin(async { Ok(Some(json!({"ready":true}))) })
-            }
-
-            fn deliver<'a>(
+            fn send<'a>(
                 &'a self,
                 conversation: &'a Conversation,
                 frame: &'a Value,
-                _: &'a Profile,
-            ) -> BoxFuture<'a, Result<Value>> {
+            ) -> BoxFuture<'a, Sent> {
                 Box::pin(async move {
                     self.calls
                         .lock()
                         .unwrap()
-                        .push(format!("deliver {} {}", conversation.thread, frame["text"]));
-                    Ok(json!({"status":"accepted"}))
+                        .push(format!("send {} {}", conversation.id, frame["text"]));
+                    Sent::Accepted
                 })
             }
-
-            fn close<'a>(&'a self, conversation: &'a Conversation) -> BoxFuture<'a, ()> {
-                Box::pin(async move {
-                    self.calls
-                        .lock()
-                        .unwrap()
-                        .push(format!("close {}", conversation.thread));
+            fn state<'a>(&'a self, _: &'a Conversation) -> BoxFuture<'a, State> {
+                Box::pin(async {
+                    State {
+                        status: Status::Working,
+                        model: Some(Model {
+                            name: "fake-1".into(),
+                            effort: Some("low".into()),
+                            thinking: None,
+                        }),
+                        inbound: Inbound::Open,
+                    }
                 })
             }
-
-            fn status<'a>(
+            fn received<'a>(
                 &'a self,
                 _: &'a Conversation,
-            ) -> BoxFuture<'a, Option<Map<String, Value>>> {
-                Box::pin(async { json!({"fake_state":"open"}).as_object().cloned() })
-            }
-
-            fn watch(&self, conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
-                tokio::spawn(async move {
-                    reporter
-                        .engine(
-                            &conversation,
-                            json!({"model":"fake-1","effort":"low","thinking":null}),
-                        )
-                        .await;
-                });
+                _: &'a [String],
+            ) -> BoxFuture<'a, Vec<String>> {
+                Box::pin(async { Vec::new() })
             }
         }
 
         let scratch = crate::test_support::temp_dir("fake-harness");
-        let profile = Profile::for_test(
-            scratch.path(),
-            &crate::adapters::Registry::standard().homes(),
-        );
+        let profile = Profile::for_test(scratch.path(), &crate::adapters::Registry::homes());
         let calls = Arc::new(Mutex::new(Vec::new()));
         let registry = Registry::new(vec![Arc::new(Fake {
             calls: calls.clone(),
@@ -2017,29 +1999,16 @@ mod tests {
         )
         .unwrap();
 
-        let refused = daemon
-            .command(
-                1,
-                "register",
-                json!({"client_ref":"other","thread":"t-2","harness":"fake",
-                "delivery":{"kind":"fake-route","thread":"elsewhere"}}),
-            )
-            .await;
-        assert!(
-            refused.is_err(),
-            "a route the harness does not take is refused"
-        );
-
         let joined = daemon
             .command(
                 1,
                 "register",
-                json!({"client_ref":"fake-1","thread":"t-1","title":"Fake","harness":"fake",
-                "delivery":{"kind":"fake-route","thread":"t-1"}}),
+                json!({"client_ref":"fake-1","thread":"t-1","title":"Fake","harness":"fake"}),
             )
             .await
             .unwrap();
-        assert_eq!(joined["prepared"], json!({"ready":true}));
+        assert_eq!(joined["delivery"], "push");
+        assert_eq!(joined["inbound"]["ok"], true);
 
         let delivered = daemon
             .deliver(
@@ -2052,51 +2021,63 @@ mod tests {
         let mut listed = Value::Null;
         for _ in 0..100 {
             listed = daemon.command(1, "status", json!({})).await.unwrap()["bindings"][0].clone();
-            if !listed["engine"].is_null() {
+            if listed["working"] == true {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert_eq!(listed["harness"], "fake");
-        assert_eq!(listed["fake_state"], "open");
+        assert_eq!(listed["working"], true);
         assert_eq!(listed["engine"]["model"], "fake-1");
-        assert_eq!(listed["capabilities"]["working"], "unsupported");
+        assert_eq!(listed["inbound"]["ok"], true);
 
         daemon
             .command(1, "unregister", json!({"client_ref":"fake-1"}))
             .await
             .unwrap();
-        assert_eq!(
-            *calls.lock().unwrap(),
-            ["deliver t-1 \"hola\"", "close t-1"]
-        );
+        assert_eq!(*calls.lock().unwrap(), ["send t-1 \"hola\""]);
+
+        let unclaimed = daemon
+            .command(
+                1,
+                "register",
+                json!({"client_ref":"other-1","thread":"o-1","harness":"other"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unclaimed["delivery"], "get_messages");
+        let refused = daemon
+            .deliver(
+                &json!({"binding_id":unclaimed["binding_id"],"message_id":"m-2","session_id":"s",
+                "revision":1,"text":"hola"}),
+            )
+            .await;
+        assert_eq!(refused["status"], "unsupported", "{refused}");
     }
 
-    /// A harness whose answers are scripted: what each handing over of a message answers, in turn.
+    /// A harness whose answers are scripted: what each handing over of a message answers, in turn, and which
+    /// messages the agent has.
     struct Scripted {
         handed: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         answers: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<&'static str>>>,
+        read: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl crate::adapters::Harness for Scripted {
         fn id(&self) -> &'static str {
             "scripted"
         }
-        fn capabilities(&self) -> Value {
-            json!({"deliver":"supported","working":"unsupported"})
+        fn registration(&self) -> &dyn crate::adapters::registration::Registration {
+            &crate::adapters::Unregistered
         }
-        fn accepts(&self, delivery: &Value, thread: &str) -> crate::adapters::Route {
-            crate::adapters::Route::known(delivery["thread"] == thread)
+        fn identify(&self, _: &crate::adapters::CallContext) -> Result<Option<Conversation>> {
+            Ok(None)
         }
-        fn prepare<'a>(&'a self, _: &'a Conversation) -> BoxFuture<'a, Result<Option<Value>>> {
-            Box::pin(async { Ok(Some(json!({"ready":true}))) })
-        }
-        fn deliver<'a>(
+        fn send<'a>(
             &'a self,
             _: &'a Conversation,
             frame: &'a Value,
-            _: &'a crate::profile::Profile,
-        ) -> BoxFuture<'a, Result<Value>> {
+        ) -> futures_util::future::BoxFuture<'a, Sent> {
             Box::pin(async move {
                 let answer = self
                     .answers
@@ -2105,25 +2086,31 @@ mod tests {
                     .pop_front()
                     .unwrap_or("accepted");
                 if answer == "link_down" {
-                    anyhow::bail!("the harness is unreachable");
+                    return Sent::Refused(Limit::Failed("the harness is unreachable".into()));
                 }
                 self.handed
                     .lock()
                     .unwrap()
                     .push(frame["text"].as_str().unwrap_or("").to_owned());
-                Ok(json!({"status":answer}))
+                match answer {
+                    "unknown" => Sent::Unconfirmed,
+                    _ => Sent::Accepted,
+                }
             })
         }
-        fn close<'a>(&'a self, _: &'a Conversation) -> BoxFuture<'a, ()> {
-            Box::pin(async {})
+        fn state<'a>(&'a self, _: &'a Conversation) -> futures_util::future::BoxFuture<'a, State> {
+            Box::pin(async { State::unknown(Inbound::Open) })
         }
-        fn status<'a>(
+        fn received<'a>(
             &'a self,
             _: &'a Conversation,
-        ) -> BoxFuture<'a, Option<serde_json::Map<String, Value>>> {
-            Box::pin(async { None })
+            ids: &'a [String],
+        ) -> futures_util::future::BoxFuture<'a, Vec<String>> {
+            Box::pin(async move {
+                let read = self.read.lock().unwrap();
+                ids.iter().filter(|id| read.contains(id)).cloned().collect()
+            })
         }
-        fn watch(&self, _: Arc<Conversation>, _: Arc<dyn crate::adapters::Reporter>) {}
     }
 
     async fn scripted_daemon(
@@ -2133,15 +2120,16 @@ mod tests {
         Arc<Daemon>,
         String,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
-        let profile = crate::profile::Profile::for_test(
-            scratch,
-            &crate::adapters::Registry::standard().homes(),
-        );
+        let profile =
+            crate::profile::Profile::for_test(scratch, &crate::adapters::Registry::homes());
         let handed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let read = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let registry = Registry::new(vec![Arc::new(Scripted {
             handed: handed.clone(),
             answers: std::sync::Arc::new(std::sync::Mutex::new(answers.iter().copied().collect())),
+            read: read.clone(),
         })]);
         let (replay_tx, _rx) = tokio::sync::mpsc::channel(1);
         let (shutdown, _) = tokio::sync::watch::channel(false);
@@ -2159,8 +2147,7 @@ mod tests {
             .command(
                 1,
                 "register",
-                json!({"client_ref":"s-1","thread":"t-1","title":"S","harness":"scripted",
-                "delivery":{"thread":"t-1"}}),
+                json!({"client_ref":"s-1","thread":"t-1","title":"S","harness":"scripted"}),
             )
             .await
             .unwrap();
@@ -2168,6 +2155,7 @@ mod tests {
             daemon,
             joined["binding_id"].as_str().unwrap().to_owned(),
             handed,
+            read,
         )
     }
 
@@ -2181,7 +2169,7 @@ mod tests {
     #[tokio::test]
     async fn the_garage_messages_reach_the_harness_once_and_in_order_across_a_restart() {
         let scratch = crate::test_support::temp_dir("garage");
-        let (daemon, binding, handed) = scripted_daemon(
+        let (daemon, binding, handed, _) = scripted_daemon(
             scratch.path(),
             &["link_down", "link_down", "link_down", "accepted"],
         )
@@ -2210,7 +2198,7 @@ mod tests {
         );
         // The core, restarted, holds all three again and offers them in order from the start.
         drop(daemon);
-        let (daemon, binding, handed_after) = scripted_daemon(scratch.path(), &[]).await;
+        let (daemon, binding, handed_after, _) = scripted_daemon(scratch.path(), &[]).await;
         for (id, text) in [("m-1", "one"), ("m-2", "two"), ("m-3", "three")] {
             assert_eq!(
                 daemon.deliver(&frame(&binding, id, text)).await["status"],
@@ -2230,27 +2218,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_answer_that_the_transcript_confirms_becomes_accepted_and_is_not_repeated() {
+    async fn an_unconfirmed_hand_over_the_agent_shows_becomes_accepted_and_is_not_repeated() {
         let scratch = crate::test_support::temp_dir("unknown-read");
-        let (daemon, binding, handed) =
+        let (daemon, binding, handed, read) =
             scripted_daemon(scratch.path(), &["unknown", "unknown"]).await;
-        // Read within the wait: the message was reported read while the harness's answer was awaited.
-        let id = daemon
-            .bindings
-            .lock()
-            .await
-            .values()
-            .next()
-            .unwrap()
-            .clone();
+        // Received within the wait: the agent shows the message while the answer is awaited.
         let reader = {
-            let daemon = daemon.clone();
-            let id = id.clone();
+            let read = read.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-                daemon
-                    .report_read(&id, "m-1", json!("s"), json!(1), Value::Null)
-                    .await;
+                read.lock().unwrap().push("m-1".into());
             })
         };
         assert_eq!(
@@ -2275,7 +2252,7 @@ mod tests {
     async fn only_a_handed_over_answer_in_the_record_is_believed() {
         let scratch = crate::test_support::temp_dir("delivered-record");
         std::fs::create_dir_all(scratch.path().join("data")).ok();
-        let (first, _, _) = scripted_daemon(scratch.path(), &[]).await;
+        let (first, _, _, _) = scripted_daemon(scratch.path(), &[]).await;
         let path = first.profile.data.join(DELIVERED_FILE);
         drop(first);
         Files::write_json(
@@ -2283,7 +2260,7 @@ mod tests {
             &json!({"t-1":[["m-1","failed"],["m-2","accepted"],["","accepted"]]}),
         )
         .unwrap();
-        let (daemon, binding, handed) = scripted_daemon(scratch.path(), &[]).await;
+        let (daemon, binding, handed, _) = scripted_daemon(scratch.path(), &[]).await;
         assert_eq!(
             daemon.deliver(&frame(&binding, "m-1", "one")).await["status"],
             "accepted"

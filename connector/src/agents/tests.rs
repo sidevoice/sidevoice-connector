@@ -1,5 +1,5 @@
 use super::*;
-use crate::adapters::registration::{aggregate_readiness, ReadinessCheck};
+use crate::adapters::registration::{readiness, Level, Warning};
 use crate::platform::data_dir;
 use crate::platform::fs::TestFiles;
 use crate::platform::fs::{Create, Files, Fs};
@@ -274,7 +274,7 @@ impl Fixture {
                     .find(|(name, _)| *name == key)
                     .map(|(_, value)| value.clone())
             },
-            &crate::adapters::Registry::standard().homes(),
+            &crate::adapters::Registry::homes(),
         )
         .unwrap();
         let cursor = root
@@ -460,7 +460,6 @@ async fn cursor_agent_row_exposes_readiness_codes_and_fallbacks_without_private_
 #[tokio::test]
 async fn cursor_readiness_distinguishes_cli_only_from_editor() {
     use crate::adapters::markers::Root;
-    use crate::adapters::registration::Registration;
     let _turn = agent_env().await;
     let fixture = Fixture::new();
     let bin = fixture.root.join("bin");
@@ -483,8 +482,7 @@ async fn cursor_readiness_distinguishes_cli_only_from_editor() {
     // A home-root install makes the missing bridge something to fix. Windows uses
     // SHGetKnownFolderPath via dirs::data_local_dir(), which ignores LOCALAPPDATA overrides.
     // Its installed-editor case is covered with injected Roots in bridge_setup's probe tests.
-    let Some(marker) = crate::adapters::cursor::Cursor
-        .install_markers()
+    let Some(marker) = crate::adapters::cursor::MARKERS
         .iter()
         .find(|marker| marker.os == std::env::consts::OS && marker.root == Root::Home)
     else {
@@ -498,62 +496,44 @@ async fn cursor_readiness_distinguishes_cli_only_from_editor() {
 }
 
 #[test]
-fn readiness_aggregation_prioritizes_unsupported_then_attention_then_ready() {
-    use ReadinessCheck::{NeedsAttention, Ok, Unsupported};
-    for (checks, expected) in [
+fn readiness_prioritizes_unsupported_then_attention_then_ready_and_notes_are_no_reason() {
+    let warning = |level, code, message: &str| Warning {
+        level,
+        code,
+        message: message.to_owned(),
+    };
+    let note = warning(Level::Note, "cursor.routes", "routes");
+    let bridge = warning(
+        Level::NeedsAttention,
+        "cursor.bridge_not_running",
+        BRIDGE_MESSAGE,
+    );
+    let unsupported = warning(
+        Level::Unsupported,
+        "cursor.unsupported",
+        UNSUPPORTED_MESSAGE,
+    );
+    for (warnings, expected) in [
         (vec![], None),
-        (vec![Ok], Some(json!({"state":"ready","reasons":[]}))),
         (
-            vec![
-                Ok,
-                NeedsAttention("cursor.bridge_not_running", BRIDGE_MESSAGE),
-            ],
+            vec![note.clone()],
+            Some(json!({"state":"ready","reasons":[]})),
+        ),
+        (
+            vec![note.clone(), bridge.clone()],
             Some(
                 json!({"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]}),
             ),
         ),
         (
-            vec![
-                NeedsAttention("cursor.bridge_not_running", BRIDGE_MESSAGE),
-                Unsupported("cursor.unsupported", UNSUPPORTED_MESSAGE),
-            ],
+            vec![bridge, unsupported],
             Some(
                 json!({"state":"unsupported","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE},{"code":"cursor.unsupported","message":UNSUPPORTED_MESSAGE}]}),
             ),
         ),
     ] {
-        assert_eq!(aggregate_readiness(&checks), expected);
+        assert_eq!(readiness(&warnings), expected);
     }
-}
-
-#[test]
-fn readiness_row_helper_attaches_only_nonempty_check_sets() {
-    assert_eq!(
-        with_readiness(
-            json!({"id":"cursor"}),
-            vec![ReadinessCheck::NeedsAttention(
-                "cursor.bridge_not_running",
-                BRIDGE_MESSAGE
-            )]
-        ),
-        json!({"id":"cursor","readiness":{"state":"needs_attention","reasons":[{"code":"cursor.bridge_not_running","message":BRIDGE_MESSAGE}]}})
-    );
-    assert_eq!(
-        with_readiness(json!({"id":"claude"}), vec![]),
-        json!({"id":"claude"})
-    );
-}
-
-#[tokio::test]
-async fn profile_only_readiness_hook_defaults_empty_for_other_agents() {
-    let _turn = agent_env().await;
-    let fixture = Fixture::new();
-    let claude = crate::adapters::claude::Claude.readiness_checks(&fixture.profile);
-    let codex = crate::adapters::codex::Codex.readiness_checks(&fixture.profile);
-    assert_eq!(aggregate_readiness(&claude), None);
-    assert_eq!(aggregate_readiness(&codex), None);
-    let cursor: &dyn Registration = &crate::adapters::cursor::Cursor;
-    assert_eq!(cursor.readiness_checks(&fixture.profile).len(), 1);
 }
 
 fn identity_signature(
@@ -1591,14 +1571,21 @@ async fn codex_delivery_does_not_use_a_cached_binary_without_login_path() {
     let mut state = empty_state();
     state["binaries"]["codex"] = json!(codex);
     write_json(&fixture.profile.data.join("agents.json"), &state);
-    assert!(agent_command(&fixture.profile, "codex").program.is_none());
-    let result = crate::adapters::codex::deliver(
-        &json!({"kind":"codex-queue","thread":"t-1"}),
+    assert!(
+        agent_command(&fixture.profile, &crate::adapters::codex::PROGRAMS)
+            .program
+            .is_none()
+    );
+    let result = crate::adapters::codex::send(
+        "t-1",
         &json!({"channel":"voice","session_id":"s","revision":1,"epoch":0,"message_id":"m","text":"hello"}),
         &fixture.profile,
     )
     .await;
-    assert!(result.is_err());
+    assert!(
+        matches!(result, crate::adapters::Sent::Refused(_)),
+        "{result:?}"
+    );
     assert!(!fixture
         .profile
         .agent_home("CODEX_HOME")
@@ -1640,14 +1627,13 @@ async fn codex_delivery_runs_the_scanned_codex_with_the_login_path() {
     assert_eq!(state["binaries"]["codex"], json!(codex));
     host.shutdown().await;
 
-    let answer = crate::adapters::codex::deliver(
-        &json!({"kind":"codex-queue","thread":"t-1"}),
+    let answer = crate::adapters::codex::send(
+        "t-1",
         &json!({"channel":"voice","session_id":"s","revision":1,"epoch":1,"message_id":"m","text":"hola"}),
         &fixture.profile,
     )
-    .await
-    .unwrap();
-    assert_eq!(answer["status"], "accepted");
+    .await;
+    assert_eq!(answer, crate::adapters::Sent::Accepted);
     let seen = fs::read_to_string(&marker).unwrap();
     let lines: Vec<&str> = seen.lines().collect();
     assert_eq!(lines[0], login);
@@ -2541,14 +2527,8 @@ fn running_turn_answers(steer: Value) -> Vec<Value> {
     ]
 }
 
-async fn deliver_to(fixture: &Fixture, id: &str) -> Value {
-    crate::adapters::codex::deliver(
-        &json!({"kind":"codex-queue","thread":"t-1"}),
-        &voice_event(id),
-        &fixture.profile,
-    )
-    .await
-    .unwrap()
+async fn deliver_to(fixture: &Fixture, id: &str) -> crate::adapters::Sent {
+    crate::adapters::codex::send("t-1", &voice_event(id), &fixture.profile).await
 }
 
 #[tokio::test]
@@ -2564,11 +2544,7 @@ async fn codex_delivery_steers_the_running_turn_when_the_version_allows() {
     )
     .await;
     let answer = deliver_to(&fixture, "m-steer").await;
-    assert_eq!(answer["status"], "accepted");
-    assert!(
-        answer["detail"].as_str().unwrap().contains("steered"),
-        "{answer}"
-    );
+    assert_eq!(answer, crate::adapters::Sent::Accepted);
     assert!(!calls.exists(), "the queue was not used");
     let seen = daemon.await.unwrap();
     let steer = seen
@@ -2592,7 +2568,7 @@ async fn codex_delivery_queues_when_the_version_is_too_old() {
         crate::adapters::codex::steer::socket_path(fixture.profile.agent_home("CODEX_HOME"));
     let daemon = crate::adapters::codex::steer::daemon_at(socket, vec![]).await;
     let answer = deliver_to(&fixture, "m-old").await;
-    assert_eq!(answer["detail"], "codex queue confirmed the thread");
+    assert_eq!(answer, crate::adapters::Sent::Accepted);
     assert!(fs::read_to_string(calls)
         .unwrap()
         .starts_with("queue\n--thread\nt-1\n--message\n"));
@@ -2604,7 +2580,7 @@ async fn codex_delivery_queues_when_no_daemon_socket_exists() {
     let _turn = agent_env().await;
     let (fixture, calls) = steer_fixture("0.163.0");
     let answer = deliver_to(&fixture, "m-nosock").await;
-    assert_eq!(answer["detail"], "codex queue confirmed the thread");
+    assert_eq!(answer, crate::adapters::Sent::Accepted);
     assert!(fs::read_to_string(calls).unwrap().starts_with("queue\n"));
 }
 
@@ -2621,7 +2597,7 @@ async fn codex_delivery_queues_when_the_steer_is_refused() {
     )
     .await;
     let answer = deliver_to(&fixture, "m-refused").await;
-    assert_eq!(answer["detail"], "codex queue confirmed the thread");
+    assert_eq!(answer, crate::adapters::Sent::Accepted);
     let queued = fs::read_to_string(calls).unwrap();
     assert!(queued.starts_with("queue\n--thread\nt-1\n--message\n"));
     assert!(
@@ -2805,7 +2781,7 @@ fn native_resolution_errors_and_unrunnable_results_keep_the_launcher() {
         resolved_program(found.clone(), Ok(Some(dir.path().join("missing-native")))),
         Some(found.clone())
     );
-    // If the launcher disappears too, resolution returns None so find_binary can try fallback_binaries.
+    // If the launcher disappears too, resolution returns None so find_binary can try the harness's fallbacks.
     std::fs::remove_file(&launcher).unwrap();
     assert_eq!(
         resolved_program(found, Err(std::io::Error::other("resolver failed"))),

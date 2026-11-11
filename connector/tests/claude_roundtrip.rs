@@ -3,8 +3,9 @@
 //! A real core and the real connector daemon run in a private profile; a real `claude` session, with the connector's
 //! MCP server (`sidevoice-connector mcp`) as its only MCP server, joins voice with `voice_connect`. The test then
 //! speaks into the call as the person would (`/api/presentation/text`): the core hands the message to the connector,
-//! which injects it through the session's messaging socket (`CLAUDE_CODE_MESSAGING_SOCKET`). The message asks for a
-//! random token through `voice_say`. The test asserts, on the core's side and the connector's:
+//! which injects it through the inbox the session's record names (`messagingSocketPath` in Claude Code's
+//! `sessions/<pid>.json`), found from the session id alone. The message asks for a random token through `voice_say`.
+//! The test asserts, on the core's side and the connector's:
 //!
 //! - the token comes back as the agent's `voice_say` reply saved in the core (never the wording around it);
 //! - the core marks the delivered message `read`: the connector confirmed the injection;
@@ -289,7 +290,7 @@ fn a_message_through_the_core_reaches_a_real_claude_session_and_its_reply_comes_
     let thread = session.id.clone().expect("claude's session id");
     let joined = binding(&profile, &thread).expect("the connector has no binding for the session");
     assert_eq!(joined["harness"], "claude", "{joined}");
-    assert_eq!(joined["delivery"]["kind"], "claude-uds", "{joined}");
+    assert_eq!(joined["inbound"]["ok"], true, "{joined}");
     // Settled: the turn above is over, so what follows is the working state of the delivered message alone.
     until("the connector reports the session idle", 90, || {
         (binding(&profile, &thread)?["working"] == false).then_some(())

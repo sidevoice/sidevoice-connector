@@ -115,12 +115,9 @@ fn a_conversation_talks_to_the_real_core_through_the_connector() {
         machine["version"].as_str().is_some_and(|v| !v.is_empty()),
         "{machine}"
     );
-    // The profile keeps homes for Claude Code, Codex and Cursor; nothing else is claimed.
-    assert_eq!(
-        machine["harnesses"],
-        json!(["claude", "codex", "cursor"]),
-        "{machine}"
-    );
+    // The harnesses are the agents the last look found installed (their registration state): none in this profile, which
+    // keeps their homes but installs no agent.
+    assert_eq!(machine["harnesses"], json!([]), "{machine}");
     let receiver = http_receiver();
     let thread = "connector-interop-thread";
     let mut command = profile.connector(&["mcp"]);

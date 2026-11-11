@@ -1,60 +1,110 @@
-use super::conversation::Conversation;
-use super::harness::{no_route, Harness, Route};
-use super::Identity;
+//! The HTTP endpoint an agent may name for its conversation (`SIDEVOICE_DELIVERY_URL`), used whatever its harness, and
+//! the fallback harness: a conversation the agent names itself (`SIDEVOICE_THREAD`), with no way in of its own.
+
+use super::harness::{Agent, CallContext, Conversation, Harness, Inbound, Limit, Sent, State};
+use super::registration::{
+    AgentError, AgentHost, Manual, Registered, Registration, RegistrationState,
+};
 use crate::platform::process::{ChildProcess, Processes};
-use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
-use std::env;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub fn capabilities() -> Value {
-    json!({"deliver":"supported","inspectInbound":"unsupported","working":"unsupported","endOfTurn":"unsupported","sessionIdentity":"supported"})
+/// The variable an agent names its own HTTP endpoint for messages in.
+pub const ENDPOINT_VAR: &str = "SIDEVOICE_DELIVERY_URL";
+
+/// The HTTP endpoint the agent of `call` names for its messages, if any.
+pub fn endpoint(call: &CallContext) -> Option<String> {
+    call.var(ENDPOINT_VAR)
 }
 
-pub fn identity() -> Result<Option<Identity>> {
-    let Ok(thread) = env::var("SIDEVOICE_THREAD") else {
-        return Ok(None);
-    };
-    if thread.is_empty() {
-        return Ok(None);
+/// Why the fallback cannot put a message in.
+const NO_ROUTE: &str = "this harness offers no way to put a message into it.";
+
+/// Any agent that names its own conversation (`SIDEVOICE_THREAD`): the harness of an id no other claims. Messages reach it only through its HTTP endpoint, when it names one.
+pub struct Http;
+
+impl Harness for Http {
+    fn id(&self) -> &'static str {
+        "http"
     }
-    let url = env::var("SIDEVOICE_DELIVERY_URL")
-        .ok()
-        .filter(|url| !url.is_empty());
-    let harness = env::var("SIDEVOICE_HARNESS").unwrap_or_else(|_| "http".into());
-    Ok(Some(identity_for(&harness, thread, url)))
-}
 
-fn identity_for(harness: &str, thread: String, url: Option<String>) -> Identity {
-    let mut identity = Identity::new(
-        harness,
-        thread.clone(),
-        url.as_ref().map_or_else(
-            || json!({"kind":"none"}),
-            |url| json!({"kind":"http","url":url,"thread":thread}),
-        ),
-    );
-    identity.capabilities = capabilities();
-    if url.is_none() {
-        identity.capabilities["deliver"] = json!("unsupported");
+    fn registration(&self) -> &dyn Registration {
+        &Unregistered
     }
-    identity
+
+    fn identify(&self, call: &CallContext) -> Result<Option<Conversation>> {
+        Ok(call.var("SIDEVOICE_THREAD").map(|id| Conversation {
+            harness: self.id().into(),
+            id,
+            agent: Agent::default(),
+        }))
+    }
+
+    fn send<'a>(&'a self, _: &'a Conversation, _: &'a Value) -> BoxFuture<'a, Sent> {
+        Box::pin(async { Sent::Refused(Limit::NoRoute(NO_ROUTE.into())) })
+    }
+
+    fn state<'a>(&'a self, _: &'a Conversation) -> BoxFuture<'a, State> {
+        Box::pin(async { State::unknown(Inbound::Blocked(Limit::NoRoute(NO_ROUTE.into()))) })
+    }
+
+    fn received<'a>(&'a self, _: &'a Conversation, _: &'a [String]) -> BoxFuture<'a, Vec<String>> {
+        Box::pin(async { Vec::new() })
+    }
 }
 
-pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
-    let url = delivery
-        .get("url")
-        .and_then(Value::as_str)
-        .context("HTTP receiver URL missing")?;
+/// A registration with no agent to register with: nothing is installed and nothing is done. The fallback's, and
+/// any harness's that has no agent of its own.
+pub struct Unregistered;
+
+impl Registration for Unregistered {
+    fn connect<'a>(&'a self, _: &'a dyn AgentHost) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Err(AgentError::Key("agents.unknown")) })
+    }
+
+    fn disconnect<'a>(&'a self, _: &'a dyn AgentHost) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Err(AgentError::Key("agents.unknown")) })
+    }
+
+    fn manual(&self, _: &dyn AgentHost, _: Registered) -> Manual {
+        Manual::default()
+    }
+
+    fn state<'a>(
+        &'a self,
+        _: &'a dyn AgentHost,
+    ) -> BoxFuture<'a, Result<RegistrationState, AgentError>> {
+        Box::pin(async {
+            Ok(RegistrationState {
+                installed: Vec::new(),
+                registered: Registered::Absent,
+                automatic: false,
+                warnings: Vec::new(),
+                launch: None,
+                program: None,
+            })
+        })
+    }
+}
+
+/// Posts `event` for conversation `thread` to the agent's HTTP `endpoint`: taken when it answers 2xx.
+pub async fn post(endpoint: &str, thread: &str, event: &Value) -> Sent {
+    match deliver(endpoint, thread, event).await {
+        Ok(()) => Sent::Accepted,
+        Err(error) => Sent::Refused(Limit::Failed(error.to_string())),
+    }
+}
+
+async fn deliver(url: &str, thread: &str, event: &Value) -> Result<()> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         bail!("HTTP receiver URL must use http or https");
     }
     let payload = json!({
-        "thread_id":delivery.get("thread").and_then(Value::as_str).unwrap_or(""),
+        "thread_id":thread,
         "text":event.get("text").and_then(Value::as_str).unwrap_or(""),
         "message_id":event.get("message_id").and_then(Value::as_str).unwrap_or(""),
         "session_id":event.get("session_id").and_then(Value::as_str).unwrap_or(""),
@@ -99,7 +149,7 @@ pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
     if !(200..300).contains(&code) {
         bail!("Harness delivery failed ({code})");
     }
-    Ok(json!({"status":"accepted","detail":format!("receiver answered {code}")}))
+    Ok(())
 }
 
 /// Runs `curl` with `payload` on its stdin and gives its exit status and output, within `limit` after the payload is
@@ -142,62 +192,9 @@ async fn send(
     }
 }
 
-/// Whether `delivery` is the HTTP route of conversation `thread`.
-/// The HTTP route, which every harness knows: `Unknown` for any other kind.
-pub fn accepts(delivery: &Value, thread: &str) -> Route {
-    match delivery.get("kind").and_then(Value::as_str) {
-        Some("none") => Route::Accepted,
-        Some("http") => {
-            Route::known(delivery.get("thread").and_then(Value::as_str) == Some(thread))
-        }
-        _ => Route::Unknown,
-    }
-}
-
-/// Any agent whose conversations take voice by HTTP (`SIDEVOICE_DELIVERY_URL`): the harness of an id no other claims.
-pub struct Http;
-
-impl Harness for Http {
-    fn id(&self) -> &'static str {
-        "http"
-    }
-
-    fn capabilities(&self) -> Value {
-        capabilities()
-    }
-
-    fn accepts(&self, delivery: &Value, thread: &str) -> Route {
-        accepts(delivery, thread)
-    }
-
-    fn deliver<'a>(
-        &'a self,
-        conversation: &'a Conversation,
-        frame: &'a Value,
-        _profile: &'a Profile,
-    ) -> BoxFuture<'a, Result<Value>> {
-        Box::pin(async move {
-            match conversation.route_kind() {
-                Some("http") => deliver(&conversation.delivery, frame).await,
-                _ => Ok(no_route(&conversation.thread)),
-            }
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_harness_without_an_injector_uses_get_messages() {
-        let identity = identity_for("http", "thread".into(), None);
-        assert_eq!(identity.delivery["kind"], "none");
-        assert_eq!(identity.capabilities["deliver"], "unsupported");
-        assert_eq!(accepts(&identity.delivery, "thread"), Route::Accepted);
-        let with_injector = identity_for("http", "thread".into(), Some("http://local".into()));
-        assert_eq!(with_injector.capabilities["deliver"], "supported");
-    }
 
     #[tokio::test]
     async fn a_request_gives_its_status_and_output() {

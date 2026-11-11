@@ -69,6 +69,7 @@ enum Action {
     StageCore { release: std::path::PathBuf },
     /// The test bench's question about the agents: a JSON request on stdin, the JSON answer on stdout.
     #[command(hide = true)]
+    #[cfg(feature = "testbench")]
     BenchAgents,
     /// A service job, as its manager runs it where the manager cannot set its environment and output (Task
     /// Scheduler): the job its definition file describes.
@@ -141,7 +142,7 @@ fn version(json: bool) -> String {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    logfile::private_ids(adapters::Registry::standard().private_id_prefixes());
+    logfile::private_ids(adapters::Registry::private_id_prefixes());
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
@@ -197,7 +198,7 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
                 LoginSetting::Status => None,
             }),
         };
-        let homes = adapters::Registry::standard().homes();
+        let homes = adapters::Registry::homes();
         let agent_vars: Vec<&'static str> = homes.iter().map(|home| home.var).collect();
         let answer = service::commands::run(action, &agent_vars).await;
         let ok = answer.get("ok") == Some(&Value::Bool(true));
@@ -214,11 +215,12 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
             ExitCode::FAILURE
         });
     }
+    #[cfg(feature = "testbench")]
     if let Action::BenchAgents = &action {
         let mut request = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut request)?;
         let request: Value = serde_json::from_str(&request)?;
-        println!("{}", adapters::registration::bench_agents(&request));
+        println!("{}", adapters::bench::agents(&request));
         return Ok(ExitCode::SUCCESS);
     }
     if let Action::RunJob { definition } = &action {
@@ -238,7 +240,7 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let profile = Profile::from_env(&adapters::Registry::standard().homes())?;
+    let profile = Profile::from_env(&adapters::Registry::homes())?;
     match action {
         Action::Install {
             no_agents,
@@ -301,6 +303,7 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
         }
         Action::Service { .. } => unreachable!("service commands run before the profile"),
         Action::StageCore { .. } => unreachable!("the core is staged before the profile"),
+        #[cfg(feature = "testbench")]
         Action::BenchAgents => unreachable!("the bench is answered before the profile"),
         Action::RunJob { .. } => unreachable!("a job runs before the profile"),
     }

@@ -1,65 +1,103 @@
-//! Codex as a harness: voice steered into the running turn when Codex allows it, else through its queue; the rollout followed.
+//! Codex as a harness: a thread is named in the tool call's metadata, reached by steering its running turn when Codex
+//! allows it and else through its queue, and followed through its rollout.
 
-use crate::adapters::conversation::{Conversation, Reporter};
-use crate::adapters::harness::{no_route, Harness, Route};
+use super::rollout;
+use crate::adapters::harness::{Agent, CallContext, Conversation, Harness, Sent, State};
 use crate::adapters::registration::Registration;
+use crate::adapters::watch::{Watch, Watches};
 use crate::profile::Profile;
 use anyhow::Result;
 use futures_util::future::BoxFuture;
 use serde_json::Value;
 use std::sync::Arc;
 
-pub struct Codex;
+/// Codex's threads, as the connector follows them.
+pub struct Threads {
+    profile: Profile,
+    watches: Watches,
+}
 
-impl Harness for Codex {
+impl Threads {
+    pub fn new(profile: Profile) -> Self {
+        Self {
+            profile,
+            watches: Watches::default(),
+        }
+    }
+
+    fn watch(&self, thread: &str) -> Arc<Watch> {
+        self.watches.get(thread, |watch| {
+            rollout::follow(
+                watch.clone(),
+                self.profile.agent_home(super::HOME.var).to_owned(),
+                thread.to_owned(),
+            )
+        })
+    }
+}
+
+impl Harness for Threads {
     fn id(&self) -> &'static str {
         "codex"
     }
 
-    fn capabilities(&self) -> Value {
-        super::capabilities()
+    fn registration(&self) -> &dyn Registration {
+        &super::Codex
     }
 
-    fn homes(&self) -> &'static [crate::profile::AgentHome] {
-        std::slice::from_ref(&super::HOME)
-    }
-
-    fn registration(&self) -> Option<&dyn Registration> {
-        Some(self)
-    }
-
-    fn accepts(&self, delivery: &Value, thread: &str) -> Route {
-        match delivery.get("kind").and_then(Value::as_str) {
-            Some("codex-queue") => {
-                Route::known(delivery.get("thread").and_then(Value::as_str) == Some(thread))
+    /// Codex names the thread in each tool call's metadata (where depends on its version), or in the environment of
+    /// an MCP server it started for one thread.
+    fn identify(&self, call: &CallContext) -> Result<Option<Conversation>> {
+        let meta = call.meta;
+        let turn = meta.get("x-codex-turn-metadata").and_then(|value| {
+            if let Some(text) = value.as_str() {
+                serde_json::from_str::<Value>(text).ok()
+            } else {
+                Some(value.clone())
             }
-            _ => crate::adapters::http::accepts(delivery, thread),
-        }
+        });
+        let thread = [
+            meta.get("openai/threadId"),
+            meta.get("openai/thread_id"),
+            meta.get("codexThreadId"),
+            meta.get("codex_thread_id"),
+            turn.as_ref().and_then(|value| value.get("thread_id")),
+            meta.get("session_id"),
+            meta.get("thread_id"),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|value| {
+            value
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| call.var("CODEX_THREAD_ID"));
+        Ok(thread.map(|id| Conversation {
+            harness: self.id().into(),
+            id,
+            agent: Agent::default(),
+        }))
     }
 
-    fn deliver<'a>(
+    fn send<'a>(
         &'a self,
         conversation: &'a Conversation,
-        frame: &'a Value,
-        profile: &'a Profile,
-    ) -> BoxFuture<'a, Result<Value>> {
-        Box::pin(async move {
-            match conversation.route_kind() {
-                Some("codex-queue") => super::deliver(&conversation.delivery, frame, profile).await,
-                Some("http") => crate::adapters::http::deliver(&conversation.delivery, frame).await,
-                _ => Ok(no_route(&conversation.thread)),
-            }
-        })
+        message: &'a Value,
+    ) -> BoxFuture<'a, Sent> {
+        Box::pin(super::send(&conversation.id, message, &self.profile))
     }
 
-    fn watch(&self, conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
-        let follows = match conversation.route_kind() {
-            Some("codex-queue") => true,
-            Some("http") => conversation.capabilities["working"] == "supported",
-            _ => false,
-        };
-        if follows {
-            super::rollout::follow(conversation, reporter);
-        }
+    fn state<'a>(&'a self, conversation: &'a Conversation) -> BoxFuture<'a, State> {
+        Box::pin(async move { self.watch(&conversation.id).state() })
+    }
+
+    fn received<'a>(
+        &'a self,
+        conversation: &'a Conversation,
+        ids: &'a [String],
+    ) -> BoxFuture<'a, Vec<String>> {
+        Box::pin(async move { self.watch(&conversation.id).received(ids) })
     }
 }
