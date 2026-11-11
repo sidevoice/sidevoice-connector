@@ -2,6 +2,9 @@
 //! the fallback harness: a conversation the agent names itself (`SIDEVOICE_THREAD`), with no way in of its own.
 
 use super::harness::{Agent, CallContext, Conversation, Harness, Inbound, Limit, Sent, State};
+use super::registration::{
+    AgentError, AgentHost, Manual, Registered, Registration, RegistrationState,
+};
 use crate::platform::process::{ChildProcess, Processes};
 use anyhow::{bail, Context, Result};
 use futures_util::future::BoxFuture;
@@ -29,6 +32,10 @@ impl Harness for Http {
         "http"
     }
 
+    fn registration(&self) -> &dyn Registration {
+        &Unregistered
+    }
+
     fn identify(&self, call: &CallContext) -> Result<Option<Conversation>> {
         Ok(call.var("SIDEVOICE_THREAD").map(|id| Conversation {
             harness: self.id().into(),
@@ -47,6 +54,40 @@ impl Harness for Http {
 
     fn received<'a>(&'a self, _: &'a Conversation, _: &'a [String]) -> BoxFuture<'a, Vec<String>> {
         Box::pin(async { Vec::new() })
+    }
+}
+
+/// A registration with no agent to register with: nothing is installed and nothing is done. The fallback's, and
+/// any harness's that has no agent of its own.
+pub struct Unregistered;
+
+impl Registration for Unregistered {
+    fn connect<'a>(&'a self, _: &'a dyn AgentHost) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Err(AgentError::Key("agents.unknown")) })
+    }
+
+    fn disconnect<'a>(&'a self, _: &'a dyn AgentHost) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(async { Err(AgentError::Key("agents.unknown")) })
+    }
+
+    fn manual(&self, _: &dyn AgentHost, _: Registered) -> Manual {
+        Manual::default()
+    }
+
+    fn state<'a>(
+        &'a self,
+        _: &'a dyn AgentHost,
+    ) -> BoxFuture<'a, Result<RegistrationState, AgentError>> {
+        Box::pin(async {
+            Ok(RegistrationState {
+                installed: Vec::new(),
+                registered: Registered::Absent,
+                automatic: false,
+                warnings: Vec::new(),
+                launch: None,
+                program: None,
+            })
+        })
     }
 }
 

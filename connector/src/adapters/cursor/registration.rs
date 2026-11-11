@@ -1,8 +1,10 @@
 //! Sidevoice's entry in Cursor (`mcp.json`, written directly: Cursor has no CLI for it).
 
 use super::Cursor;
+use crate::adapters::markers::{Marker, Root};
 use crate::adapters::registration::{
-    mcp_servers_json, AgentError, AgentHost, Entry, Launch, Manual, ReadinessCheck, Registration,
+    installed, mcp_servers_json, no_fallbacks, AgentError, AgentHost, Entry, Launch, Level, Manual,
+    Programs, Registered, Registration, RegistrationState, Warning,
 };
 use crate::platform::fs::{Files, Fs};
 use crate::profile::Profile;
@@ -204,109 +206,101 @@ fn write_cursor_config(profile: &Profile, file: &Path, config: &Value) -> Result
     Ok(())
 }
 
-/// What Cursor can and cannot do with voice, said at install so that nobody expects more.
-const INSTALL_NOTES: &str = "Cursor: ask a chat to join voice; it speaks its replies there. The first time, \
+/// Where Cursor's CLIs are. Sidevoice registers by editing Cursor's file, so it needs none of them.
+pub(crate) const PROGRAMS: Programs = Programs {
+    names: &["cursor-agent", "cursor"],
+    fallbacks: no_fallbacks,
+    npm: None,
+};
+
+/// Where only an installed Cursor editor is.
+pub(crate) const MARKERS: &[Marker] = &[
+    Marker {
+        os: "macos",
+        kind: "app_bundle",
+        root: Root::Absolute,
+        path: "/Applications/Cursor.app",
+    },
+    Marker {
+        os: "macos",
+        kind: "app_bundle",
+        root: Root::Home,
+        path: "Applications/Cursor.app",
+    },
+    Marker {
+        os: "windows",
+        kind: "install_dir",
+        root: Root::LocalAppData,
+        path: "Programs/cursor",
+    },
+    Marker {
+        os: "windows",
+        kind: "install_dir",
+        root: Root::ProgramFiles,
+        path: "cursor",
+    },
+    Marker {
+        os: "linux",
+        kind: "install_dir",
+        root: Root::Absolute,
+        path: "/usr/share/cursor",
+    },
+    Marker {
+        os: "linux",
+        kind: "install_dir",
+        root: Root::Home,
+        path: ".local/share/cursor",
+    },
+];
+
+/// What Cursor can and cannot do with voice, so that nobody expects more.
+const ROUTES: &str = "Cursor: ask a chat to join voice; it speaks its replies there. The first time, \
 Cursor asks to approve the new MCP server (cursor-agent: or run  cursor-agent mcp enable sidevoice ). What you say reaches Cursor only by experimental routes, because Cursor offers none of its own:\n  - Cursor CLI: only a \
 chat started with  cursor-agent persist  (needs tmux); Sidevoice types into its terminal.\n  - Cursor editor: through \
 Cursor's Desktop Bridge, once Cursor has recorded the chat's join call (up to ~30 s); until then nothing is sent. \
 Several chats of a window can join.\nIf you type while Sidevoice sends, the two mix.";
 
 impl Registration for Cursor {
-    fn readiness_checks(&self, profile: &Profile) -> Vec<ReadinessCheck> {
-        vec![super::bridge_setup::check(profile)]
-    }
-
-    fn after_install(&self, _profile: &Profile) -> Vec<String> {
-        vec![INSTALL_NOTES.to_owned()]
-    }
-
-    fn config_root<'a>(&self, profile: &'a Profile) -> &'a Path {
-        super::config_home(profile)
-    }
-
-    fn binary_names(&self) -> &'static [&'static str] {
-        &["cursor-agent", "cursor"]
-    }
-
-    fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
-        use crate::adapters::markers::{Marker, Root};
-        &[
-            Marker {
-                os: "macos",
-                kind: "app_bundle",
-                root: Root::Absolute,
-                path: "/Applications/Cursor.app",
-            },
-            Marker {
-                os: "macos",
-                kind: "app_bundle",
-                root: Root::Home,
-                path: "Applications/Cursor.app",
-            },
-            Marker {
-                os: "windows",
-                kind: "install_dir",
-                root: Root::LocalAppData,
-                path: "Programs/cursor",
-            },
-            Marker {
-                os: "windows",
-                kind: "install_dir",
-                root: Root::ProgramFiles,
-                path: "cursor",
-            },
-            Marker {
-                os: "linux",
-                kind: "install_dir",
-                root: Root::Absolute,
-                path: "/usr/share/cursor",
-            },
-            Marker {
-                os: "linux",
-                kind: "install_dir",
-                root: Root::Home,
-                path: ".local/share/cursor",
-            },
-        ]
-    }
-
-    fn connects_without_binary(&self) -> bool {
-        true
-    }
-
     fn state<'a>(
         &'a self,
         host: &'a dyn AgentHost,
-        _binary: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<Entry, AgentError>> {
-        Box::pin(
-            async move { Ok(registration_state(host).unwrap_or_else(|_| Entry::bare("invalid"))) },
-        )
+    ) -> BoxFuture<'a, Result<RegistrationState, AgentError>> {
+        Box::pin(async move {
+            let entry = registration_state(host).unwrap_or_else(|_| Entry::bare("invalid"));
+            let program = host.find_program(&PROGRAMS);
+            let mut warnings = vec![Warning {
+                level: Level::Note,
+                code: "cursor.routes",
+                message: ROUTES.to_owned(),
+            }];
+            warnings.extend(super::bridge_setup::check(host.profile()).warning());
+            Ok(RegistrationState {
+                installed: installed(host.profile(), program.as_deref(), MARKERS),
+                registered: Registered::from_name(&entry.registration),
+                // Cursor's file is edited directly: no CLI needed.
+                automatic: true,
+                warnings,
+                launch: entry.launch,
+                program,
+            })
+        })
     }
 
-    fn connect<'a>(
-        &'a self,
-        host: &'a dyn AgentHost,
-        _binary: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), AgentError>> {
+    fn connect<'a>(&'a self, host: &'a dyn AgentHost) -> BoxFuture<'a, Result<(), AgentError>> {
         Box::pin(async move {
             host.live()?;
             connect_entry(host)
         })
     }
 
-    fn disconnect<'a>(
-        &'a self,
-        host: &'a dyn AgentHost,
-        _binary: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), AgentError>> {
+    fn disconnect<'a>(&'a self, host: &'a dyn AgentHost) -> BoxFuture<'a, Result<(), AgentError>> {
         Box::pin(async move {
             host.live()?;
             disconnect_entry(host)
         })
     }
 
-    fn manual(&self, host: &dyn AgentHost, _registration: &str, _binary: Option<&str>) -> Manual {
+    fn manual(&self, host: &dyn AgentHost, _: Registered) -> Manual {
         Manual::by_file(
             &super::config_home(host.profile())
                 .join("mcp.json")

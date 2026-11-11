@@ -1,3 +1,5 @@
+#[cfg(feature = "testbench")]
+pub mod bench;
 pub mod claude;
 pub mod codex;
 pub mod cursor;
@@ -12,7 +14,7 @@ mod watch;
 pub use harness::{
     Agent, CallContext, Conversation, Harness, Inbound, Limit, Model, Registry, Sent, State, Status,
 };
-pub use http::{endpoint, post};
+pub use http::{endpoint, post, Unregistered};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};

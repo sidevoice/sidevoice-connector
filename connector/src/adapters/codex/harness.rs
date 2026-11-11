@@ -3,6 +3,7 @@
 
 use super::rollout;
 use crate::adapters::harness::{Agent, CallContext, Conversation, Harness, Sent, State};
+use crate::adapters::registration::Registration;
 use crate::adapters::watch::{Watch, Watches};
 use crate::profile::Profile;
 use anyhow::Result;
@@ -38,6 +39,10 @@ impl Threads {
 impl Harness for Threads {
     fn id(&self) -> &'static str {
         "codex"
+    }
+
+    fn registration(&self) -> &dyn Registration {
+        &super::Codex
     }
 
     /// Codex names the thread in each tool call's metadata (where depends on its version), or in the environment of

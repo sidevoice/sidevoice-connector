@@ -2,10 +2,12 @@
 //! (`adapters::claude::user_config`).
 
 use super::Claude;
+use crate::adapters::markers::{Marker, Root};
 use crate::adapters::registration::{
-    cli_step, run_required, strings, AgentError, AgentHost, BenchSetup, Entry, Launch, Manual,
-    Registration,
+    cli_step, installed, run_required, strings, AgentError, AgentHost, Entry, Launch, Level,
+    Manual, Programs, Registered, Registration, RegistrationState, Warning,
 };
+use crate::agents::npm::NativePackage;
 use crate::profile::Profile;
 use futures_util::future::BoxFuture;
 use serde_json::Value;
@@ -17,6 +19,56 @@ use std::path::Path;
 use std::path::PathBuf;
 
 const REMOVE: [&str; 5] = ["mcp", "remove", "--scope", "user", "sidevoice"];
+
+/// Where Claude Code's CLI is.
+pub(crate) const PROGRAMS: Programs = Programs {
+    names: &["claude"],
+    fallbacks: super::binary::fallbacks,
+    npm: Some(NativePackage {
+        package: "@anthropic-ai/claude-code",
+        platform_prefix: "@anthropic-ai/claude-code-",
+        program: "claude{exe}",
+    }),
+};
+
+/// Files only an installed Claude Code leaves, beside its CLI.
+const MARKERS: &[Marker] = &[
+    Marker {
+        os: "macos",
+        kind: "install_file",
+        root: Root::Home,
+        path: ".local/bin/claude",
+    },
+    Marker {
+        os: "macos",
+        kind: "install_file",
+        root: Root::Absolute,
+        path: "/opt/homebrew/bin/claude",
+    },
+    Marker {
+        os: "macos",
+        kind: "install_file",
+        root: Root::Absolute,
+        path: "/usr/local/bin/claude",
+    },
+    Marker {
+        os: "linux",
+        kind: "install_file",
+        root: Root::Home,
+        path: ".local/bin/claude",
+    },
+    Marker {
+        os: "windows",
+        kind: "install_file",
+        root: Root::Home,
+        path: ".local/bin/claude.exe",
+    },
+];
+
+/// Where Claude Code's CLI runs: its home.
+fn home(host: &dyn AgentHost) -> &Path {
+    host.profile().agent_home(super::HOME.var)
+}
 
 impl Claude {
     /// The `sidevoice` entry of Claude Code's user scope, read from its configuration file and never through `claude
@@ -151,10 +203,10 @@ impl Claude {
                 return Ok(());
             }
             if again == "owned-old" {
-                run_required(host, binary, &strings(&REMOVE)).await?;
+                run_required(host, home(host), binary, &strings(&REMOVE)).await?;
             }
         }
-        run_required(host, binary, &add_args(host)).await
+        run_required(host, home(host), binary, &add_args(host)).await
     }
 
     async fn disconnect_entry(
@@ -170,7 +222,9 @@ impl Claude {
         match state.as_str() {
             "not-connected" => Ok(()),
             // Ours, current or not (an older release, another environment): removed.
-            "connected" | "outdated" => run_required(host, binary, &strings(&REMOVE)).await,
+            "connected" | "outdated" => {
+                run_required(host, home(host), binary, &strings(&REMOVE)).await
+            }
             "foreign" => Err(AgentError::Key("agents.foreign")),
             "invalid" => Err(AgentError::Key("agents.invalid")),
             _ => Err(AgentError::Key("agents.registration-unknown")),
@@ -193,110 +247,35 @@ fn add_args(host: &dyn AgentHost) -> Vec<String> {
 }
 
 impl Registration for Claude {
-    fn bench_steps(&self, setup: &BenchSetup) -> Option<String> {
-        let start = setup.line(
-            "claude",
-            &strings(&["--mcp-config", setup.mcp_config, "--strict-mcp-config"]),
-            None,
-        );
-        Some(format!(
-            "Claude Code (log in once inside the profile with /login):\n  {start}"
-        ))
+    fn connect<'a>(&'a self, host: &'a dyn AgentHost) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(self.connect_entry(host, host.program()))
     }
 
-    fn after_install(&self, profile: &Profile) -> Vec<String> {
-        let mut notes = vec!["In a conversation, ask to join voice. Sessions already open need a restart before they \
-             see the server."
-            .to_owned()];
-        notes.extend(inbound_warning(profile));
-        notes
-    }
-
-    fn config_root<'a>(&self, profile: &'a Profile) -> &'a Path {
-        profile.agent_home(super::HOME.var)
-    }
-
-    fn npm_package(&self) -> Option<crate::agents::npm::NativePackage> {
-        Some(crate::agents::npm::NativePackage {
-            package: "@anthropic-ai/claude-code",
-            platform_prefix: "@anthropic-ai/claude-code-",
-            program: "claude{exe}",
-        })
-    }
-
-    fn binary_names(&self) -> &'static [&'static str] {
-        &["claude"]
-    }
-
-    fn fallback_binaries(
-        &self,
-        roots: &crate::adapters::markers::Roots,
-    ) -> Vec<std::path::PathBuf> {
-        super::binary::fallbacks(roots)
-    }
-
-    fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
-        use crate::adapters::markers::{Marker, Root};
-        &[
-            Marker {
-                os: "macos",
-                kind: "install_file",
-                root: Root::Home,
-                path: ".local/bin/claude",
-            },
-            Marker {
-                os: "macos",
-                kind: "install_file",
-                root: Root::Absolute,
-                path: "/opt/homebrew/bin/claude",
-            },
-            Marker {
-                os: "macos",
-                kind: "install_file",
-                root: Root::Absolute,
-                path: "/usr/local/bin/claude",
-            },
-            Marker {
-                os: "linux",
-                kind: "install_file",
-                root: Root::Home,
-                path: ".local/bin/claude",
-            },
-            Marker {
-                os: "windows",
-                kind: "install_file",
-                root: Root::Home,
-                path: ".local/bin/claude.exe",
-            },
-        ]
+    fn disconnect<'a>(&'a self, host: &'a dyn AgentHost) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(self.disconnect_entry(host, host.program()))
     }
 
     fn state<'a>(
         &'a self,
         host: &'a dyn AgentHost,
-        binary: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<Entry, AgentError>> {
-        Box::pin(self.registration_state(host, binary))
+    ) -> BoxFuture<'a, Result<RegistrationState, AgentError>> {
+        Box::pin(async move {
+            let program = host.find_program(&PROGRAMS);
+            let entry = self.registration_state(host, program.as_deref()).await?;
+            Ok(RegistrationState {
+                installed: installed(host.profile(), program.as_deref(), MARKERS),
+                registered: Registered::from_name(&entry.registration),
+                automatic: program.is_some(),
+                warnings: inbound_warning(host.profile()).into_iter().collect(),
+                launch: entry.launch,
+                program,
+            })
+        })
     }
 
-    fn connect<'a>(
-        &'a self,
-        host: &'a dyn AgentHost,
-        binary: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), AgentError>> {
-        Box::pin(self.connect_entry(host, binary))
-    }
-
-    fn disconnect<'a>(
-        &'a self,
-        host: &'a dyn AgentHost,
-        binary: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), AgentError>> {
-        Box::pin(self.disconnect_entry(host, binary))
-    }
-
-    fn manual(&self, host: &dyn AgentHost, registration: &str, binary: Option<&str>) -> Manual {
-        let cli = binary.unwrap_or("claude");
+    fn manual(&self, host: &dyn AgentHost, registered: Registered) -> Manual {
+        let registration = registered.as_str();
+        let cli = host.program().unwrap_or("claude");
         let profile = host.profile();
         // `claude mcp` writes Claude Code's user configuration: the file each step changes. A step names
         // `CLAUDE_CONFIG_DIR` only when the person's environment sets it, as the connector runs the CLI.
@@ -325,8 +304,9 @@ fn strings_of(value: Option<&Value>) -> Option<Vec<String>> {
     }
 }
 
-/// Claude Code holds what other local processes send to a session that bypasses permission prompts.
-fn inbound_warning(profile: &Profile) -> Option<String> {
+/// Claude Code holds what other local processes send to a session that bypasses permission prompts: sessions of
+/// this machine run so by default, and nothing lets those messages in.
+fn inbound_warning(profile: &Profile) -> Option<Warning> {
     let settings = profile.agent_home(super::HOME.var).join("settings.json");
     let parsed: Value = serde_json::from_slice(&fs::read(&settings).ok()?).ok()?;
     if parsed
@@ -339,14 +319,18 @@ fn inbound_warning(profile: &Profile) -> Option<String> {
     {
         return None;
     }
-    Some(format!(
+    Some(Warning {
+        level: Level::NeedsAttention,
+        code: "claude.inbound-held",
+        message: format!(
         "This machine runs Claude Code sessions in bypassPermissions, and those hold what Sidevoice sends instead of \
          delivering it: voice looks sent and never arrives. Either start a session with\n  --settings \
          '{{\"crossSessionInbound\":\"accept\"}}'\nor add \"crossSessionInbound\": \"accept\" to {}. That second one \
          lets any local process post into every Claude session on this machine, which is the safeguard it removes: \
          your call, not ours.",
         settings.display()
-    ))
+    ),
+    })
 }
 
 #[cfg(test)]
@@ -376,8 +360,15 @@ mod tests {
         fn mcp_env(&self) -> BTreeMap<String, String> {
             BTreeMap::new()
         }
+        fn find_program(&self, _: &Programs) -> Option<String> {
+            None
+        }
+        fn program(&self) -> Option<&str> {
+            None
+        }
         fn run<'a>(
             &'a self,
+            _cwd: &'a Path,
             _binary: &'a str,
             _args: Vec<String>,
         ) -> BoxFuture<'a, Result<CliOutput, CliError>> {

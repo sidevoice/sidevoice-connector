@@ -2,10 +2,11 @@
 
 use super::Codex;
 use crate::adapters::registration::{
-    cli_step, looks_absent, read_profile_file, run_required, strings, AgentError, AgentHost,
-    BenchSetup, CliError, Entry, Launch, Manual, Registration,
+    cli_step, installed, looks_absent, read_profile_file, run_required, strings, AgentError,
+    AgentHost, CliError, Entry, Launch, Manual, Programs, Registered, Registration,
+    RegistrationState,
 };
-use crate::profile::Profile;
+use crate::agents::npm::NativePackage;
 use anyhow::Result;
 use futures_util::future::BoxFuture;
 use serde_json::Value;
@@ -15,6 +16,22 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 const REMOVE: [&str; 3] = ["mcp", "remove", "sidevoice"];
+
+/// Where Codex's CLI is. npm and Homebrew choose their own prefix, so no file marks Codex as installed: only its CLI.
+pub(crate) const PROGRAMS: Programs = Programs {
+    names: &["codex"],
+    fallbacks: super::binary::fallbacks,
+    npm: Some(NativePackage {
+        package: "@openai/codex",
+        platform_prefix: "@openai/codex-",
+        program: "vendor/{target}/bin/codex{exe}",
+    }),
+};
+
+/// Where Codex's CLI runs: its home.
+fn home(host: &dyn AgentHost) -> &Path {
+    host.profile().agent_home(super::HOME.var)
+}
 
 impl Codex {
     async fn registration_state(
@@ -37,7 +54,11 @@ impl Codex {
             return Ok(Entry::bare("unknown"));
         };
         let output = match host
-            .run(binary, strings(&["mcp", "get", "sidevoice", "--json"]))
+            .run(
+                home(host),
+                binary,
+                strings(&["mcp", "get", "sidevoice", "--json"]),
+            )
             .await
         {
             Ok(output) => output,
@@ -155,9 +176,9 @@ impl Codex {
             return Ok(());
         }
         if file_guard(host) == "ours" {
-            run_required(host, binary, &strings(&REMOVE)).await?;
+            run_required(host, home(host), binary, &strings(&REMOVE)).await?;
         }
-        run_required(host, binary, &add_args(host)).await
+        run_required(host, home(host), binary, &add_args(host)).await
     }
 
     async fn disconnect_entry(
@@ -173,7 +194,9 @@ impl Codex {
         match state.as_str() {
             "not-connected" => Ok(()),
             // Ours, current or not (disabled, an older release, another environment): removed.
-            "connected" | "outdated" => run_required(host, binary, &strings(&REMOVE)).await,
+            "connected" | "outdated" => {
+                run_required(host, home(host), binary, &strings(&REMOVE)).await
+            }
             "foreign" => Err(AgentError::Key("agents.foreign")),
             "invalid" => Err(AgentError::Key("agents.invalid")),
             _ => Err(AgentError::Key("agents.registration-unknown")),
@@ -260,74 +283,35 @@ fn add_args(host: &dyn AgentHost) -> Vec<String> {
 }
 
 impl Registration for Codex {
-    fn bench_steps(&self, setup: &BenchSetup) -> Option<String> {
-        let mut add = strings(&["mcp", "add", "sidevoice"]);
-        for (name, value) in setup.env {
-            add.extend(["--env".to_owned(), format!("{name}={value}")]);
-        }
-        add.push("--".into());
-        Some(format!(
-            "Codex (log in once inside the profile, register once, then start it):\n  {}\n  {}\n  {}",
-            setup.line("codex", &strings(&["login"]), None),
-            setup.line("codex", &add, Some(setup.server)),
-            setup.line("codex", &[], None),
-        ))
+    fn connect<'a>(&'a self, host: &'a dyn AgentHost) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(self.connect_entry(host, host.program()))
     }
 
-    fn config_root<'a>(&self, profile: &'a Profile) -> &'a Path {
-        profile.agent_home(super::HOME.var)
-    }
-
-    fn binary_names(&self) -> &'static [&'static str] {
-        &["codex"]
-    }
-
-    fn fallback_binaries(
-        &self,
-        roots: &crate::adapters::markers::Roots,
-    ) -> Vec<std::path::PathBuf> {
-        super::binary::fallbacks(roots)
-    }
-
-    fn npm_package(&self) -> Option<crate::agents::npm::NativePackage> {
-        Some(crate::agents::npm::NativePackage {
-            package: "@openai/codex",
-            platform_prefix: "@openai/codex-",
-            program: "vendor/{target}/bin/codex{exe}",
-        })
-    }
-
-    // npm and Homebrew select their own installation prefix; neither is a stable Codex marker.
-    fn install_markers(&self) -> &'static [crate::adapters::markers::Marker] {
-        &[]
+    fn disconnect<'a>(&'a self, host: &'a dyn AgentHost) -> BoxFuture<'a, Result<(), AgentError>> {
+        Box::pin(self.disconnect_entry(host, host.program()))
     }
 
     fn state<'a>(
         &'a self,
         host: &'a dyn AgentHost,
-        binary: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<Entry, AgentError>> {
-        Box::pin(self.registration_state(host, binary))
+    ) -> BoxFuture<'a, Result<RegistrationState, AgentError>> {
+        Box::pin(async move {
+            let program = host.find_program(&PROGRAMS);
+            let entry = self.registration_state(host, program.as_deref()).await?;
+            Ok(RegistrationState {
+                installed: installed(host.profile(), program.as_deref(), &[]),
+                registered: Registered::from_name(&entry.registration),
+                automatic: program.is_some(),
+                warnings: Vec::new(),
+                launch: entry.launch,
+                program,
+            })
+        })
     }
 
-    fn connect<'a>(
-        &'a self,
-        host: &'a dyn AgentHost,
-        binary: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), AgentError>> {
-        Box::pin(self.connect_entry(host, binary))
-    }
-
-    fn disconnect<'a>(
-        &'a self,
-        host: &'a dyn AgentHost,
-        binary: Option<&'a str>,
-    ) -> BoxFuture<'a, Result<(), AgentError>> {
-        Box::pin(self.disconnect_entry(host, binary))
-    }
-
-    fn manual(&self, host: &dyn AgentHost, registration: &str, binary: Option<&str>) -> Manual {
-        let cli = binary.unwrap_or("codex");
+    fn manual(&self, host: &dyn AgentHost, registered: Registered) -> Manual {
+        let registration = registered.as_str();
+        let cli = host.program().unwrap_or("codex");
         let profile = host.profile();
         // `codex mcp` writes `config.toml` in Codex's home: the file each step changes. A step names `CODEX_HOME` only
         // when the person's environment sets it; without it, Codex's default is the same home.
