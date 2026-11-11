@@ -229,4 +229,179 @@ mod tests {
         assert_eq!(turn_signal(&stop), Some(false));
         assert_eq!(turn_signal(&side), None);
     }
+
+    /// Issue #330: a headless Claude Code session (`--input-format stream-json --output-format stream-json`, no TTY),
+    /// as Paseo runs it, is joined, sent a message, seen working and seen to have the message. Shapes as Claude Code
+    /// 2.1.318 writes them in that mode: the record (`kind` `interactive`, `entrypoint` `sdk-cli`, `status` written
+    /// from the SDK session state), the inbox that answers nothing when it takes a message, and the transcript, which
+    /// first logs the message as enqueued and then as a user entry from a peer, the envelope inside the text Claude
+    /// Code wraps it in.
+    ///
+    /// The agent's home here is a scratch directory, never this process's own `CLAUDE_CONFIG_DIR`: the daemon is
+    /// shared, and the agent that started it may have a home of its own (0.16.0 read the daemon's, and followed
+    /// nothing of any session whose home was another).
+    #[tokio::test]
+    async fn a_headless_session_is_seen_working_and_its_message_received() {
+        use super::Sessions;
+        use crate::adapters::harness::{CallContext, Harness, Inbound, Sent, Status};
+        use crate::platform::ipc::{Address, Channel, Channels, Endpoint};
+        use std::fs;
+        use std::io::Write;
+        use std::time::Duration;
+        use tokio::io::AsyncBufReadExt;
+
+        let scratch = crate::test_support::temp_dir("claude-headless");
+        // A Unix socket is only made in a directory open to this user alone.
+        #[cfg(unix)]
+        fs::set_permissions(
+            scratch.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let home = scratch.path().join("agent-home");
+        let session_id = "1094c68b-6039-4953-b701-911511511cb0";
+        let pid = std::process::id();
+        // Where Claude Code binds its inbox on this OS: a Unix socket, a named pipe on Windows.
+        let socket = Endpoint::new(scratch.path(), "inbox").to_string();
+        let transcript = home
+            .join("projects")
+            .join("-work")
+            .join(format!("{session_id}.jsonl"));
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let record = |status: &str| {
+            fs::write(
+                home.join("sessions").join(format!("{pid}.json")),
+                json!({"pid":pid,"sessionId":session_id,"cwd":"/work","version":"2.1.318","peerProtocol":1,
+                    "kind":"interactive","entrypoint":"sdk-cli","messagingSocketPath":socket,
+                    "name":"work-39","nameSource":"derived","status":status})
+                .to_string(),
+            )
+            .unwrap();
+        };
+        let append = |entries: &[serde_json::Value]| {
+            let mut file = fs::File::options()
+                .create(true)
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            for entry in entries {
+                writeln!(file, "{entry}").unwrap();
+            }
+        };
+        record("idle");
+        // The key file: native Windows takes no message without its token.
+        fs::write(
+            home.join("sessions").join(format!("{pid}.k.key")),
+            json!({"peerToken":"t"}).to_string(),
+        )
+        .unwrap();
+        append(&[]);
+
+        // Claude Code's inbox: an auth line, then the message; it answers nothing and keeps the connection open.
+        let listener = Channels::listen(&socket.parse().unwrap()).unwrap();
+        let (taken, mut inbox) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            let mut lines = tokio::io::BufReader::new(stream).lines();
+            let _auth = lines.next_line().await.unwrap();
+            let message = lines.next_line().await.unwrap().unwrap();
+            taken.send(message).unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let env_home = home.to_string_lossy().into_owned();
+        let env_socket = socket.clone();
+        let env_pid = pid.to_string();
+        let env = move |name: &str| match name {
+            "CLAUDE_CODE_SESSION_ID" => Some(session_id.to_owned()),
+            "CLAUDE_CODE_MESSAGING_SOCKET" => Some(env_socket.clone()),
+            "CLAUDE_CONFIG_DIR" => Some(env_home.clone()),
+            "CLAUDE_PID" => Some(env_pid.clone()),
+            "CLAUDE_CODE_ENTRYPOINT" => Some("sdk-cli".to_owned()),
+            _ => None,
+        };
+        let sessions = Sessions::default();
+        let conversation = sessions
+            .identify(&CallContext {
+                env: &env,
+                meta: &json!({}),
+                client: &json!({"name":"claude-code"}),
+                client_capabilities: &json!({}),
+            })
+            .unwrap()
+            .expect("a headless Claude Code session is one of Claude Code's");
+        assert_eq!(conversation.agent.pid, Some(pid));
+        assert_eq!(conversation.agent.home.as_deref(), Some(home.as_path()));
+
+        let state = sessions.state(&conversation).await;
+        assert_eq!(state.inbound, Inbound::Open);
+        assert_eq!(state.status, Status::Idle);
+
+        let message = json!({"channel":"voice","session_id":"s1","revision":1,"epoch":1,
+            "message_id":"m-330","text":"hello from voice"});
+        assert_eq!(
+            sessions.send(&conversation, &message).await,
+            Sent::Accepted,
+            "an inbox that answers nothing took the message"
+        );
+        let line: serde_json::Value = serde_json::from_str(&inbox.recv().await.unwrap()).unwrap();
+        let content = line
+            .pointer("/message/content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_owned();
+
+        // Enqueued is not in the conversation yet.
+        append(&[
+            json!({"type":"queue-operation","operation":"enqueue","sessionId":session_id,
+            "content":content}),
+        ]);
+        let ids = ["m-330".to_owned()];
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(sessions.received(&conversation, &ids).await.is_empty());
+
+        // The turn starts: the record says busy, the message is a user entry from a peer.
+        record("busy");
+        append(&[
+            json!({"type":"queue-operation","operation":"dequeue","sessionId":session_id}),
+            json!({"parentUuid":null,"isSidechain":false,"type":"user","isMeta":true,
+                "message":{"role":"user","content":format!(
+                    "Another Claude session sent a message:\n{content}\n\nThis came from another Claude session \u{2014} not typed by your user, but very likely working on their behalf.")},
+                "origin":{"kind":"peer","from":"unknown"},"promptSource":"system","turnOrigin":"peer",
+                "entrypoint":"sdk-cli","sessionId":session_id,"version":"2.1.318"}),
+        ]);
+        let (sessions, conversation, ids) = (&sessions, &conversation, &ids);
+        let until = |what: &'static str| async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+            while tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let status = sessions.state(conversation).await.status;
+                let received = sessions.received(conversation, ids).await == *ids;
+                if what == "working" && status == Status::Working && received {
+                    return true;
+                }
+                if what == "idle" && status == Status::Idle {
+                    return true;
+                }
+            }
+            false
+        };
+        assert!(until("working").await, "busy, and the message received");
+
+        // The turn ends.
+        append(&[json!({"type":"assistant","isSidechain":false,
+            "message":{"model":"claude-opus-5-5","role":"assistant","stop_reason":"end_turn",
+                "content":[{"type":"text","text":"done"}]},"sessionId":session_id})]);
+        record("idle");
+        assert!(until("idle").await, "idle once the turn ended");
+        assert_eq!(
+            sessions
+                .state(conversation)
+                .await
+                .model
+                .map(|model| model.name),
+            Some("claude-opus-5-5".to_owned())
+        );
+    }
 }
