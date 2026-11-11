@@ -30,11 +30,9 @@ pub struct Binding {
     pub id: Mutex<String>,
     pub serial: Mutex<()>,
     pub publication: Mutex<()>,
-    pub pending: Mutex<VecDeque<String>>,
     pub turns: Mutex<HashMap<String, (String, u64)>>,
     pub input_context: Mutex<HashMap<String, (String, i64)>>,
     pub recent_inputs: Mutex<VecDeque<(String, String)>>,
-    pub read: Mutex<VecDeque<String>>,
     /// How the last few deliveries to it ended (`{message_id, channel, at, result}`), for diagnostics. Never text.
     pub deliveries: Mutex<VecDeque<Value>>,
     pub working: Mutex<Option<bool>>,

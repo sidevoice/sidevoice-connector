@@ -56,8 +56,8 @@ pub(super) fn write_conversation_guard(file: &mut fs::File, state: u8) -> Result
 
 /// The speech waiting for the core, as this connector writes it: every row a speech of a conversation (its event,
 /// binding, conversation reference, utterance and text). A row of any other shape makes the outbox invalid.
-/// What was handed to each conversation's harness, by thread: the message and what the harness answered, oldest
-/// first. A record that does not parse is a record lost (a message may then be handed over once more), never a
+/// The per-id record of what was handed to each conversation's harness, by thread: each message id and `accepted` or
+/// `received`, oldest first. A record that does not parse is a record lost (a message may then be handed over once more), never a
 /// connector that cannot start.
 pub(super) fn read_delivered(
     path: &Path,
@@ -87,7 +87,7 @@ pub(super) fn read_delivered(
                     let status = row
                         .get(1)?
                         .as_str()
-                        .filter(|status| matches!(*status, "accepted" | "unknown"))?;
+                        .filter(|status| matches!(*status, "accepted" | "received"))?;
                     Some((id.to_owned(), status.to_owned()))
                 })
                 .collect();

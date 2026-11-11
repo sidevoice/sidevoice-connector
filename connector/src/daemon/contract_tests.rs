@@ -204,7 +204,7 @@ async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_
     // and the agent reads it as voice, the default.
     let frame = json!({"binding_id":"core-t-1","message_id":"m-1","session_id":"s","revision":3,"epoch":1,
         "text":"hello","channel":"a_channel_from_the_future","future_field":{"nested":true},
-        "unheard":{"count":1,"replies":[{"text":"earlier","future_reply_field":1}],"future":"x"}});
+        "unheard":{"count":1,"from":"earlier…","heard_up_to":"ear","replies":[{"text":"earlier"}],"future":{"nested":"x"}}});
     let delivered = daemon.handle_incoming("input.deliver", &frame).await;
     assert_eq!(delivered["status"], "accepted", "{delivered}");
     assert_eq!(
@@ -217,14 +217,26 @@ async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_
         header,
         json!({"channel":"voice","session_id":"s","revision":3,"epoch":1,"message_id":"m-1"})
     );
-    assert!(envelope.contains("see the end of this message.\n\nhello"));
-    assert!(envelope.contains("The person did not hear the end of your last reply."));
-    assert!(envelope.contains("How much was heard is unknown."));
+    assert!(envelope.contains("\n\nhello"));
+    let line =
+        "The person did not hear your last reply, \"earlier…\"; they heard it up to \"ear\".";
+    assert!(envelope.contains(line), "{envelope}");
+    assert!(envelope.find(line).unwrap() < envelope.find("voice_say (session_id").unwrap());
     assert!(
-        envelope.find("The person did not hear the end").unwrap()
-            < envelope.find("voice_say (session_id").unwrap()
+        !envelope.contains("Reply starting"),
+        "fields it does not know are not rendered"
     );
-    assert!(!envelope.contains("Complete unheard evidence"));
+
+    // input.received with extra keys and an id that is not text: answered for the ids it can read, from the record.
+    let asked = daemon
+        .handle_incoming(
+            "input.received",
+            &json!({"binding_id":"core-t-1","message_ids":["m-1",{"future":1},"m-never"],
+                "future_field":{"nested":true}}),
+        )
+        .await;
+    assert_eq!(asked["received"], json!([]), "{asked}");
+    assert_eq!(asked["unknown"], json!(["m-never"]), "{asked}");
 
     // speech.publish answered with a status and fields this connector does not know: saved is saved.
     let said = daemon

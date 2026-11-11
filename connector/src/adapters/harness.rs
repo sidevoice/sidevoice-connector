@@ -74,11 +74,9 @@ impl CallContext<'_> {
 /// How handing a message to a conversation went.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Sent {
-    /// The agent took it and said so.
+    /// It is in the agent's inbox: the agent took it, or it was written where the agent reads (which may answer
+    /// nothing). Whether the agent has it in the conversation is [`Harness::received`]'s to tell, later.
     Accepted,
-    /// It was written where the agent reads, which answers nothing: [`Harness::received`] tells when the agent has
-    /// it.
-    Unconfirmed,
     /// It was not taken, and why.
     Refused(Limit),
 }

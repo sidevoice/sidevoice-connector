@@ -222,7 +222,8 @@ async fn send_to_editor(watch: &EditorWatch, marker: &str, message: &Value) -> S
     let result = deliver_editor(&json!({"marker":marker,"composer":composer}), message).await;
     let (sent, outcome) = match result.as_ref().and_then(|result| result.get("status")) {
         Some(status) if status == "accepted" => (Sent::Accepted, "accepted"),
-        Some(status) if status == "unknown" => (Sent::Unconfirmed, "unconfirmed"),
+        // The bridge may or may not have sent it: handed over, so it is never typed in twice.
+        Some(status) if status == "unknown" => (Sent::Accepted, "unconfirmed"),
         _ => (
             Sent::Refused(Limit::Failed(
                 result

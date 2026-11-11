@@ -38,7 +38,7 @@ app, a browser).
 
 If a reply to the connector's speech request is lost, the connector keeps the original request and asks the core for its disposition with `speech.recover` after reconnecting. The core returns the original saved or refused result; if it never received the request, it saves the text without playing delayed audio. The connector retains a bounded receipt for the recovered result so an agent retry with the same IDs sees it, even if background recovery finished first. Once that attempt is settled, a new reply in the current conversation can play normally. A queued reply is never retried as new audio when its first admission is uncertain.
 
-Notices delivered through the agent's push or pull mode carry the same confirmed hearing evidence: heard, partially heard with a Unicode-scalar extent, or not heard. The full reply text remains available so the agent knows what was left unheard. A missing receipt stays unconfirmed and does not become a not-heard claim. An already delivered notice keeps its message ID and content across retries; stronger late hearing arrives as a separate `reply_heard` correction.
+What the person did not hear reaches the agent, pushed or pulled, as one short line: how many of its last replies were not heard, how the first of them began, and how far that one was heard. A reply counts as heard only when the app confirmed it played to its end; from the first reply not heard in full, every later one counts. No reply texts are repeated (the agent has them), and nothing is sent per reply. A message keeps its ID and content across retries.
 
 ## Get started
 
@@ -114,8 +114,8 @@ Ask the agent to call the MCP tool `voice_diagnose` in the conversation concerne
 with the versions, whether the core runs and the connector is linked to it, this conversation's harness and whether
 messages get into it (and why not: the agent's own settings, a bridge that is not running, a chat not known yet), its
 last deliveries with how each ended and whether the agent has read it, and where the logs are
-(`connector.log` and `core.log` in the data directory: `~/Library/Application Support/Sidevoice` on macOS, `$XDG_DATA_HOME/sidevoice` on Linux, `%LOCALAPPDATA%\Sidevoice\Data` on Windows; `SIDEVOICE_DATA_DIR` overrides it). It never includes message text, keys or tokens. A delivery that ends
-`unconfirmed` and is never read usually means the agent holds incoming messages (see its inbound check).
+(`connector.log` and `core.log` in the data directory: `~/Library/Application Support/Sidevoice` on macOS, `$XDG_DATA_HOME/sidevoice` on Linux, `%LOCALAPPDATA%\Sidevoice\Data` on Windows; `SIDEVOICE_DATA_DIR` overrides it). It never includes message text, keys or tokens. A delivery that
+ends `accepted` and is never read usually means the agent holds incoming messages (see its inbound check).
 
 ## Develop
 
