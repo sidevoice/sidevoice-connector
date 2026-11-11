@@ -1,4 +1,6 @@
 //! Unix: a running program can be unlinked, so no process holds an installed file in a way that stops its removal.
+//! The processes running from a release are still ended on uninstall (found by their program's path, through
+//! `sysinfo`), so that no server of ours outlives the files it runs from.
 //! Who listens on a port is `lsof`'s answer.
 
 use super::{lsof_listeners, Holder, Holding};
@@ -6,6 +8,9 @@ use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use sysinfo::{
+    Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, Signal, System, UpdateKind,
+};
 
 /// Where `lsof` is: macOS's own, then a Linux package's, then whatever the `PATH` finds.
 const LSOF: [&str; 3] = ["/usr/sbin/lsof", "/usr/bin/lsof", "lsof"];
@@ -14,13 +19,78 @@ const LSOF_LIMIT: Duration = Duration::from_secs(5);
 
 pub struct Os;
 
+/// How long a process asked to leave (`SIGTERM`) has before it is killed.
+const GRACE: Duration = Duration::from_secs(3);
+
+/// Whether the process found as `(pid, start)` is still that process (a pid reused since is another start time).
+fn alive(system: &mut System, (pid, start): (Pid, u64)) -> bool {
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().without_tasks(),
+    );
+    system.process(pid).is_some_and(|process| {
+        process.start_time() == start && process.status() != ProcessStatus::Zombie
+    })
+}
+
+/// The processes whose program is a file inside `program_root`, other than this one, asked to leave (`SIGTERM`) and
+/// killed when they are still there after [`GRACE`]. A process is only ever acted on while its start time is still
+/// the one seen when it was found, so a pid reused meanwhile is left alone, and the OS refuses a signal to a process
+/// that is not this user's: it is then not reported. Returns the pids that are gone.
+fn stop_programs_inside(program_root: &Path) -> Vec<u32> {
+    let own = std::process::id();
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .without_tasks()
+            .with_exe(UpdateKind::Always),
+    );
+    let mut found: Vec<(Pid, u64)> = Vec::new();
+    for (pid, process) in system.processes() {
+        let inside = process
+            .exe()
+            .is_some_and(|exe| super::runs_from(exe, program_root));
+        // A thread (Linux lists them as processes with the program of their process) is never signalled: that would end
+        // the whole process, this one included.
+        if inside
+            && pid.as_u32() != own
+            && process.thread_kind().is_none()
+            && process.status() != ProcessStatus::Zombie
+        {
+            process.kill_with(Signal::Term);
+            found.push((*pid, process.start_time()));
+        }
+    }
+    let deadline = Instant::now() + GRACE;
+    while Instant::now() < deadline && found.iter().any(|&target| alive(&mut system, target)) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut ended = Vec::new();
+    for target in found {
+        if alive(&mut system, target) {
+            if let Some(process) = system.process(target.0) {
+                process.kill();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            if alive(&mut system, target) {
+                continue;
+            }
+        }
+        ended.push(target.0.as_u32());
+    }
+    ended
+}
+
 impl Holding for Os {
     fn of(_: &Path) -> Vec<Holder> {
         Vec::new()
     }
 
-    fn stop_running_from(_: &[&Path], _: &Path) -> Vec<u32> {
-        Vec::new()
+    fn stop_running_from(_: &[&Path], program_root: &Path) -> Vec<u32> {
+        stop_programs_inside(program_root)
     }
 
     // `lsof -nP -iTCP:<port> -sTCP:LISTEN -Fpc`: no name or port lookups, listening sockets only, fields for a program

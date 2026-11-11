@@ -76,6 +76,46 @@ const RELEASE_PREFIX: &str = "release-";
 /// What a claimed entry of `D` is called inside [`CLAIM`], before its unique suffix.
 const DATA_PREFIX: &str = "data-";
 
+/// Why [`Removal::remove_releases`] did not finish.
+#[derive(Debug)]
+pub enum ReleasesError {
+    /// Refused or failed before anything of the releases was claimed by this run (or while claiming it): nothing here
+    /// was renamed, so nothing can be said to be left over.
+    Refused(&'static str),
+    /// This run renamed the releases into the claim directory (`folders`, each of a unique name inside it) and could
+    /// not delete them: most often something has a file in them open.
+    Left {
+        reason: &'static str,
+        folders: Vec<PathBuf>,
+    },
+}
+
+impl ReleasesError {
+    /// The reason, as every other step says it.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Refused(reason) | Self::Left { reason, .. } => reason,
+        }
+    }
+
+    /// Deleting what this run claimed (`claimed`, when it claimed anything) failed: left over while it is still there.
+    fn after_claim(reason: &'static str, claimed: Option<PathBuf>) -> Self {
+        match claimed {
+            Some(folder) if folder.exists() => Self::Left {
+                reason,
+                folders: vec![folder],
+            },
+            _ => Self::Refused(reason),
+        }
+    }
+}
+
+impl From<&'static str> for ReleasesError {
+    fn from(reason: &'static str) -> Self {
+        Self::Refused(reason)
+    }
+}
+
 const MODELS_UNRESOLVED: &str =
     "uninstall refused: cannot tell where the shared models folder is relative to the data directory";
 /// `path` as the OS resolves it: its longest existing ancestor canonicalized, the components that do not exist yet
@@ -485,8 +525,9 @@ pub trait Removal: Sized {
         before_claim: &dyn Fn(&OsStr),
     ) -> Result<Vec<String>, &'static str>;
 
-    /// Renames `R` into the claim directory and deletes everything claimed as a release.
-    fn remove_releases(&self) -> Result<(), &'static str>;
+    /// Renames `R` into the claim directory and deletes everything claimed as a release. A failure to delete what this
+    /// run claimed is [`ReleasesError::Left`], with where it is; anything else is [`ReleasesError::Refused`].
+    fn remove_releases(&self) -> Result<(), ReleasesError>;
 
     /// Removes the claim directory, which must be empty by now.
     fn finish_claim(&self) -> Result<(), &'static str>;

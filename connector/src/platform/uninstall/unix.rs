@@ -3,8 +3,8 @@
 //! anchor's (the device and the mount id on Linux, the device and where it is mounted on macOS).
 
 use super::{
-    clean_absolute, foreign, recovery_program, recovery_record, DataDir, Removal, Roots, CLAIM,
-    RECORD, RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
+    clean_absolute, foreign, recovery_program, recovery_record, DataDir, ReleasesError, Removal,
+    Roots, CLAIM, RECORD, RECORD_LIMIT, RECOVERY, RELEASE_PREFIX,
 };
 use crate::platform::user::{User, UserId};
 use serde_json::Value;
@@ -560,15 +560,16 @@ impl Removal for Os {
         Ok(releases || claimed_releases)
     }
 
-    fn remove_releases(&self) -> Result<(), &'static str> {
+    fn remove_releases(&self) -> Result<(), ReleasesError> {
         let Some((_, claim)) = self.claim_area()? else {
-            return Err("uninstall data root disappeared");
+            return Err("uninstall data root disappeared".into());
         };
         let release_parent = self.releases_rel.parent().ok_or("unsafe uninstall root")?;
         let release_name = self
             .releases_rel
             .file_name()
             .ok_or("unsafe uninstall root")?;
+        let mut mine = None;
         if let Some(parent) = self.open_relative(release_parent)? {
             if exists_at(parent.as_raw_fd(), release_name)? {
                 let claimed_name = format!("{RELEASE_PREFIX}{}", uuid::Uuid::new_v4().simple());
@@ -580,6 +581,7 @@ impl Removal for Os {
                     &claimed_name,
                     &|_| {},
                 )?;
+                mine = Some(self.roots.data.join(CLAIM).join(&claimed_name));
             }
         }
         let selected: Vec<_> = entries(claim.as_raw_fd())?
@@ -588,7 +590,7 @@ impl Removal for Os {
             .collect();
         let held = self.held_directory(&self.claim_rel, claim.as_raw_fd())?;
         held.remove_contents(&selected.iter().map(OsString::as_os_str).collect::<Vec<_>>())
-            .map_err(|_| "cannot remove claimed releases")?;
+            .map_err(|_| ReleasesError::after_claim("cannot remove claimed releases", mine))?;
         Ok(())
     }
 

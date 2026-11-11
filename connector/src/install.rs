@@ -19,7 +19,9 @@
 //! release's binary, and its `node.status`. When it does not, `current` goes back to the release it named before,
 //! that is restarted and verified, and the failed release is deleted; a first installation that does not answer is
 //! left in place, said with the core's own failure. Releases other than the current one and the one before it are
-//! pruned (exactly one previous). Running it again is the recovery.
+//! pruned (exactly one previous), unless a program still runs from one (an agent app's `mcp` server from an older
+//! release; only Windows can tell, Unix prunes it whatever runs from it): installing never ends those, they keep their binary until they exit, and the release is pruned by a later
+//! install. Running it again is the recovery.
 //!
 //! The agents (unless `--no-agents`): installing connects none. An agent gets Sidevoice only when the person connects
 //! it: Connect in the Sidevoice app (`agents.connect`), `sidevoice agents connect <id>`, or their answer to the offer
@@ -45,13 +47,14 @@
 use crate::agents::HostAgents;
 use crate::messages::Keyed;
 use crate::platform::data_dir;
+use crate::platform::deferred::{Deferred, Deferring};
 use crate::platform::env::{Env, Environment};
 use crate::platform::fs::{Create, Files, Fs};
 use crate::platform::holders::{Holder, Holders, Holding};
 use crate::platform::process::{Process, Processes};
 use crate::platform::service::{Service, Services};
 use crate::platform::target;
-use crate::platform::uninstall::{Ownership, Removal, Remover, Roots};
+use crate::platform::uninstall::{Ownership, ReleasesError, Removal, Remover, Roots};
 use crate::profile::Profile;
 use crate::service::jobs::{Job, Kind};
 use crate::service::layout::Layout;
@@ -633,9 +636,27 @@ fn left_behind(
     ))
 }
 
-/// Every release but `keep` deleted.
-fn prune(layout: &Layout, keep: &[&str]) -> Vec<String> {
-    let mut pruned = Vec::new();
+/// What [`prune`] did with the releases that are neither selected nor the one before.
+#[derive(Debug, Default, PartialEq)]
+struct Pruned {
+    /// Deleted.
+    pruned: Vec<String>,
+    /// Kept because a program runs from them. Only Windows can say so: Unix reports no holders, and deletes them
+    /// (the program keeps running from its unlinked file).
+    in_use: Vec<String>,
+    /// Not deleted, with why (`{release, error}`): said in the answer, tried again by the next install.
+    failed: Vec<Value>,
+}
+
+/// Every release but `keep` deleted, except the ones a program is running from: on Windows deleting one would take the
+/// files out from under a server an agent app still has open from it, and leave a release that is half gone. Those
+/// wait for a later install, when nothing runs from them any more.
+fn prune(layout: &Layout, keep: &[&str]) -> Pruned {
+    prune_unless(layout, keep, |release| !Holders::of(release).is_empty())
+}
+
+fn prune_unless(layout: &Layout, keep: &[&str], in_use: impl Fn(&Path) -> bool) -> Pruned {
+    let mut done = Pruned::default();
     for entry in fs::read_dir(layout.releases_dir())
         .into_iter()
         .flatten()
@@ -645,11 +666,18 @@ fn prune(layout: &Layout, keep: &[&str]) -> Vec<String> {
         if keep.contains(&name.as_str()) {
             continue;
         }
-        if fs::remove_dir_all(entry.path()).is_ok() {
-            pruned.push(name);
+        if in_use(&entry.path()) {
+            done.in_use.push(name);
+        } else {
+            match fs::remove_dir_all(entry.path()) {
+                Ok(()) => done.pruned.push(name),
+                Err(error) => done
+                    .failed
+                    .push(json!({"release": name, "error": error.to_string()})),
+            }
         }
     }
-    pruned
+    done
 }
 
 /// The environment a connector started on demand gets: where this installation lives.
@@ -986,7 +1014,7 @@ pub async fn install(
         Some(_) => "updated",
     };
     let mut answer = json!({"ok": true, "action": action, "version": id, "previous": previous,
-        "command": [release_command(&layout, &id)], "releases": layout.releases, "pruned": pruned,
+        "command": [release_command(&layout, &id)], "releases": layout.releases, "pruned": pruned.pruned, "in_use": pruned.in_use, "prune_failed": pruned.failed,
         "service": kind.as_str(), "state": state.get("state").cloned().unwrap_or(Value::Null),
         "agents": agents});
     crate::service::commands::with_legacy(&mut answer, legacy);
@@ -1460,6 +1488,35 @@ fn removal_roots(layout: &Layout) -> Roots {
     }
 }
 
+/// What to do when this run claimed the releases and could not delete them (`folders`, each a unique-named folder in
+/// the claim directory) because a program we did not start has their files open (`holders`, asked of those folders
+/// only, after our own programs were stopped): their deletion is arranged for the next sign-in, the last resort
+/// (closing the program and running `uninstall` again finishes at once). `None` when nothing holds them, which is a
+/// failure of another kind, and when the OS cannot arrange it (Unix never has the problem). `R` itself is never
+/// deferred in place: while it is not renamed into the claim directory, a later install could be hit by it.
+fn defer_releases(folders: &[PathBuf], holders: &[Holder]) -> Option<Value> {
+    let others: Vec<&Holder> = holders
+        .iter()
+        .filter(|holder| holder.pid != std::process::id())
+        .collect();
+    if others.is_empty() || folders.is_empty() || Deferring::at_next_sign_in(folders).is_err() {
+        return None;
+    }
+    let names: Vec<&str> = others.iter().map(|holder| holder.name.as_str()).collect();
+    Some(json!({"folders": folders, "holders": names}))
+}
+
+/// Who holds files in `folders`, without repeats.
+fn holders_in(folders: &[PathBuf]) -> Vec<Holder> {
+    let mut holders: Vec<Holder> = folders
+        .iter()
+        .flat_map(|folder| Holders::of(folder))
+        .collect();
+    holders.sort_by_key(|holder| holder.pid);
+    holders.dedup_by_key(|holder| holder.pid);
+    holders
+}
+
 async fn uninstall_with_hooks(
     profile: &Profile,
     options: Options,
@@ -1503,12 +1560,13 @@ async fn uninstall_with_hooks(
     }
     guard.preflight().map_err(explain)?;
     let service = runtime.unload(&layout).await?;
-    let terminated = runtime.stop_own_connectors(&layout).await;
     let agents = if options.agents {
         unregister(profile).await
     } else {
         json!({})
     };
+    // After the registrations are gone: an agent app cannot start a server again between stopping and removing.
+    let terminated = runtime.stop_own_connectors(&layout).await;
     let agents_lock = guard.lock_file("agents.lock").map_err(explain)?;
     let agents_held = crate::lock::wait_lock_file(
         agents_lock,
@@ -1519,13 +1577,31 @@ async fn uninstall_with_hooks(
     .ok_or_else(|| failed("another agents request holds agents.lock"))?;
     guard.stage_recovery().map_err(explain)?;
     let removed = guard.remove_data_contents(&before_claim).map_err(explain)?;
-    guard.remove_releases().map_err(explain)?;
-    guard.finish_claim().map_err(explain)?;
-    guard.finish_recovery().map_err(explain)?;
-    let data_dir = match guard.remove_data_dir(&|_| {}) {
-        Ok(left) => json!({"removed": left.removed, "kept": left.kept, "held": left.held}),
-        // Everything else is already gone: this is said, and is not a failure of the uninstall.
-        Err(reason) => json!({"removed": false, "kept": [], "held": [], "error": reason}),
+    // What still holds a release this run claimed, after our own programs were stopped, is a program we did not start:
+    // it is named, and the deletion of those folders is arranged for the next sign-in rather than failing an uninstall
+    // that has already removed the rest. A release that could not even be claimed (a program holds a file in it: the
+    // rename is refused) is a failure that names the holder, as before.
+    let deferred = match guard.remove_releases() {
+        Ok(()) => None,
+        Err(ReleasesError::Left { reason, folders }) => {
+            match defer_releases(&folders, &holders_in(&folders)) {
+                Some(deferred) => Some(deferred),
+                None => return Err(explain(reason)),
+            }
+        }
+        Err(ReleasesError::Refused(reason)) => return Err(explain(reason)),
+    };
+    let data_dir = if deferred.is_some() {
+        // The claim directory and the recovery copy stay until then: running `uninstall` again finishes with them.
+        json!({"removed": false, "kept": [], "held": [], "deferred": true})
+    } else {
+        guard.finish_claim().map_err(explain)?;
+        guard.finish_recovery().map_err(explain)?;
+        match guard.remove_data_dir(&|_| {}) {
+            Ok(left) => json!({"removed": left.removed, "kept": left.kept, "held": left.held}),
+            // Everything else is already gone: this is said, and is not a failure of the uninstall.
+            Err(reason) => json!({"removed": false, "kept": [], "held": [], "error": reason}),
+        }
     };
     drop(agents_held);
     drop(install_held);
@@ -1534,7 +1610,7 @@ async fn uninstall_with_hooks(
     let mut answer = json!({"ok": true, "state": "absent", "safe_uninstall": crate::identity::SAFE_UNINSTALL,
         "service": service.get("service").cloned().unwrap_or(Value::Null),
         "note": service.get("note").cloned().unwrap_or(Value::Null), "agents": agents, "terminated": terminated,
-        "releases": had_releases.then(|| layout.releases.clone()), "data": layout.data, "removed": removed, "data_dir": data_dir,
+        "releases": (had_releases && deferred.is_none()).then(|| layout.releases.clone()), "deferred": deferred, "data": layout.data, "removed": removed, "data_dir": data_dir,
         "advice": advice});
     if let Some(legacy) = service.get("legacy_jobs") {
         answer["legacy_jobs"] = legacy.clone();
@@ -1554,7 +1630,11 @@ fn data_dir_line(answer: &Value) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    if answer["data_dir"]["removed"] == true {
+    if answer["data_dir"]["deferred"] == true {
+        format!(
+            "{path} stays, with install.json, .uninstall-recovery and .uninstall-claim, until `npx sidevoice uninstall` runs again."
+        )
+    } else if answer["data_dir"]["removed"] == true {
         format!("Removed {path}.")
     } else if let Some(error) = answer["data_dir"]["error"].as_str() {
         format!("{path} was left as it is: {error}.")
@@ -1603,6 +1683,22 @@ pub fn human_uninstall(answer: &Value) -> String {
     {
         done.push(format!(
             "Removed what was in {} (credential, socket, outbox, logs, the core's data).",
+            answer["data"].as_str().unwrap_or("?")
+        ));
+    }
+    if let Some(deferred) = answer["deferred"].as_object() {
+        let holders = deferred["holders"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        done.push(format!(
+            "{holders} still has Sidevoice files open, so Windows will delete the old release folders the next time you \
+             sign in. That is all it deletes: install.json, .uninstall-recovery and .uninstall-claim in {} stay until \
+             you run `npx sidevoice uninstall` again. Run it once more after signing in, or now, after closing \
+             {holders}, to finish at once.",
             answer["data"].as_str().unwrap_or("?")
         ));
     }
@@ -1666,6 +1762,75 @@ pub(crate) mod tests {
         assert!(text.contains("Close them"), "{text}");
         assert!(!text.contains("virus scanner"), "{text}");
         assert!(!text.contains("PID 9)"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_release_a_program_runs_from_is_not_pruned_until_nothing_does() {
+        let fixture = Fixture::new("prune-in-use");
+        let layout = fixture.layout();
+        for id in ["1.0.0", "2.0.0", "3.0.0"] {
+            fs::create_dir_all(layout.releases_dir().join(id).join("bin")).unwrap();
+        }
+        let busy = |path: &Path| path.ends_with("1.0.0");
+        let first = prune_unless(&layout, &["3.0.0"], busy);
+        assert_eq!(first.pruned, vec!["2.0.0".to_owned()]);
+        assert_eq!(first.in_use, vec!["1.0.0".to_owned()]);
+        assert!(first.failed.is_empty());
+        assert!(layout.releases_dir().join("1.0.0/bin").is_dir());
+        assert!(!layout.releases_dir().join("2.0.0").exists());
+        // Once its program has exited, the next install prunes it.
+        let again = prune_unless(&layout, &["3.0.0"], |_| false);
+        assert_eq!(again.pruned, vec!["1.0.0".to_owned()]);
+        assert!(again.in_use.is_empty());
+    }
+
+    #[tokio::test]
+    async fn nothing_is_deferred_when_nothing_holds_the_claimed_releases() {
+        let fixture = Fixture::new("defer-no-holder");
+        let layout = fixture.layout();
+        let claimed = vec![layout.data.join(".uninstall-claim/release-abc")];
+        fs::create_dir_all(&claimed[0]).unwrap();
+        let own = Holder {
+            pid: std::process::id(),
+            name: "us".into(),
+        };
+        assert!(defer_releases(&claimed, &[]).is_none());
+        // Nothing claimed by this run: nothing to defer, whoever holds anything.
+        let someone = Holder {
+            pid: std::process::id() + 1,
+            name: "scanner".into(),
+        };
+        assert!(defer_releases(&[], &[someone]).is_none());
+        assert!(defer_releases(&claimed, &[own]).is_none());
+        // Unix has nothing to defer whoever holds it; Windows arranges the sign-in deletion (not exercised here:
+        // it writes the user's registry).
+        if cfg!(unix) {
+            let other = Holder {
+                pid: std::process::id() + 1,
+                name: "scanner".into(),
+            };
+            assert!(defer_releases(&claimed, &[other]).is_none());
+        }
+    }
+
+    #[test]
+    fn a_deferred_removal_is_said_with_who_holds_the_files_and_how_to_finish_now() {
+        let answer = json!({"installed": true, "service": "none", "agents": {}, "removed": [],
+            "data": "D", "advice": [],
+            "deferred": {"folders": ["D/.uninstall-claim/release-1"], "holders": ["Antivirus", "explorer.exe"]},
+            "data_dir": {"removed": false, "kept": [], "held": [], "deferred": true}});
+        let text = human_uninstall(&answer);
+        assert!(
+            text.contains("Antivirus, explorer.exe still has Sidevoice files open"),
+            "{text}"
+        );
+        assert!(
+            text.contains("old release folders the next time you sign in"),
+            "{text}"
+        );
+        assert!(text.contains(".uninstall-recovery"), "{text}");
+        assert!(text.contains("npx sidevoice uninstall"), "{text}");
+        assert!(!text.contains("Removed D."), "{text}");
     }
 
     #[test]
