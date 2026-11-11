@@ -76,23 +76,44 @@ const RELEASE_PREFIX: &str = "release-";
 /// What a claimed entry of `D` is called inside [`CLAIM`], before its unique suffix.
 const DATA_PREFIX: &str = "data-";
 
-/// The releases an uninstall has claimed and not yet managed to delete, under `data`'s claim directory: each is a
-/// directory of ours with a unique name (links are never listed), so deleting one later can never reach a fresh
-/// installation. Empty when there are none or the directory cannot be read.
-pub fn claimed_releases(data: &Path) -> Vec<PathBuf> {
-    std::fs::read_dir(data.join(CLAIM))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(RELEASE_PREFIX)
-                && entry.file_type().is_ok_and(|kind| kind.is_dir())
-        })
-        .map(|entry| entry.path())
-        .collect()
+/// Why [`Removal::remove_releases`] did not finish.
+#[derive(Debug)]
+pub enum ReleasesError {
+    /// Refused or failed before anything of the releases was claimed by this run (or while claiming it): nothing here
+    /// was renamed, so nothing can be said to be left over.
+    Refused(&'static str),
+    /// This run renamed the releases into the claim directory (`folders`, each of a unique name inside it) and could
+    /// not delete them: most often something has a file in them open.
+    Left {
+        reason: &'static str,
+        folders: Vec<PathBuf>,
+    },
+}
+
+impl ReleasesError {
+    /// The reason, as every other step says it.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Refused(reason) | Self::Left { reason, .. } => reason,
+        }
+    }
+
+    /// Deleting what this run claimed (`claimed`, when it claimed anything) failed: left over while it is still there.
+    fn after_claim(reason: &'static str, claimed: Option<PathBuf>) -> Self {
+        match claimed {
+            Some(folder) if folder.exists() => Self::Left {
+                reason,
+                folders: vec![folder],
+            },
+            _ => Self::Refused(reason),
+        }
+    }
+}
+
+impl From<&'static str> for ReleasesError {
+    fn from(reason: &'static str) -> Self {
+        Self::Refused(reason)
+    }
 }
 
 const MODELS_UNRESOLVED: &str =
@@ -504,8 +525,9 @@ pub trait Removal: Sized {
         before_claim: &dyn Fn(&OsStr),
     ) -> Result<Vec<String>, &'static str>;
 
-    /// Renames `R` into the claim directory and deletes everything claimed as a release.
-    fn remove_releases(&self) -> Result<(), &'static str>;
+    /// Renames `R` into the claim directory and deletes everything claimed as a release. A failure to delete what this
+    /// run claimed is [`ReleasesError::Left`], with where it is; anything else is [`ReleasesError::Refused`].
+    fn remove_releases(&self) -> Result<(), ReleasesError>;
 
     /// Removes the claim directory, which must be empty by now.
     fn finish_claim(&self) -> Result<(), &'static str>;
@@ -585,20 +607,6 @@ mod tests {
         fs::write(layout.releases.join("releases/1.0.0/binary"), "binary").unwrap();
         let removal = Remover::new(roots(&home)).unwrap();
         (scratch, layout, removal)
-    }
-
-    #[test]
-    fn only_claimed_release_directories_are_listed_for_a_later_deletion() {
-        let scratch = temp_dir("claimed-releases");
-        let claim = scratch.path().join(CLAIM);
-        fs::create_dir_all(claim.join("release-a/bin")).unwrap();
-        fs::create_dir_all(claim.join("data-b")).unwrap();
-        fs::write(claim.join("release-file"), "").unwrap();
-        assert_eq!(
-            claimed_releases(scratch.path()),
-            vec![claim.join("release-a")]
-        );
-        assert!(claimed_releases(&scratch.path().join("missing")).is_empty());
     }
 
     #[test]

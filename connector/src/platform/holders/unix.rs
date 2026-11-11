@@ -27,7 +27,7 @@ fn alive(system: &mut System, (pid, start): (Pid, u64)) -> bool {
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         true,
-        ProcessRefreshKind::nothing(),
+        ProcessRefreshKind::nothing().without_tasks(),
     );
     system.process(pid).is_some_and(|process| {
         process.start_time() == start && process.status() != ProcessStatus::Zombie
@@ -44,14 +44,22 @@ fn stop_programs_inside(program_root: &Path) -> Vec<u32> {
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
-        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+        ProcessRefreshKind::nothing()
+            .without_tasks()
+            .with_exe(UpdateKind::Always),
     );
     let mut found: Vec<(Pid, u64)> = Vec::new();
     for (pid, process) in system.processes() {
         let inside = process
             .exe()
             .is_some_and(|exe| super::runs_from(exe, program_root));
-        if inside && pid.as_u32() != own && process.status() != ProcessStatus::Zombie {
+        // A thread (Linux lists them as processes with the program of their process) is never signalled: that would end
+        // the whole process, this one included.
+        if inside
+            && pid.as_u32() != own
+            && process.thread_kind().is_none()
+            && process.status() != ProcessStatus::Zombie
+        {
             process.kill_with(Signal::Term);
             found.push((*pid, process.start_time()));
         }

@@ -29,6 +29,10 @@ pub trait Deferred {
     fn at_next_sign_in(folders: &[PathBuf]) -> io::Result<()>;
 }
 
+/// The longest command a `RunOnce` entry may hold.
+#[cfg(any(windows, test))]
+const RUN_ONCE_LIMIT: usize = 260;
+
 /// The command line that deletes `folder` and what is in it, without following a link or junction out of it. `None`
 /// for a path that cannot be put safely between quotes in a command line (it has a quote or a character `cmd` or the
 /// registry would expand), and for one that is not absolute: the entry runs from wherever Windows starts it.
@@ -37,8 +41,12 @@ fn removal_command(folder: &std::path::Path) -> Option<String> {
     let text = folder.to_str()?;
     let unsafe_char =
         |ch: char| ch.is_control() || matches!(ch, '"' | '%' | '^' | '!' | '&' | '|' | '<' | '>');
-    (folder.is_absolute() && !text.chars().any(unsafe_char))
-        .then(|| format!("cmd.exe /d /c rmdir /s /q \"{text}\""))
+    let command = format!("cmd.exe /d /c rmdir /s /q \"{text}\"");
+    // A `RunOnce` command is at most 260 characters (Microsoft's documentation): a longer one is refused, not cut.
+    (folder.is_absolute()
+        && !text.chars().any(unsafe_char)
+        && command.chars().count() <= RUN_ONCE_LIMIT)
+        .then_some(command)
 }
 
 #[cfg(test)]
@@ -58,6 +66,15 @@ mod tests {
             command,
             format!("cmd.exe /d /c rmdir /s /q \"{}\"", folder.display())
         );
+    }
+
+    #[test]
+    fn a_command_longer_than_run_once_allows_is_refused() {
+        let base = if cfg!(windows) { r"C:\" } else { "/" };
+        let long = format!("{base}{}", "a".repeat(260));
+        assert_eq!(removal_command(Path::new(&long)), None);
+        let fits = format!("{base}{}", "a".repeat(200));
+        assert!(removal_command(Path::new(&fits)).is_some());
     }
 
     #[test]

@@ -78,11 +78,20 @@ fn lsof_listeners(output: &str) -> Vec<Holder> {
     found
 }
 
-/// Whether the program at `image` is a file inside `root`, both as the file system resolves them.
+/// Whether the program at `image` is a file inside `root`, both as the file system resolves them. A program whose file
+/// is gone (Linux shows `/path/prog (deleted)` for one whose release was pruned while it ran) is judged by the path
+/// it was started from, against the resolved `root`: it is still a program of that installation.
 fn runs_from(image: &Path, root: &Path) -> bool {
-    match (std::fs::canonicalize(image), std::fs::canonicalize(root)) {
-        (Ok(image), Ok(root)) => dunce::simplified(&image).starts_with(dunce::simplified(&root)),
-        _ => false,
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    let root = dunce::simplified(&root);
+    match std::fs::canonicalize(image) {
+        Ok(image) => dunce::simplified(&image).starts_with(root),
+        Err(_) => image
+            .to_str()
+            .and_then(|text| text.strip_suffix(" (deleted)"))
+            .is_some_and(|text| Path::new(text).starts_with(root)),
     }
 }
 
@@ -112,6 +121,13 @@ mod tests {
         // The same name from another installation, or from a folder that only shares the prefix, is not ours.
         assert!(!runs_from(&other.join("bin/sidevoice-connector"), &root));
         assert!(!runs_from(&root.join("missing"), &root));
+        // A program whose file was pruned while it ran, as Linux names it.
+        let gone = format!(
+            "{}/bin/gone (deleted)",
+            std::fs::canonicalize(&root).unwrap().display()
+        );
+        assert!(runs_from(Path::new(&gone), &root));
+        assert!(!runs_from(Path::new(&gone), &other));
     }
 
     #[test]
@@ -183,6 +199,58 @@ mod tests {
         assert!(theirs.try_wait().unwrap().is_none(), "left running");
         theirs.kill().unwrap();
         let _ = theirs.wait();
+    }
+
+    /// What the child below runs: several threads, asleep.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "a child of the test below, not a test"]
+    fn threaded_sleeper() {
+        let threads: Vec<_> = (0..3)
+            .map(|_| std::thread::spawn(|| std::thread::sleep(std::time::Duration::from_secs(30))))
+            .collect();
+        for thread in threads {
+            let _ = thread.join();
+        }
+    }
+
+    /// A server with several threads is ended once, as the process: no thread is signalled by itself (Linux lists
+    /// threads as processes of the same program), and the caller's own threads are never touched.
+    #[cfg(unix)]
+    #[test]
+    fn a_multi_threaded_server_is_stopped_as_one_process_and_this_one_survives() {
+        let scratch = crate::test_support::temp_dir("holders-stop-threads");
+        let releases = scratch.path().join("releases");
+        std::fs::create_dir_all(releases.join("1.0.0/bin")).unwrap();
+        let copy = releases.join("1.0.0/bin/sidevoice-connector");
+        let exe = std::env::current_exe().unwrap();
+        if std::fs::hard_link(&exe, &copy).is_err() {
+            std::fs::copy(&exe, &copy).unwrap();
+        }
+        // This process has threads of its own, running the same program as the child (from another path).
+        let keep: Vec<_> = (0..2)
+            .map(|_| {
+                std::thread::spawn(|| std::thread::sleep(std::time::Duration::from_millis(500)))
+            })
+            .collect();
+        let mut child = std::process::Command::new(&copy)
+            .args([
+                "--ignored",
+                "--exact",
+                "platform::holders::tests::threaded_sleeper",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // Let its threads start.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let ended = Holders::stop_running_from(&[releases.as_path()], &releases);
+        assert_eq!(ended, vec![child.id()]);
+        assert!(child.wait().is_ok_and(|status| !status.success()));
+        for thread in keep {
+            thread.join().unwrap();
+        }
     }
 
     #[test]
