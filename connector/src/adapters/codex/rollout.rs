@@ -1,40 +1,34 @@
 //! Following a Codex thread's rollout: its engine, its turns (working) and the messages it read.
 
 use super::{default_effort, rollout_engine};
-use crate::adapters::conversation::{Conversation, IdentityFailures, Reporter};
 use crate::adapters::transcript;
+use crate::adapters::watch::{IdentityFailures, Watch};
 use crate::platform::fs::{FileId, Files, Fs};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::time::Duration;
 
-/// Follows the rollout until the conversation stops, finding it again when it moves.
-pub fn follow(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
+/// Follows the rollout of `thread`, below Codex's `home`, into `watch` until it stops, finding it again when it moves.
+pub fn follow(watch: Arc<Watch>, home: PathBuf, thread: String) {
     tokio::spawn(async move {
-        let binding = &*conversation;
         let mut path: Option<PathBuf> = None;
         let mut offset = 0u64;
         let mut file_id: Option<FileId> = None;
         let mut identity_failures = IdentityFailures::default();
         let mut partial = Vec::new();
         let mut oversized = false;
-        let mut turn: Option<String> = None;
         let mut working = None;
         let mut catching_up = true;
-        let mut defaults = DefaultEffort::new(reporter.profile().agent_home(super::HOME.var));
+        let mut defaults = DefaultEffort::new(&home);
         loop {
-            if binding.stopped.load(Ordering::Relaxed) {
+            if watch.stopped() {
                 break;
             }
             if path.is_none() {
-                path = rollout_path(
-                    reporter.profile().agent_home(super::HOME.var),
-                    &binding.thread,
-                );
+                path = rollout_path(&home, &thread);
                 if let Some(file) = &path {
                     if let Ok(found) = fs::File::open(file) {
                         offset = 0;
@@ -67,7 +61,6 @@ pub fn follow(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
                         offset = 0;
                         partial.clear();
                         oversized = false;
-                        turn = None;
                         working = None;
                         catching_up = true;
                     }
@@ -91,15 +84,12 @@ pub fn follow(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
                                         if let Ok(item) = serde_json::from_slice::<Value>(&partial)
                                         {
                                             observe(
-                                                &*reporter,
-                                                binding,
+                                                &watch,
                                                 &item,
-                                                &mut turn,
                                                 &mut working,
                                                 &mut defaults,
                                                 catching_up,
-                                            )
-                                            .await;
+                                            );
                                         }
                                     }
                                     partial.clear();
@@ -110,13 +100,7 @@ pub fn follow(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
                         if catching_up && offset >= meta.len() {
                             catching_up = false;
                             if let Some(state) = working {
-                                reporter.working(
-                                    binding,
-                                    json!({
-                                        "working":state,"turn_id":if state { turn.clone() } else { None }
-                                    }),
-                                )
-                                .await;
+                                watch.set_working(state);
                             }
                         }
                     }
@@ -161,65 +145,41 @@ impl DefaultEffort {
     }
 }
 
-async fn observe(
-    reporter: &dyn Reporter,
-    binding: &Conversation,
+/// What one rollout item says: the engine, a turn starting or ending (only told once caught up), messages read.
+fn observe(
+    watch: &Watch,
     item: &Value,
-    turn: &mut Option<String>,
     working: &mut Option<bool>,
     defaults: &mut DefaultEffort,
     catching_up: bool,
 ) {
     if let Some(engine) = rollout_engine(item) {
-        reporter.engine(binding, defaults.complete(engine)).await;
+        watch.set_engine(defaults.complete(engine));
     }
-    if item.get("type") == Some(&json!("event_msg")) {
-        let phase = item
-            .pointer("/payload/type")
+    if item.get("type") == Some(&json!("event_msg"))
+        && item
+            .pointer("/payload/turn_id")
             .and_then(Value::as_str)
-            .unwrap_or("");
-        let turn_id = item.pointer("/payload/turn_id").and_then(Value::as_str);
-        if phase == "task_started" {
-            if let Some(turn_id) = turn_id {
-                *turn = Some(turn_id.to_owned());
-                *working = Some(true);
-                if !catching_up {
-                    reporter
-                        .working(binding, json!({"working":true,"turn_id":turn_id}))
-                        .await;
-                }
-            }
-        }
-        if phase == "task_complete" || phase == "turn_aborted" {
-            if let Some(turn_id) = turn_id {
-                if turn.as_deref() == Some(turn_id) {
-                    *turn = None;
-                }
-                *working = Some(false);
-                if !catching_up {
-                    reporter
-                        .working(binding, json!({"working":false,"turn_id":turn_id}))
-                        .await;
-                }
+            .is_some()
+    {
+        let started = match item.pointer("/payload/type").and_then(Value::as_str) {
+            Some("task_started") => Some(true),
+            Some("task_complete" | "turn_aborted") => Some(false),
+            _ => None,
+        };
+        if let Some(state) = started {
+            *working = Some(state);
+            if !catching_up {
+                watch.set_working(state);
             }
         }
     }
     for header in user_headers(item) {
-        let Some(message_id) = header.get("message_id").and_then(Value::as_str) else {
-            continue;
-        };
-        reporter
-            .read(
-                binding,
-                message_id,
-                header["session_id"].clone(),
-                header["revision"].clone(),
-                json!(turn),
-            )
-            .await;
+        if let Some(message_id) = header.get("message_id").and_then(Value::as_str) {
+            watch.read(message_id);
+        }
     }
 }
-
 /// The envelope headers a user message of the rollout carries, in order: one response item can hold several.
 fn user_headers(item: &Value) -> Vec<Value> {
     if item.get("type") != Some(&json!("response_item"))

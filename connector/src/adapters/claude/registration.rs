@@ -391,10 +391,7 @@ mod tests {
     /// A profile whose Claude home is `home/.claude` (left to the default) or its own directory (`set`), created
     /// only when `exists`; and the user configuration file Claude Code reads there.
     fn profile(scratch: &tempfile::TempDir, set: bool, exists: bool) -> (Profile, PathBuf) {
-        let mut profile = Profile::for_test(
-            scratch.path(),
-            &crate::adapters::Registry::standard().homes(),
-        );
+        let mut profile = Profile::for_test(scratch.path(), &crate::adapters::Registry::homes());
         let home = profile
             .agent_homes
             .iter_mut()

@@ -1,6 +1,5 @@
 pub mod claude;
 pub mod codex;
-mod conversation;
 pub mod cursor;
 mod harness;
 pub mod health;
@@ -8,9 +7,12 @@ mod http;
 pub(crate) mod markers;
 pub mod registration;
 mod transcript;
+mod watch;
 
-pub use conversation::{Conversation, Reporter};
-pub use harness::{Harness, Registry, Route};
+pub use harness::{
+    CallContext, Conversation, Harness, Inbound, Limit, Model, Registry, Sent, State, Status,
+};
+pub use http::{endpoint, post};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -70,74 +72,6 @@ pub(crate) fn prepare_pull_page(result: &mut Value, after: u64) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug)]
-pub struct Identity {
-    pub harness: String,
-    pub thread: String,
-    pub delivery: Value,
-    pub capability_overrides: Value,
-    pub route: Option<String>,
-    pub capabilities: Value,
-    pub experimental: Vec<String>,
-    pub inbound: Option<Value>,
-    pub editor: bool,
-    pub detachable: bool,
-    /// A string unique to this join that the harness may find in its own record of the call.
-    pub chat_marker: Option<String>,
-    pub deliver_note: Option<String>,
-    pub watch_note: Option<String>,
-}
-
-impl Identity {
-    fn new(harness: &str, thread: String, delivery: Value) -> Self {
-        let capabilities = advertised_capabilities(harness);
-        Self {
-            harness: harness.to_owned(),
-            thread,
-            delivery,
-            capability_overrides: json!({}),
-            route: None,
-            capabilities,
-            experimental: Vec::new(),
-            inbound: None,
-            editor: false,
-            detachable: false,
-            chat_marker: None,
-            deliver_note: None,
-            watch_note: None,
-        }
-    }
-}
-
-pub fn advertised_capabilities(harness: &str) -> Value {
-    Registry::standard().get(harness).capabilities()
-}
-
-pub fn identify(
-    meta: &Value,
-    client: Option<&Value>,
-    client_capabilities: &Value,
-) -> Result<Identity> {
-    if client.is_some_and(cursor::is_cursor_client) {
-        if let Some(identity) =
-            http::identity()?.filter(|identity| identity.delivery["kind"] == "http")
-        {
-            return Ok(identity);
-        }
-        return cursor::identity(client.unwrap(), client_capabilities);
-    }
-    if let Some(identity) = claude::identity()? {
-        return Ok(identity);
-    }
-    if let Some(identity) = codex::identity(meta)? {
-        return Ok(identity);
-    }
-    if let Some(identity) = http::identity()? {
-        return Ok(identity);
-    }
-    bail!("{}", unidentified(client))
-}
-
 /// The agents whose conversations Sidevoice joins.
 pub const SUPPORTED: &str = "Claude Code, Codex (the CLI and the desktop app) and Cursor";
 
@@ -171,58 +105,6 @@ pub fn unidentified(client: Option<&Value>) -> String {
         (None, _) => "the agent did not say who it is".to_owned(),
     };
     format!("Cannot tell which conversation this is: {detected}. Sidevoice joins conversations of {SUPPORTED}.")
-}
-
-pub fn inspect_inbound(identity: &Identity) -> Result<Option<Value>> {
-    match identity.delivery.get("kind").and_then(Value::as_str) {
-        Some("claude-uds") => Ok(Some(claude::inspect_inbound(&identity.thread)?)),
-        _ => Ok(None),
-    }
-}
-
-pub fn engine(identity: &Identity) -> Option<Value> {
-    match identity.delivery.get("kind").and_then(Value::as_str) {
-        Some("claude-uds") => claude::session_engine(&identity.thread),
-        Some("codex-queue") | Some("http") if identity.harness == "codex" => {
-            let model = std::env::var("CODEX_MODEL")
-                .ok()
-                .filter(|value| !value.is_empty())?;
-            Some(
-                json!({"model":model,"effort":std::env::var("CODEX_REASONING_EFFORT").ok(),"thinking":Value::Null}),
-            )
-        }
-        // Cursor's database is read asynchronously by its watcher after join.
-        Some("cursor-tmux" | "none") => None,
-        _ => None,
-    }
-}
-
-pub fn conversation_capabilities(identity: &Identity) -> Value {
-    let mut capabilities = identity.capabilities.clone();
-    if let Some(overrides) = identity.capability_overrides.as_object() {
-        for (name, state) in overrides {
-            if capabilities.get(name) == Some(&json!("supported")) && state == "unsupported" {
-                capabilities[name] = state.clone();
-            }
-        }
-    }
-    capabilities
-}
-
-pub fn experimental(identity: &Identity, capabilities: &Value) -> Vec<String> {
-    let mut names = identity.experimental.clone();
-    if identity.harness == "cursor"
-        && matches!(
-            identity.delivery["kind"].as_str(),
-            Some("cursor-tmux" | "cursor-bridge")
-        )
-    {
-        names.push("deliver".into());
-    }
-    names.retain(|name| capabilities[name] == "supported");
-    names.sort();
-    names.dedup();
-    names
 }
 
 /// The sentence every voice and note envelope ends with. A message after it begins a new envelope (`transcript::voice_headers`).

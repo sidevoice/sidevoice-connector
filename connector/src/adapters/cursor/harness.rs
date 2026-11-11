@@ -1,71 +1,64 @@
-//! Cursor as a harness: the CLI's chats (tmux, transcript) and the editor's chats, reached through Cursor's Desktop
-//! Bridge once it knows which chat a conversation is, their transcript found the same way.
+//! Cursor as a harness: the CLI's chats (found by the open chat database, typed into through tmux, followed through
+//! their transcript) and the editor's chats, reached through Cursor's Desktop Bridge once it knows which chat a
+//! conversation is, their transcript found the same way.
 
 use super::engine::editor_engine_in;
 use super::{
     bridge_instances, bridge_running, composer_holding, composer_holding_for_delivery,
-    deliver_editor, editor_transcript_chat, engine, log_bridge, log_correlation, transcript_path,
-    BridgeInstance,
+    deliver_editor, editor_transcript_chat, engine, find_chat, is_cursor_client, is_editor,
+    log_bridge, log_correlation, persist_session, send_cli, transcript_path, BridgeInstance,
+    CLI_UNSUPPORTED, EDITOR_NOTE, EDITOR_PREFIX, NOT_PERSISTED,
 };
-use crate::adapters::conversation::{Conversation, Reporter};
-use crate::adapters::harness::{no_route, Harness, Route};
-use crate::adapters::registration::Registration;
+use crate::adapters::harness::{CallContext, Conversation, Harness, Inbound, Limit, Sent, State};
+use crate::adapters::http::ENDPOINT_VAR;
 use crate::adapters::transcript::{self, Observed, TranscriptReader};
-use crate::adapters::Identity;
-use crate::profile::Profile;
-use anyhow::Result;
+use crate::adapters::watch::{Watch, Watches};
+use anyhow::{bail, Result};
 use futures_util::future::BoxFuture;
-use serde_json::{json, Map, Value};
-use std::any::Any;
-use std::collections::HashSet;
+use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tokio::time::Duration;
 
-/// What an editor chat's delivery and status say until the Desktop Bridge knows which chat it is.
-const WAITING: &str = "waiting for Cursor to register this chat";
-/// What they say when Cursor's Desktop Bridge is not running at all.
-const NO_BRIDGE: &str = "Cursor's Desktop Bridge is not running";
-/// Cursor.
-#[derive(Default)]
-pub struct Cursor;
+/// How many messages handed to an editor chat are remembered to find its transcript by.
+const SENT_KEPT: usize = 64;
 
-/// Which Cursor chat a conversation is: the one the Desktop Bridge holds (`bridge`, which authenticates it), and the
-/// one whose transcript is followed.
+/// Which Cursor chat an editor conversation is: the one the Desktop Bridge holds (`bridge`, which authenticates it),
+/// the one whose transcript is followed, and the messages handed to it, which its transcript shows once it has them.
 #[derive(Default)]
-struct Chats {
+pub struct Editor {
     bridge: Mutex<Option<String>>,
     transcript: Mutex<Option<String>>,
     bridge_changed: Notify,
+    sent: Mutex<VecDeque<String>>,
 }
 
-fn chats(conversation: &Conversation) -> Option<&Chats> {
-    conversation.state.downcast_ref::<Chats>()
+type EditorWatch = Watch<Editor>;
+
+fn bridge(watch: &EditorWatch) -> Option<String> {
+    watch.extra.bridge.lock().unwrap().clone()
 }
 
-fn bridge(conversation: &Conversation) -> Option<String> {
-    chats(conversation).and_then(|chats| chats.bridge.lock().ok()?.clone())
+fn set_bridge(watch: &EditorWatch, chat: String) {
+    *watch.extra.bridge.lock().unwrap() = Some(chat);
+    watch.extra.bridge_changed.notify_one();
 }
 
-fn set_bridge(conversation: &Conversation, chat: String) {
-    if let Some(chats) = chats(conversation) {
-        if let Ok(mut bridge) = chats.bridge.lock() {
-            *bridge = Some(chat);
-            chats.bridge_changed.notify_one();
-        }
-    }
+fn followed(watch: &EditorWatch) -> Option<String> {
+    watch.extra.transcript.lock().unwrap().clone()
+}
+
+fn set_followed(watch: &EditorWatch, chat: String) {
+    *watch.extra.transcript.lock().unwrap() = Some(chat);
 }
 
 /// Wait for the next discovery scan, unless delivery already identified this chat.
-async fn wait_for_bridge_or_scan(conversation: &Conversation, scan_ms: u64) {
+async fn wait_for_bridge_or_scan(watch: &EditorWatch, scan_ms: u64) {
     // notify_one retains a permit if delivery identifies the chat between this check and wait.
-    let changed = chats(conversation)
-        .expect("Cursor conversation state")
-        .bridge_changed
-        .notified();
-    if bridge(conversation).is_some() {
+    let changed = watch.extra.bridge_changed.notified();
+    if bridge(watch).is_some() {
         return;
     }
     tokio::select! {
@@ -74,158 +67,121 @@ async fn wait_for_bridge_or_scan(conversation: &Conversation, scan_ms: u64) {
     }
 }
 
-fn followed(conversation: &Conversation) -> Option<String> {
-    chats(conversation).and_then(|chats| chats.transcript.lock().ok()?.clone())
+/// Cursor's chats, as the connector follows them.
+#[derive(Default)]
+pub struct Chats {
+    watches: Watches<Editor>,
 }
 
-fn set_followed(conversation: &Conversation, chat: String) {
-    if let Some(mut transcript) = chats(conversation).and_then(|chats| chats.transcript.lock().ok())
-    {
-        *transcript = Some(chat);
+impl Chats {
+    fn watch(&self, conversation: &Conversation) -> Arc<EditorWatch> {
+        self.watches.get(&conversation.id, |watch| {
+            match conversation.id.strip_prefix(EDITOR_PREFIX) {
+                Some(marker) => {
+                    watch_engine(watch.clone(), None);
+                    watch_editor(watch.clone(), marker.to_owned());
+                }
+                None => {
+                    let chat = conversation.id.clone();
+                    if persist_session(&chat).is_none() {
+                        watch.set_inbound(Inbound::Blocked(Limit::NoRoute(NOT_PERSISTED.into())));
+                    }
+                    watch_engine(watch.clone(), Some(chat.clone()));
+                    transcript::follow(watch.clone(), Reader { chat, editor: None });
+                }
+            }
+        })
     }
 }
 
-impl Harness for Cursor {
+impl Harness for Chats {
     fn id(&self) -> &'static str {
         "cursor"
     }
 
-    fn capabilities(&self) -> Value {
-        super::capabilities()
-    }
-
-    fn homes(&self) -> &'static [crate::profile::AgentHome] {
-        &super::HOMES
-    }
-
-    fn registration(&self) -> Option<&dyn Registration> {
-        Some(self)
-    }
-
-    fn accepts(&self, delivery: &Value, thread: &str) -> Route {
-        match delivery.get("kind").and_then(Value::as_str) {
-            Some("cursor-tmux") => {
-                Route::known(delivery.get("chat").and_then(Value::as_str) == Some(thread))
-            }
-            Some("cursor-bridge") => {
-                Route::known(delivery.get("thread").and_then(Value::as_str) == Some(thread))
-            }
-            Some("none") => Route::Accepted,
-            _ => crate::adapters::http::accepts(delivery, thread),
+    /// Cursor names itself in its MCP client info. Its editor declares MCP Apps support, and each of its chats that
+    /// joins gets a conversation id of Sidevoice's own; a CLI chat is the chat database `cursor-agent` has open. A
+    /// chat that names its own conversation and HTTP endpoint is the generic one's.
+    fn identify(&self, call: &CallContext) -> Result<Option<Conversation>> {
+        if !is_cursor_client(call.client)
+            || (call.var("SIDEVOICE_THREAD").is_some() && call.var(ENDPOINT_VAR).is_some())
+        {
+            return Ok(None);
         }
+        let id = if is_editor(call.client_capabilities) {
+            format!("{EDITOR_PREFIX}{}", uuid::Uuid::new_v4())
+        } else {
+            match find_chat() {
+                Ok(Some(found)) => found.chat,
+                Ok(None) => bail!("{EDITOR_NOTE}"),
+                Err(error) => bail!("{CLI_UNSUPPORTED} ({error})."),
+            }
+        };
+        Ok(Some(Conversation {
+            harness: self.id().into(),
+            id,
+        }))
     }
 
-    fn conversation_state(&self) -> Box<dyn Any + Send + Sync> {
-        Box::new(Chats::default())
-    }
-
-    fn deliver<'a>(
+    fn send<'a>(
         &'a self,
         conversation: &'a Conversation,
-        frame: &'a Value,
-        _profile: &'a Profile,
-    ) -> BoxFuture<'a, Result<Value>> {
+        message: &'a Value,
+    ) -> BoxFuture<'a, Sent> {
         Box::pin(async move {
-            match conversation.route_kind() {
-                Some("cursor-bridge") => Ok(deliver_to_editor(conversation, frame).await),
-                Some("cursor-tmux") => super::deliver(&conversation.delivery, frame).await,
-                Some("http") => crate::adapters::http::deliver(&conversation.delivery, frame).await,
-                _ => Ok(no_route(&conversation.thread)),
+            match conversation.id.strip_prefix(EDITOR_PREFIX) {
+                Some(marker) => send_to_editor(&self.watch(conversation), marker, message).await,
+                None => send_cli(&conversation.id, message).await,
             }
         })
     }
 
-    fn status<'a>(
-        &'a self,
-        conversation: &'a Conversation,
-    ) -> BoxFuture<'a, Option<Map<String, Value>>> {
+    fn state<'a>(&'a self, conversation: &'a Conversation) -> BoxFuture<'a, State> {
         Box::pin(async move {
-            if conversation.route_kind() != Some("cursor-bridge") {
-                return None;
+            let watch = self.watch(conversation);
+            let mut state = watch.state();
+            if conversation.id.starts_with(EDITOR_PREFIX) {
+                state.inbound = editor_inbound(bridge(&watch).is_some(), bridge_running);
             }
-            let mut fields = Map::new();
-            fields.insert(
-                "delivery_state".into(),
-                bridge_state(route_state(bridge(conversation).is_some())),
-            );
-            Some(fields)
+            state
         })
     }
 
-    fn adopts(&self, client_ref: Option<&str>) -> bool {
-        client_ref.is_none_or(|client_ref| client_ref.starts_with("cursor-editor-"))
-    }
-
-    fn private_id_prefixes(&self) -> &'static [&'static str] {
-        &["cursor-editor-"]
-    }
-
-    fn recognises_client(&self, client: &Value) -> bool {
-        client::recognises(client)
-    }
-
-    fn hosts_several_chats(&self, client_caps: &Value) -> bool {
-        super::is_editor(client_caps)
-    }
-
-    fn refine_identity<'a>(
+    fn received<'a>(
         &'a self,
-        identity: &'a mut Identity,
-        title: &'a str,
-    ) -> BoxFuture<'a, ()> {
-        Box::pin(super::refine_identity(identity, title))
-    }
-
-    fn experimental_note(&self, capability: &str, identity: &Identity) -> Option<&'static str> {
-        client::experimental_note(capability, identity)
-    }
-
-    fn joined_fields(&self, identity: &Identity, _registered: &Value) -> Map<String, Value> {
-        client::joined_fields(identity)
-    }
-
-    fn status_fields(&self, identity: &Identity, listed: Option<&Value>) -> Map<String, Value> {
-        client::status_fields(identity, listed)
-    }
-
-    fn adopted_identity(&self, name: &str, adopted: &Value) -> Option<(Identity, String)> {
-        Some(client::adopted_identity(name, adopted))
-    }
-
-    fn watch(&self, conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
-        match conversation.route_kind() {
-            Some("cursor-tmux" | "none") => {
-                let chat = conversation.thread.clone();
-                watch_engine(conversation.clone(), reporter.clone(), false);
-                transcript::follow(conversation, reporter, Reader::new(chat, false));
-            }
-            Some("cursor-bridge") => {
-                watch_engine(conversation.clone(), reporter.clone(), true);
-                watch_editor(conversation, reporter);
-            }
-            _ => {}
-        }
+        conversation: &'a Conversation,
+        ids: &'a [String],
+    ) -> BoxFuture<'a, Vec<String>> {
+        Box::pin(async move { self.watch(conversation).received(ids) })
     }
 }
 
-fn watch_engine(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>, editor: bool) {
+/// Whether messages get into an editor chat: once the Desktop Bridge knows which chat it is; else why not yet.
+fn editor_inbound(chat_known: bool, bridge_running: impl FnOnce() -> bool) -> Inbound {
+    if chat_known {
+        Inbound::Open
+    } else if !bridge_running() {
+        Inbound::Blocked(Limit::BridgeNotConnected)
+    } else {
+        Inbound::Blocked(Limit::ChatNotFound)
+    }
+}
+
+/// The engine of the chat: a CLI chat's own, an editor chat's once the Desktop Bridge and its transcript name the same
+/// chat.
+fn watch_engine(watch: Arc<EditorWatch>, cli_chat: Option<String>) {
     tokio::spawn(async move {
-        let mut last = None;
-        while !conversation.stopped.load(Ordering::Relaxed) {
-            let chat = if editor {
-                bridge(&conversation)
-                    .filter(|chat| followed(&conversation).as_deref() == Some(chat))
-            } else {
-                Some(conversation.thread.clone())
-            };
+        while !watch.stopped() {
+            let chat = cli_chat.clone().or_else(|| {
+                bridge(&watch).filter(|chat| followed(&watch).as_deref() == Some(chat))
+            });
             if let Some(chat) = chat {
                 if let Some(found) = engine(&chat).await {
-                    let still_current = !editor
-                        || (bridge(&conversation).as_deref() == Some(chat.as_str())
-                            && followed(&conversation).as_deref() == Some(chat.as_str()));
-                    if still_current && last.as_ref() != Some(&found) {
-                        reporter.engine(&conversation, found.clone()).await;
-                        last = Some(found);
+                    let still_current = cli_chat.is_some()
+                        || (bridge(&watch).as_deref() == Some(chat.as_str())
+                            && followed(&watch).as_deref() == Some(chat.as_str()));
+                    if still_current {
+                        watch.set_engine(found);
                     }
                 }
             }
@@ -234,82 +190,56 @@ fn watch_engine(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>, ed
     });
 }
 
-/// Where an editor chat's route stands: registered when the Desktop Bridge knows which chat it is, else why not
-/// yet.
-fn route_state(chat_known: bool) -> &'static str {
-    state_of(chat_known, bridge_running())
-}
-
-fn state_of(chat_known: bool, bridge_running: bool) -> &'static str {
-    if chat_known {
-        "registered"
-    } else if !bridge_running {
-        NO_BRIDGE
-    } else {
-        WAITING
-    }
-}
-
-fn bridge_state(state: &str) -> Value {
-    json!({"bridge_chat_known":state == "registered","state":state})
-}
-
 /// An editor chat, only by its own id through the Desktop Bridge. Until the bridge knows which chat it is, the
-/// message is not sent and the answer says so.
-async fn deliver_to_editor(conversation: &Conversation, frame: &Value) -> Value {
-    let mut delivery = conversation.delivery.clone();
-    log_bridge(
-        "delivery",
-        "attempt",
-        delivery.get("marker").and_then(Value::as_str),
-        None,
-        None,
-    );
-    let composer = match bridge(conversation) {
+/// message is not sent and the answer says why.
+async fn send_to_editor(watch: &EditorWatch, marker: &str, message: &Value) -> Sent {
+    log_bridge("delivery", "attempt", Some(marker), None, None);
+    if let Some(id) = message.get("message_id").and_then(Value::as_str) {
+        let mut sent = watch.extra.sent.lock().unwrap();
+        sent.push_back(id.to_owned());
+        while sent.len() > SENT_KEPT {
+            sent.pop_front();
+        }
+    }
+    let composer = match bridge(watch) {
         Some(composer) => {
             log_bridge("lookup", "cached_chat", Some(&composer), None, None);
             Some(composer)
         }
-        None => composer_holding_for_delivery(&delivery).await,
+        None => composer_holding_for_delivery(marker).await,
     };
     let Some(composer) = composer else {
-        log_bridge(
-            "delivery",
-            "chat_unresolved",
-            delivery.get("marker").and_then(Value::as_str),
-            None,
-            None,
-        );
-        let state = route_state(false);
-        return json!({"status":"failed",
-            "detail":format!("Not sent, {state}: voice reaches this Cursor chat only through its Desktop Bridge, once Cursor has recorded the chat's join call (up to ~30 s after it).")});
+        log_bridge("delivery", "chat_unresolved", Some(marker), None, None);
+        return match editor_inbound(false, bridge_running) {
+            Inbound::Blocked(limit) => Sent::Refused(limit),
+            Inbound::Open => unreachable!("an unknown chat is never open"),
+        };
     };
-    delivery["composer"] = json!(composer);
-    set_bridge(conversation, composer);
-    let result = deliver_editor(&delivery, frame).await.unwrap_or_else(|| {
-        json!({"status":"failed",
-            "detail":"Not sent: Cursor's Desktop Bridge did not take the message (it may not be running)."})
-    });
-    let outcome = match result.get("status").and_then(Value::as_str) {
-        Some("accepted") => "accepted",
-        Some("unknown") => "unconfirmed",
-        _ => "bridge_failed",
+    set_bridge(watch, composer.clone());
+    let result = deliver_editor(&json!({"marker":marker,"composer":composer}), message).await;
+    let (sent, outcome) = match result.as_ref().and_then(|result| result.get("status")) {
+        Some(status) if status == "accepted" => (Sent::Accepted, "accepted"),
+        Some(status) if status == "unknown" => (Sent::Unconfirmed, "unconfirmed"),
+        _ => (
+            Sent::Refused(Limit::Failed(
+                result
+                    .as_ref()
+                    .and_then(|result| result.get("detail"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("Not sent: Cursor's Desktop Bridge did not take the message (it may not be running).")
+                    .to_owned(),
+            )),
+            "bridge_failed",
+        ),
     };
-    log_bridge(
-        "delivery",
-        outcome,
-        delivery.get("marker").and_then(Value::as_str),
-        None,
-        None,
-    );
-    result
+    log_bridge("delivery", outcome, Some(marker), None, None);
+    sent
 }
 
 /// Finds which Cursor chat an editor conversation is (by the Desktop Bridge, or by a delivered message showing up
 /// in a transcript), then follows that chat's transcript.
-fn watch_editor(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
+fn watch_editor(watch: Arc<EditorWatch>, marker: String) {
     tokio::spawn(async move {
-        let binding = &conversation;
         let lookup_at = std::env::var("SIDEVOICE_CURSOR_LOOKUP_AT")
             .ok()
             .map(|value| {
@@ -330,66 +260,32 @@ fn watch_editor(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
         let mut lookup_index = 0;
         let mut last_bridge_lookup: Option<tokio::time::Instant> = None;
         loop {
-            if binding.stopped.load(Ordering::Relaxed) {
+            if watch.stopped() {
                 return;
             }
-            if let Some(chat) = bridge(binding) {
-                if followed(binding).as_deref() != Some(chat.as_str()) {
-                    set_followed(binding, chat.clone());
-                    transcript::follow(
-                        binding.clone(),
-                        reporter.clone(),
-                        Reader::new(chat.clone(), true),
-                    );
+            if let Some(chat) = bridge(&watch) {
+                if followed(&watch).as_deref() != Some(chat.as_str()) {
+                    follow_transcript(&watch, chat.clone());
                 }
-                follow_editor_engine(binding.clone(), reporter.clone(), chat, bridge_instances());
+                follow_editor_engine(watch.clone(), chat, bridge_instances());
                 return;
             }
 
-            let expected = binding
-                .input_context
+            let expected = watch
+                .extra
+                .sent
                 .lock()
-                .await
-                .keys()
+                .unwrap()
+                .iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            let mut excluded = HashSet::new();
-            for other in reporter.conversations().await {
-                if other.client_ref == binding.client_ref {
-                    continue;
+            if let Some(chat) = editor_transcript_chat(&expected) {
+                if followed(&watch).as_deref() != Some(chat.as_str()) {
+                    follow_transcript(&watch, chat.clone());
                 }
-                if let Some(chat) = bridge(&other) {
-                    excluded.insert(chat);
-                }
-                if let Some(chat) = followed(&other) {
-                    excluded.insert(chat);
-                }
-            }
-            if let Some((chat, pending_message_match)) =
-                editor_transcript_chat(&binding.delivery, &expected, &excluded)
-            {
-                let observed = followed(binding);
-                if observed.as_deref() != Some(chat.as_str())
-                    && (observed.is_none() || pending_message_match)
-                {
-                    set_followed(binding, chat.clone());
-                    transcript::follow(
-                        binding.clone(),
-                        reporter.clone(),
-                        Reader::new(chat.clone(), true),
-                    );
-                }
-                if pending_message_match {
-                    log_correlation(
-                        "mapping",
-                        "transcript_message",
-                        binding.delivery.get("marker").and_then(Value::as_str),
-                        &chat,
-                        None,
-                    );
-                    set_bridge(binding, chat);
-                    continue;
-                }
+                log_correlation("mapping", "transcript_message", Some(&marker), &chat, None);
+                set_bridge(&watch, chat);
+                continue;
             }
 
             let lookup_due = if lookup_index < lookup_at.len() {
@@ -402,8 +298,8 @@ fn watch_editor(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
                     lookup_index += 1;
                 }
                 last_bridge_lookup = Some(tokio::time::Instant::now());
-                if let Some(chat) = composer_holding(&binding.delivery).await {
-                    set_bridge(binding, chat);
+                if let Some(chat) = composer_holding(&marker).await {
+                    set_bridge(&watch, chat);
                     continue;
                 }
             }
@@ -412,33 +308,43 @@ fn watch_editor(conversation: Arc<Conversation>, reporter: Arc<dyn Reporter>) {
                 .and_then(|value| value.parse::<u64>().ok())
                 .unwrap_or(2_000)
                 .max(10);
-            wait_for_bridge_or_scan(binding, scan_ms).await;
+            wait_for_bridge_or_scan(&watch, scan_ms).await;
         }
     });
 }
 
+fn follow_transcript(watch: &Arc<EditorWatch>, chat: String) {
+    set_followed(watch, chat.clone());
+    transcript::follow(
+        watch.clone(),
+        Reader {
+            chat,
+            editor: Some(watch.clone()),
+        },
+    );
+}
+
 /// Observe authenticated editor metadata independently of transcript creation and replay.
 fn follow_editor_engine(
-    conversation: Arc<Conversation>,
-    reporter: Arc<dyn Reporter>,
+    watch: Arc<EditorWatch>,
     chat: String,
     instances: Vec<BridgeInstance>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            if conversation.stopped.load(Ordering::Relaxed)
-                || bridge(&conversation).as_deref() != Some(chat.as_str())
-                || followed(&conversation).as_deref() != Some(chat.as_str())
+            if watch.stopped()
+                || bridge(&watch).as_deref() != Some(chat.as_str())
+                || followed(&watch).as_deref() != Some(chat.as_str())
             {
                 return;
             }
             if let Some(engine) = editor_engine_in(&chat, &instances).await {
                 // The mapping may change while SQLite answers. Never attribute its model to a
                 // chat that is no longer authenticated for this conversation.
-                if bridge(&conversation).as_deref() == Some(chat.as_str())
-                    && followed(&conversation).as_deref() == Some(chat.as_str())
+                if bridge(&watch).as_deref() == Some(chat.as_str())
+                    && followed(&watch).as_deref() == Some(chat.as_str())
                 {
-                    reporter.engine(&conversation, engine).await;
+                    watch.set_engine(engine);
                 }
             }
             tokio::time::sleep(Duration::from_millis(400)).await;
@@ -446,18 +352,12 @@ fn follow_editor_engine(
     })
 }
 
-/// A Cursor chat's transcript: working from its turns, the engine once the chat is authenticated, and the messages
-/// read. An editor chat's is only followed while it is the conversation's, and only authenticated once the Desktop
-/// Bridge names the same chat.
+/// A Cursor chat's transcript: working from its turns, and the messages read. An editor chat's (`editor`: its watch)
+/// is only followed while it is the conversation's, and only authenticated once the Desktop Bridge names the same
+/// chat.
 struct Reader {
     chat: String,
-    editor: bool,
-}
-
-impl Reader {
-    fn new(chat: String, editor: bool) -> Self {
-        Self { chat, editor }
-    }
+    editor: Option<Arc<EditorWatch>>,
 }
 
 impl TranscriptReader for Reader {
@@ -465,19 +365,23 @@ impl TranscriptReader for Reader {
         transcript_path(&self.chat)
     }
 
-    fn current(&self, conversation: &Conversation) -> bool {
-        !self.editor || followed(conversation).as_deref() == Some(self.chat.as_str())
+    fn current(&self) -> bool {
+        self.editor
+            .as_ref()
+            .is_none_or(|watch| followed(watch).as_deref() == Some(self.chat.as_str()))
     }
 
-    fn authenticated(&self, conversation: &Conversation) -> bool {
-        !self.editor || bridge(conversation).as_deref() == Some(self.chat.as_str())
+    fn authenticated(&self) -> bool {
+        self.editor
+            .as_ref()
+            .is_none_or(|watch| bridge(watch).as_deref() == Some(self.chat.as_str()))
     }
 
     fn rewritten_in_place(&self) -> bool {
         true
     }
 
-    fn item(&mut self, item: &Value, _authenticated: bool) -> Vec<Observed> {
+    fn item(&mut self, item: &Value) -> Vec<Observed> {
         let mut observed = Vec::new();
         let text = transcript::user_text(item, false);
         if item.get("type") == Some(&json!("turn_ended")) {
@@ -496,221 +400,51 @@ impl TranscriptReader for Reader {
     }
 }
 
-/// The hooks Cursor's MCP client is served by.
-pub(super) mod client {
-    use super::*;
-
-    pub fn recognises(client: &Value) -> bool {
-        super::super::is_cursor_client(client)
-    }
-
-    pub fn experimental_note(capability: &str, identity: &Identity) -> Option<&'static str> {
-        match (capability, identity.delivery["kind"].as_str()) {
-            ("deliver", Some("cursor-tmux")) => Some("Voice reaches this conversation by an experimental route: it is pasted into this chat's terminal through tmux and sent with Enter. If the user is typing at the same moment, the two texts mix. Tell the user once."),
-            ("deliver", Some("cursor-bridge")) => Some("Voice reaches this chat by an experimental route: Cursor's Desktop Bridge submits it to this chat as if the user had typed it, once Cursor has recorded this join call (up to ~30 s). If the user is typing at the same moment, the two may mix. Tell the user once."),
-            ("sessionIdentity", _) => Some("This conversation is identified by Sidevoice, not by an id Cursor gives: each chat of this window that joins gets a conversation of its own. Asking this same chat to join again gives it a second one; leave the old one with voice_disconnect and its conversation id."),
-            _ => None,
-        }
-    }
-
-    /// What Cursor's editor client is told when one of its chats joins: how voice reaches it, and the marker the
-    /// Desktop Bridge finds this chat by in Cursor's own record of the call.
-    pub fn joined_fields(identity: &Identity) -> Map<String, Value> {
-        let mut fields = Map::new();
-        if !identity.editor {
-            return fields;
-        }
-        fields.insert("voice_in".into(), json!(format!("Voice reaches this chat through Cursor's Desktop Bridge, once Cursor has recorded this call (up to ~30 s): until then it says \"{WAITING}\" and nothing is sent. Other chats of this window can join too. Remember this chat's conversation id ({}): voice_status and voice_disconnect need it when several chats are joined.", identity.thread)));
-        fields.insert("speak_first".into(), json!(format!("To speak before the user has said anything by voice, call voice_say with conversation \"{}\" and no session_id. To answer a voice message, use its session_id and revision as usual.", identity.thread)));
-        if let Some(marker) = &identity.chat_marker {
-            fields.insert("chat_marker".into(), json!(marker));
-        }
-        fields
-    }
-
-    /// Where an editor chat's route stands, for its client.
-    pub fn status_fields(identity: &Identity, listed: Option<&Value>) -> Map<String, Value> {
-        let mut fields = Map::new();
-        if !identity.editor {
-            return fields;
-        }
-        let known = listed
-            .and_then(|item| item.pointer("/delivery_state/bridge_chat_known"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let state = listed
-            .and_then(|item| item.pointer("/delivery_state/state"))
-            .and_then(Value::as_str)
-            .unwrap_or(if known { "registered" } else { WAITING });
-        fields.insert(
-            "bridge".into(),
-            json!({"bridge_chat_known":known,"state":state}),
-        );
-        fields
-    }
-
-    pub fn adopted_identity(name: &str, result: &Value) -> (Identity, String) {
-        let delivery = result
-            .get("delivery")
-            .cloned()
-            .unwrap_or_else(|| json!({"kind":"cursor-bridge","thread":name}));
-        let identity = Identity {
-            harness: result
-                .get("harness")
-                .and_then(Value::as_str)
-                .unwrap_or("cursor")
-                .to_owned(),
-            thread: name.to_owned(),
-            delivery,
-            capability_overrides: json!({}),
-            route: result
-                .get("route")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            capabilities: result
-                .get("capabilities")
-                .cloned()
-                .unwrap_or_else(super::super::capabilities),
-            experimental: result
-                .get("experimental")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default(),
-            inbound: result
-                .get("inbound")
-                .filter(|value| !value.is_null())
-                .cloned(),
-            editor: true,
-            detachable: true,
-            chat_marker: result
-                .pointer("/delivery/marker")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            deliver_note: None,
-            watch_note: None,
-        };
-        let title = result
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or("Cursor conversation")
-            .to_owned();
-        (identity, title)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::env::{Env, Environment};
-    use std::collections::{HashMap, VecDeque};
+    use crate::adapters::harness::Status;
+    use crate::profile::Profile;
     use std::fs;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
-    use tokio::sync::Mutex as AsyncMutex;
 
-    struct RecordingReporter {
-        profile: Profile,
-        engines: AsyncMutex<Vec<Value>>,
-    }
-
-    impl Reporter for RecordingReporter {
-        fn profile(&self) -> &Profile {
-            &self.profile
-        }
-        fn engine<'a>(
-            &'a self,
-            _conversation: &'a Conversation,
-            engine: Value,
-        ) -> BoxFuture<'a, ()> {
-            Box::pin(async move {
-                self.engines.lock().await.push(engine);
-            })
-        }
-        fn working<'a>(
-            &'a self,
-            _conversation: &'a Conversation,
-            _event: Value,
-        ) -> BoxFuture<'a, ()> {
-            Box::pin(async {})
-        }
-        fn read<'a>(
-            &'a self,
-            _conversation: &'a Conversation,
-            _message_id: &'a str,
-            _session_id: Value,
-            _revision: Value,
-            _turn_id: Value,
-        ) -> BoxFuture<'a, ()> {
-            Box::pin(async {})
-        }
-        fn conversations(&self) -> BoxFuture<'_, Vec<Arc<Conversation>>> {
-            Box::pin(async { Vec::new() })
-        }
-    }
-
-    /// An editor chat as Cursor's client declares itself at `initialize`: MCP Apps support.
     fn editor_caps() -> Value {
         json!({"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app"]}}})
     }
 
-    fn conversation(identity: &Identity) -> Conversation {
-        Conversation {
-            client_ref: identity.thread.clone(),
-            harness: identity.harness.clone(),
-            thread: identity.thread.clone(),
-            title: "chat".into(),
-            delivery: identity.delivery.clone(),
-            initial_reply_context: AsyncMutex::new(Value::Null),
-            engine: AsyncMutex::new(None),
-            route: identity.route.clone(),
-            capabilities: identity.capabilities.clone(),
-            experimental: json!([]),
-            inbound: Value::Null,
-            detachable: true,
-            owner: AtomicU64::new(1),
-            id: AsyncMutex::new("local-1".into()),
-            serial: AsyncMutex::new(()),
-            publication: AsyncMutex::new(()),
-            pending: AsyncMutex::new(VecDeque::new()),
-            turns: AsyncMutex::new(HashMap::new()),
-            input_context: AsyncMutex::new(HashMap::new()),
-            recent_inputs: AsyncMutex::new(VecDeque::new()),
-            read: AsyncMutex::new(VecDeque::new()),
-            deliveries: AsyncMutex::new(VecDeque::new()),
-            working: AsyncMutex::new(None),
-            stopped: AtomicBool::new(false),
-            state: Cursor.conversation_state(),
-        }
+    fn editor_call(chats: &Chats) -> Conversation {
+        let env = |_: &str| None;
+        chats
+            .identify(&CallContext {
+                env: &env,
+                meta: &json!({}),
+                client: &json!({"name":"cursor-vscode"}),
+                client_capabilities: &editor_caps(),
+            })
+            .unwrap()
+            .unwrap()
     }
 
     /// A delivery can identify the editor chat while the periodic transcript scan sleeps.
     /// Its retained wakeup must let the watcher attach without waiting for that scan.
     #[tokio::test]
     async fn bridge_identification_wakes_working_monitor() {
-        let identity =
-            super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
-        let conversation = Arc::new(conversation(&identity));
+        let watch = Arc::new(Watch::<Editor>::default_for_test());
         let waiter = tokio::spawn({
-            let conversation = conversation.clone();
-            async move { wait_for_bridge_or_scan(&conversation, 2_000).await }
+            let watch = watch.clone();
+            async move { wait_for_bridge_or_scan(&watch, 2_000).await }
         });
         tokio::task::yield_now().await;
-        set_bridge(&conversation, "chat-1".into());
+        set_bridge(&watch, "chat-1".into());
         tokio::time::timeout(Duration::from_millis(500), waiter)
             .await
             .expect("delivery must wake the monitor without a scan interval")
             .unwrap();
-        assert_eq!(bridge(&conversation).as_deref(), Some("chat-1"));
+        assert_eq!(bridge(&watch).as_deref(), Some("chat-1"));
 
         // A bridge set just before the wait is also observed without sleeping.
         tokio::time::timeout(
             Duration::from_millis(500),
-            wait_for_bridge_or_scan(&conversation, 2_000),
+            wait_for_bridge_or_scan(&watch, 2_000),
         )
         .await
         .expect("a known bridge must not wait for another scan");
@@ -718,7 +452,10 @@ mod tests {
 
     #[test]
     fn transcript_fixture_reports_busy_until_turn_ends() {
-        let mut reader = Reader::new("chat-1".into(), true);
+        let mut reader = Reader {
+            chat: "chat-1".into(),
+            editor: None,
+        };
         let fixture = [
             r#"{"role":"user","message":{"content":"hello"}}"#,
             r#"{"role":"assistant","message":{"content":"working"}}"#,
@@ -728,7 +465,7 @@ mod tests {
             .iter()
             .map(|line| {
                 reader
-                    .item(&serde_json::from_str::<Value>(line).unwrap(), false)
+                    .item(&serde_json::from_str::<Value>(line).unwrap())
                     .into_iter()
                     .filter_map(|event| match event {
                         Observed::Working(value) => Some(value),
@@ -743,61 +480,65 @@ mod tests {
     /// Why an editor chat is not reached yet: the bridge, then Cursor recording the join.
     #[test]
     fn an_unregistered_chat_says_what_it_waits_for() {
-        assert_eq!(state_of(true, false), "registered");
-        assert_eq!(state_of(false, false), NO_BRIDGE);
-        assert_eq!(state_of(false, true), WAITING);
-    }
-
-    /// An editor chat joins on the Desktop Bridge route, with a marker of its own the bridge finds it by, which its
-    /// join answer carries; no card is drawn or offered.
-    #[test]
-    fn an_editor_chat_joins_on_the_bridge_route_with_its_marker() {
-        let identity =
-            super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
-        assert_eq!(identity.delivery["kind"], "cursor-bridge");
-        assert_eq!(identity.route.as_deref(), Some("cursor-editor-bridge"));
-        let marker = identity.chat_marker.clone().unwrap();
-        assert_eq!(identity.delivery["marker"], marker.as_str());
+        assert_eq!(editor_inbound(true, || false), Inbound::Open);
         assert_eq!(
-            Cursor.accepts(&identity.delivery, &identity.thread),
-            Route::Accepted
+            editor_inbound(false, || false),
+            Inbound::Blocked(Limit::BridgeNotConnected)
         );
-        let fields = client::joined_fields(&identity);
-        assert_eq!(fields["chat_marker"], marker.as_str());
-        assert!(fields["voice_in"].as_str().unwrap().contains(WAITING));
-        assert!(!fields.contains_key("card") && !fields.contains_key("view_link"));
+        assert_eq!(
+            editor_inbound(false, || true),
+            Inbound::Blocked(Limit::ChatNotFound)
+        );
     }
 
-    /// Until the Desktop Bridge knows which chat it is, nothing is sent and both the delivery and the status say so.
+    /// Each editor chat that joins gets a conversation of its own, whose id carries the marker the Desktop Bridge finds
+    /// it by; a chat naming its own conversation and endpoint is not Cursor's to identify.
+    #[test]
+    fn an_editor_chat_gets_an_id_of_its_own_that_carries_its_marker() {
+        let chats = Chats::default();
+        let first = editor_call(&chats);
+        let second = editor_call(&chats);
+        assert_eq!(first.harness, "cursor");
+        assert_ne!(first.id, second.id);
+        let marker = first.id.strip_prefix(EDITOR_PREFIX).unwrap();
+        assert!(super::super::valid_marker(marker), "{marker}");
+
+        let env = |name: &str| match name {
+            "SIDEVOICE_THREAD" => Some("t".to_owned()),
+            ENDPOINT_VAR => Some("http://127.0.0.1:1/".to_owned()),
+            _ => None,
+        };
+        let generic = chats
+            .identify(&CallContext {
+                env: &env,
+                meta: &json!({}),
+                client: &json!({"name":"cursor-vscode"}),
+                client_capabilities: &editor_caps(),
+            })
+            .unwrap();
+        assert_eq!(generic, None);
+    }
+
+    /// Until the Desktop Bridge knows which chat it is, nothing is sent, and both the delivery and the state say why.
     #[tokio::test]
     async fn an_unregistered_editor_chat_is_waiting_not_reached_another_way() {
-        let identity =
-            super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
-        let conversation = conversation(&identity);
+        let chats = Chats::default();
+        let conversation = editor_call(&chats);
         let frame = json!({"channel":"voice","session_id":"s","revision":1,"epoch":0,"message_id":"m","text":"hola"});
-        let answer = deliver_to_editor(&conversation, &frame).await;
-        assert_eq!(answer["status"], "failed", "{answer}");
-        // Only the fields the core takes in a delivery answer: a failure it keeps, with why in the detail.
+        let waiting = editor_inbound(false, bridge_running);
+        let Inbound::Blocked(limit) = waiting.clone() else {
+            panic!("an unknown chat is never open");
+        };
         assert_eq!(
-            answer.as_object().unwrap().keys().collect::<Vec<_>>(),
-            ["detail", "status"],
-            "{answer}"
+            chats.send(&conversation, &frame).await,
+            Sent::Refused(limit)
         );
-        let state = route_state(false);
-        assert!(
-            answer["detail"].as_str().unwrap().contains(state),
-            "{answer}"
-        );
+        let state = chats.state(&conversation).await;
+        assert_eq!(state.inbound, waiting);
+        assert_eq!(state.status, Status::Idle);
 
-        let listed = Cursor.status(&conversation).await.unwrap();
-        assert_eq!(listed["delivery_state"]["state"], state);
-        let item = json!({"delivery_state": listed["delivery_state"]});
-        let fields = client::status_fields(&identity, Some(&item));
-        assert_eq!(fields["bridge"]["bridge_chat_known"], false);
-
-        set_bridge(&conversation, "chat-1".into());
-        let listed = Cursor.status(&conversation).await.unwrap();
-        assert_eq!(listed["delivery_state"]["state"], "registered");
+        set_bridge(&chats.watch(&conversation), "chat-1".into());
+        assert_eq!(chats.state(&conversation).await.inbound, Inbound::Open);
     }
 
     #[tokio::test]
@@ -812,24 +553,9 @@ mod tests {
             &database,
             "CREATE TABLE cursorDiskKV(key TEXT, value TEXT);",
         );
-        let identity =
-            super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
-        let conversation = Arc::new(conversation(&identity));
+        let watch = Arc::new(Watch::<Editor>::default_for_test());
         let chat = "chat-model".to_owned();
-        set_followed(&conversation, chat.clone());
-        let profile = Profile::from_vars(
-            |key| match key {
-                key if key == Environment::HOME => Some(scratch.path().as_os_str().to_os_string()),
-                "SIDEVOICE_DATA_DIR" => Some(scratch.path().join("data").into_os_string()),
-                _ => None,
-            },
-            &[],
-        )
-        .unwrap();
-        let reporter = Arc::new(RecordingReporter {
-            profile,
-            engines: AsyncMutex::new(Vec::new()),
-        });
+        set_followed(&watch, chat.clone());
         let instance = BridgeInstance {
             socket: PathBuf::new(),
             token: String::new(),
@@ -837,92 +563,49 @@ mod tests {
             created_at: 0,
         };
         // A known transcript path is deliberately absent throughout this test.
-        let unauthenticated = follow_editor_engine(
-            conversation.clone(),
-            reporter.clone(),
-            chat.clone(),
-            vec![instance.clone()],
-        );
+        let unauthenticated =
+            follow_editor_engine(watch.clone(), chat.clone(), vec![instance.clone()]);
         tokio::time::sleep(Duration::from_millis(80)).await;
-        assert!(
-            reporter.engines.lock().await.is_empty(),
-            "unbound chat reported an engine"
-        );
+        assert!(watch.engine().is_none(), "unbound chat reported an engine");
         unauthenticated.await.unwrap();
-        set_bridge(&conversation, "chat-model".into());
-        let watcher =
-            follow_editor_engine(conversation.clone(), reporter.clone(), chat, vec![instance]);
+        set_bridge(&watch, "chat-model".into());
+        let watcher = follow_editor_engine(watch.clone(), chat, vec![instance]);
         tokio::time::sleep(Duration::from_millis(450)).await;
-        assert!(
-            reporter.engines.lock().await.is_empty(),
-            "missing metadata was guessed"
-        );
+        assert!(watch.engine().is_none(), "missing metadata was guessed");
         super::super::state_db::fixture(&database, "INSERT INTO cursorDiskKV VALUES ('composerData:chat-model', '{\"modelConfig\":{\"modelName\":\"gpt-5\",\"effort\":\"high\"}}');");
         tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if !reporter.engines.lock().await.is_empty() {
-                    break;
-                }
+            while watch.engine().is_none() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
         .await
         .expect("authenticated metadata was not reported without a transcript");
         assert_eq!(
-            reporter.engines.lock().await.as_slice(),
-            &[json!({"model":"gpt-5","effort":"high","thinking":null})]
+            watch.engine(),
+            Some(json!({"model":"gpt-5","effort":"high","thinking":null}))
         );
-        conversation.stopped.store(true, Ordering::Relaxed);
+        watch.stop();
         tokio::time::timeout(Duration::from_secs(1), watcher)
             .await
             .unwrap()
             .unwrap();
     }
 
-    /// Records Working from the real Cursor and Codex followers with populated histories.
-    /// The initial catch-up delay remains after Cursor bridge discovery is woken.
-    struct HistoryReporter {
-        profile: Profile,
-        events: AsyncMutex<Vec<Value>>,
-    }
-    impl Reporter for HistoryReporter {
-        fn profile(&self) -> &Profile {
-            &self.profile
-        }
-        fn engine<'a>(&'a self, _: &'a Conversation, _: Value) -> BoxFuture<'a, ()> {
-            Box::pin(async {})
-        }
-        fn working<'a>(&'a self, _: &'a Conversation, event: Value) -> BoxFuture<'a, ()> {
-            Box::pin(async move {
-                self.events.lock().await.push(event);
-            })
-        }
-        fn read<'a>(
-            &'a self,
-            _: &'a Conversation,
-            _: &'a str,
-            _: Value,
-            _: Value,
-            _: Value,
-        ) -> BoxFuture<'a, ()> {
-            Box::pin(async {})
-        }
-        fn conversations(&self) -> BoxFuture<'_, Vec<Arc<Conversation>>> {
-            Box::pin(async { vec![] })
-        }
-    }
-    async fn wait_for_caught_up_working(reporter: &HistoryReporter) {
-        tokio::time::timeout(Duration::from_secs(6), async {
-            while reporter.events.lock().await.is_empty() {
+    /// Waits for the followed state to say working, `expected`.
+    async fn wait_for_working<S>(watch: &Watch<S>, expected: Status, within: Duration) {
+        tokio::time::timeout(within, async {
+            while watch.state().status != expected {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|_| panic!("not {expected:?} within {within:?}"));
     }
+
+    /// Working is only told once a populated history is caught up, by the real Cursor and Codex followers.
     #[tokio::test]
     async fn populated_cursor_and_codex_history_delays_initial_working() {
-        use std::{fs, io::Write};
+        use std::io::Write;
         let root = std::env::temp_dir().join(format!("sv-history-watch-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let previous_data = std::env::var_os("CURSOR_DATA_DIR");
@@ -948,49 +631,31 @@ mod tests {
             };
             content.push_str("{\"role\":\"user\",\"message\":{\"content\":\"hello\"}}\n");
             fs::write(&path, &content).unwrap();
-            let identity =
-                super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
-            let binding = Arc::new(conversation(&identity));
-            let reporter = Arc::new(HistoryReporter {
-                profile: Profile::for_test(&root.join(chat), &[]),
-                events: AsyncMutex::new(vec![]),
-            });
-            watch_editor(binding.clone(), reporter.clone());
+            let watch = Arc::new(Watch::<Editor>::default_for_test());
+            watch_editor(watch.clone(), uuid::Uuid::new_v4().to_string());
             tokio::time::sleep(Duration::from_millis(50)).await;
             let start = tokio::time::Instant::now();
-            set_bridge(&binding, chat.to_owned());
-            wait_for_caught_up_working(&reporter).await;
+            set_bridge(&watch, chat.to_owned());
+            wait_for_working(&watch, Status::Working, Duration::from_secs(6)).await;
             let elapsed = start.elapsed();
             println!(
                 "History Cursor large={large} bytes={} first_working_ms={}",
                 content.len(),
                 elapsed.as_millis()
             );
-            assert_eq!(
-                reporter.events.lock().await.as_slice(),
-                &[json!({"working":true,"turn_id":null})]
-            );
             assert!(elapsed < Duration::from_secs(2));
             for _ in 0..10 {
-                set_bridge(&binding, chat.to_owned());
+                set_bridge(&watch, chat.to_owned());
             }
             let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
             writeln!(file, "{{\"type\":\"turn_ended\"}}").unwrap();
-            tokio::time::sleep(Duration::from_millis(850)).await;
-            assert_eq!(
-                reporter.events.lock().await.as_slice(),
-                &[
-                    json!({"working":true,"turn_id":null}),
-                    json!({"working":false,"turn_id":null})
-                ]
-            );
-            binding.stopped.store(true, Ordering::Relaxed);
+            wait_for_working(&watch, Status::Idle, Duration::from_millis(850)).await;
+            watch.stop();
             tokio::time::sleep(Duration::from_millis(450)).await;
         }
         let profile = Profile::for_test(&root.join("codex"), &[crate::adapters::codex::HOME]);
-        let path = profile
-            .agent_home("CODEX_HOME")
-            .join("sessions/2026/10/15/rollout-history-codex.jsonl");
+        let home = profile.agent_home("CODEX_HOME").to_owned();
+        let path = home.join("sessions/2026/10/15/rollout-history-codex.jsonl");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let history = format!(
             "{}\n",
@@ -1001,30 +666,17 @@ mod tests {
             "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}\n",
         );
         fs::write(&path, &content).unwrap();
-        let identity =
-            super::super::identity(&json!({"name":"cursor-vscode"}), &editor_caps()).unwrap();
-        let mut binding = conversation(&identity);
-        binding.thread = "history-codex".into();
-        binding.delivery = json!({"kind":"codex-queue"});
-        let binding = Arc::new(binding);
-        let reporter = Arc::new(HistoryReporter {
-            profile,
-            events: AsyncMutex::new(vec![]),
-        });
+        let watch = Arc::new(Watch::<()>::default_for_test());
         let start = tokio::time::Instant::now();
-        crate::adapters::codex::Codex.watch(binding.clone(), reporter.clone());
-        wait_for_caught_up_working(&reporter).await;
+        crate::adapters::codex::follow_rollout(watch.clone(), home, "history-codex".into());
+        wait_for_working(&watch, Status::Working, Duration::from_secs(6)).await;
         println!(
             "History Codex bytes={} first_working_ms={}",
             content.len(),
             start.elapsed().as_millis()
         );
         assert!(start.elapsed() >= Duration::from_secs(2));
-        assert_eq!(
-            reporter.events.lock().await.as_slice(),
-            &[json!({"working":true,"turn_id":"t1"})]
-        );
-        binding.stopped.store(true, Ordering::Relaxed);
+        watch.stop();
         tokio::time::sleep(Duration::from_millis(450)).await;
         if let Some(value) = previous_data {
             std::env::set_var("CURSOR_DATA_DIR", value);

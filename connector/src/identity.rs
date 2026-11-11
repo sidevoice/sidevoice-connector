@@ -52,8 +52,7 @@ fn platform_of(os: &str, arch: &str) -> String {
 
 /// Which harnesses live on this machine, by the configuration home each keeps. Nothing is run to find out.
 pub fn harnesses(profile: &Profile) -> Vec<&'static str> {
-    crate::adapters::Registry::standard()
-        .agents()
+    crate::adapters::Registry::agents()
         .filter(|(_, registration)| registration.config_root(profile).exists())
         .map(|(id, _)| id)
         .collect()
@@ -79,12 +78,8 @@ mod tests {
     #[test]
     fn the_machine_names_its_real_host_version_and_the_harnesses_it_has() {
         let scratch = crate::test_support::temp_dir("identity");
-        let profile = Profile::for_test(
-            scratch.path(),
-            &crate::adapters::Registry::standard().homes(),
-        );
-        let registry = crate::adapters::Registry::standard();
-        let mut agents: Vec<_> = registry.agents().collect();
+        let profile = Profile::for_test(scratch.path(), &crate::adapters::Registry::homes());
+        let mut agents: Vec<_> = crate::adapters::Registry::agents().collect();
         let (gone, registration) = agents.pop().unwrap();
         std::fs::remove_dir(registration.config_root(&profile)).unwrap();
         let machine = machine(&profile);

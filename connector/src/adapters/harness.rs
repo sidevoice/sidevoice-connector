@@ -1,169 +1,205 @@
-//! The harness adapter: everything the connector knows about one agent, behind one trait, found by its id.
+//! The harness interface: what Sidevoice does with an agent's conversation. One implementation per agent (Claude
+//! Code, Codex, Cursor, …), found by its id; how each one does it (sockets, CLIs, transcripts, its own cache) stays
+//! inside it.
 
-use super::conversation::{Conversation, Reporter};
 use super::registration::Registration;
-use super::Identity;
 use crate::profile::{AgentHome, Profile};
 use anyhow::Result;
 use futures_util::future::BoxFuture;
-use serde_json::{json, Map, Value};
-use std::any::Any;
-use std::sync::{Arc, Weak};
+use serde_json::{json, Value};
+use std::sync::Arc;
 
-/// What a harness makes of the delivery route a façade names for a conversation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Route {
-    /// A route this harness knows, and it reaches that conversation.
-    Accepted,
-    /// A route this harness knows, naming somewhere that is not that conversation: the registration is refused.
-    Refused,
-    /// A kind this harness does not know (a newer façade's): the conversation joins with no route in.
-    Unknown,
+/// One conversation of an agent: the harness that serves it and the conversation's id there. Plain data, made by
+/// [`Harness::identify`] in the agent's MCP server and handed back to every other call in the connector.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Conversation {
+    pub harness: String,
+    pub id: String,
 }
 
-impl Route {
-    /// `Accepted` when `matches`, else `Refused`: for a kind the harness knows.
-    pub fn known(matches: bool) -> Self {
-        if matches {
-            Self::Accepted
-        } else {
-            Self::Refused
+/// What an agent's tool call brings with it: everything [`Harness::identify`] reads.
+pub struct CallContext<'a> {
+    /// The environment the agent started its MCP server with.
+    pub env: &'a (dyn Fn(&str) -> Option<String> + Sync),
+    /// The tool call's `_meta`.
+    pub meta: &'a Value,
+    /// The MCP client's `clientInfo`, from `initialize`.
+    pub client: &'a Value,
+    /// The MCP client's capabilities, from `initialize`.
+    pub client_capabilities: &'a Value,
+}
+
+impl CallContext<'_> {
+    /// A variable of the agent's environment, when it is set and not empty.
+    pub fn var(&self, name: &str) -> Option<String> {
+        (self.env)(name).filter(|value| !value.is_empty())
+    }
+}
+
+/// How handing a message to a conversation went.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Sent {
+    /// The agent took it and said so.
+    Accepted,
+    /// It was written where the agent reads, which answers nothing: [`Harness::received`] tells when the agent has
+    /// it.
+    Unconfirmed,
+    /// It was not taken, and why.
+    Refused(Limit),
+}
+
+/// How a conversation is right now. Polled; whatever the harness can tell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct State {
+    pub status: Status,
+    pub model: Option<Model>,
+    pub inbound: Inbound,
+}
+
+impl State {
+    /// A conversation the harness can tell nothing about, with messages getting in or not.
+    pub fn unknown(inbound: Inbound) -> Self {
+        Self {
+            status: Status::Unknown,
+            model: None,
+            inbound,
         }
     }
 }
 
-/// One harness: how its conversations are reached and followed, and how Sidevoice is registered with it.
+/// Whether the agent is busy with the conversation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Idle,
+    Working,
+    /// The harness cannot tell.
+    Unknown,
+}
+
+/// The model a conversation runs on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Model {
+    pub name: String,
+    pub effort: Option<String>,
+    pub thinking: Option<String>,
+}
+
+impl Model {
+    /// From an engine record, `{model, effort, thinking}`; none without a model.
+    pub fn from_engine(engine: &Value) -> Option<Self> {
+        let text = |key: &str| {
+            engine
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        Some(Self {
+            name: text("model")?,
+            effort: text("effort"),
+            thinking: text("thinking"),
+        })
+    }
+
+    /// As the core reads an engine: `{model, effort, thinking}`.
+    pub fn engine(&self) -> Value {
+        json!({"model":self.name,"effort":self.effort,"thinking":self.thinking})
+    }
+}
+
+/// Whether messages can be put into the conversation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Inbound {
+    Open,
+    Blocked(Limit),
+}
+
+impl Inbound {
+    /// As the agent and diagnostics read it: `{ok}`, and when blocked the limit's key, why, and the remedy.
+    pub fn view(&self) -> Value {
+        match self {
+            Self::Open => json!({"ok":true}),
+            Self::Blocked(limit) => {
+                let mut view = json!({"ok":false,"limit":limit.key(),"reason":limit.detail()});
+                if let Limit::InboundBlockedByPermissions { reason, remedy } = limit {
+                    view["reason"] = json!(reason);
+                    view["remedy"] = json!(remedy);
+                }
+                view
+            }
+        }
+    }
+}
+
+/// Why a message cannot get into a conversation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Limit {
+    /// There is no way in from here: the agent reads what is said with get_messages. Says why, for the agent.
+    NoRoute(String),
+    /// The agent's own settings hold or refuse messages from other processes.
+    InboundBlockedByPermissions { reason: String, remedy: String },
+    /// The agent's bridge for messages is not running.
+    BridgeNotConnected,
+    /// The agent has not yet recorded which of its chats this conversation is.
+    ChatNotFound,
+    /// The way in failed this time; trying again may work.
+    Failed(String),
+}
+
+impl Limit {
+    /// A stable key for it.
+    pub fn key(&self) -> &'static str {
+        match self {
+            Self::NoRoute(_) => "no_route",
+            Self::InboundBlockedByPermissions { .. } => "inbound_blocked_by_permissions",
+            Self::BridgeNotConnected => "bridge_not_connected",
+            Self::ChatNotFound => "chat_not_found",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    /// Why, in English, for the agent and the log.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::NoRoute(why) | Self::Failed(why) => why.clone(),
+            Self::InboundBlockedByPermissions { reason, remedy } => format!("{reason} {remedy}"),
+            Self::BridgeNotConnected => "the agent's Desktop Bridge is not running".into(),
+            Self::ChatNotFound => "waiting for the agent to record this chat's join call".into(),
+        }
+    }
+}
+
+/// One agent: how its conversations are found, reached and followed. How Sidevoice is installed in it is its
+/// [`Registration`] (see [`Registry::agents`]).
 pub trait Harness: Send + Sync {
     /// The id conversations and the agent list name it by (`claude`, `codex`, …).
     fn id(&self) -> &'static str;
 
-    /// What its conversations can do when the client declares nothing. Harnesses with an
-    /// injection route declare `deliver: supported`; the default uses get_messages.
-    fn capabilities(&self) -> Value {
-        json!({"deliver":"unsupported"})
-    }
+    /// The conversation a tool call comes from, at join: `None` when the call is not this agent's; an error when it
+    /// is, and it cannot tell which conversation.
+    fn identify(&self, call: &CallContext) -> Result<Option<Conversation>>;
 
-    /// The directories the agent keeps, named by environment variables: what the profile resolves for it.
-    fn homes(&self) -> &'static [AgentHome] {
-        &[]
-    }
-
-    /// Registering Sidevoice with the agent itself; None when there is nothing to register with.
-    fn registration(&self) -> Option<&dyn Registration> {
-        None
-    }
-
-    /// Whether voice reaches its conversation `thread` by `delivery`, for a route kind this harness knows; a kind it
-    /// does not know is `Route::Unknown`, never refused.
-    fn accepts(&self, delivery: &Value, thread: &str) -> Route;
-
-    /// The harness's own state for one conversation, kept in `Conversation::state`.
-    fn conversation_state(&self) -> Box<dyn Any + Send + Sync> {
-        Box::new(())
-    }
-
-    /// Starts what the harness keeps for all its conversations on this machine, once the core link exists.
-    fn attach(&self, _profile: &Profile, _reporter: Weak<dyn Reporter>) -> Result<()> {
-        Ok(())
-    }
-
-    /// Readies a conversation's route as it joins; what it returns goes back to the façade as `prepared`.
-    fn prepare<'a>(
+    /// Puts a message (the core's frame) into the conversation. Whether it steers the running turn or waits for the
+    /// next is the harness's own choice.
+    fn send<'a>(
         &'a self,
-        _conversation: &'a Conversation,
-    ) -> BoxFuture<'a, Result<Option<Value>>> {
-        Box::pin(async { Ok(None) })
-    }
+        conversation: &'a Conversation,
+        message: &'a Value,
+    ) -> BoxFuture<'a, Sent>;
 
-    /// Attempts to put a message into the conversation. The default leaves it in the journal
-    /// for get_messages.
-    fn deliver<'a>(
+    /// How the conversation is now.
+    fn state<'a>(&'a self, conversation: &'a Conversation) -> BoxFuture<'a, State>;
+
+    /// Which of `ids`, messages handed to the conversation, the agent now has.
+    fn received<'a>(
         &'a self,
-        _conversation: &'a Conversation,
-        _frame: &'a Value,
-        _profile: &'a Profile,
-    ) -> BoxFuture<'a, Result<Value>> {
-        Box::pin(async { Ok(json!({"status":"unsupported"})) })
-    }
-
-    /// Releases what `prepare` held, when the conversation leaves.
-    fn close<'a>(&'a self, _conversation: &'a Conversation) -> BoxFuture<'a, ()> {
-        Box::pin(async {})
-    }
-
-    /// Fields about its route that `status` lists beside the conversation.
-    fn status<'a>(
-        &'a self,
-        _conversation: &'a Conversation,
-    ) -> BoxFuture<'a, Option<Map<String, Value>>> {
-        Box::pin(async { None })
-    }
-
-    /// Whether a detached conversation may be taken by another façade: any of this harness (`None`), or the one
-    /// named `client_ref`.
-    fn adopts(&self, _client_ref: Option<&str>) -> bool {
-        false
-    }
-
-    /// Prefixes of this harness's conversation ids that let a chat speak as it: the log names those ids by a hash.
-    fn private_id_prefixes(&self) -> &'static [&'static str] {
-        &[]
-    }
-
-    /// Whether `client` (an MCP client's `clientInfo`) is this harness: the one whose hooks below serve it.
-    fn recognises_client(&self, _client: &Value) -> bool {
-        false
-    }
-
-    /// Whether this harness's client (with capabilities `client_caps`) serves several of its chats at once, so a call
-    /// that names no conversation may be any of them.
-    fn hosts_several_chats(&self, _client_caps: &Value) -> bool {
-        false
-    }
-
-    /// Refines a conversation's identity as it joins, with the title the agent gave.
-    fn refine_identity<'a>(
-        &'a self,
-        _identity: &'a mut Identity,
-        _title: &'a str,
-    ) -> BoxFuture<'a, ()> {
-        Box::pin(async {})
-    }
-
-    /// What the agent is told once about an experimental `capability` of this conversation.
-    fn experimental_note(&self, _capability: &str, _identity: &Identity) -> Option<&'static str> {
-        None
-    }
-
-    /// Fields a join answer to this harness's client carries, from the conversation's identity and the connector's
-    /// `registered` answer.
-    fn joined_fields(&self, _identity: &Identity, _registered: &Value) -> Map<String, Value> {
-        Map::new()
-    }
-
-    /// Fields a status answer to this harness's client carries for a joined conversation: from its identity and the
-    /// connector's `listed` binding.
-    fn status_fields(&self, _identity: &Identity, _listed: Option<&Value>) -> Map<String, Value> {
-        Map::new()
-    }
-
-    /// The identity and title of conversation `name`, which another façade of this harness's client left and this
-    /// one adopted (`adopted`: the connector's answer).
-    fn adopted_identity(&self, _name: &str, _adopted: &Value) -> Option<(Identity, String)> {
-        None
-    }
-
-    /// Follows what the harness records about the conversation (transcript, rollout, session state), reporting it
-    /// to the core until the conversation stops.
-    fn watch(&self, _conversation: Arc<Conversation>, _reporter: Arc<dyn Reporter>) {}
+        conversation: &'a Conversation,
+        ids: &'a [String],
+    ) -> BoxFuture<'a, Vec<String>>;
 }
 
-/// Unsupported delivery, as a delivery result.
-pub fn no_route(thread: &str) -> Value {
-    json!({"status":"unsupported","detail":format!("{} has no delivery route", thread)})
-}
-
-/// The harnesses, by id. A conversation of an id none claims is served by the fallback (the generic HTTP route).
+/// The harnesses, by id. A conversation of an id none claims is served by the fallback, which has no way in of its
+/// own (the generic HTTP endpoint, when the agent names one, is used whatever the harness).
 pub struct Registry {
     harnesses: Vec<Arc<dyn Harness>>,
     fallback: Arc<dyn Harness>,
@@ -177,63 +213,70 @@ impl Registry {
         }
     }
 
-    /// The harnesses Sidevoice ships.
-    pub fn standard() -> Self {
+    /// The harnesses Sidevoice ships, in the order a call is identified: Cursor first, since a Cursor started from
+    /// another agent's terminal inherits that agent's environment.
+    pub fn standard(profile: &Profile) -> Self {
         Self::new(vec![
-            Arc::new(super::claude::Claude),
-            Arc::new(super::codex::Codex),
-            Arc::new(super::cursor::Cursor),
+            Arc::new(super::cursor::Chats::default()),
+            Arc::new(super::claude::Sessions::default()),
+            Arc::new(super::codex::Threads::new(profile.clone())),
         ])
     }
 
-    /// The harness whose MCP client `client` is, if one recognises it.
-    pub fn client(&self, client: &Value) -> Option<&Arc<dyn Harness>> {
-        self.harnesses
-            .iter()
-            .find(|harness| harness.recognises_client(client))
+    /// The conversation `call` comes from, asking each harness in turn and the fallback last.
+    pub fn identify(&self, call: &CallContext) -> Result<Option<Conversation>> {
+        for harness in self.all() {
+            if let Some(conversation) = harness.identify(call)? {
+                return Ok(Some(conversation));
+            }
+        }
+        Ok(None)
     }
 
     /// The harness of `id`, or the fallback.
     pub fn get(&self, id: &str) -> &Arc<dyn Harness> {
-        self.find(id).unwrap_or(&self.fallback)
+        self.harnesses
+            .iter()
+            .find(|harness| harness.id() == id)
+            .unwrap_or(&self.fallback)
     }
 
-    /// The harness of `id`, if one claims it.
-    pub fn find(&self, id: &str) -> Option<&Arc<dyn Harness>> {
-        self.harnesses.iter().find(|harness| harness.id() == id)
-    }
-
-    /// Every harness, in the order the agent list shows them.
-    pub fn all(&self) -> impl Iterator<Item = &Arc<dyn Harness>> {
+    fn all(&self) -> impl Iterator<Item = &Arc<dyn Harness>> {
         self.harnesses.iter().chain(std::iter::once(&self.fallback))
     }
 
-    /// Every harness's homes, in registry order.
-    pub fn homes(&self) -> Vec<AgentHome> {
-        self.all()
-            .flat_map(|harness| harness.homes().iter().copied())
-            .collect()
-    }
-
-    /// Every harness's private conversation-id prefixes.
-    pub fn private_id_prefixes(&self) -> Vec<&'static str> {
-        self.all()
-            .flat_map(|harness| harness.private_id_prefixes().iter().copied())
-            .collect()
-    }
-
-    /// The harnesses with an agent to register with, in the order the agent list shows them.
-    pub fn agents(&self) -> impl Iterator<Item = (&'static str, &dyn Registration)> {
-        self.harnesses.iter().filter_map(|harness| {
-            harness
-                .registration()
-                .map(|registration| (harness.id(), registration))
-        })
+    /// The agents Sidevoice is installed in, in the order the agent list shows them.
+    pub fn agents() -> impl Iterator<Item = (&'static str, &'static dyn Registration)> {
+        let agents: [(&'static str, &'static dyn Registration); 3] = [
+            ("claude", &super::claude::Claude),
+            ("codex", &super::codex::Codex),
+            ("cursor", &super::cursor::Cursor),
+        ];
+        agents.into_iter()
     }
 
     /// The registration of the agent `id`.
-    pub fn agent(&self, id: &str) -> Option<(&'static str, &dyn Registration)> {
-        self.agents().find(|(agent, _)| *agent == id)
+    pub fn agent(id: &str) -> Option<(&'static str, &'static dyn Registration)> {
+        Self::agents().find(|(agent, _)| *agent == id)
+    }
+
+    /// The directories the agents keep, named by environment variables: what the profile resolves for them.
+    pub fn homes() -> Vec<AgentHome> {
+        [super::claude::HOME, super::codex::HOME]
+            .into_iter()
+            .chain(super::cursor::HOMES)
+            .collect()
+    }
+
+    /// Prefixes of conversation ids that let a chat speak as that conversation: the log names those ids by a hash.
+    pub fn private_id_prefixes() -> Vec<&'static str> {
+        vec![super::cursor::EDITOR_PREFIX]
+    }
+
+    /// Whether the MCP client (its `clientInfo` and capabilities) serves several of its chats through one server,
+    /// so a call that names no conversation may be any of them, and its conversations outlive the server.
+    pub fn hosts_several_chats(client: &Value, client_capabilities: &Value) -> bool {
+        super::cursor::is_cursor_client(client) && super::cursor::is_editor(client_capabilities)
     }
 }
 
@@ -261,8 +304,7 @@ mod tests {
     fn no_harness_is_named_outside_the_adapters() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let adapters = src.join("adapters");
-        let names: Vec<String> = Registry::standard()
-            .agents()
+        let names: Vec<String> = Registry::agents()
             .map(|(id, _)| id.to_ascii_lowercase())
             .collect();
         assert!(!names.is_empty());

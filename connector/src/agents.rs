@@ -261,7 +261,6 @@ impl InstalledCommand {
 pub struct HostAgents {
     profile: Profile,
     selected: InstalledCommand,
-    registry: Arc<Registry>,
     gate: Arc<Mutex<()>>,
     operations: Arc<Mutex<Vec<ActiveOperation>>>,
     stopping: Arc<AtomicBool>,
@@ -318,7 +317,6 @@ impl HostAgents {
         Arc::new(Self {
             selected,
             profile,
-            registry: Arc::new(Registry::standard()),
             gate: Arc::new(Mutex::new(())),
             operations: Arc::new(Mutex::new(Vec::new())),
             stopping: Arc::new(AtomicBool::new(false)),
@@ -443,7 +441,7 @@ impl HostAgents {
     ) -> std::result::Result<Value, Failure> {
         if method == "agents.list" {
             let watch = match params.get("watch").and_then(Value::as_str) {
-                Some(value) => Some(parse_id(&self.registry, value)?),
+                Some(value) => Some(parse_id(value)?),
                 None => None,
             };
             let rescan = params.get("rescan") == Some(&Value::Bool(true));
@@ -465,7 +463,7 @@ impl HostAgents {
             ));
         }
         let id = params.get("id").and_then(Value::as_str).unwrap_or("");
-        let agent = parse_id(&self.registry, id)?;
+        let agent = parse_id(id)?;
         let state = self.load_state(cancel, deadline).await?;
         let mut state = self
             .scan(state, Some(agent), action == "check", cancel, deadline)
@@ -588,7 +586,7 @@ impl HostAgents {
 
     fn response(&self, state: &Value) -> std::result::Result<Value, Failure> {
         let mut rows = Vec::new();
-        for (id, _) in self.registry.agents() {
+        for (id, _) in Registry::agents() {
             if let Some(seen) = state.pointer(&format!("/seen/{id}")) {
                 if state.get("login_path").and_then(Value::as_str).is_some()
                     && seen.get("present") == Some(&Value::Bool(true))
@@ -695,10 +693,10 @@ impl HostAgents {
             watch
         })
         .map_or_else(
-            || self.registry.agents().map(|(id, _)| id).collect(),
+            || Registry::agents().map(|(id, _)| id).collect(),
             |id| vec![id],
         );
-        let full = ids.len() == self.registry.agents().count();
+        let full = ids.len() == Registry::agents().count();
         let mut observations = Vec::new();
         for name in ids {
             check_live(cancel, deadline)?;
@@ -936,8 +934,7 @@ impl HostAgents {
 
     /// The registration of `id`, which a scan or a request only names when one exists.
     fn registration(&self, id: AgentId) -> std::result::Result<&dyn Registration, Failure> {
-        self.registry
-            .agent(id)
+        Registry::agent(id)
             .map(|(_, registration)| registration)
             .ok_or(Failure::Internal)
     }
@@ -1060,8 +1057,8 @@ fn failure(error: AgentError, id: AgentId) -> Failure {
     }
 }
 
-fn parse_id(registry: &Registry, value: &str) -> std::result::Result<AgentId, Failure> {
-    registry.agent(value).map(|(id, _)| id).ok_or_else(|| {
+fn parse_id(value: &str) -> std::result::Result<AgentId, Failure> {
+    Registry::agent(value).map(|(id, _)| id).ok_or_else(|| {
         Failure::keyed(
             "agents.unknown",
             json!({"id":value.chars().take(120).collect::<String>()}),
@@ -1149,16 +1146,15 @@ pub struct AgentCommand {
 }
 
 pub fn agent_command(profile: &Profile, agent: &str) -> AgentCommand {
-    let id = Registry::standard().agent(agent).map(|(id, _)| id);
+    let id = Registry::agent(agent).map(|(id, _)| id);
     let state = load_state_file(profile).unwrap_or_else(|_| empty_state());
     let path = state
         .get("login_path")
         .and_then(Value::as_str)
         .filter(|path| !path.is_empty())
         .map(str::to_owned);
-    let registry = Registry::standard();
     let program = id
-        .and_then(|id| registry.agent(id).map(|(_, registration)| registration))
+        .and_then(|id| Registry::agent(id).map(|(_, registration)| registration))
         .and_then(|registration| {
             find_binary(
                 registration,

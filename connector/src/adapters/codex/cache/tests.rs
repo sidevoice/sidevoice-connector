@@ -90,9 +90,9 @@ impl Fixture {
         program
     }
 
-    async fn deliver(&self) -> Result<serde_json::Value> {
+    async fn deliver(&self) -> Result<()> {
         deliver_with_cache(
-            &json!({"kind":"codex-queue","thread":"thread"}),
+            "thread",
             &json!({"session_id":"session","revision":1,"epoch":1,"message_id":"message","text":"hello"}),
             &self.profile, &self.cache,
         ).await

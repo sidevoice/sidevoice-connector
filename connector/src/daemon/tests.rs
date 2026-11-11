@@ -1,4 +1,5 @@
-//! Delivery through a registered editor bridge reaches the harness from a core frame.
+//! Delivery to an editor chat whose Desktop Bridge is not there reaches the harness from a core frame, and is refused
+//! with why.
 
 use super::contract_tests::play_core;
 use super::Daemon;
@@ -11,26 +12,24 @@ use tokio::sync::{mpsc, watch};
 #[tokio::test]
 async fn cursor_push_frame_reaches_bridge_adapter() {
     let scratch = crate::test_support::temp_dir("cursor-push-route");
-    let registry = Registry::standard();
-    let profile = Profile::for_test(scratch.path(), &registry.homes());
+    let profile = Profile::for_test(scratch.path(), &Registry::homes());
+    let registry = Registry::standard(&profile);
     let link = Link::new();
     let core = link.attached().await;
     play_core(link.clone(), core);
     let (replay_tx, _replay_rx) = mpsc::channel(1);
     let (shutdown, _) = watch::channel(false);
     let daemon = Daemon::new(profile, link, replay_tx, registry, false, shutdown).unwrap();
+    let id = format!("cursor-editor-{}", uuid::Uuid::new_v4());
     let joined = daemon
         .command(
             1,
             "register",
-            json!({
-                "client_ref":"cursor-editor-test","harness":"cursor","thread":"cursor-editor-test",
-                "delivery":{"kind":"cursor-bridge","thread":"cursor-editor-test",
-                    "marker":"0000000000000000000000000000000000000000000000000000000000000000"}
-            }),
+            json!({"client_ref":id,"harness":"cursor","thread":id}),
         )
         .await
         .unwrap();
+    assert_eq!(joined["delivery"], "push", "{joined}");
     let answer = daemon
         .handle_incoming(
             "input.deliver",

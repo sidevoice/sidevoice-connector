@@ -2,7 +2,10 @@ mod binary;
 mod harness;
 mod registration;
 
-pub use harness::Claude;
+pub use harness::Sessions;
+
+/// Claude Code, as Sidevoice is installed in it (its [`Registration`](super::registration::Registration)).
+pub struct Claude;
 
 /// Claude Code's home: its data (projects, sessions) and, when the variable is set, its user configuration. Passed
 /// on only when the person's environment sets it: Claude Code keeps its user configuration, MCP servers included,
@@ -15,22 +18,19 @@ pub const HOME: crate::profile::AgentHome = crate::profile::AgentHome {
     check_parent: false,
 };
 
-use super::{envelope, Identity};
+use super::envelope;
+use super::harness::{Inbound, Limit, Sent};
 use crate::platform::env::{Env, Environment};
 use crate::platform::foreign::{Foreign, Foreigners};
 use crate::platform::process::{ChildProcess, Processes};
 use crate::profile::Profile;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::{json, Value};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-pub fn capabilities() -> Value {
-    json!({"deliver":"supported","inspectInbound":"supported","working":"supported","endOfTurn":"supported","sessionIdentity":"supported"})
-}
 
 fn config_dir() -> PathBuf {
     env::var_os("CLAUDE_CONFIG_DIR")
@@ -73,41 +73,6 @@ pub(crate) fn read_user_config(profile: &Profile) -> Result<Option<serde_json::V
     serde_json::from_str(&text)
         .map(Some)
         .map_err(|_| Unreadable)
-}
-
-pub fn identity() -> Result<Option<Identity>> {
-    let Some(thread) = env::var("CLAUDE_CODE_SESSION_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
-    else {
-        return Ok(None);
-    };
-    let Some(socket) = env::var("CLAUDE_CODE_MESSAGING_SOCKET")
-        .ok()
-        .filter(|s| !s.is_empty())
-    else {
-        return Ok(None);
-    };
-    let route_check = Foreigners::check(std::ffi::OsStr::new(&socket));
-    let mut identity = Identity::new(
-        "claude",
-        thread,
-        json!({
-            "kind":"claude-uds",
-            "socket":socket,
-            "token":env::var("CLAUDE_CODE_MESSAGING_TOKEN").unwrap_or_default()
-        }),
-    );
-    identity.inbound = Some(inspect_inbound(&identity.thread)?);
-    // A route this OS cannot open (native Windows documents a named pipe and nothing else) is no way in: said now,
-    // not found out at the first message.
-    if let Err(error) = route_check {
-        identity.capability_overrides = json!({"deliver":"unsupported"});
-        identity.deliver_note = Some(format!(
-            "Claude Code's inbox cannot be reached from here: {error}"
-        ));
-    }
-    Ok(Some(identity))
 }
 
 fn read_json(path: &Path) -> Option<Value> {
@@ -250,7 +215,10 @@ fn settings_from_flags(args: &str) -> Option<Value> {
     }
 }
 
-pub fn inspect_inbound(session_id: &str) -> Result<Value> {
+/// Whether Claude Code lets messages from other processes into the session: a session that bypasses permission
+/// prompts holds them for the user unless its settings accept them, and `crossSessionInbound: "refuse"` refuses them.
+/// Read from the session's launch flags and the user's settings.
+fn permissions(session_id: &str) -> Inbound {
     let record = session_record(session_id);
     let pid = record
         .as_ref()
@@ -269,20 +237,13 @@ pub fn inspect_inbound(session_id: &str) -> Result<Value> {
     let inbound = flagged
         .get("crossSessionInbound")
         .or_else(|| user.get("crossSessionInbound"))
-        .cloned();
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let bypassing = mode == "bypassPermissions";
-    let ok = !bypassing || inbound.as_ref().and_then(Value::as_str) == Some("accept");
-    let confidence = if pid.is_some() {
-        "read from the session launch flags and settings"
-    } else {
-        "settings only; the session process was not found"
-    };
-    if ok {
-        return Ok(
-            json!({"ok":true,"mode":mode,"crossSessionInbound":inbound,"confidence":confidence}),
-        );
+    if !bypassing || inbound.as_deref() == Some("accept") {
+        return Inbound::Open;
     }
-    let refuses = inbound.as_ref().and_then(Value::as_str) == Some("refuse");
+    let refuses = inbound.as_deref() == Some("refuse");
     let reason = if refuses {
         "This session refuses messages from other local processes (crossSessionInbound is \"refuse\")."
     } else {
@@ -293,23 +254,85 @@ pub fn inspect_inbound(session_id: &str) -> Result<Value> {
     } else {
         format!("Two ways out. Per session: start it with --settings '{{\"crossSessionInbound\":\"accept\"}}'. For every session on this machine: add \"crossSessionInbound\": \"accept\" to {} — that takes effect immediately, releases any messages already held, and also lets any other local process post into all your sessions, which is the safeguard it removes. Or run the conversation in a prompting mode such as --permission-mode auto.", config_dir().join("settings.json").display())
     };
-    Ok(
-        json!({"ok":false,"mode":mode,"crossSessionInbound":inbound,"reason":reason,"remedy":remedy,"confidence":confidence}),
-    )
+    Inbound::Blocked(Limit::InboundBlockedByPermissions {
+        reason: reason.into(),
+        remedy,
+    })
 }
 
-pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
-    let path = delivery
-        .get("socket")
+/// Whether messages can get into the session: its permissions, then whether its inbox, as its session record names
+/// it, is one this OS can open (native Windows documents a named pipe and nothing else). A session whose record is
+/// not there yet is taken as open: a message is refused then, and offered again.
+pub fn inbound(session_id: &str) -> Inbound {
+    if let Inbound::Blocked(limit) = permissions(session_id) {
+        return Inbound::Blocked(limit);
+    }
+    match inbox(session_id).map(|(socket, _)| Foreigners::check(std::ffi::OsStr::new(&socket))) {
+        Some(Err(error)) => Inbound::Blocked(Limit::NoRoute(format!(
+            "Claude Code's inbox cannot be reached from here: {error}"
+        ))),
+        _ => Inbound::Open,
+    }
+}
+
+/// The session's inbox, from its session record: the socket (a named pipe on Windows) and the token it takes, the
+/// `peerToken` of the key file beside the record. Native Windows checks the token; a Unix socket does not.
+fn inbox(session_id: &str) -> Option<(String, String)> {
+    let record = session_record(session_id)?;
+    let socket = record
+        .get("messagingSocketPath")
         .and_then(Value::as_str)
-        .context("Claude inbox socket missing")?;
-    let token = delivery.get("token").and_then(Value::as_str).unwrap_or("");
-    // The route is the agent's own endpoint (a Unix socket; a named pipe on native Windows, where the first line
-    // below is required: Claude Code closes a connection that does not start with a valid auth line).
-    let mut socket = Foreigners::connect(path)
+        .filter(|socket| !socket.is_empty())?
+        .to_owned();
+    let token = record
+        .get("pid")
+        .and_then(Value::as_i64)
+        .and_then(peer_token)
+        .unwrap_or_default();
+    Some((socket, token))
+}
+
+/// The `peerToken` of the session process `pid`'s key file, `sessions/<pid>.<hash>.key`.
+fn peer_token(pid: i64) -> Option<String> {
+    let prefix = format!("{pid}.");
+    fs::read_dir(config_dir().join("sessions"))
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension().is_some_and(|extension| extension == "key")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+        })
+        .find_map(|path| {
+            read_json(&path)?
+                .get("peerToken")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+/// Writes `event` into the session's inbox: an auth line, then the message as a user turn. The inbox answers nothing
+/// when it takes a message, and closes the connection when it does not.
+pub async fn send(session_id: &str, event: &Value) -> Sent {
+    let Some((socket, token)) = inbox(session_id) else {
+        return Sent::Refused(Limit::Failed(
+            "Claude Code's session record names no inbox for this session".into(),
+        ));
+    };
+    match write(&socket, &token, event).await {
+        Ok(sent) => sent,
+        Err(error) => Sent::Refused(Limit::Failed(error.to_string())),
+    }
+}
+
+async fn write(socket: &str, token: &str, event: &Value) -> Result<Sent> {
+    let content = envelope(event)?;
+    let mut socket = Foreigners::connect(socket)
         .await
         .map_err(|error| anyhow::anyhow!("Claude inbox refused the connection: {error}"))?;
-    let content = envelope(event)?;
     socket
         .write_all(json!({"type":"auth","token":token}).to_string().as_bytes())
         .await?;
@@ -324,12 +347,10 @@ pub async fn deliver(delivery: &Value, event: &Value) -> Result<Value> {
     socket.write_all(b"\n").await?;
     let mut peer = Vec::new();
     match tokio::time::timeout(Duration::from_millis(1500), socket.read_to_end(&mut peer)).await {
-        Err(_) => Ok(
-            json!({"status":"unknown","detail":"Claude Code inbox has no acknowledgement; transcript read will confirm receipt"}),
-        ),
-        Ok(Ok(_)) => Ok(
-            json!({"status":"rejected","detail":"Claude Code inbox closed before confirming delivery"}),
-        ),
+        Err(_) => Ok(Sent::Unconfirmed),
+        Ok(Ok(_)) => Ok(Sent::Refused(Limit::Failed(
+            "Claude Code inbox closed before confirming delivery".into(),
+        ))),
         Ok(Err(error)) => Err(error.into()),
     }
 }
@@ -345,7 +366,7 @@ mod tests {
         use crate::profile::Profile;
         let scratch = crate::test_support::temp_dir("claude-home");
         let home = scratch.path().to_string_lossy().into_owned();
-        let homes = crate::adapters::Registry::standard().homes();
+        let homes = crate::adapters::Registry::homes();
         let data = scratch.path().join("data").into_os_string();
         let unset = Profile::from_vars(
             |key| match key {

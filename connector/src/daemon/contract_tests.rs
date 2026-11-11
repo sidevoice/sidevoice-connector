@@ -4,7 +4,9 @@
 
 use super::Daemon;
 use crate::adapters::{prepare_pull_page, PULL_POSITION_FIELD};
-use crate::adapters::{Conversation, Harness, Registry, Route};
+use crate::adapters::{
+    CallContext, Conversation, Harness, Inbound, Model, Registry, Sent, State, Status,
+};
 use crate::link::Link;
 use crate::profile::Profile;
 use anyhow::Result;
@@ -13,7 +15,7 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
-/// A harness that takes every delivery on its route and keeps the frames it was handed.
+/// A harness that takes every message and keeps the frames it was handed.
 struct Recorder {
     frames: Arc<Mutex<Vec<Value>>>,
 }
@@ -23,36 +25,38 @@ impl Harness for Recorder {
         "recorder"
     }
 
-    fn capabilities(&self) -> Value {
-        json!({"deliver":"supported"})
+    fn identify(&self, _: &CallContext) -> Result<Option<Conversation>> {
+        Ok(None)
     }
 
-    fn accepts(&self, delivery: &Value, thread: &str) -> Route {
-        match delivery["kind"].as_str() {
-            Some("recorder") => Route::known(delivery["thread"] == thread),
-            _ => Route::Unknown,
-        }
-    }
-
-    fn deliver<'a>(
-        &'a self,
-        _: &'a Conversation,
-        frame: &'a Value,
-        _: &'a Profile,
-    ) -> BoxFuture<'a, Result<Value>> {
+    fn send<'a>(&'a self, _: &'a Conversation, frame: &'a Value) -> BoxFuture<'a, Sent> {
         Box::pin(async move {
             self.frames.lock().unwrap().push(frame.clone());
-            Ok(json!({"status":"accepted"}))
+            Sent::Accepted
         })
     }
 
-    fn adopts(&self, _: Option<&str>) -> bool {
-        true
+    fn state<'a>(&'a self, _: &'a Conversation) -> BoxFuture<'a, State> {
+        Box::pin(async {
+            State {
+                status: Status::Idle,
+                model: Some(Model {
+                    name: "m-1".into(),
+                    effort: Some("high".into()),
+                    thinking: None,
+                }),
+                inbound: Inbound::Open,
+            }
+        })
+    }
+
+    fn received<'a>(&'a self, _: &'a Conversation, _: &'a [String]) -> BoxFuture<'a, Vec<String>> {
+        Box::pin(async { Vec::new() })
     }
 }
 
 fn daemon(scratch: &tempfile::TempDir, link: Arc<Link>) -> (Arc<Daemon>, Arc<Mutex<Vec<Value>>>) {
-    let profile = Profile::for_test(scratch.path(), &Registry::standard().homes());
+    let profile = Profile::for_test(scratch.path(), &Registry::homes());
     let frames = Arc::new(Mutex::new(Vec::new()));
     let registry = Registry::new(vec![Arc::new(Recorder {
         frames: frames.clone(),
@@ -580,10 +584,7 @@ async fn ipc_commands_with_unknown_fields_are_read_for_what_they_know() {
     let listed = &status["bindings"][0];
     assert_eq!(listed["client_ref"], "t-2", "{status}");
     assert_eq!(listed["engine"]["model"], "m-1", "{status}");
-    assert_eq!(
-        listed["delivery"]["kind"], "recorder",
-        "the route is kept as it was sent: {status}"
-    );
+    assert_eq!(listed["inbound"]["ok"], true, "{status}");
     assert!(
         listed.get("deliveries").is_none(),
         "only when asked: {status}"

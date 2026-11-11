@@ -141,7 +141,7 @@ fn version(json: bool) -> String {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    logfile::private_ids(adapters::Registry::standard().private_id_prefixes());
+    logfile::private_ids(adapters::Registry::private_id_prefixes());
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
@@ -197,7 +197,7 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
                 LoginSetting::Status => None,
             }),
         };
-        let homes = adapters::Registry::standard().homes();
+        let homes = adapters::Registry::homes();
         let agent_vars: Vec<&'static str> = homes.iter().map(|home| home.var).collect();
         let answer = service::commands::run(action, &agent_vars).await;
         let ok = answer.get("ok") == Some(&Value::Bool(true));
@@ -238,7 +238,7 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let profile = Profile::from_env(&adapters::Registry::standard().homes())?;
+    let profile = Profile::from_env(&adapters::Registry::homes())?;
     match action {
         Action::Install {
             no_agents,

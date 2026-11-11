@@ -274,7 +274,7 @@ impl Fixture {
                     .find(|(name, _)| *name == key)
                     .map(|(_, value)| value.clone())
             },
-            &crate::adapters::Registry::standard().homes(),
+            &crate::adapters::Registry::homes(),
         )
         .unwrap();
         let cursor = root
@@ -1592,13 +1592,16 @@ async fn codex_delivery_does_not_use_a_cached_binary_without_login_path() {
     state["binaries"]["codex"] = json!(codex);
     write_json(&fixture.profile.data.join("agents.json"), &state);
     assert!(agent_command(&fixture.profile, "codex").program.is_none());
-    let result = crate::adapters::codex::deliver(
-        &json!({"kind":"codex-queue","thread":"t-1"}),
+    let result = crate::adapters::codex::send(
+        "t-1",
         &json!({"channel":"voice","session_id":"s","revision":1,"epoch":0,"message_id":"m","text":"hello"}),
         &fixture.profile,
     )
     .await;
-    assert!(result.is_err());
+    assert!(
+        matches!(result, crate::adapters::Sent::Refused(_)),
+        "{result:?}"
+    );
     assert!(!fixture
         .profile
         .agent_home("CODEX_HOME")
@@ -1640,14 +1643,13 @@ async fn codex_delivery_runs_the_scanned_codex_with_the_login_path() {
     assert_eq!(state["binaries"]["codex"], json!(codex));
     host.shutdown().await;
 
-    let answer = crate::adapters::codex::deliver(
-        &json!({"kind":"codex-queue","thread":"t-1"}),
+    let answer = crate::adapters::codex::send(
+        "t-1",
         &json!({"channel":"voice","session_id":"s","revision":1,"epoch":1,"message_id":"m","text":"hola"}),
         &fixture.profile,
     )
-    .await
-    .unwrap();
-    assert_eq!(answer["status"], "accepted");
+    .await;
+    assert_eq!(answer, crate::adapters::Sent::Accepted);
     let seen = fs::read_to_string(&marker).unwrap();
     let lines: Vec<&str> = seen.lines().collect();
     assert_eq!(lines[0], login);
@@ -2541,14 +2543,8 @@ fn running_turn_answers(steer: Value) -> Vec<Value> {
     ]
 }
 
-async fn deliver_to(fixture: &Fixture, id: &str) -> Value {
-    crate::adapters::codex::deliver(
-        &json!({"kind":"codex-queue","thread":"t-1"}),
-        &voice_event(id),
-        &fixture.profile,
-    )
-    .await
-    .unwrap()
+async fn deliver_to(fixture: &Fixture, id: &str) -> crate::adapters::Sent {
+    crate::adapters::codex::send("t-1", &voice_event(id), &fixture.profile).await
 }
 
 #[tokio::test]
@@ -2564,11 +2560,7 @@ async fn codex_delivery_steers_the_running_turn_when_the_version_allows() {
     )
     .await;
     let answer = deliver_to(&fixture, "m-steer").await;
-    assert_eq!(answer["status"], "accepted");
-    assert!(
-        answer["detail"].as_str().unwrap().contains("steered"),
-        "{answer}"
-    );
+    assert_eq!(answer, crate::adapters::Sent::Accepted);
     assert!(!calls.exists(), "the queue was not used");
     let seen = daemon.await.unwrap();
     let steer = seen
@@ -2592,7 +2584,7 @@ async fn codex_delivery_queues_when_the_version_is_too_old() {
         crate::adapters::codex::steer::socket_path(fixture.profile.agent_home("CODEX_HOME"));
     let daemon = crate::adapters::codex::steer::daemon_at(socket, vec![]).await;
     let answer = deliver_to(&fixture, "m-old").await;
-    assert_eq!(answer["detail"], "codex queue confirmed the thread");
+    assert_eq!(answer, crate::adapters::Sent::Accepted);
     assert!(fs::read_to_string(calls)
         .unwrap()
         .starts_with("queue\n--thread\nt-1\n--message\n"));
@@ -2604,7 +2596,7 @@ async fn codex_delivery_queues_when_no_daemon_socket_exists() {
     let _turn = agent_env().await;
     let (fixture, calls) = steer_fixture("0.163.0");
     let answer = deliver_to(&fixture, "m-nosock").await;
-    assert_eq!(answer["detail"], "codex queue confirmed the thread");
+    assert_eq!(answer, crate::adapters::Sent::Accepted);
     assert!(fs::read_to_string(calls).unwrap().starts_with("queue\n"));
 }
 
@@ -2621,7 +2613,7 @@ async fn codex_delivery_queues_when_the_steer_is_refused() {
     )
     .await;
     let answer = deliver_to(&fixture, "m-refused").await;
-    assert_eq!(answer["detail"], "codex queue confirmed the thread");
+    assert_eq!(answer, crate::adapters::Sent::Accepted);
     let queued = fs::read_to_string(calls).unwrap();
     assert!(queued.starts_with("queue\n--thread\nt-1\n--message\n"));
     assert!(

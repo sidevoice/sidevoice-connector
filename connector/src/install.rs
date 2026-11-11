@@ -1233,7 +1233,7 @@ fn advice(profile: &Profile, answer: &Value) -> Vec<String> {
             .to_owned(),
     );
     // What to do next with an agent that uses Sidevoice; one without it has its own line in the answer.
-    for (id, registration) in crate::adapters::Registry::standard().agents() {
+    for (id, registration) in crate::adapters::Registry::agents() {
         if answer["agents"][id]["outcome"] == "registered" {
             next.extend(registration.after_install(profile));
         }
@@ -1714,7 +1714,7 @@ pub(crate) mod tests {
     impl Fixture {
         fn new(label: &str) -> Self {
             let scratch = crate::test_support::temp_dir(label);
-            let homes = crate::adapters::Registry::standard().homes();
+            let homes = crate::adapters::Registry::homes();
             let original = Profile::for_test(&scratch.path().join("profile"), &homes);
             let variables = original.variables();
             let profile = Profile::from_vars(
@@ -2386,8 +2386,7 @@ pub(crate) mod tests {
     /// An agent of the registry the connector connects by itself, without its CLI: connected in any profile of the tests
     /// (its configuration directory is there) once a stand-in of its program says it is installed.
     fn agent_without_cli() -> &'static str {
-        crate::adapters::Registry::standard()
-            .agents()
+        crate::adapters::Registry::agents()
             .find(|(_, registration)| registration.connects_without_binary())
             .map(|(id, _)| id)
             .expect("an agent the connector connects without its CLI")
@@ -2406,8 +2405,9 @@ pub(crate) mod tests {
 
     /// Whether `answer`'s advice includes what to do next with the agent `id` once it uses Sidevoice.
     fn advised(profile: &Profile, answer: &Value, id: &str) -> bool {
-        let registry = crate::adapters::Registry::standard();
-        let (_, agent) = registry.agents().find(|(found, _)| *found == id).unwrap();
+        let (_, agent) = crate::adapters::Registry::agents()
+            .find(|(found, _)| *found == id)
+            .unwrap();
         let notes = agent.after_install(profile);
         assert!(!notes.is_empty(), "{id} has advice after an install");
         let advice = answer["advice"].to_string();

@@ -465,10 +465,9 @@ pub fn read_profile_file(path: &Path, limit: u64) -> anyhow::Result<String> {
 ///   (`SIDEVOICE_<ID>_BIN`), as `{"homes": {VAR: path}, "binaries": {VAR: path}}`;
 /// - `{"setup": {env_script, mcp_config, server, env}}`: how to start each agent against the bench, `{"steps": […]}`.
 pub fn bench_agents(request: &Value) -> Value {
-    let registry = super::Registry::standard();
+    let homes = super::Registry::homes();
     if let Some(root) = request.get("root").and_then(Value::as_str) {
-        let homes: serde_json::Map<String, Value> = registry
-            .homes()
+        let homes: serde_json::Map<String, Value> = homes
             .iter()
             .map(|home| {
                 let dir = Path::new(root)
@@ -481,8 +480,7 @@ pub fn bench_agents(request: &Value) -> Value {
             })
             .collect();
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let binaries: serde_json::Map<String, Value> = registry
-            .agents()
+        let binaries: serde_json::Map<String, Value> = super::Registry::agents()
             .filter_map(|(id, registration)| {
                 let found = registration
                     .binary_names()
@@ -520,8 +518,7 @@ pub fn bench_agents(request: &Value) -> Value {
         server: &server,
         env: &env,
     };
-    let steps: Vec<String> = registry
-        .agents()
+    let steps: Vec<String> = super::Registry::agents()
         .filter_map(|(_, registration)| registration.bench_steps(&bench))
         .collect();
     serde_json::json!({"steps": steps})
