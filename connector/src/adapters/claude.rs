@@ -574,6 +574,12 @@ mod tests {
             json!({"peerToken":"new"}),
             0,
         );
+        // The live parent's key: native Windows takes no message without one.
+        write_at(
+            &sessions.join(format!("{parent}.p.key")),
+            json!({"peerToken":"parent"}),
+            0,
+        );
         let session = |pid: Option<u32>, home: &Path| {
             Session::of(&Conversation {
                 harness: "claude".into(),
