@@ -122,9 +122,10 @@ mod tests {
         assert!(!runs_from(&other.join("bin/sidevoice-connector"), &root));
         assert!(!runs_from(&root.join("missing"), &root));
         // A program whose file was pruned while it ran, as Linux names it.
+        let canonical = std::fs::canonicalize(&root).unwrap();
         let gone = format!(
             "{}/bin/gone (deleted)",
-            std::fs::canonicalize(&root).unwrap().display()
+            dunce::simplified(&canonical).display()
         );
         assert!(runs_from(Path::new(&gone), &root));
         assert!(!runs_from(Path::new(&gone), &other));
