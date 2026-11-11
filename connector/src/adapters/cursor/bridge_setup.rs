@@ -1,8 +1,7 @@
 //! Read-only, local facts for the Cursor agent card. No bridge secret or home path enters the status row.
 
-use super::Cursor;
 use crate::adapters::markers::{matching_kinds, Roots};
-use crate::adapters::registration::{ReadinessCheck, Registration};
+use crate::adapters::registration::{Level, Warning};
 use crate::platform::foreign::{Foreign, Foreigners};
 use crate::profile::Profile;
 use serde::Deserialize;
@@ -13,14 +12,38 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+/// Whether the Desktop Bridge is set up, with a stable code and English text when it is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Check {
+    Ok,
+    NeedsAttention(&'static str, &'static str),
+    Unsupported(&'static str, &'static str),
+}
+
+impl Check {
+    /// As a warning of Cursor's registration state; none when it is set up.
+    pub fn warning(self) -> Option<Warning> {
+        let (level, code, message) = match self {
+            Self::Ok => return None,
+            Self::NeedsAttention(code, message) => (Level::NeedsAttention, code, message),
+            Self::Unsupported(code, message) => (Level::Unsupported, code, message),
+        };
+        Some(Warning {
+            level,
+            code,
+            message: message.to_owned(),
+        })
+    }
+}
+
 const MAX_DESCRIPTOR: u64 = 16 * 1024;
 const MAX_ENTRIES: usize = 256;
 const FRESHNESS: Duration = Duration::from_secs(2);
-const BRIDGE_NOT_RUNNING: ReadinessCheck = ReadinessCheck::NeedsAttention(
+const BRIDGE_NOT_RUNNING: Check = Check::NeedsAttention(
     "cursor.bridge_not_running",
     "Voice in the Cursor editor needs Cursor's Desktop Bridge: in Cursor, open Settings › Beta, enable “Allow CLI to access desktop agents”, then restart Cursor.",
 );
-const CURSOR_UNSUPPORTED: ReadinessCheck = ReadinessCheck::Unsupported(
+const CURSOR_UNSUPPORTED: Check = Check::Unsupported(
     "cursor.unsupported",
     "Cursor editor voice is not supported on this computer.",
 );
@@ -169,7 +192,7 @@ async fn inventory(dir: &Path) -> BridgeFiles {
     }
 }
 
-pub fn check(profile: &Profile) -> ReadinessCheck {
+pub fn check(profile: &Profile) -> Check {
     let dir = bridge_dir(profile);
     let roots = Roots::process(&profile.home);
     check_with(dir.clone(), &CACHE, move || {
@@ -182,7 +205,8 @@ async fn probe(dir: &Path, roots: &Roots) -> BridgeEvidence {
     BridgeEvidence {
         files,
         editor_app: files == BridgeFiles::Live
-            || !matching_kinds(Cursor.install_markers(), std::env::consts::OS, roots).is_empty(),
+            || !matching_kinds(super::registration::MARKERS, std::env::consts::OS, roots)
+                .is_empty(),
     }
 }
 
@@ -190,13 +214,13 @@ fn check_with(
     path: PathBuf,
     cache: &InventoryCache,
     scan: impl FnOnce() -> BridgeEvidence + Send + 'static,
-) -> ReadinessCheck {
+) -> Check {
     evaluate(cache.snapshot_or_refresh(path, scan))
 }
 
-fn evaluate(evidence: Option<BridgeEvidence>) -> ReadinessCheck {
+fn evaluate(evidence: Option<BridgeEvidence>) -> Check {
     if evidence.is_some_and(|evidence| evidence.files == BridgeFiles::Live) {
-        ReadinessCheck::Ok
+        Check::Ok
     } else if evidence.is_none_or(|evidence| evidence.editor_app) {
         // An unscanned bridge stays provisional until the background refresh completes.
         BRIDGE_NOT_RUNNING
@@ -225,7 +249,7 @@ mod tests {
             local_app_data: Some(root.join("local")),
             program_files: None,
         };
-        for marker in Cursor.install_markers() {
+        for marker in super::super::registration::MARKERS {
             if marker.os != std::env::consts::OS {
                 continue;
             }
@@ -246,9 +270,10 @@ mod tests {
             (CURSOR_UNSUPPORTED, "cursor.unsupported"),
         ] {
             let (code, message) = match check {
-                ReadinessCheck::NeedsAttention(code, message)
-                | ReadinessCheck::Unsupported(code, message) => (code, message),
-                ReadinessCheck::Ok => panic!("non-OK reason expected"),
+                Check::NeedsAttention(code, message) | Check::Unsupported(code, message) => {
+                    (code, message)
+                }
+                Check::Ok => panic!("non-OK reason expected"),
             };
             assert_eq!(code, expected_code);
             assert!(message.ends_with('.'));
@@ -316,7 +341,7 @@ mod tests {
             files: BridgeFiles::Live,
             editor_app: false,
         });
-        assert_eq!(evaluate(live), ReadinessCheck::Ok);
+        assert_eq!(evaluate(live), Check::Ok);
         for bridge in [BridgeFiles::Missing, BridgeFiles::Stale] {
             assert_eq!(
                 evaluate(Some(BridgeEvidence {
@@ -362,7 +387,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if check_with(bridge.clone(), &cache, || panic!("fresh cache rescanned"))
-                    == ReadinessCheck::Ok
+                    == Check::Ok
                 {
                     break;
                 }
@@ -431,8 +456,7 @@ mod tests {
         release_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if check_with(path.clone(), &cache, || panic!("fresh cache rescanned"))
-                    == ReadinessCheck::Ok
+                if check_with(path.clone(), &cache, || panic!("fresh cache rescanned")) == Check::Ok
                 {
                     break;
                 }

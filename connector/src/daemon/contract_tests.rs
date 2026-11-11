@@ -24,6 +24,9 @@ impl Harness for Recorder {
     fn id(&self) -> &'static str {
         "recorder"
     }
+    fn registration(&self) -> &dyn crate::adapters::registration::Registration {
+        &crate::adapters::Unregistered
+    }
 
     fn identify(&self, _: &CallContext) -> Result<Option<Conversation>> {
         Ok(None)

@@ -1940,6 +1940,9 @@ mod tests {
             fn id(&self) -> &'static str {
                 "fake"
             }
+            fn registration(&self) -> &dyn crate::adapters::registration::Registration {
+                &crate::adapters::Unregistered
+            }
             fn identify(&self, _: &CallContext) -> Result<Option<Conversation>> {
                 Ok(None)
             }
@@ -2063,6 +2066,9 @@ mod tests {
     impl crate::adapters::Harness for Scripted {
         fn id(&self) -> &'static str {
             "scripted"
+        }
+        fn registration(&self) -> &dyn crate::adapters::registration::Registration {
+            &crate::adapters::Unregistered
         }
         fn identify(&self, _: &crate::adapters::CallContext) -> Result<Option<Conversation>> {
             Ok(None)

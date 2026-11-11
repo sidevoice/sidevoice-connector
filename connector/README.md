@@ -5,9 +5,10 @@ Sidevoice core: it installs itself and the core it carries (`install`, below), s
 runs the machine's connector daemon, which holds the link to the core. On npm it is `sidevoice`, whose launcher runs
 this binary from the platform package (RELEASING.md); the command is then `sidevoice`.
 
-Each agent is one harness behind one interface (`adapters/harness.rs`): it identifies the conversation a call comes
-from, sends it a message, says how it is (working or idle, its model, whether messages get in and why not) and which
-messages it has received. The daemon asks every joined conversation's harness every half second and reports
+Each agent is one harness (`adapters/harness.rs`, one folder per agent below `adapters/`): its registration
+(`adapters/registration.rs`: connect, disconnect, the steps by hand, and the agent's state on this machine: installed,
+registered, warnings), and its conversations: it identifies the conversation a call comes from, sends it a message,
+says how it is (working or idle, its model, whether messages get in and why not) and which messages it has received. The daemon asks every joined conversation's harness every half second and reports
 `input.working` when it changes. Claude Code uses its session status, Codex uses rollout turn events, and Cursor uses
 the joined chat's transcript. For an editor chat,
 Cursor's Desktop Bridge must first identify that chat; delivery identifying it wakes transcript monitoring at once.
@@ -227,13 +228,15 @@ Every row in `agents.list` / `agents --json` may carry an optional `readiness` o
 
 `state` is `ready`, `needs_attention`, or `unsupported`. `reasons` is an ordered array of
 `{"code","message"}` objects. `code` is stable in the `<agent>.<code>` namespace;
-`message` is a plain English fallback instruction supplied by that agent's check, with no paths,
-tokens, versions, or home directories. Consumers use `code` for logic and localization: the web
-shows its `agents.readiness.<code>` translation when present, else `message`. An absent
-`readiness` field means ready: adapters with no checks omit it. Every check contributes either
-OK, needs attention with a reason, or unsupported with a reason. The aggregate is `unsupported`
-if any check is unsupported; otherwise `needs_attention` if any check needs attention; otherwise
-`ready`. All non-OK reason objects are retained in check order. A ready object has `reasons: []`.
+`message` is a plain English fallback instruction supplied by that agent, with no tokens or versions. Consumers use
+`code` for logic and localization: the web shows its `agents.readiness.<code>` translation when present, else
+`message`. Readiness is made from the warnings of the agent's registration state, each a note (something to know, no
+reason), needs attention, or unsupported; an agent with no warning omits it, which means ready. The aggregate is
+`unsupported` if any warning is unsupported; otherwise `needs_attention` if any needs attention; otherwise `ready`.
+All reasons are retained in order. A ready object has `reasons: []`. The row's `warnings` lists every warning,
+notes included, as `{"code","message"}`: what the installer prints for an agent that uses Sidevoice. Claude Code warns
+(`claude.inbound-held`, needs attention) when this machine's sessions bypass permission prompts with nothing letting
+messages from other processes in; Cursor notes how voice reaches its chats (`cursor.routes`).
 For `cursor.unsupported`, the fallback is “Cursor editor voice is not supported on this computer.”
 
 Cursor currently has one check: a usable Desktop Bridge descriptor with a live process and socket

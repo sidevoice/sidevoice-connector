@@ -13,6 +13,7 @@ use crate::adapters::harness::{
     Agent, CallContext, Conversation, Harness, Inbound, Limit, Sent, State,
 };
 use crate::adapters::http::ENDPOINT_VAR;
+use crate::adapters::registration::Registration;
 use crate::adapters::transcript::{self, Observed, TranscriptReader};
 use crate::adapters::watch::{Watch, Watches};
 use anyhow::{bail, Result};
@@ -99,6 +100,10 @@ impl Chats {
 impl Harness for Chats {
     fn id(&self) -> &'static str {
         "cursor"
+    }
+
+    fn registration(&self) -> &dyn Registration {
+        &super::Cursor
     }
 
     /// Cursor names itself in its MCP client info. Its editor declares MCP Apps support, and each of its chats that

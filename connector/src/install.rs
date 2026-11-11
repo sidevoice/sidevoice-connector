@@ -996,7 +996,7 @@ pub async fn install(
             answer["linger"] = linger;
         }
     }
-    answer["advice"] = json!(advice(profile, &answer));
+    answer["advice"] = json!(advice(&answer));
     Ok(answer)
 }
 
@@ -1124,9 +1124,22 @@ async fn refresh(profile: &Profile) -> Value {
             }
             None => continue,
         };
-        outcomes.insert(id, json!({"outcome": outcome, "message": message}));
+        outcomes.insert(
+            id,
+            json!({"outcome": outcome, "message": message, "warnings": warnings(&row)}),
+        );
     }
     Value::Object(outcomes)
+}
+
+/// The texts of what an agent row's registration state warns of.
+fn warnings(row: &Value) -> Vec<String> {
+    row["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|warning| warning["message"].as_str().map(str::to_owned))
+        .collect()
 }
 
 /// The steps of an agent row's `manual.<kind>`, each line on its own indented line: a command, or a snippet and the
@@ -1215,8 +1228,11 @@ async fn unregister(profile: &Profile) -> Value {
     Value::Object(outcomes)
 }
 
+/// What is left for the person with every agent that now uses Sidevoice.
+const AFTER_REGISTERING: &str = "Reload the open conversations of the agents that use Sidevoice to see its server, or start a new conversation where the agent cannot reload them; then ask to join voice.";
+
 /// What is left for the person after an install.
-fn advice(profile: &Profile, answer: &Value) -> Vec<String> {
+fn advice(answer: &Value) -> Vec<String> {
     let mut next = Vec::new();
     if let Some(linger) = answer
         .get("linger")
@@ -1232,11 +1248,25 @@ fn advice(profile: &Profile, answer: &Value) -> Vec<String> {
         "To pair the Sidevoice app with this machine, run `npx sidevoice pair-device` (or ask an agent for a device code)."
             .to_owned(),
     );
-    // What to do next with an agent that uses Sidevoice; one without it has its own line in the answer.
-    for (id, registration) in crate::adapters::Registry::agents() {
-        if answer["agents"][id]["outcome"] == "registered" {
-            next.extend(registration.after_install(profile));
-        }
+    // What to do next with the agents that use Sidevoice, and what each one's state warns of; one without it has its own
+    // line in the answer.
+    let registered: Vec<&Value> = answer["agents"]
+        .as_object()
+        .into_iter()
+        .flat_map(|agents| agents.values())
+        .filter(|agent| agent["outcome"] == "registered")
+        .collect();
+    if !registered.is_empty() {
+        next.push(AFTER_REGISTERING.to_owned());
+    }
+    for agent in registered {
+        next.extend(
+            agent["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|warning| warning.as_str().map(str::to_owned)),
+        );
     }
     next
 }
@@ -1338,9 +1368,14 @@ pub async fn connect_chosen(profile: &Profile, answer: &mut Value, chosen: &[Str
         let outcome = match &agents {
             Ok(agents) => {
                 let connected = agents.handle("agents.connect", json!({"id": id})).await;
+                let warnings = agent_rows(&connected)
+                    .into_iter()
+                    .find(|(found, _, _)| found == id)
+                    .map(|(_, _, row)| warnings(&row))
+                    .unwrap_or_default();
                 match error_message(&connected) {
                     None => json!({"outcome": "registered",
-                        "message": format!("Connected {label} to Sidevoice.")}),
+                        "message": format!("Connected {label} to Sidevoice."), "warnings": warnings}),
                     Some((_, message)) => json!({"outcome": "failed", "message": message}),
                 }
             }
@@ -1348,7 +1383,7 @@ pub async fn connect_chosen(profile: &Profile, answer: &mut Value, chosen: &[Str
         };
         answer["agents"][id.as_str()] = outcome;
     }
-    answer["advice"] = json!(advice(profile, answer));
+    answer["advice"] = json!(advice(answer));
 }
 
 /// `install` as a person reads it.
@@ -2386,10 +2421,7 @@ pub(crate) mod tests {
     /// An agent of the registry the connector connects by itself, without its CLI: connected in any profile of the tests
     /// (its configuration directory is there) once a stand-in of its program says it is installed.
     fn agent_without_cli() -> &'static str {
-        crate::adapters::Registry::agents()
-            .find(|(_, registration)| registration.connects_without_binary())
-            .map(|(id, _)| id)
-            .expect("an agent the connector connects without its CLI")
+        crate::adapters::Registry::without_cli()
     }
 
     /// The agent's registration as a scan finds it, judged against the installation.
@@ -2403,17 +2435,21 @@ pub(crate) mod tests {
             .unwrap_or_default()
     }
 
-    /// Whether `answer`'s advice includes what to do next with the agent `id` once it uses Sidevoice.
-    fn advised(profile: &Profile, answer: &Value, id: &str) -> bool {
-        let (_, agent) = crate::adapters::Registry::agents()
-            .find(|(found, _)| *found == id)
-            .unwrap();
-        let notes = agent.after_install(profile);
-        assert!(!notes.is_empty(), "{id} has advice after an install");
+    /// Whether `answer`'s advice says what to do next with the agents that use Sidevoice, and what the agent `id`'s
+    /// state warns of.
+    fn advised(answer: &Value, id: &str) -> bool {
         let advice = answer["advice"].to_string();
-        notes
+        if !advice.contains(&json!(AFTER_REGISTERING).to_string()) {
+            return false;
+        }
+        let warnings = answer["agents"][id]["warnings"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(!warnings.is_empty(), "{id} has warnings to give: {answer}");
+        warnings
             .iter()
-            .all(|note| advice.contains(&json!(note).to_string()))
+            .all(|warning| advice.contains(&warning.to_string()))
     }
 
     #[tokio::test]
@@ -2448,7 +2484,7 @@ pub(crate) mod tests {
         let first = with_agents("1.0.0").await;
         assert_eq!(first["agents"][id]["outcome"], "registered", "{first}");
         assert_eq!(registration(profile, id).await, "connected");
-        assert!(advised(profile, &first, id), "{first}");
+        assert!(advised(&first, id), "{first}");
 
         // Its current entry is left as it is.
         let second = with_agents("2.0.0").await;
@@ -2478,7 +2514,7 @@ pub(crate) mod tests {
             )),
             "{said}"
         );
-        assert!(!advised(profile, &third, id), "{third}");
+        assert!(!advised(&third, id), "{third}");
         assert!(offerable(&third).contains(&(id.to_owned(), label.clone())));
 
         // At a terminal the person chooses it: connected as `agents connect` connects it.
@@ -2493,7 +2529,7 @@ pub(crate) mod tests {
         connect_chosen(profile, &mut third, &chosen).await;
         assert_eq!(third["agents"][id]["outcome"], "registered", "{third}");
         assert_eq!(registration(profile, id).await, "connected");
-        assert!(advised(profile, &third, id), "{third}");
+        assert!(advised(&third, id), "{third}");
     }
 
     #[test]

@@ -2,6 +2,9 @@ pub mod bridge_setup;
 mod engine;
 mod harness;
 mod registration;
+#[cfg(test)]
+pub(crate) use registration::MARKERS;
+pub(crate) use registration::PROGRAMS;
 mod state_db;
 
 pub use engine::engine;

@@ -207,11 +207,13 @@ impl Limit {
     }
 }
 
-/// One agent: how its conversations are found, reached and followed. How Sidevoice is installed in it is its
-/// [`Registration`] (see [`Registry::agents`]).
+/// One agent: how Sidevoice is registered with it, and how its conversations are found, reached and followed.
 pub trait Harness: Send + Sync {
     /// The id conversations and the agent list name it by (`claude`, `codex`, …).
     fn id(&self) -> &'static str;
+
+    /// Registering Sidevoice with the agent, and its state on this machine.
+    fn registration(&self) -> &dyn Registration;
 
     /// The conversation a tool call comes from, at join: `None` when the call is not this agent's; an error when it
     /// is, and it cannot tell which conversation.
@@ -273,29 +275,21 @@ impl Registry {
 
     /// The harness of `id`, or the fallback.
     pub fn get(&self, id: &str) -> &Arc<dyn Harness> {
-        self.harnesses
-            .iter()
-            .find(|harness| harness.id() == id)
-            .unwrap_or(&self.fallback)
+        self.find(id).unwrap_or(&self.fallback)
     }
 
     fn all(&self) -> impl Iterator<Item = &Arc<dyn Harness>> {
         self.harnesses.iter().chain(std::iter::once(&self.fallback))
     }
 
-    /// The agents Sidevoice is installed in, in the order the agent list shows them.
-    pub fn agents() -> impl Iterator<Item = (&'static str, &'static dyn Registration)> {
-        let agents: [(&'static str, &'static dyn Registration); 3] = [
-            ("claude", &super::claude::Claude),
-            ("codex", &super::codex::Codex),
-            ("cursor", &super::cursor::Cursor),
-        ];
-        agents.into_iter()
+    /// The harnesses Sidevoice ships, in the order the agent list shows them (not the fallback, which has no agent).
+    pub fn harnesses(&self) -> impl Iterator<Item = &Arc<dyn Harness>> {
+        self.harnesses.iter()
     }
 
-    /// The registration of the agent `id`.
-    pub fn agent(id: &str) -> Option<(&'static str, &'static dyn Registration)> {
-        Self::agents().find(|(agent, _)| *agent == id)
+    /// The shipped harness of `id`, if there is one.
+    pub fn find(&self, id: &str) -> Option<&Arc<dyn Harness>> {
+        self.harnesses.iter().find(|harness| harness.id() == id)
     }
 
     /// The directories the agents keep, named by environment variables: what the profile resolves for them.
@@ -304,6 +298,12 @@ impl Registry {
             .into_iter()
             .chain(super::cursor::HOMES)
             .collect()
+    }
+
+    /// A harness whose registration edits the agent's file, so it connects without its CLI: for tests.
+    #[cfg(test)]
+    pub fn without_cli() -> &'static str {
+        super::cursor::Chats::default().id()
     }
 
     /// Prefixes of conversation ids that let a chat speak as that conversation: the log names those ids by a hash.
@@ -342,8 +342,11 @@ mod tests {
     fn no_harness_is_named_outside_the_adapters() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let adapters = src.join("adapters");
-        let names: Vec<String> = Registry::agents()
-            .map(|(id, _)| id.to_ascii_lowercase())
+        let scratch = crate::test_support::temp_dir("harness-names");
+        let profile = crate::profile::Profile::for_test(scratch.path(), &Registry::homes());
+        let names: Vec<String> = Registry::standard(&profile)
+            .harnesses()
+            .map(|harness| harness.id().to_ascii_lowercase())
             .collect();
         assert!(!names.is_empty());
         let mut files = Vec::new();

@@ -218,7 +218,7 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
         let mut request = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut request)?;
         let request: Value = serde_json::from_str(&request)?;
-        println!("{}", adapters::registration::bench_agents(&request));
+        println!("{}", adapters::bench::agents(&request));
         return Ok(ExitCode::SUCCESS);
     }
     if let Action::RunJob { definition } = &action {

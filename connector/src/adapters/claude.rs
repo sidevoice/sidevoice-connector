@@ -1,6 +1,7 @@
 mod binary;
 mod harness;
 mod registration;
+pub(crate) use registration::PROGRAMS;
 
 pub use harness::Sessions;
 
