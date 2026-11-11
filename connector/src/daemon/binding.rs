@@ -1,7 +1,7 @@
 //! A joined conversation as the daemon holds it: who it is, which façade owns it, what was handed to it, and what was
 //! last told about it.
 
-use crate::adapters::{Conversation, State};
+use crate::adapters::{Agent, Conversation, State};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicU64;
@@ -15,6 +15,8 @@ pub struct Binding {
     pub client_ref: String,
     pub harness: String,
     pub thread: String,
+    /// Where the agent runs, as its MCP server found it at join.
+    pub agent: Agent,
     pub title: String,
     /// The HTTP endpoint the agent named for its messages, used instead of its harness.
     pub endpoint: Option<String>,
@@ -44,6 +46,7 @@ impl Binding {
         Conversation {
             harness: self.harness.clone(),
             id: self.thread.clone(),
+            agent: self.agent.clone(),
         }
     }
 

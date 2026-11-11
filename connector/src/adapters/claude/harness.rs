@@ -1,10 +1,9 @@
-//! Claude Code as a harness: a session is found by the environment Claude Code starts its MCP server with, reached
-//! through the inbox its session record names, and followed through that record and its transcript.
+//! Claude Code as a harness: a session is found by the environment Claude Code starts its MCP server with (the session,
+//! where Claude Code keeps its state, its own process), reached through the inbox the process's session record names,
+//! and followed through that record and its transcript.
 
-use super::{
-    assistant_engine, assistant_model, inbound, session_engine, transcript_path, working_state,
-};
-use crate::adapters::harness::{CallContext, Conversation, Harness, Sent, State};
+use super::{agent_home, agent_process, assistant_engine, assistant_model, Session};
+use crate::adapters::harness::{Agent, CallContext, Conversation, Harness, Sent, State};
 use crate::adapters::transcript::{self, Observed, TranscriptReader};
 use crate::adapters::watch::{Watch, Watches};
 use anyhow::Result;
@@ -39,20 +38,13 @@ pub struct Sessions {
 }
 
 impl Sessions {
-    fn watch(&self, session: &str) -> Arc<Watch<OpenTurn>> {
-        self.watches.get(session, |watch| {
-            watch.set_inbound(inbound(session));
-            if let Some(engine) = session_engine(session) {
+    fn watch(&self, conversation: &Conversation) -> Arc<Watch<OpenTurn>> {
+        let session = Session::of(conversation);
+        self.watches.get(&conversation.id, |watch| {
+            if let Some(engine) = session.engine() {
                 watch.set_engine(engine);
             }
-            transcript::follow(
-                watch.clone(),
-                Reader {
-                    session: session.to_owned(),
-                    watch: watch.clone(),
-                },
-            );
-            follow_working(watch.clone(), session.to_owned());
+            follow(watch.clone(), session.clone());
         })
     }
 }
@@ -70,9 +62,13 @@ impl Harness for Sessions {
         ) else {
             return Ok(None);
         };
+        let env = |name: &str| call.var(name);
+        let home = agent_home(env);
+        let pid = home.as_deref().and_then(|home| agent_process(home, env));
         Ok(Some(Conversation {
             harness: self.id().into(),
             id,
+            agent: Agent { pid, home },
         }))
     }
 
@@ -81,11 +77,16 @@ impl Harness for Sessions {
         conversation: &'a Conversation,
         message: &'a Value,
     ) -> BoxFuture<'a, Sent> {
-        Box::pin(super::send(&conversation.id, message))
+        Box::pin(async move { super::send(&Session::of(conversation), message).await })
     }
 
     fn state<'a>(&'a self, conversation: &'a Conversation) -> BoxFuture<'a, State> {
-        Box::pin(async move { self.watch(&conversation.id).state() })
+        Box::pin(async move {
+            // Asked afresh each time: a session whose settings were fixed takes messages at once.
+            let watch = self.watch(conversation);
+            watch.set_inbound(Session::of(conversation).inbound());
+            watch.state()
+        })
     }
 
     fn received<'a>(
@@ -93,19 +94,38 @@ impl Harness for Sessions {
         conversation: &'a Conversation,
         ids: &'a [String],
     ) -> BoxFuture<'a, Vec<String>> {
-        Box::pin(async move { self.watch(&conversation.id).received(ids) })
+        Box::pin(async move { self.watch(conversation).received(ids) })
     }
 }
 
+/// Follows the session: its transcript, followed again when the process moves to another session (`/clear`), and its
+/// working state.
+///
 /// Working state: the session record says busy, or the transcript holds a turn open (a message in, no final answer
 /// yet) and was written to lately. The record alone reads idle between a message arriving and the turn starting, and
 /// between tool calls. Working at once, idle once it has held for [`IDLE_DEBOUNCE`].
-fn follow_working(watch: Arc<Watch<OpenTurn>>, session: String) {
+fn follow(watch: Arc<Watch<OpenTurn>>, session: Session) {
     tokio::spawn(async move {
         let mut idle_since = Instant::now();
+        let mut followed: Option<String> = None;
         while !watch.stopped() {
+            let current = session
+                .record()
+                .and_then(|record| record.session_id().map(str::to_owned))
+                .unwrap_or_else(|| session.id().to_owned());
+            if followed.as_deref() != Some(current.as_str()) {
+                transcript::follow(
+                    watch.clone(),
+                    Reader {
+                        session: session.clone(),
+                        followed: current.clone(),
+                        watch: watch.clone(),
+                    },
+                );
+                followed = Some(current);
+            }
             let open = watch.extra.0.load(Ordering::Relaxed);
-            let working = working_state(&session) == Some(true)
+            let working = session.working() == Some(true)
                 || (open > 0 && now_ms().saturating_sub(open) < OPEN_TURN_MS);
             if working {
                 idle_since = Instant::now();
@@ -139,15 +159,23 @@ fn turn_signal(item: &Value) -> Option<bool> {
     }
 }
 
-/// A session's transcript: the engine of each assistant entry, the open turn, and the messages read.
+/// The transcript of the session the process runs (`followed`): the engine of each assistant entry, the open turn, and
+/// the messages read. Followed while the process runs that session.
 struct Reader {
-    session: String,
+    session: Session,
+    followed: String,
     watch: Arc<Watch<OpenTurn>>,
 }
 
 impl TranscriptReader for Reader {
     fn path(&self) -> Option<PathBuf> {
-        transcript_path(&self.session)
+        self.session.transcript(&self.followed)
+    }
+
+    fn current(&self) -> bool {
+        self.session
+            .record()
+            .is_none_or(|record| record.session_id().is_none_or(|id| id == self.followed))
     }
 
     fn item(&mut self, item: &Value) -> Vec<Observed> {
@@ -158,7 +186,7 @@ impl TranscriptReader for Reader {
             None => {}
         }
         if assistant_model(item).is_some() {
-            let launch = session_engine(&self.session).unwrap_or_else(|| json!({}));
+            let launch = self.session.engine().unwrap_or_else(|| json!({}));
             if let Some(engine) = assistant_engine(item, &launch) {
                 observed.push(Observed::Engine(engine));
             }

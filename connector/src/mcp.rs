@@ -1,4 +1,4 @@
-use crate::adapters::{self, CallContext, Conversation, Registry};
+use crate::adapters::{self, Agent, CallContext, Conversation, Registry};
 use crate::frame;
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
@@ -459,7 +459,8 @@ impl Facade {
                 let id = conversation.id.clone();
                 let params = json!({
                     "client_ref":id,"harness":conversation.harness,"thread":id,"title":title,
-                    "endpoint":adapters::endpoint(&call),"detachable":several
+                    "endpoint":adapters::endpoint(&call),"detachable":several,
+                    "agent":conversation.agent.to_json()
                 });
                 let result = self.ipc.call("register", params).await?;
                 let binding_id = result
@@ -923,6 +924,7 @@ impl Facade {
         let conversation = Conversation {
             harness: harness.to_owned(),
             id: name.to_owned(),
+            agent: Agent::from_json(result.get("agent")),
         };
         let title = result
             .get("title")
@@ -930,7 +932,7 @@ impl Facade {
             .unwrap_or_default()
             .to_owned();
         let registration = json!({"client_ref":name,"harness":conversation.harness,"thread":name,
-            "title":title,"detachable":true});
+            "title":title,"detachable":true,"agent":conversation.agent.to_json()});
         self.ipc.remember_registration(registration).await;
         self.joined.lock().await.insert(
             name.to_owned(),
@@ -1178,7 +1180,7 @@ fn call_meta(context: &impl serde::Serialize, params: Option<impl serde::Seriali
 #[cfg(test)]
 mod tests {
     use super::{
-        closed_note, diagnosis, ipc_limit, tools, Conversation, Facts, Joined, INSTRUCTIONS,
+        closed_note, diagnosis, ipc_limit, tools, Agent, Conversation, Facts, Joined, INSTRUCTIONS,
     };
     use rmcp::model::InitializeRequestParams;
     use serde_json::{json, Value};
@@ -1410,6 +1412,7 @@ mod tests {
             conversation: Conversation {
                 harness: "a-harness".into(),
                 id: "thread-1".into(),
+                agent: Agent::default(),
             },
             inbound: json!({"ok":true}),
         };

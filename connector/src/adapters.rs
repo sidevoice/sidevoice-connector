@@ -10,7 +10,7 @@ mod transcript;
 mod watch;
 
 pub use harness::{
-    CallContext, Conversation, Harness, Inbound, Limit, Model, Registry, Sent, State, Status,
+    Agent, CallContext, Conversation, Harness, Inbound, Limit, Model, Registry, Sent, State, Status,
 };
 pub use http::{endpoint, post};
 

@@ -1,7 +1,7 @@
 //! The HTTP endpoint an agent may name for its conversation (`SIDEVOICE_DELIVERY_URL`), used whatever its harness, and
 //! the fallback harness: a conversation the agent names itself (`SIDEVOICE_THREAD`), with no way in of its own.
 
-use super::harness::{CallContext, Conversation, Harness, Inbound, Limit, Sent, State};
+use super::harness::{Agent, CallContext, Conversation, Harness, Inbound, Limit, Sent, State};
 use crate::platform::process::{ChildProcess, Processes};
 use anyhow::{bail, Context, Result};
 use futures_util::future::BoxFuture;
@@ -21,8 +21,7 @@ pub fn endpoint(call: &CallContext) -> Option<String> {
 /// Why the fallback cannot put a message in.
 const NO_ROUTE: &str = "this harness offers no way to put a message into it.";
 
-/// Any agent that names its own conversation (`SIDEVOICE_THREAD`, and `SIDEVOICE_HARNESS` for its harness): the
-/// harness of an id no other claims. Messages reach it only through its HTTP endpoint, when it names one.
+/// Any agent that names its own conversation (`SIDEVOICE_THREAD`): the harness of an id no other claims. Messages reach it only through its HTTP endpoint, when it names one.
 pub struct Http;
 
 impl Harness for Http {
@@ -32,10 +31,9 @@ impl Harness for Http {
 
     fn identify(&self, call: &CallContext) -> Result<Option<Conversation>> {
         Ok(call.var("SIDEVOICE_THREAD").map(|id| Conversation {
-            harness: call
-                .var("SIDEVOICE_HARNESS")
-                .unwrap_or_else(|| self.id().into()),
+            harness: self.id().into(),
             id,
+            agent: Agent::default(),
         }))
     }
 

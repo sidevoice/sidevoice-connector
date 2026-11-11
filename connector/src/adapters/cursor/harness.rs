@@ -9,7 +9,9 @@ use super::{
     log_bridge, log_correlation, persist_session, send_cli, transcript_path, BridgeInstance,
     CLI_UNSUPPORTED, EDITOR_NOTE, EDITOR_PREFIX, NOT_PERSISTED,
 };
-use crate::adapters::harness::{CallContext, Conversation, Harness, Inbound, Limit, Sent, State};
+use crate::adapters::harness::{
+    Agent, CallContext, Conversation, Harness, Inbound, Limit, Sent, State,
+};
 use crate::adapters::http::ENDPOINT_VAR;
 use crate::adapters::transcript::{self, Observed, TranscriptReader};
 use crate::adapters::watch::{Watch, Watches};
@@ -120,6 +122,7 @@ impl Harness for Chats {
         Ok(Some(Conversation {
             harness: self.id().into(),
             id,
+            agent: Agent::default(),
         }))
     }
 

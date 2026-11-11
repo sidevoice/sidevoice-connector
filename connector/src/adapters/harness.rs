@@ -7,14 +7,49 @@ use crate::profile::{AgentHome, Profile};
 use anyhow::Result;
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
+use std::path::PathBuf;
 use std::sync::Arc;
 
-/// One conversation of an agent: the harness that serves it and the conversation's id there. Plain data, made by
-/// [`Harness::identify`] in the agent's MCP server and handed back to every other call in the connector.
+/// One conversation of an agent: the harness that serves it, the conversation's id there, and where the agent runs.
+/// Plain data, made by [`Harness::identify`] in the agent's MCP server and handed back to every other call in the
+/// connector.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Conversation {
     pub harness: String,
     pub id: String,
+    pub agent: Agent,
+}
+
+/// Where the agent of a conversation runs, as its MCP server found it at join: what lets the harness find the agent's
+/// own records from the daemon, which is shared by every agent of the machine and started by none of them. Empty for
+/// a harness that needs neither.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Agent {
+    /// The agent's own process.
+    pub pid: Option<u32>,
+    /// The directory the agent keeps its state in, as the agent's environment names it.
+    pub home: Option<PathBuf>,
+}
+
+impl Agent {
+    /// As it crosses from the MCP server to the daemon: `{pid, home}`, each optional.
+    pub fn to_json(&self) -> Value {
+        json!({"pid":self.pid,"home":self.home})
+    }
+
+    /// From [`Agent::to_json`]; what is missing, `null` or of another type is absent.
+    pub fn from_json(value: Option<&Value>) -> Self {
+        let field = |key: &str| value.and_then(|value| value.get(key));
+        Self {
+            pid: field("pid")
+                .and_then(Value::as_u64)
+                .and_then(|pid| u32::try_from(pid).ok()),
+            home: field("home")
+                .and_then(Value::as_str)
+                .filter(|home| !home.is_empty())
+                .map(PathBuf::from),
+        }
+    }
 }
 
 /// What an agent's tool call brings with it: everything [`Harness::identify`] reads.
@@ -142,6 +177,8 @@ pub enum Limit {
     BridgeNotConnected,
     /// The agent has not yet recorded which of its chats this conversation is.
     ChatNotFound,
+    /// The way in cannot be found or opened now (its record is gone, its token is missing); it may come back.
+    Unreachable(String),
     /// The way in failed this time; trying again may work.
     Failed(String),
 }
@@ -154,6 +191,7 @@ impl Limit {
             Self::InboundBlockedByPermissions { .. } => "inbound_blocked_by_permissions",
             Self::BridgeNotConnected => "bridge_not_connected",
             Self::ChatNotFound => "chat_not_found",
+            Self::Unreachable(_) => "unreachable",
             Self::Failed(_) => "failed",
         }
     }
@@ -161,7 +199,7 @@ impl Limit {
     /// Why, in English, for the agent and the log.
     pub fn detail(&self) -> String {
         match self {
-            Self::NoRoute(why) | Self::Failed(why) => why.clone(),
+            Self::NoRoute(why) | Self::Unreachable(why) | Self::Failed(why) => why.clone(),
             Self::InboundBlockedByPermissions { reason, remedy } => format!("{reason} {remedy}"),
             Self::BridgeNotConnected => "the agent's Desktop Bridge is not running".into(),
             Self::ChatNotFound => "waiting for the agent to record this chat's join call".into(),

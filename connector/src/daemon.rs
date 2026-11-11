@@ -1,4 +1,4 @@
-use crate::adapters::{Conversation, Inbound, Limit, Registry, Sent, State, Status};
+use crate::adapters::{Agent, Conversation, Inbound, Limit, Registry, Sent, State, Status};
 use crate::agents::HostAgents;
 use crate::frame;
 use crate::link::{Incoming, Link};
@@ -1180,6 +1180,7 @@ impl Daemon {
                 let conversation = Conversation {
                     harness,
                     id: thread.clone(),
+                    agent: Agent::from_json(present(&params, "agent")),
                 };
                 let state = self.state_of(&conversation, endpoint.is_some()).await;
                 if let Inbound::Blocked(Limit::InboundBlockedByPermissions { reason, remedy }) =
@@ -1191,6 +1192,7 @@ impl Daemon {
                     client_ref: client_ref.clone(),
                     harness: conversation.harness,
                     thread: thread.clone(),
+                    agent: conversation.agent,
                     title,
                     endpoint,
                     initial_reply_context: Mutex::new(Value::Null),
@@ -1546,7 +1548,7 @@ impl Daemon {
                 Ok(
                     json!({"client_ref":binding.client_ref,"binding_id":*binding.id.lock().await,"thread":binding.thread,
                     "harness":binding.harness,"title":binding.title,
-                    "inbound":binding.state.lock().await.inbound.view(),"detachable":binding.detachable,
+                    "inbound":binding.state.lock().await.inbound.view(),"detachable":binding.detachable,"agent":binding.agent.to_json(),
                     "engine":binding.engine.lock().await.clone(),
                     "initial_reply_context":*binding.initial_reply_context.lock().await}),
                 )

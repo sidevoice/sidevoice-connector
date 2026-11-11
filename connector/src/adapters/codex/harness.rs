@@ -2,7 +2,7 @@
 //! allows it and else through its queue, and followed through its rollout.
 
 use super::rollout;
-use crate::adapters::harness::{CallContext, Conversation, Harness, Sent, State};
+use crate::adapters::harness::{Agent, CallContext, Conversation, Harness, Sent, State};
 use crate::adapters::watch::{Watch, Watches};
 use crate::profile::Profile;
 use anyhow::Result;
@@ -72,6 +72,7 @@ impl Harness for Threads {
         Ok(thread.map(|id| Conversation {
             harness: self.id().into(),
             id,
+            agent: Agent::default(),
         }))
     }
 
