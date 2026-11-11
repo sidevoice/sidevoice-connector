@@ -7,7 +7,8 @@
 //!
 //! Windows asks the Restart Manager (`RmGetList`), the OS's own account of which applications use a file; it refuses
 //! directories, so a lock on a directory alone is not seen. Unix can
-//! unlink a running program, so nothing there holds an installed file in a way that matters: it reports no holders.
+//! unlink a running program, so nothing there holds an installed file in a way that matters: it reports no holders,
+//! but it still ends the servers an agent app left running from a release.
 
 use std::path::Path;
 
@@ -39,7 +40,8 @@ pub trait Holding {
     /// (its full path, links resolved: the name a process gives itself proves nothing). The process is opened once;
     /// its start time (as the OS reported it holding the file) and its program are checked on that same handle, and it
     /// is ended through it, so a pid reused meanwhile is never touched. Never this process. Returns the pids ended.
-    /// Unix reports no holders, so ends nothing.
+    /// Unix has no holders to ask, so it looks at every process's program instead (`sysinfo`): the same test, a program
+    /// inside `program_root`; `roots` plays no part there.
     fn stop_running_from(roots: &[&Path], program_root: &Path) -> Vec<u32>;
 
     /// The processes listening on TCP `port` here, as far as this user can see them, without repeats: what to name
@@ -77,7 +79,6 @@ fn lsof_listeners(output: &str) -> Vec<Holder> {
 }
 
 /// Whether the program at `image` is a file inside `root`, both as the file system resolves them.
-#[cfg(any(windows, test))]
 fn runs_from(image: &Path, root: &Path) -> bool {
     match (std::fs::canonicalize(image), std::fs::canonicalize(root)) {
         (Ok(image), Ok(root)) => dunce::simplified(&image).starts_with(dunce::simplified(&root)),
@@ -149,6 +150,39 @@ mod tests {
             held.iter().any(|holder| holder.pid == std::process::id()),
             "{held:?}"
         );
+    }
+
+    /// A program running from inside the releases is ended, whatever its name, and one outside them is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_server_running_from_a_release_is_stopped_and_another_program_is_not() {
+        use std::os::unix::process::CommandExt;
+        let scratch = crate::test_support::temp_dir("holders-stop-unix");
+        let releases = scratch.path().join("releases");
+        let outside = scratch.path().join("elsewhere");
+        for dir in [&releases, &outside] {
+            std::fs::create_dir_all(dir.join("1.0.0/bin")).unwrap();
+        }
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+            .expect("a sleep program");
+        let program = |dir: &Path| {
+            let copy = dir.join("1.0.0/bin/sidevoice-connector");
+            std::fs::copy(sleep, &copy).unwrap();
+            std::process::Command::new(&copy)
+                .arg0("mcp")
+                .arg("30")
+                .spawn()
+                .unwrap()
+        };
+        let (mut ours, mut theirs) = (program(&releases), program(&outside));
+        let ended = Holders::stop_running_from(&[releases.as_path()], &releases);
+        assert_eq!(ended, vec![ours.id()]);
+        assert!(ours.wait().is_ok_and(|status| !status.success()));
+        assert!(theirs.try_wait().unwrap().is_none(), "left running");
+        theirs.kill().unwrap();
+        let _ = theirs.wait();
     }
 
     #[test]

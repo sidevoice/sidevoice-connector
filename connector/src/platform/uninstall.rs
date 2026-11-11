@@ -76,6 +76,25 @@ const RELEASE_PREFIX: &str = "release-";
 /// What a claimed entry of `D` is called inside [`CLAIM`], before its unique suffix.
 const DATA_PREFIX: &str = "data-";
 
+/// The releases an uninstall has claimed and not yet managed to delete, under `data`'s claim directory: each is a
+/// directory of ours with a unique name (links are never listed), so deleting one later can never reach a fresh
+/// installation. Empty when there are none or the directory cannot be read.
+pub fn claimed_releases(data: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(data.join(CLAIM))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(RELEASE_PREFIX)
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
 const MODELS_UNRESOLVED: &str =
     "uninstall refused: cannot tell where the shared models folder is relative to the data directory";
 /// `path` as the OS resolves it: its longest existing ancestor canonicalized, the components that do not exist yet
@@ -566,6 +585,20 @@ mod tests {
         fs::write(layout.releases.join("releases/1.0.0/binary"), "binary").unwrap();
         let removal = Remover::new(roots(&home)).unwrap();
         (scratch, layout, removal)
+    }
+
+    #[test]
+    fn only_claimed_release_directories_are_listed_for_a_later_deletion() {
+        let scratch = temp_dir("claimed-releases");
+        let claim = scratch.path().join(CLAIM);
+        fs::create_dir_all(claim.join("release-a/bin")).unwrap();
+        fs::create_dir_all(claim.join("data-b")).unwrap();
+        fs::write(claim.join("release-file"), "").unwrap();
+        assert_eq!(
+            claimed_releases(scratch.path()),
+            vec![claim.join("release-a")]
+        );
+        assert!(claimed_releases(&scratch.path().join("missing")).is_empty());
     }
 
     #[test]
