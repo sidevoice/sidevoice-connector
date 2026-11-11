@@ -111,9 +111,9 @@ The [reviewed voice-message MCP integration contract](docs/voice-message-contrac
 ## When something doesn't arrive or isn't heard
 
 Ask the agent to call the MCP tool `voice_diagnose` in the conversation concerned. It is read-only and answers
-with the versions, whether the core runs and the connector is linked to it, this conversation's
-delivery route (and whether its socket exists), its last deliveries with how each ended and whether the agent has
-read it, the harness's capabilities and inbound check, the editor bridge state, and where the logs are
+with the versions, whether the core runs and the connector is linked to it, this conversation's harness and whether
+messages get into it (and why not: the agent's own settings, a bridge that is not running, a chat not known yet), its
+last deliveries with how each ended and whether the agent has read it, and where the logs are
 (`connector.log` and `core.log` in the data directory: `~/Library/Application Support/Sidevoice` on macOS, `$XDG_DATA_HOME/sidevoice` on Linux, `%LOCALAPPDATA%\Sidevoice\Data` on Windows; `SIDEVOICE_DATA_DIR` overrides it). It never includes message text, keys or tokens. A delivery that ends
 `unconfirmed` and is never read usually means the agent holds incoming messages (see its inbound check).
 

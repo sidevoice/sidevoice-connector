@@ -5,8 +5,11 @@ Sidevoice core: it installs itself and the core it carries (`install`, below), s
 runs the machine's connector daemon, which holds the link to the core. On npm it is `sidevoice`, whose launcher runs
 this binary from the platform package (RELEASING.md); the command is then `sidevoice`.
 
-The connector reports `input.working` as soon as its harness observes a busy transition. Claude Code uses its
-session status, Codex uses rollout turn events, and Cursor uses the joined chat's transcript. For an editor chat,
+Each agent is one harness behind one interface (`adapters/harness.rs`): it identifies the conversation a call comes
+from, sends it a message, says how it is (working or idle, its model, whether messages get in and why not) and which
+messages it has received. The daemon asks every joined conversation's harness every half second and reports
+`input.working` when it changes. Claude Code uses its session status, Codex uses rollout turn events, and Cursor uses
+the joined chat's transcript. For an editor chat,
 Cursor's Desktop Bridge must first identify that chat; delivery identifying it wakes transcript monitoring at once.
 The core exposes this as a boolean fact, and the web waits three seconds before showing Working.
 
@@ -240,7 +243,8 @@ attention with `cursor.bridge_not_running`; no editor and no live bridge is unsu
 `cursor.unsupported`. A first scan reports provisional needs attention
 until its background refresh finishes. Refreshed status uses a snapshot up to two seconds old;
 filesystem discovery runs off the request worker. Readiness is machine-wide and says nothing about a particular chat.
-Per-chat `voice_status.bridge.bridge_chat_known` remains the source for whether that chat is known.
+Per-chat `voice_status.inbound` says whether that chat is known yet (until it is, its `limit` is `chat_not_found`, or
+`bridge_not_connected` when the bridge is not running).
 The setting is in Cursor Settings → Beta → “Allow CLI to access desktop agents”. `agents.list`
 with `rescan` or `watch`, and `agents check cursor`, refresh readiness; a cached list returns the
 last result.
