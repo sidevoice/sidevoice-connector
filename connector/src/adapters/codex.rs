@@ -2,6 +2,7 @@ mod binary;
 mod cache;
 mod harness;
 mod registration;
+#[cfg(any(test, feature = "testbench"))]
 pub(crate) use registration::PROGRAMS;
 mod rollout;
 pub(crate) mod steer;

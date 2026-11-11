@@ -1,3 +1,4 @@
+#[cfg(feature = "testbench")]
 pub mod bench;
 pub mod claude;
 pub mod codex;

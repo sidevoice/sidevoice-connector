@@ -1,6 +1,7 @@
 mod binary;
 mod harness;
 mod registration;
+#[cfg(any(test, feature = "testbench"))]
 pub(crate) use registration::PROGRAMS;
 
 pub use harness::Sessions;

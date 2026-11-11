@@ -69,6 +69,7 @@ enum Action {
     StageCore { release: std::path::PathBuf },
     /// The test bench's question about the agents: a JSON request on stdin, the JSON answer on stdout.
     #[command(hide = true)]
+    #[cfg(feature = "testbench")]
     BenchAgents,
     /// A service job, as its manager runs it where the manager cannot set its environment and output (Task
     /// Scheduler): the job its definition file describes.
@@ -214,6 +215,7 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
             ExitCode::FAILURE
         });
     }
+    #[cfg(feature = "testbench")]
     if let Action::BenchAgents = &action {
         let mut request = String::new();
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut request)?;
@@ -301,6 +303,7 @@ async fn run(action: Action, json: bool) -> Result<ExitCode> {
         }
         Action::Service { .. } => unreachable!("service commands run before the profile"),
         Action::StageCore { .. } => unreachable!("the core is staged before the profile"),
+        #[cfg(feature = "testbench")]
         Action::BenchAgents => unreachable!("the bench is answered before the profile"),
         Action::RunJob { .. } => unreachable!("a job runs before the profile"),
     }
