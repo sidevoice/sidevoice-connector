@@ -24,6 +24,9 @@ impl Harness for Recorder {
     fn id(&self) -> &'static str {
         "recorder"
     }
+    fn registration(&self) -> &dyn crate::adapters::registration::Registration {
+        &crate::adapters::Unregistered
+    }
 
     fn identify(&self, _: &CallContext) -> Result<Option<Conversation>> {
         Ok(None)
@@ -219,7 +222,7 @@ async fn core_link_frames_with_unknown_fields_and_values_are_read_for_what_they_
     );
     assert!(envelope.contains("\n\nhello"));
     let line =
-        "The person did not hear your last reply, \"earlier…\"; they heard it up to \"ear\".";
+        "The person did not hear the end of your last reply, which began \"earlier…\": they heard up to \"ear\".";
     assert!(envelope.contains(line), "{envelope}");
     assert!(envelope.find(line).unwrap() < envelope.find("voice_say (session_id").unwrap());
     assert!(

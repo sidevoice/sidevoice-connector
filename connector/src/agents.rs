@@ -1,4 +1,4 @@
-//! The host-agent coordinator: which agents (each harness with a `Registration`) are on this computer, and registering
+//! The host-agent coordinator: which agents (each harness's registration) are on this computer, and registering
 //! Sidevoice with them or removing it, only ever touching an entry Sidevoice wrote.
 //!
 //! One gate owns a complete request. CLI children belong to its worker task so a vanished link reply can
@@ -7,10 +7,10 @@
 pub mod npm;
 
 use crate::adapters::health::{self, Health};
-use crate::adapters::markers::{self, Roots};
+use crate::adapters::markers::Roots;
 use crate::adapters::registration::{
-    hand_command, mcp_servers_json, with_readiness, AgentError, AgentHost, CliError, CliOutput,
-    Launch, Manual, Registration,
+    hand_command, mcp_servers_json, readiness, AgentError, AgentHost, CliError, CliOutput, Launch,
+    Manual, Programs, Registration,
 };
 use crate::adapters::Registry;
 use crate::messages::message;
@@ -261,6 +261,7 @@ impl InstalledCommand {
 pub struct HostAgents {
     profile: Profile,
     selected: InstalledCommand,
+    registry: Arc<Registry>,
     gate: Arc<Mutex<()>>,
     operations: Arc<Mutex<Vec<ActiveOperation>>>,
     stopping: Arc<AtomicBool>,
@@ -316,6 +317,7 @@ impl HostAgents {
     fn with_command(profile: Profile, selected: InstalledCommand) -> Arc<Self> {
         Arc::new(Self {
             selected,
+            registry: Arc::new(Registry::standard(&profile)),
             profile,
             gate: Arc::new(Mutex::new(())),
             operations: Arc::new(Mutex::new(Vec::new())),
@@ -441,7 +443,7 @@ impl HostAgents {
     ) -> std::result::Result<Value, Failure> {
         if method == "agents.list" {
             let watch = match params.get("watch").and_then(Value::as_str) {
-                Some(value) => Some(parse_id(value)?),
+                Some(value) => Some(self.parse_id(value)?),
                 None => None,
             };
             let rescan = params.get("rescan") == Some(&Value::Bool(true));
@@ -463,7 +465,7 @@ impl HostAgents {
             ));
         }
         let id = params.get("id").and_then(Value::as_str).unwrap_or("");
-        let agent = parse_id(id)?;
+        let agent = self.parse_id(id)?;
         let state = self.load_state(cancel, deadline).await?;
         let mut state = self
             .scan(state, Some(agent), action == "check", cancel, deadline)
@@ -586,7 +588,7 @@ impl HostAgents {
 
     fn response(&self, state: &Value) -> std::result::Result<Value, Failure> {
         let mut rows = Vec::new();
-        for (id, _) in Registry::agents() {
+        for id in self.registry.harnesses().map(|harness| harness.id()) {
             if let Some(seen) = state.pointer(&format!("/seen/{id}")) {
                 if state.get("login_path").and_then(Value::as_str).is_some()
                     && seen.get("present") == Some(&Value::Bool(true))
@@ -693,10 +695,15 @@ impl HostAgents {
             watch
         })
         .map_or_else(
-            || Registry::agents().map(|(id, _)| id).collect(),
+            || {
+                self.registry
+                    .harnesses()
+                    .map(|harness| harness.id())
+                    .collect()
+            },
             |id| vec![id],
         );
-        let full = ids.len() == Registry::agents().count();
+        let full = ids.len() == self.registry.harnesses().count();
         let mut observations = Vec::new();
         for name in ids {
             check_live(cancel, deadline)?;
@@ -932,23 +939,42 @@ impl HostAgents {
         }
     }
 
+    /// The id of the agent `value` names, when a harness has it.
+    fn parse_id(&self, value: &str) -> std::result::Result<AgentId, Failure> {
+        self.registry
+            .find(value)
+            .map(|harness| harness.id())
+            .ok_or_else(|| {
+                Failure::keyed(
+                    "agents.unknown",
+                    json!({"id":value.chars().take(120).collect::<String>()}),
+                )
+            })
+    }
+
     /// The registration of `id`, which a scan or a request only names when one exists.
     fn registration(&self, id: AgentId) -> std::result::Result<&dyn Registration, Failure> {
-        Registry::agent(id)
-            .map(|(_, registration)| registration)
+        self.registry
+            .find(id)
+            .map(|harness| harness.registration())
             .ok_or(Failure::Internal)
     }
 
-    /// What a registration of `id` borrows for one request.
+    /// What the registration of `id` borrows for one request: the login PATH its CLI is looked for on, and the CLI
+    /// the last scan found.
     fn host<'a>(
         &'a self,
-        registration: &dyn Registration,
+        id: AgentId,
+        login_path: Option<&str>,
+        program: Option<&str>,
         cancel: &'a Cancellation,
         deadline: Instant,
     ) -> RequestHost<'a> {
         RequestHost {
             agents: self,
-            root: registration.config_root(&self.profile).to_path_buf(),
+            id,
+            login_path: login_path.map(str::to_owned),
+            program: program.map(str::to_owned),
             cancel,
             deadline,
         }
@@ -963,9 +989,9 @@ impl HostAgents {
     ) -> std::result::Result<(), Failure> {
         check_live(cancel, deadline)?;
         let registration = self.registration(id)?;
-        let host = self.host(registration, cancel, deadline);
+        let host = self.host(id, None, binary, cancel, deadline);
         registration
-            .connect(&host, binary)
+            .connect(&host)
             .await
             .map_err(|error| failure(error, id))
     }
@@ -979,9 +1005,9 @@ impl HostAgents {
     ) -> std::result::Result<(), Failure> {
         check_live(cancel, deadline)?;
         let registration = self.registration(id)?;
-        let host = self.host(registration, cancel, deadline);
+        let host = self.host(id, None, binary, cancel, deadline);
         registration
-            .disconnect(&host, binary)
+            .disconnect(&host)
             .await
             .map_err(|error| failure(error, id))
     }
@@ -990,7 +1016,11 @@ impl HostAgents {
 /// The coordinator as one request on one agent lends it to that agent's registration.
 struct RequestHost<'a> {
     agents: &'a HostAgents,
-    root: PathBuf,
+    /// The agent, which names the CLI a unit test puts in place of its own.
+    #[cfg_attr(not(test), allow(dead_code))]
+    id: AgentId,
+    login_path: Option<String>,
+    program: Option<String>,
     cancel: &'a Cancellation,
     deadline: Instant,
 }
@@ -1016,15 +1046,35 @@ impl AgentHost for RequestHost<'_> {
         self.agents.mcp_env()
     }
 
+    fn find_program(&self, programs: &Programs) -> Option<String> {
+        #[cfg(test)]
+        if let Some(path) = std::env::var(override_name(self.id))
+            .ok()
+            .filter(|path| executable(path))
+        {
+            return Some(path);
+        }
+        find_binary(
+            programs,
+            self.login_path.as_deref(),
+            &Roots::process(&self.agents.profile.home),
+        )
+    }
+
+    fn program(&self) -> Option<&str> {
+        self.program.as_deref()
+    }
+
     fn run<'a>(
         &'a self,
+        cwd: &'a Path,
         binary: &'a str,
         args: Vec<String>,
     ) -> futures_util::future::BoxFuture<'a, std::result::Result<CliOutput, CliError>> {
         Box::pin(async move {
             run_command(
                 &self.agents.profile,
-                Some(&self.root),
+                Some(cwd),
                 binary,
                 &args,
                 self.cancel,
@@ -1055,15 +1105,6 @@ fn failure(error: AgentError, id: AgentId) -> Failure {
         AgentError::Busy => Failure::Busy,
         AgentError::Key(key) => agent_failure(key, id),
     }
-}
-
-fn parse_id(value: &str) -> std::result::Result<AgentId, Failure> {
-    Registry::agent(value).map(|(id, _)| id).ok_or_else(|| {
-        Failure::keyed(
-            "agents.unknown",
-            json!({"id":value.chars().take(120).collect::<String>()}),
-        )
-    })
 }
 
 /// An action on an agent trusts only a scan that happened: while the last one failed, what is cached may be stale.
@@ -1145,24 +1186,30 @@ pub struct AgentCommand {
     pub path: Option<String>,
 }
 
-pub fn agent_command(profile: &Profile, agent: &str) -> AgentCommand {
-    let id = Registry::agent(agent).map(|(id, _)| id);
+pub fn agent_command(profile: &Profile, programs: &Programs) -> AgentCommand {
     let state = load_state_file(profile).unwrap_or_else(|_| empty_state());
     let path = state
         .get("login_path")
         .and_then(Value::as_str)
         .filter(|path| !path.is_empty())
         .map(str::to_owned);
-    let program = id
-        .and_then(|id| Registry::agent(id).map(|(_, registration)| registration))
-        .and_then(|registration| {
-            find_binary(
-                registration,
-                path.as_deref(),
-                &Roots::process(&profile.home),
-            )
-        });
+    let program = find_binary(programs, path.as_deref(), &Roots::process(&profile.home));
     AgentCommand { program, path }
+}
+
+/// The agents the last scan found installed (their registration state said so), by id: nothing is run to find out.
+pub fn installed(profile: &Profile) -> Vec<String> {
+    let state = load_state_file(profile).unwrap_or_else(|_| empty_state());
+    state
+        .get("seen")
+        .and_then(Value::as_object)
+        .map(|seen| {
+            seen.iter()
+                .filter(|(_, seen)| seen.get("present") == Some(&Value::Bool(true)))
+                .map(|(id, _)| id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn load_state_file(profile: &Profile) -> std::result::Result<Value, Failure> {
@@ -1259,13 +1306,13 @@ pub(crate) fn executable(value: &str) -> bool {
 
 /// The agent's CLI: on `path` first, then where the agent is known to keep it outside `PATH`.
 pub(crate) fn find_binary(
-    agent: &dyn Registration,
+    programs: &Programs,
     path: Option<&str>,
     roots: &Roots,
 ) -> Option<String> {
-    find_in_path(agent.binary_names(), path)
-        .and_then(|found| native_program(agent, found))
-        .or_else(|| first_runnable(agent.fallback_binaries(roots)))
+    find_in_path(programs.names, path)
+        .and_then(|found| native_program(programs, found))
+        .or_else(|| first_runnable((programs.fallbacks)(roots)))
 }
 
 /// The first of the candidates, best first, that is a program this OS can run (`Env::runnable`), taken as a program
@@ -1278,9 +1325,9 @@ pub(crate) fn first_runnable(candidates: Vec<PathBuf>) -> Option<String> {
 }
 
 /// What `found` (on `PATH`) stands for: the real program when it is only a launcher script of the agent, else itself.
-fn native_program(agent: &dyn Registration, found: String) -> Option<String> {
-    let resolved = match agent.npm_package() {
-        Some(package) => npm::resolve(Path::new(&found), &package),
+fn native_program(programs: &Programs, found: String) -> Option<String> {
+    let resolved = match &programs.npm {
+        Some(package) => npm::resolve(Path::new(&found), package),
         None => Ok(None),
     };
     resolved_program(found, resolved)
@@ -1513,35 +1560,29 @@ impl HostAgents {
             .validate_existing_private()
             .map_err(|_| agent_failure("agents.invalid", id))?;
         let agent = self.registration(id)?;
-        let host = self.host(agent, cancel, deadline);
-        let binary = self.resolve_binary(id, agent, login_path);
-        let entry = agent
-            .state(&host, binary.as_deref())
+        let state = agent
+            .state(&self.host(id, login_path, None, cancel, deadline))
             .await
             .map_err(|error| failure(error, id))?;
-        let registration = entry.registration;
+        let binary = state.program.clone();
+        let registration = state.registered.as_str();
         // The manual steps follow the state itself: an `outdated` entry is removed before ours is added.
-        let manual = agent.manual(&host, &registration, binary.as_deref());
+        let host = self.host(id, login_path, binary.as_deref(), cancel, deadline);
+        let manual = agent.manual(&host, state.registered);
         // `outdated`: an entry of ours that is not the current one (disabled, an older release, another environment).
         // Connect writes it again; like a current one, it is ours to remove: `owned`.
         let owned = registration == "connected" || registration == "outdated";
         // Discovery never executes a candidate binary. An apparent CLI can itself launch a GUI.
         let version: Option<String> = None;
-        let mut evidence = Vec::new();
-        if binary.is_some() {
-            evidence.push(Evidence { kind: "cli" });
-        }
-        for kind in markers::matching_kinds(
-            agent.install_markers(),
-            std::env::consts::OS,
-            &Roots::process(&self.profile.home),
-        ) {
-            evidence.push(Evidence { kind });
-        }
+        let evidence: Vec<Evidence> = state
+            .installed
+            .iter()
+            .map(|kind| Evidence { kind })
+            .collect();
         // Configuration directories are not install markers: they can survive an uninstall.
         let present = !evidence.is_empty();
         // The connector acts itself where it reaches the agent: its CLI found, or a file it edits.
-        let able = binary.is_some() || agent.connects_without_binary();
+        let able = state.automatic;
         let evidence_json = serde_json::to_value(&evidence).map_err(|_| Failure::Internal)?;
         let signature = if present {
             let identity = format!(
@@ -1555,7 +1596,7 @@ impl HostAgents {
         } else {
             None
         };
-        let row = json!({
+        let mut row = json!({
             "id":id,
             "label":label(id),
             "version":version,
@@ -1573,31 +1614,18 @@ impl HostAgents {
             "dismissed":false,
             "actionable":false,
             "health":Value::Null,
+            "warnings":state.warnings.iter().map(|warning| json!({"code":warning.code,"message":warning.message})).collect::<Vec<_>>(),
         });
+        if let Some(readiness) = readiness(&state.warnings) {
+            row["readiness"] = readiness;
+        }
         Ok(Observation {
-            row: with_readiness(row, agent.readiness_checks(&self.profile)),
-            launch: entry.launch,
+            row,
+            launch: state.launch,
             binary,
             present,
             signature,
         })
-    }
-
-    fn resolve_binary(
-        &self,
-        id: AgentId,
-        agent: &dyn Registration,
-        login_path: Option<&str>,
-    ) -> Option<String> {
-        #[cfg(test)]
-        if let Some(path) = std::env::var(override_name(id))
-            .ok()
-            .filter(|path| executable(path))
-        {
-            return Some(path);
-        }
-        let _ = id;
-        find_binary(agent, login_path, &Roots::process(&self.profile.home))
     }
 
     async fn capture_login_path(

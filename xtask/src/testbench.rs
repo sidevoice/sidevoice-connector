@@ -15,7 +15,8 @@ pub(crate) fn testbench(args: &[&str]) -> Result<()> {
     if !core.join("core.json").is_file() {
         crate::core::core(&core)?;
     }
-    // Both packages: the test bench installs the connector built beside it.
+    // Both packages: the test bench installs the connector built beside it, with the `testbench` feature the bench
+    // package enables (the `bench-agents` subcommand).
     let built = Command::new(cargo())
         .args([
             "build",

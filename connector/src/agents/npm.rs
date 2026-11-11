@@ -11,6 +11,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// A harness's published npm package and native layout. Platform names use npm's spelling.
+#[derive(Clone, Copy, Debug)]
 pub struct NativePackage {
     pub package: &'static str,
     /// Optional dependency name prefix, followed by e.g. `win32-x64`.

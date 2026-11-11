@@ -1,7 +1,11 @@
-pub mod bridge_setup;
+mod bridge_setup;
 mod engine;
 mod harness;
 mod registration;
+#[cfg(test)]
+pub(crate) use registration::MARKERS;
+#[cfg(feature = "testbench")]
+pub(crate) use registration::PROGRAMS;
 mod state_db;
 
 pub use engine::engine;

@@ -23,6 +23,7 @@ mod bridge_tests;
 #[cfg(test)]
 mod contract_tests;
 mod files;
+mod record;
 mod run;
 
 use binding::Binding;
@@ -31,17 +32,13 @@ use files::{
     prepare_conversation_guard, read_conversation_state, read_outbox, write_conversation_guard,
     CONVERSATION_STATE_MAX_BYTES, GUARD_BLOCK_RESUME, GUARD_CLEAR,
 };
+use record::Record;
 pub use run::run;
 
 /// How long `pair_device` waits for the link to the core (the code itself has 10 s more).
 const PAIR_DEVICE_LINK_WAIT: Duration = Duration::from_secs(15);
-/// What was handed to the harnesses, kept across a restart (see `Daemon::delivered`).
+/// What was handed to the harnesses, kept across a restart (see `record.rs`).
 const DELIVERED_FILE: &str = "delivered.json";
-/// Most messages remembered per thread, and most threads.
-const DELIVERED_PER_THREAD: usize = 256;
-const DELIVERED_THREADS: usize = 1024;
-/// The longest message id remembered (the core's are far shorter); a longer one is handed over but not remembered.
-const DELIVERED_ID_MAX: usize = 128;
 /// How often each joined conversation's harness is asked how it is and what it has received.
 const POLL: Duration = Duration::from_millis(500);
 const RESUME_REASON_NONE: u8 = 0;
@@ -65,7 +62,7 @@ pub struct Daemon {
     /// question about which messages the agent has (`input.received`) is answered from here too. The record is written
     /// after the hand-over, so a crash between the two offers the message once more: typed twice rather than never.
     /// Message ids are the core's own (unique), so the thread and the id name a message.
-    delivered: Mutex<HashMap<String, VecDeque<(String, String)>>>,
+    delivered: Mutex<Record>,
     replay_tx: mpsc::Sender<()>,
     host_agents: Arc<HostAgents>,
     registry: Arc<Registry>,
@@ -383,6 +380,9 @@ impl Daemon {
         if !self.persist_conversation_state().await {
             bail!("closed binding could not be saved");
         }
+        // Closed from the room: the core lets go of its messages and stops asking about them, so its record goes too. An
+        // agent's own leave keeps it: the core still holds that conversation's messages if it joins again.
+        self.forget_delivered(&binding.thread).await;
         Ok(())
     }
 
@@ -945,57 +945,38 @@ impl Daemon {
 
     /// What the record says of `message_id`, handed to `thread`'s harness: `accepted` or `received`.
     async fn record_of(&self, thread: &str, message_id: &str) -> Option<String> {
-        let delivered = self.delivered.lock().await;
-        delivered
-            .get(thread)?
-            .iter()
-            .find(|(id, _)| id == message_id)
-            .map(|(_, status)| status.clone())
+        self.delivered
+            .lock()
+            .await
+            .status(thread, message_id)
+            .map(str::to_owned)
     }
 
     /// The messages handed to `thread`'s harness that the agent has not been seen to have, oldest first.
     async fn awaiting_receipt(&self, thread: &str) -> Vec<String> {
-        self.delivered
-            .lock()
-            .await
-            .get(thread)
-            .into_iter()
-            .flatten()
-            .filter(|(_, status)| status == "accepted")
-            .map(|(id, _)| id.clone())
-            .collect()
+        self.delivered.lock().await.awaiting(thread)
     }
 
     /// Records `message_id` as `status` for `thread` and writes the record. A message received stays received.
     async fn remember(&self, thread: &str, message_id: &str, status: &str) {
-        if message_id.len() > DELIVERED_ID_MAX {
-            return;
-        }
         let mut delivered = self.delivered.lock().await;
-        if !delivered.contains_key(thread) && delivered.len() >= DELIVERED_THREADS {
-            if let Some(oldest) = delivered.keys().next().cloned() {
-                delivered.remove(&oldest);
-            }
+        if delivered.set(thread, message_id, status) {
+            self.write_delivered(&delivered);
         }
-        let rows = delivered.entry(thread.to_owned()).or_default();
-        if let Some(row) = rows.iter_mut().find(|(id, _)| id == message_id) {
-            if row.1 == "received" || row.1 == status {
-                return;
-            }
-            row.1 = status.to_owned();
-        } else {
-            rows.push_back((message_id.to_owned(), status.to_owned()));
+    }
+
+    /// Drops the record of `thread`, whose conversation ended.
+    async fn forget_delivered(&self, thread: &str) {
+        let mut delivered = self.delivered.lock().await;
+        if delivered.forget(thread) {
+            self.write_delivered(&delivered);
         }
-        while rows.len() > DELIVERED_PER_THREAD {
-            rows.pop_front();
-        }
-        let state: serde_json::Map<String, Value> = delivered
-            .iter()
-            .map(|(thread, rows)| (thread.clone(), json!(rows)))
-            .collect();
+    }
+
+    fn write_delivered(&self, delivered: &Record) {
         if let Err(error) = Files::write_json(
             &self.profile.data.join(DELIVERED_FILE),
-            &Value::Object(state),
+            &delivered.to_json(),
         ) {
             crate::logfile::log(&format!(
                 "delivery stage=daemon result=delivered_not_kept error={error}"
@@ -1004,7 +985,9 @@ impl Daemon {
     }
 
     /// Asks `binding`'s harness which of the messages handed to it the agent now has; each one newly seen is recorded and
-    /// told to the core at once (`input.read`). The core's question (`input.received`) recovers one told and lost.
+    /// told to the core at once (`input.read`). The core's question (`input.received`) recovers one told and lost. A
+    /// message the agent took while this connector was down is found too: each harness follows its conversation from
+    /// the start of its transcript or rollout the first time it is asked about it.
     async fn check_received(&self, binding: &Binding) {
         let awaiting = self.awaiting_receipt(&binding.thread).await;
         if awaiting.is_empty() || binding.endpoint.is_some() {
@@ -1070,7 +1053,13 @@ impl Daemon {
         let text = frame.get("text").and_then(Value::as_str).unwrap_or("");
         // A note from Sidevoice carries no words of the user's.
         let note = frame.get("channel").and_then(Value::as_str) == Some("note");
-        if message_id.is_empty() || session_id.is_empty() || (text.is_empty() && !note) {
+        // An id the record cannot keep is refused before anything is handed over: unremembered, it could be typed in
+        // again on every offer.
+        if message_id.is_empty()
+            || message_id.len() > record::ID_MAX
+            || session_id.is_empty()
+            || (text.is_empty() && !note)
+        {
             crate::logfile::log("delivery stage=daemon result=invalid_input");
             return json!({"status":"failed","detail":"invalid input"});
         }
@@ -1935,6 +1924,9 @@ mod tests {
             fn id(&self) -> &'static str {
                 "fake"
             }
+            fn registration(&self) -> &dyn crate::adapters::registration::Registration {
+                &crate::adapters::Unregistered
+            }
             fn identify(&self, _: &CallContext) -> Result<Option<Conversation>> {
                 Ok(None)
             }
@@ -2058,6 +2050,9 @@ mod tests {
     impl crate::adapters::Harness for Scripted {
         fn id(&self) -> &'static str {
             "scripted"
+        }
+        fn registration(&self) -> &dyn crate::adapters::registration::Registration {
+            &crate::adapters::Unregistered
         }
         fn identify(&self, _: &crate::adapters::CallContext) -> Result<Option<Conversation>> {
             Ok(None)
@@ -2240,6 +2235,13 @@ mod tests {
             handed_after.lock().unwrap().is_empty(),
             "nothing typed in twice"
         );
+        // An id the record could not keep is refused before anything reaches the agent.
+        let long = "m".repeat(record::ID_MAX + 1);
+        assert_eq!(
+            daemon.deliver(&frame(&binding, &long, "x")).await["status"],
+            "failed"
+        );
+        assert!(handed_after.lock().unwrap().is_empty());
     }
 
     /// A record that says anything but "handed over" is not believed: a message it names `failed` is handed over.
@@ -2252,7 +2254,7 @@ mod tests {
         drop(first);
         Files::write_json(
             &path,
-            &json!({"t-1":[["m-1","failed"],["m-2","accepted"],["","accepted"]]}),
+            &json!({"t-1":{"used":1,"ids":[["m-1","failed"],["m-2","accepted"],["","accepted"]]}}),
         )
         .unwrap();
         let (daemon, binding, handed, _) = scripted_daemon(scratch.path(), &[]).await;

@@ -50,12 +50,10 @@ fn platform_of(os: &str, arch: &str) -> String {
     format!("{os} {arch}")
 }
 
-/// Which harnesses live on this machine, by the configuration home each keeps. Nothing is run to find out.
-pub fn harnesses(profile: &Profile) -> Vec<&'static str> {
-    crate::adapters::Registry::agents()
-        .filter(|(_, registration)| registration.config_root(profile).exists())
-        .map(|(id, _)| id)
-        .collect()
+/// Which harnesses live on this machine: those the last look at the agents found installed (their registration
+/// state). Nothing is run to find out.
+pub fn harnesses(profile: &Profile) -> Vec<String> {
+    crate::agents::installed(profile)
 }
 
 /// This machine, as a client will list it.
@@ -79,13 +77,19 @@ mod tests {
     fn the_machine_names_its_real_host_version_and_the_harnesses_it_has() {
         let scratch = crate::test_support::temp_dir("identity");
         let profile = Profile::for_test(scratch.path(), &crate::adapters::Registry::homes());
-        let mut agents: Vec<_> = crate::adapters::Registry::agents().collect();
-        let (gone, registration) = agents.pop().unwrap();
-        std::fs::remove_dir(registration.config_root(&profile)).unwrap();
+        assert_eq!(
+            machine(&profile)["harnesses"],
+            json!([]),
+            "no look at the agents yet"
+        );
+        use crate::platform::fs::{Files, Fs};
+        Files::write_json(
+            &profile.data.join("agents.json"),
+            &json!({"version":1,"seen":{"one":{"present":true},"gone":{"present":false}}}),
+        )
+        .unwrap();
         let machine = machine(&profile);
-        let present: Vec<_> = agents.iter().map(|(id, _)| *id).collect();
-        assert_eq!(machine["harnesses"], json!(present));
-        assert!(!present.contains(&gone));
+        assert_eq!(machine["harnesses"], json!(["one"]));
         assert_eq!(machine["version"], VERSION);
         assert_eq!(machine["platform"], platform());
         let host = machine["host"].as_str().unwrap();

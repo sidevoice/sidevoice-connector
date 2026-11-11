@@ -65,6 +65,9 @@ interprocess = { version = "2.4", features = ["tokio"] }
 # What tests do to files and the program never does (`sidevoice-platform`'s `TestFiles`, re-exported as
 # `platform::fs::TestFiles`). Enabled for the tests by the dev-dependency on this crate below; never in a release build.
 test-support = ["sidevoice-platform/test-support"]
+# The test bench's hidden `bench-agents` subcommand (src/adapters/bench.rs). Test tooling: the `sidevoice-testbench`
+# package enables it, so a build that includes the bench has it; a release build (`cargo xtask dist`) never does.
+testbench = []
 
 [dev-dependencies]
 # Scratch directories in unit tests (src/test_support.rs).

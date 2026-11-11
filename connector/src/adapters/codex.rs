@@ -2,6 +2,8 @@ mod binary;
 mod cache;
 mod harness;
 mod registration;
+#[cfg(any(test, feature = "testbench"))]
+pub(crate) use registration::PROGRAMS;
 mod rollout;
 pub(crate) mod steer;
 
@@ -92,7 +94,7 @@ async fn deliver_with_cache(
     cache: &cache::Cache,
 ) -> Result<()> {
     let envelope = envelope(event)?;
-    let codex = crate::agents::agent_command(profile, "codex");
+    let codex = crate::agents::agent_command(profile, &registration::PROGRAMS);
     let program = codex
         .program
         .context("Codex not on the captured login PATH")?;

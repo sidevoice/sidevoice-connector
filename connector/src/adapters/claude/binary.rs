@@ -228,17 +228,17 @@ mod resolution {
             .join(".local/bin")
             .join(target::exe_name("claude"));
         Files::ensure_private_dir(native.parent().unwrap()).unwrap();
-        let claude = crate::adapters::claude::Claude;
-        assert_eq!(crate::agents::find_binary(&claude, None, &roots), None);
+        let claude = &crate::adapters::claude::PROGRAMS;
+        assert_eq!(crate::agents::find_binary(claude, None, &roots), None);
         Files::open_private(&native, Create::NewProgram).unwrap();
         assert_eq!(
-            crate::agents::find_binary(&claude, None, &roots).as_deref(),
+            crate::agents::find_binary(claude, None, &roots).as_deref(),
             native.to_str()
         );
         // Used as one on PATH would be, whoever else can change it.
         Files::let_others_change(&native);
         assert_eq!(
-            crate::agents::find_binary(&claude, None, &roots).as_deref(),
+            crate::agents::find_binary(claude, None, &roots).as_deref(),
             native.to_str()
         );
         // A better candidate that is missing, or a directory, does not hide the next one.
@@ -257,7 +257,7 @@ mod resolution {
         Files::ensure_private_dir(&bin).unwrap();
         Files::open_private(&first, Create::NewProgram).unwrap();
         assert_eq!(
-            crate::agents::find_binary(&claude, bin.to_str(), &roots).as_deref(),
+            crate::agents::find_binary(claude, bin.to_str(), &roots).as_deref(),
             first.to_str()
         );
     }

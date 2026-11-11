@@ -4,6 +4,7 @@
 
 use super::{agent_home, agent_process, assistant_engine, assistant_model, Session};
 use crate::adapters::harness::{Agent, CallContext, Conversation, Harness, Sent, State};
+use crate::adapters::registration::Registration;
 use crate::adapters::transcript::{self, Observed, TranscriptReader};
 use crate::adapters::watch::{Watch, Watches};
 use anyhow::Result;
@@ -52,6 +53,10 @@ impl Sessions {
 impl Harness for Sessions {
     fn id(&self) -> &'static str {
         "claude"
+    }
+
+    fn registration(&self) -> &dyn Registration {
+        &super::Claude
     }
 
     /// Claude Code names the session, and that it has an inbox for messages, in its MCP server's environment.

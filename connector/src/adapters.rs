@@ -1,3 +1,5 @@
+#[cfg(feature = "testbench")]
+pub mod bench;
 pub mod claude;
 pub mod codex;
 pub mod cursor;
@@ -12,7 +14,7 @@ mod watch;
 pub use harness::{
     Agent, CallContext, Conversation, Harness, Inbound, Limit, Model, Registry, Sent, State, Status,
 };
-pub use http::{endpoint, post};
+pub use http::{endpoint, post, Unregistered};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -197,23 +199,30 @@ fn unheard_block(unheard: Option<&Value>) -> Result<Option<String>> {
         .get("heard_up_to")
         .and_then(Value::as_str)
         .filter(|heard| !heard.is_empty());
+    let quote = |text: &str| serde_json::to_string(text);
     let mut line = if count == 1 {
-        "[Sidevoice] The person did not hear your last reply".to_owned()
+        match (from, heard) {
+            (Some(from), Some(heard)) => format!(
+                "[Sidevoice] The person did not hear the end of your last reply, which began {}: they heard up to {}",
+                quote(from)?,
+                quote(heard)?
+            ),
+            (Some(from), None) => format!(
+                "[Sidevoice] The person did not hear your last reply, which began {}",
+                quote(from)?
+            ),
+            (None, _) => "[Sidevoice] The person did not hear your last reply".to_owned(),
+        }
     } else {
-        format!("[Sidevoice] The person did not hear your last {count} replies")
+        let mut line = format!("[Sidevoice] The person did not hear your last {count} replies");
+        if let Some(from) = from {
+            line.push_str(&format!(", the first of which began {}", quote(from)?));
+            if let Some(heard) = heard {
+                line.push_str(&format!(" (they heard that one up to {})", quote(heard)?));
+            }
+        }
+        line
     };
-    if let Some(from) = from {
-        line.push_str(if count == 1 { ", " } else { ", from " });
-        line.push_str(&serde_json::to_string(from)?);
-    }
-    if let Some(heard) = heard {
-        line.push_str(if count == 1 {
-            "; they heard it up to "
-        } else {
-            "; that first one was heard up to "
-        });
-        line.push_str(&serde_json::to_string(heard)?);
-    }
     line.push('.');
     Ok(Some(line))
 }
@@ -256,19 +265,19 @@ mod tests {
                 "voice",
                 "Wait",
                 json!({"count":1,"from":"The deploy failed on…","heard_up_to":"The deploy","history_id":"h"}),
-                "[Sidevoice] The person did not hear your last reply, \"The deploy failed on…\"; they heard it up to \"The deploy\".",
+                "[Sidevoice] The person did not hear the end of your last reply, which began \"The deploy failed on…\": they heard up to \"The deploy\".",
             ),
             (
                 "voice",
                 "Next",
                 json!({"count":3,"from":"é🐙…","heard_up_to":"é🐙","history_id":"h"}),
-                "[Sidevoice] The person did not hear your last 3 replies, from \"é🐙…\"; that first one was heard up to \"é🐙\".",
+                "[Sidevoice] The person did not hear your last 3 replies, the first of which began \"é🐙…\" (they heard that one up to \"é🐙\").",
             ),
             (
                 "note",
                 "",
                 json!({"count":2,"from":"Done…","history_id":"h","added_later":{"nested":true}}),
-                "[Sidevoice] The person did not hear your last 2 replies, from \"Done…\".",
+                "[Sidevoice] The person did not hear your last 2 replies, the first of which began \"Done…\".",
             ),
         ];
         for (channel, words, unheard, line) in cases {
