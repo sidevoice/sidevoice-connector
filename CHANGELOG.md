@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.20.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.19.3...v0.20.0) (2026-11-11)
+
+
+### Features
+
+* **delivery:** per-id record answers the core's received question; one not-heard line ([#346](https://github.com/sidevoice/sidevoice-connector/issues/346)) ([563fea9](https://github.com/sidevoice/sidevoice-connector/commit/563fea93e0951d36c2e5710c5e2e2e17fab5182a))
+* **install:** keep running servers on upgrade, stop ours on uninstall, defer foreign holders ([#345](https://github.com/sidevoice/sidevoice-connector/issues/345)) ([851a11f](https://github.com/sidevoice/sidevoice-connector/commit/851a11fe51d171e46927b3c19296e87d220b554e))
+
 ## [0.19.3](https://github.com/sidevoice/sidevoice-connector/compare/v0.19.2...v0.19.3) (2026-11-10)
 
 
