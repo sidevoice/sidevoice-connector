@@ -322,7 +322,7 @@ mod tests {
         database(&db, "CREATE TABLE cursorDiskKV(key TEXT, value TEXT); INSERT INTO cursorDiskKV VALUES ('composerData:chat-a', '{\"modelConfig\":{\"modelName\":\"gpt-5\",\"parameters\":[{\"id\":\"effort\",\"value\":\"high\"}],\"privateMessage\":\"do-not-report\"}}'); INSERT INTO cursorDiskKV VALUES ('composerData:chat-b', '{\"modelConfig\":{\"modelName\":\"claude-opus\",\"defaultEffort\":\"medium\"}}');");
         let instance = BridgeInstance {
             socket: PathBuf::new(),
-            token: String::new(),
+            token: String::new().into(),
             user_data,
             created_at: 0,
         };
@@ -351,7 +351,7 @@ mod tests {
         database(&db, "CREATE TABLE cursorDiskKV(key TEXT, value TEXT); INSERT INTO cursorDiskKV VALUES ('composerData:chat-a', 'not-json'); INSERT INTO cursorDiskKV VALUES ('composerData:chat-b', '{\"modelConfig\":{\"modelName\":\"default\"}}');");
         let instance = BridgeInstance {
             socket: PathBuf::new(),
-            token: String::new(),
+            token: String::new().into(),
             user_data,
             created_at: 0,
         };

@@ -5,6 +5,7 @@
 //! instead of starting anything, until `service start`. Where the core cannot run on demand (Windows: it would end
 //! with its caller's Job Object), starting it with no core job is refused instead.
 
+#![allow(clippy::disallowed_macros)] // test output is not logging
 mod support;
 
 use std::collections::BTreeMap;

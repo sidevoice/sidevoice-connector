@@ -1341,16 +1341,14 @@ fn resolved_program(found: String, resolved: std::io::Result<Option<PathBuf>>) -
             if let Some(native) = first_runnable(vec![program.clone()]) {
                 return Some(native);
             }
-            crate::logfile::log(&format!(
-                "agent native program is not runnable: {}; keeping launcher {found}",
-                program.display()
-            ));
+            tracing::warn!(
+                path_kind = "agent_program",
+                "agent native program is not runnable; keeping its launcher"
+            );
         }
         Ok(None) => {}
         Err(error) => {
-            crate::logfile::log(&format!(
-                "cannot resolve agent launcher {found}: {error}; keeping its launcher"
-            ));
+            tracing::warn!(path_kind = "agent_program", kind = ?error.kind(), os_error = error.raw_os_error(), "cannot resolve the agent launcher; keeping it");
         }
     }
     first_runnable(vec![PathBuf::from(found)])

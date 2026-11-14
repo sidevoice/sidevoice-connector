@@ -4,6 +4,7 @@
 //! the list and the conversation has no voice tools; a client of an older version opens with `initialize` and must
 //! get the same tools.
 
+#![allow(clippy::disallowed_macros)] // test output is not logging
 mod support;
 
 use serde_json::{json, Value};

@@ -52,10 +52,7 @@ pub fn restore(path: &Path) -> io::Result<bool> {
                 ),
             )
         })?;
-    crate::logfile::log(&format!(
-        "{} was open to others; made it private again",
-        path.display()
-    ));
+    tracing::warn!("a private directory was open to others; made it private again");
     Ok(true)
 }
 

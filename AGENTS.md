@@ -59,3 +59,7 @@ MCP tools, the files another version may have written) follows these rules:
 ## Public product information
 
 For changes to user-visible behavior, supported platforms/models, setup, security/privacy practices, availability, limitations, or release/download details, follow the shared [public-information process](https://github.com/sidevoice/landing/blob/main/AGENTS.md#keep-public-product-information-current). Record the landing change/PR or a linked `sidevoice/landing` issue in the PR checklist. Landing issues are the follow-up triage queue.
+
+## Logging
+
+Logging follows the shared [logging guideline](https://github.com/sidevoice/.github-private/blob/main/docs/logging.md): `tracing` events and spans with the canonical field names, and only allowed kinds of values (`src/log_safe.rs`) in a field.

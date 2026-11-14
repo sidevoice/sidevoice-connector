@@ -1,8 +1,11 @@
 use crate::core_ready::Ready;
+use crate::link_error::LinkError;
+use crate::log_safe::error_code;
 use crate::platform::ipc::{Channel, Channels};
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +17,7 @@ use tokio_tungstenite::{
     client_async_with_config,
     tungstenite::{protocol::WebSocketConfig, Message},
 };
+use tracing::Instrument;
 
 pub struct Incoming {
     pub session: u64,
@@ -103,14 +107,19 @@ impl Link {
     /// request and is only logged; any other ID this connector could never have sent ends the link.
     async fn settle(&self, frame: &Value) -> Result<()> {
         let Some(id) = frame.get("id").filter(|id| !id.is_null()) else {
-            crate::logfile::log(&format!(
-                "Core answer without an ID ignored: {}",
-                frame.get("error").unwrap_or(&Value::Null)
-            ));
+            let error = frame.get("error");
+            let code = error
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_i64);
+            let key = error
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .and_then(crate::log_safe::error_key);
+            tracing::warn!(code, key, "core answer without an id ignored");
             return Ok(());
         };
         let Some(id) = id.as_str().filter(|id| id.starts_with("c:")) else {
-            bail!("Core response ID invalid");
+            bail!(LinkError::ResponseIdInvalid);
         };
         if let Some(waiting) = self.pending.lock().await.remove(id) {
             let result = match frame.get("result") {
@@ -164,7 +173,11 @@ impl Link {
         let mut backoff = 100u64;
         loop {
             let session = self.generation.fetch_add(1, Ordering::Relaxed);
-            let outcome = self.session(&profile, &incoming, &mut first, session).await;
+            let span = tracing::info_span!("core_link", attempt = session);
+            let outcome = self
+                .session(&profile, &incoming, &mut first, session)
+                .instrument(span.clone())
+                .await;
             self.reset().await;
             let _ = incoming
                 .send(Incoming {
@@ -178,14 +191,15 @@ impl Link {
                 Ok(()) => backoff = 100,
                 Err(error) => {
                     let message = error.to_string();
-                    crate::logfile::log(&format!("Core link: {message}"));
+                    span.in_scope(|| tracing::warn!(code = error_code(&error), "core link lost"));
                     if let Some(first) = first.take() {
                         let _ = first.send(Err(message.clone()));
                     }
                     // A core this connector starts (no core job) is started again when none answers.
                     supervisor.link_failed().await;
-                    if message.contains("authentication refused")
-                        || message.contains("Core v3 upgrade required")
+                    if error
+                        .downcast_ref::<LinkError>()
+                        .is_some_and(|error| error.is_final())
                     {
                         break;
                     }
@@ -204,7 +218,11 @@ impl Link {
         session: u64,
     ) -> Result<()> {
         let ready = profile.ready().await?;
-        let stream = timeout(Duration::from_secs(2), Channels::connect(&ready.endpoint)).await??;
+        let stream = timeout(Duration::from_secs(2), Channels::connect(&ready.endpoint))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .ok_or(LinkError::Unreachable)?;
         let mut config = WebSocketConfig::default();
         config.max_message_size = Some(1 << 20);
         config.max_frame_size = Some(1 << 20);
@@ -216,68 +234,75 @@ impl Link {
         let mut params = crate::identity::machine(profile);
         params["protocol"] = json!(3);
         params["connector_id"] = json!(ready.connector_id);
-        params["token"] = json!(ready.token);
+        #[allow(clippy::disallowed_methods)] // sent to the core, nowhere else
+        {
+            params["token"] = json!(ready.token.expose_secret());
+        }
         let hello = json!({"jsonrpc":"2.0","id":"c:1","method":"connector.hello","params":params});
         ws.send(Message::Text(hello.to_string().into())).await?;
         let reply = timeout(Duration::from_secs(5), ws.next())
             .await?
-            .context("hello closed")??;
+            .ok_or(LinkError::HelloClosed)??;
         let value: Value = serde_json::from_str(reply.to_text()?)?;
         if value.get("id") != Some(&json!("c:1"))
             || value.get("result").and_then(|v| v.get("protocol")) != Some(&json!(3))
         {
-            bail!("Core v3 authentication refused");
+            bail!(LinkError::AuthRefused);
         }
         if let Some(first) = first.take() {
             let _ = first.send(Ok(ready.clone()));
         }
+        tracing::info!(protocol = 3, launch_id = %ready.launch_id, pid = ready.pid, "core linked");
         let (mut write, mut read) = ws.split();
         let (tx, mut rx) = mpsc::channel::<Message>(128);
         *self.tx.write().await = Some(tx.clone());
         *self.core.write().await =
             Some(json!({"launch_id":ready.launch_id,"pid":ready.pid,"protocol":3}));
         let mut tasks = JoinSet::new();
-        tasks.spawn(async move {
-            while let Some(message) = rx.recv().await {
-                if write.send(message).await.is_err() {
-                    break;
+        tasks.spawn(
+            async move {
+                while let Some(message) = rx.recv().await {
+                    if write.send(message).await.is_err() {
+                        break;
+                    }
                 }
+                let _ = write.close().await;
+                true
             }
-            let _ = write.close().await;
-            true
-        });
+            .in_current_span(),
+        );
         let mut ping = tokio::time::interval(Duration::from_secs(15));
         ping.tick().await;
         let mut unanswered: Option<Instant> = None;
         loop {
             tokio::select! {
                 Some(result) = tasks.join_next() => {
-                    if result? { bail!("Core writer ended"); }
+                    if result? { bail!(LinkError::WriterEnded); }
                 }
                 _ = ping.tick() => {
-                    if unanswered.is_some_and(|at| at.elapsed() > Duration::from_secs(30)) { bail!("Core Pong timeout"); }
+                    if unanswered.is_some_and(|at| at.elapsed() > Duration::from_secs(30)) { bail!(LinkError::PongTimeout); }
                     tx.send(Message::Ping(b"sidevoice".to_vec().into())).await?;
                     if unanswered.is_none() { unanswered = Some(Instant::now()); }
                 }
                 frame = read.next() => {
-                    let frame = frame.context("Core disconnected")??;
+                    let frame = frame.ok_or(LinkError::Disconnected)??;
                     match frame {
                         Message::Pong(payload) => { if payload.as_ref() == b"sidevoice" { unanswered = None; } }
                         Message::Ping(payload) => { tx.send(Message::Pong(payload)).await?; }
                         Message::Text(text) => {
-                            if text.len() > 1 << 20 { bail!("Core frame too large"); }
+                            if text.len() > 1 << 20 { bail!(LinkError::FrameTooLarge); }
                             let value: Value = serde_json::from_str(&text)?;
-                            if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") { bail!("invalid Core JSON-RPC"); }
+                            if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") { bail!(LinkError::InvalidJsonRpc); }
                             if let Some(method) = value.get("method").and_then(Value::as_str) {
                                 if method == "input.deliver" {
-                                    crate::logfile::log("delivery stage=core_link result=received");
+                                    tracing::info!(stage = "core_link", result = "received", "delivery");
                                 }
                                 if method == "connector.welcome" {
                                     let _ = incoming.send(Incoming { session, method: method.into(), params: value.get("params").cloned().unwrap_or(Value::Null), reply: None }).await;
                                     continue;
                                 }
                                 let id = value.get("id").cloned();
-                                if tasks.len() >= 65 { bail!("Core handler limit"); }
+                                if tasks.len() >= 65 { bail!(LinkError::HandlerLimit); }
                                 let reply_tx = tx.clone();
                                 let method = method.to_owned();
                                 let delivery_frame = method == "input.deliver";
@@ -291,9 +316,9 @@ impl Link {
                                 };
                                 if !matches!(timeout(Duration::from_secs(2), incoming.send(inbound)).await, Ok(Ok(()))) {
                                     if delivery_frame {
-                                        crate::logfile::log("delivery stage=core_link result=queue_unavailable");
+                                        tracing::warn!(stage = "core_link", result = "queue_unavailable", "delivery");
                                     }
-                                    bail!("Core inbound queue unavailable");
+                                    bail!(LinkError::QueueUnavailable);
                                 }
                                 if let Some(id) = id {
                                     tasks.spawn(async move {
@@ -303,7 +328,7 @@ impl Link {
                                         let frame = json!({"jsonrpc":"2.0","id":id,"result":result});
                                         let _ = reply_tx.send(Message::Text(frame.to_string().into())).await;
                                         false
-                                    });
+                                    }.in_current_span());
                                 }
                             } else {
                                 self.settle(&value).await?;
@@ -311,13 +336,12 @@ impl Link {
                         }
                         Message::Close(frame) => {
                             if let Some(frame) = frame {
-                                bail!(
+                                return Err(anyhow::Error::new(LinkError::Closed).context(format!(
                                     "Core WebSocket closed with code {}: {}",
-                                    frame.code,
-                                    frame.reason
-                                );
+                                    frame.code, frame.reason
+                                )));
                             }
-                            bail!("Core WebSocket closed without a close frame");
+                            bail!(LinkError::Closed);
                         }
                         _ => {}
                     }

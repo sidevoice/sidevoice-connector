@@ -1,6 +1,8 @@
 //! What the test bench's integration test needs of the connector's own test helpers: a private profile, a child
 //! process stopped when dropped, an MCP client and an HTTP receiver. A copy of the subset of
 //! connector/tests/support/mod.rs the test uses: a test binary cannot share another package's `tests/`.
+#![allow(clippy::disallowed_macros)]
+// test output is not logging
 // The test speaks the connector's wire raw, as a client of another version would.
 #![allow(clippy::disallowed_types)]
 

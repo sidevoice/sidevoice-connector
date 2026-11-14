@@ -25,6 +25,7 @@ pub const HOME: crate::profile::AgentHome = crate::profile::AgentHome {
 
 use super::envelope;
 use super::harness::{Limit, Sent};
+use crate::log_safe::IdHash;
 use crate::platform::process::{ChildProcess, Processes};
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
@@ -123,14 +124,12 @@ async fn deliver_with_cache(
     .await
     {
         Ok(_) => {
-            crate::logfile::log(&format!(
-                "codex delivery path=steered thread={thread:?} message_id={message_id:?}"
-            ));
+            tracing::info!(path = "steered", conversation = %IdHash(thread), "codex delivery");
             return Ok(());
         }
         Err(error) => {
             cache.steer_failed(&key, &error);
-            crate::logfile::log(&steer_fallback_log(thread, message_id, &error));
+            log_steer_fallback(thread, &error);
         }
     }
     let mut queue = command();
@@ -139,15 +138,11 @@ async fn deliver_with_cache(
         .arg(envelope);
     match queue_call(queue).await {
         Ok(()) => {
-            crate::logfile::log(&format!(
-                "codex delivery path=queued thread={thread:?} message_id={message_id:?}"
-            ));
+            tracing::info!(path = "queued", conversation = %IdHash(thread), "codex delivery");
             Ok(())
         }
         Err(error) => {
-            crate::logfile::log(&format!(
-                "codex delivery path=queue-failed thread={thread:?} message_id={message_id:?}"
-            ));
+            tracing::warn!(path = "queue_failed", conversation = %IdHash(thread), "codex delivery");
             cache.invalidate(&key);
             Err(error)
         }
@@ -166,14 +161,16 @@ async fn queue_call(command: tokio::process::Command) -> Result<()> {
 }
 
 /// Only typed, allowlisted diagnostics reach the log; arbitrary error chains may contain voice input.
-fn steer_fallback_log(thread: &str, message_id: &str, error: &anyhow::Error) -> String {
-    let reason = error
-        .downcast_ref::<steer::Failure>()
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "reason=steer-unavailable".to_owned());
-    format!(
-        "codex delivery path=queue-fallback thread={thread:?} message_id={message_id:?} {reason}"
-    )
+fn log_steer_fallback(thread: &str, error: &anyhow::Error) {
+    let failure = error.downcast_ref::<steer::Failure>();
+    tracing::info!(
+        path = "queue_fallback",
+        conversation = %IdHash(thread),
+        reason = failure.map_or("steer-unavailable", steer::Failure::code),
+        method = failure.and_then(steer::Failure::method),
+        code = failure.and_then(steer::Failure::rpc_code),
+        "codex delivery"
+    );
 }
 
 /// Runs `command` (a Codex CLI call) to its end within `limit`, giving its exit status and, when `capture`, its
@@ -248,9 +245,18 @@ mod tests {
     fn fallback_log_does_not_format_unclassified_error_chains() {
         let error = anyhow::anyhow!("private voice input echoed")
             .context("transport returned private voice input echoed");
-        let line = steer_fallback_log("thread-1", "message-1", &error);
-        assert!(line.contains("reason=steer-unavailable"));
-        assert!(!line.contains("private voice input echoed"));
+        let log = crate::test_support::capture();
+        log_steer_fallback("thread-codex-fallback", &error);
+        let own = IdHash("thread-codex-fallback").to_string();
+        let line = log
+            .text()
+            .lines()
+            .filter(|line| line.contains(&own))
+            .collect::<String>();
+        assert!(line.contains("reason=\"steer-unavailable\""), "{line}");
+        assert!(line.contains(&own), "{line}");
+        assert!(!line.contains("private voice input echoed"), "{line}");
+        assert!(!line.contains("thread-codex-fallback"), "{line}");
     }
 
     #[test]

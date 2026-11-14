@@ -2,6 +2,7 @@ use crate::adapters::{Agent, Conversation, Inbound, Limit, Registry, Sent, State
 use crate::agents::HostAgents;
 use crate::frame;
 use crate::link::{Incoming, Link};
+use crate::log_safe::{error_code, ClientId};
 use crate::platform::fs::{Files, Fs};
 use crate::platform::ipc::Stream;
 use crate::profile::Profile;
@@ -245,10 +246,12 @@ impl Daemon {
         let mut current = binding.id.lock().await;
         let engine = binding.engine.lock().await.clone().unwrap_or(Value::Null);
         let (capabilities, inbound) = declaration(&*binding.state.lock().await);
-        crate::logfile::log(&format!(
-            "delivery stage=register result=attempt inject={}",
-            capabilities["deliver"] == "supported"
-        ));
+        tracing::debug!(
+            stage = "register",
+            result = "attempt",
+            inject = capabilities["deliver"] == "supported",
+            "delivery"
+        );
         let mut frame = json!({"client_ref":binding.client_ref,"harness":binding.harness,"thread":binding.thread,"title":binding.title,
             "inbound":inbound,"capabilities":capabilities,"engine":engine,"focus":false});
         if !current.starts_with("local-") {
@@ -261,13 +264,18 @@ impl Daemon {
         {
             Ok(reply) => reply,
             Err(error) => {
-                crate::logfile::log("delivery stage=register result=link_failed");
+                tracing::warn!(
+                    stage = "register",
+                    result = "link_failed",
+                    code = error_code(&error),
+                    "delivery"
+                );
                 return Err(error);
             }
         };
         // An answer may carry fields this connector does not know, `"error": null` among them: only an error is one.
         if let Some(error) = reply.get("error").filter(|error| !error.is_null()) {
-            crate::logfile::log("delivery stage=register result=core_refused");
+            tracing::warn!(stage = "register", result = "core_refused", "delivery");
             if error.as_str() == Some("room.binding_closed") {
                 bail!("CORE_BINDING_CLOSED");
             }
@@ -312,13 +320,13 @@ impl Daemon {
             .get("initial_reply_context")
             .cloned()
             .unwrap_or(Value::Null);
-        crate::logfile::log("delivery stage=register result=registered");
+        tracing::info!(stage = "register", result = "registered", "delivery");
         Ok(reply)
     }
 
     async fn on_welcome(self: &Arc<Self>) {
         if let Err(error) = self.retire_held_audio().await {
-            crate::logfile::log(&format!("speech outbox retained: {error}"));
+            tracing::warn!(code = error_code(&error), "speech outbox retained");
             return;
         }
         // Core may have restarted after a deliberate agent exit. Replay leaves before any live bindings so an old
@@ -327,7 +335,7 @@ impl Daemon {
         let left = self.left_by_agent.lock().await.clone();
         for (client_ref, leave) in left {
             if let Err(error) = self.confirm_agent_leave(&client_ref, &leave).await {
-                crate::logfile::log(&format!("agent leave replay: {error}"));
+                tracing::warn!(code = error_code(&error), "agent leave replay failed");
             }
         }
         drop(_state_transaction);
@@ -339,11 +347,14 @@ impl Daemon {
                         .close_binding_from_client(&binding, "binding_closed")
                         .await
                     {
-                        crate::logfile::log(&format!("close refused binding: {close_error}"));
+                        tracing::warn!(
+                            code = error_code(&close_error),
+                            "closing a refused binding failed"
+                        );
                     }
                     continue;
                 }
-                crate::logfile::log(&format!("binding replay: {error}"));
+                tracing::warn!(code = error_code(&error), "binding replay failed");
                 continue;
             }
             let working = *binding.working.lock().await;
@@ -464,7 +475,10 @@ impl Daemon {
             .map_err(|_| anyhow::anyhow!("conversation guard lock poisoned"))
             .and_then(|mut file| write_conversation_guard(&mut file, guard));
         if let Err(error) = result {
-            crate::logfile::log(&format!("emergency conversation guard: {error}"));
+            tracing::error!(
+                code = error_code(&error),
+                "emergency conversation guard failed"
+            );
             let _ = self.shutdown.send(true);
         }
     }
@@ -491,8 +505,8 @@ impl Daemon {
                     "closed_by_client":closed.clone(),"left_by_agent":left,"resume_blocked":true,
                     "resume_block_reason":self.resume_block_reason()});
             }
-            Err(error) => {
-                crate::logfile::log(&format!("conversation state: {error}"));
+            Err(_) => {
+                tracing::error!(kind = "encode", "conversation state not saved");
                 self.mark_state_write_failed();
                 return false;
             }
@@ -508,14 +522,14 @@ impl Daemon {
             if serde_json::to_vec(&state)
                 .map_or(true, |bytes| bytes.len() > CONVERSATION_STATE_MAX_BYTES)
             {
-                crate::logfile::log("compact conversation state exceeds its size limit");
+                tracing::error!(code = "state_too_large", "conversation state not saved");
                 return false;
             }
         }
         if let Err(error) =
             Files::write_json(&self.profile.data.join("conversation-state.json"), &state)
         {
-            crate::logfile::log(&format!("conversation state: {error}"));
+            tracing::error!(kind = ?error.kind(), os_error = error.raw_os_error(), "conversation state not saved");
             self.mark_state_write_failed();
             false
         } else if let Err(error) = self
@@ -524,7 +538,7 @@ impl Daemon {
             .map_err(|_| anyhow::anyhow!("conversation guard lock poisoned"))
             .and_then(|mut file| write_conversation_guard(&mut file, GUARD_CLEAR))
         {
-            crate::logfile::log(&format!("clear conversation guard: {error}"));
+            tracing::error!(code = error_code(&error), "clear conversation guard failed");
             self.mark_state_write_failed();
             false
         } else {
@@ -751,7 +765,7 @@ impl Daemon {
         let mut reply = match result {
             Ok(v) => v,
             Err(error) => {
-                crate::logfile::log(&format!("speech retry retained: {error}"));
+                tracing::warn!(code = error_code(&error), "speech retry retained");
                 return Ok(None);
             }
         };
@@ -777,7 +791,7 @@ impl Daemon {
                     {
                         Ok(value) => value,
                         Err(error) => {
-                            crate::logfile::log(&format!("speech retry retained: {error}"));
+                            tracing::warn!(code = error_code(&error), "speech retry retained");
                             return Ok(None);
                         }
                     };
@@ -830,7 +844,7 @@ impl Daemon {
             {
                 Ok(reply) => reply,
                 Err(error) => {
-                    crate::logfile::log(&format!("speech recovery retained: {error}"));
+                    tracing::warn!(code = error_code(&error), "speech recovery retained");
                     return Ok(None);
                 }
             };
@@ -926,7 +940,7 @@ impl Daemon {
                         .and_then(Value::as_str)
                         .unwrap_or("closed_from_client");
                     if let Err(error) = self.close_binding_from_client(&binding, reason).await {
-                        crate::logfile::log(&format!("close binding: {error}"));
+                        tracing::warn!(code = error_code(&error), "close binding failed");
                     }
                 }
                 json!({})
@@ -978,9 +992,7 @@ impl Daemon {
             &self.profile.data.join(DELIVERED_FILE),
             &delivered.to_json(),
         ) {
-            crate::logfile::log(&format!(
-                "delivery stage=daemon result=delivered_not_kept error={error}"
-            ));
+            tracing::warn!(stage = "daemon", result = "delivered_not_kept", kind = ?error.kind(), "delivery");
         }
     }
 
@@ -1030,17 +1042,15 @@ impl Daemon {
         json!({"received":received,"unknown":unknown})
     }
 
+    #[tracing::instrument(
+        skip_all,
+        fields(binding, message_id, session, revision, epoch, channel, harness)
+    )]
     async fn deliver(&self, frame: &Value) -> Value {
-        crate::logfile::log("delivery stage=daemon result=received");
         let id = frame
             .get("binding_id")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let Some(binding) = self.binding_for_id(id).await else {
-            crate::logfile::log("delivery stage=daemon result=unknown_binding");
-            return json!({"status":"unknown_binding"});
-        };
-        let _serial = binding.serial.lock().await;
         let message_id = frame
             .get("message_id")
             .and_then(Value::as_str)
@@ -1053,6 +1063,21 @@ impl Daemon {
         let text = frame.get("text").and_then(Value::as_str).unwrap_or("");
         // A note from Sidevoice carries no words of the user's.
         let note = frame.get("channel").and_then(Value::as_str) == Some("note");
+        // The ids are the sender's choice: they are logged only as `ClientId` shows them.
+        let span = tracing::Span::current();
+        span.record("binding", tracing::field::display(ClientId(id)))
+            .record("message_id", tracing::field::display(ClientId(message_id)))
+            .record("session", tracing::field::display(ClientId(session_id)))
+            .record("revision", revision)
+            .record("epoch", frame["epoch"].as_u64().unwrap_or(0))
+            .record("channel", if note { "note" } else { "voice" });
+        tracing::info!(stage = "daemon", result = "received", "delivery");
+        let Some(binding) = self.binding_for_id(id).await else {
+            tracing::warn!(stage = "daemon", result = "unknown_binding", "delivery");
+            return json!({"status":"unknown_binding"});
+        };
+        span.record("harness", binding.harness.as_str());
+        let _serial = binding.serial.lock().await;
         // An id the record cannot keep is refused before anything is handed over: unremembered, it could be typed in
         // again on every offer.
         if message_id.is_empty()
@@ -1060,13 +1085,13 @@ impl Daemon {
             || session_id.is_empty()
             || (text.is_empty() && !note)
         {
-            crate::logfile::log("delivery stage=daemon result=invalid_input");
+            tracing::warn!(stage = "daemon", result = "invalid_input", "delivery");
             return json!({"status":"failed","detail":"invalid input"});
         }
         // Offered again what the harness already has (the core's answer was lost, or it restarted holding the message):
         // answered from the record, never handed over twice.
         if let Some(status) = self.record_of(&binding.thread, message_id).await {
-            crate::logfile::log("delivery stage=daemon result=already_delivered");
+            tracing::info!(stage = "daemon", result = "already_delivered", "delivery");
             return json!({"status":"accepted","received":status == "received",
                 "detail":"already handed to the agent"});
         }
@@ -1078,10 +1103,12 @@ impl Daemon {
                 frame["epoch"].as_u64().unwrap_or(0),
             )
             .await;
-        crate::logfile::log(&format!(
-            "delivery stage=adapter result=attempt endpoint={}",
-            binding.endpoint.is_some()
-        ));
+        tracing::debug!(
+            stage = "adapter",
+            result = "attempt",
+            endpoint = binding.endpoint.is_some(),
+            "delivery"
+        );
         let sent = match &binding.endpoint {
             Some(endpoint) => crate::adapters::post(endpoint, &binding.thread, frame).await,
             None => {
@@ -1118,7 +1145,7 @@ impl Daemon {
             Some("unsupported") => "unsupported",
             _ => "unrecognized",
         };
-        crate::logfile::log(&format!("delivery stage=adapter result={status}"));
+        tracing::info!(stage = "adapter", result = status, "delivery");
         binding
             .record_delivery(json!({"message_id":message_id,
                 "channel":frame.get("channel").and_then(Value::as_str).unwrap_or("voice"),"at":crate::logfile::timestamp(),"result":status}))
@@ -1489,7 +1516,10 @@ impl Daemon {
                 if self.link.connected().await {
                     if let Err(error) = self.confirm_agent_leave(&binding.client_ref, &leave).await
                     {
-                        crate::logfile::log(&format!("agent leave confirmation: {error}"));
+                        tracing::warn!(
+                            code = error_code(&error),
+                            "agent leave confirmation failed"
+                        );
                     }
                 }
                 drop(_state_transaction);

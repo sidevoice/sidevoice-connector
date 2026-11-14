@@ -8,9 +8,10 @@
 //! agent's `voice_say` replies and the call's events (working state among them). What is typed there is voice input,
 //! exactly as if it had been spoken. How to point an agent at it: testbench/README.md.
 
-// macOS and Linux only: the test bench stands in for a person's login shell with a `/bin/sh` script, which is how the connector
-// finds an agent's `PATH` there; on Windows it reads the registry's instead, and the test bench has no way yet to give it its
-// own. Porting it needs that way (a decision for the connector, not for the test bench).
+#![allow(clippy::disallowed_macros)] // the test bench's output for people is not logging
+                                     // macOS and Linux only: the test bench stands in for a person's login shell with a `/bin/sh` script, which is how the connector
+                                     // finds an agent's `PATH` there; on Windows it reads the registry's instead, and the test bench has no way yet to give it its
+                                     // own. Porting it needs that way (a decision for the connector, not for the test bench).
 #[cfg(unix)]
 mod call;
 #[cfg(unix)]

@@ -1,5 +1,6 @@
 //! The desktop consumes the command's existing one-object JSON failure contract.
 
+#![allow(clippy::disallowed_macros)] // test output is not logging
 use serde_json::Value;
 use sidevoice_connector::platform::data_dir;
 mod support;

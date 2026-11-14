@@ -53,3 +53,54 @@ pub(crate) async fn assert_cancellation_stops_children<T>(
         }
     }
 }
+
+/// The log lines every thread's events produce from [`capture`] on, as the daemon would write them: one global
+/// subscriber for the whole test process, so events from `spawn_blocking` and other threads are seen too. Tests run in
+/// parallel, so others' lines are in it as well: assert on values unique to the test.
+pub(crate) struct Captured {
+    from: usize,
+}
+
+static LINES: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+impl Captured {
+    pub(crate) fn text(&self) -> String {
+        String::from_utf8_lossy(&LINES.lock().unwrap()[self.from..]).into_owned()
+    }
+}
+
+#[derive(Clone)]
+struct Shared;
+
+impl std::io::Write for Shared {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        LINES.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Shared {
+    type Writer = Shared;
+    fn make_writer(&'a self) -> Shared {
+        Shared
+    }
+}
+
+/// Captures the events of every thread at every level from now on.
+pub(crate) fn capture() -> Captured {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(Shared)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+    });
+    Captured {
+        from: LINES.lock().unwrap().len(),
+    }
+}

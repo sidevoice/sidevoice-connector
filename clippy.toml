@@ -18,6 +18,7 @@ disallowed-methods = [
     { path = "tokio::signal::windows::ctrl_close", reason = "use platform::lifecycle", allow-invalid = true },
     { path = "tokio::signal::windows::ctrl_logoff", reason = "use platform::lifecycle", allow-invalid = true },
     { path = "tokio::signal::windows::ctrl_shutdown", reason = "use platform::lifecycle", allow-invalid = true },
+    { path = "secrecy::ExposeSecret::expose_secret", reason = "a secret leaves its wrapper: #[allow] at the one send or store site" },
 ]
 
 # Local sockets: `platform::ipc` is the only place that opens one (a Unix socket, a named pipe on Windows).
@@ -28,4 +29,12 @@ disallowed-types = [
     { path = "std::os::unix::net::UnixListener", reason = "use platform::ipc" },
     { path = "std::os::unix::net::UnixStream", reason = "use platform::ipc" },
     { path = "std::os::unix::net::UnixDatagram", reason = "use platform::ipc" },
+]
+
+# Logging goes through `tracing` (the shared logging guideline). CLI output meant for people keeps its own call sites,
+# each `#[allow]`ed with the reason; tests and build scripts are not logging (crate-level `#![allow]` under `cfg(test)`).
+disallowed-macros = [
+    { path = "std::dbg", reason = "use tracing" },
+    { path = "std::eprintln", reason = "use tracing; CLI output for people #[allow]s it with a reason" },
+    { path = "std::println", reason = "use tracing; CLI output for people #[allow]s it with a reason" },
 ]

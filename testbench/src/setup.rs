@@ -2,6 +2,7 @@
 //! archive lays it out, installed by its own `install` with no service manager (Sidevoice on demand), and the files
 //! and commands that point an agent at it.
 
+#![allow(clippy::disallowed_macros)] // the test bench's output for people is not logging
 use sidevoice_connector::platform::target;
 use std::collections::BTreeMap;
 use std::fs;

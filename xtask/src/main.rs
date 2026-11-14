@@ -32,6 +32,9 @@
 //! - `testbench [ARGS...]` (or `bench`): the test bench (testbench/README.md): the pinned core (fetched when
 //!   missing), this build, and `sidevoice-testbench ARGS` run on them.
 
+// Build tooling: its output is for the person running it, not a log.
+#![allow(clippy::disallowed_macros)]
+
 mod archive;
 mod codex;
 mod core;

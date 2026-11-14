@@ -2,6 +2,9 @@
 //! `sidevoice-testbench`, the test bench package) and by what tests need of its OS-facing layer. Only what a binary uses is
 //! `pub`.
 
+// Unit tests print for their own sake (stand-in programs, timings): that is not logging.
+#![cfg_attr(test, allow(clippy::disallowed_macros))]
+
 pub mod adapters;
 pub mod agents;
 pub mod core_package;
@@ -11,7 +14,9 @@ mod frame;
 pub mod identity;
 pub mod install;
 mod link;
+mod link_error;
 mod lock;
+pub mod log_safe;
 pub mod logfile;
 pub mod mcp;
 pub mod messages;

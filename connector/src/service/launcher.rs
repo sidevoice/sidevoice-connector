@@ -154,9 +154,7 @@ pub fn core_processes(layout: &Layout) -> Vec<u32> {
 /// each only while it is provably that core ([`Process::stop`], the same on every OS).
 pub async fn terminate_core(layout: &Layout, pid: u32, grace: Duration) {
     if Processes::stop(pid, |found| is_our_core(layout, &found.command), grace).await {
-        crate::logfile::log(&format!(
-            "the core (pid {pid}) did not leave by itself: killed it"
-        ));
+        tracing::warn!(pid, "core killed after grace");
     }
 }
 
@@ -311,9 +309,7 @@ pub async fn ensure_core(layout: &Layout) -> Result<Ready> {
         Err(error) => return Err(core_failure(spawn_failure(layout, &program, &error))),
     };
     let pid = child.id();
-    crate::logfile::log(&format!(
-        "started the core (pid {pid:?}, launch {launch_id}); waiting for it to be ready"
-    ));
+    tracing::info!(pid, launch_id = %launch_id, "core started");
     let deadline = Instant::now() + READY_LIMIT;
     let mut failure = None;
     while Instant::now() < deadline {
@@ -334,7 +330,7 @@ pub async fn ensure_core(layout: &Layout) -> Result<Ready> {
     let failure =
         failure.unwrap_or_else(|| failure_cause(layout, &launch_id, None, Some("ready.timeout")));
     if failure.get("key").and_then(Value::as_str) == Some("bind.core-running") {
-        crate::logfile::log("another core holds this data directory: waiting for it instead");
+        tracing::warn!(code = "bind.core-running", "waiting for another core");
         let deadline = Instant::now() + READY_LIMIT;
         while Instant::now() < deadline {
             if let Some((ready, _)) = serving(layout, Duration::from_secs(2)).await {
@@ -629,7 +625,10 @@ impl CoreSupervisor {
             return;
         }
         if let Err(error) = ensure_core(&self.layout).await {
-            crate::logfile::log(&format!("the local core is not available: {error}"));
+            tracing::error!(
+                code = crate::log_safe::error_key(&error.key),
+                "core not available"
+            );
         }
     }
 }

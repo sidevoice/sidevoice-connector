@@ -4,6 +4,7 @@
 //! The core archive is the one `cargo xtask core` checked and kept in `target/sidevoice-core`. Without it the
 //! tests that need it are skipped locally and fail in CI, like every test that needs the real core.
 
+#![allow(clippy::disallowed_macros)] // test output is not logging
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;

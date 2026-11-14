@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros)] // the command line's output for people is not logging
 use sidevoice_connector::platform::service::{Service, Services};
 use sidevoice_connector::{
     adapters, agents, core_package, daemon, identity, install, logfile, mcp, messages, pairing,
@@ -161,6 +162,12 @@ async fn main() -> ExitCode {
         let _ = Cli::command().print_help();
         return ExitCode::from(2);
     };
+    // The daemon logs boundaries at `info`; everything else keeps its stderr for what a person or a protocol reads.
+    logfile::install(if matches!(action, Action::Connector { .. }) {
+        "info"
+    } else {
+        "warn"
+    });
     match run(action, cli.json).await {
         Ok(code) => code,
         Err(error) => {

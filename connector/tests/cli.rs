@@ -3,6 +3,7 @@
 //! guards: a data directory of ours others can enter is made private again and one reached through a link is refused,
 //! one connector serves a data directory, and its log is private.
 
+#![allow(clippy::disallowed_macros)] // test output is not logging
 mod support;
 
 use std::fs;
@@ -153,7 +154,7 @@ fn one_connector_serves_a_data_directory_and_its_log_is_private() {
     let text = until("the connector logged the missing core", 30, || {
         fs::read_to_string(&log)
             .ok()
-            .filter(|text| text.contains("[sidevoice] Core link: "))
+            .filter(|text| text.contains("core link lost"))
     });
     assert!(!text.contains("rust proof"), "{text}");
     assert!(is_private(&log));

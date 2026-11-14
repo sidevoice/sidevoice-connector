@@ -1,35 +1,220 @@
-//! The connector's log, `connector.log` in the data directory: one timestamped line per event, kept under 5 MB with
-//! the two previous ones beside it (`.1`, `.2`).
+//! The connector's log, `connector.log` in the data directory: one `tracing` line per event, kept under 5 MB with
+//! the two previous ones beside it (`.1`, `.2`). The rules for what a line may hold are the shared logging guideline's
+//! (https://github.com/sidevoice/.github-private/blob/main/docs/logging.md); [`crate::log_safe`] has the types.
 //!
 //! Rotated by copy-and-truncate, never by rename: a service manager holds the file open (`O_APPEND`) for as long as
 //! the job runs, and a renamed file would keep receiving its output under the old name. Truncating in place moves
 //! the next write to the start of the same file.
 //!
-//! A connector run by hand writes each line to stderr and to the file. Run by a service manager it writes the file
-//! only: the manager already puts its stderr in that same file, so writing both would say everything twice. Before
-//! [`init`] (the MCP server, the CLI) lines go to stderr only.
+//! [`install`] sets the process's one subscriber, whose writer is [`LogWriter`]. A connector run by hand writes each
+//! line to the file and, on a terminal, to stderr. Run by a service manager it writes the file only: the manager
+//! already puts its stderr in that same file, so writing both would say everything twice. Before [`init`] (the MCP
+//! server, the CLI) lines go to stderr only; those processes default to `warn`, so a new `info` event never mixes into
+//! what a person reads. `SIDEVOICE_LOG` is the only variable that sets the level.
 
+use crate::log_safe::IdHash;
 use crate::platform::fs::{Create, Files, Fs};
-use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 
 pub const LOG_MAX: u64 = 5 * 1024 * 1024;
 pub const LOG_KEPT: u32 = 2;
 
+/// The targets a bare level in `SIDEVOICE_LOG` applies to; every other target stays at `warn` unless named. Native
+/// tracing from dependencies (tokio, hyper, rustls) must not reach a file because someone asked for `debug`.
+const OUR_TARGETS: &[&str] = &["sidevoice_connector", "sidevoice_platform", "panic"];
+
 struct Sink {
     file: PathBuf,
     service: bool,
+    /// The home as every text spelling of it a line may hold, longest first, each shown as `~`.
+    home: Vec<String>,
 }
 
-static SINK: OnceLock<Mutex<Sink>> = OnceLock::new();
+static SINK: OnceLock<Sink> = OnceLock::new();
+/// The home as the environment names it, from [`install`]: what hides it before [`init`] has the resolved one.
+static EARLY_HOME: OnceLock<Vec<String>> = OnceLock::new();
+/// Serialises rotate + append, so concurrent lines never race the copy-and-truncate.
+static WRITE: Mutex<()> = Mutex::new(());
 
-/// From now on this process logs to `file` (and to stderr unless it runs as a service).
-pub fn init(file: PathBuf, service: bool) {
-    let _ = SINK.set(Mutex::new(Sink { file, service }));
+thread_local! {
+    /// Set while the panic hook logs: a panic raised while this thread holds [`WRITE`] must not wait for it.
+    static IN_PANIC_HOOK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// From now on this process logs to `file` (and to stderr, on a terminal, unless it runs as a service). `home` is the
+/// one this process resolved: it is shown as `~` in every line.
+pub fn init(file: PathBuf, service: bool, home: &Path) {
+    let _ = SINK.set(Sink {
+        file,
+        service,
+        home: spellings(home),
+    });
+}
+
+/// Every text spelling of `home` a line may hold, longest first: as is, with forward slashes (Windows), escaped as
+/// `Debug` prints it, and as a harness's project directories name it (every separator and dot as `-`).
+fn spellings(home: &Path) -> Vec<String> {
+    let plain = home.to_string_lossy().into_owned();
+    let mut spellings = vec![
+        plain.replace('\\', "/"),
+        plain.replace('\\', "\\\\"),
+        plain.clone(),
+        plain.replace(|c: char| !c.is_ascii_alphanumeric(), "-"),
+    ];
+    spellings.retain(|text| text.len() > 1);
+    spellings.sort_by_key(|text| std::cmp::Reverse(text.len()));
+    spellings.dedup();
+    spellings
+}
+
+/// `SIDEVOICE_LOG`'s filter: `spec` (else `default`) with a bare level confined to [`OUR_TARGETS`]. The flag says
+/// `spec` was not valid and `default` is used instead.
+fn filter(spec: Option<&str>, default: &str) -> (EnvFilter, bool) {
+    let parsed = spec.map(|spec| EnvFilter::try_new(scoped(spec, default)));
+    match parsed {
+        Some(Ok(filter)) => (filter, false),
+        other => (
+            EnvFilter::new(scoped(default, default)),
+            matches!(other, Some(Err(_))),
+        ),
+    }
+}
+
+/// A target-less `info`, `debug` or `trace` becomes `warn` plus that level for our targets; directives that name a
+/// target are kept as written. A spec with no bare level at all (only target directives) keeps `default`'s rule for
+/// everything else, so the panic hook and every warning stay on.
+fn scoped(spec: &str, default: &str) -> String {
+    let is_level = |directive: &str| {
+        matches!(
+            directive.trim().to_ascii_lowercase().as_str(),
+            "trace" | "debug" | "info" | "warn" | "error" | "off"
+        )
+    };
+    let base = if spec.split(',').any(is_level) || spec == default {
+        String::new()
+    } else {
+        format!("{},", scoped(default, default))
+    };
+    base + &spec
+        .split(',')
+        .map(str::trim)
+        .map(|directive| match directive.to_ascii_lowercase().as_str() {
+            level @ ("info" | "debug" | "trace") => std::iter::once("warn".to_owned())
+                .chain(OUR_TARGETS.iter().map(|target| format!("{target}={level}")))
+                .collect::<Vec<_>>()
+                .join(","),
+            _ => directive.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Installs the process's subscriber and panic hook; `default` is the level when `SIDEVOICE_LOG` is not set (`info` for
+/// the daemon, `warn` for anything whose stderr a person or a protocol reads). Call once, first thing.
+pub fn install(default: &str) {
+    let _ = EARLY_HOME.set(
+        dirs::home_dir()
+            .map(|home| spellings(&home))
+            .unwrap_or_default(),
+    );
+    let (filter, invalid) = filter(std::env::var("SIDEVOICE_LOG").ok().as_deref(), default);
+    let layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_target(true)
+        .log_internal_errors(false)
+        .with_writer(LogWriter);
+    if tracing_subscriber::registry()
+        .with(filter)
+        .with(layer)
+        .try_init()
+        .is_err()
+    {
+        return;
+    }
+    // The default hook is never chained: it would write the panic a second time, raw, to a stderr that is this file when
+    // a service runs and a terminal or capture otherwise. The line below is the one record, and it is redacted.
+    std::panic::set_hook(Box::new(|info| {
+        IN_PANIC_HOOK.with(|flag| flag.set(true));
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-text panic");
+        tracing::error!(target: "panic", location = %info.location().map_or_else(String::new, ToString::to_string),
+            thread = std::thread::current().name().unwrap_or("unnamed"), panic = message, "panic");
+        IN_PANIC_HOOK.with(|flag| flag.set(false));
+    }));
+    if invalid {
+        tracing::warn!(
+            code = "invalid_filter",
+            "SIDEVOICE_LOG is not a valid filter: using the default"
+        );
+    }
+}
+
+/// The subscriber's writer: each event is one buffer, redacted and written whole when it is dropped.
+#[derive(Clone, Copy)]
+pub struct LogWriter;
+
+pub struct Line(Vec<u8>);
+
+impl Write for Line {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for Line {
+    fn drop(&mut self) {
+        let mut text = redact(&String::from_utf8_lossy(&self.0));
+        let sink = SINK.get();
+        let home = sink.map(|sink| &sink.home).or_else(|| EARLY_HOME.get());
+        for spelling in home.into_iter().flatten() {
+            text = text.replace(spelling.as_str(), "~");
+        }
+        let Some(sink) = sink else {
+            let _ = std::io::stderr().write_all(text.as_bytes());
+            return;
+        };
+        // A panic always reaches stderr (a service's stderr is this file, so not then); other lines only on a terminal.
+        if !sink.service && (IN_PANIC_HOOK.with(Cell::get) || std::io::stderr().is_terminal()) {
+            let _ = std::io::stderr().write_all(text.as_bytes());
+        }
+        // Not blocked on the lock inside the panic hook: the panicking thread may be the one holding it.
+        let _held = if IN_PANIC_HOOK.with(Cell::get) {
+            None
+        } else {
+            Some(
+                WRITE
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+        };
+        append_line(&sink.file, &text);
+    }
+}
+
+impl<'a> MakeWriter<'a> for LogWriter {
+    type Writer = Line;
+
+    fn make_writer(&'a self) -> Line {
+        Line(Vec::new())
+    }
 }
 
 /// Rotates `file` if it has grown past `max`: `.1` → `.2`, a copy of the file → `.1`, the file truncated in place.
@@ -102,9 +287,7 @@ fn redact_after(line: &str, prefix: &str) -> String {
         });
         match candidate {
             Some(id) => {
-                let digest = hex::encode(Sha256::digest(format!("{prefix}{id}").as_bytes()));
-                out.push_str("h:");
-                out.push_str(&digest[..10]);
+                out.push_str(&IdHash(&format!("{prefix}{id}")).to_string());
                 rest = &tail[ID..];
             }
             None => rest = tail,
@@ -112,20 +295,6 @@ fn redact_after(line: &str, prefix: &str) -> String {
     }
     out.push_str(rest);
     out
-}
-
-/// One event: timestamped and redacted, to the log file and/or stderr as [`init`] decided.
-pub fn log(line: &str) {
-    let stamped = format!("{} [sidevoice] {}", timestamp(), redact(line));
-    match SINK.get().and_then(|sink| sink.lock().ok()) {
-        Some(sink) => {
-            if !sink.service {
-                eprintln!("{stamped}");
-            }
-            append_line(&sink.file, &stamped);
-        }
-        None => eprintln!("{stamped}"),
-    }
 }
 
 /// Now, in UTC, as RFC 3339 with milliseconds (`2026-10-06T17:35:00.123Z`).
@@ -210,6 +379,10 @@ mod tests {
     #[test]
     fn private_conversation_ids_are_logged_by_hash() {
         let id = "chat-x-0123abcd-0123-4567-89ab-0123456789ab";
+        assert_eq!(
+            redact_after(id, "chat-x-"),
+            format!("chat-x-{}", IdHash(id))
+        );
         let line = redact_after(&format!("joined {id} and chat-x-short"), "chat-x-");
         assert!(!line.contains("0123abcd"), "{line}");
         assert!(line.starts_with("joined chat-x-h:"), "{line}");
@@ -218,6 +391,39 @@ mod tests {
             line,
             redact_after(&format!("joined {id} and chat-x-short"), "chat-x-")
         );
+    }
+
+    #[test]
+    fn a_bare_level_applies_to_our_targets_only() {
+        assert_eq!(
+            scoped("info", "info"),
+            "warn,sidevoice_connector=info,sidevoice_platform=info,panic=info"
+        );
+        assert_eq!(
+            scoped("debug,reqwest=debug,sidevoice_connector::adapters=trace", "info"),
+            "warn,sidevoice_connector=debug,sidevoice_platform=debug,panic=debug,reqwest=debug,sidevoice_connector::adapters=trace"
+        );
+        assert_eq!(scoped("warn", "info"), "warn");
+        assert_eq!(
+            scoped("reqwest=debug", "info"),
+            "warn,sidevoice_connector=info,sidevoice_platform=info,panic=info,reqwest=debug"
+        );
+        let (_, invalid) = filter(Some("info,=[="), "info");
+        assert!(invalid);
+        let (_, invalid) = filter(Some("debug"), "info");
+        assert!(!invalid);
+    }
+
+    #[test]
+    fn the_home_is_shown_as_a_tilde_in_every_spelling() {
+        let mut text = "/Users/ana/x and -Users-ana-proj and C:\\\\Users\\\\ana".to_owned();
+        for spelling in spellings(Path::new("/Users/ana"))
+            .iter()
+            .chain(spellings(Path::new("C:\\Users\\ana")).iter())
+        {
+            text = text.replace(spelling.as_str(), "~");
+        }
+        assert_eq!(text, "~/x and ~-proj and ~");
     }
 
     #[test]

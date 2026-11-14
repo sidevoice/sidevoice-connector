@@ -8,6 +8,7 @@
 //! The jobs carry the real names (`ai.sidevoice.core`, `sidevoice-core.service`, …), so outside CI it runs only
 //! when asked (`SIDEVOICE_TEST_SERVICE=1`) and never over jobs this user already has. On a Linux runner with no
 //! session, lingering is enabled for the runner's user so its user manager runs (`support::service`).
+#![allow(clippy::disallowed_macros)] // test output is not logging
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
 mod support;

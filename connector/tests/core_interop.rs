@@ -3,6 +3,7 @@
 //! MCP server; what the person says in a call reaches the conversation; the conversation's reply reaches the core;
 //! and when the core restarts the connector links to the new one by itself.
 
+#![allow(clippy::disallowed_macros)] // test output is not logging
 mod support;
 
 use serde_json::json;

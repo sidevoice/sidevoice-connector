@@ -90,8 +90,10 @@ Every place comes from the environment, so a disposable profile is just a set of
 Records are written whole (a private temporary file renamed into place). Locks are kernel `flock(2)` locks on
 permanent lock files, released when their holder dies, with the holder's pid and start time written inside for
 people; a pid is signalled only after checking it is still the process recorded (owner, start time, command line).
-`connector.log` is rotated at 5 MB by copy-and-truncate, keeping two previous files. A daemon run by hand logs to
-stderr and the file; run by a service manager, to the file only.
+`connector.log` is rotated at 5 MB by copy-and-truncate, keeping two previous files. Every line is a `tracing` event (the shared logging guideline); `SIDEVOICE_LOG` sets the level (`info` by default for the
+daemon, `warn` for the CLI and `mcp`; a bare level applies to the connector's own targets only) and is never kept in a
+service definition. A daemon run by hand logs to the file and, on a terminal, to stderr; run by a service manager, to
+the file only.
 
 When it links to the core, the daemon says what this machine is: its host name, its platform (`macOS arm64`,
 `Linux x64`), the connector's version and the agents whose homes exist here. The core keeps the latest and the app
@@ -261,12 +263,13 @@ codes and contain no query values, chat text, or local paths.
 
 For a Cursor editor chat, a receipt of `delivered` means Cursor's Desktop Bridge answered `submitted` or
 `queued`; it does not prove the editor displayed or read the message. A later transcript observation supplies the
-`read` receipt. When investigating a missing message, `connector.log` records `cursor_bridge` lines with fixed
-`stage` and `result` codes: `lookup` distinguishes no bridge instance, missing database, SQLite failure, no marker,
+`read` receipt. When investigating a missing message, `connector.log` records `cursor bridge` events with fixed
+`stage` and `result` fields: `lookup` distinguishes no bridge instance, missing database, SQLite failure, no marker,
 ambiguous chats, and a found chat; `send` records the bridge instance ordinal, HTTP status, and whether it queued,
 submitted, refused, or left the reply uncertain. Instance ordinals follow descriptor creation order (newest first)
-for that scan. `id_hash` is the first 12 hex characters of SHA-256 of the marker or chat ID; the log contains no
-bridge token, message text, socket path, database path, or home path. An unconfirmed send also logs
+for that scan. `conversation` and `marker` are `h:` and the first 12 hex characters of SHA-256 of the chat or marker ID (the same hash every
+connector line uses); `instance` is the ordinal and `http_status` the bridge's answer. The log contains no bridge
+token, message text, the bridge's own error words, socket path, database path, or home path. An unconfirmed send also logs
 `reply_body`, capped at 512 bytes: arbitrary string values and unknown keys are redacted, while known
 status codes, booleans and the JSON shape remain visible. Cursor owns this Desktop Bridge; the connector
 checks descriptor `protocolVersion: 1`, not the Cursor application or extension build version. A request whose

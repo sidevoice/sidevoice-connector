@@ -165,9 +165,7 @@ impl IdentityFailures {
         if self.0 < IDENTITY_ATTEMPTS {
             return false;
         }
-        crate::logfile::log(&format!(
-            "Transcript unreadable: cannot tell which file is open after {IDENTITY_ATTEMPTS} attempts ({error}); not following it"
-        ));
+        tracing::warn!(attempts = IDENTITY_ATTEMPTS, kind = ?error.kind(), os_error = error.raw_os_error(), "transcript unreadable");
         true
     }
 }

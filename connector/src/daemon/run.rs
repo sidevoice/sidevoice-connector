@@ -3,6 +3,7 @@
 use super::Daemon;
 use crate::adapters::Registry;
 use crate::link::Link;
+use crate::log_safe::{join_result, HomePath};
 use crate::platform::ipc::{Channel, Channels};
 use crate::platform::lifecycle::{Lifecycle, Lifecycles};
 use crate::profile::Profile;
@@ -25,7 +26,8 @@ pub(super) fn prune_binding_order(order: &mut HashMap<String, oneshot::Receiver<
 pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     // Ours and private, made private again if it was only left open; refused otherwise (`crate::private_dir`).
     crate::private_dir::ensure(&profile.data)?;
-    crate::logfile::init(profile.data.join("connector.log"), managed);
+    crate::logfile::init(profile.data.join("connector.log"), managed, &profile.home);
+    tracing::info!(version = %profile.connector_version(), managed, data = %HomePath { path: &profile.data, home: &profile.home }, "connector started");
     profile.validate_existing_private()?;
     if managed {
         profile.validate_service_environment()?;
@@ -35,10 +37,8 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
         }
     }
     if profile.service_stopped()? {
-        crate::logfile::log(&crate::messages::message(
-            "service.node-stopped",
-            &Value::Null,
-        ));
+        let hint = crate::messages::message("service.node-stopped", &Value::Null);
+        tracing::info!(reason = "service_stopped", %hint, "connector stopped");
         return Ok(());
     }
     crate::private_dir::check_existing(&profile.data)
@@ -98,12 +98,13 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     );
     idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut link_exited = false;
+    let mut stop_reason = "stop_requested";
     let stop_requested = Lifecycles::stop_requests()?;
     tokio::pin!(stop_requested);
     loop {
         tokio::select! {
             Some(result) = replay_tasks.join_next(), if !replay_tasks.is_empty() => {
-                if let Err(error) = result { crate::logfile::log(&format!("outbox replay: {error}")); }
+                if let Err(error) = result { tracing::warn!(result = join_result(&error), "outbox replay task ended"); }
                 if replay_again {
                     replay_again = false;
                     let daemon = daemon.clone();
@@ -111,7 +112,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
                 }
             }
             Some(result) = client_tasks.join_next(), if !client_tasks.is_empty() => {
-                if let Err(error) = result { crate::logfile::log(&format!("IPC task: {error}")); }
+                if let Err(error) = result { tracing::warn!(result = join_result(&error), "IPC task ended"); }
             }
             Some(()) = replay_rx.recv() => {
                 if replay_tasks.is_empty() {
@@ -122,7 +123,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
                 }
             }
             Some(result) = core_tasks.join_next(), if !core_tasks.is_empty() => {
-                if let Err(error) = result { crate::logfile::log(&format!("Core handler: {error}")); }
+                if let Err(error) = result { tracing::warn!(result = join_result(&error), "core handler task ended"); }
                 prune_binding_order(&mut binding_order);
             }
             accepted = listener.accept() => {
@@ -133,7 +134,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
                 }
             }
             item = incoming_rx.recv() => {
-                let Some(item) = item else { link_exited=true; break; };
+                let Some(item) = item else { link_exited=true; stop_reason = "link_ended"; break; };
                 if item.method == "connector.lost" {
                     if item.session == core_session {
                         core_tasks.abort_all();
@@ -159,7 +160,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
                     if let Some(tx) = item.reply {
                         let _ = tx.send(json!({"status":"failed","detail":"connector handler capacity reached"}));
                     } else {
-                        crate::logfile::log("Core notification capacity reached");
+                        tracing::warn!(code = "handler_capacity", "core notification dropped");
                     }
                     continue;
                 }
@@ -188,7 +189,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
                 });
             }
             () = &mut stop_requested => { break; }
-            _ = shutdown_rx.changed() => { break; }
+            _ = shutdown_rx.changed() => { stop_reason = "shutdown"; break; }
             _ = idle_check.tick(), if !managed => {
                 let activity = daemon.activity_generation.load(Ordering::Relaxed);
                 if activity != last_activity {
@@ -196,13 +197,14 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
                     last_activity = activity;
                 }
                 if daemon.is_idle().await {
-                    if idle_since.elapsed() >= Duration::from_secs(15) { break; }
+                    if idle_since.elapsed() >= Duration::from_secs(15) { stop_reason = "idle"; break; }
                 } else {
                     idle_since = Instant::now();
                 }
             }
         }
     }
+    tracing::info!(reason = stop_reason, "connector stopped");
     // All of the cleanup has one deadline, the same on every OS: a console closing on Windows leaves the process about
     // 5 s before it is ended, launchd and systemd wait longer (20 s, 90 s by default). Cancellation comes first: the
     // agents' operations are told to stop (their child trees killed) while the clients' requests drain; what is

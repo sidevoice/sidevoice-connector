@@ -56,6 +56,8 @@ const NOT_SETTINGS: &[&str] = &[
     "SIDEVOICE_INSTALL_FROM_SOURCE",
     "SIDEVOICE_INSTALLED_BY",
     "SIDEVOICE_DATA_DIR",
+    // A level a service was installed under would stay debug for good: a managed process runs at the default.
+    "SIDEVOICE_LOG",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -368,6 +370,11 @@ impl ConnectorEndpoints {
 mod tests {
     use super::*;
     use crate::platform::fs::TestFiles;
+
+    #[test]
+    fn the_log_level_is_never_a_service_setting() {
+        assert!(NOT_SETTINGS.contains(&"SIDEVOICE_LOG"));
+    }
 
     fn layout(vars: &[(&str, &str)]) -> anyhow::Result<Layout> {
         let map: BTreeMap<String, OsString> = vars

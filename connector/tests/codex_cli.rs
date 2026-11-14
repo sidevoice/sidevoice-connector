@@ -2,6 +2,7 @@
 //! registers itself and reads its registration back through Codex's own commands; an entry somebody else wrote and a
 //! configuration Codex cannot read are refused and left exactly as they were.
 
+#![allow(clippy::disallowed_macros)] // test output is not logging
 mod support;
 
 use std::fs;

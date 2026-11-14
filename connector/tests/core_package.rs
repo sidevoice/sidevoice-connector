@@ -6,6 +6,7 @@
 //! The core archive is the one `cargo xtask core` checked and kept in `target/sidevoice-core`. Without it the test
 //! is skipped locally and fails in CI, like every test that needs the real core.
 
+#![allow(clippy::disallowed_macros)] // test output is not logging
 mod support;
 
 use sidevoice_connector::platform::fs::{Files, Fs as _};
