@@ -1,0 +1,18 @@
+# Declared in sidevoice/infrastructure (projects/workflows.tf): change it there, not here.
+name: Project status
+
+on:
+  issues:
+    types: [assigned]
+  pull_request:
+    types: [opened, reopened, ready_for_review, converted_to_draft]
+  pull_request_review:
+    types: [submitted]
+
+permissions: {}
+
+jobs:
+  status:
+    uses: sidevoice/.github/.github/workflows/project-status.yml@main
+    secrets:
+      PROJECTS_APP_PRIVATE_KEY: ${{ secrets.PROJECTS_APP_PRIVATE_KEY }}
