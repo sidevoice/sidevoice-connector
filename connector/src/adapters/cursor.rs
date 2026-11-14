@@ -1318,6 +1318,8 @@ mod bridge_tests {
             ).await.unwrap();
             server.await.unwrap();
             assert!(result["detail"].as_str().unwrap().contains("[withheld]"));
+            // Positive control: the bridge event was logged, so the check below is not on an empty log.
+            assert!(log.text().contains("cursor bridge"));
             assert!(!result.to_string().contains(token));
             assert!(!log.text().contains(token));
         }

@@ -371,6 +371,11 @@ mod tests {
     use super::*;
     use crate::platform::fs::TestFiles;
 
+    #[test]
+    fn the_log_level_is_never_a_service_setting() {
+        assert!(NOT_SETTINGS.contains(&"SIDEVOICE_LOG"));
+    }
+
     fn layout(vars: &[(&str, &str)]) -> anyhow::Result<Layout> {
         let map: BTreeMap<String, OsString> = vars
             .iter()

@@ -45,14 +45,13 @@ pub struct Launch {
     pub cwd: Option<PathBuf>,
 }
 
-/// The environment can hold a credential URL: a `Debug` of a launch shows its names only.
+/// The environment and the arguments can hold a credential URL: a `Debug` of a launch shows only how many of each.
 impl std::fmt::Debug for Launch {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         out.debug_struct("Launch")
             .field("command", &self.command)
-            .field("args", &self.args)
-            .field("env", &self.env.keys().collect::<Vec<_>>())
-            .field("cwd", &self.cwd)
+            .field("args", &format_args!("<{} args>", self.args.len()))
+            .field("env", &format_args!("<{} variables>", self.env.len()))
             .finish()
     }
 }
@@ -521,7 +520,9 @@ mod tests {
         };
         let shown = format!("{launch:?}");
         assert!(
-            shown.contains("SIDEVOICE_DELIVERY_URL") && !shown.contains("canary-pass"),
+            shown.contains("<1 variables>")
+                && !shown.contains("canary-pass")
+                && !shown.contains("SIDEVOICE_DELIVERY_URL"),
             "{shown}"
         );
     }

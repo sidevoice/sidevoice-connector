@@ -37,7 +37,8 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
         }
     }
     if profile.service_stopped()? {
-        tracing::info!(reason = "service_stopped", "connector stopped");
+        let hint = crate::messages::message("service.node-stopped", &Value::Null);
+        tracing::info!(reason = "service_stopped", %hint, "connector stopped");
         return Ok(());
     }
     crate::private_dir::check_existing(&profile.data)

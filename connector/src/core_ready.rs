@@ -86,7 +86,7 @@ fn require_v3(ready: &Ready) -> Result<()> {
         .as_ref()
         .is_some_and(|versions| versions.contains(&3))
     {
-        bail!("Core v3 upgrade required");
+        bail!(crate::link_error::LinkError::UpgradeRequired);
     }
     Ok(())
 }

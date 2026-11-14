@@ -75,7 +75,9 @@ pub fn error_code(error: &anyhow::Error) -> &'static str {
     error
         .chain()
         .find_map(|cause| {
-            if cause.is::<tokio::time::error::Elapsed>() {
+            if let Some(link) = cause.downcast_ref::<crate::link_error::LinkError>() {
+                Some(link.code())
+            } else if cause.is::<tokio::time::error::Elapsed>() {
                 Some("timeout")
             } else if cause.is::<std::io::Error>() {
                 Some("io")

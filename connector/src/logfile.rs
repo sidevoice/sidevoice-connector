@@ -12,8 +12,8 @@
 //! server, the CLI) lines go to stderr only; those processes default to `warn`, so a new `info` event never mixes into
 //! what a person reads. `SIDEVOICE_LOG` is the only variable that sets the level.
 
+use crate::log_safe::IdHash;
 use crate::platform::fs::{Create, Files, Fs};
-use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::fs::{self, OpenOptions};
 use std::io::{IsTerminal, Write};
@@ -40,6 +40,8 @@ struct Sink {
 }
 
 static SINK: OnceLock<Sink> = OnceLock::new();
+/// The home as the environment names it, from [`install`]: what hides it before [`init`] has the resolved one.
+static EARLY_HOME: OnceLock<Vec<String>> = OnceLock::new();
 /// Serialises rotate + append, so concurrent lines never race the copy-and-truncate.
 static WRITE: Mutex<()> = Mutex::new(());
 
@@ -77,20 +79,33 @@ fn spellings(home: &Path) -> Vec<String> {
 /// `SIDEVOICE_LOG`'s filter: `spec` (else `default`) with a bare level confined to [`OUR_TARGETS`]. The flag says
 /// `spec` was not valid and `default` is used instead.
 fn filter(spec: Option<&str>, default: &str) -> (EnvFilter, bool) {
-    let parsed = spec.map(|spec| EnvFilter::try_new(scoped(spec)));
+    let parsed = spec.map(|spec| EnvFilter::try_new(scoped(spec, default)));
     match parsed {
         Some(Ok(filter)) => (filter, false),
         other => (
-            EnvFilter::new(scoped(default)),
+            EnvFilter::new(scoped(default, default)),
             matches!(other, Some(Err(_))),
         ),
     }
 }
 
 /// A target-less `info`, `debug` or `trace` becomes `warn` plus that level for our targets; directives that name a
-/// target are kept as written.
-fn scoped(spec: &str) -> String {
-    spec.split(',')
+/// target are kept as written. A spec with no bare level at all (only target directives) keeps `default`'s rule for
+/// everything else, so the panic hook and every warning stay on.
+fn scoped(spec: &str, default: &str) -> String {
+    let is_level = |directive: &str| {
+        matches!(
+            directive.trim().to_ascii_lowercase().as_str(),
+            "trace" | "debug" | "info" | "warn" | "error" | "off"
+        )
+    };
+    let base = if spec.split(',').any(is_level) || spec == default {
+        String::new()
+    } else {
+        format!("{},", scoped(default, default))
+    };
+    base + &spec
+        .split(',')
         .map(str::trim)
         .map(|directive| match directive.to_ascii_lowercase().as_str() {
             level @ ("info" | "debug" | "trace") => std::iter::once("warn".to_owned())
@@ -106,6 +121,11 @@ fn scoped(spec: &str) -> String {
 /// Installs the process's subscriber and panic hook; `default` is the level when `SIDEVOICE_LOG` is not set (`info` for
 /// the daemon, `warn` for anything whose stderr a person or a protocol reads). Call once, first thing.
 pub fn install(default: &str) {
+    let _ = EARLY_HOME.set(
+        dirs::home_dir()
+            .map(|home| spellings(&home))
+            .unwrap_or_default(),
+    );
     let (filter, invalid) = filter(std::env::var("SIDEVOICE_LOG").ok().as_deref(), default);
     let layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
@@ -132,7 +152,10 @@ pub fn install(default: &str) {
         tracing::error!(target: "panic", location = %info.location().map_or_else(String::new, ToString::to_string),
             thread = std::thread::current().name().unwrap_or("unnamed"), panic = message, "panic");
         IN_PANIC_HOOK.with(|flag| flag.set(false));
-        previous(info);
+        // A service's stderr is this same file: the default hook would write the panic a second time, unredacted.
+        if !SINK.get().is_some_and(|sink| sink.service) {
+            previous(info);
+        }
     }));
     if invalid {
         tracing::warn!(
@@ -162,13 +185,15 @@ impl Write for Line {
 impl Drop for Line {
     fn drop(&mut self) {
         let mut text = redact(&String::from_utf8_lossy(&self.0));
-        let Some(sink) = SINK.get() else {
+        let sink = SINK.get();
+        let home = sink.map(|sink| &sink.home).or_else(|| EARLY_HOME.get());
+        for spelling in home.into_iter().flatten() {
+            text = text.replace(spelling.as_str(), "~");
+        }
+        let Some(sink) = sink else {
             let _ = std::io::stderr().write_all(text.as_bytes());
             return;
         };
-        for spelling in &sink.home {
-            text = text.replace(spelling.as_str(), "~");
-        }
         if !sink.service && std::io::stderr().is_terminal() {
             let _ = std::io::stderr().write_all(text.as_bytes());
         }
@@ -264,9 +289,7 @@ fn redact_after(line: &str, prefix: &str) -> String {
         });
         match candidate {
             Some(id) => {
-                let digest = hex::encode(Sha256::digest(format!("{prefix}{id}").as_bytes()));
-                out.push_str("h:");
-                out.push_str(&digest[..10]);
+                out.push_str(&IdHash(&format!("{prefix}{id}")).to_string());
                 rest = &tail[ID..];
             }
             None => rest = tail,
@@ -358,6 +381,10 @@ mod tests {
     #[test]
     fn private_conversation_ids_are_logged_by_hash() {
         let id = "chat-x-0123abcd-0123-4567-89ab-0123456789ab";
+        assert_eq!(
+            redact_after(id, "chat-x-"),
+            format!("chat-x-{}", IdHash(id))
+        );
         let line = redact_after(&format!("joined {id} and chat-x-short"), "chat-x-");
         assert!(!line.contains("0123abcd"), "{line}");
         assert!(line.starts_with("joined chat-x-h:"), "{line}");
@@ -371,14 +398,18 @@ mod tests {
     #[test]
     fn a_bare_level_applies_to_our_targets_only() {
         assert_eq!(
-            scoped("info"),
+            scoped("info", "info"),
             "warn,sidevoice_connector=info,sidevoice_platform=info,panic=info"
         );
         assert_eq!(
-            scoped("debug,reqwest=debug,sidevoice_connector::adapters=trace"),
+            scoped("debug,reqwest=debug,sidevoice_connector::adapters=trace", "info"),
             "warn,sidevoice_connector=debug,sidevoice_platform=debug,panic=debug,reqwest=debug,sidevoice_connector::adapters=trace"
         );
-        assert_eq!(scoped("warn"), "warn");
+        assert_eq!(scoped("warn", "info"), "warn");
+        assert_eq!(
+            scoped("reqwest=debug", "info"),
+            "warn,sidevoice_connector=info,sidevoice_platform=info,panic=info,reqwest=debug"
+        );
         let (_, invalid) = filter(Some("info,=[="), "info");
         assert!(invalid);
         let (_, invalid) = filter(Some("debug"), "info");
