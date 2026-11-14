@@ -154,7 +154,7 @@ fn one_connector_serves_a_data_directory_and_its_log_is_private() {
     let text = until("the connector logged the missing core", 30, || {
         fs::read_to_string(&log)
             .ok()
-            .filter(|text| text.contains("core link lost"))
+            .filter(|text| text.contains("the core link ended"))
     });
     assert!(!text.contains("rust proof"), "{text}");
     assert!(is_private(&log));

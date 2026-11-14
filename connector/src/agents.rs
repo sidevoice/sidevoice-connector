@@ -1343,12 +1343,12 @@ fn resolved_program(found: String, resolved: std::io::Result<Option<PathBuf>>) -
             }
             tracing::warn!(
                 path_kind = "agent_program",
-                "agent native program is not runnable; keeping its launcher"
+                "the agent's native program is not runnable; its launcher is kept"
             );
         }
         Ok(None) => {}
         Err(error) => {
-            tracing::warn!(path_kind = "agent_program", kind = ?error.kind(), os_error = error.raw_os_error(), "cannot resolve the agent launcher; keeping it");
+            tracing::warn!(path_kind = "agent_program", error.type = crate::error::ConnectorError::Io.code(), kind = ?error.kind(), os_error = error.raw_os_error(), "the agent launcher could not be resolved; it is kept as found");
         }
     }
     first_runnable(vec![PathBuf::from(found)])

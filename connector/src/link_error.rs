@@ -26,21 +26,39 @@ pub enum LinkError {
 }
 
 impl LinkError {
+    /// Every variant, for the tests that hold the codes unique.
+    #[cfg(test)]
+    pub const ALL: &'static [LinkError] = &[
+        Self::Unreachable,
+        Self::AuthRefused,
+        Self::UpgradeRequired,
+        Self::HelloClosed,
+        Self::Closed,
+        Self::Disconnected,
+        Self::WriterEnded,
+        Self::PongTimeout,
+        Self::FrameTooLarge,
+        Self::InvalidJsonRpc,
+        Self::ResponseIdInvalid,
+        Self::HandlerLimit,
+        Self::QueueUnavailable,
+    ];
+
     pub fn code(self) -> &'static str {
         match self {
-            Self::Unreachable => "unreachable",
-            Self::AuthRefused => "authentication_refused",
-            Self::UpgradeRequired => "upgrade_required",
-            Self::HelloClosed => "hello_closed",
-            Self::Closed => "closed",
-            Self::Disconnected => "disconnected",
-            Self::WriterEnded => "writer_ended",
-            Self::PongTimeout => "pong_timeout",
-            Self::FrameTooLarge => "frame_too_large",
-            Self::InvalidJsonRpc => "invalid_json_rpc",
-            Self::ResponseIdInvalid => "response_id_invalid",
-            Self::HandlerLimit => "handler_limit",
-            Self::QueueUnavailable => "queue_unavailable",
+            Self::Unreachable => "connector.link-unreachable",
+            Self::AuthRefused => "connector.link-auth-refused",
+            Self::UpgradeRequired => "connector.link-upgrade-required",
+            Self::HelloClosed => "connector.link-hello-closed",
+            Self::Closed => "connector.link-closed",
+            Self::Disconnected => "connector.link-disconnected",
+            Self::WriterEnded => "connector.link-writer-ended",
+            Self::PongTimeout => "connector.link-pong-timeout",
+            Self::FrameTooLarge => "connector.link-frame-too-large",
+            Self::InvalidJsonRpc => "connector.link-invalid-json-rpc",
+            Self::ResponseIdInvalid => "connector.link-response-id-invalid",
+            Self::HandlerLimit => "connector.link-handler-limit",
+            Self::QueueUnavailable => "connector.link-queue-unavailable",
         }
     }
 
@@ -77,16 +95,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn display_is_never_the_code_but_the_code_is_a_fixed_word() {
-        for error in [
-            LinkError::AuthRefused,
-            LinkError::PongTimeout,
-            LinkError::Unreachable,
-        ] {
-            assert!(error
-                .code()
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b == b'_'));
+    fn display_is_never_the_code_and_a_final_error_is_known() {
+        for error in LinkError::ALL {
+            assert!(!error.to_string().starts_with("connector."));
         }
         assert!(LinkError::AuthRefused.is_final() && !LinkError::Closed.is_final());
     }

@@ -124,7 +124,7 @@ async fn deliver_with_cache(
     .await
     {
         Ok(_) => {
-            tracing::info!(path = "steered", conversation = %IdHash(thread), "codex delivery");
+            tracing::info!(route = "steered", conversation = %IdHash(thread), "the message was steered into the running Codex turn");
             return Ok(());
         }
         Err(error) => {
@@ -138,11 +138,11 @@ async fn deliver_with_cache(
         .arg(envelope);
     match queue_call(queue).await {
         Ok(()) => {
-            tracing::info!(path = "queued", conversation = %IdHash(thread), "codex delivery");
+            tracing::info!(route = "queued", conversation = %IdHash(thread), "the message was queued for the next Codex turn");
             Ok(())
         }
         Err(error) => {
-            tracing::warn!(path = "queue_failed", conversation = %IdHash(thread), "codex delivery");
+            tracing::warn!(route = "queue_failed", conversation = %IdHash(thread), "the message could not be queued for Codex; the delivery fails");
             cache.invalidate(&key);
             Err(error)
         }
@@ -164,12 +164,12 @@ async fn queue_call(command: tokio::process::Command) -> Result<()> {
 fn log_steer_fallback(thread: &str, error: &anyhow::Error) {
     let failure = error.downcast_ref::<steer::Failure>();
     tracing::info!(
-        path = "queue_fallback",
+        route = "queue_fallback",
         conversation = %IdHash(thread),
         reason = failure.map_or("steer-unavailable", steer::Failure::code),
-        method = failure.and_then(steer::Failure::method),
-        code = failure.and_then(steer::Failure::rpc_code),
-        "codex delivery"
+        rpc.method = failure.and_then(steer::Failure::method),
+        rpc.response.status_code = failure.and_then(steer::Failure::rpc_code).map(|code| code.to_string()),
+        "steering the Codex turn was not possible; the message is queued for the next turn instead"
     );
 }
 

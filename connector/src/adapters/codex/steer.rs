@@ -354,7 +354,9 @@ mod tests {
             .filter(|line| line.contains(&own))
             .collect::<String>();
         assert!(
-            line.contains("reason=\"rpc-error\" method=\"turn/steer\" code=-32600"),
+            line.contains(
+                "reason=\"rpc-error\" rpc.method=\"turn/steer\" rpc.response.status_code=\"-32600\""
+            ),
             "{line}"
         );
         assert!(!line.contains("private voice input echoed"), "{line}");

@@ -1,8 +1,9 @@
 use crate::adapters::{Agent, Conversation, Inbound, Limit, Registry, Sent, State, Status};
 use crate::agents::HostAgents;
+use crate::error::ConnectorError;
 use crate::frame;
 use crate::link::{Incoming, Link};
-use crate::log_safe::{error_code, ClientId};
+use crate::log_safe::ClientId;
 use crate::platform::fs::{Files, Fs};
 use crate::platform::ipc::Stream;
 use crate::profile::Profile;
@@ -250,7 +251,7 @@ impl Daemon {
             stage = "register",
             result = "attempt",
             inject = capabilities["deliver"] == "supported",
-            "delivery"
+            "registering the conversation with the core"
         );
         let mut frame = json!({"client_ref":binding.client_ref,"harness":binding.harness,"thread":binding.thread,"title":binding.title,
             "inbound":inbound,"capabilities":capabilities,"engine":engine,"focus":false});
@@ -267,15 +268,19 @@ impl Daemon {
                 tracing::warn!(
                     stage = "register",
                     result = "link_failed",
-                    code = error_code(&error),
-                    "delivery"
+                    error.type = ConnectorError::of(&error, ConnectorError::CoreUnavailable),
+                    "registering the conversation with the core failed; it is not reachable until it is registered again"
                 );
                 return Err(error);
             }
         };
         // An answer may carry fields this connector does not know, `"error": null` among them: only an error is one.
         if let Some(error) = reply.get("error").filter(|error| !error.is_null()) {
-            tracing::warn!(stage = "register", result = "core_refused", "delivery");
+            tracing::warn!(
+                stage = "register",
+                result = "core_refused",
+                "the core refused the conversation registration; the conversation is not reachable"
+            );
             if error.as_str() == Some("room.binding_closed") {
                 bail!("CORE_BINDING_CLOSED");
             }
@@ -320,13 +325,17 @@ impl Daemon {
             .get("initial_reply_context")
             .cloned()
             .unwrap_or(Value::Null);
-        tracing::info!(stage = "register", result = "registered", "delivery");
+        tracing::info!(
+            stage = "register",
+            result = "registered",
+            "the conversation was registered with the core"
+        );
         Ok(reply)
     }
 
     async fn on_welcome(self: &Arc<Self>) {
         if let Err(error) = self.retire_held_audio().await {
-            tracing::warn!(code = error_code(&error), "speech outbox retained");
+            tracing::warn!(error.type = ConnectorError::of(&error, ConnectorError::SpeechOutboxRetained), "the speech outbox could not be emptied; speech stays queued for the next link");
             return;
         }
         // Core may have restarted after a deliberate agent exit. Replay leaves before any live bindings so an old
@@ -335,7 +344,7 @@ impl Daemon {
         let left = self.left_by_agent.lock().await.clone();
         for (client_ref, leave) in left {
             if let Err(error) = self.confirm_agent_leave(&client_ref, &leave).await {
-                tracing::warn!(code = error_code(&error), "agent leave replay failed");
+                tracing::warn!(error.type = ConnectorError::of(&error, ConnectorError::AgentLeaveReplayFailed), "replaying agent leaves to the core failed; the core may still list those conversations");
             }
         }
         drop(_state_transaction);
@@ -348,13 +357,13 @@ impl Daemon {
                         .await
                     {
                         tracing::warn!(
-                            code = error_code(&close_error),
-                            "closing a refused binding failed"
+                            error.type = ConnectorError::of(&close_error, ConnectorError::BindingCloseFailed),
+                            "closing a binding the core refused failed; it stays open locally"
                         );
                     }
                     continue;
                 }
-                tracing::warn!(code = error_code(&error), "binding replay failed");
+                tracing::warn!(error.type = ConnectorError::of(&error, ConnectorError::BindingReplayFailed), "registering a binding with the core again failed; that conversation is not reachable until the next link");
                 continue;
             }
             let working = *binding.working.lock().await;
@@ -476,8 +485,8 @@ impl Daemon {
             .and_then(|mut file| write_conversation_guard(&mut file, guard));
         if let Err(error) = result {
             tracing::error!(
-                code = error_code(&error),
-                "emergency conversation guard failed"
+                error.type = ConnectorError::of(&error, ConnectorError::ConversationGuardFailed),
+                "the emergency conversation guard failed; the connector is shutting down"
             );
             let _ = self.shutdown.send(true);
         }
@@ -506,7 +515,7 @@ impl Daemon {
                     "resume_block_reason":self.resume_block_reason()});
             }
             Err(_) => {
-                tracing::error!(kind = "encode", "conversation state not saved");
+                tracing::error!(error.type = ConnectorError::StateEncode.code(), "the conversation state could not be saved; a restart may forget it");
                 self.mark_state_write_failed();
                 return false;
             }
@@ -522,14 +531,14 @@ impl Daemon {
             if serde_json::to_vec(&state)
                 .map_or(true, |bytes| bytes.len() > CONVERSATION_STATE_MAX_BYTES)
             {
-                tracing::error!(code = "state_too_large", "conversation state not saved");
+                tracing::error!(error.type = ConnectorError::StateTooLarge.code(), "the conversation state could not be saved; a restart may forget it");
                 return false;
             }
         }
         if let Err(error) =
             Files::write_json(&self.profile.data.join("conversation-state.json"), &state)
         {
-            tracing::error!(kind = ?error.kind(), os_error = error.raw_os_error(), "conversation state not saved");
+            tracing::error!(error.type = ConnectorError::StateWrite.code(), kind = ?error.kind(), os_error = error.raw_os_error(), "the conversation state could not be saved; a restart may forget it");
             self.mark_state_write_failed();
             false
         } else if let Err(error) = self
@@ -538,7 +547,7 @@ impl Daemon {
             .map_err(|_| anyhow::anyhow!("conversation guard lock poisoned"))
             .and_then(|mut file| write_conversation_guard(&mut file, GUARD_CLEAR))
         {
-            tracing::error!(code = error_code(&error), "clear conversation guard failed");
+            tracing::error!(error.type = ConnectorError::of(&error, ConnectorError::ConversationGuardFailed), "clearing the conversation guard failed; conversation state is marked as not saved");
             self.mark_state_write_failed();
             false
         } else {
@@ -765,7 +774,7 @@ impl Daemon {
         let mut reply = match result {
             Ok(v) => v,
             Err(error) => {
-                tracing::warn!(code = error_code(&error), "speech retry retained");
+                tracing::warn!(error.type = ConnectorError::of(&error, ConnectorError::SpeechRetryRetained), "retrying speech failed; the speech stays queued");
                 return Ok(None);
             }
         };
@@ -791,7 +800,7 @@ impl Daemon {
                     {
                         Ok(value) => value,
                         Err(error) => {
-                            tracing::warn!(code = error_code(&error), "speech retry retained");
+                            tracing::warn!(error.type = ConnectorError::of(&error, ConnectorError::SpeechRetryRetained), "retrying speech failed; the speech stays queued");
                             return Ok(None);
                         }
                     };
@@ -844,7 +853,7 @@ impl Daemon {
             {
                 Ok(reply) => reply,
                 Err(error) => {
-                    tracing::warn!(code = error_code(&error), "speech recovery retained");
+                    tracing::warn!(error.type = ConnectorError::of(&error, ConnectorError::SpeechRecoveryRetained), "recovering speech failed; the speech stays queued");
                     return Ok(None);
                 }
             };
@@ -940,7 +949,7 @@ impl Daemon {
                         .and_then(Value::as_str)
                         .unwrap_or("closed_from_client");
                     if let Err(error) = self.close_binding_from_client(&binding, reason).await {
-                        tracing::warn!(code = error_code(&error), "close binding failed");
+                        tracing::warn!(error.type = ConnectorError::of(&error, ConnectorError::BindingCloseFailed), "closing the binding failed; the core may still list it");
                     }
                 }
                 json!({})
@@ -992,7 +1001,7 @@ impl Daemon {
             &self.profile.data.join(DELIVERED_FILE),
             &delivered.to_json(),
         ) {
-            tracing::warn!(stage = "daemon", result = "delivered_not_kept", kind = ?error.kind(), "delivery");
+            tracing::warn!(stage = "daemon", result = "delivered_not_kept", error.type = ConnectorError::Io.code(), kind = ?error.kind(), "the message reached the agent but its delivery record could not be kept; the delivery may be offered again");
         }
     }
 
@@ -1071,9 +1080,17 @@ impl Daemon {
             .record("revision", revision)
             .record("epoch", frame["epoch"].as_u64().unwrap_or(0))
             .record("channel", if note { "note" } else { "voice" });
-        tracing::info!(stage = "daemon", result = "received", "delivery");
+        tracing::info!(
+            stage = "daemon",
+            result = "received",
+            "a delivery arrived from the core"
+        );
         let Some(binding) = self.binding_for_id(id).await else {
-            tracing::warn!(stage = "daemon", result = "unknown_binding", "delivery");
+            tracing::warn!(
+                stage = "daemon",
+                result = "unknown_binding",
+                "a delivery named a conversation this connector does not know; it was refused"
+            );
             return json!({"status":"unknown_binding"});
         };
         span.record("harness", binding.harness.as_str());
@@ -1085,13 +1102,21 @@ impl Daemon {
             || session_id.is_empty()
             || (text.is_empty() && !note)
         {
-            tracing::warn!(stage = "daemon", result = "invalid_input", "delivery");
+            tracing::warn!(
+                stage = "daemon",
+                result = "invalid_input",
+                "a delivery carried an id this connector cannot keep; it was refused"
+            );
             return json!({"status":"failed","detail":"invalid input"});
         }
         // Offered again what the harness already has (the core's answer was lost, or it restarted holding the message):
         // answered from the record, never handed over twice.
         if let Some(status) = self.record_of(&binding.thread, message_id).await {
-            tracing::info!(stage = "daemon", result = "already_delivered", "delivery");
+            tracing::info!(
+                stage = "daemon",
+                result = "already_delivered",
+                "a delivery the agent already has was answered from the record"
+            );
             return json!({"status":"accepted","received":status == "received",
                 "detail":"already handed to the agent"});
         }
@@ -1107,7 +1132,7 @@ impl Daemon {
             stage = "adapter",
             result = "attempt",
             endpoint = binding.endpoint.is_some(),
-            "delivery"
+            "handing the delivery to the agent"
         );
         let sent = match &binding.endpoint {
             Some(endpoint) => crate::adapters::post(endpoint, &binding.thread, frame).await,
@@ -1145,7 +1170,11 @@ impl Daemon {
             Some("unsupported") => "unsupported",
             _ => "unrecognized",
         };
-        tracing::info!(stage = "adapter", result = status, "delivery");
+        tracing::info!(
+            stage = "adapter",
+            result = status,
+            "the delivery to the agent finished"
+        );
         binding
             .record_delivery(json!({"message_id":message_id,
                 "channel":frame.get("channel").and_then(Value::as_str).unwrap_or("voice"),"at":crate::logfile::timestamp(),"result":status}))
@@ -1517,8 +1546,8 @@ impl Daemon {
                     if let Err(error) = self.confirm_agent_leave(&binding.client_ref, &leave).await
                     {
                         tracing::warn!(
-                            code = error_code(&error),
-                            "agent leave confirmation failed"
+                            error.type = ConnectorError::of(&error, ConnectorError::AgentLeaveConfirmFailed),
+                            "confirming an agent leave to the core failed; it will be replayed at the next link"
                         );
                     }
                 }

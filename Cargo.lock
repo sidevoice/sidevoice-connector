@@ -1474,6 +1474,7 @@ dependencies = [
  "sysinfo",
  "tar",
  "tempfile",
+ "thiserror",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
