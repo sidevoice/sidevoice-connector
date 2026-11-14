@@ -14,9 +14,9 @@ const CANARY_HOME: &str = "/home/canary-user-7f3a";
 const LITERAL: &str = "literal words that may be logged";
 
 /// What the child does: log to `dir`, then panic twice, each on a thread of its own.
-fn child(dir: &Path) {
+fn child(dir: &Path, service: bool) {
     logfile::install("info");
-    logfile::init(dir.join("connector.log"), false, Path::new(CANARY_HOME));
+    logfile::init(dir.join("connector.log"), service, Path::new(CANARY_HOME));
     let literal = std::thread::Builder::new()
         .name("literal-panic".into())
         .spawn(|| panic!("literal words that may be logged"))
@@ -36,7 +36,7 @@ fn child(dir: &Path) {
 #[test]
 fn a_panic_is_two_redacted_events_and_the_backtrace_reaches_the_file_only() {
     if let Ok(dir) = std::env::var(CHILD) {
-        return child(Path::new(&dir));
+        return child(Path::new(&dir), false);
     }
     let scratch = tempfile::tempdir().unwrap();
     let stderr = scratch.path().join("stderr.txt");
@@ -115,4 +115,65 @@ fn a_panic_is_two_redacted_events_and_the_backtrace_reaches_the_file_only() {
             assert!(!text.contains(forbidden), "{forbidden} leaked:\n{text}");
         }
     }
+}
+
+const SERVICE_TEST: &str = "a_service_panic_reaches_the_file_and_not_stderr";
+const PRE_INIT_TEST: &str = "a_panic_before_the_file_sink_is_stderr_only_with_no_backtrace";
+
+/// Runs this binary again as the child of `test` and gives back the child's log file (if any) and stderr.
+fn run_child(test: &str, scratch: &Path) -> (String, String) {
+    let stderr = scratch.join("stderr.txt");
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(CHILD, scratch)
+        .env("SIDEVOICE_LOG", "trace")
+        .env("HOME", CANARY_HOME)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&stderr).unwrap())
+        .status()
+        .unwrap();
+    assert!(status.success(), "the child ran to its end");
+    (
+        fs::read_to_string(scratch.join("connector.log")).unwrap_or_default(),
+        fs::read_to_string(&stderr).unwrap(),
+    )
+}
+
+#[test]
+fn a_service_panic_reaches_the_file_and_not_stderr() {
+    if let Ok(dir) = std::env::var(CHILD) {
+        return child(Path::new(&dir), true);
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let (file, stderr) = run_child(SERVICE_TEST, scratch.path());
+    // A service's stderr is the same file under its manager: writing both would say everything twice.
+    assert_eq!(file.matches(" panic: ").count(), 2, "{file}");
+    assert_eq!(file.matches(" crash_backtrace: ").count(), 2, "{file}");
+    assert!(!stderr.contains(" panic: "), "{stderr}");
+    assert!(!stderr.contains("crash_backtrace"), "{stderr}");
+    assert!(!stderr.contains("exception.stacktrace"), "{stderr}");
+    assert!(!file.contains("canary-secret-7f3a"), "{file}");
+}
+
+#[test]
+fn a_panic_before_the_file_sink_is_stderr_only_with_no_backtrace() {
+    if let Ok(dir) = std::env::var(CHILD) {
+        // No `init`: the CLI and the MCP server have no file.
+        logfile::install("info");
+        let panicked = std::thread::Builder::new()
+            .name("early-panic".into())
+            .spawn(|| panic!("literal words that may be logged"))
+            .unwrap();
+        assert!(panicked.join().is_err());
+        assert!(!Path::new(&dir).join("connector.log").exists());
+        return;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let (file, stderr) = run_child(PRE_INIT_TEST, scratch.path());
+    assert!(file.is_empty(), "{file}");
+    assert!(stderr.contains(" panic: "), "{stderr}");
+    assert!(stderr.contains(LITERAL), "{stderr}");
+    assert!(!stderr.contains("crash_backtrace"), "{stderr}");
+    assert!(!stderr.contains("exception.stacktrace"), "{stderr}");
 }

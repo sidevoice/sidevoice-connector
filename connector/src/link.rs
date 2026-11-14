@@ -115,7 +115,7 @@ impl Link {
                 .and_then(|error| error.get("message"))
                 .and_then(Value::as_str)
                 .and_then(crate::log_safe::error_key);
-            tracing::warn!(error.type = ConnectorError::CoreAnswerUnmatched.code(), rpc.response.status_code = code, core_error_key = key, "the core answered without a request id; the answer was ignored");
+            tracing::warn!(error.type = ConnectorError::CoreAnswerUnmatched.code(), rpc.response.status_code = code.map(|code| code.to_string()), core_error_key = key, "the core answered without a request id; the answer was ignored");
             return Ok(());
         };
         let Some(id) = id.as_str().filter(|id| id.starts_with("c:")) else {

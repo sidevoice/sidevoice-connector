@@ -204,6 +204,10 @@ fn record_panic(
         service.version = crate::identity::VERSION,
         "the program panicked; the work of that thread was abandoned"
     );
+    // No file sink (the CLI, the MCP server): the backtrace has nowhere to go, so it is not even captured.
+    if SINK.get().is_none() {
+        return;
+    }
     let backtrace = std::backtrace::Backtrace::force_capture();
     tracing::event!(
         target: "crash_backtrace",
@@ -295,17 +299,23 @@ impl Drop for Line {
         {
             let _ = std::io::stderr().write_all(text.as_bytes());
         }
-        // Not blocked on the lock inside the panic hook: the panicking thread may be the one holding it.
-        let _held = if IN_PANIC_HOOK.with(Cell::get) {
-            None
+        // Inside the panic hook the lock is only tried: the panicking thread may be the one holding it. Without it the
+        // line is appended but never rotated, so a rotation is never run unlocked.
+        if IN_PANIC_HOOK.with(Cell::get) {
+            match WRITE.try_lock() {
+                Ok(_held) => append_line(&sink.file, &text),
+                Err(std::sync::TryLockError::Poisoned(held)) => {
+                    let _held = held.into_inner();
+                    append_line(&sink.file, &text);
+                }
+                Err(std::sync::TryLockError::WouldBlock) => append_unrotated(&sink.file, &text),
+            }
         } else {
-            Some(
-                WRITE
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            )
-        };
-        append_line(&sink.file, &text);
+            let _held = WRITE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            append_line(&sink.file, &text);
+        }
     }
 }
 
@@ -322,7 +332,7 @@ impl<'a> MakeWriter<'a> for LogWriter {
     fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Line {
         Line {
             bytes: Vec::new(),
-            file_only: meta.target() == BACKTRACE_TARGET,
+            file_only: is_backtrace_target(meta.target()),
         }
     }
 }
@@ -354,9 +364,22 @@ pub fn rotate(file: &Path, max: u64) -> bool {
     copied.is_ok()
 }
 
+/// Whether `target` is the backtrace event's: the same prefix rule as the filter directive `crash_backtrace=…`.
+fn is_backtrace_target(target: &str) -> bool {
+    target == BACKTRACE_TARGET
+        || target
+            .strip_prefix(BACKTRACE_TARGET)
+            .is_some_and(|rest| rest.starts_with("::"))
+}
+
 /// One line appended to a rotated log, created 0600.
 pub fn append_line(file: &Path, line: &str) {
     rotate(file, LOG_MAX);
+    append_unrotated(file, line);
+}
+
+/// One line appended as is, in a single write, created 0600. For a caller that does not hold [`WRITE`].
+fn append_unrotated(file: &Path, line: &str) {
     let opened = Files::open_private(file, Create::Append);
     if let Ok(mut opened) = opened {
         let mut text = line.to_owned();

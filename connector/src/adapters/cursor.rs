@@ -479,7 +479,7 @@ impl BridgeInstance {
 /// One bridge event: only fixed stage/result codes, the hashed conversation and the instance index.
 /// Never pass a bridge token, message text, response body, database path or socket path here.
 macro_rules! bridge_event {
-    ($level:ident, $stage:expr, $result:expr, $id:expr, $instance:expr, $status:expr $(, $field:ident = $value:expr)*) => {
+    ($level:ident, $message:literal, $stage:expr, $result:expr, $id:expr, $instance:expr, $status:expr $(, $field:ident = $value:expr)*) => {
         tracing::$level!(
             stage = $stage,
             result = $result,
@@ -487,7 +487,7 @@ macro_rules! bridge_event {
             instance = $instance,
             http.response.status_code = $status,
             $($field = $value,)*
-            "a Cursor bridge step finished"
+            $message
         )
     };
 }
@@ -499,7 +499,15 @@ fn log_bridge(
     instance: Option<usize>,
     http_status: Option<u16>,
 ) {
-    bridge_event!(info, stage, result, id, instance, http_status);
+    bridge_event!(
+        info,
+        "a Cursor bridge step finished",
+        stage,
+        result,
+        id,
+        instance,
+        http_status
+    );
 }
 
 fn short_hash(value: &str) -> String {
@@ -953,16 +961,26 @@ async fn deliver_editor_to_instances(
         .await
         {
             Err(BridgeError::Before) => {
-                log_bridge("send", "connect_failed", Some(&composer), Some(index), None);
+                bridge_event!(
+                    warn,
+                    "the Cursor bridge could not be reached; the next bridge instance is tried",
+                    "send",
+                    "connect_failed",
+                    Some(composer.as_str()),
+                    Some(index),
+                    None::<u16>
+                );
                 continue;
             }
             Err(BridgeError::After(error)) => {
-                log_bridge(
+                bridge_event!(
+                    warn,
+                    "the Cursor bridge may have taken the message but its reply was lost; delivery is reported as unknown and nothing is retried",
                     "send",
                     "reply_uncertain",
-                    Some(&composer),
+                    Some(composer.as_str()),
                     Some(index),
-                    None,
+                    None::<u16>
                 );
                 return Some(
                     json!({"status":"unknown","detail":format!("Cursor Desktop Bridge may have taken the message: {error}")}),
@@ -1002,6 +1020,7 @@ async fn deliver_editor_to_instances(
                     // The bridge's own words are not logged: they go back to the agent in `detail`, not into a file.
                     bridge_event!(
                         warn,
+                        "the Cursor bridge answered with an error; delivery failed",
                         "send",
                         "bridge_error",
                         Some(composer.as_str()),
@@ -1013,12 +1032,14 @@ async fn deliver_editor_to_instances(
                     );
                 }
                 SendReply::Refused(reason) => {
-                    log_bridge(
+                    bridge_event!(
+                        warn,
+                        "the Cursor bridge refused the message; delivery failed",
                         "send",
                         "refused",
-                        Some(&composer),
+                        Some(composer.as_str()),
                         Some(index),
-                        Some(response.status),
+                        Some(response.status)
                     );
                     return Some(
                         json!({"status":"failed","detail":format!("Cursor Desktop Bridge refused the message ({}): {reason}", response.status)}),
@@ -1027,6 +1048,7 @@ async fn deliver_editor_to_instances(
                 SendReply::Unconfirmed(reason) => {
                     bridge_event!(
                         warn,
+                        "the Cursor bridge reply did not confirm delivery; the message may or may not have arrived",
                         "send",
                         "unconfirmed_reply",
                         Some(composer.as_str()),

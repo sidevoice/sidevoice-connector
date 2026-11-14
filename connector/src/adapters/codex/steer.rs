@@ -355,7 +355,7 @@ mod tests {
             .collect::<String>();
         assert!(
             line.contains(
-                "reason=\"rpc-error\" rpc.method=\"turn/steer\" rpc.response.status_code=-32600"
+                "reason=\"rpc-error\" rpc.method=\"turn/steer\" rpc.response.status_code=\"-32600\""
             ),
             "{line}"
         );

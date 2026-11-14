@@ -168,7 +168,7 @@ fn log_steer_fallback(thread: &str, error: &anyhow::Error) {
         conversation = %IdHash(thread),
         reason = failure.map_or("steer-unavailable", steer::Failure::code),
         rpc.method = failure.and_then(steer::Failure::method),
-        rpc.response.status_code = failure.and_then(steer::Failure::rpc_code),
+        rpc.response.status_code = failure.and_then(steer::Failure::rpc_code).map(|code| code.to_string()),
         "steering the Codex turn was not possible; the message is queued for the next turn instead"
     );
 }
