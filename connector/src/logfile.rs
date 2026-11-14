@@ -140,8 +140,9 @@ pub fn install(default: &str) {
     {
         return;
     }
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
+    // The default hook is never chained: it would write the panic a second time, raw, to a stderr that is this file when
+    // a service runs and a terminal or capture otherwise. The line below is the one record, and it is redacted.
+    std::panic::set_hook(Box::new(|info| {
         IN_PANIC_HOOK.with(|flag| flag.set(true));
         let payload = info.payload();
         let message = payload
@@ -152,10 +153,6 @@ pub fn install(default: &str) {
         tracing::error!(target: "panic", location = %info.location().map_or_else(String::new, ToString::to_string),
             thread = std::thread::current().name().unwrap_or("unnamed"), panic = message, "panic");
         IN_PANIC_HOOK.with(|flag| flag.set(false));
-        // A service's stderr is this same file: the default hook would write the panic a second time, unredacted.
-        if !SINK.get().is_some_and(|sink| sink.service) {
-            previous(info);
-        }
     }));
     if invalid {
         tracing::warn!(
@@ -194,7 +191,8 @@ impl Drop for Line {
             let _ = std::io::stderr().write_all(text.as_bytes());
             return;
         };
-        if !sink.service && std::io::stderr().is_terminal() {
+        // A panic always reaches stderr (a service's stderr is this file, so not then); other lines only on a terminal.
+        if !sink.service && (IN_PANIC_HOOK.with(Cell::get) || std::io::stderr().is_terminal()) {
             let _ = std::io::stderr().write_all(text.as_bytes());
         }
         // Not blocked on the lock inside the panic hook: the panicking thread may be the one holding it.

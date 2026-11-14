@@ -345,14 +345,23 @@ mod tests {
             .await
             .unwrap_err();
         let log = crate::test_support::capture();
-        super::super::log_steer_fallback("thread-1", &error);
-        let line = log.text();
+        super::super::log_steer_fallback("thread-steer-rpc", &error);
+        // Only this test's line: the capture sees every test's.
+        let own = crate::log_safe::IdHash("thread-steer-rpc").to_string();
+        let line = log
+            .text()
+            .lines()
+            .filter(|line| line.contains(&own))
+            .collect::<String>();
         assert!(
             line.contains("reason=\"rpc-error\" method=\"turn/steer\" code=-32600"),
             "{line}"
         );
         assert!(!line.contains("private voice input echoed"), "{line}");
-        assert!(!line.contains("data"), "{line}");
+        assert!(
+            !line.contains("\"data\":") && !line.contains("input"),
+            "{line}"
+        );
     }
 
     #[tokio::test]

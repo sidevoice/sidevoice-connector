@@ -246,12 +246,17 @@ mod tests {
         let error = anyhow::anyhow!("private voice input echoed")
             .context("transport returned private voice input echoed");
         let log = crate::test_support::capture();
-        log_steer_fallback("thread-1", &error);
-        let line = log.text();
+        log_steer_fallback("thread-codex-fallback", &error);
+        let own = IdHash("thread-codex-fallback").to_string();
+        let line = log
+            .text()
+            .lines()
+            .filter(|line| line.contains(&own))
+            .collect::<String>();
         assert!(line.contains("reason=\"steer-unavailable\""), "{line}");
-        assert!(line.contains(&IdHash("thread-1").to_string()), "{line}");
+        assert!(line.contains(&own), "{line}");
         assert!(!line.contains("private voice input echoed"), "{line}");
-        assert!(!line.contains("thread-1"), "{line}");
+        assert!(!line.contains("thread-codex-fallback"), "{line}");
     }
 
     #[test]
