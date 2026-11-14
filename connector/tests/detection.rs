@@ -1,5 +1,6 @@
 //! Production binary detection: the login shell's PATH is the sole CLI source.
 
+#![allow(clippy::disallowed_macros)] // test output is not logging
 mod support;
 
 use serde_json::Value;

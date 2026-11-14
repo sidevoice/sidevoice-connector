@@ -82,6 +82,37 @@ impl std::fmt::Display for Failure {
 
 impl std::error::Error for Failure {}
 
+impl Failure {
+    /// The fixed word the log gives this failure; `Display` also prints the socket path, so it is never logged.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoSocket(_) => "no-socket",
+            Self::VersionTooOld => "version-too-old",
+            Self::VersionUnknown => "version-unparseable",
+            Self::Rpc { .. } => "rpc-error",
+            Self::Timeout => "timeout",
+            Self::NoRunningTurn => "no-running-turn",
+            Self::InvalidReply => "invalid-reply",
+        }
+    }
+
+    /// The RPC method a refusal answered, one of ours.
+    pub fn method(&self) -> Option<&'static str> {
+        match self {
+            Self::Rpc { method, .. } => Some(method),
+            _ => None,
+        }
+    }
+
+    /// The error number the Codex daemon answered with.
+    pub fn rpc_code(&self) -> Option<i64> {
+        match self {
+            Self::Rpc { code, .. } => *code,
+            _ => None,
+        }
+    }
+}
+
 type Socket = tokio_tungstenite::WebSocketStream<ForeignStream>;
 
 /// Steers the active turn of `thread` with `text`, naming the message `message_id` (Codex's `clientUserMessageId`,
@@ -313,9 +344,11 @@ mod tests {
         let error = steer(&path, "thread-1", "m-1", "private voice input echoed")
             .await
             .unwrap_err();
-        let line = super::super::steer_fallback_log("thread-1", "m-1", &error);
+        let log = crate::test_support::capture();
+        super::super::log_steer_fallback("thread-1", &error);
+        let line = log.text();
         assert!(
-            line.contains("reason=rpc-error method=turn/steer code=-32600"),
+            line.contains("reason=\"rpc-error\" method=\"turn/steer\" code=-32600"),
             "{line}"
         );
         assert!(!line.contains("private voice input echoed"), "{line}");

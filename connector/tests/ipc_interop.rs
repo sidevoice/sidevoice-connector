@@ -1,6 +1,8 @@
 //! The IPC over `connector.sock` as a façade of another version speaks it, against the daemon with its real harnesses
 //! (sidevoice/sidevoice-core#112): fields this daemon does not know (an older façade's route and capabilities) are
 //! ignored, and an optional field sent as `null` reads as absent.
+#![allow(clippy::disallowed_macros)]
+// test output is not logging
 // A façade of another version speaks the wire raw, so it opens the local endpoint itself.
 #![allow(clippy::disallowed_types)]
 

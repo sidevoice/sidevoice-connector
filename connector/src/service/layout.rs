@@ -56,6 +56,8 @@ const NOT_SETTINGS: &[&str] = &[
     "SIDEVOICE_INSTALL_FROM_SOURCE",
     "SIDEVOICE_INSTALLED_BY",
     "SIDEVOICE_DATA_DIR",
+    // A level a service was installed under would stay debug for good: a managed process runs at the default.
+    "SIDEVOICE_LOG",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]

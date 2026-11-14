@@ -53,3 +53,49 @@ pub(crate) async fn assert_cancellation_stops_children<T>(
         }
     }
 }
+
+/// The log lines the current thread's events produce while the guard lives, as the daemon would write them.
+pub(crate) struct Captured {
+    lines: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+impl Captured {
+    pub(crate) fn text(&self) -> String {
+        String::from_utf8_lossy(&self.lines.lock().unwrap()).into_owned()
+    }
+}
+
+#[derive(Clone)]
+struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Shared {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Shared {
+    type Writer = Shared;
+    fn make_writer(&'a self) -> Shared {
+        self.clone()
+    }
+}
+
+/// Captures this thread's events at every level (a `current_thread` test runtime runs its tasks on this thread).
+pub(crate) fn capture() -> Captured {
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(Shared(lines.clone()))
+        .finish();
+    Captured {
+        lines,
+        _guard: tracing::subscriber::set_default(subscriber),
+    }
+}

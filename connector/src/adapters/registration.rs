@@ -37,12 +37,24 @@ pub enum CliError {
 
 /// How the agent starts the server its entry names: the command, its arguments, the environment the entry gives it and
 /// the working directory it names, if any.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Launch {
     pub command: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub cwd: Option<PathBuf>,
+}
+
+/// The environment can hold a credential URL: a `Debug` of a launch shows its names only.
+impl std::fmt::Debug for Launch {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("Launch")
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("env", &self.env.keys().collect::<Vec<_>>())
+            .field("cwd", &self.cwd)
+            .finish()
+    }
 }
 
 /// What the agent's configuration says of Sidevoice's entry: the registration's state and, when the entry could be
@@ -495,6 +507,24 @@ pub fn read_profile_file(path: &Path, limit: u64) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_launch_never_prints_its_environment() {
+        let launch = Launch {
+            command: "sidevoice".into(),
+            env: [(
+                "SIDEVOICE_DELIVERY_URL".to_owned(),
+                "https://u:canary-pass@x/".to_owned(),
+            )]
+            .into(),
+            ..Launch::default()
+        };
+        let shown = format!("{launch:?}");
+        assert!(
+            shown.contains("SIDEVOICE_DELIVERY_URL") && !shown.contains("canary-pass"),
+            "{shown}"
+        );
+    }
 
     /// The shell reads each word as given, except where a batch shim would be re-parsed by `cmd.exe`: there no line
     /// is made when any word has `& | < > ^ % !` or `"`.

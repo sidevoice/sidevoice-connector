@@ -46,6 +46,7 @@
 //! second turn failed to start when it was deleted after the first). A test process that is killed leaves it behind,
 //! so delete the profile directory (`svclaudert-*`, under the temporary directory) if so, or avoid the copy with
 //! `CLAUDE_CODE_OAUTH_TOKEN`.
+#![allow(clippy::disallowed_macros)] // test output is not logging
 mod support;
 
 use serde_json::{json, Value};

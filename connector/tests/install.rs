@@ -9,6 +9,7 @@
 //!
 //! Upgrades, rollback and pruning are the unit tests' (`src/install.rs`): this binary is one version.
 
+#![allow(clippy::disallowed_macros)] // test output is not logging
 mod support;
 
 use std::collections::BTreeMap;

@@ -1,3 +1,4 @@
+#![allow(clippy::disallowed_macros)] // a build script talks to cargo on stdout
 use std::env;
 
 fn build_value(name: &str, fallback: &str) -> String {

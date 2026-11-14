@@ -3,6 +3,7 @@
 //! `sh` scripts). Its own small runner instead of libtest (`harness = false` in Cargo.toml): libtest writes its own
 //! lines to stdout, where a server's protocol goes.
 
+#![allow(clippy::disallowed_macros)] // test output is not logging
 use serde_json::Value;
 use sidevoice_connector::adapters::health::{check, Health};
 use sidevoice_connector::adapters::registration::Launch;

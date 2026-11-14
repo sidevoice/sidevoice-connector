@@ -90,8 +90,10 @@ Every place comes from the environment, so a disposable profile is just a set of
 Records are written whole (a private temporary file renamed into place). Locks are kernel `flock(2)` locks on
 permanent lock files, released when their holder dies, with the holder's pid and start time written inside for
 people; a pid is signalled only after checking it is still the process recorded (owner, start time, command line).
-`connector.log` is rotated at 5 MB by copy-and-truncate, keeping two previous files. A daemon run by hand logs to
-stderr and the file; run by a service manager, to the file only.
+`connector.log` is rotated at 5 MB by copy-and-truncate, keeping two previous files. Every line is a `tracing` event (the shared logging guideline); `SIDEVOICE_LOG` sets the level (`info` by default for the
+daemon, `warn` for the CLI and `mcp`; a bare level applies to the connector's own targets only) and is never kept in a
+service definition. A daemon run by hand logs to the file and, on a terminal, to stderr; run by a service manager, to
+the file only.
 
 When it links to the core, the daemon says what this machine is: its host name, its platform (`macOS arm64`,
 `Linux x64`), the connector's version and the agents whose homes exist here. The core keeps the latest and the app

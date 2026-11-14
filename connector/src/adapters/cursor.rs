@@ -44,10 +44,12 @@ pub fn config_home(profile: &crate::profile::Profile) -> &std::path::Path {
 
 use super::envelope;
 use super::harness::{Limit, Sent};
+use crate::log_safe::IdHash;
 use crate::platform::env::{Env, Environment};
 use crate::platform::foreign::{Foreign, Foreigners};
 use crate::platform::process::{ChildProcess, Process, Processes};
 use anyhow::{bail, Context, Result};
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -461,28 +463,33 @@ fn persist_session(chat: &str) -> Option<(String, bool)> {
 #[derive(Clone)]
 struct BridgeInstance {
     socket: PathBuf,
-    token: String,
+    token: SecretString,
     user_data: PathBuf,
     created_at: u64,
 }
 
-/// Diagnostics contain only fixed stage/result codes and a short one-way digest of a random ID.
+impl BridgeInstance {
+    /// The bearer: sent to the bridge in its one request, and compared with what the bridge echoes so that is withheld.
+    #[allow(clippy::disallowed_methods)]
+    fn bearer(&self) -> &str {
+        self.token.expose_secret()
+    }
+}
+
+/// One bridge event: only fixed stage/result codes, the hashed conversation and the instance index.
 /// Never pass a bridge token, message text, response body, database path or socket path here.
-fn bridge_diagnostic(
-    stage: &'static str,
-    result: &'static str,
-    id: Option<&str>,
-    instance: Option<usize>,
-    http_status: Option<u16>,
-) -> String {
-    let id = id
-        .map(|value| hex::encode(Sha256::digest(value.as_bytes()))[..12].to_owned())
-        .unwrap_or_else(|| "none".into());
-    format!(
-        "cursor_bridge stage={stage} result={result} id_hash={id} instance={} http_status={}",
-        instance.map_or_else(|| "none".into(), |index| index.to_string()),
-        http_status.map_or_else(|| "none".into(), |status| status.to_string())
-    )
+macro_rules! bridge_event {
+    ($level:ident, $stage:expr, $result:expr, $id:expr, $instance:expr, $status:expr $(, $field:ident = $value:expr)*) => {
+        tracing::$level!(
+            stage = $stage,
+            result = $result,
+            conversation = $id.map(|id: &str| tracing::field::display(IdHash(id))),
+            instance = $instance,
+            http_status = $status,
+            $($field = $value,)*
+            "cursor bridge"
+        )
+    };
 }
 
 fn log_bridge(
@@ -492,7 +499,7 @@ fn log_bridge(
     instance: Option<usize>,
     http_status: Option<u16>,
 ) {
-    crate::logfile::log(&bridge_diagnostic(stage, result, id, instance, http_status));
+    bridge_event!(info, stage, result, id, instance, http_status);
 }
 
 fn short_hash(value: &str) -> String {
@@ -508,21 +515,6 @@ fn instance_hash(instance: &BridgeInstance) -> String {
 }
 
 /// A mapping or accepted send can be correlated across descriptor reordering without exposing IDs or paths.
-fn correlation_diagnostic(
-    stage: &'static str,
-    result: &'static str,
-    marker: Option<&str>,
-    chat: &str,
-    instance: Option<&BridgeInstance>,
-) -> String {
-    format!(
-        "cursor_bridge stage={stage} result={result} marker_hash={} chat_hash={} instance_id={}",
-        marker.map(short_hash).unwrap_or_else(|| "none".into()),
-        short_hash(chat),
-        instance.map(instance_hash).unwrap_or_else(|| "none".into())
-    )
-}
-
 fn log_correlation(
     stage: &'static str,
     result: &'static str,
@@ -530,19 +522,14 @@ fn log_correlation(
     chat: &str,
     instance: Option<&BridgeInstance>,
 ) {
-    let line = correlation_diagnostic(stage, result, marker, chat, instance);
-    #[cfg(test)]
-    correlation_lines()
-        .lock()
-        .expect("correlation test sink")
-        .push(line.clone());
-    crate::logfile::log(&line);
-}
-
-#[cfg(test)]
-fn correlation_lines() -> &'static std::sync::Mutex<Vec<String>> {
-    static LINES: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
-    LINES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+    tracing::info!(
+        stage,
+        result,
+        marker = marker.map(|marker| tracing::field::display(IdHash(marker))),
+        conversation = %IdHash(chat),
+        instance_id = instance.map(instance_hash),
+        "cursor bridge"
+    );
 }
 
 fn bridge_instances() -> Vec<BridgeInstance> {
@@ -591,7 +578,7 @@ fn bridge_instances_in(dir: &Path) -> Vec<BridgeInstance> {
             }
             Some(BridgeInstance {
                 socket,
-                token,
+                token: token.into(),
                 user_data,
                 created_at: value.get("createdAt").and_then(Value::as_u64).unwrap_or(0),
             })
@@ -788,7 +775,7 @@ async fn bridge_request(
         Err(_) => return Err(BridgeError::Before),
     };
     let payload = body.to_string();
-    let request = format!("POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", instance.token, payload.len(), payload);
+    let request = format!("POST / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", instance.bearer(), payload.len(), payload);
     let transaction = async {
         stream.write_all(request.as_bytes()).await?;
         let mut response = Vec::new();
@@ -1040,7 +1027,7 @@ async fn deliver_editor_to_instances(
                     json!({"status":"unknown","detail":format!("Cursor Desktop Bridge may have taken the message: {error}")}),
                 );
             }
-            Ok(response) => match classify_send_reply(&response, &text, &instance.token) {
+            Ok(response) => match classify_send_reply(&response, &text, instance.bearer()) {
                 SendReply::Accepted(outcome) => {
                     log_correlation(
                         "accepted",
@@ -1071,16 +1058,15 @@ async fn deliver_editor_to_instances(
                     continue;
                 }
                 SendReply::Error(reason) => {
-                    crate::logfile::log(&format!(
-                        "{} reason={reason}",
-                        bridge_diagnostic(
-                            "send",
-                            "bridge_error",
-                            Some(&composer),
-                            Some(index),
-                            Some(response.status)
-                        )
-                    ));
+                    // The bridge's own words are not logged: they go back to the agent in `detail`, not into a file.
+                    bridge_event!(
+                        warn,
+                        "send",
+                        "bridge_error",
+                        Some(composer.as_str()),
+                        Some(index),
+                        Some(response.status)
+                    );
                     return Some(
                         json!({"status":"failed","detail":format!("Cursor Desktop Bridge could not send the message: {reason}")}),
                     );
@@ -1098,17 +1084,15 @@ async fn deliver_editor_to_instances(
                     );
                 }
                 SendReply::Unconfirmed(reason) => {
-                    crate::logfile::log(&format!(
-                        "{} reply_body={}",
-                        bridge_diagnostic(
-                            "send",
-                            "unconfirmed_reply",
-                            Some(&composer),
-                            Some(index),
-                            Some(response.status)
-                        ),
-                        diagnostic_reply_body(&response.body)
-                    ));
+                    bridge_event!(
+                        warn,
+                        "send",
+                        "unconfirmed_reply",
+                        Some(composer.as_str()),
+                        Some(index),
+                        Some(response.status),
+                        reply_body = diagnostic_reply_body(&response.body)
+                    );
                     return Some(
                         json!({"status":"unknown","detail":format!("Cursor Desktop Bridge did not confirm delivery: {reason}")}),
                     );
@@ -1280,6 +1264,7 @@ mod bridge_tests {
 
     #[tokio::test]
     async fn bridge_token_is_withheld_from_errors_refusals_and_unknown_replies() {
+        let log = crate::test_support::capture();
         let scratch = crate::test_support::temp_dir("bridge-secret");
         let token = "private-bearer-do-not-report";
         for (status, outcome, field) in [
@@ -1334,11 +1319,7 @@ mod bridge_tests {
             server.await.unwrap();
             assert!(result["detail"].as_str().unwrap().contains("[withheld]"));
             assert!(!result.to_string().contains(token));
-            assert!(correlation_lines()
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|line| !line.contains(token)));
+            assert!(!log.text().contains(token));
         }
         for reason in ["x".repeat(201), "🦀".repeat(100)] {
             assert_eq!(
@@ -1406,6 +1387,7 @@ mod bridge_tests {
 
     #[tokio::test]
     async fn queued_bridge_submission_has_no_editor_consumption_receipt() {
+        let log = crate::test_support::capture();
         // Short label, for the same SUN_LEN reason.
         let scratch = crate::test_support::temp_dir("bridge-delivery");
         let descriptors = scratch.path().join("desktop-bridge");
@@ -1467,20 +1449,20 @@ mod bridge_tests {
         assert_eq!(result["status"], "accepted");
         assert_eq!(result["detail"], "Cursor Desktop Bridge: queued");
         assert!(!scratch.path().join("chat.jsonl").exists());
-        let lines = correlation_lines().lock().unwrap();
-        let matching = lines
-            .iter()
-            .filter(|line| line.contains(&format!("marker_hash={}", short_hash(&marker))))
+        let text = log.text();
+        let matching = text
+            .lines()
+            .filter(|line| line.contains(&format!("marker={}", IdHash(&marker))))
             .collect::<Vec<_>>();
         let mapping = matching
             .iter()
-            .find(|line| line.contains("stage=mapping result=sqlite_scan"))
+            .find(|line| line.contains("stage=\"mapping\" result=\"sqlite_scan\""))
             .unwrap();
         let accepted = matching
             .iter()
-            .find(|line| line.contains("stage=accepted result=queued"))
+            .find(|line| line.contains("stage=\"accepted\" result=\"queued\""))
             .unwrap();
-        for field in ["marker_hash", "chat_hash", "instance_id"] {
+        for field in ["marker", "conversation", "instance_id"] {
             let value = mapping
                 .split_whitespace()
                 .find(|word| word.starts_with(&format!("{field}=")))
@@ -1518,15 +1500,18 @@ mod bridge_tests {
 
     #[test]
     fn diagnostic_never_contains_ids_or_message_material() {
-        let line = bridge_diagnostic(
+        let log = crate::test_support::capture();
+        log_bridge(
             "send",
             "queued",
             Some("private-chat-id"),
             Some(1),
             Some(200),
         );
-        assert!(line.contains("cursor_bridge stage=send result=queued"));
-        assert!(line.contains("instance=1 http_status=200"));
+        let line = log.text();
+        assert!(line.contains("stage=\"send\" result=\"queued\""), "{line}");
+        assert!(line.contains("instance=1 http_status=200"), "{line}");
+        assert!(line.contains(&IdHash("private-chat-id").to_string()));
         assert!(!line.contains("private-chat-id"));
         assert!(!line.contains("private words"));
         assert!(!line.contains("fixture-secret"));

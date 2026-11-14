@@ -5,6 +5,7 @@ use crate::platform::fs::{Files, Fs};
 use crate::platform::ipc::{Channel, Channels, Endpoint};
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
+use secrecy::SecretString;
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::Path;
@@ -22,7 +23,7 @@ pub struct Ready {
     #[serde(deserialize_with = "endpoint")]
     pub endpoint: Endpoint,
     pub connector_id: String,
-    pub token: String,
+    pub token: SecretString,
     /// The link protocols this core speaks; a number this connector does not know is only not one it speaks.
     pub connector_protocols: Option<Vec<u64>>,
 }
@@ -163,5 +164,20 @@ mod tests {
         assert!(ready(serde_json::json!({})).is_err());
         assert!(ready(serde_json::json!({"endpoint":"relative"})).is_err());
         assert!(ready(serde_json::json!({"endpoint":1})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+
+    #[test]
+    fn the_ready_file_never_prints_its_token() {
+        let ready: Ready = serde_json::from_value(serde_json::json!({
+            "pid": 1, "launch_id": "l", "endpoint": <Endpoint as crate::platform::ipc::Address>::new(Path::new("/d/core"), "local").to_string(),
+            "connector_id": "c", "token": "canary-secret-7f3a"
+        }))
+        .unwrap();
+        assert!(!format!("{ready:?}").contains("canary-secret-7f3a"));
     }
 }

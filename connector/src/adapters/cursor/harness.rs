@@ -567,7 +567,7 @@ mod tests {
         set_followed(&watch, chat.clone());
         let instance = BridgeInstance {
             socket: PathBuf::new(),
-            token: String::new(),
+            token: String::new().into(),
             user_data,
             created_at: 0,
         };
