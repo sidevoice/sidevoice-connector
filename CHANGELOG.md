@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.20.0...v0.21.0) (2026-11-14)
+
+
+### Features
+
+* **logging:** adopt tracing per the shared guideline ([#356](https://github.com/sidevoice/sidevoice-connector/issues/356)) ([11ae1fb](https://github.com/sidevoice/sidevoice-connector/commit/11ae1fbd6bdc04bddb01beaf0b1e933a27909004))
+
 ## [0.20.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.19.3...v0.20.0) (2026-11-11)
 
 
