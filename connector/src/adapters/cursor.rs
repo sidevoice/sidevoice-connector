@@ -485,9 +485,9 @@ macro_rules! bridge_event {
             result = $result,
             conversation = $id.map(|id: &str| tracing::field::display(IdHash(id))),
             instance = $instance,
-            http_status = $status,
+            http.response.status_code = $status,
             $($field = $value,)*
-            "cursor bridge"
+            "a Cursor bridge step finished"
         )
     };
 }
@@ -528,7 +528,7 @@ fn log_correlation(
         marker = marker.map(|marker| tracing::field::display(IdHash(marker))),
         conversation = %IdHash(chat),
         instance_id = instance.map(instance_hash),
-        "cursor bridge"
+        "a Cursor bridge mapping was recorded"
     );
 }
 
@@ -699,65 +699,6 @@ fn sanitize_bridge_reason(reason: &str, sent: &str, token: &str) -> String {
         return "[withheld]".into();
     }
     reason.replace(['\n', '\r'], " ")
-}
-
-/// Keep the shape of an unexpected bridge reply, never its arbitrary strings (which may echo input).
-fn diagnostic_reply_body(body: &Value) -> String {
-    fn redact(value: &Value, field: &str) -> Value {
-        match value {
-            Value::Object(fields) => Value::Object(
-                fields
-                    .iter()
-                    .map(|(key, value)| {
-                        let safe_key = match key.as_str() {
-                            "outcome" | "status" | "success" | "ok" | "error" | "reason"
-                            | "message" | "threadId" | "queued" | "submitted" | "result"
-                            | "code" | "detail" | "data" | "text" | "content" => key.as_str(),
-                            _ => "<other>",
-                        };
-                        (safe_key.to_owned(), redact(value, safe_key))
-                    })
-                    .collect(),
-            ),
-            Value::Array(items) => Value::Array(
-                items
-                    .iter()
-                    .take(8)
-                    .map(|item| redact(item, field))
-                    .collect(),
-            ),
-            Value::String(text)
-                if matches!(field, "outcome" | "status")
-                    && matches!(
-                        text.as_str(),
-                        "submitted"
-                            | "queued"
-                            | "not-found"
-                            | "unknown-thread"
-                            | "success"
-                            | "ok"
-                            | "error"
-                            | "failed"
-                            | "accepted"
-                            | "done"
-                    ) =>
-            {
-                Value::String(text.clone())
-            }
-            Value::String(_) => Value::String("[redacted]".into()),
-            _ => value.clone(),
-        }
-    }
-    let rendered = redact(body, "").to_string();
-    if rendered.len() <= 512 {
-        rendered
-    } else {
-        let mut end = 512;
-        while !rendered.is_char_boundary(end) {
-            end -= 1;
-        }
-        format!("{}...", &rendered[..end])
-    }
 }
 
 async fn bridge_request(
@@ -1090,8 +1031,7 @@ async fn deliver_editor_to_instances(
                         "unconfirmed_reply",
                         Some(composer.as_str()),
                         Some(index),
-                        Some(response.status),
-                        reply_body = diagnostic_reply_body(&response.body)
+                        Some(response.status)
                     );
                     return Some(
                         json!({"status":"unknown","detail":format!("Cursor Desktop Bridge did not confirm delivery: {reason}")}),
@@ -1282,8 +1222,6 @@ mod bridge_tests {
                 created_at: 0,
             };
             let body = json!({"outcome":outcome,(field):format!("Invalid token: {token}")});
-            let diagnostic = diagnostic_reply_body(&body);
-            assert!(!diagnostic.contains(token));
             let classified = classify_send_reply(
                 &BridgeResponse {
                     status,
@@ -1292,8 +1230,7 @@ mod bridge_tests {
                 "private words",
                 token,
             );
-            // These are exactly the reason and body strings used by the error log paths.
-            assert!(!format!("{classified:?} {diagnostic}").contains(token));
+            assert!(!format!("{classified:?}").contains(token));
             let server = tokio::spawn(async move {
                 let mut stream = listener.accept().await.unwrap();
                 let mut request = [0; 8192];
@@ -1319,7 +1256,7 @@ mod bridge_tests {
             server.await.unwrap();
             assert!(result["detail"].as_str().unwrap().contains("[withheld]"));
             // Positive control: the bridge event was logged, so the check below is not on an empty log.
-            assert!(log.text().contains("cursor bridge"));
+            assert!(log.text().contains("Cursor bridge"));
             assert!(!result.to_string().contains(token));
             assert!(!log.text().contains(token));
         }
@@ -1329,22 +1266,6 @@ mod bridge_tests {
                 "[withheld]"
             );
         }
-    }
-
-    #[test]
-    fn unconfirmed_reply_diagnostic_keeps_shape_without_private_text() {
-        let secret = "private voice message";
-        let body = json!({"success":true,"status":"success","message":secret,
-            "data":{"text":secret,"error":"not in focused chat","count":3},
-            "unknown_field":secret});
-        let rendered = diagnostic_reply_body(&body);
-        assert!(rendered.contains("\"success\":true"));
-        assert!(rendered.contains("\"status\":\"success\""));
-        assert!(!rendered.contains("\"count\":3"));
-        assert!(!rendered.contains(secret));
-        assert!(!rendered.contains("not in focused chat"));
-        assert!(rendered.len() <= 515);
-        assert!(diagnostic_reply_body(&json!({"message":"x".repeat(1000)})).len() <= 515);
     }
 
     #[tokio::test]
@@ -1512,7 +1433,10 @@ mod bridge_tests {
         );
         let line = log.text();
         assert!(line.contains("stage=\"send\" result=\"queued\""), "{line}");
-        assert!(line.contains("instance=1 http_status=200"), "{line}");
+        assert!(
+            line.contains("instance=1 http.response.status_code=200"),
+            "{line}"
+        );
         assert!(line.contains(&IdHash("private-chat-id").to_string()));
         assert!(!line.contains("private-chat-id"));
         assert!(!line.contains("private words"));

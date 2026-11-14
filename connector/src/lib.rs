@@ -10,6 +10,7 @@ pub mod agents;
 pub mod core_package;
 pub mod core_ready;
 pub mod daemon;
+mod error;
 mod frame;
 pub mod identity;
 pub mod install;

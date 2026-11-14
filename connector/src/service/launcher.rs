@@ -154,7 +154,10 @@ pub fn core_processes(layout: &Layout) -> Vec<u32> {
 /// each only while it is provably that core ([`Process::stop`], the same on every OS).
 pub async fn terminate_core(layout: &Layout, pid: u32, grace: Duration) {
     if Processes::stop(pid, |found| is_our_core(layout, &found.command), grace).await {
-        tracing::warn!(pid, "core killed after grace");
+        tracing::warn!(
+            process.pid = pid,
+            "the core did not stop in time and was killed"
+        );
     }
 }
 
@@ -309,7 +312,7 @@ pub async fn ensure_core(layout: &Layout) -> Result<Ready> {
         Err(error) => return Err(core_failure(spawn_failure(layout, &program, &error))),
     };
     let pid = child.id();
-    tracing::info!(pid, launch_id = %launch_id, "core started");
+    tracing::info!(process.pid = pid, launch_id = %launch_id, "started the core process");
     let deadline = Instant::now() + READY_LIMIT;
     let mut failure = None;
     while Instant::now() < deadline {
@@ -330,7 +333,7 @@ pub async fn ensure_core(layout: &Layout) -> Result<Ready> {
     let failure =
         failure.unwrap_or_else(|| failure_cause(layout, &launch_id, None, Some("ready.timeout")));
     if failure.get("key").and_then(Value::as_str) == Some("bind.core-running") {
-        tracing::warn!(code = "bind.core-running", "waiting for another core");
+        tracing::warn!(error.type = crate::error::ConnectorError::CoreAlreadyRunning.code(), "another core is already running; waiting for it to answer");
         let deadline = Instant::now() + READY_LIMIT;
         while Instant::now() < deadline {
             if let Some((ready, _)) = serving(layout, Duration::from_secs(2)).await {
@@ -626,8 +629,9 @@ impl CoreSupervisor {
         }
         if let Err(error) = ensure_core(&self.layout).await {
             tracing::error!(
-                code = crate::log_safe::error_key(&error.key),
-                "core not available"
+                error.type = crate::error::ConnectorError::CoreUnavailable.code(),
+                core_error_key = crate::log_safe::error_key(&error.key),
+                "the core could not be started again; voice stays paused"
             );
         }
     }

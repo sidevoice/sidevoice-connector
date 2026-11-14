@@ -27,7 +27,17 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     // Ours and private, made private again if it was only left open; refused otherwise (`crate::private_dir`).
     crate::private_dir::ensure(&profile.data)?;
     crate::logfile::init(profile.data.join("connector.log"), managed, &profile.home);
-    tracing::info!(version = %profile.connector_version(), managed, data = %HomePath { path: &profile.data, home: &profile.home }, "connector started");
+    let resource = crate::logfile::Resource::current();
+    tracing::info!(
+        service.name = resource.service_name,
+        service.version = resource.service_version,
+        os.type = resource.os_type,
+        os.name = resource.os_name,
+        host.arch = resource.host_arch,
+        managed,
+        data = %HomePath { path: &profile.data, home: &profile.home },
+        "the connector started and will link to the core"
+    );
     profile.validate_existing_private()?;
     if managed {
         profile.validate_service_environment()?;
@@ -37,8 +47,10 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
         }
     }
     if profile.service_stopped()? {
-        let hint = crate::messages::message("service.node-stopped", &Value::Null);
-        tracing::info!(reason = "service_stopped", %hint, "connector stopped");
+        tracing::info!(
+            reason = "service_stopped",
+            "the connector did not start because its service was stopped by a person"
+        );
         return Ok(());
     }
     crate::private_dir::check_existing(&profile.data)
@@ -104,7 +116,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
     loop {
         tokio::select! {
             Some(result) = replay_tasks.join_next(), if !replay_tasks.is_empty() => {
-                if let Err(error) = result { tracing::warn!(result = join_result(&error), "outbox replay task ended"); }
+                if let Err(error) = result { tracing::warn!(result = join_result(&error), "the outbox replay task ended abnormally; queued speech waits for the next replay"); }
                 if replay_again {
                     replay_again = false;
                     let daemon = daemon.clone();
@@ -112,7 +124,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
                 }
             }
             Some(result) = client_tasks.join_next(), if !client_tasks.is_empty() => {
-                if let Err(error) = result { tracing::warn!(result = join_result(&error), "IPC task ended"); }
+                if let Err(error) = result { tracing::warn!(result = join_result(&error), "a client request task ended abnormally; that client gets no answer"); }
             }
             Some(()) = replay_rx.recv() => {
                 if replay_tasks.is_empty() {
@@ -123,7 +135,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
                 }
             }
             Some(result) = core_tasks.join_next(), if !core_tasks.is_empty() => {
-                if let Err(error) = result { tracing::warn!(result = join_result(&error), "core handler task ended"); }
+                if let Err(error) = result { tracing::warn!(result = join_result(&error), "a core request task ended abnormally; the core gets no answer to it"); }
                 prune_binding_order(&mut binding_order);
             }
             accepted = listener.accept() => {
@@ -160,7 +172,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
                     if let Some(tx) = item.reply {
                         let _ = tx.send(json!({"status":"failed","detail":"connector handler capacity reached"}));
                     } else {
-                        tracing::warn!(code = "handler_capacity", "core notification dropped");
+                        tracing::warn!(error.type = crate::error::ConnectorError::HandlerCapacity.code(), "too many core requests are running; a notification from the core was dropped");
                     }
                     continue;
                 }
@@ -204,7 +216,7 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
             }
         }
     }
-    tracing::info!(reason = stop_reason, "connector stopped");
+    tracing::info!(reason = stop_reason, "the connector is stopping");
     // All of the cleanup has one deadline, the same on every OS: a console closing on Windows leaves the process about
     // 5 s before it is ended, launchd and systemd wait longer (20 s, 90 s by default). Cancellation comes first: the
     // agents' operations are told to stop (their child trees killed) while the clients' requests drain; what is

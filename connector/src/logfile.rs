@@ -12,6 +12,7 @@
 //! server, the CLI) lines go to stderr only; those processes default to `warn`, so a new `info` event never mixes into
 //! what a person reads. `SIDEVOICE_LOG` is the only variable that sets the level.
 
+use crate::error::ConnectorError;
 use crate::log_safe::IdHash;
 use crate::platform::fs::{Create, Files, Fs};
 use std::cell::Cell;
@@ -30,7 +31,21 @@ pub const LOG_KEPT: u32 = 2;
 
 /// The targets a bare level in `SIDEVOICE_LOG` applies to; every other target stays at `warn` unless named. Native
 /// tracing from dependencies (tokio, hyper, rustls) must not reach a file because someone asked for `debug`.
-const OUR_TARGETS: &[&str] = &["sidevoice_connector", "sidevoice_platform", "panic"];
+const OUR_TARGETS: &[&str] = &[
+    "sidevoice_connector",
+    "sidevoice_platform",
+    PANIC_TARGET,
+    BACKTRACE_TARGET,
+];
+
+/// The panic record: location, thread, version and, for a literal message, the message (guideline section 9).
+const PANIC_TARGET: &str = "panic";
+/// The backtrace of a panic, a second event for the app file only: never stderr, never a system log. The two targets
+/// share no prefix, so one filter directive never reaches the other.
+const BACKTRACE_TARGET: &str = "crash_backtrace";
+/// What a panic's message is replaced by when the payload is not a literal: a formatted message carries values.
+const FORMATTED_MARKER: &str = "<formatted panic message omitted>";
+const NON_TEXT_MARKER: &str = "<non-text panic payload omitted>";
 
 struct Sink {
     file: PathBuf,
@@ -141,24 +156,100 @@ pub fn install(default: &str) {
         return;
     }
     // The default hook is never chained: it would write the panic a second time, raw, to a stderr that is this file when
-    // a service runs and a terminal or capture otherwise. The line below is the one record, and it is redacted.
+    // a service runs and a terminal or capture otherwise. The two events of `record_panic` are the one record.
     std::panic::set_hook(Box::new(|info| {
         IN_PANIC_HOOK.with(|flag| flag.set(true));
-        let payload = info.payload();
-        let message = payload
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("non-text panic");
-        tracing::error!(target: "panic", location = %info.location().map_or_else(String::new, ToString::to_string),
-            thread = std::thread::current().name().unwrap_or("unnamed"), panic = message, "panic");
+        record_panic(
+            info.payload(),
+            info.location().map(|at| (at.file(), at.line())),
+            std::thread::current().name(),
+        );
         IN_PANIC_HOOK.with(|flag| flag.set(false));
     }));
     if invalid {
         tracing::warn!(
-            code = "invalid_filter",
-            "SIDEVOICE_LOG is not a valid filter: using the default"
+            error.type = ConnectorError::InvalidLogFilter.code(),
+            "SIDEVOICE_LOG is not a valid filter; the default filter is used instead"
         );
+    }
+}
+
+/// The panic's two events. First `panic`: where, on which thread, which version, and the message only when the payload
+/// is a literal (`&'static str`); a formatted `String` is replaced by a marker and its length, never its text, a prefix
+/// or a hash, because `unwrap()` and `assert_eq!` put values in it. Then `crash_backtrace`: the frames, in one line,
+/// for the app file only (see [`Line`]). Frames carry symbols and lines, no values.
+fn record_panic(
+    payload: &(dyn std::any::Any + Send),
+    location: Option<(&str, u32)>,
+    thread: Option<&str>,
+) {
+    let (message, len) = match (
+        payload.downcast_ref::<&'static str>(),
+        payload.downcast_ref::<String>(),
+    ) {
+        (Some(literal), _) => (*literal, None),
+        (None, Some(formatted)) => (FORMATTED_MARKER, Some(formatted.len())),
+        (None, None) => (NON_TEXT_MARKER, None),
+    };
+    let (file, line) = location.unzip();
+    tracing::event!(
+        target: "panic",
+        tracing::Level::ERROR,
+        exception.type = "panic",
+        exception.message = message,
+        len,
+        code.file.path = file,
+        code.line.number = line,
+        thread.name = thread.unwrap_or("unnamed"),
+        service.version = crate::identity::VERSION,
+        "the program panicked; the work of that thread was abandoned"
+    );
+    let backtrace = std::backtrace::Backtrace::force_capture();
+    tracing::event!(
+        target: "crash_backtrace",
+        tracing::Level::ERROR,
+        exception.type = "panic",
+        exception.stacktrace = ?backtrace,
+        "the backtrace of the panic recorded just before"
+    );
+}
+
+/// What this process is, as OpenTelemetry's resource conventions name it: a closed list set here, logged once in the
+/// start event and not repeated on each line. No detectors: they add host names, command lines and owners.
+pub struct Resource {
+    pub service_name: &'static str,
+    pub service_version: &'static str,
+    pub os_type: &'static str,
+    pub os_name: &'static str,
+    pub host_arch: &'static str,
+}
+
+impl Resource {
+    pub fn current() -> Resource {
+        Resource::of(std::env::consts::OS, std::env::consts::ARCH)
+    }
+
+    /// `os` and `arch` as Rust names them, in OpenTelemetry's values; one Rust does not name here travels as is.
+    fn of(os: &'static str, arch: &'static str) -> Resource {
+        Resource {
+            service_name: "sidevoice-connector",
+            service_version: crate::identity::VERSION,
+            os_type: match os {
+                "macos" => "darwin",
+                other => other,
+            },
+            os_name: match os {
+                "macos" => "macOS",
+                "linux" => "Linux",
+                "windows" => "Windows",
+                other => other,
+            },
+            host_arch: match arch {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                other => other,
+            },
+        }
     }
 }
 
@@ -166,11 +257,15 @@ pub fn install(default: &str) {
 #[derive(Clone, Copy)]
 pub struct LogWriter;
 
-pub struct Line(Vec<u8>);
+pub struct Line {
+    bytes: Vec<u8>,
+    /// A panic's backtrace: the app file only, never stderr (guideline sections 8 and 9).
+    file_only: bool,
+}
 
 impl Write for Line {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.extend_from_slice(bytes);
+        self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
 
@@ -181,18 +276,23 @@ impl Write for Line {
 
 impl Drop for Line {
     fn drop(&mut self) {
-        let mut text = redact(&String::from_utf8_lossy(&self.0));
+        let mut text = redact(&String::from_utf8_lossy(&self.bytes));
         let sink = SINK.get();
         let home = sink.map(|sink| &sink.home).or_else(|| EARLY_HOME.get());
         for spelling in home.into_iter().flatten() {
             text = text.replace(spelling.as_str(), "~");
         }
         let Some(sink) = sink else {
-            let _ = std::io::stderr().write_all(text.as_bytes());
+            if !self.file_only {
+                let _ = std::io::stderr().write_all(text.as_bytes());
+            }
             return;
         };
         // A panic always reaches stderr (a service's stderr is this file, so not then); other lines only on a terminal.
-        if !sink.service && (IN_PANIC_HOOK.with(Cell::get) || std::io::stderr().is_terminal()) {
+        if !self.file_only
+            && !sink.service
+            && (IN_PANIC_HOOK.with(Cell::get) || std::io::stderr().is_terminal())
+        {
             let _ = std::io::stderr().write_all(text.as_bytes());
         }
         // Not blocked on the lock inside the panic hook: the panicking thread may be the one holding it.
@@ -213,7 +313,17 @@ impl<'a> MakeWriter<'a> for LogWriter {
     type Writer = Line;
 
     fn make_writer(&'a self) -> Line {
-        Line(Vec::new())
+        Line {
+            bytes: Vec::new(),
+            file_only: false,
+        }
+    }
+
+    fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Line {
+        Line {
+            bytes: Vec::new(),
+            file_only: meta.target() == BACKTRACE_TARGET,
+        }
     }
 }
 
@@ -397,16 +507,16 @@ mod tests {
     fn a_bare_level_applies_to_our_targets_only() {
         assert_eq!(
             scoped("info", "info"),
-            "warn,sidevoice_connector=info,sidevoice_platform=info,panic=info"
+            "warn,sidevoice_connector=info,sidevoice_platform=info,panic=info,crash_backtrace=info"
         );
         assert_eq!(
             scoped("debug,reqwest=debug,sidevoice_connector::adapters=trace", "info"),
-            "warn,sidevoice_connector=debug,sidevoice_platform=debug,panic=debug,reqwest=debug,sidevoice_connector::adapters=trace"
+            "warn,sidevoice_connector=debug,sidevoice_platform=debug,panic=debug,crash_backtrace=debug,reqwest=debug,sidevoice_connector::adapters=trace"
         );
         assert_eq!(scoped("warn", "info"), "warn");
         assert_eq!(
             scoped("reqwest=debug", "info"),
-            "warn,sidevoice_connector=info,sidevoice_platform=info,panic=info,reqwest=debug"
+            "warn,sidevoice_connector=info,sidevoice_platform=info,panic=info,crash_backtrace=info,reqwest=debug"
         );
         let (_, invalid) = filter(Some("info,=[="), "info");
         assert!(invalid);
@@ -424,6 +534,36 @@ mod tests {
             text = text.replace(spelling.as_str(), "~");
         }
         assert_eq!(text, "~/x and ~-proj and ~");
+    }
+
+    #[test]
+    fn the_resource_is_a_closed_list_in_opentelemetry_values() {
+        let mac = Resource::of("macos", "aarch64");
+        assert_eq!(
+            (mac.os_type, mac.os_name, mac.host_arch),
+            ("darwin", "macOS", "arm64")
+        );
+        let linux = Resource::of("linux", "x86_64");
+        assert_eq!(
+            (linux.os_type, linux.os_name, linux.host_arch),
+            ("linux", "Linux", "amd64")
+        );
+        let windows = Resource::of("windows", "x86_64");
+        assert_eq!((windows.os_type, windows.os_name), ("windows", "Windows"));
+        assert_eq!(mac.service_name, "sidevoice-connector");
+        assert!(!mac.service_version.is_empty());
+    }
+
+    #[test]
+    fn the_backtrace_target_shares_no_prefix_with_another_of_ours() {
+        for (index, one) in OUR_TARGETS.iter().enumerate() {
+            for other in &OUR_TARGETS[index + 1..] {
+                assert!(
+                    !one.starts_with(other) && !other.starts_with(one),
+                    "{one} {other}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -165,7 +165,7 @@ impl IdentityFailures {
         if self.0 < IDENTITY_ATTEMPTS {
             return false;
         }
-        tracing::warn!(attempts = IDENTITY_ATTEMPTS, kind = ?error.kind(), os_error = error.raw_os_error(), "transcript unreadable");
+        tracing::warn!(attempts = IDENTITY_ATTEMPTS, error.type = crate::error::ConnectorError::Io.code(), kind = ?error.kind(), os_error = error.raw_os_error(), "the conversation transcript could not be read; following it stops");
         true
     }
 }

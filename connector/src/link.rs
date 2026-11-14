@@ -1,6 +1,6 @@
 use crate::core_ready::Ready;
+use crate::error::ConnectorError;
 use crate::link_error::LinkError;
-use crate::log_safe::error_code;
 use crate::platform::ipc::{Channel, Channels};
 use crate::profile::Profile;
 use anyhow::{bail, Context, Result};
@@ -115,7 +115,7 @@ impl Link {
                 .and_then(|error| error.get("message"))
                 .and_then(Value::as_str)
                 .and_then(crate::log_safe::error_key);
-            tracing::warn!(code, key, "core answer without an id ignored");
+            tracing::warn!(error.type = ConnectorError::CoreAnswerUnmatched.code(), rpc.response.status_code = code, core_error_key = key, "the core answered without a request id; the answer was ignored");
             return Ok(());
         };
         let Some(id) = id.as_str().filter(|id| id.starts_with("c:")) else {
@@ -191,7 +191,7 @@ impl Link {
                 Ok(()) => backoff = 100,
                 Err(error) => {
                     let message = error.to_string();
-                    span.in_scope(|| tracing::warn!(code = error_code(&error), "core link lost"));
+                    span.in_scope(|| tracing::warn!(error.type = ConnectorError::of(&error, ConnectorError::CoreUnavailable), "the core link ended; voice stays paused until the link is restored"));
                     if let Some(first) = first.take() {
                         let _ = first.send(Err(message.clone()));
                     }
@@ -252,7 +252,7 @@ impl Link {
         if let Some(first) = first.take() {
             let _ = first.send(Ok(ready.clone()));
         }
-        tracing::info!(protocol = 3, launch_id = %ready.launch_id, pid = ready.pid, "core linked");
+        tracing::info!(protocol = 3, launch_id = %ready.launch_id, process.pid = ready.pid, "linked to the core; voice can reach this machine");
         let (mut write, mut read) = ws.split();
         let (tx, mut rx) = mpsc::channel::<Message>(128);
         *self.tx.write().await = Some(tx.clone());
@@ -295,7 +295,7 @@ impl Link {
                             if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0") { bail!(LinkError::InvalidJsonRpc); }
                             if let Some(method) = value.get("method").and_then(Value::as_str) {
                                 if method == "input.deliver" {
-                                    tracing::info!(stage = "core_link", result = "received", "delivery");
+                                    tracing::info!(stage = "core_link", result = "received", "a delivery arrived on the core link");
                                 }
                                 if method == "connector.welcome" {
                                     let _ = incoming.send(Incoming { session, method: method.into(), params: value.get("params").cloned().unwrap_or(Value::Null), reply: None }).await;
@@ -316,7 +316,7 @@ impl Link {
                                 };
                                 if !matches!(timeout(Duration::from_secs(2), incoming.send(inbound)).await, Ok(Ok(()))) {
                                     if delivery_frame {
-                                        tracing::warn!(stage = "core_link", result = "queue_unavailable", "delivery");
+                                        tracing::warn!(stage = "core_link", result = "queue_unavailable", error.type = LinkError::QueueUnavailable.code(), "the inbound queue is unavailable; the core's delivery was dropped");
                                     }
                                     bail!(LinkError::QueueUnavailable);
                                 }

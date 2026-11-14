@@ -30,14 +30,3 @@ fn the_home_is_shown_as_a_tilde() {
     assert_eq!(shown("/home/ana/x/y").replace('\\', "/"), "~/x/y");
     assert_eq!(shown("/srv/z"), "/srv/z");
 }
-
-#[test]
-fn an_error_is_a_code_never_its_text() {
-    let io =
-        anyhow::Error::from(std::io::Error::other("/home/canary-user-7f3a")).context("wrapped");
-    assert_eq!(error_code(&io), "io");
-    assert_eq!(
-        error_code(&anyhow::anyhow!("/home/canary-user-7f3a")),
-        "error"
-    );
-}

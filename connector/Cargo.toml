@@ -42,6 +42,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # A secret in a type that cannot be printed or logged by accident (`core_ready::Ready`, the Cursor bridge token).
 secrecy = { version = "0.10", features = ["serde"] }
 tar = "0.4"
+# Per-crate error enums with stable codes for the log (`src/error.rs`, the logging guideline section 6).
+thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 # One JSON message per line on the local channel and an MCP server's stdout (src/frame.rs): `LinesCodec`.
 tokio-util = { version = "0.7", features = ["codec"] }

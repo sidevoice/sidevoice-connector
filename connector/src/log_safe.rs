@@ -69,28 +69,5 @@ pub fn error_key(key: &str) -> Option<&str> {
     allowed.then_some(key)
 }
 
-/// A fixed code for an error, from the types it is known to be, else `error`. Never the error's text: chains carry
-/// paths, peer words and, through a core refusal, content.
-pub fn error_code(error: &anyhow::Error) -> &'static str {
-    error
-        .chain()
-        .find_map(|cause| {
-            if let Some(link) = cause.downcast_ref::<crate::link_error::LinkError>() {
-                Some(link.code())
-            } else if cause.is::<tokio::time::error::Elapsed>() {
-                Some("timeout")
-            } else if cause.is::<std::io::Error>() {
-                Some("io")
-            } else if cause.is::<tokio_tungstenite::tungstenite::Error>() {
-                Some("websocket")
-            } else if cause.is::<serde_json::Error>() {
-                Some("json")
-            } else {
-                None
-            }
-        })
-        .unwrap_or("error")
-}
-
 #[cfg(test)]
 mod tests;

@@ -49,7 +49,7 @@ fn the_connector_log_holds_no_secret_and_no_home() {
         30,
         || {
             fs::read_to_string(&log).ok().filter(|text| {
-                text.contains("connector started") && text.contains("core link lost")
+                text.contains("the connector started") && text.contains("the core link ended")
             })
         },
     );
@@ -59,7 +59,15 @@ fn the_connector_log_holds_no_secret_and_no_home() {
         fs::read_to_string(profile.root.join("stderr.txt")).unwrap()
     );
     let home = profile.root.join("home").to_string_lossy().into_owned();
-    assert!(text.contains("version="), "{text}");
+    for expected in [
+        "service.version=",
+        "service.name=\"sidevoice-connector\"",
+        "os.type=",
+        "host.arch=",
+        "error.type=\"connector.link-",
+    ] {
+        assert!(text.contains(expected), "{expected} missing:\n{text}");
+    }
     for forbidden in [TOKEN, home.as_str(), &decimal(TOKEN), &decimal(&home)] {
         assert!(!text.contains(forbidden), "{forbidden} leaked:\n{text}");
     }
