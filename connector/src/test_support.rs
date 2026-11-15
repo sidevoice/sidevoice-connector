@@ -13,6 +13,39 @@ pub(crate) fn temp_dir(label: &str) -> tempfile::TempDir {
 
 pub(crate) mod stand_in;
 
+/// Copies a program so it can be started right after. Another test thread forking while the copy's write
+/// descriptor is open hands the child that descriptor, and starting the copy then fails with "Text file busy";
+/// closing it first narrows the window and [`spawn`] covers what is left.
+#[cfg(unix)]
+pub(crate) fn copy_program(from: &std::path::Path, to: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut source = std::fs::File::open(from).unwrap();
+    let mut target = std::fs::File::create(to).unwrap();
+    std::io::copy(&mut source, &mut target).unwrap();
+    target
+        .set_permissions(std::fs::Permissions::from_mode(0o755))
+        .unwrap();
+    target.sync_all().unwrap();
+    drop(target);
+}
+
+/// Starts `command`, trying again while the program is "Text file busy" (ETXTBSY) because a concurrent fork still
+/// holds a write descriptor of a file this test just wrote.
+#[cfg(unix)]
+pub(crate) fn spawn(command: &mut std::process::Command) -> std::process::Child {
+    const BUSY: i32 = 26;
+    let mut attempts = 0;
+    loop {
+        match command.spawn() {
+            Err(error) if error.raw_os_error() == Some(BUSY) && attempts < 100 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            result => return result.unwrap(),
+        }
+    }
+}
+
 /// Cancel only after the leader and descendants are running, then prove none survived.
 pub(crate) async fn assert_cancellation_stops_children<T>(
     task: tokio::task::JoinHandle<T>,
