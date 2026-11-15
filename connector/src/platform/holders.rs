@@ -186,12 +186,8 @@ mod tests {
             .expect("a sleep program");
         let program = |dir: &Path| {
             let copy = dir.join("1.0.0/bin/sidevoice-connector");
-            std::fs::copy(sleep, &copy).unwrap();
-            std::process::Command::new(&copy)
-                .arg0("mcp")
-                .arg("30")
-                .spawn()
-                .unwrap()
+            crate::test_support::copy_program(Path::new(sleep), &copy);
+            crate::test_support::spawn(std::process::Command::new(&copy).arg0("mcp").arg("30"))
         };
         let (mut ours, mut theirs) = (program(&releases), program(&outside));
         let ended = Holders::stop_running_from(&[releases.as_path()], &releases);
@@ -226,7 +222,7 @@ mod tests {
         let copy = releases.join("1.0.0/bin/sidevoice-connector");
         let exe = std::env::current_exe().unwrap();
         if std::fs::hard_link(&exe, &copy).is_err() {
-            std::fs::copy(&exe, &copy).unwrap();
+            crate::test_support::copy_program(&exe, &copy);
         }
         // This process has threads of its own, running the same program as the child (from another path).
         let keep: Vec<_> = (0..2)
@@ -234,16 +230,16 @@ mod tests {
                 std::thread::spawn(|| std::thread::sleep(std::time::Duration::from_millis(500)))
             })
             .collect();
-        let mut child = std::process::Command::new(&copy)
-            .args([
-                "--ignored",
-                "--exact",
-                "platform::holders::tests::threaded_sleeper",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut child = crate::test_support::spawn(
+            std::process::Command::new(&copy)
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "platform::holders::tests::threaded_sleeper",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        );
         // Let its threads start.
         std::thread::sleep(std::time::Duration::from_millis(300));
         let ended = Holders::stop_running_from(&[releases.as_path()], &releases);
