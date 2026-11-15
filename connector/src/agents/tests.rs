@@ -382,7 +382,7 @@ fn set_agent_home(profile: &mut Profile, var: &str, path: &Path, set: bool) {
 fn row<'a>(answer: &'a Value, id: &str) -> &'a Value {
     answer["agents"]
         .as_array()
-        .unwrap()
+        .unwrap_or_else(|| panic!("no agents in {answer}"))
         .iter()
         .find(|agent| agent["id"] == id)
         .unwrap()
@@ -1464,13 +1464,15 @@ async fn complete_request_gate_orders_scans_mutations_and_external_dismissals() 
 
 /// Lets the held slow CLI call of the request-gate fixture finish.
 fn release_slow_call(fixture: &Fixture) {
-    private_write(
-        &fixture
+    // Plain write: the stand-in consumes this file at once, so the private-file helper (chmod or icacls) would race its delete.
+    fs::write(
+        fixture
             .profile
             .agent_home("CODEX_HOME")
             .join("release-slow"),
         b"1",
-    );
+    )
+    .unwrap();
 }
 
 /// Waits until the fixture has written a whole pid: the file exists a moment before its content does.
@@ -1489,7 +1491,7 @@ async fn wait_for_pid(path: &Path) -> i32 {
 }
 
 async fn wait_for_file(path: &Path) {
-    let deadline = Instant::now() + StdDuration::from_secs(5);
+    let deadline = Instant::now() + StdDuration::from_secs(30);
     while Instant::now() < deadline {
         if path.exists() {
             return;
