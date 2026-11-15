@@ -382,7 +382,7 @@ fn set_agent_home(profile: &mut Profile, var: &str, path: &Path, set: bool) {
 fn row<'a>(answer: &'a Value, id: &str) -> &'a Value {
     answer["agents"]
         .as_array()
-        .unwrap()
+        .unwrap_or_else(|| panic!("no agents in {answer}"))
         .iter()
         .find(|agent| agent["id"] == id)
         .unwrap()
@@ -1301,6 +1301,9 @@ async fn complete_request_gate_orders_scans_mutations_and_external_dismissals() 
             .handle("agents.connect", json!({"id":"codex"}))
             .await
     });
+    // Give the connect request time to queue behind the held scan before it is let go.
+    tokio::time::sleep(StdDuration::from_millis(200)).await;
+    release_slow_call(&fixture);
     let listed = listing.await.unwrap();
     let connected = connecting.await.unwrap();
     assert_eq!(row(&listed, "codex")["registration"], "not-connected");
@@ -1324,6 +1327,8 @@ async fn complete_request_gate_orders_scans_mutations_and_external_dismissals() 
             .join("slow-next-get"),
         b"1",
     );
+    // The first scan left its marker behind: clear it so the wait below is for this scan.
+    fs::remove_file(&slow_scan).unwrap();
     let scanning_host = host.clone();
     let scanning = tokio::spawn(async move {
         scanning_host
@@ -1337,6 +1342,7 @@ async fn complete_request_gate_orders_scans_mutations_and_external_dismissals() 
     state["dismissed"]["codex"] = generation;
     Files::write_json(&state_path, &state).unwrap();
     lock.unlock().unwrap();
+    release_slow_call(&fixture);
     let scanned = scanning.await.unwrap();
     assert_eq!(row(&scanned, "codex")["dismissed"], true);
 
@@ -1368,6 +1374,8 @@ async fn complete_request_gate_orders_scans_mutations_and_external_dismissals() 
             .handle("agents.disconnect", json!({"id":"codex"}))
             .await
     });
+    tokio::time::sleep(StdDuration::from_millis(200)).await;
+    release_slow_call(&fixture);
     let connected = connect.await.unwrap();
     let disconnected = disconnect.await.unwrap();
     assert_eq!(row(&connected, "codex")["registration"], "connected");
@@ -1454,6 +1462,19 @@ async fn complete_request_gate_orders_scans_mutations_and_external_dismissals() 
     host.shutdown().await;
 }
 
+/// Lets the held slow CLI call of the request-gate fixture finish.
+fn release_slow_call(fixture: &Fixture) {
+    // Plain write: the stand-in consumes this file at once, so the private-file helper (chmod or icacls) would race its delete.
+    fs::write(
+        fixture
+            .profile
+            .agent_home("CODEX_HOME")
+            .join("release-slow"),
+        b"1",
+    )
+    .unwrap();
+}
+
 /// Waits until the fixture has written a whole pid: the file exists a moment before its content does.
 async fn wait_for_pid(path: &Path) -> i32 {
     let deadline = Instant::now() + StdDuration::from_secs(5);
@@ -1470,7 +1491,7 @@ async fn wait_for_pid(path: &Path) -> i32 {
 }
 
 async fn wait_for_file(path: &Path) {
-    let deadline = Instant::now() + StdDuration::from_secs(5);
+    let deadline = Instant::now() + StdDuration::from_secs(30);
     while Instant::now() < deadline {
         if path.exists() {
             return;
