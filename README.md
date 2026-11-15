@@ -117,7 +117,7 @@ last deliveries with how each ended and whether the agent has read it, and where
 (`connector.log` and `core.log` in the data directory: `~/Library/Application Support/Sidevoice` on macOS, `$XDG_DATA_HOME/sidevoice` on Linux, `%LOCALAPPDATA%\Sidevoice\Data` on Windows; `SIDEVOICE_DATA_DIR` overrides it). It never includes message text, keys or tokens. A delivery that
 ends `accepted` and is never read usually means the agent holds incoming messages (see its inbound check).
 
-The agent's instructions tell it to troubleshoot this way when you say Sidevoice is not working: it calls `voice_diagnose` and, if useful, reads this machine's logs. If the problem seems to be in your app (desktop or mobile) rather than on this machine, it asks you to copy the app's logs from the logs viewer in Settings and paste them into the conversation. It cannot fetch app logs or crash reports itself, and it changes no settings unasked.
+When you say Sidevoice is not working, the agent can also read this machine's logs at the locations `voice_diagnose` reports. If the problem seems to be in your app (desktop or mobile) rather than on this machine, it asks you to copy the app's logs from its logs viewer in Settings and paste them here; they stay in this conversation. It cannot fetch app logs or crash reports itself, and it changes no settings unasked.
 
 ## Develop
 
