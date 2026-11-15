@@ -216,6 +216,26 @@ fn record_panic(
         exception.stacktrace = ?backtrace,
         "the backtrace of the panic recorded just before"
     );
+    // Last, so the record's tail ends with the panic itself. A file in the core's spool: the core stores and serves it.
+    if let Some(sink) = SINK.get() {
+        let resource = Resource::current();
+        crate::crash::leave(
+            &crate::crash::Process {
+                version: resource.service_version,
+                os: resource.os_type,
+                arch: resource.host_arch,
+                log: &sink.file,
+                homes: &sink.home,
+            },
+            &crate::crash::Panic {
+                literal: payload.downcast_ref::<&'static str>().copied(),
+                file: file.unwrap_or_default(),
+                line: line.unwrap_or_default(),
+                backtrace: &backtrace.to_string(),
+            },
+            &timestamp(),
+        );
+    }
 }
 
 /// What this process is, as OpenTelemetry's resource conventions name it: a closed list set here, logged once in the

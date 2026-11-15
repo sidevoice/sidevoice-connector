@@ -115,6 +115,27 @@ fn a_panic_is_two_redacted_events_and_the_backtrace_reaches_the_file_only() {
             assert!(!text.contains(forbidden), "{forbidden} leaked:\n{text}");
         }
     }
+
+    // Each panic left one record in the core's spool: the closed fields, the literal or the marker, nothing of the canary.
+    let spool = scratch.path().join("crash-inbox");
+    let mut messages = Vec::new();
+    for entry in fs::read_dir(&spool).expect("the spool") {
+        let text = fs::read_to_string(entry.unwrap().path()).unwrap();
+        for forbidden in ["canary-secret-7f3a", "canary-user-7f3a"] {
+            assert!(
+                !text.contains(forbidden),
+                "{forbidden} in a record:\n{text}"
+            );
+        }
+        let record: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(record["piece"], "connector");
+        assert!(record["location"]["line"].as_u64().unwrap() > 0);
+        assert!(!record["backtrace"].as_array().unwrap().is_empty());
+        assert!(record["log_tail"].to_string().contains(" panic: "));
+        messages.push(record["exception"]["message"].as_str().unwrap().to_owned());
+    }
+    messages.sort();
+    assert_eq!(messages, ["<formatted panic message omitted>", LITERAL]);
 }
 
 const SERVICE_TEST: &str = "a_service_panic_reaches_the_file_and_not_stderr";

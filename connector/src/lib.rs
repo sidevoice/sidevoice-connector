@@ -9,6 +9,7 @@ pub mod adapters;
 pub mod agents;
 pub mod core_package;
 pub mod core_ready;
+pub mod crash;
 pub mod daemon;
 mod error;
 mod frame;
