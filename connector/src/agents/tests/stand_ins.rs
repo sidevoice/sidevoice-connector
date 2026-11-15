@@ -123,8 +123,20 @@ fn codex(args: &[String]) -> i32 {
     }
 }
 
-/// The Codex CLI of the request-gate test: its `mcp get` and `mcp add` can be made slow, or time out, or the add left
-/// without effect, by marker files in `$CODEX_HOME` that each affect the next call only.
+/// Holds a slow call until the test writes `release-slow` in `home`, so the test and not a timer decides when the call
+/// may finish. A call nobody releases is killed by the test; the cap only stops a leaked process.
+fn hold(home: &Path) {
+    let release = home.join("release-slow");
+    for _ in 0..3000 {
+        if std::fs::remove_file(&release).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The Codex CLI of the request-gate test: its `mcp get` and `mcp add` can be made slow (held until `release-slow`),
+/// or time out, or the add left without effect, by marker files in `$CODEX_HOME` that each affect the next call only.
 fn codex_gate(args: &[String]) -> i32 {
     let home = PathBuf::from(std::env::var_os("CODEX_HOME").unwrap());
     let state = home.join("fake-entry.json");
@@ -143,7 +155,7 @@ fn codex_gate(args: &[String]) -> i32 {
             }
             if take("slow-next-get") {
                 std::fs::write(home.join("slow-get-started"), &pid).unwrap();
-                std::thread::sleep(Duration::from_millis(800));
+                hold(&home);
             }
             match std::fs::read(&state) {
                 Ok(bytes) => {
@@ -173,7 +185,7 @@ fn codex_gate(args: &[String]) -> i32 {
             }
             if take("slow-next-add") {
                 std::fs::write(home.join("slow-add-started"), &pid).unwrap();
-                std::thread::sleep(Duration::from_millis(800));
+                hold(&home);
             }
             let value = json!({"name":"sidevoice","transport":{"type":"stdio","command":command,
                 "args":rest,"env":env},"enabled":true});
