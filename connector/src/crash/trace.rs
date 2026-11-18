@@ -16,6 +16,11 @@ pub(super) fn frames(trace: &Backtrace) -> Vec<Frame> {
     let mut frames = Vec::new();
     for frame in trace.frames() {
         let addr = frame.ip() as usize as u64;
+        // libgcc's unwinder (the system's, where the connector is linked with GNU ld or zig's) reports one last frame whose address
+        // is 0, the end of the stack; a frame without an address names nothing and Sentry cannot use it.
+        if addr == 0 {
+            continue;
+        }
         if frame.symbols().is_empty() {
             frames.push(Frame {
                 function: None,

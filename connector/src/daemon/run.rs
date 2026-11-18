@@ -170,6 +170,8 @@ pub async fn run(profile: Profile, managed: bool) -> Result<()> {
                     replay_again = false;
                     binding_order.clear();
                     core_session = item.session;
+                    // The link to the core is (re)made: the crash report setting is asked again, so an "off" set meanwhile holds now.
+                    crate::crash::recheck();
                 }
                 if core_tasks.len() >= 64 {
                     if let Some(tx) = item.reply {

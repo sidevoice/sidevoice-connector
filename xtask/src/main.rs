@@ -2,7 +2,8 @@
 //!
 //! - `dist`: build the release binary for this host (Linux: against glibc `glibc::FLOOR`, with cargo-zigbuild)
 //!   and package it, with its licence notices and the pinned core release's archive for this host (checked as
-//!   `core` checks it), as the archive `target/dist/sidevoice-connector-<target>.tar.zst`; then `verify` it.
+//!   `core` checks it), as the archive `target/dist/sidevoice-connector-<target>.tar.zst`; then `verify` it. The binary in the
+//!   archive has no debug sections: they are split off into `target/dist/debug` (`debug_files.rs`).
 //! - `verify ARCHIVE`: unpack it somewhere else, check its inventory (the core inside included), what the binary
 //!   links and (Linux) that it needs no glibc newer than the floor the inventory records, and run it from there: it
 //!   must report the version and build identity the inventory names, and stage the core it carries into a release,
@@ -26,7 +27,8 @@
 //! - `npm-publish TAG`: the npm packages of the GitHub release TAG's checked assets, published by trusted publishing:
 //!   the platform packages, then the launcher as a staged version a maintainer approves.
 //! - `sentry-upload` (needs `sentry-cli` and `SENTRY_AUTH_TOKEN`): the release `sidevoice-connector@<version>` and the debug
-//!   files of the build `dist` made, to Sentry (connector/src/crash.rs); only the release and nightly workflows run it.
+//!   files `dist` left in `target/dist/debug` (`debug_files.rs`), to Sentry (connector/src/crash.rs); only the release and
+//!   nightly workflows run it.
 //! - `e2e ARCHIVE`: on a disposable machine (a CI runner), the archive packed into local npm tarballs and installed through offline npx:
 //!   this user's real service manager and the real Claude Code and Codex CLIs; `install`, `pair-device`,
 //!   `agents connect`, `uninstall`, and what each must leave (xtask/src/e2e.rs).
@@ -40,6 +42,7 @@
 mod archive;
 mod codex;
 mod core;
+mod debug_files;
 mod dist;
 mod e2e;
 mod glibc;

@@ -1,7 +1,5 @@
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 
 use chrono::{Duration, SecondsFormat, Utc};
 use serde_json::{json, Value};
@@ -13,9 +11,6 @@ use super::*;
 use crate::platform::fs::{Files, Fs};
 use crate::profile::Profile;
 use crate::test_support::temp_dir;
-
-/// What the tests that read or set what this process knows of the setting take, one at a time.
-static GLOBAL: Mutex<()> = Mutex::new(());
 
 const ID: &str = "7b2f0b00-1c3e-4d5a-8f6b-0123456789ab";
 
@@ -612,6 +607,60 @@ fn an_id_file_that_is_not_ours_is_replaced() {
     }
 }
 
+// What turning sending off races with.
+
+#[test]
+fn nothing_is_kept_once_this_process_learned_that_sending_is_off() {
+    let f = fixture();
+    f.store.learned(false);
+    f.store.record(record(1)).unwrap();
+    f.store.record_without_waiting(record(2));
+    assert!(!f.data.join(store::STORE).exists(), "no record after off");
+    f.store.learned(true);
+    f.store.record(record(3)).unwrap();
+    assert_eq!(f.store.pending().unwrap().len(), 1);
+}
+
+#[test]
+fn erasing_a_store_that_is_being_written_into_is_retried_and_then_reported() {
+    let f = fixture();
+    for line in 0..MAX_RECORDS as u32 {
+        f.store.record(record(line)).unwrap();
+    }
+    let writer = {
+        let dir = f.data.join(store::STORE);
+        std::thread::spawn(move || {
+            for n in 0..200 {
+                let _ = fs::write(dir.join(format!("noise-{n}")), b"x");
+            }
+        })
+    };
+    // A directory that stays written into through every retry is reported as `DirectoryNotEmpty` (and nothing else); the next
+    // ask erases it again.
+    for _ in 0..8 {
+        if let Err(error) = erase(&f.data) {
+            assert_eq!(error.kind(), std::io::ErrorKind::DirectoryNotEmpty);
+        }
+        f.store.record(record(1)).unwrap();
+    }
+    writer.join().unwrap();
+    // Once nobody writes, it erases it all and says so.
+    erase(&f.data).unwrap();
+    assert!(f.store.pending().unwrap().is_empty());
+}
+
+#[test]
+fn a_record_is_held_only_by_its_own_id() {
+    let f = fixture();
+    let kept = record(1);
+    f.store.record(kept.clone()).unwrap();
+    assert!(f.store.holds(&kept.id));
+    assert!(!f.store.holds(&kept.id.to_uppercase()));
+    assert!(!f.store.holds("../x"));
+    f.store.remove(&kept.id).unwrap();
+    assert!(!f.store.holds(&kept.id));
+}
+
 // The capture.
 
 #[test]
@@ -645,7 +694,11 @@ fn a_capture_makes_a_record_with_the_frames_addresses() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].exception.message, "boom");
     assert!(!records[0].backtrace.is_empty());
-    assert!(records[0].backtrace.iter().all(|frame| frame.addr != 0));
+    assert!(
+        records[0].backtrace.iter().all(|frame| frame.addr != 0),
+        "{:#?}",
+        records[0].backtrace
+    );
     assert_eq!(records[0].version, crate::identity::VERSION);
 }
 
@@ -731,13 +784,38 @@ fn frames_start_at_the_code_that_panicked_and_images_are_the_ones_that_hold_a_fr
         "past the end"
     );
 
+    // A real backtrace: frames with an address each (the unwinder's terminal frame, address 0, is not one), and names.
     let mut here = backtrace::Backtrace::new();
     here.resolve();
-    assert!(trace::frames(&here).iter().all(|frame| frame.addr != 0));
+    let frames = trace::frames(&here);
+    assert!(!frames.is_empty());
+    assert!(frames.iter().all(|frame| frame.addr != 0), "{frames:#?}");
+    assert!(
+        frames.iter().any(|frame| frame.function.is_some()),
+        "{frames:#?}"
+    );
     // The program's own module is listed with a bare name, when it has a debug id.
     assert!(trace::loaded()
         .iter()
         .all(|image| !image.name.contains(['/', '\\'])));
+}
+
+#[test]
+fn a_frame_without_an_address_is_never_kept_or_sent() {
+    let mut raw = panic(Some("boom"), 1);
+    raw.frames = vec![frame("a", 0x1010), frame("end of the stack", 0)];
+    let stored = CrashRecord::from_panic(raw, &[]);
+    assert_eq!(stored.backtrace.len(), 1);
+    // Nor when it is read back from a file that has one.
+    let mut json = serde_json::to_value(&stored).unwrap();
+    json["backtrace"] = json!([
+        {"function": "a", "addr": 0x1010},
+        {"function": "z", "addr": 0}
+    ]);
+    let read = CrashRecord::from_untrusted(&json, &[]).unwrap();
+    assert_eq!(read.backtrace.len(), 1);
+    let sent = serde_json::to_string(&event(&read, "00")).unwrap();
+    assert!(!sent.contains("\"z\"") && !sent.contains("0x0\""), "{sent}");
 }
 
 // The event.
@@ -809,6 +887,12 @@ fn the_event_carries_the_closed_field_list_and_nothing_else() {
     extras.sort_unstable();
     assert_eq!(keys(&value["extra"]), extras);
     assert_eq!(value["extra"]["len"], 42);
+    for local in ["count", "first_at"] {
+        assert!(
+            value["extra"].get(local).is_none(),
+            "{local} stays on the machine"
+        );
+    }
     assert_eq!(value["extra"]["location"], "unknown:7");
     let exception = &value["exception"]["values"][0];
     assert_eq!(keys(exception), ["stacktrace", "type", "value"]);
@@ -1039,40 +1123,81 @@ fn a_core_that_cannot_be_asked_is_not_off_and_nothing_is_sent_blind() {
 
 #[test]
 fn a_core_that_says_off_erases_the_records_and_the_id_and_nothing_leaves() {
-    let _global = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
     let f = fixture();
     let server = Sentry::start(200);
     f.store.record(record(1)).unwrap();
     settings::machine_id(&f.data).unwrap();
-    pass(&context(&f), &|| Some(false), &server.dsn(), QUICK);
+    let context = context(&f);
+    pass(&context, &|| Some(false), &server.dsn(), QUICK);
     assert!(server.requests().is_empty());
     assert!(names(&f.data).is_empty(), "{:?}", names(&f.data));
-    assert!(
-        KNOWN_OFF.load(Ordering::SeqCst),
-        "and none is made after it"
-    );
-    known(true);
+    assert!(context.store.is_off(), "and none is made after it");
 }
 
 #[test]
 fn the_core_is_asked_again_before_each_record() {
-    let _global = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
     let f = fixture();
     let server = Sentry::start(200);
     f.store.record(record(1)).unwrap();
     f.store.record(record(2)).unwrap();
-    // On when the pass starts and for the first record; off for the second.
-    let answers = std::cell::RefCell::new(vec![Some(true), Some(true), Some(false)]);
+    // On when the pass starts and for the whole of the first record (before its id and after it); off for the second.
+    let answers = std::cell::RefCell::new(vec![Some(true), Some(true), Some(true), Some(false)]);
     let ask = || answers.borrow_mut().remove(0);
     pass(&context(&f), &ask, &server.dsn(), QUICK);
     assert_eq!(server.requests().len(), 1, "the second was never posted");
     assert!(names(&f.data).is_empty(), "{:?}", names(&f.data));
-    known(true);
+}
+
+#[test]
+fn an_off_that_comes_once_the_id_exists_leaves_no_id_and_posts_nothing() {
+    let f = fixture();
+    let server = Sentry::start(200);
+    f.store.record(record(1)).unwrap();
+    // On at the first look, off at the second: after the id was made and before the POST.
+    let answers = std::cell::RefCell::new(vec![Some(true), Some(false)]);
+    let ask = || answers.borrow_mut().remove(0);
+    let context = context(&f);
+    assert_eq!(drain(&context, &ask, &server.dsn(), later()), 0);
+    assert!(server.requests().is_empty());
+    assert!(names(&f.data).is_empty(), "{:?}", names(&f.data));
+    assert!(context.store.is_off());
+    // A core that cannot be asked at the second look: no id is kept either, and the record waits.
+    context.store.learned(true);
+    f.store.record(record(2)).unwrap();
+    let answers = std::cell::RefCell::new(vec![Some(true), None]);
+    let ask = || answers.borrow_mut().remove(0);
+    assert_eq!(drain(&context, &ask, &server.dsn(), later()), 0);
+    assert!(server.requests().is_empty());
+    assert!(!f.data.join("connector-crash-id.json").exists());
+    assert_eq!(f.store.pending().unwrap().len(), 1, "the record waits");
+}
+
+#[test]
+fn a_record_that_an_off_deleted_meanwhile_is_not_posted() {
+    let f = fixture();
+    let server = Sentry::start(200);
+    let doomed = record(1);
+    f.store.record(doomed.clone()).unwrap();
+    // The record's file goes between the list and the POST (an erasing from another thread): at the second look here.
+    let gone = f
+        .data
+        .join(store::STORE)
+        .join(format!("crash-{}.json", doomed.id));
+    let looks = std::cell::Cell::new(0);
+    let ask = || {
+        looks.set(looks.get() + 1);
+        if looks.get() == 2 {
+            fs::remove_file(&gone).unwrap();
+        }
+        Some(true)
+    };
+    assert_eq!(drain(&context(&f), &ask, &server.dsn(), later()), 0);
+    assert!(server.requests().is_empty(), "nothing was posted");
+    assert!(f.store.pending().unwrap().is_empty());
 }
 
 #[test]
 fn a_pass_waits_for_a_core_that_is_still_starting() {
-    let _global = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
     let f = fixture();
     let server = Sentry::start(200);
     f.store.record(record(1)).unwrap();
@@ -1092,7 +1217,40 @@ fn a_pass_waits_for_a_core_that_is_still_starting() {
     );
     assert_eq!(server.requests().len(), 1);
     assert!(f.store.pending().unwrap().is_empty());
-    known(true);
+}
+
+#[test]
+fn the_watch_applies_an_off_at_once_and_a_core_that_does_not_answer_changes_nothing() {
+    let f = fixture();
+    let context = context(&f);
+    f.store.record(record(1)).unwrap();
+    settings::machine_id(&f.data).unwrap();
+    // No answer, then on: nothing is erased, nothing is sent from here, and what was learned is on.
+    let answers = std::cell::RefCell::new(vec![None, Some(true)]);
+    let ask = || answers.borrow_mut().remove(0);
+    let laps = std::cell::Cell::new(0);
+    let mut rest = || {
+        laps.set(laps.get() + 1);
+        laps.get() <= 2
+    };
+    report::watch(&context, &ask, &mut rest);
+    assert_eq!(laps.get(), 3);
+    assert_eq!(f.store.pending().unwrap().len(), 1);
+    assert!(f.data.join("connector-crash-id.json").exists());
+    assert!(!context.store.is_off());
+    // Off, set elsewhere while the connector runs: the next look erases the records and the id, and no more are made.
+    report::settle(&context, &|| Some(false));
+    assert!(names(&f.data).is_empty(), "{:?}", names(&f.data));
+    assert!(context.store.is_off());
+    context.store.record(record(2)).unwrap();
+    context.store.record_without_waiting(record(3));
+    assert!(names(&f.data).is_empty(), "no record is made after it");
+    // Back on: records are made again.
+    report::settle(&context, &|| Some(true));
+    context.store.record(record(4)).unwrap();
+    assert_eq!(context.store.pending().unwrap().len(), 1);
+    // And asking for another look with no sender thread is nothing.
+    recheck();
 }
 
 #[test]
@@ -1284,4 +1442,21 @@ async fn the_command_forwards_to_the_core_and_off_erases_the_connectors_own() {
             .len(),
         1
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_off_command_fails_when_what_the_connector_kept_cannot_be_erased() {
+    let core = fake_core(200, true);
+    let data = core.profile.data.clone();
+    // A file where the records' directory should be: it cannot be removed as a directory.
+    fs::write(data.join(store::STORE), b"not a directory").unwrap();
+    settings::machine_id(&data).unwrap();
+    let error = forward(&core.profile, Some(false)).await.unwrap_err();
+    let keyed = crate::messages::keyed(&error);
+    assert_eq!(keyed.key, "crash-reports.erase-failed", "{error}");
+    assert_eq!(keyed.params["kind"], "NotADirectory");
+    // The id went, and the core's setting is off whatever happened here; asking changes and erases nothing.
+    assert!(!data.join("connector-crash-id.json").exists());
+    assert!(!forward(&core.profile, None).await.unwrap());
+    assert!(data.join(store::STORE).exists());
 }

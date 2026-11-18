@@ -11,6 +11,7 @@ use serde_json::json;
 use sidevoice_platform::target::ReleaseTarget;
 
 use crate::archive::write_archive;
+use crate::debug_files;
 use crate::glibc;
 use crate::host::chmod;
 use crate::notices::stage_notices;
@@ -85,6 +86,12 @@ pub(crate) fn dist() -> Result<()> {
         &read(&built.join(release_target.exe_name(PACKAGE)))?,
     )?;
     chmod(&binary, 0o755)?;
+    // The debug files go beside the archive (`target/dist/debug`, `cargo xtask sentry-upload`); the shipped binary carries none.
+    debug_files::split(
+        release_target,
+        &built.join(release_target.exe_name(PACKAGE)),
+        &binary,
+    )?;
     let mut executables = vec![entrypoint.clone()];
     if let Some(launcher) = background(target) {
         let staged = stage.join(&launcher);
@@ -134,9 +141,9 @@ pub(crate) fn dist() -> Result<()> {
     verify(&archive, None)
 }
 
-/// Where `dist` finds the release binary it built, and the debug files split off it (`sentry-upload`): on Linux below the
-/// target's triple, where `cargo zigbuild` puts what it builds for a glibc floor.
-pub(crate) fn built_dir(target: &ReleaseTarget) -> PathBuf {
+/// Where `dist` finds the release binary it built: on Linux below the target's triple, where `cargo zigbuild` puts what it
+/// builds for a glibc floor.
+fn built_dir(target: &ReleaseTarget) -> PathBuf {
     let release = repo().join("target");
     if target.os == "linux" {
         release.join(target.triple).join("release")

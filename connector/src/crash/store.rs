@@ -4,6 +4,7 @@
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
 use chrono::{DateTime, Duration, Utc};
@@ -24,6 +25,8 @@ pub struct CrashStore {
     dir: PathBuf,
     /// Every spelling of the home directory, hidden again in what is read back.
     homes: Vec<String>,
+    /// Whether this process learned that sending is off (memory only, never written): nothing is kept then.
+    off: AtomicBool,
 }
 
 /// A record on disk and the bytes it takes.
@@ -38,6 +41,7 @@ impl CrashStore {
         Self {
             dir: data.join(STORE),
             homes,
+            off: AtomicBool::new(false),
         }
     }
 
@@ -45,9 +49,14 @@ impl CrashStore {
         self.dir.join(format!("crash-{id}.json"))
     }
 
-    /// Keeps `record`: merged into the one with its signature if there is one, then the caps are applied.
+    /// Keeps `record`: merged into the one with its signature if there is one, then the caps are applied. Nothing is kept once
+    /// this process learned that sending is off: that is asked again under the lock, so a record that raced the erasing of an
+    /// `off` is not left behind (the erasing takes the same lock).
     pub fn record(&self, record: CrashRecord) -> io::Result<()> {
         let _held = lock();
+        if self.is_off() {
+            return Ok(());
+        }
         self.add(record)
     }
 
@@ -59,7 +68,9 @@ impl CrashStore {
             Err(TryLockError::Poisoned(held)) => held.into_inner(),
             Err(TryLockError::WouldBlock) => return,
         };
-        let _ = self.add(record);
+        if !self.is_off() {
+            let _ = self.add(record);
+        }
     }
 
     /// The records waiting to be sent, newest first; what is expired or unreadable is deleted.
@@ -84,14 +95,41 @@ impl CrashStore {
         }
     }
 
-    /// Deletes every record.
+    /// What this process learned of the setting: on (records are kept) or off (none are).
+    pub fn learned(&self, on: bool) {
+        self.off.store(!on, Ordering::SeqCst);
+    }
+
+    /// Whether this process learned that sending is off.
+    pub fn is_off(&self) -> bool {
+        self.off.load(Ordering::SeqCst)
+    }
+
+    /// Whether the record `id` is still on disk, asked under the store's lock (an erasing takes it too): right before a send, so
+    /// a record that an `off` deleted meanwhile is not posted. Only a UUID names a file.
+    pub fn holds(&self, id: &str) -> bool {
+        if Uuid::parse_str(id).map(|uuid| uuid.to_string()).as_deref() != Ok(id) {
+            return false;
+        }
+        let _held = lock();
+        fs::symlink_metadata(self.file(id)).is_ok_and(|meta| meta.is_file())
+    }
+
+    /// Deletes every record. A directory that is written into while it is removed (a capture that had the lock before this one)
+    /// is removed again; one that still is after a few tries is an error (`DirectoryNotEmpty`), which the caller reports: sending
+    /// is already off, nothing new is kept, and the next start erases again.
     pub fn erase(&self) -> io::Result<()> {
         let _held = lock();
-        match fs::remove_dir_all(&self.dir) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
+        let mut last: io::Error = io::ErrorKind::DirectoryNotEmpty.into();
+        for _ in 0..5 {
+            match fs::remove_dir_all(&self.dir) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => last = error,
+                Err(error) => return Err(error),
+            }
         }
+        Err(last)
     }
 
     fn add(&self, mut record: CrashRecord) -> io::Result<()> {

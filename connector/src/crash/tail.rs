@@ -218,6 +218,27 @@ fn id_kind(name: &str) -> Option<char> {
         .or_else(|| (name == "id" || stem != name).then_some('x'))
 }
 
+/// Whether `value` (a field's text, quoted or not) is shaped like an id: a UUID, a long hex string with a letter in it, or the
+/// connector's own name for a conversation's id in a log (`IdHash`: `h:` and 12 hex digits).
+fn looks_like_id(value: &str) -> bool {
+    let bare = value.trim_matches('"');
+    let uuid = bare.len() == 36
+        && bare.char_indices().all(|(at, c)| {
+            if [8, 13, 18, 23].contains(&at) {
+                c == '-'
+            } else {
+                c.is_ascii_hexdigit()
+            }
+        });
+    let hex = bare.len() >= 16
+        && bare.bytes().all(|b| b.is_ascii_hexdigit())
+        && bare.bytes().any(|b| b.is_ascii_alphabetic());
+    let hashed = bare
+        .strip_prefix("h:")
+        .is_some_and(|rest| rest.len() == 12 && rest.bytes().all(|b| b.is_ascii_hexdigit()));
+    uuid || hex || hashed
+}
+
 /// The tokens of one record: the same value of one kind of id is the same token (`d1` for the first device named, `d2` for
 /// the next).
 #[derive(Default)]
@@ -237,9 +258,10 @@ impl Tokens {
         format!("{kind}{}", index + 1)
     }
 
-    /// `name=value`, the value a token when the field carries an id; an empty value stays empty.
+    /// `name=value`, the value a token when the field carries an id, by its name or, whatever the name, by its shape (a UUID, 16 or
+    /// more hex digits with a letter among them, or `h:` and 12 hex digits); an empty value stays empty.
     fn field(&mut self, name: &str, value: &str) -> String {
-        match id_kind(name) {
+        match id_kind(name).or_else(|| looks_like_id(value).then_some('x')) {
             Some(_) if value.is_empty() => format!("{name}="),
             Some(kind) => format!("{name}={}", self.of(kind, value)),
             None => format!("{name}={value}"),
@@ -359,6 +381,45 @@ mod tests {
         for line in &lines {
             assert!(super::super::record::is_ours(line), "{line}");
         }
+    }
+
+    #[test]
+    fn a_value_shaped_like_an_id_is_re_keyed_under_any_field_name() {
+        let crashed = SystemTime::now();
+        let lines = render(
+            [entry(
+                crashed,
+                Level::WARN,
+                vec![Span {
+                    name: "call",
+                    fields: vec![(
+                        "trace".into(),
+                        "\"550e8400-e29b-41d4-a716-446655440000\"".into(),
+                    )],
+                }],
+                &[
+                    ("trace", "\"550e8400-e29b-41d4-a716-446655440000\""),
+                    ("blob", "9f86d081884c7d65"),
+                    ("other", "\"550E8400-E29B-41D4-A716-446655440001\""),
+                    ("size", "1234567890123456"),
+                    ("name", "\"deadbeef\""),
+                    ("note", "\"plain text\""),
+                    ("who", "\"h:0123456789ab\""),
+                    ("again", "h:0123456789AB"),
+                    ("short", "\"h:0123456789\""),
+                    ("long", "\"h:0123456789abc\""),
+                ],
+            )]
+            .iter(),
+            crashed,
+        );
+        assert_eq!(
+            lines[0],
+            "+0.000s WARN call{trace=x1}: sidevoice_connector::server::call: the call stopped trace=x1 blob=x2 other=x3 size=1234567890123456 name=\"deadbeef\" note=\"plain text\" who=x4 again=x5 short=\"h:0123456789\" long=\"h:0123456789abc\""
+        );
+        assert!(!looks_like_id("1234567890123456"));
+        assert!(!looks_like_id("beef"));
+        assert!(looks_like_id("h:0123456789ab"));
     }
 
     #[test]

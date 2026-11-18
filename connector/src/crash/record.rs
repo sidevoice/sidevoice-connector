@@ -245,7 +245,13 @@ impl CrashRecord {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "_./-".contains(c));
         self.location.file = if relative { file } else { "unknown".to_owned() };
-        self.backtrace = self.backtrace.iter().take(MAX_FRAMES).map(frame).collect();
+        self.backtrace = self
+            .backtrace
+            .iter()
+            .filter(|frame| frame.addr != 0)
+            .take(MAX_FRAMES)
+            .map(frame)
+            .collect();
         self.images = self
             .images
             .iter()

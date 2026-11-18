@@ -28,12 +28,17 @@ struct Identity {
     made: String,
 }
 
-/// Deletes the id and every pending record. A name that is not there is already gone.
-pub(super) fn erase(data: &Path) -> io::Result<()> {
-    let id = match std::fs::remove_file(data.join(IDENTITY)) {
+/// Deletes the id. A name that is not there is already gone.
+pub(super) fn remove_id(data: &Path) -> io::Result<()> {
+    match std::fs::remove_file(data.join(IDENTITY)) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
         _ => Ok(()),
-    };
+    }
+}
+
+/// Deletes the id and every pending record.
+pub(super) fn erase(data: &Path) -> io::Result<()> {
+    let id = remove_id(data);
     let records = CrashStore::new(data, Vec::new()).erase();
     id.and(records)
 }

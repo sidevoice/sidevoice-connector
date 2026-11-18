@@ -9,7 +9,9 @@
 //! sets). The connector keeps no setting of its own: before it sends a record, and to decide whether to keep or discard
 //! them, it asks the core over the local channel (`Profile::crash_reports`). A core that cannot be asked (not running, no
 //! answer, one that has no such setting yet) is not "off": the records are kept, nothing is sent, and the next start asks
-//! again. An answer "off" deletes the records and the connector's id, and none is made in this process afterwards.
+//! again. An answer "off" deletes the records and the connector's id, and none is made in this process afterwards. The
+//! daemon asks again every ten minutes and whenever its link to the core is made again ([`recheck`]), so an "off" set
+//! elsewhere holds at once, not only at the next start.
 //! `sidevoice-connector crash-reports on|off|status` is that same setting, forwarded to the core. What is the connector's
 //! own is its random id (`settings`), made on the first send and replaced after a year.
 //!
@@ -17,7 +19,7 @@
 //!   `trace`), then a thread of its own resolves them, matches the loaded modules that hold a frame, takes the tail of our
 //!   own warnings and errors (`tail`, an in-memory ring) and writes one record (`record`, `store`: private files in
 //!   `D/connector-crashes`, at most 20, 1 MiB and 30 days, the same signature merged with a count). The hook cannot ask
-//!   the core, so a record is made unless this process already learned "off"; it is then judged at the next start. The hook
+//!   the core, so a record is made unless this process already learned "off"; it is then judged at the next ask. The hook
 //!   stays safe (`docs/logging.md`, section 9): one capture at a time, locks only tried, a panic in the capture thread is
 //!   contained there, the wait is bounded, and the default hook is never chained.
 //! - At the next start, a thread of its own ([`start`], `report`) waits for the core, asks it, sends each record to Sentry
@@ -44,7 +46,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use crate::error::ConnectorError;
 use crate::messages::Keyed;
 use crate::profile::Profile;
 
@@ -93,18 +94,10 @@ static CONTEXT: OnceLock<Context> = OnceLock::new();
 static CAPTURING: AtomicBool = AtomicBool::new(false);
 /// One pass at start per process.
 static STARTED: AtomicBool = AtomicBool::new(false);
-/// Whether the core said "off" to this process. Memory only, never written: the core's answer is the setting, and a process
-/// that has not learned it records and lets the next start judge.
-static KNOWN_OFF: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     /// Set on the sender's thread: a panic of the reporter itself is logged and contained, never recorded (no loop).
     static SENDING: Cell<bool> = const { Cell::new(false) };
-}
-
-/// What this process has learned of the setting.
-fn known(on: bool) {
-    KNOWN_OFF.store(!on, Ordering::SeqCst);
 }
 
 /// From now on a panic of this process leaves a record. `data` is the connector's data directory; `homes` are the spellings
@@ -137,15 +130,22 @@ pub fn start(profile: Profile) {
     }
 }
 
+/// Asks the core about the setting again soon, because the connector's link to it was made again: an "off" set elsewhere then
+/// holds at once. Besides this the daemon asks every ten minutes. A no-op where nothing is sent (a build with no DSN).
+pub fn recheck() {
+    report::recheck();
+}
+
 /// Deletes the connector's id and every pending record, as the core's answer "off" does: for the command that turns the
 /// setting off, from any process of this machine.
 pub fn erase(data: &Path) -> std::io::Result<()> {
     settings::erase(data)
 }
 
-/// `crash-reports on|off|status`: the core's setting, forwarded (`set` is the new value, `None` to only ask). An answer "off"
-/// also deletes this connector's own id and pending records, as the pass at start does. A core that does not answer is an
-/// error, never a guess.
+/// `crash-reports on|off|status`: the core's setting, forwarded (`set` is the new value, `None` to only ask, which changes
+/// nothing). Turning it off also deletes this connector's own id and pending records, and a failure to delete is the command's
+/// failure (`crash-reports.erase-failed`) as it is the core's: the setting is off, nothing new is kept, and the next ask erases
+/// again. A core that does not answer is an error, never a guess.
 pub async fn forward(profile: &Profile, set: Option<bool>) -> anyhow::Result<bool> {
     let answer = match set {
         Some(send) => profile.set_crash_reports(send).await,
@@ -153,14 +153,13 @@ pub async fn forward(profile: &Profile, set: Option<bool>) -> anyhow::Result<boo
     };
     let send =
         answer.map_err(|_| Keyed::new("crash-reports.core-unavailable", serde_json::json!({})))?;
-    if !send {
-        if let Err(error) = settings::erase(&profile.data) {
-            tracing::warn!(
-                error.type = ConnectorError::CrashReportsUnavailable.code(),
-                kind = ?error.kind(),
-                "the crash reports of a machine set not to send could not be deleted; the next start deletes them"
-            );
-        }
+    if set == Some(false) {
+        settings::erase(&profile.data).map_err(|error| {
+            Keyed::new(
+                "crash-reports.erase-failed",
+                serde_json::json!({"kind": format!("{:?}", error.kind())}),
+            )
+        })?;
     }
     Ok(send)
 }
@@ -180,7 +179,9 @@ pub fn capture(literal: Option<&str>, formatted_len: usize, file: &str, line: u3
     let Some(context) = CONTEXT.get() else {
         return;
     };
-    if KNOWN_OFF.load(Ordering::SeqCst) || SENDING.get() || CAPTURING.swap(true, Ordering::SeqCst) {
+    // What the store learned of the setting is memory only, never written: the core's answer is the setting, and a process that
+    // has not learned it records and lets the next start judge.
+    if context.store.is_off() || SENDING.get() || CAPTURING.swap(true, Ordering::SeqCst) {
         return;
     }
     let trace = backtrace::Backtrace::new_unresolved();

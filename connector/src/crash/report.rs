@@ -8,10 +8,15 @@
 //! Whether the machine sends is not decided here: the core owns that setting and the pass asks it (`ask`), once it is
 //! running and again just before each POST. A core that cannot be asked (not running, no answer, a core that has no such
 //! setting) is not "off": the records stay and nothing is sent, ever blind. An answer "off" discards the records and the id.
+//!
+//! A setting changed elsewhere while the connector runs (the app, the core's own command) is looked at again every ten
+//! minutes and whenever the connector's link to the core is made again ([`recheck`]); an "off" then holds at once.
 
 use std::borrow::Cow;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::str::FromStr;
+use std::sync::OnceLock;
+use std::thread::Thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use sentry::protocol::{
@@ -23,7 +28,7 @@ use sentry::Envelope;
 use tracing::{info, warn};
 
 use super::record::CrashRecord;
-use super::{known, settings, Context, SENDING};
+use super::{settings, Context, SENDING};
 use crate::error::ConnectorError;
 use crate::profile::Profile;
 
@@ -37,7 +42,7 @@ const PASS_BUDGET: Duration = Duration::from_secs(60);
 /// The tags an event may carry.
 pub const TAGS: [&str; 4] = ["service.name", "os.type", "host.arch", "installation.id"];
 /// The `extra` entries an event may carry.
-pub const EXTRAS: [&str; 5] = ["count", "first_at", "location", "log_tail", "len"];
+pub const EXTRAS: [&str; 3] = ["location", "log_tail", "len"];
 
 /// What the core says now about sending, or `None` when it cannot be learned.
 pub(super) type Ask<'a> = &'a dyn Fn() -> Option<bool>;
@@ -106,8 +111,6 @@ pub fn event(record: &CrashRecord, machine_id: &str) -> Event<'static> {
         })
         .collect();
     let mut extra: Map<String, Value> = Map::new();
-    extra.insert("count".to_owned(), Value::from(record.count));
-    extra.insert("first_at".to_owned(), Value::from(record.first_at.clone()));
     extra.insert(
         "location".to_owned(),
         Value::from(format!("{}:{}", record.location.file, record.location.line)),
@@ -171,8 +174,9 @@ fn agent() -> ureq::Agent {
 }
 
 /// The records a previous run left, sent one at a time, newest first. A record is deleted once Sentry took it; the first
-/// failure ends the pass (the network is likely down, and every record would wait out its timeout). The core is asked
-/// again before each one. Returns how many were sent.
+/// failure ends the pass (the network is likely down, and every record would wait out its timeout). The core is asked before
+/// each one, and again once its id exists and just before the POST, because an `off` can come at any of those moments: no id
+/// is left for a machine that is not on, and a record an `off` deleted meanwhile is not posted. Returns how many were sent.
 pub(super) fn drain(context: &Context, ask: Ask<'_>, dsn: &Dsn, deadline: Instant) -> usize {
     let mut sent = 0;
     let records = match context.store.pending() {
@@ -203,6 +207,22 @@ pub(super) fn drain(context: &Context, ask: Ask<'_>, dsn: &Dsn, deadline: Instan
         let Ok(id) = settings::machine_id(&context.data) else {
             break;
         };
+        // Off may have come after the question above and before the id was made: asked again, with the id there.
+        match ask() {
+            Some(true) => {}
+            Some(false) => {
+                discard(context);
+                break;
+            }
+            None => {
+                let _ = settings::remove_id(&context.data);
+                break;
+            }
+        }
+        // Under the store's lock, which an erasing takes too: a record deleted since the list was made is not posted.
+        if !context.store.holds(&record.id) {
+            continue;
+        }
         if !deliver(&agent, dsn, event(&record, &id)) {
             warn!(
                 error.type = ConnectorError::CrashReportFailed.code(),
@@ -238,9 +258,10 @@ fn learn(ask: Ask<'_>, patience: Patience) -> Option<bool> {
     }
 }
 
-/// The core said off: the id and every record go, and none is made again in this process.
+/// The core said off: the id and every record go, and none is made again in this process. A failure to erase is one log line
+/// (the switch is the core's, already off, and the next ask erases again).
 fn discard(context: &Context) {
-    known(false);
+    context.store.learned(false);
     if let Err(error) = settings::erase(&context.data) {
         warn!(
             error.type = ConnectorError::CrashReportsUnavailable.code(),
@@ -258,8 +279,23 @@ fn dsn() -> Option<Dsn> {
         .and_then(|dsn| Dsn::from_str(dsn).ok())
 }
 
-/// The pass at start, on a thread of its own so that nothing here can hold the connector up or take it down. The core is
-/// asked over the local channel by this thread's own small runtime.
+/// The sender's thread, to be woken when the core's link comes back ([`recheck`]).
+static WATCHER: OnceLock<Thread> = OnceLock::new();
+/// How long the setting is left unasked while the connector runs: an `off` set elsewhere (the app, the core's command) holds
+/// within this long, not only at the next start.
+const RECHECK: Duration = Duration::from_secs(10 * 60);
+/// The least between two asks, whatever wakes the thread: a link that keeps reconnecting does not make it ask in a loop.
+const MIN_GAP: Duration = Duration::from_secs(5);
+
+/// Asks the core again soon: the connector's link to it was (re)made. A no-op where no sender runs (a build with no DSN).
+pub(super) fn recheck() {
+    if let Some(thread) = WATCHER.get() {
+        thread.unpark();
+    }
+}
+
+/// The pass at start, then the watch, on a thread of its own so that nothing here can hold the connector up or take it down.
+/// The core is asked over the local channel by this thread's own small runtime.
 pub(super) fn send_at_start(context: &'static Context, profile: Profile) {
     // A build with no DSN (a local one, a pull request) can never send: nothing is asked and nothing is started.
     let Some(dsn) = dsn() else { return };
@@ -267,6 +303,7 @@ pub(super) fn send_at_start(context: &'static Context, profile: Profile) {
         .name("crash-send".into())
         .spawn(move || {
             SENDING.set(true);
+            let _ = WATCHER.set(std::thread::current());
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -276,6 +313,14 @@ pub(super) fn send_at_start(context: &'static Context, profile: Profile) {
                 };
                 let ask = || runtime.block_on(profile.crash_reports()).ok();
                 pass(context, &ask, &dsn, PATIENCE);
+                let mut last = Instant::now();
+                let mut rest = || {
+                    std::thread::park_timeout(RECHECK);
+                    std::thread::sleep(MIN_GAP.saturating_sub(last.elapsed()));
+                    last = Instant::now();
+                    true
+                };
+                watch(context, &ask, &mut rest);
             }));
             if outcome.is_err() {
                 warn!(
@@ -288,7 +333,7 @@ pub(super) fn send_at_start(context: &'static Context, profile: Profile) {
 
 pub(super) fn pass(context: &Context, ask: Ask<'_>, dsn: &Dsn, patience: Patience) {
     match learn(ask, patience) {
-        Some(true) => known(true),
+        Some(true) => context.store.learned(true),
         // Records made while off, or left from before it, are discarded.
         Some(false) => {
             discard(context);
@@ -305,5 +350,23 @@ pub(super) fn pass(context: &Context, ask: Ask<'_>, dsn: &Dsn, patience: Patienc
     let sent = drain(context, ask, dsn, Instant::now() + PASS_BUDGET);
     if sent > 0 {
         info!(sent, "crash reports from a previous run were sent");
+    }
+}
+
+/// One look at the setting while the connector runs: an "off" is applied at once (the records and the id go, and no more
+/// are made), an "on" is remembered, and no answer changes nothing.
+pub(super) fn settle(context: &Context, ask: Ask<'_>) {
+    match ask() {
+        Some(true) => context.store.learned(true),
+        Some(false) => discard(context),
+        None => {}
+    }
+}
+
+/// [`settle`] each time `rest` has waited, for as long as it says to go on. Nothing is sent from here: a record made by this
+/// process waits for the next start.
+pub(super) fn watch(context: &Context, ask: Ask<'_>, rest: &mut dyn FnMut() -> bool) {
+    while rest() {
+        settle(context, ask);
     }
 }
