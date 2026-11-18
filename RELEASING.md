@@ -104,6 +104,20 @@ sidevoice-core release they run against (the `sidevoice-platform` tag) has its o
 stage or run the core the archive carries; `verify` does, on the build machine. Until a core release with the same
 floor is pinned, the package as a whole needs the core's floor.
 
+## Crash reports
+
+The connector sends its own crash reports to Sentry (`connector/README.md`, "Crash reports"; `connector/src/crash.rs`). Only the
+release and nightly builds can: `release.yml` gives `cargo xtask dist` the organisation's variable `SENTRY_DSN` as
+`SIDEVOICE_SENTRY_DSN`, which the build bakes in (`option_env!`); a pull request, a local build and `cargo test` have none,
+and a build without a DSN asks and sends nothing. The release profile keeps line tables (`debug = "line-tables-only"`,
+`split-debuginfo = "packed"`, `strip = "debuginfo"`) and Linux binaries carry a build id (`.cargo/config.toml`: the crash's
+modules are matched to the debug files by it). After each target's package, the workflow installs `sentry-cli` on its own
+(`npm install --global --ignore-scripts`, no secret in that step) and runs `cargo xtask sentry-upload` with
+`secrets.SENTRY_AUTH_TOKEN` in that step's environment alone: it creates the release `sidevoice-connector@<version>` in the
+organisation `twentynine-tech-sl`, project `sidevoice`, uploads the debug files of the build (`.dwp`, `.dSYM`, `.pdb` and the
+binary) and finalises it. `release-please.yml` passes the secret to `release.yml` by name (never `secrets: inherit`), and the
+workflows check out without persisting credentials. Whether a machine sends is the core's setting, not the connector's.
+
 ## Assets
 
 - `sidevoice-connector-<version>-<target>.tar.zst` for `macos-aarch64`, `linux-x86_64` and `linux-aarch64` (on the

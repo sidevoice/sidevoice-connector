@@ -16,6 +16,12 @@ on:
         description: The draft vX.Y.Z release release-please created; its assets are built from that tag.
         type: string
         required: true
+    # Passed by name by release-please.yml (never `secrets: inherit`): the debug files of a release go to Sentry with it. The
+    # variable `SENTRY_DSN` needs no passing: `vars` in a called workflow are the calling repository's and organisation's.
+    secrets:
+      SENTRY_AUTH_TOKEN:
+        description: The token that uploads the debug files and the release to Sentry (only `project:releases` and `project:write`).
+        required: true
 
 permissions:
   contents: read
@@ -46,11 +52,17 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           ref: ${{ inputs.tag || github.sha }}
       - uses: ./.github/actions/setup
       - run: cargo xtask fixtures
       - run: cargo test --locked
-      - run: cargo xtask dist
+      # Crash reports (connector/src/crash.rs): the DSN is baked into the binary at build time from the organisation's variable
+      # `SENTRY_DSN`; this workflow builds nightlies and releases only (a pull request builds without one and sends nothing).
+      - name: Package
+        env:
+          SIDEVOICE_SENTRY_DSN: ${{ vars.SENTRY_DSN }}
+        run: cargo xtask dist
       # The Linux binary on the oldest distribution it supports (glibc floor, xtask/src/glibc.rs).
       - if: runner.os == 'Linux'
         run: cargo xtask verify-floor target/dist/sidevoice-connector-${{ matrix.target }}.tar.zst
@@ -60,6 +72,16 @@ jobs:
           path: target/dist/*.tar.zst
           retention-days: 7
           if-no-files-found: error
+      # sentry-cli on its own: no secret in this step's environment and no install script (the pinned platform package carries
+      # the binary).
+      - name: Install sentry-cli
+        run: npm install --global --ignore-scripts @sentry/cli@3.8.2
+      # The debug files of this build and its release, to Sentry (xtask/src/sentry.rs): so that a panic's addresses become
+      # names and lines. The token is this step's alone.
+      - name: Upload the debug files and the release to Sentry
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: cargo xtask sentry-upload
 
   # Each archive installed end to end on a fresh runner of its OS (e2e.yml) before anything is published.
   e2e:
@@ -83,6 +105,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           ref: ${{ inputs.tag || github.sha }}
       - uses: ./.github/actions/setup
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -117,6 +140,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          persist-credentials: false
           ref: ${{ inputs.tag }}
       - uses: ./.github/actions/setup
       # Trusted publishing needs Node.js 22.14 or later; no registry-url, so no .npmrc and no token.

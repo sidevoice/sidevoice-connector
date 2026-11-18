@@ -25,6 +25,8 @@
 //!   `npx sidevoice --version --json` from there.
 //! - `npm-publish TAG`: the npm packages of the GitHub release TAG's checked assets, published by trusted publishing:
 //!   the platform packages, then the launcher as a staged version a maintainer approves.
+//! - `sentry-upload` (needs `sentry-cli` and `SENTRY_AUTH_TOKEN`): the release `sidevoice-connector@<version>` and the debug
+//!   files of the build `dist` made, to Sentry (connector/src/crash.rs); only the release and nightly workflows run it.
 //! - `e2e ARCHIVE`: on a disposable machine (a CI runner), the archive packed into local npm tarballs and installed through offline npx:
 //!   this user's real service manager and the real Claude Code and Codex CLIs; `install`, `pair-device`,
 //!   `agents connect`, `uninstall`, and what each must leave (xtask/src/e2e.rs).
@@ -46,6 +48,7 @@ mod manifest;
 mod notices;
 mod npm;
 mod publish;
+mod sentry;
 mod testbench;
 mod util;
 mod verify;
@@ -90,7 +93,7 @@ pub(crate) const MANIFEST: &str = "sidevoice-connector-manifest.json";
 pub(crate) const KIND: &str = "sidevoice-connector-v1";
 
 const USAGE: &str =
-    "usage: cargo xtask dist | verify ARCHIVE | verify-floor ARCHIVE | manifest DIR [--tag vX.Y.Z] | publish DIR TAG | npm ARCHIVE... | npm-smoke | npm-publish TAG | e2e ARCHIVE | fixtures | core [DIR] | codex [DIR] | testbench [ARGS...]";
+    "usage: cargo xtask dist | verify ARCHIVE | verify-floor ARCHIVE | manifest DIR [--tag vX.Y.Z] | publish DIR TAG | npm ARCHIVE... | npm-smoke | npm-publish TAG | sentry-upload | e2e ARCHIVE | fixtures | core [DIR] | codex [DIR] | testbench [ARGS...]";
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -113,6 +116,7 @@ fn main() {
             npm::npm_packages(&archives)
         }
         ["npm-smoke"] => npm::smoke(),
+        ["sentry-upload"] => sentry::upload(),
         ["e2e", archive] => e2e::e2e(Path::new(archive)),
         ["npm-publish", tag] => npm::publish(tag),
         ["testbench" | "bench", args @ ..] => testbench::testbench(args),

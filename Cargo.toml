@@ -35,3 +35,11 @@ default-members = [".", "connector", "testbench"]
 [workspace.dependencies]
 # Shared platform API and the core release bundled by xtask: one pin for both consumers.
 sidevoice-platform = { git = "https://github.com/sidevoice/sidevoice-core", tag = "v0.18.0" }
+
+# Crash reports (connector/src/crash, RELEASING.md): line tables for file and line, split off the binary where the platform can
+# (dSYM, PDB, .dwp), and the symbol table kept (`debuginfo` strips only the debug sections) so a panic's frames have names
+# with or without Sentry. The release and nightly workflows upload the debug files (`cargo xtask sentry-upload`).
+[profile.release]
+debug = "line-tables-only"
+split-debuginfo = "packed"
+strip = "debuginfo"
