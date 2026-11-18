@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.21.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.20.0...v0.21.0) (2026-11-18)
+
+
+### Features
+
+* **crash:** send handled errors to Sentry when the core says on ([#368](https://github.com/sidevoice/sidevoice-connector/issues/368)) ([3ca2bde](https://github.com/sidevoice/sidevoice-connector/commit/3ca2bdeeb2cc4a73daf2764b1a36ed716a0073ee))
+* **crash:** send the connector's own crash reports to Sentry at the next start ([#363](https://github.com/sidevoice/sidevoice-connector/issues/363)) ([e9a12a7](https://github.com/sidevoice/sidevoice-connector/commit/e9a12a70a1ca6bce3c49cf298e00bd8ff2bf87b5))
+* **logging:** adopt tracing per the shared guideline ([#356](https://github.com/sidevoice/sidevoice-connector/issues/356)) ([11ae1fb](https://github.com/sidevoice/sidevoice-connector/commit/11ae1fbd6bdc04bddb01beaf0b1e933a27909004))
+
 ## [0.20.0](https://github.com/sidevoice/sidevoice-connector/compare/v0.19.3...v0.20.0) (2026-11-11)
 
 
