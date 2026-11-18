@@ -55,8 +55,7 @@ pub enum ConnectorError {
 }
 
 impl ConnectorError {
-    /// Every variant, for the tests that hold the codes unique and well formed.
-    #[cfg(test)]
+    /// Every variant: the codes a log line may carry (`codes`), and what the tests hold unique and well formed.
     pub const ALL: &'static [ConnectorError] = &[
         Self::InvalidLogFilter,
         Self::CoreAlreadyRunning,
@@ -135,6 +134,17 @@ impl ConnectorError {
     }
 }
 
+/// Every code the connector's own log names: the ones of [`ConnectorError`] and of [`LinkError`]. The connector has no other
+/// source of an `error.type` (no refusal or fallback table, and `ConnectorError::of` only returns one of these). What leaves the
+/// machine as a handled error's type is taken from this list and from nowhere else (`crash::handled`): a value that merely has
+/// the shape of a code, a host name or an address a future call site logs by mistake among them, is never sent.
+pub fn codes() -> impl Iterator<Item = &'static str> {
+    ConnectorError::ALL
+        .iter()
+        .map(ConnectorError::code)
+        .chain(LinkError::ALL.iter().map(|error| error.code()))
+}
+
 /// A code is `connector.` and lowercase words joined by `-`.
 #[cfg(test)]
 fn well_formed(code: &str) -> bool {
@@ -152,11 +162,7 @@ mod tests {
 
     #[test]
     fn codes_are_unique_stable_and_well_formed() {
-        let codes: Vec<&str> = ConnectorError::ALL
-            .iter()
-            .map(ConnectorError::code)
-            .chain(LinkError::ALL.iter().map(|error| error.code()))
-            .collect();
+        let codes: Vec<&str> = codes().collect();
         for code in &codes {
             assert!(well_formed(code), "{code}");
         }
@@ -166,6 +172,30 @@ mod tests {
         assert_eq!(unique.len(), codes.len(), "a code is used twice");
         assert_eq!(ConnectorError::Io.code(), "connector.io");
         assert_eq!(LinkError::AuthRefused.code(), "connector.link-auth-refused");
+    }
+
+    /// A variant left out of `ALL` would never be reported as a handled error: every arm of `code()` is in the list.
+    #[test]
+    fn every_variant_is_in_the_list_of_codes() {
+        let arms = |source: &str| {
+            source
+                .split("\n#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains("=> \"connector."))
+                .count()
+        };
+        assert_eq!(
+            arms(include_str!("error.rs")),
+            ConnectorError::ALL.len(),
+            "a variant of ConnectorError is not in ALL"
+        );
+        assert_eq!(
+            arms(include_str!("link_error.rs")),
+            LinkError::ALL.len(),
+            "a variant of LinkError is not in ALL"
+        );
     }
 
     #[test]

@@ -25,12 +25,17 @@
 //! - At the next start, a thread of its own ([`start`], `report`) waits for the core, asks it, sends each record to Sentry
 //!   as an event built from the record's closed field list and deletes it once Sentry took it. No DSN in the build (a local
 //!   one, a pull request) means nothing is asked or sent, silently.
+//! - Handled errors (`handled`) go out under the same switch: the `error` events of our own targets, one event per `error.type`
+//!   per day, each with its code and place (the callsite's file and line) and the closed tags, never a message or a field value.
+//!   A layer of the subscriber queues them, and only while the core last said "on" (an answer never learned, or "off", queues
+//!   nothing); a thread of its own asks the core again before each send and sends through the same door as the crash reports.
 //!
 //! A record holds a closed list of fields ([`CrashRecord`]) and nothing else; text in it is bounded and free of control
 //! characters. The panic message is only ever a `&'static str` literal or the fixed marker (with the formatted message's
 //! length); the formatted message of `docs/logging.md` section 9 is never stored. Only the daemon records: the CLI and the
 //! MCP server have no file sink and no record.
 
+mod handled;
 mod record;
 mod report;
 mod settings;
@@ -49,14 +54,17 @@ use std::time::{Duration, SystemTime};
 use crate::messages::Keyed;
 use crate::profile::Profile;
 
+pub use handled::{layer as handled_layer, untyped as untyped_errors, TAGS as HANDLED_TAGS};
 pub use record::{CrashRecord, Exception, Frame, Image, Location, Panic};
 pub use report::{event, EXTRAS, SERVICE, TAGS};
 pub use store::CrashStore;
 pub use tail::layer as tail_layer;
 
-/// The connector's own log targets: what a record's tail keeps. Not `panic` and `crash_backtrace` (the hook's own, which the
-/// record itself replaces).
+/// The connector's own log targets: what a record's tail keeps and what the handled errors are taken from. Not `panic` and
+/// `crash_backtrace` (the hook's own, which the record itself replaces: a handled error is never one of those).
 pub const OWN_TARGETS: [&str; 2] = ["sidevoice_connector", "sidevoice_platform"];
+/// The targets the panic hook logs under: never a handled error, never in a tail.
+pub const PANIC_TARGETS: [&str; 2] = ["panic", "crash_backtrace"];
 
 /// The most records kept.
 pub const MAX_RECORDS: usize = 20;
@@ -80,7 +88,9 @@ struct Context {
     data: PathBuf,
     store: CrashStore,
     homes: Vec<String>,
+    /// `os.type`, `os.name` and `host.arch` in OpenTelemetry's values.
     os: &'static str,
+    os_name: &'static str,
     arch: &'static str,
     /// The loaded modules, listed at start.
     images: Vec<Image>,
@@ -107,6 +117,7 @@ pub fn install(
     data: &Path,
     homes: Vec<String>,
     os: &'static str,
+    os_name: &'static str,
     arch: &'static str,
     redact: fn(&str) -> String,
 ) {
@@ -115,16 +126,19 @@ pub fn install(
         store: CrashStore::new(data, homes.clone()),
         homes,
         os,
+        os_name,
         arch,
         images: trace::loaded(),
         redact,
     });
 }
 
-/// Sends what a previous run left, in the background (call once the daemon is serving). Never blocks and never fails.
+/// Sends what a previous run left, and from now on the handled errors, in the background (call once the daemon is serving).
+/// Never blocks and never fails.
 pub fn start(profile: Profile) {
     if let Some(context) = CONTEXT.get() {
         if !STARTED.swap(true, Ordering::SeqCst) {
+            handled::send_from_now_on(context, profile.clone());
             report::send_at_start(context, profile);
         }
     }

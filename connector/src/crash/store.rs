@@ -4,7 +4,7 @@
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
 use chrono::{DateTime, Duration, Utc};
@@ -17,6 +17,11 @@ use crate::platform::fs::{Files, Fs};
 /// The records' directory, in the connector's data directory (`D`).
 pub(super) const STORE: &str = "connector-crashes";
 
+/// What the core's answers have told this process so far.
+const UNKNOWN: u8 = 0;
+const ON: u8 = 1;
+const OFF: u8 = 2;
+
 /// The one lock of the store in this process. Only the daemon writes records; another process (`crash-reports off` on
 /// the command line) only deletes: a file that is gone under a read is one less record.
 static LOCK: Mutex<()> = Mutex::new(());
@@ -25,8 +30,9 @@ pub struct CrashStore {
     dir: PathBuf,
     /// Every spelling of the home directory, hidden again in what is read back.
     homes: Vec<String>,
-    /// Whether this process learned that sending is off (memory only, never written): nothing is kept then.
-    off: AtomicBool,
+    /// What this process learned of the setting, from the core's answers (memory only, never written): [`UNKNOWN`] until the
+    /// first answer, then [`ON`] or [`OFF`]. Nothing is kept once it is off; the handled errors are queued only once it is on.
+    learned: AtomicU8,
 }
 
 /// A record on disk and the bytes it takes.
@@ -41,7 +47,7 @@ impl CrashStore {
         Self {
             dir: data.join(STORE),
             homes,
-            off: AtomicBool::new(false),
+            learned: AtomicU8::new(UNKNOWN),
         }
     }
 
@@ -97,12 +103,18 @@ impl CrashStore {
 
     /// What this process learned of the setting: on (records are kept) or off (none are).
     pub fn learned(&self, on: bool) {
-        self.off.store(!on, Ordering::SeqCst);
+        self.learned
+            .store(if on { ON } else { OFF }, Ordering::SeqCst);
     }
 
     /// Whether this process learned that sending is off.
     pub fn is_off(&self) -> bool {
-        self.off.load(Ordering::SeqCst)
+        self.learned.load(Ordering::SeqCst) == OFF
+    }
+
+    /// Whether this process learned that sending is on: the latest answer of the core was "on". Not knowing is not on.
+    pub fn is_on(&self) -> bool {
+        self.learned.load(Ordering::SeqCst) == ON
     }
 
     /// Whether the record `id` is still on disk, asked under the store's lock (an erasing takes it too): right before a send, so

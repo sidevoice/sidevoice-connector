@@ -26,8 +26,7 @@ pub enum LinkError {
 }
 
 impl LinkError {
-    /// Every variant, for the tests that hold the codes unique.
-    #[cfg(test)]
+    /// Every variant: the codes a log line may carry (`error::codes`), and what the tests hold unique.
     pub const ALL: &'static [LinkError] = &[
         Self::Unreachable,
         Self::AuthRefused,

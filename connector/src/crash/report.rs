@@ -35,7 +35,7 @@ use crate::profile::Profile;
 /// The `service.name` and the release's name: `sidevoice-connector@<version>`.
 pub const SERVICE: &str = "sidevoice-connector";
 /// How long one POST may take.
-const POST_BUDGET: Duration = Duration::from_secs(10);
+pub(super) const POST_BUDGET: Duration = Duration::from_secs(10);
 /// How long the sending part of a pass may take; what is left waits for the next start.
 const PASS_BUDGET: Duration = Duration::from_secs(60);
 
@@ -65,21 +65,30 @@ pub(super) const PATIENCE: Patience = Patience {
     budget: Duration::from_secs(180),
 };
 
+/// The tags of an event: the closed list its kind allows, name and value.
+pub(super) fn tags<'a>(tags: impl IntoIterator<Item = (&'a str, &'a str)>) -> Map<String, String> {
+    tags.into_iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect()
+}
+
+/// The release of an event, as the debug files of the build are filed: `sidevoice-connector@<version>`.
+pub(super) fn release(version: &str) -> Cow<'static, str> {
+    Cow::Owned(format!("{SERVICE}@{version}"))
+}
+
 /// The event of a record, from its closed field list: the Sentry `event_id` is the record's id, the release the
 /// connector's version, and `installation.id` the connector's own random id.
 pub fn event(record: &CrashRecord, machine_id: &str) -> Event<'static> {
     let time = |text: &str| {
         chrono::DateTime::parse_from_rfc3339(text).map_or(SystemTime::now(), SystemTime::from)
     };
-    let tags: Map<String, String> = [
+    let tags = tags([
         ("service.name", SERVICE),
         ("os.type", record.os.as_str()),
         ("host.arch", record.arch.as_str()),
         ("installation.id", machine_id),
-    ]
-    .into_iter()
-    .map(|(name, value)| (name.to_owned(), value.to_owned()))
-    .collect();
+    ]);
     let frames: Vec<Frame> = record
         .backtrace
         .iter()
@@ -126,7 +135,7 @@ pub fn event(record: &CrashRecord, machine_id: &str) -> Event<'static> {
         // Never the host name: the SDK's client would fill it in, and no client exists here; still said, not assumed.
         server_name: None,
         timestamp: time(&record.last_at),
-        release: Some(Cow::Owned(format!("{SERVICE}@{}", record.version))),
+        release: Some(release(&record.version)),
         tags,
         extra,
         exception: Values::from(vec![Exception {
@@ -144,7 +153,7 @@ pub fn event(record: &CrashRecord, machine_id: &str) -> Event<'static> {
 }
 
 /// The one door anything leaves through: the envelope posted within [`POST_BUDGET`]. `true` when Sentry took it.
-fn deliver(agent: &ureq::Agent, dsn: &Dsn, event: Event<'static>) -> bool {
+pub(super) fn deliver(agent: &ureq::Agent, dsn: &Dsn, event: Event<'static>) -> bool {
     let mut body = Vec::new();
     if Envelope::from(event).to_writer(&mut body).is_err() {
         return false;
@@ -164,7 +173,7 @@ fn deliver(agent: &ureq::Agent, dsn: &Dsn, event: Event<'static>) -> bool {
         .is_ok_and(|answer| answer.status().is_success())
 }
 
-fn agent() -> ureq::Agent {
+pub(super) fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(POST_BUDGET))
         // A refusal is an answer, not an error: `deliver` reads the status.
@@ -260,7 +269,7 @@ fn learn(ask: Ask<'_>, patience: Patience) -> Option<bool> {
 
 /// The core said off: the id and every record go, and none is made again in this process. A failure to erase is one log line
 /// (the switch is the core's, already off, and the next ask erases again).
-fn discard(context: &Context) {
+pub(super) fn discard(context: &Context) {
     context.store.learned(false);
     if let Err(error) = settings::erase(&context.data) {
         warn!(
@@ -273,7 +282,7 @@ fn discard(context: &Context) {
 
 /// What the build was given: the DSN, set by the release and nightly workflows from the organisation's variable
 /// `SENTRY_DSN`. None (a local build, a pull request), or one that does not parse, means nothing is ever sent, silently.
-fn dsn() -> Option<Dsn> {
+pub(super) fn dsn() -> Option<Dsn> {
     option_env!("SIDEVOICE_SENTRY_DSN")
         .filter(|dsn| !dsn.is_empty())
         .and_then(|dsn| Dsn::from_str(dsn).ok())
