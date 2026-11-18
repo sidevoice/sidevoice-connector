@@ -42,7 +42,7 @@ async fn failed_watched_capture_keeps_the_last_scan_and_recovery_reconciles_all(
     assert_eq!(
         host.capture_login_path(
             &Cancellation::new(),
-            Instant::now() + StdDuration::from_secs(300)
+            Instant::now() + StdDuration::from_secs(120)
         )
         .await
         .unwrap(),
@@ -127,7 +127,7 @@ async fn only_a_scan_of_every_agent_clears_a_recorded_failure() {
         "version":1,"scanned_at":"old","login_path":"/usr/bin","scan_failed":false,
         "binaries":{},"seen":{},"dismissed":{}
     });
-    let deadline = Instant::now() + StdDuration::from_secs(300);
+    let deadline = Instant::now() + StdDuration::from_secs(120);
     let watched = host
         .merge_scan(
             base.clone(),
@@ -1477,7 +1477,7 @@ fn release_slow_call(fixture: &Fixture) {
 
 /// Waits until the fixture has written a whole pid: the file exists a moment before its content does.
 async fn wait_for_pid(path: &Path) -> i32 {
-    let deadline = Instant::now() + StdDuration::from_secs(300);
+    let deadline = Instant::now() + StdDuration::from_secs(120);
     while Instant::now() < deadline {
         if let Some(pid) = fs::read_to_string(path)
             .ok()
@@ -2476,7 +2476,7 @@ async fn capture_with_rc_only_path(shell_name: &str, real_shell: &str, rc: &str)
     let path = host
         .capture_login_path(
             &Cancellation::new(),
-            Instant::now() + StdDuration::from_secs(300),
+            Instant::now() + StdDuration::from_secs(120),
         )
         .await
         .unwrap()

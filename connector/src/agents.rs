@@ -353,7 +353,7 @@ impl HostAgents {
         // the rest of the suite (every stand-in is a whole test binary starting up) must not turn a slow request into
         // `agents.busy`.
         let mut agents = Arc::unwrap_or_clone(Self::with_command(profile, selected));
-        agents.request_limit = StdDuration::from_secs(600);
+        agents.request_limit = StdDuration::from_secs(120);
         Arc::new(agents)
     }
 
