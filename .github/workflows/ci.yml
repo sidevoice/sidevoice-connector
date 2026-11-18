@@ -36,6 +36,8 @@ jobs:
   test:
     name: Test and package (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
+    # Slowest platform takes about 13 minutes; a hung test must not hold a runner for the 6 hour default.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
